@@ -69,20 +69,23 @@ def split_symbol_name(value: str) -> tuple[str, str]:
     normalized = _normalize_spaces(value)
     match = re.fullmatch(r"(.+?)(\s*)\((.+)\)", normalized)
     if not match:
-        return (normalized.upper(), "")
+        return (_normalize_symbol(normalized), "")
 
     before = _normalize_spaces(match.group(1))
     separator = match.group(2)
     inside = _normalize_spaces(match.group(3))
     before_symbol = _normalize_symbol(before)
+    inside_symbol = _normalize_symbol(inside)
 
     if before_symbol != before.upper() and _looks_like_symbol(before_symbol):
         return (before_symbol, inside)
-    if separator and _looks_like_symbol(inside):
-        return (inside.upper(), before)
+    if inside_symbol != inside.upper() and _looks_like_symbol(inside_symbol):
+        return (inside_symbol, before)
+    if separator and _looks_like_symbol(inside_symbol):
+        return (inside_symbol, before)
     if _looks_like_symbol(before_symbol):
         return (before_symbol, inside)
-    return (inside.upper(), before)
+    return (inside_symbol, before)
 
 
 def detect_market(value: str) -> Market:
