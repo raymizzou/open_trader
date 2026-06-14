@@ -19,6 +19,7 @@ from open_trader.parsers.base import (
 
 BROKER = "phillips"
 ACCOUNT_ALIAS = "phillips_main"
+NUMERIC = r"(?:-?[\d,.]+|\([\d,.]+\))"
 
 
 def parse_phillips_text(text: str, month: str) -> ParseResult:
@@ -52,6 +53,8 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
             cash_balance = _parse_cash_line(line, statement_id)
             if cash_balance is not None:
                 cash_balances.append(cash_balance)
+            else:
+                in_cash = False
 
     return ParseResult(
         statement_id=statement_id,
@@ -63,17 +66,17 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
 
 def _parse_position_line(line: str, statement_id: str) -> Position | None:
     match = re.fullmatch(
-        r"股票\s+"
+        r"(?:股票|Stock)\s+"
         r"(?P<market>HK|US|SEHK|NASDAQ|NYSE)\s+"
         r"(?P<symbol>[A-Z0-9.]+)\s+"
         r"(?P<name>.+?)\s+"
-        r"(?P<previous_quantity>-?[\d,.]+)\s+"
+        rf"(?P<previous_quantity>{NUMERIC})\s+"
         r"(?P<last_buy_date>\d{4}/\d{2}/\d{2})\s+"
-        r"(?P<quantity>-?[\d,.]+)\s+"
-        r"(?P<last_price>-?[\d,.]+)\s+"
-        r"(?P<market_value>-?[\d,.]+)\s+"
-        r"(?P<margin_ratio>-?[\d,.]+)\s+"
-        r"(?P<margin_value>-?[\d,.]+)",
+        rf"(?P<quantity>{NUMERIC})\s+"
+        rf"(?P<last_price>{NUMERIC})\s+"
+        rf"(?P<market_value>{NUMERIC})\s+"
+        rf"(?P<margin_ratio>{NUMERIC})\s+"
+        rf"(?P<margin_value>{NUMERIC})",
         line,
     )
     if match is None:
@@ -112,7 +115,7 @@ def _currency_for_market(market: Market) -> str:
 
 
 def _parse_cash_line(line: str, statement_id: str) -> CashBalance | None:
-    match = re.fullmatch(r"(?P<currency>[A-Z]{3})\s+(?P<balance>-?[\d,.]+)", line)
+    match = re.fullmatch(rf"(?P<currency>[A-Z]{{3}})\s+(?P<balance>{NUMERIC})", line)
     if match is None:
         return None
 

@@ -20,6 +20,8 @@ from open_trader.parsers.base import (
 
 BROKER = "futu"
 ACCOUNT_ALIAS = "futu_main"
+NUMERIC = r"(?:-?[\d,.]+|\([\d,.]+\))"
+MULTIPLIER = rf"(?:-|{NUMERIC})"
 
 
 def parse_futu_text(text: str, month: str) -> ParseResult:
@@ -53,6 +55,8 @@ def parse_futu_text(text: str, month: str) -> ParseResult:
             cash_balance = _parse_cash_line(line, statement_id)
             if cash_balance is not None:
                 cash_balances.append(cash_balance)
+            else:
+                in_cash = False
 
     return ParseResult(
         statement_id=statement_id,
@@ -67,13 +71,13 @@ def _parse_position_line(line: str, statement_id: str) -> Position | None:
         r"(?P<display>.+?)\s+"
         r"(?P<market>US|SEHK|HK|HKEX|NASDAQ|NYSE)\s+"
         r"(?P<currency>[A-Z]{3})\s+"
-        r"(?P<quantity>-?[\d,.]+)\s+"
-        r"(?P<last_price>-?[\d,.]+)\s+"
-        r"(?P<multiplier>-|[\d,.]+)\s+"
-        r"(?P<market_value>-?[\d,.]+)\s+"
-        r"(?P<initial_margin>-?[\d,.]+)\s+"
-        r"(?P<maintenance_margin>-?[\d,.]+)\s+"
-        r"(?P<maintenance_rate>-?[\d,.]+)",
+        rf"(?P<quantity>{NUMERIC})\s+"
+        rf"(?P<last_price>{NUMERIC})\s+"
+        rf"(?P<multiplier>{MULTIPLIER})\s+"
+        rf"(?P<market_value>{NUMERIC})\s+"
+        rf"(?P<initial_margin>{NUMERIC})\s+"
+        rf"(?P<maintenance_margin>{NUMERIC})\s+"
+        rf"(?P<maintenance_rate>{NUMERIC})",
         line,
     )
     if match is None:
@@ -101,7 +105,7 @@ def _parse_position_line(line: str, statement_id: str) -> Position | None:
 
 
 def _parse_cash_line(line: str, statement_id: str) -> CashBalance | None:
-    match = re.fullmatch(r"(?P<currency>[A-Z]{3})\s+(?P<balance>-?[\d,.]+)", line)
+    match = re.fullmatch(rf"(?P<currency>[A-Z]{{3}})\s+(?P<balance>{NUMERIC})", line)
     if match is None:
         return None
 

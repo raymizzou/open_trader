@@ -19,6 +19,7 @@ from open_trader.parsers.base import (
 
 BROKER = "tiger"
 ACCOUNT_ALIAS = "tiger_main"
+NUMERIC = r"(?:-?[\d,.]+|\([\d,.]+\))"
 
 
 def parse_tiger_text(text: str, month: str) -> ParseResult:
@@ -52,6 +53,8 @@ def parse_tiger_text(text: str, month: str) -> ParseResult:
             cash_balance = _parse_cash_line(line, statement_id)
             if cash_balance is not None:
                 cash_balances.append(cash_balance)
+            else:
+                in_cash = False
 
     return ParseResult(
         statement_id=statement_id,
@@ -64,14 +67,14 @@ def parse_tiger_text(text: str, month: str) -> ParseResult:
 def _parse_position_line(line: str, statement_id: str) -> Position | None:
     match = re.fullmatch(
         r"(?P<display>.+?)\s+"
-        r"(?P<quantity>-?[\d,.]+)\s+"
-        r"(?P<multiplier>[\d,.]+)\s+"
-        r"(?P<cost_price>-?[\d,.]+)\s+"
-        r"(?P<last_price>-?[\d,.]+)\s+"
-        r"(?P<market_value>-?[\d,.]+)\s+"
-        r"(?P<unrealized_pnl>-?[\d,.]+)\s+"
-        r"(?P<initial_margin>-?[\d,.]+)\s+"
-        r"(?P<maintenance_margin>-?[\d,.]+)\s+"
+        rf"(?P<quantity>{NUMERIC})\s+"
+        rf"(?P<multiplier>{NUMERIC})\s+"
+        rf"(?P<cost_price>{NUMERIC})\s+"
+        rf"(?P<last_price>{NUMERIC})\s+"
+        rf"(?P<market_value>{NUMERIC})\s+"
+        rf"(?P<unrealized_pnl>{NUMERIC})\s+"
+        rf"(?P<initial_margin>{NUMERIC})\s+"
+        rf"(?P<maintenance_margin>{NUMERIC})\s+"
         r"(?P<currency>[A-Z]{3})",
         line,
     )
@@ -104,7 +107,7 @@ def _parse_position_line(line: str, statement_id: str) -> Position | None:
 
 
 def _parse_cash_line(line: str, statement_id: str) -> CashBalance | None:
-    match = re.fullmatch(r"(?P<currency>[A-Z]{3})\s+(?P<balance>-?[\d,.]+)", line)
+    match = re.fullmatch(rf"(?P<currency>[A-Z]{{3}})\s+(?P<balance>{NUMERIC})", line)
     if match is None:
         return None
 
