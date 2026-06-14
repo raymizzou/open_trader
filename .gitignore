@@ -1,0 +1,4 @@
+.venv/
+.tradingagents/
+__pycache__/
+*.py[cod]
