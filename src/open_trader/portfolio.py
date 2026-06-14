@@ -125,8 +125,16 @@ def build_portfolio_rows(
         unrealized_pnl = (
             None if has_missing_required_data else market_value - cost_value
         )
-        avg_cost_price = cost_value / total_quantity if total_quantity else None
-        last_price = market_value / total_quantity if total_quantity else None
+        avg_cost_price = (
+            None
+            if has_missing_required_data
+            else (cost_value / total_quantity if total_quantity else None)
+        )
+        last_price = (
+            None
+            if has_missing_required_data
+            else (market_value / total_quantity if total_quantity else None)
+        )
         quote = fx_provider.get_rate_to_hkd(currency)
         market_value_hkd = market_value * quote.rate
         cost_value_hkd = cost_value * quote.rate

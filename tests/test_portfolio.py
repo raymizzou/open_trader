@@ -168,7 +168,37 @@ def test_partial_missing_position_data_marks_merged_row_data_check():
     )
 
     nvda = rows[0]
+    assert nvda["avg_cost_price"] == ""
+    assert nvda["last_price"] == ""
     assert nvda["risk_flag"] == "data_check"
+
+
+def test_data_check_beats_overweight_for_partial_data_rows():
+    fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+    rows = build_portfolio_rows(
+        "2026-05",
+        [
+            position("futu", "AAPL", "10", "1000", "3000"),
+            position("tiger", "AAPL", "5", None, None),
+        ],
+        [
+            CashBalance(
+                statement_id="2026-05-futu",
+                broker="futu",
+                account_alias="futu_main",
+                currency="USD",
+                cash_balance=Decimal("1000"),
+                available_balance=Decimal("1000"),
+                confidence="high",
+                notes="",
+            )
+        ],
+        fx,
+    )
+
+    aapl = next(row for row in rows if row["symbol"] == "AAPL")
+    assert aapl["portfolio_weight_hkd"] == "75.00%"
+    assert aapl["risk_flag"] == "data_check"
 
 
 def test_build_portfolio_rows_sorts_by_group_then_market_value_hkd_desc():
