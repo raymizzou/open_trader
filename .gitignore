@@ -1,4 +1,6 @@
 .venv/
 .tradingagents/
+data/
+.pytest_cache/
 __pycache__/
 *.py[cod]
