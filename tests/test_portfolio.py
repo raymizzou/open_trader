@@ -5,6 +5,9 @@ from open_trader.models import AssetClass, CashBalance, Market, Position
 from open_trader.portfolio import build_portfolio_rows
 
 
+_COMPUTED_UNREALIZED_PNL = object()
+
+
 def position(
     broker: str,
     symbol: str,
@@ -16,9 +19,20 @@ def position(
     asset_class: AssetClass = AssetClass.STOCK,
     currency: str = "USD",
     confidence: str = "high",
+    unrealized_pnl: str | None | object = _COMPUTED_UNREALIZED_PNL,
 ) -> Position:
     cost_value_decimal = None if cost_value is None else Decimal(cost_value)
     market_value_decimal = None if market_value is None else Decimal(market_value)
+    if unrealized_pnl is _COMPUTED_UNREALIZED_PNL:
+        unrealized_pnl_decimal = (
+            market_value_decimal - cost_value_decimal
+            if market_value_decimal is not None and cost_value_decimal is not None
+            else None
+        )
+    elif unrealized_pnl is None:
+        unrealized_pnl_decimal = None
+    else:
+        unrealized_pnl_decimal = Decimal(str(unrealized_pnl))
     return Position(
         statement_id=f"2026-05-{broker}",
         broker=broker,
@@ -33,11 +47,7 @@ def position(
         last_price=None,
         market_value=market_value_decimal,
         cost_value=cost_value_decimal,
-        unrealized_pnl=(
-            market_value_decimal - cost_value_decimal
-            if market_value_decimal is not None and cost_value_decimal is not None
-            else None
-        ),
+        unrealized_pnl=unrealized_pnl_decimal,
         confidence=confidence,
         notes="",
     )
@@ -197,8 +207,91 @@ def test_data_check_beats_overweight_for_partial_data_rows():
     )
 
     aapl = next(row for row in rows if row["symbol"] == "AAPL")
-    assert aapl["portfolio_weight_hkd"] == "75.00%"
+    assert aapl["portfolio_weight_hkd"] == ""
     assert aapl["risk_flag"] == "data_check"
+
+
+def test_missing_position_valuation_blanks_all_portfolio_weights_and_data_checks_all_rows():
+    fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+    rows = build_portfolio_rows(
+        "2026-05",
+        [
+            position("futu", "AAPL", "10", "1000", "3000"),
+            position("tiger", "BROKEN", "5", "500", None),
+        ],
+        [
+            CashBalance(
+                statement_id="2026-05-futu",
+                broker="futu",
+                account_alias="futu_main",
+                currency="USD",
+                cash_balance=Decimal("1000"),
+                available_balance=Decimal("1000"),
+                confidence="high",
+                notes="",
+            )
+        ],
+        fx,
+    )
+
+    assert {row["portfolio_weight_hkd"] for row in rows} == {""}
+    assert {row["risk_flag"] for row in rows} == {"data_check"}
+
+
+def test_merged_rows_use_broker_unrealized_pnl_when_all_positions_provide_it():
+    fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+    rows = build_portfolio_rows(
+        "2026-05",
+        [
+            position("futu", "NVDA", "10", "1000", "1300", unrealized_pnl="250"),
+            position("tiger", "NVDA", "5", "600", "700", unrealized_pnl="100"),
+        ],
+        [
+            CashBalance(
+                statement_id="2026-05-futu",
+                broker="futu",
+                account_alias="futu_main",
+                currency="USD",
+                cash_balance=Decimal("18000"),
+                available_balance=Decimal("18000"),
+                confidence="high",
+                notes="",
+            )
+        ],
+        fx,
+    )
+
+    nvda = next(row for row in rows if row["symbol"] == "NVDA")
+    assert nvda["unrealized_pnl"] == "350.00"
+    assert nvda["unrealized_pnl_pct"] == "21.88%"
+
+
+def test_merged_rows_fall_back_to_computed_pnl_when_any_broker_pnl_is_missing():
+    fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+    rows = build_portfolio_rows(
+        "2026-05",
+        [
+            position("futu", "NVDA", "10", "1000", "1300", unrealized_pnl="250"),
+            position("tiger", "NVDA", "5", "600", "700", unrealized_pnl=None),
+        ],
+        [
+            CashBalance(
+                statement_id="2026-05-futu",
+                broker="futu",
+                account_alias="futu_main",
+                currency="USD",
+                cash_balance=Decimal("18000"),
+                available_balance=Decimal("18000"),
+                confidence="high",
+                notes="",
+            )
+        ],
+        fx,
+    )
+
+    nvda = next(row for row in rows if row["symbol"] == "NVDA")
+    assert nvda["unrealized_pnl"] == "400.00"
+    assert nvda["unrealized_pnl_pct"] == "25.00%"
 
 
 def test_build_portfolio_rows_sorts_by_group_then_market_value_hkd_desc():

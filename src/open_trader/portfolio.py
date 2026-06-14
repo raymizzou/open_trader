@@ -104,6 +104,7 @@ def build_portfolio_rows(
             position.market_value is None or position.cost_value is None
             for position in group
         )
+        has_missing_market_value = any(position.market_value is None for position in group)
         market_value = sum(
             (
                 position.market_value
@@ -122,9 +123,15 @@ def build_portfolio_rows(
             ),
             Decimal("0"),
         )
-        unrealized_pnl = (
-            None if has_missing_required_data else market_value - cost_value
-        )
+        if all(position.unrealized_pnl is not None for position in group):
+            unrealized_pnl = sum(
+                (position.unrealized_pnl for position in group),
+                Decimal("0"),
+            )
+        elif has_missing_required_data:
+            unrealized_pnl = None
+        else:
+            unrealized_pnl = market_value - cost_value
         avg_cost_price = (
             None
             if has_missing_required_data
@@ -169,6 +176,7 @@ def build_portfolio_rows(
                 "fx_to_hkd": quote.rate,
                 "market_value_hkd": market_value_hkd,
                 "cost_value_hkd": cost_value_hkd,
+                "portfolio_value_incomplete": has_missing_market_value,
                 "brokers": ";".join(brokers),
                 "accounts": ";".join(accounts),
                 "ai_eligible": ai_eligible,
@@ -218,6 +226,7 @@ def build_portfolio_rows(
                 "fx_to_hkd": quote.rate,
                 "market_value_hkd": market_value * quote.rate,
                 "cost_value_hkd": None,
+                "portfolio_value_incomplete": False,
                 "brokers": ";".join(brokers),
                 "accounts": ";".join(accounts),
                 "ai_eligible": False,
@@ -228,14 +237,24 @@ def build_portfolio_rows(
             }
         )
 
+    portfolio_value_incomplete = any(row["portfolio_value_incomplete"] for row in raw_rows)
     total_hkd = sum((row["market_value_hkd"] for row in raw_rows), Decimal("0"))
     output: list[dict[str, str]] = []
     for row in raw_rows:
-        weight = row["market_value_hkd"] / total_hkd if total_hkd else Decimal("0")
+        weight = (
+            None
+            if portfolio_value_incomplete
+            else row["market_value_hkd"] / total_hkd
+            if total_hkd
+            else Decimal("0")
+        )
+        if portfolio_value_incomplete:
+            row["risk_flag"] = "data_check"
         if (
             row["risk_flag"] != "data_check"
             and row["asset_class"]
             not in {AssetClass.CASH.value, AssetClass.MONEY_MARKET_FUND.value}
+            and weight is not None
             and weight > Decimal("0.10")
         ):
             row["risk_flag"] = "overweight"
