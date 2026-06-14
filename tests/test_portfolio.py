@@ -1,11 +1,10 @@
 from decimal import Decimal
 
+import pytest
+
 from open_trader.fx import StaticMonthEndFxProvider
 from open_trader.models import AssetClass, CashBalance, Market, Position
 from open_trader.portfolio import build_portfolio_rows
-
-
-_COMPUTED_UNREALIZED_PNL = object()
 
 
 def position(
@@ -19,20 +18,11 @@ def position(
     asset_class: AssetClass = AssetClass.STOCK,
     currency: str = "USD",
     confidence: str = "high",
-    unrealized_pnl: str | None | object = _COMPUTED_UNREALIZED_PNL,
+    unrealized_pnl: str | None = None,
 ) -> Position:
     cost_value_decimal = None if cost_value is None else Decimal(cost_value)
     market_value_decimal = None if market_value is None else Decimal(market_value)
-    if unrealized_pnl is _COMPUTED_UNREALIZED_PNL:
-        unrealized_pnl_decimal = (
-            market_value_decimal - cost_value_decimal
-            if market_value_decimal is not None and cost_value_decimal is not None
-            else None
-        )
-    elif unrealized_pnl is None:
-        unrealized_pnl_decimal = None
-    else:
-        unrealized_pnl_decimal = Decimal(str(unrealized_pnl))
+    unrealized_pnl_decimal = None if unrealized_pnl is None else Decimal(unrealized_pnl)
     return Position(
         statement_id=f"2026-05-{broker}",
         broker=broker,
@@ -181,6 +171,52 @@ def test_partial_missing_position_data_marks_merged_row_data_check():
     assert nvda["avg_cost_price"] == ""
     assert nvda["last_price"] == ""
     assert nvda["risk_flag"] == "data_check"
+
+
+def test_missing_position_values_blank_group_totals_and_hkd_totals():
+    fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+    rows = build_portfolio_rows(
+        "2026-05",
+        [
+            position("futu", "NVDA", "10", "1000", "2000"),
+            position("tiger", "NVDA", "5", None, None),
+            position("futu", "AAPL", "10", "1000", "2000"),
+            position("tiger", "AAPL", "5", None, "500"),
+            position("futu", "MSFT", "10", "1000", "0"),
+        ],
+        [],
+        fx,
+    )
+
+    nvda = next(row for row in rows if row["symbol"] == "NVDA")
+    assert nvda["market_value"] == ""
+    assert nvda["market_value_hkd"] == ""
+    assert nvda["cost_value"] == ""
+    assert nvda["cost_value_hkd"] == ""
+
+    aapl = next(row for row in rows if row["symbol"] == "AAPL")
+    assert aapl["market_value"] == "2500"
+    assert aapl["market_value_hkd"] == "19500.00"
+    assert aapl["cost_value"] == ""
+    assert aapl["cost_value_hkd"] == ""
+
+    msft = next(row for row in rows if row["symbol"] == "MSFT")
+    assert msft["market_value"] == "0"
+    assert msft["market_value_hkd"] == "0.00"
+    assert msft["cost_value"] == "1000"
+    assert msft["cost_value_hkd"] == "7800.00"
+
+
+def test_build_portfolio_rows_rejects_mismatched_fx_provider_month():
+    fx = StaticMonthEndFxProvider("2026-04", {"USD": Decimal("7.8")})
+
+    with pytest.raises(ValueError, match="month.*2026-05.*fx_provider.month.*2026-04"):
+        build_portfolio_rows(
+            "2026-05",
+            [position("futu", "NVDA", "10", "1000", "2000")],
+            [],
+            fx,
+        )
 
 
 def test_data_check_beats_overweight_for_partial_data_rows():

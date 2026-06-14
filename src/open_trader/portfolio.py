@@ -93,6 +93,12 @@ def build_portfolio_rows(
     cash_balances: Iterable[CashBalance],
     fx_provider: StaticMonthEndFxProvider,
 ) -> list[dict[str, str]]:
+    if month != fx_provider.month:
+        raise ValueError(
+            f"Portfolio month {month} does not match fx_provider.month "
+            f"{fx_provider.month}"
+        )
+
     grouped: dict[tuple[Market, AssetClass, str, str], list[Position]] = defaultdict(list)
     for position in positions:
         grouped[position.identity_key()].append(position)
@@ -105,7 +111,8 @@ def build_portfolio_rows(
             for position in group
         )
         has_missing_market_value = any(position.market_value is None for position in group)
-        market_value = sum(
+        has_missing_cost_value = any(position.cost_value is None for position in group)
+        summed_market_value = sum(
             (
                 position.market_value
                 if position.market_value is not None
@@ -114,7 +121,7 @@ def build_portfolio_rows(
             ),
             Decimal("0"),
         )
-        cost_value = sum(
+        summed_cost_value = sum(
             (
                 position.cost_value
                 if position.cost_value is not None
@@ -123,6 +130,8 @@ def build_portfolio_rows(
             ),
             Decimal("0"),
         )
+        market_value = None if has_missing_market_value else summed_market_value
+        cost_value = None if has_missing_cost_value else summed_cost_value
         if all(position.unrealized_pnl is not None for position in group):
             unrealized_pnl = sum(
                 (position.unrealized_pnl for position in group),
@@ -131,20 +140,20 @@ def build_portfolio_rows(
         elif has_missing_required_data:
             unrealized_pnl = None
         else:
-            unrealized_pnl = market_value - cost_value
+            unrealized_pnl = summed_market_value - summed_cost_value
         avg_cost_price = (
             None
             if has_missing_required_data
-            else (cost_value / total_quantity if total_quantity else None)
+            else (summed_cost_value / total_quantity if total_quantity else None)
         )
         last_price = (
             None
             if has_missing_required_data
-            else (market_value / total_quantity if total_quantity else None)
+            else (summed_market_value / total_quantity if total_quantity else None)
         )
         quote = fx_provider.get_rate_to_hkd(currency)
-        market_value_hkd = market_value * quote.rate
-        cost_value_hkd = cost_value * quote.rate
+        market_value_hkd = None if market_value is None else market_value * quote.rate
+        cost_value_hkd = None if cost_value is None else cost_value * quote.rate
         ai_eligible = any(_ai_eligible(position) for position in group)
         confidence = _merged_confidence(position.confidence for position in group)
         brokers = sorted({position.broker for position in group})
@@ -168,7 +177,9 @@ def build_portfolio_rows(
                 "unrealized_pnl": unrealized_pnl,
                 "unrealized_pnl_pct": (
                     (unrealized_pnl / cost_value)
-                    if unrealized_pnl is not None and cost_value != Decimal("0")
+                    if unrealized_pnl is not None
+                    and cost_value is not None
+                    and cost_value != Decimal("0")
                     else None
                 ),
                 "fx_source": quote.source,
@@ -238,14 +249,21 @@ def build_portfolio_rows(
         )
 
     portfolio_value_incomplete = any(row["portfolio_value_incomplete"] for row in raw_rows)
-    total_hkd = sum((row["market_value_hkd"] for row in raw_rows), Decimal("0"))
+    total_hkd = sum(
+        (
+            row["market_value_hkd"]
+            for row in raw_rows
+            if row["market_value_hkd"] is not None
+        ),
+        Decimal("0"),
+    )
     output: list[dict[str, str]] = []
     for row in raw_rows:
         weight = (
             None
             if portfolio_value_incomplete
             else row["market_value_hkd"] / total_hkd
-            if total_hkd
+            if total_hkd and row["market_value_hkd"] is not None
             else Decimal("0")
         )
         if portfolio_value_incomplete:
@@ -292,5 +310,8 @@ def build_portfolio_rows(
 
     return sorted(
         output,
-        key=lambda item: (int(item["sort_group"]), -Decimal(item["market_value_hkd"])),
+        key=lambda item: (
+            int(item["sort_group"]),
+            -Decimal(item["market_value_hkd"] or "0"),
+        ),
     )
