@@ -2,7 +2,11 @@ from decimal import Decimal
 
 import pytest
 
-from open_trader.fx import StaticMonthEndFxProvider
+from open_trader.fx import StaticMonthEndFxProvider, convert_to_hkd, month_end_date
+
+
+def test_month_end_date_handles_leap_year_february():
+    assert month_end_date("2024-02") == "2024-02-29"
 
 
 def test_static_fx_provider_returns_hkd_for_hkd():
@@ -29,3 +33,9 @@ def test_static_fx_provider_rejects_missing_currency():
 
     with pytest.raises(KeyError, match="Missing HKD FX rate for EUR"):
         provider.get_rate_to_hkd("EUR")
+
+
+def test_convert_to_hkd_multiplies_amount_by_fx_rate():
+    provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.84")})
+
+    assert convert_to_hkd(Decimal("10"), "usd", provider) == Decimal("78.40")

@@ -50,3 +50,8 @@ class StaticMonthEndFxProvider:
             rate=self.rates_to_hkd[normalized],
             source=self.source,
         )
+
+
+def convert_to_hkd(amount: Decimal, currency: str, provider: StaticMonthEndFxProvider) -> Decimal:
+    quote = provider.get_rate_to_hkd(currency)
+    return amount * quote.rate
