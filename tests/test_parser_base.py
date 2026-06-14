@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import is_dataclass
 from decimal import Decimal
+from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
@@ -115,6 +117,42 @@ def test_parse_result_shape_and_sha256_file(tmp_path) -> None:
         sha256_file(statement)
         == "ab9d1a6a6801519bbdb22ef561948b27c791ad07a9f768eb744b62a10a310ba5"
     )
+
+
+def test_sha256_file_reads_bounded_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = (b"x" * (1024 * 1024)) + b"tail"
+    read_sizes: list[int] = []
+
+    class FakeHandle:
+        def __init__(self) -> None:
+            self.offset = 0
+
+        def __enter__(self) -> FakeHandle:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            if self.offset >= len(data):
+                return b""
+            if size < 0:
+                chunk = data[self.offset :]
+                self.offset = len(data)
+                return chunk
+            chunk = data[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+    def fake_open(self: Path, mode: str) -> FakeHandle:
+        assert mode == "rb"
+        return FakeHandle()
+
+    monkeypatch.setattr(Path, "open", fake_open)
+
+    assert sha256_file(Path("fake.pdf")) == sha256(data).hexdigest()
+    assert read_sizes == [1024 * 1024, 1024 * 1024, 1024 * 1024]
 
 
 def test_parse_result_defaults_collections_and_page_count() -> None:
