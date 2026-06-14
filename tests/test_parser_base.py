@@ -24,7 +24,10 @@ def test_parse_decimal_normalizes_common_statement_values() -> None:
     assert parse_decimal("(123.45)") == Decimal("-123.45")
 
 
-@pytest.mark.parametrize("value", [None, "", "   ", "-", "--", "not a number"])
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "   ", "-", "--", "not a number", "NaN", "Infinity", "-Infinity"],
+)
 def test_parse_decimal_returns_none_for_missing_or_invalid_values(value: str | None) -> None:
     assert parse_decimal(value) is None
 
@@ -38,6 +41,8 @@ def test_parse_decimal_returns_none_for_missing_or_invalid_values(value: str | N
             ("BOTZ", "Global X Robotics & Artificial Intelligence Thematic ETF"),
         ),
         ("00700(腾讯控股)", ("00700", "腾讯控股")),
+        ("700 HK (Tencent)", ("700.HK", "Tencent")),
+        ("BRK B (Berkshire Hathaway)", ("BRK.B", "Berkshire Hathaway")),
     ],
 )
 def test_split_symbol_name_handles_symbol_and_name_orders(
@@ -51,6 +56,9 @@ def test_split_symbol_name_handles_symbol_and_name_orders(
     [
         ("US", Market.US),
         ("NASDAQ", Market.US),
+        ("CBOE", Market.US),
+        ("ARCA", Market.US),
+        ("NYSE ARCA", Market.US),
         ("SEHK", Market.HK),
         ("HK", Market.HK),
         ("SG", Market.OTHER),
@@ -66,9 +74,12 @@ def test_detect_market_maps_known_markets(value: str, expected: Market) -> None:
         ("BOTZ", "Global X Robotics & Artificial Intelligence Thematic ETF", AssetClass.ETF),
         ("2800", "Tracker Fund of Hong Kong ETF", AssetClass.ETF),
         ("USDXX", "美元货币市场基金 ETF", AssetClass.MONEY_MARKET_FUND),
+        ("USDMMF", "高腾微金美元貨幣基金", AssetClass.MONEY_MARKET_FUND),
         ("HKFUND", "盈富基金", AssetClass.FUND),
         ("NVDA 240621C00120000", "NVIDIA CALL", AssetClass.OPTION),
         ("TSLA", "Tesla PUT Option", AssetClass.OPTION),
+        ("NVDA", "NVIDIA 期权", AssetClass.OPTION),
+        ("NVDA", "NVIDIA 期權", AssetClass.OPTION),
         ("NVDA", "NVIDIA Corporation", AssetClass.STOCK),
     ],
 )
@@ -104,3 +115,12 @@ def test_parse_result_shape_and_sha256_file(tmp_path) -> None:
         sha256_file(statement)
         == "ab9d1a6a6801519bbdb22ef561948b27c791ad07a9f768eb744b62a10a310ba5"
     )
+
+
+def test_parse_result_defaults_collections_and_page_count() -> None:
+    result = ParseResult(statement_id="x", broker="futu")
+
+    assert result.positions == []
+    assert result.cash_balances == []
+    assert result.warnings == []
+    assert result.page_count == 0
