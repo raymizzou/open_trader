@@ -81,6 +81,43 @@ def test_cash_is_included_in_weight_denominator_but_not_overweight():
     assert usd_cash["risk_flag"] == "normal"
 
 
+def test_build_portfolio_rows_merges_same_cash_symbol_across_brokers():
+    fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+    cash = [
+        CashBalance(
+            statement_id="2026-05-futu",
+            broker="futu",
+            account_alias="futu_main",
+            currency="USD",
+            cash_balance=Decimal("1000"),
+            available_balance=Decimal("1000"),
+            confidence="high",
+            notes="",
+        ),
+        CashBalance(
+            statement_id="2026-05-tiger",
+            broker="tiger",
+            account_alias="tiger_main",
+            currency="USD",
+            cash_balance=Decimal("2000"),
+            available_balance=Decimal("2000"),
+            confidence="medium",
+            notes="",
+        ),
+    ]
+
+    rows = build_portfolio_rows("2026-05", [], cash, fx)
+
+    assert len(rows) == 1
+    usd_cash = rows[0]
+    assert usd_cash["symbol"] == "USD_CASH"
+    assert usd_cash["market_value"] == "3000"
+    assert usd_cash["market_value_hkd"] == "23400.00"
+    assert usd_cash["brokers"] == "futu;tiger"
+    assert usd_cash["accounts"] == "futu_main;tiger_main"
+    assert usd_cash["confidence"] == "medium"
+
+
 def test_non_cash_position_over_ten_percent_is_overweight():
     fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
     positions = [position("futu", "NVDA", "10", "1000", "2000")]

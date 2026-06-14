@@ -78,6 +78,15 @@ def _ai_eligible(position: Position) -> bool:
     }
 
 
+def _merged_confidence(confidences: Iterable[str]) -> str:
+    confidence_values = list(confidences)
+    if "low" in confidence_values:
+        return "low"
+    if "medium" in confidence_values:
+        return "medium"
+    return "high"
+
+
 def build_portfolio_rows(
     month: str,
     positions: Iterable[Position],
@@ -100,15 +109,7 @@ def build_portfolio_rows(
         market_value_hkd = market_value * quote.rate
         cost_value_hkd = cost_value * quote.rate if cost_value else None
         ai_eligible = any(_ai_eligible(position) for position in group)
-        confidence = (
-            "low"
-            if any(position.confidence == "low" for position in group)
-            else (
-                "medium"
-                if any(position.confidence == "medium" for position in group)
-                else "high"
-            )
-        )
+        confidence = _merged_confidence(position.confidence for position in group)
         brokers = sorted({position.broker for position in group})
         accounts = sorted({position.account_alias for position in group})
         name = max((position.name for position in group), key=len)
@@ -148,17 +149,29 @@ def build_portfolio_rows(
             }
         )
 
+    grouped_cash: dict[tuple[Market, AssetClass, str, str], list[CashBalance]] = defaultdict(
+        list
+    )
     for cash in cash_balances:
-        quote = fx_provider.get_rate_to_hkd(cash.currency)
-        market_value = cash.cash_balance
+        grouped_cash[
+            (Market.CASH, AssetClass.CASH, cash.symbol, cash.currency.upper())
+        ].append(cash)
+
+    for (_, _, symbol, currency), group in grouped_cash.items():
+        quote = fx_provider.get_rate_to_hkd(currency)
+        market_value = sum((cash.cash_balance for cash in group), Decimal("0"))
+        confidence = _merged_confidence(cash.confidence for cash in group)
+        brokers = sorted({cash.broker for cash in group})
+        accounts = sorted({cash.account_alias for cash in group})
+        notes = "; ".join(cash.notes for cash in group if cash.notes)
         raw_rows.append(
             {
                 "sort_group": 5,
                 "market": Market.CASH.value,
                 "asset_class": AssetClass.CASH.value,
-                "symbol": cash.symbol,
-                "name": f"{cash.currency.upper()} Cash",
-                "currency": cash.currency.upper(),
+                "symbol": symbol,
+                "name": f"{currency} Cash",
+                "currency": currency,
                 "total_quantity": Decimal("1"),
                 "avg_cost_price": None,
                 "last_price": None,
@@ -171,13 +184,13 @@ def build_portfolio_rows(
                 "fx_to_hkd": quote.rate,
                 "market_value_hkd": market_value * quote.rate,
                 "cost_value_hkd": None,
-                "brokers": cash.broker,
-                "accounts": cash.account_alias,
+                "brokers": ";".join(brokers),
+                "accounts": ";".join(accounts),
                 "ai_eligible": False,
                 "analysis_symbol": "",
-                "risk_flag": "data_check" if cash.confidence == "low" else "normal",
-                "confidence": cash.confidence,
-                "notes": cash.notes,
+                "risk_flag": "data_check" if confidence == "low" else "normal",
+                "confidence": confidence,
+                "notes": notes,
             }
         )
 
