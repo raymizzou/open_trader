@@ -99,15 +99,37 @@ def build_portfolio_rows(
 
     raw_rows: list[dict[str, object]] = []
     for (market, asset_class, symbol, currency), group in grouped.items():
-        total_quantity = sum((p.quantity for p in group), Decimal("0"))
-        market_value = sum((p.market_value or Decimal("0") for p in group), Decimal("0"))
-        cost_value = sum((p.cost_value or Decimal("0") for p in group), Decimal("0"))
-        unrealized_pnl = market_value - cost_value if cost_value else None
-        avg_cost_price = cost_value / total_quantity if total_quantity and cost_value else None
-        last_price = market_value / total_quantity if total_quantity and market_value else None
+        total_quantity = sum((position.quantity for position in group), Decimal("0"))
+        has_missing_required_data = any(
+            position.market_value is None or position.cost_value is None
+            for position in group
+        )
+        market_value = sum(
+            (
+                position.market_value
+                if position.market_value is not None
+                else Decimal("0")
+                for position in group
+            ),
+            Decimal("0"),
+        )
+        cost_value = sum(
+            (
+                position.cost_value
+                if position.cost_value is not None
+                else Decimal("0")
+                for position in group
+            ),
+            Decimal("0"),
+        )
+        unrealized_pnl = (
+            None if has_missing_required_data else market_value - cost_value
+        )
+        avg_cost_price = cost_value / total_quantity if total_quantity else None
+        last_price = market_value / total_quantity if total_quantity else None
         quote = fx_provider.get_rate_to_hkd(currency)
         market_value_hkd = market_value * quote.rate
-        cost_value_hkd = cost_value * quote.rate if cost_value else None
+        cost_value_hkd = cost_value * quote.rate
         ai_eligible = any(_ai_eligible(position) for position in group)
         confidence = _merged_confidence(position.confidence for position in group)
         brokers = sorted({position.broker for position in group})
@@ -127,11 +149,11 @@ def build_portfolio_rows(
                 "avg_cost_price": avg_cost_price,
                 "last_price": last_price,
                 "market_value": market_value,
-                "cost_value": cost_value if cost_value else None,
+                "cost_value": cost_value,
                 "unrealized_pnl": unrealized_pnl,
                 "unrealized_pnl_pct": (
                     (unrealized_pnl / cost_value)
-                    if unrealized_pnl is not None and cost_value
+                    if unrealized_pnl is not None and cost_value != Decimal("0")
                     else None
                 ),
                 "fx_source": quote.source,
@@ -143,7 +165,11 @@ def build_portfolio_rows(
                 "accounts": ";".join(accounts),
                 "ai_eligible": ai_eligible,
                 "analysis_symbol": symbol if ai_eligible else "",
-                "risk_flag": "data_check" if confidence == "low" or not market_value else "normal",
+                "risk_flag": (
+                    "data_check"
+                    if confidence == "low" or has_missing_required_data
+                    else "normal"
+                ),
                 "confidence": confidence,
                 "notes": notes,
             }
