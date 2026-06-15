@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Protocol
 
 from .models import (
@@ -96,7 +98,7 @@ def run_premarket(
         run_date=run_date,
         records=advice_records,
         data_dir=data_dir,
-        update_latest=update_latest,
+        update_latest=False,
     )
     classifications_path = write_change_classifications(
         run_date=run_date,
@@ -109,6 +111,8 @@ def run_premarket(
         data_dir=data_dir,
         reports_dir=reports_dir,
     )
+    if update_latest:
+        _promote_latest_advice(advice_path=advice_path, data_dir=data_dir)
 
     return PremarketResult(
         eligible_count=len(rows),
@@ -144,6 +148,35 @@ def _analyze_symbol(
             status="error",
             error=str(exc),
         )
+
+
+def _promote_latest_advice(*, advice_path: Path, data_dir: Path) -> None:
+    latest_path = data_dir / "latest" / "trading_advice.csv"
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "wb",
+            dir=latest_path.parent,
+            prefix=f".{latest_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            with advice_path.open("rb") as source:
+                shutil.copyfileobj(source, handle)
+        temp_path.replace(latest_path)
+    except Exception:
+        if temp_path is not None and temp_path.exists():
+            _best_effort_unlink(temp_path)
+        raise
+
+
+def _best_effort_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except Exception:
+        pass
 
 
 def _classify_symbol(

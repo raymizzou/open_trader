@@ -3,6 +3,9 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+import pytest
+
+import open_trader.advice.premarket as premarket
 from open_trader.advice.models import (
     ChangeClassification,
     PortfolioInputRow,
@@ -203,6 +206,47 @@ def test_run_premarket_dry_run_does_not_update_latest_advice(
 
     assert not (data_dir / "latest" / "trading_advice.csv").exists()
     assert (data_dir / "latest" / "premarket_actions.csv").exists()
+
+
+def test_run_premarket_keeps_existing_latest_advice_when_later_output_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    data_dir = tmp_path / "data"
+    write_previous_latest_advice(data_dir)
+    original_latest = (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    )
+
+    def fail_write_premarket_outputs(**_: object) -> tuple[Path, Path, Path]:
+        raise OSError("simulated report failure")
+
+    monkeypatch.setattr(
+        premarket,
+        "write_premarket_outputs",
+        fail_write_premarket_outputs,
+    )
+
+    with pytest.raises(OSError, match="simulated report failure"):
+        run_premarket(
+            run_date="2026-06-16",
+            portfolio_path=portfolio_path,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            advice_runner=FakeAdviceRunner(),
+            classifier=FakeClassifier(),
+            symbols=None,
+            update_latest=True,
+        )
+
+    assert (
+        data_dir / "runs" / "2026-06-16" / "trading_advice.csv"
+    ).exists()
+    assert (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    ) == original_latest
 
 
 def test_run_premarket_converts_advice_runner_failure_and_continues(
