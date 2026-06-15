@@ -8,12 +8,42 @@ import pytest
 
 from open_trader.models import AssetClass, Market
 from open_trader.parsers.base import ParseResult
-from open_trader.parsers.futu import parse_futu_text
-from open_trader.parsers.phillips import parse_phillips_text
-from open_trader.parsers.tiger import parse_tiger_text
+import open_trader.parsers.futu as futu_parser
+import open_trader.parsers.phillips as phillips_parser
+import open_trader.parsers.tiger as tiger_parser
+from open_trader.parsers.futu import FutuStatementParser, parse_futu_text
+from open_trader.parsers.phillips import PhillipsStatementParser, parse_phillips_text
+from open_trader.parsers.tiger import TigerStatementParser, parse_tiger_text
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "pdf_text"
+
+
+class FakePage:
+    def __init__(self, text: str | None) -> None:
+        self.text = text
+
+    def extract_text(self) -> str | None:
+        return self.text
+
+
+class FakePdf:
+    def __init__(self, pages: list[str | None]) -> None:
+        self.pages = [FakePage(page) for page in pages]
+
+    def __enter__(self) -> FakePdf:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def fake_pdf_open_for(pages: list[str | None]) -> Callable[[Path], FakePdf]:
+    def fake_open(path: Path) -> FakePdf:
+        assert path == Path("fake.pdf")
+        return FakePdf(pages)
+
+    return fake_open
 
 
 def test_parse_futu_text_extracts_positions_and_cash() -> None:
@@ -177,3 +207,83 @@ Stock US NVDA NVIDIA 0 2026/05/20 5 130.00 650.00 0.50 325.00
     assert result.positions[0].symbol == "NVDA"
     assert result.positions[0].market == Market.US
     assert result.positions[0].asset_class == AssetClass.STOCK
+
+
+def test_futu_statement_parser_joins_pdf_pages_and_sets_page_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        futu_parser.pdfplumber,
+        "open",
+        fake_pdf_open_for(
+            [
+                "期末概覽-股票和股票期權\n"
+                "代碼名稱 交易所/市場 貨幣種類 數量 價格 乘數 市值 初始保證金要求 維持保證金要求 維持保證金率",
+                "NVDA(NVIDIA) US USD 10 130.00 - 1300.00 650.00 520.00 0.40",
+                "現金結餘\nUSD 1000.00",
+            ]
+        ),
+    )
+
+    result = FutuStatementParser().parse(Path("fake.pdf"), "2026-05")
+
+    assert result.broker == "futu"
+    assert result.page_count == 3
+    assert [position.symbol for position in result.positions] == ["NVDA"]
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("USD", Decimal("1000.00"))
+    ]
+
+
+def test_tiger_statement_parser_joins_pdf_pages_and_sets_page_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tiger_parser.pdfplumber,
+        "open",
+        fake_pdf_open_for(
+            [
+                "期末持仓\n股票\n"
+                "代码 数量 乘数 成本价格 收盘价格 市值 未实现的损益 初始保证金要求 维持保证金要求 币种",
+                "ARM Holdings (ARM) 4 1.0 281.00 353.00 1412.00 288.00 706.00 564.80 USD\n"
+                "现金\nUSD 2000.00",
+            ]
+        ),
+    )
+
+    result = TigerStatementParser().parse(Path("fake.pdf"), "2026-05")
+
+    assert result.broker == "tiger"
+    assert result.page_count == 2
+    assert [position.symbol for position in result.positions] == ["ARM"]
+    assert result.positions[0].cost_value == Decimal("1124.00")
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("USD", Decimal("2000.00"))
+    ]
+
+
+def test_phillips_statement_parser_joins_pdf_pages_and_sets_page_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        phillips_parser.pdfplumber,
+        "open",
+        fake_pdf_open_for(
+            [
+                "Securities Portfolio\n"
+                "Product Market ProductCode ProductName Previous LastBuyDate Quantity Close MarketValue Ratio MarginValue",
+                "Stock US NVDA NVIDIA 0 2026/05/20 5 130.00 650.00 0.50 325.00",
+                "Cash Balance\nHKD 8000.00",
+            ]
+        ),
+    )
+
+    result = PhillipsStatementParser().parse(Path("fake.pdf"), "2026-05")
+
+    assert result.broker == "phillips"
+    assert result.page_count == 3
+    assert [position.symbol for position in result.positions] == ["NVDA"]
+    assert result.positions[0].market == Market.US
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("HKD", Decimal("8000.00"))
+    ]
