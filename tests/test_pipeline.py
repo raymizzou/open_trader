@@ -467,13 +467,23 @@ def test_run_import_promotion_rename_failure_restores_previous_outputs(
     first.portfolio_path.write_text("previous run\n", encoding="utf-8")
     first.latest_path.write_text("previous latest\n", encoding="utf-8")
     real_rename = Path.rename
+    latest_replace_attempted = False
 
     def fail_temp_run_promotion(self: Path, target: Path) -> Path:
         if self.name.startswith(".2026-05.") and self.suffix == ".tmp":
             raise OSError("simulated run promotion failure")
         return real_rename(self, target)
 
+    real_replace = Path.replace
+
+    def track_latest_replace(self: Path, target: Path) -> Path:
+        nonlocal latest_replace_attempted
+        if self.name.startswith(".portfolio.") and self.suffix == ".tmp":
+            latest_replace_attempted = True
+        return real_replace(self, target)
+
     monkeypatch.setattr(Path, "rename", fail_temp_run_promotion)
+    monkeypatch.setattr(Path, "replace", track_latest_replace)
 
     with pytest.raises(OSError, match="simulated run promotion failure"):
         run_import(
@@ -484,12 +494,14 @@ def test_run_import_promotion_rename_failure_restores_previous_outputs(
             fx_provider=fx_provider,
         )
 
+    assert latest_replace_attempted
     assert first.run_dir.exists()
     assert first.portfolio_path.read_text(encoding="utf-8") == "previous run\n"
     assert first.latest_path.read_text(encoding="utf-8") == "previous latest\n"
     assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
     assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
     assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
+    assert list((data_dir / "latest").glob(".portfolio.csv.*.backup")) == []
 
 
 def test_run_import_latest_replace_failure_restores_previous_outputs(
@@ -534,6 +546,7 @@ def test_run_import_latest_replace_failure_restores_previous_outputs(
     assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
     assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
     assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
+    assert list((data_dir / "latest").glob(".portfolio.csv.*.backup")) == []
 
 
 def test_run_import_rollback_cleanup_failure_preserves_original_error_and_outputs(
@@ -554,6 +567,7 @@ def test_run_import_rollback_cleanup_failure_preserves_original_error_and_output
     )
     first.portfolio_path.write_text("previous run\n", encoding="utf-8")
     first.latest_path.write_text("previous latest\n", encoding="utf-8")
+    real_rename = Path.rename
     real_replace = Path.replace
     real_rmtree = pipeline.rmtree
 
@@ -562,11 +576,17 @@ def test_run_import_rollback_cleanup_failure_preserves_original_error_and_output
             raise OSError("simulated latest replace failure")
         return real_replace(self, target)
 
+    def fail_failed_run_move(self: Path, target: Path) -> Path:
+        if self.name == "2026-05" and target.suffix == ".failed":
+            raise OSError("simulated failed run move failure")
+        return real_rename(self, target)
+
     def fail_failed_run_cleanup(path: Path) -> None:
         if path.name == "2026-05" or path.suffix == ".failed":
             raise OSError("simulated cleanup failure")
         real_rmtree(path)
 
+    monkeypatch.setattr(Path, "rename", fail_failed_run_move)
     monkeypatch.setattr(Path, "replace", fail_latest_replace)
     monkeypatch.setattr(pipeline, "rmtree", fail_failed_run_cleanup)
 
@@ -584,6 +604,7 @@ def test_run_import_rollback_cleanup_failure_preserves_original_error_and_output
     assert first.latest_path.read_text(encoding="utf-8") == "previous latest\n"
     assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
     assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
+    assert list((data_dir / "latest").glob(".portfolio.csv.*.backup")) == []
 
 
 def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[str]) -> None:

@@ -121,12 +121,15 @@ def run_import(
     portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
 
     temp_run_dir = _make_temp_run_dir(run_dir)
-    latest_dir.mkdir(parents=True, exist_ok=True)
     latest_path = latest_dir / "portfolio.csv"
-    temp_latest_path = _make_temp_latest_path(latest_path)
+    temp_latest_path: Path | None = None
+    backup_latest_path: Path | None = None
     backup_run_dir: Path | None = None
     temp_run_promoted = False
+    latest_replaced = False
     try:
+        latest_dir.mkdir(parents=True, exist_ok=True)
+        temp_latest_path = _make_temp_latest_path(latest_path)
         write_rows(
             temp_run_dir / "manifest.csv",
             MANIFEST_FIELDNAMES,
@@ -150,21 +153,31 @@ def run_import(
         write_rows(temp_run_dir / "portfolio.csv", PORTFOLIO_FIELDNAMES, portfolio_rows)
 
         copyfile(temp_run_dir / "portfolio.csv", temp_latest_path)
+        if latest_path.exists():
+            backup_latest_path = _make_backup_latest_path(latest_path)
+            latest_path.rename(backup_latest_path)
+        temp_latest_path.replace(latest_path)
+        latest_replaced = True
+
         if run_dir.exists():
             backup_run_dir = _make_backup_run_dir(run_dir)
             run_dir.rename(backup_run_dir)
         temp_run_dir.rename(run_dir)
         temp_run_promoted = True
-        temp_latest_path.replace(latest_path)
         if backup_run_dir is not None and backup_run_dir.exists():
             _best_effort_rmtree(backup_run_dir)
+        if backup_latest_path is not None and backup_latest_path.exists():
+            _best_effort_unlink(backup_latest_path)
     except Exception:
         _rollback_failed_promotion(
             run_dir=run_dir,
             temp_run_dir=temp_run_dir,
             temp_latest_path=temp_latest_path,
+            latest_path=latest_path,
+            backup_latest_path=backup_latest_path,
             backup_run_dir=backup_run_dir,
             temp_run_promoted=temp_run_promoted,
+            latest_replaced=latest_replaced,
         )
         raise
 
@@ -182,6 +195,10 @@ def run_import(
 
 def _make_backup_run_dir(run_dir: Path) -> Path:
     return _unique_sibling_path(run_dir, "backup")
+
+
+def _make_backup_latest_path(latest_path: Path) -> Path:
+    return _unique_sibling_path(latest_path, "backup")
 
 
 def _make_failed_run_dir(run_dir: Path) -> Path:
@@ -217,10 +234,19 @@ def _rollback_failed_promotion(
     *,
     run_dir: Path,
     temp_run_dir: Path,
-    temp_latest_path: Path,
+    temp_latest_path: Path | None,
+    latest_path: Path,
+    backup_latest_path: Path | None,
     backup_run_dir: Path | None,
     temp_run_promoted: bool,
+    latest_replaced: bool,
 ) -> None:
+    _restore_latest_after_failure(
+        latest_path=latest_path,
+        backup_latest_path=backup_latest_path,
+        latest_replaced=latest_replaced,
+    )
+
     failed_run_dir: Path | None = None
     if temp_run_promoted and run_dir.exists():
         failed_run_dir = _make_failed_run_dir(run_dir)
@@ -244,8 +270,27 @@ def _rollback_failed_promotion(
         _best_effort_rmtree(failed_run_dir)
     if temp_run_dir.exists():
         _best_effort_rmtree(temp_run_dir)
-    if temp_latest_path.exists():
+    if temp_latest_path is not None and temp_latest_path.exists():
         _best_effort_unlink(temp_latest_path)
+    if backup_latest_path is not None and backup_latest_path.exists():
+        _best_effort_unlink(backup_latest_path)
+
+
+def _restore_latest_after_failure(
+    *,
+    latest_path: Path,
+    backup_latest_path: Path | None,
+    latest_replaced: bool,
+) -> None:
+    if backup_latest_path is not None and backup_latest_path.exists():
+        if latest_path.exists():
+            _best_effort_unlink(latest_path)
+        try:
+            backup_latest_path.rename(latest_path)
+        except Exception:
+            pass
+    elif latest_replaced and latest_path.exists():
+        _best_effort_unlink(latest_path)
 
 
 def _best_effort_rmtree(path: Path) -> None:
