@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -42,6 +42,55 @@ class LoadedTriggers:
     skipped_count: int
 
 
+ALERT_FIELDNAMES = [
+    "alerted_at",
+    "run_date",
+    "symbol",
+    "market",
+    "futu_symbol",
+    "trigger_type",
+    "operator",
+    "trigger_price",
+    "last_price",
+    "suggested_action",
+    "severity",
+    "trigger_text",
+]
+
+
+@dataclass(frozen=True)
+class QuoteSnapshot:
+    futu_symbol: str
+    last_price: Decimal
+
+
+@dataclass(frozen=True)
+class AlertRecord:
+    alerted_at: str
+    run_date: str
+    symbol: str
+    market: str
+    futu_symbol: str
+    trigger_type: str
+    operator: str
+    trigger_price: str
+    last_price: str
+    suggested_action: str
+    severity: str
+    trigger_text: str
+
+    def to_row(self) -> dict[str, str]:
+        return {field: getattr(self, field) for field in ALERT_FIELDNAMES}
+
+
+@dataclass
+class WatchState:
+    alerted_keys: set[tuple[str, str, str, str]]
+
+    def __init__(self) -> None:
+        self.alerted_keys = set()
+
+
 def load_monitor_triggers(watchlist_path: Path, run_date: str | None) -> LoadedTriggers:
     rows = _read_watchlist_rows(watchlist_path)
     effective_run_date = (
@@ -67,6 +116,55 @@ def load_monitor_triggers(watchlist_path: Path, run_date: str | None) -> LoadedT
         triggers=triggers,
         skipped_count=skipped_count,
     )
+
+
+def evaluate_quote(
+    trigger: MonitorTrigger,
+    quote: QuoteSnapshot,
+    *,
+    alerted_at: datetime,
+    state: WatchState,
+) -> AlertRecord | None:
+    key = (
+        trigger.run_date,
+        trigger.futu_symbol,
+        trigger.operator,
+        str(trigger.trigger_price),
+    )
+    if key in state.alerted_keys:
+        return None
+    hit = (
+        quote.last_price <= trigger.trigger_price
+        if trigger.operator == "<="
+        else quote.last_price >= trigger.trigger_price
+    )
+    if not hit:
+        return None
+    state.alerted_keys.add(key)
+    return AlertRecord(
+        alerted_at=alerted_at.isoformat(timespec="seconds"),
+        run_date=trigger.run_date,
+        symbol=trigger.symbol,
+        market=trigger.market,
+        futu_symbol=trigger.futu_symbol,
+        trigger_type=trigger.trigger_type,
+        operator=trigger.operator,
+        trigger_price=str(trigger.trigger_price),
+        last_price=str(quote.last_price),
+        suggested_action=trigger.suggested_action,
+        severity=trigger.severity,
+        trigger_text=trigger.trigger_text,
+    )
+
+
+def append_alert(path: Path, alert: AlertRecord) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    needs_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=ALERT_FIELDNAMES)
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(alert.to_row())
 
 
 def _read_watchlist_rows(watchlist_path: Path) -> list[dict[str, str]]:

@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from open_trader.futu_watch import (
+    ALERT_FIELDNAMES,
     WATCHLIST_REQUIRED_FIELDNAMES,
+    AlertRecord,
     MonitorTrigger,
+    QuoteSnapshot,
+    WatchState,
+    append_alert,
+    evaluate_quote,
     load_monitor_triggers,
 )
 
@@ -157,3 +164,124 @@ def test_load_monitor_triggers_rejects_missing_required_columns(
     assert "missing watchlist column(s)" in str(exc_info.value)
     for column in set(WATCHLIST_REQUIRED_FIELDNAMES) - {"run_date", "symbol"}:
         assert column in str(exc_info.value)
+
+
+def test_evaluate_quote_returns_alert_when_downside_trigger_hits() -> None:
+    trigger = MonitorTrigger(
+        run_date="2026-06-15",
+        symbol="VIXY",
+        market="US",
+        futu_symbol="US.VIXY",
+        trigger_type="price",
+        operator="<=",
+        trigger_price=Decimal("95"),
+        suggested_action="reduce",
+        severity="high",
+        trigger_text="below 95",
+    )
+    state = WatchState()
+
+    alert = evaluate_quote(
+        trigger,
+        QuoteSnapshot(futu_symbol="US.VIXY", last_price=Decimal("94.5")),
+        alerted_at=datetime(2026, 6, 15, 13, 30, 0),
+        state=state,
+    )
+
+    assert alert == AlertRecord(
+        alerted_at="2026-06-15T13:30:00",
+        run_date="2026-06-15",
+        symbol="VIXY",
+        market="US",
+        futu_symbol="US.VIXY",
+        trigger_type="price",
+        operator="<=",
+        trigger_price="95",
+        last_price="94.5",
+        suggested_action="reduce",
+        severity="high",
+        trigger_text="below 95",
+    )
+
+
+def test_evaluate_quote_returns_alert_when_upside_trigger_hits_once() -> None:
+    trigger = MonitorTrigger(
+        run_date="2026-06-15",
+        symbol="QQQ",
+        market="US",
+        futu_symbol="US.QQQ",
+        trigger_type="price",
+        operator=">=",
+        trigger_price=Decimal("510"),
+        suggested_action="watch",
+        severity="medium",
+        trigger_text="above 510",
+    )
+    state = WatchState()
+
+    first = evaluate_quote(
+        trigger,
+        QuoteSnapshot(futu_symbol="US.QQQ", last_price=Decimal("511")),
+        alerted_at=datetime(2026, 6, 15, 13, 31, 0),
+        state=state,
+    )
+    second = evaluate_quote(
+        trigger,
+        QuoteSnapshot(futu_symbol="US.QQQ", last_price=Decimal("512")),
+        alerted_at=datetime(2026, 6, 15, 13, 32, 0),
+        state=state,
+    )
+
+    assert first is not None
+    assert second is None
+
+
+def test_evaluate_quote_returns_none_when_price_does_not_hit() -> None:
+    trigger = MonitorTrigger(
+        run_date="2026-06-15",
+        symbol="VIXY",
+        market="US",
+        futu_symbol="US.VIXY",
+        trigger_type="price",
+        operator="<=",
+        trigger_price=Decimal("95"),
+        suggested_action="reduce",
+        severity="high",
+        trigger_text="below 95",
+    )
+
+    alert = evaluate_quote(
+        trigger,
+        QuoteSnapshot(futu_symbol="US.VIXY", last_price=Decimal("96")),
+        alerted_at=datetime(2026, 6, 15, 13, 30, 0),
+        state=WatchState(),
+    )
+
+    assert alert is None
+
+
+def test_append_alert_creates_csv_header_and_appends_rows(tmp_path: Path) -> None:
+    path = tmp_path / "data/runs/2026-06-15/alerts.csv"
+    alert = AlertRecord(
+        alerted_at="2026-06-15T13:30:00",
+        run_date="2026-06-15",
+        symbol="VIXY",
+        market="US",
+        futu_symbol="US.VIXY",
+        trigger_type="price",
+        operator="<=",
+        trigger_price="95",
+        last_price="94.5",
+        suggested_action="reduce",
+        severity="high",
+        trigger_text="below 95",
+    )
+
+    append_alert(path, alert)
+    append_alert(path, alert)
+
+    rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    assert list(rows[0]) == ALERT_FIELDNAMES
+    assert len(rows) == 2
+    assert rows[0]["symbol"] == "VIXY"
+    assert rows[0]["last_price"] == "94.5"
