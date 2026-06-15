@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -11,12 +12,14 @@ from open_trader.futu_watch import (
     ALERT_FIELDNAMES,
     WATCHLIST_REQUIRED_FIELDNAMES,
     AlertRecord,
+    FutuWatchResult,
     MonitorTrigger,
     QuoteSnapshot,
     WatchState,
     append_alert,
     evaluate_quote,
     load_monitor_triggers,
+    run_futu_watch,
 )
 
 
@@ -285,3 +288,107 @@ def test_append_alert_creates_csv_header_and_appends_rows(tmp_path: Path) -> Non
     assert len(rows) == 2
     assert rows[0]["symbol"] == "VIXY"
     assert rows[0]["last_price"] == "94.5"
+
+
+class FakeQuoteClient:
+    def __init__(self, responses: list[dict[str, Decimal] | Exception]) -> None:
+        self.responses = responses
+        self.calls: list[list[str]] = []
+        self.closed = False
+
+    def get_snapshots(self, futu_symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
+        self.calls.append(list(futu_symbols))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return {
+            symbol: QuoteSnapshot(futu_symbol=symbol, last_price=price)
+            for symbol, price in response.items()
+        }
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_run_futu_watch_once_fetches_quotes_and_writes_alert(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.csv"
+    write_watchlist(
+        watchlist_path,
+        [
+            base_row(symbol="VIXY", operator="<=", trigger_price="95"),
+            base_row(symbol="QQQ", operator=">=", trigger_price="510"),
+        ],
+    )
+    client = FakeQuoteClient([{"US.VIXY": Decimal("94.5"), "US.QQQ": Decimal("500")}])
+
+    result = run_futu_watch(
+        watchlist_path=watchlist_path,
+        data_dir=tmp_path / "data",
+        run_date=None,
+        quote_client=client,
+        poll_seconds=5.0,
+        once=True,
+        sleep_fn=lambda seconds: None,
+        now_fn=lambda: datetime(2026, 6, 15, 13, 30, 0),
+        output_fn=lambda message: None,
+    )
+
+    assert result == FutuWatchResult(
+        run_date="2026-06-15",
+        trigger_count=2,
+        skipped_count=0,
+        alert_count=1,
+        alerts_path=tmp_path / "data/runs/2026-06-15/alerts.csv",
+    )
+    assert client.calls == [["US.QQQ", "US.VIXY"]]
+    assert client.closed is True
+    rows = list(csv.DictReader(result.alerts_path.open(encoding="utf-8")))
+    assert [row["symbol"] for row in rows] == ["VIXY"]
+
+
+def test_run_futu_watch_returns_zero_alerts_when_no_triggers(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.csv"
+    write_watchlist(watchlist_path, [base_row(market="HK")])
+    client = FakeQuoteClient([])
+
+    result = run_futu_watch(
+        watchlist_path=watchlist_path,
+        data_dir=tmp_path / "data",
+        run_date=None,
+        quote_client=client,
+        poll_seconds=5.0,
+        once=True,
+        sleep_fn=lambda seconds: None,
+        now_fn=lambda: datetime(2026, 6, 15, 13, 30, 0),
+        output_fn=lambda message: None,
+    )
+
+    assert result.trigger_count == 0
+    assert result.alert_count == 0
+    assert client.calls == []
+    assert client.closed is True
+
+
+def test_run_futu_watch_startup_quote_failure_is_clear(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.csv"
+    write_watchlist(watchlist_path, [base_row()])
+    client = FakeQuoteClient([RuntimeError("quote failed")])
+
+    with pytest.raises(RuntimeError, match="quote failed"):
+        run_futu_watch(
+            watchlist_path=watchlist_path,
+            data_dir=tmp_path / "data",
+            run_date=None,
+            quote_client=client,
+            poll_seconds=5.0,
+            once=True,
+            sleep_fn=lambda seconds: None,
+            now_fn=lambda: datetime(2026, 6, 15, 13, 30, 0),
+            output_fn=lambda message: None,
+        )
+
+    assert client.closed is True

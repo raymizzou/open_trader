@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -91,6 +93,23 @@ class WatchState:
         self.alerted_keys = set()
 
 
+@dataclass(frozen=True)
+class FutuWatchResult:
+    run_date: str
+    trigger_count: int
+    skipped_count: int
+    alert_count: int
+    alerts_path: Path
+
+
+class QuoteClientProtocol:
+    def get_snapshots(self, futu_symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+
 def load_monitor_triggers(watchlist_path: Path, run_date: str | None) -> LoadedTriggers:
     rows = _read_watchlist_rows(watchlist_path)
     effective_run_date = (
@@ -165,6 +184,79 @@ def append_alert(path: Path, alert: AlertRecord) -> None:
         if needs_header:
             writer.writeheader()
         writer.writerow(alert.to_row())
+
+
+def run_futu_watch(
+    *,
+    watchlist_path: Path,
+    data_dir: Path,
+    run_date: str | None,
+    quote_client: QuoteClientProtocol,
+    poll_seconds: float,
+    once: bool,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    now_fn: Callable[[], datetime] = datetime.now,
+    output_fn: Callable[[str], None] = print,
+) -> FutuWatchResult:
+    loaded = load_monitor_triggers(watchlist_path, run_date)
+    alerts_path = data_dir / "runs" / loaded.run_date / "alerts.csv"
+    output_fn(f"loaded {len(loaded.triggers)} active US trigger(s)")
+    if not loaded.triggers:
+        quote_client.close()
+        return FutuWatchResult(
+            run_date=loaded.run_date,
+            trigger_count=0,
+            skipped_count=loaded.skipped_count,
+            alert_count=0,
+            alerts_path=alerts_path,
+        )
+
+    symbols = sorted({trigger.futu_symbol for trigger in loaded.triggers})
+    triggers_by_symbol: dict[str, list[MonitorTrigger]] = {}
+    for trigger in loaded.triggers:
+        triggers_by_symbol.setdefault(trigger.futu_symbol, []).append(trigger)
+
+    state = WatchState()
+    alert_count = 0
+    try:
+        while True:
+            snapshots = quote_client.get_snapshots(symbols)
+            for futu_symbol in symbols:
+                quote = snapshots.get(futu_symbol)
+                if quote is None:
+                    output_fn(f"warning: missing quote for {futu_symbol}")
+                    continue
+                output_fn(f"quote {futu_symbol} last_price={quote.last_price}")
+                for trigger in triggers_by_symbol[futu_symbol]:
+                    alert = evaluate_quote(
+                        trigger,
+                        quote,
+                        alerted_at=now_fn(),
+                        state=state,
+                    )
+                    if alert is None:
+                        continue
+                    append_alert(alerts_path, alert)
+                    alert_count += 1
+                    output_fn(
+                        "ALERT "
+                        f"{alert.futu_symbol} last_price={alert.last_price} "
+                        f"{alert.operator} {alert.trigger_price} "
+                        f"severity={alert.severity} action={alert.suggested_action}"
+                    )
+            if once:
+                break
+            sleep_fn(poll_seconds)
+    finally:
+        quote_client.close()
+
+    return FutuWatchResult(
+        run_date=loaded.run_date,
+        trigger_count=len(loaded.triggers),
+        skipped_count=loaded.skipped_count,
+        alert_count=alert_count,
+        alerts_path=alerts_path,
+    )
 
 
 def _read_watchlist_rows(watchlist_path: Path) -> list[dict[str, str]]:
