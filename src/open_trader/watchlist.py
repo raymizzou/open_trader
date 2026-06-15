@@ -19,7 +19,7 @@ ACTION_REQUIRED_FIELDS = {
     "suggested_action",
     "watch_trigger",
 }
-ACTION_REQUIRED_NONBLANK_FIELDS = ACTION_REQUIRED_FIELDS - {"watch_trigger"}
+ACTION_REQUIRED_NONBLANK_FIELDS = ACTION_REQUIRED_FIELDS - {"run_date", "watch_trigger"}
 
 
 @dataclass(frozen=True)
@@ -103,7 +103,14 @@ def build_watchlist(
 ) -> WatchlistResult:
     rows = _read_action_rows(actions_path)
     effective_run_date = run_date or _latest_run_date(rows)
-    watchlist_rows = [_row_from_action(row, effective_run_date) for row in rows]
+    filtered_rows = _filter_action_rows(
+        rows,
+        effective_run_date,
+        allow_blank_run_date=run_date is not None,
+    )
+    watchlist_rows = [
+        _row_from_action(row, effective_run_date) for row in filtered_rows
+    ]
     watchlist_path = _write_watchlist_rows(
         data_dir / "runs" / effective_run_date / "watchlist.csv",
         watchlist_rows,
@@ -120,7 +127,7 @@ def build_watchlist(
 
 
 def _read_action_rows(actions_path: Path) -> list[dict[str, str]]:
-    with actions_path.open(encoding="utf-8", newline="") as handle:
+    with actions_path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fieldnames = set(reader.fieldnames or [])
         missing = sorted(ACTION_REQUIRED_FIELDS - fieldnames)
@@ -179,6 +186,20 @@ def _latest_run_date(rows: list[dict[str, str]]) -> str:
     if not dates:
         raise ValueError("--date is required when actions file has no run_date rows")
     return dates[-1]
+
+
+def _filter_action_rows(
+    rows: list[dict[str, str]],
+    run_date: str,
+    *,
+    allow_blank_run_date: bool,
+) -> list[dict[str, str]]:
+    return [
+        row
+        for row in rows
+        if row.get("run_date", "").strip() == run_date
+        or (allow_blank_run_date and not row.get("run_date", "").strip())
+    ]
 
 
 def _row_from_action(row: dict[str, str], fallback_run_date: str) -> WatchlistRow:

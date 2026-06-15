@@ -191,6 +191,97 @@ def test_build_watchlist_accepts_positional_run_date_and_update_latest(
     assert result.latest_path.exists()
 
 
+def test_build_watchlist_omitted_run_date_filters_to_latest_actions(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_actions(
+        actions_path,
+        [
+            {
+                "run_date": "2026-06-15",
+                "symbol": "OLD",
+                "market": "US",
+                "portfolio_weight_hkd": "1.00%",
+                "severity": "medium",
+                "change_type": "new_signal",
+                "suggested_action": "watch",
+                "summary": "Old signal",
+                "rationale": "Fake rationale",
+                "watch_trigger": "below 10",
+            },
+            {
+                "run_date": "2026-06-16",
+                "symbol": "NEW",
+                "market": "US",
+                "portfolio_weight_hkd": "2.00%",
+                "severity": "high",
+                "change_type": "action_changed",
+                "suggested_action": "reduce",
+                "summary": "New signal",
+                "rationale": "Fake rationale",
+                "watch_trigger": "below 20",
+            },
+        ],
+    )
+
+    result = build_watchlist(actions_path, tmp_path / "data")
+
+    rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
+    assert result.run_date == "2026-06-16"
+    assert result.watchlist_count == 1
+    assert [row["symbol"] for row in rows] == ["NEW"]
+    assert (
+        result.latest_path.read_text(encoding="utf-8")
+        == result.watchlist_path.read_text(encoding="utf-8")
+    )
+
+
+def test_build_watchlist_explicit_run_date_filters_matching_and_blank_rows(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_text(
+        actions_path,
+        ",".join(ACTION_FIELDNAMES)
+        + "\n"
+        + "2026-06-15,OLD,US,1.00%,medium,new_signal,watch,Old signal,"
+        + "Fake rationale,below 10\n"
+        + "2026-06-16,NEW,US,2.00%,high,action_changed,reduce,New signal,"
+        + "Fake rationale,below 20\n"
+        + ",FALLBACK,US,3.00%,low,new_signal,watch,Fallback signal,"
+        + "Fake rationale,below 30\n",
+    )
+
+    result = build_watchlist(
+        actions_path,
+        tmp_path / "data",
+        run_date="2026-06-15",
+        update_latest=False,
+    )
+
+    rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
+    assert result.watchlist_count == 2
+    assert [row["symbol"] for row in rows] == ["OLD", "FALLBACK"]
+    assert {row["run_date"] for row in rows} == {"2026-06-15"}
+
+
+def test_build_watchlist_reads_bom_prefixed_actions_header(tmp_path: Path) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_text(
+        actions_path,
+        "\ufeff"
+        + ",".join(ACTION_FIELDNAMES)
+        + "\n"
+        + "2026-06-16,VIXY,US,3.05%,high,action_changed,reduce,VIXY changed,"
+        + "Fake rationale,below 95\n",
+    )
+
+    result = build_watchlist(actions_path, tmp_path / "data")
+
+    assert result.watchlist_count == 1
+
+
 def test_build_watchlist_dry_run_does_not_update_latest(tmp_path: Path) -> None:
     actions_path = tmp_path / "data/latest/premarket_actions.csv"
     latest_path = tmp_path / "data/latest/watchlist.csv"
