@@ -34,7 +34,18 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         if not line:
             continue
 
-        if line == "Securities Portfolio" or "證券投資組合" in line or "证券投资组合" in line:
+        account_cash = _parse_account_cash_line(line, statement_id)
+        if account_cash is not None:
+            _upsert_cash_balance(cash_balances, account_cash)
+            continue
+
+        if (
+            line == "Securities Portfolio"
+            or "證券投資組合" in line
+            or "证券投资组合" in line
+            or "SSeeccuurriittiieess PPoorrttffoolliioo" in line
+            or "股股票票投投資資組組合合" in line
+        ):
             in_positions = True
             in_cash = False
             continue
@@ -52,7 +63,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         elif in_cash:
             cash_balance = _parse_cash_line(line, statement_id)
             if cash_balance is not None:
-                cash_balances.append(cash_balance)
+                _upsert_cash_balance(cash_balances, cash_balance)
             else:
                 in_cash = False
 
@@ -65,25 +76,12 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
 
 
 def _parse_position_line(line: str, statement_id: str) -> Position | None:
-    match = re.fullmatch(
-        r"(?:股票|Stock)\s+"
-        r"(?P<market>HK|US|SEHK|NASDAQ|NYSE)\s+"
-        r"(?P<symbol>[A-Z0-9.-]+)\s+"
-        r"(?P<name>.+?)\s+"
-        rf"(?P<previous_quantity>{NUMERIC})\s+"
-        r"(?P<last_buy_date>\d{4}/\d{2}/\d{2})\s+"
-        rf"(?P<quantity>{NUMERIC})\s+"
-        rf"(?P<last_price>{NUMERIC})\s+"
-        rf"(?P<market_value>{NUMERIC})\s+"
-        rf"(?P<margin_ratio>{NUMERIC})\s+"
-        rf"(?P<margin_value>{NUMERIC})",
-        line,
-    )
+    match = _match_stock_position_line(line) or _match_equity_position_line(line)
     if match is None:
         return None
 
-    market = detect_market(match.group("market"))
-    symbol = match.group("symbol").upper()
+    market = _detect_phillips_market(match.group("market"))
+    symbol = _normalize_phillips_symbol(match.group("symbol"), market)
     name = match.group("name").strip()
 
     return Position(
@@ -102,8 +100,57 @@ def _parse_position_line(line: str, statement_id: str) -> Position | None:
         cost_value=None,
         unrealized_pnl=None,
         confidence="medium",
-        notes="currency inferred from market in Phillips text fixture",
+        notes="currency inferred from market in Phillips statement",
     )
+
+
+def _match_stock_position_line(line: str) -> re.Match[str] | None:
+    return re.fullmatch(
+        r"(?:股票|Stock)\s+"
+        r"(?P<market>HK|US|SEHK|NASDAQ|NYSE)\s+"
+        r"(?P<symbol>[A-Z0-9.-]+)\s+"
+        r"(?P<name>.+?)\s+"
+        rf"(?P<previous_quantity>{NUMERIC})\s+"
+        r"(?P<last_buy_date>\d{4}/\d{2}/\d{2})\s+"
+        rf"(?P<quantity>{NUMERIC})\s+"
+        rf"(?P<last_price>{NUMERIC})\s+"
+        rf"(?P<market_value>{NUMERIC})\s+"
+        rf"(?P<margin_ratio>{NUMERIC})\s+"
+        rf"(?P<margin_value>{NUMERIC})",
+        line,
+    )
+
+
+def _match_equity_position_line(line: str) -> re.Match[str] | None:
+    return re.fullmatch(
+        r"Equity\s+"
+        r"(?P<market>XHKG|XNAS|XNYS|US|HK)\s+"
+        r"(?P<symbol>[A-Z0-9.-]+)\s+"
+        r"(?P<name>.+?)\s+"
+        rf"(?P<previous_quantity>{NUMERIC})\s+"
+        r"(?P<last_buy_date>(?:\d{2}/\d{2}/\d{2}|\d{4}/\d{2}/\d{2}))\s+"
+        rf"(?P<quantity>{NUMERIC})\s+"
+        rf"(?P<last_price>{NUMERIC})\s+"
+        rf"(?P<market_value>{NUMERIC})\s+"
+        rf"(?P<margin_ratio>{NUMERIC})\s+"
+        rf"(?P<margin_value>{NUMERIC})",
+        line,
+    )
+
+
+def _detect_phillips_market(value: str) -> Market:
+    if value == "XHKG":
+        return Market.HK
+    if value in {"XNAS", "XNYS"}:
+        return Market.US
+    return detect_market(value)
+
+
+def _normalize_phillips_symbol(symbol: str, market: Market) -> str:
+    normalized = symbol.upper()
+    if market == Market.HK and re.fullmatch(r"0\d{5}", normalized):
+        return normalized[-5:]
+    return normalized
 
 
 def _currency_for_market(market: Market) -> str:
@@ -130,6 +177,39 @@ def _parse_cash_line(line: str, statement_id: str) -> CashBalance | None:
         confidence="high",
         notes="",
     )
+
+
+def _parse_account_cash_line(line: str, statement_id: str) -> CashBalance | None:
+    match = re.fullmatch(
+        rf"(?P<currency>[A-Z]{{3}})(?P<base>\(Base\))?\s+"
+        rf"(?P<balance>{NUMERIC})\s+.*",
+        line,
+    )
+    if match is None or match.group("base"):
+        return None
+
+    balance = parse_decimal(match.group("balance")) or Decimal("0")
+    return CashBalance(
+        statement_id=statement_id,
+        broker=BROKER,
+        account_alias=ACCOUNT_ALIAS,
+        currency=match.group("currency"),
+        cash_balance=balance,
+        available_balance=balance,
+        confidence="high",
+        notes="",
+    )
+
+
+def _upsert_cash_balance(
+    cash_balances: list[CashBalance],
+    cash_balance: CashBalance,
+) -> None:
+    for index, existing in enumerate(cash_balances):
+        if existing.currency == cash_balance.currency:
+            cash_balances[index] = cash_balance
+            return
+    cash_balances.append(cash_balance)
 
 
 def _normalize_line(line: str) -> str:

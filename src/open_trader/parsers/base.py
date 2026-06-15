@@ -105,11 +105,11 @@ def detect_asset_class(symbol: str, name: str) -> AssetClass:
     if _has_any(combined, ("货币市场", "貨幣", "货币基金", "MONEY MARKET")):
         return AssetClass.MONEY_MARKET_FUND
 
+    if _has_etf_words(combined, name_upper):
+        return AssetClass.ETF
+
     if _looks_like_option_symbol(symbol_upper) or _has_option_words(combined):
         return AssetClass.OPTION
-
-    if _has_any(combined, (" ETF", "ETF ", "EXCHANGE TRADED FUND")) or name_upper.endswith("ETF"):
-        return AssetClass.ETF
 
     if _has_any(combined, ("基金", " FUND", "FUND ")):
         return AssetClass.FUND
@@ -140,11 +140,17 @@ def _normalize_symbol(value: str) -> str:
 
 
 def _looks_like_option_symbol(value: str) -> bool:
-    return bool(re.search(r"\b[A-Z]{1,6}\s*\d{6}[CP]\d{8}\b", value))
+    return bool(re.search(r"\b[A-Z]{1,6}\s*\d{6}[CP]\d{5,8}\b", value))
 
 
 def _has_option_words(value: str) -> bool:
     return bool(re.search(r"\b(?:CALL|PUT|OPTION|OPTIONS)\b|期权|期權", value))
+
+
+def _has_etf_words(value: str, name: str) -> bool:
+    return bool(
+        re.search(r"(?:^|[^A-Z])ETF(?:$|[^A-Z])|EXCHANGE TRADED FUND", value)
+    ) or name.endswith("ETF")
 
 
 def _has_any(value: str, needles: tuple[str, ...]) -> bool:

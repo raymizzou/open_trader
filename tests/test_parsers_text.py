@@ -96,6 +96,74 @@ def test_parse_tiger_text_extracts_us_positions_and_cash() -> None:
     assert arm.unrealized_pnl == Decimal("288.00")
 
 
+def test_parse_futu_text_extracts_summary_cash_from_real_statement_layout() -> None:
+    result = parse_futu_text(
+        """期末概覽
+期末資產淨值總覽 合計(HKD) 港幣資產 美元資產 人民幣資產 日元資產 新加坡元資產 韓元資產
+股票和股票期權 162,327.84 104,054.00 7,436.36 0.00 0.00 0.00 0.00
+現金結餘 236,134.20 236,134.20 0.00 0.00 0.00 0.00 0.00
+資產淨值 836,315.02 350,140.19 62,041.06 0.00 0.00 0.00 0.00
+""",
+        "2026-05",
+    )
+
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("HKD", Decimal("236134.20"))
+    ]
+
+
+def test_parse_futu_text_joins_wrapped_position_display_name() -> None:
+    result = parse_futu_text(
+        """期末概覽-股票和股票期權
+代碼名稱 交易所/市場 貨幣種類 數量 價格 乘數 市值 初始保證金要求 維持保證金要求 維持保證金率
+BOTZ(Global X Robotics & Artificial US USD 50 37.2600 - 1,863.00 1,117.80 838.35 0.4500
+Intelligence Thematic ETF)
+""",
+        "2026-05",
+    )
+
+    assert len(result.positions) == 1
+    assert result.positions[0].symbol == "BOTZ"
+    assert result.positions[0].name == "Global X Robotics & Artificial Intelligence Thematic ETF"
+    assert result.positions[0].asset_class == AssetClass.ETF
+
+
+def test_parse_tiger_text_extracts_multiline_positions_and_currency_cash() -> None:
+    result = parse_tiger_text(
+        """按货币分类: USD
+总数 证券 期货 基金
+期末现金 -12,678.64 -12,678.64 0.00 0.00
+按货币分类: HKD
+总数 证券 期货 基金
+期末现金 145,412.41 145,412.41 0.00 0.00
+期末持仓
+基金
+代码 数量 成本价格 收盘价格 市值 未实现的损益 初始保证金要求 维持保证金要求 币种
+华泰港元货币市场基金A
+543253.5521 1.0997307 1.09990 597,524.58 91.99 29,876.23 29,876.23 HKD
+(HK0000951506.HKD)
+股票
+代码 数量 乘数 成本价格 收盘价格 市值 未实现的损益 初始保证金要求 维持保证金要求 币种
+ARM Holdings
+4 1.0 281.3371000 353.29000 1,413.16 287.81 635.92 565.26 USD
+(ARM)
+""",
+        "2026-05",
+    )
+
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("USD", Decimal("-12678.64")),
+        ("HKD", Decimal("145412.41")),
+    ]
+    fund = next(position for position in result.positions if position.symbol == "HK0000951506.HKD")
+    assert fund.asset_class == AssetClass.MONEY_MARKET_FUND
+    assert fund.market == Market.HK
+    assert fund.market_value == Decimal("597524.58")
+    arm = next(position for position in result.positions if position.symbol == "ARM")
+    assert arm.name == "ARM Holdings"
+    assert arm.cost_value == Decimal("1125.3484000")
+
+
 def test_parse_phillips_text_extracts_hk_and_us_positions() -> None:
     result = parse_phillips_text(
         FIXTURE_DIR.joinpath("phillips.txt").read_text(encoding="utf-8"), "2026-05"
@@ -116,6 +184,39 @@ def test_parse_phillips_text_extracts_hk_and_us_positions() -> None:
     us = next(position for position in result.positions if position.symbol == "NVDA")
     assert us.market == Market.US
     assert us.currency == "USD"
+
+
+def test_parse_phillips_text_extracts_equity_rows_and_account_cash() -> None:
+    result = parse_phillips_text(
+        """戶口資料 Account Details
+貨幣 轉下結餘 未交收結餘 T+1 未交收結餘 T+2 未交收結餘 ≥ T+3 累計利息 可用結餘 参考匯率 借貸利率
+Currency Balance C/F Unsettled Balance Unsettled Balance Unsettled Balance ≥ T+3 Accrued Interest Available Balance Ref ExRate DR Int Rate
+Normal 普通戶口
+HKD -89,367.42 28,890.54 0.00 0.00 -42.33 -118,300.29 1.0000 列表1(Sch1)
+USD 63.20 0.00 0.00 0.00 0.00 63.20 7.8363 列表1(Sch1)
+HKD(Base) -88,872.17 28,890.54 0.00 0.00 -42.33 -117,805.04
+股股票票投投資資組組合合 SSeeccuurriittiieess PPoorrttffoolliioo
+產品 市場 產品代號 代號名稱 上日存貨 最後買貨日期 是日存貨 收市價 市值 按貨比率 按倉值
+Product Market InstrumentCd DisplayName Qty B/F LastBoughtOn Qty C/F ClsPrice Market Value MgnRatio Margin Value
+Normal 普通戶口 Currency : HKD
+Equity XHKG 002476 VGT 300 12/05/26 300 378.8000 113,640.00 0.5000 56,820.00
+股票 勝宏科技
+""",
+        "2026-05",
+    )
+
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("HKD", Decimal("-89367.42")),
+        ("USD", Decimal("63.20")),
+    ]
+    assert len(result.positions) == 1
+    position = result.positions[0]
+    assert position.symbol == "02476"
+    assert position.name == "VGT"
+    assert position.market == Market.HK
+    assert position.currency == "HKD"
+    assert position.quantity == Decimal("300")
+    assert position.market_value == Decimal("113640.00")
 
 
 def test_parse_tiger_text_accepts_parenthesized_unrealized_pnl() -> None:
