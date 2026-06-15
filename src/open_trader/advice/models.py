@@ -5,6 +5,8 @@ from typing import Literal
 
 
 AdviceStatus = Literal["ok", "error"]
+WatchlistStatus = Literal["active", "manual_review", "no_trigger", "error"]
+TriggerType = Literal["price", "open_price", "manual_review", "none"]
 ChangeType = Literal[
     "new_signal",
     "action_changed",
@@ -55,6 +57,21 @@ PREMARKET_ACTION_FIELDNAMES = [
     "summary",
     "rationale",
     "watch_trigger",
+]
+
+WATCHLIST_FIELDNAMES = [
+    "run_date",
+    "symbol",
+    "market",
+    "suggested_action",
+    "severity",
+    "portfolio_weight_hkd",
+    "trigger_type",
+    "operator",
+    "trigger_price",
+    "trigger_text",
+    "status",
+    "error",
 ]
 
 
@@ -145,3 +162,22 @@ class PremarketAction:
 
     def to_row(self) -> dict[str, str]:
         return {field: str(getattr(self, field)) for field in PREMARKET_ACTION_FIELDNAMES}
+
+
+@dataclass(frozen=True)
+class WatchlistRow:
+    run_date: str
+    symbol: str
+    market: str
+    suggested_action: str
+    severity: Severity
+    portfolio_weight_hkd: str
+    trigger_type: TriggerType
+    operator: str
+    trigger_price: str
+    trigger_text: str
+    status: WatchlistStatus
+    error: str
+
+    def to_row(self) -> dict[str, str]:
+        return {field: str(getattr(self, field)) for field in WATCHLIST_FIELDNAMES}
