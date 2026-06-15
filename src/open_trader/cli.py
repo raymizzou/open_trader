@@ -8,7 +8,7 @@ from .fx import StaticMonthEndFxProvider
 from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
-from .pipeline import run_import
+from .pipeline import run_import, validate_month
 
 
 def positive_decimal(value: str) -> Decimal:
@@ -26,6 +26,13 @@ def positive_decimal(value: str) -> Decimal:
     return rate
 
 
+def canonical_month(value: str) -> str:
+    try:
+        return validate_month(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid month: {value}") from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="open-trader")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -34,7 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
         "import-statements",
         help="Import monthly broker statements and generate portfolio.csv",
     )
-    import_parser.add_argument("--month", required=True, help="Statement month, YYYY-MM")
+    import_parser.add_argument(
+        "--month",
+        type=canonical_month,
+        required=True,
+        help="Statement month, YYYY-MM",
+    )
     import_parser.add_argument("--futu", type=Path, required=True)
     import_parser.add_argument("--tiger", type=Path, required=True)
     import_parser.add_argument("--phillips", type=Path, required=True)

@@ -88,6 +88,16 @@ class FakeParser:
         )
 
 
+class SpyParser(FakeParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parse_called = False
+
+    def parse(self, path: Path, month: str) -> ParseResult:
+        self.parse_called = True
+        return super().parse(path, month)
+
+
 def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
@@ -163,6 +173,29 @@ def test_run_import_does_not_write_run_dir_when_portfolio_build_fails(
 
     assert not (data_dir / "runs" / "2026-05").exists()
     assert not (data_dir / "latest" / "portfolio.csv").exists()
+
+
+@pytest.mark.parametrize("month", ["2026-5", "2026-00", "2026-13", "26-05"])
+def test_run_import_rejects_invalid_month_before_parsing_or_creating_dirs(
+    month: str,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    parser = SpyParser()
+
+    with pytest.raises(ValueError, match="month.*YYYY-MM"):
+        run_import(
+            month=month,
+            statement_paths={"fake": source},
+            parsers=[parser],
+            data_dir=data_dir,
+            fx_provider=StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")}),
+        )
+
+    assert not parser.parse_called
+    assert not data_dir.exists()
 
 
 def test_run_import_failed_rerun_keeps_previous_outputs(tmp_path: Path) -> None:
@@ -603,6 +636,34 @@ def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[s
 
     assert exc_info.value.code == 0
     assert "--usd-hkd" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("month", ["2026-5", "2026-00", "2026-13", "26-05"])
+def test_import_statements_rejects_invalid_month(
+    month: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(
+            [
+                "import-statements",
+                "--month",
+                month,
+                "--futu",
+                "futu.pdf",
+                "--tiger",
+                "tiger.pdf",
+                "--phillips",
+                "phillips.pdf",
+                "--usd-hkd",
+                "7.8",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "invalid month" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("rate", ["abc", "0", "-1", "NaN", "Infinity"])

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from os import close
 from pathlib import Path
+import re
 from shutil import copyfile, rmtree
 from tempfile import mkdtemp, mkstemp
 from typing import Iterable, Mapping
@@ -67,6 +68,8 @@ WARNING_FIELDNAMES = [
     "message",
 ]
 
+MONTH_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
 
 @dataclass(frozen=True)
 class ImportResult:
@@ -85,6 +88,7 @@ def run_import(
     data_dir: Path,
     fx_provider: StaticMonthEndFxProvider,
 ) -> ImportResult:
+    validate_month(month)
     parser_list = list(parsers)
     _validate_statement_paths(statement_paths, parser_list)
 
@@ -191,6 +195,12 @@ def run_import(
         cash_count=len(cash_balances),
         warnings_count=len(warnings),
     )
+
+
+def validate_month(month: str) -> str:
+    if not MONTH_PATTERN.fullmatch(month):
+        raise ValueError(f"invalid month {month!r}; expected YYYY-MM")
+    return month
 
 
 def _make_backup_run_dir(run_dir: Path) -> Path:
