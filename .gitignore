@@ -1,6 +1,7 @@
 .venv/
 .env
 .tradingagents/
+.worktrees/
 data/
 reports/
 .pytest_cache/
