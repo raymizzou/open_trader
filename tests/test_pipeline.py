@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 
+import open_trader.cli as cli
+import open_trader.pipeline as pipeline
 from open_trader.cli import build_parser
 from open_trader.fx import StaticMonthEndFxProvider
 from open_trader.models import AssetClass, CashBalance, Market, Position, WarningRecord
 from open_trader.parsers.base import ParseResult
-from open_trader.pipeline import run_import
+from open_trader.pipeline import ImportResult, run_import
 
 
 class FakeParser:
@@ -163,7 +165,7 @@ def test_run_import_does_not_write_run_dir_when_portfolio_build_fails(
     assert not (data_dir / "latest" / "portfolio.csv").exists()
 
 
-def test_run_import_failed_rerun_removes_stale_outputs(tmp_path: Path) -> None:
+def test_run_import_failed_rerun_keeps_previous_outputs(tmp_path: Path) -> None:
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
     data_dir = tmp_path / "data"
@@ -178,6 +180,8 @@ def test_run_import_failed_rerun_removes_stale_outputs(tmp_path: Path) -> None:
     )
     assert first.run_dir.exists()
     assert first.latest_path.exists()
+    original_portfolio = first.portfolio_path.read_text(encoding="utf-8")
+    original_latest = first.latest_path.read_text(encoding="utf-8")
 
     with pytest.raises(KeyError, match="SGD"):
         run_import(
@@ -188,8 +192,38 @@ def test_run_import_failed_rerun_removes_stale_outputs(tmp_path: Path) -> None:
             fx_provider=fx_provider,
         )
 
-    assert not first.run_dir.exists()
-    assert not first.latest_path.exists()
+    assert first.run_dir.exists()
+    assert first.portfolio_path.read_text(encoding="utf-8") == original_portfolio
+    assert first.latest_path.exists()
+    assert first.latest_path.read_text(encoding="utf-8") == original_latest
+
+
+def test_run_import_different_month_failure_keeps_previous_latest(tmp_path: Path) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+
+    first = run_import(
+        month="2026-05",
+        statement_paths={"fake": source},
+        parsers=[FakeParser()],
+        data_dir=data_dir,
+        fx_provider=StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")}),
+    )
+    original_latest = first.latest_path.read_text(encoding="utf-8")
+
+    with pytest.raises(KeyError, match="SGD"):
+        run_import(
+            month="2026-06",
+            statement_paths={"fake": source},
+            parsers=[FakeParser(position_currency="SGD")],
+            data_dir=data_dir,
+            fx_provider=StaticMonthEndFxProvider("2026-06", {"USD": Decimal("7.8")}),
+        )
+
+    assert first.latest_path.exists()
+    assert first.latest_path.read_text(encoding="utf-8") == original_latest
+    assert not (data_dir / "runs" / "2026-06").exists()
 
 
 def test_run_import_rejects_missing_broker_path(tmp_path: Path) -> None:
@@ -314,6 +348,48 @@ def test_run_import_rerun_replaces_outputs(tmp_path: Path) -> None:
     )
 
 
+def test_run_import_write_failure_keeps_previous_outputs_and_cleans_temp_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+
+    first = run_import(
+        month="2026-05",
+        statement_paths={"fake": source},
+        parsers=[FakeParser()],
+        data_dir=data_dir,
+        fx_provider=fx_provider,
+    )
+    original_portfolio = first.portfolio_path.read_text(encoding="utf-8")
+    original_latest = first.latest_path.read_text(encoding="utf-8")
+    real_write_rows = pipeline.write_rows
+
+    def fail_on_cash(path: Path, fieldnames: list[str], rows: object) -> None:
+        if path.name == "extracted_cash.csv":
+            raise OSError("simulated write failure")
+        real_write_rows(path, fieldnames, rows)
+
+    monkeypatch.setattr(pipeline, "write_rows", fail_on_cash)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        run_import(
+            month="2026-05",
+            statement_paths={"fake": source},
+            parsers=[FakeParser()],
+            data_dir=data_dir,
+            fx_provider=fx_provider,
+        )
+
+    assert first.run_dir.exists()
+    assert first.portfolio_path.read_text(encoding="utf-8") == original_portfolio
+    assert first.latest_path.read_text(encoding="utf-8") == original_latest
+    assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
+
+
 def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[str]) -> None:
     parser = build_parser()
 
@@ -350,3 +426,59 @@ def test_import_statements_rejects_invalid_usd_hkd(
 
     assert exc_info.value.code == 2
     assert "invalid" in capsys.readouterr().err
+
+
+def test_import_statements_main_calls_pipeline_and_prints_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_import(**kwargs: object) -> ImportResult:
+        captured.update(kwargs)
+        data_dir = kwargs["data_dir"]
+        assert isinstance(data_dir, Path)
+        return ImportResult(
+            run_dir=data_dir / "runs" / "2026-05",
+            portfolio_path=data_dir / "runs" / "2026-05" / "portfolio.csv",
+            latest_path=data_dir / "latest" / "portfolio.csv",
+            positions_count=3,
+            cash_count=2,
+            warnings_count=1,
+        )
+
+    monkeypatch.setattr(cli, "run_import", fake_run_import)
+
+    result = cli.main(
+        [
+            "import-statements",
+            "--month",
+            "2026-05",
+            "--futu",
+            "futu.pdf",
+            "--tiger",
+            "tiger.pdf",
+            "--phillips",
+            "phillips.pdf",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--usd-hkd",
+            "7.8",
+        ]
+    )
+
+    assert result == 0
+    assert captured["month"] == "2026-05"
+    assert captured["statement_paths"] == {
+        "futu": Path("futu.pdf"),
+        "tiger": Path("tiger.pdf"),
+        "phillips": Path("phillips.pdf"),
+    }
+    assert captured["fx_provider"].get_rate_to_hkd("USD").rate == Decimal("7.8")
+    output = capsys.readouterr().out
+    assert f"portfolio: {tmp_path / 'data' / 'runs' / '2026-05' / 'portfolio.csv'}" in output
+    assert f"latest: {tmp_path / 'data' / 'latest' / 'portfolio.csv'}" in output
+    assert "positions: 3" in output
+    assert "cash: 2" in output
+    assert "warnings: 1" in output

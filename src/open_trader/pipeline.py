@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from shutil import copyfile, rmtree
+from tempfile import mkdtemp
 from typing import Iterable, Mapping
 
 from .csv_io import write_rows
@@ -87,7 +88,6 @@ def run_import(
 
     run_dir = data_dir / "runs" / month
     latest_dir = data_dir / "latest"
-    _clear_stale_outputs(run_dir, latest_dir / "portfolio.csv")
 
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
@@ -118,31 +118,41 @@ def run_import(
 
     portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
 
-    write_rows(
-        run_dir / "manifest.csv",
-        MANIFEST_FIELDNAMES,
-        (_manifest_to_row(record) for record in manifest),
-    )
-    write_rows(
-        run_dir / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        (_position_to_row(position) for position in positions),
-    )
-    write_rows(
-        run_dir / "extracted_cash.csv",
-        CASH_FIELDNAMES,
-        (_cash_to_row(cash) for cash in cash_balances),
-    )
-    write_rows(
-        run_dir / "parse_warnings.csv",
-        WARNING_FIELDNAMES,
-        (warning.to_row() for warning in warnings),
-    )
+    temp_run_dir = _make_temp_run_dir(run_dir)
+    try:
+        write_rows(
+            temp_run_dir / "manifest.csv",
+            MANIFEST_FIELDNAMES,
+            (_manifest_to_row(record) for record in manifest),
+        )
+        write_rows(
+            temp_run_dir / "extracted_positions.csv",
+            POSITION_FIELDNAMES,
+            (_position_to_row(position) for position in positions),
+        )
+        write_rows(
+            temp_run_dir / "extracted_cash.csv",
+            CASH_FIELDNAMES,
+            (_cash_to_row(cash) for cash in cash_balances),
+        )
+        write_rows(
+            temp_run_dir / "parse_warnings.csv",
+            WARNING_FIELDNAMES,
+            (warning.to_row() for warning in warnings),
+        )
+        write_rows(temp_run_dir / "portfolio.csv", PORTFOLIO_FIELDNAMES, portfolio_rows)
+
+        if run_dir.exists():
+            rmtree(run_dir)
+        temp_run_dir.rename(run_dir)
+    except Exception:
+        if temp_run_dir.exists():
+            rmtree(temp_run_dir)
+        raise
 
     portfolio_path = run_dir / "portfolio.csv"
-    latest_path = latest_dir / "portfolio.csv"
-    write_rows(portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows)
     latest_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = latest_dir / "portfolio.csv"
     copyfile(portfolio_path, latest_path)
 
     return ImportResult(
@@ -152,6 +162,17 @@ def run_import(
         positions_count=len(positions),
         cash_count=len(cash_balances),
         warnings_count=len(warnings),
+    )
+
+
+def _make_temp_run_dir(run_dir: Path) -> Path:
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        mkdtemp(
+            prefix=f".{run_dir.name}.",
+            suffix=".tmp",
+            dir=run_dir.parent,
+        )
     )
 
 
@@ -168,15 +189,6 @@ def _validate_statement_paths(
     unknown = sorted(path_brokers - parser_brokers)
     if unknown:
         raise ValueError(f"unknown statement path broker(s): {', '.join(unknown)}")
-
-
-def _clear_stale_outputs(run_dir: Path, latest_path: Path) -> None:
-    if run_dir.exists():
-        rmtree(run_dir)
-    if latest_path.exists():
-        latest_path.unlink()
-
-
 def _validate_parse_result_brokers(
     expected_broker: str,
     parse_result: ParseResult,
