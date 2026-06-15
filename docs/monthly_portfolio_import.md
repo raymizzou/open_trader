@@ -90,7 +90,8 @@ into monitorable watchlist rows:
 ```bash
 .venv/bin/python -m open_trader build-watchlist \
   --actions data/latest/premarket_actions.csv \
-  --data-dir data
+  --data-dir data \
+  --date 2026-06-16
 ```
 
 Optional dry run:
@@ -99,6 +100,7 @@ Optional dry run:
 .venv/bin/python -m open_trader build-watchlist \
   --actions data/latest/premarket_actions.csv \
   --data-dir data \
+  --date 2026-06-16 \
   --dry-run
 ```
 
