@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 from collections.abc import Callable, Sequence
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -22,6 +23,14 @@ def _default_context_factory(*, host: str, port: int) -> Any:
     return OpenQuoteContext(host=host, port=port)
 
 
+def _can_connect_to_opend(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
 class FutuQuoteClient:
     def __init__(
         self,
@@ -29,7 +38,13 @@ class FutuQuoteClient:
         host: str,
         port: int,
         context_factory: Callable[..., Any] = _default_context_factory,
+        connectivity_checker: Callable[[str, int], bool] = _can_connect_to_opend,
     ) -> None:
+        if not connectivity_checker(host, port):
+            raise FutuQuoteError(
+                f"Futu OpenD is not reachable at {host}:{port}. "
+                "Start OpenD, log in, and check the configured host and port."
+            )
         try:
             self.context = context_factory(host=host, port=port)
         except FutuQuoteError:
