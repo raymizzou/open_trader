@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .fx import StaticMonthEndFxProvider
@@ -9,6 +9,21 @@ from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
 from .pipeline import run_import
+
+
+def positive_decimal(value: str) -> Decimal:
+    try:
+        rate = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid positive decimal value: {value}"
+        ) from exc
+
+    if not rate.is_finite() or rate <= Decimal("0"):
+        raise argparse.ArgumentTypeError(
+            f"invalid positive decimal value: {value}"
+        )
+    return rate
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("--data-dir", type=Path, default=Path("data"))
     import_parser.add_argument(
         "--usd-hkd",
-        type=Decimal,
+        type=positive_decimal,
         required=True,
         help="Month-end USD/HKD exchange rate",
     )

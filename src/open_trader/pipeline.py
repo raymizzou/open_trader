@@ -10,7 +10,7 @@ from typing import Iterable, Mapping
 from .csv_io import write_rows
 from .fx import StaticMonthEndFxProvider
 from .models import CashBalance, ManifestRecord, Position, WarningRecord
-from .parsers.base import StatementParser, sha256_file
+from .parsers.base import ParseResult, StatementParser, sha256_file
 from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows
 
 
@@ -82,19 +82,22 @@ def run_import(
     data_dir: Path,
     fx_provider: StaticMonthEndFxProvider,
 ) -> ImportResult:
+    parser_list = list(parsers)
+    _validate_statement_paths(statement_paths, parser_list)
+
     run_dir = data_dir / "runs" / month
     latest_dir = data_dir / "latest"
-    latest_dir.mkdir(parents=True, exist_ok=True)
 
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
     warnings: list[WarningRecord] = []
     manifest: list[ManifestRecord] = []
 
-    for parser in parsers:
+    for parser in parser_list:
         source_path = statement_paths[parser.broker]
         parsed_at = datetime.now(UTC).isoformat()
         parse_result = parser.parse(source_path, month)
+        _validate_parse_result_brokers(parser.broker, parse_result)
 
         positions.extend(parse_result.positions)
         cash_balances.extend(parse_result.cash_balances)
@@ -111,6 +114,8 @@ def run_import(
                 status="parsed",
             )
         )
+
+    portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
 
     write_rows(
         run_dir / "manifest.csv",
@@ -133,10 +138,10 @@ def run_import(
         (warning.to_row() for warning in warnings),
     )
 
-    portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
     portfolio_path = run_dir / "portfolio.csv"
     latest_path = latest_dir / "portfolio.csv"
     write_rows(portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows)
+    latest_dir.mkdir(parents=True, exist_ok=True)
     copyfile(portfolio_path, latest_path)
 
     return ImportResult(
@@ -147,6 +152,40 @@ def run_import(
         cash_count=len(cash_balances),
         warnings_count=len(warnings),
     )
+
+
+def _validate_statement_paths(
+    statement_paths: Mapping[str, Path],
+    parsers: list[StatementParser],
+) -> None:
+    parser_brokers = {parser.broker for parser in parsers}
+    path_brokers = set(statement_paths)
+    missing = sorted(parser_brokers - path_brokers)
+    if missing:
+        raise ValueError(f"missing statement path for broker(s): {', '.join(missing)}")
+
+    unknown = sorted(path_brokers - parser_brokers)
+    if unknown:
+        raise ValueError(f"unknown statement path broker(s): {', '.join(unknown)}")
+
+
+def _validate_parse_result_brokers(
+    expected_broker: str,
+    parse_result: ParseResult,
+) -> None:
+    result_broker = parse_result.broker
+    if result_broker != expected_broker:
+        raise ValueError(
+            f"parser broker {expected_broker} returned result broker {result_broker}"
+        )
+
+    for collection_name in ("positions", "cash_balances", "warnings"):
+        for record in getattr(parse_result, collection_name):
+            if record.broker != expected_broker:
+                raise ValueError(
+                    f"parser broker {expected_broker} emitted {collection_name} "
+                    f"record for broker {record.broker}"
+                )
 
 
 def _manifest_to_row(record: ManifestRecord) -> dict[str, str]:
