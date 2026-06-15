@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
-from .advice.tradingagents_adapter import TradingAgentsAdapter
+from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
 from .fx import StaticMonthEndFxProvider
 from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
@@ -41,6 +41,16 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid positive integer: {value}") from exc
     if parsed < 1:
         raise argparse.ArgumentTypeError(f"invalid positive integer: {value}")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid positive float: {value}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"invalid positive float: {value}")
     return parsed
 
 
@@ -133,6 +143,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="TradingAgents quick-thinking model",
     )
     premarket_parser.add_argument(
+        "--ta-timeout-seconds",
+        type=positive_float,
+        default=120.0,
+        help="TradingAgents LLM request timeout in seconds",
+    )
+    premarket_parser.add_argument(
+        "--ta-max-retries",
+        type=positive_int,
+        default=1,
+        help="TradingAgents LLM request retry count",
+    )
+    premarket_parser.add_argument(
+        "--symbol-timeout-seconds",
+        type=positive_float,
+        default=300.0,
+        help="Hard timeout for one symbol's TradingAgents analysis",
+    )
+    premarket_parser.add_argument(
         "--symbols",
         help="Comma-separated subset of symbols to analyze",
     )
@@ -189,12 +217,15 @@ def main(argv: list[str] | None = None) -> int:
             "llm_provider": args.ta_provider,
             "deep_think_llm": args.ta_deep_model,
             "quick_think_llm": args.ta_quick_model,
+            "llm_timeout": args.ta_timeout_seconds,
+            "llm_max_retries": args.ta_max_retries,
         }
 
-        def advice_runner_factory() -> TradingAgentsAdapter:
-            return TradingAgentsAdapter.from_project_path(
-                args.tradingagents_path,
+        def advice_runner_factory() -> TradingAgentsSubprocessRunner:
+            return TradingAgentsSubprocessRunner(
+                project_path=args.tradingagents_path,
                 config_overrides=tradingagents_config_overrides,
+                timeout_seconds=args.symbol_timeout_seconds,
             )
 
         result = run_premarket(

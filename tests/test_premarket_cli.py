@@ -57,6 +57,9 @@ def test_run_premarket_help_includes_expected_options(
     assert "--ta-provider" in output
     assert "--ta-deep-model" in output
     assert "--ta-quick-model" in output
+    assert "--ta-timeout-seconds" in output
+    assert "--ta-max-retries" in output
+    assert "--symbol-timeout-seconds" in output
     assert "--max-workers" in output
     assert "--dry-run" in output
 
@@ -68,17 +71,17 @@ def test_run_premarket_main_wires_pipeline(
 ) -> None:
     captured: dict[str, object] = {}
 
-    class FakeAdapter:
-        @classmethod
-        def from_project_path(
-            cls,
-            path: Path,
+    class FakeSubprocessRunner:
+        def __init__(
+            self,
             *,
-            config_overrides: dict[str, object] | None = None,
-        ) -> FakeAdapter:
-            captured["tradingagents_path"] = path
+            project_path: Path,
+            config_overrides: dict[str, object],
+            timeout_seconds: float,
+        ) -> None:
+            captured["tradingagents_path"] = project_path
             captured["tradingagents_config_overrides"] = config_overrides
-            return cls()
+            captured["symbol_timeout_seconds"] = timeout_seconds
 
     class FakeOpenAIClassifierClient:
         def __init__(self, *, model: str) -> None:
@@ -110,7 +113,7 @@ def test_run_premarket_main_wires_pipeline(
             report_path=reports_dir / "premarket" / "2026-06-16.md",
         )
 
-    monkeypatch.setattr(cli, "TradingAgentsAdapter", FakeAdapter)
+    monkeypatch.setattr(cli, "TradingAgentsSubprocessRunner", FakeSubprocessRunner)
     monkeypatch.setattr(cli, "OpenAIClassifierClient", FakeOpenAIClassifierClient)
     monkeypatch.setattr(cli, "ChangeClassifier", FakeChangeClassifier)
     monkeypatch.setattr(cli, "run_premarket", fake_run_premarket)
@@ -134,6 +137,12 @@ def test_run_premarket_main_wires_pipeline(
             "deepseek-v4-pro",
             "--ta-quick-model",
             "deepseek-v4-flash",
+            "--ta-timeout-seconds",
+            "45",
+            "--ta-max-retries",
+            "1",
+            "--symbol-timeout-seconds",
+            "90",
             "--max-workers",
             "4",
             "--symbols",
@@ -150,13 +159,16 @@ def test_run_premarket_main_wires_pipeline(
     assert captured["symbols"] == {"VIXY", "QQQ"}
     assert captured["update_latest"] is False
     assert captured["advice_runner"] is None
-    assert isinstance(captured["factory_result"], FakeAdapter)
+    assert isinstance(captured["factory_result"], FakeSubprocessRunner)
     assert captured["tradingagents_path"] == Path("/tmp/TradingAgents")
     assert captured["tradingagents_config_overrides"] == {
         "llm_provider": "deepseek",
         "deep_think_llm": "deepseek-v4-pro",
         "quick_think_llm": "deepseek-v4-flash",
+        "llm_timeout": 45,
+        "llm_max_retries": 1,
     }
+    assert captured["symbol_timeout_seconds"] == 90
     assert captured["max_workers"] == 4
     assert captured["model"] == "gpt-5.4-mini"
 

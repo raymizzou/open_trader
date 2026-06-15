@@ -39,7 +39,10 @@ export DEEPSEEK_API_KEY=...
 .venv/bin/python -m open_trader run-premarket \
   --date 2026-06-16 \
   --portfolio data/latest/portfolio.csv \
-  --max-workers 3
+  --max-workers 3 \
+  --ta-timeout-seconds 120 \
+  --ta-max-retries 1 \
+  --symbol-timeout-seconds 300
 ```
 
 By default, the TradingAgents run uses DeepSeek:
@@ -48,6 +51,9 @@ By default, the TradingAgents run uses DeepSeek:
 --ta-provider deepseek
 --ta-deep-model deepseek-v4-pro
 --ta-quick-model deepseek-v4-flash
+--ta-timeout-seconds 120
+--ta-max-retries 1
+--symbol-timeout-seconds 300
 ```
 
 Optional test run for a subset:
@@ -58,6 +64,9 @@ Optional test run for a subset:
   --portfolio data/latest/portfolio.csv \
   --symbols VIXY,QQQ \
   --max-workers 2 \
+  --ta-timeout-seconds 120 \
+  --ta-max-retries 1 \
+  --symbol-timeout-seconds 300 \
   --dry-run
 ```
 

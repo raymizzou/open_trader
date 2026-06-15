@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import dataclasses
 import json
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -117,3 +120,94 @@ def _extract_summary(state: Any, decision: Any) -> str:
 
 def _resolved_sys_path_strings() -> set[str]:
     return {str(Path(path_entry).resolve()) for path_entry in sys.path}
+
+
+class TradingAgentsSubprocessRunner:
+    def __init__(
+        self,
+        *,
+        project_path: Path,
+        config_overrides: Mapping[str, object],
+        timeout_seconds: float,
+        python_executable: str | None = None,
+    ) -> None:
+        self._project_path = project_path
+        self._config_overrides = dict(config_overrides)
+        self._timeout_seconds = timeout_seconds
+        self._python_executable = python_executable or sys.executable
+
+    def analyze(self, row: PortfolioInputRow, run_date: str) -> TradingAdvice:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".json",
+            prefix=f"open-trader-{row.symbol}-",
+            delete=False,
+        ) as handle:
+            output_path = Path(handle.name)
+
+        command = [
+            self._python_executable,
+            "-m",
+            "open_trader.advice.tradingagents_worker",
+            "--project-path",
+            str(self._project_path),
+            "--run-date",
+            run_date,
+            "--row-json",
+            json.dumps(dataclasses.asdict(row), ensure_ascii=False),
+            "--config-json",
+            json.dumps(self._config_overrides, ensure_ascii=False),
+            "--output",
+            str(output_path),
+        ]
+
+        try:
+            subprocess.run(
+                command,
+                cwd=Path.cwd(),
+                capture_output=True,
+                text=True,
+                timeout=self._timeout_seconds,
+                check=True,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            return TradingAdvice(**data)
+        except subprocess.TimeoutExpired:
+            return _error_advice(
+                row=row,
+                run_date=run_date,
+                error=f"TradingAgents timed out after {self._timeout_seconds} seconds",
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            return _error_advice(row=row, run_date=run_date, error=detail)
+        except Exception as exc:
+            return _error_advice(row=row, run_date=run_date, error=str(exc))
+        finally:
+            try:
+                output_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _error_advice(
+    *,
+    row: PortfolioInputRow,
+    run_date: str,
+    error: str,
+) -> TradingAdvice:
+    return TradingAdvice(
+        run_date=run_date,
+        symbol=row.symbol,
+        market=row.market,
+        asset_class=row.asset_class,
+        portfolio_weight_hkd=row.portfolio_weight_hkd,
+        risk_flag=row.risk_flag,
+        source="tradingagents",
+        advice_action="",
+        advice_summary="",
+        raw_decision="",
+        status="error",
+        error=error,
+    )

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 from open_trader.advice.models import PortfolioInputRow
-from open_trader.advice.tradingagents_adapter import TradingAgentsAdapter
+from open_trader.advice.tradingagents_adapter import (
+    TradingAgentsAdapter,
+    TradingAgentsSubprocessRunner,
+)
 
 
 class FakeGraph:
@@ -192,3 +197,82 @@ def test_from_project_path_merges_config_overrides(
         "deep_think_llm": "deepseek-v4-pro",
         "quick_think_llm": "deepseek-v4-flash",
     }
+
+
+def test_subprocess_runner_reads_worker_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        captured["cwd"] = cwd
+        captured["timeout"] = timeout
+        output_path = Path(command[command.index("--output") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "run_date": "2026-06-16",
+                    "symbol": "VIXY",
+                    "market": "US",
+                    "asset_class": "etf",
+                    "portfolio_weight_hkd": "3.05%",
+                    "risk_flag": "normal",
+                    "source": "tradingagents",
+                    "advice_action": "hold",
+                    "advice_summary": "Hold VIXY",
+                    "raw_decision": "{}",
+                    "status": "ok",
+                    "error": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="noise", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = TradingAgentsSubprocessRunner(
+        project_path=tmp_path / "TradingAgents",
+        config_overrides={"llm_provider": "deepseek"},
+        timeout_seconds=45.0,
+        python_executable="/python",
+    )
+
+    advice = runner.analyze(portfolio_row("VIXY"), "2026-06-16")
+
+    assert advice.status == "ok"
+    assert advice.symbol == "VIXY"
+    assert advice.advice_action == "hold"
+    assert captured["cwd"] == Path.cwd()
+    assert captured["timeout"] == 45.0
+    assert "open_trader.advice.tradingagents_worker" in captured["command"]
+
+
+def test_subprocess_runner_returns_error_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=["worker"], timeout=30.0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = TradingAgentsSubprocessRunner(
+        project_path=tmp_path / "TradingAgents",
+        config_overrides={},
+        timeout_seconds=30.0,
+        python_executable="/python",
+    )
+
+    advice = runner.analyze(portfolio_row("QQQ"), "2026-06-16")
+
+    assert advice.status == "error"
+    assert advice.symbol == "QQQ"
+    assert advice.source == "tradingagents"
+    assert advice.error == "TradingAgents timed out after 30.0 seconds"
