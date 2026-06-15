@@ -11,6 +11,55 @@ from open_trader.advice.models import (
 )
 
 
+EXPECTED_TRADING_ADVICE_FIELDNAMES = [
+    "run_date",
+    "symbol",
+    "market",
+    "asset_class",
+    "portfolio_weight_hkd",
+    "risk_flag",
+    "source",
+    "advice_action",
+    "advice_summary",
+    "raw_decision",
+    "status",
+    "error",
+]
+
+EXPECTED_CHANGE_CLASSIFICATION_FIELDNAMES = [
+    "run_date",
+    "symbol",
+    "include_in_report",
+    "change_type",
+    "severity",
+    "suggested_action",
+    "summary",
+    "rationale",
+    "watch_trigger",
+    "status",
+    "error",
+]
+
+EXPECTED_PREMARKET_ACTION_FIELDNAMES = [
+    "run_date",
+    "symbol",
+    "market",
+    "portfolio_weight_hkd",
+    "severity",
+    "change_type",
+    "suggested_action",
+    "summary",
+    "rationale",
+    "watch_trigger",
+]
+
+
+def test_csv_fieldnames_match_external_contract() -> None:
+    assert TRADING_ADVICE_FIELDNAMES == EXPECTED_TRADING_ADVICE_FIELDNAMES
+    assert CHANGE_CLASSIFICATION_FIELDNAMES == EXPECTED_CHANGE_CLASSIFICATION_FIELDNAMES
+    assert PREMARKET_ACTION_FIELDNAMES == EXPECTED_PREMARKET_ACTION_FIELDNAMES
+
+
 def test_trading_advice_to_row_has_stable_csv_fields() -> None:
     advice = TradingAdvice(
         run_date="2026-06-16",
@@ -29,7 +78,7 @@ def test_trading_advice_to_row_has_stable_csv_fields() -> None:
 
     row = advice.to_row()
 
-    assert list(row) == TRADING_ADVICE_FIELDNAMES
+    assert list(row) == EXPECTED_TRADING_ADVICE_FIELDNAMES
     assert row["symbol"] == "VIXY"
     assert row["advice_action"] == "reduce"
     assert row["error"] == ""
@@ -52,7 +101,7 @@ def test_change_classification_to_row_has_required_fields() -> None:
 
     row = classification.to_row()
 
-    assert list(row) == CHANGE_CLASSIFICATION_FIELDNAMES
+    assert list(row) == EXPECTED_CHANGE_CLASSIFICATION_FIELDNAMES
     assert row["include_in_report"] == "true"
     assert row["severity"] == "high"
 
@@ -83,7 +132,7 @@ def test_premarket_action_is_derived_from_portfolio_and_classification() -> None
 
     action = PremarketAction.from_classification(portfolio, classification)
 
-    assert list(action.to_row()) == PREMARKET_ACTION_FIELDNAMES
+    assert list(action.to_row()) == EXPECTED_PREMARKET_ACTION_FIELDNAMES
     assert action.symbol == "VIXY"
     assert action.market == "US"
     assert action.portfolio_weight_hkd == "3.05%"
