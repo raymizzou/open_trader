@@ -251,6 +251,20 @@ def test_run_import_rejects_extra_statement_path_key(tmp_path: Path) -> None:
         )
 
 
+def test_run_import_rejects_duplicate_parser_brokers(tmp_path: Path) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+
+    with pytest.raises(ValueError, match="duplicate.*fake"):
+        run_import(
+            month="2026-05",
+            statement_paths={"fake": source},
+            parsers=[FakeParser(), FakeParser()],
+            data_dir=tmp_path / "data",
+            fx_provider=StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")}),
+        )
+
+
 def test_run_import_rejects_parse_result_broker_mismatch(tmp_path: Path) -> None:
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
@@ -518,6 +532,56 @@ def test_run_import_latest_replace_failure_restores_previous_outputs(
     assert first.portfolio_path.read_text(encoding="utf-8") == "previous run\n"
     assert first.latest_path.read_text(encoding="utf-8") == "previous latest\n"
     assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
+    assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
+    assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
+
+
+def test_run_import_rollback_cleanup_failure_preserves_original_error_and_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+
+    first = run_import(
+        month="2026-05",
+        statement_paths={"fake": source},
+        parsers=[FakeParser()],
+        data_dir=data_dir,
+        fx_provider=fx_provider,
+    )
+    first.portfolio_path.write_text("previous run\n", encoding="utf-8")
+    first.latest_path.write_text("previous latest\n", encoding="utf-8")
+    real_replace = Path.replace
+    real_rmtree = pipeline.rmtree
+
+    def fail_latest_replace(self: Path, target: Path) -> Path:
+        if self.name.startswith(".portfolio.") and self.suffix == ".tmp":
+            raise OSError("simulated latest replace failure")
+        return real_replace(self, target)
+
+    def fail_failed_run_cleanup(path: Path) -> None:
+        if path.name == "2026-05" or path.suffix == ".failed":
+            raise OSError("simulated cleanup failure")
+        real_rmtree(path)
+
+    monkeypatch.setattr(Path, "replace", fail_latest_replace)
+    monkeypatch.setattr(pipeline, "rmtree", fail_failed_run_cleanup)
+
+    with pytest.raises(OSError, match="simulated latest replace failure"):
+        run_import(
+            month="2026-05",
+            statement_paths={"fake": source},
+            parsers=[FakeParser()],
+            data_dir=data_dir,
+            fx_provider=fx_provider,
+        )
+
+    assert first.run_dir.exists()
+    assert first.portfolio_path.read_text(encoding="utf-8") == "previous run\n"
+    assert first.latest_path.read_text(encoding="utf-8") == "previous latest\n"
     assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
     assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
 

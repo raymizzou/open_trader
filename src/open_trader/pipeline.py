@@ -8,6 +8,7 @@ from pathlib import Path
 from shutil import copyfile, rmtree
 from tempfile import mkdtemp, mkstemp
 from typing import Iterable, Mapping
+from uuid import uuid4
 
 from .csv_io import write_rows
 from .fx import StaticMonthEndFxProvider
@@ -156,16 +157,15 @@ def run_import(
         temp_run_promoted = True
         temp_latest_path.replace(latest_path)
         if backup_run_dir is not None and backup_run_dir.exists():
-            rmtree(backup_run_dir)
+            _best_effort_rmtree(backup_run_dir)
     except Exception:
-        if temp_run_promoted and run_dir.exists():
-            rmtree(run_dir)
-        if backup_run_dir is not None and backup_run_dir.exists():
-            backup_run_dir.rename(run_dir)
-        if temp_run_dir.exists():
-            rmtree(temp_run_dir)
-        if temp_latest_path.exists():
-            temp_latest_path.unlink()
+        _rollback_failed_promotion(
+            run_dir=run_dir,
+            temp_run_dir=temp_run_dir,
+            temp_latest_path=temp_latest_path,
+            backup_run_dir=backup_run_dir,
+            temp_run_promoted=temp_run_promoted,
+        )
         raise
 
     portfolio_path = run_dir / "portfolio.csv"
@@ -181,15 +181,15 @@ def run_import(
 
 
 def _make_backup_run_dir(run_dir: Path) -> Path:
-    backup_dir = Path(
-        mkdtemp(
-            prefix=f".{run_dir.name}.",
-            suffix=".backup",
-            dir=run_dir.parent,
-        )
-    )
-    rmtree(backup_dir)
-    return backup_dir
+    return _unique_sibling_path(run_dir, "backup")
+
+
+def _make_failed_run_dir(run_dir: Path) -> Path:
+    return _unique_sibling_path(run_dir, "failed")
+
+
+def _unique_sibling_path(path: Path, suffix: str) -> Path:
+    return path.parent / f".{path.name}.{uuid4().hex}.{suffix}"
 
 
 def _make_temp_latest_path(latest_path: Path) -> Path:
@@ -213,11 +213,71 @@ def _make_temp_run_dir(run_dir: Path) -> Path:
     )
 
 
+def _rollback_failed_promotion(
+    *,
+    run_dir: Path,
+    temp_run_dir: Path,
+    temp_latest_path: Path,
+    backup_run_dir: Path | None,
+    temp_run_promoted: bool,
+) -> None:
+    failed_run_dir: Path | None = None
+    if temp_run_promoted and run_dir.exists():
+        failed_run_dir = _make_failed_run_dir(run_dir)
+        try:
+            run_dir.rename(failed_run_dir)
+        except Exception:
+            failed_run_dir = None
+            if backup_run_dir is None:
+                _best_effort_rmtree(run_dir)
+
+    if backup_run_dir is not None and backup_run_dir.exists():
+        if run_dir.exists():
+            _best_effort_rmtree(run_dir)
+        if not run_dir.exists():
+            try:
+                backup_run_dir.rename(run_dir)
+            except Exception:
+                pass
+
+    if failed_run_dir is not None and failed_run_dir.exists():
+        _best_effort_rmtree(failed_run_dir)
+    if temp_run_dir.exists():
+        _best_effort_rmtree(temp_run_dir)
+    if temp_latest_path.exists():
+        _best_effort_unlink(temp_latest_path)
+
+
+def _best_effort_rmtree(path: Path) -> None:
+    try:
+        rmtree(path)
+    except Exception:
+        pass
+
+
+def _best_effort_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except Exception:
+        pass
+
+
 def _validate_statement_paths(
     statement_paths: Mapping[str, Path],
     parsers: list[StatementParser],
 ) -> None:
-    parser_brokers = {parser.broker for parser in parsers}
+    parser_broker_list = [parser.broker for parser in parsers]
+    duplicate_brokers = sorted(
+        broker
+        for broker in set(parser_broker_list)
+        if parser_broker_list.count(broker) > 1
+    )
+    if duplicate_brokers:
+        raise ValueError(
+            f"duplicate parser broker(s): {', '.join(duplicate_brokers)}"
+        )
+
+    parser_brokers = set(parser_broker_list)
     path_brokers = set(statement_paths)
     missing = sorted(parser_brokers - path_brokers)
     if missing:
