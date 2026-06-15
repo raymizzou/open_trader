@@ -94,6 +94,10 @@ into monitorable watchlist rows:
   --date 2026-06-16
 ```
 
+Use the same `--date` as the premarket run. The command filters action rows to
+that date; it is required when the actions file is empty because no `run_date`
+can be inferred from rows.
+
 Optional dry run:
 
 ```bash
@@ -104,11 +108,16 @@ Optional dry run:
   --dry-run
 ```
 
-Main output:
+Run output:
 
 ```text
+data/runs/<YYYY-MM-DD>/watchlist.csv
 data/latest/watchlist.csv
 ```
 
+`--dry-run` writes only the dated run output and does not update
+`data/latest/watchlist.csv`.
+
 Rows with clear price conditions become `active`. Rows with unclear trigger text
-become `manual_review` and should be reviewed before automated alerting.
+become `manual_review` and should be reviewed before any future alerting
+automation.
