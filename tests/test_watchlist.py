@@ -332,6 +332,49 @@ def test_build_watchlist_writes_empty_headers_when_no_actions(tmp_path: Path) ->
     assert result.watchlist_count == 0
 
 
+def test_build_watchlist_write_failure_preserves_existing_run_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    run_path = tmp_path / "data/runs/2026-06-16/watchlist.csv"
+    run_path.parent.mkdir(parents=True, exist_ok=True)
+    run_path.write_text("existing\n", encoding="utf-8")
+    write_actions(
+        actions_path,
+        [
+            {
+                "run_date": "2026-06-16",
+                "symbol": "VIXY",
+                "market": "US",
+                "portfolio_weight_hkd": "3.05%",
+                "severity": "high",
+                "change_type": "action_changed",
+                "suggested_action": "reduce",
+                "summary": "VIXY changed",
+                "rationale": "Fake rationale",
+                "watch_trigger": "below 95",
+            },
+        ],
+    )
+
+    def fail_writerows(self: csv.DictWriter, rowdicts: object) -> None:
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(csv.DictWriter, "writerows", fail_writerows)
+
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        build_watchlist(
+            actions_path,
+            tmp_path / "data",
+            run_date="2026-06-16",
+            update_latest=False,
+        )
+
+    assert run_path.read_text(encoding="utf-8") == "existing\n"
+    assert list(run_path.parent.glob(".watchlist.csv.*.tmp")) == []
+
+
 def test_build_watchlist_unmatched_explicit_date_preserves_latest(
     tmp_path: Path,
 ) -> None:

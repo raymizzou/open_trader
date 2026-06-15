@@ -257,10 +257,26 @@ def _row_from_action(row: dict[str, str], fallback_run_date: str) -> WatchlistRo
 
 def _write_watchlist_rows(path: Path, rows: list[WatchlistRow]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=WATCHLIST_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(row.to_row() for row in rows)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            writer = csv.DictWriter(handle, fieldnames=WATCHLIST_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(row.to_row() for row in rows)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
     return path
 
 
