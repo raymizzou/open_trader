@@ -390,6 +390,50 @@ def test_run_import_write_failure_keeps_previous_outputs_and_cleans_temp_dir(
     assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
 
 
+def test_run_import_latest_copy_failure_keeps_previous_latest_and_run_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+
+    first = run_import(
+        month="2026-05",
+        statement_paths={"fake": source},
+        parsers=[FakeParser()],
+        data_dir=data_dir,
+        fx_provider=fx_provider,
+    )
+    original_portfolio = first.portfolio_path.read_text(encoding="utf-8")
+    original_latest = first.latest_path.read_text(encoding="utf-8")
+    real_copyfile = pipeline.copyfile
+
+    def fail_latest_copy(src: Path, dst: Path) -> None:
+        if dst.parent.name == "latest":
+            dst.write_text("partial latest\n", encoding="utf-8")
+            raise OSError("simulated latest copy failure")
+        real_copyfile(src, dst)
+
+    monkeypatch.setattr(pipeline, "copyfile", fail_latest_copy)
+
+    with pytest.raises(OSError, match="simulated latest copy failure"):
+        run_import(
+            month="2026-05",
+            statement_paths={"fake": source},
+            parsers=[FakeParser()],
+            data_dir=data_dir,
+            fx_provider=fx_provider,
+        )
+
+    assert first.run_dir.exists()
+    assert first.portfolio_path.read_text(encoding="utf-8") == original_portfolio
+    assert first.latest_path.read_text(encoding="utf-8") == original_latest
+    assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
+    assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
+
+
 def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[str]) -> None:
     parser = build_parser()
 

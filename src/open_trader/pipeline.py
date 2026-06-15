@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from os import close
 from pathlib import Path
 from shutil import copyfile, rmtree
-from tempfile import mkdtemp
+from tempfile import mkdtemp, mkstemp
 from typing import Iterable, Mapping
 
 from .csv_io import write_rows
@@ -119,6 +120,9 @@ def run_import(
     portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
 
     temp_run_dir = _make_temp_run_dir(run_dir)
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = latest_dir / "portfolio.csv"
+    temp_latest_path = _make_temp_latest_path(latest_path)
     try:
         write_rows(
             temp_run_dir / "manifest.csv",
@@ -142,18 +146,19 @@ def run_import(
         )
         write_rows(temp_run_dir / "portfolio.csv", PORTFOLIO_FIELDNAMES, portfolio_rows)
 
+        copyfile(temp_run_dir / "portfolio.csv", temp_latest_path)
         if run_dir.exists():
             rmtree(run_dir)
         temp_run_dir.rename(run_dir)
+        temp_latest_path.replace(latest_path)
     except Exception:
         if temp_run_dir.exists():
             rmtree(temp_run_dir)
+        if temp_latest_path.exists():
+            temp_latest_path.unlink()
         raise
 
     portfolio_path = run_dir / "portfolio.csv"
-    latest_dir.mkdir(parents=True, exist_ok=True)
-    latest_path = latest_dir / "portfolio.csv"
-    copyfile(portfolio_path, latest_path)
 
     return ImportResult(
         run_dir=run_dir,
@@ -163,6 +168,16 @@ def run_import(
         cash_count=len(cash_balances),
         warnings_count=len(warnings),
     )
+
+
+def _make_temp_latest_path(latest_path: Path) -> Path:
+    file_descriptor, name = mkstemp(
+        prefix=".portfolio.",
+        suffix=".tmp",
+        dir=latest_path.parent,
+    )
+    close(file_descriptor)
+    return Path(name)
 
 
 def _make_temp_run_dir(run_dir: Path) -> Path:
