@@ -332,6 +332,43 @@ def test_build_watchlist_writes_empty_headers_when_no_actions(tmp_path: Path) ->
     assert result.watchlist_count == 0
 
 
+def test_build_watchlist_unmatched_explicit_date_preserves_latest(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    latest_path = tmp_path / "data/latest/watchlist.csv"
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.write_text("existing\n", encoding="utf-8")
+    write_actions(
+        actions_path,
+        [
+            {
+                "run_date": "2026-06-16",
+                "symbol": "VIXY",
+                "market": "US",
+                "portfolio_weight_hkd": "3.05%",
+                "severity": "high",
+                "change_type": "action_changed",
+                "suggested_action": "reduce",
+                "summary": "VIXY changed",
+                "rationale": "Fake rationale",
+                "watch_trigger": "below 95",
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="no action rows match run_date 2026-06-15"):
+        build_watchlist(
+            actions_path,
+            tmp_path / "data",
+            run_date="2026-06-15",
+            update_latest=True,
+        )
+
+    assert latest_path.read_text(encoding="utf-8") == "existing\n"
+    assert not (tmp_path / "data/runs/2026-06-15/watchlist.csv").exists()
+
+
 def test_build_watchlist_missing_required_columns_raises_value_error(
     tmp_path: Path,
 ) -> None:
@@ -351,6 +388,20 @@ def test_build_watchlist_missing_required_columns_raises_value_error(
         )
 
 
+def test_build_watchlist_duplicate_columns_raises_value_error(tmp_path: Path) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_text(
+        actions_path,
+        ",".join(ACTION_FIELDNAMES + ["symbol"])
+        + "\n"
+        + "2026-06-16,VIXY,US,3.05%,high,action_changed,reduce,VIXY changed,"
+        + "Fake rationale,below 95,VIXY\n",
+    )
+
+    with pytest.raises(ValueError, match="duplicate action column\\(s\\).*symbol"):
+        build_watchlist(actions_path, tmp_path / "data")
+
+
 def test_build_watchlist_without_rows_requires_run_date(tmp_path: Path) -> None:
     actions_path = tmp_path / "data/latest/premarket_actions.csv"
     write_actions(actions_path, [])
@@ -362,6 +413,23 @@ def test_build_watchlist_without_rows_requires_run_date(tmp_path: Path) -> None:
             run_date=None,
             update_latest=True,
         )
+
+
+def test_build_watchlist_extra_column_raises_value_error(tmp_path: Path) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_text(
+        actions_path,
+        ",".join(ACTION_FIELDNAMES)
+        + "\n"
+        + "2026-06-16,VIXY,US,3.05%,high,action_changed,reduce,VIXY changed,"
+        + "Fake rationale,below 95,unexpected\n",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="row 2.*symbol VIXY.*extra column",
+    ):
+        build_watchlist(actions_path, tmp_path / "data")
 
 
 def test_build_watchlist_ragged_row_missing_required_cell_raises_value_error(

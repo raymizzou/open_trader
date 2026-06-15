@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import re
 import shutil
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -108,6 +109,8 @@ def build_watchlist(
         effective_run_date,
         allow_blank_run_date=run_date is not None,
     )
+    if rows and not filtered_rows:
+        raise ValueError(f"no action rows match run_date {effective_run_date}")
     watchlist_rows = [
         _row_from_action(row, effective_run_date) for row in filtered_rows
     ]
@@ -129,7 +132,15 @@ def build_watchlist(
 def _read_action_rows(actions_path: Path) -> list[dict[str, str]]:
     with actions_path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        fieldnames = set(reader.fieldnames or [])
+        raw_fieldnames = reader.fieldnames or []
+        duplicate_columns = sorted(
+            column for column, count in Counter(raw_fieldnames).items() if count > 1
+        )
+        if duplicate_columns:
+            raise ValueError(
+                f"duplicate action column(s): {', '.join(duplicate_columns)}"
+            )
+        fieldnames = set(raw_fieldnames)
         missing = sorted(ACTION_REQUIRED_FIELDS - fieldnames)
         if missing:
             raise ValueError(f"missing action column(s): {', '.join(missing)}")
