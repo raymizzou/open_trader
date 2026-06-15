@@ -123,6 +123,8 @@ def run_import(
     latest_dir.mkdir(parents=True, exist_ok=True)
     latest_path = latest_dir / "portfolio.csv"
     temp_latest_path = _make_temp_latest_path(latest_path)
+    backup_run_dir: Path | None = None
+    temp_run_promoted = False
     try:
         write_rows(
             temp_run_dir / "manifest.csv",
@@ -148,10 +150,18 @@ def run_import(
 
         copyfile(temp_run_dir / "portfolio.csv", temp_latest_path)
         if run_dir.exists():
-            rmtree(run_dir)
+            backup_run_dir = _make_backup_run_dir(run_dir)
+            run_dir.rename(backup_run_dir)
         temp_run_dir.rename(run_dir)
+        temp_run_promoted = True
         temp_latest_path.replace(latest_path)
+        if backup_run_dir is not None and backup_run_dir.exists():
+            rmtree(backup_run_dir)
     except Exception:
+        if temp_run_promoted and run_dir.exists():
+            rmtree(run_dir)
+        if backup_run_dir is not None and backup_run_dir.exists():
+            backup_run_dir.rename(run_dir)
         if temp_run_dir.exists():
             rmtree(temp_run_dir)
         if temp_latest_path.exists():
@@ -168,6 +178,18 @@ def run_import(
         cash_count=len(cash_balances),
         warnings_count=len(warnings),
     )
+
+
+def _make_backup_run_dir(run_dir: Path) -> Path:
+    backup_dir = Path(
+        mkdtemp(
+            prefix=f".{run_dir.name}.",
+            suffix=".backup",
+            dir=run_dir.parent,
+        )
+    )
+    rmtree(backup_dir)
+    return backup_dir
 
 
 def _make_temp_latest_path(latest_path: Path) -> Path:
@@ -204,6 +226,8 @@ def _validate_statement_paths(
     unknown = sorted(path_brokers - parser_brokers)
     if unknown:
         raise ValueError(f"unknown statement path broker(s): {', '.join(unknown)}")
+
+
 def _validate_parse_result_brokers(
     expected_broker: str,
     parse_result: ParseResult,

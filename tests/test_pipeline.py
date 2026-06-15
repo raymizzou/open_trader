@@ -434,6 +434,94 @@ def test_run_import_latest_copy_failure_keeps_previous_latest_and_run_dir(
     assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
 
 
+def test_run_import_promotion_rename_failure_restores_previous_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+
+    first = run_import(
+        month="2026-05",
+        statement_paths={"fake": source},
+        parsers=[FakeParser()],
+        data_dir=data_dir,
+        fx_provider=fx_provider,
+    )
+    first.portfolio_path.write_text("previous run\n", encoding="utf-8")
+    first.latest_path.write_text("previous latest\n", encoding="utf-8")
+    real_rename = Path.rename
+
+    def fail_temp_run_promotion(self: Path, target: Path) -> Path:
+        if self.name.startswith(".2026-05.") and self.suffix == ".tmp":
+            raise OSError("simulated run promotion failure")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_temp_run_promotion)
+
+    with pytest.raises(OSError, match="simulated run promotion failure"):
+        run_import(
+            month="2026-05",
+            statement_paths={"fake": source},
+            parsers=[FakeParser()],
+            data_dir=data_dir,
+            fx_provider=fx_provider,
+        )
+
+    assert first.run_dir.exists()
+    assert first.portfolio_path.read_text(encoding="utf-8") == "previous run\n"
+    assert first.latest_path.read_text(encoding="utf-8") == "previous latest\n"
+    assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
+    assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
+    assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
+
+
+def test_run_import_latest_replace_failure_restores_previous_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+
+    first = run_import(
+        month="2026-05",
+        statement_paths={"fake": source},
+        parsers=[FakeParser()],
+        data_dir=data_dir,
+        fx_provider=fx_provider,
+    )
+    first.portfolio_path.write_text("previous run\n", encoding="utf-8")
+    first.latest_path.write_text("previous latest\n", encoding="utf-8")
+    real_replace = Path.replace
+
+    def fail_latest_replace(self: Path, target: Path) -> Path:
+        if self.name.startswith(".portfolio.") and self.suffix == ".tmp":
+            raise OSError("simulated latest replace failure")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_latest_replace)
+
+    with pytest.raises(OSError, match="simulated latest replace failure"):
+        run_import(
+            month="2026-05",
+            statement_paths={"fake": source},
+            parsers=[FakeParser()],
+            data_dir=data_dir,
+            fx_provider=fx_provider,
+        )
+
+    assert first.run_dir.exists()
+    assert first.portfolio_path.read_text(encoding="utf-8") == "previous run\n"
+    assert first.latest_path.read_text(encoding="utf-8") == "previous latest\n"
+    assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
+    assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
+    assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
+
+
 def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[str]) -> None:
     parser = build_parser()
 
