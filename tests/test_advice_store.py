@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+
+import pytest
+
+from open_trader.advice.models import ChangeClassification, TradingAdvice
+from open_trader.advice.store import (
+    load_latest_advice_by_symbol,
+    write_change_classifications,
+    write_trading_advice,
+)
+
+
+def advice(symbol: str, action: str = "hold") -> TradingAdvice:
+    return TradingAdvice(
+        run_date="2026-06-16",
+        symbol=symbol,
+        market="US",
+        asset_class="etf",
+        portfolio_weight_hkd="3.05%",
+        risk_flag="normal",
+        source="tradingagents",
+        advice_action=action,
+        advice_summary=f"{symbol} {action}",
+        raw_decision='{"action":"hold"}',
+        status="ok",
+        error="",
+    )
+
+
+def classification(symbol: str) -> ChangeClassification:
+    return ChangeClassification(
+        run_date="2026-06-16",
+        symbol=symbol,
+        include_in_report=True,
+        change_type="new_signal",
+        severity="medium",
+        suggested_action="watch",
+        summary=f"{symbol} watch",
+        rationale="New symbol in advice store.",
+        watch_trigger="",
+        status="ok",
+        error="",
+    )
+
+
+def test_write_trading_advice_writes_run_and_latest_files(tmp_path: Path) -> None:
+    run_path, latest_path = write_trading_advice(
+        run_date="2026-06-16",
+        records=[advice("VIXY"), advice("QQQ")],
+        data_dir=tmp_path / "data",
+        update_latest=True,
+    )
+
+    assert run_path == tmp_path / "data" / "runs" / "2026-06-16" / "trading_advice.csv"
+    assert latest_path == tmp_path / "data" / "latest" / "trading_advice.csv"
+    assert run_path.read_text(encoding="utf-8") == latest_path.read_text(encoding="utf-8")
+
+    rows = list(csv.DictReader(run_path.open(encoding="utf-8")))
+    assert [row["symbol"] for row in rows] == ["VIXY", "QQQ"]
+
+
+def test_write_trading_advice_dry_run_does_not_update_latest(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_trading_advice(
+        run_date="2026-06-15",
+        records=[advice("OLD")],
+        data_dir=data_dir,
+        update_latest=True,
+    )
+    original_latest = (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    )
+
+    write_trading_advice(
+        run_date="2026-06-16",
+        records=[advice("NEW")],
+        data_dir=data_dir,
+        update_latest=False,
+    )
+
+    assert (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    ) == original_latest
+
+
+def test_load_latest_advice_by_symbol_returns_empty_when_missing(tmp_path: Path) -> None:
+    assert load_latest_advice_by_symbol(tmp_path / "data") == {}
+
+
+def test_load_latest_advice_by_symbol_indexes_existing_latest(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_trading_advice(
+        run_date="2026-06-16",
+        records=[advice("VIXY", "reduce")],
+        data_dir=data_dir,
+        update_latest=True,
+    )
+
+    latest = load_latest_advice_by_symbol(data_dir)
+
+    assert latest["VIXY"]["advice_action"] == "reduce"
+
+
+def test_write_change_classifications_writes_run_file(tmp_path: Path) -> None:
+    path = write_change_classifications(
+        run_date="2026-06-16",
+        records=[classification("VIXY")],
+        data_dir=tmp_path / "data",
+    )
+
+    rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    assert rows[0]["symbol"] == "VIXY"
+    assert rows[0]["include_in_report"] == "true"
+
+
+def test_atomic_latest_write_cleans_temp_file_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    original_writerow = csv.DictWriter.writerow
+
+    def fail_after_header(self: csv.DictWriter, rowdict: dict[str, str]) -> object:
+        if rowdict.get("symbol") == "VIXY":
+            raise OSError("simulated csv write failure")
+        return original_writerow(self, rowdict)
+
+    monkeypatch.setattr(csv.DictWriter, "writerow", fail_after_header)
+
+    with pytest.raises(OSError, match="simulated csv write failure"):
+        write_trading_advice(
+            run_date="2026-06-16",
+            records=[advice("VIXY")],
+            data_dir=data_dir,
+            update_latest=True,
+        )
+
+    latest_dir = data_dir / "latest"
+    assert not (latest_dir / "trading_advice.csv").exists()
+    assert list(latest_dir.glob(".trading_advice.csv.*.tmp")) == []
