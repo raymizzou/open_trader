@@ -97,9 +97,8 @@ def parse_watch_trigger(text: str) -> ParsedTrigger:
 def build_watchlist(
     actions_path: Path,
     data_dir: Path,
-    *,
-    run_date: str | None,
-    update_latest: bool,
+    run_date: str | None = None,
+    update_latest: bool = True,
 ) -> WatchlistResult:
     rows = _read_action_rows(actions_path)
     effective_run_date = run_date or _latest_run_date(rows)

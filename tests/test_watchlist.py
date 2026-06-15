@@ -143,12 +143,7 @@ def test_build_watchlist_writes_run_and_latest_outputs(tmp_path: Path) -> None:
         ],
     )
 
-    result = build_watchlist(
-        actions_path,
-        tmp_path / "data",
-        run_date=None,
-        update_latest=True,
-    )
+    result = build_watchlist(actions_path, tmp_path / "data")
 
     assert result.run_date == "2026-06-16"
     assert result.watchlist_count == 2
@@ -166,6 +161,34 @@ def test_build_watchlist_writes_run_and_latest_outputs(tmp_path: Path) -> None:
     assert rows[1]["symbol"] == "QQQ"
     assert rows[1]["trigger_type"] == "manual_review"
     assert rows[1]["status"] == "manual_review"
+
+
+def test_build_watchlist_accepts_positional_run_date_and_update_latest(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_actions(
+        actions_path,
+        [
+            {
+                "run_date": "2026-06-16",
+                "symbol": "VIXY",
+                "market": "US",
+                "portfolio_weight_hkd": "3.05%",
+                "severity": "high",
+                "change_type": "action_changed",
+                "suggested_action": "reduce",
+                "summary": "VIXY changed",
+                "rationale": "Fake rationale",
+                "watch_trigger": "below 95",
+            },
+        ],
+    )
+
+    result = build_watchlist(actions_path, tmp_path / "data", None, True)
+
+    assert result.run_date == "2026-06-16"
+    assert result.latest_path.exists()
 
 
 def test_build_watchlist_dry_run_does_not_update_latest(tmp_path: Path) -> None:
