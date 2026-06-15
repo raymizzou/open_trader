@@ -528,7 +528,7 @@ def test_build_watchlist_duplicate_columns_raises_value_error(tmp_path: Path) ->
         build_watchlist(actions_path, tmp_path / "data")
 
 
-def test_build_watchlist_extra_column_raises_value_error(tmp_path: Path) -> None:
+def test_build_watchlist_extra_column_writes_error_row(tmp_path: Path) -> None:
     actions_path = tmp_path / "data/latest/premarket_actions.csv"
     write_text(
         actions_path,
@@ -538,11 +538,24 @@ def test_build_watchlist_extra_column_raises_value_error(tmp_path: Path) -> None
         + "Fake rationale,below 95,unexpected\n",
     )
 
-    with pytest.raises(
-        ValueError,
-        match="row 2.*symbol VIXY.*extra column",
-    ):
-        build_watchlist(actions_path, tmp_path / "data")
+    result = build_watchlist(actions_path, tmp_path / "data")
+
+    rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
+    assert result.watchlist_count == 1
+    assert rows[0]["run_date"] == "2026-06-16"
+    assert rows[0]["symbol"] == "VIXY"
+    assert rows[0]["market"] == "US"
+    assert rows[0]["suggested_action"] == "reduce"
+    assert rows[0]["portfolio_weight_hkd"] == "3.05%"
+    assert rows[0]["severity"] == "high"
+    assert rows[0]["trigger_type"] == "none"
+    assert rows[0]["operator"] == ""
+    assert rows[0]["trigger_price"] == ""
+    assert rows[0]["trigger_text"] == "below 95"
+    assert rows[0]["status"] == "error"
+    assert "row 2" in rows[0]["error"]
+    assert "symbol VIXY" in rows[0]["error"]
+    assert "extra column" in rows[0]["error"]
 
 
 def test_build_watchlist_ragged_row_missing_required_cell_raises_value_error(
@@ -688,6 +701,22 @@ def test_build_watchlist_blank_symbol_still_raises_value_error(
                 "watch_trigger": "below 95",
             },
         ],
+    )
+
+    with pytest.raises(ValueError, match="row 2.*symbol"):
+        build_watchlist(actions_path, tmp_path / "data")
+
+
+def test_build_watchlist_extra_column_with_blank_symbol_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_text(
+        actions_path,
+        ",".join(ACTION_FIELDNAMES)
+        + "\n"
+        + "2026-06-16, ,US,3.05%,high,action_changed,reduce,VIXY changed,"
+        + "Fake rationale,below 95,unexpected\n",
     )
 
     with pytest.raises(ValueError, match="row 2.*symbol"):

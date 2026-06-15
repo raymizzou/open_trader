@@ -164,14 +164,10 @@ def _validated_action_row(
     row: dict[str | None, str | list[str] | None],
     row_number: int,
 ) -> ActionRow:
-    if None in row:
-        symbol = row.get("symbol") or "<unknown>"
-        raise ValueError(
-            f"malformed action row {row_number} symbol {symbol}: extra column(s)"
-        )
-
     normalized = {
-        column: "" if value is None else str(value) for column, value in row.items()
+        column: "" if value is None else str(value)
+        for column, value in row.items()
+        if column is not None
     }
     symbol = normalized.get("symbol", "").strip()
     if not symbol:
@@ -186,6 +182,23 @@ def _validated_action_row(
                 f"malformed action row {row_number} symbol {symbol}: "
                 f"invalid run_date {csv_run_date}"
             ) from exc
+
+    if None in row:
+        extra_values = row[None]
+        extra_text = ""
+        if isinstance(extra_values, list):
+            extra_text = ", ".join(str(value) for value in extra_values)
+        elif extra_values is not None:
+            extra_text = str(extra_values)
+        details = f": {extra_text}" if extra_text else ""
+        return ActionRow(
+            values=normalized,
+            row_number=row_number,
+            error=(
+                f"malformed action row {row_number} symbol {symbol}: "
+                f"extra column(s){details}"
+            ),
+        )
 
     missing_values = [column for column, value in row.items() if value is None]
     if missing_values:
