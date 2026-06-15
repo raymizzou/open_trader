@@ -28,16 +28,24 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
     cash_balances: list[CashBalance] = []
     in_positions = False
     in_cash = False
+    in_account_details = False
 
     for raw_line in text.splitlines():
         line = _normalize_line(raw_line)
         if not line:
             continue
 
-        account_cash = _parse_account_cash_line(line, statement_id)
-        if account_cash is not None:
-            _upsert_cash_balance(cash_balances, account_cash)
+        if _is_account_details_start(line):
+            in_account_details = True
+            in_positions = False
+            in_cash = False
             continue
+
+        if in_account_details:
+            account_cash = _parse_account_cash_line(line, statement_id)
+            if account_cash is not None:
+                _upsert_cash_balance(cash_balances, account_cash)
+                continue
 
         if (
             line == "Securities Portfolio"
@@ -47,12 +55,14 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
             or "股股票票投投資資組組合合" in line
         ):
             in_positions = True
+            in_account_details = False
             in_cash = False
             continue
         if line.startswith(("產品 市場", "Product Market")):
             continue
         if line == "Cash Balance":
             in_positions = False
+            in_account_details = False
             in_cash = True
             continue
 
@@ -198,6 +208,16 @@ def _parse_account_cash_line(line: str, statement_id: str) -> CashBalance | None
         available_balance=balance,
         confidence="high",
         notes="",
+    )
+
+
+def _is_account_details_start(line: str) -> bool:
+    return (
+        "Account Details" in line
+        or "戶口資料" in line
+        or "户口资料" in line
+        or line.startswith("Currency Balance C/F")
+        or line.startswith("貨幣 轉下結餘")
     )
 
 

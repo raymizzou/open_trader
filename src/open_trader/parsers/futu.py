@@ -30,6 +30,7 @@ def parse_futu_text(text: str, month: str) -> ParseResult:
     cash_balances: list[CashBalance] = []
     in_positions = False
     in_cash = False
+    in_ending_summary = False
     wrapped_position_line: str | None = None
 
     for raw_line in text.splitlines():
@@ -45,19 +46,34 @@ def parse_futu_text(text: str, month: str) -> ParseResult:
                 positions.append(position)
             continue
 
-        summary_cash = _parse_summary_cash_line(line, statement_id)
-        if summary_cash is not None:
-            _upsert_cash_balance(cash_balances, summary_cash)
+        if line == "期末概覽" or line == "期末概览":
+            in_ending_summary = True
+            in_positions = False
+            in_cash = False
+            continue
+        if line.startswith(("期初概覽", "期初概览")):
+            in_ending_summary = False
+
+        summary_cash_balances = _parse_summary_cash_line(
+            line,
+            statement_id,
+            parse_multicurrency=in_ending_summary,
+        )
+        if summary_cash_balances:
+            for summary_cash in summary_cash_balances:
+                _upsert_cash_balance(cash_balances, summary_cash)
             in_positions = False
             in_cash = False
             continue
 
         if "期末概覽-股票" in line or "期末概览-股票" in line:
             in_positions = True
+            in_ending_summary = False
             in_cash = False
             continue
         if "現金結餘" in line or "现金结余" in line:
             in_positions = False
+            in_ending_summary = False
             in_cash = True
             continue
         if line.startswith(("代碼名稱", "代码名称")):
@@ -163,26 +179,56 @@ def _parse_cash_line(line: str, statement_id: str) -> CashBalance | None:
     )
 
 
-def _parse_summary_cash_line(line: str, statement_id: str) -> CashBalance | None:
+def _parse_summary_cash_line(
+    line: str,
+    statement_id: str,
+    *,
+    parse_multicurrency: bool,
+) -> list[CashBalance]:
     if not line.startswith(("現金結餘 ", "现金结余 ")):
-        return None
+        return []
 
     values = re.findall(NUMERIC, line)
     if len(values) < 2:
-        return None
+        return []
 
-    balance_index = 1 if len(values) == 3 else 0
-    balance = parse_decimal(values[balance_index]) or Decimal("0")
-    return CashBalance(
-        statement_id=statement_id,
-        broker=BROKER,
-        account_alias=ACCOUNT_ALIAS,
-        currency="HKD",
-        cash_balance=balance,
-        available_balance=balance,
-        confidence="medium",
-        notes="cash parsed from HKD statement summary",
-    )
+    if len(values) == 3:
+        balance = parse_decimal(values[1]) or Decimal("0")
+        return [
+            CashBalance(
+                statement_id=statement_id,
+                broker=BROKER,
+                account_alias=ACCOUNT_ALIAS,
+                currency="HKD",
+                cash_balance=balance,
+                available_balance=balance,
+                confidence="medium",
+                notes="cash parsed from statement summary by ending amount",
+            )
+        ]
+
+    if not parse_multicurrency:
+        return []
+
+    currencies = ("HKD", "USD", "CNH", "JPY", "SGD", "KRW")
+    balances: list[CashBalance] = []
+    for currency, value in zip(currencies, values[1:], strict=False):
+        balance = parse_decimal(value)
+        if balance is None or balance == Decimal("0"):
+            continue
+        balances.append(
+            CashBalance(
+                statement_id=statement_id,
+                broker=BROKER,
+                account_alias=ACCOUNT_ALIAS,
+                currency=currency,
+                cash_balance=balance,
+                available_balance=balance,
+                confidence="medium",
+                notes="cash parsed from statement summary by currency column",
+            )
+        )
+    return balances
 
 
 def _upsert_cash_balance(

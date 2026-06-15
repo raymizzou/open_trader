@@ -112,6 +112,37 @@ def test_parse_futu_text_extracts_summary_cash_from_real_statement_layout() -> N
     ]
 
 
+def test_parse_futu_text_extracts_hkd_summary_cash_not_total_when_usd_cash_exists() -> None:
+    result = parse_futu_text(
+        """期末概覽
+期末資產淨值總覽 合計(HKD) 港幣資產 美元資產 人民幣資產 日元資產 新加坡元資產 韓元資產
+現金結餘 228,284.20 236,134.20 -1,000.00 0.00 0.00 0.00 0.00
+""",
+        "2026-05",
+    )
+
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("HKD", Decimal("236134.20")),
+        ("USD", Decimal("-1000.00")),
+    ]
+
+
+def test_parse_futu_text_ignores_non_ending_multicurrency_cash_summary() -> None:
+    result = parse_futu_text(
+        """期初概覽-資產
+現金結餘 -190,663.65 -192,328.80 212.48 0.00 0.00 0.00 0.00
+期末概覽
+期末資產淨值總覽 合計(HKD) 港幣資產 美元資產 人民幣資產 日元資產 新加坡元資產 韓元資產
+現金結餘 236,134.20 236,134.20 0.00 0.00 0.00 0.00 0.00
+""",
+        "2026-05",
+    )
+
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("HKD", Decimal("236134.20"))
+    ]
+
+
 def test_parse_futu_text_joins_wrapped_position_display_name() -> None:
     result = parse_futu_text(
         """期末概覽-股票和股票期權
@@ -217,6 +248,35 @@ Equity XHKG 002476 VGT 300 12/05/26 300 378.8000 113,640.00 0.5000 56,820.00
     assert position.currency == "HKD"
     assert position.quantity == Decimal("300")
     assert position.market_value == Decimal("113640.00")
+
+
+def test_parse_phillips_text_enters_account_details_from_currency_balance_header() -> None:
+    result = parse_phillips_text(
+        """Currency Balance C/F Unsettled Balance Unsettled Balance Unsettled Balance ≥ T+3 Accrued Interest Available Balance Ref ExRate DR Int Rate
+Normal 普通戶口
+USD 63.20 0.00 0.00 0.00 0.00 63.20 7.8363 列表1(Sch1)
+""",
+        "2026-05",
+    )
+
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("USD", Decimal("63.20"))
+    ]
+
+
+def test_parse_phillips_text_does_not_parse_currency_rows_outside_account_details() -> None:
+    result = parse_phillips_text(
+        """Cash Balance
+HKD 8000.00
+Other Section
+USD 9999.00 unexpected non-account row
+""",
+        "2026-05",
+    )
+
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("HKD", Decimal("8000.00"))
+    ]
 
 
 def test_parse_tiger_text_accepts_parenthesized_unrealized_pnl() -> None:
