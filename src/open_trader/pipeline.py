@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from shutil import copyfile
+from shutil import copyfile, rmtree
 from typing import Iterable, Mapping
 
 from .csv_io import write_rows
@@ -87,6 +87,7 @@ def run_import(
 
     run_dir = data_dir / "runs" / month
     latest_dir = data_dir / "latest"
+    _clear_stale_outputs(run_dir, latest_dir / "portfolio.csv")
 
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
@@ -167,6 +168,13 @@ def _validate_statement_paths(
     unknown = sorted(path_brokers - parser_brokers)
     if unknown:
         raise ValueError(f"unknown statement path broker(s): {', '.join(unknown)}")
+
+
+def _clear_stale_outputs(run_dir: Path, latest_path: Path) -> None:
+    if run_dir.exists():
+        rmtree(run_dir)
+    if latest_path.exists():
+        latest_path.unlink()
 
 
 def _validate_parse_result_brokers(

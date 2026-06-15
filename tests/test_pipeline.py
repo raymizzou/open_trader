@@ -24,11 +24,17 @@ class FakeParser:
         result_broker: str | None = None,
         position_currency: str = "USD",
         warning_page: int | None = 1,
+        position_broker: str | None = None,
+        cash_broker: str | None = None,
+        warning_broker: str | None = None,
     ) -> None:
         self.broker = broker
         self.result_broker = result_broker or broker
         self.position_currency = position_currency
         self.warning_page = warning_page
+        self.position_broker = position_broker or self.result_broker
+        self.cash_broker = cash_broker or self.result_broker
+        self.warning_broker = warning_broker or self.result_broker
 
     def parse(self, path: Path, month: str) -> ParseResult:
         return ParseResult(
@@ -37,7 +43,7 @@ class FakeParser:
             positions=[
                 Position(
                     statement_id=f"{month}-{self.result_broker}",
-                    broker=self.result_broker,
+                    broker=self.position_broker,
                     account_alias="main",
                     market=Market.US,
                     asset_class=AssetClass.STOCK,
@@ -57,7 +63,7 @@ class FakeParser:
             cash_balances=[
                 CashBalance(
                     statement_id=f"{month}-{self.result_broker}",
-                    broker=self.result_broker,
+                    broker=self.cash_broker,
                     account_alias="main",
                     currency="USD",
                     cash_balance=Decimal("50"),
@@ -69,7 +75,7 @@ class FakeParser:
             warnings=[
                 WarningRecord(
                     statement_id=f"{month}-{self.result_broker}",
-                    broker=self.result_broker,
+                    broker=self.warning_broker,
                     page=self.warning_page,
                     severity="warning",
                     code="fake_warning",
@@ -157,6 +163,35 @@ def test_run_import_does_not_write_run_dir_when_portfolio_build_fails(
     assert not (data_dir / "latest" / "portfolio.csv").exists()
 
 
+def test_run_import_failed_rerun_removes_stale_outputs(tmp_path: Path) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+
+    first = run_import(
+        month="2026-05",
+        statement_paths={"fake": source},
+        parsers=[FakeParser()],
+        data_dir=data_dir,
+        fx_provider=fx_provider,
+    )
+    assert first.run_dir.exists()
+    assert first.latest_path.exists()
+
+    with pytest.raises(KeyError, match="SGD"):
+        run_import(
+            month="2026-05",
+            statement_paths={"fake": source},
+            parsers=[FakeParser(position_currency="SGD")],
+            data_dir=data_dir,
+            fx_provider=fx_provider,
+        )
+
+    assert not first.run_dir.exists()
+    assert not first.latest_path.exists()
+
+
 def test_run_import_rejects_missing_broker_path(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="missing.*fake"):
         run_import(
@@ -191,6 +226,32 @@ def test_run_import_rejects_parse_result_broker_mismatch(tmp_path: Path) -> None
             month="2026-05",
             statement_paths={"fake": source},
             parsers=[FakeParser(result_broker="other")],
+            data_dir=tmp_path / "data",
+            fx_provider=StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("collection", "parser_kwargs"),
+    [
+        ("positions", {"position_broker": "other"}),
+        ("cash_balances", {"cash_broker": "other"}),
+        ("warnings", {"warning_broker": "other"}),
+    ],
+)
+def test_run_import_rejects_nested_broker_mismatch(
+    collection: str,
+    parser_kwargs: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+
+    with pytest.raises(ValueError, match=f"{collection}.*other"):
+        run_import(
+            month="2026-05",
+            statement_paths={"fake": source},
+            parsers=[FakeParser(**parser_kwargs)],
             data_dir=tmp_path / "data",
             fx_provider=StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")}),
         )
@@ -263,7 +324,7 @@ def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[s
     assert "--usd-hkd" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("rate", ["abc", "0", "-1"])
+@pytest.mark.parametrize("rate", ["abc", "0", "-1", "NaN", "Infinity"])
 def test_import_statements_rejects_invalid_usd_hkd(
     rate: str,
     capsys: pytest.CaptureFixture[str],
