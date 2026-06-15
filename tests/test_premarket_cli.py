@@ -57,6 +57,7 @@ def test_run_premarket_help_includes_expected_options(
     assert "--ta-provider" in output
     assert "--ta-deep-model" in output
     assert "--ta-quick-model" in output
+    assert "--max-workers" in output
     assert "--dry-run" in output
 
 
@@ -89,6 +90,9 @@ def test_run_premarket_main_wires_pipeline(
 
     def fake_run_premarket(**kwargs: object) -> PremarketResult:
         captured.update(kwargs)
+        advice_runner_factory = kwargs["advice_runner_factory"]
+        assert callable(advice_runner_factory)
+        captured["factory_result"] = advice_runner_factory()
         data_dir = kwargs["data_dir"]
         reports_dir = kwargs["reports_dir"]
         assert isinstance(data_dir, Path)
@@ -130,6 +134,8 @@ def test_run_premarket_main_wires_pipeline(
             "deepseek-v4-pro",
             "--ta-quick-model",
             "deepseek-v4-flash",
+            "--max-workers",
+            "4",
             "--symbols",
             "VIXY,QQQ",
             "--classifier-model",
@@ -143,12 +149,15 @@ def test_run_premarket_main_wires_pipeline(
     assert captured["portfolio_path"] == Path("portfolio.csv")
     assert captured["symbols"] == {"VIXY", "QQQ"}
     assert captured["update_latest"] is False
+    assert captured["advice_runner"] is None
+    assert isinstance(captured["factory_result"], FakeAdapter)
     assert captured["tradingagents_path"] == Path("/tmp/TradingAgents")
     assert captured["tradingagents_config_overrides"] == {
         "llm_provider": "deepseek",
         "deep_think_llm": "deepseek-v4-pro",
         "quick_think_llm": "deepseek-v4-flash",
     }
+    assert captured["max_workers"] == 4
     assert captured["model"] == "gpt-5.4-mini"
 
     output = capsys.readouterr().out

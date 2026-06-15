@@ -34,6 +34,16 @@ def positive_decimal(value: str) -> Decimal:
     return rate
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid positive integer: {value}") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"invalid positive integer: {value}")
+    return parsed
+
+
 def canonical_month(value: str) -> str:
     try:
         return validate_month(value)
@@ -132,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="OpenAI model for change classification",
     )
     premarket_parser.add_argument(
+        "--max-workers",
+        type=positive_int,
+        default=3,
+        help="Maximum symbols to analyze in parallel",
+    )
+    premarket_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Write run outputs but do not update latest advice or actions",
@@ -169,24 +185,31 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run-premarket":
         symbols = _parse_symbol_subset(args.symbols)
+        tradingagents_config_overrides = {
+            "llm_provider": args.ta_provider,
+            "deep_think_llm": args.ta_deep_model,
+            "quick_think_llm": args.ta_quick_model,
+        }
+
+        def advice_runner_factory() -> TradingAgentsAdapter:
+            return TradingAgentsAdapter.from_project_path(
+                args.tradingagents_path,
+                config_overrides=tradingagents_config_overrides,
+            )
+
         result = run_premarket(
             run_date=args.date,
             portfolio_path=args.portfolio,
             data_dir=args.data_dir,
             reports_dir=args.reports_dir,
-            advice_runner=TradingAgentsAdapter.from_project_path(
-                args.tradingagents_path,
-                config_overrides={
-                    "llm_provider": args.ta_provider,
-                    "deep_think_llm": args.ta_deep_model,
-                    "quick_think_llm": args.ta_quick_model,
-                },
-            ),
+            advice_runner=None,
+            advice_runner_factory=advice_runner_factory,
             classifier=ChangeClassifier(
                 client=OpenAIClassifierClient(model=args.classifier_model)
             ),
             symbols=symbols,
             update_latest=not args.dry_run,
+            max_workers=args.max_workers,
         )
         print(f"eligible: {result.eligible_count}")
         print(f"advice: {result.advice_count}")

@@ -38,7 +38,8 @@ export DEEPSEEK_API_KEY=...
 
 .venv/bin/python -m open_trader run-premarket \
   --date 2026-06-16 \
-  --portfolio data/latest/portfolio.csv
+  --portfolio data/latest/portfolio.csv \
+  --max-workers 3
 ```
 
 By default, the TradingAgents run uses DeepSeek:
@@ -56,6 +57,7 @@ Optional test run for a subset:
   --date 2026-06-16 \
   --portfolio data/latest/portfolio.csv \
   --symbols VIXY,QQQ \
+  --max-workers 2 \
   --dry-run
 ```
 

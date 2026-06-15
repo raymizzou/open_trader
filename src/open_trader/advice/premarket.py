@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .models import (
     ChangeClassification,
@@ -24,6 +25,9 @@ from .store import (
 class AdviceRunner(Protocol):
     def analyze(self, row: PortfolioInputRow, run_date: str) -> TradingAdvice:
         pass
+
+
+AdviceRunnerFactory = Callable[[], AdviceRunner]
 
 
 class Classifier(Protocol):
@@ -49,6 +53,14 @@ class PremarketResult:
     report_path: Path
 
 
+@dataclass(frozen=True)
+class _SymbolResult:
+    index: int
+    row: PortfolioInputRow
+    advice: TradingAdvice
+    classification: ChangeClassification
+
+
 @dataclass
 class _LatestPromotion:
     source_path: Path
@@ -64,11 +76,16 @@ def run_premarket(
     portfolio_path: Path,
     data_dir: Path,
     reports_dir: Path,
-    advice_runner: AdviceRunner,
+    advice_runner: AdviceRunner | None,
     classifier: Classifier,
     symbols: set[str] | None,
     update_latest: bool,
+    max_workers: int = 1,
+    advice_runner_factory: AdviceRunnerFactory | None = None,
 ) -> PremarketResult:
+    if max_workers < 1:
+        raise ValueError("max_workers must be at least 1")
+
     rows = load_eligible_portfolio_rows(portfolio_path)
     if symbols is not None:
         normalized_symbols = {symbol.casefold() for symbol in symbols}
@@ -110,28 +127,23 @@ def run_premarket(
         )
 
     previous_by_symbol = load_latest_advice_by_symbol(data_dir)
-    advice_records: list[TradingAdvice] = []
-    classifications: list[ChangeClassification] = []
+    symbol_results = _run_symbols(
+        rows=rows,
+        run_date=run_date,
+        advice_runner=advice_runner,
+        advice_runner_factory=advice_runner_factory,
+        classifier=classifier,
+        previous_by_symbol=previous_by_symbol,
+        max_workers=max_workers,
+    )
+    advice_records = [result.advice for result in symbol_results]
+    classifications = [result.classification for result in symbol_results]
     actions: list[PremarketAction] = []
 
-    for row in rows:
-        advice = _analyze_symbol(
-            advice_runner=advice_runner,
-            row=row,
-            run_date=run_date,
-        )
-        advice_records.append(advice)
-
-        classification = _classify_symbol(
-            classifier=classifier,
-            run_date=run_date,
-            row=row,
-            previous_advice=previous_by_symbol.get(row.symbol),
-            latest_advice=advice,
-        )
-        classifications.append(classification)
+    for result in symbol_results:
+        classification = result.classification
         if classification.status == "ok" and classification.include_in_report:
-            actions.append(PremarketAction.from_classification(row, classification))
+            actions.append(PremarketAction.from_classification(result.row, classification))
 
     advice_path, _ = write_trading_advice(
         run_date=run_date,
@@ -166,6 +178,85 @@ def run_premarket(
         classifications_path=classifications_path,
         actions_path=actions_path,
         report_path=report_path,
+    )
+
+
+def _run_symbols(
+    *,
+    rows: list[PortfolioInputRow],
+    run_date: str,
+    advice_runner: AdviceRunner | None,
+    advice_runner_factory: AdviceRunnerFactory | None,
+    classifier: Classifier,
+    previous_by_symbol: dict[str, dict[str, str]],
+    max_workers: int,
+) -> list[_SymbolResult]:
+    if max_workers == 1:
+        return [
+            _run_symbol(
+                index=index,
+                row=row,
+                run_date=run_date,
+                advice_runner=advice_runner,
+                advice_runner_factory=advice_runner_factory,
+                classifier=classifier,
+                previous_by_symbol=previous_by_symbol,
+            )
+            for index, row in enumerate(rows)
+        ]
+
+    results: list[_SymbolResult] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _run_symbol,
+                index=index,
+                row=row,
+                run_date=run_date,
+                advice_runner=advice_runner,
+                advice_runner_factory=advice_runner_factory,
+                classifier=classifier,
+                previous_by_symbol=previous_by_symbol,
+            )
+            for index, row in enumerate(rows)
+        ]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    return sorted(results, key=lambda result: result.index)
+
+
+def _run_symbol(
+    *,
+    index: int,
+    row: PortfolioInputRow,
+    run_date: str,
+    advice_runner: AdviceRunner | None,
+    advice_runner_factory: AdviceRunnerFactory | None,
+    classifier: Classifier,
+    previous_by_symbol: dict[str, dict[str, str]],
+) -> _SymbolResult:
+    runner = advice_runner_factory() if advice_runner_factory is not None else advice_runner
+    if runner is None:
+        raise ValueError("advice_runner or advice_runner_factory is required")
+
+    advice = _analyze_symbol(
+        advice_runner=runner,
+        row=row,
+        run_date=run_date,
+    )
+    classification = _classify_symbol(
+        classifier=classifier,
+        run_date=run_date,
+        row=row,
+        previous_advice=previous_by_symbol.get(row.symbol),
+        latest_advice=advice,
+    )
+    return _SymbolResult(
+        index=index,
+        row=row,
+        advice=advice,
+        classification=classification,
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import threading
 from pathlib import Path
 
 import pytest
@@ -85,6 +86,52 @@ class FakeClassifier:
             status="ok",
             error="",
         )
+
+
+class BlockingAdviceRunner(FakeAdviceRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.qqq_started = threading.Event()
+        self.vixy_waited_for_qqq = False
+
+    def analyze(self, row: PortfolioInputRow, run_date: str) -> TradingAdvice:
+        if row.symbol == "VIXY":
+            self.calls.append((row.symbol, run_date))
+            self.vixy_waited_for_qqq = self.qqq_started.wait(timeout=1)
+            return TradingAdvice(
+                run_date=run_date,
+                symbol=row.symbol,
+                market=row.market,
+                asset_class=row.asset_class,
+                portfolio_weight_hkd=row.portfolio_weight_hkd,
+                risk_flag=row.risk_flag,
+                source="fake",
+                advice_action="reduce",
+                advice_summary="VIXY summary",
+                raw_decision="{}",
+                status="ok",
+                error="",
+            )
+
+        if row.symbol == "QQQ":
+            self.calls.append((row.symbol, run_date))
+            self.qqq_started.set()
+            return TradingAdvice(
+                run_date=run_date,
+                symbol=row.symbol,
+                market=row.market,
+                asset_class=row.asset_class,
+                portfolio_weight_hkd=row.portfolio_weight_hkd,
+                risk_flag=row.risk_flag,
+                source="fake",
+                advice_action="hold",
+                advice_summary="QQQ summary",
+                raw_decision="{}",
+                status="ok",
+                error="",
+            )
+
+        return super().analyze(row, run_date)
 
 
 def write_portfolio(path: Path) -> None:
@@ -215,6 +262,64 @@ def test_run_premarket_symbols_subset_limits_analysis_case_insensitively(
 
     assert result.eligible_count == 1
     assert advice_runner.calls == [("QQQ", "2026-06-16")]
+
+
+def test_run_premarket_parallelizes_symbols_but_preserves_output_order(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    advice_runner = BlockingAdviceRunner()
+
+    result = run_premarket(
+        run_date="2026-06-16",
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        advice_runner=advice_runner,
+        classifier=FakeClassifier(),
+        symbols=None,
+        update_latest=True,
+        max_workers=2,
+    )
+
+    assert advice_runner.vixy_waited_for_qqq is True
+    advice_rows = list(csv.DictReader(result.advice_path.open(encoding="utf-8")))
+    classification_rows = list(
+        csv.DictReader(result.classifications_path.open(encoding="utf-8"))
+    )
+    assert [row["symbol"] for row in advice_rows] == ["VIXY", "QQQ"]
+    assert [row["symbol"] for row in classification_rows] == ["VIXY", "QQQ"]
+
+
+def test_run_premarket_uses_advice_runner_factory_per_symbol(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    created_runners: list[FakeAdviceRunner] = []
+
+    def advice_runner_factory() -> FakeAdviceRunner:
+        runner = FakeAdviceRunner()
+        created_runners.append(runner)
+        return runner
+
+    result = run_premarket(
+        run_date="2026-06-16",
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        advice_runner=None,
+        advice_runner_factory=advice_runner_factory,
+        classifier=FakeClassifier(),
+        symbols=None,
+        update_latest=True,
+        max_workers=2,
+    )
+
+    assert result.advice_count == 2
+    assert len(created_runners) == 2
+    assert sorted(runner.calls[0][0] for runner in created_runners) == ["QQQ", "VIXY"]
 
 
 def test_run_premarket_dry_run_does_not_update_latest_advice(
