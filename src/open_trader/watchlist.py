@@ -95,9 +95,9 @@ def parse_watch_trigger(text: str) -> ParsedTrigger:
 
 
 def build_watchlist(
-    *,
     actions_path: Path,
     data_dir: Path,
+    *,
     run_date: str | None,
     update_latest: bool,
 ) -> WatchlistResult:

@@ -139,8 +139,8 @@ def test_build_watchlist_writes_run_and_latest_outputs(tmp_path: Path) -> None:
     )
 
     result = build_watchlist(
-        actions_path=actions_path,
-        data_dir=tmp_path / "data",
+        actions_path,
+        tmp_path / "data",
         run_date=None,
         update_latest=True,
     )
