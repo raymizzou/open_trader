@@ -16,11 +16,11 @@ class ParsedTrigger:
 
 PRICE_RE = r"(?P<price>\d+(?:\.\d+)?)"
 DOWNSIDE_RE = re.compile(
-    rf"(?P<open>open\s+)?(?:(?:breaks\s+)?(?:below|under)|<=|<)\s*\$?{PRICE_RE}",
+    rf"^(?P<open>open\s+)?(?:(?:breaks\s+)?(?:below|under)|<=|<)\s*\$?{PRICE_RE}$",
     re.IGNORECASE,
 )
 UPSIDE_RE = re.compile(
-    rf"(?P<open>open\s+)?(?:(?:breaks\s+)?(?:above|over)|>=|>)\s*\$?{PRICE_RE}",
+    rf"^(?P<open>open\s+)?(?:(?:breaks\s+)?(?:above|over)|>=|>)\s*\$?{PRICE_RE}$",
     re.IGNORECASE,
 )
 
@@ -37,7 +37,7 @@ def parse_watch_trigger(text: str) -> ParsedTrigger:
             error="",
         )
 
-    downside = DOWNSIDE_RE.search(original)
+    downside = DOWNSIDE_RE.fullmatch(original)
     if downside:
         return ParsedTrigger(
             trigger_type="open_price" if downside.group("open") else "price",
@@ -48,7 +48,7 @@ def parse_watch_trigger(text: str) -> ParsedTrigger:
             error="",
         )
 
-    upside = UPSIDE_RE.search(original)
+    upside = UPSIDE_RE.fullmatch(original)
     if upside:
         return ParsedTrigger(
             trigger_type="open_price" if upside.group("open") else "price",

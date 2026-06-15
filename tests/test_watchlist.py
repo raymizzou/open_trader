@@ -56,3 +56,26 @@ def test_parse_watch_trigger_marks_unclear_text_as_manual_review() -> None:
         status="manual_review",
         error="",
     )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not below 95",
+        "do not buy below 95",
+        "below 95 or above 110",
+        "above 110 below 95",
+        "below 95abc",
+    ],
+)
+def test_parse_watch_trigger_marks_ambiguous_comparisons_as_manual_review(
+    text: str,
+) -> None:
+    assert parse_watch_trigger(text) == ParsedTrigger(
+        trigger_type="manual_review",
+        operator="",
+        trigger_price="",
+        trigger_text=text,
+        status="manual_review",
+        error="",
+    )
