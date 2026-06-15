@@ -89,6 +89,56 @@ def test_load_eligible_portfolio_rows_uses_analysis_symbol_when_present(
     assert rows[0].analysis_symbol == "BRK-B"
 
 
+def test_load_eligible_portfolio_rows_handles_case_and_whitespace(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            {
+                "market": " US ",
+                "asset_class": " etf ",
+                "symbol": " VIXY ",
+                "name": " Volatility ETF ",
+                "portfolio_weight_hkd": " 3.05% ",
+                "ai_eligible": " TRUE ",
+                "analysis_symbol": " ",
+                "risk_flag": " normal ",
+            },
+        ],
+    )
+
+    rows = load_eligible_portfolio_rows(portfolio_path)
+
+    assert rows[0].symbol == "VIXY"
+    assert rows[0].market == "US"
+    assert rows[0].asset_class == "etf"
+    assert rows[0].name == "Volatility ETF"
+    assert rows[0].portfolio_weight_hkd == "3.05%"
+    assert rows[0].risk_flag == "normal"
+    assert rows[0].analysis_symbol == "VIXY"
+
+
+def test_load_eligible_portfolio_rows_rejects_eligible_row_missing_symbol(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "\n".join(
+            [
+                ",".join(FIELDNAMES),
+                "US,etf,VIXY,Volatility ETF,3.05%,false,VIXY,normal",
+                "US,etf,,Volatility ETF,3.05%,true,VIXY,normal",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="row 3.*symbol"):
+        load_eligible_portfolio_rows(portfolio_path)
+
+
 def test_load_eligible_portfolio_rows_rejects_missing_file(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_eligible_portfolio_rows(tmp_path / "missing.csv")
