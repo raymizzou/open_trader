@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,77 @@ def test_adapter_records_symbol_failure_as_error() -> None:
     assert advice.raw_decision == ""
 
 
+def test_adapter_preserves_real_tradingagents_detail_shape() -> None:
+    class RealShapeGraph:
+        def propagate(self, symbol: str, run_date: str) -> tuple[dict[str, str], str]:
+            return {"final_trade_decision": "Detailed PM rationale"}, "Hold"
+
+    adapter = TradingAgentsAdapter.from_graph(RealShapeGraph())
+
+    advice = adapter.analyze(portfolio_row("AAPL"), "2026-06-16")
+
+    assert advice.status == "ok"
+    assert advice.advice_action == "Hold"
+    assert advice.advice_summary == "Detailed PM rationale"
+    assert "final_trade_decision" in advice.raw_decision
+
+
+def test_adapter_stringifies_non_json_values_without_raising() -> None:
+    non_json_value = object()
+
+    class NonJsonGraph:
+        def propagate(
+            self, symbol: str, run_date: str
+        ) -> tuple[dict[str, object], dict[str, object]]:
+            return {
+                "final_trade_decision": non_json_value,
+            }, {
+                "action": "hold",
+                "summary": non_json_value,
+            }
+
+    adapter = TradingAgentsAdapter.from_graph(NonJsonGraph())
+
+    advice = adapter.analyze(portfolio_row("MSFT"), "2026-06-16")
+
+    assert advice.status == "ok"
+    assert advice.error == ""
+    assert advice.advice_action == "hold"
+    assert advice.advice_summary == str(non_json_value)
+    assert str(non_json_value) in advice.raw_decision
+
+
 def test_adapter_rejects_missing_tradingagents_path(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         TradingAgentsAdapter.from_project_path(tmp_path / "missing")
+
+
+def test_adapter_removes_project_path_after_graph_construction_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "TradingAgents"
+    project_path.mkdir()
+    package_path = project_path / "tradingagents"
+    graph_path = package_path / "graph"
+    graph_path.mkdir(parents=True)
+    (package_path / "__init__.py").write_text("", encoding="utf-8")
+    (graph_path / "__init__.py").write_text("", encoding="utf-8")
+    (package_path / "default_config.py").write_text(
+        "DEFAULT_CONFIG = {'provider': 'fake'}\n", encoding="utf-8"
+    )
+    (graph_path / "trading_graph.py").write_text(
+        "class TradingAgentsGraph:\n"
+        "    def __init__(self, debug, config):\n"
+        "        raise RuntimeError('graph construction failed')\n",
+        encoding="utf-8",
+    )
+    project_path_str = str(project_path.resolve())
+
+    for module_name in list(sys.modules):
+        if module_name == "tradingagents" or module_name.startswith("tradingagents."):
+            monkeypatch.delitem(sys.modules, module_name)
+
+    with pytest.raises(RuntimeError, match="graph construction failed"):
+        TradingAgentsAdapter.from_project_path(project_path)
+
+    assert project_path_str not in sys.path

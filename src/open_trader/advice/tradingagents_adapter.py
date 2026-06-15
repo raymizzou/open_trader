@@ -18,22 +18,48 @@ class TradingAgentsAdapter:
 
     @classmethod
     def from_project_path(cls, project_path: Path) -> TradingAgentsAdapter:
-        if not project_path.exists():
+        resolved_project_path = project_path.resolve()
+        if not resolved_project_path.exists():
             raise FileNotFoundError(project_path)
 
-        project_path_str = str(project_path)
-        if project_path_str not in sys.path:
+        project_path_str = str(resolved_project_path)
+        inserted_path = False
+        if project_path_str not in _resolved_sys_path_strings():
             sys.path.insert(0, project_path_str)
+            inserted_path = True
 
-        from tradingagents.default_config import DEFAULT_CONFIG
-        from tradingagents.graph.trading_graph import TradingAgentsGraph
+        try:
+            from tradingagents.default_config import DEFAULT_CONFIG
+            from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-        graph = TradingAgentsGraph(debug=False, config=DEFAULT_CONFIG.copy())
+            graph = TradingAgentsGraph(debug=False, config=DEFAULT_CONFIG.copy())
+        except Exception:
+            if inserted_path:
+                sys.path.remove(project_path_str)
+            raise
         return cls(graph)
 
     def analyze(self, row: PortfolioInputRow, run_date: str) -> TradingAdvice:
         try:
-            _, decision = self._graph.propagate(row.analysis_symbol, run_date)
+            state, decision = self._graph.propagate(row.analysis_symbol, run_date)
+            return TradingAdvice(
+                run_date=run_date,
+                symbol=row.symbol,
+                market=row.market,
+                asset_class=row.asset_class,
+                portfolio_weight_hkd=row.portfolio_weight_hkd,
+                risk_flag=row.risk_flag,
+                source="tradingagents",
+                advice_action=_extract_action(decision),
+                advice_summary=_extract_summary(state, decision),
+                raw_decision=json.dumps(
+                    {"state": state, "decision": decision},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                status="ok",
+                error="",
+            )
         except Exception as exc:
             return TradingAdvice(
                 run_date=run_date,
@@ -50,23 +76,10 @@ class TradingAgentsAdapter:
                 error=str(exc),
             )
 
-        return TradingAdvice(
-            run_date=run_date,
-            symbol=row.symbol,
-            market=row.market,
-            asset_class=row.asset_class,
-            portfolio_weight_hkd=row.portfolio_weight_hkd,
-            risk_flag=row.risk_flag,
-            source="tradingagents",
-            advice_action=_extract_action(decision),
-            advice_summary=_extract_summary(decision),
-            raw_decision=json.dumps(decision, ensure_ascii=False, sort_keys=True),
-            status="ok",
-            error="",
-        )
-
 
 def _extract_action(decision: Any) -> str:
+    if isinstance(decision, str):
+        return decision
     if isinstance(decision, dict):
         for key in ("action", "decision", "recommendation", "signal"):
             value = decision.get(key)
@@ -75,10 +88,18 @@ def _extract_action(decision: Any) -> str:
     return ""
 
 
-def _extract_summary(decision: Any) -> str:
+def _extract_summary(state: Any, decision: Any) -> str:
+    if isinstance(state, dict):
+        value = state.get("final_trade_decision")
+        if value:
+            return str(value)
     if isinstance(decision, dict):
         for key in ("summary", "reasoning", "rationale", "analysis"):
             value = decision.get(key)
             if value:
                 return str(value)
     return str(decision)
+
+
+def _resolved_sys_path_strings() -> set[str]:
+    return {str(Path(path_entry).resolve()) for path_entry in sys.path}
