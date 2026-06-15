@@ -567,30 +567,18 @@ def test_run_import_rollback_cleanup_failure_preserves_original_error_and_output
     )
     first.portfolio_path.write_text("previous run\n", encoding="utf-8")
     first.latest_path.write_text("previous latest\n", encoding="utf-8")
-    real_rename = Path.rename
-    real_replace = Path.replace
     real_rmtree = pipeline.rmtree
 
-    def fail_latest_replace(self: Path, target: Path) -> Path:
-        if self.name.startswith(".portfolio.") and self.suffix == ".tmp":
-            raise OSError("simulated latest replace failure")
-        return real_replace(self, target)
-
-    def fail_failed_run_move(self: Path, target: Path) -> Path:
-        if self.name == "2026-05" and target.suffix == ".failed":
-            raise OSError("simulated failed run move failure")
-        return real_rename(self, target)
-
-    def fail_failed_run_cleanup(path: Path) -> None:
-        if path.name == "2026-05" or path.suffix == ".failed":
-            raise OSError("simulated cleanup failure")
+    def fail_backup_and_failed_cleanup(path: Path) -> None:
+        if path.suffix == ".backup":
+            raise OSError("simulated post-promotion backup cleanup failure")
+        if path.suffix == ".failed":
+            raise OSError("simulated failed run cleanup failure")
         real_rmtree(path)
 
-    monkeypatch.setattr(Path, "rename", fail_failed_run_move)
-    monkeypatch.setattr(Path, "replace", fail_latest_replace)
-    monkeypatch.setattr(pipeline, "rmtree", fail_failed_run_cleanup)
+    monkeypatch.setattr(pipeline, "rmtree", fail_backup_and_failed_cleanup)
 
-    with pytest.raises(OSError, match="simulated latest replace failure"):
+    with pytest.raises(OSError, match="simulated post-promotion backup cleanup failure"):
         run_import(
             month="2026-05",
             statement_paths={"fake": source},

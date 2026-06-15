@@ -165,7 +165,7 @@ def run_import(
         temp_run_dir.rename(run_dir)
         temp_run_promoted = True
         if backup_run_dir is not None and backup_run_dir.exists():
-            _best_effort_rmtree(backup_run_dir)
+            rmtree(backup_run_dir)
         if backup_latest_path is not None and backup_latest_path.exists():
             _best_effort_unlink(backup_latest_path)
     except Exception:
