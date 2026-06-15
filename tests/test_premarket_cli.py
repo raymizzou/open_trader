@@ -9,11 +9,32 @@ from open_trader.advice.premarket import PremarketResult
 from open_trader.cli import build_parser
 
 
-@pytest.mark.parametrize("value", [None, "", "   "])
+@pytest.mark.parametrize("value", [None, "", "   ", " , , "])
 def test_parse_symbol_subset_returns_none_for_blank_values(
     value: str | None,
 ) -> None:
     assert cli._parse_symbol_subset(value) is None
+
+
+def test_run_premarket_parser_accepts_valid_date() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(["run-premarket", "--date", "2026-06-16"])
+
+    assert args.date == "2026-06-16"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2026-6-16", "today", "2026-06-16/foo", "2026-02-30"],
+)
+def test_run_premarket_parser_rejects_invalid_dates(value: str) -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["run-premarket", "--date", value])
+
+    assert exc_info.value.code == 2
 
 
 def test_parse_symbol_subset_normalizes_comma_separated_values() -> None:

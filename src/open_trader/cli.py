@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import re
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -12,6 +14,9 @@ from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
 from .pipeline import run_import, validate_month
+
+
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 
 
 def positive_decimal(value: str) -> Decimal:
@@ -36,10 +41,23 @@ def canonical_month(value: str) -> str:
         raise argparse.ArgumentTypeError(f"invalid month: {value}") from exc
 
 
+def canonical_date(value: str) -> str:
+    if not DATE_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"invalid date: {value}")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid date: {value}") from exc
+    if parsed.isoformat() != value:
+        raise argparse.ArgumentTypeError(f"invalid date: {value}")
+    return value
+
+
 def _parse_symbol_subset(value: str | None) -> set[str] | None:
     if value is None or not value.strip():
         return None
-    return {symbol.strip().upper() for symbol in value.split(",") if symbol.strip()}
+    symbols = {symbol.strip().upper() for symbol in value.split(",") if symbol.strip()}
+    return symbols or None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,7 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
         "run-premarket",
         help="Run daily premarket TradingAgents advice and write action report",
     )
-    premarket_parser.add_argument("--date", required=True, help="Run date, YYYY-MM-DD")
+    premarket_parser.add_argument(
+        "--date",
+        type=canonical_date,
+        required=True,
+        help="Run date, YYYY-MM-DD",
+    )
     premarket_parser.add_argument(
         "--portfolio",
         type=Path,
