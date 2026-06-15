@@ -9,6 +9,8 @@ from pathlib import Path
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
+from .futu_quote import FutuQuoteClient, FutuQuoteError
+from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
 from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
@@ -203,6 +205,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write run output but do not update latest watchlist",
     )
 
+    watch_futu_parser = subparsers.add_parser(
+        "watch-futu",
+        help="Watch active US price triggers with Futu OpenD quotes",
+    )
+    watch_futu_parser.add_argument(
+        "--watchlist",
+        type=Path,
+        default=Path("data/latest/watchlist.csv"),
+    )
+    watch_futu_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    watch_futu_parser.add_argument("--date", type=canonical_date)
+    watch_futu_parser.add_argument("--host", default="127.0.0.1")
+    watch_futu_parser.add_argument("--port", type=positive_int, default=11111)
+    watch_futu_parser.add_argument(
+        "--poll-seconds",
+        type=positive_float,
+        default=5.0,
+    )
+    watch_futu_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Fetch one quote snapshot and exit",
+    )
+
     return parser
 
 
@@ -286,6 +312,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"watchlist: {result.watchlist_count}")
         print(f"watchlist_csv: {result.watchlist_path}")
         print(f"latest: {result.latest_path}")
+        return 0
+
+    if args.command == "watch-futu":
+        try:
+            quote_client = FutuQuoteClient(host=args.host, port=args.port)
+            print(f"connected to Futu OpenD at {args.host}:{args.port}")
+            result = run_futu_watch(
+                watchlist_path=args.watchlist,
+                data_dir=args.data_dir,
+                run_date=args.date,
+                quote_client=quote_client,
+                poll_seconds=args.poll_seconds,
+                once=args.once,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+            parser.error(str(exc))
+        print(f"run_date: {result.run_date}")
+        print(f"triggers: {result.trigger_count}")
+        print(f"skipped: {result.skipped_count}")
+        print(f"alerts: {result.alert_count}")
+        print(f"alerts_csv: {result.alerts_path}")
         return 0
 
     parser.error(f"unknown command: {args.command}")
