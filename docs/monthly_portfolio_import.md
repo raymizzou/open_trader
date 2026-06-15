@@ -34,9 +34,19 @@ data/runs/<YYYY-MM>/portfolio.csv
 After `data/latest/portfolio.csv` exists, run the daily premarket advice workflow:
 
 ```bash
+export DEEPSEEK_API_KEY=...
+
 .venv/bin/python -m open_trader run-premarket \
   --date 2026-06-16 \
   --portfolio data/latest/portfolio.csv
+```
+
+By default, the TradingAgents run uses DeepSeek:
+
+```text
+--ta-provider deepseek
+--ta-deep-model deepseek-v4-pro
+--ta-quick-model deepseek-v4-flash
 ```
 
 Optional test run for a subset:

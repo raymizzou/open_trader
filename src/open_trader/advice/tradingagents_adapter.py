@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .models import PortfolioInputRow, TradingAdvice
 
@@ -17,7 +17,12 @@ class TradingAgentsAdapter:
         return cls(graph)
 
     @classmethod
-    def from_project_path(cls, project_path: Path) -> TradingAgentsAdapter:
+    def from_project_path(
+        cls,
+        project_path: Path,
+        *,
+        config_overrides: Mapping[str, object] | None = None,
+    ) -> TradingAgentsAdapter:
         resolved_project_path = project_path.resolve()
         if not resolved_project_path.exists():
             raise FileNotFoundError(project_path)
@@ -32,7 +37,16 @@ class TradingAgentsAdapter:
             from tradingagents.default_config import DEFAULT_CONFIG
             from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-            graph = TradingAgentsGraph(debug=False, config=DEFAULT_CONFIG.copy())
+            config = DEFAULT_CONFIG.copy()
+            if config_overrides is not None:
+                config.update(
+                    {
+                        key: value
+                        for key, value in config_overrides.items()
+                        if value is not None
+                    }
+                )
+            graph = TradingAgentsGraph(debug=False, config=config)
         except Exception:
             if inserted_path:
                 sys.path.remove(project_path_str)

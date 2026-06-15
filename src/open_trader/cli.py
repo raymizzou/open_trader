@@ -108,6 +108,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/Users/ray/projects/TradingAgents"),
     )
     premarket_parser.add_argument(
+        "--ta-provider",
+        default="deepseek",
+        help="TradingAgents LLM provider",
+    )
+    premarket_parser.add_argument(
+        "--ta-deep-model",
+        default="deepseek-v4-pro",
+        help="TradingAgents deep-thinking model",
+    )
+    premarket_parser.add_argument(
+        "--ta-quick-model",
+        default="deepseek-v4-flash",
+        help="TradingAgents quick-thinking model",
+    )
+    premarket_parser.add_argument(
         "--symbols",
         help="Comma-separated subset of symbols to analyze",
     )
@@ -160,7 +175,12 @@ def main(argv: list[str] | None = None) -> int:
             data_dir=args.data_dir,
             reports_dir=args.reports_dir,
             advice_runner=TradingAgentsAdapter.from_project_path(
-                args.tradingagents_path
+                args.tradingagents_path,
+                config_overrides={
+                    "llm_provider": args.ta_provider,
+                    "deep_think_llm": args.ta_deep_model,
+                    "quick_think_llm": args.ta_quick_model,
+                },
             ),
             classifier=ChangeClassifier(
                 client=OpenAIClassifierClient(model=args.classifier_model)

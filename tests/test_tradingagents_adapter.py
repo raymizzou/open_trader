@@ -141,3 +141,54 @@ def test_adapter_removes_project_path_after_graph_construction_failure(
         TradingAgentsAdapter.from_project_path(project_path)
 
     assert project_path_str not in sys.path
+
+
+def test_from_project_path_merges_config_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "TradingAgents"
+    project_path.mkdir()
+    package_path = project_path / "tradingagents"
+    graph_path = package_path / "graph"
+    graph_path.mkdir(parents=True)
+    (package_path / "__init__.py").write_text("", encoding="utf-8")
+    (graph_path / "__init__.py").write_text("", encoding="utf-8")
+    (package_path / "default_config.py").write_text(
+        "DEFAULT_CONFIG = {\n"
+        "    'llm_provider': 'openai',\n"
+        "    'deep_think_llm': 'gpt-5.4',\n"
+        "    'quick_think_llm': 'gpt-5.4-mini',\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (graph_path / "trading_graph.py").write_text(
+        "CAPTURED_CONFIG = None\n"
+        "class TradingAgentsGraph:\n"
+        "    def __init__(self, debug, config):\n"
+        "        global CAPTURED_CONFIG\n"
+        "        CAPTURED_CONFIG = config\n"
+        "    def propagate(self, symbol, run_date):\n"
+        "        return {'final_trade_decision': 'Hold'}, 'Hold'\n",
+        encoding="utf-8",
+    )
+
+    for module_name in list(sys.modules):
+        if module_name == "tradingagents" or module_name.startswith("tradingagents."):
+            monkeypatch.delitem(sys.modules, module_name)
+
+    TradingAgentsAdapter.from_project_path(
+        project_path,
+        config_overrides={
+            "llm_provider": "deepseek",
+            "deep_think_llm": "deepseek-v4-pro",
+            "quick_think_llm": "deepseek-v4-flash",
+        },
+    )
+
+    from tradingagents.graph import trading_graph
+
+    assert trading_graph.CAPTURED_CONFIG == {
+        "llm_provider": "deepseek",
+        "deep_think_llm": "deepseek-v4-pro",
+        "quick_think_llm": "deepseek-v4-flash",
+    }

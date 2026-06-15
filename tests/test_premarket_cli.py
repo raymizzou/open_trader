@@ -54,6 +54,9 @@ def test_run_premarket_help_includes_expected_options(
     assert "--date" in output
     assert "--portfolio" in output
     assert "--tradingagents-path" in output
+    assert "--ta-provider" in output
+    assert "--ta-deep-model" in output
+    assert "--ta-quick-model" in output
     assert "--dry-run" in output
 
 
@@ -66,8 +69,14 @@ def test_run_premarket_main_wires_pipeline(
 
     class FakeAdapter:
         @classmethod
-        def from_project_path(cls, path: Path) -> FakeAdapter:
+        def from_project_path(
+            cls,
+            path: Path,
+            *,
+            config_overrides: dict[str, object] | None = None,
+        ) -> FakeAdapter:
             captured["tradingagents_path"] = path
+            captured["tradingagents_config_overrides"] = config_overrides
             return cls()
 
     class FakeOpenAIClassifierClient:
@@ -115,6 +124,12 @@ def test_run_premarket_main_wires_pipeline(
             str(tmp_path / "reports"),
             "--tradingagents-path",
             "/tmp/TradingAgents",
+            "--ta-provider",
+            "deepseek",
+            "--ta-deep-model",
+            "deepseek-v4-pro",
+            "--ta-quick-model",
+            "deepseek-v4-flash",
             "--symbols",
             "VIXY,QQQ",
             "--classifier-model",
@@ -129,6 +144,11 @@ def test_run_premarket_main_wires_pipeline(
     assert captured["symbols"] == {"VIXY", "QQQ"}
     assert captured["update_latest"] is False
     assert captured["tradingagents_path"] == Path("/tmp/TradingAgents")
+    assert captured["tradingagents_config_overrides"] == {
+        "llm_provider": "deepseek",
+        "deep_think_llm": "deepseek-v4-pro",
+        "quick_think_llm": "deepseek-v4-flash",
+    }
     assert captured["model"] == "gpt-5.4-mini"
 
     output = capsys.readouterr().out
