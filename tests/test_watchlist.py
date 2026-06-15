@@ -28,6 +28,11 @@ def write_actions(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     ("text", "trigger_type", "operator", "price"),
     [
@@ -211,3 +216,59 @@ def test_build_watchlist_writes_empty_headers_when_no_actions(tmp_path: Path) ->
     rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
     assert rows == []
     assert result.watchlist_count == 0
+
+
+def test_build_watchlist_missing_required_columns_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_text(
+        actions_path,
+        "run_date,symbol,market,portfolio_weight_hkd,severity,suggested_action\n"
+        "2026-06-16,VIXY,US,3.05%,high,reduce\n",
+    )
+
+    with pytest.raises(ValueError, match="missing action column\\(s\\).*watch_trigger"):
+        build_watchlist(
+            actions_path=actions_path,
+            data_dir=tmp_path / "data",
+            run_date=None,
+            update_latest=True,
+        )
+
+
+def test_build_watchlist_without_rows_requires_run_date(tmp_path: Path) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_actions(actions_path, [])
+
+    with pytest.raises(ValueError, match="--date is required"):
+        build_watchlist(
+            actions_path=actions_path,
+            data_dir=tmp_path / "data",
+            run_date=None,
+            update_latest=True,
+        )
+
+
+def test_build_watchlist_ragged_row_missing_required_cell_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_text(
+        actions_path,
+        ",".join(ACTION_FIELDNAMES)
+        + "\n"
+        + "2026-06-16,VIXY,US,3.05%,high,action_changed,reduce,VIXY changed,"
+        + "Fake rationale\n",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="row 2.*symbol VIXY.*watch_trigger",
+    ):
+        build_watchlist(
+            actions_path=actions_path,
+            data_dir=tmp_path / "data",
+            run_date=None,
+            update_latest=True,
+        )

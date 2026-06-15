@@ -126,7 +126,32 @@ def _read_action_rows(actions_path: Path) -> list[dict[str, str]]:
         missing = sorted(ACTION_REQUIRED_FIELDS - fieldnames)
         if missing:
             raise ValueError(f"missing action column(s): {', '.join(missing)}")
-        return list(reader)
+        return [
+            _validated_action_row(row, row_number)
+            for row_number, row in enumerate(reader, 2)
+        ]
+
+
+def _validated_action_row(
+    row: dict[str | None, str | list[str] | None],
+    row_number: int,
+) -> dict[str, str]:
+    if None in row:
+        symbol = row.get("symbol") or "<unknown>"
+        raise ValueError(
+            f"malformed action row {row_number} symbol {symbol}: extra column(s)"
+        )
+
+    missing_values = [column for column, value in row.items() if value is None]
+    if missing_values:
+        symbol = row.get("symbol") or "<unknown>"
+        columns = ", ".join(str(column) for column in missing_values)
+        raise ValueError(
+            f"malformed action row {row_number} symbol {symbol}: "
+            f"missing value for column(s): {columns}"
+        )
+
+    return {column: str(value) for column, value in row.items()}
 
 
 def _latest_run_date(rows: list[dict[str, str]]) -> str:
