@@ -295,3 +295,32 @@ def test_build_watchlist_ragged_row_missing_required_cell_raises_value_error(
             run_date=None,
             update_latest=True,
         )
+
+
+def test_build_watchlist_blank_required_cell_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_actions(
+        actions_path,
+        [
+            {
+                "run_date": "2026-06-16",
+                "symbol": "VIXY",
+                "market": "US",
+                "portfolio_weight_hkd": "3.05%",
+                "severity": "high",
+                "change_type": "action_changed",
+                "suggested_action": "   ",
+                "summary": "VIXY changed",
+                "rationale": "Fake rationale",
+                "watch_trigger": "",
+            },
+        ],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="row 2.*symbol VIXY.*suggested_action",
+    ):
+        build_watchlist(actions_path, tmp_path / "data")

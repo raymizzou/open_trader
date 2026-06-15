@@ -19,6 +19,7 @@ ACTION_REQUIRED_FIELDS = {
     "suggested_action",
     "watch_trigger",
 }
+ACTION_REQUIRED_NONBLANK_FIELDS = ACTION_REQUIRED_FIELDS - {"watch_trigger"}
 
 
 @dataclass(frozen=True)
@@ -150,7 +151,21 @@ def _validated_action_row(
             f"missing value for column(s): {columns}"
         )
 
-    return {column: str(value) for column, value in row.items()}
+    normalized = {column: str(value) for column, value in row.items()}
+    blank_values = [
+        column
+        for column in sorted(ACTION_REQUIRED_NONBLANK_FIELDS)
+        if not normalized[column].strip()
+    ]
+    if blank_values:
+        symbol = normalized.get("symbol", "").strip() or "<unknown>"
+        columns = ", ".join(blank_values)
+        raise ValueError(
+            f"malformed action row {row_number} symbol {symbol}: "
+            f"blank value for column(s): {columns}"
+        )
+
+    return normalized
 
 
 def _latest_run_date(rows: list[dict[str, str]]) -> str:
