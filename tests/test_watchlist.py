@@ -369,6 +369,57 @@ def test_build_watchlist_unmatched_explicit_date_preserves_latest(
     assert not (tmp_path / "data/runs/2026-06-15/watchlist.csv").exists()
 
 
+def test_build_watchlist_rejects_path_like_explicit_run_date(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    latest_path = tmp_path / "data/latest/watchlist.csv"
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.write_text("existing\n", encoding="utf-8")
+    write_actions(actions_path, [])
+
+    with pytest.raises(ValueError, match="invalid run_date.*../latest"):
+        build_watchlist(
+            actions_path,
+            tmp_path / "data",
+            run_date="../latest",
+            update_latest=True,
+        )
+
+    assert latest_path.read_text(encoding="utf-8") == "existing\n"
+    assert not (tmp_path / "data/runs").exists()
+
+
+def test_build_watchlist_rejects_path_like_csv_run_date(tmp_path: Path) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_text(
+        actions_path,
+        ",".join(ACTION_FIELDNAMES)
+        + "\n"
+        + "../latest,VIXY,US,3.05%,high,action_changed,reduce,VIXY changed,"
+        + "Fake rationale,below 95\n",
+    )
+
+    with pytest.raises(ValueError, match="row 2.*run_date.*../latest"):
+        build_watchlist(actions_path, tmp_path / "data")
+
+    assert not (tmp_path / "data/runs").exists()
+
+
+def test_build_watchlist_rejects_malformed_csv_run_date(tmp_path: Path) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_text(
+        actions_path,
+        ",".join(ACTION_FIELDNAMES)
+        + "\n"
+        + "2026-02-30,VIXY,US,3.05%,high,action_changed,reduce,VIXY changed,"
+        + "Fake rationale,below 95\n",
+    )
+
+    with pytest.raises(ValueError, match="row 2.*run_date.*2026-02-30"):
+        build_watchlist(actions_path, tmp_path / "data")
+
+
 def test_build_watchlist_missing_required_columns_raises_value_error(
     tmp_path: Path,
 ) -> None:

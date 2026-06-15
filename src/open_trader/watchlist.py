@@ -5,6 +5,7 @@ import re
 import shutil
 from collections import Counter
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -102,6 +103,8 @@ def build_watchlist(
     run_date: str | None = None,
     update_latest: bool = True,
 ) -> WatchlistResult:
+    if run_date is not None:
+        run_date = _validated_run_date(run_date)
     rows = _read_action_rows(actions_path)
     effective_run_date = run_date or _latest_run_date(rows)
     filtered_rows = _filter_action_rows(
@@ -183,7 +186,28 @@ def _validated_action_row(
             f"blank value for column(s): {columns}"
         )
 
+    csv_run_date = normalized.get("run_date", "").strip()
+    if csv_run_date:
+        try:
+            normalized["run_date"] = _validated_run_date(csv_run_date)
+        except ValueError as exc:
+            symbol = normalized.get("symbol", "").strip() or "<unknown>"
+            raise ValueError(
+                f"malformed action row {row_number} symbol {symbol}: "
+                f"invalid run_date {csv_run_date}"
+            ) from exc
+
     return normalized
+
+
+def _validated_run_date(value: str) -> str:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"invalid run_date {value}") from exc
+    if parsed.isoformat() != value:
+        raise ValueError(f"invalid run_date {value}")
+    return value
 
 
 def _latest_run_date(rows: list[dict[str, str]]) -> str:
@@ -242,14 +266,20 @@ def _write_watchlist_rows(path: Path, rows: list[WatchlistRow]) -> Path:
 
 def _promote_latest(*, source_path: Path, latest_path: Path) -> None:
     latest_path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(
-        "wb",
-        dir=latest_path.parent,
-        prefix=f".{latest_path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temp_path = Path(handle.name)
-        with source_path.open("rb") as source:
-            shutil.copyfileobj(source, handle)
-    temp_path.replace(latest_path)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "wb",
+            dir=latest_path.parent,
+            prefix=f".{latest_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            with source_path.open("rb") as source:
+                shutil.copyfileobj(source, handle)
+        temp_path.replace(latest_path)
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
