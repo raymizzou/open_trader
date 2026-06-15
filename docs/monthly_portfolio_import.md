@@ -122,3 +122,27 @@ data/latest/watchlist.csv
 Rows with clear price conditions become `active`. Rows with unclear trigger text
 become `manual_review` and should be reviewed before any future alerting
 automation.
+
+## Futu Quote Watch
+
+Start Futu OpenD and log in before running the watcher. The first verification
+mode fetches one quote snapshot and exits:
+
+```bash
+.venv/bin/python -m open_trader watch-futu \
+  --watchlist data/runs/2026-06-15/watchlist.csv \
+  --data-dir data \
+  --date 2026-06-15 \
+  --poll-seconds 5 \
+  --once
+```
+
+Expected successful output includes:
+
+```text
+connected to Futu OpenD at 127.0.0.1:11111
+loaded N active US trigger(s)
+quote US.<SYMBOL> last_price=...
+```
+
+To keep watching until interrupted, omit `--once`.
