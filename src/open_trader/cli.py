@@ -14,6 +14,7 @@ from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
 from .pipeline import run_import, validate_month
+from .watchlist import build_watchlist
 
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
@@ -181,6 +182,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write run outputs but do not update latest advice or actions",
     )
 
+    watchlist_parser = subparsers.add_parser(
+        "build-watchlist",
+        help="Convert premarket action rows into watchlist.csv",
+    )
+    watchlist_parser.add_argument(
+        "--actions",
+        type=Path,
+        default=Path("data/latest/premarket_actions.csv"),
+    )
+    watchlist_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    watchlist_parser.add_argument(
+        "--date",
+        type=canonical_date,
+        help="Run date, YYYY-MM-DD. Required only when actions rows do not contain run_date.",
+    )
+    watchlist_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write run output but do not update latest watchlist",
+    )
+
     return parser
 
 
@@ -248,6 +270,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"advice_csv: {result.advice_path}")
         print(f"actions_csv: {result.actions_path}")
         print(f"report: {result.report_path}")
+        return 0
+
+    if args.command == "build-watchlist":
+        result = build_watchlist(
+            actions_path=args.actions,
+            data_dir=args.data_dir,
+            run_date=args.date,
+            update_latest=not args.dry_run,
+        )
+        print(f"run_date: {result.run_date}")
+        print(f"watchlist: {result.watchlist_count}")
+        print(f"watchlist_csv: {result.watchlist_path}")
+        print(f"latest: {result.latest_path}")
         return 0
 
     parser.error(f"unknown command: {args.command}")
