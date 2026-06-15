@@ -116,19 +116,62 @@ def test_write_change_classifications_writes_run_file(tmp_path: Path) -> None:
     assert rows[0]["include_in_report"] == "true"
 
 
+def test_rerun_trading_advice_write_failure_preserves_previous_run_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    run_path, _ = write_trading_advice(
+        run_date="2026-06-16",
+        records=[advice("OLD")],
+        data_dir=data_dir,
+        update_latest=False,
+    )
+    original_run = run_path.read_text(encoding="utf-8")
+    fail_csv_row_for_symbol(monkeypatch, "VIXY")
+
+    with pytest.raises(OSError, match="simulated csv write failure"):
+        write_trading_advice(
+            run_date="2026-06-16",
+            records=[advice("VIXY")],
+            data_dir=data_dir,
+            update_latest=False,
+        )
+
+    assert run_path.read_text(encoding="utf-8") == original_run
+    assert list(run_path.parent.glob(".trading_advice.csv.*.tmp")) == []
+
+
+def test_change_classification_write_failure_preserves_previous_run_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    path = write_change_classifications(
+        run_date="2026-06-16",
+        records=[classification("OLD")],
+        data_dir=data_dir,
+    )
+    original_run = path.read_text(encoding="utf-8")
+    fail_csv_row_for_symbol(monkeypatch, "VIXY")
+
+    with pytest.raises(OSError, match="simulated csv write failure"):
+        write_change_classifications(
+            run_date="2026-06-16",
+            records=[classification("VIXY")],
+            data_dir=data_dir,
+        )
+
+    assert path.read_text(encoding="utf-8") == original_run
+    assert list(path.parent.glob(".change_classifications.csv.*.tmp")) == []
+
+
 def test_atomic_latest_write_cleans_temp_file_on_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data_dir = tmp_path / "data"
-    original_writerow = csv.DictWriter.writerow
-
-    def fail_after_header(self: csv.DictWriter, rowdict: dict[str, str]) -> object:
-        if rowdict.get("symbol") == "VIXY":
-            raise OSError("simulated csv write failure")
-        return original_writerow(self, rowdict)
-
-    monkeypatch.setattr(csv.DictWriter, "writerow", fail_after_header)
+    fail_csv_row_for_symbol(monkeypatch, "VIXY")
 
     with pytest.raises(OSError, match="simulated csv write failure"):
         write_trading_advice(
@@ -141,3 +184,17 @@ def test_atomic_latest_write_cleans_temp_file_on_failure(
     latest_dir = data_dir / "latest"
     assert not (latest_dir / "trading_advice.csv").exists()
     assert list(latest_dir.glob(".trading_advice.csv.*.tmp")) == []
+
+
+def fail_csv_row_for_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+    symbol: str,
+) -> None:
+    original_writerow = csv.DictWriter.writerow
+
+    def fail_after_header(self: csv.DictWriter, rowdict: dict[str, str]) -> object:
+        if rowdict.get("symbol") == symbol:
+            raise OSError("simulated csv write failure")
+        return original_writerow(self, rowdict)
+
+    monkeypatch.setattr(csv.DictWriter, "writerow", fail_after_header)

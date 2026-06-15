@@ -3,9 +3,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Iterable
-
-from open_trader.csv_io import write_rows
+from typing import Iterable, Mapping
 
 from .models import (
     CHANGE_CLASSIFICATION_FIELDNAMES,
@@ -26,9 +24,9 @@ def write_trading_advice(
     run_path = data_dir / "runs" / run_date / "trading_advice.csv"
     latest_path = data_dir / "latest" / "trading_advice.csv"
 
-    write_rows(run_path, TRADING_ADVICE_FIELDNAMES, rows)
+    _atomic_write_csv(run_path, TRADING_ADVICE_FIELDNAMES, rows)
     if update_latest:
-        _atomic_write_latest(latest_path, TRADING_ADVICE_FIELDNAMES, rows)
+        _atomic_write_csv(latest_path, TRADING_ADVICE_FIELDNAMES, rows)
 
     return run_path, latest_path
 
@@ -40,7 +38,7 @@ def write_change_classifications(
     data_dir: Path,
 ) -> Path:
     run_path = data_dir / "runs" / run_date / "change_classifications.csv"
-    write_rows(
+    _atomic_write_csv(
         run_path,
         CHANGE_CLASSIFICATION_FIELDNAMES,
         (record.to_row() for record in records),
@@ -61,10 +59,10 @@ def load_latest_advice_by_symbol(data_dir: Path) -> dict[str, dict[str, str]]:
         }
 
 
-def _atomic_write_latest(
+def _atomic_write_csv(
     path: Path,
     fieldnames: list[str],
-    rows: list[dict[str, str]],
+    rows: Iterable[Mapping[str, object]],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
@@ -81,9 +79,22 @@ def _atomic_write_latest(
             temp_path = Path(handle.name)
             writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(rows)
+            for row in rows:
+                writer.writerow(
+                    {
+                        key: "" if row.get(key) is None else row.get(key)
+                        for key in fieldnames
+                    }
+                )
         temp_path.replace(path)
     except Exception:
         if temp_path is not None and temp_path.exists():
-            temp_path.unlink()
+            _best_effort_unlink(temp_path)
         raise
+
+
+def _best_effort_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except Exception:
+        pass
