@@ -82,19 +82,25 @@ def _parse_position_line(line: str, statement_id: str) -> Position | None:
         return None
 
     symbol, name = split_symbol_name(match.group("display"))
+    currency = match.group("currency")
     quantity = parse_decimal(match.group("quantity")) or Decimal("0")
+    multiplier = parse_decimal(match.group("multiplier"))
     cost_price = parse_decimal(match.group("cost_price"))
-    cost_value = cost_price * quantity if cost_price is not None else None
+    cost_value = (
+        cost_price * quantity * multiplier
+        if cost_price is not None and multiplier is not None
+        else None
+    )
 
     return Position(
         statement_id=statement_id,
         broker=BROKER,
         account_alias=ACCOUNT_ALIAS,
-        market=Market.US,
+        market=_market_for_currency(currency),
         asset_class=detect_asset_class(symbol, name),
         symbol=symbol,
         name=name,
-        currency=match.group("currency"),
+        currency=currency,
         quantity=quantity,
         cost_price=cost_price,
         last_price=parse_decimal(match.group("last_price")),
@@ -104,6 +110,12 @@ def _parse_position_line(line: str, statement_id: str) -> Position | None:
         confidence="high",
         notes="",
     )
+
+
+def _market_for_currency(currency: str) -> Market:
+    if currency == "HKD":
+        return Market.HK
+    return Market.US
 
 
 def _parse_cash_line(line: str, statement_id: str) -> CashBalance | None:

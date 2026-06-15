@@ -68,7 +68,7 @@ def _parse_position_line(line: str, statement_id: str) -> Position | None:
     match = re.fullmatch(
         r"(?:股票|Stock)\s+"
         r"(?P<market>HK|US|SEHK|NASDAQ|NYSE)\s+"
-        r"(?P<symbol>[A-Z0-9.]+)\s+"
+        r"(?P<symbol>[A-Z0-9.-]+)\s+"
         r"(?P<name>.+?)\s+"
         rf"(?P<previous_quantity>{NUMERIC})\s+"
         r"(?P<last_buy_date>\d{4}/\d{2}/\d{2})\s+"

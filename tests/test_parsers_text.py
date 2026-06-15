@@ -132,6 +132,36 @@ ARM Holdings (ARM) 4 1.0 281.00 353.00 1412.00 (288.00) 706.00 564.80 USD
     assert result.positions[0].unrealized_pnl == Decimal("-288.00")
 
 
+def test_parse_tiger_text_infers_hk_market_from_hkd_position_currency() -> None:
+    result = parse_tiger_text(
+        """期末持仓
+股票
+代码 数量 乘数 成本价格 收盘价格 市值 未实现的损益 初始保证金要求 维持保证金要求 币种
+00700(腾讯控股) 100 1.0 300.00 380.00 38000.00 8000.00 19000.00 15200.00 HKD
+""",
+        "2026-05",
+    )
+
+    assert len(result.positions) == 1
+    assert result.positions[0].symbol == "00700"
+    assert result.positions[0].market == Market.HK
+    assert result.positions[0].currency == "HKD"
+
+
+def test_parse_tiger_text_applies_multiplier_to_cost_value() -> None:
+    result = parse_tiger_text(
+        """期末持仓
+股票
+代码 数量 乘数 成本价格 收盘价格 市值 未实现的损益 初始保证金要求 维持保证金要求 币种
+ARM Holdings (ARM) 4 2.0 281.00 353.00 1412.00 288.00 706.00 564.80 USD
+""",
+        "2026-05",
+    )
+
+    assert len(result.positions) == 1
+    assert result.positions[0].cost_value == Decimal("2248.000")
+
+
 def test_parse_futu_and_phillips_text_accept_parenthesized_numeric_fields() -> None:
     futu = parse_futu_text(
         """期末概覽-股票和股票期權
@@ -207,6 +237,19 @@ Stock US NVDA NVIDIA 0 2026/05/20 5 130.00 650.00 0.50 325.00
     assert result.positions[0].symbol == "NVDA"
     assert result.positions[0].market == Market.US
     assert result.positions[0].asset_class == AssetClass.STOCK
+
+
+def test_parse_phillips_text_accepts_hyphenated_symbols() -> None:
+    result = parse_phillips_text(
+        """Securities Portfolio
+Product Market ProductCode ProductName Previous LastBuyDate Quantity Close MarketValue Ratio MarginValue
+Stock US BRK-B Berkshire Hathaway 0 2026/05/20 1 500.00 500.00 0.50 250.00
+""",
+        "2026-05",
+    )
+
+    assert len(result.positions) == 1
+    assert result.positions[0].symbol == "BRK-B"
 
 
 def test_futu_statement_parser_joins_pdf_pages_and_sets_page_count(
