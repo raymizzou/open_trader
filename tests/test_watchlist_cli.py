@@ -69,3 +69,53 @@ def test_build_watchlist_main_wires_pipeline(
     assert "watchlist: 2" in output
     assert "watchlist_csv:" in output
     assert "latest:" in output
+
+
+def test_build_watchlist_main_reports_missing_actions_file(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing_path = tmp_path / "missing.csv"
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "build-watchlist",
+                "--actions",
+                str(missing_path),
+                "--data-dir",
+                str(tmp_path / "data"),
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "missing.csv" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_build_watchlist_main_reports_build_value_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_build_watchlist(**kwargs: object) -> WatchlistResult:
+        raise ValueError("missing action column(s): watch_trigger")
+
+    monkeypatch.setattr(cli, "build_watchlist", fake_build_watchlist)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "build-watchlist",
+                "--actions",
+                "premarket_actions.csv",
+                "--data-dir",
+                str(tmp_path / "data"),
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "missing action column(s): watch_trigger" in stderr
+    assert "Traceback" not in stderr

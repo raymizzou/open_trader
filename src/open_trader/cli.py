@@ -273,12 +273,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "build-watchlist":
-        result = build_watchlist(
-            actions_path=args.actions,
-            data_dir=args.data_dir,
-            run_date=args.date,
-            update_latest=not args.dry_run,
-        )
+        try:
+            result = build_watchlist(
+                actions_path=args.actions,
+                data_dir=args.data_dir,
+                run_date=args.date,
+                update_latest=not args.dry_run,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            parser.error(str(exc))
         print(f"run_date: {result.run_date}")
         print(f"watchlist: {result.watchlist_count}")
         print(f"watchlist_csv: {result.watchlist_path}")

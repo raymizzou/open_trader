@@ -94,9 +94,10 @@ into monitorable watchlist rows:
   --date 2026-06-16
 ```
 
-Use the same `--date` as the premarket run. The command filters action rows to
-that date; it is required when the actions file is empty because no `run_date`
-can be inferred from rows.
+Use the same `--date` as the premarket run, normally the premarket date. The
+command filters action rows to that date. If `--date` is omitted and the actions
+file has headers but no rows, today's local date is used and a header-only
+watchlist is written.
 
 Optional dry run:
 

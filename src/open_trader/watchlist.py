@@ -42,13 +42,20 @@ class WatchlistResult:
     latest_path: Path
 
 
+@dataclass(frozen=True)
+class ActionRow:
+    values: dict[str, str]
+    row_number: int
+    error: str = ""
+
+
 PRICE_RE = r"(?P<price>\d+(?:\.\d+)?)"
 DOWNSIDE_RE = re.compile(
-    rf"^(?P<open>open\s+)?(?:(?:breaks\s+)?(?:below|under)|<=|<)\s*\$?{PRICE_RE}$",
+    rf"^(?P<open>(?:if\s+)?open\s+)?(?:(?:breaks\s+)?(?:below|under)|<=|<)\s*\$?{PRICE_RE}$",
     re.IGNORECASE,
 )
 UPSIDE_RE = re.compile(
-    rf"^(?P<open>open\s+)?(?:(?:breaks\s+)?(?:above|over)|>=|>)\s*\$?{PRICE_RE}$",
+    rf"^(?P<open>(?:if\s+)?open\s+)?(?:(?:breaks\s+)?(?:above|over)|>=|>)\s*\$?{PRICE_RE}$",
     re.IGNORECASE,
 )
 
@@ -114,9 +121,7 @@ def build_watchlist(
     )
     if rows and not filtered_rows:
         raise ValueError(f"no action rows match run_date {effective_run_date}")
-    watchlist_rows = [
-        _row_from_action(row, effective_run_date) for row in filtered_rows
-    ]
+    watchlist_rows = [_row_from_action(row, effective_run_date) for row in filtered_rows]
     watchlist_path = _write_watchlist_rows(
         data_dir / "runs" / effective_run_date / "watchlist.csv",
         watchlist_rows,
@@ -132,10 +137,12 @@ def build_watchlist(
     )
 
 
-def _read_action_rows(actions_path: Path) -> list[dict[str, str]]:
+def _read_action_rows(actions_path: Path) -> list[ActionRow]:
     with actions_path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         raw_fieldnames = reader.fieldnames or []
+        if any(not (column or "").strip() for column in raw_fieldnames):
+            raise ValueError("unnamed action column(s)")
         duplicate_columns = sorted(
             column for column, count in Counter(raw_fieldnames).items() if count > 1
         )
@@ -156,48 +163,80 @@ def _read_action_rows(actions_path: Path) -> list[dict[str, str]]:
 def _validated_action_row(
     row: dict[str | None, str | list[str] | None],
     row_number: int,
-) -> dict[str, str]:
+) -> ActionRow:
     if None in row:
         symbol = row.get("symbol") or "<unknown>"
         raise ValueError(
             f"malformed action row {row_number} symbol {symbol}: extra column(s)"
         )
 
-    missing_values = [column for column, value in row.items() if value is None]
-    if missing_values:
-        symbol = row.get("symbol") or "<unknown>"
-        columns = ", ".join(str(column) for column in missing_values)
-        raise ValueError(
-            f"malformed action row {row_number} symbol {symbol}: "
-            f"missing value for column(s): {columns}"
-        )
-
-    normalized = {column: str(value) for column, value in row.items()}
-    blank_values = [
-        column
-        for column in sorted(ACTION_REQUIRED_NONBLANK_FIELDS)
-        if not normalized[column].strip()
-    ]
-    if blank_values:
-        symbol = normalized.get("symbol", "").strip() or "<unknown>"
-        columns = ", ".join(blank_values)
-        raise ValueError(
-            f"malformed action row {row_number} symbol {symbol}: "
-            f"blank value for column(s): {columns}"
-        )
+    normalized = {
+        column: "" if value is None else str(value) for column, value in row.items()
+    }
+    symbol = normalized.get("symbol", "").strip()
+    if not symbol:
+        raise ValueError(f"malformed action row {row_number}: blank symbol")
 
     csv_run_date = normalized.get("run_date", "").strip()
     if csv_run_date:
         try:
             normalized["run_date"] = _validated_run_date(csv_run_date)
         except ValueError as exc:
-            symbol = normalized.get("symbol", "").strip() or "<unknown>"
             raise ValueError(
                 f"malformed action row {row_number} symbol {symbol}: "
                 f"invalid run_date {csv_run_date}"
             ) from exc
 
-    return normalized
+    missing_values = [column for column, value in row.items() if value is None]
+    if missing_values:
+        columns = ", ".join(str(column) for column in missing_values)
+        return ActionRow(
+            values=normalized,
+            row_number=row_number,
+            error=(
+                f"malformed action row {row_number} symbol {symbol}: "
+                f"missing value for column(s): {columns}"
+            ),
+        )
+
+    blank_values = [
+        column
+        for column in sorted(ACTION_REQUIRED_NONBLANK_FIELDS - {"symbol"})
+        if not normalized[column].strip()
+    ]
+    if blank_values:
+        columns = ", ".join(blank_values)
+        return ActionRow(
+            values=normalized,
+            row_number=row_number,
+            error=(
+                f"malformed action row {row_number} symbol {symbol}: "
+                f"blank value for column(s): {columns}"
+            ),
+        )
+
+    return ActionRow(values=normalized, row_number=row_number)
+
+
+def _error_row_from_action(
+    row: dict[str, str],
+    fallback_run_date: str,
+    error: str,
+) -> WatchlistRow:
+    return WatchlistRow(
+        run_date=row.get("run_date", "").strip() or fallback_run_date,
+        symbol=row.get("symbol", "").strip(),
+        market=row.get("market", "").strip(),
+        suggested_action=row.get("suggested_action", "").strip(),
+        severity=row.get("severity", "low").strip() or "low",
+        portfolio_weight_hkd=row.get("portfolio_weight_hkd", "").strip(),
+        trigger_type="none",
+        operator="",
+        trigger_price="",
+        trigger_text=row.get("watch_trigger", ""),
+        status="error",
+        error=error,
+    )
 
 
 def _validated_run_date(value: str) -> str:
@@ -210,12 +249,14 @@ def _validated_run_date(value: str) -> str:
     return value
 
 
-def _latest_run_date(rows: list[dict[str, str]]) -> str:
+def _latest_run_date(rows: list[ActionRow]) -> str:
+    if not rows:
+        return date.today().isoformat()
     dates = sorted(
         {
-            row.get("run_date", "").strip()
+            row.values.get("run_date", "").strip()
             for row in rows
-            if row.get("run_date", "").strip()
+            if row.values.get("run_date", "").strip()
         }
     )
     if not dates:
@@ -224,20 +265,23 @@ def _latest_run_date(rows: list[dict[str, str]]) -> str:
 
 
 def _filter_action_rows(
-    rows: list[dict[str, str]],
+    rows: list[ActionRow],
     run_date: str,
     *,
     allow_blank_run_date: bool,
-) -> list[dict[str, str]]:
+) -> list[ActionRow]:
     return [
         row
         for row in rows
-        if row.get("run_date", "").strip() == run_date
-        or (allow_blank_run_date and not row.get("run_date", "").strip())
+        if row.values.get("run_date", "").strip() == run_date
+        or (allow_blank_run_date and not row.values.get("run_date", "").strip())
     ]
 
 
-def _row_from_action(row: dict[str, str], fallback_run_date: str) -> WatchlistRow:
+def _row_from_action(action_row: ActionRow, fallback_run_date: str) -> WatchlistRow:
+    row = action_row.values
+    if action_row.error:
+        return _error_row_from_action(row, fallback_run_date, action_row.error)
     parsed = parse_watch_trigger(row.get("watch_trigger", ""))
     return WatchlistRow(
         run_date=row.get("run_date", "").strip() or fallback_run_date,

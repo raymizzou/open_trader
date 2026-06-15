@@ -1,4 +1,5 @@
 import csv
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,8 @@ def write_text(path: Path, text: str) -> None:
         (">= 110", "price", ">=", "110"),
         ("open below 95", "open_price", "<=", "95"),
         ("open above 110", "open_price", ">=", "110"),
+        ("if open below 95", "open_price", "<=", "95"),
+        ("if open above 110", "open_price", ">=", "110"),
     ],
 )
 def test_parse_watch_trigger_returns_monitorable_price_trigger(
@@ -94,6 +97,8 @@ def test_parse_watch_trigger_marks_unclear_text_as_manual_review() -> None:
         "not below 95",
         "do not buy below 95",
         "below 95 or above 110",
+        "not open below 95",
+        "open below 95 or open above 110",
         "above 110 below 95",
         "below 95abc",
     ],
@@ -332,6 +337,33 @@ def test_build_watchlist_writes_empty_headers_when_no_actions(tmp_path: Path) ->
     assert result.watchlist_count == 0
 
 
+def test_build_watchlist_empty_actions_without_run_date_uses_today(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_actions(actions_path, [])
+
+    class FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return cls(2026, 6, 17)
+
+    monkeypatch.setattr("open_trader.watchlist.date", FixedDate)
+
+    result = build_watchlist(
+        actions_path=actions_path,
+        data_dir=tmp_path / "data",
+        run_date=None,
+        update_latest=True,
+    )
+
+    rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
+    assert result.run_date == "2026-06-17"
+    assert result.watchlist_count == 0
+    assert rows == []
+
+
 def test_build_watchlist_write_failure_preserves_existing_run_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -496,19 +528,6 @@ def test_build_watchlist_duplicate_columns_raises_value_error(tmp_path: Path) ->
         build_watchlist(actions_path, tmp_path / "data")
 
 
-def test_build_watchlist_without_rows_requires_run_date(tmp_path: Path) -> None:
-    actions_path = tmp_path / "data/latest/premarket_actions.csv"
-    write_actions(actions_path, [])
-
-    with pytest.raises(ValueError, match="--date is required"):
-        build_watchlist(
-            actions_path=actions_path,
-            data_dir=tmp_path / "data",
-            run_date=None,
-            update_latest=True,
-        )
-
-
 def test_build_watchlist_extra_column_raises_value_error(tmp_path: Path) -> None:
     actions_path = tmp_path / "data/latest/premarket_actions.csv"
     write_text(
@@ -538,19 +557,31 @@ def test_build_watchlist_ragged_row_missing_required_cell_raises_value_error(
         + "Fake rationale\n",
     )
 
-    with pytest.raises(
-        ValueError,
-        match="row 2.*symbol VIXY.*watch_trigger",
-    ):
-        build_watchlist(
-            actions_path=actions_path,
-            data_dir=tmp_path / "data",
-            run_date=None,
-            update_latest=True,
-        )
+    result = build_watchlist(
+        actions_path=actions_path,
+        data_dir=tmp_path / "data",
+        run_date=None,
+        update_latest=True,
+    )
+
+    rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
+    assert result.watchlist_count == 1
+    assert rows[0]["run_date"] == "2026-06-16"
+    assert rows[0]["symbol"] == "VIXY"
+    assert rows[0]["market"] == "US"
+    assert rows[0]["suggested_action"] == "reduce"
+    assert rows[0]["portfolio_weight_hkd"] == "3.05%"
+    assert rows[0]["severity"] == "high"
+    assert rows[0]["trigger_type"] == "none"
+    assert rows[0]["operator"] == ""
+    assert rows[0]["trigger_price"] == ""
+    assert rows[0]["trigger_text"] == ""
+    assert rows[0]["status"] == "error"
+    assert "row 2" in rows[0]["error"]
+    assert "watch_trigger" in rows[0]["error"]
 
 
-def test_build_watchlist_blank_required_cell_raises_value_error(
+def test_build_watchlist_blank_required_cell_writes_error_row(
     tmp_path: Path,
 ) -> None:
     actions_path = tmp_path / "data/latest/premarket_actions.csv"
@@ -572,8 +603,92 @@ def test_build_watchlist_blank_required_cell_raises_value_error(
         ],
     )
 
-    with pytest.raises(
-        ValueError,
-        match="row 2.*symbol VIXY.*suggested_action",
-    ):
+    result = build_watchlist(actions_path, tmp_path / "data")
+
+    rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
+    assert result.watchlist_count == 1
+    assert rows[0]["run_date"] == "2026-06-16"
+    assert rows[0]["symbol"] == "VIXY"
+    assert rows[0]["market"] == "US"
+    assert rows[0]["suggested_action"] == ""
+    assert rows[0]["portfolio_weight_hkd"] == "3.05%"
+    assert rows[0]["severity"] == "high"
+    assert rows[0]["trigger_type"] == "none"
+    assert rows[0]["operator"] == ""
+    assert rows[0]["trigger_price"] == ""
+    assert rows[0]["trigger_text"] == ""
+    assert rows[0]["status"] == "error"
+    assert "row 2" in rows[0]["error"]
+    assert "suggested_action" in rows[0]["error"]
+
+
+def test_build_watchlist_row_error_uses_explicit_fallback_date(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_actions(
+        actions_path,
+        [
+            {
+                "run_date": "",
+                "symbol": " VIXY ",
+                "market": " US ",
+                "portfolio_weight_hkd": " 3.05% ",
+                "severity": " ",
+                "change_type": "action_changed",
+                "suggested_action": "",
+                "summary": "VIXY changed",
+                "rationale": "Fake rationale",
+                "watch_trigger": " open below 95 ",
+            },
+        ],
+    )
+
+    result = build_watchlist(
+        actions_path=actions_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-16",
+        update_latest=True,
+    )
+
+    rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
+    assert result.watchlist_count == 1
+    assert rows[0]["run_date"] == "2026-06-16"
+    assert rows[0]["symbol"] == "VIXY"
+    assert rows[0]["market"] == "US"
+    assert rows[0]["suggested_action"] == ""
+    assert rows[0]["portfolio_weight_hkd"] == "3.05%"
+    assert rows[0]["severity"] == "low"
+    assert rows[0]["trigger_type"] == "none"
+    assert rows[0]["operator"] == ""
+    assert rows[0]["trigger_price"] == ""
+    assert rows[0]["trigger_text"] == " open below 95 "
+    assert rows[0]["status"] == "error"
+    assert "row 2" in rows[0]["error"]
+    assert "suggested_action" in rows[0]["error"]
+
+
+def test_build_watchlist_blank_symbol_still_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_actions(
+        actions_path,
+        [
+            {
+                "run_date": "2026-06-16",
+                "symbol": " ",
+                "market": "US",
+                "portfolio_weight_hkd": "3.05%",
+                "severity": "high",
+                "change_type": "action_changed",
+                "suggested_action": "reduce",
+                "summary": "VIXY changed",
+                "rationale": "Fake rationale",
+                "watch_trigger": "below 95",
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="row 2.*symbol"):
         build_watchlist(actions_path, tmp_path / "data")
