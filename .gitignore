@@ -1,6 +1,7 @@
 .venv/
 .tradingagents/
 data/
+reports/
 .pytest_cache/
 *.egg-info/
 __pycache__/

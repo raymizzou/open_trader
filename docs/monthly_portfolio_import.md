@@ -28,3 +28,35 @@ data/runs/<YYYY-MM>/extracted_cash.csv
 data/runs/<YYYY-MM>/parse_warnings.csv
 data/runs/<YYYY-MM>/portfolio.csv
 ```
+
+## Daily Premarket Advice
+
+After `data/latest/portfolio.csv` exists, run the daily premarket advice workflow:
+
+```bash
+.venv/bin/python -m open_trader run-premarket \
+  --date 2026-06-16 \
+  --portfolio data/latest/portfolio.csv
+```
+
+Optional test run for a subset:
+
+```bash
+.venv/bin/python -m open_trader run-premarket \
+  --date 2026-06-16 \
+  --portfolio data/latest/portfolio.csv \
+  --symbols VIXY,QQQ \
+  --dry-run
+```
+
+Main readable output:
+
+```text
+reports/premarket/<YYYY-MM-DD>.md
+```
+
+Machine-readable action list:
+
+```text
+data/latest/premarket_actions.csv
+```
