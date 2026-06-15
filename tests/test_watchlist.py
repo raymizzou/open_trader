@@ -1,6 +1,31 @@
+import csv
+from pathlib import Path
+
 import pytest
 
-from open_trader.watchlist import ParsedTrigger, parse_watch_trigger
+from open_trader.watchlist import ParsedTrigger, build_watchlist, parse_watch_trigger
+
+
+ACTION_FIELDNAMES = [
+    "run_date",
+    "symbol",
+    "market",
+    "portfolio_weight_hkd",
+    "severity",
+    "change_type",
+    "suggested_action",
+    "summary",
+    "rationale",
+    "watch_trigger",
+]
+
+
+def write_actions(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=ACTION_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 @pytest.mark.parametrize(
@@ -79,3 +104,110 @@ def test_parse_watch_trigger_marks_ambiguous_comparisons_as_manual_review(
         status="manual_review",
         error="",
     )
+
+
+def test_build_watchlist_writes_run_and_latest_outputs(tmp_path: Path) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_actions(
+        actions_path,
+        [
+            {
+                "run_date": "2026-06-16",
+                "symbol": "VIXY",
+                "market": "US",
+                "portfolio_weight_hkd": "3.05%",
+                "severity": "high",
+                "change_type": "action_changed",
+                "suggested_action": "reduce",
+                "summary": "VIXY changed",
+                "rationale": "Fake rationale",
+                "watch_trigger": "below 95",
+            },
+            {
+                "run_date": "2026-06-16",
+                "symbol": "QQQ",
+                "market": "US",
+                "portfolio_weight_hkd": "1.40%",
+                "severity": "medium",
+                "change_type": "new_signal",
+                "suggested_action": "watch",
+                "summary": "QQQ changed",
+                "rationale": "Fake rationale",
+                "watch_trigger": "support fails",
+            },
+        ],
+    )
+
+    result = build_watchlist(
+        actions_path=actions_path,
+        data_dir=tmp_path / "data",
+        run_date=None,
+        update_latest=True,
+    )
+
+    assert result.run_date == "2026-06-16"
+    assert result.watchlist_count == 2
+    assert result.watchlist_path == tmp_path / "data/runs/2026-06-16/watchlist.csv"
+    assert result.latest_path == tmp_path / "data/latest/watchlist.csv"
+    assert result.watchlist_path.exists()
+    assert result.latest_path.exists()
+
+    rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
+    assert rows[0]["symbol"] == "VIXY"
+    assert rows[0]["trigger_type"] == "price"
+    assert rows[0]["operator"] == "<="
+    assert rows[0]["trigger_price"] == "95"
+    assert rows[0]["status"] == "active"
+    assert rows[1]["symbol"] == "QQQ"
+    assert rows[1]["trigger_type"] == "manual_review"
+    assert rows[1]["status"] == "manual_review"
+
+
+def test_build_watchlist_dry_run_does_not_update_latest(tmp_path: Path) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    latest_path = tmp_path / "data/latest/watchlist.csv"
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.write_text("existing\n", encoding="utf-8")
+    write_actions(
+        actions_path,
+        [
+            {
+                "run_date": "2026-06-16",
+                "symbol": "VIXY",
+                "market": "US",
+                "portfolio_weight_hkd": "3.05%",
+                "severity": "high",
+                "change_type": "action_changed",
+                "suggested_action": "reduce",
+                "summary": "VIXY changed",
+                "rationale": "Fake rationale",
+                "watch_trigger": "below 95",
+            },
+        ],
+    )
+
+    result = build_watchlist(
+        actions_path=actions_path,
+        data_dir=tmp_path / "data",
+        run_date=None,
+        update_latest=False,
+    )
+
+    assert result.watchlist_path.exists()
+    assert latest_path.read_text(encoding="utf-8") == "existing\n"
+
+
+def test_build_watchlist_writes_empty_headers_when_no_actions(tmp_path: Path) -> None:
+    actions_path = tmp_path / "data/latest/premarket_actions.csv"
+    write_actions(actions_path, [])
+
+    result = build_watchlist(
+        actions_path=actions_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-16",
+        update_latest=True,
+    )
+
+    rows = list(csv.DictReader(result.watchlist_path.open(encoding="utf-8")))
+    assert rows == []
+    assert result.watchlist_count == 0
