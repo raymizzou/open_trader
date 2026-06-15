@@ -81,3 +81,32 @@ Machine-readable action list:
 ```text
 data/latest/premarket_actions.csv
 ```
+
+## Build Watchlist
+
+After the premarket run creates `data/latest/premarket_actions.csv`, convert it
+into monitorable watchlist rows:
+
+```bash
+.venv/bin/python -m open_trader build-watchlist \
+  --actions data/latest/premarket_actions.csv \
+  --data-dir data
+```
+
+Optional dry run:
+
+```bash
+.venv/bin/python -m open_trader build-watchlist \
+  --actions data/latest/premarket_actions.csv \
+  --data-dir data \
+  --dry-run
+```
+
+Main output:
+
+```text
+data/latest/watchlist.csv
+```
+
+Rows with clear price conditions become `active`. Rows with unclear trigger text
+become `manual_review` and should be reviewed before automated alerting.
