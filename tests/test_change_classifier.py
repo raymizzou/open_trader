@@ -101,6 +101,41 @@ def test_validate_classifier_output_rejects_invalid_enum() -> None:
         )
 
 
+def test_validate_classifier_output_rejects_extra_keys() -> None:
+    with pytest.raises(InvalidClassificationError, match="unexpected|extra"):
+        validate_classifier_output(
+            json.dumps(
+                {
+                    "include_in_report": True,
+                    "change_type": "action_changed",
+                    "severity": "high",
+                    "suggested_action": "reduce",
+                    "summary": "summary",
+                    "rationale": "rationale",
+                    "watch_trigger": "",
+                    "confidence": 0.9,
+                }
+            )
+        )
+
+
+def test_validate_classifier_output_rejects_non_string_report_fields() -> None:
+    with pytest.raises(InvalidClassificationError, match="summary"):
+        validate_classifier_output(
+            json.dumps(
+                {
+                    "include_in_report": True,
+                    "change_type": "action_changed",
+                    "severity": "high",
+                    "suggested_action": "reduce",
+                    "summary": ["not", "a", "string"],
+                    "rationale": "rationale",
+                    "watch_trigger": "",
+                }
+            )
+        )
+
+
 def test_change_classifier_uses_client_response() -> None:
     class FakeClient:
         def __init__(self) -> None:
@@ -134,3 +169,32 @@ def test_change_classifier_uses_client_response() -> None:
     assert result.status == "ok"
     assert result.include_in_report is True
     assert client.payloads[0]["previous_advice"] is None
+
+
+def test_change_classifier_returns_error_for_malformed_client_response() -> None:
+    class MalformedClient:
+        def classify(self, prompt: str, payload: dict[str, object]) -> str:
+            return json.dumps(
+                {
+                    "include_in_report": True,
+                    "change_type": "action_changed",
+                    "severity": "high",
+                    "suggested_action": "reduce",
+                    "summary": ["not", "a", "string"],
+                    "rationale": "rationale",
+                    "watch_trigger": "",
+                }
+            )
+
+    classifier = ChangeClassifier(client=MalformedClient())
+
+    result = classifier.classify(
+        run_date="2026-06-16",
+        portfolio_row=portfolio_row(),
+        previous_advice=None,
+        latest_advice=latest_advice(),
+    )
+
+    assert result.status == "error"
+    assert result.include_in_report is False
+    assert "summary" in result.error

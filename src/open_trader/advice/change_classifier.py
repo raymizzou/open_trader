@@ -17,6 +17,21 @@ CHANGE_TYPES = {
     "no_material_change",
 }
 SEVERITIES = {"low", "medium", "high"}
+REQUIRED_CLASSIFICATION_FIELDS = {
+    "include_in_report",
+    "change_type",
+    "severity",
+    "suggested_action",
+    "summary",
+    "rationale",
+    "watch_trigger",
+}
+STRING_CLASSIFICATION_FIELDS = {
+    "suggested_action",
+    "summary",
+    "rationale",
+    "watch_trigger",
+}
 
 CLASSIFICATION_JSON_SCHEMA = {
     "name": "premarket_change_classification",
@@ -141,33 +156,31 @@ def validate_classifier_output(raw: str) -> _ParsedClassification:
     if not isinstance(data, dict):
         raise InvalidClassificationError("classification output must be an object")
 
-    required = {
-        "include_in_report",
-        "change_type",
-        "severity",
-        "suggested_action",
-        "summary",
-        "rationale",
-        "watch_trigger",
-    }
-    missing = sorted(required - set(data))
+    fields = set(data)
+    missing = sorted(REQUIRED_CLASSIFICATION_FIELDS - fields)
     if missing:
         raise InvalidClassificationError(f"missing field(s): {', '.join(missing)}")
+    extra = sorted(fields - REQUIRED_CLASSIFICATION_FIELDS)
+    if extra:
+        raise InvalidClassificationError(f"unexpected field(s): {', '.join(extra)}")
     if not isinstance(data["include_in_report"], bool):
         raise InvalidClassificationError("include_in_report must be boolean")
     if data["change_type"] not in CHANGE_TYPES:
         raise InvalidClassificationError(f"invalid change_type: {data['change_type']}")
     if data["severity"] not in SEVERITIES:
         raise InvalidClassificationError(f"invalid severity: {data['severity']}")
+    for field in sorted(STRING_CLASSIFICATION_FIELDS):
+        if not isinstance(data[field], str):
+            raise InvalidClassificationError(f"{field} must be string")
 
     return _ParsedClassification(
         include_in_report=data["include_in_report"],
         change_type=data["change_type"],
         severity=data["severity"],
-        suggested_action=str(data["suggested_action"]),
-        summary=str(data["summary"]),
-        rationale=str(data["rationale"]),
-        watch_trigger=str(data["watch_trigger"]),
+        suggested_action=data["suggested_action"],
+        summary=data["summary"],
+        rationale=data["rationale"],
+        watch_trigger=data["watch_trigger"],
     )
 
 
