@@ -119,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
     premarket_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Write run outputs but do not update latest trading advice",
+        help="Write run outputs but do not update latest advice or actions",
     )
 
     return parser

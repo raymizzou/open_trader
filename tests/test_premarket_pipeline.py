@@ -128,6 +128,37 @@ def write_portfolio(path: Path) -> None:
         )
 
 
+def write_all_ineligible_portfolio(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(
+            [
+                {
+                    "market": "HK",
+                    "asset_class": "stock",
+                    "symbol": "02476",
+                    "name": "VGT",
+                    "portfolio_weight_hkd": "15.20%",
+                    "ai_eligible": "false",
+                    "analysis_symbol": "",
+                    "risk_flag": "overweight",
+                },
+                {
+                    "market": "US",
+                    "asset_class": "stock",
+                    "symbol": "AAPL",
+                    "name": "Apple",
+                    "portfolio_weight_hkd": "8.00%",
+                    "ai_eligible": "false",
+                    "analysis_symbol": "AAPL",
+                    "risk_flag": "normal",
+                },
+            ]
+        )
+
+
 def test_run_premarket_writes_full_advice_classifications_and_actions(
     tmp_path: Path,
 ) -> None:
@@ -205,7 +236,101 @@ def test_run_premarket_dry_run_does_not_update_latest_advice(
     )
 
     assert not (data_dir / "latest" / "trading_advice.csv").exists()
-    assert (data_dir / "latest" / "premarket_actions.csv").exists()
+    assert not (data_dir / "latest" / "premarket_actions.csv").exists()
+
+
+def test_run_premarket_all_ineligible_writes_empty_run_outputs_and_preserves_latest(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_all_ineligible_portfolio(portfolio_path)
+    data_dir = tmp_path / "data"
+    write_previous_latest_advice(data_dir)
+    write_previous_latest_actions(data_dir)
+    original_advice = (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    )
+    original_actions = (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    )
+    advice_runner = FakeAdviceRunner()
+    classifier = FakeClassifier()
+
+    result = run_premarket(
+        run_date="2026-06-16",
+        portfolio_path=portfolio_path,
+        data_dir=data_dir,
+        reports_dir=tmp_path / "reports",
+        advice_runner=advice_runner,
+        classifier=classifier,
+        symbols=None,
+        update_latest=True,
+    )
+
+    assert result.eligible_count == 0
+    assert result.advice_count == 0
+    assert result.action_count == 0
+    assert advice_runner.calls == []
+    assert classifier.previous_by_symbol == {}
+    assert result.advice_path.exists()
+    assert result.classifications_path.exists()
+    assert result.actions_path.exists()
+    assert "No eligible US stocks or ETFs were found" in result.report_path.read_text(
+        encoding="utf-8"
+    )
+    assert (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    ) == original_advice
+    assert (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    ) == original_actions
+
+
+def test_run_premarket_no_matching_symbols_writes_empty_run_outputs_and_preserves_latest(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    data_dir = tmp_path / "data"
+    write_previous_latest_advice(data_dir)
+    write_previous_latest_actions(data_dir)
+    original_advice = (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    )
+    original_actions = (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    )
+    advice_runner = FakeAdviceRunner()
+    classifier = FakeClassifier()
+
+    result = run_premarket(
+        run_date="2026-06-16",
+        portfolio_path=portfolio_path,
+        data_dir=data_dir,
+        reports_dir=tmp_path / "reports",
+        advice_runner=advice_runner,
+        classifier=classifier,
+        symbols={"MSFT"},
+        update_latest=True,
+    )
+
+    assert result.eligible_count == 0
+    assert result.advice_count == 0
+    assert result.action_count == 0
+    assert advice_runner.calls == []
+    assert classifier.previous_by_symbol == {}
+    assert result.advice_path.exists()
+    assert result.classifications_path.exists()
+    assert result.actions_path.exists()
+    assert "No eligible US stocks or ETFs were found" in result.report_path.read_text(
+        encoding="utf-8"
+    )
+    assert (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    ) == original_advice
+    assert (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    ) == original_actions
 
 
 def test_run_premarket_keeps_existing_latest_advice_when_later_output_fails(
@@ -247,6 +372,55 @@ def test_run_premarket_keeps_existing_latest_advice_when_later_output_fails(
     assert (data_dir / "latest" / "trading_advice.csv").read_text(
         encoding="utf-8"
     ) == original_latest
+
+
+def test_run_premarket_latest_promotion_failure_restores_previous_latest_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    data_dir = tmp_path / "data"
+    write_previous_latest_advice(data_dir)
+    write_previous_latest_actions(data_dir)
+    original_advice = (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    )
+    original_actions = (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    )
+    original_replace = Path.replace
+
+    def fail_action_latest_replace(self: Path, target: Path) -> Path:
+        if target == data_dir / "latest" / "premarket_actions.csv":
+            assert (data_dir / "latest" / "trading_advice.csv").read_text(
+                encoding="utf-8"
+            ) != original_advice
+            raise OSError("simulated action latest promotion failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_action_latest_replace)
+
+    with pytest.raises(OSError, match="simulated action latest promotion failure"):
+        run_premarket(
+            run_date="2026-06-16",
+            portfolio_path=portfolio_path,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            advice_runner=FakeAdviceRunner(),
+            classifier=FakeClassifier(),
+            symbols=None,
+            update_latest=True,
+        )
+
+    assert (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    ) == original_advice
+    assert (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    ) == original_actions
+    assert list((data_dir / "latest").glob("*.backup")) == []
+    assert list((data_dir / "latest").glob(".*.tmp")) == []
 
 
 def test_run_premarket_converts_advice_runner_failure_and_continues(
@@ -339,5 +513,41 @@ def write_previous_latest_advice(data_dir: Path) -> None:
                 "raw_decision": "{}",
                 "status": "ok",
                 "error": "",
+            }
+        )
+
+
+def write_previous_latest_actions(data_dir: Path) -> None:
+    latest_path = data_dir / "latest" / "premarket_actions.csv"
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    with latest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "run_date",
+                "symbol",
+                "market",
+                "portfolio_weight_hkd",
+                "severity",
+                "change_type",
+                "suggested_action",
+                "summary",
+                "rationale",
+                "watch_trigger",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "run_date": "2026-06-15",
+                "symbol": "VIXY",
+                "market": "US",
+                "portfolio_weight_hkd": "3.05%",
+                "severity": "high",
+                "change_type": "action_changed",
+                "suggested_action": "hold",
+                "summary": "Old VIXY action",
+                "rationale": "Old rationale.",
+                "watch_trigger": "",
             }
         )

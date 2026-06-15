@@ -17,6 +17,8 @@ def write_premarket_outputs(
     actions: Iterable[PremarketAction],
     data_dir: Path,
     reports_dir: Path,
+    update_latest: bool = True,
+    no_eligible: bool = False,
 ) -> tuple[Path, Path, Path]:
     sorted_actions = sorted(
         actions,
@@ -33,14 +35,27 @@ def write_premarket_outputs(
     report_path = reports_dir / "premarket" / f"{run_date}.md"
 
     _atomic_write_csv(run_actions_path, PREMARKET_ACTION_FIELDNAMES, rows)
-    _atomic_write_csv(latest_actions_path, PREMARKET_ACTION_FIELDNAMES, rows)
-    _atomic_write_text(report_path, _render_markdown(run_date, sorted_actions))
+    if update_latest:
+        _atomic_write_csv(latest_actions_path, PREMARKET_ACTION_FIELDNAMES, rows)
+    _atomic_write_text(
+        report_path,
+        _render_markdown(run_date, sorted_actions, no_eligible=no_eligible),
+    )
 
     return run_actions_path, latest_actions_path, report_path
 
 
-def _render_markdown(run_date: str, actions: list[PremarketAction]) -> str:
+def _render_markdown(
+    run_date: str,
+    actions: list[PremarketAction],
+    *,
+    no_eligible: bool = False,
+) -> str:
     lines = [f"# Premarket Trading Brief - {run_date}", ""]
+    if no_eligible:
+        lines.extend(["No eligible US stocks or ETFs were found.", ""])
+        return "\n".join(lines)
+
     if not actions:
         lines.extend(["No material trading advice changes were generated.", ""])
         return "\n".join(lines)

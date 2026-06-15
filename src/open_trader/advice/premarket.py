@@ -49,6 +49,15 @@ class PremarketResult:
     report_path: Path
 
 
+@dataclass
+class _LatestPromotion:
+    source_path: Path
+    latest_path: Path
+    temp_path: Path | None = None
+    backup_path: Path | None = None
+    latest_replaced: bool = False
+
+
 def run_premarket(
     *,
     run_date: str,
@@ -69,6 +78,36 @@ def run_premarket(
             if row.symbol.casefold() in normalized_symbols
             or row.analysis_symbol.casefold() in normalized_symbols
         ]
+
+    if not rows:
+        advice_path, _ = write_trading_advice(
+            run_date=run_date,
+            records=[],
+            data_dir=data_dir,
+            update_latest=False,
+        )
+        classifications_path = write_change_classifications(
+            run_date=run_date,
+            records=[],
+            data_dir=data_dir,
+        )
+        actions_path, _, report_path = write_premarket_outputs(
+            run_date=run_date,
+            actions=[],
+            data_dir=data_dir,
+            reports_dir=reports_dir,
+            update_latest=False,
+            no_eligible=True,
+        )
+        return PremarketResult(
+            eligible_count=0,
+            advice_count=0,
+            action_count=0,
+            advice_path=advice_path,
+            classifications_path=classifications_path,
+            actions_path=actions_path,
+            report_path=report_path,
+        )
 
     previous_by_symbol = load_latest_advice_by_symbol(data_dir)
     advice_records: list[TradingAdvice] = []
@@ -110,9 +149,14 @@ def run_premarket(
         actions=actions,
         data_dir=data_dir,
         reports_dir=reports_dir,
+        update_latest=False,
     )
     if update_latest:
-        _promote_latest_advice(advice_path=advice_path, data_dir=data_dir)
+        _promote_latest_outputs(
+            advice_path=advice_path,
+            actions_path=actions_path,
+            data_dir=data_dir,
+        )
 
     return PremarketResult(
         eligible_count=len(rows),
@@ -150,26 +194,94 @@ def _analyze_symbol(
         )
 
 
-def _promote_latest_advice(*, advice_path: Path, data_dir: Path) -> None:
-    latest_path = data_dir / "latest" / "trading_advice.csv"
-    latest_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: Path | None = None
+def _promote_latest_outputs(
+    *,
+    advice_path: Path,
+    actions_path: Path,
+    data_dir: Path,
+) -> None:
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    promotions = [
+        _LatestPromotion(
+            source_path=advice_path,
+            latest_path=latest_dir / "trading_advice.csv",
+        ),
+        _LatestPromotion(
+            source_path=actions_path,
+            latest_path=latest_dir / "premarket_actions.csv",
+        ),
+    ]
+
     try:
-        with NamedTemporaryFile(
-            "wb",
-            dir=latest_path.parent,
-            prefix=f".{latest_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temp_path = Path(handle.name)
-            with advice_path.open("rb") as source:
-                shutil.copyfileobj(source, handle)
-        temp_path.replace(latest_path)
+        for promotion in promotions:
+            promotion.temp_path = _copy_latest_temp(
+                source_path=promotion.source_path,
+                latest_path=promotion.latest_path,
+            )
+
+        for promotion in promotions:
+            if promotion.latest_path.exists():
+                promotion.backup_path = _make_backup_latest_path(
+                    promotion.latest_path
+                )
+                promotion.latest_path.rename(promotion.backup_path)
+            if promotion.temp_path is None:
+                raise RuntimeError("latest promotion temp path was not staged")
+            promotion.temp_path.replace(promotion.latest_path)
+            promotion.latest_replaced = True
+            promotion.temp_path = None
     except Exception:
-        if temp_path is not None and temp_path.exists():
-            _best_effort_unlink(temp_path)
+        _restore_latest_promotions(promotions)
         raise
+    else:
+        for promotion in promotions:
+            if promotion.backup_path is not None and promotion.backup_path.exists():
+                _best_effort_unlink(promotion.backup_path)
+    finally:
+        for promotion in promotions:
+            if promotion.temp_path is not None and promotion.temp_path.exists():
+                _best_effort_unlink(promotion.temp_path)
+
+
+def _copy_latest_temp(*, source_path: Path, latest_path: Path) -> Path:
+    with NamedTemporaryFile(
+        "wb",
+        dir=latest_path.parent,
+        prefix=f".{latest_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+        with source_path.open("rb") as source:
+            shutil.copyfileobj(source, handle)
+    return temp_path
+
+
+def _make_backup_latest_path(latest_path: Path) -> Path:
+    with NamedTemporaryFile(
+        "wb",
+        dir=latest_path.parent,
+        prefix=f".{latest_path.name}.",
+        suffix=".backup",
+        delete=False,
+    ) as handle:
+        backup_path = Path(handle.name)
+    backup_path.unlink()
+    return backup_path
+
+
+def _restore_latest_promotions(promotions: list[_LatestPromotion]) -> None:
+    for promotion in reversed(promotions):
+        if promotion.backup_path is not None and promotion.backup_path.exists():
+            if promotion.latest_path.exists():
+                _best_effort_unlink(promotion.latest_path)
+            try:
+                promotion.backup_path.rename(promotion.latest_path)
+            except Exception:
+                pass
+        elif promotion.latest_replaced and promotion.latest_path.exists():
+            _best_effort_unlink(promotion.latest_path)
 
 
 def _best_effort_unlink(path: Path) -> None:
