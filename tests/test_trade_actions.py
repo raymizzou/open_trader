@@ -6,10 +6,12 @@ import pytest
 from decimal import Decimal
 from pathlib import Path
 
+from open_trader.trading_plan import PlanQuoteStatus, TradingPlanRow
 from open_trader.trade_actions import (
     TRADE_ACTION_FIELDNAMES,
     PortfolioPositionSnapshot,
     PortfolioActionContext,
+    build_trade_action_row,
     map_quote_status_to_action,
     load_portfolio_action_context,
 )
@@ -49,6 +51,59 @@ def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def active_plan(
+    *,
+    symbol: str = "MSFT",
+    max_weight: str = "12%",
+    plan_text: str = "操作计划：在380-400美元区间分3-4次买入目标仓位的60%，350美元附近加仓剩余40%。",
+) -> TradingPlanRow:
+    return TradingPlanRow(
+        run_date="2026-06-16",
+        symbol=symbol,
+        market="US",
+        rating="Overweight",
+        entry_zone_low=Decimal("380"),
+        entry_zone_high=Decimal("400"),
+        add_price=Decimal("350"),
+        stop_loss=Decimal("340"),
+        target_1=Decimal("450"),
+        target_2=Decimal("500"),
+        max_weight=max_weight,
+        catalyst="10月底财报",
+        time_horizon="3-6个月",
+        plan_text=plan_text,
+        status="active",
+        error="",
+    )
+
+
+def portfolio_context(*, quantity: str = "10", cash: str = "1000") -> PortfolioActionContext:
+    return PortfolioActionContext(
+        positions={
+            ("US", "MSFT"): PortfolioPositionSnapshot(
+                currency="USD",
+                quantity=Decimal(quantity),
+                market_value=Decimal("3900"),
+                market_value_hkd=Decimal("30420"),
+                weight=Decimal("0.039"),
+                fx_to_hkd=Decimal("7.8"),
+            )
+        },
+        cash_by_currency={"USD": Decimal(cash)},
+        total_market_value_hkd=Decimal("780000"),
+    )
+
+
+def quote_status(trigger_status: str, price: str = "390") -> PlanQuoteStatus:
+    return PlanQuoteStatus(
+        symbol="MSFT",
+        futu_symbol="US.MSFT",
+        last_price=Decimal(price),
+        status=trigger_status,
+        message="fixture message",
+    )
 
 
 def test_trade_action_fieldnames_are_stable() -> None:
@@ -913,3 +968,150 @@ def test_map_quote_status_to_trade_action() -> None:
     assert map_quote_status_to_action("watch") == ("HOLD", "low")
     assert map_quote_status_to_action("missing_quote") == ("REVIEW", "medium")
     assert map_quote_status_to_action("unexpected") == ("REVIEW", "medium")
+
+
+def test_buy_action_uses_plan_ratio_target_cap_and_cash_cap() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio_context(cash="1000"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "BUY"
+    assert row["status"] == "ready"
+    assert row["suggested_notional"] == "1000"
+    assert row["suggested_quantity"] == "2"
+    assert row["cash_available"] == "1000"
+    assert row["limit_price"] == "390"
+    assert row["stop_price"] == "340"
+
+
+def test_buy_action_is_review_when_budget_is_below_one_share() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio_context(cash="100"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert row["suggested_quantity"] == ""
+    assert "below one share" in row["error"]
+
+
+def test_add_action_defaults_to_40_percent_when_plan_ratio_is_missing() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(plan_text="操作计划：350美元附近加仓。"),
+        quote_status=quote_status("add_zone", price="350"),
+        portfolio=portfolio_context(cash="20000"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "ADD"
+    assert row["status"] == "ready"
+    assert row["suggested_notional"] == "4550"
+    assert row["suggested_quantity"] == "13"
+
+
+def test_stop_loss_sells_full_position() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("stop_loss_hit", price="339"),
+        portfolio=portfolio_context(quantity="10"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "SELL_STOP"
+    assert row["priority"] == "critical"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "10"
+    assert row["suggested_notional"] == "3390"
+    assert row["stop_price"] == "340"
+
+
+def test_target_one_trims_half_position() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("target_1_hit", price="451"),
+        portfolio=portfolio_context(quantity="9"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "TRIM"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "4"
+    assert row["suggested_notional"] == "1804"
+
+
+def test_target_two_takes_profit_on_full_position() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("target_2_hit", price="501"),
+        portfolio=portfolio_context(quantity="9"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "TAKE_PROFIT"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "9"
+    assert row["suggested_notional"] == "4509"
+
+
+def test_watch_maps_to_hold_without_sizing() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("watch"),
+        portfolio=portfolio_context(),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "HOLD"
+    assert row["status"] == "watch"
+    assert row["suggested_quantity"] == ""
+    assert row["suggested_notional"] == ""
+
+
+def test_missing_quote_maps_to_review_with_quote_message() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("missing_quote"),
+        portfolio=portfolio_context(),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert row["error"] == "fixture message"
+    assert row["reason"] == "fixture message"
+
+
+def test_buy_side_missing_portfolio_position_maps_to_review() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("entry_zone"),
+        portfolio=PortfolioActionContext(
+            positions={},
+            cash_by_currency={"USD": Decimal("1000")},
+            total_market_value_hkd=Decimal("780000"),
+        ),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "missing portfolio position" in row["error"]
+
+
+def test_buy_side_unparseable_target_max_weight_maps_to_review() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(max_weight="twelve percent"),
+        quote_status=quote_status("entry_zone"),
+        portfolio=portfolio_context(),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "target max weight" in row["error"]
