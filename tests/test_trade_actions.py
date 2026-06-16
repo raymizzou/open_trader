@@ -1001,6 +1001,19 @@ def test_buy_action_is_review_when_budget_is_below_one_share() -> None:
     assert "below one share" in row["error"]
 
 
+def test_buy_action_is_review_when_same_currency_cash_is_zero() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio_context(cash="0"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "same-currency cash" in row["error"]
+
+
 def test_add_action_defaults_to_40_percent_when_plan_ratio_is_missing() -> None:
     row = build_trade_action_row(
         plan=active_plan(plan_text="操作计划：350美元附近加仓。"),
@@ -1013,6 +1026,48 @@ def test_add_action_defaults_to_40_percent_when_plan_ratio_is_missing() -> None:
     assert row["status"] == "ready"
     assert row["suggested_notional"] == "4550"
     assert row["suggested_quantity"] == "13"
+
+
+def test_buy_action_defaults_to_60_percent_when_plan_ratio_is_missing() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(plan_text="操作计划：耐心等待回调，350美元附近加仓剩余40%。"),
+        quote_status=quote_status("entry_zone", price="400"),
+        portfolio=portfolio_context(cash="20000"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "BUY"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "18"
+    assert row["suggested_notional"] == "7200"
+
+
+def test_buy_action_uses_remaining_target_budget_as_binding_cap() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(max_weight="5%"),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio_context(cash="20000"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "BUY"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "2"
+    assert row["suggested_notional"] == "780"
+
+
+def test_add_action_uses_remaining_target_budget_as_binding_cap() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(max_weight="5%", plan_text="操作计划：350美元附近加仓。"),
+        quote_status=quote_status("add_zone", price="350"),
+        portfolio=portfolio_context(cash="20000"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "ADD"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "3"
+    assert row["suggested_notional"] == "1050"
 
 
 def test_stop_loss_sells_full_position() -> None:
@@ -1028,6 +1083,7 @@ def test_stop_loss_sells_full_position() -> None:
     assert row["status"] == "ready"
     assert row["suggested_quantity"] == "10"
     assert row["suggested_notional"] == "3390"
+    assert row["limit_price"] == ""
     assert row["stop_price"] == "340"
 
 

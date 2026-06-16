@@ -269,7 +269,8 @@ def _size_sell_action_row(
     if quantity < 1:
         return _review_row(row, "current quantity below one share for sell sizing")
 
-    row["limit_price"] = _decimal_to_text(quote_status.last_price)
+    if action != "SELL_STOP":
+        row["limit_price"] = _decimal_to_text(quote_status.last_price)
     row["suggested_quantity"] = _decimal_to_text(quantity)
     row["suggested_notional"] = _decimal_to_text(quantity * quote_status.last_price)
     row["status"] = "ready"
@@ -293,6 +294,8 @@ def _size_buy_action_row(
         return _review_row(row, "missing portfolio position for buy-side sizing")
     if position.fx_to_hkd <= 0:
         return _review_row(row, "missing positive fx_to_hkd for buy-side sizing")
+    if cash_available <= 0:
+        return _review_row(row, "no same-currency cash available")
 
     portfolio_value_in_symbol_currency = (
         portfolio.total_market_value_hkd / position.fx_to_hkd
