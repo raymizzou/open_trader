@@ -318,6 +318,8 @@ def _size_buy_action_row(
         remaining_target_budget,
         cash_available,
     )
+    if quote_status.last_price <= 0:
+        return _review_row(row, "invalid last price")
     quantity = (suggested_notional_budget / quote_status.last_price).to_integral_value(
         rounding=ROUND_DOWN
     )

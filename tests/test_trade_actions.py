@@ -1024,6 +1024,22 @@ def test_buy_action_is_review_when_same_currency_cash_is_zero() -> None:
     assert row["reason"] == row["error"]
 
 
+def test_buy_action_is_review_when_last_price_is_invalid() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("entry_zone", price="0"),
+        portfolio=portfolio_context(cash="1000"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "invalid last price" in row["error"]
+    assert row["reason"] == row["error"]
+    assert row["limit_price"] == ""
+    assert row["stop_price"] == "340"
+
+
 def test_add_action_defaults_to_40_percent_when_plan_ratio_is_missing() -> None:
     row = build_trade_action_row(
         plan=active_plan(plan_text="操作计划：350美元附近加仓。"),
@@ -1036,6 +1052,8 @@ def test_add_action_defaults_to_40_percent_when_plan_ratio_is_missing() -> None:
     assert row["status"] == "ready"
     assert row["suggested_notional"] == "4550"
     assert row["suggested_quantity"] == "13"
+    assert row["limit_price"] == "350"
+    assert row["stop_price"] == "340"
 
 
 def test_buy_action_defaults_to_60_percent_when_plan_ratio_is_missing() -> None:
@@ -1195,6 +1213,7 @@ def test_target_one_trims_half_position() -> None:
     assert row["action"] == "TRIM"
     assert row["status"] == "ready"
     assert row["limit_price"] == "451"
+    assert row["stop_price"] == "340"
     assert row["suggested_quantity"] == "4"
     assert row["suggested_notional"] == "1804"
 
@@ -1210,6 +1229,7 @@ def test_target_two_takes_profit_on_full_position() -> None:
     assert row["action"] == "TAKE_PROFIT"
     assert row["status"] == "ready"
     assert row["limit_price"] == "501"
+    assert row["stop_price"] == "340"
     assert row["suggested_quantity"] == "9"
     assert row["suggested_notional"] == "4509"
 
@@ -1224,6 +1244,8 @@ def test_watch_maps_to_hold_without_sizing() -> None:
 
     assert row["action"] == "HOLD"
     assert row["status"] == "watch"
+    assert row["limit_price"] == ""
+    assert row["stop_price"] == "340"
     assert row["suggested_quantity"] == ""
     assert row["suggested_notional"] == ""
 
@@ -1258,6 +1280,8 @@ def test_buy_side_missing_portfolio_position_maps_to_review() -> None:
     assert row["status"] == "review"
     assert "missing portfolio position" in row["error"]
     assert row["reason"] == row["error"]
+    assert row["limit_price"] == ""
+    assert row["stop_price"] == "340"
 
 
 def test_buy_side_unparseable_target_max_weight_maps_to_review() -> None:
@@ -1272,6 +1296,8 @@ def test_buy_side_unparseable_target_max_weight_maps_to_review() -> None:
     assert row["status"] == "review"
     assert "target max weight" in row["error"]
     assert row["reason"] == row["error"]
+    assert row["limit_price"] == ""
+    assert row["stop_price"] == "340"
 
 
 def test_trade_action_rows_always_match_fieldname_shape() -> None:
