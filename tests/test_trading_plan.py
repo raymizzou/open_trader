@@ -28,6 +28,9 @@ ADVICE_FIELDNAMES = [
     "raw_decision",
     "status",
     "error",
+    "source_status",
+    "fallback_reason",
+    "fallback_from_date",
 ]
 
 
@@ -185,6 +188,43 @@ def test_build_trading_plan_accepts_large_raw_decision_field(tmp_path: Path) -> 
     assert result.plan_count == 1
 
 
+def test_build_trading_plan_accepts_fallback_advice_and_preserves_source_status(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-17",
+                "symbol": "MSFT",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "1.13%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Overweight",
+                "advice_summary": msft_advice_summary(),
+                "raw_decision": "{}",
+                "status": "fallback",
+                "error": "",
+                "source_status": "fallback",
+                "fallback_reason": "daily deadline exceeded",
+                "fallback_from_date": "2026-06-16",
+            }
+        ],
+    )
+
+    result = build_trading_plan(advice_path, tmp_path / "data")
+    rows = list(csv.DictReader(result.plan_path.open(encoding="utf-8")))
+
+    assert rows[0]["symbol"] == "MSFT"
+    assert rows[0]["status"] == "active"
+    assert rows[0]["source_status"] == "fallback"
+    assert rows[0]["fallback_reason"] == "daily deadline exceeded"
+    assert rows[0]["fallback_from_date"] == "2026-06-16"
+
+
 def test_load_trading_plan_rows_reads_active_rows(tmp_path: Path) -> None:
     path = tmp_path / "trading_plan.csv"
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -216,6 +256,9 @@ def test_load_trading_plan_rows_reads_active_rows(tmp_path: Path) -> None:
             run_date="2026-06-16",
             symbol="MSFT",
             market="US",
+            source_status="ok",
+            fallback_reason="",
+            fallback_from_date="",
             rating="Overweight",
             entry_zone_low=Decimal("380"),
             entry_zone_high=Decimal("400"),
@@ -233,11 +276,54 @@ def test_load_trading_plan_rows_reads_active_rows(tmp_path: Path) -> None:
     ]
 
 
+def test_load_trading_plan_rows_accepts_legacy_rows_without_source_status(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy_plan.csv"
+    legacy_fieldnames = [
+        field
+        for field in TRADING_PLAN_FIELDNAMES
+        if field not in {"source_status", "fallback_reason", "fallback_from_date"}
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=legacy_fieldnames)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "run_date": "2026-06-16",
+                "symbol": "MSFT",
+                "market": "US",
+                "rating": "Overweight",
+                "entry_zone_low": "380",
+                "entry_zone_high": "400",
+                "add_price": "350",
+                "stop_loss": "340",
+                "target_1": "450",
+                "target_2": "500",
+                "max_weight": "12%",
+                "catalyst": "10月底财报",
+                "time_horizon": "3-6个月",
+                "plan_text": "plan",
+                "status": "active",
+                "error": "",
+            }
+        )
+
+    rows = load_trading_plan_rows(path)
+
+    assert rows[0].source_status == "ok"
+    assert rows[0].fallback_reason == ""
+    assert rows[0].fallback_from_date == ""
+
+
 def test_evaluate_plan_quote_classifies_current_price() -> None:
     plan = TradingPlanRow(
         run_date="2026-06-16",
         symbol="MSFT",
         market="US",
+        source_status="ok",
+        fallback_reason="",
+        fallback_from_date="",
         rating="Overweight",
         entry_zone_low=Decimal("380"),
         entry_zone_high=Decimal("400"),

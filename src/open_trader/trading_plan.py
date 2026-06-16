@@ -14,6 +14,9 @@ TRADING_PLAN_FIELDNAMES = [
     "run_date",
     "symbol",
     "market",
+    "source_status",
+    "fallback_reason",
+    "fallback_from_date",
     "rating",
     "entry_zone_low",
     "entry_zone_high",
@@ -53,6 +56,9 @@ class TradingPlanRow:
     run_date: str
     symbol: str
     market: str
+    source_status: str
+    fallback_reason: str
+    fallback_from_date: str
     rating: str
     entry_zone_low: Decimal | None
     entry_zone_high: Decimal | None
@@ -120,7 +126,8 @@ def load_trading_plan_rows(plan_path: Path) -> list[TradingPlanRow]:
     with plan_path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fieldnames = reader.fieldnames or []
-        missing = sorted(set(TRADING_PLAN_FIELDNAMES) - set(fieldnames))
+        optional = {"source_status", "fallback_reason", "fallback_from_date"}
+        missing = sorted(set(TRADING_PLAN_FIELDNAMES) - optional - set(fieldnames))
         if missing:
             raise ValueError(f"missing trading plan column(s): {', '.join(missing)}")
         return [_trading_plan_from_row(row) for row in reader]
@@ -190,11 +197,15 @@ def _plan_row_from_advice(row: dict[str, str], fallback_run_date: str) -> dict[s
     run_date = row.get("run_date", "").strip() or fallback_run_date
     symbol = row.get("symbol", "").strip().upper()
     market = row.get("market", "").strip().upper()
-    if row.get("status", "").strip() != "ok":
+    advice_status = row.get("status", "").strip()
+    if advice_status not in {"ok", "fallback"}:
         return _base_plan_row(
             run_date=run_date,
             symbol=symbol,
             market=market,
+            source_status=advice_status or "error",
+            fallback_reason=row.get("fallback_reason", "").strip(),
+            fallback_from_date=row.get("fallback_from_date", "").strip(),
             status="error",
             error=row.get("error", "").strip(),
         )
@@ -205,6 +216,9 @@ def _plan_row_from_advice(row: dict[str, str], fallback_run_date: str) -> dict[s
             run_date=run_date,
             symbol=symbol,
             market=market,
+            source_status=row.get("source_status", "").strip() or advice_status,
+            fallback_reason=row.get("fallback_reason", "").strip(),
+            fallback_from_date=row.get("fallback_from_date", "").strip(),
             rating=row.get("advice_action", "").strip(),
             plan_text=row.get("advice_summary", "").strip(),
             status="manual_review",
@@ -217,6 +231,9 @@ def _plan_row_from_advice(row: dict[str, str], fallback_run_date: str) -> dict[s
         run_date=run_date,
         symbol=symbol,
         market=market,
+        source_status=row.get("source_status", "").strip() or advice_status,
+        fallback_reason=row.get("fallback_reason", "").strip(),
+        fallback_from_date=row.get("fallback_from_date", "").strip(),
         rating=sections.get("评级") or row.get("advice_action", "").strip(),
         entry_zone_low=_decimal_to_text(entry_low),
         entry_zone_high=_decimal_to_text(entry_high),
@@ -239,6 +256,9 @@ def _base_plan_row(
     run_date: str,
     symbol: str,
     market: str,
+    source_status: str = "ok",
+    fallback_reason: str = "",
+    fallback_from_date: str = "",
     rating: str = "",
     entry_zone_low: str = "",
     entry_zone_high: str = "",
@@ -257,6 +277,9 @@ def _base_plan_row(
         "run_date": run_date,
         "symbol": symbol,
         "market": market,
+        "source_status": source_status,
+        "fallback_reason": fallback_reason,
+        "fallback_from_date": fallback_from_date,
         "rating": rating,
         "entry_zone_low": entry_zone_low,
         "entry_zone_high": entry_zone_high,
@@ -351,6 +374,9 @@ def _trading_plan_from_row(row: Mapping[str, str]) -> TradingPlanRow:
         run_date=row.get("run_date", "").strip(),
         symbol=row.get("symbol", "").strip().upper(),
         market=row.get("market", "").strip().upper(),
+        source_status=row.get("source_status", "").strip() or "ok",
+        fallback_reason=row.get("fallback_reason", "").strip(),
+        fallback_from_date=row.get("fallback_from_date", "").strip(),
         rating=row.get("rating", "").strip(),
         entry_zone_low=_optional_decimal(row.get("entry_zone_low", "")),
         entry_zone_high=_optional_decimal(row.get("entry_zone_high", "")),
