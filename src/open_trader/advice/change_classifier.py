@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -32,6 +33,8 @@ STRING_CLASSIFICATION_FIELDS = {
     "rationale",
     "watch_trigger",
 }
+DEFAULT_CLASSIFIER_MODEL = "deepseek-v4-flash"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 CLASSIFICATION_JSON_SCHEMA = {
     "name": "premarket_change_classification",
@@ -185,10 +188,13 @@ def validate_classifier_output(raw: str) -> _ParsedClassification:
 
 
 class OpenAIClassifierClient:
-    def __init__(self, *, model: str = "gpt-5.4-mini") -> None:
+    def __init__(self, *, model: str = DEFAULT_CLASSIFIER_MODEL) -> None:
         from openai import OpenAI
 
-        self._client = OpenAI()
+        self._client = OpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url=DEEPSEEK_BASE_URL,
+        )
         self._model = model
 
     def classify(self, prompt: str, payload: dict[str, object]) -> str:
@@ -201,10 +207,7 @@ class OpenAIClassifierClient:
                     "content": json.dumps(payload, ensure_ascii=False, sort_keys=True),
                 },
             ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": CLASSIFICATION_JSON_SCHEMA,
-            },
+            response_format={"type": "json_object"},
         )
         content = response.choices[0].message.content
         if not content:

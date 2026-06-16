@@ -153,7 +153,7 @@ def test_run_premarket_main_wires_pipeline(
             "--exclude-symbols",
             "AGRZ, ARGG",
             "--classifier-model",
-            "gpt-5.4-mini",
+            "deepseek-v4-flash",
             "--dry-run",
         ]
     )
@@ -176,7 +176,7 @@ def test_run_premarket_main_wires_pipeline(
     }
     assert captured["symbol_timeout_seconds"] == 90
     assert captured["max_workers"] == 4
-    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["model"] == "deepseek-v4-flash"
 
     output = capsys.readouterr().out
     assert "eligible: 2" in output

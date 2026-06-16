@@ -42,7 +42,7 @@ class DailyPremarketConfig:
     ta_timeout_seconds: float = 600.0
     ta_max_retries: int = 2
     tradingagents_path: Path = Path("/Users/ray/projects/TradingAgents")
-    classifier_model: str = "gpt-5.4-mini"
+    classifier_model: str = "deepseek-v4-flash"
 
 
 @dataclass(frozen=True)
@@ -121,7 +121,6 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         "OPEN_TRADER_FUTU_HOST",
         "OPEN_TRADER_FUTU_PORT",
         "DEEPSEEK_API_KEY",
-        "OPENAI_API_KEY",
     ]
     missing = [key for key in required if not values.get(key)]
     if missing:
@@ -153,7 +152,7 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
             values.get("OPEN_TRADER_TRADINGAGENTS_PATH", "/Users/ray/projects/TradingAgents"),
             repo,
         ),
-        classifier_model=values.get("OPEN_TRADER_CLASSIFIER_MODEL", "gpt-5.4-mini"),
+        classifier_model=values.get("OPEN_TRADER_CLASSIFIER_MODEL", "deepseek-v4-flash"),
     )
 
 

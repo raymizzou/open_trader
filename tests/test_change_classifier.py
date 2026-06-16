@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 from open_trader.advice.change_classifier import (
     ChangeClassifier,
     InvalidClassificationError,
+    OpenAIClassifierClient,
     build_classifier_payload,
     load_prompt,
     validate_classifier_output,
@@ -198,3 +201,35 @@ def test_change_classifier_returns_error_for_malformed_client_response() -> None
     assert result.status == "error"
     assert result.include_in_report is False
     assert "summary" in result.error
+
+
+def test_openai_classifier_client_uses_deepseek_compatible_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            captured["request"] = kwargs
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str | None = None, base_url: str | None = None):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+
+    client = OpenAIClassifierClient()
+    content = client.classify("Return JSON.", {"symbol": "QQQ"})
+
+    assert content == '{"ok": true}'
+    assert captured["api_key"] == "deepseek-secret"
+    assert captured["base_url"] == "https://api.deepseek.com"
+    request = captured["request"]
+    assert request["model"] == "deepseek-v4-flash"
+    assert request["response_format"] == {"type": "json_object"}

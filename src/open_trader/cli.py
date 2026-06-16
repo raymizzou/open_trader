@@ -221,8 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     premarket_parser.add_argument(
         "--classifier-model",
-        default="gpt-5.4-mini",
-        help="OpenAI model for change classification",
+        default="deepseek-v4-flash",
+        help="DeepSeek model for change classification",
     )
     premarket_parser.add_argument(
         "--max-workers",

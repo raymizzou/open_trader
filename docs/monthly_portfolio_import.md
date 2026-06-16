@@ -233,7 +233,7 @@ Copy the local env template:
 cp config/daily_premarket.env.example config/daily_premarket.env
 ```
 
-Fill in local paths and API keys in `config/daily_premarket.env`. Do not commit
+Fill in local paths and the DeepSeek API key in `config/daily_premarket.env`. Do not commit
 the real env file.
 
 Run one manual dry run:

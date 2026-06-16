@@ -38,7 +38,6 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "OPEN_TRADER_FUTU_HOST=127.0.0.1",
                 "OPEN_TRADER_FUTU_PORT=11111",
                 "DEEPSEEK_API_KEY=secret",
-                "OPENAI_API_KEY=secret",
             ]
         ),
         encoding="utf-8",
@@ -52,6 +51,7 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.deadline == "21:10"
     assert config.futu_host == "127.0.0.1"
     assert config.futu_port == 11111
+    assert config.classifier_model == "deepseek-v4-flash"
 
 
 def test_load_env_config_rejects_missing_required_values(tmp_path: Path) -> None:
@@ -63,7 +63,8 @@ def test_load_env_config_rejects_missing_required_values(tmp_path: Path) -> None
     message = str(exc_info.value)
     assert message.startswith("missing config value(s):")
     assert "OPEN_TRADER_PYTHON" in message
-    assert "OPENAI_API_KEY" in message
+    assert "DEEPSEEK_API_KEY" in message
+    assert "OPENAI_API_KEY" not in message
 
 
 def test_run_lock_rejects_second_owner(tmp_path: Path) -> None:
@@ -1081,9 +1082,9 @@ def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
         "OPEN_TRADER_FUTU_HOST",
         "OPEN_TRADER_FUTU_PORT",
         "DEEPSEEK_API_KEY",
-        "OPENAI_API_KEY",
     ]:
         assert key in example
+    assert "OPENAI_API_KEY" not in example
     assert "sk-" not in example
 
 
