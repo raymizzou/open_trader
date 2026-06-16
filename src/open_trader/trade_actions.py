@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+import re
 from types import MappingProxyType
 from typing import Mapping
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
-TRADE_ACTION_FIELDNAMES = [
+TRADE_ACTION_FIELDNAMES = (
     "run_date",
     "symbol",
     "market",
@@ -30,9 +31,9 @@ TRADE_ACTION_FIELDNAMES = [
     "source_plan",
     "status",
     "error",
-]
+)
 
-PORTFOLIO_REQUIRED_FIELDNAMES = [
+PORTFOLIO_REQUIRED_FIELDNAMES = (
     "market",
     "asset_class",
     "symbol",
@@ -42,7 +43,12 @@ PORTFOLIO_REQUIRED_FIELDNAMES = [
     "fx_to_hkd",
     "market_value_hkd",
     "portfolio_weight_hkd",
-]
+)
+
+
+_GROUPED_DECIMAL_WITH_OPTIONAL_SIGN_PATTERN = re.compile(
+    r"^[+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -140,11 +146,18 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
 
 
 def _optional_decimal(value: str) -> Decimal | None:
-    value = value.strip().replace(",", "")
+    value = value.strip()
     if not value:
         return None
+
+    if "," in value and not _GROUPED_DECIMAL_WITH_OPTIONAL_SIGN_PATTERN.fullmatch(value):
+        return None
+
+    parsed_value = value.replace(",", "")
+    if not parsed_value:
+        return None
     try:
-        parsed = Decimal(value)
+        parsed = Decimal(parsed_value)
     except (InvalidOperation, ValueError):
         return None
     return parsed if parsed.is_finite() else None

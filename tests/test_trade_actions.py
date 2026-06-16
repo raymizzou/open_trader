@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import FrozenInstanceError
 import pytest
 from decimal import Decimal
 from pathlib import Path
@@ -50,7 +51,7 @@ def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 def test_trade_action_fieldnames_are_stable() -> None:
-    assert TRADE_ACTION_FIELDNAMES == [
+    assert TRADE_ACTION_FIELDNAMES == (
         "run_date",
         "symbol",
         "market",
@@ -72,7 +73,7 @@ def test_trade_action_fieldnames_are_stable() -> None:
         "source_plan",
         "status",
         "error",
-    ]
+    )
 
 
 def test_load_portfolio_action_context_indexes_positions_cash_and_total_value(
@@ -203,6 +204,9 @@ def test_load_portfolio_action_context_is_immutable(tmp_path: Path) -> None:
 
     with pytest.raises(TypeError):
         context.cash_by_currency["USD"] = Decimal("1")
+
+    with pytest.raises((TypeError, FrozenInstanceError)):
+        context.positions[("US", "MSFT")].quantity = Decimal("20")
 
 
 def test_load_portfolio_action_context_rejects_missing_required_columns(tmp_path: Path) -> None:
@@ -612,6 +616,91 @@ def test_load_portfolio_action_context_falls_back_to_zero_for_invalid_position_v
             weight=Decimal("0"),
             fx_to_hkd=Decimal("0"),
         )
+    }
+
+
+def test_load_portfolio_action_context_parses_grouped_numbers_and_falls_back_for_invalid_grouping(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "GOOD",
+            "name": "Good",
+            "currency": "USD",
+            "total_quantity": "1,234",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "12,345,678.90",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "30.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7,800",
+            "market_value_hkd": "10,000.00",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "1.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "GOOD",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "BAD",
+            "name": "Bad",
+            "currency": "USD",
+            "total_quantity": "12,34",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "1,2,3",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "30.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7,8",
+            "market_value_hkd": "10,000",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "BAD",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+
+    context = load_portfolio_action_context(path)
+
+    assert context.positions == {
+        ("US", "GOOD"): PortfolioPositionSnapshot(
+            currency="USD",
+            quantity=Decimal("1234"),
+            market_value=Decimal("12345678.90"),
+            market_value_hkd=Decimal("10000.00"),
+            weight=Decimal("0.01"),
+            fx_to_hkd=Decimal("7800"),
+        ),
+        ("US", "BAD"): PortfolioPositionSnapshot(
+            currency="USD",
+            quantity=Decimal("0"),
+            market_value=Decimal("0"),
+            market_value_hkd=Decimal("10000"),
+            weight=Decimal("0"),
+            fx_to_hkd=Decimal("0"),
+        ),
     }
 
 
