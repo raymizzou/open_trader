@@ -187,6 +187,197 @@ def test_load_portfolio_action_context_rejects_missing_required_columns(tmp_path
         load_portfolio_action_context(path)
 
 
+def test_load_portfolio_action_context_rejects_blank_or_duplicate_portfolio_columns(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    malformed_headers = [
+        "market",
+        "asset_class",
+        "",
+        "currency",
+        "symbol",
+        "symbol",
+        "total_quantity",
+        "market_value",
+        "fx_to_hkd",
+        "market_value_hkd",
+        "portfolio_weight_hkd",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(",".join(malformed_headers) + "\n")
+
+    with pytest.raises(ValueError, match=r"portfolio column names must not be blank"):
+        load_portfolio_action_context(path)
+
+
+def test_load_portfolio_action_context_aggregates_same_currency_cash_rows(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "5",
+            "market": "CASH",
+            "asset_class": "cash",
+            "symbol": "USD_CASH",
+            "name": "USD Cash",
+            "currency": "USD",
+            "total_quantity": "1",
+            "avg_cost_price": "",
+            "last_price": "",
+            "market_value": "1000",
+            "cost_value": "",
+            "unrealized_pnl": "",
+            "unrealized_pnl_pct": "",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "7800",
+            "cost_value_hkd": "",
+            "portfolio_weight_hkd": "0.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "false",
+            "analysis_symbol": "",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+        {
+            "sort_group": "5",
+            "market": "CASH",
+            "asset_class": "cash",
+            "symbol": "USD_CASH2",
+            "name": "USD Cash2",
+            "currency": "USD",
+            "total_quantity": "1",
+            "avg_cost_price": "",
+            "last_price": "",
+            "market_value": "2000",
+            "cost_value": "",
+            "unrealized_pnl": "",
+            "unrealized_pnl_pct": "",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "15600",
+            "cost_value_hkd": "",
+            "portfolio_weight_hkd": "0.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "false",
+            "analysis_symbol": "",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+
+    context = load_portfolio_action_context(path)
+
+    assert context.cash_by_currency == {"USD": Decimal("3000")}
+
+
+def test_load_portfolio_action_context_skips_non_cash_rows_with_missing_keys(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "",
+            "asset_class": "stock",
+            "symbol": "MISSING_MARKET",
+            "name": "No Market",
+            "currency": "USD",
+            "total_quantity": "1",
+            "avg_cost_price": "",
+            "last_price": "",
+            "market_value": "100",
+            "cost_value": "",
+            "unrealized_pnl": "",
+            "unrealized_pnl_pct": "",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "780",
+            "cost_value_hkd": "",
+            "portfolio_weight_hkd": "0.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "MISSING_MARKET",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "",
+            "name": "No Symbol",
+            "currency": "USD",
+            "total_quantity": "1",
+            "avg_cost_price": "",
+            "last_price": "",
+            "market_value": "100",
+            "cost_value": "",
+            "unrealized_pnl": "",
+            "unrealized_pnl_pct": "",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "780",
+            "cost_value_hkd": "",
+            "portfolio_weight_hkd": "0.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "GOOD",
+            "name": "Good Row",
+            "currency": "USD",
+            "total_quantity": "2",
+            "avg_cost_price": "200",
+            "last_price": "100",
+            "market_value": "200",
+            "cost_value": "200",
+            "unrealized_pnl": "0",
+            "unrealized_pnl_pct": "0.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "1560",
+            "cost_value_hkd": "1560",
+            "portfolio_weight_hkd": "1.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "GOOD",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+
+    context = load_portfolio_action_context(path)
+
+    assert context.positions == {
+        ("US", "GOOD"): {
+            "currency": "USD",
+            "quantity": Decimal("2"),
+            "market_value": Decimal("200"),
+            "market_value_hkd": Decimal("1560"),
+            "weight": Decimal("0.01"),
+            "fx_to_hkd": Decimal("7.8"),
+        }
+    }
+
+
 def test_load_portfolio_action_context_accepts_utf8_sig_input(tmp_path: Path) -> None:
     path = tmp_path / "portfolio.csv"
     write_portfolio(path, [

@@ -54,6 +54,22 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
     with portfolio_path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fieldnames = reader.fieldnames or []
+        blank_columns = [name for name in fieldnames if not (name or "").strip()]
+        if blank_columns:
+            raise ValueError("portfolio column names must not be blank")
+
+        duplicate_columns = sorted(
+            {
+                name
+                for name in fieldnames
+                if fieldnames.count(name) > 1
+            }
+        )
+        if duplicate_columns:
+            raise ValueError(
+                f"duplicate portfolio column(s): {', '.join(duplicate_columns)}"
+            )
+
         missing = sorted(set(PORTFOLIO_REQUIRED_FIELDNAMES) - set(fieldnames))
         if missing:
             raise ValueError(f"missing portfolio column(s): {', '.join(missing)}")
