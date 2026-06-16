@@ -270,7 +270,59 @@ Daily outputs:
 data/runs/<YYYY-MM-DD>/daily_run_status.json
 reports/daily_runs/<YYYY-MM-DD>.md
 logs/daily_premarket/<YYYY-MM-DD>.log
+data/runs/<YYYY-MM-DD>/trade_actions.csv
+reports/trade_actions/<YYYY-MM-DD>.md
 ```
+
+## WeCom Notifications
+
+To send the daily report to Enterprise WeChat, create a group robot and add the
+webhook to the local env file:
+
+```bash
+OPEN_TRADER_NOTIFIERS=wecom,macos
+OPEN_TRADER_WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...
+OPEN_TRADER_WECOM_MESSAGE_FORMAT=markdown
+OPEN_TRADER_NOTIFY_DAILY_REPORT=1
+OPEN_TRADER_NOTIFY_ACTION_TRIGGERS=1
+```
+
+Do not commit the real webhook URL. `run-daily-premarket --dry-run` renders and
+writes dated artifacts but does not send the WeCom webhook.
+
+After the daily run has produced `trading_plan.csv` and `trade_actions.csv`, test
+one trigger-check pass:
+
+```bash
+.venv/bin/python -m open_trader watch-actions \
+  --date today \
+  --plan data/latest/trading_plan.csv \
+  --actions data/latest/trade_actions.csv \
+  --data-dir data \
+  --reports-dir reports \
+  --once
+```
+
+To keep watching during market hours, omit `--once`:
+
+```bash
+.venv/bin/python -m open_trader watch-actions \
+  --date today \
+  --plan data/latest/trading_plan.csv \
+  --actions data/latest/trade_actions.csv \
+  --data-dir data \
+  --reports-dir reports \
+  --poll-seconds 30
+```
+
+The watcher writes same-day silence state to:
+
+```text
+data/runs/<YYYY-MM-DD>/notification_state.json
+```
+
+Each `(run_date, futu_symbol, trigger_status)` is sent at most once per day. A
+later different trigger for the same symbol can still notify once.
 
 To uninstall:
 
