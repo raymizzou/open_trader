@@ -999,6 +999,7 @@ def test_buy_action_is_review_when_budget_is_below_one_share() -> None:
     assert row["status"] == "review"
     assert row["suggested_quantity"] == ""
     assert "below one share" in row["error"]
+    assert row["reason"] == row["error"]
 
 
 def test_buy_action_is_review_when_same_currency_cash_is_zero() -> None:
@@ -1012,6 +1013,7 @@ def test_buy_action_is_review_when_same_currency_cash_is_zero() -> None:
     assert row["action"] == "REVIEW"
     assert row["status"] == "review"
     assert "same-currency cash" in row["error"]
+    assert row["reason"] == row["error"]
 
 
 def test_add_action_defaults_to_40_percent_when_plan_ratio_is_missing() -> None:
@@ -1056,6 +1058,20 @@ def test_buy_action_uses_remaining_target_budget_as_binding_cap() -> None:
     assert row["suggested_notional"] == "780"
 
 
+def test_buy_action_is_review_when_no_remaining_target_budget() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(max_weight="3%"),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio_context(cash="20000"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "no remaining target budget" in row["error"]
+    assert row["reason"] == row["error"]
+
+
 def test_add_action_uses_remaining_target_budget_as_binding_cap() -> None:
     row = build_trade_action_row(
         plan=active_plan(max_weight="5%", plan_text="操作计划：350美元附近加仓。"),
@@ -1087,6 +1103,38 @@ def test_stop_loss_sells_full_position() -> None:
     assert row["stop_price"] == "340"
 
 
+def test_stop_loss_missing_position_is_review() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("stop_loss_hit", price="339"),
+        portfolio=PortfolioActionContext(
+            positions={},
+            cash_by_currency={"USD": Decimal("1000")},
+            total_market_value_hkd=Decimal("780000"),
+        ),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "missing portfolio position" in row["error"]
+    assert row["reason"] == row["error"]
+
+
+def test_trim_with_quantity_below_one_share_is_review() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("target_1_hit", price="451"),
+        portfolio=portfolio_context(quantity="1"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "below one share" in row["error"]
+    assert row["reason"] == row["error"]
+
+
 def test_target_one_trims_half_position() -> None:
     row = build_trade_action_row(
         plan=active_plan(),
@@ -1097,6 +1145,7 @@ def test_target_one_trims_half_position() -> None:
 
     assert row["action"] == "TRIM"
     assert row["status"] == "ready"
+    assert row["limit_price"] == "451"
     assert row["suggested_quantity"] == "4"
     assert row["suggested_notional"] == "1804"
 
@@ -1111,6 +1160,7 @@ def test_target_two_takes_profit_on_full_position() -> None:
 
     assert row["action"] == "TAKE_PROFIT"
     assert row["status"] == "ready"
+    assert row["limit_price"] == "501"
     assert row["suggested_quantity"] == "9"
     assert row["suggested_notional"] == "4509"
 
@@ -1158,6 +1208,7 @@ def test_buy_side_missing_portfolio_position_maps_to_review() -> None:
     assert row["action"] == "REVIEW"
     assert row["status"] == "review"
     assert "missing portfolio position" in row["error"]
+    assert row["reason"] == row["error"]
 
 
 def test_buy_side_unparseable_target_max_weight_maps_to_review() -> None:
@@ -1171,3 +1222,4 @@ def test_buy_side_unparseable_target_max_weight_maps_to_review() -> None:
     assert row["action"] == "REVIEW"
     assert row["status"] == "review"
     assert "target max weight" in row["error"]
+    assert row["reason"] == row["error"]

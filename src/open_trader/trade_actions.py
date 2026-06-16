@@ -302,6 +302,8 @@ def _size_buy_action_row(
     )
     target_budget = portfolio_value_in_symbol_currency * target_max_weight
     remaining_target_budget = target_budget - position.market_value
+    if remaining_target_budget <= 0:
+        return _review_row(row, "no remaining target budget")
     plan_ratio = _plan_ratio(plan.plan_text, action)
     plan_budget = target_budget * plan_ratio
     suggested_notional_budget = min(
@@ -326,6 +328,7 @@ def _size_buy_action_row(
 def _review_row(row: dict[str, str], error: str) -> dict[str, str]:
     row["action"] = "REVIEW"
     row["priority"] = "medium"
+    row["reason"] = error
     row["status"] = "review"
     row["error"] = error
     return row
