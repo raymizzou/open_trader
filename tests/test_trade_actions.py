@@ -980,7 +980,7 @@ def test_buy_action_uses_plan_ratio_target_cap_and_cash_cap() -> None:
 
     assert row["action"] == "BUY"
     assert row["status"] == "ready"
-    assert row["suggested_notional"] == "1000"
+    assert row["suggested_notional"] == "780"
     assert row["suggested_quantity"] == "2"
     assert row["cash_available"] == "1000"
     assert row["limit_price"] == "390"

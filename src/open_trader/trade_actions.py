@@ -315,10 +315,7 @@ def _size_buy_action_row(
     executable_notional = quantity * quote_status.last_price
     row["limit_price"] = _decimal_to_text(quote_status.last_price)
     row["suggested_quantity"] = _decimal_to_text(quantity)
-    if suggested_notional_budget == cash_available:
-        row["suggested_notional"] = _decimal_to_text(suggested_notional_budget)
-    else:
-        row["suggested_notional"] = _decimal_to_text(executable_notional)
+    row["suggested_notional"] = _decimal_to_text(executable_notional)
     row["status"] = "ready"
     return row
 
