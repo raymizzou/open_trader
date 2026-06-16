@@ -54,6 +54,15 @@ class DailyRunResult:
     log_path: Path
 
 
+@dataclass
+class _LatestPromotion:
+    source_path: Path
+    latest_path: Path
+    temp_path: Path | None = None
+    backup_path: Path | None = None
+    latest_replaced: bool = False
+
+
 class RunLock:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -266,9 +275,12 @@ class DailyPremarketRunner:
         latest_actions_path = self.config.data_dir / "latest" / "premarket_actions.csv"
         latest_plan_path = self.config.data_dir / "latest" / "trading_plan.csv"
         if not self.config.dry_run:
-            _promote_latest(advice_path, latest_advice_path)
-            _promote_latest(actions_path, latest_actions_path)
-            _promote_latest(plan_result.plan_path, latest_plan_path)
+            _promote_latest_set(
+                advice_path=advice_path,
+                actions_path=actions_path,
+                plan_path=plan_result.plan_path,
+                data_dir=self.config.data_dir,
+            )
 
         artifacts = {
             "advice": str(advice_path),
@@ -566,26 +578,110 @@ def _validate_run_date(run_date: str) -> None:
         raise ValueError("run_date must be YYYY-MM-DD")
 
 
-def _promote_latest(source_path: Path, latest_path: Path) -> None:
-    latest_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: Path | None = None
+def _promote_latest_set(
+    *,
+    advice_path: Path,
+    actions_path: Path,
+    plan_path: Path,
+    data_dir: Path,
+) -> None:
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    promotions = [
+        _LatestPromotion(
+            source_path=advice_path,
+            latest_path=latest_dir / "trading_advice.csv",
+        ),
+        _LatestPromotion(
+            source_path=actions_path,
+            latest_path=latest_dir / "premarket_actions.csv",
+        ),
+        _LatestPromotion(
+            source_path=plan_path,
+            latest_path=latest_dir / "trading_plan.csv",
+        ),
+    ]
+
     try:
-        with tempfile.NamedTemporaryFile(
-            "wb",
-            delete=False,
-            dir=latest_path.parent,
-            prefix=f".{latest_path.name}.",
-        ) as temp_handle:
-            temp_path = Path(temp_handle.name)
-            with source_path.open("rb") as source_handle:
-                shutil.copyfileobj(source_handle, temp_handle)
-        temp_path.replace(latest_path)
+        for promotion in promotions:
+            promotion.temp_path = _copy_latest_temp(
+                source_path=promotion.source_path,
+                latest_path=promotion.latest_path,
+            )
+
+        for promotion in promotions:
+            if promotion.latest_path.exists():
+                promotion.backup_path = _make_backup_latest_path(
+                    promotion.latest_path
+                )
+                promotion.latest_path.rename(promotion.backup_path)
+            if promotion.temp_path is None:
+                raise RuntimeError("latest promotion temp path was not staged")
+            _replace_latest_path(promotion.temp_path, promotion.latest_path)
+            promotion.latest_replaced = True
+            promotion.temp_path = None
+    except Exception:
+        _restore_latest_promotions(promotions)
+        raise
+    else:
+        for promotion in promotions:
+            if promotion.backup_path is not None and promotion.backup_path.exists():
+                _best_effort_unlink(promotion.backup_path)
     finally:
-        if temp_path is not None:
+        for promotion in promotions:
+            if promotion.temp_path is not None and promotion.temp_path.exists():
+                _best_effort_unlink(promotion.temp_path)
+
+
+def _copy_latest_temp(*, source_path: Path, latest_path: Path) -> Path:
+    with tempfile.NamedTemporaryFile(
+        "wb",
+        dir=latest_path.parent,
+        prefix=f".{latest_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+        with source_path.open("rb") as source:
+            shutil.copyfileobj(source, handle)
+    return temp_path
+
+
+def _make_backup_latest_path(latest_path: Path) -> Path:
+    with tempfile.NamedTemporaryFile(
+        "wb",
+        dir=latest_path.parent,
+        prefix=f".{latest_path.name}.",
+        suffix=".backup",
+        delete=False,
+    ) as handle:
+        backup_path = Path(handle.name)
+    backup_path.unlink()
+    return backup_path
+
+
+def _replace_latest_path(source_path: Path, latest_path: Path) -> None:
+    source_path.replace(latest_path)
+
+
+def _restore_latest_promotions(promotions: list[_LatestPromotion]) -> None:
+    for promotion in reversed(promotions):
+        if promotion.backup_path is not None and promotion.backup_path.exists():
+            if promotion.latest_path.exists():
+                _best_effort_unlink(promotion.latest_path)
             try:
-                temp_path.unlink()
-            except FileNotFoundError:
+                promotion.backup_path.rename(promotion.latest_path)
+            except Exception:
                 pass
+        elif promotion.latest_replaced and promotion.latest_path.exists():
+            _best_effort_unlink(promotion.latest_path)
+
+
+def _best_effort_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except Exception:
+        pass
 
 
 def _deadline_reached(config: DailyPremarketConfig) -> Callable[[], bool]:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import open_trader.daily_premarket as daily_premarket
 from open_trader.daily_premarket import (
     DailyPremarketConfig,
     DailyPremarketRunner,
@@ -395,6 +396,70 @@ def test_daily_runner_does_not_promote_latest_when_plan_build_fails(
     assert (latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
         "old actions\n"
     )
+
+
+def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    latest_dir = tmp_path / "data/latest"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
+    (latest_dir / "premarket_actions.csv").write_text(
+        "old actions\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+
+    def fail_on_actions_replace(source_path: Path, latest_path: Path) -> None:
+        if latest_path.name == "premarket_actions.csv":
+            raise RuntimeError("replace failed")
+        source_path.replace(latest_path)
+
+    monkeypatch.setattr(
+        daily_premarket,
+        "_replace_latest_path",
+        fail_on_actions_replace,
+        raising=False,
+    )
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "failed"
+    assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "old advice\n"
+    )
+    assert (latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
+        "old actions\n"
+    )
+    assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
+        "old plan\n"
+    )
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "failed"
+    assert "replace failed" in status["error"]
 
 
 def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None:
