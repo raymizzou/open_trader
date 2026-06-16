@@ -1103,6 +1103,39 @@ def test_launchd_installer_resolves_relative_python_under_repo(
     assert "<string>.venv/bin/python</string>" not in result.stdout
 
 
+def test_launchd_installer_uses_last_duplicate_env_values_like_runtime_parser(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    first_repo = tmp_path / "first_repo"
+    second_repo = tmp_path / "second_repo"
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={first_repo}",
+                f"OPEN_TRADER_PYTHON={first_repo / '.venv/bin/python'}",
+                f"OPEN_TRADER_REPO={second_repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    assert str(first_repo) not in result.stdout
+    assert f"<string>{second_repo}</string>" in result.stdout
+    assert f"<string>{second_repo}/.venv/bin/python</string>" in result.stdout
+
+
 def test_launchd_installer_rejects_export_syntax_like_runtime_parser(
     tmp_path: Path,
 ) -> None:
