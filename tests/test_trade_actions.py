@@ -1185,6 +1185,12 @@ def test_sell_side_invalid_last_price_is_review(trigger_status: str) -> None:
     assert row["reason"] == row["error"]
     assert row["suggested_quantity"] == ""
     assert row["suggested_notional"] == ""
+    if trigger_status == "stop_loss_hit":
+        assert row["priority"] == "critical"
+    elif trigger_status == "target_2_hit":
+        assert row["priority"] == "high"
+    else:
+        assert row["priority"] == "medium"
 
 
 def test_stop_loss_missing_position_is_review() -> None:
@@ -1295,6 +1301,7 @@ def test_buy_side_missing_portfolio_position_maps_to_review() -> None:
 
     assert row["action"] == "REVIEW"
     assert row["status"] == "review"
+    assert row["priority"] == "high"
     assert "missing portfolio position" in row["error"]
     assert row["reason"] == row["error"]
     assert row["limit_price"] == ""

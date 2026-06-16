@@ -338,7 +338,6 @@ def _size_buy_action_row(
 
 def _review_row(row: dict[str, str], error: str) -> dict[str, str]:
     row["action"] = "REVIEW"
-    row["priority"] = "medium"
     row["reason"] = error
     row["status"] = "review"
     row["error"] = error
