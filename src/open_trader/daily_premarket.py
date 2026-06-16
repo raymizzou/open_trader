@@ -166,17 +166,37 @@ class DailyPremarketRunner:
         status_path = self.config.data_dir / "runs" / run_date / "daily_run_status.json"
         report_path = self.config.reports_dir / "daily_runs" / f"{run_date}.md"
         log_path = self.config.logs_dir / "daily_premarket" / f"{run_date}.log"
+        lock_log_path = self.config.logs_dir / "daily_premarket" / f"{run_date}.lock.log"
         lock_path = self.config.data_dir / "runs" / ".daily_premarket.lock"
         try:
             with RunLock(lock_path):
-                return self._run_locked(
+                try:
+                    return self._run_locked(
+                        run_date=run_date,
+                        started_at=started_at,
+                        status_path=status_path,
+                        report_path=report_path,
+                        log_path=log_path,
+                    )
+                except Exception as exc:
+                    return self._write_failure(
+                        run_date=run_date,
+                        started_at=started_at,
+                        status_path=status_path,
+                        report_path=report_path,
+                        log_path=log_path,
+                        error=str(exc),
+                    )
+        except RuntimeError as exc:
+            if str(exc) == "daily premarket run already active":
+                return self._write_already_running(
                     run_date=run_date,
                     started_at=started_at,
                     status_path=status_path,
                     report_path=report_path,
-                    log_path=log_path,
+                    log_path=lock_log_path,
+                    error=str(exc),
                 )
-        except Exception as exc:
             return self._write_failure(
                 run_date=run_date,
                 started_at=started_at,
@@ -231,6 +251,7 @@ class DailyPremarketRunner:
             or advice_counts["error"]
             or plan_counts["fallback"]
             or plan_counts["error"]
+            or int(futu_status.get("missing", 0)) > 0
             or futu_status["error"]
             else "success"
         )
@@ -412,7 +433,14 @@ class DailyPremarketRunner:
             "deadline_at": _deadline_at(self.config).isoformat(),
             "status": "failed",
             "error": error,
-            "premarket": {"ok": 0, "fallback": 0, "error": 0},
+            "premarket": {
+                "eligible": 0,
+                "advice": 0,
+                "actions": 0,
+                "ok": 0,
+                "fallback": 0,
+                "error": 0,
+            },
             "trading_plan": {"active": 0, "fallback": 0, "error": 0},
             "futu_plan_check": {
                 "checked": 0,
@@ -443,6 +471,33 @@ class DailyPremarketRunner:
         return DailyRunResult(
             run_date=run_date,
             status="failed",
+            status_path=status_path,
+            report_path=report_path,
+            log_path=log_path,
+        )
+
+    def _write_already_running(
+        self,
+        *,
+        run_date: str,
+        started_at: datetime,
+        status_path: Path,
+        report_path: Path,
+        log_path: Path,
+        error: str,
+    ) -> DailyRunResult:
+        payload = {
+            "run_date": run_date,
+            "started_at": started_at.isoformat(),
+            "status": "already_running",
+            "error": error,
+            "status_path": str(status_path),
+            "report_path": str(report_path),
+        }
+        _write_text(log_path, json.dumps(payload, ensure_ascii=False) + "\n")
+        return DailyRunResult(
+            run_date=run_date,
+            status="already_running",
             status_path=status_path,
             report_path=report_path,
             log_path=log_path,

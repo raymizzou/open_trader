@@ -242,6 +242,50 @@ def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
     assert (tmp_path / "reports/daily_runs/2026-06-17.md").exists()
 
 
+def test_daily_runner_lock_contention_does_not_overwrite_run_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    status_path = tmp_path / "data/runs/2026-06-17/daily_run_status.json"
+    report_path = tmp_path / "reports/daily_runs/2026-06-17.md"
+    log_path = tmp_path / "logs/daily_premarket/2026-06-17.log"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text('{"status": "active"}\n', encoding="utf-8")
+    report_path.write_text("# active run\n", encoding="utf-8")
+    log_path.write_text('{"status": "active"}\n', encoding="utf-8")
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    with RunLock(config.data_dir / "runs" / ".daily_premarket.lock"):
+        result = runner.run("2026-06-17")
+
+    assert result.status == "already_running"
+    assert status_path.read_text(encoding="utf-8") == '{"status": "active"}\n'
+    assert report_path.read_text(encoding="utf-8") == "# active run\n"
+    assert log_path.read_text(encoding="utf-8") == '{"status": "active"}\n'
+    assert result.log_path == tmp_path / "logs/daily_premarket/2026-06-17.lock.log"
+
+
 class UnavailableQuoteClient:
     def __init__(self, *, host: str, port: int) -> None:
         raise FutuQuoteError("Futu OpenD is not reachable")
@@ -283,6 +327,58 @@ def test_daily_runner_marks_partial_when_futu_is_unavailable(tmp_path: Path) -> 
     assert status["futu_plan_check"]["error"] == "Futu OpenD is not reachable"
 
 
+class MissingQuoteClient:
+    def __init__(self, *, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+
+    def get_snapshots(self, futu_symbols: list[str]) -> dict[str, QuoteSnapshot]:
+        assert futu_symbols == ["US.MSFT"]
+        return {}
+
+    def close(self) -> None:
+        pass
+
+
+def test_daily_runner_marks_partial_when_futu_quote_is_missing(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=MissingQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "partial"
+    status = json.loads(
+        (tmp_path / "data/runs/2026-06-17/daily_run_status.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert status["status"] == "partial"
+    assert status["futu_plan_check"]["missing"] == 1
+
+
 def test_daily_runner_writes_failed_status_when_portfolio_is_missing(
     tmp_path: Path,
 ) -> None:
@@ -314,3 +410,6 @@ def test_daily_runner_writes_failed_status_when_portfolio_is_missing(
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["status"] == "failed"
     assert "portfolio not found" in status["error"]
+    assert status["premarket"]["eligible"] == 0
+    assert status["premarket"]["advice"] == 0
+    assert status["premarket"]["actions"] == 0
