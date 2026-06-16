@@ -220,3 +220,71 @@ quote US.<SYMBOL> last_price=...
 ```
 
 To keep watching until interrupted, omit `--once`.
+
+## Daily Premarket Automation
+
+The automated daily workflow is designed for a Mac that stays online with Futu
+OpenD logged in. During development it can run on the Mac Air; the same setup
+can later move to the Mac mini.
+
+Copy the local env template:
+
+```bash
+cp config/daily_premarket.env.example config/daily_premarket.env
+```
+
+Fill in local paths and API keys in `config/daily_premarket.env`. Do not commit
+the real env file.
+
+Run one manual dry run:
+
+```bash
+.venv/bin/python -m open_trader run-daily-premarket \
+  --date today \
+  --config config/daily_premarket.env \
+  --dry-run
+```
+
+Run one real manual check with Futu OpenD connected:
+
+```bash
+.venv/bin/python -m open_trader run-daily-premarket \
+  --date today \
+  --config config/daily_premarket.env
+```
+
+Install the launchd job:
+
+```bash
+scripts/install_daily_premarket_launchd.sh
+```
+
+The job runs Monday through Friday at 18:30 Asia/Shanghai. The daily runner uses
+21:10 Asia/Shanghai as the hard deadline. If a symbol has no fresh advice by the
+deadline, the runner reuses the latest prior successful advice for that symbol
+and marks the row as `fallback`.
+
+Daily outputs:
+
+```text
+data/runs/<YYYY-MM-DD>/daily_run_status.json
+reports/daily_runs/<YYYY-MM-DD>.md
+logs/daily_premarket/<YYYY-MM-DD>.log
+```
+
+To uninstall:
+
+```bash
+scripts/uninstall_daily_premarket_launchd.sh
+```
+
+Mac mini migration checklist:
+
+1. Clone or copy this repo.
+2. Recreate `.venv` and install dependencies.
+3. Install and log in to Futu OpenD.
+4. Confirm `check-futu-plan` can connect to `127.0.0.1:11111`.
+5. Fill `config/daily_premarket.env`.
+6. Run `run-daily-premarket --dry-run`.
+7. Run one real manual `run-daily-premarket`.
+8. Install launchd.
