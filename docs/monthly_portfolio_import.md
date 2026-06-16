@@ -87,6 +87,22 @@ Each row in `trading_advice.csv` keeps the raw TradingAgents response in
 rating, action plan, risk control, position sizing, catalyst, price target, time
 window, and rationale.
 
+Convert those summaries into a machine-readable trading plan:
+
+```bash
+.venv/bin/python -m open_trader build-trading-plan \
+  --advice data/latest/trading_advice.csv \
+  --data-dir data \
+  --date 2026-06-16
+```
+
+Run output:
+
+```text
+data/runs/<YYYY-MM-DD>/trading_plan.csv
+data/latest/trading_plan.csv
+```
+
 ## Build Watchlist
 
 After the premarket run creates `data/latest/premarket_actions.csv`, convert it
@@ -142,6 +158,16 @@ To verify the current portfolio quote universe first, run:
 
 This reads portfolio rows, excludes cash and money market funds, and fetches one
 snapshot for each remaining quoteable Futu symbol.
+
+To compare live quotes against the structured trader plan, run:
+
+```bash
+.venv/bin/python -m open_trader check-futu-plan \
+  --plan data/latest/trading_plan.csv
+```
+
+This reports whether each live quote is in the entry zone, near the add price,
+at a stop loss, at a target, or only on watch.
 
 ```bash
 .venv/bin/python -m open_trader watch-futu \

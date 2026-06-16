@@ -17,6 +17,11 @@ from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
 from .pipeline import run_import, validate_month
+from .trading_plan import (
+    build_trading_plan,
+    evaluate_plan_quote,
+    load_trading_plan_rows,
+)
 from .watchlist import build_watchlist
 
 
@@ -242,6 +247,35 @@ def build_parser() -> argparse.ArgumentParser:
     check_futu_quotes_parser.add_argument("--host", default="127.0.0.1")
     check_futu_quotes_parser.add_argument("--port", type=positive_int, default=11111)
 
+    trading_plan_parser = subparsers.add_parser(
+        "build-trading-plan",
+        help="Convert trading_advice.csv into structured trading_plan.csv",
+    )
+    trading_plan_parser.add_argument(
+        "--advice",
+        type=Path,
+        default=Path("data/latest/trading_advice.csv"),
+    )
+    trading_plan_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    trading_plan_parser.add_argument("--date", type=canonical_date)
+    trading_plan_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write run output but do not update latest trading plan",
+    )
+
+    check_futu_plan_parser = subparsers.add_parser(
+        "check-futu-plan",
+        help="Evaluate live Futu quotes against trading_plan.csv",
+    )
+    check_futu_plan_parser.add_argument(
+        "--plan",
+        type=Path,
+        default=Path("data/latest/trading_plan.csv"),
+    )
+    check_futu_plan_parser.add_argument("--host", default="127.0.0.1")
+    check_futu_plan_parser.add_argument("--port", type=positive_int, default=11111)
+
     return parser
 
 
@@ -386,6 +420,49 @@ def main(argv: list[str] | None = None) -> int:
         print(f"quotes: {quote_count}")
         print(f"missing: {missing_count}")
         print(f"skipped: {len(universe.skipped)}")
+        return 0
+
+    if args.command == "build-trading-plan":
+        try:
+            result = build_trading_plan(
+                advice_path=args.advice,
+                data_dir=args.data_dir,
+                run_date=args.date,
+                update_latest=not args.dry_run,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            parser.error(str(exc))
+        print(f"run_date: {result.run_date}")
+        print(f"plans: {result.plan_count}")
+        print(f"plan_csv: {result.plan_path}")
+        print(f"latest: {result.latest_path}")
+        return 0
+
+    if args.command == "check-futu-plan":
+        quote_client = None
+        try:
+            plans = [plan for plan in load_trading_plan_rows(args.plan) if plan.status == "active"]
+            quote_client = FutuQuoteClient(host=args.host, port=args.port)
+            print(f"connected to Futu OpenD at {args.host}:{args.port}")
+            print(f"loaded {len(plans)} active trading plan(s)")
+            symbols = sorted({plan.futu_symbol for plan in plans})
+            snapshots = quote_client.get_snapshots(symbols) if symbols else {}
+            plans_by_symbol = {plan.futu_symbol: plan for plan in plans}
+            for futu_symbol in symbols:
+                quote = snapshots.get(futu_symbol)
+                if quote is None:
+                    print(f"plan {futu_symbol} status=missing_quote message=Futu did not return a quote.")
+                    continue
+                status = evaluate_plan_quote(plans_by_symbol[futu_symbol], quote.last_price)
+                print(
+                    f"plan {status.futu_symbol} last_price={status.last_price} "
+                    f"status={status.status} message={status.message}"
+                )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+            parser.error(str(exc))
+        finally:
+            if quote_client is not None:
+                quote_client.close()
         return 0
 
     parser.error(f"unknown command: {args.command}")
