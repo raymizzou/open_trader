@@ -11,6 +11,16 @@ The universe is used for quote checks and future portfolio-driven Futu
 monitoring. It does not change `portfolio.csv` generation or asset allocation
 reporting.
 
+The first user-facing entry point is:
+
+```bash
+.venv/bin/python -m open_trader check-futu-quotes \
+  --portfolio data/latest/portfolio.csv
+```
+
+The command connects to Futu OpenD, fetches one market snapshot for each
+quoteable position, and reports quote, missing, and skipped counts.
+
 ## Inclusion Rules
 
 Rows from `data/latest/portfolio.csv` are candidates only when:
@@ -43,4 +53,5 @@ verification.
 ## Testing
 
 Unit tests cover inclusion, cash exclusion, money-market-fund exclusion, invalid
-quantity exclusion, and HK code normalization.
+quantity exclusion, HK code normalization, and CLI wiring for the quote check
+command.

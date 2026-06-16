@@ -128,6 +128,16 @@ automation.
 Start Futu OpenD and log in before running the watcher. The first verification
 mode fetches one quote snapshot and exits:
 
+To verify the current portfolio quote universe first, run:
+
+```bash
+.venv/bin/python -m open_trader check-futu-quotes \
+  --portfolio data/latest/portfolio.csv
+```
+
+This reads portfolio rows, excludes cash and money market funds, and fetches one
+snapshot for each remaining quoteable Futu symbol.
+
 ```bash
 .venv/bin/python -m open_trader watch-futu \
   --watchlist data/runs/2026-06-15/watchlist.csv \

@@ -10,6 +10,7 @@ from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
 from .futu_quote import FutuQuoteClient, FutuQuoteError
+from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
 from .parsers.futu import FutuStatementParser
@@ -229,6 +230,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch one quote snapshot and exit",
     )
 
+    check_futu_quotes_parser = subparsers.add_parser(
+        "check-futu-quotes",
+        help="Fetch Futu quote snapshots for quoteable portfolio positions",
+    )
+    check_futu_quotes_parser.add_argument(
+        "--portfolio",
+        type=Path,
+        default=Path("data/latest/portfolio.csv"),
+    )
+    check_futu_quotes_parser.add_argument("--host", default="127.0.0.1")
+    check_futu_quotes_parser.add_argument("--port", type=positive_int, default=11111)
+
     return parser
 
 
@@ -333,6 +346,46 @@ def main(argv: list[str] | None = None) -> int:
         print(f"skipped: {result.skipped_count}")
         print(f"alerts: {result.alert_count}")
         print(f"alerts_csv: {result.alerts_path}")
+        return 0
+
+    if args.command == "check-futu-quotes":
+        quote_client = None
+        try:
+            universe = load_futu_quote_universe(args.portfolio)
+            quote_client = FutuQuoteClient(host=args.host, port=args.port)
+            print(f"connected to Futu OpenD at {args.host}:{args.port}")
+            print(f"loaded {len(universe.items)} quoteable position(s)")
+            symbols = sorted({item.futu_symbol for item in universe.items})
+            snapshots = quote_client.get_snapshots(symbols) if symbols else {}
+            quote_count = 0
+            missing_count = 0
+            for futu_symbol in symbols:
+                quote = snapshots.get(futu_symbol)
+                if quote is None:
+                    missing_count += 1
+                    print(f"warning: missing quote for {futu_symbol}")
+                    continue
+                quote_count += 1
+                print(f"quote {futu_symbol} last_price={quote.last_price}")
+            for skipped in universe.skipped:
+                skipped_symbol = (
+                    f"{skipped.market}.{skipped.symbol}"
+                    if skipped.market and skipped.symbol
+                    else skipped.symbol
+                )
+                print(
+                    f"skipped {skipped_symbol} "
+                    f"asset_class={skipped.asset_class} "
+                    f"reason={skipped.reason}"
+                )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+            parser.error(str(exc))
+        finally:
+            if quote_client is not None:
+                quote_client.close()
+        print(f"quotes: {quote_count}")
+        print(f"missing: {missing_count}")
+        print(f"skipped: {len(universe.skipped)}")
         return 0
 
     parser.error(f"unknown command: {args.command}")
