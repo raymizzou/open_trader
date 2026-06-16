@@ -84,14 +84,15 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
         weight = _optional_percent(row.get("portfolio_weight_hkd", "") or "")
         fx_to_hkd = _optional_decimal(row.get("fx_to_hkd", "") or "")
 
-        positions[(market, symbol)] = {
-            "currency": currency,
-            "quantity": quantity or Decimal("0"),
-            "market_value": market_value or Decimal("0"),
-            "market_value_hkd": market_value_hkd or Decimal("0"),
-            "weight": weight or Decimal("0"),
-            "fx_to_hkd": fx_to_hkd or Decimal("0"),
-        }
+        if market and symbol:
+            positions[(market, symbol)] = {
+                "currency": currency,
+                "quantity": quantity or Decimal("0"),
+                "market_value": market_value or Decimal("0"),
+                "market_value_hkd": market_value_hkd or Decimal("0"),
+                "weight": weight or Decimal("0"),
+                "fx_to_hkd": fx_to_hkd or Decimal("0"),
+            }
 
     return PortfolioActionContext(
         positions=positions,

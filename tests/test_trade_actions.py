@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import pytest
 from decimal import Decimal
 from pathlib import Path
 
@@ -152,3 +153,173 @@ def test_load_portfolio_action_context_indexes_positions_cash_and_total_value(
         cash_by_currency={"USD": Decimal("1000")},
         total_market_value_hkd=Decimal("38220"),
     )
+
+
+def test_load_portfolio_action_context_rejects_missing_required_columns(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    fieldnames = [
+        "market",
+        "asset_class",
+        "symbol",
+        "currency",
+        "total_quantity",
+        "market_value",
+        "market_value_hkd",
+        "portfolio_weight_hkd",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows([{
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "MSFT",
+            "currency": "USD",
+            "total_quantity": "10",
+            "market_value": "3900",
+            "market_value_hkd": "30420",
+            "portfolio_weight_hkd": "39.00%",
+        }])
+
+    with pytest.raises(
+        ValueError, match=r"missing portfolio column\(s\): fx_to_hkd"
+    ):
+        load_portfolio_action_context(path)
+
+
+def test_load_portfolio_action_context_accepts_utf8_sig_input(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "MSFT",
+            "name": "Microsoft",
+            "currency": "USD",
+            "total_quantity": "10",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "30.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "39.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "MSFT",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        }
+    ])
+    raw = path.read_bytes()
+    path.write_bytes(b"\xef\xbb\xbf" + raw)
+
+    context = load_portfolio_action_context(path)
+
+    assert context == PortfolioActionContext(
+        positions={("US", "MSFT"): {
+            "currency": "USD",
+            "quantity": Decimal("10"),
+            "market_value": Decimal("3900"),
+            "market_value_hkd": Decimal("30420"),
+            "weight": Decimal("0.39"),
+            "fx_to_hkd": Decimal("7.8"),
+        }},
+        cash_by_currency={},
+        total_market_value_hkd=Decimal("30420"),
+    )
+
+
+def test_load_portfolio_action_context_falls_back_to_zero_for_invalid_position_values(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "AAPL",
+            "name": "Apple",
+            "currency": "USD",
+            "total_quantity": "",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "bad",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "bad",
+            "market_value_hkd": "",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "AAPL",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+
+    context = load_portfolio_action_context(path)
+
+    assert context.positions == {
+        ("US", "AAPL"): {
+            "currency": "USD",
+            "quantity": Decimal("0"),
+            "market_value": Decimal("0"),
+            "market_value_hkd": Decimal("0"),
+            "weight": Decimal("0"),
+            "fx_to_hkd": Decimal("0"),
+        },
+    }
+
+
+def test_load_portfolio_action_context_parses_percentage_to_fractional_weight(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "AAPL",
+            "name": "Apple",
+            "currency": "USD",
+            "total_quantity": "10",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "30.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "12.50%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "AAPL",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+
+    context = load_portfolio_action_context(path)
+
+    assert context.positions[("US", "AAPL")]["weight"] == Decimal("0.125")
