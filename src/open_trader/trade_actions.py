@@ -305,7 +305,14 @@ def _size_buy_action_row(
     if remaining_target_budget <= 0:
         return _review_row(row, "no remaining target budget")
     plan_ratio = _plan_ratio(plan.plan_text, action)
-    plan_budget = target_budget * plan_ratio
+    if action == "BUY":
+        entry_tranche_budget = target_budget * plan_ratio
+        remaining_entry_budget = entry_tranche_budget - position.market_value
+        if remaining_entry_budget <= 0:
+            return _review_row(row, "no remaining entry budget")
+        plan_budget = remaining_entry_budget
+    else:
+        plan_budget = target_budget * plan_ratio
     suggested_notional_budget = min(
         plan_budget,
         remaining_target_budget,

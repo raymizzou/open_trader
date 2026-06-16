@@ -79,16 +79,24 @@ def active_plan(
     )
 
 
-def portfolio_context(*, quantity: str = "10", cash: str = "1000") -> PortfolioActionContext:
+def portfolio_context(
+    *,
+    quantity: str = "10",
+    cash: str = "1000",
+    market_value: str = "3900",
+    market_value_hkd: str = "30420",
+    weight: str = "0.039",
+    fx_to_hkd: str = "7.8",
+) -> PortfolioActionContext:
     return PortfolioActionContext(
         positions={
             ("US", "MSFT"): PortfolioPositionSnapshot(
                 currency="USD",
                 quantity=Decimal(quantity),
-                market_value=Decimal("3900"),
-                market_value_hkd=Decimal("30420"),
-                weight=Decimal("0.039"),
-                fx_to_hkd=Decimal("7.8"),
+                market_value=Decimal(market_value),
+                market_value_hkd=Decimal(market_value_hkd),
+                weight=Decimal(weight),
+                fx_to_hkd=Decimal(fx_to_hkd),
             )
         },
         cash_by_currency={"USD": Decimal(cash)},
@@ -1034,7 +1042,13 @@ def test_buy_action_defaults_to_60_percent_when_plan_ratio_is_missing() -> None:
     row = build_trade_action_row(
         plan=active_plan(plan_text="操作计划：耐心等待回调，350美元附近加仓剩余40%。"),
         quote_status=quote_status("entry_zone", price="400"),
-        portfolio=portfolio_context(cash="20000"),
+        portfolio=portfolio_context(
+            quantity="0",
+            cash="20000",
+            market_value="0",
+            market_value_hkd="0",
+            weight="0",
+        ),
         source_plan="data/latest/trading_plan.csv",
     )
 
@@ -1044,9 +1058,9 @@ def test_buy_action_defaults_to_60_percent_when_plan_ratio_is_missing() -> None:
     assert row["suggested_notional"] == "7200"
 
 
-def test_buy_action_uses_remaining_target_budget_as_binding_cap() -> None:
+def test_buy_action_uses_remaining_entry_budget_as_binding_cap() -> None:
     row = build_trade_action_row(
-        plan=active_plan(max_weight="5%"),
+        plan=active_plan(max_weight="10%"),
         quote_status=quote_status("entry_zone", price="390"),
         portfolio=portfolio_context(cash="20000"),
         source_plan="data/latest/trading_plan.csv",
@@ -1054,8 +1068,8 @@ def test_buy_action_uses_remaining_target_budget_as_binding_cap() -> None:
 
     assert row["action"] == "BUY"
     assert row["status"] == "ready"
-    assert row["suggested_quantity"] == "2"
-    assert row["suggested_notional"] == "780"
+    assert row["suggested_quantity"] == "5"
+    assert row["suggested_notional"] == "1950"
 
 
 def test_buy_action_is_review_when_no_remaining_target_budget() -> None:
@@ -1072,6 +1086,20 @@ def test_buy_action_is_review_when_no_remaining_target_budget() -> None:
     assert row["reason"] == row["error"]
 
 
+def test_buy_action_is_review_when_no_remaining_entry_budget() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(max_weight="6%"),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio_context(cash="20000"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "no remaining entry budget" in row["error"]
+    assert row["reason"] == row["error"]
+
+
 def test_add_action_uses_remaining_target_budget_as_binding_cap() -> None:
     row = build_trade_action_row(
         plan=active_plan(max_weight="5%", plan_text="操作计划：350美元附近加仓。"),
@@ -1084,6 +1112,27 @@ def test_add_action_uses_remaining_target_budget_as_binding_cap() -> None:
     assert row["status"] == "ready"
     assert row["suggested_quantity"] == "3"
     assert row["suggested_notional"] == "1050"
+
+
+@pytest.mark.parametrize("trigger_status, plan_text", [
+    ("entry_zone", "操作计划：在380-400美元区间分3-4次买入目标仓位的60%，350美元附近加仓剩余40%。"),
+    ("add_zone", "操作计划：350美元附近加仓。"),
+])
+def test_buy_side_zero_fx_is_review(
+    trigger_status: str,
+    plan_text: str,
+) -> None:
+    row = build_trade_action_row(
+        plan=active_plan(plan_text=plan_text),
+        quote_status=quote_status(trigger_status),
+        portfolio=portfolio_context(fx_to_hkd="0"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "positive fx_to_hkd" in row["error"]
+    assert row["reason"] == row["error"]
 
 
 def test_stop_loss_sells_full_position() -> None:
@@ -1223,3 +1272,29 @@ def test_buy_side_unparseable_target_max_weight_maps_to_review() -> None:
     assert row["status"] == "review"
     assert "target max weight" in row["error"]
     assert row["reason"] == row["error"]
+
+
+def test_trade_action_rows_always_match_fieldname_shape() -> None:
+    buy_row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio_context(cash="1000"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+    sell_row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("stop_loss_hit", price="339"),
+        portfolio=portfolio_context(quantity="10"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+    review_row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("missing_quote"),
+        portfolio=portfolio_context(),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    expected_keys = set(TRADE_ACTION_FIELDNAMES)
+    assert set(buy_row) == expected_keys
+    assert set(sell_row) == expected_keys
+    assert set(review_row) == expected_keys
