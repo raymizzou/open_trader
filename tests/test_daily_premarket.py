@@ -1007,3 +1007,37 @@ def test_daily_runner_rejects_malformed_run_dates_without_escaped_writes(
 
     assert not (tmp_path / "data/latest/daily_run_status.json").exists()
     assert not (tmp_path / "reports/latest.md").exists()
+
+
+def test_launchd_template_runs_daily_premarket_command() -> None:
+    template = (
+        Path(__file__).resolve().parents[1]
+        / "ops/launchd/com.open-trader.premarket.plist.template"
+    ).read_text(encoding="utf-8")
+
+    assert "com.open-trader.premarket" in template
+    assert "run-daily-premarket" in template
+    assert "<key>Hour</key>" in template
+    assert "<integer>18</integer>" in template
+    assert "<key>Minute</key>" in template
+    assert "<integer>30</integer>" in template
+    assert "OPEN_TRADER_REPO" in template
+
+
+def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
+    example = (
+        Path(__file__).resolve().parents[1] / "config/daily_premarket.env.example"
+    ).read_text(encoding="utf-8")
+
+    for key in [
+        "OPEN_TRADER_REPO",
+        "OPEN_TRADER_PYTHON",
+        "OPEN_TRADER_TIMEZONE",
+        "OPEN_TRADER_DEADLINE",
+        "OPEN_TRADER_FUTU_HOST",
+        "OPEN_TRADER_FUTU_PORT",
+        "DEEPSEEK_API_KEY",
+        "OPENAI_API_KEY",
+    ]:
+        assert key in example
+    assert "sk-" not in example

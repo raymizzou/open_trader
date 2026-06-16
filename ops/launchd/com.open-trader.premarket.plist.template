@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.open-trader.premarket</string>
+
+  <key>WorkingDirectory</key>
+  <string>OPEN_TRADER_REPO</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>OPEN_TRADER_PYTHON</string>
+    <string>-m</string>
+    <string>open_trader</string>
+    <string>run-daily-premarket</string>
+    <string>--date</string>
+    <string>today</string>
+    <string>--config</string>
+    <string>OPEN_TRADER_REPO/config/daily_premarket.env</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Weekday</key>
+      <integer>1</integer>
+      <key>Hour</key>
+      <integer>18</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key>
+      <integer>2</integer>
+      <key>Hour</key>
+      <integer>18</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key>
+      <integer>3</integer>
+      <key>Hour</key>
+      <integer>18</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key>
+      <integer>4</integer>
+      <key>Hour</key>
+      <integer>18</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key>
+      <integer>5</integer>
+      <key>Hour</key>
+      <integer>18</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>OPEN_TRADER_REPO/logs/daily_premarket/launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>OPEN_TRADER_REPO/logs/daily_premarket/launchd.err.log</string>
+</dict>
+</plist>
