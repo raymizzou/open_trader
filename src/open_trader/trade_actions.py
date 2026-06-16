@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from types import MappingProxyType
 from typing import Iterable, Mapping
@@ -106,10 +106,12 @@ def generate_trade_actions(
     ]
     effective_run_date = run_date or _latest_run_date(active_plans)
     plans = [
-        plan
+        _plan_for_run(plan, effective_run_date)
         for plan in active_plans
-        if plan.run_date == effective_run_date
+        if _plan_matches_run_date(plan, effective_run_date)
     ]
+    if run_date is not None and not plans:
+        raise ValueError(f"no active trading plans match run_date {effective_run_date}")
     portfolio = load_portfolio_action_context(portfolio_path)
 
     rows = [
@@ -164,7 +166,7 @@ def render_trade_actions_report(run_date: str, rows: list[dict[str, str]]) -> st
             f"标的：{row.get('futu_symbol', '').strip()}",
             f"优先级：{row.get('priority', '').strip()}",
             f"价格：{row.get('last_price', '').strip()}",
-            f"建议：{_suggestion_text(row.get('action', '').strip())}",
+            f"建议：{_suggestion_text(row)}",
             f"条件：{row.get('reason', '').strip()}",
             f"风控：止损 {row.get('stop_price', '').strip()}",
             (
@@ -530,6 +532,16 @@ def _quote_status_for_plan(
     return evaluate_plan_quote(plan, quote.last_price)
 
 
+def _plan_matches_run_date(plan: TradingPlanRow, run_date: str) -> bool:
+    return not plan.run_date.strip() or plan.run_date == run_date
+
+
+def _plan_for_run(plan: TradingPlanRow, run_date: str) -> TradingPlanRow:
+    if plan.run_date.strip():
+        return plan
+    return replace(plan, run_date=run_date)
+
+
 def _priority_sort_key(row: Mapping[str, str]) -> tuple[int, str]:
     priority_order = {
         "critical": 0,
@@ -542,8 +554,16 @@ def _priority_sort_key(row: Mapping[str, str]) -> tuple[int, str]:
     return priority_order.get(priority, len(priority_order)), futu_symbol
 
 
-def _suggestion_text(action: str) -> str:
-    return {
+def _suggestion_text(row: Mapping[str, str]) -> str:
+    status = row.get("status", "").strip()
+    if status == "watch":
+        return "继续观察，不建议交易"
+    if status == "review":
+        error = row.get("error", "").strip() or row.get("reason", "").strip()
+        return f"需要人工复核：{error}"
+
+    action = row.get("action", "").strip()
+    verb = {
         "BUY": "买入",
         "ADD": "加仓",
         "TRIM": "减仓",
@@ -552,6 +572,12 @@ def _suggestion_text(action: str) -> str:
         "HOLD": "继续观察",
         "REVIEW": "人工复核",
     }.get(action, "人工复核")
+    quantity = row.get("suggested_quantity", "").strip()
+    currency = row.get("notional_currency", "").strip()
+    notional = row.get("suggested_notional", "").strip()
+    if quantity and currency and notional:
+        return f"{verb} {quantity} 股，预算约 {currency} {notional}"
+    return verb
 
 
 def _atomic_write_csv(

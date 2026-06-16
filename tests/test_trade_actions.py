@@ -18,6 +18,7 @@ from open_trader.trade_actions import (
     generate_trade_actions,
     map_quote_status_to_action,
     load_portfolio_action_context,
+    render_trade_actions_report,
 )
 
 
@@ -1498,7 +1499,7 @@ def test_generate_trade_actions_writes_csv_report_and_latest(
     report = expected_report_path.read_text(encoding="utf-8")
     assert "行动：BUY" in report
     assert "标的：US.MSFT" in report
-    assert "建议：买入" in report
+    assert "建议：买入 8 股，预算约 USD 3120" in report
 
 
 def test_generate_trade_actions_dry_run_does_not_update_latest(
@@ -1578,3 +1579,199 @@ def test_generate_trade_actions_requires_date_when_active_rows_have_no_run_date(
             run_date=None,
             update_latest=False,
         )
+
+
+def test_generate_trade_actions_explicit_run_date_with_no_match_fails_without_writes(
+    tmp_path: Path,
+    valid_portfolio_path: Path,
+) -> None:
+    plan_path = tmp_path / "trading_plan.csv"
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports"
+    latest_path = data_dir / "latest" / "trade_actions.csv"
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.write_text("old latest", encoding="utf-8")
+    write_trading_plan(plan_path, [msft_plan_row(run_date="2026-06-15")])
+
+    with pytest.raises(
+        ValueError,
+        match=r"no active trading plans match run_date 2026-06-16",
+    ):
+        generate_trade_actions(
+            plan_path=plan_path,
+            portfolio_path=valid_portfolio_path,
+            data_dir=data_dir,
+            reports_dir=reports_dir,
+            snapshots={},
+            run_date="2026-06-16",
+            update_latest=True,
+        )
+
+    assert latest_path.read_text(encoding="utf-8") == "old latest"
+    assert not (data_dir / "runs" / "2026-06-16" / "trade_actions.csv").exists()
+    assert not (reports_dir / "trade_actions" / "2026-06-16.md").exists()
+
+
+def test_generate_trade_actions_includes_blank_run_date_rows_in_selected_run(
+    tmp_path: Path,
+    valid_portfolio_path: Path,
+) -> None:
+    plan_path = tmp_path / "trading_plan.csv"
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports"
+    write_trading_plan(plan_path, [
+        msft_plan_row(run_date=""),
+        msft_plan_row(run_date="2026-06-16"),
+    ])
+
+    result = generate_trade_actions(
+        plan_path=plan_path,
+        portfolio_path=valid_portfolio_path,
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        snapshots={"US.MSFT": QuoteSnapshot(futu_symbol="US.MSFT", last_price=Decimal("390"))},
+        run_date="2026-06-16",
+        update_latest=False,
+    )
+
+    assert result.action_count == 2
+    assert result.ready_count == 2
+    with result.actions_path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 2
+    assert {row["run_date"] for row in rows} == {"2026-06-16"}
+
+
+def test_render_trade_actions_report_orders_rows_and_formats_status_specific_suggestions() -> None:
+    rows = [
+        {
+            "run_date": "2026-06-16",
+            "symbol": "NFLX",
+            "market": "US",
+            "futu_symbol": "US.NFLX",
+            "action": "SELL_STOP",
+            "priority": "critical",
+            "last_price": "700",
+            "trigger_status": "stop_loss_hit",
+            "suggested_quantity": "5",
+            "suggested_notional": "3500",
+            "notional_currency": "USD",
+            "current_quantity": "5",
+            "current_weight": "5%",
+            "target_max_weight": "10%",
+            "cash_available": "0",
+            "limit_price": "",
+            "stop_price": "710",
+            "reason": "Current price is at or below the stop loss.",
+            "source_plan": "plan.csv",
+            "status": "ready",
+            "error": "",
+        },
+        {
+            "run_date": "2026-06-16",
+            "symbol": "ZZZ",
+            "market": "US",
+            "futu_symbol": "US.ZZZ",
+            "action": "BUY",
+            "priority": "high",
+            "last_price": "390",
+            "trigger_status": "entry_zone",
+            "suggested_quantity": "2",
+            "suggested_notional": "780",
+            "notional_currency": "USD",
+            "current_quantity": "10",
+            "current_weight": "39%",
+            "target_max_weight": "12%",
+            "cash_available": "1000",
+            "limit_price": "390",
+            "stop_price": "340",
+            "reason": "Current price is inside the planned entry zone.",
+            "source_plan": "plan.csv",
+            "status": "ready",
+            "error": "",
+        },
+        {
+            "run_date": "2026-06-16",
+            "symbol": "AAA",
+            "market": "US",
+            "futu_symbol": "US.AAA",
+            "action": "BUY",
+            "priority": "high",
+            "last_price": "390",
+            "trigger_status": "entry_zone",
+            "suggested_quantity": "3",
+            "suggested_notional": "1170",
+            "notional_currency": "USD",
+            "current_quantity": "0",
+            "current_weight": "0%",
+            "target_max_weight": "12%",
+            "cash_available": "5000",
+            "limit_price": "390",
+            "stop_price": "340",
+            "reason": "Current price is inside the planned entry zone.",
+            "source_plan": "plan.csv",
+            "status": "ready",
+            "error": "",
+        },
+        {
+            "run_date": "2026-06-16",
+            "symbol": "MSFT",
+            "market": "US",
+            "futu_symbol": "US.MSFT",
+            "action": "REVIEW",
+            "priority": "medium",
+            "last_price": "0",
+            "trigger_status": "missing_quote",
+            "suggested_quantity": "",
+            "suggested_notional": "",
+            "notional_currency": "USD",
+            "current_quantity": "10",
+            "current_weight": "39%",
+            "target_max_weight": "12%",
+            "cash_available": "1000",
+            "limit_price": "",
+            "stop_price": "340",
+            "reason": "Futu did not return a quote.",
+            "source_plan": "plan.csv",
+            "status": "review",
+            "error": "Futu did not return a quote.",
+        },
+        {
+            "run_date": "2026-06-16",
+            "symbol": "TSLA",
+            "market": "US",
+            "futu_symbol": "US.TSLA",
+            "action": "HOLD",
+            "priority": "low",
+            "last_price": "300",
+            "trigger_status": "watch",
+            "suggested_quantity": "",
+            "suggested_notional": "",
+            "notional_currency": "USD",
+            "current_quantity": "1",
+            "current_weight": "2%",
+            "target_max_weight": "8%",
+            "cash_available": "1000",
+            "limit_price": "",
+            "stop_price": "250",
+            "reason": "No plan trigger is active.",
+            "source_plan": "plan.csv",
+            "status": "watch",
+            "error": "",
+        },
+    ]
+
+    report = render_trade_actions_report("2026-06-16", rows)
+
+    headings = [line for line in report.splitlines() if line.startswith("## ")]
+    assert headings == [
+        "## US.NFLX",
+        "## US.AAA",
+        "## US.ZZZ",
+        "## US.MSFT",
+        "## US.TSLA",
+    ]
+    assert "建议：买入 3 股，预算约 USD 1170" in report
+    assert "建议：继续观察，不建议交易" in report
+    assert "建议：需要人工复核：Futu did not return a quote." in report
