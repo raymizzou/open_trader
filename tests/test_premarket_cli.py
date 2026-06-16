@@ -253,3 +253,81 @@ def test_run_premarket_main_allows_disabling_symbol_timeout(
 
     assert result == 0
     assert captured["symbol_timeout_seconds"] is None
+
+
+def test_run_daily_premarket_help_includes_expected_options(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["run-daily-premarket", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--date" in output
+    assert "--config" in output
+    assert "--dry-run" in output
+
+
+def test_run_daily_premarket_main_wires_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRunner:
+        def __init__(self, *, config: object) -> None:
+            captured["config"] = config
+
+        def run(self, run_date: str):
+            captured["run_date"] = run_date
+            return type(
+                "DailyRunResult",
+                (),
+                {
+                    "status": "success",
+                    "status_path": tmp_path
+                    / "data/runs/2026-06-17/daily_run_status.json",
+                    "report_path": tmp_path / "reports/daily_runs/2026-06-17.md",
+                    "log_path": tmp_path / "logs/daily_premarket/2026-06-17.log",
+                },
+            )()
+
+    def fake_load_env_config(path: Path, *, dry_run: bool):
+        captured["config_path"] = path
+        captured["dry_run"] = dry_run
+        return object()
+
+    monkeypatch.setattr(cli, "DailyPremarketRunner", FakeRunner)
+    monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
+
+    result = cli.main(
+        [
+            "run-daily-premarket",
+            "--date",
+            "2026-06-17",
+            "--config",
+            str(tmp_path / "daily.env"),
+            "--dry-run",
+        ]
+    )
+
+    assert result == 0
+    assert captured["config_path"] == tmp_path / "daily.env"
+    assert captured["dry_run"] is True
+    assert captured["run_date"] == "2026-06-17"
+    output = capsys.readouterr().out
+    assert "status: success" in output
+    assert "status_json:" in output
+    assert "report:" in output
+    assert "log:" in output
+
+
+def test_run_daily_premarket_accepts_today_date() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(["run-daily-premarket", "--date", "today"])
+
+    assert args.date == "today"

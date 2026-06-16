@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import re
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
+from .daily_premarket import DailyPremarketRunner, load_env_config
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
@@ -234,6 +236,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write run outputs but do not update latest advice or actions",
     )
 
+    daily_parser = subparsers.add_parser(
+        "run-daily-premarket",
+        help="Run the scheduled daily premarket automation workflow",
+    )
+    daily_parser.add_argument(
+        "--date",
+        required=True,
+        help="Run date, YYYY-MM-DD, or today",
+    )
+    daily_parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/daily_premarket.env"),
+    )
+    daily_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write dated outputs but do not update latest artifacts",
+    )
+
     watchlist_parser = subparsers.add_parser(
         "build-watchlist",
         help="Convert premarket action rows into watchlist.csv",
@@ -419,6 +441,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"advice_csv: {result.advice_path}")
         print(f"actions_csv: {result.actions_path}")
         print(f"report: {result.report_path}")
+        return 0
+
+    if args.command == "run-daily-premarket":
+        try:
+            config = load_env_config(args.config, dry_run=args.dry_run)
+            run_date = (
+                datetime.now(ZoneInfo(config.timezone)).date().isoformat()
+                if args.date == "today"
+                else canonical_date(args.date)
+            )
+            result = DailyPremarketRunner(config=config).run(run_date)
+        except (
+            FileNotFoundError,
+            ValueError,
+            RuntimeError,
+            argparse.ArgumentTypeError,
+        ) as exc:
+            parser.error(str(exc))
+        print(f"status: {result.status}")
+        print(f"status_json: {result.status_path}")
+        print(f"report: {result.report_path}")
+        print(f"log: {result.log_path}")
         return 0
 
     if args.command == "build-watchlist":
