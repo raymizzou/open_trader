@@ -54,8 +54,12 @@ def test_load_env_config_rejects_missing_required_values(tmp_path: Path) -> None
     env = tmp_path / "daily.env"
     env.write_text("OPEN_TRADER_REPO=/tmp/open_trader\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="missing config value"):
+    with pytest.raises(ValueError) as exc_info:
         load_env_config(env)
+    message = str(exc_info.value)
+    assert message.startswith("missing config value(s):")
+    assert "OPEN_TRADER_PYTHON" in message
+    assert "OPENAI_API_KEY" in message
 
 
 def test_run_lock_rejects_second_owner(tmp_path: Path) -> None:
