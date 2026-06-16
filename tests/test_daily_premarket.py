@@ -260,6 +260,105 @@ class RaisingCloseQuoteClient(FakeQuoteClient):
         raise RuntimeError("close failed")
 
 
+class RecordingDailyNotifier:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+
+
+class FailingDailyNotifier:
+    def notify(self, title: str, message: str) -> None:
+        raise RuntimeError("webhook failed")
+
+
+def _daily_config(tmp_path: Path, *, dry_run: bool = False) -> DailyPremarketConfig:
+    return DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=dry_run,
+    )
+
+
+def _write_daily_portfolio(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        (
+            "month,broker,account_alias,market,asset_class,symbol,name,currency,"
+            "total_quantity,cost_price,last_price,market_value,cost_value,"
+            "unrealized_pnl,fx_to_hkd,market_value_hkd,cost_value_hkd,"
+            "unrealized_pnl_hkd,portfolio_weight_hkd,confidence,notes\n"
+            "2026-05,futu,main,US,stock,MSFT,Microsoft,USD,2,350,399,798,"
+            "700,98,7.8,6224.4,5460,764.4,1.0%,high,\n"
+            "2026-05,futu,main,US,cash,USD,US Dollar,USD,0,0,0,10000,0,0,"
+            "7.8,78000,0,0,12.0%,high,\n"
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_daily_runner_generates_trade_actions_and_sends_daily_notification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = _daily_config(tmp_path)
+    _write_daily_portfolio(config.portfolio)
+    notifier = RecordingDailyNotifier()
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=notifier,
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "success"
+    assert (tmp_path / "data/runs/2026-06-17/trade_actions.csv").exists()
+    assert (tmp_path / "reports/trade_actions/2026-06-17.md").exists()
+    assert notifier.messages
+    assert "# Open Trader 2026-06-17: success" in notifier.messages[-1][1]
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["artifacts"]["trade_actions"] == str(
+        tmp_path / "data/runs/2026-06-17/trade_actions.csv"
+    )
+
+
+def test_daily_runner_records_notification_error_without_failing_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = _daily_config(tmp_path)
+    _write_daily_portfolio(config.portfolio)
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=FailingDailyNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "success"
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert "webhook failed" in status["notification_error"]
+
+
 def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,
@@ -275,7 +374,7 @@ def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
         dry_run=False,
     )
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
 
     runner = DailyPremarketRunner(
         config=config,
@@ -321,7 +420,7 @@ def test_daily_runner_deadline_uses_requested_run_date(
         dry_run=False,
     )
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
     premarket = FakePremarket()
     runner = DailyPremarketRunner(
         config=config,
@@ -355,7 +454,7 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
         dry_run=False,
     )
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
     premarket = FakePremarket()
     plan_builder = FakePlanBuilder()
 
@@ -417,7 +516,7 @@ def test_daily_runner_does_not_promote_latest_when_plan_build_fails(
     )
     latest_dir = tmp_path / "data/latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
         "old actions\n",
@@ -462,7 +561,7 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
     )
     latest_dir = tmp_path / "data/latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
         "old actions\n",
@@ -526,7 +625,7 @@ def test_daily_runner_does_not_promote_latest_when_report_write_fails(
     )
     latest_dir = tmp_path / "data/latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
         "old actions\n",
@@ -597,7 +696,7 @@ def test_daily_runner_returns_failed_when_failure_reporting_writes_fail(
     )
     latest_dir = tmp_path / "data/latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
         "old actions\n",
@@ -648,7 +747,7 @@ def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None
     )
     latest_dir = tmp_path / "data/latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
         "old actions\n",
@@ -700,7 +799,7 @@ def test_daily_runner_dry_run_argument_overrides_config(
     )
     latest_dir = tmp_path / "data/latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
         "old actions\n",
@@ -833,7 +932,7 @@ def test_daily_runner_marks_partial_when_futu_is_unavailable(tmp_path: Path) -> 
         dry_run=False,
     )
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
 
     runner = DailyPremarketRunner(
         config=config,
@@ -884,7 +983,7 @@ def test_daily_runner_marks_partial_when_futu_quote_is_missing(
         dry_run=False,
     )
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
 
     runner = DailyPremarketRunner(
         config=config,
@@ -921,7 +1020,7 @@ def test_daily_runner_ignores_quote_client_close_failure(tmp_path: Path) -> None
         dry_run=False,
     )
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
 
     runner = DailyPremarketRunner(
         config=config,
@@ -1038,7 +1137,7 @@ def test_daily_runner_rejects_malformed_run_dates_without_escaped_writes(
         dry_run=False,
     )
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
-    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    _write_daily_portfolio(config.portfolio)
     runner = DailyPremarketRunner(
         config=config,
         premarket_runner=FakePremarket(),

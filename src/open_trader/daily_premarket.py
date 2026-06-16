@@ -5,19 +5,26 @@ import fcntl
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
 from .futu_quote import FutuQuoteClient, FutuQuoteError
+from .notifications import (
+    MacOSNotifier,
+    Notifier,
+    NullNotifier,
+    load_trade_action_rows,
+    render_daily_trade_action_message,
+)
+from .trade_actions import generate_trade_actions
 from .trading_plan import (
     TradingPlanBuildResult,
     build_trading_plan,
@@ -44,6 +51,7 @@ class DailyPremarketConfig:
     ta_max_retries: int = 2
     tradingagents_path: Path = Path("/Users/ray/projects/TradingAgents")
     classifier_model: str = "deepseek-v4-flash"
+    notify_daily_report: bool = True
 
 
 @dataclass(frozen=True)
@@ -91,25 +99,6 @@ class RunLock:
         self._handle = None
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
-
-
-class Notifier(Protocol):
-    def notify(self, title: str, message: str) -> None:
-        pass
-
-
-class NullNotifier:
-    def notify(self, title: str, message: str) -> None:
-        pass
-
-
-class MacOSNotifier:
-    def notify(self, title: str, message: str) -> None:
-        script = (
-            f'display notification "{_escape_osascript(message)}" '
-            f'with title "{_escape_osascript(title)}"'
-        )
-        subprocess.run(["osascript", "-e", script], check=False)
 
 
 def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfig:
@@ -260,7 +249,16 @@ class DailyPremarketRunner:
             run_date=run_date,
             update_latest=False,
         )
-        futu_status = self._check_futu_plan(plan_result.plan_path)
+        futu_status, snapshots = self._check_futu_plan(plan_result.plan_path)
+        trade_actions_result = generate_trade_actions(
+            plan_path=plan_result.plan_path,
+            portfolio_path=self.config.portfolio,
+            data_dir=self.config.data_dir,
+            reports_dir=self.config.reports_dir,
+            snapshots=snapshots,
+            run_date=run_date,
+            update_latest=False,
+        )
         advice_counts = _count_advice(advice_path)
         plan_counts = _count_plan(plan_result.plan_path)
         status = (
@@ -277,15 +275,19 @@ class DailyPremarketRunner:
         latest_advice_path = self.config.data_dir / "latest" / "trading_advice.csv"
         latest_actions_path = self.config.data_dir / "latest" / "premarket_actions.csv"
         latest_plan_path = self.config.data_dir / "latest" / "trading_plan.csv"
+        latest_trade_actions_path = self.config.data_dir / "latest" / "trade_actions.csv"
         artifacts = {
             "advice": str(advice_path),
             "classifications": str(getattr(premarket_result, "classifications_path")),
             "actions": str(actions_path),
             "premarket_report": str(getattr(premarket_result, "report_path")),
             "trading_plan": str(plan_result.plan_path),
+            "trade_actions": str(trade_actions_result.actions_path),
+            "trade_actions_report": str(trade_actions_result.report_path),
             "latest_advice": str(latest_advice_path),
             "latest_actions": str(latest_actions_path),
             "latest_trading_plan": str(latest_plan_path),
+            "latest_trade_actions": str(latest_trade_actions_path),
             "status": str(status_path),
             "report": str(report_path),
             "log": str(log_path),
@@ -312,12 +314,29 @@ class DailyPremarketRunner:
                 advice_path=advice_path,
                 actions_path=actions_path,
                 plan_path=plan_result.plan_path,
+                trade_actions_path=trade_actions_result.actions_path,
                 data_dir=self.config.data_dir,
             )
-        self._notify(
-            "Open Trader daily premarket",
-            _notification_message(status, plan_counts, futu_status, advice_counts),
-        )
+        if self.config.notify_daily_report:
+            notification_error = self._notify(
+                "Open Trader daily premarket",
+                render_daily_trade_action_message(
+                    run_date=run_date,
+                    status=status,
+                    premarket=advice_counts,
+                    futu_status=futu_status,
+                    action_rows=load_trade_action_rows(trade_actions_result.actions_path),
+                    daily_report_path=report_path,
+                    trade_actions_report_path=trade_actions_result.report_path,
+                ),
+            )
+            if notification_error:
+                _record_notification_error(
+                    status_path=status_path,
+                    report_path=report_path,
+                    log_path=log_path,
+                    error=notification_error,
+                )
         return result
 
     def _advice_runner_factory(
@@ -339,7 +358,10 @@ class DailyPremarketRunner:
 
         return factory
 
-    def _check_futu_plan(self, plan_path: Path) -> dict[str, object]:
+    def _check_futu_plan(
+        self,
+        plan_path: Path,
+    ) -> tuple[dict[str, object], dict[str, object]]:
         quote_client: object | None = None
         try:
             active_plans = [
@@ -348,13 +370,16 @@ class DailyPremarketRunner:
                 if plan.status == "active"
             ]
             if not active_plans:
-                return {
-                    "checked": 0,
-                    "missing": 0,
-                    "triggered": 0,
-                    "items": [],
-                    "error": "",
-                }
+                return (
+                    {
+                        "checked": 0,
+                        "missing": 0,
+                        "triggered": 0,
+                        "items": [],
+                        "error": "",
+                    },
+                    {},
+                )
 
             quote_client = self.quote_client_factory(
                 host=self.config.futu_host,
@@ -391,21 +416,27 @@ class DailyPremarketRunner:
                         "message": quote_status.message,
                     }
                 )
-            return {
-                "checked": len(active_plans),
-                "missing": missing,
-                "triggered": triggered,
-                "items": items,
-                "error": "",
-            }
+            return (
+                {
+                    "checked": len(active_plans),
+                    "missing": missing,
+                    "triggered": triggered,
+                    "items": items,
+                    "error": "",
+                },
+                snapshots,
+            )
         except FutuQuoteError as exc:
-            return {
-                "checked": 0,
-                "missing": 0,
-                "triggered": 0,
-                "items": [],
-                "error": str(exc),
-            }
+            return (
+                {
+                    "checked": 0,
+                    "missing": 0,
+                    "triggered": 0,
+                    "items": [],
+                    "error": str(exc),
+                },
+                {},
+            )
         finally:
             if quote_client is not None and hasattr(quote_client, "close"):
                 try:
@@ -491,9 +522,12 @@ class DailyPremarketRunner:
                 "actions": "",
                 "premarket_report": "",
                 "trading_plan": "",
+                "trade_actions": "",
+                "trade_actions_report": "",
                 "latest_advice": "",
                 "latest_actions": "",
                 "latest_trading_plan": "",
+                "latest_trade_actions": "",
                 "status": str(status_path),
                 "report": str(report_path),
                 "log": str(log_path),
@@ -566,11 +600,12 @@ class DailyPremarketRunner:
             log_path=log_path,
         )
 
-    def _notify(self, title: str, message: str) -> None:
+    def _notify(self, title: str, message: str) -> str:
         try:
             self.notifier.notify(title, message)
-        except Exception:
-            pass
+        except Exception as exc:
+            return str(exc)
+        return ""
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -613,6 +648,7 @@ def _promote_latest_set(
     advice_path: Path,
     actions_path: Path,
     plan_path: Path,
+    trade_actions_path: Path,
     data_dir: Path,
 ) -> None:
     latest_dir = data_dir / "latest"
@@ -629,6 +665,10 @@ def _promote_latest_set(
         _LatestPromotion(
             source_path=plan_path,
             latest_path=latest_dir / "trading_plan.csv",
+        ),
+        _LatestPromotion(
+            source_path=trade_actions_path,
+            latest_path=latest_dir / "trade_actions.csv",
         ),
     ]
 
@@ -705,6 +745,25 @@ def _restore_latest_promotions(promotions: list[_LatestPromotion]) -> None:
                 pass
         elif promotion.latest_replaced and promotion.latest_path.exists():
             _best_effort_unlink(promotion.latest_path)
+
+
+def _record_notification_error(
+    *,
+    status_path: Path,
+    report_path: Path,
+    log_path: Path,
+    error: str,
+) -> None:
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    payload["notification_error"] = error
+    _write_json(status_path, payload)
+    _write_text(report_path, _render_daily_report(payload))
+    _write_text(log_path, json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _best_effort_unlink(path: Path) -> None:
@@ -811,6 +870,8 @@ def _render_daily_report(payload: dict[str, object]) -> str:
     )
     if futu.get("error"):
         lines.append(f"- Futu error: {futu.get('error')}")
+    if payload.get("notification_error"):
+        lines.append(f"- Notification error: {payload.get('notification_error')}")
 
     lines.extend(["", "## Futu Plan Checks", ""])
     items = futu.get("items") if isinstance(futu.get("items"), list) else []
@@ -832,7 +893,10 @@ def _render_daily_report(payload: dict[str, object]) -> str:
         "actions",
         "premarket_report",
         "trading_plan",
+        "trade_actions",
+        "trade_actions_report",
         "latest_trading_plan",
+        "latest_trade_actions",
         "status",
         "report",
         "log",
