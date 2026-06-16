@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
+import subprocess
 from decimal import Decimal
 from pathlib import Path
 
@@ -1041,3 +1043,104 @@ def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
     ]:
         assert key in example
     assert "sk-" not in example
+
+
+def test_launchd_installer_expands_tilde_paths_for_launchd(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                "OPEN_TRADER_REPO=~/projects/open_trader",
+                "OPEN_TRADER_PYTHON=~/.venv/bin/python",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    assert f"{home}/projects/open_trader" in result.stdout
+    assert f"{home}/.venv/bin/python" in result.stdout
+    assert "~/projects/open_trader" not in result.stdout
+    assert "~/.venv/bin/python" not in result.stdout
+
+
+def test_launchd_installer_rejects_export_syntax_like_runtime_parser(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"export OPEN_TRADER_REPO={repo}",
+                f"OPEN_TRADER_PYTHON={repo / '.venv/bin/python'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 1
+    assert "OPEN_TRADER_REPO and OPEN_TRADER_PYTHON are required" in result.stderr
+
+
+def test_launchd_installer_preserves_inline_comment_text_like_runtime_parser(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo} # literal suffix",
+                f"OPEN_TRADER_PYTHON={repo / '.venv/bin/python'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    assert f"{repo} # literal suffix" in result.stdout
+
+
+def _copy_launchd_installer_assets(tmp_path: Path) -> Path:
+    source_root = Path(__file__).resolve().parents[1]
+    repo = tmp_path / "repo"
+    (repo / "config").mkdir(parents=True)
+    (repo / "ops/launchd").mkdir(parents=True)
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copy2(
+        source_root / "ops/launchd/com.open-trader.premarket.plist.template",
+        repo / "ops/launchd/com.open-trader.premarket.plist.template",
+    )
+    shutil.copy2(
+        source_root / "scripts/install_daily_premarket_launchd.sh",
+        repo / "scripts/install_daily_premarket_launchd.sh",
+    )
+    return repo

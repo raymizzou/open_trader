@@ -27,14 +27,20 @@ fi
 read_env_value() {
   local key="$1"
   awk -v key="$key" '
+    function trim(value) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      return value
+    }
     /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
     {
-      line=$0
-      sub(/^[[:space:]]*export[[:space:]]+/, "", line)
-      if (index(line, key "=") == 1) {
-        value=substr(line, length(key) + 2)
-        sub(/[[:space:]]+#.*$/, "", value)
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      stripped=trim($0)
+      equals=index(stripped, "=")
+      if (equals == 0) {
+        next
+      }
+      parsed_key=trim(substr(stripped, 1, equals - 1))
+      if (parsed_key == key) {
+        value=trim(substr(stripped, equals + 1))
         if ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") ||
             (substr(value, 1, 1) == "'"'"'" && substr(value, length(value), 1) == "'"'"'")) {
           value=substr(value, 2, length(value) - 2)
@@ -44,6 +50,17 @@ read_env_value() {
       }
     }
   ' "$ENV_FILE"
+}
+
+expand_home_path() {
+  local value="$1"
+  if [[ "$value" == "~" ]]; then
+    printf '%s' "$HOME"
+  elif [[ "$value" == "~/"* ]]; then
+    printf '%s/%s' "$HOME" "${value#"~/"}"
+  else
+    printf '%s' "$value"
+  fi
 }
 
 xml_escape() {
@@ -71,6 +88,9 @@ if [[ -z "$OPEN_TRADER_REPO" || -z "$OPEN_TRADER_PYTHON" ]]; then
   echo "OPEN_TRADER_REPO and OPEN_TRADER_PYTHON are required in $ENV_FILE" >&2
   exit 1
 fi
+
+OPEN_TRADER_REPO="$(expand_home_path "$OPEN_TRADER_REPO")"
+OPEN_TRADER_PYTHON="$(expand_home_path "$OPEN_TRADER_PYTHON")"
 
 RENDERED="$(
   sed \
