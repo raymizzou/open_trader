@@ -80,6 +80,12 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
     total_market_value_hkd = Decimal("0")
 
     for row in rows:
+        if None in row:
+            continue
+
+        if any(row.get(name) is None for name in PORTFOLIO_REQUIRED_FIELDNAMES):
+            continue
+
         market_value_hkd = _optional_decimal(row.get("market_value_hkd", "") or "")
         if market_value_hkd is not None:
             total_market_value_hkd += market_value_hkd

@@ -187,14 +187,13 @@ def test_load_portfolio_action_context_rejects_missing_required_columns(tmp_path
         load_portfolio_action_context(path)
 
 
-def test_load_portfolio_action_context_rejects_blank_or_duplicate_portfolio_columns(tmp_path: Path) -> None:
+def test_load_portfolio_action_context_rejects_blank_portfolio_columns(tmp_path: Path) -> None:
     path = tmp_path / "portfolio.csv"
     malformed_headers = [
         "market",
         "asset_class",
         "",
         "currency",
-        "symbol",
         "symbol",
         "total_quantity",
         "market_value",
@@ -206,6 +205,27 @@ def test_load_portfolio_action_context_rejects_blank_or_duplicate_portfolio_colu
         handle.write(",".join(malformed_headers) + "\n")
 
     with pytest.raises(ValueError, match=r"portfolio column names must not be blank"):
+        load_portfolio_action_context(path)
+
+
+def test_load_portfolio_action_context_rejects_duplicate_portfolio_columns(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    malformed_headers = [
+        "market",
+        "asset_class",
+        "symbol",
+        "symbol",
+        "currency",
+        "total_quantity",
+        "market_value",
+        "fx_to_hkd",
+        "market_value_hkd",
+        "portfolio_weight_hkd",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(",".join(malformed_headers) + "\n")
+
+    with pytest.raises(ValueError, match=r"duplicate portfolio column\(s\): symbol"):
         load_portfolio_action_context(path)
 
 
@@ -476,6 +496,47 @@ def test_load_portfolio_action_context_falls_back_to_zero_for_invalid_position_v
             "fx_to_hkd": Decimal("0"),
         },
     }
+
+
+def test_load_portfolio_action_context_skips_truncated_rows(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(
+            "market,asset_class,symbol,currency,total_quantity,market_value,"
+            "fx_to_hkd,market_value_hkd,portfolio_weight_hkd\n"
+        )
+        handle.write("US,stock,TRUNC,USD,10\n")
+
+    context = load_portfolio_action_context(path)
+
+    assert context == PortfolioActionContext(
+        positions={},
+        cash_by_currency={},
+        total_market_value_hkd=Decimal("0"),
+    )
+
+
+def test_load_portfolio_action_context_skips_rows_with_extra_cells(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        header = (
+            "market,asset_class,symbol,currency,total_quantity,market_value,"
+            "cost_value,unrealized_pnl,fx_to_hkd,market_value_hkd,portfolio_weight_hkd\n"
+        )
+        row = (
+            "US,stock,AAPL,USD,10,3900,3000,900,7.8,30420,39.00%,"
+            "extra-cell\n"
+        )
+        handle.write(header)
+        handle.write(row)
+
+    context = load_portfolio_action_context(path)
+
+    assert context == PortfolioActionContext(
+        positions={},
+        cash_by_currency={},
+        total_market_value_hkd=Decimal("0"),
+    )
 
 
 def test_load_portfolio_action_context_parses_percentage_to_fractional_weight(tmp_path: Path) -> None:
