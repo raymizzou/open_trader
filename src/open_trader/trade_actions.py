@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Mapping
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -45,8 +47,8 @@ PORTFOLIO_REQUIRED_FIELDNAMES = [
 
 @dataclass(frozen=True)
 class PortfolioActionContext:
-    positions: dict[tuple[str, str], PortfolioPositionSnapshot]
-    cash_by_currency: dict[str, Decimal]
+    positions: Mapping[tuple[str, str], PortfolioPositionSnapshot]
+    cash_by_currency: Mapping[str, Decimal]
     total_market_value_hkd: Decimal
 
 
@@ -127,8 +129,8 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
             )
 
     return PortfolioActionContext(
-        positions=positions,
-        cash_by_currency=cash_by_currency,
+        positions=MappingProxyType(positions),
+        cash_by_currency=MappingProxyType(cash_by_currency),
         total_market_value_hkd=total_market_value_hkd,
     )
 
@@ -148,8 +150,7 @@ def _optional_percent(value: str) -> Decimal | None:
     value = value.strip()
     if not value:
         return None
-    if value.endswith("%"):
+    if value.endswith("%"): 
         parsed = _optional_decimal(value[:-1])
         return None if parsed is None else parsed / Decimal("100")
-    parsed = _optional_decimal(value)
-    return parsed
+    return None

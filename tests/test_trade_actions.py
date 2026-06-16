@@ -156,6 +156,55 @@ def test_load_portfolio_action_context_indexes_positions_cash_and_total_value(
     )
 
 
+def test_load_portfolio_action_context_is_immutable(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "MSFT",
+            "name": "Microsoft",
+            "currency": "USD",
+            "total_quantity": "10",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "30.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "39.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "MSFT",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        }
+    ])
+
+    context = load_portfolio_action_context(path)
+
+    with pytest.raises(TypeError):
+        context.positions[("US", "MSFT")] = PortfolioPositionSnapshot(
+            currency="USD",
+            quantity=Decimal("1"),
+            market_value=Decimal("1"),
+            market_value_hkd=Decimal("1"),
+            weight=Decimal("0.1"),
+            fx_to_hkd=Decimal("1"),
+        )
+
+    with pytest.raises(TypeError):
+        context.cash_by_currency["USD"] = Decimal("1")
+
+
 def test_load_portfolio_action_context_rejects_missing_required_columns(tmp_path: Path) -> None:
     path = tmp_path / "portfolio.csv"
     fieldnames = [
@@ -629,3 +678,72 @@ def test_load_portfolio_action_context_parses_percentage_to_fractional_weight(tm
     context = load_portfolio_action_context(path)
 
     assert context.positions[("US", "AAPL")].weight == Decimal("0.125")
+
+
+def test_load_portfolio_action_context_prefers_only_percentage_weight_strings(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "AAPL",
+            "name": "Apple",
+            "currency": "USD",
+            "total_quantity": "10",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "12.50",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "AAPL",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "MSFT",
+            "name": "Microsoft",
+            "currency": "USD",
+            "total_quantity": "10",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "12.50%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "MSFT",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+
+    context = load_portfolio_action_context(path)
+
+    assert context.positions[("US", "AAPL")].weight == Decimal("0")
+    assert context.positions[("US", "MSFT")].weight == Decimal("0.125")
