@@ -119,7 +119,11 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
         fx_to_hkd = _optional_decimal(row.get("fx_to_hkd", "") or "")
 
         if market and symbol:
-            positions[(market, symbol)] = PortfolioPositionSnapshot(
+            key = (market, symbol)
+            if key in positions:
+                raise ValueError(f"duplicate portfolio position(s): {market}.{symbol}")
+
+            positions[key] = PortfolioPositionSnapshot(
                 currency=currency,
                 quantity=quantity or Decimal("0"),
                 market_value=market_value or Decimal("0"),

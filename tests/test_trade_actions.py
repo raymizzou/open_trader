@@ -279,6 +279,71 @@ def test_load_portfolio_action_context_rejects_duplicate_portfolio_columns(tmp_p
         load_portfolio_action_context(path)
 
 
+def test_load_portfolio_action_context_rejects_duplicate_positions(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "MSFT",
+            "name": "Microsoft",
+            "currency": "USD",
+            "total_quantity": "10",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "30.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "39.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "MSFT",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+        {
+            "sort_group": "1",
+            "market": "us",
+            "asset_class": "stock",
+            "symbol": "msft",
+            "name": "Microsoft",
+            "currency": "USD",
+            "total_quantity": "10",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "30.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "39.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "MSFT",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+
+    with pytest.raises(ValueError, match=r"duplicate portfolio position\(s\): US\.MSFT"):
+        load_portfolio_action_context(path)
+
+
 def test_load_portfolio_action_context_aggregates_same_currency_cash_rows(tmp_path: Path) -> None:
     path = tmp_path / "portfolio.csv"
     write_portfolio(path, [
