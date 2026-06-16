@@ -82,6 +82,11 @@ Machine-readable action list:
 data/latest/premarket_actions.csv
 ```
 
+Each row in `trading_advice.csv` keeps the raw TradingAgents response in
+`raw_decision` and writes a normalized per-symbol template to `advice_summary`:
+rating, action plan, risk control, position sizing, catalyst, price target, time
+window, and rationale.
+
 ## Build Watchlist
 
 After the premarket run creates `data/latest/premarket_actions.csv`, convert it

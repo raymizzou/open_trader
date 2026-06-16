@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .models import PortfolioInputRow, TradingAdvice
+from .trader_template import format_trader_template
 
 
 class TradingAgentsAdapter:
@@ -68,7 +69,11 @@ class TradingAgentsAdapter:
                 risk_flag=row.risk_flag,
                 source="tradingagents",
                 advice_action=_extract_action(decision),
-                advice_summary=_extract_summary(state, decision),
+                advice_summary=_extract_summary(
+                    state,
+                    decision,
+                    action=_extract_action(decision),
+                ),
                 raw_decision=json.dumps(
                     {"state": state, "decision": decision},
                     ensure_ascii=False,
@@ -105,11 +110,11 @@ def _extract_action(decision: Any) -> str:
     return ""
 
 
-def _extract_summary(state: Any, decision: Any) -> str:
+def _extract_summary(state: Any, decision: Any, *, action: str = "") -> str:
     if isinstance(state, dict):
         value = state.get("final_trade_decision")
         if value:
-            return str(value)
+            return format_trader_template(value, action)
     if isinstance(decision, dict):
         for key in ("summary", "reasoning", "rationale", "analysis"):
             value = decision.get(key)

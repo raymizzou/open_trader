@@ -87,6 +87,40 @@ def test_adapter_preserves_real_tradingagents_detail_shape() -> None:
     assert "final_trade_decision" in advice.raw_decision
 
 
+def test_adapter_formats_trader_decision_with_standard_template() -> None:
+    class TemplateShapeGraph:
+        def propagate(self, symbol: str, run_date: str) -> tuple[dict[str, str], str]:
+            return {
+                "final_trade_decision": (
+                    "**Rating**: Overweight\n\n"
+                    "**Executive Summary**: 在380-400美元区间分3-4次买入目标仓位的60%，"
+                    "350美元附近加仓剩余40%。统一停损线设在340美元。"
+                    "10月底财报为关键催化剂。\n\n"
+                    "**Investment Thesis**: 微软AI商业化路径清晰，Azure和Copilot支撑中期增长。\n\n"
+                    "**Price Target**: 450.0\n\n"
+                    "**Time Horizon**: 3-6个月"
+                )
+            }, "Overweight"
+
+    adapter = TradingAgentsAdapter.from_graph(TemplateShapeGraph())
+
+    advice = adapter.analyze(portfolio_row("MSFT"), "2026-06-16")
+
+    assert advice.advice_action == "Overweight"
+    assert advice.advice_summary == "\n".join(
+        [
+            "评级：Overweight",
+            "操作计划：在380-400美元区间分3-4次买入目标仓位的60%，350美元附近加仓剩余40%。统一停损线设在340美元。10月底财报为关键催化剂。",
+            "风控：统一停损线设在340美元。",
+            "仓位：在380-400美元区间分3-4次买入目标仓位的60%，350美元附近加仓剩余40%。",
+            "催化剂：10月底财报为关键催化剂。",
+            "目标价：450.0",
+            "时间窗口：3-6个月",
+            "理由：微软AI商业化路径清晰，Azure和Copilot支撑中期增长。",
+        ]
+    )
+
+
 def test_adapter_stringifies_non_json_values_without_raising() -> None:
     non_json_value = object()
 
