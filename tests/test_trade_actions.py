@@ -6,12 +6,16 @@ import pytest
 from decimal import Decimal
 from pathlib import Path
 
+from open_trader.futu_watch import QuoteSnapshot
 from open_trader.trading_plan import PlanQuoteStatus, TradingPlanRow
+from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 from open_trader.trade_actions import (
     TRADE_ACTION_FIELDNAMES,
     PortfolioPositionSnapshot,
     PortfolioActionContext,
+    TradeActionsResult,
     build_trade_action_row,
+    generate_trade_actions,
     map_quote_status_to_action,
     load_portfolio_action_context,
 )
@@ -51,6 +55,104 @@ def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_trading_plan(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TRADING_PLAN_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def msft_plan_row(
+    *,
+    run_date: str = "2026-06-16",
+    status: str = "active",
+    symbol: str = "MSFT",
+) -> dict[str, str]:
+    return {
+        "run_date": run_date,
+        "symbol": symbol,
+        "market": "US",
+        "rating": "Overweight",
+        "entry_zone_low": "380",
+        "entry_zone_high": "400",
+        "add_price": "350",
+        "stop_loss": "340",
+        "target_1": "450",
+        "target_2": "500",
+        "max_weight": "12%",
+        "catalyst": "10月底财报",
+        "time_horizon": "3-6个月",
+        "plan_text": "操作计划：在380-400美元区间分3-4次买入目标仓位的60%，350美元附近加仓剩余40%。",
+        "status": status,
+        "error": "",
+    }
+
+
+@pytest.fixture
+def valid_portfolio_path(tmp_path: Path) -> Path:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "MSFT",
+            "name": "Microsoft",
+            "currency": "USD",
+            "total_quantity": "10",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "30.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "39.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "MSFT",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+        {
+            "sort_group": "5",
+            "market": "CASH",
+            "asset_class": "cash",
+            "symbol": "USD_CASH",
+            "name": "USD Cash",
+            "currency": "USD",
+            "total_quantity": "1",
+            "avg_cost_price": "",
+            "last_price": "",
+            "market_value": "96100",
+            "cost_value": "",
+            "unrealized_pnl": "",
+            "unrealized_pnl_pct": "",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "749580",
+            "cost_value_hkd": "",
+            "portfolio_weight_hkd": "96.10%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "false",
+            "analysis_symbol": "",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+    return path
 
 
 def active_plan(
@@ -1348,3 +1450,131 @@ def test_trade_action_rows_always_match_fieldname_shape() -> None:
     assert set(buy_row) == expected_keys
     assert set(sell_row) == expected_keys
     assert set(review_row) == expected_keys
+
+
+def test_generate_trade_actions_writes_csv_report_and_latest(
+    tmp_path: Path,
+    valid_portfolio_path: Path,
+) -> None:
+    plan_path = tmp_path / "trading_plan.csv"
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports"
+    write_trading_plan(plan_path, [msft_plan_row()])
+
+    result = generate_trade_actions(
+        plan_path=plan_path,
+        portfolio_path=valid_portfolio_path,
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        snapshots={"US.MSFT": QuoteSnapshot(futu_symbol="US.MSFT", last_price=Decimal("390"))},
+        run_date=None,
+        update_latest=True,
+    )
+
+    expected_actions_path = data_dir / "runs" / "2026-06-16" / "trade_actions.csv"
+    expected_latest_path = data_dir / "latest" / "trade_actions.csv"
+    expected_report_path = reports_dir / "trade_actions" / "2026-06-16.md"
+    assert result == TradeActionsResult(
+        run_date="2026-06-16",
+        action_count=1,
+        ready_count=1,
+        review_count=0,
+        watch_count=0,
+        actions_path=expected_actions_path,
+        latest_path=expected_latest_path,
+        report_path=expected_report_path,
+    )
+
+    with expected_actions_path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 1
+    assert rows[0]["action"] == "BUY"
+    assert rows[0]["status"] == "ready"
+    assert expected_latest_path.read_text(encoding="utf-8") == expected_actions_path.read_text(
+        encoding="utf-8"
+    )
+
+    report = expected_report_path.read_text(encoding="utf-8")
+    assert "行动：BUY" in report
+    assert "标的：US.MSFT" in report
+    assert "建议：买入" in report
+
+
+def test_generate_trade_actions_dry_run_does_not_update_latest(
+    tmp_path: Path,
+    valid_portfolio_path: Path,
+) -> None:
+    plan_path = tmp_path / "trading_plan.csv"
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports"
+    latest_path = data_dir / "latest" / "trade_actions.csv"
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.write_text("old latest", encoding="utf-8")
+    write_trading_plan(plan_path, [msft_plan_row()])
+
+    result = generate_trade_actions(
+        plan_path=plan_path,
+        portfolio_path=valid_portfolio_path,
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        snapshots={},
+        run_date="2026-06-16",
+        update_latest=False,
+    )
+
+    assert result.actions_path.exists()
+    assert result.report_path.exists()
+    assert latest_path.read_text(encoding="utf-8") == "old latest"
+
+
+def test_generate_trade_actions_marks_missing_quote_for_review(
+    tmp_path: Path,
+    valid_portfolio_path: Path,
+) -> None:
+    plan_path = tmp_path / "trading_plan.csv"
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports"
+    write_trading_plan(plan_path, [msft_plan_row()])
+
+    result = generate_trade_actions(
+        plan_path=plan_path,
+        portfolio_path=valid_portfolio_path,
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        snapshots={},
+        run_date="2026-06-16",
+        update_latest=False,
+    )
+
+    with result.actions_path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 1
+    assert rows[0]["action"] == "REVIEW"
+    assert rows[0]["status"] == "review"
+    assert rows[0]["trigger_status"] == "missing_quote"
+    assert "Futu did not return a quote." in rows[0]["reason"]
+    assert "Futu did not return a quote." in rows[0]["error"]
+
+
+def test_generate_trade_actions_requires_date_when_active_rows_have_no_run_date(
+    tmp_path: Path,
+    valid_portfolio_path: Path,
+) -> None:
+    plan_path = tmp_path / "trading_plan.csv"
+    write_trading_plan(plan_path, [msft_plan_row(run_date="")])
+
+    with pytest.raises(
+        ValueError,
+        match=r"--date is required when trading plan has no active run_date rows",
+    ):
+        generate_trade_actions(
+            plan_path=plan_path,
+            portfolio_path=valid_portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            snapshots={},
+            run_date=None,
+            update_latest=False,
+        )

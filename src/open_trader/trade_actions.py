@@ -4,11 +4,18 @@ import csv
 from dataclasses import dataclass
 import re
 from types import MappingProxyType
-from typing import Mapping
+from typing import Iterable, Mapping
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-from .trading_plan import PlanQuoteStatus, TradingPlanRow
+from .futu_watch import QuoteSnapshot
+from .trading_plan import (
+    PlanQuoteStatus,
+    TradingPlanRow,
+    evaluate_plan_quote,
+    load_trading_plan_rows,
+)
 
 
 TRADE_ACTION_FIELDNAMES = (
@@ -68,6 +75,106 @@ class PortfolioPositionSnapshot:
     market_value_hkd: Decimal
     weight: Decimal
     fx_to_hkd: Decimal
+
+
+@dataclass(frozen=True)
+class TradeActionsResult:
+    run_date: str
+    action_count: int
+    ready_count: int
+    review_count: int
+    watch_count: int
+    actions_path: Path
+    latest_path: Path
+    report_path: Path
+
+
+def generate_trade_actions(
+    *,
+    plan_path: Path,
+    portfolio_path: Path,
+    data_dir: Path,
+    reports_dir: Path,
+    snapshots: dict[str, QuoteSnapshot],
+    run_date: str | None,
+    update_latest: bool,
+) -> TradeActionsResult:
+    active_plans = [
+        plan
+        for plan in load_trading_plan_rows(plan_path)
+        if plan.status == "active"
+    ]
+    effective_run_date = run_date or _latest_run_date(active_plans)
+    plans = [
+        plan
+        for plan in active_plans
+        if plan.run_date == effective_run_date
+    ]
+    portfolio = load_portfolio_action_context(portfolio_path)
+
+    rows = [
+        build_trade_action_row(
+            plan=plan,
+            quote_status=_quote_status_for_plan(plan, snapshots),
+            portfolio=portfolio,
+            source_plan=str(plan_path),
+        )
+        for plan in plans
+    ]
+
+    actions_path = data_dir / "runs" / effective_run_date / "trade_actions.csv"
+    latest_path = data_dir / "latest" / "trade_actions.csv"
+    report_path = reports_dir / "trade_actions" / f"{effective_run_date}.md"
+
+    _atomic_write_csv(actions_path, TRADE_ACTION_FIELDNAMES, rows)
+    _atomic_write_text(report_path, render_trade_actions_report(effective_run_date, rows))
+    if update_latest:
+        _atomic_write_csv(latest_path, TRADE_ACTION_FIELDNAMES, rows)
+
+    status_counts = {
+        "ready": sum(1 for row in rows if row.get("status") == "ready"),
+        "review": sum(1 for row in rows if row.get("status") == "review"),
+        "watch": sum(1 for row in rows if row.get("status") == "watch"),
+    }
+    return TradeActionsResult(
+        run_date=effective_run_date,
+        action_count=len(rows),
+        ready_count=status_counts["ready"],
+        review_count=status_counts["review"],
+        watch_count=status_counts["watch"],
+        actions_path=actions_path,
+        latest_path=latest_path,
+        report_path=report_path,
+    )
+
+
+def render_trade_actions_report(run_date: str, rows: list[dict[str, str]]) -> str:
+    lines = [f"# Trade Actions - {run_date}", ""]
+    if not rows:
+        lines.append("No active trading actions were generated.")
+        return "\n".join(lines) + "\n"
+
+    sorted_rows = sorted(rows, key=_priority_sort_key)
+    for index, row in enumerate(sorted_rows):
+        if index:
+            lines.append("")
+        lines.extend([
+            f"## {row.get('futu_symbol', '').strip()}",
+            f"行动：{row.get('action', '').strip()}",
+            f"标的：{row.get('futu_symbol', '').strip()}",
+            f"优先级：{row.get('priority', '').strip()}",
+            f"价格：{row.get('last_price', '').strip()}",
+            f"建议：{_suggestion_text(row.get('action', '').strip())}",
+            f"条件：{row.get('reason', '').strip()}",
+            f"风控：止损 {row.get('stop_price', '').strip()}",
+            (
+                "原因：来自 "
+                f"{row.get('source_plan', '').strip()}，"
+                f"计划仓位上限 {row.get('target_max_weight', '').strip()}"
+            ),
+            f"状态：{row.get('status', '').strip()}",
+        ])
+    return "\n".join(lines) + "\n"
 
 
 def map_quote_status_to_action(trigger_status: str) -> tuple[str, str]:
@@ -398,3 +505,100 @@ def _percent_to_text(value: Decimal | None) -> str:
     if value is None:
         return ""
     return f"{_decimal_to_text(value * Decimal('100'))}%"
+
+
+def _latest_run_date(plans: list[TradingPlanRow]) -> str:
+    dates = sorted({plan.run_date.strip() for plan in plans if plan.run_date.strip()})
+    if not dates:
+        raise ValueError("--date is required when trading plan has no active run_date rows")
+    return dates[-1]
+
+
+def _quote_status_for_plan(
+    plan: TradingPlanRow,
+    snapshots: Mapping[str, QuoteSnapshot],
+) -> PlanQuoteStatus:
+    quote = snapshots.get(plan.futu_symbol)
+    if quote is None:
+        return PlanQuoteStatus(
+            symbol=plan.symbol,
+            futu_symbol=plan.futu_symbol,
+            last_price=Decimal("0"),
+            status="missing_quote",
+            message="Futu did not return a quote.",
+        )
+    return evaluate_plan_quote(plan, quote.last_price)
+
+
+def _priority_sort_key(row: Mapping[str, str]) -> tuple[int, str]:
+    priority_order = {
+        "critical": 0,
+        "high": 1,
+        "medium": 2,
+        "low": 3,
+    }
+    priority = row.get("priority", "").strip().lower()
+    futu_symbol = row.get("futu_symbol", "").strip()
+    return priority_order.get(priority, len(priority_order)), futu_symbol
+
+
+def _suggestion_text(action: str) -> str:
+    return {
+        "BUY": "买入",
+        "ADD": "加仓",
+        "TRIM": "减仓",
+        "TAKE_PROFIT": "止盈卖出",
+        "SELL_STOP": "止损卖出",
+        "HOLD": "继续观察",
+        "REVIEW": "人工复核",
+    }.get(action, "人工复核")
+
+
+def _atomic_write_csv(
+    path: Path,
+    fieldnames: tuple[str, ...],
+    rows: Iterable[Mapping[str, str]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: row.get(field, "") for field in fieldnames})
+        temp_path.replace(path)
+    except Exception:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+        raise
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(content)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+        raise
