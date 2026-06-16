@@ -7,6 +7,7 @@ from pathlib import Path
 
 from open_trader.trade_actions import (
     TRADE_ACTION_FIELDNAMES,
+    PortfolioPositionSnapshot,
     PortfolioActionContext,
     load_portfolio_action_context,
 )
@@ -141,14 +142,14 @@ def test_load_portfolio_action_context_indexes_positions_cash_and_total_value(
 
     assert context == PortfolioActionContext(
         positions={
-            ("US", "MSFT"): {
-                "currency": "USD",
-                "quantity": Decimal("10"),
-                "market_value": Decimal("3900"),
-                "market_value_hkd": Decimal("30420"),
-                "weight": Decimal("0.39"),
-                "fx_to_hkd": Decimal("7.8"),
-            }
+            ("US", "MSFT"): PortfolioPositionSnapshot(
+                currency="USD",
+                quantity=Decimal("10"),
+                market_value=Decimal("3900"),
+                market_value_hkd=Decimal("30420"),
+                weight=Decimal("0.39"),
+                fx_to_hkd=Decimal("7.8"),
+            )
         },
         cash_by_currency={"USD": Decimal("1000")},
         total_market_value_hkd=Decimal("38220"),
@@ -387,14 +388,14 @@ def test_load_portfolio_action_context_skips_non_cash_rows_with_missing_keys(tmp
     context = load_portfolio_action_context(path)
 
     assert context.positions == {
-        ("US", "GOOD"): {
-            "currency": "USD",
-            "quantity": Decimal("2"),
-            "market_value": Decimal("200"),
-            "market_value_hkd": Decimal("1560"),
-            "weight": Decimal("0.01"),
-            "fx_to_hkd": Decimal("7.8"),
-        }
+        ("US", "GOOD"): PortfolioPositionSnapshot(
+            currency="USD",
+            quantity=Decimal("2"),
+            market_value=Decimal("200"),
+            market_value_hkd=Decimal("1560"),
+            weight=Decimal("0.01"),
+            fx_to_hkd=Decimal("7.8"),
+        )
     }
 
 
@@ -436,14 +437,16 @@ def test_load_portfolio_action_context_accepts_utf8_sig_input(tmp_path: Path) ->
     context = load_portfolio_action_context(path)
 
     assert context == PortfolioActionContext(
-        positions={("US", "MSFT"): {
-            "currency": "USD",
-            "quantity": Decimal("10"),
-            "market_value": Decimal("3900"),
-            "market_value_hkd": Decimal("30420"),
-            "weight": Decimal("0.39"),
-            "fx_to_hkd": Decimal("7.8"),
-        }},
+        positions={
+            ("US", "MSFT"): PortfolioPositionSnapshot(
+                currency="USD",
+                quantity=Decimal("10"),
+                market_value=Decimal("3900"),
+                market_value_hkd=Decimal("30420"),
+                weight=Decimal("0.39"),
+                fx_to_hkd=Decimal("7.8"),
+            )
+        },
         cash_by_currency={},
         total_market_value_hkd=Decimal("30420"),
     )
@@ -487,15 +490,66 @@ def test_load_portfolio_action_context_falls_back_to_zero_for_invalid_position_v
     context = load_portfolio_action_context(path)
 
     assert context.positions == {
-        ("US", "AAPL"): {
-            "currency": "USD",
-            "quantity": Decimal("0"),
-            "market_value": Decimal("0"),
-            "market_value_hkd": Decimal("0"),
-            "weight": Decimal("0"),
-            "fx_to_hkd": Decimal("0"),
-        },
+        ("US", "AAPL"): PortfolioPositionSnapshot(
+            currency="USD",
+            quantity=Decimal("0"),
+            market_value=Decimal("0"),
+            market_value_hkd=Decimal("0"),
+            weight=Decimal("0"),
+            fx_to_hkd=Decimal("0"),
+        )
     }
+
+
+def test_load_portfolio_action_context_keeps_blank_optional_string_fields(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "AAPL",
+            "name": "Apple",
+            "currency": "",
+            "total_quantity": "10",
+            "avg_cost_price": "300",
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "AAPL",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+
+    context = load_portfolio_action_context(path)
+
+    assert context == PortfolioActionContext(
+        positions={
+            ("US", "AAPL"): PortfolioPositionSnapshot(
+                currency="",
+                quantity=Decimal("10"),
+                market_value=Decimal("3900"),
+                market_value_hkd=Decimal("30420"),
+                weight=Decimal("0"),
+                fx_to_hkd=Decimal("7.8"),
+            )
+        },
+        cash_by_currency={},
+        total_market_value_hkd=Decimal("30420"),
+    )
 
 
 def test_load_portfolio_action_context_skips_truncated_rows(tmp_path: Path) -> None:
@@ -574,4 +628,4 @@ def test_load_portfolio_action_context_parses_percentage_to_fractional_weight(tm
 
     context = load_portfolio_action_context(path)
 
-    assert context.positions[("US", "AAPL")]["weight"] == Decimal("0.125")
+    assert context.positions[("US", "AAPL")].weight == Decimal("0.125")

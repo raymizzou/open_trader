@@ -45,9 +45,19 @@ PORTFOLIO_REQUIRED_FIELDNAMES = [
 
 @dataclass(frozen=True)
 class PortfolioActionContext:
-    positions: dict[tuple[str, str], dict[str, Decimal | str]]
+    positions: dict[tuple[str, str], PortfolioPositionSnapshot]
     cash_by_currency: dict[str, Decimal]
     total_market_value_hkd: Decimal
+
+
+@dataclass(frozen=True)
+class PortfolioPositionSnapshot:
+    currency: str
+    quantity: Decimal
+    market_value: Decimal
+    market_value_hkd: Decimal
+    weight: Decimal
+    fx_to_hkd: Decimal
 
 
 def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContext:
@@ -75,7 +85,7 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
             raise ValueError(f"missing portfolio column(s): {', '.join(missing)}")
         rows = [row for row in reader]
 
-    positions: dict[tuple[str, str], dict[str, Decimal | str]] = {}
+    positions: dict[tuple[str, str], PortfolioPositionSnapshot] = {}
     cash_by_currency: dict[str, Decimal] = {}
     total_market_value_hkd = Decimal("0")
 
@@ -107,14 +117,14 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
         fx_to_hkd = _optional_decimal(row.get("fx_to_hkd", "") or "")
 
         if market and symbol:
-            positions[(market, symbol)] = {
-                "currency": currency,
-                "quantity": quantity or Decimal("0"),
-                "market_value": market_value or Decimal("0"),
-                "market_value_hkd": market_value_hkd or Decimal("0"),
-                "weight": weight or Decimal("0"),
-                "fx_to_hkd": fx_to_hkd or Decimal("0"),
-            }
+            positions[(market, symbol)] = PortfolioPositionSnapshot(
+                currency=currency,
+                quantity=quantity or Decimal("0"),
+                market_value=market_value or Decimal("0"),
+                market_value_hkd=market_value_hkd or Decimal("0"),
+                weight=weight or Decimal("0"),
+                fx_to_hkd=fx_to_hkd or Decimal("0"),
+            )
 
     return PortfolioActionContext(
         positions=positions,
