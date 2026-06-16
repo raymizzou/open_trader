@@ -456,6 +456,7 @@ class DailyPremarketRunner:
         error: str,
     ) -> DailyRunResult:
         finished_at = datetime.now(ZoneInfo(self.config.timezone))
+        write_errors: list[dict[str, str]] = []
         payload: dict[str, object] = {
             "run_date": run_date,
             "started_at": started_at.isoformat(),
@@ -493,9 +494,31 @@ class DailyPremarketRunner:
                 "log": str(log_path),
             },
         }
-        _write_json(status_path, payload)
-        _write_text(report_path, _render_daily_report(payload))
-        _write_text(log_path, json.dumps(payload, ensure_ascii=False) + "\n")
+
+        def attempt_write(label: str, write: Callable[[], None]) -> None:
+            try:
+                write()
+            except Exception as exc:
+                write_errors.append(
+                    {
+                        "artifact": label,
+                        "error": str(exc),
+                    }
+                )
+                payload["write_errors"] = write_errors
+
+        attempt_write("status", lambda: _write_json(status_path, payload))
+        attempt_write(
+            "report",
+            lambda: _write_text(report_path, _render_daily_report(payload)),
+        )
+        attempt_write(
+            "log",
+            lambda: _write_text(
+                log_path,
+                json.dumps(payload, ensure_ascii=False) + "\n",
+            ),
+        )
         self._notify(
             "Open Trader daily premarket",
             _notification_message("failed", {}, {}, {}),

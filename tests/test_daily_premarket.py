@@ -533,6 +533,60 @@ def test_daily_runner_does_not_promote_latest_when_status_write_fails(
     assert "status write failed" in status["error"]
 
 
+def test_daily_runner_returns_failed_when_failure_reporting_writes_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    latest_dir = tmp_path / "data/latest"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
+    (latest_dir / "premarket_actions.csv").write_text(
+        "old actions\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+
+    def always_fail_write(path: Path, text: str) -> None:
+        raise RuntimeError(f"write failed: {path.name}")
+
+    monkeypatch.setattr(daily_premarket, "_write_text", always_fail_write)
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "failed"
+    assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "old advice\n"
+    )
+    assert (latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
+        "old actions\n"
+    )
+    assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
+        "old plan\n"
+    )
+
+
 def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,
