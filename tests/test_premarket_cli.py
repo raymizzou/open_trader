@@ -279,8 +279,9 @@ def test_run_daily_premarket_main_wires_runner(
     captured: dict[str, object] = {}
 
     class FakeRunner:
-        def __init__(self, *, config: object) -> None:
+        def __init__(self, *, config: object, notifier: object) -> None:
             captured["config"] = config
+            captured["notifier"] = notifier
 
         def run(self, *, run_date: str, dry_run: bool):
             captured["run_date"] = run_date
@@ -321,6 +322,7 @@ def test_run_daily_premarket_main_wires_runner(
     assert captured["dry_run"] is True
     assert captured["run_date"] == "2026-06-17"
     assert captured["runner_dry_run"] is True
+    assert captured["notifier"].__class__.__name__ == "NullNotifier"
     output = capsys.readouterr().out
     assert "status: success" in output
     assert "status_json:" in output
@@ -336,7 +338,7 @@ def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     class FakeRunner:
-        def __init__(self, *, config: object) -> None:
+        def __init__(self, *, config: object, notifier: object) -> None:
             pass
 
         def run(self, *, run_date: str, dry_run: bool):
@@ -366,6 +368,74 @@ def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status
     assert "status_json:" in output
     assert "report:" in output
     assert "log:" in output
+
+
+def test_run_daily_premarket_builds_wecom_notifier_from_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = tmp_path / "daily.env"
+    env.write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={tmp_path}",
+                f"OPEN_TRADER_PYTHON={tmp_path / '.venv/bin/python'}",
+                "OPEN_TRADER_TIMEZONE=Asia/Shanghai",
+                "OPEN_TRADER_DEADLINE=21:10",
+                "OPEN_TRADER_FUTU_HOST=127.0.0.1",
+                "OPEN_TRADER_FUTU_PORT=11111",
+                "DEEPSEEK_API_KEY=secret",
+                "OPEN_TRADER_NOTIFIERS=wecom",
+                "OPEN_TRADER_WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeRunner:
+        def __init__(self, *, config: object, notifier: object) -> None:
+            captured["config"] = config
+            captured["notifier"] = notifier
+
+        def run(self, *, run_date: str, dry_run: bool):
+            captured["run_date"] = run_date
+            captured["runner_dry_run"] = dry_run
+            return type(
+                "DailyRunResult",
+                (),
+                {
+                    "status": "success",
+                    "status_path": tmp_path
+                    / "data/runs/2026-06-17/daily_run_status.json",
+                    "report_path": tmp_path / "reports/daily_runs/2026-06-17.md",
+                    "log_path": tmp_path / "logs/daily_premarket/2026-06-17.log",
+                },
+            )()
+
+    monkeypatch.setattr(cli, "DailyPremarketRunner", FakeRunner)
+
+    result = cli.main(
+        [
+            "run-daily-premarket",
+            "--date",
+            "2026-06-17",
+            "--config",
+            str(env),
+        ]
+    )
+
+    assert result == 0
+    assert captured["notifier"].__class__.__name__ == "CompositeNotifier"
+
+
+def test_watch_actions_help_is_registered() -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["watch-actions", "--help"])
+
+    assert exc_info.value.code == 0
 
 
 def test_run_daily_premarket_accepts_today_date() -> None:

@@ -15,6 +15,7 @@ from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
+from .notifications import build_notifier_from_values
 from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
@@ -371,6 +372,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write dated output and report but do not update latest trade actions",
     )
 
+    watch_actions_parser = subparsers.add_parser(
+        "watch-actions",
+        help="Watch active trade action triggers and send notifications",
+    )
+    watch_actions_parser.add_argument(
+        "--date",
+        required=True,
+        help="Run date, YYYY-MM-DD, or today",
+    )
+    watch_actions_parser.add_argument(
+        "--plan",
+        type=Path,
+        default=Path("data/latest/trading_plan.csv"),
+    )
+    watch_actions_parser.add_argument(
+        "--actions",
+        type=Path,
+        default=Path("data/latest/trade_actions.csv"),
+    )
+    watch_actions_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    watch_actions_parser.add_argument("--reports-dir", type=Path, default=Path("reports"))
+    watch_actions_parser.add_argument("--config", type=Path, default=Path("config/daily_premarket.env"))
+    watch_actions_parser.add_argument("--host", default="127.0.0.1")
+    watch_actions_parser.add_argument("--port", type=positive_int, default=11111)
+    watch_actions_parser.add_argument(
+        "--poll-seconds",
+        type=positive_float,
+        default=30.0,
+    )
+    watch_actions_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Fetch one quote snapshot and exit",
+    )
+    watch_actions_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Render would-send trigger messages without calling notifiers",
+    )
+
     return parser
 
 
@@ -451,7 +492,11 @@ def main(argv: list[str] | None = None) -> int:
                 if args.date == "today"
                 else canonical_date(args.date)
             )
-            result = DailyPremarketRunner(config=config).run(
+            notifier = build_notifier_from_values(
+                getattr(config, "notifier_values", {}),
+                dry_run=args.dry_run,
+            )
+            result = DailyPremarketRunner(config=config, notifier=notifier).run(
                 run_date=run_date,
                 dry_run=args.dry_run,
             )

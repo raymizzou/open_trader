@@ -81,6 +81,46 @@ class WeComWebhookNotifier:
         )
 
 
+def build_notifier_from_values(
+    values: Mapping[str, str],
+    *,
+    dry_run: bool = False,
+) -> Notifier:
+    names = [
+        name.strip().lower()
+        for name in values.get("OPEN_TRADER_NOTIFIERS", "").split(",")
+        if name.strip()
+    ]
+    if dry_run or not names or names == ["none"]:
+        return NullNotifier()
+
+    notifiers: list[Notifier] = []
+    for name in names:
+        if name == "macos":
+            notifiers.append(MacOSNotifier())
+        elif name == "wecom":
+            webhook_url = values.get("OPEN_TRADER_WECOM_WEBHOOK_URL", "").strip()
+            if not webhook_url:
+                raise ValueError(
+                    "OPEN_TRADER_WECOM_WEBHOOK_URL is required when wecom notifier is enabled"
+                )
+            notifiers.append(
+                WeComWebhookNotifier(
+                    webhook_url=webhook_url,
+                    message_format=values.get(
+                        "OPEN_TRADER_WECOM_MESSAGE_FORMAT",
+                        "markdown",
+                    ).strip()
+                    or "markdown",
+                )
+            )
+        elif name == "none":
+            continue
+        else:
+            raise ValueError(f"unknown notifier: {name}")
+    return CompositeNotifier(notifiers) if notifiers else NullNotifier()
+
+
 @dataclass
 class NotificationState:
     path: Path

@@ -7,10 +7,10 @@ import os
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 from zoneinfo import ZoneInfo
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
@@ -52,6 +52,7 @@ class DailyPremarketConfig:
     tradingagents_path: Path = Path("/Users/ray/projects/TradingAgents")
     classifier_model: str = "deepseek-v4-flash"
     notify_daily_report: bool = True
+    notifier_values: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,8 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
             repo,
         ),
         classifier_model=values.get("OPEN_TRADER_CLASSIFIER_MODEL", "deepseek-v4-flash"),
+        notify_daily_report=values.get("OPEN_TRADER_NOTIFY_DAILY_REPORT", "1") != "0",
+        notifier_values=dict(values),
     )
 
 
