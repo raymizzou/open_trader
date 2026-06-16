@@ -737,7 +737,7 @@ def test_load_portfolio_action_context_accepts_utf8_sig_input(tmp_path: Path) ->
     )
 
 
-def test_load_portfolio_action_context_falls_back_to_zero_for_invalid_position_values(
+def test_load_portfolio_action_context_tracks_invalid_position_values(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "portfolio.csv"
@@ -782,6 +782,12 @@ def test_load_portfolio_action_context_falls_back_to_zero_for_invalid_position_v
             market_value_hkd=Decimal("0"),
             weight=Decimal("0"),
             fx_to_hkd=Decimal("0"),
+            invalid_fields=(
+                "total_quantity",
+                "market_value",
+                "fx_to_hkd",
+                "market_value_hkd",
+            ),
         )
     }
 
@@ -867,6 +873,11 @@ def test_load_portfolio_action_context_parses_grouped_numbers_and_falls_back_for
             market_value_hkd=Decimal("10000"),
             weight=Decimal("0"),
             fx_to_hkd=Decimal("0"),
+            invalid_fields=(
+                "total_quantity",
+                "market_value",
+                "fx_to_hkd",
+            ),
         ),
     }
 
@@ -1254,6 +1265,40 @@ def test_buy_side_zero_fx_is_review(
     assert row["status"] == "review"
     assert "positive fx_to_hkd" in row["error"]
     assert row["reason"] == row["error"]
+
+
+@pytest.mark.parametrize("trigger_status", ["entry_zone", "add_zone"])
+def test_buy_side_invalid_portfolio_sizing_fields_map_to_review(
+    trigger_status: str,
+) -> None:
+    portfolio = portfolio_context(cash="20000", market_value="0")
+    broken_position = PortfolioPositionSnapshot(
+        currency="USD",
+        quantity=Decimal("10"),
+        market_value=Decimal("0"),
+        market_value_hkd=Decimal("30420"),
+        weight=Decimal("0.039"),
+        fx_to_hkd=Decimal("7.8"),
+        invalid_fields=("market_value",),
+    )
+    portfolio = PortfolioActionContext(
+        positions={("US", "MSFT"): broken_position},
+        cash_by_currency=portfolio.cash_by_currency,
+        total_market_value_hkd=portfolio.total_market_value_hkd,
+    )
+
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status(trigger_status),
+        portfolio=portfolio,
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "invalid portfolio sizing field(s): market_value" in row["error"]
+    assert row["suggested_quantity"] == ""
+    assert row["suggested_notional"] == ""
 
 
 def test_stop_loss_sells_full_position() -> None:

@@ -75,6 +75,7 @@ class PortfolioPositionSnapshot:
     market_value_hkd: Decimal
     weight: Decimal
     fx_to_hkd: Decimal
+    invalid_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -305,10 +306,13 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
                 cash_by_currency[currency] = cash_by_currency.get(currency, Decimal("0")) + cash_value
             continue
 
-        quantity = _optional_decimal(row.get("total_quantity", "") or "")
-        market_value = _optional_decimal(row.get("market_value", "") or "")
-        weight = _optional_percent(row.get("portfolio_weight_hkd", "") or "")
-        fx_to_hkd = _optional_decimal(row.get("fx_to_hkd", "") or "")
+        invalid_fields: list[str] = []
+        quantity = _position_decimal(row, "total_quantity", invalid_fields)
+        market_value = _position_decimal(row, "market_value", invalid_fields)
+        weight = _position_percent(row, "portfolio_weight_hkd", invalid_fields)
+        fx_to_hkd = _position_decimal(row, "fx_to_hkd", invalid_fields)
+        if market_value_hkd is None:
+            invalid_fields.append("market_value_hkd")
 
         if market and symbol:
             key = (market, symbol)
@@ -322,6 +326,7 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
                 market_value_hkd=market_value_hkd or Decimal("0"),
                 weight=weight or Decimal("0"),
                 fx_to_hkd=fx_to_hkd or Decimal("0"),
+                invalid_fields=tuple(invalid_fields),
             )
 
     return PortfolioActionContext(
@@ -359,6 +364,29 @@ def _optional_percent(value: str) -> Decimal | None:
     return None
 
 
+def _position_decimal(
+    row: dict[str, str],
+    fieldname: str,
+    invalid_fields: list[str],
+) -> Decimal | None:
+    parsed = _optional_decimal(row.get(fieldname, "") or "")
+    if parsed is None:
+        invalid_fields.append(fieldname)
+    return parsed
+
+
+def _position_percent(
+    row: dict[str, str],
+    fieldname: str,
+    invalid_fields: list[str],
+) -> Decimal | None:
+    raw_value = row.get(fieldname, "") or ""
+    parsed = _optional_percent(raw_value)
+    if parsed is None and raw_value.strip():
+        invalid_fields.append(fieldname)
+    return parsed
+
+
 def _size_sell_action_row(
     row: dict[str, str],
     action: str,
@@ -369,6 +397,12 @@ def _size_sell_action_row(
         return _review_row(row, "invalid last price")
     if position is None:
         return _review_row(row, "missing portfolio position for sell sizing")
+    invalid_fields = _invalid_position_fields(position, ("total_quantity",))
+    if invalid_fields:
+        return _review_row(
+            row,
+            f"invalid portfolio sizing field(s): {', '.join(invalid_fields)}",
+        )
 
     if action == "TRIM":
         quantity = (position.quantity * Decimal("0.5")).to_integral_value(
@@ -403,6 +437,15 @@ def _size_buy_action_row(
         return _review_row(row, "unparseable target max weight")
     if position is None:
         return _review_row(row, "missing portfolio position for buy-side sizing")
+    invalid_fields = _invalid_position_fields(
+        position,
+        ("total_quantity", "market_value", "market_value_hkd", "fx_to_hkd"),
+    )
+    if invalid_fields:
+        return _review_row(
+            row,
+            f"invalid portfolio sizing field(s): {', '.join(invalid_fields)}",
+        )
     if position.fx_to_hkd <= 0:
         return _review_row(row, "missing positive fx_to_hkd for buy-side sizing")
     if cash_available <= 0:
@@ -443,6 +486,14 @@ def _size_buy_action_row(
     row["suggested_notional"] = _decimal_to_text(executable_notional)
     row["status"] = "ready"
     return row
+
+
+def _invalid_position_fields(
+    position: PortfolioPositionSnapshot,
+    fieldnames: tuple[str, ...],
+) -> tuple[str, ...]:
+    invalid = set(position.invalid_fields)
+    return tuple(fieldname for fieldname in fieldnames if fieldname in invalid)
 
 
 def _review_row(row: dict[str, str], error: str) -> dict[str, str]:
