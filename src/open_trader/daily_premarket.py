@@ -4,7 +4,9 @@ import csv
 import fcntl
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
@@ -59,12 +61,14 @@ class RunLock:
 
     def __enter__(self) -> RunLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("w", encoding="utf-8")
+        handle = self.path.open("a+", encoding="utf-8")
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             handle.close()
             raise RuntimeError("daily premarket run already active") from exc
+        handle.seek(0)
+        handle.truncate()
         handle.write(str(os.getpid()))
         handle.flush()
         self._handle = handle
@@ -161,6 +165,7 @@ class DailyPremarketRunner:
         self.notifier = notifier or NullNotifier()
 
     def run(self, run_date: str) -> DailyRunResult:
+        _validate_run_date(run_date)
         zone = ZoneInfo(self.config.timezone)
         started_at = datetime.now(zone)
         status_path = self.config.data_dir / "runs" / run_date / "daily_run_status.json"
@@ -230,17 +235,18 @@ class DailyPremarketRunner:
             ),
             symbols=None,
             excluded_symbols=None,
-            update_latest=not self.config.dry_run,
+            update_latest=False,
             max_workers=self.config.max_workers,
             use_fallback=True,
             deadline_reached=_deadline_reached(self.config),
         )
         advice_path = Path(getattr(premarket_result, "advice_path"))
+        actions_path = Path(getattr(premarket_result, "actions_path"))
         plan_result = self.plan_builder(
             advice_path=advice_path,
             data_dir=self.config.data_dir,
             run_date=run_date,
-            update_latest=not self.config.dry_run,
+            update_latest=False,
         )
         futu_status = self._check_futu_plan(plan_result.plan_path)
         advice_counts = _count_advice(advice_path)
@@ -256,13 +262,23 @@ class DailyPremarketRunner:
             else "success"
         )
 
+        latest_advice_path = self.config.data_dir / "latest" / "trading_advice.csv"
+        latest_actions_path = self.config.data_dir / "latest" / "premarket_actions.csv"
+        latest_plan_path = self.config.data_dir / "latest" / "trading_plan.csv"
+        if not self.config.dry_run:
+            _promote_latest(advice_path, latest_advice_path)
+            _promote_latest(actions_path, latest_actions_path)
+            _promote_latest(plan_result.plan_path, latest_plan_path)
+
         artifacts = {
             "advice": str(advice_path),
             "classifications": str(getattr(premarket_result, "classifications_path")),
-            "actions": str(getattr(premarket_result, "actions_path")),
+            "actions": str(actions_path),
             "premarket_report": str(getattr(premarket_result, "report_path")),
             "trading_plan": str(plan_result.plan_path),
-            "latest_trading_plan": str(plan_result.latest_path),
+            "latest_advice": str(latest_advice_path),
+            "latest_actions": str(latest_actions_path),
+            "latest_trading_plan": str(latest_plan_path),
             "status": str(status_path),
             "report": str(report_path),
             "log": str(log_path),
@@ -376,7 +392,10 @@ class DailyPremarketRunner:
             }
         finally:
             if quote_client is not None and hasattr(quote_client, "close"):
-                quote_client.close()
+                try:
+                    quote_client.close()
+                except Exception:
+                    pass
 
     def _write_status_and_report(
         self,
@@ -455,6 +474,8 @@ class DailyPremarketRunner:
                 "actions": "",
                 "premarket_report": "",
                 "trading_plan": "",
+                "latest_advice": "",
+                "latest_actions": "",
                 "latest_trading_plan": "",
                 "status": str(status_path),
                 "report": str(report_path),
@@ -534,6 +555,37 @@ def _config_path(value: str, repo: Path) -> Path:
     if path.is_absolute():
         return path
     return repo / path
+
+
+def _validate_run_date(run_date: str) -> None:
+    try:
+        parsed = datetime.strptime(run_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("run_date must be YYYY-MM-DD") from exc
+    if parsed.strftime("%Y-%m-%d") != run_date:
+        raise ValueError("run_date must be YYYY-MM-DD")
+
+
+def _promote_latest(source_path: Path, latest_path: Path) -> None:
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb",
+            delete=False,
+            dir=latest_path.parent,
+            prefix=f".{latest_path.name}.",
+        ) as temp_handle:
+            temp_path = Path(temp_handle.name)
+            with source_path.open("rb") as source_handle:
+                shutil.copyfileobj(source_handle, temp_handle)
+        temp_path.replace(latest_path)
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _deadline_reached(config: DailyPremarketConfig) -> Callable[[], bool]:

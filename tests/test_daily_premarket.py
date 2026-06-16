@@ -84,6 +84,7 @@ class FakePremarket:
         assert isinstance(data_dir, Path)
         assert isinstance(run_date, str)
         advice_path = data_dir / "runs" / run_date / "trading_advice.csv"
+        actions_path = data_dir / "runs" / run_date / "premarket_actions.csv"
         advice_path.parent.mkdir(parents=True, exist_ok=True)
         with advice_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
@@ -126,6 +127,22 @@ class FakePremarket:
                     "fallback_from_date": "",
                 }
             )
+        actions_path.write_text(
+            "run_date,symbol,market,status\n"
+            f"{run_date},MSFT,US,ok\n",
+            encoding="utf-8",
+        )
+        if kwargs["update_latest"]:
+            latest_dir = data_dir / "latest"
+            latest_dir.mkdir(parents=True, exist_ok=True)
+            (latest_dir / "trading_advice.csv").write_text(
+                advice_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (latest_dir / "premarket_actions.csv").write_text(
+                actions_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
         return type(
             "PremarketResult",
             (),
@@ -138,13 +155,16 @@ class FakePremarket:
                 / "runs"
                 / run_date
                 / "change_classifications.csv",
-                "actions_path": data_dir / "runs" / run_date / "premarket_actions.csv",
+                "actions_path": actions_path,
                 "report_path": Path("reports/premarket") / f"{run_date}.md",
             },
         )()
 
 
 class FakePlanBuilder:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
     def __call__(
         self,
         *,
@@ -153,6 +173,14 @@ class FakePlanBuilder:
         run_date: str,
         update_latest: bool,
     ) -> TradingPlanBuildResult:
+        self.calls.append(
+            {
+                "advice_path": advice_path,
+                "data_dir": data_dir,
+                "run_date": run_date,
+                "update_latest": update_latest,
+            }
+        )
         assert advice_path.exists()
         plan_path = data_dir / "runs" / run_date / "trading_plan.csv"
         latest_path = data_dir / "latest" / "trading_plan.csv"
@@ -177,9 +205,14 @@ class FakePlanBuilder:
             "status": "active",
             "error": "",
         }
-        for path in [plan_path, latest_path]:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("w", encoding="utf-8", newline="") as handle:
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        with plan_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=TRADING_PLAN_FIELDNAMES)
+            writer.writeheader()
+            writer.writerow(row)
+        if update_latest:
+            latest_path.parent.mkdir(parents=True, exist_ok=True)
+            with latest_path.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=TRADING_PLAN_FIELDNAMES)
                 writer.writeheader()
                 writer.writerow(row)
@@ -203,6 +236,23 @@ class FakeQuoteClient:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FailingPlanBuilder:
+    def __call__(
+        self,
+        *,
+        advice_path: Path,
+        data_dir: Path,
+        run_date: str,
+        update_latest: bool,
+    ) -> TradingPlanBuildResult:
+        raise RuntimeError("plan builder failed")
+
+
+class RaisingCloseQuoteClient(FakeQuoteClient):
+    def close(self) -> None:
+        raise RuntimeError("close failed")
 
 
 def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
@@ -240,6 +290,161 @@ def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
     assert status["trading_plan"]["active"] == 1
     assert status["futu_plan_check"]["checked"] == 1
     assert (tmp_path / "reports/daily_runs/2026-06-17.md").exists()
+
+
+def test_daily_runner_defers_latest_promotion_until_final_success(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    premarket = FakePremarket()
+    plan_builder = FakePlanBuilder()
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=premarket,
+        plan_builder=plan_builder,
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "success"
+    assert premarket.calls[0]["update_latest"] is False
+    assert plan_builder.calls[0]["update_latest"] is False
+    assert (tmp_path / "data/latest/trading_advice.csv").read_text(
+        encoding="utf-8"
+    ) == (tmp_path / "data/runs/2026-06-17/trading_advice.csv").read_text(
+        encoding="utf-8"
+    )
+    assert (tmp_path / "data/latest/premarket_actions.csv").read_text(
+        encoding="utf-8"
+    ) == (tmp_path / "data/runs/2026-06-17/premarket_actions.csv").read_text(
+        encoding="utf-8"
+    )
+    assert (tmp_path / "data/latest/trading_plan.csv").read_text(
+        encoding="utf-8"
+    ) == (tmp_path / "data/runs/2026-06-17/trading_plan.csv").read_text(
+        encoding="utf-8"
+    )
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["artifacts"]["latest_advice"] == str(
+        tmp_path / "data/latest/trading_advice.csv"
+    )
+    assert status["artifacts"]["latest_actions"] == str(
+        tmp_path / "data/latest/premarket_actions.csv"
+    )
+    assert status["artifacts"]["latest_trading_plan"] == str(
+        tmp_path / "data/latest/trading_plan.csv"
+    )
+
+
+def test_daily_runner_does_not_promote_latest_when_plan_build_fails(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    latest_dir = tmp_path / "data/latest"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
+    (latest_dir / "premarket_actions.csv").write_text(
+        "old actions\n",
+        encoding="utf-8",
+    )
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FailingPlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "failed"
+    assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "old advice\n"
+    )
+    assert (latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
+        "old actions\n"
+    )
+
+
+def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=True,
+    )
+    latest_dir = tmp_path / "data/latest"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
+    (latest_dir / "premarket_actions.csv").write_text(
+        "old actions\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+    premarket = FakePremarket()
+    plan_builder = FakePlanBuilder()
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=premarket,
+        plan_builder=plan_builder,
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "success"
+    assert premarket.calls[0]["update_latest"] is False
+    assert plan_builder.calls[0]["update_latest"] is False
+    assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "old advice\n"
+    )
+    assert (latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
+        "old actions\n"
+    )
+    assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
+        "old plan\n"
+    )
 
 
 def test_daily_runner_lock_contention_does_not_overwrite_run_artifacts(
@@ -379,6 +584,40 @@ def test_daily_runner_marks_partial_when_futu_quote_is_missing(
     assert status["futu_plan_check"]["missing"] == 1
 
 
+def test_daily_runner_ignores_quote_client_close_failure(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=RaisingCloseQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "success"
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "success"
+    assert status["futu_plan_check"]["checked"] == 1
+    assert status["futu_plan_check"]["error"] == ""
+
+
 def test_daily_runner_writes_failed_status_when_portfolio_is_missing(
     tmp_path: Path,
 ) -> None:
@@ -410,6 +649,52 @@ def test_daily_runner_writes_failed_status_when_portfolio_is_missing(
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["status"] == "failed"
     assert "portfolio not found" in status["error"]
+    assert set(status["premarket"]) == {
+        "eligible",
+        "advice",
+        "actions",
+        "ok",
+        "fallback",
+        "error",
+    }
     assert status["premarket"]["eligible"] == 0
     assert status["premarket"]["advice"] == 0
     assert status["premarket"]["actions"] == 0
+
+
+@pytest.mark.parametrize(
+    "run_date",
+    ["today", "../latest", "2026-06-17/foo", "2026-02-30"],
+)
+def test_daily_runner_rejects_malformed_run_dates_without_escaped_writes(
+    tmp_path: Path,
+    run_date: str,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    with pytest.raises(ValueError, match="run_date must be YYYY-MM-DD"):
+        runner.run(run_date)
+
+    assert not (tmp_path / "data/latest/daily_run_status.json").exists()
+    assert not (tmp_path / "reports/latest.md").exists()
