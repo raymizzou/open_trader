@@ -5,7 +5,7 @@ import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
@@ -451,12 +451,16 @@ def main(argv: list[str] | None = None) -> int:
                 if args.date == "today"
                 else canonical_date(args.date)
             )
-            result = DailyPremarketRunner(config=config).run(run_date)
+            result = DailyPremarketRunner(config=config).run(
+                run_date=run_date,
+                dry_run=args.dry_run,
+            )
         except (
             FileNotFoundError,
             ValueError,
             RuntimeError,
             argparse.ArgumentTypeError,
+            ZoneInfoNotFoundError,
         ) as exc:
             parser.error(str(exc))
         print(f"status: {result.status}")

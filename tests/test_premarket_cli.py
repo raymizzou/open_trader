@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -281,8 +282,9 @@ def test_run_daily_premarket_main_wires_runner(
         def __init__(self, *, config: object) -> None:
             captured["config"] = config
 
-        def run(self, run_date: str):
+        def run(self, *, run_date: str, dry_run: bool):
             captured["run_date"] = run_date
+            captured["runner_dry_run"] = dry_run
             return type(
                 "DailyRunResult",
                 (),
@@ -318,6 +320,7 @@ def test_run_daily_premarket_main_wires_runner(
     assert captured["config_path"] == tmp_path / "daily.env"
     assert captured["dry_run"] is True
     assert captured["run_date"] == "2026-06-17"
+    assert captured["runner_dry_run"] is True
     output = capsys.readouterr().out
     assert "status: success" in output
     assert "status_json:" in output
@@ -331,3 +334,20 @@ def test_run_daily_premarket_accepts_today_date() -> None:
     args = parser.parse_args(["run-daily-premarket", "--date", "today"])
 
     assert args.date == "today"
+
+
+def test_run_daily_premarket_today_reports_invalid_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_load_env_config(path: Path, *, dry_run: bool):
+        return SimpleNamespace(timezone="Invalid/Timezone")
+
+    monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["run-daily-premarket", "--date", "today"])
+
+    assert exc_info.value.code == 2
+    error = capsys.readouterr().err
+    assert "Invalid/Timezone" in error

@@ -637,6 +637,54 @@ def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None
     )
 
 
+def test_daily_runner_dry_run_argument_overrides_config(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    latest_dir = tmp_path / "data/latest"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
+    (latest_dir / "premarket_actions.csv").write_text(
+        "old actions\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17", dry_run=True)
+
+    assert result.status == "success"
+    assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "old advice\n"
+    )
+    assert (latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
+        "old actions\n"
+    )
+    assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
+        "old plan\n"
+    )
+
+
 def test_daily_runner_lock_contention_does_not_overwrite_run_artifacts(
     tmp_path: Path,
 ) -> None:

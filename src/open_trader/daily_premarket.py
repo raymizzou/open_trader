@@ -173,8 +173,9 @@ class DailyPremarketRunner:
         self.quote_client_factory = quote_client_factory
         self.notifier = notifier or NullNotifier()
 
-    def run(self, run_date: str) -> DailyRunResult:
+    def run(self, run_date: str, *, dry_run: bool | None = None) -> DailyRunResult:
         _validate_run_date(run_date)
+        effective_dry_run = self.config.dry_run if dry_run is None else dry_run
         zone = ZoneInfo(self.config.timezone)
         started_at = datetime.now(zone)
         status_path = self.config.data_dir / "runs" / run_date / "daily_run_status.json"
@@ -191,6 +192,7 @@ class DailyPremarketRunner:
                         status_path=status_path,
                         report_path=report_path,
                         log_path=log_path,
+                        dry_run=effective_dry_run,
                     )
                 except Exception as exc:
                     return self._write_failure(
@@ -228,6 +230,7 @@ class DailyPremarketRunner:
         status_path: Path,
         report_path: Path,
         log_path: Path,
+        dry_run: bool,
     ) -> DailyRunResult:
         if not self.config.portfolio.exists():
             raise FileNotFoundError(f"portfolio not found: {self.config.portfolio}")
@@ -304,7 +307,7 @@ class DailyPremarketRunner:
             report_path=report_path,
             log_path=log_path,
         )
-        if not self.config.dry_run:
+        if not dry_run:
             _promote_latest_set(
                 advice_path=advice_path,
                 actions_path=actions_path,
