@@ -461,7 +461,7 @@ class DailyPremarketRunner:
             "run_date": run_date,
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
-            "deadline_at": _deadline_at(self.config).isoformat(),
+            "deadline_at": _failure_deadline_at(self.config),
             "status": "failed",
             "error": error,
             "premarket": {
@@ -549,7 +549,10 @@ class DailyPremarketRunner:
             "status_path": str(status_path),
             "report_path": str(report_path),
         }
-        _write_text(log_path, json.dumps(payload, ensure_ascii=False) + "\n")
+        try:
+            _write_text(log_path, json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
         return DailyRunResult(
             run_date=run_date,
             status="already_running",
@@ -716,6 +719,13 @@ def _deadline_reached(config: DailyPremarketConfig) -> Callable[[], bool]:
 def _seconds_until_deadline(config: DailyPremarketConfig) -> float:
     seconds = (_deadline_at(config) - datetime.now(ZoneInfo(config.timezone))).total_seconds()
     return max(1.0, seconds)
+
+
+def _failure_deadline_at(config: DailyPremarketConfig) -> str:
+    try:
+        return _deadline_at(config).isoformat()
+    except Exception:
+        return f"invalid:{config.deadline}"
 
 
 def _deadline_at(config: DailyPremarketConfig) -> datetime:

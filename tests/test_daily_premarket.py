@@ -462,7 +462,7 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
     assert "replace failed" in status["error"]
 
 
-def test_daily_runner_does_not_promote_latest_when_status_write_fails(
+def test_daily_runner_does_not_promote_latest_when_report_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -681,6 +681,45 @@ def test_daily_runner_lock_contention_does_not_overwrite_run_artifacts(
     assert result.log_path == tmp_path / "logs/daily_premarket/2026-06-17.lock.log"
 
 
+def test_daily_runner_returns_already_running_when_lock_log_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+
+    def fail_lock_log_write(path: Path, text: str) -> None:
+        if path == tmp_path / "logs/daily_premarket/2026-06-17.lock.log":
+            raise RuntimeError("lock log write failed")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    monkeypatch.setattr(daily_premarket, "_write_text", fail_lock_log_write)
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    with RunLock(config.data_dir / "runs" / ".daily_premarket.lock"):
+        result = runner.run("2026-06-17")
+
+    assert result.status == "already_running"
+
+
 class UnavailableQuoteClient:
     def __init__(self, *, host: str, port: int) -> None:
         raise FutuQuoteError("Futu OpenD is not reachable")
@@ -850,6 +889,38 @@ def test_daily_runner_writes_failed_status_when_portfolio_is_missing(
     assert status["premarket"]["eligible"] == 0
     assert status["premarket"]["advice"] == 0
     assert status["premarket"]["actions"] == 0
+
+
+def test_daily_runner_writes_failed_status_when_deadline_is_malformed(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="bad",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "failed"
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "failed"
+    assert status["deadline_at"] == "invalid:bad"
 
 
 @pytest.mark.parametrize(
