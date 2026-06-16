@@ -1170,6 +1170,23 @@ def test_stop_loss_sells_full_position() -> None:
     assert row["stop_price"] == "340"
 
 
+@pytest.mark.parametrize("trigger_status", ["stop_loss_hit", "target_1_hit", "target_2_hit"])
+def test_sell_side_invalid_last_price_is_review(trigger_status: str) -> None:
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status(trigger_status, price="0"),
+        portfolio=portfolio_context(quantity="10"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert "invalid last price" in row["error"]
+    assert row["reason"] == row["error"]
+    assert row["suggested_quantity"] == ""
+    assert row["suggested_notional"] == ""
+
+
 def test_stop_loss_missing_position_is_review() -> None:
     row = build_trade_action_row(
         plan=active_plan(),

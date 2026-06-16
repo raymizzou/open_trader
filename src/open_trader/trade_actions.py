@@ -256,6 +256,8 @@ def _size_sell_action_row(
     quote_status: PlanQuoteStatus,
     position: PortfolioPositionSnapshot | None,
 ) -> dict[str, str]:
+    if quote_status.last_price <= 0:
+        return _review_row(row, "invalid last price")
     if position is None:
         return _review_row(row, "missing portfolio position for sell sizing")
 
