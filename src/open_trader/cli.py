@@ -566,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
                 run_date=args.date,
                 update_latest=not args.dry_run,
             )
-        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+        except (FileNotFoundError, ValueError, FutuQuoteError) as exc:
             parser.error(str(exc))
         finally:
             if quote_client is not None:
