@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Iterable, Mapping
@@ -51,6 +52,7 @@ def load_latest_advice_by_symbol(data_dir: Path) -> dict[str, dict[str, str]]:
     if not latest_path.exists():
         return {}
 
+    csv.field_size_limit(sys.maxsize)
     with latest_path.open(encoding="utf-8-sig", newline="") as handle:
         return {
             normalized["symbol"]: normalized

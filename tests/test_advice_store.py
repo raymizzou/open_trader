@@ -104,6 +104,37 @@ def test_load_latest_advice_by_symbol_indexes_existing_latest(tmp_path: Path) ->
     assert latest["VIXY"]["advice_action"] == "reduce"
 
 
+def test_load_latest_advice_by_symbol_accepts_large_raw_decision(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_trading_advice(
+        run_date="2026-06-16",
+        records=[
+            TradingAdvice(
+                run_date="2026-06-16",
+                symbol="MSFT",
+                market="US",
+                asset_class="stock",
+                portfolio_weight_hkd="1.13%",
+                risk_flag="normal",
+                source="tradingagents",
+                advice_action="hold",
+                advice_summary="Large raw decision.",
+                raw_decision="x" * 200_000,
+                status="ok",
+                error="",
+            )
+        ],
+        data_dir=data_dir,
+        update_latest=True,
+    )
+
+    latest = load_latest_advice_by_symbol(data_dir)
+
+    assert latest["MSFT"]["raw_decision"] == "x" * 200_000
+
+
 def test_load_latest_advice_accepts_legacy_rows_without_fallback_columns(
     tmp_path: Path,
 ) -> None:

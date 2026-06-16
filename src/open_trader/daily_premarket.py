@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, time
@@ -751,6 +752,7 @@ def _parse_deadline(deadline: str) -> tuple[int, int]:
 
 def _count_advice(advice_path: Path) -> dict[str, int]:
     counts = {"ok": 0, "fallback": 0, "error": 0}
+    csv.field_size_limit(sys.maxsize)
     with advice_path.open(encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
             status = (row.get("status") or "").strip()
