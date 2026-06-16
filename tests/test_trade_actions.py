@@ -10,6 +10,7 @@ from open_trader.trade_actions import (
     TRADE_ACTION_FIELDNAMES,
     PortfolioPositionSnapshot,
     PortfolioActionContext,
+    map_quote_status_to_action,
     load_portfolio_action_context,
 )
 
@@ -901,3 +902,14 @@ def test_load_portfolio_action_context_prefers_only_percentage_weight_strings(
 
     assert context.positions[("US", "AAPL")].weight == Decimal("0")
     assert context.positions[("US", "MSFT")].weight == Decimal("0.125")
+
+
+def test_map_quote_status_to_trade_action() -> None:
+    assert map_quote_status_to_action("stop_loss_hit") == ("SELL_STOP", "critical")
+    assert map_quote_status_to_action("target_2_hit") == ("TAKE_PROFIT", "high")
+    assert map_quote_status_to_action("target_1_hit") == ("TRIM", "medium")
+    assert map_quote_status_to_action("entry_zone") == ("BUY", "high")
+    assert map_quote_status_to_action("add_zone") == ("ADD", "medium")
+    assert map_quote_status_to_action("watch") == ("HOLD", "low")
+    assert map_quote_status_to_action("missing_quote") == ("REVIEW", "medium")
+    assert map_quote_status_to_action("unexpected") == ("REVIEW", "medium")

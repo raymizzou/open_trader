@@ -68,6 +68,19 @@ class PortfolioPositionSnapshot:
     fx_to_hkd: Decimal
 
 
+def map_quote_status_to_action(trigger_status: str) -> tuple[str, str]:
+    mapping = {
+        "stop_loss_hit": ("SELL_STOP", "critical"),
+        "target_2_hit": ("TAKE_PROFIT", "high"),
+        "target_1_hit": ("TRIM", "medium"),
+        "entry_zone": ("BUY", "high"),
+        "add_zone": ("ADD", "medium"),
+        "watch": ("HOLD", "low"),
+        "missing_quote": ("REVIEW", "medium"),
+    }
+    return mapping.get(trigger_status, ("REVIEW", "medium"))
+
+
 def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContext:
     with portfolio_path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
