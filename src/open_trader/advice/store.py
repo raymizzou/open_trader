@@ -51,12 +51,20 @@ def load_latest_advice_by_symbol(data_dir: Path) -> dict[str, dict[str, str]]:
     if not latest_path.exists():
         return {}
 
-    with latest_path.open(encoding="utf-8", newline="") as handle:
+    with latest_path.open(encoding="utf-8-sig", newline="") as handle:
         return {
-            row["symbol"]: row
+            normalized["symbol"]: normalized
             for row in csv.DictReader(handle)
             if row.get("symbol")
+            for normalized in [_normalize_advice_row(row)]
         }
+
+
+def _normalize_advice_row(row: dict[str, str]) -> dict[str, str]:
+    normalized = {field: row.get(field, "") for field in TRADING_ADVICE_FIELDNAMES}
+    if not normalized["source_status"]:
+        normalized["source_status"] = normalized["status"] or "ok"
+    return normalized
 
 
 def _atomic_write_csv(

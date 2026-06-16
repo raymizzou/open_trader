@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-AdviceStatus = Literal["ok", "error"]
+AdviceStatus = Literal["ok", "fallback", "error"]
 WatchlistStatus = Literal["active", "manual_review", "no_trigger", "error"]
 TriggerType = Literal["price", "open_price", "manual_review", "none"]
 ChangeType = Literal[
@@ -30,6 +30,9 @@ TRADING_ADVICE_FIELDNAMES = [
     "raw_decision",
     "status",
     "error",
+    "source_status",
+    "fallback_reason",
+    "fallback_from_date",
 ]
 
 CHANGE_CLASSIFICATION_FIELDNAMES = [
@@ -100,6 +103,9 @@ class TradingAdvice:
     raw_decision: str
     status: AdviceStatus
     error: str
+    source_status: str = "ok"
+    fallback_reason: str = ""
+    fallback_from_date: str = ""
 
     def to_row(self) -> dict[str, str]:
         return {field: str(getattr(self, field)) for field in TRADING_ADVICE_FIELDNAMES}

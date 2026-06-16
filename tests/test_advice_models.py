@@ -24,6 +24,9 @@ EXPECTED_TRADING_ADVICE_FIELDNAMES = [
     "raw_decision",
     "status",
     "error",
+    "source_status",
+    "fallback_reason",
+    "fallback_from_date",
 ]
 
 EXPECTED_CHANGE_CLASSIFICATION_FIELDNAMES = [
@@ -82,6 +85,36 @@ def test_trading_advice_to_row_has_stable_csv_fields() -> None:
     assert row["symbol"] == "VIXY"
     assert row["advice_action"] == "reduce"
     assert row["error"] == ""
+
+
+def test_trading_advice_row_includes_fallback_metadata() -> None:
+    advice = TradingAdvice(
+        run_date="2026-06-17",
+        symbol="MSFT",
+        market="US",
+        asset_class="stock",
+        portfolio_weight_hkd="1.13%",
+        risk_flag="normal",
+        source="tradingagents",
+        advice_action="Overweight",
+        advice_summary="评级：Overweight",
+        raw_decision="{}",
+        status="fallback",
+        error="",
+        source_status="fallback",
+        fallback_reason="daily deadline exceeded",
+        fallback_from_date="2026-06-16",
+    )
+
+    row = advice.to_row()
+
+    assert "source_status" in TRADING_ADVICE_FIELDNAMES
+    assert "fallback_reason" in TRADING_ADVICE_FIELDNAMES
+    assert "fallback_from_date" in TRADING_ADVICE_FIELDNAMES
+    assert row["status"] == "fallback"
+    assert row["source_status"] == "fallback"
+    assert row["fallback_reason"] == "daily deadline exceeded"
+    assert row["fallback_from_date"] == "2026-06-16"
 
 
 def test_change_classification_to_row_has_required_fields() -> None:

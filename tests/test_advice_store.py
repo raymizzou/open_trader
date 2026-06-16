@@ -104,6 +104,87 @@ def test_load_latest_advice_by_symbol_indexes_existing_latest(tmp_path: Path) ->
     assert latest["VIXY"]["advice_action"] == "reduce"
 
 
+def test_load_latest_advice_accepts_legacy_rows_without_fallback_columns(
+    tmp_path: Path,
+) -> None:
+    latest = tmp_path / "data/latest/trading_advice.csv"
+    latest.parent.mkdir(parents=True)
+    with latest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "run_date",
+                "symbol",
+                "market",
+                "asset_class",
+                "portfolio_weight_hkd",
+                "risk_flag",
+                "source",
+                "advice_action",
+                "advice_summary",
+                "raw_decision",
+                "status",
+                "error",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "run_date": "2026-06-16",
+                "symbol": "MSFT",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "1.13%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Overweight",
+                "advice_summary": "评级：Overweight",
+                "raw_decision": "{}",
+                "status": "ok",
+                "error": "",
+            }
+        )
+
+    rows = load_latest_advice_by_symbol(tmp_path / "data")
+
+    assert rows["MSFT"]["source_status"] == "ok"
+    assert rows["MSFT"]["fallback_reason"] == ""
+    assert rows["MSFT"]["fallback_from_date"] == ""
+
+
+def test_write_trading_advice_writes_fallback_columns(tmp_path: Path) -> None:
+    run_path, _ = write_trading_advice(
+        run_date="2026-06-17",
+        data_dir=tmp_path / "data",
+        update_latest=False,
+        records=[
+            TradingAdvice(
+                run_date="2026-06-17",
+                symbol="MSFT",
+                market="US",
+                asset_class="stock",
+                portfolio_weight_hkd="1.13%",
+                risk_flag="normal",
+                source="tradingagents",
+                advice_action="Overweight",
+                advice_summary="评级：Overweight",
+                raw_decision="{}",
+                status="fallback",
+                error="",
+                source_status="fallback",
+                fallback_reason="daily deadline exceeded",
+                fallback_from_date="2026-06-16",
+            )
+        ],
+    )
+
+    rows = list(csv.DictReader(run_path.open(encoding="utf-8")))
+
+    assert rows[0]["source_status"] == "fallback"
+    assert rows[0]["fallback_reason"] == "daily deadline exceeded"
+    assert rows[0]["fallback_from_date"] == "2026-06-16"
+
+
 def test_write_change_classifications_writes_run_file(tmp_path: Path) -> None:
     path = write_change_classifications(
         run_date="2026-06-16",
