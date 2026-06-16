@@ -274,14 +274,6 @@ class DailyPremarketRunner:
         latest_advice_path = self.config.data_dir / "latest" / "trading_advice.csv"
         latest_actions_path = self.config.data_dir / "latest" / "premarket_actions.csv"
         latest_plan_path = self.config.data_dir / "latest" / "trading_plan.csv"
-        if not self.config.dry_run:
-            _promote_latest_set(
-                advice_path=advice_path,
-                actions_path=actions_path,
-                plan_path=plan_result.plan_path,
-                data_dir=self.config.data_dir,
-            )
-
         artifacts = {
             "advice": str(advice_path),
             "classifications": str(getattr(premarket_result, "classifications_path")),
@@ -312,6 +304,13 @@ class DailyPremarketRunner:
             report_path=report_path,
             log_path=log_path,
         )
+        if not self.config.dry_run:
+            _promote_latest_set(
+                advice_path=advice_path,
+                actions_path=actions_path,
+                plan_path=plan_result.plan_path,
+                data_dir=self.config.data_dir,
+            )
         self._notify(
             "Open Trader daily premarket",
             _notification_message(status, plan_counts, futu_status, advice_counts),
