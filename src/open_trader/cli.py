@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import time
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -15,7 +16,12 @@ from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
-from .notifications import build_notifier_from_values
+from .notifications import (
+    NotificationState,
+    build_notifier_from_values,
+    load_trade_action_rows,
+    render_trigger_message,
+)
 from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
@@ -674,5 +680,130 @@ def main(argv: list[str] | None = None) -> int:
         print(f"latest: {result.latest_path}")
         return 0
 
+    if args.command == "watch-actions":
+        try:
+            run_date = (
+                date.today().isoformat()
+                if args.date == "today"
+                else canonical_date(args.date)
+            )
+            notifier_values = {}
+            if args.config.exists():
+                notifier_values = dict(
+                    load_env_config(args.config, dry_run=args.dry_run).notifier_values
+                )
+            notifier = build_notifier_from_values(
+                notifier_values,
+                dry_run=args.dry_run,
+            )
+            result = _run_watch_actions(
+                run_date=run_date,
+                plan_path=args.plan,
+                actions_path=args.actions,
+                data_dir=args.data_dir,
+                reports_dir=args.reports_dir,
+                host=args.host,
+                port=args.port,
+                poll_seconds=args.poll_seconds,
+                once=args.once,
+                dry_run=args.dry_run,
+                notifier=notifier,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+            parser.error(str(exc))
+        print(f"run_date: {result['run_date']}")
+        print(f"checked: {result['checked']}")
+        print(f"sent: {result['sent']}")
+        print(f"skipped: {result['skipped']}")
+        print(f"state: {result['state_path']}")
+        return 0
+
     parser.error(f"unknown command: {args.command}")
     return 2
+
+
+def _run_watch_actions(
+    *,
+    run_date: str,
+    plan_path: Path,
+    actions_path: Path,
+    data_dir: Path,
+    reports_dir: Path,
+    host: str,
+    port: int,
+    poll_seconds: float,
+    once: bool,
+    dry_run: bool,
+    notifier: object,
+) -> dict[str, object]:
+    plans = [
+        plan
+        for plan in load_trading_plan_rows(plan_path)
+        if plan.status == "active"
+        and (not plan.run_date.strip() or plan.run_date == run_date)
+    ]
+    action_rows = [
+        row
+        for row in load_trade_action_rows(actions_path)
+        if not row.get("run_date", "").strip() or row.get("run_date") == run_date
+    ]
+    actions_by_key = {
+        (row.get("futu_symbol", "").strip(), row.get("trigger_status", "").strip()): row
+        for row in action_rows
+    }
+    state_path = data_dir / "runs" / run_date / "notification_state.json"
+    report_path = reports_dir / "trade_actions" / f"{run_date}.md"
+    quote_client = None
+    total_checked = 0
+    total_sent = 0
+    total_skipped = 0
+    try:
+        quote_client = FutuQuoteClient(host=host, port=port)
+        while True:
+            symbols = sorted({plan.futu_symbol for plan in plans})
+            snapshots = quote_client.get_snapshots(symbols) if symbols else {}
+            state = NotificationState.load(state_path)
+            for plan in plans:
+                snapshot = snapshots.get(plan.futu_symbol)
+                if snapshot is None:
+                    total_skipped += 1
+                    continue
+                total_checked += 1
+                quote_status = evaluate_plan_quote(plan, snapshot.last_price)
+                if quote_status.status in {"watch", "missing_quote"}:
+                    total_skipped += 1
+                    continue
+                action_row = actions_by_key.get(
+                    (quote_status.futu_symbol, quote_status.status)
+                )
+                if action_row is None:
+                    total_skipped += 1
+                    continue
+                if state.was_sent(run_date, quote_status.futu_symbol, quote_status.status):
+                    total_skipped += 1
+                    continue
+                message = render_trigger_message(
+                    run_date=run_date,
+                    row={**action_row, "last_price": str(quote_status.last_price)},
+                    report_path=report_path,
+                )
+                if dry_run:
+                    print(message)
+                else:
+                    notifier.notify("Open Trader action trigger", message)
+                state.record_sent(run_date, quote_status.futu_symbol, quote_status.status)
+                state.save()
+                total_sent += 1
+            if once:
+                break
+            time.sleep(poll_seconds)
+    finally:
+        if quote_client is not None:
+            quote_client.close()
+    return {
+        "run_date": run_date,
+        "checked": total_checked,
+        "sent": total_sent,
+        "skipped": total_skipped,
+        "state_path": state_path,
+    }
