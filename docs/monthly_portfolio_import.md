@@ -174,6 +174,34 @@ To compare live quotes against the structured trader plan, run:
 This reports whether each live quote is in the entry zone, near the add price,
 at a stop loss, at a target, or only on watch.
 
+## Generate Trade Actions
+
+After `data/latest/trading_plan.csv` and `data/latest/portfolio.csv` are ready,
+generate concrete trade actions from live Futu quotes:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m open_trader generate-trade-actions \
+  --plan data/latest/trading_plan.csv \
+  --portfolio data/latest/portfolio.csv \
+  --data-dir data \
+  --reports-dir reports \
+  --date 2026-06-16
+```
+
+Run output:
+
+```text
+data/runs/2026-06-16/trade_actions.csv
+data/latest/trade_actions.csv
+reports/trade_actions/2026-06-16.md
+```
+
+The CSV files are machine-readable for later automation. The Markdown report is
+human-readable for review. This command does not place orders.
+
+Use `--dry-run` to write the dated CSV and report without updating
+`data/latest/trade_actions.csv`.
+
 ```bash
 .venv/bin/python -m open_trader watch-futu \
   --watchlist data/runs/2026-06-15/watchlist.csv \
