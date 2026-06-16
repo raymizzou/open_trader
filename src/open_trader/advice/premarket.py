@@ -11,6 +11,7 @@ from .models import (
     ChangeClassification,
     PortfolioInputRow,
     PremarketAction,
+    TRADING_ADVICE_FIELDNAMES,
     TradingAdvice,
 )
 from .portfolio_loader import load_eligible_portfolio_rows
@@ -28,6 +29,7 @@ class AdviceRunner(Protocol):
 
 
 AdviceRunnerFactory = Callable[[], AdviceRunner]
+DeadlineReached = Callable[[], bool]
 DEFAULT_EXCLUDED_SYMBOLS = {"AGRZ", "ARGG"}
 
 
@@ -84,6 +86,8 @@ def run_premarket(
     max_workers: int = 1,
     advice_runner_factory: AdviceRunnerFactory | None = None,
     excluded_symbols: set[str] | None = None,
+    use_fallback: bool = False,
+    deadline_reached: DeadlineReached | None = None,
 ) -> PremarketResult:
     if max_workers < 1:
         raise ValueError("max_workers must be at least 1")
@@ -152,6 +156,8 @@ def run_premarket(
         classifier=classifier,
         previous_by_symbol=previous_by_symbol,
         max_workers=max_workers,
+        use_fallback=use_fallback,
+        deadline_reached=deadline_reached,
     )
     advice_records = [result.advice for result in symbol_results]
     classifications = [result.classification for result in symbol_results]
@@ -207,22 +213,28 @@ def _run_symbols(
     classifier: Classifier,
     previous_by_symbol: dict[str, dict[str, str]],
     max_workers: int,
+    use_fallback: bool,
+    deadline_reached: DeadlineReached | None,
 ) -> list[_SymbolResult]:
     if max_workers == 1:
-        return [
-            _run_symbol(
-                index=index,
-                row=row,
-                run_date=run_date,
-                advice_runner=advice_runner,
-                advice_runner_factory=advice_runner_factory,
-                classifier=classifier,
-                previous_by_symbol=previous_by_symbol,
+        results: list[_SymbolResult] = []
+        for index, row in enumerate(rows):
+            results.append(
+                _run_symbol(
+                    index=index,
+                    row=row,
+                    run_date=run_date,
+                    advice_runner=advice_runner,
+                    advice_runner_factory=advice_runner_factory,
+                    classifier=classifier,
+                    previous_by_symbol=previous_by_symbol,
+                    use_fallback=use_fallback,
+                    deadline_reached=deadline_reached,
+                )
             )
-            for index, row in enumerate(rows)
-        ]
+        return results
 
-    results: list[_SymbolResult] = []
+    results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
@@ -234,6 +246,8 @@ def _run_symbols(
                 advice_runner_factory=advice_runner_factory,
                 classifier=classifier,
                 previous_by_symbol=previous_by_symbol,
+                use_fallback=use_fallback,
+                deadline_reached=deadline_reached,
             )
             for index, row in enumerate(rows)
         ]
@@ -252,7 +266,28 @@ def _run_symbol(
     advice_runner_factory: AdviceRunnerFactory | None,
     classifier: Classifier,
     previous_by_symbol: dict[str, dict[str, str]],
+    use_fallback: bool,
+    deadline_reached: DeadlineReached | None,
 ) -> _SymbolResult:
+    if deadline_reached is not None and deadline_reached():
+        advice = _fallback_or_error_advice(
+            row=row,
+            run_date=run_date,
+            previous_by_symbol=previous_by_symbol,
+            reason="daily deadline exceeded",
+        )
+        classification = _classification_for_non_ok(
+            row=row,
+            advice=advice,
+            run_date=run_date,
+        )
+        return _SymbolResult(
+            index=index,
+            row=row,
+            advice=advice,
+            classification=classification,
+        )
+
     runner = advice_runner_factory() if advice_runner_factory is not None else advice_runner
     if runner is None:
         raise ValueError("advice_runner or advice_runner_factory is required")
@@ -261,7 +296,22 @@ def _run_symbol(
         advice_runner=runner,
         row=row,
         run_date=run_date,
+        previous_by_symbol=previous_by_symbol,
+        use_fallback=use_fallback,
     )
+    if advice.status != "ok":
+        classification = _classification_for_non_ok(
+            row=row,
+            advice=advice,
+            run_date=run_date,
+        )
+        return _SymbolResult(
+            index=index,
+            row=row,
+            advice=advice,
+            classification=classification,
+        )
+
     classification = _classify_symbol(
         classifier=classifier,
         run_date=run_date,
@@ -277,15 +327,90 @@ def _run_symbol(
     )
 
 
+def _fallback_or_error_advice(
+    *,
+    row: PortfolioInputRow,
+    run_date: str,
+    previous_by_symbol: dict[str, dict[str, str]],
+    reason: str,
+) -> TradingAdvice:
+    previous = previous_by_symbol.get(row.symbol)
+    if previous and previous.get("status") == "ok":
+        return TradingAdvice(
+            run_date=run_date,
+            symbol=row.symbol,
+            market=row.market,
+            asset_class=row.asset_class,
+            portfolio_weight_hkd=row.portfolio_weight_hkd,
+            risk_flag=row.risk_flag,
+            source=previous.get("source", "tradingagents"),
+            advice_action=previous.get("advice_action", ""),
+            advice_summary=previous.get("advice_summary", ""),
+            raw_decision=previous.get("raw_decision", ""),
+            status="fallback",
+            error="",
+            source_status="fallback",
+            fallback_reason=reason,
+            fallback_from_date=previous.get("run_date", ""),
+        )
+    return TradingAdvice(
+        run_date=run_date,
+        symbol=row.symbol,
+        market=row.market,
+        asset_class=row.asset_class,
+        portfolio_weight_hkd=row.portfolio_weight_hkd,
+        risk_flag=row.risk_flag,
+        source="tradingagents",
+        advice_action="",
+        advice_summary="",
+        raw_decision="",
+        status="error",
+        error=reason,
+        source_status="error",
+        fallback_reason="",
+        fallback_from_date="",
+    )
+
+
+def _classification_for_non_ok(
+    *,
+    row: PortfolioInputRow,
+    advice: TradingAdvice,
+    run_date: str,
+) -> ChangeClassification:
+    return ChangeClassification(
+        run_date=run_date,
+        symbol=row.symbol,
+        include_in_report=False,
+        change_type="no_material_change",
+        severity="low",
+        suggested_action=advice.advice_action,
+        summary="",
+        rationale="",
+        watch_trigger="",
+        status="ok" if advice.status == "fallback" else "error",
+        error=advice.error,
+    )
+
+
 def _analyze_symbol(
     *,
     advice_runner: AdviceRunner,
     row: PortfolioInputRow,
     run_date: str,
+    previous_by_symbol: dict[str, dict[str, str]],
+    use_fallback: bool,
 ) -> TradingAdvice:
     try:
         return advice_runner.analyze(row, run_date)
     except Exception as exc:
+        if use_fallback:
+            return _fallback_or_error_advice(
+                row=row,
+                run_date=run_date,
+                previous_by_symbol=previous_by_symbol,
+                reason=str(exc),
+            )
         return TradingAdvice(
             run_date=run_date,
             symbol=row.symbol,
@@ -299,6 +424,9 @@ def _analyze_symbol(
             raw_decision="",
             status="error",
             error=str(exc),
+            source_status="error",
+            fallback_reason="",
+            fallback_from_date="",
         )
 
 
