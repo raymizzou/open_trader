@@ -19,6 +19,7 @@ from .parsers.tiger import TigerStatementParser
 from .pipeline import run_import, validate_month
 from .trade_actions import generate_trade_actions
 from .trading_plan import (
+    TradingPlanRow,
     build_trading_plan,
     evaluate_plan_quote,
     load_trading_plan_rows,
@@ -92,6 +93,34 @@ def _parse_symbol_subset(value: str | None) -> set[str] | None:
 
 def _parse_symbol_set(value: str | None) -> set[str]:
     return _parse_symbol_subset(value) or set()
+
+
+def _active_trade_action_plans_for_quotes(
+    plans: list[TradingPlanRow],
+    run_date: str | None,
+) -> list[TradingPlanRow]:
+    active_plans = [plan for plan in plans if plan.status == "active"]
+    if run_date is not None:
+        matching_plans = [
+            plan
+            for plan in active_plans
+            if not plan.run_date.strip() or plan.run_date == run_date
+        ]
+        if not matching_plans:
+            raise ValueError(f"no active trading plans match run_date {run_date}")
+        return matching_plans
+
+    dates = sorted({
+        plan.run_date.strip() for plan in active_plans if plan.run_date.strip()
+    })
+    if not dates:
+        raise ValueError("--date is required when trading plan has no active run_date rows")
+    effective_run_date = dates[-1]
+    return [
+        plan
+        for plan in active_plans
+        if not plan.run_date.strip() or plan.run_date == effective_run_date
+    ]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -307,7 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     trade_actions_parser.add_argument("--data-dir", type=Path, default=Path("data"))
     trade_actions_parser.add_argument("--reports-dir", type=Path, default=Path("reports"))
-    trade_actions_parser.add_argument("--date", type=canonical_date)
+    trade_actions_parser.add_argument(
+        "--date",
+        type=canonical_date,
+        help="Run date, YYYY-MM-DD. Required only when active plan rows do not contain run_date.",
+    )
     trade_actions_parser.add_argument("--host", default="127.0.0.1")
     trade_actions_parser.add_argument("--port", type=positive_int, default=11111)
     trade_actions_parser.add_argument(
@@ -515,11 +548,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "generate-trade-actions":
         quote_client = None
         try:
-            plans = [
-                plan
-                for plan in load_trading_plan_rows(args.plan)
-                if plan.status == "active"
-            ]
+            plans = _active_trade_action_plans_for_quotes(
+                load_trading_plan_rows(args.plan),
+                args.date,
+            )
             quote_client = FutuQuoteClient(host=args.host, port=args.port)
             print(f"connected to Futu OpenD at {args.host}:{args.port}")
             print(f"loaded {len(plans)} active trading plan(s)")
@@ -539,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             if quote_client is not None:
                 quote_client.close()
+        print(f"run_date: {result.run_date}")
         print(f"actions: {result.action_count}")
         print(f"ready: {result.ready_count}")
         print(f"review: {result.review_count}")

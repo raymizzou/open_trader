@@ -27,6 +27,9 @@ def test_generate_trade_actions_help_includes_expected_options(
     assert "--data-dir" in output
     assert "--reports-dir" in output
     assert "--date" in output
+    assert "Run date, YYYY-MM-DD." in output
+    assert "Required only when active plan" in output
+    assert "rows do not contain run_date." in output
     assert "--host" in output
     assert "--port" in output
     assert "--dry-run" in output
@@ -38,7 +41,31 @@ def test_generate_trade_actions_main_fetches_quotes_and_prints_summary(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured: dict[str, object] = {}
-    active_plan = SimpleNamespace(futu_symbol="US.MSFT", status="active")
+    selected_plan = SimpleNamespace(
+        futu_symbol="US.MSFT",
+        status="active",
+        run_date="2026-06-16",
+    )
+    blank_date_plan = SimpleNamespace(
+        futu_symbol="US.NVDA",
+        status="active",
+        run_date="",
+    )
+    other_date_plan = SimpleNamespace(
+        futu_symbol="US.AAPL",
+        status="active",
+        run_date="2026-06-15",
+    )
+    inactive_plan = SimpleNamespace(
+        futu_symbol="US.TSLA",
+        status="inactive",
+        run_date="2026-06-16",
+    )
+    duplicate_symbol_plan = SimpleNamespace(
+        futu_symbol="US.MSFT",
+        status="active",
+        run_date="2026-06-16",
+    )
 
     class FakeFutuQuoteClient:
         def __init__(self, *, host: str, port: int) -> None:
@@ -53,6 +80,10 @@ def test_generate_trade_actions_main_fetches_quotes_and_prints_summary(
                 "US.MSFT": QuoteSnapshot(
                     futu_symbol="US.MSFT",
                     last_price=Decimal("390"),
+                ),
+                "US.NVDA": QuoteSnapshot(
+                    futu_symbol="US.NVDA",
+                    last_price=Decimal("120"),
                 )
             }
 
@@ -72,7 +103,17 @@ def test_generate_trade_actions_main_fetches_quotes_and_prints_summary(
             report_path=tmp_path / "reports/trade_actions/2026-06-16.md",
         )
 
-    monkeypatch.setattr(cli, "load_trading_plan_rows", lambda path: [active_plan])
+    monkeypatch.setattr(
+        cli,
+        "load_trading_plan_rows",
+        lambda path: [
+            selected_plan,
+            blank_date_plan,
+            other_date_plan,
+            inactive_plan,
+            duplicate_symbol_plan,
+        ],
+    )
     monkeypatch.setattr(cli, "FutuQuoteClient", FakeFutuQuoteClient)
     monkeypatch.setattr(cli, "generate_trade_actions", fake_generate_trade_actions)
 
@@ -100,7 +141,7 @@ def test_generate_trade_actions_main_fetches_quotes_and_prints_summary(
     assert result == 0
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 11111
-    assert captured["symbols"] == ["US.MSFT"]
+    assert captured["symbols"] == ["US.MSFT", "US.NVDA"]
     assert captured["closed"] is True
     assert captured["generator_kwargs"] == {
         "plan_path": tmp_path / "trading_plan.csv",
@@ -111,6 +152,10 @@ def test_generate_trade_actions_main_fetches_quotes_and_prints_summary(
             "US.MSFT": QuoteSnapshot(
                 futu_symbol="US.MSFT",
                 last_price=Decimal("390"),
+            ),
+            "US.NVDA": QuoteSnapshot(
+                futu_symbol="US.NVDA",
+                last_price=Decimal("120"),
             )
         },
         "run_date": "2026-06-16",
@@ -118,7 +163,8 @@ def test_generate_trade_actions_main_fetches_quotes_and_prints_summary(
     }
     output = capsys.readouterr().out
     assert "connected to Futu OpenD at 127.0.0.1:11111" in output
-    assert "loaded 1 active trading plan(s)" in output
+    assert "loaded 3 active trading plan(s)" in output
+    assert "run_date: 2026-06-16" in output
     assert "actions: 1" in output
     assert "ready: 1" in output
     assert "review: 0" in output
@@ -142,4 +188,43 @@ def test_generate_trade_actions_main_reports_clean_errors(
     assert exc_info.value.code == 2
     stderr = capsys.readouterr().err
     assert "missing trading plan column(s): symbol" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_generate_trade_actions_main_closes_quote_client_on_snapshot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    active_plan = SimpleNamespace(
+        futu_symbol="US.MSFT",
+        status="active",
+        run_date="2026-06-16",
+    )
+
+    class FakeFutuQuoteClient:
+        def __init__(self, *, host: str, port: int) -> None:
+            captured["host"] = host
+            captured["port"] = port
+
+        def get_snapshots(
+            self, futu_symbols: list[str]
+        ) -> dict[str, QuoteSnapshot]:
+            captured["symbols"] = futu_symbols
+            raise RuntimeError("snapshot fetch failed")
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    monkeypatch.setattr(cli, "load_trading_plan_rows", lambda path: [active_plan])
+    monkeypatch.setattr(cli, "FutuQuoteClient", FakeFutuQuoteClient)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["generate-trade-actions", "--date", "2026-06-16"])
+
+    assert exc_info.value.code == 2
+    assert captured["symbols"] == ["US.MSFT"]
+    assert captured["closed"] is True
+    stderr = capsys.readouterr().err
+    assert "snapshot fetch failed" in stderr
     assert "Traceback" not in stderr
