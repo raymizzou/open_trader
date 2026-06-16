@@ -17,6 +17,7 @@ from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
 from .pipeline import run_import, validate_month
+from .trade_actions import generate_trade_actions
 from .trading_plan import (
     build_trading_plan,
     evaluate_plan_quote,
@@ -290,6 +291,31 @@ def build_parser() -> argparse.ArgumentParser:
     check_futu_plan_parser.add_argument("--host", default="127.0.0.1")
     check_futu_plan_parser.add_argument("--port", type=positive_int, default=11111)
 
+    trade_actions_parser = subparsers.add_parser(
+        "generate-trade-actions",
+        help="Generate trade action CSV and report from trading_plan.csv",
+    )
+    trade_actions_parser.add_argument(
+        "--plan",
+        type=Path,
+        default=Path("data/latest/trading_plan.csv"),
+    )
+    trade_actions_parser.add_argument(
+        "--portfolio",
+        type=Path,
+        default=Path("data/latest/portfolio.csv"),
+    )
+    trade_actions_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    trade_actions_parser.add_argument("--reports-dir", type=Path, default=Path("reports"))
+    trade_actions_parser.add_argument("--date", type=canonical_date)
+    trade_actions_parser.add_argument("--host", default="127.0.0.1")
+    trade_actions_parser.add_argument("--port", type=positive_int, default=11111)
+    trade_actions_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write dated output and report but do not update latest trade actions",
+    )
+
     return parser
 
 
@@ -458,7 +484,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "check-futu-plan":
         quote_client = None
         try:
-            plans = [plan for plan in load_trading_plan_rows(args.plan) if plan.status == "active"]
+            plans = [
+                plan
+                for plan in load_trading_plan_rows(args.plan)
+                if plan.status == "active"
+            ]
             quote_client = FutuQuoteClient(host=args.host, port=args.port)
             print(f"connected to Futu OpenD at {args.host}:{args.port}")
             print(f"loaded {len(plans)} active trading plan(s)")
@@ -480,6 +510,42 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             if quote_client is not None:
                 quote_client.close()
+        return 0
+
+    if args.command == "generate-trade-actions":
+        quote_client = None
+        try:
+            plans = [
+                plan
+                for plan in load_trading_plan_rows(args.plan)
+                if plan.status == "active"
+            ]
+            quote_client = FutuQuoteClient(host=args.host, port=args.port)
+            print(f"connected to Futu OpenD at {args.host}:{args.port}")
+            print(f"loaded {len(plans)} active trading plan(s)")
+            symbols = sorted({plan.futu_symbol for plan in plans})
+            snapshots = quote_client.get_snapshots(symbols) if symbols else {}
+            result = generate_trade_actions(
+                plan_path=args.plan,
+                portfolio_path=args.portfolio,
+                data_dir=args.data_dir,
+                reports_dir=args.reports_dir,
+                snapshots=snapshots,
+                run_date=args.date,
+                update_latest=not args.dry_run,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+            parser.error(str(exc))
+        finally:
+            if quote_client is not None:
+                quote_client.close()
+        print(f"actions: {result.action_count}")
+        print(f"ready: {result.ready_count}")
+        print(f"review: {result.review_count}")
+        print(f"watch: {result.watch_count}")
+        print(f"trade_actions_csv: {result.actions_path}")
+        print(f"report: {result.report_path}")
+        print(f"latest: {result.latest_path}")
         return 0
 
     parser.error(f"unknown command: {args.command}")
