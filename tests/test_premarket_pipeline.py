@@ -52,6 +52,32 @@ class FakeAdviceRunner:
         )
 
 
+class ReturningErrorAdviceRunner(FakeAdviceRunner):
+    def __init__(self, error_symbols: set[str]) -> None:
+        super().__init__()
+        self.error_symbols = error_symbols
+
+    def analyze(self, row: PortfolioInputRow, run_date: str) -> TradingAdvice:
+        self.calls.append((row.symbol, run_date))
+        if row.symbol in self.error_symbols:
+            return TradingAdvice(
+                run_date=run_date,
+                symbol=row.symbol,
+                market=row.market,
+                asset_class=row.asset_class,
+                portfolio_weight_hkd=row.portfolio_weight_hkd,
+                risk_flag=row.risk_flag,
+                source="tradingagents",
+                advice_action="",
+                advice_summary="",
+                raw_decision="",
+                status="error",
+                error=f"{row.symbol} subprocess timed out",
+                source_status="error",
+            )
+        return super().analyze(row, run_date)
+
+
 class FakeClassifier:
     def __init__(self, fail_symbols: set[str] | None = None) -> None:
         self.fail_symbols = fail_symbols or set()
@@ -672,6 +698,135 @@ def test_run_premarket_falls_back_to_latest_ok_advice_on_symbol_failure(
     assert qqq["fallback_from_date"] == "2026-06-16"
     assert qqq["advice_summary"] == "QQQ prior summary"
     assert result.advice_count == 2
+
+
+def test_run_premarket_falls_back_when_runner_returns_error_advice(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    data_dir = tmp_path / "data"
+    latest = data_dir / "latest/trading_advice.csv"
+    latest.parent.mkdir(parents=True)
+    with latest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=premarket.TRADING_ADVICE_FIELDNAMES)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "run_date": "2026-06-16",
+                "symbol": "QQQ",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "1.40%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "QQQ prior summary",
+                "raw_decision": "{}",
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        )
+
+    result = run_premarket(
+        run_date="2026-06-17",
+        portfolio_path=portfolio_path,
+        data_dir=data_dir,
+        reports_dir=tmp_path / "reports",
+        advice_runner=ReturningErrorAdviceRunner(error_symbols={"QQQ"}),
+        classifier=FakeClassifier(),
+        symbols={"QQQ"},
+        update_latest=True,
+        use_fallback=True,
+    )
+
+    rows = list(csv.DictReader(result.advice_path.open(encoding="utf-8")))
+    assert rows[0]["symbol"] == "QQQ"
+    assert rows[0]["status"] == "fallback"
+    assert rows[0]["fallback_from_date"] == "2026-06-16"
+    assert rows[0]["advice_action"] == "hold"
+    action_rows = list(csv.DictReader(result.actions_path.open(encoding="utf-8")))
+    assert action_rows == []
+
+
+def test_run_premarket_falls_back_from_latest_fallback_advice(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    data_dir = tmp_path / "data"
+    latest = data_dir / "latest/trading_advice.csv"
+    latest.parent.mkdir(parents=True)
+    with latest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=premarket.TRADING_ADVICE_FIELDNAMES)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "run_date": "2026-06-16",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "3.05%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "reduce",
+                "advice_summary": "VIXY carried summary",
+                "raw_decision": "{}",
+                "status": "fallback",
+                "error": "",
+                "source_status": "fallback",
+                "fallback_reason": "daily deadline exceeded",
+                "fallback_from_date": "",
+            }
+        )
+        writer.writerow(
+            {
+                "run_date": "2026-06-16",
+                "symbol": "QQQ",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "1.40%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "QQQ carried summary",
+                "raw_decision": "{}",
+                "status": "fallback",
+                "error": "",
+                "source_status": "fallback",
+                "fallback_reason": "daily deadline exceeded",
+                "fallback_from_date": "2026-06-15",
+            }
+        )
+
+    result = run_premarket(
+        run_date="2026-06-17",
+        portfolio_path=portfolio_path,
+        data_dir=data_dir,
+        reports_dir=tmp_path / "reports",
+        advice_runner=ReturningErrorAdviceRunner(error_symbols={"VIXY", "QQQ"}),
+        classifier=FakeClassifier(),
+        symbols={"VIXY", "QQQ"},
+        update_latest=True,
+        use_fallback=True,
+    )
+
+    rows = {
+        row["symbol"]: row
+        for row in csv.DictReader(result.advice_path.open(encoding="utf-8"))
+    }
+    assert rows["QQQ"]["status"] == "fallback"
+    assert rows["QQQ"]["fallback_reason"] == "QQQ subprocess timed out"
+    assert rows["QQQ"]["fallback_from_date"] == "2026-06-15"
+    assert rows["QQQ"]["advice_action"] == "hold"
+    assert rows["QQQ"]["advice_summary"] == "QQQ carried summary"
+    assert rows["VIXY"]["status"] == "fallback"
+    assert rows["VIXY"]["fallback_from_date"] == "2026-06-16"
+    assert rows["VIXY"]["advice_action"] == "reduce"
+    assert rows["VIXY"]["advice_summary"] == "VIXY carried summary"
 
 
 def test_run_premarket_records_error_when_failure_has_no_fallback(

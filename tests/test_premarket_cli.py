@@ -328,6 +328,46 @@ def test_run_daily_premarket_main_wires_runner(
     assert "log:" in output
 
 
+@pytest.mark.parametrize("status", ["failed", "already_running"])
+def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status(
+    status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakeRunner:
+        def __init__(self, *, config: object) -> None:
+            pass
+
+        def run(self, *, run_date: str, dry_run: bool):
+            return type(
+                "DailyRunResult",
+                (),
+                {
+                    "status": status,
+                    "status_path": tmp_path
+                    / "data/runs/2026-06-17/daily_run_status.json",
+                    "report_path": tmp_path / "reports/daily_runs/2026-06-17.md",
+                    "log_path": tmp_path / "logs/daily_premarket/2026-06-17.log",
+                },
+            )()
+
+    def fake_load_env_config(path: Path, *, dry_run: bool):
+        return object()
+
+    monkeypatch.setattr(cli, "DailyPremarketRunner", FakeRunner)
+    monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
+
+    result = cli.main(["run-daily-premarket", "--date", "2026-06-17"])
+
+    assert result == 1
+    output = capsys.readouterr().out
+    assert f"status: {status}" in output
+    assert "status_json:" in output
+    assert "report:" in output
+    assert "log:" in output
+
+
 def test_run_daily_premarket_accepts_today_date() -> None:
     parser = build_parser()
 

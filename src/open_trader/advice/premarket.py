@@ -335,7 +335,10 @@ def _fallback_or_error_advice(
     reason: str,
 ) -> TradingAdvice:
     previous = previous_by_symbol.get(row.symbol)
-    if previous and previous.get("status") == "ok":
+    if previous and previous.get("status") in {"ok", "fallback"}:
+        fallback_from_date = previous.get("fallback_from_date", "") or previous.get(
+            "run_date", ""
+        )
         return TradingAdvice(
             run_date=run_date,
             symbol=row.symbol,
@@ -351,7 +354,7 @@ def _fallback_or_error_advice(
             error="",
             source_status="fallback",
             fallback_reason=reason,
-            fallback_from_date=previous.get("run_date", ""),
+            fallback_from_date=fallback_from_date,
         )
     return TradingAdvice(
         run_date=run_date,
@@ -402,7 +405,7 @@ def _analyze_symbol(
     use_fallback: bool,
 ) -> TradingAdvice:
     try:
-        return advice_runner.analyze(row, run_date)
+        advice = advice_runner.analyze(row, run_date)
     except Exception as exc:
         if use_fallback:
             return _fallback_or_error_advice(
@@ -428,6 +431,14 @@ def _analyze_symbol(
             fallback_reason="",
             fallback_from_date="",
         )
+    if use_fallback and advice.status != "ok":
+        return _fallback_or_error_advice(
+            row=row,
+            run_date=run_date,
+            previous_by_symbol=previous_by_symbol,
+            reason=advice.error or f"{row.symbol} analysis returned {advice.status}",
+        )
+    return advice
 
 
 def _promote_latest_outputs(

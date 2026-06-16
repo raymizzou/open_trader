@@ -4,6 +4,7 @@ import csv
 import json
 import shutil
 import subprocess
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -293,6 +294,47 @@ def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
     assert status["trading_plan"]["active"] == 1
     assert status["futu_plan_check"]["checked"] == 1
     assert (tmp_path / "reports/daily_runs/2026-06-17.md").exists()
+
+
+def test_daily_runner_deadline_uses_requested_run_date(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 6, 16, 22, 0, tzinfo=tz)
+
+    monkeypatch.setattr(daily_premarket, "datetime", FixedDatetime)
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    premarket = FakePremarket()
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=premarket,
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17")
+
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["deadline_at"] == "2026-06-17T21:10:00+08:00"
+    assert premarket.calls[0]["deadline_reached"]() is False
 
 
 def test_daily_runner_defers_latest_promotion_until_final_success(

@@ -467,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"status_json: {result.status_path}")
         print(f"report: {result.report_path}")
         print(f"log: {result.log_path}")
-        return 0
+        return 1 if result.status in {"failed", "already_running"} else 0
 
     if args.command == "build-watchlist":
         try:

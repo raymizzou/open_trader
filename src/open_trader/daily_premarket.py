@@ -241,7 +241,7 @@ class DailyPremarketRunner:
             data_dir=self.config.data_dir,
             reports_dir=self.config.reports_dir,
             advice_runner=None,
-            advice_runner_factory=self._advice_runner_factory(),
+            advice_runner_factory=self._advice_runner_factory(run_date),
             classifier=ChangeClassifier(
                 client=OpenAIClassifierClient(model=self.config.classifier_model)
             ),
@@ -250,7 +250,7 @@ class DailyPremarketRunner:
             update_latest=False,
             max_workers=self.config.max_workers,
             use_fallback=True,
-            deadline_reached=_deadline_reached(self.config),
+            deadline_reached=_deadline_reached(self.config, run_date),
         )
         advice_path = Path(getattr(premarket_result, "advice_path"))
         actions_path = Path(getattr(premarket_result, "actions_path"))
@@ -320,7 +320,9 @@ class DailyPremarketRunner:
         )
         return result
 
-    def _advice_runner_factory(self) -> Callable[[], TradingAgentsSubprocessRunner]:
+    def _advice_runner_factory(
+        self, run_date: str
+    ) -> Callable[[], TradingAgentsSubprocessRunner]:
         def factory() -> TradingAgentsSubprocessRunner:
             return TradingAgentsSubprocessRunner(
                 project_path=self.config.tradingagents_path,
@@ -331,7 +333,7 @@ class DailyPremarketRunner:
                     "llm_timeout": self.config.ta_timeout_seconds,
                     "llm_max_retries": self.config.ta_max_retries,
                 },
-                timeout_seconds=_seconds_until_deadline(self.config),
+                timeout_seconds=_seconds_until_deadline(self.config, run_date),
                 python_executable=str(self.config.python),
             )
 
@@ -430,7 +432,7 @@ class DailyPremarketRunner:
             "run_date": run_date,
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
-            "deadline_at": _deadline_at(self.config).isoformat(),
+            "deadline_at": _deadline_at(self.config, run_date).isoformat(),
             "status": status,
             "premarket": premarket,
             "trading_plan": plan_counts,
@@ -464,7 +466,7 @@ class DailyPremarketRunner:
             "run_date": run_date,
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
-            "deadline_at": _failure_deadline_at(self.config),
+            "deadline_at": _failure_deadline_at(self.config, run_date),
             "status": "failed",
             "error": error,
             "premarket": {
@@ -712,29 +714,35 @@ def _best_effort_unlink(path: Path) -> None:
         pass
 
 
-def _deadline_reached(config: DailyPremarketConfig) -> Callable[[], bool]:
+def _deadline_reached(config: DailyPremarketConfig, run_date: str) -> Callable[[], bool]:
     def reached() -> bool:
-        return datetime.now(ZoneInfo(config.timezone)) >= _deadline_at(config)
+        return datetime.now(ZoneInfo(config.timezone)) >= _deadline_at(config, run_date)
 
     return reached
 
 
-def _seconds_until_deadline(config: DailyPremarketConfig) -> float:
-    seconds = (_deadline_at(config) - datetime.now(ZoneInfo(config.timezone))).total_seconds()
+def _seconds_until_deadline(config: DailyPremarketConfig, run_date: str) -> float:
+    seconds = (
+        _deadline_at(config, run_date) - datetime.now(ZoneInfo(config.timezone))
+    ).total_seconds()
     return max(1.0, seconds)
 
 
-def _failure_deadline_at(config: DailyPremarketConfig) -> str:
+def _failure_deadline_at(config: DailyPremarketConfig, run_date: str) -> str:
     try:
-        return _deadline_at(config).isoformat()
+        return _deadline_at(config, run_date).isoformat()
     except Exception:
         return f"invalid:{config.deadline}"
 
 
-def _deadline_at(config: DailyPremarketConfig) -> datetime:
+def _deadline_at(config: DailyPremarketConfig, run_date: str) -> datetime:
     zone = ZoneInfo(config.timezone)
     hour, minute = _parse_deadline(config.deadline)
-    return datetime.combine(datetime.now(zone).date(), time(hour, minute), tzinfo=zone)
+    return datetime.combine(
+        datetime.strptime(run_date, "%Y-%m-%d").date(),
+        time(hour, minute),
+        tzinfo=zone,
+    )
 
 
 def _parse_deadline(deadline: str) -> tuple[int, int]:
