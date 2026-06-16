@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import re
+import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -161,6 +162,7 @@ def _status(
 
 
 def _read_advice_rows(advice_path: Path) -> list[dict[str, str]]:
+    csv.field_size_limit(sys.maxsize)
     with advice_path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fieldnames = reader.fieldnames or []

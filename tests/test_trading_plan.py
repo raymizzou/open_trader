@@ -158,6 +158,33 @@ def test_build_trading_plan_dry_run_does_not_update_latest(tmp_path: Path) -> No
     assert latest_path.read_text(encoding="utf-8") == "old latest"
 
 
+def test_build_trading_plan_accepts_large_raw_decision_field(tmp_path: Path) -> None:
+    advice_path = tmp_path / "advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-16",
+                "symbol": "MSFT",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "1.13%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Overweight",
+                "advice_summary": msft_advice_summary(),
+                "raw_decision": "x" * 200_000,
+                "status": "ok",
+                "error": "",
+            }
+        ],
+    )
+
+    result = build_trading_plan(advice_path, tmp_path / "data")
+
+    assert result.plan_count == 1
+
+
 def test_load_trading_plan_rows_reads_active_rows(tmp_path: Path) -> None:
     path = tmp_path / "trading_plan.csv"
     with path.open("w", encoding="utf-8", newline="") as handle:

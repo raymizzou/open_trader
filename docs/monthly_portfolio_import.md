@@ -58,7 +58,8 @@ By default, the TradingAgents run uses DeepSeek:
 
 Use `--no-symbol-timeout` for first-time portfolio initialization when every
 eligible symbol should be allowed to finish. Combine it with `--max-workers` to
-run symbols in parallel.
+run symbols in parallel. `AGRZ` and the common typo `ARGG` are excluded by the
+default premarket blacklist; add more with `--exclude-symbols`.
 
 Optional test run for a subset:
 

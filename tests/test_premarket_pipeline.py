@@ -175,6 +175,47 @@ def write_portfolio(path: Path) -> None:
         )
 
 
+def write_blacklisted_portfolio(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(
+            [
+                {
+                    "market": "US",
+                    "asset_class": "etf",
+                    "symbol": "VIXY",
+                    "name": "Volatility ETF",
+                    "portfolio_weight_hkd": "3.05%",
+                    "ai_eligible": "true",
+                    "analysis_symbol": "VIXY",
+                    "risk_flag": "normal",
+                },
+                {
+                    "market": "US",
+                    "asset_class": "etf",
+                    "symbol": "AGRZ",
+                    "name": "Ignored ETF",
+                    "portfolio_weight_hkd": "0.15%",
+                    "ai_eligible": "true",
+                    "analysis_symbol": "AGRZ",
+                    "risk_flag": "normal",
+                },
+                {
+                    "market": "US",
+                    "asset_class": "etf",
+                    "symbol": "ARGG",
+                    "name": "Ignored typo ETF",
+                    "portfolio_weight_hkd": "0.10%",
+                    "ai_eligible": "true",
+                    "analysis_symbol": "ARGG",
+                    "risk_flag": "normal",
+                },
+            ]
+        )
+
+
 def write_all_ineligible_portfolio(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -240,6 +281,29 @@ def test_run_premarket_writes_full_advice_classifications_and_actions(
 
     advice_rows = list(csv.DictReader(result.advice_path.open(encoding="utf-8")))
     assert [row["symbol"] for row in advice_rows] == ["VIXY", "QQQ"]
+
+
+def test_run_premarket_excludes_default_blacklisted_symbols(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_blacklisted_portfolio(portfolio_path)
+    advice_runner = FakeAdviceRunner()
+
+    result = run_premarket(
+        run_date="2026-06-16",
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        advice_runner=advice_runner,
+        classifier=FakeClassifier(),
+        symbols=None,
+        update_latest=True,
+    )
+
+    assert result.eligible_count == 1
+    assert result.advice_count == 1
+    assert advice_runner.calls == [("VIXY", "2026-06-16")]
 
 
 def test_run_premarket_symbols_subset_limits_analysis_case_insensitively(

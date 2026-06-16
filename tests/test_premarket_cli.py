@@ -61,6 +61,7 @@ def test_run_premarket_help_includes_expected_options(
     assert "--ta-max-retries" in output
     assert "--symbol-timeout-seconds" in output
     assert "--no-symbol-timeout" in output
+    assert "--exclude-symbols" in output
     assert "--max-workers" in output
     assert "--dry-run" in output
 
@@ -148,6 +149,8 @@ def test_run_premarket_main_wires_pipeline(
             "4",
             "--symbols",
             "VIXY,QQQ",
+            "--exclude-symbols",
+            "AGRZ, ARGG",
             "--classifier-model",
             "gpt-5.4-mini",
             "--dry-run",
@@ -158,6 +161,7 @@ def test_run_premarket_main_wires_pipeline(
     assert captured["run_date"] == "2026-06-16"
     assert captured["portfolio_path"] == Path("portfolio.csv")
     assert captured["symbols"] == {"VIXY", "QQQ"}
+    assert captured["excluded_symbols"] == {"AGRZ", "ARGG"}
     assert captured["update_latest"] is False
     assert captured["advice_runner"] is None
     assert isinstance(captured["factory_result"], FakeSubprocessRunner)

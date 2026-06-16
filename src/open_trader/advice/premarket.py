@@ -28,6 +28,7 @@ class AdviceRunner(Protocol):
 
 
 AdviceRunnerFactory = Callable[[], AdviceRunner]
+DEFAULT_EXCLUDED_SYMBOLS = {"AGRZ", "ARGG"}
 
 
 class Classifier(Protocol):
@@ -82,11 +83,27 @@ def run_premarket(
     update_latest: bool,
     max_workers: int = 1,
     advice_runner_factory: AdviceRunnerFactory | None = None,
+    excluded_symbols: set[str] | None = None,
 ) -> PremarketResult:
     if max_workers < 1:
         raise ValueError("max_workers must be at least 1")
 
     rows = load_eligible_portfolio_rows(portfolio_path)
+    normalized_excluded_symbols = {
+        symbol.casefold()
+        for symbol in (
+            DEFAULT_EXCLUDED_SYMBOLS
+            if excluded_symbols is None
+            else DEFAULT_EXCLUDED_SYMBOLS | excluded_symbols
+        )
+    }
+    if normalized_excluded_symbols:
+        rows = [
+            row
+            for row in rows
+            if row.symbol.casefold() not in normalized_excluded_symbols
+            and row.analysis_symbol.casefold() not in normalized_excluded_symbols
+        ]
     if symbols is not None:
         normalized_symbols = {symbol.casefold() for symbol in symbols}
         rows = [

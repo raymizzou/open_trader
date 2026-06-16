@@ -89,6 +89,10 @@ def _parse_symbol_subset(value: str | None) -> set[str] | None:
     return symbols or None
 
 
+def _parse_symbol_set(value: str | None) -> set[str]:
+    return _parse_symbol_subset(value) or set()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="open-trader")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -177,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     premarket_parser.add_argument(
         "--symbols",
         help="Comma-separated subset of symbols to analyze",
+    )
+    premarket_parser.add_argument(
+        "--exclude-symbols",
+        default="",
+        help="Comma-separated symbols to skip in addition to the default blacklist",
     )
     premarket_parser.add_argument(
         "--classifier-model",
@@ -341,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
                 client=OpenAIClassifierClient(model=args.classifier_model)
             ),
             symbols=symbols,
+            excluded_symbols=_parse_symbol_set(args.exclude_symbols),
             update_latest=not args.dry_run,
             max_workers=args.max_workers,
         )
