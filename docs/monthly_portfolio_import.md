@@ -285,6 +285,6 @@ Mac mini migration checklist:
 3. Install and log in to Futu OpenD.
 4. Confirm `check-futu-plan` can connect to `127.0.0.1:11111`.
 5. Fill `config/daily_premarket.env`.
-6. Run `run-daily-premarket --dry-run`.
-7. Run one real manual `run-daily-premarket`.
+6. Run `.venv/bin/python -m open_trader run-daily-premarket --date today --config config/daily_premarket.env --dry-run`.
+7. Run one real manual `.venv/bin/python -m open_trader run-daily-premarket --date today --config config/daily_premarket.env`.
 8. Install launchd.
