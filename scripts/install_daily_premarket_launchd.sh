@@ -63,6 +63,17 @@ expand_home_path() {
   fi
 }
 
+resolve_config_path() {
+  local value="$1"
+  local repo="$2"
+  value="$(expand_home_path "$value")"
+  if [[ "$value" == /* ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s/%s' "$repo" "$value"
+  fi
+}
+
 xml_escape() {
   local value="$1"
   value="${value//&/&amp;}"
@@ -90,7 +101,7 @@ if [[ -z "$OPEN_TRADER_REPO" || -z "$OPEN_TRADER_PYTHON" ]]; then
 fi
 
 OPEN_TRADER_REPO="$(expand_home_path "$OPEN_TRADER_REPO")"
-OPEN_TRADER_PYTHON="$(expand_home_path "$OPEN_TRADER_PYTHON")"
+OPEN_TRADER_PYTHON="$(resolve_config_path "$OPEN_TRADER_PYTHON" "$OPEN_TRADER_REPO")"
 
 RENDERED="$(
   sed \

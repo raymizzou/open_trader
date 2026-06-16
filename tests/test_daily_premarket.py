@@ -1075,6 +1075,34 @@ def test_launchd_installer_expands_tilde_paths_for_launchd(
     assert "~/.venv/bin/python" not in result.stdout
 
 
+def test_launchd_installer_resolves_relative_python_under_repo(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    assert f"<string>{repo}/.venv/bin/python</string>" in result.stdout
+    assert "<string>.venv/bin/python</string>" not in result.stdout
+
+
 def test_launchd_installer_rejects_export_syntax_like_runtime_parser(
     tmp_path: Path,
 ) -> None:
