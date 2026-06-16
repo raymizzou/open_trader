@@ -133,7 +133,7 @@ class TradingAgentsSubprocessRunner:
         *,
         project_path: Path,
         config_overrides: Mapping[str, object],
-        timeout_seconds: float,
+        timeout_seconds: float | None,
         python_executable: str | None = None,
     ) -> None:
         self._project_path = project_path
@@ -179,10 +179,15 @@ class TradingAgentsSubprocessRunner:
             data = json.loads(output_path.read_text(encoding="utf-8"))
             return TradingAdvice(**data)
         except subprocess.TimeoutExpired:
+            timeout_label = (
+                "disabled"
+                if self._timeout_seconds is None
+                else f"{self._timeout_seconds} seconds"
+            )
             return _error_advice(
                 row=row,
                 run_date=run_date,
-                error=f"TradingAgents timed out after {self._timeout_seconds} seconds",
+                error=f"TradingAgents timed out after {timeout_label}",
             )
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()

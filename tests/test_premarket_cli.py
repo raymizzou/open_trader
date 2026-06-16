@@ -60,6 +60,7 @@ def test_run_premarket_help_includes_expected_options(
     assert "--ta-timeout-seconds" in output
     assert "--ta-max-retries" in output
     assert "--symbol-timeout-seconds" in output
+    assert "--no-symbol-timeout" in output
     assert "--max-workers" in output
     assert "--dry-run" in output
 
@@ -77,7 +78,7 @@ def test_run_premarket_main_wires_pipeline(
             *,
             project_path: Path,
             config_overrides: dict[str, object],
-            timeout_seconds: float,
+            timeout_seconds: float | None,
         ) -> None:
             captured["tradingagents_path"] = project_path
             captured["tradingagents_config_overrides"] = config_overrides
@@ -179,3 +180,72 @@ def test_run_premarket_main_wires_pipeline(
     assert "advice_csv:" in output
     assert "actions_csv:" in output
     assert "report:" in output
+
+
+def test_run_premarket_main_allows_disabling_symbol_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeSubprocessRunner:
+        def __init__(
+            self,
+            *,
+            project_path: Path,
+            config_overrides: dict[str, object],
+            timeout_seconds: float | None,
+        ) -> None:
+            captured["symbol_timeout_seconds"] = timeout_seconds
+
+    class FakeOpenAIClassifierClient:
+        def __init__(self, *, model: str) -> None:
+            pass
+
+    class FakeChangeClassifier:
+        def __init__(self, client: object) -> None:
+            pass
+
+    def fake_run_premarket(**kwargs: object) -> PremarketResult:
+        advice_runner_factory = kwargs["advice_runner_factory"]
+        assert callable(advice_runner_factory)
+        advice_runner_factory()
+        data_dir = kwargs["data_dir"]
+        reports_dir = kwargs["reports_dir"]
+        assert isinstance(data_dir, Path)
+        assert isinstance(reports_dir, Path)
+        return PremarketResult(
+            eligible_count=1,
+            advice_count=1,
+            action_count=0,
+            advice_path=data_dir / "runs" / "2026-06-16" / "trading_advice.csv",
+            classifications_path=data_dir
+            / "runs"
+            / "2026-06-16"
+            / "change_classifications.csv",
+            actions_path=data_dir / "runs" / "2026-06-16" / "premarket_actions.csv",
+            report_path=reports_dir / "premarket" / "2026-06-16.md",
+        )
+
+    monkeypatch.setattr(cli, "TradingAgentsSubprocessRunner", FakeSubprocessRunner)
+    monkeypatch.setattr(cli, "OpenAIClassifierClient", FakeOpenAIClassifierClient)
+    monkeypatch.setattr(cli, "ChangeClassifier", FakeChangeClassifier)
+    monkeypatch.setattr(cli, "run_premarket", fake_run_premarket)
+
+    result = cli.main(
+        [
+            "run-premarket",
+            "--date",
+            "2026-06-16",
+            "--portfolio",
+            "portfolio.csv",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--reports-dir",
+            str(tmp_path / "reports"),
+            "--no-symbol-timeout",
+        ]
+    )
+
+    assert result == 0
+    assert captured["symbol_timeout_seconds"] is None

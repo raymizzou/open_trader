@@ -42,7 +42,7 @@ export DEEPSEEK_API_KEY=...
   --max-workers 3 \
   --ta-timeout-seconds 120 \
   --ta-max-retries 1 \
-  --symbol-timeout-seconds 300
+  --no-symbol-timeout
 ```
 
 By default, the TradingAgents run uses DeepSeek:
@@ -55,6 +55,10 @@ By default, the TradingAgents run uses DeepSeek:
 --ta-max-retries 1
 --symbol-timeout-seconds 300
 ```
+
+Use `--no-symbol-timeout` for first-time portfolio initialization when every
+eligible symbol should be allowed to finish. Combine it with `--max-workers` to
+run symbols in parallel.
 
 Optional test run for a subset:
 

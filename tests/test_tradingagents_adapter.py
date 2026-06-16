@@ -244,7 +244,7 @@ def test_subprocess_runner_reads_worker_output(
         cwd: Path,
         capture_output: bool,
         text: bool,
-        timeout: float,
+        timeout: float | None,
         check: bool,
     ) -> subprocess.CompletedProcess[str]:
         captured["command"] = command
@@ -308,5 +308,57 @@ def test_subprocess_runner_returns_error_on_timeout(
 
     assert advice.status == "error"
     assert advice.symbol == "QQQ"
+    assert "timed out after 30.0 seconds" in advice.error
+
+
+def test_subprocess_runner_can_run_without_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        timeout: float | None,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        captured["timeout"] = timeout
+        output_path = Path(command[command.index("--output") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "run_date": "2026-06-16",
+                    "symbol": "MSFT",
+                    "market": "US",
+                    "asset_class": "stock",
+                    "portfolio_weight_hkd": "1.13%",
+                    "risk_flag": "normal",
+                    "source": "tradingagents",
+                    "advice_action": "Overweight",
+                    "advice_summary": "评级：Overweight",
+                    "raw_decision": "{}",
+                    "status": "ok",
+                    "error": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = TradingAgentsSubprocessRunner(
+        project_path=tmp_path / "TradingAgents",
+        config_overrides={},
+        timeout_seconds=None,
+        python_executable="/python",
+    )
+
+    advice = runner.analyze(portfolio_row("MSFT"), "2026-06-16")
+
+    assert advice.status == "ok"
+    assert captured["timeout"] is None
     assert advice.source == "tradingagents"
-    assert advice.error == "TradingAgents timed out after 30.0 seconds"
+    assert advice.error == ""

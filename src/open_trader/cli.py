@@ -170,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hard timeout for one symbol's TradingAgents analysis",
     )
     premarket_parser.add_argument(
+        "--no-symbol-timeout",
+        action="store_true",
+        help="Disable the per-symbol TradingAgents subprocess timeout",
+    )
+    premarket_parser.add_argument(
         "--symbols",
         help="Comma-separated subset of symbols to analyze",
     )
@@ -320,7 +325,9 @@ def main(argv: list[str] | None = None) -> int:
             return TradingAgentsSubprocessRunner(
                 project_path=args.tradingagents_path,
                 config_overrides=tradingagents_config_overrides,
-                timeout_seconds=args.symbol_timeout_seconds,
+                timeout_seconds=(
+                    None if args.no_symbol_timeout else args.symbol_timeout_seconds
+                ),
             )
 
         result = run_premarket(
