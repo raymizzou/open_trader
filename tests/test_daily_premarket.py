@@ -550,6 +550,51 @@ def test_daily_runner_writes_success_status_and_report(
     assert (tmp_path / "reports/daily_runs/2026-06-17.md").exists()
 
 
+def test_daily_runner_sends_feishu_order_review_after_trade_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+        notifiers=("feishu",),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        notify_daily_report=True,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=notifier,
+    ).run("2026-06-17")
+
+    assert result.status == "success"
+    assert len(notifier.calls) == 1
+    title, body = notifier.calls[0]
+    assert title == "Open Trader daily order review"
+    assert "Open Trader 2026-06-17: success" in body
+    assert "US.MSFT | high | BUY" in body
+    assert "Post-trade average cost" in body
+    assert str(tmp_path / "reports/trade_actions/2026-06-17.md") in body
+    assert str(tmp_path / "reports/daily_runs/2026-06-17.md") in body
+
+
 def test_daily_runner_skips_daily_notification_when_report_notify_disabled(
     tmp_path: Path,
 ) -> None:

@@ -24,6 +24,7 @@ from .notifications import (
     MacOSNotifier,
     Notifier,
     NullNotifier,
+    render_feishu_order_review,
 )
 from .futu_watch import QuoteSnapshot
 from .trade_actions import TradeActionsResult, generate_trade_actions
@@ -371,8 +372,16 @@ class DailyPremarketRunner:
             )
         if self.config.notify_daily_report and not dry_run:
             self._notify(
-                "Open Trader daily premarket",
-                _notification_message(status, plan_counts, futu_status, advice_counts),
+                "Open Trader daily order review",
+                render_feishu_order_review(
+                    run_date=run_date,
+                    status=status,
+                    actions_path=trade_actions_result.actions_path,
+                    report_paths=[
+                        trade_actions_result.report_path,
+                        report_path,
+                    ],
+                ),
             )
         return result
 
