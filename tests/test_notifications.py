@@ -2,6 +2,7 @@ from pathlib import Path
 
 from open_trader.notifications import (
     CompositeNotifier,
+    FeishuAppNotifier,
     NotificationSendError,
     NotificationState,
     RecordingNotifier,
@@ -128,3 +129,72 @@ def test_notification_state_records_sent_keys(tmp_path: Path) -> None:
     reloaded = NotificationState.load(path)
     assert reloaded.was_sent("2026-06-17", "US.MSFT", "entry_zone") is True
     assert reloaded.was_sent("2026-06-17", "US.MSFT", "stop_loss_hit") is False
+
+
+def test_feishu_app_notifier_fetches_token_and_sends_text_message() -> None:
+    calls = []
+
+    def sender(
+        url: str,
+        payload: dict[str, object],
+        timeout: float,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        calls.append((url, payload, timeout, headers or {}))
+        if url.endswith("/open-apis/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        return {"code": 0, "data": {"message_id": "om_xxx"}}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_xxx",
+        app_secret="secret",
+        receive_id_type="mobile",
+        receive_id="+8613812345678",
+        sender=sender,
+        timeout_seconds=3.0,
+    )
+
+    notifier.notify("Open Trader", "hello")
+
+    assert calls[0] == (
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        {"app_id": "cli_xxx", "app_secret": "secret"},
+        3.0,
+        {},
+    )
+    assert calls[1] == (
+        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=mobile",
+        {
+            "receive_id": "+8613812345678",
+            "msg_type": "text",
+            "content": '{"text": "hello"}',
+        },
+        3.0,
+        {"Authorization": "Bearer tenant-token"},
+    )
+
+
+def test_feishu_app_notifier_raises_on_nonzero_response() -> None:
+    def sender(
+        url: str,
+        payload: dict[str, object],
+        timeout: float,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        return {"code": 99991663, "msg": "missing permission"}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_xxx",
+        app_secret="secret",
+        receive_id_type="email",
+        receive_id="you@example.com",
+        sender=sender,
+    )
+
+    try:
+        notifier.notify("Open Trader", "hello")
+    except NotificationSendError as exc:
+        assert "99991663" in str(exc)
+        assert "missing permission" in str(exc)
+    else:
+        raise AssertionError("expected NotificationSendError")

@@ -5,6 +5,7 @@ import json
 import subprocess
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +79,90 @@ class WeComWebhookNotifier:
             self.webhook_url,
             _wecom_payload(message, self.message_format),
             self.timeout_seconds,
+        )
+
+
+FeishuSender = Callable[
+    [str, dict[str, object], float, dict[str, str] | None],
+    dict[str, object],
+]
+
+
+class FeishuAppClient:
+    def __init__(
+        self,
+        *,
+        app_id: str,
+        app_secret: str,
+        sender: FeishuSender | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.sender = sender or _send_feishu_json
+        self.timeout_seconds = timeout_seconds
+
+    def get_tenant_access_token(self) -> str:
+        payload = self.sender(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            {"app_id": self.app_id, "app_secret": self.app_secret},
+            self.timeout_seconds,
+            None,
+        )
+        _check_feishu_response(payload, "tenant_access_token")
+        token = payload.get("tenant_access_token")
+        if not isinstance(token, str) or not token:
+            raise NotificationSendError("Feishu tenant_access_token response missing token")
+        return token
+
+    def send_text(
+        self,
+        *,
+        receive_id_type: str,
+        receive_id: str,
+        text: str,
+    ) -> None:
+        token = self.get_tenant_access_token()
+        query = urllib.parse.urlencode({"receive_id_type": receive_id_type})
+        payload = {
+            "receive_id": receive_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": text}, ensure_ascii=False),
+        }
+        response = self.sender(
+            f"https://open.feishu.cn/open-apis/im/v1/messages?{query}",
+            payload,
+            self.timeout_seconds,
+            {"Authorization": f"Bearer {token}"},
+        )
+        _check_feishu_response(response, "message_send")
+
+
+class FeishuAppNotifier:
+    def __init__(
+        self,
+        *,
+        app_id: str,
+        app_secret: str,
+        receive_id_type: str,
+        receive_id: str,
+        sender: FeishuSender | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self.receive_id_type = receive_id_type
+        self.receive_id = receive_id
+        self.client = FeishuAppClient(
+            app_id=app_id,
+            app_secret=app_secret,
+            sender=sender,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def notify(self, title: str, message: str) -> None:
+        self.client.send_text(
+            receive_id_type=self.receive_id_type,
+            receive_id=self.receive_id,
+            text=message,
         )
 
 
@@ -280,6 +365,48 @@ def _send_wecom_payload(
                 )
     except urllib.error.URLError as exc:
         raise NotificationSendError(f"WeCom webhook failed: {exc.reason}") from exc
+
+
+def _send_feishu_json(
+    url: str,
+    payload: dict[str, object],
+    timeout_seconds: float,
+    headers: dict[str, str] | None = None,
+) -> dict[str, object]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers=request_headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            if response.status < 200 or response.status >= 300:
+                raise NotificationSendError(
+                    f"Feishu webhook returned HTTP {response.status}"
+                )
+            try:
+                decoded = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise NotificationSendError("Feishu response was not JSON") from exc
+            if not isinstance(decoded, dict):
+                raise NotificationSendError("Feishu response was not an object")
+            return decoded
+    except urllib.error.URLError as exc:
+        raise NotificationSendError(f"Feishu request failed: {exc.reason}") from exc
+
+
+def _check_feishu_response(payload: Mapping[str, object], operation: str) -> None:
+    code = payload.get("code")
+    if code in {0, None}:
+        return
+    message = payload.get("msg") or payload.get("message") or ""
+    raise NotificationSendError(f"Feishu {operation} error {code}: {message}")
 
 
 def _wecom_payload(message: str, message_format: str) -> dict[str, object]:
