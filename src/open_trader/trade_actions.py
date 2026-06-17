@@ -32,10 +32,15 @@ TRADE_ACTION_FIELDNAMES = (
     "notional_currency",
     "current_quantity",
     "current_weight",
+    "avg_cost_price",
     "target_max_weight",
     "cash_available",
     "limit_price",
     "stop_price",
+    "post_trade_quantity",
+    "post_trade_weight",
+    "post_trade_avg_cost",
+    "risk_to_stop",
     "reason",
     "source_plan",
     "status",
@@ -48,6 +53,7 @@ PORTFOLIO_REQUIRED_FIELDNAMES = (
     "symbol",
     "currency",
     "total_quantity",
+    "avg_cost_price",
     "market_value",
     "fx_to_hkd",
     "market_value_hkd",
@@ -71,6 +77,7 @@ class PortfolioActionContext:
 class PortfolioPositionSnapshot:
     currency: str
     quantity: Decimal
+    avg_cost_price: Decimal
     market_value: Decimal
     market_value_hkd: Decimal
     weight: Decimal
@@ -220,6 +227,9 @@ def build_trade_action_row(
         "notional_currency": notional_currency,
         "current_quantity": _decimal_to_text(position.quantity if position else None),
         "current_weight": _percent_to_text(position.weight if position else None),
+        "avg_cost_price": _decimal_to_text(
+            position.avg_cost_price if position else None
+        ),
         "target_max_weight": (
             _percent_to_text(target_max_weight)
             if target_max_weight is not None
@@ -228,6 +238,10 @@ def build_trade_action_row(
         "cash_available": _decimal_to_text(cash_available),
         "limit_price": "",
         "stop_price": _decimal_to_text(plan.stop_loss),
+        "post_trade_quantity": "",
+        "post_trade_weight": "",
+        "post_trade_avg_cost": "",
+        "risk_to_stop": "",
         "reason": quote_status.message,
         "source_plan": source_plan,
         "status": "",
@@ -242,7 +256,7 @@ def build_trade_action_row(
         row["error"] = quote_status.message
         return row
     if action in {"SELL_STOP", "TAKE_PROFIT", "TRIM"}:
-        return _size_sell_action_row(row, action, quote_status, position)
+        return _size_sell_action_row(row, action, quote_status, position, portfolio)
     return _size_buy_action_row(
         row=row,
         action=action,
@@ -308,6 +322,11 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
 
         invalid_fields: list[str] = []
         quantity = _position_decimal(row, "total_quantity", invalid_fields)
+        avg_cost_price = _position_positive_decimal(
+            row,
+            "avg_cost_price",
+            invalid_fields,
+        )
         market_value = _position_decimal(row, "market_value", invalid_fields)
         weight = _position_percent(row, "portfolio_weight_hkd", invalid_fields)
         fx_to_hkd = _position_decimal(row, "fx_to_hkd", invalid_fields)
@@ -322,6 +341,7 @@ def load_portfolio_action_context(portfolio_path: Path) -> PortfolioActionContex
             positions[key] = PortfolioPositionSnapshot(
                 currency=currency,
                 quantity=quantity or Decimal("0"),
+                avg_cost_price=avg_cost_price or Decimal("0"),
                 market_value=market_value or Decimal("0"),
                 market_value_hkd=market_value_hkd or Decimal("0"),
                 weight=weight or Decimal("0"),
@@ -375,6 +395,18 @@ def _position_decimal(
     return parsed
 
 
+def _position_positive_decimal(
+    row: dict[str, str],
+    fieldname: str,
+    invalid_fields: list[str],
+) -> Decimal | None:
+    parsed = _optional_decimal(row.get(fieldname, "") or "")
+    if parsed is None or parsed <= 0:
+        invalid_fields.append(fieldname)
+        return None
+    return parsed
+
+
 def _position_percent(
     row: dict[str, str],
     fieldname: str,
@@ -392,17 +424,29 @@ def _size_sell_action_row(
     action: str,
     quote_status: PlanQuoteStatus,
     position: PortfolioPositionSnapshot | None,
+    portfolio: PortfolioActionContext,
 ) -> dict[str, str]:
     if quote_status.last_price <= 0:
         return _review_row(row, "invalid last price")
     if position is None:
         return _review_row(row, "missing portfolio position for sell sizing")
-    invalid_fields = _invalid_position_fields(position, ("total_quantity",))
+    invalid_fields = _invalid_position_fields(
+        position,
+        (
+            "total_quantity",
+            "avg_cost_price",
+            "market_value",
+            "market_value_hkd",
+            "fx_to_hkd",
+        ),
+    )
     if invalid_fields:
         return _review_row(
             row,
             f"invalid portfolio sizing field(s): {', '.join(invalid_fields)}",
         )
+    if position.fx_to_hkd <= 0:
+        return _review_row(row, "missing positive fx_to_hkd for sell-side sizing")
 
     if action == "TRIM":
         quantity = (position.quantity * Decimal("0.5")).to_integral_value(
@@ -417,7 +461,18 @@ def _size_sell_action_row(
     if action != "SELL_STOP":
         row["limit_price"] = _decimal_to_text(quote_status.last_price)
     row["suggested_quantity"] = _decimal_to_text(quantity)
-    row["suggested_notional"] = _decimal_to_text(quantity * quote_status.last_price)
+    executable_notional = quantity * quote_status.last_price
+    row["suggested_notional"] = _decimal_to_text(executable_notional)
+    _set_post_trade_fields(
+        row=row,
+        position=position,
+        quantity_delta=-quantity,
+        execution_price=quote_status.last_price,
+        total_market_value_hkd=portfolio.total_market_value_hkd,
+        post_trade_avg_cost=(
+            position.avg_cost_price if position.quantity > quantity else None
+        ),
+    )
     row["status"] = "ready"
     return row
 
@@ -439,7 +494,14 @@ def _size_buy_action_row(
         return _review_row(row, "missing portfolio position for buy-side sizing")
     invalid_fields = _invalid_position_fields(
         position,
-        ("total_quantity", "market_value", "market_value_hkd", "fx_to_hkd"),
+        (
+            "total_quantity",
+            "avg_cost_price",
+            "market_value",
+            "market_value_hkd",
+            "fx_to_hkd",
+        ),
+        require_avg_cost_price=position.quantity > 0,
     )
     if invalid_fields:
         return _review_row(
@@ -484,15 +546,68 @@ def _size_buy_action_row(
     row["limit_price"] = _decimal_to_text(quote_status.last_price)
     row["suggested_quantity"] = _decimal_to_text(quantity)
     row["suggested_notional"] = _decimal_to_text(executable_notional)
+    post_trade_quantity = position.quantity + quantity
+    post_trade_avg_cost = (
+        (position.quantity * position.avg_cost_price) + executable_notional
+    ) / post_trade_quantity
+    _set_post_trade_fields(
+        row=row,
+        position=position,
+        quantity_delta=quantity,
+        execution_price=quote_status.last_price,
+        total_market_value_hkd=portfolio.total_market_value_hkd,
+        post_trade_avg_cost=post_trade_avg_cost,
+    )
     row["status"] = "ready"
     return row
+
+
+def _set_post_trade_fields(
+    *,
+    row: dict[str, str],
+    position: PortfolioPositionSnapshot,
+    quantity_delta: Decimal,
+    execution_price: Decimal,
+    total_market_value_hkd: Decimal | None,
+    post_trade_avg_cost: Decimal | None,
+) -> None:
+    post_trade_quantity = position.quantity + quantity_delta
+    row["post_trade_quantity"] = _decimal_to_text(post_trade_quantity)
+    row["post_trade_avg_cost"] = (
+        _decimal_to_text(post_trade_avg_cost) if post_trade_quantity > 0 else ""
+    )
+
+    portfolio_value_hkd = total_market_value_hkd
+    if portfolio_value_hkd is None:
+        portfolio_value_hkd = position.market_value_hkd
+    if portfolio_value_hkd > 0 and position.fx_to_hkd > 0 and execution_price > 0:
+        post_trade_market_value_hkd = (
+            post_trade_quantity * execution_price * position.fx_to_hkd
+        )
+        row["post_trade_weight"] = _percent_to_text(
+            post_trade_market_value_hkd / portfolio_value_hkd
+        )
+
+    stop_price = _optional_decimal(row.get("stop_price", ""))
+    if stop_price is not None and execution_price > 0 and post_trade_quantity > 0:
+        risk_to_stop = max(
+            Decimal("0"),
+            (execution_price - stop_price) * post_trade_quantity,
+        )
+        row["risk_to_stop"] = _decimal_to_text(risk_to_stop)
 
 
 def _invalid_position_fields(
     position: PortfolioPositionSnapshot,
     fieldnames: tuple[str, ...],
+    *,
+    require_avg_cost_price: bool = True,
 ) -> tuple[str, ...]:
     invalid = set(position.invalid_fields)
+    if not require_avg_cost_price:
+        invalid.discard("avg_cost_price")
+    elif "avg_cost_price" in fieldnames and position.avg_cost_price <= 0:
+        invalid.add("avg_cost_price")
     return tuple(fieldname for fieldname in fieldnames if fieldname in invalid)
 
 

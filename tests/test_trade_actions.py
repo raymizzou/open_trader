@@ -188,6 +188,7 @@ def active_plan(
 def portfolio_context(
     *,
     quantity: str = "10",
+    avg_cost_price: str = "300",
     cash: str = "1000",
     market_value: str = "3900",
     market_value_hkd: str = "30420",
@@ -199,6 +200,7 @@ def portfolio_context(
             ("US", "MSFT"): PortfolioPositionSnapshot(
                 currency="USD",
                 quantity=Decimal(quantity),
+                avg_cost_price=Decimal(avg_cost_price),
                 market_value=Decimal(market_value),
                 market_value_hkd=Decimal(market_value_hkd),
                 weight=Decimal(weight),
@@ -235,10 +237,15 @@ def test_trade_action_fieldnames_are_stable() -> None:
         "notional_currency",
         "current_quantity",
         "current_weight",
+        "avg_cost_price",
         "target_max_weight",
         "cash_available",
         "limit_price",
         "stop_price",
+        "post_trade_quantity",
+        "post_trade_weight",
+        "post_trade_avg_cost",
+        "risk_to_stop",
         "reason",
         "source_plan",
         "status",
@@ -316,6 +323,7 @@ def test_load_portfolio_action_context_indexes_positions_cash_and_total_value(
             ("US", "MSFT"): PortfolioPositionSnapshot(
                 currency="USD",
                 quantity=Decimal("10"),
+                avg_cost_price=Decimal("300"),
                 market_value=Decimal("3900"),
                 market_value_hkd=Decimal("30420"),
                 weight=Decimal("0.39"),
@@ -366,6 +374,7 @@ def test_load_portfolio_action_context_is_immutable(tmp_path: Path) -> None:
         context.positions[("US", "MSFT")] = PortfolioPositionSnapshot(
             currency="USD",
             quantity=Decimal("1"),
+            avg_cost_price=Decimal("1"),
             market_value=Decimal("1"),
             market_value_hkd=Decimal("1"),
             weight=Decimal("0.1"),
@@ -406,7 +415,7 @@ def test_load_portfolio_action_context_rejects_missing_required_columns(tmp_path
         }])
 
     with pytest.raises(
-        ValueError, match=r"missing portfolio column\(s\): fx_to_hkd"
+        ValueError, match=r"missing portfolio column\(s\): avg_cost_price, fx_to_hkd"
     ):
         load_portfolio_action_context(path)
 
@@ -679,6 +688,7 @@ def test_load_portfolio_action_context_skips_non_cash_rows_with_missing_keys(tmp
         ("US", "GOOD"): PortfolioPositionSnapshot(
             currency="USD",
             quantity=Decimal("2"),
+            avg_cost_price=Decimal("200"),
             market_value=Decimal("200"),
             market_value_hkd=Decimal("1560"),
             weight=Decimal("0.01"),
@@ -729,6 +739,7 @@ def test_load_portfolio_action_context_accepts_utf8_sig_input(tmp_path: Path) ->
             ("US", "MSFT"): PortfolioPositionSnapshot(
                 currency="USD",
                 quantity=Decimal("10"),
+                avg_cost_price=Decimal("300"),
                 market_value=Decimal("3900"),
                 market_value_hkd=Decimal("30420"),
                 weight=Decimal("0.39"),
@@ -781,6 +792,7 @@ def test_load_portfolio_action_context_tracks_invalid_position_values(
         ("US", "AAPL"): PortfolioPositionSnapshot(
             currency="USD",
             quantity=Decimal("0"),
+            avg_cost_price=Decimal("300"),
             market_value=Decimal("0"),
             market_value_hkd=Decimal("0"),
             weight=Decimal("0"),
@@ -793,6 +805,49 @@ def test_load_portfolio_action_context_tracks_invalid_position_values(
             ),
         )
     }
+
+
+@pytest.mark.parametrize("avg_cost_price", ["", "bad", "0", "-1"])
+def test_load_portfolio_action_context_tracks_invalid_average_cost_values(
+    tmp_path: Path,
+    avg_cost_price: str,
+) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(path, [
+        {
+            "sort_group": "1",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "AAPL",
+            "name": "Apple",
+            "currency": "USD",
+            "total_quantity": "10",
+            "avg_cost_price": avg_cost_price,
+            "last_price": "390",
+            "market_value": "3900",
+            "cost_value": "3000",
+            "unrealized_pnl": "900",
+            "unrealized_pnl_pct": "30.00%",
+            "fx_source": "fixture",
+            "fx_date": "2026-05-31",
+            "fx_to_hkd": "7.8",
+            "market_value_hkd": "30420",
+            "cost_value_hkd": "23400",
+            "portfolio_weight_hkd": "39.00%",
+            "brokers": "futu",
+            "accounts": "futu_main",
+            "ai_eligible": "true",
+            "analysis_symbol": "AAPL",
+            "risk_flag": "normal",
+            "confidence": "high",
+            "notes": "",
+        },
+    ])
+
+    context = load_portfolio_action_context(path)
+
+    assert context.positions[("US", "AAPL")].avg_cost_price == Decimal("0")
+    assert context.positions[("US", "AAPL")].invalid_fields == ("avg_cost_price",)
 
 
 def test_load_portfolio_action_context_parses_grouped_numbers_and_falls_back_for_invalid_grouping(
@@ -864,6 +919,7 @@ def test_load_portfolio_action_context_parses_grouped_numbers_and_falls_back_for
         ("US", "GOOD"): PortfolioPositionSnapshot(
             currency="USD",
             quantity=Decimal("1234"),
+            avg_cost_price=Decimal("300"),
             market_value=Decimal("12345678.90"),
             market_value_hkd=Decimal("10000.00"),
             weight=Decimal("0.01"),
@@ -872,6 +928,7 @@ def test_load_portfolio_action_context_parses_grouped_numbers_and_falls_back_for
         ("US", "BAD"): PortfolioPositionSnapshot(
             currency="USD",
             quantity=Decimal("0"),
+            avg_cost_price=Decimal("300"),
             market_value=Decimal("0"),
             market_value_hkd=Decimal("10000"),
             weight=Decimal("0"),
@@ -925,6 +982,7 @@ def test_load_portfolio_action_context_keeps_blank_optional_string_fields(tmp_pa
             ("US", "AAPL"): PortfolioPositionSnapshot(
                 currency="",
                 quantity=Decimal("10"),
+                avg_cost_price=Decimal("300"),
                 market_value=Decimal("3900"),
                 market_value_hkd=Decimal("30420"),
                 weight=Decimal("0"),
@@ -940,8 +998,8 @@ def test_load_portfolio_action_context_skips_truncated_rows(tmp_path: Path) -> N
     path = tmp_path / "portfolio.csv"
     with path.open("w", encoding="utf-8", newline="") as handle:
         handle.write(
-            "market,asset_class,symbol,currency,total_quantity,market_value,"
-            "fx_to_hkd,market_value_hkd,portfolio_weight_hkd\n"
+            "market,asset_class,symbol,currency,total_quantity,avg_cost_price,"
+            "market_value,fx_to_hkd,market_value_hkd,portfolio_weight_hkd\n"
         )
         handle.write("US,stock,TRUNC,USD,10\n")
 
@@ -958,11 +1016,12 @@ def test_load_portfolio_action_context_skips_rows_with_extra_cells(tmp_path: Pat
     path = tmp_path / "portfolio.csv"
     with path.open("w", encoding="utf-8", newline="") as handle:
         header = (
-            "market,asset_class,symbol,currency,total_quantity,market_value,"
-            "cost_value,unrealized_pnl,fx_to_hkd,market_value_hkd,portfolio_weight_hkd\n"
+            "market,asset_class,symbol,currency,total_quantity,avg_cost_price,"
+            "market_value,cost_value,unrealized_pnl,fx_to_hkd,market_value_hkd,"
+            "portfolio_weight_hkd\n"
         )
         row = (
-            "US,stock,AAPL,USD,10,3900,3000,900,7.8,30420,39.00%,"
+            "US,stock,AAPL,USD,10,300,3900,3000,900,7.8,30420,39.00%,"
             "extra-cell\n"
         )
         handle.write(header)
@@ -1278,6 +1337,7 @@ def test_buy_side_invalid_portfolio_sizing_fields_map_to_review(
     broken_position = PortfolioPositionSnapshot(
         currency="USD",
         quantity=Decimal("10"),
+        avg_cost_price=Decimal("300"),
         market_value=Decimal("0"),
         market_value_hkd=Decimal("30420"),
         weight=Decimal("0.039"),
@@ -1304,6 +1364,147 @@ def test_buy_side_invalid_portfolio_sizing_fields_map_to_review(
     assert row["suggested_notional"] == ""
 
 
+def test_ready_buy_includes_average_cost_and_post_trade_fields() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(max_weight="10.4%"),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio_context(
+            quantity="10",
+            avg_cost_price="300",
+            cash="20000",
+            market_value="3900",
+            market_value_hkd="30420",
+            weight="0.039",
+            fx_to_hkd="7.8",
+        ),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "BUY"
+    assert row["status"] == "ready"
+    assert row["avg_cost_price"] == "300"
+    assert row["suggested_quantity"] == "6"
+    assert row["suggested_notional"] == "2340"
+    assert row["post_trade_quantity"] == "16"
+    assert row["post_trade_avg_cost"] == "333.75"
+    assert row["post_trade_weight"] == "6.24%"
+    assert row["risk_to_stop"] == "800"
+
+
+def test_invalid_average_cost_maps_buy_to_review_and_blanks_post_trade_fields() -> None:
+    portfolio = portfolio_context(cash="20000")
+    broken_position = PortfolioPositionSnapshot(
+        currency="USD",
+        quantity=Decimal("10"),
+        avg_cost_price=Decimal("0"),
+        market_value=Decimal("3900"),
+        market_value_hkd=Decimal("30420"),
+        weight=Decimal("0.039"),
+        fx_to_hkd=Decimal("7.8"),
+        invalid_fields=("avg_cost_price",),
+    )
+    portfolio = PortfolioActionContext(
+        positions={("US", "MSFT"): broken_position},
+        cash_by_currency=portfolio.cash_by_currency,
+        total_market_value_hkd=portfolio.total_market_value_hkd,
+    )
+
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio,
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert row["error"] == "invalid portfolio sizing field(s): avg_cost_price"
+    assert row["post_trade_quantity"] == ""
+    assert row["post_trade_weight"] == ""
+    assert row["post_trade_avg_cost"] == ""
+    assert row["risk_to_stop"] == ""
+
+
+def test_nonpositive_average_cost_value_maps_buy_to_review() -> None:
+    portfolio = portfolio_context(cash="20000")
+    broken_position = PortfolioPositionSnapshot(
+        currency="USD",
+        quantity=Decimal("10"),
+        avg_cost_price=Decimal("0"),
+        market_value=Decimal("3900"),
+        market_value_hkd=Decimal("30420"),
+        weight=Decimal("0.039"),
+        fx_to_hkd=Decimal("7.8"),
+    )
+    portfolio = PortfolioActionContext(
+        positions={("US", "MSFT"): broken_position},
+        cash_by_currency=portfolio.cash_by_currency,
+        total_market_value_hkd=portfolio.total_market_value_hkd,
+    )
+
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio,
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert row["error"] == "invalid portfolio sizing field(s): avg_cost_price"
+
+
+@pytest.mark.parametrize(
+    ("avg_cost_price", "invalid_fields"),
+    [
+        (Decimal("0"), ("avg_cost_price",)),
+        (Decimal("0"), ()),
+    ],
+)
+def test_buy_opening_position_allows_missing_average_cost(
+    avg_cost_price: Decimal,
+    invalid_fields: tuple[str, ...],
+) -> None:
+    portfolio = portfolio_context(
+        quantity="0",
+        avg_cost_price="1",
+        cash="20000",
+        market_value="0",
+        market_value_hkd="0",
+        weight="0",
+        fx_to_hkd="7.8",
+    )
+    opening_position = PortfolioPositionSnapshot(
+        currency="USD",
+        quantity=Decimal("0"),
+        avg_cost_price=avg_cost_price,
+        market_value=Decimal("0"),
+        market_value_hkd=Decimal("0"),
+        weight=Decimal("0"),
+        fx_to_hkd=Decimal("7.8"),
+        invalid_fields=invalid_fields,
+    )
+    portfolio = PortfolioActionContext(
+        positions={("US", "MSFT"): opening_position},
+        cash_by_currency=portfolio.cash_by_currency,
+        total_market_value_hkd=portfolio.total_market_value_hkd,
+    )
+
+    row = build_trade_action_row(
+        plan=active_plan(plan_text="操作计划：在380-400美元区间买入目标仓位的60%。"),
+        quote_status=quote_status("entry_zone", price="390"),
+        portfolio=portfolio,
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "BUY"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "18"
+    assert row["suggested_notional"] == "7020"
+    assert row["post_trade_quantity"] == "18"
+    assert row["post_trade_avg_cost"] == "390"
+
+
 def test_stop_loss_sells_full_position() -> None:
     row = build_trade_action_row(
         plan=active_plan(),
@@ -1319,6 +1520,10 @@ def test_stop_loss_sells_full_position() -> None:
     assert row["suggested_notional"] == "3390"
     assert row["limit_price"] == ""
     assert row["stop_price"] == "340"
+    assert row["post_trade_quantity"] == "0"
+    assert row["post_trade_weight"] == "0%"
+    assert row["post_trade_avg_cost"] == ""
+    assert row["risk_to_stop"] == ""
 
 
 @pytest.mark.parametrize("trigger_status", ["stop_loss_hit", "target_1_hit", "target_2_hit"])
@@ -1390,6 +1595,42 @@ def test_target_one_trims_half_position() -> None:
     assert row["stop_price"] == "340"
     assert row["suggested_quantity"] == "4"
     assert row["suggested_notional"] == "1804"
+    assert row["post_trade_quantity"] == "5"
+    assert row["post_trade_weight"] == "2.255%"
+    assert row["post_trade_avg_cost"] == "300"
+    assert row["risk_to_stop"] == "555"
+
+
+@pytest.mark.parametrize("trigger_status", ["stop_loss_hit", "target_1_hit", "target_2_hit"])
+def test_nonpositive_average_cost_value_maps_sell_to_review(
+    trigger_status: str,
+) -> None:
+    portfolio = portfolio_context()
+    broken_position = PortfolioPositionSnapshot(
+        currency="USD",
+        quantity=Decimal("10"),
+        avg_cost_price=Decimal("0"),
+        market_value=Decimal("3900"),
+        market_value_hkd=Decimal("30420"),
+        weight=Decimal("0.039"),
+        fx_to_hkd=Decimal("7.8"),
+    )
+    portfolio = PortfolioActionContext(
+        positions={("US", "MSFT"): broken_position},
+        cash_by_currency=portfolio.cash_by_currency,
+        total_market_value_hkd=portfolio.total_market_value_hkd,
+    )
+
+    row = build_trade_action_row(
+        plan=active_plan(),
+        quote_status=quote_status(trigger_status, price="451"),
+        portfolio=portfolio,
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "REVIEW"
+    assert row["status"] == "review"
+    assert row["error"] == "invalid portfolio sizing field(s): avg_cost_price"
 
 
 def test_target_two_takes_profit_on_full_position() -> None:
