@@ -19,4 +19,19 @@ Return exactly one JSON object with these keys:
 - rationale: short explanation of why this matters now
 - watch_trigger: optional trigger condition; empty string if none
 
+Concrete evidence requirements:
+
+- The summary must state the actual trading change, not merely say that a
+  change exists.
+- The rationale must include concrete evidence from the input when available:
+  price, stop, target, target weight, quantity, percent trim/add,
+  prior-vs-latest action change, catalyst, or risk condition.
+- The watch_trigger must include a specific price, level, event, or condition
+  when latest advice provides one.
+- If source advice lacks enough detail for concrete rationale, set
+  include_in_report false unless the action itself changed materially.
+- Do not write circular rationale. Banned examples include:
+  "This matters because severity is high."
+  "This is important because it is material."
+
 Do not recommend automatic order placement. This system only writes reports.

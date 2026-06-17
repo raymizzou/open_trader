@@ -54,6 +54,17 @@ def test_load_prompt_reads_version_controlled_prompt() -> None:
     assert "latest tradingagents advice" in prompt.lower()
 
 
+def test_prompt_requires_concrete_evidence_and_bans_circular_rationale() -> None:
+    prompt = load_prompt()
+
+    assert "concrete evidence" in prompt
+    assert "price" in prompt
+    assert "stop" in prompt
+    assert "target weight" in prompt
+    assert "Do not write circular rationale" in prompt
+    assert "because severity is high" in prompt
+
+
 def test_build_classifier_payload_includes_previous_and_latest_advice() -> None:
     payload = build_classifier_payload(
         run_date="2026-06-16",
