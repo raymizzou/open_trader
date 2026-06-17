@@ -648,12 +648,11 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
     assert result.status == "success"
     assert len(notifier.calls) == 1
     title, body = notifier.calls[0]
-    assert title == "Open Trader 每日订单复核"
-    assert "Open Trader 2026-06-17：成功" in body
-    assert "US.MSFT | 高 | 买入" in body
+    assert title == "开放交易助手 每日订单复核"
+    assert "开放交易助手 2026-06-17：成功" in body
+    assert "标的：MSFT | 高 | 买入" in body
     assert "交易后成本" in body
-    assert str(tmp_path / "reports/trade_actions/2026-06-17.md") in body
-    assert str(tmp_path / "reports/daily_runs/2026-06-17.md") in body
+    assert "reports/" not in body
 
 
 @pytest.mark.parametrize(

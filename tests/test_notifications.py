@@ -219,7 +219,7 @@ def test_feishu_app_notifier_sends_text_message() -> None:
         timeout_seconds=3.0,
     )
 
-    notifier.notify("Open Trader 每日订单复核", "测试正文")
+    notifier.notify("开放交易助手 每日订单复核", "测试正文")
 
     assert calls == [
         {
@@ -234,7 +234,7 @@ def test_feishu_app_notifier_sends_text_message() -> None:
                 "receive_id": "ray@example.com",
                 "msg_type": "text",
                 "content": json.dumps(
-                    {"text": "Open Trader 每日订单复核\n\n测试正文"},
+                    {"text": "开放交易助手 每日订单复核\n\n测试正文"},
                     ensure_ascii=False,
                 ),
             },
@@ -324,21 +324,25 @@ def test_render_feishu_order_review_includes_precise_ready_fields(tmp_path: Path
         report_paths=[Path("reports/trade_actions/2026-06-17.md")],
     )
 
-    assert "Open Trader 2026-06-17：成功" in body
-    assert "US.RKLB | 高 | 加仓" in body
+    assert "开放交易助手 2026-06-17：成功" in body
+    assert "标的：RKLB | 高 | 加仓" in body
     assert "当前价：109" in body
     assert "当前数量：120" in body
     assert "当前仓位：1.36%" in body
     assert "当前成本：101.20" in body
     assert "触发价：102" in body
     assert "本次指令：加仓 80 股" in body
-    assert "预计金额：USD 8720" in body
+    assert "预计金额：美元 8720" in body
     assert "交易后数量：200" in body
     assert "交易后仓位：2.20%" in body
     assert "交易后成本：104.32" in body
     assert "硬止损：94" in body
-    assert "止损风险：USD 3000" in body
-    assert "原因：price entered entry zone" in body
+    assert "止损风险：美元 3000" in body
+    assert "原因：价格进入计划买入区间。" in body
+    assert "Open Trader" not in body
+    assert "USD" not in body
+    assert "reports/" not in body
+    assert "price entered entry zone" not in body
 
 
 def test_render_feishu_order_review_marks_missing_post_trade_fields_review(
@@ -387,7 +391,7 @@ def test_render_feishu_order_review_marks_missing_post_trade_fields_review(
 
     assert "可执行：0" in body
     assert "需复核：1" in body
-    assert "US.MSFT | 高 | 人工复核" in body
+    assert "标的：MSFT | 高 | 人工复核" in body
     assert (
         "执行前缺少：当前成本、交易后数量、交易后仓位、交易后成本、止损风险"
     ) in body
@@ -401,6 +405,7 @@ def test_render_feishu_order_review_keeps_ready_sell_stop_with_blank_limit_price
         actions_path,
         [
             _action_row(
+                symbol="MSFT",
                 futu_symbol="US.MSFT",
                 action="SELL_STOP",
                 priority="critical",
@@ -431,7 +436,7 @@ def test_render_feishu_order_review_keeps_ready_sell_stop_with_blank_limit_price
         report_paths=[],
     )
 
-    assert "US.MSFT | 最高 | 止损卖出" in body
+    assert "标的：MSFT | 最高 | 止损卖出" in body
     assert "触发价：339" in body
     assert "当前价：339" in body
     assert "硬止损：340" in body
@@ -446,11 +451,11 @@ def test_render_feishu_order_review_truncates_ready_rows_and_includes_reports(
     _write_actions(
         actions_path,
         [
-            _action_row(futu_symbol="US.AAA", priority="high", status="ready"),
-            _action_row(futu_symbol="US.BBB", priority="medium", status="ready"),
-            _action_row(futu_symbol="US.CCC", priority="low", status="ready"),
-            _action_row(futu_symbol="US.DDD", priority="critical", status="review"),
-            _action_row(futu_symbol="US.EEE", priority="low", status="watch"),
+            _action_row(symbol="AAA", futu_symbol="US.AAA", priority="high", status="ready"),
+            _action_row(symbol="BBB", futu_symbol="US.BBB", priority="medium", status="ready"),
+            _action_row(symbol="CCC", futu_symbol="US.CCC", priority="low", status="ready"),
+            _action_row(symbol="DDD", futu_symbol="US.DDD", priority="critical", status="review"),
+            _action_row(symbol="EEE", futu_symbol="US.EEE", priority="low", status="watch"),
         ],
     )
 
@@ -468,12 +473,59 @@ def test_render_feishu_order_review_truncates_ready_rows_and_includes_reports(
     assert "可执行：3" in body
     assert "需复核：1" in body
     assert "观察中：1" in body
-    assert "US.AAA | 高 | 买入" in body
-    assert "US.BBB | 中 | 买入" in body
-    assert "US.CCC | 低 | 买入" not in body
+    assert "标的：AAA | 高 | 买入" in body
+    assert "标的：BBB | 中 | 买入" in body
+    assert "标的：CCC | 低 | 买入" not in body
     assert "另有 1 条可执行动作见报告。" in body
-    assert "reports/trade_actions/2026-06-17.md" in body
-    assert "data/runs/2026-06-17/trade_actions.csv" in body
+    assert "reports/" not in body
+
+
+def test_render_feishu_order_review_translates_review_errors_and_hides_paths(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "trade_actions.csv"
+    _write_actions(
+        actions_path,
+        [
+            _action_row(
+                symbol="BOTZ",
+                futu_symbol="US.BOTZ",
+                priority="high",
+                status="review",
+                error="unparseable target max weight",
+            ),
+            _action_row(
+                symbol="VIXY",
+                futu_symbol="US.VIXY",
+                priority="medium",
+                status="ready",
+                action="TRIM",
+                reason="Current price is at or above target 1.",
+                avg_cost_price="",
+                post_trade_quantity="",
+                post_trade_weight="",
+                post_trade_avg_cost="",
+                risk_to_stop="",
+            ),
+        ],
+    )
+
+    body = render_feishu_order_review(
+        run_date="2026-06-17",
+        status="partial",
+        actions_path=actions_path,
+        report_paths=[
+            Path("reports/trade_actions/2026-06-17.md"),
+            Path("reports/daily_runs/2026-06-17.md"),
+        ],
+    )
+
+    assert "标的：BOTZ 高: 目标最大仓位无法解析" in body
+    assert "标的：VIXY | 中 | 人工复核" in body
+    assert "原因：当前价格已达到或高于目标价 1。" in body
+    assert "unparseable target max weight" not in body
+    assert "Current price is at or above target 1." not in body
+    assert "reports/" not in body
 
 
 def _write_actions(path: Path, rows: list[dict[str, str]]) -> None:

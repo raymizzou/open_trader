@@ -157,7 +157,7 @@ def render_feishu_order_review(
     watch_rows = [row for row in rows if _effective_status(row) == "watch"]
 
     lines = [
-        f"Open Trader {run_date}：{_status_label(status)}",
+        f"开放交易助手 {run_date}：{_status_label(status)}",
         "",
         "摘要：",
         f"- 可执行：{len(ready_rows)}",
@@ -180,17 +180,15 @@ def render_feishu_order_review(
             if _row_status(row) == "ready":
                 lines.extend(["", *_render_ready_section(row)])
                 continue
-            symbol = row.get("futu_symbol", "").strip()
+            symbol = _symbol_label(row)
             priority = _priority_label(row.get("priority", "").strip())
-            reason = row.get("error", "").strip() or row.get("reason", "").strip()
-            lines.append(f"- {symbol} {priority}: {reason}".rstrip())
+            reason = _localized_note(
+                row.get("error", "").strip() or row.get("reason", "").strip()
+            )
+            lines.append(f"- 标的：{symbol} {priority}: {reason}".rstrip())
 
     if watch_rows:
         lines.extend(["", f"观察中：{len(watch_rows)} 条动作等待触发。"])
-
-    if report_paths:
-        lines.extend(["", "报告："])
-        lines.extend(f"- {path}" for path in report_paths)
 
     return "\n".join(lines).strip() + "\n"
 
@@ -204,7 +202,7 @@ def _render_ready_section(row: Mapping[str, str]) -> list[str]:
     )
     lines = [
         (
-            f"## {row.get('futu_symbol', '').strip()} | "
+            f"## 标的：{_symbol_label(row)} | "
             f"{_priority_label(row.get('priority', '').strip())} | {action}"
         )
     ]
@@ -213,12 +211,12 @@ def _render_ready_section(row: Mapping[str, str]) -> list[str]:
         lines.extend(
             [
                 f"执行前缺少：{'、'.join(_field_label(field) for field in missing_fields)}",
-                f"原因：{row.get('reason', '').strip()}",
+                f"原因：{_localized_note(row.get('reason', '').strip())}",
             ]
         )
         return lines
 
-    currency = row.get("notional_currency", "").strip()
+    currency = _currency_label(row.get("notional_currency", "").strip())
     trigger_price = _trigger_price(row)
     lines.extend(
         [
@@ -240,10 +238,18 @@ def _render_ready_section(row: Mapping[str, str]) -> list[str]:
             f"交易后成本：{row.get('post_trade_avg_cost', '').strip()}",
             f"硬止损：{row.get('stop_price', '').strip()}",
             f"止损风险：{_risk_to_stop_text(row, currency)}",
-            f"原因：{row.get('reason', '').strip()}",
+            f"原因：{_localized_note(row.get('reason', '').strip())}",
         ]
     )
     return lines
+
+
+def _symbol_label(row: Mapping[str, str]) -> str:
+    symbol = row.get("symbol", "").strip()
+    if symbol:
+        return symbol
+    futu_symbol = row.get("futu_symbol", "").strip()
+    return futu_symbol.rsplit(".", 1)[-1] if futu_symbol else ""
 
 
 def _status_label(status: str) -> str:
@@ -292,6 +298,37 @@ def _field_label(field: str) -> str:
         "stop_price": "硬止损",
         "reason": "原因",
     }.get(field, field)
+
+
+def _currency_label(currency: str) -> str:
+    return {
+        "USD": "美元",
+        "HKD": "港元",
+        "CNY": "人民币",
+        "CNH": "离岸人民币",
+    }.get(currency.strip().upper(), currency)
+
+
+def _localized_note(text: str) -> str:
+    normalized = " ".join(text.strip().split())
+    if not normalized:
+        return ""
+    translated = {
+        "price entered entry zone": "价格进入计划买入区间。",
+        "missing avg cost": "当前成本缺失。",
+        "Stop loss was hit.": "已触发止损。",
+        "Current price is at or below the stop loss.": "当前价格已达到或低于止损价。",
+        "Current price is at or above target 1.": "当前价格已达到或高于目标价 1。",
+        "Current price is at or above target 2.": "当前价格已达到或高于目标价 2。",
+        "Current price is inside the planned entry zone.": "当前价格位于计划买入区间。",
+        "Current price is near the planned add price.": "当前价格接近计划加仓价。",
+        "unparseable target max weight": "目标最大仓位无法解析",
+    }.get(normalized)
+    if translated is not None:
+        return translated
+    if any(("A" <= char <= "Z") or ("a" <= char <= "z") for char in normalized):
+        return "系统原因，需人工复核。"
+    return normalized
 
 
 def _missing_precise_fields(row: Mapping[str, str]) -> list[str]:
