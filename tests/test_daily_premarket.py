@@ -648,10 +648,11 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
     assert result.status == "success"
     assert len(notifier.calls) == 1
     title, body = notifier.calls[0]
-    assert title == "开放交易助手 每日订单复核"
-    assert "开放交易助手 2026-06-17：成功" in body
-    assert "标的：MSFT | 高 | 买入" in body
-    assert "交易后成本" in body
+    assert title == "Open Trader 行动通知"
+    assert "Open Trader｜行动通知" in body
+    assert "今日结论：有 1 条可采取行动，需人工确认后执行。" in body
+    assert "标的：MSFT｜指示：买入 3 股｜优先级：高" in body
+    assert "影响：" in body
     assert "reports/" not in body
 
 

@@ -219,7 +219,7 @@ def test_feishu_app_notifier_sends_text_message() -> None:
         timeout_seconds=3.0,
     )
 
-    notifier.notify("开放交易助手 每日订单复核", "测试正文")
+    notifier.notify("Open Trader 行动通知", "测试正文")
 
     assert calls == [
         {
@@ -234,7 +234,7 @@ def test_feishu_app_notifier_sends_text_message() -> None:
                 "receive_id": "ray@example.com",
                 "msg_type": "text",
                 "content": json.dumps(
-                    {"text": "开放交易助手 每日订单复核\n\n测试正文"},
+                    {"text": "Open Trader 行动通知\n\n测试正文"},
                     ensure_ascii=False,
                 ),
             },
@@ -324,22 +324,15 @@ def test_render_feishu_order_review_includes_precise_ready_fields(tmp_path: Path
         report_paths=[Path("reports/trade_actions/2026-06-17.md")],
     )
 
-    assert "开放交易助手 2026-06-17：成功" in body
-    assert "标的：RKLB | 高 | 加仓" in body
+    assert "Open Trader｜行动通知" in body
+    assert "今日结论：有 1 条可采取行动，需人工确认后执行。" in body
+    assert "标的：RKLB｜指示：加仓 80 股｜优先级：高" in body
     assert "当前价：109" in body
-    assert "当前数量：120" in body
-    assert "当前仓位：1.36%" in body
-    assert "当前成本：101.20" in body
     assert "触发价：102" in body
-    assert "本次指令：加仓 80 股" in body
     assert "预计金额：美元 8720" in body
-    assert "交易后数量：200" in body
-    assert "交易后仓位：2.20%" in body
-    assert "交易后成本：104.32" in body
-    assert "硬止损：94" in body
-    assert "止损风险：美元 3000" in body
+    assert "影响：当前数量 120 股、当前仓位 1.36%；执行后数量 200 股、仓位 2.20%、成本 104.32。" in body
+    assert "风控：硬止损 94，止损风险 美元 3000。" in body
     assert "原因：价格进入计划买入区间。" in body
-    assert "Open Trader" not in body
     assert "USD" not in body
     assert "reports/" not in body
     assert "price entered entry zone" not in body
@@ -389,12 +382,10 @@ def test_render_feishu_order_review_marks_missing_post_trade_fields_review(
         report_paths=[],
     )
 
-    assert "可执行：0" in body
-    assert "需复核：1" in body
-    assert "标的：MSFT | 高 | 人工复核" in body
-    assert (
-        "执行前缺少：当前成本、交易后数量、交易后仓位、交易后成本、止损风险"
-    ) in body
+    assert "今日结论：暂无可采取行动。" in body
+    assert "标的：MSFT｜指示：人工复核｜优先级：高" in body
+    assert "阻塞：执行前缺少当前成本、交易后数量、交易后仓位、交易后成本、止损风险。" in body
+    assert "影响：系统无法计算精确数量、金额、交易后仓位或风险，暂不能执行。" in body
 
 
 def test_render_feishu_order_review_keeps_ready_sell_stop_with_blank_limit_price(
@@ -436,11 +427,10 @@ def test_render_feishu_order_review_keeps_ready_sell_stop_with_blank_limit_price
         report_paths=[],
     )
 
-    assert "标的：MSFT | 最高 | 止损卖出" in body
+    assert "标的：MSFT｜指示：止损卖出 10 股｜优先级：最高" in body
     assert "触发价：339" in body
     assert "当前价：339" in body
-    assert "硬止损：340" in body
-    assert "止损风险：全部退出" in body
+    assert "风控：硬止损 340，止损风险 全部退出。" in body
     assert "执行前缺少" not in body
 
 
@@ -470,13 +460,13 @@ def test_render_feishu_order_review_truncates_ready_rows_and_includes_reports(
         max_ready_sections=2,
     )
 
-    assert "可执行：3" in body
-    assert "需复核：1" in body
-    assert "观察中：1" in body
-    assert "标的：AAA | 高 | 买入" in body
-    assert "标的：BBB | 中 | 买入" in body
-    assert "标的：CCC | 低 | 买入" not in body
-    assert "另有 1 条可执行动作见报告。" in body
+    assert "今日结论：有 3 条可采取行动，需人工确认后执行。" in body
+    assert "标的：AAA｜指示：买入 5 股｜优先级：高" in body
+    assert "标的：BBB｜指示：买入 5 股｜优先级：中" in body
+    assert "标的：CCC｜指示：买入 5 股｜优先级：低" not in body
+    assert "另有 1 条可采取行动未展开。" in body
+    assert "另有 1 条需处理事项。" in body
+    assert "观察中：1 条动作等待触发。" in body
     assert "reports/" not in body
 
 
@@ -493,6 +483,15 @@ def test_render_feishu_order_review_translates_review_errors_and_hides_paths(
                 priority="high",
                 status="review",
                 error="unparseable target max weight",
+                avg_cost_price="",
+                limit_price="",
+                suggested_quantity="",
+                suggested_notional="",
+                post_trade_quantity="",
+                post_trade_weight="",
+                post_trade_avg_cost="",
+                risk_to_stop="",
+                stop_price="",
             ),
             _action_row(
                 symbol="VIXY",
@@ -520,8 +519,12 @@ def test_render_feishu_order_review_translates_review_errors_and_hides_paths(
         ],
     )
 
-    assert "标的：BOTZ 高: 目标最大仓位无法解析" in body
-    assert "标的：VIXY | 中 | 人工复核" in body
+    assert "今日结论：暂无可采取行动。" in body
+    assert "标的：BOTZ｜指示：人工处理｜优先级：高" in body
+    assert "阻塞：目标最大仓位无法解析。" in body
+    assert "标的：VIXY｜指示：人工复核｜优先级：中" in body
+    assert "阻塞：执行前缺少当前成本、交易后数量、交易后仓位、交易后成本、止损风险。" in body
+    assert "影响：系统无法计算精确数量、金额、交易后仓位或风险，暂不能执行。" in body
     assert "原因：当前价格已达到或高于目标价 1。" in body
     assert "unparseable target max weight" not in body
     assert "Current price is at or above target 1." not in body

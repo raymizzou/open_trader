@@ -157,35 +157,26 @@ def render_feishu_order_review(
     watch_rows = [row for row in rows if _effective_status(row) == "watch"]
 
     lines = [
-        f"开放交易助手 {run_date}：{_status_label(status)}",
+        "Open Trader｜行动通知",
+        f"日期：{run_date}｜状态：{_status_label(status)}",
         "",
-        "摘要：",
-        f"- 可执行：{len(ready_rows)}",
-        f"- 需复核：{len(review_rows)}",
-        f"- 观察中：{len(watch_rows)}",
+        _conclusion_line(ready_rows),
     ]
 
     if ready_rows:
-        lines.extend(["", "可执行："])
+        lines.extend(["", "可采取行动："])
         sorted_ready_rows = sorted(ready_rows, key=_priority_sort_key)
-        for row in sorted_ready_rows[:max_ready_sections]:
-            lines.extend(["", *_render_ready_section(row)])
+        for index, row in enumerate(sorted_ready_rows[:max_ready_sections], start=1):
+            lines.extend(["", *_render_ready_section(row, index=index)])
         remaining_count = len(sorted_ready_rows) - max_ready_sections
         if remaining_count > 0:
-            lines.append(f"- 另有 {remaining_count} 条可执行动作见报告。")
+            lines.append(f"- 另有 {remaining_count} 条可采取行动未展开。")
 
     if review_rows:
-        lines.extend(["", "需复核："])
+        lines.extend(["", "暂不能行动："])
+        lines.append(f"- 另有 {len(review_rows)} 条需处理事项。")
         for row in sorted(review_rows, key=_priority_sort_key):
-            if _row_status(row) == "ready":
-                lines.extend(["", *_render_ready_section(row)])
-                continue
-            symbol = _symbol_label(row)
-            priority = _priority_label(row.get("priority", "").strip())
-            reason = _localized_note(
-                row.get("error", "").strip() or row.get("reason", "").strip()
-            )
-            lines.append(f"- 标的：{symbol} {priority}: {reason}".rstrip())
+            lines.extend(["", *_render_blocked_section(row)])
 
     if watch_rows:
         lines.extend(["", f"观察中：{len(watch_rows)} 条动作等待触发。"])
@@ -193,27 +184,24 @@ def render_feishu_order_review(
     return "\n".join(lines).strip() + "\n"
 
 
-def _render_ready_section(row: Mapping[str, str]) -> list[str]:
+def _conclusion_line(ready_rows: list[dict[str, str]]) -> str:
+    if ready_rows:
+        return f"今日结论：有 {len(ready_rows)} 条可采取行动，需人工确认后执行。"
+    return "今日结论：暂无可采取行动。"
+
+
+def _render_ready_section(row: Mapping[str, str], *, index: int) -> list[str]:
     missing_fields = _missing_precise_fields(row)
     action = (
         _action_label("REVIEW")
         if missing_fields
         else _action_label(row.get("action", "").strip())
     )
-    lines = [
-        (
-            f"## 标的：{_symbol_label(row)} | "
-            f"{_priority_label(row.get('priority', '').strip())} | {action}"
-        )
-    ]
+    quantity = row.get("suggested_quantity", "").strip()
+    lines = [_action_heading(row, action=action, quantity=quantity, index=index)]
 
     if missing_fields:
-        lines.extend(
-            [
-                f"执行前缺少：{'、'.join(_field_label(field) for field in missing_fields)}",
-                f"原因：{_localized_note(row.get('reason', '').strip())}",
-            ]
-        )
+        lines.extend(_blocked_detail_lines(row, missing_fields=missing_fields))
         return lines
 
     currency = _currency_label(row.get("notional_currency", "").strip())
@@ -221,27 +209,92 @@ def _render_ready_section(row: Mapping[str, str]) -> list[str]:
     lines.extend(
         [
             f"当前价：{row.get('last_price', '').strip()}",
-            f"当前数量：{row.get('current_quantity', '').strip()}",
-            f"当前仓位：{row.get('current_weight', '').strip()}",
-            f"当前成本：{row.get('avg_cost_price', '').strip()}",
             f"触发价：{trigger_price}",
-            (
-                f"本次指令：{_action_label(row.get('action', '').strip())} "
-                f"{row.get('suggested_quantity', '').strip()} 股"
-            ),
             (
                 f"预计金额：{currency} "
                 f"{row.get('suggested_notional', '').strip()}"
             ),
-            f"交易后数量：{row.get('post_trade_quantity', '').strip()}",
-            f"交易后仓位：{row.get('post_trade_weight', '').strip()}",
-            f"交易后成本：{row.get('post_trade_avg_cost', '').strip()}",
-            f"硬止损：{row.get('stop_price', '').strip()}",
-            f"止损风险：{_risk_to_stop_text(row, currency)}",
+            (
+                "影响："
+                f"当前数量 {row.get('current_quantity', '').strip()} 股、"
+                f"当前仓位 {row.get('current_weight', '').strip()}；"
+                f"执行后数量 {row.get('post_trade_quantity', '').strip()} 股、"
+                f"仓位 {row.get('post_trade_weight', '').strip()}、"
+                f"成本 {row.get('post_trade_avg_cost', '').strip()}。"
+            ),
+            (
+                f"风控：硬止损 {row.get('stop_price', '').strip()}，"
+                f"止损风险 {_risk_to_stop_text(row, currency)}。"
+            ),
             f"原因：{_localized_note(row.get('reason', '').strip())}",
         ]
     )
     return lines
+
+
+def _render_blocked_section(row: Mapping[str, str]) -> list[str]:
+    action = _action_label("REVIEW" if _row_status(row) == "ready" else "MANUAL")
+    lines = [_action_heading(row, action=action, quantity="", index=None)]
+    explicit_error = row.get("error", "").strip()
+    if explicit_error:
+        reason = _localized_note(explicit_error)
+        lines.extend(
+            [
+                f"阻塞：{_sentence(reason)}",
+                "影响：系统无法生成可直接执行的行动，请先处理该问题。",
+            ]
+        )
+        return lines
+    missing_fields = _missing_precise_fields(row)
+    if missing_fields:
+        lines.extend(_blocked_detail_lines(row, missing_fields=missing_fields))
+        return lines
+    reason = _localized_note(
+        row.get("error", "").strip() or row.get("reason", "").strip()
+    )
+    lines.extend(
+        [
+            f"阻塞：{_sentence(reason)}",
+            "影响：系统无法生成可直接执行的行动，请先处理该问题。",
+        ]
+    )
+    return lines
+
+
+def _action_heading(
+    row: Mapping[str, str],
+    *,
+    action: str,
+    quantity: str,
+    index: int | None,
+) -> str:
+    prefix = f"{index}. " if index is not None else "- "
+    quantity_text = f" {quantity} 股" if quantity else ""
+    return (
+        f"{prefix}标的：{_symbol_label(row)}｜指示：{action}{quantity_text}"
+        f"｜优先级：{_priority_label(row.get('priority', '').strip())}"
+    )
+
+
+def _blocked_detail_lines(
+    row: Mapping[str, str],
+    *,
+    missing_fields: list[str],
+) -> list[str]:
+    return [
+        f"阻塞：执行前缺少{'、'.join(_field_label(field) for field in missing_fields)}。",
+        "影响：系统无法计算精确数量、金额、交易后仓位或风险，暂不能执行。",
+        f"原因：{_sentence(_localized_note(row.get('reason', '').strip()))}",
+    ]
+
+
+def _sentence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if stripped.endswith(("。", "！", "？")):
+        return stripped
+    return f"{stripped}。"
 
 
 def _symbol_label(row: Mapping[str, str]) -> str:
@@ -269,6 +322,7 @@ def _action_label(action: str) -> str:
         "TAKE_PROFIT": "止盈卖出",
         "HOLD": "持有",
         "REVIEW": "人工复核",
+        "MANUAL": "人工处理",
     }.get(action.strip().upper(), action)
 
 

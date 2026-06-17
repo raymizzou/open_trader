@@ -411,7 +411,7 @@ class DailyPremarketRunner:
             except Exception:
                 pass
             else:
-                self._notify("开放交易助手 每日订单复核", message)
+                self._notify("Open Trader 行动通知", message)
         return result
 
     def _advice_runner_factory(
