@@ -607,7 +607,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"connected to Futu OpenD at {args.host}:{args.port}")
             print(f"loaded {len(plans)} active trading plan(s)")
             symbols = sorted({plan.futu_symbol for plan in plans})
-            snapshots = quote_client.get_snapshots(symbols) if symbols else {}
+            try:
+                snapshots = quote_client.get_snapshots(symbols) if symbols else {}
+            except FutuQuoteError as exc:
+                print(f"warning: Futu quote snapshot failed: {exc}")
+                print(
+                    "continuing with missing quotes for "
+                    f"{len(plans)} active plan(s)"
+                )
+                snapshots = {}
             result = generate_trade_actions(
                 plan_path=args.plan,
                 portfolio_path=args.portfolio,

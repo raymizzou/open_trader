@@ -317,7 +317,8 @@ def test_generate_trade_actions_main_without_date_uses_latest_active_symbols(
     assert "run_date: 2026-06-16" in output
 
 
-def test_generate_trade_actions_main_closes_quote_client_on_futu_quote_error(
+def test_generate_trade_actions_main_falls_back_to_missing_quotes_on_snapshot_error(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -342,18 +343,33 @@ def test_generate_trade_actions_main_closes_quote_client_on_futu_quote_error(
         def close(self) -> None:
             captured["closed"] = True
 
+    def fake_generate_trade_actions(**kwargs: object) -> TradeActionsResult:
+        captured["generator_kwargs"] = kwargs
+        return TradeActionsResult(
+            run_date="2026-06-16",
+            action_count=1,
+            ready_count=0,
+            review_count=1,
+            watch_count=0,
+            actions_path=tmp_path / "data/runs/2026-06-16/trade_actions.csv",
+            latest_path=tmp_path / "data/latest/trade_actions.csv",
+            report_path=tmp_path / "reports/trade_actions/2026-06-16.md",
+        )
+
     monkeypatch.setattr(cli, "load_trading_plan_rows", lambda path: [active_plan])
     monkeypatch.setattr(cli, "FutuQuoteClient", FakeFutuQuoteClient)
+    monkeypatch.setattr(cli, "generate_trade_actions", fake_generate_trade_actions)
 
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main(["generate-trade-actions", "--date", "2026-06-16"])
+    result = cli.main(["generate-trade-actions", "--date", "2026-06-16"])
 
-    assert exc_info.value.code == 2
+    assert result == 0
     assert captured["symbols"] == ["US.MSFT"]
     assert captured["closed"] is True
-    stderr = capsys.readouterr().err
-    assert "snapshot fetch failed" in stderr
-    assert "Traceback" not in stderr
+    assert captured["generator_kwargs"]["snapshots"] == {}
+    output = capsys.readouterr().out
+    assert "warning: Futu quote snapshot failed: snapshot fetch failed" in output
+    assert "continuing with missing quotes for 1 active plan(s)" in output
+    assert "review: 1" in output
 
 
 def test_generate_trade_actions_main_does_not_catch_generic_runtime_error(
