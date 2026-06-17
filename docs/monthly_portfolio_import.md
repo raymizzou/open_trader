@@ -274,6 +274,45 @@ data/runs/<YYYY-MM-DD>/trade_actions.csv
 reports/trade_actions/<YYYY-MM-DD>.md
 ```
 
+## Feishu App Notifications
+
+Use this path when the Feishu group custom robot entry is unavailable. Create a
+Feishu enterprise custom app, enable its bot capability, grant message-send
+permission, publish/install it in the organization, then add the app credentials
+to the local env file:
+
+```bash
+OPEN_TRADER_NOTIFIERS=feishu_app,macos
+OPEN_TRADER_FEISHU_APP_ID=cli_xxx
+OPEN_TRADER_FEISHU_APP_SECRET=replace-me
+OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=mobile
+OPEN_TRADER_FEISHU_RECEIVE_ID=+8613812345678
+OPEN_TRADER_FEISHU_MESSAGE_FORMAT=text
+OPEN_TRADER_NOTIFY_DAILY_REPORT=1
+OPEN_TRADER_NOTIFY_ACTION_TRIGGERS=1
+```
+
+Do not commit the real app secret. `OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE` can be
+`mobile`, `email`, `open_id`, `user_id`, `union_id`, or `chat_id`. Use
+international format for mobile numbers, for example `+8613812345678`.
+
+For email delivery:
+
+```bash
+OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email
+OPEN_TRADER_FEISHU_RECEIVE_ID=you@example.com
+```
+
+For group delivery after a `chat_id` is known:
+
+```bash
+OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=chat_id
+OPEN_TRADER_FEISHU_RECEIVE_ID=oc_xxxxxxxxxxxxx
+```
+
+`run-daily-premarket --dry-run` renders and writes dated artifacts but does not
+call the Feishu API.
+
 ## WeCom Notifications
 
 To send the daily report to Enterprise WeChat, create a group robot and add the
