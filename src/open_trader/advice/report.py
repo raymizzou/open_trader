@@ -69,9 +69,10 @@ def _render_markdown(
             "## 持仓全景",
             "",
             f"本次分析标的：{len(advice_records)} 个｜今日重点：{len(actions)} 个",
+            f"已分析持仓合计仓位：{_total_weight_text(advice_records)}",
             "",
-            "| 标的 | 当前仓位 | 风险标记 | 当前观点 | 状态 |",
-            "| --- | --- | --- | --- | --- |",
+            "| 标的 | 港元市值 | 当前仓位 | 风险标记 | 当前观点 | 状态 |",
+            "| --- | --- | --- | --- | --- | --- |",
         ]
     )
     if advice_records:
@@ -79,13 +80,14 @@ def _render_markdown(
             lines.append(
                 "| "
                 f"{_escape_table_cell(advice.symbol)} | "
+                f"{_market_value_hkd_text(advice.market_value_hkd)} | "
                 f"{_escape_table_cell(advice.portfolio_weight_hkd)} | "
                 f"{_risk_flag_text(advice.risk_flag)} | "
                 f"{_advice_action_text(advice.advice_action)} | "
                 f"{_advice_status_text(advice.status)} |"
             )
     else:
-        lines.append("| 无 | - | - | - | - |")
+        lines.append("| 无 | - | - | - | - | - |")
 
     lines.extend(["", "## 今日重点策略", ""])
     if not actions:
@@ -196,6 +198,26 @@ def _advice_status_text(value: str) -> str:
 
 def _escape_table_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _total_weight_text(advice_records: list[TradingAdvice]) -> str:
+    total = 0.0
+    for advice in advice_records:
+        try:
+            total += float(advice.portfolio_weight_hkd.strip().rstrip("%").replace(",", ""))
+        except ValueError:
+            continue
+    return f"{total:.2f}%"
+
+
+def _market_value_hkd_text(value: str) -> str:
+    cleaned = value.strip().replace(",", "")
+    if not cleaned:
+        return "-"
+    try:
+        return f"HKD {float(cleaned):,.2f}"
+    except ValueError:
+        return _escape_table_cell(value)
 
 
 def _negative_weight(value: str) -> float:

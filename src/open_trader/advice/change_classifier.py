@@ -144,6 +144,7 @@ def build_classifier_payload(
             "asset_class": portfolio_row.asset_class,
             "name": portfolio_row.name,
             "portfolio_weight_hkd": portfolio_row.portfolio_weight_hkd,
+            "market_value_hkd": portfolio_row.market_value_hkd,
             "risk_flag": portfolio_row.risk_flag,
         },
         "previous_advice": previous_advice,

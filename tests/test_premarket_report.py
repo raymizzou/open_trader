@@ -30,6 +30,7 @@ def advice(
     symbol: str,
     action_text: str,
     weight: str = "3.05%",
+    market_value_hkd: str = "38015.98",
     risk_flag: str = "normal",
     status: str = "ok",
 ) -> TradingAdvice:
@@ -39,6 +40,7 @@ def advice(
         market="US",
         asset_class="stock",
         portfolio_weight_hkd=weight,
+        market_value_hkd=market_value_hkd,
         risk_flag=risk_flag,
         source="tradingagents",
         advice_action=action_text,
@@ -62,8 +64,8 @@ def test_write_premarket_outputs_writes_actions_csv_and_markdown(
             action("MSFT", "medium", "7.00%"),
         ],
         advice_records=[
-            advice("AAPL", "Hold", "5.10%"),
-            advice("MSFT", "Underweight", "7.00%", "data_check", "fallback"),
+            advice("AAPL", "Hold", "5.10%", "63800.00"),
+            advice("MSFT", "Underweight", "7.00%", "87500.00", "data_check", "fallback"),
         ],
         data_dir=tmp_path / "data",
         reports_dir=tmp_path / "reports",
@@ -83,9 +85,10 @@ def test_write_premarket_outputs_writes_actions_csv_and_markdown(
     assert "# 开盘前交易简报 - 2026-06-16" in markdown
     assert "## 持仓全景" in markdown
     assert "本次分析标的：2 个｜今日重点：5 个" in markdown
-    assert "| 标的 | 当前仓位 | 风险标记 | 当前观点 | 状态 |" in markdown
-    assert "| AAPL | 5.10% | 正常 | 持有 | 正常 |" in markdown
-    assert "| MSFT | 7.00% | 数据需复核 | 低配 | 沿用旧建议 |" in markdown
+    assert "已分析持仓合计仓位：12.10%" in markdown
+    assert "| 标的 | 港元市值 | 当前仓位 | 风险标记 | 当前观点 | 状态 |" in markdown
+    assert "| AAPL | HKD 63,800.00 | 5.10% | 正常 | 持有 | 正常 |" in markdown
+    assert "| MSFT | HKD 87,500.00 | 7.00% | 数据需复核 | 低配 | 沿用旧建议 |" in markdown
     assert "## 今日重点策略" in markdown
     assert "| 标的 | 重要性 | 当前仓位 | 建议动作 |" in markdown
     assert "| AAPL | 高 | 5.10% | 减仓 |" in markdown
@@ -108,8 +111,8 @@ def test_write_premarket_outputs_handles_no_actions(tmp_path: Path) -> None:
         run_date="2026-06-16",
         actions=[],
         advice_records=[
-            advice("AAPL", "Hold", "5.10%"),
-            advice("MSFT", "Underweight", "7.00%"),
+            advice("AAPL", "Hold", "5.10%", "63800.00"),
+            advice("MSFT", "Underweight", "7.00%", "87500.00"),
         ],
         data_dir=tmp_path / "data",
         reports_dir=tmp_path / "reports",
@@ -119,8 +122,9 @@ def test_write_premarket_outputs_handles_no_actions(tmp_path: Path) -> None:
     assert "# 开盘前交易简报 - 2026-06-16" in markdown
     assert "## 持仓全景" in markdown
     assert "本次分析标的：2 个｜今日重点：0 个" in markdown
-    assert "| AAPL | 5.10% | 正常 | 持有 | 正常 |" in markdown
-    assert "| MSFT | 7.00% | 正常 | 低配 | 正常 |" in markdown
+    assert "已分析持仓合计仓位：12.10%" in markdown
+    assert "| AAPL | HKD 63,800.00 | 5.10% | 正常 | 持有 | 正常 |" in markdown
+    assert "| MSFT | HKD 87,500.00 | 7.00% | 正常 | 低配 | 正常 |" in markdown
     assert "## 今日重点策略" in markdown
     assert "今日没有需要特别关注的交易建议变化。" in markdown
     assert "No material trading advice changes" not in markdown

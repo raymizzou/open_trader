@@ -20,6 +20,7 @@ PORTFOLIO_FIELDNAMES = [
     "asset_class",
     "symbol",
     "name",
+    "market_value_hkd",
     "portfolio_weight_hkd",
     "ai_eligible",
     "analysis_symbol",
@@ -42,6 +43,7 @@ class FakeAdviceRunner:
             market=row.market,
             asset_class=row.asset_class,
             portfolio_weight_hkd=row.portfolio_weight_hkd,
+            market_value_hkd=row.market_value_hkd,
             risk_flag=row.risk_flag,
             source="fake",
             advice_action="reduce" if row.symbol == "VIXY" else "hold",
@@ -66,6 +68,7 @@ class ReturningErrorAdviceRunner(FakeAdviceRunner):
                 market=row.market,
                 asset_class=row.asset_class,
                 portfolio_weight_hkd=row.portfolio_weight_hkd,
+                market_value_hkd=row.market_value_hkd,
                 risk_flag=row.risk_flag,
                 source="tradingagents",
                 advice_action="",
@@ -130,6 +133,7 @@ class BlockingAdviceRunner(FakeAdviceRunner):
                 market=row.market,
                 asset_class=row.asset_class,
                 portfolio_weight_hkd=row.portfolio_weight_hkd,
+                market_value_hkd=row.market_value_hkd,
                 risk_flag=row.risk_flag,
                 source="fake",
                 advice_action="reduce",
@@ -148,6 +152,7 @@ class BlockingAdviceRunner(FakeAdviceRunner):
                 market=row.market,
                 asset_class=row.asset_class,
                 portfolio_weight_hkd=row.portfolio_weight_hkd,
+                market_value_hkd=row.market_value_hkd,
                 risk_flag=row.risk_flag,
                 source="fake",
                 advice_action="hold",
@@ -172,6 +177,7 @@ def write_portfolio(path: Path) -> None:
                     "asset_class": "etf",
                     "symbol": "VIXY",
                     "name": "Volatility ETF",
+                    "market_value_hkd": "38015.98",
                     "portfolio_weight_hkd": "3.05%",
                     "ai_eligible": "true",
                     "analysis_symbol": "VIXY",
@@ -182,6 +188,7 @@ def write_portfolio(path: Path) -> None:
                     "asset_class": "stock",
                     "symbol": "QQQ",
                     "name": "Nasdaq ETF",
+                    "market_value_hkd": "17387.20",
                     "portfolio_weight_hkd": "1.40%",
                     "ai_eligible": "true",
                     "analysis_symbol": "TQQQ",
@@ -192,6 +199,7 @@ def write_portfolio(path: Path) -> None:
                     "asset_class": "stock",
                     "symbol": "02476",
                     "name": "VGT",
+                    "market_value_hkd": "189400.00",
                     "portfolio_weight_hkd": "15.20%",
                     "ai_eligible": "false",
                     "analysis_symbol": "",
@@ -303,8 +311,8 @@ def test_run_premarket_writes_full_advice_classifications_and_actions(
     assert result.report_path.exists()
     report = result.report_path.read_text(encoding="utf-8")
     assert "## 持仓全景" in report
-    assert "| VIXY | 3.05% | 正常 | 减仓 | 正常 |" in report
-    assert "| QQQ | 1.40% | 正常 | 持有 | 正常 |" in report
+    assert "| VIXY | HKD 38,015.98 | 3.05% | 正常 | 减仓 | 正常 |" in report
+    assert "| QQQ | HKD 17,387.20 | 1.40% | 正常 | 持有 | 正常 |" in report
     assert "## 今日重点策略" in report
     assert "overweight" not in report
 

@@ -25,6 +25,7 @@ def load_eligible_portfolio_rows(portfolio_path: Path) -> list[PortfolioInputRow
                     "market",
                     "asset_class",
                     "name",
+                    "market_value_hkd",
                     "portfolio_weight_hkd",
                     "ai_eligible",
                     "analysis_symbol",
@@ -55,6 +56,7 @@ def load_eligible_portfolio_rows(portfolio_path: Path) -> list[PortfolioInputRow
                     portfolio_weight_hkd=normalized_row["portfolio_weight_hkd"],
                     risk_flag=normalized_row["risk_flag"],
                     analysis_symbol=analysis_symbol,
+                    market_value_hkd=normalized_row["market_value_hkd"],
                 )
             )
     return eligible

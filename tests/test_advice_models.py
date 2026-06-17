@@ -17,6 +17,7 @@ EXPECTED_TRADING_ADVICE_FIELDNAMES = [
     "market",
     "asset_class",
     "portfolio_weight_hkd",
+    "market_value_hkd",
     "risk_flag",
     "source",
     "advice_action",
@@ -70,6 +71,7 @@ def test_trading_advice_to_row_has_stable_csv_fields() -> None:
         market="US",
         asset_class="etf",
         portfolio_weight_hkd="3.05%",
+        market_value_hkd="38015.98",
         risk_flag="normal",
         source="tradingagents",
         advice_action="reduce",
@@ -83,6 +85,7 @@ def test_trading_advice_to_row_has_stable_csv_fields() -> None:
 
     assert list(row) == EXPECTED_TRADING_ADVICE_FIELDNAMES
     assert row["symbol"] == "VIXY"
+    assert row["market_value_hkd"] == "38015.98"
     assert row["advice_action"] == "reduce"
     assert row["error"] == ""
 
@@ -94,6 +97,7 @@ def test_trading_advice_row_includes_fallback_metadata() -> None:
         market="US",
         asset_class="stock",
         portfolio_weight_hkd="1.13%",
+        market_value_hkd="14123.45",
         risk_flag="normal",
         source="tradingagents",
         advice_action="Overweight",
@@ -112,6 +116,7 @@ def test_trading_advice_row_includes_fallback_metadata() -> None:
     assert "fallback_reason" in TRADING_ADVICE_FIELDNAMES
     assert "fallback_from_date" in TRADING_ADVICE_FIELDNAMES
     assert row["status"] == "fallback"
+    assert row["market_value_hkd"] == "14123.45"
     assert row["source_status"] == "fallback"
     assert row["fallback_reason"] == "daily deadline exceeded"
     assert row["fallback_from_date"] == "2026-06-16"
@@ -146,6 +151,7 @@ def test_premarket_action_is_derived_from_portfolio_and_classification() -> None
         asset_class="etf",
         name="Volatility ETF",
         portfolio_weight_hkd="3.05%",
+        market_value_hkd="38015.98",
         risk_flag="normal",
         analysis_symbol="VIXY",
     )
