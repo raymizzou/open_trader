@@ -21,9 +21,8 @@ robot entry is not available. The trading workflow, daily summaries,
 - Support direct recipient configuration:
   - `OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email`
   - `OPEN_TRADER_FEISHU_RECEIVE_ID=<user email>`
-  - or `mobile`, `open_id`, `user_id`, `union_id`, `chat_id`
-- Support `mobile` values in international format, for example
-  `+8613812345678`.
+  - or `open_id`, `user_id`, `union_id`, `chat_id`
+- Do not support `mobile` for direct sends; Feishu's message API rejects it.
 - Send text messages in the first version. The existing daily and trigger
   message renderers already produce concise plain text with Markdown-like
   structure that is readable in Feishu.
@@ -94,8 +93,8 @@ Extend `config/daily_premarket.env.example`:
 OPEN_TRADER_NOTIFIERS=feishu_app,macos
 OPEN_TRADER_FEISHU_APP_ID=cli_replace_me
 OPEN_TRADER_FEISHU_APP_SECRET=replace-me
-OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=mobile
-OPEN_TRADER_FEISHU_RECEIVE_ID=+8613812345678
+OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email
+OPEN_TRADER_FEISHU_RECEIVE_ID=you@example.com
 OPEN_TRADER_FEISHU_MESSAGE_FORMAT=text
 ```
 

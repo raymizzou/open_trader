@@ -44,8 +44,8 @@ def test_feishu_app_notifier_fetches_token_and_sends_text_message() -> None:
     notifier = FeishuAppNotifier(
         app_id="cli_xxx",
         app_secret="secret",
-        receive_id_type="mobile",
-        receive_id="+8613812345678",
+        receive_id_type="email",
+        receive_id="you@example.com",
         sender=sender,
         timeout_seconds=3.0,
     )
@@ -59,9 +59,9 @@ def test_feishu_app_notifier_fetches_token_and_sends_text_message() -> None:
         {},
     )
     assert calls[1] == (
-        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=mobile",
+        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=email",
         {
-            "receive_id": "+8613812345678",
+            "receive_id": "you@example.com",
             "msg_type": "text",
             "content": "{\"text\": \"hello\"}",
         },
@@ -163,8 +163,8 @@ def test_build_notifier_from_values_supports_feishu_app_and_macos() -> None:
             "OPEN_TRADER_NOTIFIERS": "feishu_app,macos",
             "OPEN_TRADER_FEISHU_APP_ID": "cli_xxx",
             "OPEN_TRADER_FEISHU_APP_SECRET": "secret",
-            "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE": "mobile",
-            "OPEN_TRADER_FEISHU_RECEIVE_ID": "+8613812345678",
+            "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE": "email",
+            "OPEN_TRADER_FEISHU_RECEIVE_ID": "you@example.com",
         }
     )
 
@@ -209,8 +209,8 @@ def test_run_daily_premarket_builds_feishu_notifier_from_config(
                 "OPEN_TRADER_NOTIFIERS=feishu_app",
                 "OPEN_TRADER_FEISHU_APP_ID=cli_xxx",
                 "OPEN_TRADER_FEISHU_APP_SECRET=secret",
-                "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=mobile",
-                "OPEN_TRADER_FEISHU_RECEIVE_ID=+8613812345678",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID=you@example.com",
             ]
         ),
         encoding="utf-8",
@@ -305,8 +305,8 @@ Add Feishu settings next to notification settings while keeping WeCom examples:
 ```bash
 OPEN_TRADER_FEISHU_APP_ID=cli_replace_me
 OPEN_TRADER_FEISHU_APP_SECRET=replace-me
-OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=mobile
-OPEN_TRADER_FEISHU_RECEIVE_ID=+8613812345678
+OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email
+OPEN_TRADER_FEISHU_RECEIVE_ID=you@example.com
 OPEN_TRADER_FEISHU_MESSAGE_FORMAT=text
 ```
 
@@ -320,11 +320,12 @@ In `docs/monthly_portfolio_import.md`, add a "Feishu App Notifications" subsecti
   OPEN_TRADER_NOTIFIERS=feishu_app,macos
   OPEN_TRADER_FEISHU_APP_ID=cli_xxx
   OPEN_TRADER_FEISHU_APP_SECRET=...
-  OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=mobile
-  OPEN_TRADER_FEISHU_RECEIVE_ID=+8613812345678
+  OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email
+  OPEN_TRADER_FEISHU_RECEIVE_ID=you@example.com
   OPEN_TRADER_FEISHU_MESSAGE_FORMAT=text
   ```
-- Mention `email`, `open_id`, `user_id`, `union_id`, and `chat_id` as alternatives.
+- Mention `open_id`, `user_id`, `union_id`, and `chat_id` as alternatives.
+- State that Feishu's message API does not accept `mobile` directly.
 - State that the app must be published/installed and have message-send permission.
 - Keep existing WeCom documentation.
 

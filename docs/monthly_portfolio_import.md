@@ -285,16 +285,16 @@ to the local env file:
 OPEN_TRADER_NOTIFIERS=feishu_app,macos
 OPEN_TRADER_FEISHU_APP_ID=cli_xxx
 OPEN_TRADER_FEISHU_APP_SECRET=replace-me
-OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=mobile
-OPEN_TRADER_FEISHU_RECEIVE_ID=+8613812345678
+OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email
+OPEN_TRADER_FEISHU_RECEIVE_ID=you@example.com
 OPEN_TRADER_FEISHU_MESSAGE_FORMAT=text
 OPEN_TRADER_NOTIFY_DAILY_REPORT=1
 OPEN_TRADER_NOTIFY_ACTION_TRIGGERS=1
 ```
 
 Do not commit the real app secret. `OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE` can be
-`mobile`, `email`, `open_id`, `user_id`, `union_id`, or `chat_id`. Use
-international format for mobile numbers, for example `+8613812345678`.
+`email`, `open_id`, `user_id`, `union_id`, or `chat_id`. The message API does
+not accept `mobile` directly.
 
 For email delivery:
 

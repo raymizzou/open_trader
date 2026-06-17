@@ -149,8 +149,8 @@ def test_feishu_app_notifier_fetches_token_and_sends_text_message() -> None:
     notifier = FeishuAppNotifier(
         app_id="cli_xxx",
         app_secret="secret",
-        receive_id_type="mobile",
-        receive_id="+8613812345678",
+        receive_id_type="email",
+        receive_id="you@example.com",
         sender=sender,
         timeout_seconds=3.0,
     )
@@ -164,9 +164,9 @@ def test_feishu_app_notifier_fetches_token_and_sends_text_message() -> None:
         {},
     )
     assert calls[1] == (
-        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=mobile",
+        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=email",
         {
-            "receive_id": "+8613812345678",
+            "receive_id": "you@example.com",
             "msg_type": "text",
             "content": '{"text": "hello"}',
         },
@@ -207,8 +207,8 @@ def test_build_notifier_from_values_supports_feishu_app_and_macos() -> None:
             "OPEN_TRADER_NOTIFIERS": "feishu_app,macos",
             "OPEN_TRADER_FEISHU_APP_ID": "cli_xxx",
             "OPEN_TRADER_FEISHU_APP_SECRET": "secret",
-            "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE": "mobile",
-            "OPEN_TRADER_FEISHU_RECEIVE_ID": "+8613812345678",
+            "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE": "email",
+            "OPEN_TRADER_FEISHU_RECEIVE_ID": "you@example.com",
         }
     )
 
@@ -228,5 +228,26 @@ def test_build_notifier_from_values_rejects_incomplete_feishu_config() -> None:
         assert "OPEN_TRADER_FEISHU_APP_SECRET" in message
         assert "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE" in message
         assert "OPEN_TRADER_FEISHU_RECEIVE_ID" in message
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_build_notifier_from_values_rejects_unsupported_feishu_receive_id_type() -> None:
+    try:
+        build_notifier_from_values(
+            {
+                "OPEN_TRADER_NOTIFIERS": "feishu_app",
+                "OPEN_TRADER_FEISHU_APP_ID": "cli_xxx",
+                "OPEN_TRADER_FEISHU_APP_SECRET": "secret",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE": "mobile",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID": "+8613812345678",
+            }
+        )
+    except ValueError as exc:
+        message = str(exc)
+        assert "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE" in message
+        assert "mobile" in message
+        assert "email" in message
+        assert "chat_id" in message
     else:
         raise AssertionError("expected ValueError")

@@ -447,8 +447,8 @@ def test_run_daily_premarket_builds_feishu_notifier_from_config(
                 "OPEN_TRADER_NOTIFIERS=feishu_app",
                 "OPEN_TRADER_FEISHU_APP_ID=cli_xxx",
                 "OPEN_TRADER_FEISHU_APP_SECRET=secret",
-                "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=mobile",
-                "OPEN_TRADER_FEISHU_RECEIVE_ID=+8613812345678",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID=you@example.com",
             ]
         ),
         encoding="utf-8",

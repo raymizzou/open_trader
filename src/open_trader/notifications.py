@@ -86,6 +86,7 @@ FeishuSender = Callable[
     [str, dict[str, object], float, dict[str, str] | None],
     dict[str, object],
 ]
+FEISHU_RECEIVE_ID_TYPES = {"open_id", "user_id", "union_id", "email", "chat_id"}
 
 
 class FeishuAppClient:
@@ -221,13 +222,18 @@ def build_notifier_from_values(
             ).strip() or "text"
             if message_format != "text":
                 raise ValueError("OPEN_TRADER_FEISHU_MESSAGE_FORMAT must be text")
+            receive_id_type = values["OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE"].strip()
+            if receive_id_type not in FEISHU_RECEIVE_ID_TYPES:
+                supported = ", ".join(sorted(FEISHU_RECEIVE_ID_TYPES))
+                raise ValueError(
+                    "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE must be one of "
+                    f"{supported}; got {receive_id_type}"
+                )
             notifiers.append(
                 FeishuAppNotifier(
                     app_id=values["OPEN_TRADER_FEISHU_APP_ID"].strip(),
                     app_secret=values["OPEN_TRADER_FEISHU_APP_SECRET"].strip(),
-                    receive_id_type=values[
-                        "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE"
-                    ].strip(),
+                    receive_id_type=receive_id_type,
                     receive_id=values["OPEN_TRADER_FEISHU_RECEIVE_ID"].strip(),
                 )
             )
