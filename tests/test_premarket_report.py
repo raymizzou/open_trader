@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from open_trader.advice.models import PremarketAction
+from open_trader.advice.models import PremarketAction, TradingAdvice
 from open_trader.advice.report import write_premarket_outputs
 
 
@@ -26,6 +26,29 @@ def action(
     )
 
 
+def advice(
+    symbol: str,
+    action_text: str,
+    weight: str = "3.05%",
+    risk_flag: str = "normal",
+    status: str = "ok",
+) -> TradingAdvice:
+    return TradingAdvice(
+        run_date="2026-06-16",
+        symbol=symbol,
+        market="US",
+        asset_class="stock",
+        portfolio_weight_hkd=weight,
+        risk_flag=risk_flag,
+        source="tradingagents",
+        advice_action=action_text,
+        advice_summary="",
+        raw_decision="",
+        status=status,  # type: ignore[arg-type]
+        error="",
+    )
+
+
 def test_write_premarket_outputs_writes_actions_csv_and_markdown(
     tmp_path: Path,
 ) -> None:
@@ -37,6 +60,10 @@ def test_write_premarket_outputs_writes_actions_csv_and_markdown(
             action("SPY", "high", "5.10%"),
             action("AAPL", "high", "5.10%"),
             action("MSFT", "medium", "7.00%"),
+        ],
+        advice_records=[
+            advice("AAPL", "Hold", "5.10%"),
+            advice("MSFT", "Underweight", "7.00%", "data_check", "fallback"),
         ],
         data_dir=tmp_path / "data",
         reports_dir=tmp_path / "reports",
@@ -54,7 +81,12 @@ def test_write_premarket_outputs_writes_actions_csv_and_markdown(
 
     markdown = report_path.read_text(encoding="utf-8")
     assert "# 开盘前交易简报 - 2026-06-16" in markdown
-    assert "## 今日需要关注" in markdown
+    assert "## 持仓全景" in markdown
+    assert "本次分析标的：2 个｜今日重点：5 个" in markdown
+    assert "| 标的 | 当前仓位 | 风险标记 | 当前观点 | 状态 |" in markdown
+    assert "| AAPL | 5.10% | 正常 | 持有 | 正常 |" in markdown
+    assert "| MSFT | 7.00% | 数据需复核 | 低配 | 沿用旧建议 |" in markdown
+    assert "## 今日重点策略" in markdown
     assert "| 标的 | 重要性 | 当前仓位 | 建议动作 |" in markdown
     assert "| AAPL | 高 | 5.10% | 减仓 |" in markdown
     assert "| MSFT | 中 | 7.00% | 减仓 |" in markdown
@@ -75,12 +107,21 @@ def test_write_premarket_outputs_handles_no_actions(tmp_path: Path) -> None:
     _, _, report_path = write_premarket_outputs(
         run_date="2026-06-16",
         actions=[],
+        advice_records=[
+            advice("AAPL", "Hold", "5.10%"),
+            advice("MSFT", "Underweight", "7.00%"),
+        ],
         data_dir=tmp_path / "data",
         reports_dir=tmp_path / "reports",
     )
 
     markdown = report_path.read_text(encoding="utf-8")
     assert "# 开盘前交易简报 - 2026-06-16" in markdown
+    assert "## 持仓全景" in markdown
+    assert "本次分析标的：2 个｜今日重点：0 个" in markdown
+    assert "| AAPL | 5.10% | 正常 | 持有 | 正常 |" in markdown
+    assert "| MSFT | 7.00% | 正常 | 低配 | 正常 |" in markdown
+    assert "## 今日重点策略" in markdown
     assert "今日没有需要特别关注的交易建议变化。" in markdown
     assert "No material trading advice changes" not in markdown
 

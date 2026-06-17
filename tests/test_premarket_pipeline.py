@@ -301,6 +301,12 @@ def test_run_premarket_writes_full_advice_classifications_and_actions(
     assert advice_runner.calls == [("VIXY", "2026-06-16"), ("QQQ", "2026-06-16")]
     assert classifier.previous_by_symbol["VIXY"]["advice_action"] == "hold"
     assert result.report_path.exists()
+    report = result.report_path.read_text(encoding="utf-8")
+    assert "## 持仓全景" in report
+    assert "| VIXY | 3.05% | 正常 | 减仓 | 正常 |" in report
+    assert "| QQQ | 1.40% | 正常 | 持有 | 正常 |" in report
+    assert "## 今日重点策略" in report
+    assert "overweight" not in report
 
     actions = list(csv.DictReader(result.actions_path.open(encoding="utf-8")))
     assert [row["symbol"] for row in actions] == ["VIXY"]

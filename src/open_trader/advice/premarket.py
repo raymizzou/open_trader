@@ -182,6 +182,7 @@ def run_premarket(
     actions_path, _, report_path = write_premarket_outputs(
         run_date=run_date,
         actions=actions,
+        advice_records=advice_records,
         data_dir=data_dir,
         reports_dir=reports_dir,
         update_latest=False,

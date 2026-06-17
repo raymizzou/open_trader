@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Iterable, Mapping
 
-from .models import PREMARKET_ACTION_FIELDNAMES, PremarketAction
+from .models import PREMARKET_ACTION_FIELDNAMES, PremarketAction, TradingAdvice
 
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
@@ -17,6 +17,7 @@ def write_premarket_outputs(
     actions: Iterable[PremarketAction],
     data_dir: Path,
     reports_dir: Path,
+    advice_records: Iterable[TradingAdvice] = (),
     update_latest: bool = True,
     no_eligible: bool = False,
 ) -> tuple[Path, Path, Path]:
@@ -29,6 +30,7 @@ def write_premarket_outputs(
         ),
     )
     rows = [action.to_row() for action in sorted_actions]
+    sorted_advice_records = list(advice_records)
 
     run_actions_path = data_dir / "runs" / run_date / "premarket_actions.csv"
     latest_actions_path = data_dir / "latest" / "premarket_actions.csv"
@@ -39,7 +41,12 @@ def write_premarket_outputs(
         _atomic_write_csv(latest_actions_path, PREMARKET_ACTION_FIELDNAMES, rows)
     _atomic_write_text(
         report_path,
-        _render_markdown(run_date, sorted_actions, no_eligible=no_eligible),
+        _render_markdown(
+            run_date,
+            sorted_actions,
+            advice_records=sorted_advice_records,
+            no_eligible=no_eligible,
+        ),
     )
 
     return run_actions_path, latest_actions_path, report_path
@@ -49,6 +56,7 @@ def _render_markdown(
     run_date: str,
     actions: list[PremarketAction],
     *,
+    advice_records: list[TradingAdvice],
     no_eligible: bool = False,
 ) -> str:
     lines = [f"# 开盘前交易简报 - {run_date}", ""]
@@ -56,14 +64,36 @@ def _render_markdown(
         lines.extend(["没有找到符合条件的美股或 ETF 标的。", ""])
         return "\n".join(lines)
 
+    lines.extend(
+        [
+            "## 持仓全景",
+            "",
+            f"本次分析标的：{len(advice_records)} 个｜今日重点：{len(actions)} 个",
+            "",
+            "| 标的 | 当前仓位 | 风险标记 | 当前观点 | 状态 |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    if advice_records:
+        for advice in advice_records:
+            lines.append(
+                "| "
+                f"{_escape_table_cell(advice.symbol)} | "
+                f"{_escape_table_cell(advice.portfolio_weight_hkd)} | "
+                f"{_risk_flag_text(advice.risk_flag)} | "
+                f"{_advice_action_text(advice.advice_action)} | "
+                f"{_advice_status_text(advice.status)} |"
+            )
+    else:
+        lines.append("| 无 | - | - | - | - |")
+
+    lines.extend(["", "## 今日重点策略", ""])
     if not actions:
         lines.extend(["今日没有需要特别关注的交易建议变化。", ""])
         return "\n".join(lines)
 
     lines.extend(
         [
-            "## 今日需要关注",
-            "",
             "| 标的 | 重要性 | 当前仓位 | 建议动作 |",
             "| --- | --- | --- | --- |",
         ]
@@ -129,6 +159,38 @@ def _suggested_action_text(value: str) -> str:
         "trim": "减仓",
         "buy": "买入",
         "sell": "卖出",
+    }.get(value.strip().lower(), value.strip())
+
+
+def _advice_action_text(value: str) -> str:
+    return {
+        "overweight": "高配",
+        "neutral": "中性",
+        "underweight": "低配",
+        "hold": "持有",
+        "buy": "买入",
+        "sell": "卖出",
+        "reduce": "减仓",
+        "trim": "减仓",
+        "add": "加仓",
+        "exit": "清仓",
+    }.get(value.strip().lower(), value.strip())
+
+
+def _risk_flag_text(value: str) -> str:
+    return {
+        "normal": "正常",
+        "data_check": "数据需复核",
+        "overweight": "仓位偏高",
+        "underweight": "仓位偏低",
+    }.get(value.strip().lower(), value.strip())
+
+
+def _advice_status_text(value: str) -> str:
+    return {
+        "ok": "正常",
+        "fallback": "沿用旧建议",
+        "error": "分析失败",
     }.get(value.strip().lower(), value.strip())
 
 
