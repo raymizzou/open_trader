@@ -470,7 +470,7 @@ def test_run_premarket_all_ineligible_writes_empty_run_outputs_and_preserves_lat
     assert result.advice_path.exists()
     assert result.classifications_path.exists()
     assert result.actions_path.exists()
-    assert "No eligible US stocks or ETFs were found" in result.report_path.read_text(
+    assert "没有找到符合条件的美股或 ETF 标的。" in result.report_path.read_text(
         encoding="utf-8"
     )
     assert (data_dir / "latest" / "trading_advice.csv").read_text(
@@ -517,7 +517,7 @@ def test_run_premarket_no_matching_symbols_writes_empty_run_outputs_and_preserve
     assert result.advice_path.exists()
     assert result.classifications_path.exists()
     assert result.actions_path.exists()
-    assert "No eligible US stocks or ETFs were found" in result.report_path.read_text(
+    assert "没有找到符合条件的美股或 ETF 标的。" in result.report_path.read_text(
         encoding="utf-8"
     )
     assert (data_dir / "latest" / "trading_advice.csv").read_text(

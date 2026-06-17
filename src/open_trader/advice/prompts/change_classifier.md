@@ -19,4 +19,12 @@ Return exactly one JSON object with these keys:
 - rationale: short explanation of why this matters now
 - watch_trigger: optional trigger condition; empty string if none
 
+For report readability, `suggested_action`, `summary`, `rationale`, and
+`watch_trigger` must be written in Chinese. Do not mix English enum values into
+report-facing fields. Keep enum fields (`change_type`, `severity`) in the
+required machine-readable English values.
+
+报告可读性要求：suggested_action、summary、rationale、watch_trigger 必须使用中文。
+不要在报告字段中混用英文枚举值；change_type 和 severity 仍使用 schema 要求的英文枚举。
+
 Do not recommend automatic order placement. This system only writes reports.

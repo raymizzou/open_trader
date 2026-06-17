@@ -51,34 +51,89 @@ def _render_markdown(
     *,
     no_eligible: bool = False,
 ) -> str:
-    lines = [f"# Premarket Trading Brief - {run_date}", ""]
+    lines = [f"# 开盘前交易简报 - {run_date}", ""]
     if no_eligible:
-        lines.extend(["No eligible US stocks or ETFs were found.", ""])
+        lines.extend(["没有找到符合条件的美股或 ETF 标的。", ""])
         return "\n".join(lines)
 
     if not actions:
-        lines.extend(["No material trading advice changes were generated.", ""])
+        lines.extend(["今日没有需要特别关注的交易建议变化。", ""])
         return "\n".join(lines)
 
-    lines.extend(["## Action Items", ""])
+    lines.extend(
+        [
+            "## 今日需要关注",
+            "",
+            "| 标的 | 重要性 | 当前仓位 | 建议动作 |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    for action in actions:
+        lines.append(
+            "| "
+            f"{_escape_table_cell(action.symbol)} | "
+            f"{_severity_text(action.severity)} | "
+            f"{_escape_table_cell(action.portfolio_weight_hkd)} | "
+            f"{_suggested_action_text(action.suggested_action)} |"
+        )
+    lines.extend(["", "## 详细说明", ""])
     for index, action in enumerate(actions, start=1):
         lines.extend(
             [
                 f"### {index}. {action.symbol}",
                 "",
-                f"- Severity: {action.severity}",
-                f"- Current weight: {action.portfolio_weight_hkd}",
-                f"- Change type: {action.change_type}",
-                f"- Suggested action: {action.suggested_action}",
-                f"- Summary: {action.summary}",
-                f"- Rationale: {action.rationale}",
+                "| 项目 | 内容 |",
+                "| --- | --- |",
+                f"| 重要性 | {_severity_text(action.severity)} |",
+                f"| 当前仓位 | {_escape_table_cell(action.portfolio_weight_hkd)} |",
+                f"| 变化类型 | {_change_type_text(action.change_type)} |",
+                f"| 建议动作 | {_suggested_action_text(action.suggested_action)} |",
+                "",
+                f"**为什么重要：** {action.rationale}",
+                "",
+                f"**摘要：** {action.summary}",
             ]
         )
         if action.watch_trigger:
-            lines.append(f"- Watch trigger: {action.watch_trigger}")
+            lines.extend(["", f"**观察条件：** {action.watch_trigger}"])
         lines.append("")
 
     return "\n".join(lines)
+
+
+def _severity_text(value: str) -> str:
+    return {
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+    }.get(value.strip().lower(), value.strip())
+
+
+def _change_type_text(value: str) -> str:
+    return {
+        "new_signal": "新信号",
+        "action_changed": "建议动作变化",
+        "risk_changed": "风险变化",
+        "trigger_changed": "触发条件变化",
+        "no_material_change": "无实质变化",
+    }.get(value.strip().lower(), value.strip())
+
+
+def _suggested_action_text(value: str) -> str:
+    return {
+        "hold": "持有",
+        "watch": "观察",
+        "reduce": "减仓",
+        "add": "加仓",
+        "exit": "清仓",
+        "trim": "减仓",
+        "buy": "买入",
+        "sell": "卖出",
+    }.get(value.strip().lower(), value.strip())
+
+
+def _escape_table_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ").strip()
 
 
 def _negative_weight(value: str) -> float:

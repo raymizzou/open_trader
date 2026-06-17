@@ -35,9 +35,9 @@ assert "| AAPL | 高 | 5.10% | 减仓 |" in markdown
 assert "| MSFT | 中 | 7.00% | 减仓 |" in markdown
 assert "## 详细说明" in markdown
 assert "| 变化类型 | 建议动作变化 |" in markdown
-assert "**为什么重要：** AAPL latest advice changed." in markdown
-assert "**摘要：** AAPL needs action." in markdown
-assert "**观察条件：** Watch the open." in markdown
+assert "**为什么重要：** AAPL 今日建议相对上次发生变化，需要优先确认。" in markdown
+assert "**摘要：** 建议开盘前重点复核 AAPL 的仓位和风险。" in markdown
+assert "**观察条件：** 若开盘后触发计划价位，应优先处理。" in markdown
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
