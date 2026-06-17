@@ -89,11 +89,14 @@ def test_render_daily_trade_action_message_groups_rows() -> None:
         trade_actions_report_path=Path("reports/trade_actions/2026-06-17.md"),
     )
 
-    assert "# Open Trader 2026-06-17: success" in message
-    assert "- Actions: 1 ready, 1 review, 1 watch" in message
-    assert "- US.MSFT BUY high @ 399, qty 3, entered entry zone" in message
-    assert "- US.TSLA REVIEW medium, missing_quote" in message
-    assert "- US.AAPL HOLD low @ 210, wait" in message
+    assert "【Open Trader 日报】2026-06-17" in message
+    assert "汇总：可执行 1｜需复核 1｜观察 1" in message
+    assert "标的｜方向｜仓位" in message
+    assert "US.MSFT｜买入｜3股" in message
+    assert "US.TSLA｜复核｜暂无，需人工确认" in message
+    assert "US.AAPL｜观察｜不操作" in message
+    assert "报告：" in message
+    assert "reports/trade_actions/2026-06-17.md" in message
 
 
 def test_render_trigger_message_contains_action_detail() -> None:
@@ -112,11 +115,12 @@ def test_render_trigger_message_contains_action_detail() -> None:
         report_path=Path("reports/trade_actions/2026-06-17.md"),
     )
 
-    assert "# Open Trader Trigger" in message
-    assert "US.MSFT BUY triggered" in message
-    assert "- Price: 399" in message
-    assert "- Quantity: 3" in message
-    assert "- Notional: USD 1197" in message
+    assert "【价格触发】US.MSFT" in message
+    assert "标的：US.MSFT" in message
+    assert "方向：买入" in message
+    assert "仓位：3股 / USD 1197" in message
+    assert "价格：399" in message
+    assert "原因：entered entry zone" in message
 
 
 def test_notification_state_records_sent_keys(tmp_path: Path) -> None:

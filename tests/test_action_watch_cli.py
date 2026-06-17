@@ -89,7 +89,9 @@ def test_watch_actions_once_sends_trigger_and_records_state(
 
     assert result == 0
     assert len(sent) == 1
-    assert "US.MSFT BUY triggered" in sent[0][1]
+    assert "【价格触发】US.MSFT" in sent[0][1]
+    assert "方向：买入" in sent[0][1]
+    assert "仓位：3股 / USD 1197" in sent[0][1]
     assert (tmp_path / "data/runs/2026-06-17/notification_state.json").exists()
 
 

@@ -329,7 +329,8 @@ def test_daily_runner_generates_trade_actions_and_sends_daily_notification(
     assert (tmp_path / "data/runs/2026-06-17/trade_actions.csv").exists()
     assert (tmp_path / "reports/trade_actions/2026-06-17.md").exists()
     assert notifier.messages
-    assert "# Open Trader 2026-06-17: success" in notifier.messages[-1][1]
+    assert "【Open Trader 日报】2026-06-17" in notifier.messages[-1][1]
+    assert "标的｜方向｜仓位" in notifier.messages[-1][1]
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["artifacts"]["trade_actions"] == str(
         tmp_path / "data/runs/2026-06-17/trade_actions.csv"

@@ -308,30 +308,25 @@ def render_daily_trade_action_message(
     review = [row for row in action_rows if row.get("status") == "review"]
     watch = [row for row in action_rows if row.get("status") == "watch"]
     lines = [
-        f"# Open Trader {run_date}: {status}",
+        f"【Open Trader 日报】{run_date}",
         "",
-        "Summary:",
-        (
-            f"- Advice: {premarket.get('ok', 0)} ok, "
-            f"{premarket.get('fallback', 0)} fallback, "
-            f"{premarket.get('error', 0)} error"
-        ),
-        f"- Actions: {len(ready)} ready, {len(review)} review, {len(watch)} watch",
-        (
-            f"- Futu: {futu_status.get('checked', 0)} checked, "
-            f"{futu_status.get('missing', 0)} missing, "
-            f"{futu_status.get('triggered', 0)} triggered"
-        ),
+        f"汇总：可执行 {len(ready)}｜需复核 {len(review)}｜观察 {len(watch)}",
+        "",
+        "标的｜方向｜仓位",
     ]
-    _append_action_section(lines, "Ready", ready)
-    _append_action_section(lines, "Review", review)
-    _append_action_section(lines, "Watch", watch)
+    rows = [*ready, *review, *watch]
+    if rows:
+        for row in rows[:20]:
+            lines.append(_notification_action_line(row))
+        if len(rows) > 20:
+            lines.append(f"还有 {len(rows) - 20} 个标的，见报告")
+    else:
+        lines.append("暂无需要关注的标的")
     lines.extend(
         [
             "",
-            "Reports:",
-            f"- {daily_report_path}",
-            f"- {trade_actions_report_path}",
+            "报告：",
+            str(trade_actions_report_path),
         ]
     )
     return "\n".join(lines)
@@ -346,22 +341,17 @@ def render_trigger_message(
     futu_symbol = row.get("futu_symbol", "").strip()
     action = row.get("action", "").strip()
     lines = [
-        "# Open Trader Trigger",
+        f"【价格触发】{futu_symbol}",
         "",
-        f"{futu_symbol} {action} triggered",
-        f"- Price: {row.get('last_price', '').strip()}",
+        f"标的：{futu_symbol}",
+        f"方向：{_direction_text(action)}",
+        f"仓位：{_position_text(row)}",
+        f"价格：{row.get('last_price', '').strip()}",
     ]
-    quantity = row.get("suggested_quantity", "").strip()
-    if quantity:
-        lines.append(f"- Quantity: {quantity}")
-    notional = row.get("suggested_notional", "").strip()
-    currency = row.get("notional_currency", "").strip()
-    if notional:
-        lines.append(f"- Notional: {currency} {notional}".strip())
     reason = _trim_reason(row.get("reason", ""))
     if reason:
-        lines.append(f"- Reason: {reason}")
-    lines.append(f"- Report: {report_path}")
+        lines.append(f"原因：{reason}")
+    lines.append(f"报告：{report_path}")
     return "\n".join(lines)
 
 
@@ -466,6 +456,46 @@ def _append_action_section(
         lines.append(_format_action_line(row))
     if len(rows) > 20:
         lines.append(f"- ... {len(rows) - 20} more")
+
+
+def _notification_action_line(row: Mapping[str, str]) -> str:
+    futu_symbol = row.get("futu_symbol", "").strip()
+    direction = _direction_text(row.get("action", ""))
+    position = _position_text(row)
+    return f"{futu_symbol}｜{direction}｜{position}"
+
+
+def _direction_text(action: str) -> str:
+    mapping = {
+        "BUY": "买入",
+        "ADD": "加仓",
+        "TRIM": "减仓",
+        "SELL_STOP": "止损卖出",
+        "TAKE_PROFIT": "止盈",
+        "HOLD": "观察",
+        "REVIEW": "复核",
+    }
+    normalized = action.strip().upper()
+    return mapping.get(normalized, action.strip())
+
+
+def _position_text(row: Mapping[str, str]) -> str:
+    action = row.get("action", "").strip().upper()
+    status = row.get("status", "").strip().lower()
+    quantity = row.get("suggested_quantity", "").strip()
+    notional = row.get("suggested_notional", "").strip()
+    currency = row.get("notional_currency", "").strip()
+    if quantity and notional:
+        return f"{quantity}股 / {currency} {notional}".strip()
+    if quantity:
+        return f"{quantity}股"
+    if notional:
+        return f"{currency} {notional}".strip()
+    if action == "REVIEW" or status == "review":
+        return "暂无，需人工确认"
+    if action == "HOLD" or status == "watch":
+        return "不操作"
+    return "暂无"
 
 
 def _format_action_line(row: Mapping[str, str]) -> str:
