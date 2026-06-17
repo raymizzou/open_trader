@@ -199,6 +199,38 @@ def build_notifier_from_values(
                     or "markdown",
                 )
             )
+        elif name == "feishu_app":
+            missing = [
+                key
+                for key in [
+                    "OPEN_TRADER_FEISHU_APP_ID",
+                    "OPEN_TRADER_FEISHU_APP_SECRET",
+                    "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE",
+                    "OPEN_TRADER_FEISHU_RECEIVE_ID",
+                ]
+                if not values.get(key, "").strip()
+            ]
+            if missing:
+                raise ValueError(
+                    "missing Feishu notifier config value(s): "
+                    + ", ".join(missing)
+                )
+            message_format = values.get(
+                "OPEN_TRADER_FEISHU_MESSAGE_FORMAT",
+                "text",
+            ).strip() or "text"
+            if message_format != "text":
+                raise ValueError("OPEN_TRADER_FEISHU_MESSAGE_FORMAT must be text")
+            notifiers.append(
+                FeishuAppNotifier(
+                    app_id=values["OPEN_TRADER_FEISHU_APP_ID"].strip(),
+                    app_secret=values["OPEN_TRADER_FEISHU_APP_SECRET"].strip(),
+                    receive_id_type=values[
+                        "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE"
+                    ].strip(),
+                    receive_id=values["OPEN_TRADER_FEISHU_RECEIVE_ID"].strip(),
+                )
+            )
         elif name == "none":
             continue
         else:

@@ -429,6 +429,66 @@ def test_run_daily_premarket_builds_wecom_notifier_from_config(
     assert captured["notifier"].__class__.__name__ == "CompositeNotifier"
 
 
+def test_run_daily_premarket_builds_feishu_notifier_from_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = tmp_path / "daily.env"
+    env.write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={tmp_path}",
+                f"OPEN_TRADER_PYTHON={tmp_path / '.venv/bin/python'}",
+                "OPEN_TRADER_TIMEZONE=Asia/Shanghai",
+                "OPEN_TRADER_DEADLINE=21:10",
+                "OPEN_TRADER_FUTU_HOST=127.0.0.1",
+                "OPEN_TRADER_FUTU_PORT=11111",
+                "DEEPSEEK_API_KEY=secret",
+                "OPEN_TRADER_NOTIFIERS=feishu_app",
+                "OPEN_TRADER_FEISHU_APP_ID=cli_xxx",
+                "OPEN_TRADER_FEISHU_APP_SECRET=secret",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=mobile",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID=+8613812345678",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeRunner:
+        def __init__(self, *, config: object, notifier: object) -> None:
+            captured["notifier"] = notifier
+
+        def run(self, *, run_date: str, dry_run: bool):
+            return type(
+                "DailyRunResult",
+                (),
+                {
+                    "status": "success",
+                    "status_path": tmp_path / "status.json",
+                    "report_path": tmp_path / "report.md",
+                    "log_path": tmp_path / "run.log",
+                },
+            )()
+
+    monkeypatch.setattr(cli, "DailyPremarketRunner", FakeRunner)
+
+    result = cli.main(
+        [
+            "run-daily-premarket",
+            "--date",
+            "2026-06-17",
+            "--config",
+            str(env),
+        ]
+    )
+
+    assert result == 0
+    notifier = captured["notifier"]
+    assert notifier.__class__.__name__ == "CompositeNotifier"
+    assert notifier.notifiers[0].__class__.__name__ == "FeishuAppNotifier"
+
+
 def test_watch_actions_help_is_registered() -> None:
     parser = build_parser()
 

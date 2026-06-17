@@ -7,6 +7,7 @@ from open_trader.notifications import (
     NotificationState,
     RecordingNotifier,
     WeComWebhookNotifier,
+    build_notifier_from_values,
     render_daily_trade_action_message,
     render_trigger_message,
 )
@@ -198,3 +199,34 @@ def test_feishu_app_notifier_raises_on_nonzero_response() -> None:
         assert "missing permission" in str(exc)
     else:
         raise AssertionError("expected NotificationSendError")
+
+
+def test_build_notifier_from_values_supports_feishu_app_and_macos() -> None:
+    notifier = build_notifier_from_values(
+        {
+            "OPEN_TRADER_NOTIFIERS": "feishu_app,macos",
+            "OPEN_TRADER_FEISHU_APP_ID": "cli_xxx",
+            "OPEN_TRADER_FEISHU_APP_SECRET": "secret",
+            "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE": "mobile",
+            "OPEN_TRADER_FEISHU_RECEIVE_ID": "+8613812345678",
+        }
+    )
+
+    assert notifier.__class__.__name__ == "CompositeNotifier"
+    assert [child.__class__.__name__ for child in notifier.notifiers] == [
+        "FeishuAppNotifier",
+        "MacOSNotifier",
+    ]
+
+
+def test_build_notifier_from_values_rejects_incomplete_feishu_config() -> None:
+    try:
+        build_notifier_from_values({"OPEN_TRADER_NOTIFIERS": "feishu_app"})
+    except ValueError as exc:
+        message = str(exc)
+        assert "OPEN_TRADER_FEISHU_APP_ID" in message
+        assert "OPEN_TRADER_FEISHU_APP_SECRET" in message
+        assert "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE" in message
+        assert "OPEN_TRADER_FEISHU_RECEIVE_ID" in message
+    else:
+        raise AssertionError("expected ValueError")
