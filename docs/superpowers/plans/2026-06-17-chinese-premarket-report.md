@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `reports/premarket/<YYYY-MM-DD>.md` fully Chinese, easier to scan, and explicit about why each symbol is important.
+**Goal:** Make `reports/premarket/<YYYY-MM-DD>.md` fully Chinese, show every analyzed holding's current state, and separate that overview from the strategy items that need attention.
 
-**Architecture:** Keep `PremarketAction` and CSV output unchanged. Localize only Markdown rendering in `src/open_trader/advice/report.py` and update the classifier prompt so future free-text fields are Chinese. Tests lock the report structure, enum localization, empty states, and prompt requirement.
+**Architecture:** Keep `PremarketAction` and CSV output unchanged. Pass analyzed `TradingAdvice` records into Markdown rendering so the report can include a full holdings overview while `premarket_actions.csv` remains action-only. Localize rendering in `src/open_trader/advice/report.py` and update prompts so future report-facing fields are Chinese.
 
 **Tech Stack:** Python 3.12, pytest, Markdown text generation.
 
@@ -13,9 +13,69 @@
 ## File Structure
 
 - Modify `src/open_trader/advice/report.py`: localize Markdown report output and add small formatting helpers.
+- Modify `src/open_trader/advice/premarket.py`: pass `advice_records` into the report writer.
 - Modify `tests/test_premarket_report.py`: assert Chinese report structure and empty states.
+- Modify `tests/test_premarket_pipeline.py`: assert real pipeline reports include holdings overview even when action rows are empty.
 - Modify `src/open_trader/advice/prompts/change_classifier.md`: require Chinese free-text output.
 - Add or modify tests in `tests/test_premarket_report.py` to verify prompt text contains the Chinese-output requirement.
+
+## Task 0: Add Holdings Overview Contract
+
+**Files:**
+- Modify: `tests/test_premarket_report.py`
+- Modify: `src/open_trader/advice/report.py`
+- Modify: `src/open_trader/advice/premarket.py`
+
+- [ ] **Step 1: Write failing holdings overview test**
+
+Update `test_write_premarket_outputs_writes_actions_csv_and_markdown()` so it passes `advice_records=[...]` and asserts:
+
+```python
+assert "## 持仓全景" in markdown
+assert "本次分析标的：2 个｜今日重点：1 个" in markdown
+assert "| 标的 | 当前仓位 | 风险标记 | 当前观点 | 状态 |" in markdown
+assert "| AAPL | 5.10% | 正常 | 持有 | 正常 |" in markdown
+assert "| MSFT | 7.00% | 数据需复核 | 低配 | 沿用旧建议 |" in markdown
+assert "## 今日重点策略" in markdown
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run:
+
+```bash
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest tests/test_premarket_report.py::test_write_premarket_outputs_writes_actions_csv_and_markdown -v
+```
+
+Expected: FAIL because `write_premarket_outputs()` does not yet accept advice records and the report has no holdings overview.
+
+- [ ] **Step 3: Implement holdings overview rendering**
+
+In `src/open_trader/advice/report.py`:
+
+- Import `TradingAdvice`.
+- Add optional parameter `advice_records: Iterable[TradingAdvice] = ()` to `write_premarket_outputs()`.
+- Pass a sorted list into `_render_markdown()`.
+- Add `## 持仓全景` before `## 今日重点策略`.
+- Add helpers:
+  - `_advice_action_text(value: str) -> str`
+  - `_risk_flag_text(value: str) -> str`
+  - `_advice_status_text(value: str) -> str`
+
+In `src/open_trader/advice/premarket.py`:
+
+- Pass `advice_records=advice_records` when writing normal reports.
+- For no eligible rows, keep `advice_records=[]`.
+
+- [ ] **Step 4: Run focused tests**
+
+Run:
+
+```bash
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest tests/test_premarket_report.py tests/test_premarket_pipeline.py -v
+```
+
+Expected: PASS after test updates in later tasks.
 
 ## Task 1: Localize Premarket Markdown Report
 

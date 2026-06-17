@@ -9,7 +9,7 @@ the item matters before market open.
 ## Decisions
 
 - Keep CSV outputs unchanged for automation compatibility.
-- Localize only the Markdown premarket report and the classifier prompt.
+- Localize only the Markdown premarket report and model prompts.
 - Do not add a second model call or translation layer.
 - The report template must not display raw English enum values such as
   `high`, `action_changed`, or `reduce`.
@@ -17,18 +17,33 @@ the item matters before market open.
   `suggested_action`, `summary`, `rationale`, and `watch_trigger`.
 - Each detailed symbol section must include a visible `为什么重要` paragraph from
   `rationale`.
+- The report must include every analyzed holding, not only material changes.
+- The report separates two concepts:
+  - `持仓全景`: every holding's current state.
+  - `今日重点策略`: only items the trader should actively review today.
+- `premarket_actions.csv` remains action-only for automation. The all-holdings
+  overview is a Markdown/report concern.
 
 ## Report Shape
 
 ```markdown
 # 开盘前交易简报 - 2026-06-16
 
-## 今日需要关注
+## 持仓全景
+
+本次分析标的：3 个｜今日重点：1 个
+
+| 标的 | 当前仓位 | 风险标记 | 当前观点 | 状态 |
+| --- | --- | --- | --- | --- |
+| AAPL | 5.10% | 正常 | 持有 | 正常 |
+| MSFT | 7.00% | 正常 | 低配 | 正常 |
+| VIXY | 3.05% | 数据需复核 | 低配 | 正常 |
+
+## 今日重点策略
 
 | 标的 | 重要性 | 当前仓位 | 建议动作 |
 | --- | --- | --- | --- |
 | AAPL | 高 | 5.10% | 减仓 |
-| MSFT | 中 | 7.00% | 观察 |
 
 ## 详细说明
 
@@ -50,7 +65,26 @@ the item matters before market open.
 
 ## Empty States
 
-No material changes:
+No material changes, with analyzed holdings:
+
+```markdown
+# 开盘前交易简报 - 2026-06-16
+
+## 持仓全景
+
+本次分析标的：2 个｜今日重点：0 个
+
+| 标的 | 当前仓位 | 风险标记 | 当前观点 | 状态 |
+| --- | --- | --- | --- | --- |
+| AAPL | 5.10% | 正常 | 持有 | 正常 |
+| MSFT | 7.00% | 正常 | 低配 | 正常 |
+
+## 今日重点策略
+
+今日没有需要特别关注的交易建议变化。
+```
+
+No analyzed holdings:
 
 ```markdown
 # 开盘前交易简报 - 2026-06-16
@@ -93,6 +127,27 @@ common English phrases are localized:
 - `trim`: `减仓`
 - `buy`: `买入`
 - `sell`: `卖出`
+
+Advice action:
+
+- `Overweight`: `高配`
+- `Neutral`: `中性`
+- `Underweight`: `低配`
+- `Hold`: `持有`
+- `Buy`: `买入`
+- `Sell`: `卖出`
+- `Reduce`: `减仓`
+
+Risk flag:
+
+- `normal`: `正常`
+- `data_check`: `数据需复核`
+
+Advice status:
+
+- `ok`: `正常`
+- `fallback`: `沿用旧建议`
+- `error`: `分析失败`
 
 Unknown values are shown as-is so the report never hides model output.
 
