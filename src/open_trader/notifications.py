@@ -5,6 +5,7 @@ import json
 import subprocess
 import urllib.error
 import urllib.request
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Protocol
 
@@ -214,21 +215,13 @@ def _render_ready_section(row: Mapping[str, str], *, index: int) -> list[str]:
                 f"预计金额：{currency} "
                 f"{row.get('suggested_notional', '').strip()}"
             ),
-            (
-                "影响："
-                f"当前数量 {row.get('current_quantity', '').strip()} 股、"
-                f"当前仓位 {row.get('current_weight', '').strip()}；"
-                f"执行后数量 {row.get('post_trade_quantity', '').strip()} 股、"
-                f"仓位 {row.get('post_trade_weight', '').strip()}、"
-                f"成本 {row.get('post_trade_avg_cost', '').strip()}。"
-            ),
-            (
-                f"风控：硬止损 {row.get('stop_price', '').strip()}，"
-                f"止损风险 {_risk_to_stop_text(row, currency)}。"
-            ),
+            _ready_impact_text(row),
             f"原因：{_localized_note(row.get('reason', '').strip())}",
         ]
     )
+    risk_control = _risk_control_text(row, currency)
+    if risk_control:
+        lines.insert(-1, risk_control)
     return lines
 
 
@@ -274,6 +267,46 @@ def _action_heading(
         f"{prefix}标的：{_symbol_label(row)}｜指示：{action}{quantity_text}"
         f"｜优先级：{_priority_label(row.get('priority', '').strip())}"
     )
+
+
+def _ready_impact_text(row: Mapping[str, str]) -> str:
+    current_quantity = row.get("current_quantity", "").strip()
+    current_weight = _display_percent(row.get("current_weight", "").strip())
+    post_trade_quantity = row.get("post_trade_quantity", "").strip()
+    post_trade_weight = _display_percent(row.get("post_trade_weight", "").strip())
+    post_trade_avg_cost = row.get("post_trade_avg_cost", "").strip()
+    post_cost_text = f"、成本 {post_trade_avg_cost}" if post_trade_avg_cost else ""
+    return (
+        "影响："
+        f"当前数量 {current_quantity} 股、当前仓位 {current_weight}；"
+        f"执行后数量 {post_trade_quantity} 股、仓位 {post_trade_weight}"
+        f"{post_cost_text}。"
+    )
+
+
+def _risk_control_text(row: Mapping[str, str], currency: str) -> str:
+    stop_price = row.get("stop_price", "").strip()
+    risk_to_stop = _risk_to_stop_text(row, currency)
+    parts: list[str] = []
+    if stop_price:
+        parts.append(f"硬止损 {stop_price}")
+    if risk_to_stop:
+        parts.append(f"止损风险 {risk_to_stop}")
+    if not parts:
+        return ""
+    return f"风控：{'，'.join(parts)}。"
+
+
+def _display_percent(value: str) -> str:
+    stripped = value.strip()
+    if not stripped.endswith("%"):
+        return stripped
+    number = stripped[:-1].strip()
+    try:
+        rounded = Decimal(number).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        return stripped
+    return f"{rounded}%"
 
 
 def _blocked_detail_lines(
@@ -376,6 +409,7 @@ def _localized_note(text: str) -> str:
         "Current price is at or above target 2.": "当前价格已达到或高于目标价 2。",
         "Current price is inside the planned entry zone.": "当前价格位于计划买入区间。",
         "Current price is near the planned add price.": "当前价格接近计划加仓价。",
+        "Plan text indicates trim at current levels.": "计划正文要求在当前价位减仓。",
         "unparseable target max weight": "目标最大仓位无法解析",
     }.get(normalized)
     if translated is not None:
@@ -391,8 +425,9 @@ def _missing_precise_fields(row: Mapping[str, str]) -> list[str]:
         "last_price",
         "current_quantity",
         "current_weight",
-        "avg_cost_price",
     ]
+    if action not in {"TRIM", "TAKE_PROFIT", "SELL_STOP"}:
+        required_fields.append("avg_cost_price")
     if action != "SELL_STOP":
         required_fields.append("limit_price")
     required_fields.extend(
@@ -404,15 +439,11 @@ def _missing_precise_fields(row: Mapping[str, str]) -> list[str]:
             "post_trade_weight",
         ]
     )
-    if action != "SELL_STOP" or row.get("post_trade_quantity", "").strip() != "0":
+    if action not in {"TRIM", "TAKE_PROFIT", "SELL_STOP"}:
         required_fields.append("post_trade_avg_cost")
         required_fields.append("risk_to_stop")
-    required_fields.extend(
-        [
-            "stop_price",
-            "reason",
-        ]
-    )
+        required_fields.append("stop_price")
+    required_fields.append("reason")
     return [field for field in required_fields if not row.get(field, "").strip()]
 
 
@@ -441,7 +472,7 @@ def _risk_to_stop_text(row: Mapping[str, str], currency: str) -> str:
         and row.get("post_trade_quantity", "").strip() == "0"
     ):
         return "全部退出"
-    return currency
+    return ""
 
 
 def _read_action_rows(path: Path) -> list[dict[str, str]]:

@@ -212,6 +212,10 @@ def build_trade_action_row(
     notional_currency = _notional_currency(plan.market, position)
     cash_available = portfolio.cash_by_currency.get(notional_currency, Decimal("0"))
     action, priority = map_quote_status_to_action(quote_status.status)
+    reason = quote_status.message
+    if action == "BUY" and _plan_text_implies_trim(plan.plan_text):
+        action, priority = "TRIM", "medium"
+        reason = "Plan text indicates trim at current levels."
 
     row = {
         "run_date": plan.run_date,
@@ -237,12 +241,16 @@ def build_trade_action_row(
         ),
         "cash_available": _decimal_to_text(cash_available),
         "limit_price": "",
-        "stop_price": _decimal_to_text(plan.stop_loss),
+        "stop_price": _decimal_to_text(
+            plan.stop_loss
+            if plan.stop_loss is not None and plan.stop_loss > 0
+            else None
+        ),
         "post_trade_quantity": "",
         "post_trade_weight": "",
         "post_trade_avg_cost": "",
         "risk_to_stop": "",
-        "reason": quote_status.message,
+        "reason": reason,
         "source_plan": source_plan,
         "status": "",
         "error": "",
@@ -434,11 +442,11 @@ def _size_sell_action_row(
         position,
         (
             "total_quantity",
-            "avg_cost_price",
             "market_value",
             "market_value_hkd",
             "fx_to_hkd",
         ),
+        require_avg_cost_price=False,
     )
     if invalid_fields:
         return _review_row(
@@ -470,7 +478,9 @@ def _size_sell_action_row(
         execution_price=quote_status.last_price,
         total_market_value_hkd=portfolio.total_market_value_hkd,
         post_trade_avg_cost=(
-            position.avg_cost_price if position.quantity > quantity else None
+            position.avg_cost_price
+            if position.quantity > quantity and position.avg_cost_price > 0
+            else None
         ),
     )
     row["status"] = "ready"
@@ -589,7 +599,12 @@ def _set_post_trade_fields(
         )
 
     stop_price = _optional_decimal(row.get("stop_price", ""))
-    if stop_price is not None and execution_price > 0 and post_trade_quantity > 0:
+    if (
+        stop_price is not None
+        and stop_price > 0
+        and execution_price > 0
+        and post_trade_quantity > 0
+    ):
         risk_to_stop = max(
             Decimal("0"),
             (execution_price - stop_price) * post_trade_quantity,
@@ -630,6 +645,21 @@ def _plan_ratio(plan_text: str, action: str) -> Decimal:
         plan_text,
         keywords=("买入", "買入", "建仓", "建倉"),
         fallback=Decimal("0.6"),
+    )
+
+
+def _plan_text_implies_trim(plan_text: str) -> bool:
+    normalized = plan_text.lower()
+    return any(
+        keyword in normalized
+        for keyword in (
+            "trim",
+            "reduce",
+            "减仓",
+            "減倉",
+            "降低仓位",
+            "降低倉位",
+        )
     )
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import pytest
 from decimal import Decimal
 from pathlib import Path
@@ -1601,9 +1601,70 @@ def test_target_one_trims_half_position() -> None:
     assert row["risk_to_stop"] == "555"
 
 
-@pytest.mark.parametrize("trigger_status", ["stop_loss_hit", "target_1_hit", "target_2_hit"])
-def test_nonpositive_average_cost_value_maps_sell_to_review(
+def test_target_one_trim_does_not_require_average_cost_or_stop_loss() -> None:
+    portfolio = portfolio_context()
+    position = PortfolioPositionSnapshot(
+        currency="USD",
+        quantity=Decimal("200"),
+        avg_cost_price=Decimal("0"),
+        market_value=Decimal("4842.8"),
+        market_value_hkd=Decimal("38015.98"),
+        weight=Decimal("0.0305"),
+        fx_to_hkd=Decimal("7.85"),
+        invalid_fields=("avg_cost_price",),
+    )
+    portfolio = PortfolioActionContext(
+        positions={("US", "MSFT"): position},
+        cash_by_currency=portfolio.cash_by_currency,
+        total_market_value_hkd=portfolio.total_market_value_hkd,
+    )
+    plan = active_plan(max_weight="", plan_text="操作计划：Reduce existing exposure by 50%.")
+    plan = replace(plan, stop_loss=Decimal("0"))
+
+    row = build_trade_action_row(
+        plan=plan,
+        quote_status=quote_status("target_1_hit", price="21.7"),
+        portfolio=portfolio,
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "TRIM"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "100"
+    assert row["suggested_notional"] == "2170"
+    assert row["post_trade_quantity"] == "100"
+    assert row["post_trade_weight"] == "2.183910256410256410256410256%"
+    assert row["post_trade_avg_cost"] == ""
+    assert row["risk_to_stop"] == ""
+
+
+def test_sell_action_handles_blank_stop_loss() -> None:
+    plan = replace(active_plan(), stop_loss=None)
+
+    row = build_trade_action_row(
+        plan=plan,
+        quote_status=quote_status("target_1_hit", price="451"),
+        portfolio=portfolio_context(quantity="9"),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "TRIM"
+    assert row["status"] == "ready"
+    assert row["stop_price"] == ""
+    assert row["risk_to_stop"] == ""
+
+
+@pytest.mark.parametrize(
+    ("trigger_status", "expected_action"),
+    [
+        ("stop_loss_hit", "SELL_STOP"),
+        ("target_1_hit", "TRIM"),
+        ("target_2_hit", "TAKE_PROFIT"),
+    ],
+)
+def test_nonpositive_average_cost_value_does_not_block_sell_actions(
     trigger_status: str,
+    expected_action: str,
 ) -> None:
     portfolio = portfolio_context()
     broken_position = PortfolioPositionSnapshot(
@@ -1628,9 +1689,48 @@ def test_nonpositive_average_cost_value_maps_sell_to_review(
         source_plan="data/latest/trading_plan.csv",
     )
 
-    assert row["action"] == "REVIEW"
-    assert row["status"] == "review"
-    assert row["error"] == "invalid portfolio sizing field(s): avg_cost_price"
+    assert row["action"] == expected_action
+    assert row["status"] == "ready"
+    assert row["error"] == ""
+    assert row["post_trade_avg_cost"] == ""
+
+
+def test_underweight_trim_plan_entry_zone_maps_to_trim_without_target_weight() -> None:
+    portfolio = portfolio_context(quantity="50", avg_cost_price="0")
+    position = PortfolioPositionSnapshot(
+        currency="USD",
+        quantity=Decimal("50"),
+        avg_cost_price=Decimal("0"),
+        market_value=Decimal("1863"),
+        market_value_hkd=Decimal("14624.55"),
+        weight=Decimal("0.0117"),
+        fx_to_hkd=Decimal("7.85"),
+        invalid_fields=("avg_cost_price",),
+    )
+    portfolio = PortfolioActionContext(
+        positions={("US", "MSFT"): position},
+        cash_by_currency=portfolio.cash_by_currency,
+        total_market_value_hkd=portfolio.total_market_value_hkd,
+    )
+    plan = active_plan(
+        max_weight="",
+        plan_text="操作计划：Trim BOTZ position by 30-40% at current levels.",
+    )
+
+    row = build_trade_action_row(
+        plan=plan,
+        quote_status=quote_status("entry_zone", price="38.25"),
+        portfolio=portfolio,
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["action"] == "TRIM"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "25"
+    assert row["suggested_notional"] == "956.25"
+    assert row["target_max_weight"] == ""
+    assert row["reason"] == "Plan text indicates trim at current levels."
+    assert row["error"] == ""
 
 
 def test_target_two_takes_profit_on_full_position() -> None:

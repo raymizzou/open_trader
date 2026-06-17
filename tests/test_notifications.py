@@ -434,6 +434,55 @@ def test_render_feishu_order_review_keeps_ready_sell_stop_with_blank_limit_price
     assert "执行前缺少" not in body
 
 
+def test_render_feishu_order_review_keeps_ready_trim_with_blank_cost_and_stop(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "trade_actions.csv"
+    _write_actions(
+        actions_path,
+        [
+            _action_row(
+                symbol="VIXY",
+                futu_symbol="US.VIXY",
+                action="TRIM",
+                priority="medium",
+                last_price="21.7",
+                trigger_status="target_1_hit",
+                suggested_quantity="100",
+                suggested_notional="2170",
+                notional_currency="USD",
+                current_quantity="200",
+                current_weight="3.05%",
+                avg_cost_price="0",
+                limit_price="21.7",
+                stop_price="",
+                post_trade_quantity="100",
+                post_trade_weight="1.366871988339962877122505175%",
+                post_trade_avg_cost="",
+                risk_to_stop="",
+                reason="Current price is at or above target 1.",
+                status="ready",
+            )
+        ],
+    )
+
+    body = render_feishu_order_review(
+        run_date="2026-06-17",
+        status="success",
+        actions_path=actions_path,
+        report_paths=[],
+    )
+
+    assert "今日结论：有 1 条可采取行动，需人工确认后执行。" in body
+    assert "标的：VIXY｜指示：减仓 100 股｜优先级：中" in body
+    assert "影响：当前数量 200 股、当前仓位 3.05%；执行后数量 100 股、仓位 1.37%。" in body
+    assert "风控：" not in body
+    assert "成本 。" not in body
+    assert "硬止损 ，" not in body
+    assert "暂不能行动" not in body
+    assert "阻塞：" not in body
+
+
 def test_render_feishu_order_review_truncates_ready_rows_and_includes_reports(
     tmp_path: Path,
 ) -> None:
@@ -523,7 +572,7 @@ def test_render_feishu_order_review_translates_review_errors_and_hides_paths(
     assert "标的：BOTZ｜指示：人工处理｜优先级：高" in body
     assert "阻塞：目标最大仓位无法解析。" in body
     assert "标的：VIXY｜指示：人工复核｜优先级：中" in body
-    assert "阻塞：执行前缺少当前成本、交易后数量、交易后仓位、交易后成本、止损风险。" in body
+    assert "阻塞：执行前缺少交易后数量、交易后仓位。" in body
     assert "影响：系统无法计算精确数量、金额、交易后仓位或风险，暂不能执行。" in body
     assert "原因：当前价格已达到或高于目标价 1。" in body
     assert "unparseable target max weight" not in body
