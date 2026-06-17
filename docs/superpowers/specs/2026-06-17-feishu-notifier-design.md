@@ -1,10 +1,10 @@
-# WeCom Notifier Design
+# Feishu Notifier Design
 
 ## Goal
 
 Add notification support to Open Trader so the daily premarket workflow sends a
-WeChat-readable report through an Enterprise WeChat group robot, and an intraday
-watcher sends a trigger notification when an action condition is reached.
+Feishu-readable report through a Feishu group bot, and an intraday watcher sends
+a trigger notification when an action condition is reached.
 
 The first version must keep the trading workflow file-based and auditable. It
 must not place orders. It must also leave a clean path for a later voice speaker
@@ -13,8 +13,8 @@ trading logic.
 
 ## Decisions
 
-- Channel: Enterprise WeChat group robot webhook.
-- Daily content: one Markdown order-review sheet covering each actionable
+- Channel: Feishu group bot webhook.
+- Daily content: one structured text order-review sheet covering each actionable
   symbol's exact price, quantity, estimated notional, post-trade position,
   post-trade weight, post-trade average cost when available, stop, risk, and
   review notes. The notification must not be a generic summary.
@@ -41,8 +41,9 @@ The module owns notification channel interfaces and message rendering:
 - `NullNotifier`: no-op implementation for tests and disabled notifications.
 - `MacOSNotifier`: move or keep the existing local macOS notification behavior
   behind the same protocol.
-- `WeComWebhookNotifier`: sends Markdown or text payloads to an Enterprise
-  WeChat group robot webhook.
+- `FeishuWebhookNotifier`: sends structured text payloads to a Feishu group bot
+  webhook. The first version should use plain text with stable line breaks; rich
+  Feishu cards can be added later without changing the trading calculations.
 - `CompositeNotifier`: sends the same rendered message through multiple
   configured notifiers.
 - Rendering helpers for daily order-review sheets and intraday trigger messages.
@@ -83,7 +84,7 @@ run daily advice
 -> fetch live Futu snapshots
 -> generate trade_actions.csv and reports/trade_actions/<date>.md
 -> write daily_run_status.json and reports/daily_runs/<date>.md
--> send WeCom daily order-review sheet
+-> send Feishu daily order-review sheet
 -> promote latest artifacts when the run is not a dry run
 ```
 
@@ -158,7 +159,7 @@ messages are avoided as much as practical.
 
 ## Message Content
 
-Daily WeCom notification is one concise Markdown order-review sheet:
+Daily Feishu notification is one concise order-review sheet:
 
 ```text
 # Open Trader 2026-06-17: success
@@ -236,7 +237,7 @@ Each actionable symbol section should include:
 
 The message must stay readable on a phone. If a section is long, keep the
 highest-priority rows first and include the report path for the complete detail.
-The top-level WeCom message may show only the highest-priority actionable rows
+The top-level Feishu message may show only the highest-priority actionable rows
 when the body would become too long, but those rows must still preserve exact
 price, quantity, post-trade, and risk details. Lower-priority rows can be
 summarized by count with a report path.
@@ -269,7 +270,7 @@ Examples of acceptable message content:
   200; post-trade weight about 2.20%; post-trade average cost about 104.32."
 - "Hard stop: 94; total position risk to stop about 0.25%-0.35% of portfolio."
 
-Intraday trigger notification is a short Markdown message:
+Intraday trigger notification is a short structured text message:
 
 ```text
 # Open Trader Trigger
@@ -287,9 +288,9 @@ US.MSFT BUY triggered
 Extend `config/daily_premarket.env.example` with local notification settings:
 
 ```bash
-OPEN_TRADER_NOTIFIERS=wecom,macos
-OPEN_TRADER_WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
-OPEN_TRADER_WECOM_MESSAGE_FORMAT=markdown
+OPEN_TRADER_NOTIFIERS=feishu,macos
+OPEN_TRADER_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/replace-me
+OPEN_TRADER_FEISHU_MESSAGE_FORMAT=text
 OPEN_TRADER_NOTIFY_DAILY_REPORT=1
 OPEN_TRADER_NOTIFY_ACTION_TRIGGERS=1
 ```
@@ -301,7 +302,7 @@ Recommended CLI defaults:
 ```text
 run-daily-premarket:
   uses notification config from --config
-  does not send WeCom messages when --dry-run is set
+  does not send Feishu messages when --dry-run is set
 
 watch-actions:
   --date today
@@ -327,7 +328,7 @@ Rules:
 - Send the daily notification only after dated daily status and trade-action
   report artifacts are written.
 - Do not read stale `latest` files when composing a dated daily message.
-- In dry-run mode, render or log would-send messages but do not call the WeCom
+- In dry-run mode, render or log would-send messages but do not call the Feishu
   webhook.
 - For intraday trigger notifications, write the silence state only after the
   webhook send succeeds. This avoids suppressing an alert that was never sent.
@@ -343,7 +344,7 @@ Rules:
 Focused tests should cover:
 
 - Env parsing builds the expected notifier configuration.
-- `WeComWebhookNotifier` emits the expected JSON payload for Markdown messages.
+- `FeishuWebhookNotifier` emits the expected JSON payload for text messages.
 - `CompositeNotifier` invokes each child notifier and isolates failures where
   appropriate.
 - Daily runner generates trade actions and passes the dated daily order-review
@@ -372,8 +373,8 @@ Focused tests should cover:
 The first version does not include:
 
 - Automatic order placement.
-- Personal WeChat client automation.
-- Official account or service-account template messages.
+- Personal chat-client automation.
+- Feishu interactive cards or approval workflows.
 - Real speaker or voice-device integration.
 - Hosted web reports, images, or rich cards.
 - Price-near-threshold warnings.
