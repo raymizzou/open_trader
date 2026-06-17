@@ -14,8 +14,10 @@ trading logic.
 ## Decisions
 
 - Channel: Enterprise WeChat group robot webhook.
-- Daily content: one Markdown summary covering each symbol's short report and
-  suggested action, plus local artifact paths.
+- Daily content: one Markdown order-review sheet covering each actionable
+  symbol's exact price, quantity, estimated notional, post-trade position,
+  post-trade weight, post-trade average cost when available, stop, risk, and
+  review notes. The notification must not be a generic summary.
 - Intraday trigger rule: notify when the action condition is reached, not when
   price is merely close.
 - Intraday silence rule: after a `(run_date, futu_symbol, trigger_status)` has
@@ -43,12 +45,23 @@ The module owns notification channel interfaces and message rendering:
   WeChat group robot webhook.
 - `CompositeNotifier`: sends the same rendered message through multiple
   configured notifiers.
-- Rendering helpers for daily summaries and intraday trigger messages.
+- Rendering helpers for daily order-review sheets and intraday trigger messages.
 
 `DailyPremarketRunner` should depend only on the notifier interface. It should
 not know webhook JSON details. The CLI loads config from
 `config/daily_premarket.env`, builds the configured notifier, and passes it to
 the runner.
+
+The daily renderer should be deterministic. It may translate fixed labels into
+Chinese, but it must not ask a model to re-summarize the report. Re-summarizing
+the report can discard concrete trade details and produce circular language such
+as "important because it was marked high priority."
+
+The upstream change-classifier prompt should also be tightened so that
+`summary`, `rationale`, and `watch_trigger` contain evidence that can support
+the order-review sheet. At least one concrete detail should be present when the
+source data provides it: price, stop, target, target weight, quantity, percent
+trim/add, prior-vs-latest action change, catalyst, or risk condition.
 
 Add an intraday watcher command:
 
@@ -70,7 +83,7 @@ run daily advice
 -> fetch live Futu snapshots
 -> generate trade_actions.csv and reports/trade_actions/<date>.md
 -> write daily_run_status.json and reports/daily_runs/<date>.md
--> send WeCom daily summary
+-> send WeCom daily order-review sheet
 -> promote latest artifacts when the run is not a dry run
 ```
 
@@ -88,6 +101,24 @@ reports/trade_actions/<YYYY-MM-DD>.md
 The daily report should not parse `data/latest` for its content. It should use
 the current run's dated files so a failed or dry run cannot accidentally send a
 summary for older action data.
+
+The daily order-review sheet should join these dated inputs:
+
+- `portfolio.csv` or the portfolio fields carried into the run: current
+  quantity, current market value, current weight, and current average cost when
+  available.
+- `trading_plan.csv`: rating, entry zone, stop loss, targets, max weight,
+  catalyst, time horizon, and structured plan text.
+- `trade_actions.csv`: normalized action, suggested quantity, estimated
+  notional, priority/status, and machine-readable reason/error fields.
+- Futu quote snapshots used by the run: latest price and quote availability.
+- `premarket_actions.csv` and `change_classifications.csv`: concrete rationale,
+  prior-vs-latest advice change, and watch trigger.
+
+Post-trade quantity, weight, and average cost should be calculated from the same
+inputs used for the report. If the calculation cannot be made because a required
+field is missing or malformed, the symbol should become `REVIEW` with a clear
+missing-field reason.
 
 ## Intraday Watch Data Flow
 
@@ -127,7 +158,7 @@ messages are avoided as much as practical.
 
 ## Message Content
 
-Daily WeCom notification is one concise Markdown message:
+Daily WeCom notification is one concise Markdown order-review sheet:
 
 ```text
 # Open Trader 2026-06-17: success
@@ -138,8 +169,38 @@ Summary:
 - Futu: 13 checked, 0 missing, 2 triggered
 
 Ready:
-- US.MSFT BUY high @ 399, qty 3, reason...
-- US.QQQ TRIM medium @ 520, qty 1, reason...
+
+## US.RKLB | high | ADD
+
+Current:
+- Last price: 109.00
+- Current quantity: 120
+- Current weight: 1.36%
+- Current average cost: 101.20
+
+Suggested action:
+- Trigger price: buy first tranche on 99-102 pullback; buy next tranche only on
+  confirmed close above 113 with volume
+- This order: buy 80 shares
+- Estimated notional: USD 8,720
+- Post-trade quantity: 200
+- Post-trade weight: about 2.20%
+- Post-trade average cost: about 104.32
+
+Risk:
+- Hard stop: 94
+- New-position risk to stop: about USD 800-900
+- Total position risk to stop: about 0.25%-0.35% of portfolio
+
+Why it matters:
+- RKLB changed from reduce/watch to Overweight. Evidence: 63% YoY revenue
+  growth, gross margin improvement to 38%, USD 1.24B net cash, KeyBanc 135
+  target, and a bounce near the 50-day SMA.
+
+Review before action:
+- Confirm target weight can rise from 1.36% to about 2.20%.
+- Avoid chasing above the trigger plan.
+- Confirm the 94 stop is acceptable before placing any order.
 
 Review:
 - US.TSLA REVIEW medium, missing_quote...
@@ -152,18 +213,61 @@ Reports:
 - reports/trade_actions/2026-06-17.md
 ```
 
-Each symbol line should include:
+Each actionable symbol section should include:
 
 - `futu_symbol`
 - `action`
 - `priority`
 - `last_price`
-- `suggested_quantity` when present
+- current quantity
+- current position weight
+- current average cost when available
+- trigger price or execution condition
+- suggested quantity
+- estimated notional
+- post-trade quantity
+- post-trade position weight
+- post-trade average cost when available
+- stop price when available
+- estimated risk when available
 - `status`
-- a short `reason`
+- a concrete `reason`
+- review checklist
 
 The message must stay readable on a phone. If a section is long, keep the
 highest-priority rows first and include the report path for the complete detail.
+The top-level WeCom message may show only the highest-priority actionable rows
+when the body would become too long, but those rows must still preserve exact
+price, quantity, post-trade, and risk details. Lower-priority rows can be
+summarized by count with a report path.
+
+If any key input is missing, do not invent values. Mark the row as `REVIEW` and
+state the exact missing input. Examples:
+
+```text
+## US.MSFT | high | REVIEW
+
+Reason: cannot calculate post-trade average cost because current average cost is
+missing from the portfolio input.
+Needed before action:
+- current quantity
+- current average cost
+- target quantity or target weight
+```
+
+Examples of unacceptable message content:
+
+- "Why it matters: RKLB is high priority because it was marked high priority."
+- "Summary: review RKLB position, price condition, and order risk."
+- "Suggested action: add" with no trigger price, quantity, or post-trade effect.
+
+Examples of acceptable message content:
+
+- "Trigger price: buy first tranche at 99-102; second tranche only after close
+  above 113 with volume."
+- "This order: buy 80 shares; estimated notional USD 8,720; post-trade quantity
+  200; post-trade weight about 2.20%; post-trade average cost about 104.32."
+- "Hard stop: 94; total position risk to stop about 0.25%-0.35% of portfolio."
 
 Intraday trigger notification is a short Markdown message:
 
@@ -242,8 +346,16 @@ Focused tests should cover:
 - `WeComWebhookNotifier` emits the expected JSON payload for Markdown messages.
 - `CompositeNotifier` invokes each child notifier and isolates failures where
   appropriate.
-- Daily runner generates trade actions and passes the dated daily summary to the
-  notifier.
+- Daily runner generates trade actions and passes the dated daily order-review
+  sheet to the notifier.
+- Daily renderer includes trigger price, suggested quantity, estimated notional,
+  post-trade quantity, post-trade weight, and post-trade average cost when the
+  inputs are present.
+- Daily renderer marks a row `REVIEW` instead of inventing values when current
+  quantity, cost, latest price, target quantity, or target weight is missing.
+- Prompt tests reject circular or generic classifier guidance such as
+  "important because priority is high" and require concrete evidence in
+  classifier output fixtures.
 - Daily notification failure records an error but does not discard valid run
   artifacts.
 - `watch-actions --once` sends a trigger notification when an action condition is
