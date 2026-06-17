@@ -279,8 +279,9 @@ def test_run_daily_premarket_main_wires_runner(
     captured: dict[str, object] = {}
 
     class FakeRunner:
-        def __init__(self, *, config: object) -> None:
+        def __init__(self, *, config: object, notifier: object) -> None:
             captured["config"] = config
+            captured["notifier"] = notifier
 
         def run(self, *, run_date: str, dry_run: bool):
             captured["run_date"] = run_date
@@ -302,8 +303,13 @@ def test_run_daily_premarket_main_wires_runner(
         captured["dry_run"] = dry_run
         return object()
 
+    def fake_build_notifier(config: object) -> object:
+        captured["notifier_config"] = config
+        return object()
+
     monkeypatch.setattr(cli, "DailyPremarketRunner", FakeRunner)
     monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
+    monkeypatch.setattr(cli, "build_notifier", fake_build_notifier)
 
     result = cli.main(
         [
@@ -319,6 +325,8 @@ def test_run_daily_premarket_main_wires_runner(
     assert result == 0
     assert captured["config_path"] == tmp_path / "daily.env"
     assert captured["dry_run"] is True
+    assert captured["notifier_config"] is captured["config"]
+    assert captured["notifier"] is not None
     assert captured["run_date"] == "2026-06-17"
     assert captured["runner_dry_run"] is True
     output = capsys.readouterr().out
@@ -336,7 +344,7 @@ def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     class FakeRunner:
-        def __init__(self, *, config: object) -> None:
+        def __init__(self, *, config: object, notifier: object) -> None:
             pass
 
         def run(self, *, run_date: str, dry_run: bool):
@@ -357,6 +365,7 @@ def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status
 
     monkeypatch.setattr(cli, "DailyPremarketRunner", FakeRunner)
     monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
+    monkeypatch.setattr(cli, "build_notifier", lambda config: object())
 
     result = cli.main(["run-daily-premarket", "--date", "2026-06-17"])
 

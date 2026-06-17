@@ -52,6 +52,7 @@ class DailyPremarketConfig:
     classifier_model: str = "deepseek-v4-flash"
     notifiers: tuple[str, ...] = ()
     feishu_webhook_url: str = ""
+    feishu_message_format: str = "text"
     notify_daily_report: bool = False
     notify_action_triggers: bool = False
 
@@ -147,6 +148,9 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         classifier_model=values.get("OPEN_TRADER_CLASSIFIER_MODEL", "deepseek-v4-flash"),
         notifiers=_csv_config(values.get("OPEN_TRADER_NOTIFIERS", "")),
         feishu_webhook_url=values.get("OPEN_TRADER_FEISHU_WEBHOOK_URL", ""),
+        feishu_message_format=_feishu_message_format_config(
+            values.get("OPEN_TRADER_FEISHU_MESSAGE_FORMAT", "text"),
+        ),
         notify_daily_report=_bool_config(
             values.get("OPEN_TRADER_NOTIFY_DAILY_REPORT", ""),
         ),
@@ -223,6 +227,7 @@ class DailyPremarketRunner:
                         report_path=report_path,
                         log_path=log_path,
                         error=str(exc),
+                        dry_run=effective_dry_run,
                     )
         except RuntimeError as exc:
             if str(exc) == "daily premarket run already active":
@@ -241,6 +246,7 @@ class DailyPremarketRunner:
                 report_path=report_path,
                 log_path=log_path,
                 error=str(exc),
+                dry_run=effective_dry_run,
             )
 
     def _run_locked(
@@ -481,6 +487,7 @@ class DailyPremarketRunner:
         report_path: Path,
         log_path: Path,
         error: str,
+        dry_run: bool,
     ) -> DailyRunResult:
         finished_at = datetime.now(ZoneInfo(self.config.timezone))
         write_errors: list[dict[str, str]] = []
@@ -546,10 +553,11 @@ class DailyPremarketRunner:
                 json.dumps(payload, ensure_ascii=False) + "\n",
             ),
         )
-        self._notify(
-            "Open Trader daily premarket",
-            _notification_message("failed", {}, {}, {}),
-        )
+        if self.config.notify_daily_report and not dry_run:
+            self._notify(
+                "Open Trader daily premarket",
+                _notification_message("failed", {}, {}, {}),
+            )
         return DailyRunResult(
             run_date=run_date,
             status="failed",
@@ -629,6 +637,13 @@ def _bool_config(value: str, default: bool = False) -> bool:
     if not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _feishu_message_format_config(value: str) -> str:
+    message_format = value.strip().lower() or "text"
+    if message_format != "text":
+        raise ValueError("OPEN_TRADER_FEISHU_MESSAGE_FORMAT must be text")
+    return message_format
 
 
 def _validate_run_date(run_date: str) -> None:
