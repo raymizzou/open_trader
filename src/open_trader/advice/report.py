@@ -71,8 +71,8 @@ def _render_markdown(
             f"本次分析标的：{len(advice_records)} 个｜今日重点：{len(actions)} 个",
             f"已分析持仓合计仓位：{_total_weight_text(advice_records)}",
             "",
-            "| 标的 | 港元市值 | 当前仓位 | 风险标记 | 当前观点 | 状态 |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| 标的 | 最新价 | 港元市值 | 当前仓位 | 风险标记 | 当前观点 | 状态 |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     if advice_records:
@@ -80,6 +80,7 @@ def _render_markdown(
             lines.append(
                 "| "
                 f"{_escape_table_cell(advice.symbol)} | "
+                f"{_last_price_text(advice.last_price, advice.price_currency)} | "
                 f"{_market_value_hkd_text(advice.market_value_hkd)} | "
                 f"{_escape_table_cell(advice.portfolio_weight_hkd)} | "
                 f"{_risk_flag_text(advice.risk_flag)} | "
@@ -89,12 +90,13 @@ def _render_markdown(
         lines.append(
             "| "
             "合计 | "
+            "- | "
             f"{_total_market_value_hkd_text(advice_records)} | "
             f"{_total_weight_text(advice_records)} | "
             "- | - | - |"
         )
     else:
-        lines.append("| 无 | - | - | - | - | - |")
+        lines.append("| 无 | - | - | - | - | - | - |")
 
     lines.extend(["", "## 今日重点策略", ""])
     if not actions:
@@ -128,13 +130,13 @@ def _render_markdown(
                 f"| 变化类型 | {_change_type_text(action.change_type)} |",
                 f"| 建议动作 | {_suggested_action_text(action.suggested_action)} |",
                 "",
-                f"**为什么重要：** {action.rationale}",
+                f"**为什么重要：** {_action_rationale_text(action)}",
                 "",
-                f"**摘要：** {action.summary}",
+                f"**摘要：** {_action_summary_text(action)}",
             ]
         )
         if action.watch_trigger:
-            lines.extend(["", f"**观察条件：** {action.watch_trigger}"])
+            lines.extend(["", f"**观察条件：** {_watch_trigger_text(action.watch_trigger)}"])
         lines.append("")
 
     return "\n".join(lines)
@@ -159,6 +161,15 @@ def _change_type_text(value: str) -> str:
 
 
 def _suggested_action_text(value: str) -> str:
+    normalized = value.strip().lower()
+    if "initiate" in normalized or "starter position" in normalized:
+        return "建仓"
+    if "scale" in normalized and "buy" in normalized:
+        return "分批买入"
+    if "reduce" in normalized or "trim" in normalized:
+        return "减仓"
+    if "exit" in normalized or "sell all" in normalized:
+        return "清仓"
     return {
         "hold": "持有",
         "watch": "观察",
@@ -168,7 +179,7 @@ def _suggested_action_text(value: str) -> str:
         "trim": "减仓",
         "buy": "买入",
         "sell": "卖出",
-    }.get(value.strip().lower(), value.strip())
+    }.get(normalized, "人工复核" if _looks_like_english_prose(value) else value.strip())
 
 
 def _advice_action_text(value: str) -> str:
@@ -219,11 +230,15 @@ def _total_weight_text(advice_records: list[TradingAdvice]) -> str:
 
 def _total_market_value_hkd_text(advice_records: list[TradingAdvice]) -> str:
     total = 0.0
+    found_value = False
     for advice in advice_records:
         try:
             total += float(advice.market_value_hkd.strip().replace(",", ""))
+            found_value = True
         except ValueError:
             continue
+    if not found_value:
+        return "-"
     return f"HKD {total:,.2f}"
 
 
@@ -235,6 +250,54 @@ def _market_value_hkd_text(value: str) -> str:
         return f"HKD {float(cleaned):,.2f}"
     except ValueError:
         return _escape_table_cell(value)
+
+
+def _last_price_text(value: str, currency: str) -> str:
+    cleaned = value.strip().replace(",", "")
+    if not cleaned:
+        return "-"
+    prefix = currency.strip().upper()
+    try:
+        price = f"{float(cleaned):,.2f}"
+    except ValueError:
+        price = _escape_table_cell(value)
+    if prefix:
+        return f"{prefix} {price}"
+    return price
+
+
+def _action_rationale_text(action: PremarketAction) -> str:
+    fallback = (
+        f"{action.symbol} 的建议被标记为{_severity_text(action.severity)}重要性，"
+        f"变化类型为{_change_type_text(action.change_type)}，"
+        f"建议动作是{_suggested_action_text(action.suggested_action)}。"
+        "开盘前需要人工确认是否执行。"
+    )
+    return _chinese_text_or_fallback(action.rationale, fallback)
+
+
+def _action_summary_text(action: PremarketAction) -> str:
+    fallback = (
+        f"建议开盘前重点复核 {action.symbol} 的仓位、价格条件和下单风险。"
+    )
+    return _chinese_text_or_fallback(action.summary, fallback)
+
+
+def _watch_trigger_text(value: str) -> str:
+    return _chinese_text_or_fallback(value, "请以交易计划中的价格触发条件为准。")
+
+
+def _chinese_text_or_fallback(value: str, fallback: str) -> str:
+    cleaned = value.strip()
+    if not cleaned or _looks_like_english_prose(cleaned):
+        return fallback
+    return _escape_table_cell(cleaned)
+
+
+def _looks_like_english_prose(value: str) -> bool:
+    letters = sum(1 for char in value if char.isascii() and char.isalpha())
+    cjk = sum(1 for char in value if "\u4e00" <= char <= "\u9fff")
+    return letters >= 6 and letters > cjk
 
 
 def _negative_weight(value: str) -> float:

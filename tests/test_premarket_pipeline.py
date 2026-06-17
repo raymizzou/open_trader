@@ -20,6 +20,8 @@ PORTFOLIO_FIELDNAMES = [
     "asset_class",
     "symbol",
     "name",
+    "currency",
+    "last_price",
     "market_value_hkd",
     "portfolio_weight_hkd",
     "ai_eligible",
@@ -42,6 +44,8 @@ class FakeAdviceRunner:
             symbol=row.symbol,
             market=row.market,
             asset_class=row.asset_class,
+            last_price=row.last_price,
+            price_currency=row.price_currency,
             portfolio_weight_hkd=row.portfolio_weight_hkd,
             market_value_hkd=row.market_value_hkd,
             risk_flag=row.risk_flag,
@@ -67,6 +71,8 @@ class ReturningErrorAdviceRunner(FakeAdviceRunner):
                 symbol=row.symbol,
                 market=row.market,
                 asset_class=row.asset_class,
+                last_price=row.last_price,
+                price_currency=row.price_currency,
                 portfolio_weight_hkd=row.portfolio_weight_hkd,
                 market_value_hkd=row.market_value_hkd,
                 risk_flag=row.risk_flag,
@@ -132,6 +138,8 @@ class BlockingAdviceRunner(FakeAdviceRunner):
                 symbol=row.symbol,
                 market=row.market,
                 asset_class=row.asset_class,
+                last_price=row.last_price,
+                price_currency=row.price_currency,
                 portfolio_weight_hkd=row.portfolio_weight_hkd,
                 market_value_hkd=row.market_value_hkd,
                 risk_flag=row.risk_flag,
@@ -151,6 +159,8 @@ class BlockingAdviceRunner(FakeAdviceRunner):
                 symbol=row.symbol,
                 market=row.market,
                 asset_class=row.asset_class,
+                last_price=row.last_price,
+                price_currency=row.price_currency,
                 portfolio_weight_hkd=row.portfolio_weight_hkd,
                 market_value_hkd=row.market_value_hkd,
                 risk_flag=row.risk_flag,
@@ -177,6 +187,8 @@ def write_portfolio(path: Path) -> None:
                     "asset_class": "etf",
                     "symbol": "VIXY",
                     "name": "Volatility ETF",
+                    "currency": "USD",
+                    "last_price": "21.82",
                     "market_value_hkd": "38015.98",
                     "portfolio_weight_hkd": "3.05%",
                     "ai_eligible": "true",
@@ -188,6 +200,8 @@ def write_portfolio(path: Path) -> None:
                     "asset_class": "stock",
                     "symbol": "QQQ",
                     "name": "Nasdaq ETF",
+                    "currency": "USD",
+                    "last_price": "448.10",
                     "market_value_hkd": "17387.20",
                     "portfolio_weight_hkd": "1.40%",
                     "ai_eligible": "true",
@@ -199,6 +213,8 @@ def write_portfolio(path: Path) -> None:
                     "asset_class": "stock",
                     "symbol": "02476",
                     "name": "VGT",
+                    "currency": "HKD",
+                    "last_price": "23.10",
                     "market_value_hkd": "189400.00",
                     "portfolio_weight_hkd": "15.20%",
                     "ai_eligible": "false",
@@ -311,8 +327,8 @@ def test_run_premarket_writes_full_advice_classifications_and_actions(
     assert result.report_path.exists()
     report = result.report_path.read_text(encoding="utf-8")
     assert "## 持仓全景" in report
-    assert "| VIXY | HKD 38,015.98 | 3.05% | 正常 | 减仓 | 正常 |" in report
-    assert "| QQQ | HKD 17,387.20 | 1.40% | 正常 | 持有 | 正常 |" in report
+    assert "| VIXY | USD 21.82 | HKD 38,015.98 | 3.05% | 正常 | 减仓 | 正常 |" in report
+    assert "| QQQ | USD 448.10 | HKD 17,387.20 | 1.40% | 正常 | 持有 | 正常 |" in report
     assert "## 今日重点策略" in report
     assert "overweight" not in report
 

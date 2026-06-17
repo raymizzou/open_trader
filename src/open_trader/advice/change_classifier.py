@@ -143,6 +143,8 @@ def build_classifier_payload(
             "market": portfolio_row.market,
             "asset_class": portfolio_row.asset_class,
             "name": portfolio_row.name,
+            "last_price": portfolio_row.last_price,
+            "price_currency": portfolio_row.price_currency,
             "portfolio_weight_hkd": portfolio_row.portfolio_weight_hkd,
             "market_value_hkd": portfolio_row.market_value_hkd,
             "risk_flag": portfolio_row.risk_flag,

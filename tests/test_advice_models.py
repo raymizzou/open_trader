@@ -16,6 +16,8 @@ EXPECTED_TRADING_ADVICE_FIELDNAMES = [
     "symbol",
     "market",
     "asset_class",
+    "last_price",
+    "price_currency",
     "portfolio_weight_hkd",
     "market_value_hkd",
     "risk_flag",
@@ -70,6 +72,8 @@ def test_trading_advice_to_row_has_stable_csv_fields() -> None:
         symbol="VIXY",
         market="US",
         asset_class="etf",
+        last_price="21.82",
+        price_currency="USD",
         portfolio_weight_hkd="3.05%",
         market_value_hkd="38015.98",
         risk_flag="normal",
@@ -85,6 +89,8 @@ def test_trading_advice_to_row_has_stable_csv_fields() -> None:
 
     assert list(row) == EXPECTED_TRADING_ADVICE_FIELDNAMES
     assert row["symbol"] == "VIXY"
+    assert row["last_price"] == "21.82"
+    assert row["price_currency"] == "USD"
     assert row["market_value_hkd"] == "38015.98"
     assert row["advice_action"] == "reduce"
     assert row["error"] == ""
@@ -96,6 +102,8 @@ def test_trading_advice_row_includes_fallback_metadata() -> None:
         symbol="MSFT",
         market="US",
         asset_class="stock",
+        last_price="394.00",
+        price_currency="USD",
         portfolio_weight_hkd="1.13%",
         market_value_hkd="14123.45",
         risk_flag="normal",
@@ -150,6 +158,8 @@ def test_premarket_action_is_derived_from_portfolio_and_classification() -> None
         market="US",
         asset_class="etf",
         name="Volatility ETF",
+        last_price="21.82",
+        price_currency="USD",
         portfolio_weight_hkd="3.05%",
         market_value_hkd="38015.98",
         risk_flag="normal",

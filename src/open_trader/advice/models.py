@@ -22,6 +22,8 @@ TRADING_ADVICE_FIELDNAMES = [
     "symbol",
     "market",
     "asset_class",
+    "last_price",
+    "price_currency",
     "portfolio_weight_hkd",
     "market_value_hkd",
     "risk_flag",
@@ -89,6 +91,8 @@ class PortfolioInputRow:
     risk_flag: str
     analysis_symbol: str
     market_value_hkd: str = ""
+    last_price: str = ""
+    price_currency: str = ""
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,8 @@ class TradingAdvice:
     fallback_reason: str = ""
     fallback_from_date: str = ""
     market_value_hkd: str = ""
+    last_price: str = ""
+    price_currency: str = ""
 
     def to_row(self) -> dict[str, str]:
         return {field: str(getattr(self, field)) for field in TRADING_ADVICE_FIELDNAMES}

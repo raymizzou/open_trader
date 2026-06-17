@@ -34,10 +34,10 @@ Update `test_write_premarket_outputs_writes_actions_csv_and_markdown()` so it pa
 assert "## 持仓全景" in markdown
 assert "本次分析标的：2 个｜今日重点：1 个" in markdown
 assert "已分析持仓合计仓位：12.10%" in markdown
-assert "| 标的 | 港元市值 | 当前仓位 | 风险标记 | 当前观点 | 状态 |" in markdown
-assert "| AAPL | HKD 63,800.00 | 5.10% | 正常 | 持有 | 正常 |" in markdown
-assert "| MSFT | HKD 87,500.00 | 7.00% | 数据需复核 | 低配 | 沿用旧建议 |" in markdown
-assert "| 合计 | HKD 151,300.00 | 12.10% | - | - | - |" in markdown
+assert "| 标的 | 最新价 | 港元市值 | 当前仓位 | 风险标记 | 当前观点 | 状态 |" in markdown
+assert "| AAPL | USD 195.20 | HKD 63,800.00 | 5.10% | 正常 | 持有 | 正常 |" in markdown
+assert "| MSFT | USD 448.10 | HKD 87,500.00 | 7.00% | 数据需复核 | 低配 | 沿用旧建议 |" in markdown
+assert "| 合计 | - | HKD 151,300.00 | 12.10% | - | - | - |" in markdown
 assert "## 今日重点策略" in markdown
 ```
 
