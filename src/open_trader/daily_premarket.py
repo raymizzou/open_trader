@@ -371,9 +371,8 @@ class DailyPremarketRunner:
                 data_dir=self.config.data_dir,
             )
         if self.config.notify_daily_report and not dry_run:
-            self._notify(
-                "Open Trader daily order review",
-                render_feishu_order_review(
+            try:
+                message = render_feishu_order_review(
                     run_date=run_date,
                     status=status,
                     actions_path=trade_actions_result.actions_path,
@@ -381,8 +380,11 @@ class DailyPremarketRunner:
                         trade_actions_result.report_path,
                         report_path,
                     ],
-                ),
-            )
+                )
+            except Exception:
+                pass
+            else:
+                self._notify("Open Trader daily order review", message)
         return result
 
     def _advice_runner_factory(

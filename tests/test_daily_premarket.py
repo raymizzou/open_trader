@@ -595,6 +595,71 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
     assert str(tmp_path / "reports/daily_runs/2026-06-17.md") in body
 
 
+@pytest.mark.parametrize(
+    "expected_status",
+    [
+        "success",
+        "partial",
+    ],
+)
+def test_daily_runner_keeps_success_status_when_order_review_rendering_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_status: str,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+
+    def raise_render_error(**kwargs: object) -> str:
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(
+        daily_premarket,
+        "render_feishu_order_review",
+        raise_render_error,
+    )
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+        notifiers=("feishu",),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        notify_daily_report=True,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+    quote_client_factory = (
+        FakeQuoteClient if expected_status == "success" else MissingQuoteClient
+    )
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=quote_client_factory,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=notifier,
+    ).run("2026-06-17")
+
+    assert result.status == expected_status
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == expected_status
+    assert "error" not in status
+    report = result.report_path.read_text(encoding="utf-8")
+    assert f"- Status: {expected_status}" in report
+    assert "- Status: failed" not in report
+    assert (tmp_path / "data/latest/trade_actions.csv").exists()
+    assert notifier.calls == []
+
+
 def test_daily_runner_skips_daily_notification_when_report_notify_disabled(
     tmp_path: Path,
 ) -> None:
