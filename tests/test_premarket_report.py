@@ -89,6 +89,7 @@ def test_write_premarket_outputs_writes_actions_csv_and_markdown(
     assert "| 标的 | 港元市值 | 当前仓位 | 风险标记 | 当前观点 | 状态 |" in markdown
     assert "| AAPL | HKD 63,800.00 | 5.10% | 正常 | 持有 | 正常 |" in markdown
     assert "| MSFT | HKD 87,500.00 | 7.00% | 数据需复核 | 低配 | 沿用旧建议 |" in markdown
+    assert "| 合计 | HKD 151,300.00 | 12.10% | - | - | - |" in markdown
     assert "## 今日重点策略" in markdown
     assert "| 标的 | 重要性 | 当前仓位 | 建议动作 |" in markdown
     assert "| AAPL | 高 | 5.10% | 减仓 |" in markdown
@@ -125,6 +126,7 @@ def test_write_premarket_outputs_handles_no_actions(tmp_path: Path) -> None:
     assert "已分析持仓合计仓位：12.10%" in markdown
     assert "| AAPL | HKD 63,800.00 | 5.10% | 正常 | 持有 | 正常 |" in markdown
     assert "| MSFT | HKD 87,500.00 | 7.00% | 正常 | 低配 | 正常 |" in markdown
+    assert "| 合计 | HKD 151,300.00 | 12.10% | - | - | - |" in markdown
     assert "## 今日重点策略" in markdown
     assert "今日没有需要特别关注的交易建议变化。" in markdown
     assert "No material trading advice changes" not in markdown

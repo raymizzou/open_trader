@@ -86,6 +86,13 @@ def _render_markdown(
                 f"{_advice_action_text(advice.advice_action)} | "
                 f"{_advice_status_text(advice.status)} |"
             )
+        lines.append(
+            "| "
+            "合计 | "
+            f"{_total_market_value_hkd_text(advice_records)} | "
+            f"{_total_weight_text(advice_records)} | "
+            "- | - | - |"
+        )
     else:
         lines.append("| 无 | - | - | - | - | - |")
 
@@ -208,6 +215,16 @@ def _total_weight_text(advice_records: list[TradingAdvice]) -> str:
         except ValueError:
             continue
     return f"{total:.2f}%"
+
+
+def _total_market_value_hkd_text(advice_records: list[TradingAdvice]) -> str:
+    total = 0.0
+    for advice in advice_records:
+        try:
+            total += float(advice.market_value_hkd.strip().replace(",", ""))
+        except ValueError:
+            continue
+    return f"HKD {total:,.2f}"
 
 
 def _market_value_hkd_text(value: str) -> str:
