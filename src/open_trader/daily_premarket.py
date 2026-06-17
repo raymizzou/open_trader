@@ -9,6 +9,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, time
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -24,6 +25,8 @@ from .notifications import (
     Notifier,
     NullNotifier,
 )
+from .futu_watch import QuoteSnapshot
+from .trade_actions import TradeActionsResult, generate_trade_actions
 from .trading_plan import (
     TradingPlanBuildResult,
     build_trading_plan,
@@ -190,12 +193,17 @@ class DailyPremarketRunner:
         premarket_runner: Callable[..., object] = run_premarket,
         plan_builder: Callable[..., TradingPlanBuildResult] = build_trading_plan,
         quote_client_factory: Callable[..., object] = FutuQuoteClient,
+        trade_action_generator: Callable[
+            ...,
+            TradeActionsResult,
+        ] = generate_trade_actions,
         notifier: Notifier | None = None,
     ) -> None:
         self.config = config
         self.premarket_runner = premarket_runner
         self.plan_builder = plan_builder
         self.quote_client_factory = quote_client_factory
+        self.trade_action_generator = trade_action_generator
         self.notifier = notifier or NullNotifier()
 
     def run(self, run_date: str, *, dry_run: bool | None = None) -> DailyRunResult:
@@ -288,6 +296,21 @@ class DailyPremarketRunner:
             update_latest=False,
         )
         futu_status = self._check_futu_plan(plan_result.plan_path)
+        trade_actions_result = self.trade_action_generator(
+            plan_path=plan_result.plan_path,
+            portfolio_path=self.config.portfolio,
+            data_dir=self.config.data_dir,
+            reports_dir=self.config.reports_dir,
+            snapshots=_snapshots_from_futu_status(futu_status),
+            run_date=run_date,
+            update_latest=False,
+        )
+        trade_action_counts = {
+            "actions": trade_actions_result.action_count,
+            "ready": trade_actions_result.ready_count,
+            "review": trade_actions_result.review_count,
+            "watch": trade_actions_result.watch_count,
+        }
         advice_counts = _count_advice(advice_path)
         plan_counts = _count_plan(plan_result.plan_path)
         status = (
@@ -310,9 +333,12 @@ class DailyPremarketRunner:
             "actions": str(actions_path),
             "premarket_report": str(getattr(premarket_result, "report_path")),
             "trading_plan": str(plan_result.plan_path),
+            "trade_actions": str(trade_actions_result.actions_path),
+            "trade_actions_report": str(trade_actions_result.report_path),
             "latest_advice": str(latest_advice_path),
             "latest_actions": str(latest_actions_path),
             "latest_trading_plan": str(latest_plan_path),
+            "latest_trade_actions": str(trade_actions_result.latest_path),
             "status": str(status_path),
             "report": str(report_path),
             "log": str(log_path),
@@ -329,6 +355,7 @@ class DailyPremarketRunner:
             },
             plan_counts=plan_counts,
             futu_status=futu_status,
+            trade_actions=trade_action_counts,
             artifacts=artifacts,
             status_path=status_path,
             report_path=report_path,
@@ -339,6 +366,7 @@ class DailyPremarketRunner:
                 advice_path=advice_path,
                 actions_path=actions_path,
                 plan_path=plan_result.plan_path,
+                trade_actions_path=trade_actions_result.actions_path,
                 data_dir=self.config.data_dir,
             )
         if self.config.notify_daily_report and not dry_run:
@@ -450,6 +478,7 @@ class DailyPremarketRunner:
         premarket: dict[str, int],
         plan_counts: dict[str, int],
         futu_status: dict[str, object],
+        trade_actions: dict[str, int],
         artifacts: dict[str, str],
         status_path: Path,
         report_path: Path,
@@ -465,6 +494,7 @@ class DailyPremarketRunner:
             "premarket": premarket,
             "trading_plan": plan_counts,
             "futu_plan_check": futu_status,
+            "trade_actions": trade_actions,
             "artifacts": artifacts,
         }
         _write_json(status_path, payload)
@@ -514,15 +544,19 @@ class DailyPremarketRunner:
                 "items": [],
                 "error": "",
             },
+            "trade_actions": {"actions": 0, "ready": 0, "review": 0, "watch": 0},
             "artifacts": {
                 "advice": "",
                 "classifications": "",
                 "actions": "",
                 "premarket_report": "",
                 "trading_plan": "",
+                "trade_actions": "",
+                "trade_actions_report": "",
                 "latest_advice": "",
                 "latest_actions": "",
                 "latest_trading_plan": "",
+                "latest_trade_actions": "",
                 "status": str(status_path),
                 "report": str(report_path),
                 "log": str(log_path),
@@ -660,6 +694,7 @@ def _promote_latest_set(
     advice_path: Path,
     actions_path: Path,
     plan_path: Path,
+    trade_actions_path: Path,
     data_dir: Path,
 ) -> None:
     latest_dir = data_dir / "latest"
@@ -676,6 +711,10 @@ def _promote_latest_set(
         _LatestPromotion(
             source_path=plan_path,
             latest_path=latest_dir / "trading_plan.csv",
+        ),
+        _LatestPromotion(
+            source_path=trade_actions_path,
+            latest_path=latest_dir / "trade_actions.csv",
         ),
     ]
 
@@ -879,7 +918,10 @@ def _render_daily_report(payload: dict[str, object]) -> str:
         "actions",
         "premarket_report",
         "trading_plan",
+        "trade_actions",
+        "trade_actions_report",
         "latest_trading_plan",
+        "latest_trade_actions",
         "status",
         "report",
         "log",
@@ -920,3 +962,28 @@ def _write_text(path: Path, text: str) -> None:
 
 def _mapping(value: object) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
+
+
+def _snapshots_from_futu_status(
+    futu_status: dict[str, object],
+) -> dict[str, QuoteSnapshot]:
+    items = futu_status.get("items")
+    if not isinstance(items, list):
+        return {}
+    snapshots: dict[str, QuoteSnapshot] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        futu_symbol = str(item.get("futu_symbol", "")).strip()
+        last_price_text = str(item.get("last_price", "")).strip()
+        if not futu_symbol or not last_price_text:
+            continue
+        try:
+            last_price = Decimal(last_price_text)
+        except Exception:
+            continue
+        snapshots[futu_symbol] = QuoteSnapshot(
+            futu_symbol=futu_symbol,
+            last_price=last_price,
+        )
+    return snapshots

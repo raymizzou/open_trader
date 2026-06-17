@@ -22,6 +22,7 @@ from open_trader.daily_premarket import (
 from open_trader.futu_quote import FutuQuoteError
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier
+from open_trader.trade_actions import TradeActionsResult
 from open_trader.trading_plan import (
     TRADING_PLAN_FIELDNAMES,
     TradingPlanBuildResult,
@@ -172,6 +173,25 @@ def test_build_notifier_requires_feishu_webhook(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="OPEN_TRADER_FEISHU_WEBHOOK_URL is required"):
         build_notifier(config)
+
+
+def test_daily_runner_defaults_to_generate_trade_actions(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+    )
+
+    runner = DailyPremarketRunner(config=config)
+
+    assert runner.trade_action_generator is daily_premarket.generate_trade_actions
 
 
 def test_load_env_config_rejects_missing_required_values(tmp_path: Path) -> None:
@@ -363,6 +383,48 @@ class FakeQuoteClient:
         self.closed = True
 
 
+class FakeTradeActionGenerator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, **kwargs: object) -> TradeActionsResult:
+        self.calls.append(kwargs)
+        data_dir = kwargs["data_dir"]
+        reports_dir = kwargs["reports_dir"]
+        run_date = kwargs["run_date"]
+        assert isinstance(data_dir, Path)
+        assert isinstance(reports_dir, Path)
+        assert isinstance(run_date, str)
+        actions_path = data_dir / "runs" / run_date / "trade_actions.csv"
+        latest_path = data_dir / "latest" / "trade_actions.csv"
+        report_path = reports_dir / "trade_actions" / f"{run_date}.md"
+        actions_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        actions_path.write_text(
+            "run_date,symbol,market,futu_symbol,action,priority,last_price,"
+            "trigger_status,suggested_quantity,suggested_notional,"
+            "notional_currency,current_quantity,current_weight,avg_cost_price,"
+            "target_max_weight,cash_available,limit_price,stop_price,"
+            "post_trade_quantity,post_trade_weight,post_trade_avg_cost,"
+            "risk_to_stop,reason,source_plan,status,error\n"
+            f"{run_date},MSFT,US,US.MSFT,BUY,high,399,entry_zone,3,1197,"
+            "USD,10,1.13%,390,2%,1000,399,340,13,1.40%,392.08,767,"
+            f"fixture,data/runs/{run_date}/trading_plan.csv,ready,\n",
+            encoding="utf-8",
+        )
+        report_path.write_text("# Trade Actions\n", encoding="utf-8")
+        return TradeActionsResult(
+            run_date=run_date,
+            action_count=1,
+            ready_count=1,
+            review_count=0,
+            watch_count=0,
+            actions_path=actions_path,
+            latest_path=latest_path,
+            report_path=report_path,
+        )
+
+
 class FailingPlanBuilder:
     def __call__(
         self,
@@ -388,7 +450,11 @@ class CapturingNotifier:
         self.calls.append((title, message))
 
 
-def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
+def test_daily_runner_writes_success_status_and_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -404,12 +470,14 @@ def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
     )
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    fake_trade_actions = FakeTradeActionGenerator()
 
     runner = DailyPremarketRunner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
+        trade_action_generator=fake_trade_actions,
         notifier=NullNotifier(),
     )
 
@@ -422,6 +490,43 @@ def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
     assert status["premarket"]["ok"] == 1
     assert status["trading_plan"]["active"] == 1
     assert status["futu_plan_check"]["checked"] == 1
+    assert fake_trade_actions.calls
+    assert fake_trade_actions.calls[0]["plan_path"] == (
+        tmp_path / "data/runs/2026-06-17/trading_plan.csv"
+    )
+    assert fake_trade_actions.calls[0]["portfolio_path"] == (
+        tmp_path / "data/latest/portfolio.csv"
+    )
+    assert fake_trade_actions.calls[0]["data_dir"] == tmp_path / "data"
+    assert fake_trade_actions.calls[0]["reports_dir"] == tmp_path / "reports"
+    assert fake_trade_actions.calls[0]["run_date"] == "2026-06-17"
+    assert fake_trade_actions.calls[0]["update_latest"] is False
+    assert fake_trade_actions.calls[0]["snapshots"] == {
+        "US.MSFT": QuoteSnapshot(
+            futu_symbol="US.MSFT",
+            last_price=Decimal("399"),
+        )
+    }
+    assert status["trade_actions"] == {
+        "actions": 1,
+        "ready": 1,
+        "review": 0,
+        "watch": 0,
+    }
+    assert status["artifacts"]["trade_actions"] == str(
+        tmp_path / "data/runs/2026-06-17/trade_actions.csv"
+    )
+    assert status["artifacts"]["trade_actions_report"] == str(
+        tmp_path / "reports/trade_actions/2026-06-17.md"
+    )
+    assert status["artifacts"]["latest_trade_actions"] == str(
+        tmp_path / "data/latest/trade_actions.csv"
+    )
+    report = (tmp_path / "reports/daily_runs/2026-06-17.md").read_text(
+        encoding="utf-8"
+    )
+    assert "- trade_actions: " in report
+    assert "- trade_actions_report: " in report
     assert (tmp_path / "reports/daily_runs/2026-06-17.md").exists()
 
 
@@ -453,6 +558,7 @@ def test_daily_runner_skips_daily_notification_when_report_notify_disabled(
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=notifier,
     )
 
@@ -488,6 +594,7 @@ def test_daily_runner_skips_daily_notification_in_dry_run(tmp_path: Path) -> Non
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=notifier,
     )
 
@@ -528,6 +635,7 @@ def test_daily_runner_skips_partial_notification_when_env_report_notify_zero(
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=MissingQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=notifier,
     )
 
@@ -631,6 +739,7 @@ def test_daily_runner_deadline_uses_requested_run_date(
         premarket_runner=premarket,
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
     )
 
@@ -643,7 +752,9 @@ def test_daily_runner_deadline_uses_requested_run_date(
 
 def test_daily_runner_defers_latest_promotion_until_final_success(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -661,12 +772,14 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     premarket = FakePremarket()
     plan_builder = FakePlanBuilder()
+    fake_trade_actions = FakeTradeActionGenerator()
 
     runner = DailyPremarketRunner(
         config=config,
         premarket_runner=premarket,
         plan_builder=plan_builder,
         quote_client_factory=FakeQuoteClient,
+        trade_action_generator=fake_trade_actions,
         notifier=NullNotifier(),
     )
 
@@ -675,6 +788,7 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     assert result.status == "success"
     assert premarket.calls[0]["update_latest"] is False
     assert plan_builder.calls[0]["update_latest"] is False
+    assert fake_trade_actions.calls[0]["update_latest"] is False
     assert (tmp_path / "data/latest/trading_advice.csv").read_text(
         encoding="utf-8"
     ) == (tmp_path / "data/runs/2026-06-17/trading_advice.csv").read_text(
@@ -690,6 +804,11 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     ) == (tmp_path / "data/runs/2026-06-17/trading_plan.csv").read_text(
         encoding="utf-8"
     )
+    assert (tmp_path / "data/latest/trade_actions.csv").read_text(
+        encoding="utf-8"
+    ) == (tmp_path / "data/runs/2026-06-17/trade_actions.csv").read_text(
+        encoding="utf-8"
+    )
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["artifacts"]["latest_advice"] == str(
         tmp_path / "data/latest/trading_advice.csv"
@@ -699,6 +818,9 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     )
     assert status["artifacts"]["latest_trading_plan"] == str(
         tmp_path / "data/latest/trading_plan.csv"
+    )
+    assert status["artifacts"]["latest_trade_actions"] == str(
+        tmp_path / "data/latest/trade_actions.csv"
     )
 
 
@@ -790,6 +912,7 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
     )
 
@@ -861,6 +984,7 @@ def test_daily_runner_does_not_promote_latest_when_report_write_fails(
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
     )
 
@@ -966,6 +1090,7 @@ def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None
         premarket_runner=premarket,
         plan_builder=plan_builder,
         quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
     )
 
@@ -1016,6 +1141,7 @@ def test_daily_runner_dry_run_argument_overrides_config(
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
     )
 
@@ -1143,6 +1269,7 @@ def test_daily_runner_marks_partial_when_futu_is_unavailable(tmp_path: Path) -> 
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=UnavailableQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
     )
 
@@ -1194,6 +1321,7 @@ def test_daily_runner_marks_partial_when_futu_quote_is_missing(
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=MissingQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
     )
 
@@ -1231,6 +1359,7 @@ def test_daily_runner_ignores_quote_client_close_failure(tmp_path: Path) -> None
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=RaisingCloseQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
     )
 
