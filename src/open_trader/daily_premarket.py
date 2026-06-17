@@ -5,19 +5,25 @@ import fcntl
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
 from .futu_quote import FutuQuoteClient, FutuQuoteError
+from .notifications import (
+    CompositeNotifier,
+    FeishuWebhookNotifier,
+    MacOSNotifier,
+    Notifier,
+    NullNotifier,
+)
 from .trading_plan import (
     TradingPlanBuildResult,
     build_trading_plan,
@@ -44,6 +50,10 @@ class DailyPremarketConfig:
     ta_max_retries: int = 2
     tradingagents_path: Path = Path("/Users/ray/projects/TradingAgents")
     classifier_model: str = "deepseek-v4-flash"
+    notifiers: tuple[str, ...] = ()
+    feishu_webhook_url: str = ""
+    notify_daily_report: bool = False
+    notify_action_triggers: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,25 +103,6 @@ class RunLock:
         handle.close()
 
 
-class Notifier(Protocol):
-    def notify(self, title: str, message: str) -> None:
-        pass
-
-
-class NullNotifier:
-    def notify(self, title: str, message: str) -> None:
-        pass
-
-
-class MacOSNotifier:
-    def notify(self, title: str, message: str) -> None:
-        script = (
-            f'display notification "{_escape_osascript(message)}" '
-            f'with title "{_escape_osascript(title)}"'
-        )
-        subprocess.run(["osascript", "-e", script], check=False)
-
-
 def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfig:
     values = _read_env_file(path)
     required = [
@@ -154,7 +145,37 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
             repo,
         ),
         classifier_model=values.get("OPEN_TRADER_CLASSIFIER_MODEL", "deepseek-v4-flash"),
+        notifiers=_csv_config(values.get("OPEN_TRADER_NOTIFIERS", "")),
+        feishu_webhook_url=values.get("OPEN_TRADER_FEISHU_WEBHOOK_URL", ""),
+        notify_daily_report=_bool_config(
+            values.get("OPEN_TRADER_NOTIFY_DAILY_REPORT", ""),
+        ),
+        notify_action_triggers=_bool_config(
+            values.get("OPEN_TRADER_NOTIFY_ACTION_TRIGGERS", ""),
+        ),
     )
+
+
+def build_notifier(config: DailyPremarketConfig) -> Notifier:
+    notifiers: list[Notifier] = []
+    for name in config.notifiers:
+        if name == "macos":
+            notifiers.append(MacOSNotifier())
+            continue
+        if name == "feishu":
+            if not config.feishu_webhook_url:
+                raise ValueError("OPEN_TRADER_FEISHU_WEBHOOK_URL is required")
+            notifiers.append(
+                FeishuWebhookNotifier(webhook_url=config.feishu_webhook_url)
+            )
+            continue
+        raise ValueError(f"unknown notifier: {name}")
+
+    if not notifiers:
+        return NullNotifier()
+    if len(notifiers) == 1:
+        return notifiers[0]
+    return CompositeNotifier(notifiers)
 
 
 class DailyPremarketRunner:
@@ -314,10 +335,11 @@ class DailyPremarketRunner:
                 plan_path=plan_result.plan_path,
                 data_dir=self.config.data_dir,
             )
-        self._notify(
-            "Open Trader daily premarket",
-            _notification_message(status, plan_counts, futu_status, advice_counts),
-        )
+        if self.config.notify_daily_report and not dry_run:
+            self._notify(
+                "Open Trader daily premarket",
+                _notification_message(status, plan_counts, futu_status, advice_counts),
+            )
         return result
 
     def _advice_runner_factory(
@@ -599,6 +621,16 @@ def _config_path(value: str, repo: Path) -> Path:
     return repo / path
 
 
+def _csv_config(value: str) -> tuple[str, ...]:
+    return tuple(item.strip().lower() for item in value.split(",") if item.strip())
+
+
+def _bool_config(value: str, default: bool = False) -> bool:
+    if not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _validate_run_date(run_date: str) -> None:
     try:
         parsed = datetime.strptime(run_date, "%Y-%m-%d")
@@ -873,7 +905,3 @@ def _write_text(path: Path, text: str) -> None:
 
 def _mapping(value: object) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
-
-
-def _escape_osascript(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')

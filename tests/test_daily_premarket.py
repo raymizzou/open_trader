@@ -16,10 +16,12 @@ from open_trader.daily_premarket import (
     DailyPremarketRunner,
     NullNotifier,
     RunLock,
+    build_notifier,
     load_env_config,
 )
 from open_trader.futu_quote import FutuQuoteError
 from open_trader.futu_watch import QuoteSnapshot
+from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier
 from open_trader.trading_plan import (
     TRADING_PLAN_FIELDNAMES,
     TradingPlanBuildResult,
@@ -37,6 +39,10 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "OPEN_TRADER_DEADLINE=21:10",
                 "OPEN_TRADER_FUTU_HOST=127.0.0.1",
                 "OPEN_TRADER_FUTU_PORT=11111",
+                "OPEN_TRADER_NOTIFIERS=Feishu, macos",
+                "OPEN_TRADER_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/test",
+                "OPEN_TRADER_NOTIFY_DAILY_REPORT=yes",
+                "OPEN_TRADER_NOTIFY_ACTION_TRIGGERS=1",
                 "DEEPSEEK_API_KEY=secret",
             ]
         ),
@@ -52,6 +58,94 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.futu_host == "127.0.0.1"
     assert config.futu_port == 11111
     assert config.classifier_model == "deepseek-v4-flash"
+    assert config.notifiers == ("feishu", "macos")
+    assert (
+        config.feishu_webhook_url
+        == "https://open.feishu.cn/open-apis/bot/v2/hook/test"
+    )
+    assert config.notify_daily_report is True
+    assert config.notify_action_triggers is True
+
+
+def test_build_notifier_uses_configured_feishu_and_macos(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        notifiers=("feishu", "macos"),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+    )
+
+    notifier = build_notifier(config)
+
+    assert isinstance(notifier, CompositeNotifier)
+    inner_notifiers = notifier._notifiers
+    assert len(inner_notifiers) == 2
+    assert isinstance(inner_notifiers[0], FeishuWebhookNotifier)
+    assert inner_notifiers[0].webhook_url == config.feishu_webhook_url
+    assert inner_notifiers[1].__class__.__name__ == "MacOSNotifier"
+
+
+def test_build_notifier_returns_null_when_none_configured(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+    )
+
+    assert isinstance(build_notifier(config), NullNotifier)
+
+
+def test_build_notifier_rejects_unknown_notifier(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        notifiers=("email",),
+    )
+
+    with pytest.raises(ValueError, match="unknown notifier: email"):
+        build_notifier(config)
+
+
+def test_build_notifier_requires_feishu_webhook(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        notifiers=("feishu",),
+    )
+
+    with pytest.raises(ValueError, match="OPEN_TRADER_FEISHU_WEBHOOK_URL is required"):
+        build_notifier(config)
 
 
 def test_load_env_config_rejects_missing_required_values(tmp_path: Path) -> None:
@@ -260,6 +354,14 @@ class RaisingCloseQuoteClient(FakeQuoteClient):
         raise RuntimeError("close failed")
 
 
+class CapturingNotifier:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.calls.append((title, message))
+
+
 def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,
@@ -295,6 +397,78 @@ def test_daily_runner_writes_success_status_and_report(tmp_path: Path) -> None:
     assert status["trading_plan"]["active"] == 1
     assert status["futu_plan_check"]["checked"] == 1
     assert (tmp_path / "reports/daily_runs/2026-06-17.md").exists()
+
+
+def test_daily_runner_skips_daily_notification_when_report_notify_disabled(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+        notifiers=("feishu",),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        notify_daily_report=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=notifier,
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "success"
+    assert notifier.calls == []
+
+
+def test_daily_runner_skips_daily_notification_in_dry_run(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=True,
+        notifiers=("feishu",),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        notify_daily_report=True,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=notifier,
+    )
+
+    result = runner.run("2026-06-17")
+
+    assert result.status == "success"
+    assert notifier.calls == []
 
 
 def test_daily_runner_deadline_uses_requested_run_date(
@@ -1081,6 +1255,11 @@ def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
         "OPEN_TRADER_DEADLINE",
         "OPEN_TRADER_FUTU_HOST",
         "OPEN_TRADER_FUTU_PORT",
+        "OPEN_TRADER_NOTIFIERS",
+        "OPEN_TRADER_FEISHU_WEBHOOK_URL",
+        "OPEN_TRADER_FEISHU_MESSAGE_FORMAT",
+        "OPEN_TRADER_NOTIFY_DAILY_REPORT",
+        "OPEN_TRADER_NOTIFY_ACTION_TRIGGERS",
         "DEEPSEEK_API_KEY",
     ]:
         assert key in example

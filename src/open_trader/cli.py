@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
-from .daily_premarket import DailyPremarketRunner, load_env_config
+from .daily_premarket import DailyPremarketRunner, build_notifier, load_env_config
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
@@ -451,7 +451,10 @@ def main(argv: list[str] | None = None) -> int:
                 if args.date == "today"
                 else canonical_date(args.date)
             )
-            result = DailyPremarketRunner(config=config).run(
+            result = DailyPremarketRunner(
+                config=config,
+                notifier=build_notifier(config),
+            ).run(
                 run_date=run_date,
                 dry_run=args.dry_run,
             )
