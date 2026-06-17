@@ -45,6 +45,10 @@ class CompositeNotifier:
 
 
 PostJson = Callable[[str, dict[str, object], float], dict[str, object]]
+PostJsonWithHeaders = Callable[
+    [str, dict[str, object], dict[str, str], float],
+    dict[str, object],
+]
 
 
 class FeishuWebhookNotifier:
@@ -77,6 +81,68 @@ class FeishuWebhookNotifier:
             raise NotificationError(f"Feishu webhook error {code}: {message}")
 
 
+class FeishuAppNotifier:
+    token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+
+    def __init__(
+        self,
+        *,
+        app_id: str,
+        app_secret: str,
+        receive_id_type: str,
+        receive_id: str,
+        post_json: PostJsonWithHeaders | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.receive_id_type = receive_id_type
+        self.receive_id = receive_id
+        self._post_json = post_json or _post_json_with_headers
+        self.timeout_seconds = timeout_seconds
+
+    def notify(self, title: str, message: str) -> None:
+        token = self._tenant_access_token()
+        response = self._post_json(
+            (
+                "https://open.feishu.cn/open-apis/im/v1/messages"
+                f"?receive_id_type={self.receive_id_type}"
+            ),
+            {
+                "receive_id": self.receive_id,
+                "msg_type": "text",
+                "content": json.dumps(
+                    {"text": f"{title}\n\n{message}"},
+                    ensure_ascii=False,
+                ),
+            },
+            {"Authorization": f"Bearer {token}"},
+            self.timeout_seconds,
+        )
+        code = response.get("code")
+        if code not in {0, "0"}:
+            raise NotificationError(
+                f"Feishu message error {code}: {response.get('msg', '')}"
+            )
+
+    def _tenant_access_token(self) -> str:
+        response = self._post_json(
+            self.token_url,
+            {"app_id": self.app_id, "app_secret": self.app_secret},
+            {},
+            self.timeout_seconds,
+        )
+        code = response.get("code")
+        if code not in {0, "0"}:
+            raise NotificationError(
+                f"Feishu token error {code}: {response.get('msg', '')}"
+            )
+        token = response.get("tenant_access_token")
+        if not isinstance(token, str) or not token:
+            raise NotificationError("Feishu token error missing: tenant_access_token")
+        return token
+
+
 def render_feishu_order_review(
     *,
     run_date: str,
@@ -91,39 +157,39 @@ def render_feishu_order_review(
     watch_rows = [row for row in rows if _effective_status(row) == "watch"]
 
     lines = [
-        f"Open Trader {run_date}: {status}",
+        f"Open Trader {run_date}：{_status_label(status)}",
         "",
-        "Summary:",
-        f"- Ready: {len(ready_rows)}",
-        f"- Review: {len(review_rows)}",
-        f"- Watch: {len(watch_rows)}",
+        "摘要：",
+        f"- 可执行：{len(ready_rows)}",
+        f"- 需复核：{len(review_rows)}",
+        f"- 观察中：{len(watch_rows)}",
     ]
 
     if ready_rows:
-        lines.extend(["", "Ready:"])
+        lines.extend(["", "可执行："])
         sorted_ready_rows = sorted(ready_rows, key=_priority_sort_key)
         for row in sorted_ready_rows[:max_ready_sections]:
             lines.extend(["", *_render_ready_section(row)])
         remaining_count = len(sorted_ready_rows) - max_ready_sections
         if remaining_count > 0:
-            lines.append(f"- {remaining_count} additional ready action(s) in report.")
+            lines.append(f"- 另有 {remaining_count} 条可执行动作见报告。")
 
     if review_rows:
-        lines.extend(["", "Review:"])
+        lines.extend(["", "需复核："])
         for row in sorted(review_rows, key=_priority_sort_key):
             if _row_status(row) == "ready":
                 lines.extend(["", *_render_ready_section(row)])
                 continue
             symbol = row.get("futu_symbol", "").strip()
-            priority = row.get("priority", "").strip()
+            priority = _priority_label(row.get("priority", "").strip())
             reason = row.get("error", "").strip() or row.get("reason", "").strip()
             lines.append(f"- {symbol} {priority}: {reason}".rstrip())
 
     if watch_rows:
-        lines.extend(["", f"Watch: {len(watch_rows)} action(s) waiting for trigger."])
+        lines.extend(["", f"观察中：{len(watch_rows)} 条动作等待触发。"])
 
     if report_paths:
-        lines.extend(["", "Reports:"])
+        lines.extend(["", "报告："])
         lines.extend(f"- {path}" for path in report_paths)
 
     return "\n".join(lines).strip() + "\n"
@@ -131,19 +197,23 @@ def render_feishu_order_review(
 
 def _render_ready_section(row: Mapping[str, str]) -> list[str]:
     missing_fields = _missing_precise_fields(row)
-    action = "REVIEW" if missing_fields else row.get("action", "").strip()
+    action = (
+        _action_label("REVIEW")
+        if missing_fields
+        else _action_label(row.get("action", "").strip())
+    )
     lines = [
         (
             f"## {row.get('futu_symbol', '').strip()} | "
-            f"{row.get('priority', '').strip()} | {action}"
+            f"{_priority_label(row.get('priority', '').strip())} | {action}"
         )
     ]
 
     if missing_fields:
         lines.extend(
             [
-                f"Missing before action: {', '.join(missing_fields)}",
-                f"Reason: {row.get('reason', '').strip()}",
+                f"执行前缺少：{'、'.join(_field_label(field) for field in missing_fields)}",
+                f"原因：{row.get('reason', '').strip()}",
             ]
         )
         return lines
@@ -152,28 +222,76 @@ def _render_ready_section(row: Mapping[str, str]) -> list[str]:
     trigger_price = _trigger_price(row)
     lines.extend(
         [
-            f"Current price: {row.get('last_price', '').strip()}",
-            f"Current quantity: {row.get('current_quantity', '').strip()}",
-            f"Current weight: {row.get('current_weight', '').strip()}",
-            f"Current average cost: {row.get('avg_cost_price', '').strip()}",
-            f"Trigger price: {trigger_price}",
+            f"当前价：{row.get('last_price', '').strip()}",
+            f"当前数量：{row.get('current_quantity', '').strip()}",
+            f"当前仓位：{row.get('current_weight', '').strip()}",
+            f"当前成本：{row.get('avg_cost_price', '').strip()}",
+            f"触发价：{trigger_price}",
             (
-                f"This order: {row.get('action', '').strip()} "
-                f"{row.get('suggested_quantity', '').strip()} shares"
+                f"本次指令：{_action_label(row.get('action', '').strip())} "
+                f"{row.get('suggested_quantity', '').strip()} 股"
             ),
             (
-                f"Estimated notional: {currency} "
+                f"预计金额：{currency} "
                 f"{row.get('suggested_notional', '').strip()}"
             ),
-            f"Post-trade quantity: {row.get('post_trade_quantity', '').strip()}",
-            f"Post-trade weight: {row.get('post_trade_weight', '').strip()}",
-            f"Post-trade average cost: {row.get('post_trade_avg_cost', '').strip()}",
-            f"Hard stop: {row.get('stop_price', '').strip()}",
-            f"Risk to stop: {_risk_to_stop_text(row, currency)}",
-            f"Reason: {row.get('reason', '').strip()}",
+            f"交易后数量：{row.get('post_trade_quantity', '').strip()}",
+            f"交易后仓位：{row.get('post_trade_weight', '').strip()}",
+            f"交易后成本：{row.get('post_trade_avg_cost', '').strip()}",
+            f"硬止损：{row.get('stop_price', '').strip()}",
+            f"止损风险：{_risk_to_stop_text(row, currency)}",
+            f"原因：{row.get('reason', '').strip()}",
         ]
     )
     return lines
+
+
+def _status_label(status: str) -> str:
+    return {
+        "success": "成功",
+        "partial": "部分完成",
+        "failed": "失败",
+    }.get(status.strip().lower(), status)
+
+
+def _action_label(action: str) -> str:
+    return {
+        "BUY": "买入",
+        "ADD": "加仓",
+        "TRIM": "减仓",
+        "SELL_STOP": "止损卖出",
+        "TAKE_PROFIT": "止盈卖出",
+        "HOLD": "持有",
+        "REVIEW": "人工复核",
+    }.get(action.strip().upper(), action)
+
+
+def _priority_label(priority: str) -> str:
+    return {
+        "critical": "最高",
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+    }.get(priority.strip().lower(), priority)
+
+
+def _field_label(field: str) -> str:
+    return {
+        "last_price": "当前价",
+        "current_quantity": "当前数量",
+        "current_weight": "当前仓位",
+        "avg_cost_price": "当前成本",
+        "limit_price": "触发价",
+        "suggested_quantity": "本次数量",
+        "suggested_notional": "预计金额",
+        "notional_currency": "金额币种",
+        "post_trade_quantity": "交易后数量",
+        "post_trade_weight": "交易后仓位",
+        "post_trade_avg_cost": "交易后成本",
+        "risk_to_stop": "止损风险",
+        "stop_price": "硬止损",
+        "reason": "原因",
+    }.get(field, field)
 
 
 def _missing_precise_fields(row: Mapping[str, str]) -> list[str]:
@@ -231,7 +349,7 @@ def _risk_to_stop_text(row: Mapping[str, str], currency: str) -> str:
         row.get("action", "").strip().upper() == "SELL_STOP"
         and row.get("post_trade_quantity", "").strip() == "0"
     ):
-        return "full exit"
+        return "全部退出"
     return currency
 
 
@@ -283,6 +401,36 @@ def _post_json(
 
     if not isinstance(parsed, dict):
         raise NotificationError("Feishu webhook returned non-object JSON")
+    return parsed
+
+
+def _post_json_with_headers(
+    url: str,
+    payload: dict[str, object],
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> dict[str, object]:
+    merged_headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        **headers,
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=merged_headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8")
+    except Exception as exc:
+        raise NotificationError(f"Feishu app request failed: {exc}") from exc
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise NotificationError("Feishu app returned invalid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise NotificationError("Feishu app returned non-object JSON")
     return parsed
 
 

@@ -20,6 +20,7 @@ from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .notifications import (
     CompositeNotifier,
+    FeishuAppNotifier,
     FeishuWebhookNotifier,
     MacOSNotifier,
     Notifier,
@@ -56,6 +57,10 @@ class DailyPremarketConfig:
     classifier_model: str = "deepseek-v4-flash"
     notifiers: tuple[str, ...] = ()
     feishu_webhook_url: str = ""
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_receive_id_type: str = ""
+    feishu_receive_id: str = ""
     feishu_message_format: str = "text"
     notify_daily_report: bool = False
     notify_action_triggers: bool = False
@@ -152,6 +157,10 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         classifier_model=values.get("OPEN_TRADER_CLASSIFIER_MODEL", "deepseek-v4-flash"),
         notifiers=_csv_config(values.get("OPEN_TRADER_NOTIFIERS", "")),
         feishu_webhook_url=values.get("OPEN_TRADER_FEISHU_WEBHOOK_URL", ""),
+        feishu_app_id=values.get("OPEN_TRADER_FEISHU_APP_ID", ""),
+        feishu_app_secret=values.get("OPEN_TRADER_FEISHU_APP_SECRET", ""),
+        feishu_receive_id_type=values.get("OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE", ""),
+        feishu_receive_id=values.get("OPEN_TRADER_FEISHU_RECEIVE_ID", ""),
         feishu_message_format=_feishu_message_format_config(
             values.get("OPEN_TRADER_FEISHU_MESSAGE_FORMAT", "text"),
         ),
@@ -175,6 +184,24 @@ def build_notifier(config: DailyPremarketConfig) -> Notifier:
                 raise ValueError("OPEN_TRADER_FEISHU_WEBHOOK_URL is required")
             notifiers.append(
                 FeishuWebhookNotifier(webhook_url=config.feishu_webhook_url)
+            )
+            continue
+        if name == "feishu_app":
+            for field_name, value in [
+                ("OPEN_TRADER_FEISHU_APP_ID", config.feishu_app_id),
+                ("OPEN_TRADER_FEISHU_APP_SECRET", config.feishu_app_secret),
+                ("OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE", config.feishu_receive_id_type),
+                ("OPEN_TRADER_FEISHU_RECEIVE_ID", config.feishu_receive_id),
+            ]:
+                if not value:
+                    raise ValueError(f"{field_name} is required")
+            notifiers.append(
+                FeishuAppNotifier(
+                    app_id=config.feishu_app_id,
+                    app_secret=config.feishu_app_secret,
+                    receive_id_type=config.feishu_receive_id_type,
+                    receive_id=config.feishu_receive_id,
+                )
             )
             continue
         raise ValueError(f"unknown notifier: {name}")
@@ -384,7 +411,7 @@ class DailyPremarketRunner:
             except Exception:
                 pass
             else:
-                self._notify("Open Trader daily order review", message)
+                self._notify("Open Trader 每日订单复核", message)
         return result
 
     def _advice_runner_factory(

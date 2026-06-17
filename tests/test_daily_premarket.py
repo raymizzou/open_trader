@@ -21,7 +21,11 @@ from open_trader.daily_premarket import (
 )
 from open_trader.futu_quote import FutuQuoteError
 from open_trader.futu_watch import QuoteSnapshot
-from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier
+from open_trader.notifications import (
+    CompositeNotifier,
+    FeishuAppNotifier,
+    FeishuWebhookNotifier,
+)
 from open_trader.trade_actions import TradeActionsResult
 from open_trader.trading_plan import (
     TRADING_PLAN_FIELDNAMES,
@@ -40,8 +44,11 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "OPEN_TRADER_DEADLINE=21:10",
                 "OPEN_TRADER_FUTU_HOST=127.0.0.1",
                 "OPEN_TRADER_FUTU_PORT=11111",
-                "OPEN_TRADER_NOTIFIERS=Feishu, macos",
-                "OPEN_TRADER_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/test",
+                "OPEN_TRADER_NOTIFIERS=Feishu_App, macos",
+                "OPEN_TRADER_FEISHU_APP_ID=cli_test",
+                "OPEN_TRADER_FEISHU_APP_SECRET=secret",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email",
+                "OPEN_TRADER_FEISHU_RECEIVE_ID=ray@example.com",
                 "OPEN_TRADER_FEISHU_MESSAGE_FORMAT=text",
                 "OPEN_TRADER_NOTIFY_DAILY_REPORT=yes",
                 "OPEN_TRADER_NOTIFY_ACTION_TRIGGERS=1",
@@ -60,11 +67,11 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.futu_host == "127.0.0.1"
     assert config.futu_port == 11111
     assert config.classifier_model == "deepseek-v4-flash"
-    assert config.notifiers == ("feishu", "macos")
-    assert (
-        config.feishu_webhook_url
-        == "https://open.feishu.cn/open-apis/bot/v2/hook/test"
-    )
+    assert config.notifiers == ("feishu_app", "macos")
+    assert config.feishu_app_id == "cli_test"
+    assert config.feishu_app_secret == "secret"
+    assert config.feishu_receive_id_type == "email"
+    assert config.feishu_receive_id == "ray@example.com"
     assert config.feishu_message_format == "text"
     assert config.notify_daily_report is True
     assert config.notify_action_triggers is True
@@ -120,6 +127,37 @@ def test_build_notifier_uses_configured_feishu_and_macos(tmp_path: Path) -> None
     assert inner_notifiers[1].__class__.__name__ == "MacOSNotifier"
 
 
+def test_build_notifier_uses_configured_feishu_app_and_macos(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        notifiers=("feishu_app", "macos"),
+        feishu_app_id="cli_test",
+        feishu_app_secret="secret",
+        feishu_receive_id_type="email",
+        feishu_receive_id="ray@example.com",
+    )
+
+    notifier = build_notifier(config)
+
+    assert isinstance(notifier, CompositeNotifier)
+    inner_notifiers = notifier._notifiers
+    assert len(inner_notifiers) == 2
+    assert isinstance(inner_notifiers[0], FeishuAppNotifier)
+    assert inner_notifiers[0].app_id == config.feishu_app_id
+    assert inner_notifiers[0].receive_id_type == config.feishu_receive_id_type
+    assert inner_notifiers[0].receive_id == config.feishu_receive_id
+    assert inner_notifiers[1].__class__.__name__ == "MacOSNotifier"
+
+
 def test_build_notifier_returns_null_when_none_configured(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,
@@ -172,6 +210,29 @@ def test_build_notifier_requires_feishu_webhook(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="OPEN_TRADER_FEISHU_WEBHOOK_URL is required"):
+        build_notifier(config)
+
+
+def test_build_notifier_requires_feishu_app_config(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        notifiers=("feishu_app",),
+        feishu_app_id="cli_test",
+        feishu_app_secret="",
+        feishu_receive_id_type="email",
+        feishu_receive_id="ray@example.com",
+    )
+
+    with pytest.raises(ValueError, match="OPEN_TRADER_FEISHU_APP_SECRET is required"):
         build_notifier(config)
 
 
@@ -587,10 +648,10 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
     assert result.status == "success"
     assert len(notifier.calls) == 1
     title, body = notifier.calls[0]
-    assert title == "Open Trader daily order review"
-    assert "Open Trader 2026-06-17: success" in body
-    assert "US.MSFT | high | BUY" in body
-    assert "Post-trade average cost" in body
+    assert title == "Open Trader 每日订单复核"
+    assert "Open Trader 2026-06-17：成功" in body
+    assert "US.MSFT | 高 | 买入" in body
+    assert "交易后成本" in body
     assert str(tmp_path / "reports/trade_actions/2026-06-17.md") in body
     assert str(tmp_path / "reports/daily_runs/2026-06-17.md") in body
 

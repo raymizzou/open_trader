@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import urllib.request
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 
 from open_trader.notifications import (
     CompositeNotifier,
+    FeishuAppNotifier,
     FeishuWebhookNotifier,
     NotificationError,
     render_feishu_order_review,
@@ -187,6 +189,82 @@ def test_feishu_webhook_notifier_raises_on_non_object_json_response(
         notifier.notify("Open Trader", "hello")
 
 
+def test_feishu_app_notifier_sends_text_message() -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        calls.append(
+            {
+                "url": url,
+                "payload": payload,
+                "headers": headers,
+                "timeout": timeout_seconds,
+            }
+        )
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        return {"code": 0, "data": {"message_id": "om_test"}}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_test",
+        app_secret="secret",
+        receive_id_type="email",
+        receive_id="ray@example.com",
+        post_json=fake_post,
+        timeout_seconds=3.0,
+    )
+
+    notifier.notify("Open Trader 每日订单复核", "测试正文")
+
+    assert calls == [
+        {
+            "url": "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            "payload": {"app_id": "cli_test", "app_secret": "secret"},
+            "headers": {},
+            "timeout": 3.0,
+        },
+        {
+            "url": "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=email",
+            "payload": {
+                "receive_id": "ray@example.com",
+                "msg_type": "text",
+                "content": json.dumps(
+                    {"text": "Open Trader 每日订单复核\n\n测试正文"},
+                    ensure_ascii=False,
+                ),
+            },
+            "headers": {"Authorization": "Bearer tenant-token"},
+            "timeout": 3.0,
+        },
+    ]
+
+
+def test_feishu_app_notifier_raises_on_token_error() -> None:
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        return {"code": 999, "msg": "bad app"}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_test",
+        app_secret="secret",
+        receive_id_type="email",
+        receive_id="ray@example.com",
+        post_json=fake_post,
+    )
+
+    with pytest.raises(NotificationError, match="Feishu token error 999"):
+        notifier.notify("Open Trader", "hello")
+
+
 def test_composite_notifier_continues_after_child_failure() -> None:
     events: list[str] = []
 
@@ -246,21 +324,21 @@ def test_render_feishu_order_review_includes_precise_ready_fields(tmp_path: Path
         report_paths=[Path("reports/trade_actions/2026-06-17.md")],
     )
 
-    assert "Open Trader 2026-06-17: success" in body
-    assert "US.RKLB | high | ADD" in body
-    assert "Current price: 109" in body
-    assert "Current quantity: 120" in body
-    assert "Current weight: 1.36%" in body
-    assert "Current average cost: 101.20" in body
-    assert "Trigger price: 102" in body
-    assert "This order: ADD 80 shares" in body
-    assert "Estimated notional: USD 8720" in body
-    assert "Post-trade quantity: 200" in body
-    assert "Post-trade weight: 2.20%" in body
-    assert "Post-trade average cost: 104.32" in body
-    assert "Hard stop: 94" in body
-    assert "Risk to stop: USD 3000" in body
-    assert "Reason: price entered entry zone" in body
+    assert "Open Trader 2026-06-17：成功" in body
+    assert "US.RKLB | 高 | 加仓" in body
+    assert "当前价：109" in body
+    assert "当前数量：120" in body
+    assert "当前仓位：1.36%" in body
+    assert "当前成本：101.20" in body
+    assert "触发价：102" in body
+    assert "本次指令：加仓 80 股" in body
+    assert "预计金额：USD 8720" in body
+    assert "交易后数量：200" in body
+    assert "交易后仓位：2.20%" in body
+    assert "交易后成本：104.32" in body
+    assert "硬止损：94" in body
+    assert "止损风险：USD 3000" in body
+    assert "原因：price entered entry zone" in body
 
 
 def test_render_feishu_order_review_marks_missing_post_trade_fields_review(
@@ -307,12 +385,11 @@ def test_render_feishu_order_review_marks_missing_post_trade_fields_review(
         report_paths=[],
     )
 
-    assert "Ready: 0" in body
-    assert "Review: 1" in body
-    assert "US.MSFT | high | REVIEW" in body
+    assert "可执行：0" in body
+    assert "需复核：1" in body
+    assert "US.MSFT | 高 | 人工复核" in body
     assert (
-        "Missing before action: avg_cost_price, post_trade_quantity, "
-        "post_trade_weight, post_trade_avg_cost, risk_to_stop"
+        "执行前缺少：当前成本、交易后数量、交易后仓位、交易后成本、止损风险"
     ) in body
 
 
@@ -354,12 +431,12 @@ def test_render_feishu_order_review_keeps_ready_sell_stop_with_blank_limit_price
         report_paths=[],
     )
 
-    assert "US.MSFT | critical | SELL_STOP" in body
-    assert "Trigger price: 339" in body
-    assert "Current price: 339" in body
-    assert "Hard stop: 340" in body
-    assert "Risk to stop: full exit" in body
-    assert "Missing before action" not in body
+    assert "US.MSFT | 最高 | 止损卖出" in body
+    assert "触发价：339" in body
+    assert "当前价：339" in body
+    assert "硬止损：340" in body
+    assert "止损风险：全部退出" in body
+    assert "执行前缺少" not in body
 
 
 def test_render_feishu_order_review_truncates_ready_rows_and_includes_reports(
@@ -388,13 +465,13 @@ def test_render_feishu_order_review_truncates_ready_rows_and_includes_reports(
         max_ready_sections=2,
     )
 
-    assert "Ready: 3" in body
-    assert "Review: 1" in body
-    assert "Watch: 1" in body
-    assert "US.AAA | high | BUY" in body
-    assert "US.BBB | medium | BUY" in body
-    assert "US.CCC | low | BUY" not in body
-    assert "1 additional ready action(s) in report." in body
+    assert "可执行：3" in body
+    assert "需复核：1" in body
+    assert "观察中：1" in body
+    assert "US.AAA | 高 | 买入" in body
+    assert "US.BBB | 中 | 买入" in body
+    assert "US.CCC | 低 | 买入" not in body
+    assert "另有 1 条可执行动作见报告。" in body
     assert "reports/trade_actions/2026-06-17.md" in body
     assert "data/runs/2026-06-17/trade_actions.csv" in body
 
