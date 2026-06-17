@@ -194,6 +194,26 @@ def test_daily_runner_defaults_to_generate_trade_actions(tmp_path: Path) -> None
     assert runner.trade_action_generator is daily_premarket.generate_trade_actions
 
 
+def test_snapshots_from_futu_status_ignores_nonfinite_last_prices() -> None:
+    snapshots = daily_premarket._snapshots_from_futu_status(
+        {
+            "items": [
+                {"futu_symbol": "US.MSFT", "last_price": "399"},
+                {"futu_symbol": "US.NAN", "last_price": "NaN"},
+                {"futu_symbol": "US.INF", "last_price": "Infinity"},
+                {"futu_symbol": "US.NEGINF", "last_price": "-Infinity"},
+            ]
+        }
+    )
+
+    assert snapshots == {
+        "US.MSFT": QuoteSnapshot(
+            futu_symbol="US.MSFT",
+            last_price=Decimal("399"),
+        )
+    }
+
+
 def test_load_env_config_rejects_missing_required_values(tmp_path: Path) -> None:
     env = tmp_path / "daily.env"
     env.write_text("OPEN_TRADER_REPO=/tmp/open_trader\n", encoding="utf-8")

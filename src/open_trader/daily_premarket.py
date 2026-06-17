@@ -982,6 +982,8 @@ def _snapshots_from_futu_status(
             last_price = Decimal(last_price_text)
         except Exception:
             continue
+        if not last_price.is_finite():
+            continue
         snapshots[futu_symbol] = QuoteSnapshot(
             futu_symbol=futu_symbol,
             last_price=last_price,
