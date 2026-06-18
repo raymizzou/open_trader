@@ -344,12 +344,21 @@ def _base_plan_row(
 
 def _parse_template(text: str) -> dict[str, str]:
     sections: dict[str, str] = {}
+    known_keys = {"评级", "操作计划", "风控", "仓位", "催化剂", "目标价", "时间窗口", "理由"}
     for line in text.splitlines():
-        if "：" not in line:
+        full_width_index = line.find("：")
+        ascii_index = line.find(":")
+        if full_width_index == -1 and ascii_index == -1:
             continue
-        key, value = line.split("：", 1)
+        if full_width_index == -1:
+            separator = ":"
+        elif ascii_index == -1:
+            separator = "："
+        else:
+            separator = "：" if full_width_index < ascii_index else ":"
+        key, value = line.split(separator, 1)
         key = key.strip()
-        if key in {"评级", "操作计划", "风控", "仓位", "催化剂", "目标价", "时间窗口", "理由"}:
+        if key in known_keys:
             sections[key] = value.strip()
     return sections
 

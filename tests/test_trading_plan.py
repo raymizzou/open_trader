@@ -81,6 +81,21 @@ def mrvl_underweight_summary() -> str:
     )
 
 
+def msft_advice_summary_ascii_colons() -> str:
+    return "\n".join(
+        [
+            "评级: Overweight",
+            "操作计划: 在380-400美元区间分3-4次买入目标仓位的60%，350美元附近加仓剩余40%。",
+            "风控: 统一停损线设在340美元。",
+            "仓位: 总仓位控制在投资组合的8%-12%。",
+            "催化剂: 10月底财报为关键催化剂。",
+            "目标价: 450 / 500",
+            "时间窗口: 3-6个月",
+            "理由: 微软AI商业化路径清晰。",
+        ]
+    )
+
+
 def test_build_trading_plan_extracts_structured_prices_and_writes_latest(
     tmp_path: Path,
 ) -> None:
@@ -351,6 +366,39 @@ def test_build_trading_plan_extracts_agent_reason_and_excerpt(tmp_path: Path) ->
         "The bear demonstrated that normalized earnings imply a ~316x P/E"
     )
     assert "目标价：200.0" not in rows[0]["agent_reason"]
+
+
+def test_build_trading_plan_accepts_ascii_section_separators(tmp_path: Path) -> None:
+    advice_path = tmp_path / "advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-18",
+                "symbol": "MSFT",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "1.13%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Overweight",
+                "advice_summary": msft_advice_summary_ascii_colons(),
+                "raw_decision": "{}",
+                "status": "ok",
+                "error": "",
+            }
+        ],
+    )
+
+    result = build_trading_plan(advice_path, tmp_path / "data")
+    rows = list(csv.DictReader(result.plan_path.open(encoding="utf-8")))
+
+    assert rows[0]["status"] == "active"
+    assert rows[0]["rating"] == "Overweight"
+    assert rows[0]["target_1"] == "450"
+    assert rows[0]["target_2"] == "500"
+    assert rows[0]["agent_reason"] == "微软AI商业化路径清晰。"
+    assert rows[0]["agent_excerpt"] == "微软AI商业化路径清晰。"
 
 
 def test_load_trading_plan_rows_reads_active_rows(tmp_path: Path) -> None:
