@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import csv
+import json
 import socket
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Callable
 
+from .csv_io import write_rows
+from .fx import StaticMonthEndFxProvider
 from .models import AssetClass, CashBalance, Market, Position
+from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
 
 
 TRD_ENV_REAL = "REAL"
@@ -383,3 +389,240 @@ def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
     if raw_type in {"OPTION", "WARRANT"}:
         return AssetClass.OPTION
     return AssetClass.UNKNOWN
+
+
+@dataclass(frozen=True)
+class FutuPortfolioSyncResult:
+    run_date: str
+    account_count: int
+    position_count: int
+    cash_count: int
+    merged_row_count: int
+    snapshot_path: Path
+    portfolio_path: Path
+    report_path: Path
+    latest_path: Path
+    updated_latest: bool
+
+
+def sync_futu_portfolio(
+    *,
+    snapshot: FutuAccountSnapshot,
+    portfolio_path: Path,
+    data_dir: Path,
+    reports_dir: Path,
+    run_date: str,
+    update_latest: bool,
+) -> FutuPortfolioSyncResult:
+    existing_rows = _read_portfolio_rows(portfolio_path)
+    _raise_for_mixed_futu_broker_rows(existing_rows)
+    fx_provider = _fx_provider_from_existing_rows(run_date, existing_rows)
+    preserved_rows = [row for row in existing_rows if not _has_futu_broker(row)]
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date=run_date,
+    )
+    if update_latest and blocking_errors:
+        raise FutuAccountError(
+            "; ".join(blocking_errors),
+            error_type="blocking_data_error",
+        )
+    futu_rows = build_portfolio_rows(
+        run_date[:7],
+        positions,
+        cash_balances,
+        fx_provider,
+    )
+    merged_rows = _recalculate_combined_portfolio_rows([*preserved_rows, *futu_rows])
+    run_dir = data_dir / "runs" / run_date
+    run_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = run_dir / "futu_account_snapshot.json"
+    merged_portfolio_path = run_dir / "portfolio.csv"
+    report_path = run_dir / "futu_account_report.md"
+    snapshot_path.write_text(
+        json.dumps(_snapshot_to_json(snapshot), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    write_rows(merged_portfolio_path, PORTFOLIO_FIELDNAMES, merged_rows)
+    report_path.write_text(
+        _render_futu_account_report(
+            account_count=len(snapshot.accounts),
+            position_count=len(positions),
+            cash_count=len(cash_balances),
+            blocking_errors=blocking_errors,
+            updated_latest=update_latest and not blocking_errors,
+        ),
+        encoding="utf-8",
+    )
+    latest_path = data_dir / "latest" / "portfolio.csv"
+    updated_latest = False
+    if update_latest and not blocking_errors:
+        write_rows(latest_path, PORTFOLIO_FIELDNAMES, merged_rows)
+        updated_latest = True
+    return FutuPortfolioSyncResult(
+        run_date=run_date,
+        account_count=len(snapshot.accounts),
+        position_count=len(positions),
+        cash_count=len(cash_balances),
+        merged_row_count=len(merged_rows),
+        snapshot_path=snapshot_path,
+        portfolio_path=merged_portfolio_path,
+        report_path=report_path,
+        latest_path=latest_path,
+        updated_latest=updated_latest,
+    )
+
+
+def _read_portfolio_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _has_futu_broker(row: dict[str, str]) -> bool:
+    return "futu" in _broker_parts(row)
+
+
+def _broker_parts(row: dict[str, str]) -> set[str]:
+    brokers = row.get("brokers", "")
+    return {
+        part.strip().lower()
+        for chunk in brokers.split(",")
+        for part in chunk.split(";")
+        if part.strip()
+    }
+
+
+def _raise_for_mixed_futu_broker_rows(rows: list[dict[str, str]]) -> None:
+    for row in rows:
+        parts = _broker_parts(row)
+        if "futu" in parts and len(parts) > 1:
+            symbol = row.get("symbol", "")
+            brokers = row.get("brokers", "")
+            raise FutuAccountError(
+                f"portfolio row {symbol} mixes Futu with other brokers: {brokers}",
+                error_type="mixed_futu_broker_row",
+            )
+
+
+def _fx_provider_from_existing_rows(
+    run_date: str,
+    rows: list[dict[str, str]],
+) -> StaticMonthEndFxProvider:
+    rates: dict[str, Decimal] = {}
+    for row in rows:
+        currency = row.get("currency", "").strip().upper()
+        rate_text = row.get("fx_to_hkd", "").strip()
+        if not currency or currency == "HKD" or not rate_text:
+            continue
+        try:
+            rate = Decimal(rate_text)
+        except (InvalidOperation, ValueError):
+            continue
+        if rate.is_finite() and rate > 0:
+            rates[currency] = rate
+    return StaticMonthEndFxProvider(run_date[:7], rates)
+
+
+def _recalculate_combined_portfolio_rows(
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    normalized_rows = [
+        {field: str(row.get(field, "")) for field in PORTFOLIO_FIELDNAMES}
+        for row in rows
+    ]
+    values: list[Decimal] = []
+    has_missing_value = False
+    for row in normalized_rows:
+        value_text = row.get("market_value_hkd", "").strip()
+        if not value_text:
+            has_missing_value = True
+            continue
+        try:
+            value = Decimal(value_text)
+        except (InvalidOperation, ValueError):
+            has_missing_value = True
+            continue
+        if not value.is_finite():
+            has_missing_value = True
+            continue
+        values.append(value)
+    total = sum(values, Decimal("0"))
+    for row in normalized_rows:
+        if has_missing_value:
+            row["portfolio_weight_hkd"] = ""
+            row["risk_flag"] = "data_check"
+            continue
+        market_value_hkd = Decimal(row["market_value_hkd"] or "0")
+        weight = market_value_hkd / total if total else Decimal("0")
+        row["portfolio_weight_hkd"] = pct(weight)
+        if (
+            row["risk_flag"] != "data_check"
+            and row["asset_class"] not in {"cash", "money_market_fund"}
+            and weight > Decimal("0.10")
+        ):
+            row["risk_flag"] = "overweight"
+    return sorted(
+        normalized_rows,
+        key=lambda row: (
+            int(row.get("sort_group") or "9"),
+            -Decimal(row.get("market_value_hkd") or "0"),
+        ),
+    )
+
+
+def _snapshot_to_json(snapshot: FutuAccountSnapshot) -> dict[str, object]:
+    return {
+        "accounts": [
+            {
+                "acc_id": account.acc_id,
+                "acc_index": account.acc_index,
+                "trd_env": account.trd_env,
+                "acc_type": account.acc_type,
+                "account_alias": account.account_alias,
+            }
+            for account in snapshot.accounts
+        ],
+        "cash_records": [_json_safe_record(record) for record in snapshot.cash_records],
+        "position_records": [
+            _json_safe_record(record) for record in snapshot.position_records
+        ],
+    }
+
+
+def _json_safe_record(record: dict[str, object]) -> dict[str, object]:
+    output: dict[str, object] = {}
+    for key, value in record.items():
+        if isinstance(value, Decimal):
+            output[key] = str(value)
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            output[key] = value
+        else:
+            output[key] = str(value)
+    return output
+
+
+def _render_futu_account_report(
+    *,
+    account_count: int,
+    position_count: int,
+    cash_count: int,
+    blocking_errors: list[str],
+    updated_latest: bool,
+) -> str:
+    latest_text = "已更新 latest" if updated_latest else "未更新 latest"
+    lines = [
+        "# 富途账户同步",
+        "",
+        f"- 真实账户：{account_count}",
+        f"- 富途持仓：{position_count}",
+        f"- 现金币种：{cash_count}",
+        f"- latest 状态：{latest_text}",
+    ]
+    if blocking_errors:
+        lines.append("- 数据检查：需要复核")
+        for error in blocking_errors:
+            lines.append(f"- 问题：{error}")
+    else:
+        lines.append("- 数据检查：通过")
+    return "\n".join(lines) + "\n"
