@@ -17,6 +17,8 @@ from .daily_premarket import (
     load_env_config,
     send_notification_with_results,
 )
+from .dashboard import DashboardConfig
+from .dashboard_web import serve_dashboard
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
@@ -402,6 +404,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write dated output and report but do not update latest trade actions",
     )
 
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="Serve the realtime portfolio dashboard",
+    )
+    dashboard_parser.add_argument("--host", default="127.0.0.1")
+    dashboard_parser.add_argument("--port", type=positive_int, default=8765)
+    dashboard_parser.add_argument(
+        "--portfolio",
+        type=Path,
+        default=Path("data/latest/portfolio.csv"),
+    )
+    dashboard_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    dashboard_parser.add_argument("--reports-dir", type=Path, default=Path("reports"))
+    dashboard_parser.add_argument(
+        "--poll-seconds",
+        type=positive_float,
+        default=5.0,
+    )
+    dashboard_parser.add_argument("--futu-host", default="127.0.0.1")
+    dashboard_parser.add_argument("--futu-port", type=positive_int, default=11111)
+
     return parser
 
 
@@ -702,6 +725,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"trade_actions_csv: {result.actions_path}")
         print(f"report: {result.report_path}")
         print(f"latest: {result.latest_path}")
+        return 0
+
+    if args.command == "dashboard":
+        config = DashboardConfig(
+            portfolio_path=args.portfolio,
+            data_dir=args.data_dir,
+            reports_dir=args.reports_dir,
+            poll_seconds=args.poll_seconds,
+            futu_host=args.futu_host,
+            futu_port=args.futu_port,
+        )
+        serve_dashboard(config, host=args.host, port=args.port)
         return 0
 
     parser.error(f"unknown command: {args.command}")
