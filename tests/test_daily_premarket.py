@@ -786,6 +786,32 @@ def test_daily_config_deadline_for_market_uses_hk_and_us_defaults(
     assert daily_premarket._deadline_for_market(config, "US") == "21:10"
 
 
+def test_daily_config_for_hk_uses_shanghai_timezone(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="UTC",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+    )
+
+    hk_config = daily_premarket._config_for_market(config, "HK")
+    us_config = daily_premarket._config_for_market(config, "US")
+
+    assert hk_config.timezone == "Asia/Shanghai"
+    assert hk_config.deadline == "09:00"
+    assert daily_premarket._deadline_at(hk_config, "2026-06-19").isoformat() == (
+        "2026-06-19T09:00:00+08:00"
+    )
+    assert us_config.timezone == "UTC"
+    assert us_config.deadline == "21:10"
+
+
 def test_daily_runner_hk_uses_market_scoped_paths_and_calls_market_filter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

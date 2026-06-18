@@ -1030,6 +1030,8 @@ def _config_for_market(
     market: str,
 ) -> DailyPremarketConfig:
     scope = parse_market_scope(market)
+    if scope is MarketScope.HK:
+        return replace(config, timezone="Asia/Shanghai", deadline="09:00")
     return replace(config, deadline=_deadline_for_market(config, scope.value))
 
 
