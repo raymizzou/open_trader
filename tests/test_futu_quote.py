@@ -45,6 +45,66 @@ class FakeFailingContext(FakeOpenQuoteContext):
         return -1, "OpenD connection failed"
 
 
+class FakeInterruptedContext(FakeOpenQuoteContext):
+    def get_market_snapshot(self, symbols: list[str]) -> tuple[int, object]:
+        return -1, "网络中断"
+
+
+def test_futu_quote_error_preserves_diagnostic_metadata() -> None:
+    error = FutuQuoteError(
+        "网络中断",
+        error_type="quote_server_interrupted",
+        next_step="请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。",
+        opend_reachable=True,
+        context_ok=True,
+        snapshot_ok=False,
+    )
+
+    assert str(error) == "网络中断"
+    assert error.error_type == "quote_server_interrupted"
+    assert error.next_step == "请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。"
+    assert error.opend_reachable is True
+    assert error.context_ok is True
+    assert error.snapshot_ok is False
+
+
+def test_futu_quote_client_classifies_unreachable_opend() -> None:
+    with pytest.raises(FutuQuoteError) as exc_info:
+        FutuQuoteClient(
+            host="127.0.0.1",
+            port=11111,
+            context_factory=FakeOpenQuoteContext,
+            connectivity_checker=lambda host, port: False,
+        )
+
+    error = exc_info.value
+    assert error.error_type == "opend_unreachable"
+    assert error.opend_reachable is False
+    assert error.context_ok is False
+    assert error.snapshot_ok is False
+    assert "请启动或重启 Futu OpenD" in error.next_step
+
+
+def test_futu_quote_client_classifies_quote_server_interruption() -> None:
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=FakeInterruptedContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    with pytest.raises(FutuQuoteError) as exc_info:
+        client.get_snapshots(["US.VIXY"])
+
+    error = exc_info.value
+    assert str(error) == "网络中断"
+    assert error.error_type == "quote_server_interrupted"
+    assert error.opend_reachable is True
+    assert error.context_ok is True
+    assert error.snapshot_ok is False
+    assert "qot_logined=True" in error.next_step
+
+
 def test_futu_quote_client_returns_normalized_snapshots() -> None:
     client = FutuQuoteClient(
         host="127.0.0.1",
@@ -105,3 +165,5 @@ def test_futu_quote_client_fails_fast_when_opend_port_is_not_reachable() -> None
 
     assert called is False
     assert "Futu OpenD is not reachable at 127.0.0.1:11111" in str(exc_info.value)
+    assert exc_info.value.error_type == "opend_unreachable"
+    assert exc_info.value.opend_reachable is False

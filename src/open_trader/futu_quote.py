@@ -8,8 +8,37 @@ from typing import Any
 from .futu_watch import QuoteSnapshot
 
 
+OPEND_UNREACHABLE_NEXT_STEP = (
+    "请启动或重启 Futu OpenD，确认已登录，并检查配置的 host/port 后重新运行每日盘前流程。"
+)
+CONTEXT_FAILED_NEXT_STEP = (
+    "请确认 futu-api 可用、OpenD 已启动且登录正常，然后重新运行每日盘前流程。"
+)
+QUOTE_INTERRUPTED_NEXT_STEP = (
+    "请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。"
+)
+SNAPSHOT_FAILED_NEXT_STEP = (
+    "请检查 OpenD 行情服务状态和网络连接，然后重新运行每日盘前流程。"
+)
+
+
 class FutuQuoteError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str = "snapshot_failed",
+        next_step: str = SNAPSHOT_FAILED_NEXT_STEP,
+        opend_reachable: bool | None = None,
+        context_ok: bool | None = None,
+        snapshot_ok: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.next_step = next_step
+        self.opend_reachable = opend_reachable
+        self.context_ok = context_ok
+        self.snapshot_ok = snapshot_ok
 
 
 def _default_context_factory(*, host: str, port: int) -> Any:
@@ -18,7 +47,12 @@ def _default_context_factory(*, host: str, port: int) -> Any:
     except ImportError as exc:
         raise FutuQuoteError(
             "futu-api is not installed. Install it with: "
-            ".venv/bin/python -m pip install futu-api"
+            ".venv/bin/python -m pip install futu-api",
+            error_type="context_failed",
+            next_step="请在当前虚拟环境安装 futu-api 后重新运行每日盘前流程。",
+            opend_reachable=None,
+            context_ok=False,
+            snapshot_ok=False,
         ) from exc
     return OpenQuoteContext(host=host, port=port)
 
@@ -43,7 +77,12 @@ class FutuQuoteClient:
         if not connectivity_checker(host, port):
             raise FutuQuoteError(
                 f"Futu OpenD is not reachable at {host}:{port}. "
-                "Start OpenD, log in, and check the configured host and port."
+                "Start OpenD, log in, and check the configured host and port.",
+                error_type="opend_unreachable",
+                next_step=OPEND_UNREACHABLE_NEXT_STEP,
+                opend_reachable=False,
+                context_ok=False,
+                snapshot_ok=False,
             )
         try:
             self.context = context_factory(host=host, port=port)
@@ -51,7 +90,12 @@ class FutuQuoteClient:
             raise
         except Exception as exc:
             raise FutuQuoteError(
-                f"failed to connect to Futu OpenD at {host}:{port}: {exc}"
+                f"failed to connect to Futu OpenD at {host}:{port}: {exc}",
+                error_type="context_failed",
+                next_step=CONTEXT_FAILED_NEXT_STEP,
+                opend_reachable=True,
+                context_ok=False,
+                snapshot_ok=False,
             ) from exc
         self.host = host
         self.port = port
@@ -59,7 +103,24 @@ class FutuQuoteClient:
     def get_snapshots(self, futu_symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
         ret_code, data = self.context.get_market_snapshot(list(futu_symbols))
         if ret_code != 0:
-            raise FutuQuoteError(str(data))
+            message = str(data)
+            if "网络中断" in message:
+                raise FutuQuoteError(
+                    message,
+                    error_type="quote_server_interrupted",
+                    next_step=QUOTE_INTERRUPTED_NEXT_STEP,
+                    opend_reachable=True,
+                    context_ok=True,
+                    snapshot_ok=False,
+                )
+            raise FutuQuoteError(
+                message,
+                error_type="snapshot_failed",
+                next_step=SNAPSHOT_FAILED_NEXT_STEP,
+                opend_reachable=True,
+                context_ok=True,
+                snapshot_ok=False,
+            )
         snapshots: dict[str, QuoteSnapshot] = {}
         for record in data.to_dict("records"):
             code = str(record.get("code", "")).strip()
