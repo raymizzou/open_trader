@@ -7,6 +7,7 @@ import urllib.request
 from typing import Any
 
 from open_trader.dashboard_quotes import QuoteRefreshResult
+from open_trader.dashboard_web import STATIC_DIR
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 
 from tests.test_dashboard import dashboard_config, portfolio_rows, write_csv
@@ -74,6 +75,19 @@ def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
             json.loads(payload.decode("utf-8")),
         )
     raise AssertionError("expected HTTPError")
+
+
+def test_dashboard_static_assets_include_local_shell() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+
+    assert "Open Trader" in html
+    assert "持仓实时看板" in html
+    assert "刷新行情" in html
+    assert "缺行情" in js
+    assert "数据已过期" in js
+    assert ".dashboard-shell" in css
 
 
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
