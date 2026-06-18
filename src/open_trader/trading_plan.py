@@ -34,6 +34,8 @@ TRADING_PLAN_FIELDNAMES = [
     "catalyst",
     "time_horizon",
     "plan_text",
+    "agent_reason",
+    "agent_excerpt",
     "status",
     "error",
 ]
@@ -76,6 +78,8 @@ class TradingPlanRow:
     catalyst: str
     time_horizon: str
     plan_text: str
+    agent_reason: str
+    agent_excerpt: str
     status: str
     error: str
 
@@ -152,7 +156,13 @@ def load_trading_plan_rows(plan_path: Path) -> list[TradingPlanRow]:
     with plan_path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fieldnames = reader.fieldnames or []
-        optional = {"source_status", "fallback_reason", "fallback_from_date"}
+        optional = {
+            "source_status",
+            "fallback_reason",
+            "fallback_from_date",
+            "agent_reason",
+            "agent_excerpt",
+        }
         missing = sorted(set(TRADING_PLAN_FIELDNAMES) - optional - set(fieldnames))
         if missing:
             raise ValueError(f"missing trading plan column(s): {', '.join(missing)}")
@@ -253,6 +263,10 @@ def _plan_row_from_advice(row: dict[str, str], fallback_run_date: str) -> dict[s
 
     entry_low, entry_high = _extract_entry_zone(sections.get("操作计划", ""))
     target_1, target_2 = _extract_targets(sections.get("目标价", ""))
+    agent_reason, agent_excerpt = _agent_reason_and_excerpt(
+        sections,
+        advice_action=row.get("advice_action", "").strip(),
+    )
     row_values = _base_plan_row(
         run_date=run_date,
         symbol=symbol,
@@ -271,6 +285,8 @@ def _plan_row_from_advice(row: dict[str, str], fallback_run_date: str) -> dict[s
         catalyst=sections.get("催化剂", ""),
         time_horizon=sections.get("时间窗口", ""),
         plan_text=row.get("advice_summary", "").strip(),
+        agent_reason=agent_reason,
+        agent_excerpt=agent_excerpt,
         status="active",
         error="",
     )
@@ -296,6 +312,8 @@ def _base_plan_row(
     catalyst: str = "",
     time_horizon: str = "",
     plan_text: str = "",
+    agent_reason: str = "",
+    agent_excerpt: str = "",
     status: str,
     error: str,
 ) -> dict[str, str]:
@@ -317,6 +335,8 @@ def _base_plan_row(
         "catalyst": catalyst,
         "time_horizon": time_horizon,
         "plan_text": plan_text,
+        "agent_reason": agent_reason,
+        "agent_excerpt": agent_excerpt,
         "status": status,
         "error": error,
     }
@@ -332,6 +352,53 @@ def _parse_template(text: str) -> dict[str, str]:
         if key in {"评级", "操作计划", "风控", "仓位", "催化剂", "目标价", "时间窗口", "理由"}:
             sections[key] = value.strip()
     return sections
+
+
+def _agent_reason_and_excerpt(
+    sections: dict[str, str],
+    *,
+    advice_action: str,
+) -> tuple[str, str]:
+    source = (
+        sections.get("理由", "").strip()
+        or sections.get("操作计划", "").strip()
+        or " ".join(value.strip() for value in sections.values() if value.strip())
+    )
+    excerpt = _excerpt_text(source)
+    if not excerpt:
+        return "", ""
+    if _contains_cjk(excerpt):
+        return excerpt, excerpt
+    action = advice_action.strip()
+    if action:
+        return f"TradingAgents建议{_action_reason_label(action)}，原文依据：{excerpt}", excerpt
+    return f"TradingAgents原文依据：{excerpt}", excerpt
+
+
+def _excerpt_text(text: str, *, max_chars: int = 220) -> str:
+    normalized = " ".join(text.strip().split())
+    if not normalized:
+        return ""
+    sentence_parts = re.split(r"(?<=[。.!?])\s+", normalized)
+    selected = sentence_parts[0].strip() if sentence_parts else normalized
+    if len(selected) <= max_chars:
+        return selected
+    return selected[: max_chars - 1].rstrip() + "..."
+
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def _action_reason_label(action: str) -> str:
+    normalized = action.strip().lower()
+    if any(word in normalized for word in ("underweight", "sell", "reduce", "trim")):
+        return "减仓"
+    if any(word in normalized for word in ("overweight", "buy", "accumulate", "add")):
+        return "买入或加仓"
+    if "hold" in normalized:
+        return "继续持有"
+    return action.strip()
 
 
 def _extract_entry_zone(text: str) -> tuple[Decimal | None, Decimal | None]:
@@ -414,6 +481,8 @@ def _trading_plan_from_row(row: Mapping[str, str]) -> TradingPlanRow:
         catalyst=row.get("catalyst", "").strip(),
         time_horizon=row.get("time_horizon", "").strip(),
         plan_text=row.get("plan_text", "").strip(),
+        agent_reason=row.get("agent_reason", "").strip(),
+        agent_excerpt=row.get("agent_excerpt", "").strip(),
         status=row.get("status", "").strip(),
         error=row.get("error", "").strip(),
     )

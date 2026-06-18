@@ -59,6 +59,28 @@ def msft_advice_summary() -> str:
     )
 
 
+def mrvl_underweight_summary() -> str:
+    return "\n".join(
+        [
+            "评级：Underweight",
+            (
+                "操作计划：Reduce MRVL to approximately half the portfolio's normal "
+                "weighting by selling into the $290-300 zone."
+            ),
+            "风控：Set a hard stop at $244.",
+            "仓位：",
+            "催化剂：Nvidia partnership remains supportive.",
+            "目标价：200.0",
+            "时间窗口：3-6 months",
+            (
+                "理由：The bear demonstrated that normalized earnings imply a "
+                "~316x P/E, while MACD divergence and collapsing volume show "
+                "technical exhaustion."
+            ),
+        ]
+    )
+
+
 def test_build_trading_plan_extracts_structured_prices_and_writes_latest(
     tmp_path: Path,
 ) -> None:
@@ -118,6 +140,8 @@ def test_build_trading_plan_extracts_structured_prices_and_writes_latest(
     assert rows[0]["max_weight"] == "12%"
     assert rows[0]["catalyst"] == "10月底财报为关键催化剂。"
     assert rows[0]["time_horizon"] == "3-6个月"
+    assert rows[0]["agent_reason"] == "微软AI商业化路径清晰。"
+    assert rows[0]["agent_excerpt"] == "微软AI商业化路径清晰。"
     assert rows[0]["status"] == "active"
     assert rows[1]["symbol"] == "BAD"
     assert rows[1]["status"] == "error"
@@ -293,6 +317,42 @@ def test_build_trading_plan_accepts_fallback_advice_and_preserves_source_status(
     assert rows[0]["fallback_from_date"] == "2026-06-16"
 
 
+def test_build_trading_plan_extracts_agent_reason_and_excerpt(tmp_path: Path) -> None:
+    advice_path = tmp_path / "advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-18",
+                "symbol": "MRVL",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "2.0%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": mrvl_underweight_summary(),
+                "raw_decision": "{}",
+                "status": "ok",
+                "error": "",
+            }
+        ],
+    )
+
+    result = build_trading_plan(advice_path, tmp_path / "data")
+    rows = list(csv.DictReader(result.plan_path.open(encoding="utf-8")))
+
+    assert rows[0]["target_1"] == "200"
+    assert rows[0]["agent_reason"].startswith(
+        "TradingAgents建议减仓，原文依据：The bear demonstrated"
+    )
+    assert "normalized earnings imply a ~316x P/E" in rows[0]["agent_reason"]
+    assert rows[0]["agent_excerpt"].startswith(
+        "The bear demonstrated that normalized earnings imply a ~316x P/E"
+    )
+    assert "目标价：200.0" not in rows[0]["agent_reason"]
+
+
 def test_load_trading_plan_rows_reads_active_rows(tmp_path: Path) -> None:
     path = tmp_path / "trading_plan.csv"
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -314,6 +374,8 @@ def test_load_trading_plan_rows_reads_active_rows(tmp_path: Path) -> None:
                 "catalyst": "10月底财报",
                 "time_horizon": "3-6个月",
                 "plan_text": "plan",
+                "agent_reason": "agent reason",
+                "agent_excerpt": "agent excerpt",
                 "status": "active",
                 "error": "",
             }
@@ -338,6 +400,8 @@ def test_load_trading_plan_rows_reads_active_rows(tmp_path: Path) -> None:
             catalyst="10月底财报",
             time_horizon="3-6个月",
             plan_text="plan",
+            agent_reason="agent reason",
+            agent_excerpt="agent excerpt",
             status="active",
             error="",
         )
@@ -351,7 +415,14 @@ def test_load_trading_plan_rows_accepts_legacy_rows_without_source_status(
     legacy_fieldnames = [
         field
         for field in TRADING_PLAN_FIELDNAMES
-        if field not in {"source_status", "fallback_reason", "fallback_from_date"}
+        if field
+        not in {
+            "source_status",
+            "fallback_reason",
+            "fallback_from_date",
+            "agent_reason",
+            "agent_excerpt",
+        }
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=legacy_fieldnames)
@@ -382,6 +453,8 @@ def test_load_trading_plan_rows_accepts_legacy_rows_without_source_status(
     assert rows[0].source_status == "ok"
     assert rows[0].fallback_reason == ""
     assert rows[0].fallback_from_date == ""
+    assert rows[0].agent_reason == ""
+    assert rows[0].agent_excerpt == ""
 
 
 def test_evaluate_plan_quote_classifies_current_price() -> None:
@@ -403,6 +476,8 @@ def test_evaluate_plan_quote_classifies_current_price() -> None:
         catalyst="10月底财报",
         time_horizon="3-6个月",
         plan_text="plan",
+        agent_reason="",
+        agent_excerpt="",
         status="active",
         error="",
     )

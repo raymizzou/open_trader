@@ -99,6 +99,8 @@ def test_check_futu_plan_main_reports_plan_statuses(
         catalyst="10月底财报",
         time_horizon="3-6个月",
         plan_text="plan",
+        agent_reason="",
+        agent_excerpt="",
         status="active",
         error="",
     )
