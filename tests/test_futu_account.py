@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from open_trader.futu_account import (
     FutuAccountClient,
     FutuAccountError,
+    map_snapshot_to_portfolio_inputs,
 )
+from open_trader.models import AssetClass, Market
 
 
 class FakeDataFrame:
@@ -251,3 +255,132 @@ def test_futu_account_client_close_closes_context() -> None:
     client.close()
 
     assert client.context.closed is True
+
+
+def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:
+    client = FutuAccountClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=FakeSecTradeContext,
+        connectivity_checker=lambda host, port: True,
+    )
+    snapshot = client.fetch_snapshot()
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-18",
+    )
+
+    assert blocking_errors == []
+    assert len(positions) == 1
+    position = positions[0]
+    assert position.statement_id == "2026-06-18-futu-live"
+    assert position.broker == "futu"
+    assert position.account_alias == "futu_111"
+    assert position.market == Market.US
+    assert position.asset_class == AssetClass.STOCK
+    assert position.symbol == "MSFT"
+    assert position.name == "Microsoft"
+    assert position.currency == "USD"
+    assert position.quantity == Decimal("2")
+    assert position.cost_price == Decimal("300")
+    assert position.last_price == Decimal("410")
+    assert position.market_value == Decimal("820")
+    assert position.cost_value == Decimal("600")
+    assert position.unrealized_pnl == Decimal("220")
+    assert position.confidence == "high"
+    assert "Futu live account" in position.notes
+
+    assert len(cash_balances) == 1
+    cash = cash_balances[0]
+    assert cash.statement_id == "2026-06-18-futu-live"
+    assert cash.broker == "futu"
+    assert cash.account_alias == "futu_111"
+    assert cash.currency == "USD"
+    assert cash.cash_balance == Decimal("100.25")
+    assert cash.available_balance == Decimal("88.50")
+    assert cash.confidence == "high"
+
+
+def test_map_snapshot_marks_malformed_required_position_fields_low_confidence() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "USD",
+                "cash": "100",
+                "available_cash": "100",
+            }
+        ],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "US.BROKEN",
+                "stock_name": "Broken",
+                "qty": "not-a-number",
+                "market_val": "100",
+                "currency": "USD",
+                "stock_type": "STOCK",
+            }
+        ],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-18",
+    )
+
+    assert cash_balances[0].cash_balance == Decimal("100")
+    assert len(positions) == 1
+    assert positions[0].symbol == "BROKEN"
+    assert positions[0].quantity == Decimal("0")
+    assert positions[0].market_value is None
+    assert positions[0].confidence == "low"
+    assert blocking_errors == [
+        "position US.BROKEN has invalid required field qty='not-a-number'"
+    ]
+
+
+def test_map_snapshot_accepts_empty_positions() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "HKD",
+                "cash": "5000",
+                "available_cash": "4500",
+            }
+        ],
+        position_records=[],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-18",
+    )
+
+    assert positions == []
+    assert cash_balances[0].symbol == "HKD_CASH"
+    assert blocking_errors == []
+
+
+def client_snapshot_from_records(
+    *,
+    cash_records: list[dict[str, object]],
+    position_records: list[dict[str, object]],
+) -> object:
+    from open_trader.futu_account import FutuAccount, FutuAccountSnapshot
+
+    return FutuAccountSnapshot(
+        accounts=[
+            FutuAccount(
+                acc_id=111,
+                acc_index=0,
+                trd_env="REAL",
+                acc_type="CASH",
+                account_alias="futu_111",
+            )
+        ],
+        cash_records=cash_records,
+        position_records=position_records,
+    )

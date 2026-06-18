@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import socket
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
+
+from .models import AssetClass, CashBalance, Market, Position
 
 
 TRD_ENV_REAL = "REAL"
@@ -182,3 +185,178 @@ class FutuAccountClient:
 
     def close(self) -> None:
         self.context.close()
+
+
+def map_snapshot_to_portfolio_inputs(
+    snapshot: FutuAccountSnapshot,
+    *,
+    run_date: str,
+) -> tuple[list[Position], list[CashBalance], list[str]]:
+    statement_id = f"{run_date}-futu-live"
+    blocking_errors: list[str] = []
+    positions = [
+        _position_from_record(record, statement_id, blocking_errors)
+        for record in snapshot.position_records
+    ]
+    cash_balances = [
+        _cash_from_record(record, statement_id, blocking_errors)
+        for record in snapshot.cash_records
+    ]
+    return positions, cash_balances, blocking_errors
+
+
+def _position_from_record(
+    record: dict[str, object],
+    statement_id: str,
+    blocking_errors: list[str],
+) -> Position:
+    code = _first_text(record, ("code", "stock_code", "symbol")).upper()
+    market = _market_from_code(code)
+    symbol = _symbol_from_code(code)
+    quantity, quantity_ok = _required_decimal(
+        record, ("qty", "quantity", "position_qty"), "qty", code
+    )
+    last_price = _optional_decimal(record, ("nominal_price", "last_price", "price"))
+    market_value = _optional_decimal(record, ("market_val", "market_value", "market_vale"))
+    cost_price = _optional_decimal(record, ("cost_price", "average_cost"))
+    raw_cost_value = _optional_decimal(record, ("cost_value", "cost_val"))
+    cost_value = raw_cost_value
+    if cost_value is None and cost_price is not None and quantity_ok:
+        cost_value = cost_price * quantity
+    unrealized_pnl = _optional_decimal(record, ("pl_val", "unrealized_pnl", "pl_value"))
+    currency = _first_text(
+        record, ("currency", "currency_type"), _default_currency_for_market(market)
+    ).upper()
+    name = _first_text(record, ("stock_name", "name", "security_name"), symbol)
+    if not quantity_ok:
+        value = record.get("qty", record.get("quantity", record.get("position_qty")))
+        blocking_errors.append(
+            f"position {code or symbol} has invalid required field qty={value!r}"
+        )
+        market_value = None
+        cost_value = None
+        unrealized_pnl = None
+    confidence = "high" if quantity_ok and market_value is not None else "low"
+    return Position(
+        statement_id=statement_id,
+        broker="futu",
+        account_alias=_first_text(record, ("_account_alias",), "futu_unknown"),
+        market=market,
+        asset_class=_asset_class_from_record(record),
+        symbol=symbol,
+        name=name,
+        currency=currency,
+        quantity=quantity,
+        cost_price=cost_price,
+        last_price=last_price,
+        market_value=market_value,
+        cost_value=cost_value,
+        unrealized_pnl=unrealized_pnl,
+        confidence=confidence,
+        notes="Futu live account position",
+    )
+
+
+def _cash_from_record(
+    record: dict[str, object],
+    statement_id: str,
+    blocking_errors: list[str],
+) -> CashBalance:
+    currency = _first_text(record, ("currency", "currency_type"), "HKD").upper()
+    cash_value, cash_ok = _required_decimal(
+        record, ("cash", "cash_balance", "total_cash"), "cash", currency
+    )
+    available_balance = _optional_decimal(
+        record, ("available_cash", "available_balance", "available_funds")
+    )
+    if not cash_ok:
+        value = record.get("cash", record.get("cash_balance", record.get("total_cash")))
+        blocking_errors.append(
+            f"cash {currency} has invalid required field cash={value!r}"
+        )
+    return CashBalance(
+        statement_id=statement_id,
+        broker="futu",
+        account_alias=_first_text(record, ("_account_alias",), "futu_unknown"),
+        currency=currency,
+        cash_balance=cash_value,
+        available_balance=available_balance,
+        confidence="high" if cash_ok else "low",
+        notes="Futu live account cash",
+    )
+
+
+def _required_decimal(
+    record: dict[str, object],
+    keys: tuple[str, ...],
+    field_name: str,
+    label: str,
+) -> tuple[Decimal, bool]:
+    raw_value = None
+    for key in keys:
+        if record.get(key) not in {None, ""}:
+            raw_value = record.get(key)
+            break
+    if raw_value is None:
+        return Decimal("0"), False
+    try:
+        value = Decimal(str(raw_value).strip())
+    except (InvalidOperation, ValueError):
+        return Decimal("0"), False
+    if not value.is_finite():
+        return Decimal("0"), False
+    return value, True
+
+
+def _optional_decimal(
+    record: dict[str, object],
+    keys: tuple[str, ...],
+) -> Decimal | None:
+    for key in keys:
+        raw_value = record.get(key)
+        if raw_value in {None, ""}:
+            continue
+        try:
+            value = Decimal(str(raw_value).strip())
+        except (InvalidOperation, ValueError):
+            return None
+        return value if value.is_finite() else None
+    return None
+
+
+def _market_from_code(code: str) -> Market:
+    if code.startswith("US."):
+        return Market.US
+    if code.startswith("HK."):
+        return Market.HK
+    return Market.OTHER
+
+
+def _symbol_from_code(code: str) -> str:
+    if "." in code:
+        return code.split(".", 1)[1]
+    return code
+
+
+def _default_currency_for_market(market: Market) -> str:
+    if market == Market.US:
+        return "USD"
+    if market == Market.HK:
+        return "HKD"
+    return "HKD"
+
+
+def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
+    raw_type = _first_text(
+        record,
+        ("stock_type", "security_type", "asset_class", "sec_type"),
+    ).upper()
+    if raw_type in {"STOCK", "EQUITY", "COMMON_STOCK"}:
+        return AssetClass.STOCK
+    if raw_type in {"ETF", "EXCHANGE_TRADED_FUND"}:
+        return AssetClass.ETF
+    if raw_type in {"FUND", "MUTUAL_FUND"}:
+        return AssetClass.FUND
+    if raw_type in {"OPTION", "WARRANT"}:
+        return AssetClass.OPTION
+    return AssetClass.UNKNOWN
