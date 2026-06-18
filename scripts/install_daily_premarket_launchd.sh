@@ -2,13 +2,35 @@
 set -euo pipefail
 
 DRY_RUN=0
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=1
-  shift
-fi
+MARKET="all"
 
-if [[ $# -ne 0 ]]; then
-  echo "usage: $0 [--dry-run]" >&2
+usage() {
+  echo "usage: $0 [--dry-run] [--market HK|US|all]" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --market)
+      if [[ $# -lt 2 ]]; then
+        usage
+        exit 2
+      fi
+      MARKET="$2"
+      shift 2
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$MARKET" != "HK" && "$MARKET" != "US" && "$MARKET" != "all" ]]; then
+  usage
   exit 2
 fi
 
@@ -16,7 +38,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="$REPO_ROOT/config/daily_premarket.env"
 TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.premarket.plist.template"
-TARGET="$HOME/Library/LaunchAgents/com.open-trader.premarket.plist"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "missing required config: $ENV_FILE" >&2
@@ -98,38 +119,71 @@ sed_replacement_escape() {
 
 OPEN_TRADER_REPO="$(read_env_value OPEN_TRADER_REPO)"
 OPEN_TRADER_PYTHON="$(read_env_value OPEN_TRADER_PYTHON)"
-OPEN_TRADER_MARKET="$(read_env_value OPEN_TRADER_MARKET)"
 
 if [[ -z "$OPEN_TRADER_REPO" || -z "$OPEN_TRADER_PYTHON" ]]; then
   echo "OPEN_TRADER_REPO and OPEN_TRADER_PYTHON are required in $ENV_FILE" >&2
   exit 1
 fi
-if [[ -z "$OPEN_TRADER_MARKET" ]]; then
-  OPEN_TRADER_MARKET="US"
-fi
-if [[ "$OPEN_TRADER_MARKET" != "HK" && "$OPEN_TRADER_MARKET" != "US" ]]; then
-  echo "OPEN_TRADER_MARKET must be HK or US" >&2
-  exit 2
-fi
 
 OPEN_TRADER_REPO="$(expand_home_path "$OPEN_TRADER_REPO")"
 OPEN_TRADER_PYTHON="$(resolve_config_path "$OPEN_TRADER_PYTHON" "$OPEN_TRADER_REPO")"
 
-RENDERED="$(
-  sed \
-    -e "s#OPEN_TRADER_REPO#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_REPO")")#g" \
-    -e "s#OPEN_TRADER_PYTHON#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_PYTHON")")#g" \
-    -e "s#OPEN_TRADER_MARKET#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_MARKET")")#g" \
-    "$TEMPLATE"
-)"
-
-if [[ "$DRY_RUN" -eq 1 ]]; then
-  printf '%s\n' "$RENDERED"
-  exit 0
+markets=()
+if [[ "$MARKET" == "all" ]]; then
+  markets=("HK" "US")
+else
+  markets=("$MARKET")
 fi
 
-mkdir -p "$HOME/Library/LaunchAgents" "$OPEN_TRADER_REPO/logs/daily_premarket"
-printf '%s\n' "$RENDERED" > "$TARGET"
-launchctl unload "$TARGET" 2>/dev/null || true
-launchctl load "$TARGET"
-echo "installed launchd agent: $TARGET"
+render_market() {
+  local market="$1"
+  local label hour minute
+  if [[ "$market" == "HK" ]]; then
+    label="com.open-trader.premarket.hk"
+    hour="8"
+    minute="0"
+  elif [[ "$market" == "US" ]]; then
+    label="com.open-trader.premarket.us"
+    hour="18"
+    minute="30"
+  else
+    usage
+    exit 2
+  fi
+
+  sed \
+    -e "s#OPEN_TRADER_LABEL#$(sed_replacement_escape "$(xml_escape "$label")")#g" \
+    -e "s#OPEN_TRADER_MARKET#$(sed_replacement_escape "$(xml_escape "$market")")#g" \
+    -e "s#OPEN_TRADER_HOUR#$hour#g" \
+    -e "s#OPEN_TRADER_MINUTE#$minute#g" \
+    -e "s#OPEN_TRADER_REPO#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_REPO")")#g" \
+    -e "s#OPEN_TRADER_PYTHON#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_PYTHON")")#g" \
+    "$TEMPLATE"
+}
+
+lint_rendered() {
+  local rendered="$1"
+  local temp_path
+  temp_path="$(mktemp "${TMPDIR:-/tmp}/open-trader-launchd.XXXXXX.plist")"
+  printf '%s\n' "$rendered" > "$temp_path"
+  plutil -lint "$temp_path" >/dev/null
+  rm -f "$temp_path"
+}
+
+for market in "${markets[@]}"; do
+  rendered="$(render_market "$market")"
+  lint_rendered "$rendered"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%s\n' "$rendered"
+    continue
+  fi
+
+  label="com.open-trader.premarket.$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
+  target="$HOME/Library/LaunchAgents/$label.plist"
+  mkdir -p "$HOME/Library/LaunchAgents" "$OPEN_TRADER_REPO/logs/daily_premarket"
+  printf '%s\n' "$rendered" > "$target"
+  plutil -lint "$target" >/dev/null
+  launchctl unload "$target" 2>/dev/null || true
+  launchctl load "$target"
+  echo "installed launchd agent: $target"
+done

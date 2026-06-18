@@ -2483,18 +2483,22 @@ def test_launchd_template_runs_daily_premarket_command() -> None:
         / "ops/launchd/com.open-trader.premarket.plist.template"
     ).read_text(encoding="utf-8")
 
-    assert "com.open-trader.premarket" in template
+    assert "OPEN_TRADER_LABEL" in template
     assert "run-daily-premarket" in template
     assert "<string>--market</string>" in template
     assert "<string>OPEN_TRADER_MARKET</string>" in template
+    assert "<string>--date</string>" in template
+    assert "<string>today</string>" in template
     assert "<key>Hour</key>" in template
-    assert "<integer>18</integer>" in template
+    assert "<integer>OPEN_TRADER_HOUR</integer>" in template
     assert "<key>Minute</key>" in template
-    assert "<integer>30</integer>" in template
+    assert "<integer>OPEN_TRADER_MINUTE</integer>" in template
+    assert "launchd-OPEN_TRADER_MARKET.out.log" in template
+    assert "launchd-OPEN_TRADER_MARKET.err.log" in template
     assert "OPEN_TRADER_REPO" in template
 
 
-def test_launchd_installer_defaults_daily_market_to_us(
+def test_launchd_installer_default_renders_hk_and_us_jobs(
     tmp_path: Path,
 ) -> None:
     repo = _copy_launchd_installer_assets(tmp_path)
@@ -2518,12 +2522,40 @@ def test_launchd_installer_defaults_daily_market_to_us(
         env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
     )
 
-    args = _launchd_program_arguments(result.stdout)
-    market_index = args.index("--market")
-    assert args[market_index + 1] == "US"
+    plists = _launchd_plists(result.stdout)
+    by_label = {payload["Label"]: payload for payload in plists}
+    assert set(by_label) == {
+        "com.open-trader.premarket.hk",
+        "com.open-trader.premarket.us",
+    }
+    _assert_launchd_job(
+        by_label["com.open-trader.premarket.hk"],
+        repo=repo,
+        market="HK",
+        hour=8,
+        minute=0,
+    )
+    _assert_launchd_job(
+        by_label["com.open-trader.premarket.us"],
+        repo=repo,
+        market="US",
+        hour=18,
+        minute=30,
+    )
 
 
-def test_launchd_installer_renders_configured_daily_market(
+@pytest.mark.parametrize(
+    ("market", "label", "hour", "minute"),
+    [
+        ("HK", "com.open-trader.premarket.hk", 8, 0),
+        ("US", "com.open-trader.premarket.us", 18, 30),
+    ],
+)
+def test_launchd_installer_renders_single_market_job(
+    market: str,
+    label: str,
+    hour: int,
+    minute: int,
     tmp_path: Path,
 ) -> None:
     repo = _copy_launchd_installer_assets(tmp_path)
@@ -2534,26 +2566,37 @@ def test_launchd_installer_renders_configured_daily_market(
             [
                 f"OPEN_TRADER_REPO={repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
-                "OPEN_TRADER_MARKET=HK",
             ]
         ),
         encoding="utf-8",
     )
 
     result = subprocess.run(
-        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--dry-run",
+            "--market",
+            market,
+        ],
         check=True,
         capture_output=True,
         encoding="utf-8",
         env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
     )
 
-    args = _launchd_program_arguments(result.stdout)
-    market_index = args.index("--market")
-    assert args[market_index + 1] == "HK"
+    plists = _launchd_plists(result.stdout)
+    assert len(plists) == 1
+    assert plists[0]["Label"] == label
+    _assert_launchd_job(
+        plists[0],
+        repo=repo,
+        market=market,
+        hour=hour,
+        minute=minute,
+    )
 
 
-def test_launchd_installer_rejects_unsupported_daily_market(
+def test_launchd_installer_rejects_unsupported_market_argument(
     tmp_path: Path,
 ) -> None:
     repo = _copy_launchd_installer_assets(tmp_path)
@@ -2564,21 +2607,25 @@ def test_launchd_installer_rejects_unsupported_daily_market(
             [
                 f"OPEN_TRADER_REPO={repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
-                "OPEN_TRADER_MARKET=CN",
             ]
         ),
         encoding="utf-8",
     )
 
     result = subprocess.run(
-        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--dry-run",
+            "--market",
+            "CN",
+        ],
         capture_output=True,
         encoding="utf-8",
         env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
     )
 
     assert result.returncode == 2
-    assert "OPEN_TRADER_MARKET must be HK or US" in result.stderr
+    assert "usage:" in result.stderr
 
 
 def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
@@ -2601,6 +2648,8 @@ def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
         "DEEPSEEK_API_KEY",
     ]:
         assert key in example
+    assert "HK daily workflow deadline is fixed by code at 09:00 Asia/Shanghai" in example
+    assert "US daily workflow uses OPEN_TRADER_DEADLINE" in example
     assert "OPENAI_API_KEY" not in example
     assert "sk-" not in example
 
@@ -2750,11 +2799,131 @@ def test_launchd_installer_preserves_inline_comment_text_like_runtime_parser(
     assert f"{repo} # literal suffix" in result.stdout
 
 
-def _launchd_program_arguments(plist_text: str) -> list[str]:
-    payload = plistlib.loads(plist_text.encode("utf-8"))
+def test_launchd_uninstaller_defaults_to_hk_us_and_legacy_plists(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    hk = agents / "com.open-trader.premarket.hk.plist"
+    us = agents / "com.open-trader.premarket.us.plist"
+    legacy = agents / "com.open-trader.premarket.plist"
+    for path in [hk, us, legacy]:
+        path.write_text("plist\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+
+    result = subprocess.run(
+        [str(repo / "scripts/uninstall_daily_premarket_launchd.sh")],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert not hk.exists()
+    assert not us.exists()
+    assert not legacy.exists()
+    assert "com.open-trader.premarket.hk.plist" in result.stdout
+    assert "com.open-trader.premarket.us.plist" in result.stdout
+
+
+def test_launchd_uninstaller_removes_only_requested_market(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    hk = agents / "com.open-trader.premarket.hk.plist"
+    us = agents / "com.open-trader.premarket.us.plist"
+    hk.write_text("hk\n", encoding="utf-8")
+    us.write_text("us\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+
+    subprocess.run(
+        [
+            str(repo / "scripts/uninstall_daily_premarket_launchd.sh"),
+            "--market",
+            "HK",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert not hk.exists()
+    assert us.exists()
+
+
+def test_launchd_uninstaller_rejects_unsupported_market_argument(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/uninstall_daily_premarket_launchd.sh"),
+            "--market",
+            "CN",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+
+
+def _launchd_plists(plist_text: str) -> list[dict[str, object]]:
+    documents = [
+        f"<?xml{document}"
+        for document in plist_text.split("<?xml")
+        if document.strip()
+    ]
+    return [plistlib.loads(document.encode("utf-8")) for document in documents]
+
+
+def _assert_launchd_job(
+    payload: dict[str, object],
+    *,
+    repo: Path,
+    market: str,
+    hour: int,
+    minute: int,
+) -> None:
     args = payload["ProgramArguments"]
     assert isinstance(args, list)
-    return [str(arg) for arg in args]
+    args = [str(arg) for arg in args]
+    market_index = args.index("--market")
+    assert args[market_index + 1] == market
+    assert args[args.index("--date") + 1] == "today"
+    assert args[args.index("--config") + 1] == f"{repo}/config/daily_premarket.env"
+    intervals = payload["StartCalendarInterval"]
+    assert isinstance(intervals, list)
+    assert {item["Weekday"] for item in intervals} == {1, 2, 3, 4, 5}
+    assert {item["Hour"] for item in intervals} == {hour}
+    assert {item["Minute"] for item in intervals} == {minute}
+    assert payload["StandardOutPath"] == (
+        f"{repo}/logs/daily_premarket/launchd-{market}.out.log"
+    )
+    assert payload["StandardErrorPath"] == (
+        f"{repo}/logs/daily_premarket/launchd-{market}.err.log"
+    )
+
+
+def _fake_launchctl_bin(tmp_path: Path) -> Path:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    launchctl.chmod(0o755)
+    return fake_bin
 
 
 def _copy_launchd_installer_assets(tmp_path: Path) -> Path:
@@ -2770,5 +2939,9 @@ def _copy_launchd_installer_assets(tmp_path: Path) -> Path:
     shutil.copy2(
         source_root / "scripts/install_daily_premarket_launchd.sh",
         repo / "scripts/install_daily_premarket_launchd.sh",
+    )
+    shutil.copy2(
+        source_root / "scripts/uninstall_daily_premarket_launchd.sh",
+        repo / "scripts/uninstall_daily_premarket_launchd.sh",
     )
     return repo

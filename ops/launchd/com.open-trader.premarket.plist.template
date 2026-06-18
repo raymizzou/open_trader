@@ -4,7 +4,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.open-trader.premarket</string>
+  <string>OPEN_TRADER_LABEL</string>
 
   <key>WorkingDirectory</key>
   <string>OPEN_TRADER_REPO</string>
@@ -15,10 +15,10 @@
     <string>-m</string>
     <string>open_trader</string>
     <string>run-daily-premarket</string>
-    <string>--date</string>
-    <string>today</string>
     <string>--market</string>
     <string>OPEN_TRADER_MARKET</string>
+    <string>--date</string>
+    <string>today</string>
     <string>--config</string>
     <string>OPEN_TRADER_REPO/config/daily_premarket.env</string>
   </array>
@@ -29,48 +29,48 @@
       <key>Weekday</key>
       <integer>1</integer>
       <key>Hour</key>
-      <integer>18</integer>
+      <integer>OPEN_TRADER_HOUR</integer>
       <key>Minute</key>
-      <integer>30</integer>
+      <integer>OPEN_TRADER_MINUTE</integer>
     </dict>
     <dict>
       <key>Weekday</key>
       <integer>2</integer>
       <key>Hour</key>
-      <integer>18</integer>
+      <integer>OPEN_TRADER_HOUR</integer>
       <key>Minute</key>
-      <integer>30</integer>
+      <integer>OPEN_TRADER_MINUTE</integer>
     </dict>
     <dict>
       <key>Weekday</key>
       <integer>3</integer>
       <key>Hour</key>
-      <integer>18</integer>
+      <integer>OPEN_TRADER_HOUR</integer>
       <key>Minute</key>
-      <integer>30</integer>
+      <integer>OPEN_TRADER_MINUTE</integer>
     </dict>
     <dict>
       <key>Weekday</key>
       <integer>4</integer>
       <key>Hour</key>
-      <integer>18</integer>
+      <integer>OPEN_TRADER_HOUR</integer>
       <key>Minute</key>
-      <integer>30</integer>
+      <integer>OPEN_TRADER_MINUTE</integer>
     </dict>
     <dict>
       <key>Weekday</key>
       <integer>5</integer>
       <key>Hour</key>
-      <integer>18</integer>
+      <integer>OPEN_TRADER_HOUR</integer>
       <key>Minute</key>
-      <integer>30</integer>
+      <integer>OPEN_TRADER_MINUTE</integer>
     </dict>
   </array>
 
   <key>StandardOutPath</key>
-  <string>OPEN_TRADER_REPO/logs/daily_premarket/launchd.out.log</string>
+  <string>OPEN_TRADER_REPO/logs/daily_premarket/launchd-OPEN_TRADER_MARKET.out.log</string>
 
   <key>StandardErrorPath</key>
-  <string>OPEN_TRADER_REPO/logs/daily_premarket/launchd.err.log</string>
+  <string>OPEN_TRADER_REPO/logs/daily_premarket/launchd-OPEN_TRADER_MARKET.err.log</string>
 </dict>
 </plist>
