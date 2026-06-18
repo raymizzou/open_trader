@@ -17,6 +17,8 @@
     <string>run-daily-premarket</string>
     <string>--date</string>
     <string>today</string>
+    <string>--market</string>
+    <string>OPEN_TRADER_MARKET</string>
     <string>--config</string>
     <string>OPEN_TRADER_REPO/config/daily_premarket.env</string>
   </array>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import plistlib
 import shutil
 import subprocess
 from datetime import datetime
@@ -1617,12 +1618,18 @@ def test_daily_runner_does_not_promote_latest_when_plan_build_fails(
         portfolio=tmp_path / "data/latest/portfolio.csv",
         dry_run=False,
     )
-    latest_dir = tmp_path / "data/latest"
+    latest_dir = tmp_path / "data/latest/US"
+    hk_latest_dir = tmp_path / "data/latest/HK"
     latest_dir.mkdir(parents=True, exist_ok=True)
+    hk_latest_dir.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
         "old actions\n",
+        encoding="utf-8",
+    )
+    (hk_latest_dir / "trading_advice.csv").write_text(
+        "hk advice\n",
         encoding="utf-8",
     )
 
@@ -1643,6 +1650,9 @@ def test_daily_runner_does_not_promote_latest_when_plan_build_fails(
     assert (latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
         "old actions\n"
     )
+    assert (hk_latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "hk advice\n"
+    )
 
 
 def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
@@ -1662,8 +1672,10 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
         portfolio=tmp_path / "data/latest/portfolio.csv",
         dry_run=False,
     )
-    latest_dir = tmp_path / "data/latest"
+    latest_dir = tmp_path / "data/latest/US"
+    hk_latest_dir = tmp_path / "data/latest/HK"
     latest_dir.mkdir(parents=True, exist_ok=True)
+    hk_latest_dir.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
@@ -1671,6 +1683,7 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
         encoding="utf-8",
     )
     (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+    (hk_latest_dir / "trading_plan.csv").write_text("hk plan\n", encoding="utf-8")
 
     def fail_on_actions_replace(source_path: Path, latest_path: Path) -> None:
         if latest_path.name == "premarket_actions.csv":
@@ -1705,6 +1718,9 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
     assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
         "old plan\n"
     )
+    assert (hk_latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
+        "hk plan\n"
+    )
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["status"] == "failed"
     assert "replace failed" in status["error"]
@@ -1727,8 +1743,10 @@ def test_daily_runner_does_not_promote_latest_when_report_write_fails(
         portfolio=tmp_path / "data/latest/portfolio.csv",
         dry_run=False,
     )
-    latest_dir = tmp_path / "data/latest"
+    latest_dir = tmp_path / "data/latest/US"
+    hk_latest_dir = tmp_path / "data/latest/HK"
     latest_dir.mkdir(parents=True, exist_ok=True)
+    hk_latest_dir.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
@@ -1736,6 +1754,10 @@ def test_daily_runner_does_not_promote_latest_when_report_write_fails(
         encoding="utf-8",
     )
     (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+    (hk_latest_dir / "premarket_actions.csv").write_text(
+        "hk actions\n",
+        encoding="utf-8",
+    )
     original_write_text = daily_premarket._write_text
     raised = False
 
@@ -1777,6 +1799,9 @@ def test_daily_runner_does_not_promote_latest_when_report_write_fails(
     assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
         "old plan\n"
     )
+    assert (hk_latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
+        "hk actions\n"
+    )
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["status"] == "failed"
     assert "status write failed" in status["error"]
@@ -1799,8 +1824,10 @@ def test_daily_runner_returns_failed_when_failure_reporting_writes_fail(
         portfolio=tmp_path / "data/latest/portfolio.csv",
         dry_run=False,
     )
-    latest_dir = tmp_path / "data/latest"
+    latest_dir = tmp_path / "data/latest/US"
+    hk_latest_dir = tmp_path / "data/latest/HK"
     latest_dir.mkdir(parents=True, exist_ok=True)
+    hk_latest_dir.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
@@ -1808,6 +1835,7 @@ def test_daily_runner_returns_failed_when_failure_reporting_writes_fail(
         encoding="utf-8",
     )
     (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+    (hk_latest_dir / "trading_plan.csv").write_text("hk plan\n", encoding="utf-8")
 
     def always_fail_write(path: Path, text: str) -> None:
         raise RuntimeError(f"write failed: {path.name}")
@@ -1834,6 +1862,9 @@ def test_daily_runner_returns_failed_when_failure_reporting_writes_fail(
     assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
         "old plan\n"
     )
+    assert (hk_latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
+        "hk plan\n"
+    )
 
 
 def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None:
@@ -1850,8 +1881,10 @@ def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None
         portfolio=tmp_path / "data/latest/portfolio.csv",
         dry_run=True,
     )
-    latest_dir = tmp_path / "data/latest"
+    latest_dir = tmp_path / "data/latest/US"
+    hk_latest_dir = tmp_path / "data/latest/HK"
     latest_dir.mkdir(parents=True, exist_ok=True)
+    hk_latest_dir.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
@@ -1859,6 +1892,10 @@ def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None
         encoding="utf-8",
     )
     (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+    (hk_latest_dir / "trading_advice.csv").write_text(
+        "hk advice\n",
+        encoding="utf-8",
+    )
     premarket = FakePremarket()
     plan_builder = FakePlanBuilder()
 
@@ -1885,6 +1922,9 @@ def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None
     assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
         "old plan\n"
     )
+    assert (hk_latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "hk advice\n"
+    )
 
 
 def test_daily_runner_dry_run_argument_overrides_config(
@@ -1903,8 +1943,10 @@ def test_daily_runner_dry_run_argument_overrides_config(
         portfolio=tmp_path / "data/latest/portfolio.csv",
         dry_run=False,
     )
-    latest_dir = tmp_path / "data/latest"
+    latest_dir = tmp_path / "data/latest/US"
+    hk_latest_dir = tmp_path / "data/latest/HK"
     latest_dir.mkdir(parents=True, exist_ok=True)
+    hk_latest_dir.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
     (latest_dir / "premarket_actions.csv").write_text(
@@ -1912,6 +1954,10 @@ def test_daily_runner_dry_run_argument_overrides_config(
         encoding="utf-8",
     )
     (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+    (hk_latest_dir / "trading_advice.csv").write_text(
+        "hk advice\n",
+        encoding="utf-8",
+    )
 
     runner = DailyPremarketRunner(
         config=config,
@@ -1933,6 +1979,9 @@ def test_daily_runner_dry_run_argument_overrides_config(
     )
     assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
         "old plan\n"
+    )
+    assert (hk_latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "hk advice\n"
     )
 
 
@@ -2436,11 +2485,100 @@ def test_launchd_template_runs_daily_premarket_command() -> None:
 
     assert "com.open-trader.premarket" in template
     assert "run-daily-premarket" in template
+    assert "<string>--market</string>" in template
+    assert "<string>OPEN_TRADER_MARKET</string>" in template
     assert "<key>Hour</key>" in template
     assert "<integer>18</integer>" in template
     assert "<key>Minute</key>" in template
     assert "<integer>30</integer>" in template
     assert "OPEN_TRADER_REPO" in template
+
+
+def test_launchd_installer_defaults_daily_market_to_us(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    args = _launchd_program_arguments(result.stdout)
+    market_index = args.index("--market")
+    assert args[market_index + 1] == "US"
+
+
+def test_launchd_installer_renders_configured_daily_market(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                "OPEN_TRADER_MARKET=HK",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    args = _launchd_program_arguments(result.stdout)
+    market_index = args.index("--market")
+    assert args[market_index + 1] == "HK"
+
+
+def test_launchd_installer_rejects_unsupported_daily_market(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                "OPEN_TRADER_MARKET=CN",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--dry-run"],
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 2
+    assert "OPEN_TRADER_MARKET must be HK or US" in result.stderr
 
 
 def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
@@ -2610,6 +2748,13 @@ def test_launchd_installer_preserves_inline_comment_text_like_runtime_parser(
     )
 
     assert f"{repo} # literal suffix" in result.stdout
+
+
+def _launchd_program_arguments(plist_text: str) -> list[str]:
+    payload = plistlib.loads(plist_text.encode("utf-8"))
+    args = payload["ProgramArguments"]
+    assert isinstance(args, list)
+    return [str(arg) for arg in args]
 
 
 def _copy_launchd_installer_assets(tmp_path: Path) -> Path:

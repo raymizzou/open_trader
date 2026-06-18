@@ -98,10 +98,18 @@ sed_replacement_escape() {
 
 OPEN_TRADER_REPO="$(read_env_value OPEN_TRADER_REPO)"
 OPEN_TRADER_PYTHON="$(read_env_value OPEN_TRADER_PYTHON)"
+OPEN_TRADER_MARKET="$(read_env_value OPEN_TRADER_MARKET)"
 
 if [[ -z "$OPEN_TRADER_REPO" || -z "$OPEN_TRADER_PYTHON" ]]; then
   echo "OPEN_TRADER_REPO and OPEN_TRADER_PYTHON are required in $ENV_FILE" >&2
   exit 1
+fi
+if [[ -z "$OPEN_TRADER_MARKET" ]]; then
+  OPEN_TRADER_MARKET="US"
+fi
+if [[ "$OPEN_TRADER_MARKET" != "HK" && "$OPEN_TRADER_MARKET" != "US" ]]; then
+  echo "OPEN_TRADER_MARKET must be HK or US" >&2
+  exit 2
 fi
 
 OPEN_TRADER_REPO="$(expand_home_path "$OPEN_TRADER_REPO")"
@@ -111,6 +119,7 @@ RENDERED="$(
   sed \
     -e "s#OPEN_TRADER_REPO#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_REPO")")#g" \
     -e "s#OPEN_TRADER_PYTHON#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_PYTHON")")#g" \
+    -e "s#OPEN_TRADER_MARKET#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_MARKET")")#g" \
     "$TEMPLATE"
 )"
 
