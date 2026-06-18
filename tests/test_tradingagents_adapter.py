@@ -55,6 +55,33 @@ def test_adapter_calls_graph_and_normalizes_success() -> None:
     assert '"action": "hold"' in advice.raw_decision
 
 
+def test_adapter_uses_hk_futu_symbol_and_records_hk_context() -> None:
+    graph = FakeGraph()
+    adapter = TradingAgentsAdapter.from_graph(graph)
+    row = PortfolioInputRow(
+        symbol="00700",
+        market="HK",
+        asset_class="stock",
+        name="Tencent",
+        portfolio_weight_hkd="2.00%",
+        risk_flag="normal",
+        analysis_symbol="00700",
+    )
+
+    advice = adapter.analyze(row, "2026-06-19")
+    raw = json.loads(advice.raw_decision)
+
+    assert graph.calls == [("HK.00700", "2026-06-19")]
+    assert raw["market_context"] == {
+        "market": "HK",
+        "market_name": "Hong Kong / HKEX",
+        "currency": "HKD",
+        "portfolio_symbol": "00700",
+        "tradingagents_symbol": "HK.00700",
+        "futu_symbol": "HK.00700",
+    }
+
+
 def test_adapter_records_symbol_failure_as_error() -> None:
     class FailingGraph:
         def propagate(

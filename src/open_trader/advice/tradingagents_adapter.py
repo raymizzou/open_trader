@@ -59,7 +59,11 @@ class TradingAgentsAdapter:
 
     def analyze(self, row: PortfolioInputRow, run_date: str) -> TradingAdvice:
         try:
-            state, decision = self._graph.propagate(row.analysis_symbol, run_date)
+            market_context = _market_context(row)
+            state, decision = self._graph.propagate(
+                market_context["tradingagents_symbol"],
+                run_date,
+            )
             return TradingAdvice(
                 run_date=run_date,
                 symbol=row.symbol,
@@ -75,7 +79,11 @@ class TradingAgentsAdapter:
                     action=_extract_action(decision),
                 ),
                 raw_decision=json.dumps(
-                    {"state": state, "decision": decision},
+                    {
+                        "market_context": market_context,
+                        "state": state,
+                        "decision": decision,
+                    },
                     ensure_ascii=False,
                     default=str,
                 ),
@@ -97,6 +105,38 @@ class TradingAgentsAdapter:
                 status="error",
                 error=str(exc),
             )
+
+
+def _market_context(row: PortfolioInputRow) -> dict[str, str]:
+    market = row.market.strip().upper()
+    tradingagents_symbol = _tradingagents_symbol(row)
+    if market == "HK":
+        return {
+            "market": "HK",
+            "market_name": "Hong Kong / HKEX",
+            "currency": "HKD",
+            "portfolio_symbol": row.symbol,
+            "tradingagents_symbol": tradingagents_symbol,
+            "futu_symbol": tradingagents_symbol,
+        }
+    return {
+        "market": market or "US",
+        "market_name": "United States",
+        "currency": "USD",
+        "portfolio_symbol": row.symbol,
+        "tradingagents_symbol": tradingagents_symbol,
+        "futu_symbol": tradingagents_symbol
+        if "." in tradingagents_symbol
+        else f"US.{tradingagents_symbol}",
+    }
+
+
+def _tradingagents_symbol(row: PortfolioInputRow) -> str:
+    market = row.market.strip().upper()
+    symbol = row.analysis_symbol.strip().upper() or row.symbol.strip().upper()
+    if market == "HK" and symbol.isdigit():
+        return f"HK.{symbol.zfill(5)}"
+    return symbol
 
 
 def _extract_action(decision: Any) -> str:
