@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Open Trader 持仓实时看板</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+    <script src="/static/dashboard.js" defer></script>
+  </head>
+  <body>
+    <div class="dashboard-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <span class="brand">Open Trader</span>
+          <span class="page-title">持仓实时看板</span>
+        </div>
+        <div class="topbar-actions">
+          <span id="quote-status" class="status-pill status-muted">等待行情</span>
+          <span id="last-refresh" class="last-refresh">尚未刷新</span>
+          <button id="refresh-quotes" class="primary-button" type="button">刷新行情</button>
+        </div>
+      </header>
+
+      <section class="summary-grid" aria-label="组合摘要">
+        <article class="summary-card">
+          <span class="summary-label">组合总资产 HKD</span>
+          <strong id="summary-value">-</strong>
+          <span id="summary-holding-count" class="summary-note">持仓 -</span>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">实时刷新状态</span>
+          <strong id="summary-refresh-status">等待行情</strong>
+          <span id="summary-refresh-note" class="summary-note">-</span>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">券商账户</span>
+          <strong id="summary-brokers">-</strong>
+          <span id="summary-detail-month" class="summary-note">明细月份 -</span>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">数据健康</span>
+          <strong id="summary-health">加载中</strong>
+          <span id="summary-health-note" class="summary-note">-</span>
+        </article>
+      </section>
+
+      <main class="workspace-grid">
+        <aside class="filter-panel" aria-label="筛选">
+          <section class="panel-section">
+            <h2>筛选</h2>
+            <div class="filter-group" id="market-filters">
+              <button class="filter-button active" type="button" data-market="ALL">全部市场</button>
+              <button class="filter-button" type="button" data-market="US">US</button>
+              <button class="filter-button" type="button" data-market="HK">HK</button>
+              <button class="filter-button" type="button" data-market="CASH">现金</button>
+            </div>
+          </section>
+          <section class="panel-section">
+            <h2>券商</h2>
+            <div id="broker-filters" class="filter-group dynamic-filters"></div>
+          </section>
+        </aside>
+
+        <section class="holdings-panel">
+          <div class="section-heading">
+            <div>
+              <h1>持仓列表</h1>
+              <p>合并持仓可展开查看券商与账户明细。</p>
+            </div>
+            <span id="visible-count" class="count-pill">-</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>明细</th>
+                  <th>市场</th>
+                  <th>标的</th>
+                  <th>券商</th>
+                  <th>数量</th>
+                  <th>持仓价</th>
+                  <th>实时价</th>
+                  <th>港元市值</th>
+                  <th>盈亏</th>
+                  <th>动作</th>
+                </tr>
+              </thead>
+              <tbody id="holdings-body">
+                <tr>
+                  <td colspan="10" class="empty-state">加载中</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="right-rail">
+          <section class="info-panel">
+            <div class="section-heading compact">
+              <h2>今日交易动作</h2>
+              <span id="action-count" class="count-pill">-</span>
+            </div>
+            <div id="trade-actions" class="action-list"></div>
+          </section>
+
+          <section class="info-panel">
+            <div class="section-heading compact">
+              <h2>实时连接与任务</h2>
+            </div>
+            <dl class="connection-list">
+              <div>
+                <dt>行情状态</dt>
+                <dd id="connection-status">等待行情</dd>
+              </div>
+              <div>
+                <dt>上次成功</dt>
+                <dd id="connection-success">-</dd>
+              </div>
+              <div>
+                <dt>刷新频率</dt>
+                <dd id="connection-poll">-</dd>
+              </div>
+              <div>
+                <dt>任务状态</dt>
+                <dd id="connection-task">加载中</dd>
+              </div>
+            </dl>
+          </section>
+        </aside>
+      </main>
+    </div>
+  </body>
+</html>
