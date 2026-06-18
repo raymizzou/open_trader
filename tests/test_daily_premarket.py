@@ -359,6 +359,55 @@ def test_derive_daily_state_marks_success_as_ready() -> None:
     }
 
 
+def test_readiness_label_uses_chinese_fallback_for_unknown_values() -> None:
+    assert daily_premarket._readiness_label("") == "未分类"
+    assert daily_premarket._readiness_label("unexpected") == "未分类"
+
+
+def test_status_reason_label_uses_chinese_fallback_for_unknown_values() -> None:
+    assert daily_premarket._status_reason_label("unexpected_reason") == "其他原因"
+
+
+def test_render_daily_report_legacy_payload_uses_blocker_next_step() -> None:
+    report = daily_premarket._render_daily_report(
+        {
+            "run_date": "2026-06-17",
+            "started_at": "2026-06-17T21:00:00+08:00",
+            "finished_at": "2026-06-17T21:01:00+08:00",
+            "deadline_at": "2026-06-17T21:10:00+08:00",
+            "status": "partial",
+            "premarket": {"ok": 1, "fallback": 0, "error": 0},
+            "trading_plan": {"active": 1, "fallback": 0, "error": 0},
+            "futu_plan_check": {
+                "checked": 0,
+                "missing": 0,
+                "triggered": 0,
+                "items": [],
+                "error": "网络中断",
+            },
+            "trade_actions": {"actions": 0, "ready": 0, "review": 0, "watch": 0},
+            "artifacts": {},
+        }
+    )
+
+    assert "- 下一步：无需处理。" not in report
+    assert "- 下一步：请启动或重启 Futu OpenD，确认行情连接恢复后重新运行每日盘前流程。" in report
+
+
+def test_blocker_notification_readiness_label_without_readiness_uses_chinese_fallback() -> None:
+    body = daily_premarket._blocker_notification_message(
+        run_date="2026-06-17",
+        status="partial",
+        futu_status={"error": "", "missing": 0},
+        trade_actions={"review": 0},
+        artifacts={},
+    )
+
+    assert "可用性：\n" not in body
+    assert "可用性：未分类" in body
+    assert "unexpected_reason" not in body
+
+
 def test_load_env_config_rejects_missing_required_values(tmp_path: Path) -> None:
     env = tmp_path / "daily.env"
     env.write_text("OPEN_TRADER_REPO=/tmp/open_trader\n", encoding="utf-8")

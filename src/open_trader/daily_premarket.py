@@ -1312,7 +1312,7 @@ def _readiness_label(readiness: str) -> str:
         "ready": "可复核",
         "review_required": "需要人工复核",
         "blocked": "阻塞",
-    }.get(readiness.strip().lower(), readiness)
+    }.get(readiness.strip().lower(), "未分类")
 
 
 def _status_reason_label(reason: str) -> str:
@@ -1326,7 +1326,7 @@ def _status_reason_label(reason: str) -> str:
         "trade_action_review": "交易动作需要人工复核",
         "run_failed": "运行失败",
         "already_running": "已有任务运行中",
-    }.get(reason.strip().lower(), reason)
+    }.get(reason.strip().lower(), "其他原因")
 
 
 def _reason_labels(reasons: object) -> list[str]:
@@ -1346,6 +1346,17 @@ def _diagnostic_next_step(payload: dict[str, object]) -> str:
         return "请先处理阻塞原因，再重新运行每日盘前流程。"
     if readiness == "review_required":
         return "请先人工复核标记项，再决定是否执行交易动作。"
+    if str(payload.get("status", "")).strip() == "failed" or str(
+        payload.get("error", "")
+    ).strip():
+        return "请先查看运行失败原因，修复后重新运行每日盘前流程。"
+    if str(futu.get("error", "")).strip():
+        return "请启动或重启 Futu OpenD，确认行情连接恢复后重新运行每日盘前流程。"
+    if int(futu.get("missing", 0) or 0) > 0:
+        return "请人工复核缺失行情标的，补齐行情后重新运行每日盘前流程。"
+    trade_actions = _mapping(payload.get("trade_actions"))
+    if int(trade_actions.get("review", 0) or 0) > 0:
+        return "请人工复核交易动作，再决定是否执行。"
     return "无需处理。"
 
 
