@@ -355,7 +355,14 @@ def test_build_portfolio_rows_sorts_by_group_then_market_value_hkd_desc():
         fx,
     )
 
-    assert [row["symbol"] for row in rows] == ["MSFT", "BABA", "0700", "FUNDX", "USD_CASH"]
+    assert [row["symbol"] for row in rows] == ["0700", "MSFT", "BABA", "FUNDX", "USD_CASH"]
+    assert {row["symbol"]: row["sort_group"] for row in rows} == {
+        "0700": "1",
+        "MSFT": "2",
+        "BABA": "4",
+        "FUNDX": "5",
+        "USD_CASH": "6",
+    }
 
 
 def test_non_cash_position_over_ten_percent_is_overweight():
@@ -400,3 +407,65 @@ def test_money_market_fund_is_not_overweight():
     fund = rows[0]
     assert fund["portfolio_weight_hkd"] == "100.00%"
     assert fund["risk_flag"] == "normal"
+
+
+def test_hk_stock_and_etf_are_ai_eligible() -> None:
+    fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+    positions = [
+        position(
+            "futu",
+            "00700",
+            "100",
+            "35000",
+            "38000",
+            market=Market.HK,
+            currency="HKD",
+        ),
+        position(
+            "futu",
+            "02800",
+            "200",
+            "40000",
+            "42000",
+            market=Market.HK,
+            asset_class=AssetClass.ETF,
+            currency="HKD",
+        ),
+    ]
+
+    rows = build_portfolio_rows("2026-05", positions, [], fx)
+
+    tencent = next(row for row in rows if row["symbol"] == "00700")
+    tracker = next(row for row in rows if row["symbol"] == "02800")
+    assert tencent["market"] == "HK"
+    assert tencent["currency"] == "HKD"
+    assert tencent["ai_eligible"] == "true"
+    assert tencent["analysis_symbol"] == "00700"
+    assert tracker["ai_eligible"] == "true"
+    assert tracker["analysis_symbol"] == "02800"
+
+
+def test_hk_money_market_fund_stays_ai_ineligible() -> None:
+    fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+    rows = build_portfolio_rows(
+        "2026-05",
+        [
+            position(
+                "futu",
+                "HK0000951506.HKD",
+                "100",
+                "100",
+                "100",
+                market=Market.HK,
+                asset_class=AssetClass.MONEY_MARKET_FUND,
+                currency="HKD",
+            )
+        ],
+        [],
+        fx,
+    )
+
+    fund = rows[0]
+    assert fund["market"] == "HK"
+    assert fund["ai_eligible"] == "false"
+    assert fund["analysis_symbol"] == ""

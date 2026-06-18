@@ -60,19 +60,21 @@ def pct(value: Decimal | None) -> str:
 
 
 def _sort_group(market: Market, asset_class: AssetClass, ai_eligible: bool) -> int:
-    if market == Market.US and ai_eligible:
+    if market == Market.HK and ai_eligible:
         return 1
-    if market == Market.US:
+    if market == Market.US and ai_eligible:
         return 2
     if market == Market.HK:
         return 3
+    if market == Market.US:
+        return 4
     if market == Market.CASH:
-        return 5
-    return 4
+        return 6
+    return 5
 
 
 def _ai_eligible(position: Position) -> bool:
-    return position.market == Market.US and position.asset_class in {
+    return position.market in {Market.US, Market.HK} and position.asset_class in {
         AssetClass.STOCK,
         AssetClass.ETF,
     }
@@ -219,7 +221,7 @@ def build_portfolio_rows(
         notes = "; ".join(cash.notes for cash in group if cash.notes)
         raw_rows.append(
             {
-                "sort_group": 5,
+                "sort_group": _sort_group(Market.CASH, AssetClass.CASH, False),
                 "market": Market.CASH.value,
                 "asset_class": AssetClass.CASH.value,
                 "symbol": symbol,
