@@ -36,7 +36,7 @@ class QuoteRefreshResult:
     fetched_at: str
     last_success_at: str
     stale: bool
-    quotes: list[dict[str, Any]]
+    quotes: dict[str, dict[str, Any]]
     diagnostic: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
@@ -48,7 +48,10 @@ class QuoteRefreshResult:
             "fetched_at": self.fetched_at,
             "last_success_at": self.last_success_at,
             "stale": self.stale,
-            "quotes": [dict(quote) for quote in self.quotes],
+            "quotes": {
+                futu_symbol: dict(quote)
+                for futu_symbol, quote in self.quotes.items()
+            },
             "diagnostic": dict(self.diagnostic),
         }
 
@@ -58,7 +61,7 @@ class DashboardQuoteService:
     config: DashboardConfig
     client_factory: Callable[[], DashboardQuoteClient] | None = None
     last_success_at: str = ""
-    last_quotes: list[dict[str, Any]] = field(default_factory=list)
+    last_quotes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def refresh(self) -> QuoteRefreshResult:
         fetched_at = _now_text()
@@ -83,30 +86,36 @@ class DashboardQuoteService:
                 fetched_at=fetched_at,
                 last_success_at=self.last_success_at,
                 stale=bool(self.last_quotes),
-                quotes=_mark_stale(self.last_quotes, fetched_at=fetched_at),
+                quotes=_mark_stale(self.last_quotes),
                 diagnostic=_error_diagnostic(exc),
             )
         finally:
             if client is not None and hasattr(client, "close"):
                 client.close()
 
-        quotes = [
-            _quote_row(
+        quotes = {
+            futu_symbol: _quote_row(
                 item=items_by_symbol[futu_symbol],
                 snapshot=snapshots.get(futu_symbol),
                 fetched_at=fetched_at,
                 stale=False,
             )
             for futu_symbol in requested_symbols
-        ]
-        missing_count = sum(1 for quote in quotes if quote["status"] == "missing_quote")
+        }
+        missing_count = sum(
+            1 for quote in quotes.values() if quote["status"] == "missing_quote"
+        )
         quote_count = len(requested_symbols) - missing_count
         status = "partial" if missing_count else "ok"
         diagnostic = (
             _missing_quotes_diagnostic(missing_count) if missing_count else {}
         )
-        self.last_success_at = fetched_at
-        self.last_quotes = [dict(quote) for quote in quotes]
+        if status == "ok":
+            self.last_success_at = fetched_at
+            self.last_quotes = {
+                futu_symbol: dict(quote)
+                for futu_symbol, quote in quotes.items()
+            }
 
         return QuoteRefreshResult(
             status=status,
@@ -174,16 +183,13 @@ def _decimal_text(value: Decimal) -> str:
 
 
 def _mark_stale(
-    quotes: list[dict[str, Any]],
-    *,
-    fetched_at: str,
-) -> list[dict[str, Any]]:
-    stale_quotes: list[dict[str, Any]] = []
-    for quote in quotes:
+    quotes: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    stale_quotes: dict[str, dict[str, Any]] = {}
+    for futu_symbol, quote in quotes.items():
         row = dict(quote)
         row["stale"] = True
-        row["fetched_at"] = fetched_at
-        stale_quotes.append(row)
+        stale_quotes[futu_symbol] = row
     return stale_quotes
 
 

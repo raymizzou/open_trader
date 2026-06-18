@@ -26,6 +26,24 @@ class FakeQuoteClient:
         self.closed = True
 
 
+class RaisingQuoteClient:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def get_snapshots(self, futu_symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
+        raise FutuQuoteError(
+            "网络中断",
+            error_type="quote_server_interrupted",
+            next_step="请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。",
+            opend_reachable=True,
+            context_ok=True,
+            snapshot_ok=False,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def write_portfolio(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -152,13 +170,11 @@ def test_quote_service_returns_ok_and_never_writes_portfolio(tmp_path: Path) -> 
     assert result["quote_count"] == 2
     assert result["missing_count"] == 0
     assert result["stale"] is False
-    assert [quote["futu_symbol"] for quote in result["quotes"]] == [
-        "US.AAPL",
-        "US.MSFT",
-    ]
-    assert [quote["last_price"] for quote in result["quotes"]] == ["160", "500"]
-    assert all(quote["status"] == "ok" for quote in result["quotes"])
-    assert all(quote["stale"] is False for quote in result["quotes"])
+    assert list(result["quotes"]) == ["US.AAPL", "US.MSFT"]
+    assert result["quotes"]["US.AAPL"]["last_price"] == "160"
+    assert result["quotes"]["US.MSFT"]["last_price"] == "500"
+    assert all(quote["status"] == "ok" for quote in result["quotes"].values())
+    assert all(quote["stale"] is False for quote in result["quotes"].values())
     assert result["last_success_at"]
     assert client.closed is True
     assert config.portfolio_path.read_text(encoding="utf-8") == original_portfolio
@@ -179,11 +195,10 @@ def test_quote_service_returns_partial_for_missing_quotes(tmp_path: Path) -> Non
     assert result["quote_count"] == 1
     assert result["missing_count"] == 1
     assert result["stale"] is False
-    quotes_by_symbol = {quote["futu_symbol"]: quote for quote in result["quotes"]}
-    assert quotes_by_symbol["US.MSFT"]["last_price"] == "510.25"
-    assert quotes_by_symbol["US.MSFT"]["status"] == "ok"
-    assert quotes_by_symbol["US.AAPL"]["status"] == "missing_quote"
-    assert quotes_by_symbol["US.AAPL"]["last_price"] == ""
+    assert result["quotes"]["US.MSFT"]["last_price"] == "510.25"
+    assert result["quotes"]["US.MSFT"]["status"] == "ok"
+    assert result["quotes"]["US.AAPL"]["status"] == "missing_quote"
+    assert result["quotes"]["US.AAPL"]["last_price"] == ""
     assert result["diagnostic"]["error_type"] == "missing_quotes"
 
 
@@ -221,5 +236,67 @@ def test_quote_service_returns_failed_and_keeps_last_success(tmp_path: Path) -> 
     assert failed_result["diagnostic"]["context_ok"] is True
     assert failed_result["diagnostic"]["snapshot_ok"] is False
     assert failed_result["quotes"]
-    assert all(quote["stale"] is True for quote in failed_result["quotes"])
-    assert {quote["last_price"] for quote in failed_result["quotes"]} == {"160", "500"}
+    assert all(quote["stale"] is True for quote in failed_result["quotes"].values())
+    assert {quote["last_price"] for quote in failed_result["quotes"].values()} == {
+        "160",
+        "500",
+    }
+    assert {
+        quote["fetched_at"] for quote in failed_result["quotes"].values()
+    } == {first_result["fetched_at"]}
+    assert failed_result["fetched_at"] >= first_result["fetched_at"]
+
+
+def test_partial_refresh_does_not_replace_complete_success_cache(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    full_client = FakeQuoteClient(
+        {
+            "US.MSFT": QuoteSnapshot("US.MSFT", Decimal("500")),
+            "US.AAPL": QuoteSnapshot("US.AAPL", Decimal("160")),
+        }
+    )
+    service = DashboardQuoteService(config=config, client_factory=lambda: full_client)
+    first_result = service.refresh().to_dict()
+
+    partial_client = FakeQuoteClient(
+        {"US.MSFT": QuoteSnapshot("US.MSFT", Decimal("510.25"))}
+    )
+    service.client_factory = lambda: partial_client
+    partial_result = service.refresh().to_dict()
+    assert partial_result["status"] == "partial"
+    assert partial_result["quotes"]["US.AAPL"]["last_price"] == ""
+    assert partial_result["last_success_at"] == first_result["last_success_at"]
+
+    def raise_futu_error() -> FakeQuoteClient:
+        raise FutuQuoteError(
+            "网络中断",
+            error_type="quote_server_interrupted",
+            next_step="请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。",
+            opend_reachable=True,
+            context_ok=True,
+            snapshot_ok=False,
+        )
+
+    service.client_factory = raise_futu_error
+    failed_result = service.refresh().to_dict()
+
+    assert failed_result["status"] == "failed"
+    assert failed_result["last_success_at"] == first_result["last_success_at"]
+    assert failed_result["quotes"]["US.AAPL"]["last_price"] == "160"
+    assert failed_result["quotes"]["US.AAPL"]["stale"] is True
+
+
+def test_quote_service_closes_client_when_snapshot_call_fails(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    client = RaisingQuoteClient()
+    service = DashboardQuoteService(config=config, client_factory=lambda: client)
+
+    result = service.refresh().to_dict()
+
+    assert result["status"] == "failed"
+    assert result["diagnostic"]["error_type"] == "quote_server_interrupted"
+    assert client.closed is True
