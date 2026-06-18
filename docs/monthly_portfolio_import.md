@@ -31,7 +31,9 @@ data/runs/<YYYY-MM>/portfolio.csv
 
 ## Daily Premarket Advice
 
-After `data/latest/portfolio.csv` exists, run the daily premarket advice workflow:
+After `data/latest/portfolio.csv` exists, run the daily premarket advice workflow.
+HK and US can be run separately with the scheduled daily runner; the lower-level
+manual `run-premarket` command remains useful for ad hoc analysis and debugging:
 
 ```bash
 export DEEPSEEK_API_KEY=...
@@ -60,6 +62,10 @@ Use `--no-symbol-timeout` for first-time portfolio initialization when every
 eligible symbol should be allowed to finish. Combine it with `--max-workers` to
 run symbols in parallel. `AGRZ` and the common typo `ARGG` are excluded by the
 default premarket blacklist; add more with `--exclude-symbols`.
+
+US and HK stocks and ETFs are AI-eligible portfolio rows. HK cash, HK money
+market funds, cash balances, options, and unsupported markets stay excluded from
+AI analysis rather than guessed.
 
 Optional test run for a subset:
 
@@ -162,7 +168,8 @@ To verify the current portfolio quote universe first, run:
 ```
 
 This reads portfolio rows, excludes cash and money market funds, and fetches one
-snapshot for each remaining quoteable Futu symbol.
+snapshot for each remaining quoteable Futu symbol. HK stock codes are normalized
+to Futu symbols such as `HK.00700`.
 
 To compare live quotes against the structured trader plan, run:
 
@@ -290,10 +297,17 @@ cp config/daily_premarket.env.example config/daily_premarket.env
 Fill in local paths and the DeepSeek API key in `config/daily_premarket.env`. Do not commit
 the real env file.
 
-Run one manual dry run:
+Run manual dry runs for both market-scoped daily workflows:
 
 ```bash
 .venv/bin/python -m open_trader run-daily-premarket \
+  --market HK \
+  --date today \
+  --config config/daily_premarket.env \
+  --dry-run
+
+.venv/bin/python -m open_trader run-daily-premarket \
+  --market US \
   --date today \
   --config config/daily_premarket.env \
   --dry-run
@@ -303,27 +317,41 @@ Run one real manual check with Futu OpenD connected:
 
 ```bash
 .venv/bin/python -m open_trader run-daily-premarket \
+  --market HK \
   --date today \
   --config config/daily_premarket.env
 ```
 
-Install the launchd job:
+Install the launchd jobs:
 
 ```bash
 scripts/install_daily_premarket_launchd.sh
 ```
 
-The job runs Monday through Friday at 18:30 Asia/Shanghai. The daily runner uses
-21:10 Asia/Shanghai as the hard deadline. If a symbol has no fresh advice by the
-deadline, the runner reuses the latest prior successful advice for that symbol
-and marks the row as `fallback`.
+By default the installer creates two user-level jobs:
+
+```text
+com.open-trader.premarket.hk  Monday-Friday 08:00 Asia/Shanghai
+com.open-trader.premarket.us  Monday-Friday 18:30 Asia/Shanghai
+```
+
+HK runs use a fixed 09:00 Asia/Shanghai hard deadline so the report is ready
+before the HK market opens. US runs use `OPEN_TRADER_DEADLINE`, normally 21:10
+Asia/Shanghai. If a symbol has no fresh advice by the deadline, the runner
+reuses the latest prior successful advice for that symbol and marks the row as
+`fallback`.
 
 Daily outputs:
 
 ```text
-data/runs/<YYYY-MM-DD>/daily_run_status.json
-reports/daily_runs/<YYYY-MM-DD>.md
-logs/daily_premarket/<YYYY-MM-DD>.log
+data/runs/<YYYY-MM-DD>/HK/daily_run_status.json
+data/runs/<YYYY-MM-DD>/US/daily_run_status.json
+data/latest/HK/
+data/latest/US/
+reports/daily_runs/<YYYY-MM-DD>-HK.md
+reports/daily_runs/<YYYY-MM-DD>-US.md
+logs/daily_premarket/<YYYY-MM-DD>-HK.log
+logs/daily_premarket/<YYYY-MM-DD>-US.log
 ```
 
 To uninstall:
@@ -339,6 +367,7 @@ Mac mini migration checklist:
 3. Install and log in to Futu OpenD.
 4. Confirm `check-futu-plan` can connect to `127.0.0.1:11111`.
 5. Fill `config/daily_premarket.env`.
-6. Run `.venv/bin/python -m open_trader run-daily-premarket --date today --config config/daily_premarket.env --dry-run`.
-7. Run one real manual `.venv/bin/python -m open_trader run-daily-premarket --date today --config config/daily_premarket.env`.
-8. Install launchd.
+6. Run `.venv/bin/python -m open_trader run-daily-premarket --market HK --date today --config config/daily_premarket.env --dry-run`.
+7. Run `.venv/bin/python -m open_trader run-daily-premarket --market US --date today --config config/daily_premarket.env --dry-run`.
+8. Run one real manual market workflow, for example `.venv/bin/python -m open_trader run-daily-premarket --market HK --date today --config config/daily_premarket.env`.
+9. Install launchd.

@@ -63,19 +63,27 @@ Start Futu OpenD, log in, and confirm quote access:
   --portfolio data/latest/portfolio.csv
 ```
 
-Run one daily premarket dry run:
+Run daily premarket dry runs for each market:
 
 ```bash
 .venv/bin/python -m open_trader run-daily-premarket \
+  --market HK \
+  --date today \
+  --config config/daily_premarket.env \
+  --dry-run
+
+.venv/bin/python -m open_trader run-daily-premarket \
+  --market US \
   --date today \
   --config config/daily_premarket.env \
   --dry-run
 ```
 
-Run one real daily check:
+Run one real daily check for a market:
 
 ```bash
 .venv/bin/python -m open_trader run-daily-premarket \
+  --market HK \
   --date today \
   --config config/daily_premarket.env
 ```
@@ -100,7 +108,8 @@ Important keys:
 - `OPEN_TRADER_REPO`: absolute path to this repository.
 - `OPEN_TRADER_PYTHON`: Python executable used by the scheduled job.
 - `OPEN_TRADER_TIMEZONE`: defaults to `Asia/Shanghai`.
-- `OPEN_TRADER_DEADLINE`: daily hard deadline, default `21:10`.
+- `OPEN_TRADER_DEADLINE`: US daily hard deadline, default `21:10`.
+  HK daily runs use a fixed `09:00` Asia/Shanghai deadline.
 - `OPEN_TRADER_FUTU_HOST`: Futu OpenD host, usually `127.0.0.1`.
 - `OPEN_TRADER_FUTU_PORT`: Futu OpenD quote port, usually `11111`.
 - `OPEN_TRADER_CLASSIFIER_MODEL`: defaults to `deepseek-v4-flash`.
@@ -194,21 +203,36 @@ plan symbols.
 
 ## Daily Automation
 
-Install the macOS user-level `launchd` job:
+Install the macOS user-level `launchd` jobs:
 
 ```bash
 scripts/install_daily_premarket_launchd.sh
 ```
 
-The job runs Monday through Friday at 18:30 Asia/Shanghai:
+By default this installs two jobs:
 
-```text
-.venv/bin/python -m open_trader run-daily-premarket --date today --config config/daily_premarket.env
+- `com.open-trader.premarket.hk`: Monday through Friday at 08:00 Asia/Shanghai.
+- `com.open-trader.premarket.us`: Monday through Friday at 18:30 Asia/Shanghai.
+
+Install only one market when needed:
+
+```bash
+scripts/install_daily_premarket_launchd.sh --market HK
+scripts/install_daily_premarket_launchd.sh --market US
 ```
 
-The daily runner uses `21:10` Asia/Shanghai as the hard deadline. If a symbol
-does not receive fresh advice before the deadline, the runner reuses the latest
-prior successful advice for that symbol and marks it as `fallback`.
+The scheduled commands run the daily workflow with an explicit market:
+
+```text
+.venv/bin/python -m open_trader run-daily-premarket --market HK --date today --config config/daily_premarket.env
+.venv/bin/python -m open_trader run-daily-premarket --market US --date today --config config/daily_premarket.env
+```
+
+HK uses a fixed 09:00 Asia/Shanghai hard deadline so the premarket state is
+available before the HK market opens. US uses `OPEN_TRADER_DEADLINE`, normally
+21:10 Asia/Shanghai. If a symbol does not receive fresh advice before the
+deadline, the runner reuses the latest prior successful advice for that symbol
+and marks it as `fallback`.
 
 Uninstall the job:
 
@@ -221,22 +245,36 @@ scripts/uninstall_daily_premarket_launchd.sh
 Run-scoped outputs:
 
 ```text
-data/runs/<YYYY-MM-DD>/trading_advice.csv
-data/runs/<YYYY-MM-DD>/change_classifications.csv
-data/runs/<YYYY-MM-DD>/premarket_actions.csv
-data/runs/<YYYY-MM-DD>/trading_plan.csv
-data/runs/<YYYY-MM-DD>/daily_run_status.json
-reports/daily_runs/<YYYY-MM-DD>.md
-logs/daily_premarket/<YYYY-MM-DD>.log
+data/runs/<YYYY-MM-DD>/HK/trading_advice.csv
+data/runs/<YYYY-MM-DD>/HK/change_classifications.csv
+data/runs/<YYYY-MM-DD>/HK/premarket_actions.csv
+data/runs/<YYYY-MM-DD>/HK/trading_plan.csv
+data/runs/<YYYY-MM-DD>/HK/trade_actions.csv
+data/runs/<YYYY-MM-DD>/HK/daily_run_status.json
+data/runs/<YYYY-MM-DD>/US/trading_advice.csv
+data/runs/<YYYY-MM-DD>/US/change_classifications.csv
+data/runs/<YYYY-MM-DD>/US/premarket_actions.csv
+data/runs/<YYYY-MM-DD>/US/trading_plan.csv
+data/runs/<YYYY-MM-DD>/US/trade_actions.csv
+data/runs/<YYYY-MM-DD>/US/daily_run_status.json
+reports/daily_runs/<YYYY-MM-DD>-HK.md
+reports/daily_runs/<YYYY-MM-DD>-US.md
+logs/daily_premarket/<YYYY-MM-DD>-HK.log
+logs/daily_premarket/<YYYY-MM-DD>-US.log
 ```
 
 Latest promoted outputs:
 
 ```text
 data/latest/portfolio.csv
-data/latest/trading_advice.csv
-data/latest/premarket_actions.csv
-data/latest/trading_plan.csv
+data/latest/HK/trading_advice.csv
+data/latest/HK/premarket_actions.csv
+data/latest/HK/trading_plan.csv
+data/latest/HK/trade_actions.csv
+data/latest/US/trading_advice.csv
+data/latest/US/premarket_actions.csv
+data/latest/US/trading_plan.csv
+data/latest/US/trade_actions.csv
 ```
 
 ## Development

@@ -55,19 +55,27 @@ OPEN_TRADER_FUTU_PORT=11111
   --portfolio data/latest/portfolio.csv
 ```
 
-先跑一次每日盘前 dry run：
+先分别跑一次港股和美股每日盘前 dry run：
 
 ```bash
 .venv/bin/python -m open_trader run-daily-premarket \
+  --market HK \
+  --date today \
+  --config config/daily_premarket.env \
+  --dry-run
+
+.venv/bin/python -m open_trader run-daily-premarket \
+  --market US \
   --date today \
   --config config/daily_premarket.env \
   --dry-run
 ```
 
-再跑一次真实检查：
+再跑一次指定市场的真实检查：
 
 ```bash
 .venv/bin/python -m open_trader run-daily-premarket \
+  --market HK \
   --date today \
   --config config/daily_premarket.env
 ```
@@ -92,7 +100,8 @@ config/daily_premarket.env.example
 - `OPEN_TRADER_REPO`：本仓库的绝对路径。
 - `OPEN_TRADER_PYTHON`：定时任务使用的 Python 可执行文件。
 - `OPEN_TRADER_TIMEZONE`：默认 `Asia/Shanghai`。
-- `OPEN_TRADER_DEADLINE`：每日硬截止时间，默认 `21:10`。
+- `OPEN_TRADER_DEADLINE`：美股每日硬截止时间，默认 `21:10`。
+  港股每日流程固定使用 Asia/Shanghai `09:00` 截止时间。
 - `OPEN_TRADER_FUTU_HOST`：Futu OpenD 地址，通常是 `127.0.0.1`。
 - `OPEN_TRADER_FUTU_PORT`：Futu OpenD 行情端口，通常是 `11111`。
 - `OPEN_TRADER_CLASSIFIER_MODEL`：默认 `deepseek-v4-flash`。
@@ -185,13 +194,26 @@ open /Applications/FutuOpenD_10.7.6718_Mac/FutuOpenD.app
 scripts/install_daily_premarket_launchd.sh
 ```
 
-任务会在周一到周五 18:30 Asia/Shanghai 运行：
+默认会安装两条任务：
 
-```text
-.venv/bin/python -m open_trader run-daily-premarket --date today --config config/daily_premarket.env
+- `com.open-trader.premarket.hk`：周一到周五 08:00 Asia/Shanghai 运行。
+- `com.open-trader.premarket.us`：周一到周五 18:30 Asia/Shanghai 运行。
+
+也可以只安装单个市场：
+
+```bash
+scripts/install_daily_premarket_launchd.sh --market HK
+scripts/install_daily_premarket_launchd.sh --market US
 ```
 
-每日 runner 使用 21:10 Asia/Shanghai 作为硬截止时间。如果某个标的在截止时间前没有拿到新建议，runner 会复用该标的最近一次成功建议，并把状态标记为 `fallback`。
+定时任务会显式区分市场：
+
+```text
+.venv/bin/python -m open_trader run-daily-premarket --market HK --date today --config config/daily_premarket.env
+.venv/bin/python -m open_trader run-daily-premarket --market US --date today --config config/daily_premarket.env
+```
+
+港股流程固定使用 09:00 Asia/Shanghai 作为硬截止时间，保证港股开盘前形成可复核状态；美股流程使用 `OPEN_TRADER_DEADLINE`，通常是 21:10 Asia/Shanghai。如果某个标的在截止时间前没有拿到新建议，runner 会复用该标的最近一次成功建议，并把状态标记为 `fallback`。
 
 卸载定时任务：
 
@@ -204,22 +226,36 @@ scripts/uninstall_daily_premarket_launchd.sh
 单次运行输出：
 
 ```text
-data/runs/<YYYY-MM-DD>/trading_advice.csv
-data/runs/<YYYY-MM-DD>/change_classifications.csv
-data/runs/<YYYY-MM-DD>/premarket_actions.csv
-data/runs/<YYYY-MM-DD>/trading_plan.csv
-data/runs/<YYYY-MM-DD>/daily_run_status.json
-reports/daily_runs/<YYYY-MM-DD>.md
-logs/daily_premarket/<YYYY-MM-DD>.log
+data/runs/<YYYY-MM-DD>/HK/trading_advice.csv
+data/runs/<YYYY-MM-DD>/HK/change_classifications.csv
+data/runs/<YYYY-MM-DD>/HK/premarket_actions.csv
+data/runs/<YYYY-MM-DD>/HK/trading_plan.csv
+data/runs/<YYYY-MM-DD>/HK/trade_actions.csv
+data/runs/<YYYY-MM-DD>/HK/daily_run_status.json
+data/runs/<YYYY-MM-DD>/US/trading_advice.csv
+data/runs/<YYYY-MM-DD>/US/change_classifications.csv
+data/runs/<YYYY-MM-DD>/US/premarket_actions.csv
+data/runs/<YYYY-MM-DD>/US/trading_plan.csv
+data/runs/<YYYY-MM-DD>/US/trade_actions.csv
+data/runs/<YYYY-MM-DD>/US/daily_run_status.json
+reports/daily_runs/<YYYY-MM-DD>-HK.md
+reports/daily_runs/<YYYY-MM-DD>-US.md
+logs/daily_premarket/<YYYY-MM-DD>-HK.log
+logs/daily_premarket/<YYYY-MM-DD>-US.log
 ```
 
 最新 promoted 输出：
 
 ```text
 data/latest/portfolio.csv
-data/latest/trading_advice.csv
-data/latest/premarket_actions.csv
-data/latest/trading_plan.csv
+data/latest/HK/trading_advice.csv
+data/latest/HK/premarket_actions.csv
+data/latest/HK/trading_plan.csv
+data/latest/HK/trade_actions.csv
+data/latest/US/trading_advice.csv
+data/latest/US/premarket_actions.csv
+data/latest/US/trading_plan.csv
+data/latest/US/trade_actions.csv
 ```
 
 ## 开发
