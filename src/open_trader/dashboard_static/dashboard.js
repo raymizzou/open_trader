@@ -14,6 +14,50 @@ const state = {
 
 const elements = {};
 
+const ACTION_LABELS = {
+  ADD: "加仓",
+  BUY: "买入",
+  HOLD: "观察",
+  REVIEW: "人工复核",
+  SELL_STOP: "止损卖出",
+  TAKE_PROFIT: "止盈",
+  TRIM: "减仓",
+};
+
+const ACTION_STATUS_LABELS = {
+  ready: "待确认",
+  review: "需复核",
+  watch: "观察中",
+};
+
+const PRIORITY_LABELS = {
+  critical: "紧急",
+  high: "高",
+  low: "低",
+  medium: "中",
+};
+
+const TRIGGER_STATUS_LABELS = {
+  add_zone: "接近加仓价",
+  entry_zone: "进入买入区间",
+  missing_quote: "缺失行情",
+  stop_loss_hit: "达到止损价",
+  target_1_hit: "达到第一目标价",
+  target_2_hit: "达到第二目标价",
+  watch: "未触发",
+};
+
+const REASON_LABELS = {
+  "Current price is at or below the stop loss.": "当前价格已达到或低于止损价。",
+  "Current price is at or above target 1.": "当前价格已达到或高于第一目标价。",
+  "Current price is at or above target 2.": "当前价格已达到或高于第二目标价。",
+  "Current price is inside the planned entry zone.": "当前价格位于计划买入区间。",
+  "Current price is near the planned add price.": "当前价格接近计划加仓价。",
+  "No plan trigger is active.": "暂无触发中的交易计划。",
+  "Futu did not return a quote.": "Futu 未返回行情。",
+  "missing quote": "缺失行情。",
+};
+
 document.addEventListener("DOMContentLoaded", () => {
   bindElements();
   bindEvents();
@@ -289,11 +333,11 @@ function renderTradeActions() {
   elements["trade-actions"].innerHTML = actions.map((action) => `
     <article class="action-item">
       <strong>${escapeHtml(formatPlain(action.market))}.${escapeHtml(formatPlain(action.symbol))}</strong>
-      <span class="meta-text">${escapeHtml(formatPlain(action.reason))}</span>
+      <span class="meta-text">${escapeHtml(formatActionReason(action.reason))}</span>
       <div class="action-meta">
         ${renderActionBadge(action.action, action.status)}
-        <span class="badge">${escapeHtml(formatPlain(action.priority))}</span>
-        <span class="badge">${escapeHtml(formatPlain(action.trigger_status))}</span>
+        <span class="badge">${escapeHtml(formatPriority(action.priority))}</span>
+        <span class="badge">${escapeHtml(formatTriggerStatus(action.trigger_status))}</span>
       </div>
     </article>
   `).join("");
@@ -392,8 +436,8 @@ function renderQuotePrice(holding, quote) {
 }
 
 function renderActionBadge(action, status) {
-  const actionText = formatPlain(action);
-  const statusText = formatPlain(status);
+  const actionText = formatAction(action);
+  const statusText = formatActionStatus(status);
   if (actionText === "-" && statusText === "-") {
     return `<span class="badge">-</span>`;
   }
@@ -432,12 +476,44 @@ function formatDiagnostic(payload) {
   }
   const diagnostic = payload.diagnostic || {};
   if (diagnostic.reason) {
-    return String(diagnostic.reason);
+    return formatDiagnosticMessage(diagnostic.reason);
   }
   if (diagnostic.message) {
-    return String(diagnostic.message);
+    return formatDiagnosticMessage(diagnostic.message);
   }
   return quoteStatusLabel(payload.status);
+}
+
+function formatAction(action) {
+  return labelFromMap(ACTION_LABELS, action);
+}
+
+function formatActionStatus(status) {
+  return labelFromMap(ACTION_STATUS_LABELS, status);
+}
+
+function formatPriority(priority) {
+  return labelFromMap(PRIORITY_LABELS, priority);
+}
+
+function formatTriggerStatus(status) {
+  return labelFromMap(TRIGGER_STATUS_LABELS, status);
+}
+
+function formatActionReason(reason) {
+  return labelFromMap(REASON_LABELS, reason);
+}
+
+function formatDiagnosticMessage(message) {
+  return labelFromMap(REASON_LABELS, message);
+}
+
+function labelFromMap(map, value) {
+  const raw = formatPlain(value);
+  if (raw === "-") {
+    return raw;
+  }
+  return map[raw] || map[raw.toLowerCase()] || raw;
 }
 
 function setActiveFilter(container, activeButton) {

@@ -91,6 +91,11 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "dashboardError" in js
     assert "scheduleQuotePolling" in js
     assert "Math.max(1000" in js
+    assert "减仓" in js
+    assert "待确认" in js
+    assert "观察中" in js
+    assert "达到第一目标价" in js
+    assert "暂无触发中的交易计划" in js
     assert ".dashboard-shell" in css
 
 
