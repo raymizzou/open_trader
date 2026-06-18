@@ -16,7 +16,7 @@ class DashboardConfig:
     portfolio_path: Path
     data_dir: Path
     reports_dir: Path
-    poll_seconds: int
+    poll_seconds: float
     futu_host: str
     futu_port: int
 
@@ -156,6 +156,7 @@ def _merge_holding(
     key = _market_symbol_key(row)
     broker_details = positions_by_holding.get(key, []) if key is not None else []
     holding["broker_detail_count"] = len(broker_details)
+    holding["broker_details"] = broker_details
     holding["trade_action"] = actions_by_holding.get(key, {}) if key is not None else {}
     return holding
 

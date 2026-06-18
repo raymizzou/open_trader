@@ -52,7 +52,7 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
         portfolio_path=tmp_path / "data" / "latest" / "portfolio.csv",
         data_dir=tmp_path / "data",
         reports_dir=tmp_path / "reports",
-        poll_seconds=7,
+        poll_seconds=1.5,
         futu_host="127.0.0.1",
         futu_port=11111,
     )
@@ -207,7 +207,7 @@ def test_load_dashboard_state_merges_portfolio_details_cash_and_trade_actions(
     assert state["portfolio_path"] == str(config.portfolio_path)
     assert state["data_dir"] == str(config.data_dir)
     assert state["reports_dir"] == str(config.reports_dir)
-    assert state["poll_seconds"] == 7
+    assert state["poll_seconds"] == 1.5
     assert state["futu_host"] == "127.0.0.1"
     assert state["futu_port"] == 11111
     assert state["broker_detail_month"] == "2026-05"
@@ -221,6 +221,28 @@ def test_load_dashboard_state_merges_portfolio_details_cash_and_trade_actions(
 
     holdings_by_symbol = {row["symbol"]: row for row in state["holdings"]}
     assert holdings_by_symbol["VIXY"]["broker_detail_count"] == 2
+    assert [
+        {
+            "broker": row["broker"],
+            "account_alias": row["account_alias"],
+            "quantity": row["quantity"],
+            "market_value": row["market_value"],
+        }
+        for row in holdings_by_symbol["VIXY"]["broker_details"]
+    ] == [
+        {
+            "broker": "futu",
+            "account_alias": "main",
+            "quantity": "40",
+            "market_value": "1940.00",
+        },
+        {
+            "broker": "tiger",
+            "account_alias": "growth",
+            "quantity": "60",
+            "market_value": "2910.00",
+        },
+    ]
     assert holdings_by_symbol["VIXY"]["trade_action"]["action"] == "TRIM"
 
 
@@ -238,3 +260,5 @@ def test_load_dashboard_state_uses_portfolio_when_monthly_details_are_absent(
     holdings_by_symbol = {row["symbol"]: row for row in state["holdings"]}
     assert "VIXY" in holdings_by_symbol
     assert holdings_by_symbol["VIXY"]["broker_detail_count"] == 0
+    assert holdings_by_symbol["VIXY"]["broker_details"] == []
+    assert holdings_by_symbol["VIXY"]["trade_action"] == {}
