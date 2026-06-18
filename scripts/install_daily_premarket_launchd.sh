@@ -170,6 +170,19 @@ lint_rendered() {
   rm -f "$temp_path"
 }
 
+remove_legacy_agent() {
+  local legacy_target="$HOME/Library/LaunchAgents/com.open-trader.premarket.plist"
+  if [[ -f "$legacy_target" ]]; then
+    launchctl unload "$legacy_target" 2>/dev/null || true
+    rm "$legacy_target"
+    echo "removed legacy launchd agent: $legacy_target"
+  fi
+}
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  remove_legacy_agent
+fi
+
 for market in "${markets[@]}"; do
   rendered="$(render_market "$market")"
   lint_rendered "$rendered"

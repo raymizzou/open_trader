@@ -2628,6 +2628,114 @@ def test_launchd_installer_rejects_unsupported_market_argument(
     assert "usage:" in result.stderr
 
 
+def test_launchd_installer_removes_legacy_agent_before_installing_split_jobs(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    legacy = agents / "com.open-trader.premarket.plist"
+    legacy.write_text("legacy\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--market", "all"],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert not legacy.exists()
+    assert (agents / "com.open-trader.premarket.hk.plist").exists()
+    assert (agents / "com.open-trader.premarket.us.plist").exists()
+
+
+def test_launchd_installer_removes_legacy_agent_for_single_market_install(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    legacy = agents / "com.open-trader.premarket.plist"
+    legacy.write_text("legacy\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--market",
+            "HK",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert not legacy.exists()
+    assert (agents / "com.open-trader.premarket.hk.plist").exists()
+    assert not (agents / "com.open-trader.premarket.us.plist").exists()
+
+
+def test_launchd_installer_dry_run_does_not_remove_legacy_agent(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    legacy = agents / "com.open-trader.premarket.plist"
+    legacy.write_text("legacy\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--dry-run",
+            "--market",
+            "all",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert legacy.exists()
+    assert not (agents / "com.open-trader.premarket.hk.plist").exists()
+    assert not (agents / "com.open-trader.premarket.us.plist").exists()
+
+
 def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
     example = (
         Path(__file__).resolve().parents[1] / "config/daily_premarket.env.example"
