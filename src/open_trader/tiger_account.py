@@ -17,9 +17,16 @@ from .models import AssetClass, CashBalance, Market, Position
 
 
 class TigerAccountError(RuntimeError):
-    def __init__(self, message: str, *, error_type: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str,
+        sync_result: TigerPortfolioSyncResult | None = None,
+    ) -> None:
         super().__init__(message)
         self.error_type = error_type
+        self.sync_result = sync_result
 
 
 @dataclass(frozen=True)
@@ -119,10 +126,24 @@ def sync_tiger_portfolio(
         ),
     )
 
+    blocking_result = TigerPortfolioSyncResult(
+        run_date=run_date,
+        account_count=len(snapshot.accounts),
+        position_count=len(positions),
+        cash_count=len(cash_balances),
+        merged_row_count=len(merged_rows),
+        snapshot_path=snapshot_path,
+        portfolio_path=merged_portfolio_path,
+        report_path=report_path,
+        latest_path=latest_path,
+        updated_latest=False,
+    )
+
     if blocking_errors:
         raise TigerAccountError(
             "; ".join(blocking_errors),
             error_type="blocking_data_error",
+            sync_result=blocking_result,
         )
 
     if update_latest:
@@ -222,9 +243,9 @@ def load_tiger_account_config(
         or ""
     ).strip()
     private_key = (
-        properties.get("private_key_pk1")
+        os.environ.get("TIGEROPEN_PRIVATE_KEY")
+        or properties.get("private_key_pk1")
         or properties.get("private_key")
-        or os.environ.get("TIGEROPEN_PRIVATE_KEY")
         or None
     )
     private_key_path = Path(private_key_path_text).expanduser() if private_key_path_text else None
@@ -308,7 +329,7 @@ def _account_alias(account: str) -> str:
 
 
 def _is_active_account(account: object) -> bool:
-    return _text(account, "status").upper() == "FUNDED"
+    return _text(account, "status").upper() in {"FUNDED", "OPEN"}
 
 
 def _asset_method_for_account_type(account_type: str) -> str:
@@ -549,30 +570,42 @@ class TigerAccountClient:
         segments = _get_attr(payload, "segments", {})
         if not isinstance(segments, dict):
             return records
-        for segment in segments.values():
-            currency_assets = _get_attr(segment, "currency_assets", {})
-            if not isinstance(currency_assets, dict):
+        segment = segments.get("S")
+        if segment is None:
+            segment = next(
+                (
+                    candidate
+                    for candidate in segments.values()
+                    if _text(candidate, "category").upper() == "S"
+                ),
+                None,
+            )
+        if segment is None:
+            return records
+
+        currency_assets = _get_attr(segment, "currency_assets", {})
+        if not isinstance(currency_assets, dict):
+            return records
+        for currency_asset in currency_assets.values():
+            if not self._has_non_zero_balance(currency_asset):
                 continue
-            for currency_asset in currency_assets.values():
-                if not self._has_non_zero_balance(currency_asset):
-                    continue
-                records.append(
-                    {
-                        "account": account.account,
-                        "account_alias": account.account_alias,
-                        "currency": _text(currency_asset, "currency"),
-                        "cash_balance": _text(currency_asset, "cash_balance"),
-                        "available_balance": _first_present_value(
-                            currency_asset,
-                            "cash_available_for_trade",
-                            "cash_available_for_withdrawal",
-                        ),
-                        "gross_position_value": _text(
-                            currency_asset, "gross_position_value"
-                        ),
-                        "source": account.asset_method,
-                    }
-                )
+            records.append(
+                {
+                    "account": account.account,
+                    "account_alias": account.account_alias,
+                    "currency": _text(currency_asset, "currency"),
+                    "cash_balance": _text(currency_asset, "cash_balance"),
+                    "available_balance": _first_present_value(
+                        currency_asset,
+                        "cash_available_for_trade",
+                        "cash_available_for_withdrawal",
+                    ),
+                    "gross_position_value": _text(
+                        currency_asset, "gross_position_value"
+                    ),
+                    "source": account.asset_method,
+                }
+            )
         return records
 
     @staticmethod
@@ -815,6 +848,20 @@ def _market_from_record(record: dict[str, object]) -> Market:
     if raw_market == "US":
         return Market.US
     if raw_market == "HK":
+        return Market.HK
+    if raw_market:
+        return Market.OTHER
+
+    currency = _text(record, "currency", "").upper()
+    if currency == "USD":
+        return Market.US
+    if currency == "HKD":
+        return Market.HK
+
+    symbol = _text(record, "symbol", "").upper()
+    if symbol.endswith(".HK") or symbol.startswith("HK."):
+        return Market.HK
+    if symbol.isdigit() and 4 <= len(symbol) <= 5:
         return Market.HK
     return Market.OTHER
 

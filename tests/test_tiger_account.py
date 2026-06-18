@@ -16,6 +16,7 @@ from open_trader.tiger_account import (
     TigerAccountError,
     TigerAccountClient,
     TigerAccountSnapshot,
+    TigerPortfolioSyncResult,
     sync_tiger_portfolio,
     map_snapshot_to_portfolio_inputs,
     load_tiger_account_config,
@@ -138,6 +139,35 @@ def test_load_config_reads_official_properties_file(tmp_path: Path) -> None:
     )
     assert config.private_key_path is None
     assert config.config_dir == config_dir
+
+
+def test_load_config_environment_private_key_overrides_properties_private_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / ".tigeropen"
+    config_dir.mkdir()
+    config_dir.joinpath("tiger_openapi_config.properties").write_text(
+        "\n".join(
+            [
+                "tiger_id=file-tiger-id",
+                "account=file-account",
+                "private_key_pk1=file-pk1-key",
+                "private_key=file-private-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TIGEROPEN_PRIVATE_KEY", "env-private-key")
+
+    config = load_tiger_account_config(
+        config_dir=config_dir,
+        account=None,
+        sandbox=False,
+    )
+
+    assert config.private_key == "env-private-key"
+    assert config.private_key_path is None
 
 
 def test_load_config_prefers_private_key_path_over_raw_private_key(
@@ -301,6 +331,35 @@ class FakePrimeAssetsWithUsefulZeroCash:
         }
 
 
+class FakePrimeAssetsWithCommodityCash:
+    def __init__(self) -> None:
+        self.account = "123456789"
+        self.segments = {
+            "S": FakeSegment(
+                category="S",
+                currency_assets={
+                    "USD": FakeCurrencyAsset(
+                        currency="USD",
+                        cash_balance="100.25",
+                        cash_available_for_trade="88.50",
+                        gross_position_value="820",
+                    ),
+                },
+            ),
+            "C": FakeSegment(
+                category="C",
+                currency_assets={
+                    "USD": FakeCurrencyAsset(
+                        currency="USD",
+                        cash_balance="9999.99",
+                        cash_available_for_trade="9999.99",
+                        gross_position_value="0",
+                    ),
+                },
+            ),
+        }
+
+
 class FakePrimeAssetsWithWithdrawalOnly:
     def __init__(self) -> None:
         self.account = "123456789"
@@ -374,6 +433,12 @@ class FakePrimeAssetUsefulCashTradeClient(FakeTradeClient):
         return FakePrimeAssetsWithUsefulZeroCash()
 
 
+class FakePrimeAssetCommodityCashTradeClient(FakeTradeClient):
+    def get_prime_assets(self, **kwargs: object) -> FakePrimeAssetsWithCommodityCash:
+        self.prime_asset_calls.append(kwargs)
+        return FakePrimeAssetsWithCommodityCash()
+
+
 class FakePrimeAssetWithdrawalOnlyTradeClient(FakeTradeClient):
     def get_prime_assets(self, **kwargs: object) -> FakePrimeAssetsWithWithdrawalOnly:
         self.prime_asset_calls.append(kwargs)
@@ -439,6 +504,22 @@ class FakeGlobalTradeClient(FakeTradeClient):
                             },
                         )()
                     },
+                },
+            )()
+        ]
+
+
+class FakeOpenStatusTradeClient(FakeTradeClient):
+    def get_managed_accounts(self, account: str | None = None) -> list[object]:
+        return [
+            type(
+                "Profile",
+                (),
+                {
+                    "account": "123456789",
+                    "accountType": "STANDARD",
+                    "capability": "RegTMargin",
+                    "status": "Open",
                 },
             )()
         ]
@@ -586,6 +667,26 @@ def test_tiger_account_client_fetches_standard_account_snapshot() -> None:
     assert snapshot.cash_records[0]["cash_balance"] == "100.25"
     assert client.trade_client.position_calls == [{"account": "123456789"}]
     assert client.trade_client.prime_asset_calls == [{"account": "123456789"}]
+
+
+def test_tiger_account_client_accepts_open_status_case_insensitively() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=FakeOpenStatusTradeClient,
+    )
+
+    snapshot = client.fetch_snapshot()
+
+    assert snapshot.accounts == [
+        TigerAccount(
+            account="123456789",
+            account_alias="tiger_6789",
+            account_type="STANDARD",
+            capability="REGTMARGIN",
+            status="OPEN",
+            asset_method="get_prime_assets",
+        )
+    ]
 
 
 def test_tiger_account_client_uses_get_assets_for_global_account() -> None:
@@ -766,6 +867,34 @@ def test_tiger_account_client_keeps_zero_cash_row_if_other_balance_is_positive()
         if record["currency"] == "HKD":
             assert record["cash_balance"] == "0"
             assert record["gross_position_value"] == "100.00"
+
+
+def test_tiger_account_client_prime_asset_ignores_commodity_segment_cash() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=FakePrimeAssetCommodityCashTradeClient,
+    )
+
+    snapshot = client.fetch_snapshot()
+    _, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert blocking_errors == []
+    assert snapshot.cash_records == [
+        {
+            "account": "123456789",
+            "account_alias": "tiger_6789",
+            "currency": "USD",
+            "cash_balance": "100.25",
+            "available_balance": "88.50",
+            "gross_position_value": "820",
+            "source": "get_prime_assets",
+        }
+    ]
+    assert len(cash_balances) == 1
+    assert cash_balances[0].cash_balance == Decimal("100.25")
 
 
 def test_tiger_account_client_masks_raw_text_in_position_query_errors() -> None:
@@ -1115,6 +1244,65 @@ def test_map_snapshot_recomputes_identity_from_fallback_symbol_fields() -> None:
     assert len(positions) == 1
     assert positions[0].symbol == "MSFT"
     assert positions[0].confidence == "high"
+
+
+def test_map_snapshot_infers_us_market_from_currency_when_market_is_missing() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "sec_type": "STK",
+                "currency": "USD",
+                "position_qty": "2",
+                "market_value": "820",
+            }
+        ],
+    )
+
+    positions, _, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert blocking_errors == []
+    assert len(positions) == 1
+    assert positions[0].market == Market.US
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"symbol": "00700", "currency": "HKD"},
+        {"symbol": "00700.HK", "currency": ""},
+        {"symbol": "HK.00700", "currency": ""},
+    ],
+)
+def test_map_snapshot_infers_hk_market_when_market_is_missing(
+    record: dict[str, object],
+) -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "sec_type": "STK",
+                "position_qty": "100",
+                "market_value": "32000",
+                **record,
+            }
+        ],
+    )
+
+    positions, _, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert blocking_errors == []
+    assert len(positions) == 1
+    assert positions[0].market == Market.HK
 
 
 def test_map_snapshot_skips_malformed_cash_rows_and_reports_error() -> None:
@@ -1502,6 +1690,18 @@ def test_sync_tiger_portfolio_blocks_latest_update_on_data_errors(
         )
 
     assert exc_info.value.error_type == "blocking_data_error"
+    assert exc_info.value.sync_result == TigerPortfolioSyncResult(
+        run_date="2026-06-19",
+        account_count=1,
+        position_count=0,
+        cash_count=0,
+        merged_row_count=0,
+        snapshot_path=run_dir / "tiger_account_snapshot.json",
+        portfolio_path=run_dir / "portfolio.csv",
+        report_path=tmp_path / "reports/tiger_account/2026-06-19.md",
+        latest_path=tmp_path / "data/latest/portfolio.csv",
+        updated_latest=False,
+    )
     assert read_portfolio(portfolio_path)[0]["symbol"] == "QQQ"
     assert run_dir.joinpath("tiger_account_snapshot.json").exists()
     assert run_dir.joinpath("portfolio.csv").exists()

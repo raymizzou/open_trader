@@ -9,6 +9,7 @@ from open_trader.cli import build_parser
 from open_trader.tiger_account import (
     TigerAccount,
     TigerAccountConfig,
+    TigerAccountError,
     TigerAccountSnapshot,
     TigerPortfolioSyncResult,
 )
@@ -125,8 +126,14 @@ def test_check_tiger_account_main_prints_diagnostic_summary(
     output = capsys.readouterr().out
     assert "connected to Tiger OpenAPI account *****6789" in output
     assert "accounts: 1" in output
+    assert (
+        "account: alias=tiger_6789 account_type=STANDARD "
+        "status=FUNDED asset_method=get_prime_assets"
+    ) in output
     assert "positions: 1" in output
     assert "cash_records: 1" in output
+    assert "cash_currencies: USD" in output
+    assert "123456789" not in output
 
 
 def test_sync_tiger_portfolio_main_wires_sync(
@@ -218,3 +225,78 @@ def test_sync_tiger_portfolio_main_wires_sync(
     assert f"report: {tmp_path / 'reports/tiger_account/2026-06-19.md'}" in output
     assert f"latest: {tmp_path / 'data/latest/portfolio.csv'}" in output
     assert "updated_latest: true" in output
+
+
+def test_sync_tiger_portfolio_main_prints_artifacts_for_blocking_data_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    snapshot = tiger_snapshot()
+    config = tiger_config()
+    result = TigerPortfolioSyncResult(
+        run_date="2026-06-19",
+        account_count=1,
+        position_count=0,
+        cash_count=1,
+        merged_row_count=2,
+        snapshot_path=tmp_path / "data/runs/2026-06-19/tiger_account_snapshot.json",
+        portfolio_path=tmp_path / "data/runs/2026-06-19/portfolio.csv",
+        report_path=tmp_path / "reports/tiger_account/2026-06-19.md",
+        latest_path=tmp_path / "data/latest/portfolio.csv",
+        updated_latest=False,
+    )
+
+    def fake_load_tiger_account_config(**_kwargs: object) -> TigerAccountConfig:
+        return config
+
+    class FakeTigerAccountClient:
+        def __init__(self, *, config: TigerAccountConfig) -> None:
+            self.config = config
+
+        def fetch_snapshot(self) -> TigerAccountSnapshot:
+            return snapshot
+
+        def close(self) -> None:
+            pass
+
+    def fake_sync_tiger_portfolio(**_kwargs: object) -> TigerPortfolioSyncResult:
+        raise TigerAccountError(
+            "position BROKEN has invalid required field position_qty='bad'",
+            error_type="blocking_data_error",
+            sync_result=result,
+        )
+
+    monkeypatch.setattr(cli, "load_tiger_account_config", fake_load_tiger_account_config)
+    monkeypatch.setattr(cli, "TigerAccountClient", FakeTigerAccountClient)
+    monkeypatch.setattr(cli, "sync_tiger_portfolio", fake_sync_tiger_portfolio)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "sync-tiger-portfolio",
+                "--portfolio",
+                str(tmp_path / "data/latest/portfolio.csv"),
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--reports-dir",
+                str(tmp_path / "reports"),
+                "--date",
+                "2026-06-19",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "run_date: 2026-06-19" in captured.out
+    assert "accounts: 1" in captured.out
+    assert "positions: 0" in captured.out
+    assert "cash: 1" in captured.out
+    assert "merged_rows: 2" in captured.out
+    assert f"snapshot: {result.snapshot_path}" in captured.out
+    assert f"portfolio: {result.portfolio_path}" in captured.out
+    assert f"report: {result.report_path}" in captured.out
+    assert f"latest: {result.latest_path}" in captured.out
+    assert "updated_latest: false" in captured.out
+    assert "blocking_data_error" not in captured.out
+    assert "invalid required field position_qty" in captured.err

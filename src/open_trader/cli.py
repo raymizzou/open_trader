@@ -32,6 +32,7 @@ from .pipeline import run_import, validate_month
 from .tiger_account import (
     TigerAccountClient,
     TigerAccountError,
+    TigerPortfolioSyncResult,
     load_tiger_account_config,
     mask_account_id,
     sync_tiger_portfolio,
@@ -119,6 +120,19 @@ def _parse_symbol_subset(value: str | None) -> set[str] | None:
 
 def _parse_symbol_set(value: str | None) -> set[str]:
     return _parse_symbol_subset(value) or set()
+
+
+def _print_tiger_sync_result(result: TigerPortfolioSyncResult) -> None:
+    print(f"run_date: {result.run_date}")
+    print(f"accounts: {result.account_count}")
+    print(f"positions: {result.position_count}")
+    print(f"cash: {result.cash_count}")
+    print(f"merged_rows: {result.merged_row_count}")
+    print(f"snapshot: {result.snapshot_path}")
+    print(f"portfolio: {result.portfolio_path}")
+    print(f"report: {result.report_path}")
+    print(f"latest: {result.latest_path}")
+    print(f"updated_latest: {'true' if result.updated_latest else 'false'}")
 
 
 def _active_trade_action_plans_for_quotes(
@@ -783,8 +797,25 @@ def main(argv: list[str] | None = None) -> int:
             if account_client is not None:
                 account_client.close()
         print(f"accounts: {len(snapshot.accounts)}")
+        for account in snapshot.accounts:
+            print(
+                "account: "
+                f"alias={account.account_alias} "
+                f"account_type={account.account_type} "
+                f"status={account.status} "
+                f"asset_method={account.asset_method}"
+            )
         print(f"positions: {len(snapshot.position_records)}")
         print(f"cash_records: {len(snapshot.cash_records)}")
+        cash_currencies = sorted(
+            {
+                str(record.get("currency", "")).strip().upper()
+                for record in snapshot.cash_records
+                if str(record.get("currency", "")).strip()
+            }
+        )
+        if cash_currencies:
+            print(f"cash_currencies: {','.join(cash_currencies)}")
         return 0
 
     if args.command == "sync-tiger-portfolio":
@@ -809,21 +840,16 @@ def main(argv: list[str] | None = None) -> int:
                 run_date=args.date,
                 update_latest=args.update_latest,
             )
-        except (FileNotFoundError, ValueError, RuntimeError, TigerAccountError) as exc:
+        except TigerAccountError as exc:
+            if exc.error_type == "blocking_data_error" and exc.sync_result is not None:
+                _print_tiger_sync_result(exc.sync_result)
+            parser.error(str(exc))
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
             parser.error(str(exc))
         finally:
             if account_client is not None:
                 account_client.close()
-        print(f"run_date: {result.run_date}")
-        print(f"accounts: {result.account_count}")
-        print(f"positions: {result.position_count}")
-        print(f"cash: {result.cash_count}")
-        print(f"merged_rows: {result.merged_row_count}")
-        print(f"snapshot: {result.snapshot_path}")
-        print(f"portfolio: {result.portfolio_path}")
-        print(f"report: {result.report_path}")
-        print(f"latest: {result.latest_path}")
-        print(f"updated_latest: {'true' if result.updated_latest else 'false'}")
+        _print_tiger_sync_result(result)
         return 0
 
     if args.command == "build-trading-plan":
