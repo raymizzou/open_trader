@@ -15,6 +15,8 @@ OpenD, and writes reports. It does not place orders automatically.
 - Import monthly broker statements into a normalized portfolio CSV.
 - Pull live Futu real-account holdings and cash into the standard portfolio CSV
   while keeping other brokers on statement imports.
+- Pull live Tiger OpenAPI holdings and cash into the standard portfolio CSV
+  while preserving non-Tiger rows.
 - Generate per-symbol premarket advice with TradingAgents and DeepSeek.
 - Preserve raw model output and normalized trader templates for auditability.
 - Fall back to the latest prior successful advice when a daily run misses the
@@ -118,6 +120,14 @@ Important keys:
 - `OPEN_TRADER_FUTU_PORT`: Futu OpenD quote port, usually `11111`.
 - `OPEN_TRADER_CLASSIFIER_MODEL`: defaults to `deepseek-v4-flash`.
 
+Tiger OpenAPI account sync uses Tiger's official
+`~/.tigeropen/tiger_openapi_config.properties` file, CLI `--account`, or
+`TIGEROPEN_*` environment variables. Supported environment variables are
+`TIGEROPEN_TIGER_ID`, `TIGEROPEN_ACCOUNT`, `TIGEROPEN_PRIVATE_KEY_PATH`,
+`TIGEROPEN_PRIVATE_KEY`, and optional `TIGEROPEN_SECRET_KEY` or
+`TIGEROPEN_TOKEN`. Prefer the properties file or private key path over a raw
+private key environment value.
+
 ## Common Workflows
 
 ### Import Monthly Statements
@@ -193,6 +203,36 @@ open /Applications/FutuOpenD_10.7.6718_Mac/FutuOpenD.app
 After login, rerun `get_global_state()` and confirm `qot_logined=True`, then
 rerun `check-futu-plan`. A healthy check prints `last_price=...` for active
 plan symbols.
+
+### Sync Tiger OpenAPI Portfolio
+
+Tiger live account sync is read-only and does not place orders. It works from
+the current `data/latest/portfolio.csv`, replaces Tiger-only rows with current
+Tiger OpenAPI holdings and cash, and preserves non-Tiger rows. Monthly
+`import-statements` still requires statement inputs; Tiger sync is a separate
+current-account refresh.
+
+```bash
+.venv/bin/python -m open_trader check-tiger-account
+
+.venv/bin/python -m open_trader sync-tiger-portfolio \
+  --date 2026-06-19
+```
+
+The sync command above is the no-latest review run by default. Review
+`data/runs/2026-06-19/tiger_account_snapshot.json`,
+`data/runs/2026-06-19/portfolio.csv`, and
+`reports/tiger_account/2026-06-19.md`. Then promote after review:
+
+```bash
+.venv/bin/python -m open_trader sync-tiger-portfolio \
+  --date 2026-06-19 \
+  --update-latest
+```
+
+Rows that mix Tiger with another broker stop for manual review instead of
+being split automatically. Malformed Tiger data writes dated artifacts and a
+report, then blocks latest promotion.
 
 ### Generate Trade Actions
 
