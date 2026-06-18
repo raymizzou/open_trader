@@ -15,6 +15,16 @@ from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
 
 
 TRD_ENV_REAL = "REAL"
+FUTU_CASH_CURRENCY_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("HKD", "hk_cash", "hk_avl_withdrawal_cash"),
+    ("USD", "us_cash", "us_avl_withdrawal_cash"),
+    ("CNH", "cn_cash", "cn_avl_withdrawal_cash"),
+    ("JPY", "jp_cash", "jp_avl_withdrawal_cash"),
+    ("SGD", "sg_cash", "sg_avl_withdrawal_cash"),
+    ("AUD", "au_cash", "au_avl_withdrawal_cash"),
+    ("CAD", "ca_cash", "ca_avl_withdrawal_cash"),
+    ("MYR", "my_cash", "my_avl_withdrawal_cash"),
+)
 
 
 class FutuAccountError(RuntimeError):
@@ -205,8 +215,13 @@ def map_snapshot_to_portfolio_inputs(
         for record in snapshot.position_records
     ]
     cash_balances = [
-        _cash_from_record(record, statement_id, blocking_errors)
+        cash_balance
         for record in snapshot.cash_records
+        for cash_balance in _cash_balances_from_record(
+            record,
+            statement_id,
+            blocking_errors,
+        )
     ]
     return positions, cash_balances, blocking_errors
 
@@ -281,6 +296,49 @@ def _position_from_record(
         confidence=confidence,
         notes="Futu live account position",
     )
+
+
+def _cash_balances_from_record(
+    record: dict[str, object],
+    statement_id: str,
+    blocking_errors: list[str],
+) -> list[CashBalance]:
+    cash_balances = _per_currency_cash_balances_from_record(record, statement_id)
+    if cash_balances:
+        return cash_balances
+    return [_cash_from_record(record, statement_id, blocking_errors)]
+
+
+def _per_currency_cash_balances_from_record(
+    record: dict[str, object],
+    statement_id: str,
+) -> list[CashBalance]:
+    cash_balances: list[CashBalance] = []
+    for currency, cash_key, available_key in FUTU_CASH_CURRENCY_FIELDS:
+        cash_value = _optional_decimal(record, (cash_key,))
+        available_balance = _optional_decimal(record, (available_key,))
+        if cash_value is None and available_balance is None:
+            continue
+        if (cash_value or Decimal("0")) == 0 and (
+            available_balance or Decimal("0")
+        ) == 0:
+            continue
+        cash_balances.append(
+            CashBalance(
+                statement_id=statement_id,
+                broker="futu",
+                account_alias=_first_text(record, ("_account_alias",), "futu_unknown"),
+                currency=currency,
+                cash_balance=(
+                    cash_value if cash_value is not None else available_balance
+                )
+                or Decimal("0"),
+                available_balance=available_balance,
+                confidence="high" if cash_value is not None else "low",
+                notes="Futu live account cash",
+            )
+        )
+    return cash_balances
 
 
 def _cash_from_record(
@@ -431,10 +489,11 @@ def sync_futu_portfolio(
     merged_rows = _recalculate_combined_portfolio_rows([*preserved_rows, *futu_rows])
     run_dir = data_dir / "runs" / run_date
     run_dir.mkdir(parents=True, exist_ok=True)
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_dir = reports_dir / "futu_account"
+    report_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = run_dir / "futu_account_snapshot.json"
     merged_portfolio_path = run_dir / "portfolio.csv"
-    report_path = run_dir / "futu_account_report.md"
+    report_path = report_dir / f"{run_date}.md"
     snapshot_path.write_text(
         json.dumps(_snapshot_to_json(snapshot), ensure_ascii=False, indent=2),
         encoding="utf-8",

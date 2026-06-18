@@ -214,7 +214,7 @@ Review:
 
 - `data/runs/2026-06-18/futu_account_snapshot.json`
 - `data/runs/2026-06-18/portfolio.csv`
-- `data/runs/2026-06-18/futu_account_report.md`
+- `reports/futu_account/2026-06-18.md`
 
 After confirming the merged portfolio, promote it:
 

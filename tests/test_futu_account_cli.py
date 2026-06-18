@@ -132,7 +132,7 @@ def test_sync_futu_portfolio_main_wires_sync(
             merged_row_count=3,
             snapshot_path=tmp_path / "data/runs/2026-06-18/futu_account_snapshot.json",
             portfolio_path=tmp_path / "data/runs/2026-06-18/portfolio.csv",
-            report_path=tmp_path / "data/runs/2026-06-18/futu_account_report.md",
+            report_path=tmp_path / "reports/futu_account/2026-06-18.md",
             latest_path=tmp_path / "data/latest/portfolio.csv",
             updated_latest=True,
         )
@@ -173,4 +173,5 @@ def test_sync_futu_portfolio_main_wires_sync(
     assert "positions: 2" in output
     assert "cash: 1" in output
     assert "merged_rows: 3" in output
+    assert f"report: {tmp_path / 'reports/futu_account/2026-06-18.md'}" in output
     assert "updated_latest: true" in output

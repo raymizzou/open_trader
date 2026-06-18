@@ -308,6 +308,66 @@ def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:
     assert cash.confidence == "high"
 
 
+def test_map_snapshot_expands_futu_accinfo_per_currency_cash() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "HKD",
+                "cash": "-114156.26",
+                "hk_cash": "-125409.59",
+                "hk_avl_withdrawal_cash": "-125409.59",
+                "us_cash": "1435.8",
+                "us_avl_withdrawal_cash": "1400.50",
+                "cn_cash": "0",
+                "cn_avl_withdrawal_cash": "0",
+                "au_cash": "N/A",
+                "au_avl_withdrawal_cash": "N/A",
+            }
+        ],
+        position_records=[],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-18",
+    )
+
+    assert positions == []
+    assert blocking_errors == []
+    assert [cash.currency for cash in cash_balances] == ["HKD", "USD"]
+    cash_by_currency = {cash.currency: cash for cash in cash_balances}
+    assert cash_by_currency["HKD"].cash_balance == Decimal("-125409.59")
+    assert cash_by_currency["USD"].cash_balance == Decimal("1435.8")
+    assert cash_by_currency["USD"].available_balance == Decimal("1400.50")
+
+
+def test_map_snapshot_preserves_simple_fake_cash_record_compatibility() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "USD",
+                "cash": "100.25",
+                "available_cash": "88.50",
+            }
+        ],
+        position_records=[],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-18",
+    )
+
+    assert positions == []
+    assert blocking_errors == []
+    assert len(cash_balances) == 1
+    assert cash_balances[0].currency == "USD"
+    assert cash_balances[0].cash_balance == Decimal("100.25")
+    assert cash_balances[0].available_balance == Decimal("88.50")
+
+
 def test_map_snapshot_marks_malformed_required_position_fields_low_confidence() -> None:
     snapshot = client_snapshot_from_records(
         cash_records=[
@@ -615,6 +675,11 @@ def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
     assert aapl["brokers"] == "tiger"
     assert aapl["portfolio_weight_hkd"] == "17.86%"
     assert result.latest_path == tmp_path / "data/latest/portfolio.csv"
+    assert result.snapshot_path == (
+        tmp_path / "data/runs/2026-06-18/futu_account_snapshot.json"
+    )
+    assert result.portfolio_path == tmp_path / "data/runs/2026-06-18/portfolio.csv"
+    assert result.report_path == tmp_path / "reports/futu_account/2026-06-18.md"
     assert read_portfolio(result.latest_path)[0]["symbol"] == "OLD"
     assert result.updated_latest is False
 
@@ -624,6 +689,42 @@ def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
     assert "富途账户同步" in report
     assert "真实账户：1" in report
     assert "未更新 latest" in report
+
+
+def test_sync_futu_portfolio_cash_count_uses_expanded_currency_balances(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [tiger_row()])
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "HKD",
+                "cash": "-114156.26",
+                "hk_cash": "-125409.59",
+                "hk_avl_withdrawal_cash": "-125409.59",
+                "us_cash": "1435.8",
+                "us_avl_withdrawal_cash": "1400.50",
+            }
+        ],
+        position_records=[],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-18",
+        update_latest=False,
+    )
+
+    assert result.cash_count == 2
+    rows = read_portfolio(result.portfolio_path)
+    assert {"HKD_CASH", "USD_CASH"} <= {row["symbol"] for row in rows}
+    report = result.report_path.read_text(encoding="utf-8")
+    assert "现金币种：2" in report
 
 
 def test_sync_futu_portfolio_updates_latest_only_when_requested(tmp_path: Path) -> None:
@@ -772,7 +873,7 @@ def test_sync_futu_portfolio_blocks_latest_when_required_fields_are_malformed(
     run_dir = tmp_path / "data/runs/2026-06-18"
     snapshot_path = run_dir / "futu_account_snapshot.json"
     merged_portfolio_path = run_dir / "portfolio.csv"
-    report_path = run_dir / "futu_account_report.md"
+    report_path = tmp_path / "reports/futu_account/2026-06-18.md"
     assert snapshot_path.exists()
     assert merged_portfolio_path.exists()
     assert report_path.exists()
