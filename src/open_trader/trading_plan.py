@@ -396,11 +396,13 @@ def _agent_reason_and_excerpt(
 def _english_reason_themes(text: str) -> list[str]:
     normalized = text.lower()
     themes: list[str] = []
+    valuation_keywords = ("valuation", "p/e", "multiple", "margin", "goodwill", "sbc")
+    if any(keyword in normalized for keyword in valuation_keywords) or re.search(
+        r"\bearn(?:ing|ings)?\b",
+        normalized,
+    ):
+        themes.append("估值或盈利质量风险上升")
     theme_rules = [
-        (
-            ("valuation", "earnings", "p/e", "multiple", "margin", "goodwill", "sbc"),
-            "估值或盈利质量风险上升",
-        ),
         (
             ("macd", "volume", "divergence", "moving average", "death cross", "technical", "rsi"),
             "技术动能转弱",

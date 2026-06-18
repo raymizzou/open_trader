@@ -8,6 +8,7 @@ import pytest
 
 from open_trader.trading_plan import (
     TRADING_PLAN_FIELDNAMES,
+    _english_reason_themes,
     PlanQuoteStatus,
     TradingPlanBuildResult,
     TradingPlanRow,
@@ -73,9 +74,9 @@ def mrvl_underweight_summary() -> str:
             "目标价：200.0",
             "时间窗口：3-6 months",
             (
-                "理由：The bear demonstrated that normalized earnings imply a "
-                "~316x P/E, while MACD divergence and collapsing volume show "
-                "technical exhaustion."
+                "理由：The bear asked what does MRVL actually earn, arguing "
+                "that the current setup still implies a ~316x P/E, while "
+                "MACD divergence and collapsing volume show technical exhaustion."
             ),
         ]
     )
@@ -379,9 +380,10 @@ def test_build_trading_plan_extracts_agent_reason_and_excerpt(tmp_path: Path) ->
     assert rows[0]["agent_reason"].startswith("TradingAgents建议减仓，理由是")
     assert "估值或盈利质量风险上升" in rows[0]["agent_reason"]
     assert "技术动能转弱" in rows[0]["agent_reason"]
+    assert "理由见原文摘录" not in rows[0]["agent_reason"]
     assert "The bear demonstrated" not in rows[0]["agent_reason"]
     assert rows[0]["agent_excerpt"].startswith(
-        "The bear demonstrated that normalized earnings imply a ~316x P/E"
+        "The bear asked what does MRVL actually earn"
     )
     assert "目标价：200.0" not in rows[0]["agent_reason"]
 
@@ -432,6 +434,12 @@ def test_build_trading_plan_english_reasons_map_to_different_chinese_themes(
     assert "技术动能转弱" in rows["MRVL"]["agent_reason"]
     assert "风险回报不利" in rows["QQQ"]["agent_reason"]
     assert "宏观或事件风险偏高" in rows["QQQ"]["agent_reason"]
+
+
+def test_english_reason_themes_treats_earn_as_valuation_signal() -> None:
+    themes = _english_reason_themes("What does MRVL actually earn?")
+
+    assert "估值或盈利质量风险上升" in themes
 
 
 def test_build_trading_plan_accepts_ascii_section_separators(tmp_path: Path) -> None:
