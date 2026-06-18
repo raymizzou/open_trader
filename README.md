@@ -20,6 +20,8 @@ OpenD, and writes reports. It does not place orders automatically.
 - Build machine-readable trading plans from the advice summaries.
 - Check trading plans against live Futu OpenD quotes.
 - Generate reviewable trade-action CSV and Markdown reports.
+- View a local realtime portfolio dashboard with live quote refresh and stale
+  data warnings.
 - Run the daily premarket workflow automatically on macOS with `launchd`.
 
 ## Safety Notice
@@ -200,6 +202,22 @@ plan symbols.
   --reports-dir reports \
   --date 2026-06-16
 ```
+
+### Run Realtime Portfolio Dashboard
+
+```bash
+.venv/bin/python -m open_trader dashboard --portfolio data/latest/portfolio.csv --poll-seconds 5
+```
+
+The dashboard serves locally at `http://127.0.0.1:8765` by default. It reads
+`data/latest/portfolio.csv`, broker detail artifacts under
+`data/broker_positions/`, and the latest trade actions and reports when present.
+
+When Futu OpenD quotes are available, the dashboard refreshes prices from OpenD.
+If a quote refresh fails, it keeps the last successful quote snapshot and shows
+a failure or stale warning instead of hiding the problem.
+
+The dashboard is read-only: it does not place orders or modify data.
 
 ## Daily Automation
 
