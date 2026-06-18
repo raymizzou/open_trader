@@ -8,7 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time
 from decimal import Decimal
 from pathlib import Path
@@ -29,6 +29,7 @@ from .notifications import (
     render_feishu_order_review,
 )
 from .futu_watch import QuoteSnapshot
+from .market_scope import MarketScope, parse_market_scope
 from .trade_actions import TradeActionsResult, generate_trade_actions
 from .trading_plan import (
     TradingPlanBuildResult,
@@ -287,21 +288,53 @@ class DailyPremarketRunner:
         self.trade_action_generator = trade_action_generator
         self.notifier = notifier or NullNotifier()
 
-    def run(self, run_date: str, *, dry_run: bool | None = None) -> DailyRunResult:
+    def run(
+        self,
+        run_date: str,
+        *,
+        market: str,
+        dry_run: bool | None = None,
+    ) -> DailyRunResult:
         _validate_run_date(run_date)
+        market_scope = parse_market_scope(market)
+        market_config = _config_for_market(self.config, market_scope.value)
         effective_dry_run = self.config.dry_run if dry_run is None else dry_run
-        zone = ZoneInfo(self.config.timezone)
+        zone = ZoneInfo(market_config.timezone)
         started_at = datetime.now(zone)
-        status_path = self.config.data_dir / "runs" / run_date / "daily_run_status.json"
-        report_path = self.config.reports_dir / "daily_runs" / f"{run_date}.md"
-        log_path = self.config.logs_dir / "daily_premarket" / f"{run_date}.log"
-        lock_log_path = self.config.logs_dir / "daily_premarket" / f"{run_date}.lock.log"
-        lock_path = self.config.data_dir / "runs" / ".daily_premarket.lock"
+        status_path = (
+            self.config.data_dir
+            / "runs"
+            / run_date
+            / market_scope.value
+            / "daily_run_status.json"
+        )
+        report_path = (
+            self.config.reports_dir
+            / "daily_runs"
+            / f"{run_date}-{market_scope.value}.md"
+        )
+        log_path = (
+            self.config.logs_dir
+            / "daily_premarket"
+            / f"{run_date}-{market_scope.value}.log"
+        )
+        lock_log_path = (
+            self.config.logs_dir
+            / "daily_premarket"
+            / f"{run_date}-{market_scope.value}.lock.log"
+        )
+        lock_path = (
+            self.config.data_dir
+            / "runs"
+            / f".daily_premarket.{market_scope.value}.lock"
+        )
         try:
             with RunLock(lock_path):
                 try:
                     return self._run_locked(
                         run_date=run_date,
+                        market=market_scope.value,
+                        config=market_config,
                         started_at=started_at,
                         status_path=status_path,
                         report_path=report_path,
@@ -311,6 +344,8 @@ class DailyPremarketRunner:
                 except Exception as exc:
                     return self._write_failure(
                         run_date=run_date,
+                        market=market_scope.value,
+                        config=market_config,
                         started_at=started_at,
                         status_path=status_path,
                         report_path=report_path,
@@ -322,6 +357,8 @@ class DailyPremarketRunner:
             if str(exc) == "daily premarket run already active":
                 return self._write_already_running(
                     run_date=run_date,
+                    market=market_scope.value,
+                    config=market_config,
                     started_at=started_at,
                     status_path=status_path,
                     report_path=report_path,
@@ -330,6 +367,8 @@ class DailyPremarketRunner:
                 )
             return self._write_failure(
                 run_date=run_date,
+                market=market_scope.value,
+                config=market_config,
                 started_at=started_at,
                 status_path=status_path,
                 report_path=report_path,
@@ -342,49 +381,54 @@ class DailyPremarketRunner:
         self,
         *,
         run_date: str,
+        market: str,
+        config: DailyPremarketConfig,
         started_at: datetime,
         status_path: Path,
         report_path: Path,
         log_path: Path,
         dry_run: bool,
     ) -> DailyRunResult:
-        if not self.config.portfolio.exists():
-            raise FileNotFoundError(f"portfolio not found: {self.config.portfolio}")
+        if not config.portfolio.exists():
+            raise FileNotFoundError(f"portfolio not found: {config.portfolio}")
 
         premarket_result = self.premarket_runner(
             run_date=run_date,
-            portfolio_path=self.config.portfolio,
-            data_dir=self.config.data_dir,
-            reports_dir=self.config.reports_dir,
+            portfolio_path=config.portfolio,
+            data_dir=config.data_dir,
+            reports_dir=config.reports_dir,
             advice_runner=None,
-            advice_runner_factory=self._advice_runner_factory(run_date),
+            advice_runner_factory=self._advice_runner_factory(config, run_date),
             classifier=ChangeClassifier(
-                client=OpenAIClassifierClient(model=self.config.classifier_model)
+                client=OpenAIClassifierClient(model=config.classifier_model)
             ),
             symbols=None,
             excluded_symbols=None,
             update_latest=False,
-            max_workers=self.config.max_workers,
+            max_workers=config.max_workers,
             use_fallback=True,
-            deadline_reached=_deadline_reached(self.config, run_date),
+            deadline_reached=_deadline_reached(config, run_date),
+            market=market,
         )
         advice_path = Path(getattr(premarket_result, "advice_path"))
         actions_path = Path(getattr(premarket_result, "actions_path"))
         plan_result = self.plan_builder(
             advice_path=advice_path,
-            data_dir=self.config.data_dir,
+            data_dir=config.data_dir,
             run_date=run_date,
             update_latest=False,
+            market=market,
         )
         futu_status = self._check_futu_plan(plan_result.plan_path)
         trade_actions_result = self.trade_action_generator(
             plan_path=plan_result.plan_path,
-            portfolio_path=self.config.portfolio,
-            data_dir=self.config.data_dir,
-            reports_dir=self.config.reports_dir,
+            portfolio_path=config.portfolio,
+            data_dir=config.data_dir,
+            reports_dir=config.reports_dir,
             snapshots=_snapshots_from_futu_status(futu_status),
             run_date=run_date,
             update_latest=False,
+            market=market,
         )
         trade_action_counts = {
             "actions": trade_actions_result.action_count,
@@ -402,9 +446,11 @@ class DailyPremarketRunner:
         )
         status = str(daily_state["status"])
 
-        latest_advice_path = self.config.data_dir / "latest" / "trading_advice.csv"
-        latest_actions_path = self.config.data_dir / "latest" / "premarket_actions.csv"
-        latest_plan_path = self.config.data_dir / "latest" / "trading_plan.csv"
+        latest_dir = config.data_dir / "latest" / market
+        latest_advice_path = latest_dir / "trading_advice.csv"
+        latest_actions_path = latest_dir / "premarket_actions.csv"
+        latest_plan_path = latest_dir / "trading_plan.csv"
+        latest_trade_actions_path = latest_dir / "trade_actions.csv"
         artifacts = {
             "advice": str(advice_path),
             "classifications": str(getattr(premarket_result, "classifications_path")),
@@ -416,13 +462,15 @@ class DailyPremarketRunner:
             "latest_advice": str(latest_advice_path),
             "latest_actions": str(latest_actions_path),
             "latest_trading_plan": str(latest_plan_path),
-            "latest_trade_actions": str(trade_actions_result.latest_path),
+            "latest_trade_actions": str(latest_trade_actions_path),
             "status": str(status_path),
             "report": str(report_path),
             "log": str(log_path),
         }
         result = self._write_status_and_report(
             run_date=run_date,
+            market=market,
+            config=config,
             started_at=started_at,
             status=status,
             readiness=str(daily_state["readiness"]),
@@ -447,7 +495,8 @@ class DailyPremarketRunner:
                 actions_path=actions_path,
                 plan_path=plan_result.plan_path,
                 trade_actions_path=trade_actions_result.actions_path,
-                data_dir=self.config.data_dir,
+                data_dir=config.data_dir,
+                market=market,
             )
         if self.config.notify_daily_report and not dry_run:
             if _should_notify_blocker(
@@ -486,20 +535,20 @@ class DailyPremarketRunner:
         return result
 
     def _advice_runner_factory(
-        self, run_date: str
+        self, config: DailyPremarketConfig, run_date: str
     ) -> Callable[[], TradingAgentsSubprocessRunner]:
         def factory() -> TradingAgentsSubprocessRunner:
             return TradingAgentsSubprocessRunner(
-                project_path=self.config.tradingagents_path,
+                project_path=config.tradingagents_path,
                 config_overrides={
                     "llm_provider": "deepseek",
                     "deep_think_llm": "deepseek-v4-pro",
                     "quick_think_llm": "deepseek-v4-flash",
-                    "llm_timeout": self.config.ta_timeout_seconds,
-                    "llm_max_retries": self.config.ta_max_retries,
+                    "llm_timeout": config.ta_timeout_seconds,
+                    "llm_max_retries": config.ta_max_retries,
                 },
-                timeout_seconds=_seconds_until_deadline(self.config, run_date),
-                python_executable=str(self.config.python),
+                timeout_seconds=_seconds_until_deadline(config, run_date),
+                python_executable=str(config.python),
             )
 
         return factory
@@ -604,6 +653,8 @@ class DailyPremarketRunner:
         self,
         *,
         run_date: str,
+        market: str,
+        config: DailyPremarketConfig,
         started_at: datetime,
         status: str,
         readiness: str,
@@ -617,12 +668,13 @@ class DailyPremarketRunner:
         report_path: Path,
         log_path: Path,
     ) -> DailyRunResult:
-        finished_at = datetime.now(ZoneInfo(self.config.timezone))
+        finished_at = datetime.now(ZoneInfo(config.timezone))
         payload: dict[str, object] = {
             "run_date": run_date,
+            "market": market,
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
-            "deadline_at": _deadline_at(self.config, run_date).isoformat(),
+            "deadline_at": _deadline_at(config, run_date).isoformat(),
             "status": status,
             "readiness": readiness,
             "status_reasons": status_reasons,
@@ -647,6 +699,8 @@ class DailyPremarketRunner:
         self,
         *,
         run_date: str,
+        market: str,
+        config: DailyPremarketConfig,
         started_at: datetime,
         status_path: Path,
         report_path: Path,
@@ -654,7 +708,7 @@ class DailyPremarketRunner:
         error: str,
         dry_run: bool,
     ) -> DailyRunResult:
-        finished_at = datetime.now(ZoneInfo(self.config.timezone))
+        finished_at = datetime.now(ZoneInfo(config.timezone))
         write_errors: list[dict[str, str]] = []
         daily_state = _derive_daily_state(
             advice_counts={"ok": 0, "fallback": 0, "error": 0},
@@ -671,9 +725,10 @@ class DailyPremarketRunner:
         )
         payload: dict[str, object] = {
             "run_date": run_date,
+            "market": market,
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
-            "deadline_at": _failure_deadline_at(self.config, run_date),
+            "deadline_at": _failure_deadline_at(config, run_date),
             "status": "failed",
             "readiness": daily_state["readiness"],
             "status_reasons": daily_state["status_reasons"],
@@ -694,8 +749,8 @@ class DailyPremarketRunner:
                 "items": [],
                 "error": "",
                 "diagnostic": _futu_diagnostic(
-                    host=self.config.futu_host,
-                    port=self.config.futu_port,
+                    host=config.futu_host,
+                    port=config.futu_port,
                     error_type="none",
                     message="",
                     next_step="",
@@ -775,6 +830,8 @@ class DailyPremarketRunner:
         self,
         *,
         run_date: str,
+        market: str,
+        config: DailyPremarketConfig,
         started_at: datetime,
         status_path: Path,
         report_path: Path,
@@ -796,6 +853,7 @@ class DailyPremarketRunner:
         )
         payload = {
             "run_date": run_date,
+            "market": market,
             "started_at": started_at.isoformat(),
             "status": "already_running",
             "readiness": daily_state["readiness"],
@@ -910,6 +968,21 @@ def _validate_run_date(run_date: str) -> None:
         raise ValueError("run_date must be YYYY-MM-DD")
 
 
+def _deadline_for_market(config: DailyPremarketConfig, market: str) -> str:
+    scope = parse_market_scope(market)
+    if scope is MarketScope.HK:
+        return "09:00"
+    return config.deadline
+
+
+def _config_for_market(
+    config: DailyPremarketConfig,
+    market: str,
+) -> DailyPremarketConfig:
+    scope = parse_market_scope(market)
+    return replace(config, deadline=_deadline_for_market(config, scope.value))
+
+
 def _promote_latest_set(
     *,
     advice_path: Path,
@@ -917,8 +990,9 @@ def _promote_latest_set(
     plan_path: Path,
     trade_actions_path: Path,
     data_dir: Path,
+    market: str | None = None,
 ) -> None:
-    latest_dir = data_dir / "latest"
+    latest_dir = data_dir / "latest" / market if market else data_dir / "latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
     promotions = [
         _LatestPromotion(
@@ -1098,6 +1172,8 @@ def _render_daily_report(payload: dict[str, object]) -> str:
         f"- Finished: {payload.get('finished_at', '')}",
         f"- Deadline: {payload.get('deadline_at', '')}",
     ]
+    if payload.get("market"):
+        lines.append(f"- Market: {payload['market']}")
     if payload.get("error"):
         lines.append(f"- Error: {payload.get('error')}")
     readiness = str(payload.get("readiness", "")).strip()

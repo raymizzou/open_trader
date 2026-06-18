@@ -268,8 +268,29 @@ def test_run_daily_premarket_help_includes_expected_options(
     assert exc_info.value.code == 0
     output = capsys.readouterr().out
     assert "--date" in output
+    assert "--market" in output
     assert "--config" in output
     assert "--dry-run" in output
+
+
+def test_run_daily_premarket_requires_market() -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["run-daily-premarket", "--date", "2026-06-17"])
+
+    assert exc_info.value.code == 2
+
+
+def test_run_daily_premarket_rejects_invalid_market() -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(
+            ["run-daily-premarket", "--date", "2026-06-17", "--market", "CN"]
+        )
+
+    assert exc_info.value.code == 2
 
 
 def test_run_daily_premarket_main_wires_runner(
@@ -284,8 +305,9 @@ def test_run_daily_premarket_main_wires_runner(
             captured["config"] = config
             captured["notifier"] = notifier
 
-        def run(self, *, run_date: str, dry_run: bool):
+        def run(self, *, run_date: str, market: str, dry_run: bool):
             captured["run_date"] = run_date
+            captured["market"] = market
             captured["runner_dry_run"] = dry_run
             return type(
                 "DailyRunResult",
@@ -317,6 +339,8 @@ def test_run_daily_premarket_main_wires_runner(
             "run-daily-premarket",
             "--date",
             "2026-06-17",
+            "--market",
+            "US",
             "--config",
             str(tmp_path / "daily.env"),
             "--dry-run",
@@ -329,6 +353,7 @@ def test_run_daily_premarket_main_wires_runner(
     assert captured["notifier_config"] is captured["config"]
     assert captured["notifier"] is not None
     assert captured["run_date"] == "2026-06-17"
+    assert captured["market"] == "US"
     assert captured["runner_dry_run"] is True
     output = capsys.readouterr().out
     assert "status: success" in output
@@ -348,7 +373,7 @@ def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status
         def __init__(self, *, config: object, notifier: object) -> None:
             pass
 
-        def run(self, *, run_date: str, dry_run: bool):
+        def run(self, *, run_date: str, market: str, dry_run: bool):
             return type(
                 "DailyRunResult",
                 (),
@@ -368,7 +393,9 @@ def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status
     monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
     monkeypatch.setattr(cli, "build_notifier", lambda config: object())
 
-    result = cli.main(["run-daily-premarket", "--date", "2026-06-17"])
+    result = cli.main(
+        ["run-daily-premarket", "--date", "2026-06-17", "--market", "US"]
+    )
 
     assert result == 1
     output = capsys.readouterr().out
@@ -465,9 +492,10 @@ def test_test_notification_main_returns_nonzero_when_composite_child_fails(
 def test_run_daily_premarket_accepts_today_date() -> None:
     parser = build_parser()
 
-    args = parser.parse_args(["run-daily-premarket", "--date", "today"])
+    args = parser.parse_args(["run-daily-premarket", "--date", "today", "--market", "US"])
 
     assert args.date == "today"
+    assert args.market == "US"
 
 
 def test_run_daily_premarket_today_reports_invalid_timezone(
@@ -480,7 +508,7 @@ def test_run_daily_premarket_today_reports_invalid_timezone(
     monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
 
     with pytest.raises(SystemExit) as exc_info:
-        cli.main(["run-daily-premarket", "--date", "today"])
+        cli.main(["run-daily-premarket", "--date", "today", "--market", "US"])
 
     assert exc_info.value.code == 2
     error = capsys.readouterr().err

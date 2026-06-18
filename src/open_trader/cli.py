@@ -21,6 +21,7 @@ from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
+from .market_scope import parse_market_scope
 from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
@@ -90,6 +91,13 @@ def canonical_date(value: str) -> str:
     if parsed.isoformat() != value:
         raise argparse.ArgumentTypeError(f"invalid date: {value}")
     return value
+
+
+def canonical_market(value: str) -> str:
+    try:
+        return parse_market_scope(value).value
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _parse_symbol_subset(value: str | None) -> set[str] | None:
@@ -250,6 +258,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--date",
         required=True,
         help="Run date, YYYY-MM-DD, or today",
+    )
+    daily_parser.add_argument(
+        "--market",
+        type=canonical_market,
+        required=True,
+        choices=["HK", "US"],
+        help="Market workflow to run: HK or US",
     )
     daily_parser.add_argument(
         "--config",
@@ -504,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
                 notifier=build_notifier(config),
             ).run(
                 run_date=run_date,
+                market=args.market,
                 dry_run=args.dry_run,
             )
         except (

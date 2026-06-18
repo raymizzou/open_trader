@@ -480,7 +480,9 @@ def test_run_lock_rejects_second_owner(tmp_path: Path) -> None:
 
 
 class FakePremarket:
-    def __init__(self) -> None:
+    def __init__(self, *, market: str = "US", symbol: str = "MSFT") -> None:
+        self.market = market
+        self.symbol = symbol
         self.calls: list[dict[str, object]] = []
 
     def __call__(self, **kwargs: object):
@@ -489,8 +491,12 @@ class FakePremarket:
         run_date = kwargs["run_date"]
         assert isinstance(data_dir, Path)
         assert isinstance(run_date, str)
-        advice_path = data_dir / "runs" / run_date / "trading_advice.csv"
-        actions_path = data_dir / "runs" / run_date / "premarket_actions.csv"
+        if kwargs.get("market"):
+            run_dir = data_dir / "runs" / run_date / self.market
+        else:
+            run_dir = data_dir / "runs" / run_date
+        advice_path = run_dir / "trading_advice.csv"
+        actions_path = run_dir / "premarket_actions.csv"
         advice_path.parent.mkdir(parents=True, exist_ok=True)
         with advice_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
@@ -517,8 +523,8 @@ class FakePremarket:
             writer.writerow(
                 {
                     "run_date": run_date,
-                    "symbol": "MSFT",
-                    "market": "US",
+                    "symbol": self.symbol,
+                    "market": self.market,
                     "asset_class": "stock",
                     "portfolio_weight_hkd": "1.13%",
                     "risk_flag": "normal",
@@ -535,7 +541,7 @@ class FakePremarket:
             )
         actions_path.write_text(
             "run_date,symbol,market,status\n"
-            f"{run_date},MSFT,US,ok\n",
+            f"{run_date},{self.symbol},{self.market},ok\n",
             encoding="utf-8",
         )
         if kwargs["update_latest"]:
@@ -568,7 +574,9 @@ class FakePremarket:
 
 
 class FakePlanBuilder:
-    def __init__(self) -> None:
+    def __init__(self, *, market: str = "US", symbol: str = "MSFT") -> None:
+        self.market = market
+        self.symbol = symbol
         self.calls: list[dict[str, object]] = []
 
     def __call__(
@@ -578,6 +586,7 @@ class FakePlanBuilder:
         data_dir: Path,
         run_date: str,
         update_latest: bool,
+        market: str | None = None,
     ) -> TradingPlanBuildResult:
         self.calls.append(
             {
@@ -585,15 +594,20 @@ class FakePlanBuilder:
                 "data_dir": data_dir,
                 "run_date": run_date,
                 "update_latest": update_latest,
+                "market": market,
             }
         )
         assert advice_path.exists()
-        plan_path = data_dir / "runs" / run_date / "trading_plan.csv"
-        latest_path = data_dir / "latest" / "trading_plan.csv"
+        if market:
+            plan_path = data_dir / "runs" / run_date / self.market / "trading_plan.csv"
+            latest_path = data_dir / "latest" / self.market / "trading_plan.csv"
+        else:
+            plan_path = data_dir / "runs" / run_date / "trading_plan.csv"
+            latest_path = data_dir / "latest" / "trading_plan.csv"
         row = {
             "run_date": run_date,
-            "symbol": "MSFT",
-            "market": "US",
+            "symbol": self.symbol,
+            "market": self.market,
             "source_status": "ok",
             "fallback_reason": "",
             "fallback_from_date": "",
@@ -631,21 +645,32 @@ class FakePlanBuilder:
 
 
 class FakeQuoteClient:
-    def __init__(self, *, host: str, port: int) -> None:
+    def __init__(
+        self,
+        snapshots: dict[str, QuoteSnapshot] | None = None,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 11111,
+    ) -> None:
         self.host = host
         self.port = port
         self.closed = False
+        self.snapshots = snapshots or {
+            "US.MSFT": QuoteSnapshot(futu_symbol="US.MSFT", last_price=Decimal("399"))
+        }
 
     def get_snapshots(self, futu_symbols: list[str]) -> dict[str, QuoteSnapshot]:
-        assert futu_symbols == ["US.MSFT"]
-        return {"US.MSFT": QuoteSnapshot(futu_symbol="US.MSFT", last_price=Decimal("399"))}
+        assert futu_symbols == list(self.snapshots)
+        return self.snapshots
 
     def close(self) -> None:
         self.closed = True
 
 
 class FakeTradeActionGenerator:
-    def __init__(self) -> None:
+    def __init__(self, *, market: str = "US", symbol: str = "MSFT") -> None:
+        self.market = market
+        self.symbol = symbol
         self.calls: list[dict[str, object]] = []
 
     def __call__(self, **kwargs: object) -> TradeActionsResult:
@@ -656,9 +681,14 @@ class FakeTradeActionGenerator:
         assert isinstance(data_dir, Path)
         assert isinstance(reports_dir, Path)
         assert isinstance(run_date, str)
-        actions_path = data_dir / "runs" / run_date / "trade_actions.csv"
-        latest_path = data_dir / "latest" / "trade_actions.csv"
-        report_path = reports_dir / "trade_actions" / f"{run_date}.md"
+        if kwargs.get("market"):
+            actions_path = data_dir / "runs" / run_date / self.market / "trade_actions.csv"
+            latest_path = data_dir / "latest" / self.market / "trade_actions.csv"
+            report_path = reports_dir / "trade_actions" / f"{run_date}-{self.market}.md"
+        else:
+            actions_path = data_dir / "runs" / run_date / "trade_actions.csv"
+            latest_path = data_dir / "latest" / "trade_actions.csv"
+            report_path = reports_dir / "trade_actions" / f"{run_date}.md"
         actions_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.parent.mkdir(parents=True, exist_ok=True)
         actions_path.write_text(
@@ -668,7 +698,7 @@ class FakeTradeActionGenerator:
             "target_max_weight,cash_available,limit_price,stop_price,"
             "post_trade_quantity,post_trade_weight,post_trade_avg_cost,"
             "risk_to_stop,reason,source_plan,status,error\n"
-            f"{run_date},MSFT,US,US.MSFT,BUY,high,399,entry_zone,3,1197,"
+            f"{run_date},{self.symbol},{self.market},{self.market}.{self.symbol},BUY,high,399,entry_zone,3,1197,"
             "USD,10,1.13%,390,2%,1000,399,340,13,1.40%,392.08,767,"
             f"fixture,data/runs/{run_date}/trading_plan.csv,ready,\n",
             encoding="utf-8",
@@ -694,6 +724,7 @@ class FailingPlanBuilder:
         data_dir: Path,
         run_date: str,
         update_latest: bool,
+        market: str | None = None,
     ) -> TradingPlanBuildResult:
         raise RuntimeError("plan builder failed")
 
@@ -729,6 +760,58 @@ def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
         logs_dir=tmp_path / "logs",
         portfolio=tmp_path / "data/latest/portfolio.csv",
     )
+
+
+def test_daily_config_deadline_for_market_uses_hk_and_us_defaults(
+    tmp_path: Path,
+) -> None:
+    config = _daily_config(tmp_path)
+
+    assert daily_premarket._deadline_for_market(config, "HK") == "09:00"
+    assert daily_premarket._deadline_for_market(config, "US") == "21:10"
+
+
+def test_daily_runner_hk_uses_market_scoped_paths_and_calls_market_filter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("portfolio\n", encoding="utf-8")
+    premarket = FakePremarket(market="HK", symbol="00700")
+    plan_builder = FakePlanBuilder(market="HK", symbol="00700")
+    trade_actions = FakeTradeActionGenerator(market="HK", symbol="00700")
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=premarket,
+        plan_builder=plan_builder,
+        quote_client_factory=lambda **kwargs: FakeQuoteClient(
+            {"HK.00700": QuoteSnapshot("HK.00700", Decimal("380"))},
+            **kwargs,
+        ),
+        trade_action_generator=trade_actions,
+    ).run(run_date="2026-06-19", market="HK")
+
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert result.status_path == (
+        tmp_path / "data/runs/2026-06-19/HK/daily_run_status.json"
+    )
+    assert result.report_path == tmp_path / "reports/daily_runs/2026-06-19-HK.md"
+    assert result.log_path == tmp_path / "logs/daily_premarket/2026-06-19-HK.log"
+    assert status["market"] == "HK"
+    assert status["deadline_at"].endswith("09:00:00+08:00")
+    assert premarket.calls[0]["market"] == "HK"
+    assert plan_builder.calls[0]["market"] == "HK"
+    assert trade_actions.calls[0]["market"] == "HK"
+    assert status["artifacts"]["status"] == str(result.status_path)
+    assert status["artifacts"]["report"] == str(result.report_path)
+    assert status["artifacts"]["log"] == str(result.log_path)
+    assert status["artifacts"]["latest_trading_plan"] == str(
+        tmp_path / "data/latest/HK/trading_plan.csv"
+    )
+    assert "data/latest/trading_plan.csv" not in status["artifacts"].values()
 
 
 def test_daily_notify_logs_success(
@@ -832,10 +915,10 @@ def test_daily_runner_writes_success_status_and_report(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "success"
-    status_path = tmp_path / "data/runs/2026-06-17/daily_run_status.json"
+    status_path = tmp_path / "data/runs/2026-06-17/US/daily_run_status.json"
     status = json.loads(status_path.read_text(encoding="utf-8"))
     assert status["status"] == "success"
     assert status["premarket"]["ok"] == 1
@@ -843,7 +926,7 @@ def test_daily_runner_writes_success_status_and_report(
     assert status["futu_plan_check"]["checked"] == 1
     assert fake_trade_actions.calls
     assert fake_trade_actions.calls[0]["plan_path"] == (
-        tmp_path / "data/runs/2026-06-17/trading_plan.csv"
+        tmp_path / "data/runs/2026-06-17/US/trading_plan.csv"
     )
     assert fake_trade_actions.calls[0]["portfolio_path"] == (
         tmp_path / "data/latest/portfolio.csv"
@@ -865,20 +948,20 @@ def test_daily_runner_writes_success_status_and_report(
         "watch": 0,
     }
     assert status["artifacts"]["trade_actions"] == str(
-        tmp_path / "data/runs/2026-06-17/trade_actions.csv"
+        tmp_path / "data/runs/2026-06-17/US/trade_actions.csv"
     )
     assert status["artifacts"]["trade_actions_report"] == str(
-        tmp_path / "reports/trade_actions/2026-06-17.md"
+        tmp_path / "reports/trade_actions/2026-06-17-US.md"
     )
     assert status["artifacts"]["latest_trade_actions"] == str(
-        tmp_path / "data/latest/trade_actions.csv"
+        tmp_path / "data/latest/US/trade_actions.csv"
     )
-    report = (tmp_path / "reports/daily_runs/2026-06-17.md").read_text(
+    report = (tmp_path / "reports/daily_runs/2026-06-17-US.md").read_text(
         encoding="utf-8"
     )
     assert "- trade_actions: " in report
     assert "- trade_actions_report: " in report
-    assert (tmp_path / "reports/daily_runs/2026-06-17.md").exists()
+    assert (tmp_path / "reports/daily_runs/2026-06-17-US.md").exists()
 
 
 def test_daily_runner_sends_feishu_order_review_after_trade_actions(
@@ -913,7 +996,7 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
         quote_client_factory=FakeQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
         notifier=notifier,
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == "success"
     assert len(notifier.calls) == 1
@@ -958,7 +1041,7 @@ def test_daily_runner_sends_blocker_notification_when_futu_is_unavailable(
         quote_client_factory=UnavailableQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
         notifier=notifier,
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == "partial"
     blocker_calls = [
@@ -1006,7 +1089,7 @@ def test_daily_runner_sends_blocker_notification_when_futu_quote_is_missing(
         quote_client_factory=MissingQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
         notifier=notifier,
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == "partial"
     blocker_calls = [
@@ -1052,7 +1135,7 @@ def test_daily_runner_blocker_notification_uses_chinese_readiness_text(
         quote_client_factory=InterruptedQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
         notifier=notifier,
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == "partial"
     blocker_calls = [
@@ -1094,7 +1177,7 @@ def test_daily_runner_sends_blocker_notification_when_run_fails(
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
         notifier=notifier,
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == "failed"
     assert len(notifier.calls) == 1
@@ -1144,7 +1227,7 @@ def test_daily_runner_keeps_partial_status_when_blocker_rendering_fails(
         quote_client_factory=MissingQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
         notifier=notifier,
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == "partial"
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
@@ -1205,7 +1288,7 @@ def test_daily_runner_keeps_success_status_when_order_review_rendering_fails(
         quote_client_factory=quote_client_factory,
         trade_action_generator=FakeTradeActionGenerator(),
         notifier=notifier,
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == expected_status
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
@@ -1214,7 +1297,7 @@ def test_daily_runner_keeps_success_status_when_order_review_rendering_fails(
     report = result.report_path.read_text(encoding="utf-8")
     assert f"- Status: {expected_status}" in report
     assert "- Status: failed" not in report
-    assert (tmp_path / "data/latest/trade_actions.csv").exists()
+    assert (tmp_path / "data/latest/US/trade_actions.csv").exists()
     if expected_status == "success":
         assert notifier.calls == []
     else:
@@ -1256,7 +1339,7 @@ def test_daily_runner_skips_daily_notification_when_report_notify_disabled(
         notifier=notifier,
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "success"
     assert notifier.calls == []
@@ -1292,7 +1375,7 @@ def test_daily_runner_skips_daily_notification_in_dry_run(tmp_path: Path) -> Non
         notifier=notifier,
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "success"
     assert notifier.calls == []
@@ -1333,7 +1416,7 @@ def test_daily_runner_skips_partial_notification_when_env_report_notify_zero(
         notifier=notifier,
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "partial"
     assert config.notify_daily_report is False
@@ -1366,7 +1449,7 @@ def test_daily_runner_skips_failure_notification_when_report_notify_disabled(
         notifier=notifier,
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "failed"
     assert notifier.calls == []
@@ -1396,7 +1479,7 @@ def test_daily_runner_skips_failure_notification_in_dry_run(tmp_path: Path) -> N
         notifier=notifier,
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "failed"
     assert notifier.calls == []
@@ -1437,7 +1520,7 @@ def test_daily_runner_deadline_uses_requested_run_date(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["deadline_at"] == "2026-06-17T21:10:00+08:00"
@@ -1477,44 +1560,44 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "success"
     assert premarket.calls[0]["update_latest"] is False
     assert plan_builder.calls[0]["update_latest"] is False
     assert fake_trade_actions.calls[0]["update_latest"] is False
-    assert (tmp_path / "data/latest/trading_advice.csv").read_text(
+    assert (tmp_path / "data/latest/US/trading_advice.csv").read_text(
         encoding="utf-8"
-    ) == (tmp_path / "data/runs/2026-06-17/trading_advice.csv").read_text(
-        encoding="utf-8"
-    )
-    assert (tmp_path / "data/latest/premarket_actions.csv").read_text(
-        encoding="utf-8"
-    ) == (tmp_path / "data/runs/2026-06-17/premarket_actions.csv").read_text(
+    ) == (tmp_path / "data/runs/2026-06-17/US/trading_advice.csv").read_text(
         encoding="utf-8"
     )
-    assert (tmp_path / "data/latest/trading_plan.csv").read_text(
+    assert (tmp_path / "data/latest/US/premarket_actions.csv").read_text(
         encoding="utf-8"
-    ) == (tmp_path / "data/runs/2026-06-17/trading_plan.csv").read_text(
+    ) == (tmp_path / "data/runs/2026-06-17/US/premarket_actions.csv").read_text(
         encoding="utf-8"
     )
-    assert (tmp_path / "data/latest/trade_actions.csv").read_text(
+    assert (tmp_path / "data/latest/US/trading_plan.csv").read_text(
         encoding="utf-8"
-    ) == (tmp_path / "data/runs/2026-06-17/trade_actions.csv").read_text(
+    ) == (tmp_path / "data/runs/2026-06-17/US/trading_plan.csv").read_text(
+        encoding="utf-8"
+    )
+    assert (tmp_path / "data/latest/US/trade_actions.csv").read_text(
+        encoding="utf-8"
+    ) == (tmp_path / "data/runs/2026-06-17/US/trade_actions.csv").read_text(
         encoding="utf-8"
     )
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["artifacts"]["latest_advice"] == str(
-        tmp_path / "data/latest/trading_advice.csv"
+        tmp_path / "data/latest/US/trading_advice.csv"
     )
     assert status["artifacts"]["latest_actions"] == str(
-        tmp_path / "data/latest/premarket_actions.csv"
+        tmp_path / "data/latest/US/premarket_actions.csv"
     )
     assert status["artifacts"]["latest_trading_plan"] == str(
-        tmp_path / "data/latest/trading_plan.csv"
+        tmp_path / "data/latest/US/trading_plan.csv"
     )
     assert status["artifacts"]["latest_trade_actions"] == str(
-        tmp_path / "data/latest/trade_actions.csv"
+        tmp_path / "data/latest/US/trade_actions.csv"
     )
 
 
@@ -1551,7 +1634,7 @@ def test_daily_runner_does_not_promote_latest_when_plan_build_fails(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "failed"
     assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
@@ -1610,7 +1693,7 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "failed"
     assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
@@ -1660,7 +1743,7 @@ def test_daily_runner_does_not_promote_latest_when_report_write_fails(
         nonlocal raised
         if (
             not raised
-            and path == tmp_path / "reports/daily_runs/2026-06-17.md"
+            and path == tmp_path / "reports/daily_runs/2026-06-17-US.md"
             and "- Status: success" in text
         ):
             raised = True
@@ -1682,7 +1765,7 @@ def test_daily_runner_does_not_promote_latest_when_report_write_fails(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "failed"
     assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
@@ -1739,7 +1822,7 @@ def test_daily_runner_returns_failed_when_failure_reporting_writes_fail(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "failed"
     assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
@@ -1788,7 +1871,7 @@ def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "success"
     assert premarket.calls[0]["update_latest"] is False
@@ -1839,7 +1922,7 @@ def test_daily_runner_dry_run_argument_overrides_config(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17", dry_run=True)
+    result = runner.run("2026-06-17", market="US", dry_run=True)
 
     assert result.status == "success"
     assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
@@ -1869,9 +1952,9 @@ def test_daily_runner_lock_contention_does_not_overwrite_run_artifacts(
         portfolio=tmp_path / "data/latest/portfolio.csv",
         dry_run=False,
     )
-    status_path = tmp_path / "data/runs/2026-06-17/daily_run_status.json"
-    report_path = tmp_path / "reports/daily_runs/2026-06-17.md"
-    log_path = tmp_path / "logs/daily_premarket/2026-06-17.log"
+    status_path = tmp_path / "data/runs/2026-06-17/US/daily_run_status.json"
+    report_path = tmp_path / "reports/daily_runs/2026-06-17-US.md"
+    log_path = tmp_path / "logs/daily_premarket/2026-06-17-US.log"
     status_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1887,14 +1970,14 @@ def test_daily_runner_lock_contention_does_not_overwrite_run_artifacts(
         notifier=NullNotifier(),
     )
 
-    with RunLock(config.data_dir / "runs" / ".daily_premarket.lock"):
-        result = runner.run("2026-06-17")
+    with RunLock(config.data_dir / "runs" / ".daily_premarket.US.lock"):
+        result = runner.run("2026-06-17", market="US")
 
     assert result.status == "already_running"
     assert status_path.read_text(encoding="utf-8") == '{"status": "active"}\n'
     assert report_path.read_text(encoding="utf-8") == "# active run\n"
     assert log_path.read_text(encoding="utf-8") == '{"status": "active"}\n'
-    assert result.log_path == tmp_path / "logs/daily_premarket/2026-06-17.lock.log"
+    assert result.log_path == tmp_path / "logs/daily_premarket/2026-06-17-US.lock.log"
     lock_status = json.loads(result.log_path.read_text(encoding="utf-8"))
     assert lock_status["status"] == "already_running"
     assert lock_status["readiness"] == "blocked"
@@ -1920,7 +2003,7 @@ def test_daily_runner_returns_already_running_when_lock_log_write_fails(
     )
 
     def fail_lock_log_write(path: Path, text: str) -> None:
-        if path == tmp_path / "logs/daily_premarket/2026-06-17.lock.log":
+        if path == tmp_path / "logs/daily_premarket/2026-06-17-US.lock.log":
             raise RuntimeError("lock log write failed")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
@@ -1934,8 +2017,8 @@ def test_daily_runner_returns_already_running_when_lock_log_write_fails(
         notifier=NullNotifier(),
     )
 
-    with RunLock(config.data_dir / "runs" / ".daily_premarket.lock"):
-        result = runner.run("2026-06-17")
+    with RunLock(config.data_dir / "runs" / ".daily_premarket.US.lock"):
+        result = runner.run("2026-06-17", market="US")
 
     assert result.status == "already_running"
 
@@ -2001,11 +2084,11 @@ def test_daily_runner_marks_partial_when_futu_is_unavailable(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "partial"
     status = json.loads(
-        (tmp_path / "data/runs/2026-06-17/daily_run_status.json").read_text(
+        (tmp_path / "data/runs/2026-06-17/US/daily_run_status.json").read_text(
             encoding="utf-8"
         )
     )
@@ -2040,7 +2123,7 @@ def test_daily_runner_writes_futu_diagnostic_when_opend_is_unavailable(
         quote_client_factory=UnavailableQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == "partial"
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
@@ -2084,7 +2167,7 @@ def test_daily_runner_writes_futu_diagnostic_when_snapshot_is_interrupted(
         quote_client_factory=InterruptedQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == "partial"
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
@@ -2144,11 +2227,11 @@ def test_daily_runner_marks_partial_when_futu_quote_is_missing(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "partial"
     status = json.loads(
-        (tmp_path / "data/runs/2026-06-17/daily_run_status.json").read_text(
+        (tmp_path / "data/runs/2026-06-17/US/daily_run_status.json").read_text(
             encoding="utf-8"
         )
     )
@@ -2184,7 +2267,7 @@ def test_daily_runner_marks_missing_quote_as_review_required(
         quote_client_factory=MissingQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
         notifier=NullNotifier(),
-    ).run("2026-06-17")
+    ).run("2026-06-17", market="US")
 
     assert result.status == "partial"
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
@@ -2222,7 +2305,7 @@ def test_daily_runner_ignores_quote_client_close_failure(tmp_path: Path) -> None
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "success"
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
@@ -2256,7 +2339,7 @@ def test_daily_runner_writes_failed_status_when_portfolio_is_missing(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "failed"
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
@@ -2299,7 +2382,7 @@ def test_daily_runner_writes_failed_status_when_deadline_is_malformed(
         notifier=NullNotifier(),
     )
 
-    result = runner.run("2026-06-17")
+    result = runner.run("2026-06-17", market="US")
 
     assert result.status == "failed"
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
@@ -2339,7 +2422,7 @@ def test_daily_runner_rejects_malformed_run_dates_without_escaped_writes(
     )
 
     with pytest.raises(ValueError, match="run_date must be YYYY-MM-DD"):
-        runner.run(run_date)
+        runner.run(run_date, market="US")
 
     assert not (tmp_path / "data/latest/daily_run_status.json").exists()
     assert not (tmp_path / "reports/latest.md").exists()
