@@ -341,6 +341,104 @@ def test_map_snapshot_marks_malformed_required_position_fields_low_confidence() 
     ]
 
 
+def test_map_snapshot_blocks_invalid_cost_basis() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "US.COST",
+                "stock_name": "Cost Broken",
+                "qty": "3",
+                "market_val": "120",
+                "cost_price": "not-a-number",
+                "currency": "USD",
+                "stock_type": "STOCK",
+            }
+        ],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-18",
+    )
+
+    assert cash_balances == []
+    assert len(positions) == 1
+    assert positions[0].symbol == "COST"
+    assert positions[0].market_value == Decimal("120")
+    assert positions[0].cost_value is None
+    assert positions[0].confidence == "low"
+    assert blocking_errors == [
+        "position US.COST has invalid required field cost_value=None"
+    ]
+
+
+def test_map_snapshot_blocks_invalid_market_value() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "US.BADVAL",
+                "stock_name": "Bad Value",
+                "qty": "3",
+                "market_val": "not-a-number",
+                "cost_value": "90",
+                "currency": "USD",
+                "stock_type": "STOCK",
+            }
+        ],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-18",
+    )
+
+    assert cash_balances == []
+    assert len(positions) == 1
+    assert positions[0].symbol == "BADVAL"
+    assert positions[0].market_value is None
+    assert positions[0].cost_value == Decimal("90")
+    assert positions[0].confidence == "low"
+    assert blocking_errors == [
+        "position US.BADVAL has invalid required field market_val='not-a-number'"
+    ]
+
+
+@pytest.mark.parametrize("record", [{"code": " "}, {"stock_name": "No Code"}])
+def test_map_snapshot_blocks_blank_or_missing_code(record: dict[str, object]) -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "stock_name": "No Code",
+                "qty": "3",
+                "market_val": "120",
+                "cost_value": "90",
+                "currency": "USD",
+                "stock_type": "STOCK",
+                **record,
+            }
+        ],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-18",
+    )
+
+    assert cash_balances == []
+    assert len(positions) == 1
+    assert positions[0].symbol == ""
+    assert positions[0].confidence == "low"
+    assert blocking_errors == [
+        f"position has invalid required field code={record.get('code')!r}"
+    ]
+
+
 def test_map_snapshot_accepts_empty_positions() -> None:
     snapshot = client_snapshot_from_records(
         cash_records=[

@@ -211,18 +211,24 @@ def _position_from_record(
     blocking_errors: list[str],
 ) -> Position:
     code = _first_text(record, ("code", "stock_code", "symbol")).upper()
+    identity_ok = bool(code)
+    if not identity_ok:
+        value = _first_raw_value(record, ("code", "stock_code", "symbol"))
+        blocking_errors.append(f"position has invalid required field code={value!r}")
     market = _market_from_code(code)
     symbol = _symbol_from_code(code)
-    quantity, quantity_ok = _required_decimal(
-        record, ("qty", "quantity", "position_qty"), "qty", code
-    )
+    quantity, quantity_ok = _required_decimal(record, ("qty", "quantity", "position_qty"))
     last_price = _optional_decimal(record, ("nominal_price", "last_price", "price"))
-    market_value = _optional_decimal(record, ("market_val", "market_value", "market_vale"))
+    parsed_market_value, market_value_ok = _required_decimal(
+        record, ("market_val", "market_value")
+    )
+    market_value = parsed_market_value if market_value_ok else None
     cost_price = _optional_decimal(record, ("cost_price", "average_cost"))
     raw_cost_value = _optional_decimal(record, ("cost_value", "cost_val"))
     cost_value = raw_cost_value
     if cost_value is None and cost_price is not None and quantity_ok:
         cost_value = cost_price * quantity
+    cost_value_ok = cost_value is not None
     unrealized_pnl = _optional_decimal(record, ("pl_val", "unrealized_pnl", "pl_value"))
     currency = _first_text(
         record, ("currency", "currency_type"), _default_currency_for_market(market)
@@ -236,7 +242,21 @@ def _position_from_record(
         market_value = None
         cost_value = None
         unrealized_pnl = None
-    confidence = "high" if quantity_ok and market_value is not None else "low"
+    if not market_value_ok:
+        value = _first_raw_value(record, ("market_val", "market_value"))
+        blocking_errors.append(
+            f"position {code or symbol} has invalid required field market_val={value!r}"
+        )
+    if quantity_ok and not cost_value_ok:
+        value = _first_raw_value(record, ("cost_value", "cost_val"))
+        blocking_errors.append(
+            f"position {code or symbol} has invalid required field cost_value={value!r}"
+        )
+    confidence = (
+        "high"
+        if identity_ok and quantity_ok and market_value_ok and cost_value_ok
+        else "low"
+    )
     return Position(
         statement_id=statement_id,
         broker="futu",
@@ -263,9 +283,7 @@ def _cash_from_record(
     blocking_errors: list[str],
 ) -> CashBalance:
     currency = _first_text(record, ("currency", "currency_type"), "HKD").upper()
-    cash_value, cash_ok = _required_decimal(
-        record, ("cash", "cash_balance", "total_cash"), "cash", currency
-    )
+    cash_value, cash_ok = _required_decimal(record, ("cash", "cash_balance", "total_cash"))
     available_balance = _optional_decimal(
         record, ("available_cash", "available_balance", "available_funds")
     )
@@ -289,8 +307,6 @@ def _cash_from_record(
 def _required_decimal(
     record: dict[str, object],
     keys: tuple[str, ...],
-    field_name: str,
-    label: str,
 ) -> tuple[Decimal, bool]:
     raw_value = None
     for key in keys:
@@ -306,6 +322,13 @@ def _required_decimal(
     if not value.is_finite():
         return Decimal("0"), False
     return value, True
+
+
+def _first_raw_value(record: dict[str, object], keys: tuple[str, ...]) -> object:
+    for key in keys:
+        if key in record:
+            return record.get(key)
+    return None
 
 
 def _optional_decimal(
