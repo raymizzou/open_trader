@@ -3,9 +3,11 @@ from __future__ import annotations
 import inspect
 import os
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
+
+from .models import AssetClass, CashBalance, Market, Position
 
 
 class TigerAccountError(RuntimeError):
@@ -409,7 +411,7 @@ class TigerAccountClient:
             if not isinstance(currency_assets, dict):
                 continue
             for currency_asset in currency_assets.values():
-                if not self._has_positive_balance(currency_asset):
+                if not self._has_non_zero_balance(currency_asset):
                     continue
                 records.append(
                     {
@@ -431,12 +433,12 @@ class TigerAccountClient:
         return records
 
     @staticmethod
-    def _has_positive_balance(currency_asset: object) -> bool:
+    def _has_non_zero_balance(currency_asset: object) -> bool:
         balance_fields = (
-            _text(currency_asset, "cash_balance"),
-            _text(currency_asset, "cash_available_for_withdrawal", ""),
-            _text(currency_asset, "cash_available_for_trade", ""),
-            _text(currency_asset, "gross_position_value", ""),
+            _get_attr(currency_asset, "cash_balance", ""),
+            _get_attr(currency_asset, "cash_available_for_withdrawal", ""),
+            _get_attr(currency_asset, "cash_available_for_trade", ""),
+            _get_attr(currency_asset, "gross_position_value", ""),
         )
         for raw_value in balance_fields:
             if raw_value:
@@ -444,7 +446,7 @@ class TigerAccountClient:
                     value = Decimal(raw_value)
                 except Exception:
                     return True
-                if value > 0:
+                if value.is_finite() and value != 0:
                     return True
         return False
 
@@ -475,7 +477,205 @@ class TigerAccountClient:
                             "cash_available_for_withdrawal",
                             "available_balance",
                         ),
+                        "gross_position_value": _first_present_value(
+                            market_value,
+                            "gross_position_value",
+                            "net_liquidation",
+                        ),
                         "source": account.asset_method,
                     }
                 )
         return records
+
+
+def map_snapshot_to_portfolio_inputs(
+    snapshot: TigerAccountSnapshot,
+    *,
+    run_date: str,
+) -> tuple[list[Position], list[CashBalance], list[str]]:
+    statement_id = f"{run_date}-tiger-live"
+    blocking_errors: list[str] = []
+    # Malformed position rows are intentionally excluded from downstream inputs after
+    # recording blocking errors, so we never emit fake zero/NaN quantities.
+    positions = [
+        position
+        for position in (
+            _position_from_record(record, statement_id, blocking_errors)
+            for record in snapshot.position_records
+        )
+        if position is not None
+    ]
+    cash_balances = [
+        cash_balance
+        for record in snapshot.cash_records
+        for cash_balance in _cash_balances_from_record(
+            record,
+            statement_id,
+            blocking_errors,
+        )
+    ]
+    return positions, cash_balances, blocking_errors
+
+
+def _position_from_record(
+    record: dict[str, object],
+    statement_id: str,
+    blocking_errors: list[str],
+) -> Position | None:
+    raw_symbol: object | None = None
+    for key in ("symbol", "code", "security_code", "ticker"):
+        value, found = _attr_with_presence(record, key)
+        if found:
+            if value in {"", None}:
+                continue
+            raw_symbol = value
+            break
+    if raw_symbol is None or str(raw_symbol).strip() == "":
+        blocking_errors.append("position has invalid required field symbol=None")
+        return None
+
+    symbol = str(raw_symbol).strip().upper()
+    identity_ok = bool(symbol)
+
+    quantity, quantity_ok, quantity_raw = _required_decimal(
+        record,
+        ("position_qty", "quantity"),
+    )
+    market_value, market_value_ok, market_value_raw = _required_decimal(
+        record,
+        ("market_value",),
+    )
+    if not quantity_ok:
+        blocking_errors.append(
+            f"position {symbol} has invalid required field position_qty={quantity_raw!r}"
+        )
+    if not market_value_ok:
+        blocking_errors.append(
+            f"position {symbol} has invalid required field market_value={market_value_raw!r}"
+        )
+    if not quantity_ok or not market_value_ok:
+        return None
+
+    cost_price = _optional_decimal(record, ("average_cost",))
+    cost_value = (
+        cost_price * quantity if cost_price is not None else None
+    )
+    return Position(
+        statement_id=statement_id,
+        broker="tiger",
+        account_alias=_text(record, "account_alias", "tiger_unknown"),
+        market=_market_from_record(record),
+        asset_class=_asset_class_from_record(record),
+        symbol=symbol,
+        name=_text(record, "name", symbol),
+        currency=_text(record, "currency").upper(),
+        quantity=quantity,
+        cost_price=cost_price,
+        last_price=_optional_decimal(record, ("market_price", "last_price")),
+        market_value=market_value,
+        cost_value=cost_value,
+        unrealized_pnl=_optional_decimal(record, ("unrealized_pnl",)),
+        confidence=(
+            "high"
+            if identity_ok and quantity_ok and market_value_ok
+            else "low"
+        ),
+        notes="Tiger live account position",
+    )
+
+
+def _cash_balances_from_record(
+    record: dict[str, object],
+    statement_id: str,
+    blocking_errors: list[str],
+) -> list[CashBalance]:
+    currency = _text(record, "currency").upper()
+    if currency in {"", "N/A"}:
+        return []
+
+    cash_balance, cash_ok, cash_raw = _required_decimal(record, ("cash_balance", "cash"))
+    available_balance = _optional_decimal(record, ("available_balance",))
+    gross_position_value = _optional_decimal(record, ("gross_position_value",))
+    if cash_ok and cash_balance == 0 and (
+        available_balance is None or available_balance == 0
+    ) and not (
+        gross_position_value is not None
+        and gross_position_value.is_finite()
+        and gross_position_value != 0
+    ):
+        return []
+
+    if not cash_ok:
+        blocking_errors.append(
+            f"cash {currency} has invalid required field cash_balance={cash_raw!r}"
+        )
+        return []
+
+    return [
+        CashBalance(
+            statement_id=statement_id,
+            broker="tiger",
+            account_alias=_text(record, "account_alias", "tiger_unknown"),
+            currency=currency,
+            cash_balance=cash_balance,
+            available_balance=available_balance,
+            confidence="high" if cash_ok else "low",
+            notes="Tiger live account cash",
+        )
+    ]
+
+
+def _required_decimal(
+    record: dict[str, object],
+    keys: tuple[str, ...],
+) -> tuple[Decimal, bool, object | None]:
+    raw_value: object | None = None
+    for key in keys:
+        value = record.get(key)
+        if value in {"", None}:
+            continue
+        raw_value = value
+        break
+    if raw_value is None:
+        return Decimal("0"), False, None
+    try:
+        value = Decimal(str(raw_value).strip())
+    except (InvalidOperation, ValueError):
+        return Decimal("0"), False, raw_value
+    if not value.is_finite():
+        return Decimal("0"), False, raw_value
+    return value, True, raw_value
+
+
+def _optional_decimal(
+    record: dict[str, object],
+    keys: tuple[str, ...],
+) -> Decimal | None:
+    for key in keys:
+        raw_value = record.get(key)
+        if raw_value in {"", None}:
+            continue
+        try:
+            value = Decimal(str(raw_value).strip())
+        except (InvalidOperation, ValueError):
+            return None
+        return value if value.is_finite() else None
+    return None
+
+
+def _market_from_record(record: dict[str, object]) -> Market:
+    raw_market = _text(record, "market", "").upper()
+    if raw_market == "US":
+        return Market.US
+    if raw_market == "HK":
+        return Market.HK
+    return Market.OTHER
+
+
+def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
+    raw_type = _text(record, "sec_type", "").upper()
+    if raw_type in {"STK", "STOCK", "EQUITY", "COMMON_STOCK"}:
+        return AssetClass.STOCK
+    if raw_type in {"ETF", "EXCHANGE_TRADED_FUND"}:
+        return AssetClass.ETF
+    return AssetClass.UNKNOWN

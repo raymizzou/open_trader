@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from decimal import Decimal
 
 import pytest
 
+from open_trader.models import AssetClass, Market
 from open_trader.tiger_account import (
     TigerAccount,
     TigerAccountConfig,
     TigerAccountError,
     TigerAccountClient,
+    TigerAccountSnapshot,
+    map_snapshot_to_portfolio_inputs,
     load_tiger_account_config,
     mask_account_id,
 )
@@ -389,7 +393,33 @@ class FakeGlobalTradeClient(FakeTradeClient):
         ]
 
 
-class FakeGlobalTradeClientBlankTradeField(FakeTradeClient):
+class FakeGlobalTradeClientBlankTradeField(FakeGlobalTradeClient):
+    def get_assets(self, **kwargs: object) -> list[object]:
+        return [
+            type(
+                "PortfolioAccount",
+                (),
+                {
+                    "account": "U575569",
+                    "market_values": {
+                        "USD": type(
+                            "MarketValue",
+                            (),
+                            {
+                                "currency": "USD",
+                                "cash_balance": "55.50",
+                                "cash_available_for_trade": "",
+                                "cash_available_for_withdrawal": "33.33",
+                                "net_liquidation": "900.00",
+                            },
+                        )()
+                    },
+                },
+            )()
+        ]
+
+
+class FakeGlobalTradeClientZeroCashAndPositiveNetLiquidation(FakeTradeClient):
     def get_managed_accounts(self, account: str | None = None) -> list[object]:
         return [
             type(
@@ -399,7 +429,7 @@ class FakeGlobalTradeClientBlankTradeField(FakeTradeClient):
                     "account": "U575569",
                     "accountType": "GLOBAL",
                     "capability": "Cash",
-                    "status": "Funded",
+                    "status": "FUNDED",
                 },
             )()
         ]
@@ -417,9 +447,9 @@ class FakeGlobalTradeClientBlankTradeField(FakeTradeClient):
                             (),
                             {
                                 "currency": "USD",
-                                "cash_balance": "55.50",
+                                "cash_balance": "0",
                                 "cash_available_for_trade": "",
-                                "cash_available_for_withdrawal": "33.33",
+                                "cash_available_for_withdrawal": "",
                                 "net_liquidation": "900.00",
                             },
                         )()
@@ -489,6 +519,7 @@ def test_tiger_account_client_uses_get_assets_for_global_account() -> None:
             "currency": "USD",
             "cash_balance": "55.50",
             "available_balance": "33.33",
+            "gross_position_value": "900.00",
             "source": "get_assets",
         }
     ]
@@ -509,9 +540,41 @@ def test_tiger_account_client_uses_withdrawal_when_global_trade_field_blank() ->
             "currency": "USD",
             "cash_balance": "55.50",
             "available_balance": "33.33",
+            "gross_position_value": "900.00",
             "source": "get_assets",
         }
     ]
+
+
+def test_tiger_account_client_global_zero_cash_row_keeps_net_liquidation_as_gross_position_value() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(account="U575569"),
+        trade_client_factory=FakeGlobalTradeClientZeroCashAndPositiveNetLiquidation,
+    )
+
+    snapshot = client.fetch_snapshot()
+
+    assert snapshot.cash_records == [
+        {
+            "account": "U575569",
+            "account_alias": "tiger_5569",
+            "currency": "USD",
+            "cash_balance": "0",
+            "available_balance": None,
+            "gross_position_value": "900.00",
+            "source": "get_assets",
+        }
+    ]
+
+    _, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert len(cash_balances) == 1
+    assert cash_balances[0].cash_balance == Decimal("0")
+    assert cash_balances[0].available_balance is None
+    assert blocking_errors == []
 
 
 def test_tiger_account_client_reports_no_matching_accounts() -> None:
@@ -639,3 +702,343 @@ def test_default_factory_reports_tigeropen_missing_when_sdk_not_available(monkey
         TigerAccountClient(config=tiger_config())
 
     assert exc_info.value.error_type == "tigeropen_missing"
+
+
+def tiger_snapshot_from_records(
+    *,
+    cash_records: list[dict[str, object]],
+    position_records: list[dict[str, object]],
+) -> TigerAccountSnapshot:
+    return TigerAccountSnapshot(
+        accounts=[
+            TigerAccount(
+                account="123456789",
+                account_alias="tiger_6789",
+                account_type="STANDARD",
+                capability="RegTMargin",
+                status="FUNDED",
+                asset_method="get_prime_assets",
+            )
+        ],
+        cash_records=cash_records,
+        position_records=position_records,
+    )
+
+
+def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "100.25",
+                "available_balance": "88.50",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert blocking_errors == []
+    assert len(positions) == 1
+    position = positions[0]
+    assert position.statement_id == "2026-06-19-tiger-live"
+    assert position.broker == "tiger"
+    assert position.account_alias == "tiger_6789"
+    assert position.market == Market.US
+    assert position.asset_class == AssetClass.STOCK
+    assert position.symbol == "MSFT"
+    assert position.name == "Microsoft"
+    assert position.currency == "USD"
+    assert position.quantity == Decimal("2")
+    assert position.cost_price == Decimal("300")
+    assert position.last_price == Decimal("410")
+    assert position.market_value == Decimal("820")
+    assert position.cost_value == Decimal("600")
+    assert position.unrealized_pnl == Decimal("220")
+    assert position.confidence == "high"
+    assert "Tiger live account" in position.notes
+
+    assert len(cash_balances) == 1
+    cash = cash_balances[0]
+    assert cash.statement_id == "2026-06-19-tiger-live"
+    assert cash.broker == "tiger"
+    assert cash.account_alias == "tiger_6789"
+    assert cash.currency == "USD"
+    assert cash.cash_balance == Decimal("100.25")
+    assert cash.available_balance == Decimal("88.50")
+    assert cash.confidence == "high"
+
+
+@pytest.mark.parametrize(
+    (
+        "position_records",
+        "expected_blocking_errors",
+    ),
+    [
+        (
+            [
+                {
+                    "account_alias": "tiger_6789",
+                    "symbol": "MSFT",
+                    "sec_type": "STK",
+                    "currency": "USD",
+                    "market": "US",
+                    "position_qty": "bad",
+                    "average_cost": "300",
+                    "market_price": "410",
+                    "market_value": "820",
+                    "unrealized_pnl": "220",
+                }
+            ],
+            ["position MSFT has invalid required field position_qty='bad'"],
+        ),
+        (
+            [
+                {
+                    "account_alias": "tiger_6789",
+                    "symbol": "MSFT",
+                    "sec_type": "STK",
+                    "currency": "USD",
+                    "market": "US",
+                    "position_qty": "bad",
+                    "average_cost": "300",
+                    "market_price": "410",
+                    "market_value": "bad",
+                    "unrealized_pnl": "220",
+                }
+            ],
+            [
+                "position MSFT has invalid required field position_qty='bad'",
+                "position MSFT has invalid required field market_value='bad'",
+            ],
+        ),
+    ],
+)
+def test_map_snapshot_skips_malformed_required_position_rows_and_records_blocking_errors(
+    position_records: list[dict[str, object]],
+    expected_blocking_errors: list[str],
+) -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=position_records,
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert cash_balances == []
+    assert positions == []
+    assert blocking_errors == expected_blocking_errors
+
+
+def test_map_snapshot_recomputes_identity_from_fallback_symbol_fields() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "code": "msft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    positions, _, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert blocking_errors == []
+    assert len(positions) == 1
+    assert positions[0].symbol == "MSFT"
+    assert positions[0].confidence == "high"
+
+
+def test_map_snapshot_skips_malformed_cash_rows_and_reports_error() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "bad",
+                "available_balance": "88.50",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert positions == []
+    assert cash_balances == []
+    assert blocking_errors == ["cash USD has invalid required field cash_balance='bad'"]
+
+
+def test_map_snapshot_preserves_negative_prime_asset_cash_balance() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "-12.50",
+                "available_balance": "0",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert positions == []
+    assert len(cash_balances) == 1
+    assert cash_balances[0].cash_balance == Decimal("-12.50")
+    assert blocking_errors == []
+
+
+def test_map_snapshot_skips_zero_cash_records() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "HKD",
+                "cash_balance": "0",
+                "available_balance": "0",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert positions == []
+    assert cash_balances == []
+    assert blocking_errors == []
+
+
+def test_map_snapshot_keeps_zero_cash_record_with_gross_position_value() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "0",
+                "available_balance": "0",
+                "gross_position_value": "100.00",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert positions == []
+    assert len(cash_balances) == 1
+    cash = cash_balances[0]
+    assert cash.statement_id == "2026-06-19-tiger-live"
+    assert cash.broker == "tiger"
+    assert cash.account_alias == "tiger_6789"
+    assert cash.currency == "USD"
+    assert cash.cash_balance == Decimal("0")
+    assert cash.available_balance == Decimal("0")
+    assert cash.confidence == "high"
+    assert "Tiger live account cash" in cash.notes
+    assert blocking_errors == []
+
+
+def test_map_snapshot_keeps_zero_cash_record_with_negative_gross_position_value() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "0",
+                "available_balance": "0",
+                "gross_position_value": "-900.00",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert positions == []
+    assert len(cash_balances) == 1
+    assert cash_balances[0].cash_balance == Decimal("0")
+    assert blocking_errors == []
+
+
+def test_map_snapshot_skips_position_row_when_identity_is_missing() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert positions == []
+    assert cash_balances == []
+    assert blocking_errors == ["position has invalid required field symbol=None"]
