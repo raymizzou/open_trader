@@ -183,11 +183,19 @@ at a stop loss, at a target, or only on watch.
 
 ## Futu Live Account Sync
 
-Futu holdings can be pulled from Futu OpenD instead of re-importing a Futu
-monthly statement. Other brokers still use the statement import workflow. The
-sync replaces existing `brokers=futu` rows and keeps non-Futu broker rows from
-the current portfolio. If an existing aggregate row mixes `futu` with another
-broker, the command stops for manual review instead of guessing how to split it.
+Current limitation: `import-statements` still requires all statement inputs,
+including Futu. Until an other-broker-only import exists,
+`sync-futu-portfolio` operates on the current `data/latest/portfolio.csv` and
+replaces its Futu-only rows with live Futu holdings and cash from Futu OpenD.
+It keeps non-Futu broker rows from the current portfolio.
+
+Operational order today: keep `data/latest/portfolio.csv` current enough to
+preserve non-Futu rows, verify read-only account access, write dated sync
+artifacts, review them, and only then promote with `--update-latest`.
+
+If an existing aggregate row mixes Futu with another broker, for example
+`brokers=futu;tiger`, the command stops for manual review before promotion
+instead of guessing how to split it.
 
 First verify read-only account access:
 
