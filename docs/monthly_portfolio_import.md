@@ -181,6 +181,52 @@ To compare live quotes against the structured trader plan, run:
 This reports whether each live quote is in the entry zone, near the add price,
 at a stop loss, at a target, or only on watch.
 
+## Futu Live Account Sync
+
+Current limitation: `import-statements` still requires all statement inputs,
+including Futu. Until an other-broker-only import exists,
+`sync-futu-portfolio` operates on the current `data/latest/portfolio.csv` and
+replaces its Futu-only rows with live Futu holdings and cash from Futu OpenD.
+It keeps non-Futu broker rows from the current portfolio.
+
+Operational order today: keep `data/latest/portfolio.csv` current enough to
+preserve non-Futu rows, verify read-only account access, write dated sync
+artifacts, review them, and only then promote with `--update-latest`.
+
+If an existing aggregate row mixes Futu with another broker, for example
+`brokers=futu;tiger`, the command stops for manual review before promotion
+instead of guessing how to split it.
+
+First verify read-only account access:
+
+```bash
+.venv/bin/python -m open_trader check-futu-account
+```
+
+Then generate a dated merged portfolio without changing `data/latest`:
+
+```bash
+.venv/bin/python -m open_trader sync-futu-portfolio \
+  --date 2026-06-18
+```
+
+Review:
+
+- `data/runs/2026-06-18/futu_account_snapshot.json`
+- `data/runs/2026-06-18/portfolio.csv`
+- `reports/futu_account/2026-06-18.md`
+
+After confirming the merged portfolio, promote it:
+
+```bash
+.venv/bin/python -m open_trader sync-futu-portfolio \
+  --date 2026-06-18 \
+  --update-latest
+```
+
+The command is read-only against Futu. It does not unlock trading, does not
+store a trading password, and does not place orders.
+
 ### Troubleshooting OpenD `网络中断`
 
 If `check-futu-plan` or `generate-trade-actions` prints

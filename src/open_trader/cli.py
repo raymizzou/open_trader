@@ -17,6 +17,7 @@ from .daily_premarket import (
     load_env_config,
     send_notification_with_results,
 )
+from .futu_account import FutuAccountClient, FutuAccountError, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
@@ -344,6 +345,37 @@ def build_parser() -> argparse.ArgumentParser:
     check_futu_quotes_parser.add_argument("--host", default="127.0.0.1")
     check_futu_quotes_parser.add_argument("--port", type=positive_int, default=11111)
 
+    check_futu_account_parser = subparsers.add_parser(
+        "check-futu-account",
+        help="Diagnose read-only Futu real-account access",
+    )
+    check_futu_account_parser.add_argument("--host", default="127.0.0.1")
+    check_futu_account_parser.add_argument("--port", type=positive_int, default=11111)
+
+    sync_futu_portfolio_parser = subparsers.add_parser(
+        "sync-futu-portfolio",
+        help="Merge live Futu real-account data into portfolio.csv",
+    )
+    sync_futu_portfolio_parser.add_argument(
+        "--portfolio",
+        type=Path,
+        default=Path("data/latest/portfolio.csv"),
+    )
+    sync_futu_portfolio_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    sync_futu_portfolio_parser.add_argument(
+        "--reports-dir",
+        type=Path,
+        default=Path("reports"),
+    )
+    sync_futu_portfolio_parser.add_argument("--date", type=canonical_date, required=True)
+    sync_futu_portfolio_parser.add_argument("--host", default="127.0.0.1")
+    sync_futu_portfolio_parser.add_argument("--port", type=positive_int, default=11111)
+    sync_futu_portfolio_parser.add_argument(
+        "--update-latest",
+        action="store_true",
+        help="Update data/latest/portfolio.csv after writing dated artifacts",
+    )
+
     trading_plan_parser = subparsers.add_parser(
         "build-trading-plan",
         help="Convert trading_advice.csv into structured trading_plan.csv",
@@ -611,6 +643,53 @@ def main(argv: list[str] | None = None) -> int:
         print(f"quotes: {quote_count}")
         print(f"missing: {missing_count}")
         print(f"skipped: {len(universe.skipped)}")
+        return 0
+
+    if args.command == "check-futu-account":
+        account_client = None
+        try:
+            account_client = FutuAccountClient(host=args.host, port=args.port)
+            print(f"connected to Futu OpenD at {args.host}:{args.port}")
+            snapshot = account_client.fetch_snapshot()
+        except (RuntimeError, FutuAccountError) as exc:
+            parser.error(str(exc))
+        finally:
+            if account_client is not None:
+                account_client.close()
+        print(f"real_accounts: {len(snapshot.accounts)}")
+        print(f"positions: {len(snapshot.position_records)}")
+        print(f"cash_records: {len(snapshot.cash_records)}")
+        return 0
+
+    if args.command == "sync-futu-portfolio":
+        account_client = None
+        try:
+            account_client = FutuAccountClient(host=args.host, port=args.port)
+            print(f"connected to Futu OpenD at {args.host}:{args.port}")
+            snapshot = account_client.fetch_snapshot()
+            result = sync_futu_portfolio(
+                snapshot=snapshot,
+                portfolio_path=args.portfolio,
+                data_dir=args.data_dir,
+                reports_dir=args.reports_dir,
+                run_date=args.date,
+                update_latest=args.update_latest,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuAccountError) as exc:
+            parser.error(str(exc))
+        finally:
+            if account_client is not None:
+                account_client.close()
+        print(f"run_date: {result.run_date}")
+        print(f"real_accounts: {result.account_count}")
+        print(f"positions: {result.position_count}")
+        print(f"cash: {result.cash_count}")
+        print(f"merged_rows: {result.merged_row_count}")
+        print(f"snapshot: {result.snapshot_path}")
+        print(f"portfolio: {result.portfolio_path}")
+        print(f"report: {result.report_path}")
+        print(f"latest: {result.latest_path}")
+        print(f"updated_latest: {'true' if result.updated_latest else 'false'}")
         return 0
 
     if args.command == "build-trading-plan":
