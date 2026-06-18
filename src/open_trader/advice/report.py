@@ -5,6 +5,14 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Iterable, Mapping
 
+from open_trader.market_scope import (
+    MarketScope,
+    market_report_path,
+    market_run_dir,
+    market_scoped_latest_path,
+    parse_market_scope,
+)
+
 from .models import PREMARKET_ACTION_FIELDNAMES, PremarketAction
 
 
@@ -19,7 +27,7 @@ def write_premarket_outputs(
     reports_dir: Path,
     update_latest: bool = True,
     no_eligible: bool = False,
-    market: str | None = None,
+    market: str | MarketScope | None = None,
 ) -> tuple[Path, Path, Path]:
     sorted_actions = sorted(
         actions,
@@ -31,15 +39,24 @@ def write_premarket_outputs(
     )
     rows = [action.to_row() for action in sorted_actions]
 
-    market_value = market.strip().upper() if market else ""
-    if market_value:
-        run_actions_path = (
-            data_dir / "runs" / run_date / market_value / "premarket_actions.csv"
+    market_scope = parse_market_scope(market) if market is not None else None
+    if market_scope is not None:
+        run_actions_path = market_run_dir(
+            data_dir,
+            run_date,
+            market_scope,
+        ) / "premarket_actions.csv"
+        latest_actions_path = market_scoped_latest_path(
+            data_dir,
+            market_scope,
+            "premarket_actions.csv",
         )
-        latest_actions_path = (
-            data_dir / "latest" / market_value / "premarket_actions.csv"
+        report_path = market_report_path(
+            reports_dir,
+            "premarket",
+            run_date,
+            market_scope,
         )
-        report_path = reports_dir / "premarket" / f"{run_date}-{market_value}.md"
     else:
         run_actions_path = data_dir / "runs" / run_date / "premarket_actions.csv"
         latest_actions_path = data_dir / "latest" / "premarket_actions.csv"
@@ -54,7 +71,7 @@ def write_premarket_outputs(
             run_date,
             sorted_actions,
             no_eligible=no_eligible,
-            market=market,
+            market=market_scope,
         ),
     )
 
@@ -66,7 +83,7 @@ def _render_markdown(
     actions: list[PremarketAction],
     *,
     no_eligible: bool = False,
-    market: str | None = None,
+    market: MarketScope | None = None,
 ) -> str:
     lines = [f"# Premarket Trading Brief - {run_date}", ""]
     if no_eligible:
@@ -98,10 +115,10 @@ def _render_markdown(
     return "\n".join(lines)
 
 
-def _no_eligible_message(market: str | None) -> str:
-    if market and market.strip().upper() == "HK":
+def _no_eligible_message(market: MarketScope | None) -> str:
+    if market == MarketScope.HK:
         return "No eligible HK stocks or ETFs were found."
-    if market and market.strip().upper() == "US":
+    if market == MarketScope.US:
         return "No eligible US stocks or ETFs were found."
     return "No eligible stocks or ETFs were found."
 

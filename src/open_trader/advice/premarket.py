@@ -9,6 +9,14 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Callable, Iterable, Mapping, Protocol
 
+from open_trader.market_scope import (
+    MarketScope,
+    market_run_dir,
+    market_scoped_latest_dir,
+    market_scoped_latest_path,
+    parse_market_scope,
+)
+
 from .models import (
     CHANGE_CLASSIFICATION_FIELDNAMES,
     ChangeClassification,
@@ -92,7 +100,11 @@ def run_premarket(
     if max_workers < 1:
         raise ValueError("max_workers must be at least 1")
 
-    rows = load_eligible_portfolio_rows(portfolio_path, market=market)
+    market_scope = parse_market_scope(market) if market is not None else None
+    rows = load_eligible_portfolio_rows(
+        portfolio_path,
+        market=market_scope.value if market_scope is not None else None,
+    )
     normalized_excluded_symbols = {
         symbol.casefold()
         for symbol in (
@@ -122,13 +134,13 @@ def run_premarket(
             run_date=run_date,
             records=[],
             data_dir=data_dir,
-            market=market,
+            market=market_scope,
         )
         classifications_path = _write_change_classifications_run(
             run_date=run_date,
             records=[],
             data_dir=data_dir,
-            market=market,
+            market=market_scope,
         )
         actions_path, _, report_path = write_premarket_outputs(
             run_date=run_date,
@@ -137,7 +149,7 @@ def run_premarket(
             reports_dir=reports_dir,
             update_latest=False,
             no_eligible=True,
-            market=market,
+            market=market_scope,
         )
         return PremarketResult(
             eligible_count=0,
@@ -152,7 +164,7 @@ def run_premarket(
     if classifier is None:
         raise ValueError("classifier is required")
 
-    previous_by_symbol = _load_latest_advice_by_symbol(data_dir, market=market)
+    previous_by_symbol = _load_latest_advice_by_symbol(data_dir, market=market_scope)
     symbol_results = _run_symbols(
         rows=rows,
         run_date=run_date,
@@ -177,13 +189,13 @@ def run_premarket(
         run_date=run_date,
         records=advice_records,
         data_dir=data_dir,
-        market=market,
+        market=market_scope,
     )
     classifications_path = _write_change_classifications_run(
         run_date=run_date,
         records=classifications,
         data_dir=data_dir,
-        market=market,
+        market=market_scope,
     )
     actions_path, _, report_path = write_premarket_outputs(
         run_date=run_date,
@@ -191,14 +203,14 @@ def run_premarket(
         data_dir=data_dir,
         reports_dir=reports_dir,
         update_latest=False,
-        market=market,
+        market=market_scope,
     )
     if update_latest:
         _promote_latest_outputs(
             advice_path=advice_path,
             actions_path=actions_path,
             data_dir=data_dir,
-            market=market,
+            market=market_scope,
         )
 
     return PremarketResult(
@@ -454,7 +466,7 @@ def _promote_latest_outputs(
     advice_path: Path,
     actions_path: Path,
     data_dir: Path,
-    market: str | None,
+    market: MarketScope | None,
 ) -> None:
     latest_dir = _latest_dir(data_dir, market)
     latest_dir.mkdir(parents=True, exist_ok=True)
@@ -552,7 +564,7 @@ def _write_trading_advice_run(
     run_date: str,
     records: Iterable[TradingAdvice],
     data_dir: Path,
-    market: str | None,
+    market: MarketScope | None,
 ) -> Path:
     rows = [record.to_row() for record in records]
     run_path = _run_path(data_dir, run_date, market, "trading_advice.csv")
@@ -565,7 +577,7 @@ def _write_change_classifications_run(
     run_date: str,
     records: Iterable[ChangeClassification],
     data_dir: Path,
-    market: str | None,
+    market: MarketScope | None,
 ) -> Path:
     run_path = _run_path(data_dir, run_date, market, "change_classifications.csv")
     _atomic_write_csv(
@@ -579,12 +591,12 @@ def _write_change_classifications_run(
 def _load_latest_advice_by_symbol(
     data_dir: Path,
     *,
-    market: str | None,
+    market: MarketScope | None,
 ) -> dict[str, dict[str, str]]:
-    if not _market_value(market):
+    if market is None:
         return load_latest_advice_by_symbol(data_dir)
 
-    latest_path = _latest_dir(data_dir, market) / "trading_advice.csv"
+    latest_path = market_scoped_latest_path(data_dir, market, "trading_advice.csv")
     if not latest_path.exists():
         return {}
 
@@ -605,22 +617,21 @@ def _normalize_advice_row(row: dict[str, str]) -> dict[str, str]:
     return normalized
 
 
-def _run_path(data_dir: Path, run_date: str, market: str | None, name: str) -> Path:
-    market_value = _market_value(market)
-    if market_value:
-        return data_dir / "runs" / run_date / market_value / name
+def _run_path(
+    data_dir: Path,
+    run_date: str,
+    market: MarketScope | None,
+    name: str,
+) -> Path:
+    if market is not None:
+        return market_run_dir(data_dir, run_date, market) / name
     return data_dir / "runs" / run_date / name
 
 
-def _latest_dir(data_dir: Path, market: str | None) -> Path:
-    market_value = _market_value(market)
-    if market_value:
-        return data_dir / "latest" / market_value
+def _latest_dir(data_dir: Path, market: MarketScope | None) -> Path:
+    if market is not None:
+        return market_scoped_latest_dir(data_dir, market)
     return data_dir / "latest"
-
-
-def _market_value(market: str | None) -> str:
-    return market.strip().upper() if market else ""
 
 
 def _atomic_write_csv(

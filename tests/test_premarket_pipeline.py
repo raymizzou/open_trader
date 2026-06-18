@@ -358,9 +358,38 @@ def test_run_premarket_filters_hk_market_and_writes_market_scoped_outputs(
 
     assert result.eligible_count == 1
     assert result.advice_path == tmp_path / "data/runs/2026-06-19/HK/trading_advice.csv"
+    assert (
+        result.classifications_path
+        == tmp_path / "data/runs/2026-06-19/HK/change_classifications.csv"
+    )
     assert result.actions_path == tmp_path / "data/runs/2026-06-19/HK/premarket_actions.csv"
     assert result.report_path == tmp_path / "reports/premarket/2026-06-19-HK.md"
     assert (tmp_path / "data/latest/HK/trading_advice.csv").exists()
+    assert (tmp_path / "data/latest/HK/premarket_actions.csv").exists()
+    assert not (tmp_path / "data/latest/trading_advice.csv").exists()
+
+
+def test_run_premarket_rejects_invalid_market_scope(tmp_path: Path) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    write_portfolio(
+        portfolio,
+        [
+            portfolio_row(symbol="MSFT", market="US", ai_eligible="true"),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="^market must be one of: HK, US$"):
+        run_premarket(
+            run_date="2026-06-19",
+            portfolio_path=portfolio,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            advice_runner=FakeAdviceRunner(),
+            classifier=FakeClassifier(),
+            market="CN",
+            update_latest=True,
+            max_workers=1,
+        )
 
 
 def test_run_premarket_excludes_default_blacklisted_symbols(
