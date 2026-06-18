@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import inspect
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
+from typing import Callable
 
 
 class TigerAccountError(RuntimeError):
@@ -16,11 +19,28 @@ class TigerAccountConfig:
     tiger_id: str
     account: str
     private_key_path: Path | None
-    private_key: str | None
-    secret_key: str | None
-    token: str | None
+    private_key: str | None = field(repr=False)
+    secret_key: str | None = field(repr=False)
+    token: str | None = field(repr=False)
     sandbox: bool
     config_dir: Path
+
+
+@dataclass(frozen=True)
+class TigerAccount:
+    account: str
+    account_alias: str
+    account_type: str
+    capability: str
+    status: str
+    asset_method: str
+
+
+@dataclass(frozen=True)
+class TigerAccountSnapshot:
+    accounts: list[TigerAccount]
+    cash_records: list[dict[str, object]]
+    position_records: list[dict[str, object]]
 
 
 def mask_account_id(account_id: str) -> str:
@@ -74,9 +94,9 @@ def load_tiger_account_config(
         or ""
     ).strip()
     private_key = (
-        os.environ.get("TIGEROPEN_PRIVATE_KEY")
-        or properties.get("private_key_pk1")
+        properties.get("private_key_pk1")
         or properties.get("private_key")
+        or os.environ.get("TIGEROPEN_PRIVATE_KEY")
         or None
     )
     private_key_path = Path(private_key_path_text).expanduser() if private_key_path_text else None
@@ -84,6 +104,7 @@ def load_tiger_account_config(
     token = os.environ.get("TIGEROPEN_TOKEN") or properties.get("token")
 
     if private_key_path is not None:
+        private_key = None
         if not private_key_path.exists() or not private_key_path.is_file():
             raise TigerAccountError(
                 (
@@ -112,3 +133,349 @@ def load_tiger_account_config(
         sandbox=sandbox,
         config_dir=expanded_config_dir,
     )
+
+
+def _get_attr(record: object, key: str, default: object = None) -> object:
+    if isinstance(record, dict):
+        return record.get(key, default)
+    return getattr(record, key, default)
+
+
+def _text(record: object, key: str, default: str = "") -> str:
+    value = _get_attr(record, key)
+    if value is None:
+        return default
+    value_text = str(value).strip()
+    return value_text if value_text else default
+
+
+def _attr_with_presence(record: object, key: str) -> tuple[object | None, bool]:
+    if isinstance(record, dict):
+        if key in record:
+            return record[key], True
+        return None, False
+    if hasattr(record, key):
+        return getattr(record, key), True
+    return None, False
+
+
+def _first_present_value(record: object, *keys: str) -> str | None:
+    for key in keys:
+        value, found = _attr_with_presence(record, key)
+        if not found:
+            continue
+        normalized = _text({key: value}, key, None)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _account_alias(account: str) -> str:
+    text = str(account).strip()
+    if not text:
+        return "tiger_"
+    if len(text) <= 4:
+        return f"tiger_{text}"
+    return f"tiger_{text[-4:]}"
+
+
+def _is_active_account(account: object) -> bool:
+    return _text(account, "status").upper() == "FUNDED"
+
+
+def _asset_method_for_account_type(account_type: str) -> str:
+    return "get_assets" if str(account_type).strip().upper() == "GLOBAL" else "get_prime_assets"
+
+
+def _default_trade_client_factory(client_config: TigerAccountConfig) -> object:
+    try:
+        from tigeropen.trade.trade_client import TradeClient
+        from tigeropen.tiger_open_config import TigerOpenClientConfig
+        from tigeropen.common.consts import Language
+    except ImportError:
+        raise TigerAccountError(
+            "Tiger OpenAPI SDK (tigeropen) is not installed. Install it before running Tiger sync.",
+            error_type="tigeropen_missing",
+        )
+
+    private_key = client_config.private_key
+    if private_key is None:
+        if client_config.private_key_path is None:
+            raise TigerAccountError(
+                "Tiger OpenAPI private key is required",
+                error_type="config_invalid",
+            )
+        try:
+            private_key = client_config.private_key_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise TigerAccountError(
+                f"Cannot read Tiger OpenAPI private key file: {client_config.private_key_path}",
+                error_type="config_invalid",
+            ) from exc
+
+    if not private_key:
+        raise TigerAccountError(
+            "Tiger OpenAPI private key is required",
+            error_type="config_invalid",
+        )
+
+    open_config = TigerOpenClientConfig(sandbox_debug=client_config.sandbox)
+    open_config.tiger_id = client_config.tiger_id
+    open_config.account = client_config.account
+    open_config.private_key = private_key
+    open_config.language = Language.zh_CN
+    if client_config.secret_key:
+        open_config.secret_key = client_config.secret_key
+    if client_config.token:
+        open_config.token = client_config.token
+
+    try:
+        return TradeClient(open_config)
+    except Exception as exc:
+        raise TigerAccountError(
+            f"failed to initialize Tiger TradeClient: {exc}",
+            error_type="config_invalid",
+        ) from exc
+
+
+class TigerAccountClient:
+    def __init__(
+        self,
+        *,
+        config: TigerAccountConfig,
+        trade_client_factory: Callable[[TigerAccountConfig], object] = _default_trade_client_factory,
+    ) -> None:
+        self.config = config
+        self.trade_client = self._make_trade_client(trade_client_factory)
+
+    def _make_trade_client(
+        self,
+        trade_client_factory: Callable[[TigerAccountConfig], object],
+    ) -> object:
+        try:
+            return self._coerce_trade_client_factory_call(trade_client_factory)
+        except TigerAccountError:
+            raise
+        except Exception as exc:  # pragma: no cover - safety net for SDK init issues
+            raise TigerAccountError(
+                f"failed to initialize Tiger TradeClient: {exc}",
+                error_type="config_invalid",
+            ) from exc
+
+    def _coerce_trade_client_factory_call(
+        self,
+        trade_client_factory: Callable[[TigerAccountConfig], object],
+    ) -> object:
+        try:
+            signature = inspect.signature(trade_client_factory)
+        except (TypeError, ValueError):
+            return trade_client_factory(self.config)
+
+        if self._factory_accepts_client_config_keyword(signature):
+            return trade_client_factory(client_config=self.config)
+
+        if self._factory_accepts_single_positional_arg(signature):
+            return trade_client_factory(self.config)
+
+        return trade_client_factory(self.config)
+
+    @staticmethod
+    def _factory_accepts_client_config_keyword(signature: inspect.Signature) -> bool:
+        kwargs: dict[str, object] = {"client_config": None}
+        try:
+            signature.bind_partial(**kwargs)
+            return True
+        except TypeError:
+            return False
+
+    @staticmethod
+    def _factory_accepts_single_positional_arg(signature: inspect.Signature) -> bool:
+        try:
+            signature.bind(None)
+            return True
+        except TypeError:
+            return False
+
+    def fetch_snapshot(self) -> TigerAccountSnapshot:
+        if not hasattr(self.trade_client, "get_managed_accounts"):
+            raise TigerAccountError(
+                "Tiger OpenAPI TradeClient is unavailable. Install tigeropen and retry.",
+                error_type="tigeropen_missing",
+            )
+
+        try:
+            profiles = list(self.trade_client.get_managed_accounts(account=self.config.account))
+        except Exception as exc:
+            raise TigerAccountError(str(exc), error_type="account_query_failed") from exc
+
+        matching_accounts = []
+        for profile in profiles:
+            account = self._parse_account(profile)
+            if (
+                account is not None
+                and account.account == self.config.account
+                and _is_active_account(profile)
+            ):
+                matching_accounts.append(account)
+
+        if not matching_accounts:
+            raise TigerAccountError(
+                f"no active Tiger accounts matched account {self.config.account}",
+                error_type="no_matching_accounts",
+            )
+
+        position_records: list[dict[str, object]] = []
+        cash_records: list[dict[str, object]] = []
+
+        for account in matching_accounts:
+            position_records.extend(self._fetch_position_records(account))
+            cash_records.extend(self._fetch_cash_records(account))
+
+        return TigerAccountSnapshot(
+            accounts=matching_accounts,
+            cash_records=cash_records,
+            position_records=position_records,
+        )
+
+    def _parse_account(self, profile: object) -> TigerAccount | None:
+        account_id = _text(profile, "account")
+        if not account_id:
+            return None
+        account_type = _text(profile, "accountType", "STANDARD").upper() or "STANDARD"
+        capability = _text(profile, "capability").upper() or ""
+        status = _text(profile, "status").upper() or ""
+        return TigerAccount(
+            account=account_id,
+            account_alias=_account_alias(account_id),
+            account_type=account_type,
+            capability=capability,
+            status=status,
+            asset_method=_asset_method_for_account_type(account_type),
+        )
+
+    def _fetch_position_records(self, account: TigerAccount) -> list[dict[str, object]]:
+        try:
+            positions = list(self.trade_client.get_positions(account=account.account))
+        except Exception as exc:
+            raise TigerAccountError(str(exc), error_type="position_query_failed") from exc
+        return [self._position_record(account, position) for position in positions]
+
+    def _fetch_cash_records(self, account: TigerAccount) -> list[dict[str, object]]:
+        if account.asset_method == "get_assets":
+            try:
+                payload = self.trade_client.get_assets(
+                    account=account.account,
+                    market_value=True,
+                )
+            except Exception as exc:
+                raise TigerAccountError(str(exc), error_type="asset_query_failed") from exc
+            return self._records_from_assets(account, payload)
+
+        try:
+            payload = self.trade_client.get_prime_assets(account=account.account)
+        except Exception as exc:
+            raise TigerAccountError(str(exc), error_type="asset_query_failed") from exc
+        return self._records_from_prime_assets(account, payload)
+
+    def _position_record(self, account: TigerAccount, position: object) -> dict[str, object]:
+        contract = _get_attr(position, "contract", None)
+        return {
+            "account": account.account,
+            "account_alias": account.account_alias,
+            "symbol": _text(contract, "symbol"),
+            "name": _text(contract, "name"),
+            "sec_type": _text(contract, "sec_type"),
+            "currency": _text(contract, "currency"),
+            "market": _text(contract, "market"),
+            "position_qty": _text(position, "position_qty"),
+            "average_cost": _text(position, "average_cost"),
+            "market_price": _text(position, "market_price"),
+            "market_value": _text(position, "market_value"),
+            "unrealized_pnl": _text(position, "unrealized_pnl"),
+            "source": "get_positions",
+        }
+
+    def _records_from_prime_assets(
+        self,
+        account: TigerAccount,
+        payload: object,
+    ) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        segments = _get_attr(payload, "segments", {})
+        if not isinstance(segments, dict):
+            return records
+        for segment in segments.values():
+            currency_assets = _get_attr(segment, "currency_assets", {})
+            if not isinstance(currency_assets, dict):
+                continue
+            for currency_asset in currency_assets.values():
+                if not self._has_positive_balance(currency_asset):
+                    continue
+                records.append(
+                    {
+                        "account": account.account,
+                        "account_alias": account.account_alias,
+                        "currency": _text(currency_asset, "currency"),
+                        "cash_balance": _text(currency_asset, "cash_balance"),
+                        "available_balance": _first_present_value(
+                            currency_asset,
+                            "cash_available_for_trade",
+                            "cash_available_for_withdrawal",
+                        ),
+                        "gross_position_value": _text(
+                            currency_asset, "gross_position_value"
+                        ),
+                        "source": account.asset_method,
+                    }
+                )
+        return records
+
+    @staticmethod
+    def _has_positive_balance(currency_asset: object) -> bool:
+        balance_fields = (
+            _text(currency_asset, "cash_balance"),
+            _text(currency_asset, "cash_available_for_withdrawal", ""),
+            _text(currency_asset, "cash_available_for_trade", ""),
+            _text(currency_asset, "gross_position_value", ""),
+        )
+        for raw_value in balance_fields:
+            if raw_value:
+                try:
+                    value = Decimal(raw_value)
+                except Exception:
+                    return True
+                if value > 0:
+                    return True
+        return False
+
+    def _records_from_assets(self, account: TigerAccount, payload: object) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        payload_accounts: list[object]
+        if isinstance(payload, list):
+            payload_accounts = list(payload)
+        else:
+            payload_accounts = [payload]
+
+        for payload_account in payload_accounts:
+            if _text(payload_account, "account") != account.account:
+                continue
+            market_values = _get_attr(payload_account, "market_values", {})
+            if not isinstance(market_values, dict):
+                continue
+            for market_value in market_values.values():
+                records.append(
+                    {
+                        "account": account.account,
+                        "account_alias": account.account_alias,
+                        "currency": _text(market_value, "currency"),
+                        "cash_balance": _text(market_value, "cash_balance"),
+                        "available_balance": _first_present_value(
+                            market_value,
+                            "cash_available_for_trade",
+                            "cash_available_for_withdrawal",
+                            "available_balance",
+                        ),
+                        "source": account.asset_method,
+                    }
+                )
+        return records
