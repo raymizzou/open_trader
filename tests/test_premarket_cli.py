@@ -377,6 +377,55 @@ def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status
     assert "log:" in output
 
 
+def test_test_notification_main_sends_chinese_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sent: list[tuple[str, str]] = []
+    config = SimpleNamespace()
+
+    class FakeNotifier:
+        def notify(self, title: str, message: str) -> None:
+            sent.append((title, message))
+
+    def fake_load_env_config(path: Path, *, dry_run: bool):
+        assert path == tmp_path / "daily.env"
+        assert dry_run is False
+        return config
+
+    monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
+    monkeypatch.setattr(cli, "build_notifier", lambda loaded: FakeNotifier())
+
+    result = cli.main(["test-notification", "--config", str(tmp_path / "daily.env")])
+
+    assert result == 0
+    assert sent == [("Open Trader 测试通知", "这是一条 Open Trader 测试通知。")]
+    assert "通知测试已发送" in capsys.readouterr().out
+
+
+def test_test_notification_main_returns_nonzero_when_send_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailingNotifier:
+        def notify(self, title: str, message: str) -> None:
+            raise RuntimeError("delivery failed")
+
+    def fake_load_env_config(path: Path, *, dry_run: bool):
+        assert dry_run is False
+        return SimpleNamespace()
+
+    monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
+    monkeypatch.setattr(cli, "build_notifier", lambda config: FailingNotifier())
+
+    result = cli.main(["test-notification", "--config", str(tmp_path / "daily.env")])
+
+    assert result == 1
+    assert "通知测试失败" in capsys.readouterr().err
+
+
 def test_run_daily_premarket_accepts_today_date() -> None:
     parser = build_parser()
 

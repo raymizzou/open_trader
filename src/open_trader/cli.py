@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -256,6 +257,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write dated outputs but do not update latest artifacts",
     )
 
+    test_notification_parser = subparsers.add_parser(
+        "test-notification",
+        help="Send a test notification using configured notifiers",
+    )
+    test_notification_parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/daily_premarket.env"),
+    )
+
     watchlist_parser = subparsers.add_parser(
         "build-watchlist",
         help="Convert premarket action rows into watchlist.csv",
@@ -441,6 +452,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"advice_csv: {result.advice_path}")
         print(f"actions_csv: {result.actions_path}")
         print(f"report: {result.report_path}")
+        return 0
+
+    if args.command == "test-notification":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            notifier = build_notifier(config)
+            notifier.notify(
+                "Open Trader 测试通知",
+                "这是一条 Open Trader 测试通知。",
+            )
+        except (
+            FileNotFoundError,
+            ValueError,
+            RuntimeError,
+            argparse.ArgumentTypeError,
+            ZoneInfoNotFoundError,
+        ) as exc:
+            print(f"通知测试失败：{exc}", file=sys.stderr)
+            return 1
+        print("通知测试已发送。")
         return 0
 
     if args.command == "run-daily-premarket":
