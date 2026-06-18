@@ -409,6 +409,8 @@ class DailyPremarketRunner:
                         futu_status=futu_status,
                         trade_actions=trade_action_counts,
                         artifacts=artifacts,
+                        readiness=str(daily_state["readiness"]),
+                        status_reasons=list(daily_state["status_reasons"]),
                     )
                 except Exception:
                     pass
@@ -701,6 +703,8 @@ class DailyPremarketRunner:
                     trade_actions=_mapping(payload.get("trade_actions")),
                     artifacts=_mapping(payload.get("artifacts")),
                     error=error,
+                    readiness=str(daily_state["readiness"]),
+                    status_reasons=list(daily_state["status_reasons"]),
                 )
             except Exception:
                 pass
@@ -993,6 +997,18 @@ def _render_daily_report(payload: dict[str, object]) -> str:
     ]
     if payload.get("error"):
         lines.append(f"- Error: {payload.get('error')}")
+    readiness = str(payload.get("readiness", "")).strip()
+    reason_labels = _reason_labels(payload.get("status_reasons"))
+    lines.extend(
+        [
+            "",
+            "## 可用性判断",
+            "",
+            f"- 可用性：{_readiness_label(readiness)}",
+            f"- 原因：{', '.join(reason_labels) if reason_labels else '无'}",
+            f"- 下一步：{_diagnostic_next_step(payload)}",
+        ]
+    )
     lines.extend(
         [
             "",
@@ -1231,10 +1247,17 @@ def _blocker_notification_message(
     trade_actions: dict[str, object],
     artifacts: dict[str, object],
     error: str = "",
+    readiness: str = "",
+    status_reasons: list[str] | None = None,
 ) -> str:
+    reason_labels = [_status_reason_label(reason) for reason in (status_reasons or [])]
+    diagnostic = _mapping(futu_status.get("diagnostic"))
+    diagnostic_next_step = str(diagnostic.get("next_step", "")).strip()
     lines = [
         "Open Trader｜阻塞通知",
         f"日期：{run_date}｜状态：{_daily_status_label(status)}",
+        f"可用性：{_readiness_label(readiness)}",
+        f"原因：{', '.join(reason_labels) if reason_labels else '未分类'}",
         "",
     ]
     if error:
@@ -1259,7 +1282,7 @@ def _blocker_notification_message(
         [
             "",
             "影响：自动流程不能给出完整可靠的可执行结论。",
-            "下一步：先恢复 OpenD 行情连接或处理阻塞项，再重新运行盘前流程。",
+            f"下一步：{diagnostic_next_step or '请先处理阻塞项，再重新运行每日盘前流程。'}",
         ]
     )
 
@@ -1282,6 +1305,48 @@ def _daily_status_label(status: str) -> str:
         "failed": "失败",
         "already_running": "已有任务运行中",
     }.get(status.strip().lower(), status)
+
+
+def _readiness_label(readiness: str) -> str:
+    return {
+        "ready": "可复核",
+        "review_required": "需要人工复核",
+        "blocked": "阻塞",
+    }.get(readiness.strip().lower(), readiness)
+
+
+def _status_reason_label(reason: str) -> str:
+    return {
+        "advice_fallback": "使用历史建议",
+        "advice_error": "建议生成异常",
+        "plan_fallback": "交易计划使用历史建议",
+        "plan_error": "交易计划异常",
+        "futu_error": "Futu 行情异常",
+        "missing_quotes": "缺失行情",
+        "trade_action_review": "交易动作需要人工复核",
+        "run_failed": "运行失败",
+        "already_running": "已有任务运行中",
+    }.get(reason.strip().lower(), reason)
+
+
+def _reason_labels(reasons: object) -> list[str]:
+    if not isinstance(reasons, list):
+        return []
+    return [_status_reason_label(str(reason)) for reason in reasons]
+
+
+def _diagnostic_next_step(payload: dict[str, object]) -> str:
+    futu = _mapping(payload.get("futu_plan_check"))
+    diagnostic = _mapping(futu.get("diagnostic"))
+    next_step = str(diagnostic.get("next_step", "")).strip()
+    if next_step:
+        return next_step
+    readiness = str(payload.get("readiness", "")).strip()
+    if readiness == "blocked":
+        return "请先处理阻塞原因，再重新运行每日盘前流程。"
+    if readiness == "review_required":
+        return "请先人工复核标记项，再决定是否执行交易动作。"
+    return "无需处理。"
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:

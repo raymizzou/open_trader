@@ -742,7 +742,9 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
 
 def test_daily_runner_sends_blocker_notification_when_futu_is_unavailable(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -781,12 +783,15 @@ def test_daily_runner_sends_blocker_notification_when_futu_is_unavailable(
     assert "Open Trader｜阻塞通知" in body
     assert "日期：2026-06-17｜状态：部分完成" in body
     assert "Futu 行情异常：Futu OpenD is not reachable" in body
-    assert "下一步：先恢复 OpenD 行情连接或处理阻塞项，再重新运行盘前流程。" in body
+    assert "原因：Futu 行情异常" in body
+    assert "请启动或重启 Futu OpenD" in body
 
 
 def test_daily_runner_sends_blocker_notification_when_futu_quote_is_missing(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -822,8 +827,57 @@ def test_daily_runner_sends_blocker_notification_when_futu_quote_is_missing(
     ]
     assert len(blocker_calls) == 1
     _, body = blocker_calls[0]
+    assert "可用性：需要人工复核" in body
+    assert "原因：缺失行情" in body
     assert "缺失行情：1" in body
     assert "报告：" in body
+
+
+def test_daily_runner_blocker_notification_uses_chinese_readiness_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+        notifiers=("feishu",),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        notify_daily_report=True,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=InterruptedQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=notifier,
+    ).run("2026-06-17")
+
+    assert result.status == "partial"
+    blocker_calls = [
+        call for call in notifier.calls if call[0] == "Open Trader 阻塞通知"
+    ]
+    assert len(blocker_calls) == 1
+    _, body = blocker_calls[0]
+    assert "可用性：阻塞" in body
+    assert "原因：Futu 行情异常" in body
+    assert "下一步：请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。" in body
+    assert "futu_error" not in body
+    assert "quote_server_interrupted" not in body
 
 
 def test_daily_runner_sends_blocker_notification_when_run_fails(
@@ -1846,6 +1900,11 @@ def test_daily_runner_writes_futu_diagnostic_when_snapshot_is_interrupted(
     assert diagnostic["context_ok"] is True
     assert diagnostic["snapshot_ok"] is False
     assert diagnostic["next_step"] == "请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。"
+    report = result.report_path.read_text(encoding="utf-8")
+    assert "## 可用性判断" in report
+    assert "- 可用性：阻塞" in report
+    assert "- 原因：Futu 行情异常" in report
+    assert "- 下一步：请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。" in report
 
 
 class MissingQuoteClient:
