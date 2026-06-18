@@ -63,6 +63,43 @@ def test_load_eligible_portfolio_rows_filters_ai_eligible_rows(tmp_path: Path) -
     assert rows[0].portfolio_weight_hkd == "3.05%"
 
 
+def test_load_eligible_portfolio_rows_filters_by_market(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(
+        path,
+        [
+            {
+                "symbol": "MSFT",
+                "market": "US",
+                "asset_class": "stock",
+                "name": "Microsoft",
+                "portfolio_weight_hkd": "1.13%",
+                "ai_eligible": "true",
+                "analysis_symbol": "MSFT",
+                "risk_flag": "normal",
+            },
+            {
+                "symbol": "00700",
+                "market": "HK",
+                "asset_class": "stock",
+                "name": "Tencent",
+                "portfolio_weight_hkd": "2.00%",
+                "ai_eligible": "true",
+                "analysis_symbol": "00700",
+                "risk_flag": "normal",
+            },
+        ],
+    )
+
+    hk_rows = load_eligible_portfolio_rows(path, market="HK")
+    us_rows = load_eligible_portfolio_rows(path, market="US")
+
+    assert [row.symbol for row in hk_rows] == ["00700"]
+    assert hk_rows[0].market == "HK"
+    assert [row.symbol for row in us_rows] == ["MSFT"]
+    assert us_rows[0].market == "US"
+
+
 def test_load_eligible_portfolio_rows_uses_analysis_symbol_when_present(
     tmp_path: Path,
 ) -> None:

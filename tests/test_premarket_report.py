@@ -69,3 +69,19 @@ def test_write_premarket_outputs_handles_no_actions(tmp_path: Path) -> None:
 
     markdown = report_path.read_text(encoding="utf-8")
     assert "No material trading advice changes" in markdown
+
+
+def test_write_premarket_outputs_no_eligible_message_is_market_aware(
+    tmp_path: Path,
+) -> None:
+    _, _, report_path = write_premarket_outputs(
+        run_date="2026-06-19",
+        actions=[],
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        no_eligible=True,
+        market="HK",
+    )
+
+    markdown = report_path.read_text(encoding="utf-8")
+    assert "No eligible HK stocks or ETFs were found." in markdown

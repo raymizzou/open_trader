@@ -19,6 +19,7 @@ def write_premarket_outputs(
     reports_dir: Path,
     update_latest: bool = True,
     no_eligible: bool = False,
+    market: str | None = None,
 ) -> tuple[Path, Path, Path]:
     sorted_actions = sorted(
         actions,
@@ -30,16 +31,31 @@ def write_premarket_outputs(
     )
     rows = [action.to_row() for action in sorted_actions]
 
-    run_actions_path = data_dir / "runs" / run_date / "premarket_actions.csv"
-    latest_actions_path = data_dir / "latest" / "premarket_actions.csv"
-    report_path = reports_dir / "premarket" / f"{run_date}.md"
+    market_value = market.strip().upper() if market else ""
+    if market_value:
+        run_actions_path = (
+            data_dir / "runs" / run_date / market_value / "premarket_actions.csv"
+        )
+        latest_actions_path = (
+            data_dir / "latest" / market_value / "premarket_actions.csv"
+        )
+        report_path = reports_dir / "premarket" / f"{run_date}-{market_value}.md"
+    else:
+        run_actions_path = data_dir / "runs" / run_date / "premarket_actions.csv"
+        latest_actions_path = data_dir / "latest" / "premarket_actions.csv"
+        report_path = reports_dir / "premarket" / f"{run_date}.md"
 
     _atomic_write_csv(run_actions_path, PREMARKET_ACTION_FIELDNAMES, rows)
     if update_latest:
         _atomic_write_csv(latest_actions_path, PREMARKET_ACTION_FIELDNAMES, rows)
     _atomic_write_text(
         report_path,
-        _render_markdown(run_date, sorted_actions, no_eligible=no_eligible),
+        _render_markdown(
+            run_date,
+            sorted_actions,
+            no_eligible=no_eligible,
+            market=market,
+        ),
     )
 
     return run_actions_path, latest_actions_path, report_path
@@ -50,10 +66,11 @@ def _render_markdown(
     actions: list[PremarketAction],
     *,
     no_eligible: bool = False,
+    market: str | None = None,
 ) -> str:
     lines = [f"# Premarket Trading Brief - {run_date}", ""]
     if no_eligible:
-        lines.extend(["No eligible US stocks or ETFs were found.", ""])
+        lines.extend([_no_eligible_message(market), ""])
         return "\n".join(lines)
 
     if not actions:
@@ -79,6 +96,14 @@ def _render_markdown(
         lines.append("")
 
     return "\n".join(lines)
+
+
+def _no_eligible_message(market: str | None) -> str:
+    if market and market.strip().upper() == "HK":
+        return "No eligible HK stocks or ETFs were found."
+    if market and market.strip().upper() == "US":
+        return "No eligible US stocks or ETFs were found."
+    return "No eligible stocks or ETFs were found."
 
 
 def _negative_weight(value: str) -> float:

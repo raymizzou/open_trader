@@ -160,45 +160,68 @@ class BlockingAdviceRunner(FakeAdviceRunner):
         return super().analyze(row, run_date)
 
 
-def write_portfolio(path: Path) -> None:
+def portfolio_row(
+    *,
+    symbol: str,
+    market: str,
+    ai_eligible: str,
+    asset_class: str = "stock",
+    name: str = "Test Holding",
+    portfolio_weight_hkd: str = "1.00%",
+    analysis_symbol: str | None = None,
+    risk_flag: str = "normal",
+) -> dict[str, str]:
+    return {
+        "market": market,
+        "asset_class": asset_class,
+        "symbol": symbol,
+        "name": name,
+        "portfolio_weight_hkd": portfolio_weight_hkd,
+        "ai_eligible": ai_eligible,
+        "analysis_symbol": analysis_symbol or symbol,
+        "risk_flag": risk_flag,
+    }
+
+
+def write_portfolio(path: Path, rows: list[dict[str, str]] | None = None) -> None:
+    if rows is None:
+        rows = [
+            {
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "VIXY",
+                "name": "Volatility ETF",
+                "portfolio_weight_hkd": "3.05%",
+                "ai_eligible": "true",
+                "analysis_symbol": "VIXY",
+                "risk_flag": "normal",
+            },
+            {
+                "market": "US",
+                "asset_class": "stock",
+                "symbol": "QQQ",
+                "name": "Nasdaq ETF",
+                "portfolio_weight_hkd": "1.40%",
+                "ai_eligible": "true",
+                "analysis_symbol": "TQQQ",
+                "risk_flag": "normal",
+            },
+            {
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "02476",
+                "name": "VGT",
+                "portfolio_weight_hkd": "15.20%",
+                "ai_eligible": "false",
+                "analysis_symbol": "",
+                "risk_flag": "overweight",
+            },
+        ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
         writer.writeheader()
-        writer.writerows(
-            [
-                {
-                    "market": "US",
-                    "asset_class": "etf",
-                    "symbol": "VIXY",
-                    "name": "Volatility ETF",
-                    "portfolio_weight_hkd": "3.05%",
-                    "ai_eligible": "true",
-                    "analysis_symbol": "VIXY",
-                    "risk_flag": "normal",
-                },
-                {
-                    "market": "US",
-                    "asset_class": "stock",
-                    "symbol": "QQQ",
-                    "name": "Nasdaq ETF",
-                    "portfolio_weight_hkd": "1.40%",
-                    "ai_eligible": "true",
-                    "analysis_symbol": "TQQQ",
-                    "risk_flag": "normal",
-                },
-                {
-                    "market": "HK",
-                    "asset_class": "stock",
-                    "symbol": "02476",
-                    "name": "VGT",
-                    "portfolio_weight_hkd": "15.20%",
-                    "ai_eligible": "false",
-                    "analysis_symbol": "",
-                    "risk_flag": "overweight",
-                },
-            ]
-        )
+        writer.writerows(rows)
 
 
 def write_blacklisted_portfolio(path: Path) -> None:
@@ -307,6 +330,37 @@ def test_run_premarket_writes_full_advice_classifications_and_actions(
 
     advice_rows = list(csv.DictReader(result.advice_path.open(encoding="utf-8")))
     assert [row["symbol"] for row in advice_rows] == ["VIXY", "QQQ"]
+
+
+def test_run_premarket_filters_hk_market_and_writes_market_scoped_outputs(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    write_portfolio(
+        portfolio,
+        [
+            portfolio_row(symbol="MSFT", market="US", ai_eligible="true"),
+            portfolio_row(symbol="00700", market="HK", ai_eligible="true"),
+        ],
+    )
+
+    result = run_premarket(
+        run_date="2026-06-19",
+        portfolio_path=portfolio,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        advice_runner=FakeAdviceRunner(),
+        classifier=FakeClassifier(),
+        market="HK",
+        update_latest=True,
+        max_workers=1,
+    )
+
+    assert result.eligible_count == 1
+    assert result.advice_path == tmp_path / "data/runs/2026-06-19/HK/trading_advice.csv"
+    assert result.actions_path == tmp_path / "data/runs/2026-06-19/HK/premarket_actions.csv"
+    assert result.report_path == tmp_path / "reports/premarket/2026-06-19-HK.md"
+    assert (tmp_path / "data/latest/HK/trading_advice.csv").exists()
 
 
 def test_run_premarket_excludes_default_blacklisted_symbols(
@@ -470,7 +524,7 @@ def test_run_premarket_all_ineligible_writes_empty_run_outputs_and_preserves_lat
     assert result.advice_path.exists()
     assert result.classifications_path.exists()
     assert result.actions_path.exists()
-    assert "No eligible US stocks or ETFs were found" in result.report_path.read_text(
+    assert "No eligible stocks or ETFs were found" in result.report_path.read_text(
         encoding="utf-8"
     )
     assert (data_dir / "latest" / "trading_advice.csv").read_text(
@@ -517,7 +571,7 @@ def test_run_premarket_no_matching_symbols_writes_empty_run_outputs_and_preserve
     assert result.advice_path.exists()
     assert result.classifications_path.exists()
     assert result.actions_path.exists()
-    assert "No eligible US stocks or ETFs were found" in result.report_path.read_text(
+    assert "No eligible stocks or ETFs were found" in result.report_path.read_text(
         encoding="utf-8"
     )
     assert (data_dir / "latest" / "trading_advice.csv").read_text(

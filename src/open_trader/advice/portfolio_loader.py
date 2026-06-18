@@ -13,7 +13,12 @@ def _csv_value(value: str | None) -> str:
     return (value or "").strip()
 
 
-def load_eligible_portfolio_rows(portfolio_path: Path) -> list[PortfolioInputRow]:
+def load_eligible_portfolio_rows(
+    portfolio_path: Path,
+    *,
+    market: str | None = None,
+) -> list[PortfolioInputRow]:
+    market_filter = market.strip().upper() if market else None
     with portfolio_path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         eligible: list[PortfolioInputRow] = []
@@ -31,6 +36,9 @@ def load_eligible_portfolio_rows(portfolio_path: Path) -> list[PortfolioInputRow
                     "risk_flag",
                 )
             }
+            normalized_row["market"] = normalized_row["market"].upper()
+            if market_filter is not None and normalized_row["market"] != market_filter:
+                continue
             if normalized_row["ai_eligible"].lower() != "true":
                 continue
 

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import csv
 import shutil
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Callable, Protocol
+from typing import Callable, Iterable, Mapping, Protocol
 
 from .models import (
+    CHANGE_CLASSIFICATION_FIELDNAMES,
     ChangeClassification,
     PortfolioInputRow,
     PremarketAction,
@@ -16,11 +19,7 @@ from .models import (
 )
 from .portfolio_loader import load_eligible_portfolio_rows
 from .report import write_premarket_outputs
-from .store import (
-    load_latest_advice_by_symbol,
-    write_change_classifications,
-    write_trading_advice,
-)
+from .store import load_latest_advice_by_symbol
 
 
 class AdviceRunner(Protocol):
@@ -79,20 +78,21 @@ def run_premarket(
     portfolio_path: Path,
     data_dir: Path,
     reports_dir: Path,
-    advice_runner: AdviceRunner | None,
-    classifier: Classifier,
-    symbols: set[str] | None,
-    update_latest: bool,
-    max_workers: int = 1,
+    advice_runner: AdviceRunner | None = None,
     advice_runner_factory: AdviceRunnerFactory | None = None,
+    classifier: Classifier | None = None,
+    symbols: set[str] | None = None,
     excluded_symbols: set[str] | None = None,
+    update_latest: bool = True,
+    max_workers: int = 1,
     use_fallback: bool = False,
     deadline_reached: DeadlineReached | None = None,
+    market: str | None = None,
 ) -> PremarketResult:
     if max_workers < 1:
         raise ValueError("max_workers must be at least 1")
 
-    rows = load_eligible_portfolio_rows(portfolio_path)
+    rows = load_eligible_portfolio_rows(portfolio_path, market=market)
     normalized_excluded_symbols = {
         symbol.casefold()
         for symbol in (
@@ -118,16 +118,17 @@ def run_premarket(
         ]
 
     if not rows:
-        advice_path, _ = write_trading_advice(
+        advice_path = _write_trading_advice_run(
             run_date=run_date,
             records=[],
             data_dir=data_dir,
-            update_latest=False,
+            market=market,
         )
-        classifications_path = write_change_classifications(
+        classifications_path = _write_change_classifications_run(
             run_date=run_date,
             records=[],
             data_dir=data_dir,
+            market=market,
         )
         actions_path, _, report_path = write_premarket_outputs(
             run_date=run_date,
@@ -136,6 +137,7 @@ def run_premarket(
             reports_dir=reports_dir,
             update_latest=False,
             no_eligible=True,
+            market=market,
         )
         return PremarketResult(
             eligible_count=0,
@@ -147,7 +149,10 @@ def run_premarket(
             report_path=report_path,
         )
 
-    previous_by_symbol = load_latest_advice_by_symbol(data_dir)
+    if classifier is None:
+        raise ValueError("classifier is required")
+
+    previous_by_symbol = _load_latest_advice_by_symbol(data_dir, market=market)
     symbol_results = _run_symbols(
         rows=rows,
         run_date=run_date,
@@ -168,16 +173,17 @@ def run_premarket(
         if classification.status == "ok" and classification.include_in_report:
             actions.append(PremarketAction.from_classification(result.row, classification))
 
-    advice_path, _ = write_trading_advice(
+    advice_path = _write_trading_advice_run(
         run_date=run_date,
         records=advice_records,
         data_dir=data_dir,
-        update_latest=False,
+        market=market,
     )
-    classifications_path = write_change_classifications(
+    classifications_path = _write_change_classifications_run(
         run_date=run_date,
         records=classifications,
         data_dir=data_dir,
+        market=market,
     )
     actions_path, _, report_path = write_premarket_outputs(
         run_date=run_date,
@@ -185,12 +191,14 @@ def run_premarket(
         data_dir=data_dir,
         reports_dir=reports_dir,
         update_latest=False,
+        market=market,
     )
     if update_latest:
         _promote_latest_outputs(
             advice_path=advice_path,
             actions_path=actions_path,
             data_dir=data_dir,
+            market=market,
         )
 
     return PremarketResult(
@@ -446,8 +454,9 @@ def _promote_latest_outputs(
     advice_path: Path,
     actions_path: Path,
     data_dir: Path,
+    market: str | None,
 ) -> None:
-    latest_dir = data_dir / "latest"
+    latest_dir = _latest_dir(data_dir, market)
     latest_dir.mkdir(parents=True, exist_ok=True)
     promotions = [
         _LatestPromotion(
@@ -536,6 +545,116 @@ def _best_effort_unlink(path: Path) -> None:
         path.unlink()
     except Exception:
         pass
+
+
+def _write_trading_advice_run(
+    *,
+    run_date: str,
+    records: Iterable[TradingAdvice],
+    data_dir: Path,
+    market: str | None,
+) -> Path:
+    rows = [record.to_row() for record in records]
+    run_path = _run_path(data_dir, run_date, market, "trading_advice.csv")
+    _atomic_write_csv(run_path, TRADING_ADVICE_FIELDNAMES, rows)
+    return run_path
+
+
+def _write_change_classifications_run(
+    *,
+    run_date: str,
+    records: Iterable[ChangeClassification],
+    data_dir: Path,
+    market: str | None,
+) -> Path:
+    run_path = _run_path(data_dir, run_date, market, "change_classifications.csv")
+    _atomic_write_csv(
+        run_path,
+        CHANGE_CLASSIFICATION_FIELDNAMES,
+        (record.to_row() for record in records),
+    )
+    return run_path
+
+
+def _load_latest_advice_by_symbol(
+    data_dir: Path,
+    *,
+    market: str | None,
+) -> dict[str, dict[str, str]]:
+    if not _market_value(market):
+        return load_latest_advice_by_symbol(data_dir)
+
+    latest_path = _latest_dir(data_dir, market) / "trading_advice.csv"
+    if not latest_path.exists():
+        return {}
+
+    csv.field_size_limit(sys.maxsize)
+    with latest_path.open(encoding="utf-8-sig", newline="") as handle:
+        return {
+            normalized["symbol"]: normalized
+            for row in csv.DictReader(handle)
+            if row.get("symbol")
+            for normalized in [_normalize_advice_row(row)]
+        }
+
+
+def _normalize_advice_row(row: dict[str, str]) -> dict[str, str]:
+    normalized = {field: row.get(field, "") for field in TRADING_ADVICE_FIELDNAMES}
+    if not normalized["source_status"]:
+        normalized["source_status"] = normalized["status"] or "ok"
+    return normalized
+
+
+def _run_path(data_dir: Path, run_date: str, market: str | None, name: str) -> Path:
+    market_value = _market_value(market)
+    if market_value:
+        return data_dir / "runs" / run_date / market_value / name
+    return data_dir / "runs" / run_date / name
+
+
+def _latest_dir(data_dir: Path, market: str | None) -> Path:
+    market_value = _market_value(market)
+    if market_value:
+        return data_dir / "latest" / market_value
+    return data_dir / "latest"
+
+
+def _market_value(market: str | None) -> str:
+    return market.strip().upper() if market else ""
+
+
+def _atomic_write_csv(
+    path: Path,
+    fieldnames: list[str],
+    rows: Iterable[Mapping[str, object]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        key: "" if row.get(key) is None else row.get(key)
+                        for key in fieldnames
+                    }
+                )
+        temp_path.replace(path)
+    except Exception:
+        if temp_path is not None and temp_path.exists():
+            _best_effort_unlink(temp_path)
+        raise
 
 
 def _classify_symbol(
