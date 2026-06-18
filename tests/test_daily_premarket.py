@@ -763,6 +763,20 @@ def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
     )
 
 
+def _notification_rows(
+    tmp_path: Path,
+    run_date: str,
+    market: str,
+) -> list[dict[str, str]]:
+    return list(
+        csv.DictReader(
+            (tmp_path / f"logs/notifications/{run_date}-{market}.csv").open(
+                encoding="utf-8"
+            )
+        )
+    )
+
+
 def test_daily_config_deadline_for_market_uses_hk_and_us_defaults(
     tmp_path: Path,
 ) -> None:
@@ -815,6 +829,43 @@ def test_daily_runner_hk_uses_market_scoped_paths_and_calls_market_filter(
     assert "data/latest/trading_plan.csv" not in status["artifacts"].values()
 
 
+def test_hk_daily_runner_uses_market_notification_titles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    base_config = _daily_config(tmp_path)
+    config = DailyPremarketConfig(
+        **{
+            **base_config.__dict__,
+            "notify_daily_report": True,
+        }
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("portfolio\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+
+    DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(market="HK", symbol="00700"),
+        plan_builder=FakePlanBuilder(market="HK", symbol="00700"),
+        quote_client_factory=lambda **kwargs: FakeQuoteClient(
+            {"HK.00700": QuoteSnapshot("HK.00700", Decimal("380"))},
+            **kwargs,
+        ),
+        trade_action_generator=FakeTradeActionGenerator(market="HK", symbol="00700"),
+        notifier=notifier,
+    ).run(run_date="2026-06-19", market="HK")
+
+    assert [title for title, _ in notifier.calls] == ["Open Trader 港股行动通知"]
+    rows = _notification_rows(tmp_path, "2026-06-19", "HK")
+    assert len(rows) == 1
+    assert rows[0]["market"] == "HK"
+    assert rows[0]["title"] == "Open Trader 港股行动通知"
+    assert rows[0]["channel"] == "CapturingNotifier"
+    assert rows[0]["success"] == "true"
+
+
 def test_daily_notify_logs_success(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -826,16 +877,21 @@ def test_daily_notify_logs_success(
     )
 
     with caplog.at_level("INFO", logger="open_trader.daily_premarket"):
-        runner._notify("Open Trader 行动通知", "测试正文")
+        runner._notify(
+            "Open Trader 美股行动通知",
+            "测试正文",
+            market="US",
+            run_date="2026-06-17",
+        )
 
-    assert notifier.calls == [("Open Trader 行动通知", "测试正文")]
-    assert "通知已发送：Open Trader 行动通知" in caplog.text
-    notification_logs = list((tmp_path / "logs/notifications").glob("*.jsonl"))
-    assert len(notification_logs) == 1
-    payload = json.loads(notification_logs[0].read_text(encoding="utf-8"))
-    assert payload["title"] == "Open Trader 行动通知"
-    assert payload["channel"] == "CapturingNotifier"
-    assert payload["success"] is True
+    assert notifier.calls == [("Open Trader 美股行动通知", "测试正文")]
+    assert "通知已发送：Open Trader 美股行动通知" in caplog.text
+    rows = _notification_rows(tmp_path, "2026-06-17", "US")
+    assert len(rows) == 1
+    assert rows[0]["market"] == "US"
+    assert rows[0]["title"] == "Open Trader 美股行动通知"
+    assert rows[0]["channel"] == "CapturingNotifier"
+    assert rows[0]["success"] == "true"
 
 
 def test_daily_notify_logs_failure_without_raising(
@@ -848,19 +904,24 @@ def test_daily_notify_logs_failure_without_raising(
     )
 
     with caplog.at_level("WARNING", logger="open_trader.daily_premarket"):
-        runner._notify("Open Trader 行动通知", "测试正文")
+        runner._notify(
+            "Open Trader 港股阻塞通知",
+            "测试正文",
+            market="HK",
+            run_date="2026-06-19",
+        )
 
-    assert "通知发送失败：Open Trader 行动通知" in caplog.text
+    assert "通知发送失败：Open Trader 港股阻塞通知" in caplog.text
     assert "RuntimeError" in caplog.text
     assert "delivery failed" in caplog.text
-    notification_logs = list((tmp_path / "logs/notifications").glob("*.jsonl"))
-    assert len(notification_logs) == 1
-    payload = json.loads(notification_logs[0].read_text(encoding="utf-8"))
-    assert payload["title"] == "Open Trader 行动通知"
-    assert payload["channel"] == "FailingNotifier"
-    assert payload["success"] is False
-    assert payload["error_type"] == "RuntimeError"
-    assert payload["error"] == "delivery failed"
+    rows = _notification_rows(tmp_path, "2026-06-19", "HK")
+    assert len(rows) == 1
+    assert rows[0]["market"] == "HK"
+    assert rows[0]["title"] == "Open Trader 港股阻塞通知"
+    assert rows[0]["channel"] == "FailingNotifier"
+    assert rows[0]["success"] == "false"
+    assert rows[0]["error_type"] == "RuntimeError"
+    assert rows[0]["error"] == "delivery failed"
 
 
 def test_daily_notify_logs_composite_child_failure_without_raising(
@@ -877,12 +938,24 @@ def test_daily_notify_logs_composite_child_failure_without_raising(
     )
 
     with caplog.at_level("INFO", logger="open_trader.daily_premarket"):
-        runner._notify("Open Trader 行动通知", "测试正文")
+        runner._notify(
+            "Open Trader 美股行动通知",
+            "测试正文",
+            market="US",
+            run_date="2026-06-17",
+        )
 
-    assert "通知发送失败：Open Trader 行动通知" in caplog.text
+    assert "通知发送失败：Open Trader 美股行动通知" in caplog.text
     assert "RuntimeError" in caplog.text
     assert "delivery failed" in caplog.text
-    assert "通知已发送：Open Trader 行动通知" in caplog.text
+    assert "通知已发送：Open Trader 美股行动通知" in caplog.text
+    rows = _notification_rows(tmp_path, "2026-06-17", "US")
+    assert [row["market"] for row in rows] == ["US", "US"]
+    assert [row["title"] for row in rows] == [
+        "Open Trader 美股行动通知",
+        "Open Trader 美股行动通知",
+    ]
+    assert [row["success"] for row in rows] == ["false", "true"]
 
 
 def test_daily_runner_writes_success_status_and_report(
@@ -1002,7 +1075,7 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
     assert result.status == "success"
     assert len(notifier.calls) == 1
     title, body = notifier.calls[0]
-    assert title == "Open Trader 行动通知"
+    assert title == "Open Trader 美股行动通知"
     assert "Open Trader｜行动通知" in body
     assert "今日结论：有 1 条可采取行动，需人工确认后执行。" in body
     assert "标的：MSFT｜指示：买入 3 股｜优先级：高" in body
@@ -1046,7 +1119,7 @@ def test_daily_runner_sends_blocker_notification_when_futu_is_unavailable(
 
     assert result.status == "partial"
     blocker_calls = [
-        call for call in notifier.calls if call[0] == "Open Trader 阻塞通知"
+        call for call in notifier.calls if call[0] == "Open Trader 美股阻塞通知"
     ]
     assert len(blocker_calls) == 1
     _, body = blocker_calls[0]
@@ -1094,7 +1167,7 @@ def test_daily_runner_sends_blocker_notification_when_futu_quote_is_missing(
 
     assert result.status == "partial"
     blocker_calls = [
-        call for call in notifier.calls if call[0] == "Open Trader 阻塞通知"
+        call for call in notifier.calls if call[0] == "Open Trader 美股阻塞通知"
     ]
     assert len(blocker_calls) == 1
     _, body = blocker_calls[0]
@@ -1140,7 +1213,7 @@ def test_daily_runner_blocker_notification_uses_chinese_readiness_text(
 
     assert result.status == "partial"
     blocker_calls = [
-        call for call in notifier.calls if call[0] == "Open Trader 阻塞通知"
+        call for call in notifier.calls if call[0] == "Open Trader 美股阻塞通知"
     ]
     assert len(blocker_calls) == 1
     _, body = blocker_calls[0]
@@ -1183,10 +1256,15 @@ def test_daily_runner_sends_blocker_notification_when_run_fails(
     assert result.status == "failed"
     assert len(notifier.calls) == 1
     title, body = notifier.calls[0]
-    assert title == "Open Trader 阻塞通知"
+    assert title == "Open Trader 美股阻塞通知"
     assert "运行失败：每日流程未完成。" in body
     assert "portfolio not found" not in body
     assert "状态文件：" in body
+    rows = _notification_rows(tmp_path, "2026-06-17", "US")
+    assert len(rows) == 1
+    assert rows[0]["market"] == "US"
+    assert rows[0]["title"] == "Open Trader 美股阻塞通知"
+    assert rows[0]["success"] == "true"
 
 
 def test_daily_runner_keeps_partial_status_when_blocker_rendering_fails(
@@ -1234,7 +1312,7 @@ def test_daily_runner_keeps_partial_status_when_blocker_rendering_fails(
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["status"] == "partial"
     assert "error" not in status
-    assert [title for title, _ in notifier.calls] == ["Open Trader 行动通知"]
+    assert [title for title, _ in notifier.calls] == ["Open Trader 美股行动通知"]
 
 
 @pytest.mark.parametrize(
@@ -1304,7 +1382,7 @@ def test_daily_runner_keeps_success_status_when_order_review_rendering_fails(
     else:
         assert len(notifier.calls) == 1
         title, body = notifier.calls[0]
-        assert title == "Open Trader 阻塞通知"
+        assert title == "Open Trader 美股阻塞通知"
         assert "缺失行情：1" in body
 
 

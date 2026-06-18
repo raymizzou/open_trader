@@ -517,7 +517,12 @@ class DailyPremarketRunner:
                 except Exception:
                     pass
                 else:
-                    self._notify("Open Trader 阻塞通知", blocker_message)
+                    self._notify(
+                        _notification_title("阻塞通知", market),
+                        blocker_message,
+                        market=market,
+                        run_date=run_date,
+                    )
             try:
                 message = render_feishu_order_review(
                     run_date=run_date,
@@ -531,7 +536,12 @@ class DailyPremarketRunner:
             except Exception:
                 pass
             else:
-                self._notify("Open Trader 行动通知", message)
+                self._notify(
+                    _notification_title("行动通知", market),
+                    message,
+                    market=market,
+                    run_date=run_date,
+                )
         return result
 
     def _advice_runner_factory(
@@ -817,7 +827,12 @@ class DailyPremarketRunner:
             except Exception:
                 pass
             else:
-                self._notify("Open Trader 阻塞通知", blocker_message)
+                self._notify(
+                    _notification_title("阻塞通知", market),
+                    blocker_message,
+                    market=market,
+                    run_date=run_date,
+                )
         return DailyRunResult(
             run_date=run_date,
             status="failed",
@@ -874,10 +889,15 @@ class DailyPremarketRunner:
             log_path=log_path,
         )
 
-    def _notify(self, title: str, message: str) -> None:
+    def _notify(self, title: str, message: str, *, market: str, run_date: str) -> None:
         attempts = send_notification_with_results(self.notifier, title, message)
         for attempt in attempts:
-            self._write_notification_log(title=title, attempt=attempt)
+            self._write_notification_log(
+                title=title,
+                attempt=attempt,
+                market=market,
+                run_date=run_date,
+            )
             if attempt.success:
                 LOGGER.info("通知已发送：%s channel=%s", title, attempt.channel)
                 continue
@@ -894,24 +914,42 @@ class DailyPremarketRunner:
         *,
         title: str,
         attempt: NotificationAttempt,
+        market: str,
+        run_date: str,
     ) -> None:
         try:
             now = datetime.now(ZoneInfo(self.config.timezone))
             log_dir = self.config.logs_dir / "notifications"
             log_dir.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "timestamp": now.isoformat(),
+            path = log_dir / f"{run_date}-{market}.csv"
+            fieldnames = [
+                "sent_at",
+                "market",
+                "title",
+                "channel",
+                "success",
+                "error_type",
+                "error",
+            ]
+            row = {
+                "sent_at": now.isoformat(),
+                "market": market,
                 "title": title,
                 "channel": attempt.channel,
-                "success": attempt.success,
+                "success": "true" if attempt.success else "false",
                 "error_type": attempt.error_type,
                 "error": attempt.error,
             }
-            with (log_dir / f"{now.date().isoformat()}.jsonl").open(
+            write_header = not path.exists() or path.stat().st_size == 0
+            with path.open(
                 "a",
                 encoding="utf-8",
+                newline="",
             ) as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
         except Exception as exc:
             LOGGER.warning("通知日志写入失败：%s", exc)
 
@@ -973,6 +1011,18 @@ def _deadline_for_market(config: DailyPremarketConfig, market: str) -> str:
     if scope is MarketScope.HK:
         return "09:00"
     return config.deadline
+
+
+def _market_label(market: str) -> str:
+    if market == "HK":
+        return "港股"
+    if market == "US":
+        return "美股"
+    return market
+
+
+def _notification_title(kind: str, market: str) -> str:
+    return f"Open Trader {_market_label(market)}{kind}"
 
 
 def _config_for_market(
