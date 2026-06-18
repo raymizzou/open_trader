@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import csv
 import inspect
 import os
 from dataclasses import dataclass, field
+import json
 from decimal import Decimal, InvalidOperation
+import uuid
 from pathlib import Path
 from typing import Callable
 
+from .csv_io import write_rows
+from .fx import StaticMonthEndFxProvider
+from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
 from .models import AssetClass, CashBalance, Market, Position
 
 
@@ -45,7 +51,127 @@ class TigerAccountSnapshot:
     position_records: list[dict[str, object]]
 
 
-def mask_account_id(account_id: str) -> str:
+@dataclass(frozen=True)
+class TigerPortfolioSyncResult:
+    run_date: str
+    account_count: int
+    position_count: int
+    cash_count: int
+    merged_row_count: int
+    snapshot_path: Path
+    portfolio_path: Path
+    report_path: Path
+    latest_path: Path
+    updated_latest: bool
+
+
+def sync_tiger_portfolio(
+    *,
+    snapshot: TigerAccountSnapshot,
+    portfolio_path: Path,
+    data_dir: Path,
+    reports_dir: Path,
+    run_date: str,
+    update_latest: bool,
+) -> TigerPortfolioSyncResult:
+    existing_rows = _read_portfolio_rows(portfolio_path)
+    _raise_for_mixed_tiger_broker_rows(existing_rows)
+    fx_provider = _fx_provider_from_existing_rows(run_date, existing_rows)
+    preserved_rows = [row for row in existing_rows if not _has_tiger_broker(row)]
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date=run_date,
+    )
+    tiger_rows = build_portfolio_rows(
+        run_date[:7],
+        positions,
+        cash_balances,
+        fx_provider,
+    )
+    merged_rows = _recalculate_combined_portfolio_rows(
+        [*preserved_rows, *tiger_rows]
+    )
+
+    run_dir = data_dir / "runs" / run_date
+    run_dir.mkdir(parents=True, exist_ok=True)
+    report_dir = reports_dir / "tiger_account"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    snapshot_path = run_dir / "tiger_account_snapshot.json"
+    merged_portfolio_path = run_dir / "portfolio.csv"
+    report_path = report_dir / f"{run_date}.md"
+    latest_path = data_dir / "latest" / "portfolio.csv"
+    updated_latest = False
+
+    _write_text_file_atomic(
+        snapshot_path,
+        json.dumps(_snapshot_to_json(snapshot), ensure_ascii=False, indent=2),
+    )
+    _write_portfolio_rows_atomic(merged_portfolio_path, merged_rows)
+    _write_text_file_atomic(
+        report_path,
+        _render_tiger_account_report(
+            account_count=len(snapshot.accounts),
+            position_count=len(positions),
+            cash_count=len(cash_balances),
+            blocking_errors=blocking_errors,
+            updated_latest=False,
+        ),
+    )
+
+    if blocking_errors:
+        raise TigerAccountError(
+            "; ".join(blocking_errors),
+            error_type="blocking_data_error",
+        )
+
+    if update_latest:
+        latest_backup_path: Path | None = None
+        latest_existed = latest_path.exists()
+        if latest_existed:
+            latest_backup_path = _atomic_temp_path(latest_path)
+            latest_backup_path.write_bytes(latest_path.read_bytes())
+
+        try:
+            _write_latest_portfolio_atomic(latest_path, merged_rows)
+            _write_text_file_atomic(
+                report_path,
+                _render_tiger_account_report(
+                    account_count=len(snapshot.accounts),
+                    position_count=len(positions),
+                    cash_count=len(cash_balances),
+                    blocking_errors=blocking_errors,
+                    updated_latest=True,
+                ),
+            )
+            updated_latest = True
+        except Exception:
+            if latest_existed:
+                assert latest_backup_path is not None
+                latest_backup_path.replace(latest_path)
+            else:
+                if latest_path.exists():
+                    latest_path.unlink()
+            raise
+        finally:
+            if latest_backup_path is not None and latest_backup_path.exists():
+                latest_backup_path.unlink()
+
+    return TigerPortfolioSyncResult(
+        run_date=run_date,
+        account_count=len(snapshot.accounts),
+        position_count=len(positions),
+        cash_count=len(cash_balances),
+        merged_row_count=len(merged_rows),
+        snapshot_path=snapshot_path,
+        portfolio_path=merged_portfolio_path,
+        report_path=report_path,
+        latest_path=latest_path,
+        updated_latest=updated_latest,
+    )
+
+
+def mask_account_id(account_id: object) -> str:
     text = str(account_id).strip()
     if not text:
         return ""
@@ -235,7 +361,7 @@ def _default_trade_client_factory(client_config: TigerAccountConfig) -> object:
         return TradeClient(open_config)
     except Exception as exc:
         raise TigerAccountError(
-            f"failed to initialize Tiger TradeClient: {exc}",
+            "failed to initialize Tiger TradeClient",
             error_type="config_invalid",
         ) from exc
 
@@ -260,7 +386,7 @@ class TigerAccountClient:
             raise
         except Exception as exc:  # pragma: no cover - safety net for SDK init issues
             raise TigerAccountError(
-                f"failed to initialize Tiger TradeClient: {exc}",
+                "failed to initialize Tiger TradeClient",
                 error_type="config_invalid",
             ) from exc
 
@@ -308,7 +434,10 @@ class TigerAccountClient:
         try:
             profiles = list(self.trade_client.get_managed_accounts(account=self.config.account))
         except Exception as exc:
-            raise TigerAccountError(str(exc), error_type="account_query_failed") from exc
+            raise TigerAccountError(
+                "failed to query Tiger managed accounts",
+                error_type="account_query_failed",
+            ) from exc
 
         matching_accounts = []
         for profile in profiles:
@@ -322,7 +451,7 @@ class TigerAccountClient:
 
         if not matching_accounts:
             raise TigerAccountError(
-                f"no active Tiger accounts matched account {self.config.account}",
+                f"no active Tiger accounts matched account {mask_account_id(self.config.account)}",
                 error_type="no_matching_accounts",
             )
 
@@ -359,7 +488,10 @@ class TigerAccountClient:
         try:
             positions = list(self.trade_client.get_positions(account=account.account))
         except Exception as exc:
-            raise TigerAccountError(str(exc), error_type="position_query_failed") from exc
+            raise TigerAccountError(
+                "failed to query Tiger account positions",
+                error_type="position_query_failed",
+            ) from exc
         return [self._position_record(account, position) for position in positions]
 
     def _fetch_cash_records(self, account: TigerAccount) -> list[dict[str, object]]:
@@ -370,13 +502,19 @@ class TigerAccountClient:
                     market_value=True,
                 )
             except Exception as exc:
-                raise TigerAccountError(str(exc), error_type="asset_query_failed") from exc
+                raise TigerAccountError(
+                    "failed to query Tiger assets",
+                    error_type="asset_query_failed",
+                ) from exc
             return self._records_from_assets(account, payload)
 
         try:
             payload = self.trade_client.get_prime_assets(account=account.account)
         except Exception as exc:
-            raise TigerAccountError(str(exc), error_type="asset_query_failed") from exc
+            raise TigerAccountError(
+                "failed to query Tiger assets",
+                error_type="asset_query_failed",
+            ) from exc
         return self._records_from_prime_assets(account, payload)
 
     def _position_record(self, account: TigerAccount, position: object) -> dict[str, object]:
@@ -526,7 +664,7 @@ def _position_from_record(
     for key in ("symbol", "code", "security_code", "ticker"):
         value, found = _attr_with_presence(record, key)
         if found:
-            if value in {"", None}:
+            if _is_blank_scalar(value):
                 continue
             raw_symbol = value
             break
@@ -632,7 +770,7 @@ def _required_decimal(
     raw_value: object | None = None
     for key in keys:
         value = record.get(key)
-        if value in {"", None}:
+        if _is_blank_scalar(value):
             continue
         raw_value = value
         break
@@ -640,7 +778,7 @@ def _required_decimal(
         return Decimal("0"), False, None
     try:
         value = Decimal(str(raw_value).strip())
-    except (InvalidOperation, ValueError):
+    except (InvalidOperation, TypeError, ValueError):
         return Decimal("0"), False, raw_value
     if not value.is_finite():
         return Decimal("0"), False, raw_value
@@ -653,14 +791,18 @@ def _optional_decimal(
 ) -> Decimal | None:
     for key in keys:
         raw_value = record.get(key)
-        if raw_value in {"", None}:
+        if _is_blank_scalar(raw_value):
             continue
         try:
             value = Decimal(str(raw_value).strip())
-        except (InvalidOperation, ValueError):
+        except (InvalidOperation, TypeError, ValueError):
             return None
         return value if value.is_finite() else None
     return None
+
+
+def _is_blank_scalar(value: object) -> bool:
+    return value is None or (isinstance(value, str) and value == "")
 
 
 def _market_from_record(record: dict[str, object]) -> Market:
@@ -679,3 +821,230 @@ def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
     if raw_type in {"ETF", "EXCHANGE_TRADED_FUND"}:
         return AssetClass.ETF
     return AssetClass.UNKNOWN
+
+
+def _read_portfolio_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _atomic_temp_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+
+
+def _write_text_file_atomic(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    temp_path = _atomic_temp_path(path)
+    try:
+        temp_path.write_text(text, encoding=encoding)
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _write_portfolio_rows_atomic(path: Path, rows: list[dict[str, str]]) -> None:
+    temp_path = _atomic_temp_path(path)
+    try:
+        write_rows(temp_path, PORTFOLIO_FIELDNAMES, rows)
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _write_bytes_to_path_atomic(source_path: Path, destination_path: Path) -> None:
+    temp_path = _atomic_temp_path(destination_path)
+    try:
+        temp_path.write_bytes(source_path.read_bytes())
+        temp_path.replace(destination_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _write_latest_portfolio_atomic(latest_path: Path, rows: list[dict[str, str]]) -> None:
+    _write_portfolio_rows_atomic(latest_path, rows)
+
+
+def _has_tiger_broker(row: dict[str, str]) -> bool:
+    return "tiger" in _broker_parts(row)
+
+
+def _broker_parts(row: dict[str, str]) -> set[str]:
+    brokers = row.get("brokers", "")
+    return {
+        part.strip().lower()
+        for chunk in brokers.split(",")
+        for part in chunk.split(";")
+        if part.strip()
+    }
+
+
+def _raise_for_mixed_tiger_broker_rows(rows: list[dict[str, str]]) -> None:
+    for row in rows:
+        parts = _broker_parts(row)
+        if "tiger" in parts and len(parts) > 1:
+            symbol = row.get("symbol", "")
+            brokers = row.get("brokers", "")
+            raise TigerAccountError(
+                f"portfolio row {symbol} mixes Tiger with other brokers: {brokers}",
+                error_type="mixed_tiger_broker_row",
+            )
+
+
+def _fx_provider_from_existing_rows(
+    run_date: str,
+    rows: list[dict[str, str]],
+) -> StaticMonthEndFxProvider:
+    rates: dict[str, Decimal] = {}
+    for row in rows:
+        currency = row.get("currency", "").strip().upper()
+        rate_text = row.get("fx_to_hkd", "").strip()
+        if not currency or currency == "HKD" or not rate_text:
+            continue
+        try:
+            rate = Decimal(rate_text)
+        except (InvalidOperation, ValueError):
+            continue
+        if rate.is_finite() and rate > 0:
+            rates[currency] = rate
+    return StaticMonthEndFxProvider(run_date[:7], rates)
+
+
+def _recalculate_combined_portfolio_rows(
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    normalized_rows = [
+        {field: str(row.get(field, "")) for field in PORTFOLIO_FIELDNAMES}
+        for row in rows
+    ]
+    parsed_market_values: list[Decimal | None] = []
+    values: list[Decimal] = []
+    has_missing_value = False
+    for row in normalized_rows:
+        value = _parse_finite_decimal(row.get("market_value_hkd", "").strip())
+        parsed_market_values.append(value)
+        if value is None:
+            has_missing_value = True
+            continue
+        values.append(value)
+    total = sum(values, Decimal("0"))
+    for row, market_value_hkd in zip(normalized_rows, parsed_market_values):
+        if has_missing_value:
+            row["portfolio_weight_hkd"] = ""
+            row["risk_flag"] = "data_check"
+            continue
+        market_value_hkd = market_value_hkd or Decimal("0")
+        weight = market_value_hkd / total if total else Decimal("0")
+        row["portfolio_weight_hkd"] = pct(weight)
+        # Keep existing data_check markers as manual/data-review flags; recompute
+        # only non-review risk states.
+        if row["risk_flag"] == "data_check":
+            continue
+        if row["asset_class"] not in {"cash", "money_market_fund"} and weight > Decimal(
+            "0.10"
+        ):
+            row["risk_flag"] = "overweight"
+        else:
+            row["risk_flag"] = "normal"
+    return [
+        row
+        for row, _ in sorted(
+            zip(normalized_rows, parsed_market_values),
+            key=lambda item: (
+                _safe_sort_group(item[0].get("sort_group", "")),
+                -(item[1] or Decimal("0")),
+            ),
+        )
+    ]
+
+
+def _safe_sort_group(value: str, default_sort_group: int = 9) -> int:
+    raw = value.strip()
+    try:
+        return int(raw) if raw else default_sort_group
+    except ValueError:
+        return default_sort_group
+
+
+def _parse_finite_decimal(value_text: str) -> Decimal | None:
+    if not value_text:
+        return None
+    try:
+        value = Decimal(value_text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not value.is_finite():
+        return None
+    return value
+
+
+def _snapshot_to_json(snapshot: TigerAccountSnapshot) -> dict[str, object]:
+    return {
+        "accounts": [
+            {
+                "account": mask_account_id(account.account),
+                "account_alias": account.account_alias,
+                "account_type": account.account_type,
+                "capability": account.capability,
+                "status": account.status,
+                "asset_method": account.asset_method,
+            }
+            for account in snapshot.accounts
+        ],
+        "cash_records": [
+            _json_safe_record(_mask_snapshot_record(record)) for record in snapshot.cash_records
+        ],
+        "position_records": [
+            _json_safe_record(_mask_snapshot_record(record))
+            for record in snapshot.position_records
+        ],
+    }
+
+
+def _mask_snapshot_record(record: dict[str, object]) -> dict[str, object]:
+    output: dict[str, object] = {}
+    for key, value in record.items():
+        if key == "account" and value is not None:
+            output[key] = mask_account_id(value)
+        else:
+            output[key] = value
+    return output
+
+
+def _json_safe_record(record: dict[str, object]) -> dict[str, object]:
+    output: dict[str, object] = {}
+    for key, value in record.items():
+        if isinstance(value, Decimal):
+            output[key] = str(value)
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            output[key] = value
+        else:
+            output[key] = str(value)
+    return output
+
+
+def _render_tiger_account_report(
+    *,
+    account_count: int,
+    position_count: int,
+    cash_count: int,
+    blocking_errors: list[str],
+    updated_latest: bool,
+) -> str:
+    latest_text = "已更新 latest" if updated_latest else "未更新 latest"
+    lines = [
+        "# 老虎账户同步",
+        "",
+        f"- 老虎账户：{account_count}",
+        f"- 老虎持仓：{position_count}",
+        f"- 现金币种：{cash_count}",
+        f"- latest 状态：{latest_text}",
+    ]
+    if blocking_errors:
+        lines.append("- 数据检查：需要复核")
+        for error in blocking_errors:
+            lines.append(f"- 问题：{error}")
+    else:
+        lines.append("- 数据检查：通过")
+    return "\n".join(lines) + "\n"

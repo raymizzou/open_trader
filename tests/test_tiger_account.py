@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import csv
+import json
 import sys
 from pathlib import Path
 from decimal import Decimal
 
 import pytest
+from open_trader import tiger_account as tiger_account_module
 
 from open_trader.models import AssetClass, Market
 from open_trader.tiger_account import (
@@ -13,10 +16,58 @@ from open_trader.tiger_account import (
     TigerAccountError,
     TigerAccountClient,
     TigerAccountSnapshot,
+    sync_tiger_portfolio,
     map_snapshot_to_portfolio_inputs,
     load_tiger_account_config,
     mask_account_id,
 )
+from open_trader.portfolio import PORTFOLIO_FIELDNAMES
+
+
+def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def read_portfolio(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def base_portfolio_row(**overrides: object) -> dict[str, str]:
+    row: dict[str, str] = {
+        "sort_group": "2",
+        "market": "US",
+        "asset_class": "stock",
+        "symbol": "OLD",
+        "name": "Old Tiger",
+        "currency": "USD",
+        "total_quantity": "1",
+        "avg_cost_price": "1.00",
+        "last_price": "1.00",
+        "market_value": "1",
+        "cost_value": "1",
+        "unrealized_pnl": "0.00",
+        "unrealized_pnl_pct": "0.00%",
+        "fx_source": "external_month_end_static",
+        "fx_date": "2026-06-30",
+        "fx_to_hkd": "7.80",
+        "market_value_hkd": "7.80",
+        "cost_value_hkd": "7.80",
+        "portfolio_weight_hkd": "0.01%",
+        "brokers": "tiger",
+        "accounts": "old",
+        "ai_eligible": "true",
+        "analysis_symbol": "OLD",
+        "risk_flag": "normal",
+        "confidence": "high",
+        "notes": "",
+    }
+    row.update({key: str(value) for key, value in overrides.items()})
+    return row
 
 
 def test_mask_account_id_masks_short_and_long_values() -> None:
@@ -464,6 +515,41 @@ class FakeEmptyTradeClient(FakeTradeClient):
         return []
 
 
+class FakeAccountQueryFailedTradeClient(FakeTradeClient):
+    def get_managed_accounts(self, account: str | None = None) -> list[object]:
+        raise RuntimeError("Tiger account query failed: secret=SECRET-AAA-123456789")
+
+
+class FakePositionQueryFailedTradeClient(FakeTradeClient):
+    def get_positions(self, **kwargs: object) -> list[object]:
+        raise RuntimeError("Tiger position query failed: secret=SECRET-POS-123456789")
+
+
+class FakeGetAssetsQueryFailedTradeClient(FakeTradeClient):
+    def get_managed_accounts(self, account: str | None = None) -> list[object]:
+        return [
+            type(
+                "Profile",
+                (),
+                {
+                    "account": "U575569",
+                    "accountType": "GLOBAL",
+                    "capability": "Cash",
+                    "status": "Funded",
+                },
+            )()
+        ]
+
+    def get_prime_assets(self, **kwargs: object) -> list[object]:
+        raise RuntimeError("Tiger asset query failed: secret=SECRET-ASSET-123456789")
+
+    def get_assets(self, **kwargs: object) -> list[object]:
+        raise RuntimeError("Tiger asset query failed: secret=SECRET-ASSET-123456789")
+
+    def get_positions(self, **kwargs: object) -> list[object]:
+        return []
+
+
 def tiger_config(account: str = "123456789") -> TigerAccountConfig:
     return TigerAccountConfig(
         tiger_id="tiger-123",
@@ -585,6 +671,23 @@ def test_tiger_account_client_reports_no_matching_accounts() -> None:
 
     assert exc_info.value.error_type == "no_matching_accounts"
     assert "no active Tiger accounts matched" in str(exc_info.value)
+    assert "*****6789" in str(exc_info.value)
+    assert "123456789" not in str(exc_info.value)
+
+
+def test_tiger_account_client_masks_raw_text_in_account_query_errors() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=FakeAccountQueryFailedTradeClient,
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        client.fetch_snapshot()
+
+    assert exc_info.value.error_type == "account_query_failed"
+    assert "failed to query Tiger managed accounts" in str(exc_info.value)
+    assert "SECRET-AAA-123456789" not in str(exc_info.value)
+    assert "123456789" not in str(exc_info.value)
 
 
 def test_tiger_account_client_supports_positional_factory() -> None:
@@ -627,8 +730,25 @@ def test_tiger_account_client_does_not_retry_positional_factory_on_type_error() 
         TigerAccountClient(config=tiger_config(), trade_client_factory=broken_factory)
 
     assert exc_info.value.error_type == "config_invalid"
-    assert "failed to initialize Tiger TradeClient: factory failed" in str(exc_info.value)
+    assert "failed to initialize Tiger TradeClient" in str(exc_info.value)
     assert len(calls) == 1
+
+
+def test_tiger_account_client_hides_raw_error_text_from_trade_client_initialization() -> None:
+    secret_text = "secret=SECRET-INIT-123456789"
+
+    def secret_factory(_: object) -> None:
+        raise RuntimeError(
+            f"cannot initialize trade client because {secret_text} and account=123456789"
+        )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        TigerAccountClient(config=tiger_config(), trade_client_factory=secret_factory)
+
+    assert exc_info.value.error_type == "config_invalid"
+    assert "failed to initialize Tiger TradeClient" in str(exc_info.value)
+    assert secret_text not in str(exc_info.value)
+    assert "123456789" not in str(exc_info.value)
 
 
 def test_tiger_account_client_keeps_zero_cash_row_if_other_balance_is_positive() -> None:
@@ -646,6 +766,36 @@ def test_tiger_account_client_keeps_zero_cash_row_if_other_balance_is_positive()
         if record["currency"] == "HKD":
             assert record["cash_balance"] == "0"
             assert record["gross_position_value"] == "100.00"
+
+
+def test_tiger_account_client_masks_raw_text_in_position_query_errors() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=FakePositionQueryFailedTradeClient,
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        client.fetch_snapshot()
+
+    assert exc_info.value.error_type == "position_query_failed"
+    assert "failed to query Tiger account positions" in str(exc_info.value)
+    assert "SECRET-POS-123456789" not in str(exc_info.value)
+    assert "123456789" not in str(exc_info.value)
+
+
+def test_tiger_account_client_masks_raw_text_in_asset_query_errors() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(account="U575569"),
+        trade_client_factory=FakeGetAssetsQueryFailedTradeClient,
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        client.fetch_snapshot()
+
+    assert exc_info.value.error_type == "asset_query_failed"
+    assert "failed to query Tiger assets" in str(exc_info.value)
+    assert "SECRET-ASSET-123456789" not in str(exc_info.value)
+    assert "U575569" not in str(exc_info.value)
 
 
 def test_tiger_account_client_keeps_withdrawal_only_prime_asset_row() -> None:
@@ -853,6 +1003,90 @@ def test_map_snapshot_skips_malformed_required_position_rows_and_records_blockin
     assert blocking_errors == expected_blocking_errors
 
 
+def test_map_snapshot_handles_non_scalar_required_decimal_values_as_blocking_errors() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": [],
+                "available_balance": "88.50",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": [],
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": [],
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert positions == []
+    assert cash_balances == []
+    assert blocking_errors == [
+        "position MSFT has invalid required field position_qty=[]",
+        "position MSFT has invalid required field market_value=[]",
+        "cash USD has invalid required field cash_balance=[]",
+    ]
+
+
+def test_map_snapshot_handles_non_scalar_optional_decimal_values_as_missing() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "10",
+                "available_balance": [],
+                "gross_position_value": [],
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": [],
+                "market_price": [],
+                "market_value": "820",
+                "unrealized_pnl": [],
+            }
+        ],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-19",
+    )
+
+    assert blocking_errors == []
+    assert len(positions) == 1
+    assert positions[0].cost_price is None
+    assert positions[0].cost_value is None
+    assert positions[0].last_price is None
+    assert positions[0].unrealized_pnl is None
+    assert len(cash_balances) == 1
+    assert cash_balances[0].available_balance is None
+
+
 def test_map_snapshot_recomputes_identity_from_fallback_symbol_fields() -> None:
     snapshot = tiger_snapshot_from_records(
         cash_records=[],
@@ -1042,3 +1276,572 @@ def test_map_snapshot_skips_position_row_when_identity_is_missing() -> None:
     assert positions == []
     assert cash_balances == []
     assert blocking_errors == ["position has invalid required field symbol=None"]
+
+
+def test_sync_tiger_portfolio_replaces_tiger_only_rows_and_writes_artifacts(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    qqq_row = {
+        **base_portfolio_row(
+            symbol="QQQ",
+            name="Invesco QQQ",
+            analysis_symbol="QQQ",
+            accounts="phillips",
+            brokers="futu",
+        ),
+    }
+    write_portfolio(portfolio_path, [base_portfolio_row(), qqq_row])
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "88.50",
+                "available_balance": "88.50",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-19",
+        update_latest=False,
+    )
+
+    assert result.account_count == 1
+    assert result.position_count == 1
+    assert result.cash_count == 1
+    assert result.snapshot_path == (
+        tmp_path / "data/runs/2026-06-19/tiger_account_snapshot.json"
+    )
+    assert result.portfolio_path == (
+        tmp_path / "data/runs/2026-06-19/portfolio.csv"
+    )
+    assert result.report_path == tmp_path / "reports/tiger_account/2026-06-19.md"
+    assert result.updated_latest is False
+    symbols = {row["symbol"] for row in read_portfolio(result.portfolio_path)}
+    assert "OLD" not in symbols
+    assert {"MSFT", "QQQ", "USD_CASH"} <= symbols
+    snapshot_text = result.snapshot_path.read_text(encoding="utf-8")
+    assert "*****6789" in snapshot_text
+    assert "123456789" not in snapshot_text
+    report = result.report_path.read_text(encoding="utf-8")
+    assert "# 老虎账户同步" in report
+
+
+def test_sync_tiger_portfolio_masks_numeric_account_values_in_snapshot_artifact(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [base_portfolio_row()])
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account": 123456789,
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "88.50",
+                "available_balance": "88.50",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[
+            {
+                "account": 123456789,
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-19",
+        update_latest=False,
+    )
+
+    snapshot_payload = json.loads(result.snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot_payload["cash_records"][0]["account"] == "*****6789"
+    assert snapshot_payload["position_records"][0]["account"] == "*****6789"
+    assert "123456789" not in result.snapshot_path.read_text(encoding="utf-8")
+
+
+def test_sync_tiger_portfolio_updates_latest_when_requested(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [base_portfolio_row()])
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-19",
+        update_latest=True,
+    )
+
+    latest_rows = read_portfolio(result.latest_path)
+    assert {row["symbol"] for row in latest_rows} == {"MSFT"}
+    assert result.updated_latest is True
+
+
+def test_sync_tiger_portfolio_blocks_mixed_tiger_broker_rows(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    mixed_row = {**base_portfolio_row(symbol="MSFT"), "brokers": "futu;tiger"}
+    write_portfolio(portfolio_path, [mixed_row])
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[],
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-19",
+            update_latest=True,
+        )
+
+    assert exc_info.value.error_type == "mixed_tiger_broker_row"
+    assert "MSFT" in str(exc_info.value)
+
+
+def test_sync_tiger_portfolio_blocks_latest_update_on_data_errors(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [base_portfolio_row(symbol="QQQ")])
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "BROKEN",
+                "name": "Broken",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "bad",
+                "market_value": "invalid",
+                "average_cost": "300",
+                "market_price": "410",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+    run_dir = tmp_path / "data/runs/2026-06-19"
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-19",
+            update_latest=True,
+        )
+
+    assert exc_info.value.error_type == "blocking_data_error"
+    assert read_portfolio(portfolio_path)[0]["symbol"] == "QQQ"
+    assert run_dir.joinpath("tiger_account_snapshot.json").exists()
+    assert run_dir.joinpath("portfolio.csv").exists()
+    assert (tmp_path / "reports/tiger_account/2026-06-19.md").exists()
+
+
+def test_sync_tiger_portfolio_raises_blocking_error_after_dated_artifacts_without_latest_update(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [base_portfolio_row(symbol="QQQ")])
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "BROKEN",
+                "name": "Broken",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "bad",
+                "market_value": "invalid",
+                "average_cost": "300",
+                "market_price": "410",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+    run_dir = tmp_path / "data/runs/2026-06-19"
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-19",
+            update_latest=False,
+        )
+
+    assert exc_info.value.error_type == "blocking_data_error"
+    assert read_portfolio(portfolio_path)[0]["symbol"] == "QQQ"
+    assert run_dir.joinpath("tiger_account_snapshot.json").exists()
+    assert run_dir.joinpath("portfolio.csv").exists()
+    report_path = tmp_path / "reports/tiger_account/2026-06-19.md"
+    assert report_path.exists()
+    assert "未更新 latest" in report_path.read_text(encoding="utf-8")
+
+
+def test_sync_tiger_portfolio_does_not_report_updated_latest_if_latest_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            {
+                **base_portfolio_row(
+                    symbol="QQQ",
+                    name="Invesco QQQ",
+                    analysis_symbol="QQQ",
+                    accounts="phillips",
+                    brokers="futu",
+                )
+            }
+        ],
+    )
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "1",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    report_path = tmp_path / "reports/tiger_account/2026-06-19.md"
+
+    def fail_write_latest(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("latest write failed")
+
+    monkeypatch.setattr(
+        tiger_account_module,
+        "_write_latest_portfolio_atomic",
+        fail_write_latest,
+    )
+
+    with pytest.raises(RuntimeError, match="latest write failed"):
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-19",
+            update_latest=True,
+        )
+
+    assert report_path.exists()
+    assert "未更新 latest" in report_path.read_text(encoding="utf-8")
+    assert "已更新 latest" not in report_path.read_text(encoding="utf-8")
+
+
+def test_sync_tiger_portfolio_restores_latest_if_final_report_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    base_rows = [
+        {
+            **base_portfolio_row(
+                symbol="QQQ",
+                name="Invesco QQQ",
+                analysis_symbol="QQQ",
+                accounts="phillips",
+                brokers="futu",
+            )
+        }
+    ]
+    write_portfolio(portfolio_path, base_rows)
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "1",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    report_path = tmp_path / "reports/tiger_account/2026-06-19.md"
+    original_write_text = tiger_account_module._write_text_file_atomic
+
+    def fail_on_final_report(
+        path: Path,
+        text: str,
+        **kwargs: object,
+    ) -> None:
+        if path == report_path and "已更新 latest" in text:
+            raise RuntimeError("final report write failed")
+        original_write_text(path, text, **kwargs)
+
+    monkeypatch.setattr(
+        tiger_account_module,
+        "_write_text_file_atomic",
+        fail_on_final_report,
+    )
+
+    with pytest.raises(RuntimeError, match="final report write failed"):
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-19",
+            update_latest=True,
+        )
+
+    latest_rows = read_portfolio(portfolio_path)
+    assert len(latest_rows) == 1
+    assert latest_rows[0]["symbol"] == "QQQ"
+    assert latest_rows[0]["name"] == "Invesco QQQ"
+    assert report_path.exists()
+    assert "未更新 latest" in report_path.read_text(encoding="utf-8")
+    assert "已更新 latest" not in report_path.read_text(encoding="utf-8")
+
+
+def test_sync_tiger_portfolio_restores_latest_using_rename_on_final_report_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    base_rows = [
+        {
+            **base_portfolio_row(
+                symbol="QQQ",
+                name="Invesco QQQ",
+                analysis_symbol="QQQ",
+                accounts="phillips",
+                brokers="futu",
+            )
+        }
+    ]
+    write_portfolio(portfolio_path, base_rows)
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "1",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    report_path = tmp_path / "reports/tiger_account/2026-06-19.md"
+    original_write_text = tiger_account_module._write_text_file_atomic
+
+    def fail_on_final_report(
+        path: Path,
+        text: str,
+        **kwargs: object,
+    ) -> None:
+        if path == report_path and "已更新 latest" in text:
+            raise RuntimeError("final report write failed")
+        original_write_text(path, text, **kwargs)
+
+    def fail_if_bytes_restore(
+        source_path: Path,
+        destination_path: Path,
+    ) -> None:
+        raise AssertionError(
+            "_write_bytes_to_path_atomic should not be used for final rollback"
+        )
+
+    monkeypatch.setattr(
+        tiger_account_module,
+        "_write_text_file_atomic",
+        fail_on_final_report,
+    )
+    monkeypatch.setattr(
+        tiger_account_module,
+        "_write_bytes_to_path_atomic",
+        fail_if_bytes_restore,
+    )
+
+    with pytest.raises(RuntimeError, match="final report write failed"):
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-19",
+            update_latest=True,
+        )
+
+    latest_rows = read_portfolio(portfolio_path)
+    assert len(latest_rows) == 1
+    assert latest_rows[0]["symbol"] == "QQQ"
+    assert latest_rows[0]["name"] == "Invesco QQQ"
+    assert report_path.exists()
+    assert "未更新 latest" in report_path.read_text(encoding="utf-8")
+    assert "已更新 latest" not in report_path.read_text(encoding="utf-8")
+
+
+def test_atomic_temp_path_includes_process_and_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    path = Path("/tmp/tiger-portfolio.csv")
+    tokens = ["a" * 32, "b" * 32]
+
+    class _Token:
+        def __init__(self, value: str) -> None:
+            self.hex = value
+
+    def fake_uuid4() -> _Token:
+        return _Token(tokens.pop(0))
+
+    monkeypatch.setattr(tiger_account_module.uuid, "uuid4", fake_uuid4)
+    first = tiger_account_module._atomic_temp_path(path)
+    second = tiger_account_module._atomic_temp_path(path)
+
+    assert first.name != second.name
+    assert first.name.startswith(f".{path.name}.")
+    assert first.name.endswith(".tmp")
+    assert second.name.startswith(f".{path.name}.")
+    assert second.name.endswith(".tmp")
+
+
+def test_sync_tiger_portfolio_uses_safe_sort_group_parsing(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            {
+                **base_portfolio_row(symbol="QQQ", sort_group="bad"),
+                "brokers": "futu",
+            }
+        ],
+    )
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "1",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "520",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-19",
+        update_latest=False,
+    )
+
+    symbols = {row["symbol"] for row in read_portfolio(result.portfolio_path)}
+    assert {"MSFT", "QQQ"} <= symbols
