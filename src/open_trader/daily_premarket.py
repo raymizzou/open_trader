@@ -341,16 +341,13 @@ class DailyPremarketRunner:
         }
         advice_counts = _count_advice(advice_path)
         plan_counts = _count_plan(plan_result.plan_path)
-        status = (
-            "partial"
-            if advice_counts["fallback"]
-            or advice_counts["error"]
-            or plan_counts["fallback"]
-            or plan_counts["error"]
-            or int(futu_status.get("missing", 0)) > 0
-            or futu_status["error"]
-            else "success"
+        daily_state = _derive_daily_state(
+            advice_counts=advice_counts,
+            plan_counts=plan_counts,
+            futu_status=futu_status,
+            trade_actions=trade_action_counts,
         )
+        status = str(daily_state["status"])
 
         latest_advice_path = self.config.data_dir / "latest" / "trading_advice.csv"
         latest_actions_path = self.config.data_dir / "latest" / "premarket_actions.csv"
@@ -375,6 +372,8 @@ class DailyPremarketRunner:
             run_date=run_date,
             started_at=started_at,
             status=status,
+            readiness=str(daily_state["readiness"]),
+            status_reasons=list(daily_state["status_reasons"]),
             premarket={
                 **advice_counts,
                 "eligible": int(getattr(premarket_result, "eligible_count")),
@@ -465,6 +464,10 @@ class DailyPremarketRunner:
                     "triggered": 0,
                     "items": [],
                     "error": "",
+                    "diagnostic": _no_active_plans_diagnostic(
+                        host=self.config.futu_host,
+                        port=self.config.futu_port,
+                    ),
                 }
 
             quote_client = self.quote_client_factory(
@@ -502,12 +505,25 @@ class DailyPremarketRunner:
                         "message": quote_status.message,
                     }
                 )
+            diagnostic = (
+                _missing_quotes_diagnostic(
+                    host=self.config.futu_host,
+                    port=self.config.futu_port,
+                    missing=missing,
+                )
+                if missing
+                else _successful_futu_diagnostic(
+                    host=self.config.futu_host,
+                    port=self.config.futu_port,
+                )
+            )
             return {
                 "checked": len(active_plans),
                 "missing": missing,
                 "triggered": triggered,
                 "items": items,
                 "error": "",
+                "diagnostic": diagnostic,
             }
         except FutuQuoteError as exc:
             return {
@@ -516,6 +532,11 @@ class DailyPremarketRunner:
                 "triggered": 0,
                 "items": [],
                 "error": str(exc),
+                "diagnostic": _error_futu_diagnostic(
+                    host=self.config.futu_host,
+                    port=self.config.futu_port,
+                    error=exc,
+                ),
             }
         finally:
             if quote_client is not None and hasattr(quote_client, "close"):
@@ -530,6 +551,8 @@ class DailyPremarketRunner:
         run_date: str,
         started_at: datetime,
         status: str,
+        readiness: str,
+        status_reasons: list[str],
         premarket: dict[str, int],
         plan_counts: dict[str, int],
         futu_status: dict[str, object],
@@ -546,6 +569,8 @@ class DailyPremarketRunner:
             "finished_at": finished_at.isoformat(),
             "deadline_at": _deadline_at(self.config, run_date).isoformat(),
             "status": status,
+            "readiness": readiness,
+            "status_reasons": status_reasons,
             "premarket": premarket,
             "trading_plan": plan_counts,
             "futu_plan_check": futu_status,
@@ -576,12 +601,27 @@ class DailyPremarketRunner:
     ) -> DailyRunResult:
         finished_at = datetime.now(ZoneInfo(self.config.timezone))
         write_errors: list[dict[str, str]] = []
+        daily_state = _derive_daily_state(
+            advice_counts={"ok": 0, "fallback": 0, "error": 0},
+            plan_counts={"active": 0, "fallback": 0, "error": 0},
+            futu_status={
+                "checked": 0,
+                "missing": 0,
+                "triggered": 0,
+                "items": [],
+                "error": "",
+            },
+            trade_actions={"actions": 0, "ready": 0, "review": 0, "watch": 0},
+            run_failed=True,
+        )
         payload: dict[str, object] = {
             "run_date": run_date,
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
             "deadline_at": _failure_deadline_at(self.config, run_date),
             "status": "failed",
+            "readiness": daily_state["readiness"],
+            "status_reasons": daily_state["status_reasons"],
             "error": error,
             "premarket": {
                 "eligible": 0,
@@ -598,6 +638,16 @@ class DailyPremarketRunner:
                 "triggered": 0,
                 "items": [],
                 "error": "",
+                "diagnostic": _futu_diagnostic(
+                    host=self.config.futu_host,
+                    port=self.config.futu_port,
+                    error_type="none",
+                    message="",
+                    next_step="",
+                    opend_reachable=None,
+                    context_ok=None,
+                    snapshot_ok=None,
+                ),
             },
             "trade_actions": {"actions": 0, "ready": 0, "review": 0, "watch": 0},
             "artifacts": {
@@ -1013,6 +1063,95 @@ def _notification_message(
             f"{advice_counts.get('error', 0)} error"
         )
     return "failed: see daily run logs"
+
+
+def _futu_diagnostic(
+    *,
+    host: str,
+    port: int,
+    error_type: str,
+    message: str = "",
+    next_step: str = "",
+    opend_reachable: bool | None = None,
+    context_ok: bool | None = None,
+    snapshot_ok: bool | None = None,
+) -> dict[str, object]:
+    return {
+        "host": host,
+        "port": port,
+        "opend_reachable": opend_reachable,
+        "context_ok": context_ok,
+        "snapshot_ok": snapshot_ok,
+        "error_type": error_type,
+        "message": message,
+        "next_step": next_step,
+    }
+
+
+def _successful_futu_diagnostic(*, host: str, port: int) -> dict[str, object]:
+    return _futu_diagnostic(
+        host=host,
+        port=port,
+        error_type="none",
+        message="",
+        next_step="",
+        opend_reachable=True,
+        context_ok=True,
+        snapshot_ok=True,
+    )
+
+
+def _no_active_plans_diagnostic(*, host: str, port: int) -> dict[str, object]:
+    return _futu_diagnostic(
+        host=host,
+        port=port,
+        error_type="no_active_plans",
+        message="没有需要检查行情的 active trading plan。",
+        next_step="",
+        opend_reachable=None,
+        context_ok=None,
+        snapshot_ok=None,
+    )
+
+
+def _missing_quotes_diagnostic(
+    *,
+    host: str,
+    port: int,
+    missing: int,
+) -> dict[str, object]:
+    return _futu_diagnostic(
+        host=host,
+        port=port,
+        error_type="missing_quotes",
+        message=f"缺失 {missing} 个标的行情。",
+        next_step=f"请人工复核缺失 {missing} 个标的行情，再决定是否执行相关交易动作。",
+        opend_reachable=True,
+        context_ok=True,
+        snapshot_ok=True,
+    )
+
+
+def _error_futu_diagnostic(
+    *,
+    host: str,
+    port: int,
+    error: FutuQuoteError,
+) -> dict[str, object]:
+    return _futu_diagnostic(
+        host=host,
+        port=port,
+        error_type=getattr(error, "error_type", "snapshot_failed"),
+        message=str(error),
+        next_step=getattr(
+            error,
+            "next_step",
+            "请检查 OpenD 行情服务状态后重新运行每日盘前流程。",
+        ),
+        opend_reachable=getattr(error, "opend_reachable", None),
+        context_ok=getattr(error, "context_ok", None),
+        snapshot_ok=getattr(error, "snapshot_ok", None),
+    )
 
 
 def _derive_daily_state(

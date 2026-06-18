@@ -1696,7 +1696,33 @@ def test_daily_runner_returns_already_running_when_lock_log_write_fails(
 
 class UnavailableQuoteClient:
     def __init__(self, *, host: str, port: int) -> None:
-        raise FutuQuoteError("Futu OpenD is not reachable")
+        raise FutuQuoteError(
+            "Futu OpenD is not reachable",
+            error_type="opend_unreachable",
+            next_step="请启动或重启 Futu OpenD，确认已登录，并检查配置的 host/port 后重新运行每日盘前流程。",
+            opend_reachable=False,
+            context_ok=False,
+            snapshot_ok=False,
+        )
+
+
+class InterruptedQuoteClient:
+    def __init__(self, *, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+
+    def get_snapshots(self, futu_symbols: list[str]) -> dict[str, QuoteSnapshot]:
+        raise FutuQuoteError(
+            "网络中断",
+            error_type="quote_server_interrupted",
+            next_step="请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。",
+            opend_reachable=True,
+            context_ok=True,
+            snapshot_ok=False,
+        )
+
+    def close(self) -> None:
+        pass
 
 
 def test_daily_runner_marks_partial_when_futu_is_unavailable(tmp_path: Path) -> None:
@@ -1734,6 +1760,92 @@ def test_daily_runner_marks_partial_when_futu_is_unavailable(tmp_path: Path) -> 
         )
     )
     assert status["futu_plan_check"]["error"] == "Futu OpenD is not reachable"
+
+
+def test_daily_runner_writes_futu_diagnostic_when_opend_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=UnavailableQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=NullNotifier(),
+    ).run("2026-06-17")
+
+    assert result.status == "partial"
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["readiness"] == "blocked"
+    assert status["status_reasons"] == ["futu_error"]
+    diagnostic = status["futu_plan_check"]["diagnostic"]
+    assert diagnostic["host"] == "127.0.0.1"
+    assert diagnostic["port"] == 11111
+    assert diagnostic["error_type"] == "opend_unreachable"
+    assert diagnostic["opend_reachable"] is False
+    assert diagnostic["context_ok"] is False
+    assert diagnostic["snapshot_ok"] is False
+    assert "请启动或重启 Futu OpenD" in diagnostic["next_step"]
+
+
+def test_daily_runner_writes_futu_diagnostic_when_snapshot_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=InterruptedQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=NullNotifier(),
+    ).run("2026-06-17")
+
+    assert result.status == "partial"
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["readiness"] == "blocked"
+    assert status["status_reasons"] == ["futu_error"]
+    diagnostic = status["futu_plan_check"]["diagnostic"]
+    assert diagnostic["error_type"] == "quote_server_interrupted"
+    assert diagnostic["opend_reachable"] is True
+    assert diagnostic["context_ok"] is True
+    assert diagnostic["snapshot_ok"] is False
+    assert diagnostic["next_step"] == "请重启 OpenD，确认 qot_logined=True 后重新运行每日盘前流程。"
 
 
 class MissingQuoteClient:
@@ -1787,6 +1899,46 @@ def test_daily_runner_marks_partial_when_futu_quote_is_missing(
     )
     assert status["status"] == "partial"
     assert status["futu_plan_check"]["missing"] == 1
+
+
+def test_daily_runner_marks_missing_quote_as_review_required(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=MissingQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=NullNotifier(),
+    ).run("2026-06-17")
+
+    assert result.status == "partial"
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["readiness"] == "review_required"
+    assert "missing_quotes" in status["status_reasons"]
+    diagnostic = status["futu_plan_check"]["diagnostic"]
+    assert diagnostic["error_type"] == "missing_quotes"
+    assert diagnostic["snapshot_ok"] is True
+    assert "缺失 1 个标的行情" in diagnostic["next_step"]
 
 
 def test_daily_runner_ignores_quote_client_close_failure(tmp_path: Path) -> None:
