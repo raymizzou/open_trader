@@ -2,12 +2,14 @@
 
 const state = {
   dashboard: null,
+  dashboardError: null,
   quotes: {},
   quotePayload: null,
   marketFilter: "ALL",
   brokerFilter: "ALL",
   expanded: new Set(),
   refreshActive: false,
+  quoteIntervalId: null,
 };
 
 const elements = {};
@@ -17,7 +19,6 @@ document.addEventListener("DOMContentLoaded", () => {
   bindEvents();
   loadDashboard();
   refreshQuotes();
-  window.setInterval(refreshQuotes, 5000);
 });
 
 function bindElements() {
@@ -90,10 +91,29 @@ async function loadDashboard() {
       throw new Error(`dashboard ${response.status}`);
     }
     state.dashboard = await response.json();
+    state.dashboardError = null;
+    scheduleQuotePolling(state.dashboard.poll_seconds);
     renderDashboard();
   } catch (error) {
     renderLoadError(error);
   }
+}
+
+function scheduleQuotePolling(pollSeconds) {
+  if (state.quoteIntervalId !== null) {
+    window.clearInterval(state.quoteIntervalId);
+    state.quoteIntervalId = null;
+  }
+
+  const seconds = Number(pollSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    elements["connection-poll"].textContent = "-";
+    return;
+  }
+
+  const intervalMs = Math.max(1000, seconds * 1000);
+  elements["connection-poll"].textContent = `${intervalMs / 1000} 秒`;
+  state.quoteIntervalId = window.setInterval(refreshQuotes, intervalMs);
 }
 
 async function refreshQuotes() {
@@ -149,9 +169,6 @@ function renderSummary() {
     : "暂无券商明细";
   elements["summary-health"].textContent = dashboard.detail_available ? "明细可用" : "仅组合汇总";
   elements["summary-health-note"].textContent = dashboard.portfolio_path || "-";
-  elements["connection-poll"].textContent = dashboard.poll_seconds
-    ? `${dashboard.poll_seconds} 秒`
-    : "-";
 }
 
 function renderBrokerFilters() {
@@ -175,6 +192,10 @@ function renderBrokerFilters() {
 function renderHoldings() {
   const holdings = filteredHoldings();
   elements["visible-count"].textContent = `${holdings.length} 条`;
+  if (state.dashboardError) {
+    renderDashboardErrorState();
+    return;
+  }
   if (!state.dashboard) {
     elements["holdings-body"].innerHTML = `<tr><td colspan="10" class="empty-state">加载中</td></tr>`;
     return;
@@ -308,8 +329,19 @@ function renderConnectionPanel() {
 }
 
 function renderLoadError(error) {
+  state.dashboard = null;
+  state.dashboardError = error;
+  if (state.quoteIntervalId !== null) {
+    window.clearInterval(state.quoteIntervalId);
+    state.quoteIntervalId = null;
+  }
   elements["summary-health"].textContent = "加载失败";
   elements["summary-health-note"].textContent = error.message || "无法读取看板数据";
+  elements["connection-poll"].textContent = "-";
+  renderDashboardErrorState();
+}
+
+function renderDashboardErrorState() {
   elements["holdings-body"].innerHTML = `<tr><td colspan="10" class="empty-state">看板数据加载失败</td></tr>`;
 }
 
