@@ -20,7 +20,7 @@ def load_eligible_portfolio_rows(
     *,
     market: str | None = None,
 ) -> list[PortfolioInputRow]:
-    market_filter = parse_market_scope(market).value if market else None
+    market_filter = parse_market_scope(market).value if market is not None else None
     with portfolio_path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         eligible: list[PortfolioInputRow] = []

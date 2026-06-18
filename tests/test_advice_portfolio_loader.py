@@ -122,6 +122,28 @@ def test_load_eligible_portfolio_rows_rejects_invalid_market(tmp_path: Path) -> 
         load_eligible_portfolio_rows(path, market="CN")
 
 
+def test_load_eligible_portfolio_rows_rejects_blank_market(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(
+        path,
+        [
+            {
+                "symbol": "MSFT",
+                "market": "US",
+                "asset_class": "stock",
+                "name": "Microsoft",
+                "portfolio_weight_hkd": "1.13%",
+                "ai_eligible": "true",
+                "analysis_symbol": "MSFT",
+                "risk_flag": "normal",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="market must be one of: HK, US"):
+        load_eligible_portfolio_rows(path, market="")
+
+
 def test_load_eligible_portfolio_rows_uses_analysis_symbol_when_present(
     tmp_path: Path,
 ) -> None:
