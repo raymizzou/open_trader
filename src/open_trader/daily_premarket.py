@@ -79,6 +79,14 @@ class DailyRunResult:
     log_path: Path
 
 
+@dataclass(frozen=True)
+class NotificationAttempt:
+    channel: str
+    success: bool
+    error_type: str = ""
+    error: str = ""
+
+
 @dataclass
 class _LatestPromotion:
     source_path: Path
@@ -215,6 +223,47 @@ def build_notifier(config: DailyPremarketConfig) -> Notifier:
     if len(notifiers) == 1:
         return notifiers[0]
     return CompositeNotifier(notifiers)
+
+
+def send_notification_with_results(
+    notifier: Notifier,
+    title: str,
+    message: str,
+) -> list[NotificationAttempt]:
+    if isinstance(notifier, CompositeNotifier):
+        targets = list(notifier._notifiers)
+    else:
+        targets = [notifier]
+
+    attempts: list[NotificationAttempt] = []
+    for target in targets:
+        channel = _notifier_channel(target)
+        try:
+            target.notify(title, message)
+        except Exception as exc:
+            attempts.append(
+                NotificationAttempt(
+                    channel=channel,
+                    success=False,
+                    error_type=exc.__class__.__name__,
+                    error=str(exc),
+                )
+            )
+        else:
+            attempts.append(NotificationAttempt(channel=channel, success=True))
+    return attempts
+
+
+def _notifier_channel(notifier: Notifier) -> str:
+    if isinstance(notifier, FeishuAppNotifier):
+        return "feishu_app"
+    if isinstance(notifier, FeishuWebhookNotifier):
+        return "feishu"
+    if isinstance(notifier, MacOSNotifier):
+        return "macos"
+    if isinstance(notifier, NullNotifier):
+        return "none"
+    return notifier.__class__.__name__
 
 
 class DailyPremarketRunner:
@@ -768,17 +817,18 @@ class DailyPremarketRunner:
         )
 
     def _notify(self, title: str, message: str) -> None:
-        try:
-            self.notifier.notify(title, message)
-        except Exception as exc:
+        attempts = send_notification_with_results(self.notifier, title, message)
+        for attempt in attempts:
+            if attempt.success:
+                LOGGER.info("通知已发送：%s channel=%s", title, attempt.channel)
+                continue
             LOGGER.warning(
-                "通知发送失败：%s error_type=%s error=%s",
+                "通知发送失败：%s channel=%s error_type=%s error=%s",
                 title,
-                exc.__class__.__name__,
-                str(exc),
+                attempt.channel,
+                attempt.error_type,
+                attempt.error,
             )
-            return
-        LOGGER.info("通知已发送：%s", title)
 
 
 def _read_env_file(path: Path) -> dict[str, str]:

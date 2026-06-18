@@ -11,7 +11,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
-from .daily_premarket import DailyPremarketRunner, build_notifier, load_env_config
+from .daily_premarket import (
+    DailyPremarketRunner,
+    build_notifier,
+    load_env_config,
+    send_notification_with_results,
+)
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
@@ -458,7 +463,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             config = load_env_config(args.config, dry_run=False)
             notifier = build_notifier(config)
-            notifier.notify(
+            attempts = send_notification_with_results(
+                notifier,
                 "Open Trader 测试通知",
                 "这是一条 Open Trader 测试通知。",
             )
@@ -470,6 +476,17 @@ def main(argv: list[str] | None = None) -> int:
             ZoneInfoNotFoundError,
         ) as exc:
             print(f"通知测试失败：{exc}", file=sys.stderr)
+            return 1
+        failed_attempts = [attempt for attempt in attempts if not attempt.success]
+        if failed_attempts:
+            for attempt in failed_attempts:
+                print(
+                    (
+                        "通知测试失败："
+                        f"{attempt.channel} {attempt.error_type}: {attempt.error}"
+                    ),
+                    file=sys.stderr,
+                )
             return 1
         print("通知测试已发送。")
         return 0

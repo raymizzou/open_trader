@@ -765,6 +765,28 @@ def test_daily_notify_logs_failure_without_raising(
     assert "delivery failed" in caplog.text
 
 
+def test_daily_notify_logs_composite_child_failure_without_raising(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class WorkingNotifier:
+        def notify(self, title: str, message: str) -> None:
+            pass
+
+    runner = DailyPremarketRunner(
+        config=_daily_config(tmp_path),
+        notifier=CompositeNotifier([FailingNotifier(), WorkingNotifier()]),
+    )
+
+    with caplog.at_level("INFO", logger="open_trader.daily_premarket"):
+        runner._notify("Open Trader 行动通知", "测试正文")
+
+    assert "通知发送失败：Open Trader 行动通知" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "delivery failed" in caplog.text
+    assert "通知已发送：Open Trader 行动通知" in caplog.text
+
+
 def test_daily_runner_writes_success_status_and_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

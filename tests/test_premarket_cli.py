@@ -8,6 +8,7 @@ import pytest
 import open_trader.cli as cli
 from open_trader.advice.premarket import PremarketResult
 from open_trader.cli import build_parser
+from open_trader.notifications import CompositeNotifier
 
 
 @pytest.mark.parametrize("value", [None, "", "   ", " , , "])
@@ -424,6 +425,41 @@ def test_test_notification_main_returns_nonzero_when_send_fails(
 
     assert result == 1
     assert "通知测试失败" in capsys.readouterr().err
+
+
+def test_test_notification_main_returns_nonzero_when_composite_child_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sent: list[tuple[str, str]] = []
+
+    class FailingNotifier:
+        def notify(self, title: str, message: str) -> None:
+            raise RuntimeError("feishu failed")
+
+    class WorkingNotifier:
+        def notify(self, title: str, message: str) -> None:
+            sent.append((title, message))
+
+    def fake_load_env_config(path: Path, *, dry_run: bool):
+        assert dry_run is False
+        return SimpleNamespace()
+
+    monkeypatch.setattr(cli, "load_env_config", fake_load_env_config)
+    monkeypatch.setattr(
+        cli,
+        "build_notifier",
+        lambda config: CompositeNotifier([FailingNotifier(), WorkingNotifier()]),
+    )
+
+    result = cli.main(["test-notification", "--config", str(tmp_path / "daily.env")])
+
+    assert result == 1
+    assert sent == [("Open Trader 测试通知", "这是一条 Open Trader 测试通知。")]
+    error = capsys.readouterr().err
+    assert "通知测试失败" in error
+    assert "feishu failed" in error
 
 
 def test_run_daily_premarket_accepts_today_date() -> None:
