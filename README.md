@@ -13,6 +13,8 @@ OpenD, and writes reports. It does not place orders automatically.
 ## Features
 
 - Import monthly broker statements into a normalized portfolio CSV.
+- Pull live Futu real-account holdings and cash into the standard portfolio CSV
+  while keeping other brokers on statement imports.
 - Generate per-symbol premarket advice with TradingAgents and DeepSeek.
 - Preserve raw model output and normalized trader templates for auditability.
 - Fall back to the latest prior successful advice when a daily run misses the
