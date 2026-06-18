@@ -81,6 +81,24 @@ def mrvl_underweight_summary() -> str:
     )
 
 
+def qqq_trim_summary() -> str:
+    return "\n".join(
+        [
+            "评级：Underweight",
+            "操作计划：Trim QQQ into strength near 550.",
+            "风控：Use 510 as the main stop reference.",
+            "仓位：",
+            "催化剂：Fed commentary remains a swing factor.",
+            "目标价：520.0",
+            "时间窗口：1-3 months",
+            (
+                "理由：Risk/reward looks skewed after the recent squeeze, while "
+                "hawkish Fed rhetoric keeps macro downside elevated."
+            ),
+        ]
+    )
+
+
 def msft_advice_summary_ascii_colons() -> str:
     return "\n".join(
         [
@@ -358,14 +376,62 @@ def test_build_trading_plan_extracts_agent_reason_and_excerpt(tmp_path: Path) ->
     rows = list(csv.DictReader(result.plan_path.open(encoding="utf-8")))
 
     assert rows[0]["target_1"] == "200"
-    assert rows[0]["agent_reason"].startswith(
-        "TradingAgents建议减仓，原文依据：The bear demonstrated"
-    )
-    assert "normalized earnings imply a ~316x P/E" in rows[0]["agent_reason"]
+    assert rows[0]["agent_reason"].startswith("TradingAgents建议减仓，理由是")
+    assert "估值或盈利质量风险上升" in rows[0]["agent_reason"]
+    assert "技术动能转弱" in rows[0]["agent_reason"]
+    assert "The bear demonstrated" not in rows[0]["agent_reason"]
     assert rows[0]["agent_excerpt"].startswith(
         "The bear demonstrated that normalized earnings imply a ~316x P/E"
     )
     assert "目标价：200.0" not in rows[0]["agent_reason"]
+
+
+def test_build_trading_plan_english_reasons_map_to_different_chinese_themes(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-18",
+                "symbol": "MRVL",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "2.0%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": mrvl_underweight_summary(),
+                "raw_decision": "{}",
+                "status": "ok",
+                "error": "",
+            },
+            {
+                "run_date": "2026-06-18",
+                "symbol": "QQQ",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "3.0%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": qqq_trim_summary(),
+                "raw_decision": "{}",
+                "status": "ok",
+                "error": "",
+            },
+        ],
+    )
+
+    result = build_trading_plan(advice_path, tmp_path / "data")
+    rows = {row["symbol"]: row for row in csv.DictReader(result.plan_path.open(encoding="utf-8"))}
+
+    assert rows["MRVL"]["agent_reason"] != rows["QQQ"]["agent_reason"]
+    assert "估值或盈利质量风险上升" in rows["MRVL"]["agent_reason"]
+    assert "技术动能转弱" in rows["MRVL"]["agent_reason"]
+    assert "风险回报不利" in rows["QQQ"]["agent_reason"]
+    assert "宏观或事件风险偏高" in rows["QQQ"]["agent_reason"]
 
 
 def test_build_trading_plan_accepts_ascii_section_separators(tmp_path: Path) -> None:

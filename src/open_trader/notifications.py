@@ -441,7 +441,7 @@ def _trigger_reason_line(row: Mapping[str, str]) -> str:
 
 def _concise_agent_reason(row: Mapping[str, str], agent_reason: str) -> str:
     concise_reason = agent_reason.split("，原文依据：", 1)[0].strip()
-    if concise_reason and not _contains_ascii_letters(concise_reason):
+    if concise_reason and _contains_cjk(concise_reason):
         return concise_reason
     if concise_reason and "TradingAgents" in concise_reason and not _looks_english_only(
         concise_reason
@@ -467,10 +467,12 @@ def _contains_ascii_letters(text: str) -> bool:
     return any(("A" <= char <= "Z") or ("a" <= char <= "z") for char in text)
 
 
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
 def _looks_english_only(text: str) -> bool:
-    return _contains_ascii_letters(text) and not any(
-        "\u4e00" <= char <= "\u9fff" for char in text
-    )
+    return _contains_ascii_letters(text) and not _contains_cjk(text)
 
 
 def _localized_note(text: str) -> str:
@@ -480,6 +482,16 @@ def _localized_note(text: str) -> str:
     translated = {
         "price entered entry zone": "价格进入计划买入区间。",
         "missing avg cost": "当前成本缺失。",
+        "missing portfolio position for sell sizing": "缺少持仓信息，无法计算卖出数量。",
+        "missing portfolio position for buy-side sizing": "缺少持仓信息，无法计算买入数量。",
+        "invalid last price": "当前价无效。",
+        "current quantity below one share for sell sizing": "当前数量不足 1 股，无法计算卖出数量。",
+        "suggested quantity below one share": "建议数量不足 1 股。",
+        "no same-currency cash available": "没有可用的同币种现金。",
+        "no remaining target budget": "目标仓位预算已用完。",
+        "no remaining entry budget": "首笔建仓预算已用完。",
+        "missing positive fx_to_hkd for sell-side sizing": "缺少有效汇率，无法计算卖出后仓位。",
+        "missing positive fx_to_hkd for buy-side sizing": "缺少有效汇率，无法计算买入后仓位。",
         "Stop loss was hit.": "已触发止损。",
         "Current price is at or below the stop loss.": "当前价格已达到或低于止损价。",
         "Current price is at or above target 1.": "当前价格已满足计划触发条件。",

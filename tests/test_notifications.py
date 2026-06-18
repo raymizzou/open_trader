@@ -513,17 +513,13 @@ def test_render_feishu_order_review_shows_agent_reason_excerpt_and_neutral_trim_
                 post_trade_avg_cost="169.81",
                 risk_to_stop="",
                 agent_reason=(
-                    "TradingAgents建议减仓，原文依据：The bear demonstrated that "
-                    "normalized earnings imply a ~316x P/E."
+                    "TradingAgents建议减仓，理由是估值或盈利质量风险上升。"
                 ),
                 agent_excerpt=(
                     "The bear demonstrated that normalized earnings imply a ~316x P/E."
                 ),
                 trigger_reason="Current price is at or above target 1.",
-                reason=(
-                    "TradingAgents建议减仓，原文依据：The bear demonstrated that "
-                    "normalized earnings imply a ~316x P/E."
-                ),
+                reason="TradingAgents建议减仓，理由是估值或盈利质量风险上升。",
                 status="ready",
             )
         ],
@@ -536,7 +532,7 @@ def test_render_feishu_order_review_shows_agent_reason_excerpt_and_neutral_trim_
         report_paths=[],
     )
 
-    assert "原因：TradingAgents建议减仓。" in body
+    assert "原因：TradingAgents建议减仓，理由是估值或盈利质量风险上升。" in body
     assert "原文：The bear demonstrated that normalized earnings imply a ~316x P/E." in body
     assert "触发：当前价 289.54，行动已满足计划中的减仓/风控条件。" in body
     assert "目标价 1" not in body
@@ -585,6 +581,36 @@ def test_render_feishu_order_review_uses_chinese_fallback_for_english_only_agent
     assert "原因：TradingAgents建议加仓，需结合原文确认。" in body
     assert "原文：The bull case remains intact." in body
     assert "原因：The bull case remains intact." not in body
+
+
+def test_render_feishu_order_review_keeps_cjk_reason_with_ascii_acronyms(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "trade_actions.csv"
+    _write_actions(
+        actions_path,
+        [
+            _action_row(
+                symbol="MSFT",
+                futu_symbol="US.MSFT",
+                action="ADD",
+                priority="high",
+                agent_reason="微软AI商业化路径清晰。",
+                agent_excerpt="微软AI商业化路径清晰。",
+                status="ready",
+            )
+        ],
+    )
+
+    body = render_feishu_order_review(
+        run_date="2026-06-18",
+        status="success",
+        actions_path=actions_path,
+        report_paths=[],
+    )
+
+    assert "原因：微软AI商业化路径清晰。" in body
+    assert "原因：TradingAgents建议加仓，需结合原文确认。" not in body
 
 
 def test_render_feishu_order_review_truncates_ready_rows_and_includes_reports(
@@ -682,6 +708,34 @@ def test_render_feishu_order_review_translates_review_errors_and_hides_paths(
     assert "unparseable target max weight" not in body
     assert "Current price is at or above target 1." not in body
     assert "reports/" not in body
+
+
+def test_render_feishu_order_review_translates_structured_sell_sizing_error(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "trade_actions.csv"
+    _write_actions(
+        actions_path,
+        [
+            _action_row(
+                symbol="SOXX",
+                futu_symbol="US.SOXX",
+                priority="high",
+                status="review",
+                error="missing portfolio position for sell sizing",
+            )
+        ],
+    )
+
+    body = render_feishu_order_review(
+        run_date="2026-06-18",
+        status="partial",
+        actions_path=actions_path,
+        report_paths=[],
+    )
+
+    assert "阻塞：缺少持仓信息，无法计算卖出数量。" in body
+    assert "missing portfolio position for sell sizing" not in body
 
 
 def test_render_feishu_order_review_supports_legacy_rows_without_agent_fields(

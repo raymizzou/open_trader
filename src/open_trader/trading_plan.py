@@ -379,9 +379,48 @@ def _agent_reason_and_excerpt(
     if _contains_cjk(excerpt):
         return excerpt, excerpt
     action = advice_action.strip()
+    themes = _english_reason_themes(excerpt)
     if action:
-        return f"TradingAgents建议{_action_reason_label(action)}，原文依据：{excerpt}", excerpt
-    return f"TradingAgents原文依据：{excerpt}", excerpt
+        if themes:
+            return (
+                f"TradingAgents建议{_action_reason_label(action)}，理由是"
+                f"{'、'.join(themes[:2])}。",
+                excerpt,
+            )
+        return f"TradingAgents建议{_action_reason_label(action)}，理由见原文摘录。", excerpt
+    if themes:
+        return f"TradingAgents理由是{'、'.join(themes[:2])}。", excerpt
+    return "TradingAgents理由见原文摘录。", excerpt
+
+
+def _english_reason_themes(text: str) -> list[str]:
+    normalized = text.lower()
+    themes: list[str] = []
+    theme_rules = [
+        (
+            ("valuation", "earnings", "p/e", "multiple", "margin", "goodwill", "sbc"),
+            "估值或盈利质量风险上升",
+        ),
+        (
+            ("macd", "volume", "divergence", "moving average", "death cross", "technical", "rsi"),
+            "技术动能转弱",
+        ),
+        (
+            ("risk/reward", "downside", "upside", "drawdown", "asymmetry"),
+            "风险回报不利",
+        ),
+        (
+            ("fed", "rate", "macro", "hawkish", "iran", "oil", "peace"),
+            "宏观或事件风险偏高",
+        ),
+        (("contango", "volatility", "vix"), "波动率结构偏空"),
+        (("cash flow", "free cash flow", "capex"), "现金流压力需要关注"),
+        (("support", "stop", "sma", "retest", "break"), "关键支撑或风控位需要关注"),
+    ]
+    for keywords, label in theme_rules:
+        if any(keyword in normalized for keyword in keywords):
+            themes.append(label)
+    return themes
 
 
 def _excerpt_text(text: str, *, max_chars: int = 220) -> str:
