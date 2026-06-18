@@ -54,6 +54,7 @@ FUTU_CASH_CURRENCY_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("CAD", "ca_cash", "ca_avl_withdrawal_cash"),
     ("MYR", "my_cash", "my_avl_withdrawal_cash"),
 )
+FUTU_UNMAPPED_ASSETS_SYMBOL = "FUTU_UNMAPPED_ASSETS"
 
 
 class FutuAccountError(RuntimeError):
@@ -405,6 +406,75 @@ def _cash_from_record(
     )
 
 
+def _unmapped_total_asset_positions(
+    *,
+    snapshot: FutuAccountSnapshot,
+    positions: list[Position],
+    cash_balances: list[CashBalance],
+    fx_provider: StaticMonthEndFxProvider,
+    run_date: str,
+) -> list[Position]:
+    mapped_hkd_by_account: dict[str, Decimal] = {}
+    for position in positions:
+        if position.market_value is None:
+            continue
+        mapped_hkd_by_account[position.account_alias] = mapped_hkd_by_account.get(
+            position.account_alias,
+            Decimal("0"),
+        ) + (
+            position.market_value
+            * fx_provider.get_rate_to_hkd(position.currency.upper()).rate
+        )
+    for cash in cash_balances:
+        mapped_hkd_by_account[cash.account_alias] = mapped_hkd_by_account.get(
+            cash.account_alias,
+            Decimal("0"),
+        ) + (
+            cash.cash_balance * fx_provider.get_rate_to_hkd(cash.currency.upper()).rate
+        )
+
+    adjustments: list[Position] = []
+    statement_id = f"{run_date}-futu-live"
+    for record in snapshot.cash_records:
+        total_assets = _optional_decimal(record, ("total_assets",))
+        if total_assets is None:
+            continue
+        account_alias = _first_text(record, ("_account_alias",), "futu_unknown")
+        total_currency = _first_text(record, ("currency",), "HKD").upper()
+        if total_currency in {"", "N/A"}:
+            total_currency = "HKD"
+        total_assets_hkd = (
+            total_assets * fx_provider.get_rate_to_hkd(total_currency).rate
+        )
+        residual_hkd = total_assets_hkd - mapped_hkd_by_account.get(
+            account_alias,
+            Decimal("0"),
+        )
+        if abs(residual_hkd) < Decimal("0.01"):
+            continue
+        adjustments.append(
+            Position(
+                statement_id=statement_id,
+                broker="futu",
+                account_alias=account_alias,
+                market=Market.CASH,
+                asset_class=AssetClass.CASH,
+                symbol=FUTU_UNMAPPED_ASSETS_SYMBOL,
+                name="富途未明细账户资产",
+                currency="HKD",
+                quantity=Decimal("1"),
+                cost_price=residual_hkd,
+                last_price=residual_hkd,
+                market_value=residual_hkd,
+                cost_value=residual_hkd,
+                unrealized_pnl=Decimal("0"),
+                confidence="high",
+                notes="Futu total_assets reconciliation for fund_assets or pending_asset not returned as positions",
+            )
+        )
+    return adjustments
+
+
 def _required_decimal(
     record: dict[str, object],
     keys: tuple[str, ...],
@@ -527,16 +597,25 @@ def sync_futu_portfolio(
             positions,
             _asset_class_hints(preserved_positions),
         )
+    asset_adjustments = _unmapped_total_asset_positions(
+        snapshot=snapshot,
+        positions=positions,
+        cash_balances=cash_balances,
+        fx_provider=fx_provider,
+        run_date=run_date,
+    )
+    futu_positions = [*positions, *asset_adjustments]
+    if use_statement_details:
         merged_rows = build_portfolio_rows(
             run_date[:7],
-            [*preserved_positions, *positions],
+            [*preserved_positions, *futu_positions],
             [*preserved_cash, *cash_balances],
             fx_provider,
         )
     else:
         futu_rows = build_portfolio_rows(
             run_date[:7],
-            positions,
+            futu_positions,
             cash_balances,
             fx_provider,
         )
@@ -559,7 +638,7 @@ def sync_futu_portfolio(
         POSITION_DETAIL_FIELDNAMES,
         (
             _position_to_statement_row(position)
-            for position in [*preserved_positions, *positions]
+            for position in [*preserved_positions, *futu_positions]
         ),
     )
     write_rows(

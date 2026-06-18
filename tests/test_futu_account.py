@@ -882,6 +882,59 @@ def test_sync_futu_portfolio_cash_count_uses_expanded_currency_balances(
     assert "现金币种：2" in report
 
 
+def test_sync_futu_portfolio_reconciles_unmapped_futu_total_assets(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [tiger_row()])
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "HKD",
+                "total_assets": "1000",
+                "cash": "-100",
+                "hk_cash": "-100",
+                "hk_avl_withdrawal_cash": "0",
+            }
+        ],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "HK.00700",
+                "stock_name": "Tencent",
+                "qty": "1",
+                "cost_price": "200",
+                "nominal_price": "200",
+                "market_val": "200",
+                "pl_val": "0",
+                "currency": "HKD",
+                "stock_type": "STOCK",
+            }
+        ],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-18",
+        update_latest=False,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    adjustment = next(row for row in rows if row["symbol"] == "FUTU_UNMAPPED_ASSETS")
+    assert adjustment["market"] == "CASH"
+    assert adjustment["asset_class"] == "cash"
+    assert adjustment["name"] == "富途未明细账户资产"
+    assert adjustment["market_value_hkd"] == "900.00"
+    assert adjustment["brokers"] == "futu"
+    assert adjustment["accounts"] == "futu_111"
+    total_hkd = sum(Decimal(row["market_value_hkd"]) for row in rows)
+    assert total_hkd == Decimal("2560.00")
+
+
 def test_sync_futu_portfolio_updates_latest_only_when_requested(tmp_path: Path) -> None:
     portfolio_path = tmp_path / "data/latest/portfolio.csv"
     write_portfolio(portfolio_path, [old_futu_row(), tiger_row()])

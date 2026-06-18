@@ -426,7 +426,9 @@ function futuSymbolForHolding(holding) {
 }
 
 function renderQuotePrice(holding, quote) {
-  if (String(holding.market || "").toUpperCase() === "CASH") {
+  const market = String(holding.market || "").toUpperCase();
+  const assetClass = String(holding.asset_class || "").toLowerCase();
+  if (market === "CASH" || assetClass === "cash" || assetClass === "money_market_fund") {
     return escapeHtml("-");
   }
   if (!quote || !hasValue(quote.last_price)) {

@@ -6,7 +6,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
-QUOTEABLE_ASSET_CLASSES = {"stock", "etf", "fund", "option"}
+QUOTEABLE_ASSET_CLASSES = {"stock", "etf", "fund", "option", "unknown"}
 SUPPORTED_MARKETS = {"US", "HK"}
 
 

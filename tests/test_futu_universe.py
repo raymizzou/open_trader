@@ -196,3 +196,51 @@ def test_load_futu_quote_universe_skips_blank_symbols_and_unsupported_markets(
             reason="blank_symbol",
         ),
     ]
+
+
+def test_load_futu_quote_universe_includes_unknown_supported_market_holdings(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(
+        path,
+        [
+            {
+                "market": "US",
+                "asset_class": "unknown",
+                "symbol": "BOTZ",
+                "name": "Global X Robotics ETF",
+                "total_quantity": "50",
+            },
+            {
+                "market": "HK",
+                "asset_class": "unknown",
+                "symbol": "1989",
+                "name": "HK stock",
+                "total_quantity": "100",
+            },
+            {
+                "market": "CASH",
+                "asset_class": "unknown",
+                "symbol": "HKD_CASH",
+                "name": "HKD Cash",
+                "total_quantity": "1",
+            },
+        ],
+    )
+
+    universe = load_futu_quote_universe(path)
+
+    assert [item.futu_symbol for item in universe.items] == [
+        "US.BOTZ",
+        "HK.01989",
+    ]
+    assert universe.skipped == [
+        SkippedFutuUniverseRow(
+            row_number=4,
+            market="CASH",
+            asset_class="unknown",
+            symbol="HKD_CASH",
+            reason="unsupported_market",
+        ),
+    ]
