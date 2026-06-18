@@ -310,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     watch_futu_parser = subparsers.add_parser(
         "watch-futu",
-        help="Watch active US price triggers with Futu OpenD quotes",
+        help="Watch active US/HK price triggers with Futu OpenD quotes",
     )
     watch_futu_parser.add_argument(
         "--watchlist",

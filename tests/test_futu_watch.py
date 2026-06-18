@@ -115,6 +115,73 @@ def test_load_monitor_triggers_keeps_supported_us_active_price_rows(
     ]
 
 
+def test_load_monitor_triggers_keeps_hk_active_price_rows(tmp_path: Path) -> None:
+    path = tmp_path / "watchlist.csv"
+    write_watchlist(
+        path,
+        [
+            base_row(
+                symbol="00700",
+                market="HK",
+                operator=">=",
+                trigger_price="390",
+                trigger_text="升穿 390",
+            ),
+            base_row(symbol="BADHK", market="HK"),
+            base_row(symbol="MSFT", market="US"),
+        ],
+    )
+
+    loaded = load_monitor_triggers(path, run_date=None)
+
+    assert loaded.triggers == [
+        MonitorTrigger(
+            run_date="2026-06-15",
+            symbol="00700",
+            market="HK",
+            futu_symbol="HK.00700",
+            trigger_type="price",
+            operator=">=",
+            trigger_price=Decimal("390"),
+            suggested_action="reduce",
+            severity="high",
+            trigger_text="升穿 390",
+        ),
+        MonitorTrigger(
+            run_date="2026-06-15",
+            symbol="MSFT",
+            market="US",
+            futu_symbol="US.MSFT",
+            trigger_type="price",
+            operator="<=",
+            trigger_price=Decimal("95"),
+            suggested_action="reduce",
+            severity="high",
+            trigger_text="below 95",
+        ),
+    ]
+    assert loaded.skipped_count == 1
+
+
+def test_load_monitor_triggers_skips_malformed_hk_symbols(tmp_path: Path) -> None:
+    path = tmp_path / "watchlist.csv"
+    write_watchlist(
+        path,
+        [
+            base_row(symbol="700.HK", market="HK"),
+            base_row(symbol="ABC", market="HK"),
+            base_row(symbol="", market="HK"),
+            base_row(symbol="123456", market="HK"),
+            base_row(symbol="700", market="HK"),
+        ],
+    )
+
+    loaded = load_monitor_triggers(path, run_date=None)
+
+    assert [trigger.futu_symbol for trigger in loaded.triggers] == ["HK.00700"]
+    assert loaded.skipped_count == 4
+
+
 def test_load_monitor_triggers_uses_explicit_run_date_and_blank_rows(
     tmp_path: Path,
 ) -> None:
@@ -346,6 +413,29 @@ def test_run_futu_watch_once_fetches_quotes_and_writes_alert(
     assert client.closed is True
     rows = list(csv.DictReader(result.alerts_path.open(encoding="utf-8")))
     assert [row["symbol"] for row in rows] == ["VIXY"]
+
+
+def test_run_futu_watch_output_does_not_claim_only_us_triggers(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.csv"
+    write_watchlist(watchlist_path, [base_row(symbol="00700", market="HK")])
+    client = FakeQuoteClient([{"HK.00700": Decimal("94.5")}])
+    messages: list[str] = []
+
+    run_futu_watch(
+        watchlist_path=watchlist_path,
+        data_dir=tmp_path / "data",
+        run_date=None,
+        quote_client=client,
+        poll_seconds=5.0,
+        once=True,
+        sleep_fn=lambda seconds: None,
+        now_fn=lambda: datetime(2026, 6, 15, 13, 30, 0),
+        output_fn=messages.append,
+    )
+
+    assert messages[0] == "loaded 1 active trigger(s)"
 
 
 def test_run_futu_watch_returns_zero_alerts_when_no_triggers(

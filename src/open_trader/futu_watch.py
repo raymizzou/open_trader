@@ -200,7 +200,7 @@ def run_futu_watch(
 ) -> FutuWatchResult:
     loaded = load_monitor_triggers(watchlist_path, run_date)
     alerts_path = data_dir / "runs" / loaded.run_date / "alerts.csv"
-    output_fn(f"loaded {len(loaded.triggers)} active US trigger(s)")
+    output_fn(f"loaded {len(loaded.triggers)} active trigger(s)")
     if not loaded.triggers:
         quote_client.close()
         return FutuWatchResult(
@@ -307,12 +307,12 @@ def _trigger_from_row(
     market = row.get("market", "").strip().upper()
     trigger_type = row.get("trigger_type", "").strip()
     operator = row.get("operator", "").strip()
+    futu_symbol = _to_futu_symbol(market, symbol)
     if (
-        market != "US"
+        futu_symbol is None
         or row.get("status", "").strip() != "active"
         or trigger_type not in {"price", "open_price"}
         or operator not in {"<=", ">="}
-        or not symbol
     ):
         return None
     try:
@@ -325,7 +325,7 @@ def _trigger_from_row(
         run_date=row.get("run_date", "").strip() or fallback_run_date,
         symbol=symbol,
         market=market,
-        futu_symbol=f"US.{symbol}",
+        futu_symbol=futu_symbol,
         trigger_type=trigger_type,
         operator=operator,
         trigger_price=trigger_price,
@@ -333,3 +333,11 @@ def _trigger_from_row(
         severity=row.get("severity", "").strip(),
         trigger_text=row.get("trigger_text", "").strip(),
     )
+
+
+def _to_futu_symbol(market: str, symbol: str) -> str | None:
+    if market == "US" and symbol:
+        return f"US.{symbol}"
+    if market == "HK" and symbol.isdigit() and len(symbol) <= 5:
+        return f"HK.{symbol.zfill(5)}"
+    return None
