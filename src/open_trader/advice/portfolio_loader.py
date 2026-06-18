@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+from open_trader.market_scope import parse_market_scope
+
 from .models import PortfolioInputRow
 
 
@@ -18,7 +20,7 @@ def load_eligible_portfolio_rows(
     *,
     market: str | None = None,
 ) -> list[PortfolioInputRow]:
-    market_filter = market.strip().upper() if market else None
+    market_filter = parse_market_scope(market).value if market else None
     with portfolio_path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         eligible: list[PortfolioInputRow] = []
