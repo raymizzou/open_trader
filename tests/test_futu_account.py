@@ -34,7 +34,7 @@ class FakeSecTradeContext:
                         "acc_id": 111,
                         "acc_index": 0,
                         "trd_env": "REAL",
-                        "acc_type": "SECURITY",
+                        "acc_type": "CASH",
                         "card_num": "12345678",
                     },
                     {
@@ -190,16 +190,24 @@ def test_futu_account_client_fetches_only_real_accounts() -> None:
 
 
 def test_futu_account_client_fails_fast_when_opend_unreachable() -> None:
+    called = False
+
+    def context_factory(*, host: str, port: int) -> FakeSecTradeContext:
+        nonlocal called
+        called = True
+        return FakeSecTradeContext(host=host, port=port)
+
     with pytest.raises(FutuAccountError) as exc_info:
         FutuAccountClient(
             host="127.0.0.1",
             port=11111,
-            context_factory=FakeSecTradeContext,
+            context_factory=context_factory,
             connectivity_checker=lambda host, port: False,
         )
 
     assert exc_info.value.error_type == "opend_unreachable"
     assert "Futu OpenD is not reachable" in str(exc_info.value)
+    assert called is False
 
 
 def test_futu_account_client_reports_no_real_accounts() -> None:

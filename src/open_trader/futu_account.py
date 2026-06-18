@@ -92,12 +92,7 @@ def _account_from_record(record: dict[str, object]) -> FutuAccount:
 
 
 def _is_real_security_account(account: FutuAccount) -> bool:
-    return account.trd_env == TRD_ENV_REAL and account.acc_type in {
-        "SECURITY",
-        "SEC",
-        "STOCK",
-        "UNIVERSAL",
-    }
+    return account.trd_env == TRD_ENV_REAL
 
 
 class FutuAccountClient:
