@@ -216,12 +216,21 @@ def _render_ready_section(row: Mapping[str, str], *, index: int) -> list[str]:
                 f"{row.get('suggested_notional', '').strip()}"
             ),
             _ready_impact_text(row),
-            f"原因：{_localized_note(row.get('reason', '').strip())}",
+            _agent_reason_line(row),
         ]
     )
     risk_control = _risk_control_text(row, currency)
     if risk_control:
         lines.insert(-1, risk_control)
+    excerpt_line = _agent_excerpt_line(row)
+    if excerpt_line:
+        lines.append(excerpt_line)
+    missing_agent_reason = _missing_agent_reason_line(row)
+    if missing_agent_reason:
+        lines.append(missing_agent_reason)
+    trigger_line = _trigger_reason_line(row)
+    if trigger_line:
+        lines.append(trigger_line)
     return lines
 
 
@@ -317,7 +326,7 @@ def _blocked_detail_lines(
     return [
         f"阻塞：执行前缺少{'、'.join(_field_label(field) for field in missing_fields)}。",
         "影响：系统无法计算精确数量、金额、交易后仓位或风险，暂不能执行。",
-        f"原因：{_sentence(_localized_note(row.get('reason', '').strip()))}",
+        _agent_reason_line(row),
     ]
 
 
@@ -396,6 +405,45 @@ def _currency_label(currency: str) -> str:
     }.get(currency.strip().upper(), currency)
 
 
+def _agent_reason_line(row: Mapping[str, str]) -> str:
+    agent_reason = row.get("agent_reason", "").strip()
+    if agent_reason:
+        return f"原因：{_sentence(agent_reason)}"
+    fallback = _localized_note(row.get("reason", "").strip())
+    if fallback:
+        return f"原因：{_sentence(fallback)}"
+    return "原因：原文依据缺失，需人工复核。"
+
+
+def _agent_excerpt_line(row: Mapping[str, str]) -> str:
+    excerpt = row.get("agent_excerpt", "").strip()
+    if not excerpt:
+        return ""
+    return f"原文：{excerpt}"
+
+
+def _missing_agent_reason_line(row: Mapping[str, str]) -> str:
+    if row.get("agent_reason", "").strip():
+        return ""
+    return "原文依据缺失，需人工复核。"
+
+
+def _trigger_reason_line(row: Mapping[str, str]) -> str:
+    trigger_reason = row.get("trigger_reason", "").strip()
+    action = row.get("action", "").strip().upper()
+    last_price = row.get("last_price", "").strip()
+    if action in {"TRIM", "TAKE_PROFIT", "SELL_STOP"} and trigger_reason:
+        if action == "SELL_STOP":
+            return f"触发：当前价 {last_price}，行动已满足计划中的止损条件。"
+        return f"触发：当前价 {last_price}，行动已满足计划中的减仓/风控条件。"
+    if trigger_reason:
+        return f"触发：{_sentence(_localized_note(trigger_reason))}"
+    fallback = row.get("reason", "").strip()
+    if fallback:
+        return f"触发：{_sentence(_localized_note(fallback))}"
+    return ""
+
+
 def _localized_note(text: str) -> str:
     normalized = " ".join(text.strip().split())
     if not normalized:
@@ -405,8 +453,8 @@ def _localized_note(text: str) -> str:
         "missing avg cost": "当前成本缺失。",
         "Stop loss was hit.": "已触发止损。",
         "Current price is at or below the stop loss.": "当前价格已达到或低于止损价。",
-        "Current price is at or above target 1.": "当前价格已达到或高于目标价 1。",
-        "Current price is at or above target 2.": "当前价格已达到或高于目标价 2。",
+        "Current price is at or above target 1.": "当前价格已满足计划触发条件。",
+        "Current price is at or above target 2.": "当前价格已满足计划触发条件。",
         "Current price is inside the planned entry zone.": "当前价格位于计划买入区间。",
         "Current price is near the planned add price.": "当前价格接近计划加仓价。",
         "Plan text indicates trim at current levels.": "计划正文要求在当前价位减仓。",
