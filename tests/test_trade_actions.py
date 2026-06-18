@@ -1891,6 +1891,73 @@ def test_generate_trade_actions_writes_csv_report_and_latest(
     assert "建议：买入 8 股，预算约 USD 3120" in report
 
 
+def test_generate_trade_actions_writes_market_scoped_hk_paths_and_uses_hkd_cash(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "data/runs/2026-06-19/HK/trading_plan.csv"
+    hk_plan = msft_plan_row(
+        run_date="2026-06-19",
+        symbol="00700",
+    )
+    hk_plan.update(
+        {
+            "market": "HK",
+            "entry_zone_low": "370",
+            "entry_zone_high": "390",
+            "max_weight": "5%",
+        }
+    )
+    write_trading_plan(plan_path, [hk_plan])
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            {
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "00700",
+                "currency": "HKD",
+                "total_quantity": "100",
+                "avg_cost_price": "350",
+                "market_value": "38000",
+                "fx_to_hkd": "1",
+                "market_value_hkd": "38000",
+                "portfolio_weight_hkd": "2.00%",
+            },
+            {
+                "market": "CASH",
+                "asset_class": "cash",
+                "symbol": "HKD_CASH",
+                "currency": "HKD",
+                "total_quantity": "1",
+                "market_value": "10000",
+                "fx_to_hkd": "1",
+                "market_value_hkd": "10000",
+                "portfolio_weight_hkd": "0.50%",
+            },
+        ],
+    )
+
+    result = generate_trade_actions(
+        plan_path=plan_path,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        snapshots={"HK.00700": QuoteSnapshot("HK.00700", Decimal("380"))},
+        run_date="2026-06-19",
+        update_latest=True,
+        market="HK",
+    )
+    rows = list(csv.DictReader(result.actions_path.open(encoding="utf-8")))
+
+    assert result.actions_path == tmp_path / "data/runs/2026-06-19/HK/trade_actions.csv"
+    assert result.latest_path == tmp_path / "data/latest/HK/trade_actions.csv"
+    assert result.report_path == tmp_path / "reports/trade_actions/2026-06-19-HK.md"
+    assert rows[0]["futu_symbol"] == "HK.00700"
+    assert rows[0]["notional_currency"] == "HKD"
+    assert rows[0]["cash_available"] == "10000"
+
+
 def test_generate_trade_actions_dry_run_does_not_update_latest(
     tmp_path: Path,
     valid_portfolio_path: Path,

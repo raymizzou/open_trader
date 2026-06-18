@@ -106,6 +106,7 @@ def generate_trade_actions(
     snapshots: dict[str, QuoteSnapshot],
     run_date: str | None,
     update_latest: bool,
+    market: str | None = None,
 ) -> TradeActionsResult:
     active_plans = [
         plan
@@ -118,6 +119,9 @@ def generate_trade_actions(
         for plan in active_plans
         if _plan_matches_run_date(plan, effective_run_date)
     ]
+    market_filter = market.strip().upper() if market else None
+    if market_filter is not None:
+        plans = [plan for plan in plans if plan.market.upper() == market_filter]
     if run_date is not None and not plans:
         raise ValueError(f"no active trading plans match run_date {effective_run_date}")
     portfolio = load_portfolio_action_context(portfolio_path)
@@ -132,9 +136,18 @@ def generate_trade_actions(
         for plan in plans
     ]
 
-    actions_path = data_dir / "runs" / effective_run_date / "trade_actions.csv"
-    latest_path = data_dir / "latest" / "trade_actions.csv"
-    report_path = reports_dir / "trade_actions" / f"{effective_run_date}.md"
+    if market_filter:
+        actions_path = (
+            data_dir / "runs" / effective_run_date / market_filter / "trade_actions.csv"
+        )
+        latest_path = data_dir / "latest" / market_filter / "trade_actions.csv"
+        report_path = (
+            reports_dir / "trade_actions" / f"{effective_run_date}-{market_filter}.md"
+        )
+    else:
+        actions_path = data_dir / "runs" / effective_run_date / "trade_actions.csv"
+        latest_path = data_dir / "latest" / "trade_actions.csv"
+        report_path = reports_dir / "trade_actions" / f"{effective_run_date}.md"
 
     _atomic_write_csv(actions_path, TRADE_ACTION_FIELDNAMES, rows)
     _atomic_write_text(report_path, render_trade_actions_report(effective_run_date, rows))

@@ -96,6 +96,7 @@ def build_trading_plan(
     data_dir: Path,
     run_date: str | None = None,
     update_latest: bool = True,
+    market: str | None = None,
 ) -> TradingPlanBuildResult:
     advice_rows = _read_advice_rows(advice_path)
     effective_run_date = run_date or _latest_run_date(advice_rows)
@@ -105,12 +106,25 @@ def build_trading_plan(
         if not row.get("run_date", "").strip()
         or row.get("run_date", "").strip() == effective_run_date
     ]
+    market_filter = market.strip().upper() if market else None
+    if market_filter is not None:
+        filtered_rows = [
+            row
+            for row in filtered_rows
+            if row.get("market", "").strip().upper() == market_filter
+        ]
     if not filtered_rows and run_date is not None:
         raise ValueError(f"no advice rows match run_date {effective_run_date}")
 
     plan_rows = [_plan_row_from_advice(row, effective_run_date) for row in filtered_rows]
-    plan_path = data_dir / "runs" / effective_run_date / "trading_plan.csv"
-    latest_path = data_dir / "latest" / "trading_plan.csv"
+    if market_filter:
+        plan_path = (
+            data_dir / "runs" / effective_run_date / market_filter / "trading_plan.csv"
+        )
+        latest_path = data_dir / "latest" / market_filter / "trading_plan.csv"
+    else:
+        plan_path = data_dir / "runs" / effective_run_date / "trading_plan.csv"
+        latest_path = data_dir / "latest" / "trading_plan.csv"
     _atomic_write_csv(plan_path, TRADING_PLAN_FIELDNAMES, plan_rows)
     if update_latest:
         _atomic_write_csv(latest_path, TRADING_PLAN_FIELDNAMES, plan_rows)

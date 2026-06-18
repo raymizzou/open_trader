@@ -125,6 +125,37 @@ def test_build_trading_plan_extracts_structured_prices_and_writes_latest(
     )
 
 
+def test_build_trading_plan_writes_market_scoped_hk_paths(tmp_path: Path) -> None:
+    advice = tmp_path / "advice.csv"
+    write_advice(
+        advice,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "00700",
+                "market": "HK",
+                "advice_action": "Overweight",
+                "advice_summary": msft_advice_summary(),
+                "status": "ok",
+                "error": "",
+            }
+        ],
+    )
+
+    result = build_trading_plan(
+        advice,
+        tmp_path / "data",
+        run_date="2026-06-19",
+        update_latest=True,
+        market="HK",
+    )
+    rows = load_trading_plan_rows(result.plan_path)
+
+    assert result.plan_path == tmp_path / "data/runs/2026-06-19/HK/trading_plan.csv"
+    assert result.latest_path == tmp_path / "data/latest/HK/trading_plan.csv"
+    assert rows[0].futu_symbol == "HK.00700"
+
+
 def test_build_trading_plan_dry_run_does_not_update_latest(tmp_path: Path) -> None:
     advice_path = tmp_path / "advice.csv"
     latest_path = tmp_path / "data/latest/trading_plan.csv"
