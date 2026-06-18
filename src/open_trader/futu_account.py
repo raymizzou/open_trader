@@ -306,7 +306,8 @@ def _cash_balances_from_record(
     cash_balances = _per_currency_cash_balances_from_record(record, statement_id)
     if cash_balances:
         return cash_balances
-    return [_cash_from_record(record, statement_id, blocking_errors)]
+    fallback = _cash_from_record(record, statement_id, blocking_errors)
+    return [] if fallback is None else [fallback]
 
 
 def _per_currency_cash_balances_from_record(
@@ -345,12 +346,16 @@ def _cash_from_record(
     record: dict[str, object],
     statement_id: str,
     blocking_errors: list[str],
-) -> CashBalance:
+) -> CashBalance | None:
     currency = _first_text(record, ("currency", "currency_type"), "HKD").upper()
+    if currency in {"", "N/A"}:
+        return None
     cash_value, cash_ok = _required_decimal(record, ("cash", "cash_balance", "total_cash"))
     available_balance = _optional_decimal(
         record, ("available_cash", "available_balance", "available_funds")
     )
+    if cash_ok and cash_value == 0 and (available_balance is None or available_balance == 0):
+        return None
     if not cash_ok:
         value = record.get("cash", record.get("cash_balance", record.get("total_cash")))
         blocking_errors.append(

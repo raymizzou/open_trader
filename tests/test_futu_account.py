@@ -368,6 +368,35 @@ def test_map_snapshot_preserves_simple_fake_cash_record_compatibility() -> None:
     assert cash_balances[0].available_balance == Decimal("88.50")
 
 
+def test_map_snapshot_skips_empty_na_cash_record() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_222",
+                "currency": "N/A",
+                "cash": "0",
+                "available_funds": "N/A",
+                "hk_cash": "0",
+                "hk_avl_withdrawal_cash": "0",
+                "us_cash": "N/A",
+                "us_avl_withdrawal_cash": "N/A",
+                "cn_cash": "N/A",
+                "cn_avl_withdrawal_cash": "N/A",
+            }
+        ],
+        position_records=[],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-18",
+    )
+
+    assert positions == []
+    assert cash_balances == []
+    assert blocking_errors == []
+
+
 def test_map_snapshot_marks_malformed_required_position_fields_low_confidence() -> None:
     snapshot = client_snapshot_from_records(
         cash_records=[
