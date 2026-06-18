@@ -45,7 +45,16 @@ class FakeSecTradeContext:
                         "acc_index": 0,
                         "trd_env": "REAL",
                         "acc_type": "CASH",
+                        "acc_status": "ACTIVE",
                         "card_num": "12345678",
+                    },
+                    {
+                        "acc_id": 333,
+                        "acc_index": 2,
+                        "trd_env": "REAL",
+                        "acc_type": "MARGIN",
+                        "acc_status": "DISABLED",
+                        "card_num": "87654321",
                     },
                     {
                         "acc_id": 222,

@@ -40,6 +40,7 @@ class FutuAccount:
     trd_env: str
     acc_type: str
     account_alias: str
+    acc_status: str = "ACTIVE"
 
 
 @dataclass(frozen=True)
@@ -101,17 +102,19 @@ def _account_from_record(record: dict[str, object]) -> FutuAccount:
     acc_index = _as_int(record.get("acc_index", 0), field_name="acc_index")
     trd_env = _first_text(record, ("trd_env", "env", "trd_env_name")).upper()
     acc_type = _first_text(record, ("acc_type", "account_type"), "SECURITY").upper()
+    acc_status = _first_text(record, ("acc_status", "status"), "ACTIVE").upper()
     return FutuAccount(
         acc_id=acc_id,
         acc_index=acc_index,
         trd_env=trd_env,
         acc_type=acc_type,
         account_alias=f"futu_{acc_id}",
+        acc_status=acc_status,
     )
 
 
 def _is_real_security_account(account: FutuAccount) -> bool:
-    return account.trd_env == TRD_ENV_REAL
+    return account.trd_env == TRD_ENV_REAL and account.acc_status == "ACTIVE"
 
 
 class FutuAccountClient:
@@ -667,6 +670,7 @@ def _snapshot_to_json(snapshot: FutuAccountSnapshot) -> dict[str, object]:
                 "acc_index": account.acc_index,
                 "trd_env": account.trd_env,
                 "acc_type": account.acc_type,
+                "acc_status": account.acc_status,
                 "account_alias": account.account_alias,
             }
             for account in snapshot.accounts
