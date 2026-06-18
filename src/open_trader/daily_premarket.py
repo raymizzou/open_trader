@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import fcntl
 import json
+import logging
 import os
 import shutil
 import sys
@@ -35,6 +36,9 @@ from .trading_plan import (
     evaluate_plan_quote,
     load_trading_plan_rows,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -766,8 +770,15 @@ class DailyPremarketRunner:
     def _notify(self, title: str, message: str) -> None:
         try:
             self.notifier.notify(title, message)
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.warning(
+                "通知发送失败：%s error_type=%s error=%s",
+                title,
+                exc.__class__.__name__,
+                str(exc),
+            )
+            return
+        LOGGER.info("通知已发送：%s", title)
 
 
 def _read_env_file(path: Path) -> dict[str, str]:

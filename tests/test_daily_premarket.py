@@ -711,6 +711,60 @@ class CapturingNotifier:
         self.calls.append((title, message))
 
 
+class FailingNotifier:
+    def notify(self, title: str, message: str) -> None:
+        raise RuntimeError("delivery failed")
+
+
+def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
+    return DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+    )
+
+
+def test_daily_notify_logs_success(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    notifier = CapturingNotifier()
+    runner = DailyPremarketRunner(
+        config=_daily_config(tmp_path),
+        notifier=notifier,
+    )
+
+    with caplog.at_level("INFO", logger="open_trader.daily_premarket"):
+        runner._notify("Open Trader 行动通知", "测试正文")
+
+    assert notifier.calls == [("Open Trader 行动通知", "测试正文")]
+    assert "通知已发送：Open Trader 行动通知" in caplog.text
+
+
+def test_daily_notify_logs_failure_without_raising(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = DailyPremarketRunner(
+        config=_daily_config(tmp_path),
+        notifier=FailingNotifier(),
+    )
+
+    with caplog.at_level("WARNING", logger="open_trader.daily_premarket"):
+        runner._notify("Open Trader 行动通知", "测试正文")
+
+    assert "通知发送失败：Open Trader 行动通知" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "delivery failed" in caplog.text
+
+
 def test_daily_runner_writes_success_status_and_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
