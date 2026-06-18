@@ -174,6 +174,60 @@ To compare live quotes against the structured trader plan, run:
 This reports whether each live quote is in the entry zone, near the add price,
 at a stop loss, at a target, or only on watch.
 
+### Troubleshooting OpenD `网络中断`
+
+If `check-futu-plan` or `generate-trade-actions` prints
+`connected to Futu OpenD at 127.0.0.1:11111` and then fails with `网络中断`,
+the local OpenD port is reachable. The usual cause is that OpenD is not logged
+in to the quote server.
+
+Run a direct OpenAPI state check:
+
+```bash
+.venv/bin/python - <<'PY'
+from futu import OpenQuoteContext
+ctx = OpenQuoteContext(host="127.0.0.1", port=11111)
+ret, data = ctx.get_global_state()
+print(ret, data)
+ctx.close()
+PY
+```
+
+Interpret the result:
+
+```text
+trd_logined=True, qot_logined=False
+```
+
+means the trading server is logged in, but the quote server is not logged in.
+In this state, `get_market_snapshot()` returns `网络中断` for US and HK symbols
+even though other OpenD calls can still work.
+
+Recovery:
+
+```bash
+ps aux | grep -i FutuOpenD
+pkill -f FutuOpenD
+ps aux | grep -i FutuOpenD
+open /Applications/FutuOpenD_10.7.6718_Mac/FutuOpenD.app
+```
+
+Only the `grep -i FutuOpenD` process should remain after `pkill`. After
+reopening OpenD, log in again, rerun `get_global_state()`, and confirm:
+
+```text
+qot_logined=True
+```
+
+Then rerun:
+
+```bash
+.venv/bin/python -m open_trader check-futu-plan \
+  --plan data/latest/trading_plan.csv
+```
+
+Healthy output includes one `last_price=...` line per active plan symbol.
+
 ## Generate Trade Actions
 
 After `data/latest/trading_plan.csv` and `data/latest/portfolio.csv` are ready,

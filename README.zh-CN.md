@@ -143,6 +143,29 @@ data/latest/portfolio.csv
   --plan data/latest/trading_plan.csv
 ```
 
+如果命令显示已经连接到 `127.0.0.1:11111`，但快照接口报 `网络中断`，先确认 OpenD 的行情服务器是否登录：
+
+```bash
+.venv/bin/python - <<'PY'
+from futu import OpenQuoteContext
+ctx = OpenQuoteContext(host="127.0.0.1", port=11111)
+ret, data = ctx.get_global_state()
+print(ret, data)
+ctx.close()
+PY
+```
+
+重点看 `qot_logined`。如果 `trd_logined=True` 但 `qot_logined=False`，说明交易服务器已登录，但行情服务器未登录，`get_market_snapshot()` 会返回 `网络中断`。恢复步骤：
+
+```bash
+ps aux | grep -i FutuOpenD
+pkill -f FutuOpenD
+ps aux | grep -i FutuOpenD
+open /Applications/FutuOpenD_10.7.6718_Mac/FutuOpenD.app
+```
+
+重新登录 OpenD 后，再跑上面的 `get_global_state()`。看到 `qot_logined=True` 后，再执行 `check-futu-plan`；成功输出应包含 `last_price=...`。
+
 ### 生成交易动作
 
 ```bash

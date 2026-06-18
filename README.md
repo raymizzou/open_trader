@@ -151,6 +151,36 @@ data/latest/portfolio.csv
   --plan data/latest/trading_plan.csv
 ```
 
+If the command connects to `127.0.0.1:11111` but the snapshot call returns
+`网络中断`, check whether OpenD is logged in to the quote server:
+
+```bash
+.venv/bin/python - <<'PY'
+from futu import OpenQuoteContext
+ctx = OpenQuoteContext(host="127.0.0.1", port=11111)
+ret, data = ctx.get_global_state()
+print(ret, data)
+ctx.close()
+PY
+```
+
+Look for `qot_logined`. If `trd_logined=True` but `qot_logined=False`, the
+trading server is logged in but the quote server is not. In that state,
+`get_market_snapshot()` can return `网络中断`.
+
+Restart OpenD completely and log in again:
+
+```bash
+ps aux | grep -i FutuOpenD
+pkill -f FutuOpenD
+ps aux | grep -i FutuOpenD
+open /Applications/FutuOpenD_10.7.6718_Mac/FutuOpenD.app
+```
+
+After login, rerun `get_global_state()` and confirm `qot_logined=True`, then
+rerun `check-futu-plan`. A healthy check prints `last_price=...` for active
+plan symbols.
+
 ### Generate Trade Actions
 
 ```bash
