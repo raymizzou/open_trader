@@ -819,6 +819,7 @@ class DailyPremarketRunner:
     def _notify(self, title: str, message: str) -> None:
         attempts = send_notification_with_results(self.notifier, title, message)
         for attempt in attempts:
+            self._write_notification_log(title=title, attempt=attempt)
             if attempt.success:
                 LOGGER.info("通知已发送：%s channel=%s", title, attempt.channel)
                 continue
@@ -829,6 +830,32 @@ class DailyPremarketRunner:
                 attempt.error_type,
                 attempt.error,
             )
+
+    def _write_notification_log(
+        self,
+        *,
+        title: str,
+        attempt: NotificationAttempt,
+    ) -> None:
+        try:
+            now = datetime.now(ZoneInfo(self.config.timezone))
+            log_dir = self.config.logs_dir / "notifications"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "timestamp": now.isoformat(),
+                "title": title,
+                "channel": attempt.channel,
+                "success": attempt.success,
+                "error_type": attempt.error_type,
+                "error": attempt.error,
+            }
+            with (log_dir / f"{now.date().isoformat()}.jsonl").open(
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            LOGGER.warning("通知日志写入失败：%s", exc)
 
 
 def _read_env_file(path: Path) -> dict[str, str]:

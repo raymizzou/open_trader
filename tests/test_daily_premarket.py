@@ -746,6 +746,12 @@ def test_daily_notify_logs_success(
 
     assert notifier.calls == [("Open Trader 行动通知", "测试正文")]
     assert "通知已发送：Open Trader 行动通知" in caplog.text
+    notification_logs = list((tmp_path / "logs/notifications").glob("*.jsonl"))
+    assert len(notification_logs) == 1
+    payload = json.loads(notification_logs[0].read_text(encoding="utf-8"))
+    assert payload["title"] == "Open Trader 行动通知"
+    assert payload["channel"] == "CapturingNotifier"
+    assert payload["success"] is True
 
 
 def test_daily_notify_logs_failure_without_raising(
@@ -763,6 +769,14 @@ def test_daily_notify_logs_failure_without_raising(
     assert "通知发送失败：Open Trader 行动通知" in caplog.text
     assert "RuntimeError" in caplog.text
     assert "delivery failed" in caplog.text
+    notification_logs = list((tmp_path / "logs/notifications").glob("*.jsonl"))
+    assert len(notification_logs) == 1
+    payload = json.loads(notification_logs[0].read_text(encoding="utf-8"))
+    assert payload["title"] == "Open Trader 行动通知"
+    assert payload["channel"] == "FailingNotifier"
+    assert payload["success"] is False
+    assert payload["error_type"] == "RuntimeError"
+    assert payload["error"] == "delivery failed"
 
 
 def test_daily_notify_logs_composite_child_failure_without_raising(
