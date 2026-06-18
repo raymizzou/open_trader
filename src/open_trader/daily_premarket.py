@@ -1304,7 +1304,7 @@ def _daily_status_label(status: str) -> str:
         "partial": "部分完成",
         "failed": "失败",
         "already_running": "已有任务运行中",
-    }.get(status.strip().lower(), status)
+    }.get(status.strip().lower(), "未知状态")
 
 
 def _readiness_label(readiness: str) -> str:

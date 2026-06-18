@@ -368,6 +368,28 @@ def test_status_reason_label_uses_chinese_fallback_for_unknown_values() -> None:
     assert daily_premarket._status_reason_label("unexpected_reason") == "其他原因"
 
 
+def test_daily_status_label_uses_chinese_fallback_for_unknown_values() -> None:
+    assert daily_premarket._daily_status_label("unexpected_status") == "未知状态"
+
+
+def test_blocker_notification_unexpected_status_uses_chinese_fallbacks() -> None:
+    body = daily_premarket._blocker_notification_message(
+        run_date="2026-06-17",
+        status="unexpected_status",
+        futu_status={"error": "", "missing": 0, "diagnostic": {}},
+        trade_actions={"review": 0},
+        artifacts={},
+        readiness="",
+        status_reasons=["unexpected_reason"],
+    )
+
+    assert "状态：未知状态" in body
+    assert "可用性：未分类" in body
+    assert "原因：其他原因" in body
+    assert "unexpected_status" not in body
+    assert "unexpected_reason" not in body
+
+
 def test_render_daily_report_legacy_payload_uses_blocker_next_step() -> None:
     report = daily_premarket._render_daily_report(
         {
