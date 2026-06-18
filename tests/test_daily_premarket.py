@@ -656,6 +656,177 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
     assert "reports/" not in body
 
 
+def test_daily_runner_sends_blocker_notification_when_futu_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+        notifiers=("feishu",),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        notify_daily_report=True,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=UnavailableQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=notifier,
+    ).run("2026-06-17")
+
+    assert result.status == "partial"
+    blocker_calls = [
+        call for call in notifier.calls if call[0] == "Open Trader 阻塞通知"
+    ]
+    assert len(blocker_calls) == 1
+    _, body = blocker_calls[0]
+    assert "Open Trader｜阻塞通知" in body
+    assert "日期：2026-06-17｜状态：部分完成" in body
+    assert "Futu 行情异常：Futu OpenD is not reachable" in body
+    assert "下一步：先恢复 OpenD 行情连接或处理阻塞项，再重新运行盘前流程。" in body
+
+
+def test_daily_runner_sends_blocker_notification_when_futu_quote_is_missing(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+        notifiers=("feishu",),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        notify_daily_report=True,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=MissingQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=notifier,
+    ).run("2026-06-17")
+
+    assert result.status == "partial"
+    blocker_calls = [
+        call for call in notifier.calls if call[0] == "Open Trader 阻塞通知"
+    ]
+    assert len(blocker_calls) == 1
+    _, body = blocker_calls[0]
+    assert "缺失行情：1" in body
+    assert "报告：" in body
+
+
+def test_daily_runner_sends_blocker_notification_when_run_fails(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+        notifiers=("feishu",),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        notify_daily_report=True,
+    )
+    notifier = CapturingNotifier()
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        notifier=notifier,
+    ).run("2026-06-17")
+
+    assert result.status == "failed"
+    assert len(notifier.calls) == 1
+    title, body = notifier.calls[0]
+    assert title == "Open Trader 阻塞通知"
+    assert "运行失败：portfolio not found" in body
+    assert "状态文件：" in body
+
+
+def test_daily_runner_keeps_partial_status_when_blocker_rendering_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_blocker_render_error(**kwargs: object) -> str:
+        raise RuntimeError("blocker render failed")
+
+    monkeypatch.setattr(
+        daily_premarket,
+        "_blocker_notification_message",
+        raise_blocker_render_error,
+    )
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+        notifiers=("feishu",),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        notify_daily_report=True,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=MissingQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=notifier,
+    ).run("2026-06-17")
+
+    assert result.status == "partial"
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "partial"
+    assert "error" not in status
+    assert [title for title, _ in notifier.calls] == ["Open Trader 行动通知"]
+
+
 @pytest.mark.parametrize(
     "expected_status",
     [
@@ -718,7 +889,13 @@ def test_daily_runner_keeps_success_status_when_order_review_rendering_fails(
     assert f"- Status: {expected_status}" in report
     assert "- Status: failed" not in report
     assert (tmp_path / "data/latest/trade_actions.csv").exists()
-    assert notifier.calls == []
+    if expected_status == "success":
+        assert notifier.calls == []
+    else:
+        assert len(notifier.calls) == 1
+        title, body = notifier.calls[0]
+        assert title == "Open Trader 阻塞通知"
+        assert "缺失行情：1" in body
 
 
 def test_daily_runner_skips_daily_notification_when_report_notify_disabled(

@@ -398,6 +398,23 @@ class DailyPremarketRunner:
                 data_dir=self.config.data_dir,
             )
         if self.config.notify_daily_report and not dry_run:
+            if _should_notify_blocker(
+                status=status,
+                futu_status=futu_status,
+                trade_actions=trade_action_counts,
+            ):
+                try:
+                    blocker_message = _blocker_notification_message(
+                        run_date=run_date,
+                        status=status,
+                        futu_status=futu_status,
+                        trade_actions=trade_action_counts,
+                        artifacts=artifacts,
+                    )
+                except Exception:
+                    pass
+                else:
+                    self._notify("Open Trader 阻塞通知", blocker_message)
             try:
                 message = render_feishu_order_review(
                     run_date=run_date,
@@ -626,10 +643,19 @@ class DailyPremarketRunner:
             ),
         )
         if self.config.notify_daily_report and not dry_run:
-            self._notify(
-                "Open Trader daily premarket",
-                _notification_message("failed", {}, {}, {}),
-            )
+            try:
+                blocker_message = _blocker_notification_message(
+                    run_date=run_date,
+                    status="failed",
+                    futu_status=_mapping(payload.get("futu_plan_check")),
+                    trade_actions=_mapping(payload.get("trade_actions")),
+                    artifacts=_mapping(payload.get("artifacts")),
+                    error=error,
+                )
+            except Exception:
+                pass
+            else:
+                self._notify("Open Trader 阻塞通知", blocker_message)
         return DailyRunResult(
             run_date=run_date,
             status="failed",
@@ -987,6 +1013,84 @@ def _notification_message(
             f"{advice_counts.get('error', 0)} error"
         )
     return "failed: see daily run logs"
+
+
+def _should_notify_blocker(
+    *,
+    status: str,
+    futu_status: dict[str, object],
+    trade_actions: dict[str, int],
+) -> bool:
+    if status == "failed":
+        return True
+    if str(futu_status.get("error", "")).strip():
+        return True
+    if int(futu_status.get("missing", 0) or 0) > 0:
+        return True
+    if int(trade_actions.get("review", 0) or 0) > 0:
+        return True
+    return False
+
+
+def _blocker_notification_message(
+    *,
+    run_date: str,
+    status: str,
+    futu_status: dict[str, object],
+    trade_actions: dict[str, object],
+    artifacts: dict[str, object],
+    error: str = "",
+) -> str:
+    lines = [
+        "Open Trader｜阻塞通知",
+        f"日期：{run_date}｜状态：{_daily_status_label(status)}",
+        "",
+    ]
+    if error:
+        lines.append(f"运行失败：{error}")
+
+    futu_error = str(futu_status.get("error", "")).strip()
+    if futu_error:
+        lines.append(f"Futu 行情异常：{futu_error}")
+
+    missing = int(futu_status.get("missing", 0) or 0)
+    if missing > 0:
+        lines.append(f"缺失行情：{missing}")
+
+    review = int(trade_actions.get("review", 0) or 0)
+    if review > 0:
+        lines.append(f"需人工处理：{review}")
+
+    if not any((error, futu_error, missing > 0, review > 0)):
+        lines.append("阻塞：系统未能完成自动盘前流程。")
+
+    lines.extend(
+        [
+            "",
+            "影响：自动流程不能给出完整可靠的可执行结论。",
+            "下一步：先恢复 OpenD 行情连接或处理阻塞项，再重新运行盘前流程。",
+        ]
+    )
+
+    status_path = str(artifacts.get("status", "")).strip()
+    report_path = str(artifacts.get("report", "")).strip()
+    artifact_lines: list[str] = []
+    if status_path:
+        artifact_lines.append(f"状态文件：{status_path}")
+    if report_path:
+        artifact_lines.append(f"报告：{report_path}")
+    if artifact_lines:
+        lines.extend(["", *artifact_lines])
+    return "\n".join(lines).strip() + "\n"
+
+
+def _daily_status_label(status: str) -> str:
+    return {
+        "success": "成功",
+        "partial": "部分完成",
+        "failed": "失败",
+        "already_running": "已有任务运行中",
+    }.get(status.strip().lower(), status)
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
