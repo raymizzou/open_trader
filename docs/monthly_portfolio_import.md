@@ -181,6 +181,44 @@ To compare live quotes against the structured trader plan, run:
 This reports whether each live quote is in the entry zone, near the add price,
 at a stop loss, at a target, or only on watch.
 
+## Futu Live Account Sync
+
+Futu holdings can be pulled from Futu OpenD instead of re-importing a Futu
+monthly statement. Other brokers still use the statement import workflow. The
+sync replaces existing `brokers=futu` rows and keeps non-Futu broker rows from
+the current portfolio. If an existing aggregate row mixes `futu` with another
+broker, the command stops for manual review instead of guessing how to split it.
+
+First verify read-only account access:
+
+```bash
+.venv/bin/python -m open_trader check-futu-account
+```
+
+Then generate a dated merged portfolio without changing `data/latest`:
+
+```bash
+.venv/bin/python -m open_trader sync-futu-portfolio \
+  --date 2026-06-18
+```
+
+Review:
+
+- `data/runs/2026-06-18/futu_account_snapshot.json`
+- `data/runs/2026-06-18/portfolio.csv`
+- `data/runs/2026-06-18/futu_account_report.md`
+
+After confirming the merged portfolio, promote it:
+
+```bash
+.venv/bin/python -m open_trader sync-futu-portfolio \
+  --date 2026-06-18 \
+  --update-latest
+```
+
+The command is read-only against Futu. It does not unlock trading, does not
+store a trading password, and does not place orders.
+
 ### Troubleshooting OpenD `网络中断`
 
 If `check-futu-plan` or `generate-trade-actions` prints
