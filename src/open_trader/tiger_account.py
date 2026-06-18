@@ -468,6 +468,11 @@ class TigerAccountClient:
             position_records=position_records,
         )
 
+    def close(self) -> None:
+        close = getattr(self.trade_client, "close", None)
+        if callable(close):
+            close()
+
     def _parse_account(self, profile: object) -> TigerAccount | None:
         account_id = _text(profile, "account")
         if not account_id:

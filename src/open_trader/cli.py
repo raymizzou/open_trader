@@ -29,6 +29,13 @@ from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
 from .pipeline import run_import, validate_month
+from .tiger_account import (
+    TigerAccountClient,
+    TigerAccountError,
+    load_tiger_account_config,
+    mask_account_id,
+    sync_tiger_portfolio,
+)
 from .trade_actions import generate_trade_actions
 from .trading_plan import (
     TradingPlanRow,
@@ -378,6 +385,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Update data/latest/portfolio.csv after writing dated artifacts",
     )
 
+    check_tiger_account_parser = subparsers.add_parser(
+        "check-tiger-account",
+        help="Diagnose read-only Tiger OpenAPI account access",
+    )
+    check_tiger_account_parser.add_argument(
+        "--config-dir",
+        type=Path,
+        default=Path("~/.tigeropen/"),
+    )
+    check_tiger_account_parser.add_argument("--account")
+    check_tiger_account_parser.add_argument("--sandbox", action="store_true")
+
+    sync_tiger_portfolio_parser = subparsers.add_parser(
+        "sync-tiger-portfolio",
+        help="Merge live Tiger OpenAPI account data into portfolio.csv",
+    )
+    sync_tiger_portfolio_parser.add_argument(
+        "--portfolio",
+        type=Path,
+        default=Path("data/latest/portfolio.csv"),
+    )
+    sync_tiger_portfolio_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    sync_tiger_portfolio_parser.add_argument(
+        "--reports-dir",
+        type=Path,
+        default=Path("reports"),
+    )
+    sync_tiger_portfolio_parser.add_argument("--date", type=canonical_date, required=True)
+    sync_tiger_portfolio_parser.add_argument(
+        "--config-dir",
+        type=Path,
+        default=Path("~/.tigeropen/"),
+    )
+    sync_tiger_portfolio_parser.add_argument("--account")
+    sync_tiger_portfolio_parser.add_argument("--sandbox", action="store_true")
+    sync_tiger_portfolio_parser.add_argument(
+        "--update-latest",
+        action="store_true",
+        help="Update data/latest/portfolio.csv after writing dated artifacts",
+    )
+
     trading_plan_parser = subparsers.add_parser(
         "build-trading-plan",
         help="Convert trading_advice.csv into structured trading_plan.csv",
@@ -705,6 +753,69 @@ def main(argv: list[str] | None = None) -> int:
                 account_client.close()
         print(f"run_date: {result.run_date}")
         print(f"real_accounts: {result.account_count}")
+        print(f"positions: {result.position_count}")
+        print(f"cash: {result.cash_count}")
+        print(f"merged_rows: {result.merged_row_count}")
+        print(f"snapshot: {result.snapshot_path}")
+        print(f"portfolio: {result.portfolio_path}")
+        print(f"report: {result.report_path}")
+        print(f"latest: {result.latest_path}")
+        print(f"updated_latest: {'true' if result.updated_latest else 'false'}")
+        return 0
+
+    if args.command == "check-tiger-account":
+        account_client = None
+        try:
+            config = load_tiger_account_config(
+                config_dir=args.config_dir,
+                account=args.account,
+                sandbox=args.sandbox,
+            )
+            account_client = TigerAccountClient(config=config)
+            print(
+                "connected to Tiger OpenAPI account "
+                f"{mask_account_id(config.account)}"
+            )
+            snapshot = account_client.fetch_snapshot()
+        except (FileNotFoundError, ValueError, RuntimeError, TigerAccountError) as exc:
+            parser.error(str(exc))
+        finally:
+            if account_client is not None:
+                account_client.close()
+        print(f"accounts: {len(snapshot.accounts)}")
+        print(f"positions: {len(snapshot.position_records)}")
+        print(f"cash_records: {len(snapshot.cash_records)}")
+        return 0
+
+    if args.command == "sync-tiger-portfolio":
+        account_client = None
+        try:
+            config = load_tiger_account_config(
+                config_dir=args.config_dir,
+                account=args.account,
+                sandbox=args.sandbox,
+            )
+            account_client = TigerAccountClient(config=config)
+            print(
+                "connected to Tiger OpenAPI account "
+                f"{mask_account_id(config.account)}"
+            )
+            snapshot = account_client.fetch_snapshot()
+            result = sync_tiger_portfolio(
+                snapshot=snapshot,
+                portfolio_path=args.portfolio,
+                data_dir=args.data_dir,
+                reports_dir=args.reports_dir,
+                run_date=args.date,
+                update_latest=args.update_latest,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError, TigerAccountError) as exc:
+            parser.error(str(exc))
+        finally:
+            if account_client is not None:
+                account_client.close()
+        print(f"run_date: {result.run_date}")
+        print(f"accounts: {result.account_count}")
         print(f"positions: {result.position_count}")
         print(f"cash: {result.cash_count}")
         print(f"merged_rows: {result.merged_row_count}")
