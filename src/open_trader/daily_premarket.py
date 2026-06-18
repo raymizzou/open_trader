@@ -728,10 +728,25 @@ class DailyPremarketRunner:
         log_path: Path,
         error: str,
     ) -> DailyRunResult:
+        daily_state = _derive_daily_state(
+            advice_counts={"ok": 0, "fallback": 0, "error": 0},
+            plan_counts={"active": 0, "fallback": 0, "error": 0},
+            futu_status={
+                "checked": 0,
+                "missing": 0,
+                "triggered": 0,
+                "items": [],
+                "error": "",
+            },
+            trade_actions={"actions": 0, "ready": 0, "review": 0, "watch": 0},
+            already_running=True,
+        )
         payload = {
             "run_date": run_date,
             "started_at": started_at.isoformat(),
             "status": "already_running",
+            "readiness": daily_state["readiness"],
+            "status_reasons": daily_state["status_reasons"],
             "error": error,
             "status_path": str(status_path),
             "report_path": str(report_path),
@@ -1261,11 +1276,11 @@ def _blocker_notification_message(
         "",
     ]
     if error:
-        lines.append(f"运行失败：{error}")
+        lines.append("运行失败：每日流程未完成。")
 
     futu_error = str(futu_status.get("error", "")).strip()
     if futu_error:
-        lines.append(f"Futu 行情异常：{futu_error}")
+        lines.append("Futu 行情异常：行情检查未完成。")
 
     missing = int(futu_status.get("missing", 0) or 0)
     if missing > 0:

@@ -390,6 +390,31 @@ def test_blocker_notification_unexpected_status_uses_chinese_fallbacks() -> None
     assert "unexpected_reason" not in body
 
 
+def test_blocker_notification_does_not_expose_raw_error_text() -> None:
+    body = daily_premarket._blocker_notification_message(
+        run_date="2026-06-17",
+        status="partial",
+        futu_status={
+            "error": "Futu OpenD is not reachable",
+            "missing": 0,
+            "diagnostic": {
+                "error_type": "opend_unreachable",
+                "next_step": "请启动或重启 Futu OpenD，确认已登录，并检查配置的 host/port 后重新运行每日盘前流程。",
+            },
+        },
+        trade_actions={"review": 0},
+        artifacts={},
+        error="portfolio not found",
+        readiness="blocked",
+        status_reasons=["run_failed", "futu_error"],
+    )
+
+    assert "运行失败：每日流程未完成。" in body
+    assert "Futu 行情异常：行情检查未完成。" in body
+    assert "portfolio not found" not in body
+    assert "Futu OpenD is not reachable" not in body
+
+
 def test_render_daily_report_legacy_payload_uses_blocker_next_step() -> None:
     report = daily_premarket._render_daily_report(
         {
@@ -853,7 +878,8 @@ def test_daily_runner_sends_blocker_notification_when_futu_is_unavailable(
     _, body = blocker_calls[0]
     assert "Open Trader｜阻塞通知" in body
     assert "日期：2026-06-17｜状态：部分完成" in body
-    assert "Futu 行情异常：Futu OpenD is not reachable" in body
+    assert "Futu 行情异常：行情检查未完成。" in body
+    assert "Futu OpenD is not reachable" not in body
     assert "原因：Futu 行情异常" in body
     assert "请启动或重启 Futu OpenD" in body
 
@@ -984,7 +1010,8 @@ def test_daily_runner_sends_blocker_notification_when_run_fails(
     assert len(notifier.calls) == 1
     title, body = notifier.calls[0]
     assert title == "Open Trader 阻塞通知"
-    assert "运行失败：portfolio not found" in body
+    assert "运行失败：每日流程未完成。" in body
+    assert "portfolio not found" not in body
     assert "状态文件：" in body
 
 
@@ -1778,6 +1805,10 @@ def test_daily_runner_lock_contention_does_not_overwrite_run_artifacts(
     assert report_path.read_text(encoding="utf-8") == "# active run\n"
     assert log_path.read_text(encoding="utf-8") == '{"status": "active"}\n'
     assert result.log_path == tmp_path / "logs/daily_premarket/2026-06-17.lock.log"
+    lock_status = json.loads(result.log_path.read_text(encoding="utf-8"))
+    assert lock_status["status"] == "already_running"
+    assert lock_status["readiness"] == "blocked"
+    assert lock_status["status_reasons"] == ["already_running"]
 
 
 def test_daily_runner_returns_already_running_when_lock_log_write_fails(
@@ -1850,7 +1881,11 @@ class InterruptedQuoteClient:
         pass
 
 
-def test_daily_runner_marks_partial_when_futu_is_unavailable(tmp_path: Path) -> None:
+def test_daily_runner_marks_partial_when_futu_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
