@@ -654,6 +654,39 @@ def test_sync_futu_portfolio_updates_latest_only_when_requested(tmp_path: Path) 
     assert result.updated_latest is True
 
 
+def test_sync_futu_portfolio_clears_stale_preserved_overweight_flag(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    stale_overweight = {**tiger_row(), "risk_flag": "overweight"}
+    write_portfolio(portfolio_path, [old_futu_row(), stale_overweight])
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "USD",
+                "cash": "2000",
+                "available_cash": "2000",
+            }
+        ],
+        position_records=[],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-18",
+        update_latest=False,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    aapl = next(row for row in rows if row["symbol"] == "AAPL")
+    assert aapl["portfolio_weight_hkd"] == "9.09%"
+    assert aapl["risk_flag"] == "normal"
+
+
 def test_sync_futu_portfolio_blocks_latest_when_required_fields_are_malformed(
     tmp_path: Path,
 ) -> None:

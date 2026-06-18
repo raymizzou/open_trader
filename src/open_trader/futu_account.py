@@ -556,12 +556,14 @@ def _recalculate_combined_portfolio_rows(
         market_value_hkd = Decimal(row["market_value_hkd"] or "0")
         weight = market_value_hkd / total if total else Decimal("0")
         row["portfolio_weight_hkd"] = pct(weight)
-        if (
-            row["risk_flag"] != "data_check"
-            and row["asset_class"] not in {"cash", "money_market_fund"}
-            and weight > Decimal("0.10")
+        if row["risk_flag"] == "data_check":
+            continue
+        if row["asset_class"] not in {"cash", "money_market_fund"} and weight > Decimal(
+            "0.10"
         ):
             row["risk_flag"] = "overweight"
+        else:
+            row["risk_flag"] = "normal"
     return sorted(
         normalized_rows,
         key=lambda row: (
