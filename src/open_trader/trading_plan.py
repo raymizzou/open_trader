@@ -78,10 +78,10 @@ class TradingPlanRow:
     catalyst: str
     time_horizon: str
     plan_text: str
-    agent_reason: str = ""
-    agent_excerpt: str = ""
     status: str = ""
     error: str = ""
+    agent_reason: str = ""
+    agent_excerpt: str = ""
 
     @property
     def futu_symbol(self) -> str:

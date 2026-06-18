@@ -532,6 +532,35 @@ def test_trading_plan_row_defaults_agent_fields() -> None:
     assert row.agent_excerpt == ""
 
 
+def test_trading_plan_row_preserves_old_positional_constructor_order() -> None:
+    row = TradingPlanRow(
+        "2026-06-16",
+        "MSFT",
+        "US",
+        "ok",
+        "",
+        "",
+        "Overweight",
+        Decimal("380"),
+        Decimal("400"),
+        Decimal("350"),
+        Decimal("340"),
+        Decimal("450"),
+        Decimal("500"),
+        "12%",
+        "10月底财报",
+        "3-6个月",
+        "plan",
+        "active",
+        "",
+    )
+
+    assert row.status == "active"
+    assert row.error == ""
+    assert row.agent_reason == ""
+    assert row.agent_excerpt == ""
+
+
 def test_evaluate_plan_quote_classifies_current_price() -> None:
     plan = TradingPlanRow(
         run_date="2026-06-16",
