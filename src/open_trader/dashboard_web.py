@@ -46,23 +46,43 @@ def create_dashboard_server(
                 )
                 return
             if path == "/api/dashboard":
-                self._send_json(build_dashboard_payload(config))
+                try:
+                    self._send_json(build_dashboard_payload(config))
+                except Exception as exc:
+                    self._send_error_json(exc)
                 return
             if path == "/api/quotes":
-                self._send_json(build_quotes_payload(service))
+                try:
+                    self._send_json(build_quotes_payload(service))
+                except Exception as exc:
+                    self._send_error_json(exc)
                 return
             self._send_not_found()
 
         def log_message(self, format: str, *args: Any) -> None:
             return
 
-        def _send_json(self, payload: dict[str, Any]) -> None:
+        def _send_json(
+            self,
+            payload: dict[str, Any],
+            status: HTTPStatus = HTTPStatus.OK,
+        ) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_error_json(self, error: Exception) -> None:
+            self._send_json(
+                {
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                },
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
         def _send_file(self, path: Path, content_type: str) -> None:
             if not path.is_file():
