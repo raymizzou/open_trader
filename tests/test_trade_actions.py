@@ -71,6 +71,8 @@ def msft_plan_row(
     run_date: str = "2026-06-16",
     status: str = "active",
     symbol: str = "MSFT",
+    agent_reason: str = "",
+    agent_excerpt: str = "",
 ) -> dict[str, str]:
     return {
         "run_date": run_date,
@@ -87,6 +89,8 @@ def msft_plan_row(
         "catalyst": "10月底财报",
         "time_horizon": "3-6个月",
         "plan_text": "操作计划：在380-400美元区间分3-4次买入目标仓位的60%，350美元附近加仓剩余40%。",
+        "agent_reason": agent_reason,
+        "agent_excerpt": agent_excerpt,
         "status": status,
         "error": "",
     }
@@ -161,6 +165,8 @@ def active_plan(
     symbol: str = "MSFT",
     max_weight: str = "12%",
     plan_text: str = "操作计划：在380-400美元区间分3-4次买入目标仓位的60%，350美元附近加仓剩余40%。",
+    agent_reason: str = "",
+    agent_excerpt: str = "",
 ) -> TradingPlanRow:
     return TradingPlanRow(
         run_date="2026-06-16",
@@ -180,6 +186,8 @@ def active_plan(
         catalyst="10月底财报",
         time_horizon="3-6个月",
         plan_text=plan_text,
+        agent_reason=agent_reason,
+        agent_excerpt=agent_excerpt,
         status="active",
         error="",
     )
@@ -246,6 +254,9 @@ def test_trade_action_fieldnames_are_stable() -> None:
         "post_trade_weight",
         "post_trade_avg_cost",
         "risk_to_stop",
+        "agent_reason",
+        "agent_excerpt",
+        "trigger_reason",
         "reason",
         "source_plan",
         "status",
@@ -1731,6 +1742,33 @@ def test_underweight_trim_plan_entry_zone_maps_to_trim_without_target_weight() -
     assert row["target_max_weight"] == ""
     assert row["reason"] == "Plan text indicates trim at current levels."
     assert row["error"] == ""
+
+
+def test_build_trade_action_row_preserves_agent_reason_and_trigger() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(
+            max_weight="",
+            plan_text="操作计划：Reduce MSFT exposure at current levels.",
+            agent_reason=(
+                "TradingAgents建议减仓，原文依据：The bear demonstrated that "
+                "normalized earnings imply a ~316x P/E."
+            ),
+            agent_excerpt=(
+                "The bear demonstrated that normalized earnings imply a ~316x P/E."
+            ),
+        ),
+        quote_status=quote_status("target_1_hit", price="451"),
+        portfolio=portfolio_context(),
+        source_plan="plan.csv",
+    )
+
+    assert row["action"] == "TRIM"
+    assert row["agent_reason"].startswith("TradingAgents建议减仓")
+    assert row["agent_excerpt"] == (
+        "The bear demonstrated that normalized earnings imply a ~316x P/E."
+    )
+    assert row["trigger_reason"] == "fixture message"
+    assert row["reason"] == row["agent_reason"]
 
 
 def test_target_two_takes_profit_on_full_position() -> None:

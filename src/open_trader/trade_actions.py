@@ -47,6 +47,9 @@ TRADE_ACTION_FIELDNAMES = (
     "post_trade_weight",
     "post_trade_avg_cost",
     "risk_to_stop",
+    "agent_reason",
+    "agent_excerpt",
+    "trigger_reason",
     "reason",
     "source_plan",
     "status",
@@ -240,10 +243,12 @@ def build_trade_action_row(
     notional_currency = _notional_currency(plan.market, position)
     cash_available = portfolio.cash_by_currency.get(notional_currency, Decimal("0"))
     action, priority = map_quote_status_to_action(quote_status.status)
-    reason = quote_status.message
+    trigger_reason = quote_status.message
+    reason = plan.agent_reason.strip() or trigger_reason
     if action == "BUY" and _plan_text_implies_trim(plan.plan_text):
         action, priority = "TRIM", "medium"
-        reason = "Plan text indicates trim at current levels."
+        trigger_reason = "Plan text indicates trim at current levels."
+        reason = plan.agent_reason.strip() or trigger_reason
 
     row = {
         "run_date": plan.run_date,
@@ -278,6 +283,9 @@ def build_trade_action_row(
         "post_trade_weight": "",
         "post_trade_avg_cost": "",
         "risk_to_stop": "",
+        "agent_reason": plan.agent_reason.strip(),
+        "agent_excerpt": plan.agent_excerpt.strip(),
+        "trigger_reason": trigger_reason,
         "reason": reason,
         "source_plan": source_plan,
         "status": "",
