@@ -1015,6 +1015,58 @@ def _notification_message(
     return "failed: see daily run logs"
 
 
+def _derive_daily_state(
+    *,
+    advice_counts: dict[str, int],
+    plan_counts: dict[str, int],
+    futu_status: dict[str, object],
+    trade_actions: dict[str, int],
+    run_failed: bool = False,
+    already_running: bool = False,
+) -> dict[str, object]:
+    reasons: list[str] = []
+    if run_failed:
+        reasons.append("run_failed")
+    if already_running:
+        reasons.append("already_running")
+    if int(advice_counts.get("fallback", 0) or 0) > 0:
+        reasons.append("advice_fallback")
+    if int(advice_counts.get("error", 0) or 0) > 0:
+        reasons.append("advice_error")
+    if int(plan_counts.get("fallback", 0) or 0) > 0:
+        reasons.append("plan_fallback")
+    if int(plan_counts.get("error", 0) or 0) > 0:
+        reasons.append("plan_error")
+    if str(futu_status.get("error", "")).strip():
+        reasons.append("futu_error")
+    if int(futu_status.get("missing", 0) or 0) > 0:
+        reasons.append("missing_quotes")
+    if int(trade_actions.get("review", 0) or 0) > 0:
+        reasons.append("trade_action_review")
+
+    if run_failed:
+        status = "failed"
+    elif already_running:
+        status = "already_running"
+    elif any(reason != "trade_action_review" for reason in reasons):
+        status = "partial"
+    else:
+        status = "success"
+
+    if any(reason in {"run_failed", "already_running", "futu_error"} for reason in reasons):
+        readiness = "blocked"
+    elif reasons:
+        readiness = "review_required"
+    else:
+        readiness = "ready"
+
+    return {
+        "status": status,
+        "readiness": readiness,
+        "status_reasons": reasons,
+    }
+
+
 def _should_notify_blocker(
     *,
     status: str,

@@ -275,6 +275,90 @@ def test_snapshots_from_futu_status_ignores_nonfinite_last_prices() -> None:
     }
 
 
+def test_derive_daily_state_marks_futu_error_as_blocked() -> None:
+    state = daily_premarket._derive_daily_state(
+        advice_counts={"ok": 1, "fallback": 0, "error": 0},
+        plan_counts={"active": 1, "fallback": 0, "error": 0},
+        futu_status={
+            "checked": 0,
+            "missing": 0,
+            "triggered": 0,
+            "items": [],
+            "error": "网络中断",
+        },
+        trade_actions={"actions": 1, "ready": 0, "review": 0, "watch": 1},
+    )
+
+    assert state == {
+        "status": "partial",
+        "readiness": "blocked",
+        "status_reasons": ["futu_error"],
+    }
+
+
+def test_derive_daily_state_marks_missing_quote_as_review_required() -> None:
+    state = daily_premarket._derive_daily_state(
+        advice_counts={"ok": 1, "fallback": 0, "error": 0},
+        plan_counts={"active": 1, "fallback": 0, "error": 0},
+        futu_status={
+            "checked": 1,
+            "missing": 1,
+            "triggered": 0,
+            "items": [],
+            "error": "",
+        },
+        trade_actions={"actions": 1, "ready": 0, "review": 1, "watch": 0},
+    )
+
+    assert state == {
+        "status": "partial",
+        "readiness": "review_required",
+        "status_reasons": ["missing_quotes", "trade_action_review"],
+    }
+
+
+def test_derive_daily_state_keeps_trade_action_review_as_success_status() -> None:
+    state = daily_premarket._derive_daily_state(
+        advice_counts={"ok": 1, "fallback": 0, "error": 0},
+        plan_counts={"active": 1, "fallback": 0, "error": 0},
+        futu_status={
+            "checked": 1,
+            "missing": 0,
+            "triggered": 1,
+            "items": [],
+            "error": "",
+        },
+        trade_actions={"actions": 1, "ready": 0, "review": 1, "watch": 0},
+    )
+
+    assert state == {
+        "status": "success",
+        "readiness": "review_required",
+        "status_reasons": ["trade_action_review"],
+    }
+
+
+def test_derive_daily_state_marks_success_as_ready() -> None:
+    state = daily_premarket._derive_daily_state(
+        advice_counts={"ok": 1, "fallback": 0, "error": 0},
+        plan_counts={"active": 1, "fallback": 0, "error": 0},
+        futu_status={
+            "checked": 1,
+            "missing": 0,
+            "triggered": 0,
+            "items": [],
+            "error": "",
+        },
+        trade_actions={"actions": 1, "ready": 1, "review": 0, "watch": 0},
+    )
+
+    assert state == {
+        "status": "success",
+        "readiness": "ready",
+        "status_reasons": [],
+    }
+
+
 def test_load_env_config_rejects_missing_required_values(tmp_path: Path) -> None:
     env = tmp_path / "daily.env"
     env.write_text("OPEN_TRADER_REPO=/tmp/open_trader\n", encoding="utf-8")
