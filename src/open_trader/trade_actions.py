@@ -10,6 +10,12 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .futu_watch import QuoteSnapshot
+from .market_scope import (
+    market_report_path,
+    market_run_dir,
+    market_scoped_latest_path,
+    parse_market_scope,
+)
 from .trading_plan import (
     PlanQuoteStatus,
     TradingPlanRow,
@@ -108,6 +114,7 @@ def generate_trade_actions(
     update_latest: bool,
     market: str | None = None,
 ) -> TradeActionsResult:
+    market_scope = parse_market_scope(market) if market is not None else None
     active_plans = [
         plan
         for plan in load_trading_plan_rows(plan_path)
@@ -119,9 +126,8 @@ def generate_trade_actions(
         for plan in active_plans
         if _plan_matches_run_date(plan, effective_run_date)
     ]
-    market_filter = market.strip().upper() if market else None
-    if market_filter is not None:
-        plans = [plan for plan in plans if plan.market.upper() == market_filter]
+    if market_scope is not None:
+        plans = [plan for plan in plans if plan.market.upper() == market_scope.value]
     if run_date is not None and not plans:
         raise ValueError(f"no active trading plans match run_date {effective_run_date}")
     portfolio = load_portfolio_action_context(portfolio_path)
@@ -136,13 +142,22 @@ def generate_trade_actions(
         for plan in plans
     ]
 
-    if market_filter:
-        actions_path = (
-            data_dir / "runs" / effective_run_date / market_filter / "trade_actions.csv"
+    if market_scope is not None:
+        actions_path = market_run_dir(
+            data_dir,
+            effective_run_date,
+            market_scope,
+        ) / "trade_actions.csv"
+        latest_path = market_scoped_latest_path(
+            data_dir,
+            market_scope,
+            "trade_actions.csv",
         )
-        latest_path = data_dir / "latest" / market_filter / "trade_actions.csv"
-        report_path = (
-            reports_dir / "trade_actions" / f"{effective_run_date}-{market_filter}.md"
+        report_path = market_report_path(
+            reports_dir,
+            "trade_actions",
+            effective_run_date,
+            market_scope,
         )
     else:
         actions_path = data_dir / "runs" / effective_run_date / "trade_actions.csv"

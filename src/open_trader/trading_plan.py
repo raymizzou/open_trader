@@ -9,6 +9,12 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Iterable, Mapping
 
+from open_trader.market_scope import (
+    market_run_dir,
+    market_scoped_latest_path,
+    parse_market_scope,
+)
+
 
 TRADING_PLAN_FIELDNAMES = [
     "run_date",
@@ -100,28 +106,34 @@ def build_trading_plan(
 ) -> TradingPlanBuildResult:
     advice_rows = _read_advice_rows(advice_path)
     effective_run_date = run_date or _latest_run_date(advice_rows)
+    market_scope = parse_market_scope(market) if market is not None else None
     filtered_rows = [
         row
         for row in advice_rows
         if not row.get("run_date", "").strip()
         or row.get("run_date", "").strip() == effective_run_date
     ]
-    market_filter = market.strip().upper() if market else None
-    if market_filter is not None:
+    if market_scope is not None:
         filtered_rows = [
             row
             for row in filtered_rows
-            if row.get("market", "").strip().upper() == market_filter
+            if row.get("market", "").strip().upper() == market_scope.value
         ]
     if not filtered_rows and run_date is not None:
         raise ValueError(f"no advice rows match run_date {effective_run_date}")
 
     plan_rows = [_plan_row_from_advice(row, effective_run_date) for row in filtered_rows]
-    if market_filter:
-        plan_path = (
-            data_dir / "runs" / effective_run_date / market_filter / "trading_plan.csv"
+    if market_scope is not None:
+        plan_path = market_run_dir(
+            data_dir,
+            effective_run_date,
+            market_scope,
+        ) / "trading_plan.csv"
+        latest_path = market_scoped_latest_path(
+            data_dir,
+            market_scope,
+            "trading_plan.csv",
         )
-        latest_path = data_dir / "latest" / market_filter / "trading_plan.csv"
     else:
         plan_path = data_dir / "runs" / effective_run_date / "trading_plan.csv"
         latest_path = data_dir / "latest" / "trading_plan.csv"

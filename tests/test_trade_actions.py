@@ -1958,6 +1958,34 @@ def test_generate_trade_actions_writes_market_scoped_hk_paths_and_uses_hkd_cash(
     assert rows[0]["cash_available"] == "10000"
 
 
+@pytest.mark.parametrize("market", ["CN", "../HK", ""])
+def test_generate_trade_actions_rejects_invalid_market_before_writing(
+    tmp_path: Path,
+    valid_portfolio_path: Path,
+    market: str,
+) -> None:
+    plan_path = tmp_path / "trading_plan.csv"
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports"
+    write_trading_plan(plan_path, [msft_plan_row()])
+
+    with pytest.raises(ValueError, match="market must be one of: HK, US"):
+        generate_trade_actions(
+            plan_path=plan_path,
+            portfolio_path=valid_portfolio_path,
+            data_dir=data_dir,
+            reports_dir=reports_dir,
+            snapshots={"US.MSFT": QuoteSnapshot("US.MSFT", Decimal("390"))},
+            run_date="2026-06-16",
+            update_latest=True,
+            market=market,
+        )
+
+    assert not (data_dir / "runs").exists()
+    assert not (data_dir / "latest").exists()
+    assert not (reports_dir / "trade_actions").exists()
+
+
 def test_generate_trade_actions_dry_run_does_not_update_latest(
     tmp_path: Path,
     valid_portfolio_path: Path,

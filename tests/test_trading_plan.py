@@ -4,6 +4,8 @@ import csv
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from open_trader.trading_plan import (
     TRADING_PLAN_FIELDNAMES,
     PlanQuoteStatus,
@@ -154,6 +156,41 @@ def test_build_trading_plan_writes_market_scoped_hk_paths(tmp_path: Path) -> Non
     assert result.plan_path == tmp_path / "data/runs/2026-06-19/HK/trading_plan.csv"
     assert result.latest_path == tmp_path / "data/latest/HK/trading_plan.csv"
     assert rows[0].futu_symbol == "HK.00700"
+
+
+@pytest.mark.parametrize("market", ["CN", "../HK", ""])
+def test_build_trading_plan_rejects_invalid_market_before_writing(
+    tmp_path: Path,
+    market: str,
+) -> None:
+    advice = tmp_path / "advice.csv"
+    data_dir = tmp_path / "data"
+    write_advice(
+        advice,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "00700",
+                "market": "HK",
+                "advice_action": "Overweight",
+                "advice_summary": msft_advice_summary(),
+                "status": "ok",
+                "error": "",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="market must be one of: HK, US"):
+        build_trading_plan(
+            advice,
+            data_dir,
+            run_date="2026-06-19",
+            update_latest=True,
+            market=market,
+        )
+
+    assert not (data_dir / "runs").exists()
+    assert not (data_dir / "latest").exists()
 
 
 def test_build_trading_plan_dry_run_does_not_update_latest(tmp_path: Path) -> None:
