@@ -1817,6 +1817,24 @@ def test_missing_quote_maps_to_review_with_quote_message() -> None:
     assert row["reason"] == "fixture message"
 
 
+def test_missing_quote_review_keeps_agent_fields_but_reason_stays_operational() -> None:
+    row = build_trade_action_row(
+        plan=active_plan(
+            agent_reason="TradingAgents建议继续观察，但这里先保留模型叙述。",
+            agent_excerpt="Model narrative excerpt.",
+        ),
+        quote_status=quote_status("missing_quote"),
+        portfolio=portfolio_context(),
+        source_plan="data/latest/trading_plan.csv",
+    )
+
+    assert row["status"] == "review"
+    assert row["agent_reason"] == "TradingAgents建议继续观察，但这里先保留模型叙述。"
+    assert row["trigger_reason"] == "fixture message"
+    assert row["error"] == "fixture message"
+    assert row["reason"] == "fixture message"
+
+
 def test_buy_side_missing_portfolio_position_maps_to_review() -> None:
     row = build_trade_action_row(
         plan=active_plan(),

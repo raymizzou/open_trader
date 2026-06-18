@@ -296,9 +296,7 @@ def build_trade_action_row(
         row["status"] = "watch"
         return row
     if action == "REVIEW":
-        row["status"] = "review"
-        row["error"] = quote_status.message
-        return row
+        return _review_row(row, quote_status.message)
     if action in {"SELL_STOP", "TAKE_PROFIT", "TRIM"}:
         return _size_sell_action_row(row, action, quote_status, position, portfolio)
     return _size_buy_action_row(
