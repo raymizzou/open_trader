@@ -536,11 +536,55 @@ def test_render_feishu_order_review_shows_agent_reason_excerpt_and_neutral_trim_
         report_paths=[],
     )
 
-    assert "原因：TradingAgents建议减仓，原文依据：The bear demonstrated" in body
+    assert "原因：TradingAgents建议减仓。" in body
     assert "原文：The bear demonstrated that normalized earnings imply a ~316x P/E." in body
     assert "触发：当前价 289.54，行动已满足计划中的减仓/风控条件。" in body
     assert "目标价 1" not in body
     assert "Current price is at or above target 1." not in body
+
+
+def test_render_feishu_order_review_uses_chinese_fallback_for_english_only_agent_reason(
+    tmp_path: Path,
+) -> None:
+    actions_path = tmp_path / "trade_actions.csv"
+    _write_actions(
+        actions_path,
+        [
+            _action_row(
+                symbol="NVDA",
+                futu_symbol="US.NVDA",
+                action="ADD",
+                priority="high",
+                last_price="120",
+                suggested_quantity="10",
+                suggested_notional="1200",
+                notional_currency="USD",
+                current_quantity="20",
+                current_weight="1.00%",
+                avg_cost_price="100",
+                limit_price="118",
+                stop_price="110",
+                post_trade_quantity="30",
+                post_trade_weight="1.50%",
+                post_trade_avg_cost="106.67",
+                risk_to_stop="100",
+                agent_reason="The bull case remains intact.",
+                agent_excerpt="The bull case remains intact.",
+                status="ready",
+            )
+        ],
+    )
+
+    body = render_feishu_order_review(
+        run_date="2026-06-18",
+        status="success",
+        actions_path=actions_path,
+        report_paths=[],
+    )
+
+    assert "原因：TradingAgents建议加仓，需结合原文确认。" in body
+    assert "原文：The bull case remains intact." in body
+    assert "原因：The bull case remains intact." not in body
 
 
 def test_render_feishu_order_review_truncates_ready_rows_and_includes_reports(
@@ -669,7 +713,8 @@ def test_render_feishu_order_review_supports_legacy_rows_without_agent_fields(
     )
 
     assert "原因：价格进入计划买入区间。" in body
-    assert "原文依据缺失，需人工复核。" in body
+    assert "原文依据缺失，需人工复核。" not in body
+    assert "触发：价格进入计划买入区间。" not in body
 
 
 def _write_actions(path: Path, rows: list[dict[str, str]]) -> None:

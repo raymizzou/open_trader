@@ -225,9 +225,6 @@ def _render_ready_section(row: Mapping[str, str], *, index: int) -> list[str]:
     excerpt_line = _agent_excerpt_line(row)
     if excerpt_line:
         lines.append(excerpt_line)
-    missing_agent_reason = _missing_agent_reason_line(row)
-    if missing_agent_reason:
-        lines.append(missing_agent_reason)
     trigger_line = _trigger_reason_line(row)
     if trigger_line:
         lines.append(trigger_line)
@@ -334,7 +331,7 @@ def _sentence(text: str) -> str:
     stripped = text.strip()
     if not stripped:
         return ""
-    if stripped.endswith(("。", "！", "？")):
+    if stripped.endswith(("。", "！", "？", ".", "!", "?")):
         return stripped
     return f"{stripped}。"
 
@@ -408,7 +405,8 @@ def _currency_label(currency: str) -> str:
 def _agent_reason_line(row: Mapping[str, str]) -> str:
     agent_reason = row.get("agent_reason", "").strip()
     if agent_reason:
-        return f"原因：{_sentence(agent_reason)}"
+        concise_reason = _concise_agent_reason(row, agent_reason)
+        return f"原因：{_sentence(concise_reason)}"
     fallback = _localized_note(row.get("reason", "").strip())
     if fallback:
         return f"原因：{_sentence(fallback)}"
@@ -430,18 +428,49 @@ def _missing_agent_reason_line(row: Mapping[str, str]) -> str:
 
 def _trigger_reason_line(row: Mapping[str, str]) -> str:
     trigger_reason = row.get("trigger_reason", "").strip()
+    if not trigger_reason:
+        return ""
     action = row.get("action", "").strip().upper()
     last_price = row.get("last_price", "").strip()
     if action in {"TRIM", "TAKE_PROFIT", "SELL_STOP"} and trigger_reason:
         if action == "SELL_STOP":
             return f"触发：当前价 {last_price}，行动已满足计划中的止损条件。"
         return f"触发：当前价 {last_price}，行动已满足计划中的减仓/风控条件。"
-    if trigger_reason:
-        return f"触发：{_sentence(_localized_note(trigger_reason))}"
-    fallback = row.get("reason", "").strip()
-    if fallback:
-        return f"触发：{_sentence(_localized_note(fallback))}"
-    return ""
+    return f"触发：{_sentence(_localized_note(trigger_reason))}"
+
+
+def _concise_agent_reason(row: Mapping[str, str], agent_reason: str) -> str:
+    concise_reason = agent_reason.split("，原文依据：", 1)[0].strip()
+    if concise_reason and not _contains_ascii_letters(concise_reason):
+        return concise_reason
+    if concise_reason and "TradingAgents" in concise_reason and not _looks_english_only(
+        concise_reason
+    ):
+        return concise_reason
+    return _agent_reason_fallback(row)
+
+
+def _agent_reason_fallback(row: Mapping[str, str]) -> str:
+    action = row.get("action", "").strip().upper()
+    action_text = {
+        "BUY": "买入",
+        "ADD": "加仓",
+        "TRIM": "减仓",
+        "SELL_STOP": "止损卖出",
+        "TAKE_PROFIT": "止盈卖出",
+        "HOLD": "持有",
+    }.get(action, "处理")
+    return f"TradingAgents建议{action_text}，需结合原文确认"
+
+
+def _contains_ascii_letters(text: str) -> bool:
+    return any(("A" <= char <= "Z") or ("a" <= char <= "z") for char in text)
+
+
+def _looks_english_only(text: str) -> bool:
+    return _contains_ascii_letters(text) and not any(
+        "\u4e00" <= char <= "\u9fff" for char in text
+    )
 
 
 def _localized_note(text: str) -> str:
