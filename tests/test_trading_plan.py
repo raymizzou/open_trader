@@ -457,6 +457,33 @@ def test_load_trading_plan_rows_accepts_legacy_rows_without_source_status(
     assert rows[0].agent_excerpt == ""
 
 
+def test_trading_plan_row_defaults_agent_fields() -> None:
+    row = TradingPlanRow(
+        run_date="2026-06-16",
+        symbol="MSFT",
+        market="US",
+        source_status="ok",
+        fallback_reason="",
+        fallback_from_date="",
+        rating="Overweight",
+        entry_zone_low=Decimal("380"),
+        entry_zone_high=Decimal("400"),
+        add_price=Decimal("350"),
+        stop_loss=Decimal("340"),
+        target_1=Decimal("450"),
+        target_2=Decimal("500"),
+        max_weight="12%",
+        catalyst="10月底财报",
+        time_horizon="3-6个月",
+        plan_text="plan",
+        status="active",
+        error="",
+    )
+
+    assert row.agent_reason == ""
+    assert row.agent_excerpt == ""
+
+
 def test_evaluate_plan_quote_classifies_current_price() -> None:
     plan = TradingPlanRow(
         run_date="2026-06-16",
