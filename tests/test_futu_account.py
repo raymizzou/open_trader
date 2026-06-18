@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from open_trader import futu_account as futu_account_module
 from open_trader.futu_account import (
     FutuAccountClient,
     FutuAccountError,
@@ -654,6 +655,50 @@ def test_sync_futu_portfolio_updates_latest_only_when_requested(tmp_path: Path) 
     assert result.updated_latest is True
 
 
+def test_sync_futu_portfolio_promotes_latest_through_atomic_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [old_futu_row(), tiger_row()])
+    calls: list[tuple[Path, set[str]]] = []
+
+    def spy_write_latest(path: Path, rows: list[dict[str, str]]) -> None:
+        rows_list = list(rows)
+        calls.append((path, {row["symbol"] for row in rows_list}))
+        write_portfolio(path, rows_list)
+
+    monkeypatch.setattr(
+        futu_account_module,
+        "_write_latest_portfolio_atomic",
+        spy_write_latest,
+        raising=False,
+    )
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "USD",
+                "cash": "100",
+                "available_cash": "90",
+            }
+        ],
+        position_records=[],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-18",
+        update_latest=True,
+    )
+
+    assert calls == [(result.latest_path, {"AAPL", "USD_CASH"})]
+    assert result.updated_latest is True
+
+
 def test_sync_futu_portfolio_clears_stale_preserved_overweight_flag(
     tmp_path: Path,
 ) -> None:
@@ -724,6 +769,53 @@ def test_sync_futu_portfolio_blocks_latest_when_required_fields_are_malformed(
 
     assert exc_info.value.error_type == "blocking_data_error"
     assert read_portfolio(portfolio_path)[0]["symbol"] == "OLD"
+    run_dir = tmp_path / "data/runs/2026-06-18"
+    snapshot_path = run_dir / "futu_account_snapshot.json"
+    merged_portfolio_path = run_dir / "portfolio.csv"
+    report_path = run_dir / "futu_account_report.md"
+    assert snapshot_path.exists()
+    assert merged_portfolio_path.exists()
+    assert report_path.exists()
+    snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot_payload["position_records"][0]["qty"] == "bad"
+    report = report_path.read_text(encoding="utf-8")
+    assert "富途账户同步" in report
+    assert "数据检查：需要复核" in report
+    assert "未更新 latest" in report
+
+
+@pytest.mark.parametrize("market_value_hkd", ["", "not-a-number"])
+def test_sync_futu_portfolio_marks_all_rows_data_check_when_preserved_hkd_value_is_invalid(
+    tmp_path: Path,
+    market_value_hkd: str,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    malformed_tiger = {**tiger_row(), "market_value_hkd": market_value_hkd}
+    write_portfolio(portfolio_path, [malformed_tiger])
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "USD",
+                "cash": "100",
+                "available_cash": "90",
+            }
+        ],
+        position_records=[],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-18",
+        update_latest=False,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    assert {row["portfolio_weight_hkd"] for row in rows} == {""}
+    assert {row["risk_flag"] for row in rows} == {"data_check"}
 
 
 def test_sync_futu_portfolio_blocks_mixed_futu_broker_rows(tmp_path: Path) -> None:

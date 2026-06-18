@@ -422,11 +422,6 @@ def sync_futu_portfolio(
         snapshot,
         run_date=run_date,
     )
-    if update_latest and blocking_errors:
-        raise FutuAccountError(
-            "; ".join(blocking_errors),
-            error_type="blocking_data_error",
-        )
     futu_rows = build_portfolio_rows(
         run_date[:7],
         positions,
@@ -458,8 +453,13 @@ def sync_futu_portfolio(
     latest_path = data_dir / "latest" / "portfolio.csv"
     updated_latest = False
     if update_latest and not blocking_errors:
-        write_rows(latest_path, PORTFOLIO_FIELDNAMES, merged_rows)
+        _write_latest_portfolio_atomic(latest_path, merged_rows)
         updated_latest = True
+    if update_latest and blocking_errors:
+        raise FutuAccountError(
+            "; ".join(blocking_errors),
+            error_type="blocking_data_error",
+        )
     return FutuPortfolioSyncResult(
         run_date=run_date,
         account_count=len(snapshot.accounts),
@@ -477,6 +477,19 @@ def sync_futu_portfolio(
 def _read_portfolio_rows(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _write_latest_portfolio_atomic(
+    latest_path: Path,
+    rows: list[dict[str, str]],
+) -> None:
+    temp_path = latest_path.with_name(f".{latest_path.name}.tmp")
+    try:
+        write_rows(temp_path, PORTFOLIO_FIELDNAMES, rows)
+        temp_path.replace(latest_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def _has_futu_broker(row: dict[str, str]) -> bool:
@@ -531,29 +544,23 @@ def _recalculate_combined_portfolio_rows(
         {field: str(row.get(field, "")) for field in PORTFOLIO_FIELDNAMES}
         for row in rows
     ]
+    parsed_market_values: list[Decimal | None] = []
     values: list[Decimal] = []
     has_missing_value = False
     for row in normalized_rows:
-        value_text = row.get("market_value_hkd", "").strip()
-        if not value_text:
-            has_missing_value = True
-            continue
-        try:
-            value = Decimal(value_text)
-        except (InvalidOperation, ValueError):
-            has_missing_value = True
-            continue
-        if not value.is_finite():
+        value = _parse_finite_decimal(row.get("market_value_hkd", "").strip())
+        parsed_market_values.append(value)
+        if value is None:
             has_missing_value = True
             continue
         values.append(value)
     total = sum(values, Decimal("0"))
-    for row in normalized_rows:
+    for row, market_value_hkd in zip(normalized_rows, parsed_market_values):
         if has_missing_value:
             row["portfolio_weight_hkd"] = ""
             row["risk_flag"] = "data_check"
             continue
-        market_value_hkd = Decimal(row["market_value_hkd"] or "0")
+        market_value_hkd = market_value_hkd or Decimal("0")
         weight = market_value_hkd / total if total else Decimal("0")
         row["portfolio_weight_hkd"] = pct(weight)
         if row["risk_flag"] == "data_check":
@@ -564,13 +571,28 @@ def _recalculate_combined_portfolio_rows(
             row["risk_flag"] = "overweight"
         else:
             row["risk_flag"] = "normal"
-    return sorted(
-        normalized_rows,
-        key=lambda row: (
-            int(row.get("sort_group") or "9"),
-            -Decimal(row.get("market_value_hkd") or "0"),
-        ),
-    )
+    return [
+        row
+        for row, _ in sorted(
+            zip(normalized_rows, parsed_market_values),
+            key=lambda item: (
+                int(item[0].get("sort_group") or "9"),
+                -(item[1] or Decimal("0")),
+            ),
+        )
+    ]
+
+
+def _parse_finite_decimal(value_text: str) -> Decimal | None:
+    if not value_text:
+        return None
+    try:
+        value = Decimal(value_text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not value.is_finite():
+        return None
+    return value
 
 
 def _snapshot_to_json(snapshot: FutuAccountSnapshot) -> dict[str, object]:
