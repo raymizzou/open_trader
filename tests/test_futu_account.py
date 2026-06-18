@@ -596,6 +596,14 @@ def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]) if rows else [])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def read_portfolio(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle))
@@ -727,6 +735,115 @@ def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
     assert "富途账户同步" in report
     assert "真实账户：1" in report
     assert "未更新 latest" in report
+
+
+def test_sync_futu_portfolio_rebuilds_mixed_symbols_from_statement_details(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    mixed_vixy_row = {
+        **old_futu_row(),
+        "asset_class": "etf",
+        "symbol": "VIXY",
+        "name": "VIXY",
+        "total_quantity": "200",
+        "market_value": "4842.8",
+        "market_value_hkd": "38015.98",
+        "brokers": "futu;tiger",
+        "accounts": "futu_main;tiger_main",
+        "fx_to_hkd": "7.85",
+    }
+    write_portfolio(portfolio_path, [mixed_vixy_row])
+    write_csv(
+        tmp_path / "data/runs/2026-05/extracted_positions.csv",
+        [
+            {
+                "statement_id": "2026-05-futu",
+                "broker": "futu",
+                "account_alias": "futu_main",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "VIXY",
+                "name": "VIXY",
+                "currency": "USD",
+                "quantity": "165",
+                "cost_price": "",
+                "last_price": "24.41",
+                "market_value": "4027.65",
+                "cost_value": "",
+                "unrealized_pnl": "",
+                "confidence": "high",
+                "notes": "",
+            },
+            {
+                "statement_id": "2026-05-tiger",
+                "broker": "tiger",
+                "account_alias": "tiger_main",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "VIXY",
+                "name": "VIXY",
+                "currency": "USD",
+                "quantity": "35",
+                "cost_price": "28.7408571",
+                "last_price": "23.29",
+                "market_value": "815.15",
+                "cost_value": "1005.9299985",
+                "unrealized_pnl": "-190.78",
+                "confidence": "high",
+                "notes": "",
+            },
+        ],
+    )
+    snapshot = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "US.VIXY",
+                "stock_name": "VIXY",
+                "qty": "100",
+                "cost_price": "42.616",
+                "nominal_price": "21.925",
+                "market_val": "2192.5",
+                "pl_val": "-2069.07",
+                "currency": "USD",
+            }
+        ],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-19",
+        update_latest=False,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "VIXY"
+    assert rows[0]["brokers"] == "futu;tiger"
+    assert rows[0]["total_quantity"] == "135"
+    assert rows[0]["market_value"] == "3007.65"
+    assert read_portfolio(portfolio_path)[0]["total_quantity"] == "200"
+    with (tmp_path / "data/runs/2026-06-19/extracted_positions.csv").open(
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        detail_rows = list(csv.DictReader(handle))
+    assert [
+        {
+            "broker": row["broker"],
+            "symbol": row["symbol"],
+            "quantity": row["quantity"],
+        }
+        for row in detail_rows
+    ] == [
+        {"broker": "tiger", "symbol": "VIXY", "quantity": "35"},
+        {"broker": "futu", "symbol": "VIXY", "quantity": "100"},
+    ]
 
 
 def test_sync_futu_portfolio_cash_count_uses_expanded_currency_balances(

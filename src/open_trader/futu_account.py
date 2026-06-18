@@ -4,6 +4,7 @@ import csv
 import json
 import socket
 from dataclasses import dataclass
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +16,34 @@ from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
 
 
 TRD_ENV_REAL = "REAL"
+POSITION_DETAIL_FIELDNAMES = [
+    "statement_id",
+    "broker",
+    "account_alias",
+    "market",
+    "asset_class",
+    "symbol",
+    "name",
+    "currency",
+    "quantity",
+    "cost_price",
+    "last_price",
+    "market_value",
+    "cost_value",
+    "unrealized_pnl",
+    "confidence",
+    "notes",
+]
+CASH_DETAIL_FIELDNAMES = [
+    "statement_id",
+    "broker",
+    "account_alias",
+    "currency",
+    "cash_balance",
+    "available_balance",
+    "confidence",
+    "notes",
+]
 FUTU_CASH_CURRENCY_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("HKD", "hk_cash", "hk_avl_withdrawal_cash"),
     ("USD", "us_cash", "us_avl_withdrawal_cash"),
@@ -481,30 +510,62 @@ def sync_futu_portfolio(
     update_latest: bool,
 ) -> FutuPortfolioSyncResult:
     existing_rows = _read_portfolio_rows(portfolio_path)
-    _raise_for_mixed_futu_broker_rows(existing_rows)
     fx_provider = _fx_provider_from_existing_rows(run_date, existing_rows)
-    preserved_rows = [row for row in existing_rows if not _has_futu_broker(row)]
+    preserved_positions, preserved_cash = _latest_non_futu_statement_inputs(data_dir)
+    use_statement_details = bool(preserved_positions or preserved_cash)
+    if not use_statement_details:
+        _raise_for_mixed_futu_broker_rows(existing_rows)
+        preserved_rows = [row for row in existing_rows if not _has_futu_broker(row)]
+    else:
+        preserved_rows = []
     positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
         snapshot,
         run_date=run_date,
     )
-    futu_rows = build_portfolio_rows(
-        run_date[:7],
-        positions,
-        cash_balances,
-        fx_provider,
-    )
-    merged_rows = _recalculate_combined_portfolio_rows([*preserved_rows, *futu_rows])
+    if use_statement_details:
+        positions = _apply_asset_class_hints(
+            positions,
+            _asset_class_hints(preserved_positions),
+        )
+        merged_rows = build_portfolio_rows(
+            run_date[:7],
+            [*preserved_positions, *positions],
+            [*preserved_cash, *cash_balances],
+            fx_provider,
+        )
+    else:
+        futu_rows = build_portfolio_rows(
+            run_date[:7],
+            positions,
+            cash_balances,
+            fx_provider,
+        )
+        merged_rows = _recalculate_combined_portfolio_rows([*preserved_rows, *futu_rows])
     run_dir = data_dir / "runs" / run_date
     run_dir.mkdir(parents=True, exist_ok=True)
     report_dir = reports_dir / "futu_account"
     report_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = run_dir / "futu_account_snapshot.json"
     merged_portfolio_path = run_dir / "portfolio.csv"
+    extracted_positions_path = run_dir / "extracted_positions.csv"
+    extracted_cash_path = run_dir / "extracted_cash.csv"
     report_path = report_dir / f"{run_date}.md"
     snapshot_path.write_text(
         json.dumps(_snapshot_to_json(snapshot), ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+    write_rows(
+        extracted_positions_path,
+        POSITION_DETAIL_FIELDNAMES,
+        (
+            _position_to_statement_row(position)
+            for position in [*preserved_positions, *positions]
+        ),
+    )
+    write_rows(
+        extracted_cash_path,
+        CASH_DETAIL_FIELDNAMES,
+        (_cash_to_statement_row(cash) for cash in [*preserved_cash, *cash_balances]),
     )
     write_rows(merged_portfolio_path, PORTFOLIO_FIELDNAMES, merged_rows)
     report_path.write_text(
@@ -544,6 +605,178 @@ def sync_futu_portfolio(
 def _read_portfolio_rows(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _latest_non_futu_statement_inputs(
+    data_dir: Path,
+) -> tuple[list[Position], list[CashBalance]]:
+    detail_dir = _latest_statement_detail_dir(data_dir)
+    if detail_dir is None:
+        return [], []
+    positions = [
+        _position_from_statement_row(row)
+        for row in _read_csv_rows(detail_dir / "extracted_positions.csv")
+        if row.get("broker", "").strip().lower() != "futu"
+    ]
+    cash_balances = [
+        _cash_from_statement_row(row)
+        for row in _read_csv_rows(detail_dir / "extracted_cash.csv")
+        if row.get("broker", "").strip().lower() != "futu"
+    ]
+    return positions, cash_balances
+
+
+def _latest_statement_detail_dir(data_dir: Path) -> Path | None:
+    runs_dir = data_dir / "runs"
+    if not runs_dir.exists():
+        return None
+    detail_dirs = [
+        path
+        for path in runs_dir.iterdir()
+        if path.is_dir()
+        and len(path.name) == 7
+        and (path / "extracted_positions.csv").is_file()
+    ]
+    return max(detail_dirs, key=lambda path: path.name) if detail_dirs else None
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _position_from_statement_row(row: dict[str, str]) -> Position:
+    quantity, quantity_ok = _required_decimal(row, ("quantity",))
+    confidence = _confidence(row.get("confidence", ""), quantity_ok)
+    return Position(
+        statement_id=row.get("statement_id", ""),
+        broker=row.get("broker", ""),
+        account_alias=row.get("account_alias", ""),
+        market=_market_from_text(row.get("market", "")),
+        asset_class=_asset_class_from_text(row.get("asset_class", "")),
+        symbol=row.get("symbol", ""),
+        name=row.get("name", ""),
+        currency=row.get("currency", "").upper(),
+        quantity=quantity,
+        cost_price=_optional_decimal(row, ("cost_price",)),
+        last_price=_optional_decimal(row, ("last_price",)),
+        market_value=_optional_decimal(row, ("market_value",)),
+        cost_value=_optional_decimal(row, ("cost_value",)),
+        unrealized_pnl=_optional_decimal(row, ("unrealized_pnl",)),
+        confidence=confidence,
+        notes=row.get("notes", ""),
+    )
+
+
+def _cash_from_statement_row(row: dict[str, str]) -> CashBalance:
+    cash_balance, cash_ok = _required_decimal(row, ("cash_balance",))
+    return CashBalance(
+        statement_id=row.get("statement_id", ""),
+        broker=row.get("broker", ""),
+        account_alias=row.get("account_alias", ""),
+        currency=row.get("currency", "").upper(),
+        cash_balance=cash_balance,
+        available_balance=_optional_decimal(row, ("available_balance",)),
+        confidence=_confidence(row.get("confidence", ""), cash_ok),
+        notes=row.get("notes", ""),
+    )
+
+
+def _position_to_statement_row(position: Position) -> dict[str, str]:
+    return {
+        "statement_id": position.statement_id,
+        "broker": position.broker,
+        "account_alias": position.account_alias,
+        "market": position.market.value,
+        "asset_class": position.asset_class.value,
+        "symbol": position.symbol,
+        "name": position.name,
+        "currency": position.currency,
+        "quantity": _decimal_to_str(position.quantity),
+        "cost_price": _decimal_to_str(position.cost_price),
+        "last_price": _decimal_to_str(position.last_price),
+        "market_value": _decimal_to_str(position.market_value),
+        "cost_value": _decimal_to_str(position.cost_value),
+        "unrealized_pnl": _decimal_to_str(position.unrealized_pnl),
+        "confidence": position.confidence,
+        "notes": position.notes,
+    }
+
+
+def _cash_to_statement_row(cash: CashBalance) -> dict[str, str]:
+    return {
+        "statement_id": cash.statement_id,
+        "broker": cash.broker,
+        "account_alias": cash.account_alias,
+        "currency": cash.currency,
+        "cash_balance": _decimal_to_str(cash.cash_balance),
+        "available_balance": _decimal_to_str(cash.available_balance),
+        "confidence": cash.confidence,
+        "notes": cash.notes,
+    }
+
+
+def _decimal_to_str(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    return format(value.normalize(), "f")
+
+
+def _market_from_text(value: str) -> Market:
+    try:
+        return Market(value.strip().upper())
+    except ValueError:
+        return Market.OTHER
+
+
+def _asset_class_from_text(value: str) -> AssetClass:
+    try:
+        return AssetClass(value.strip().lower())
+    except ValueError:
+        return AssetClass.UNKNOWN
+
+
+def _confidence(value: str, required_fields_ok: bool) -> str:
+    normalized = value.strip().lower()
+    if required_fields_ok and normalized in {"high", "medium", "low"}:
+        return normalized
+    return "low"
+
+
+def _asset_class_hints(
+    positions: list[Position],
+) -> dict[tuple[Market, str, str], AssetClass]:
+    return {
+        (
+            position.market,
+            position.symbol.upper(),
+            position.currency.upper(),
+        ): position.asset_class
+        for position in positions
+        if position.asset_class != AssetClass.UNKNOWN
+    }
+
+
+def _apply_asset_class_hints(
+    positions: list[Position],
+    hints: dict[tuple[Market, str, str], AssetClass],
+) -> list[Position]:
+    output: list[Position] = []
+    for position in positions:
+        if position.asset_class != AssetClass.UNKNOWN:
+            output.append(position)
+            continue
+        hint = hints.get(
+            (
+                position.market,
+                position.symbol.upper(),
+                position.currency.upper(),
+            )
+        )
+        output.append(replace(position, asset_class=hint) if hint is not None else position)
+    return output
 
 
 def _write_latest_portfolio_atomic(

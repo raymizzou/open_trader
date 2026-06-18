@@ -262,3 +262,65 @@ def test_load_dashboard_state_uses_portfolio_when_monthly_details_are_absent(
     assert holdings_by_symbol["VIXY"]["broker_detail_count"] == 0
     assert holdings_by_symbol["VIXY"]["broker_details"] == []
     assert holdings_by_symbol["VIXY"]["trade_action"] == {}
+
+
+def test_load_dashboard_state_prefers_latest_daily_sync_details(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "runs" / "2026-05" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-05-futu",
+                "broker": "futu",
+                "account_alias": "old",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "VIXY",
+                "name": "VIXY",
+                "currency": "USD",
+                "quantity": "165",
+                "cost_price": "",
+                "last_price": "24.41",
+                "market_value": "4027.65",
+                "cost_value": "",
+                "unrealized_pnl": "",
+                "confidence": "high",
+                "notes": "",
+            }
+        ],
+    )
+    write_csv(
+        config.data_dir / "runs" / "2026-06-19" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-06-19-futu-live",
+                "broker": "futu",
+                "account_alias": "live",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "VIXY",
+                "name": "VIXY",
+                "currency": "USD",
+                "quantity": "100",
+                "cost_price": "42.62",
+                "last_price": "21.93",
+                "market_value": "2193.00",
+                "cost_value": "4261.60",
+                "unrealized_pnl": "-2068.60",
+                "confidence": "high",
+                "notes": "Futu live account position",
+            }
+        ],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    assert state["broker_detail_month"] == "2026-06-19"
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["broker_details"][0]["account_alias"] == "live"
+    assert vixy["broker_details"][0]["quantity"] == "100"

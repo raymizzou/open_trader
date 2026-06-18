@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-MONTH_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,7 @@ def latest_broker_detail_month(data_dir: Path) -> str:
         path.name
         for path in runs_dir.iterdir()
         if path.is_dir()
-        and MONTH_DIR_PATTERN.fullmatch(path.name)
+        and DETAIL_DIR_PATTERN.fullmatch(path.name)
         and (path / "extracted_positions.csv").is_file()
     ]
     return max(months) if months else ""
