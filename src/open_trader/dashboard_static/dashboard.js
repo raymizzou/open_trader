@@ -1701,9 +1701,17 @@ function renderBrokerSummaryCards() {
     <article class="broker-summary-card" data-broker="${escapeHtml(brokerKey(summary))}">
       <span class="summary-label">${escapeHtml(brokerDisplayName(summary))}</span>
       <strong>${escapeHtml(formatMoney(summary.portfolio_value_hkd, "HKD"))}</strong>
-      <span class="summary-note">持仓 ${escapeHtml(formatPlain(summary.holding_count))} · ${escapeHtml(sourceKindText(summary.source_kind || summary.source_status))}</span>
+      <span class="summary-note">持仓 ${escapeHtml(formatPlain(summary.holding_count))} · ${escapeHtml(brokerSummarySourceText(summary))}</span>
     </article>
   `).join("");
+}
+
+function brokerSummarySourceText(summary) {
+  const source = sourceStatuses().find((row) => brokerKey(row) === brokerKey(summary));
+  if (source) {
+    return sourceDisplayText(source);
+  }
+  return sourceKindText(summary.source_kind || summary.source_status);
 }
 
 function renderSourceStatusListIntoHeader() {

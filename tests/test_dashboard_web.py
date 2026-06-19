@@ -393,12 +393,26 @@ state.dashboard = {
       holding_count: 1,
       source_status: "statement",
     },
+    {
+      broker: "tiger",
+      display_name: "老虎",
+      portfolio_value_hkd: "22698.00",
+      holding_count: 1,
+      source_status: "real_time",
+    },
   ],
   source_statuses: [
     {
       broker: "futu",
       display_name: "富途",
       status: "real_time",
+      updated_at: "2026-06-19T09:30:00+08:00",
+    },
+    {
+      broker: "tiger",
+      display_name: "老虎",
+      status: "ok",
+      display_text: "账户实时同步，行情走富途",
       updated_at: "2026-06-19T09:30:00+08:00",
     },
     {
@@ -489,6 +503,9 @@ state.dashboard.holdings.pop();
 const brokerCards = renderBrokerSummaryCards();
 if (!brokerCards.includes("富途") || !brokerCards.includes("HKD -99071.35")) {
   throw new Error("broker card missing expected text: " + brokerCards);
+}
+if (!brokerCards.includes("老虎") || !brokerCards.includes("账户实时同步，行情走富途")) {
+  throw new Error("broker card should distinguish Tiger account data from Futu quotes: " + brokerCards);
 }
 let sourceList = renderSourceStatusList();
 if (!sourceList.includes("辉立") || !sourceList.includes("非实时")) {
