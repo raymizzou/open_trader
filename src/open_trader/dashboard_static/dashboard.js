@@ -43,6 +43,7 @@ const ACTION_STATUS_LABELS = {
   active: "有效",
   error: "错误",
   ok: "正常",
+  manual_review: "需复核",
   ready: "待确认",
   review: "需复核",
   watch: "观察中",
@@ -666,9 +667,7 @@ function renderSymbolDetail(holding, index) {
       ${renderMetric("数据健康", dataHealthText(holding))}
     </section>
     <div class="detail-grid">
-      ${renderAgentReportSection(holding.agent_report, holding)}
-      ${renderStrategySection(holding.strategy, holding)}
-      ${renderTradeActionSection(holding)}
+      ${renderAnalysisStrategySection(holding)}
       ${renderBrokerDetailSection(holding.broker_details)}
     </div>
   `;
@@ -740,15 +739,15 @@ function renderChineseAgentSummary(report, holding) {
   const action = holding.trade_action || holding.premarket_action || {};
   const reason = safeChineseReason(action, strategy, report);
   const terms = [
-    renderRequiredTerm("观点", formatAction(report.rating || report.advice_action)),
-    renderRequiredTerm("报告状态", formatActionStatus(report.status)),
+    renderRequiredTerm("观点", firstMappedActionLabel(report.rating, report.advice_action)),
+    renderRequiredTerm("报告状态", mappedActionStatusLabel(report.status)),
     renderRequiredTerm("生成时间", report.generated_at || report.run_date),
-    renderChineseTerm("交易动作", action.action),
-    renderChineseTerm("动作状态", action.status),
-    renderChineseTerm("触发状态", action.trigger_status),
+    renderChineseTerm("交易动作", firstMappedActionLabel(action.action, action.suggested_action)),
+    renderChineseTerm("动作状态", mappedActionStatusLabel(action.status)),
+    renderChineseTerm("触发状态", decisionTriggerText(action)),
     renderChineseTerm("核心理由", reason),
-    renderChineseTerm("目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range),
-    renderChineseTerm("止损价", strategy.stop_loss || action.stop_price),
+    renderChineseTerm("目标价", safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)),
+    renderChineseTerm("止损价", firstSafePrimaryValue(strategy.stop_loss, action.stop_price)),
   ].filter(Boolean).join("");
   return terms ? `<dl class="detail-dl translated-summary">${terms}</dl>` : "";
 }
@@ -783,18 +782,18 @@ function renderStrategySection(strategy, holding) {
 function renderChineseStrategyTerms(strategy, holding) {
   const action = holding.trade_action || {};
   const terms = [
-    renderRequiredTerm("观点", formatAction(strategy.view || strategy.stance || strategy.signal || strategy.rating)),
-    renderChineseTerm("买入区间", joinRange(strategy.entry_min, strategy.entry_max) || joinRange(strategy.entry_zone_low, strategy.entry_zone_high) || strategy.entry_range),
-    renderChineseTerm("加仓价", strategy.add_price),
-    renderChineseTerm("止损价", strategy.stop_loss || action.stop_price),
-    renderChineseTerm("目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range),
-    renderChineseTerm("仓位上限", strategy.target_weight || strategy.target_position || strategy.max_weight),
-    renderChineseTerm("时间周期", strategy.time_horizon),
-    renderChineseTerm("催化因素", strategy.catalyst),
-    renderChineseTerm("风险", strategy.risk_level || strategy.risk),
-    renderChineseTerm("当前动作", action.action),
-    renderChineseTerm("触发状态", action.trigger_status),
-    renderChineseTerm("说明", action.agent_reason || strategy.agent_reason || strategy.notes),
+    renderRequiredTerm("观点", firstMappedActionLabel(strategy.view, strategy.stance, strategy.signal, strategy.rating)),
+    renderChineseTerm("买入区间", safeRangeText(strategy.entry_min, strategy.entry_max) || safeRangeText(strategy.entry_zone_low, strategy.entry_zone_high) || safePrimaryValue(strategy.entry_range)),
+    renderChineseTerm("加仓价", safePrimaryValue(strategy.add_price)),
+    renderChineseTerm("止损价", firstSafePrimaryValue(strategy.stop_loss, action.stop_price)),
+    renderChineseTerm("目标价", safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)),
+    renderChineseTerm("仓位上限", firstSafePrimaryValue(strategy.target_weight, strategy.target_position, strategy.max_weight)),
+    renderSafeChineseTerm("时间周期", strategy.time_horizon_zh, strategy.time_horizon),
+    renderSafeChineseTerm("催化因素", strategy.catalyst_zh, strategy.catalyst),
+    renderSafeChineseTerm("风险", strategy.risk_level_zh, strategy.risk_zh, strategy.risk_level, strategy.risk),
+    renderChineseTerm("当前动作", firstMappedActionLabel(action.action, action.suggested_action)),
+    renderChineseTerm("触发状态", decisionTriggerText(action)),
+    renderSafeChineseTerm("说明", action.agent_reason_zh, strategy.agent_reason_zh, strategy.notes_zh, action.agent_reason, strategy.agent_reason, strategy.notes),
   ].filter(Boolean).join("");
   if (!terms) {
     return renderStatusMessage("暂无交易策略", strategy);
@@ -813,20 +812,135 @@ function renderEnglishSourceBlock(text, rawText, buttonText) {
   `;
 }
 
-function renderTradeActionSection(holding) {
-  const premarketAction = holding.premarket_action || {};
-  const tradeAction = holding.trade_action || {};
+function renderTradeActionSection(detailHolding) {
+  const premarketAction = detailHolding.premarket_action || {};
+  const tradeAction = detailHolding.trade_action || {};
   if (!sectionAvailable(tradeAction) && !sectionAvailable(premarketAction)) {
     return renderDetailSection("当前交易动作", renderStatusMessage("暂无触发中的交易动作", tradeAction));
   }
   const action = sectionAvailable(tradeAction) ? tradeAction : premarketAction;
   const body = `
     ${renderStatusWarning(action)}
-    ${renderTradeDecisionBand(action, holding)}
-    ${renderTradeImpactGrid(action, holding)}
-    ${typeof renderRationaleDialogue === "function" ? renderRationaleDialogue(holding) : ""}
+    ${renderTradeDecisionBand(action, detailHolding)}
+    ${renderTradeImpactGrid(action, detailHolding)}
+    ${typeof renderRationaleDialogue === "function" ? renderRationaleDialogue(detailHolding) : ""}
   `;
   return renderDetailSection("当前交易动作", body);
+}
+
+function renderAnalysisStrategySection(holding) {
+  const body = `
+    ${renderReportStatusLine(holding)}
+    <div class="decision-dashboard">
+      <article class="decision-card primary">
+        <span>当前希望你做什么</span>
+        <strong>${escapeHtml(desiredActionText(holding))}</strong>
+        <p>${escapeHtml(decisionSubline(holding))}</p>
+      </article>
+      <article class="decision-card">
+        <span>操作指令</span>
+        <dl class="operation-list">
+          ${operationRows(holding).map(([label, value]) => renderCompactKv(label, value)).join("")}
+        </dl>
+      </article>
+      <article class="decision-card">
+        <span>今天重点关注</span>
+        <p>${escapeHtml(watchPointText(holding))}</p>
+      </article>
+    </div>
+    <div class="decision-metric-strip" aria-label="分析指标">
+      ${decisionMetricCells(holding).map(([label, value]) => `
+        <article>
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(formatPlain(value))}</strong>
+        </article>
+      `).join("")}
+    </div>
+    ${renderAnalystDialogue(holding)}
+    ${renderFinalConclusion(holding)}
+    ${renderSourceReview(holding)}
+  `;
+  return renderDetailSection("分析与交易策略", body, "analysis-strategy-section");
+}
+
+function renderReportStatusLine(holding) {
+  const report = holding.agent_report || {};
+  const action = currentDecisionAction(holding);
+  const usedFallback = report.fallback_used || report.used_fallback || report.source_status === "fallback";
+  const parts = [
+    analystViewText(holding),
+    mappedActionStatusLabel(report.status),
+    usedFallback ? "使用历史报告回退" : "",
+    mappedActionStatusLabel(action.status),
+    report.generated_at || report.run_date,
+    "只读 · 需要人工确认",
+  ].filter((part) => hasValue(part) && part !== "-");
+  const fallbackWarning = renderStatusWarning(report) || renderStatusWarning(action);
+  return `
+    <div class="report-status-line">
+      <span>${escapeHtml(parts.join(" · ") || "只读 · 需要人工确认")}</span>
+      ${fallbackWarning}
+    </div>
+  `;
+}
+
+function renderAnalystDialogue(holding) {
+  const rows = rationaleRows(rationaleSource(holding))
+    .map((row) => ({
+      label: row.label,
+      text: chineseDisplayText(row.text),
+    }))
+    .filter((row) => hasValue(row.text) && row.text !== "-" && safePrimaryValue(row.text));
+  if (!rows.length) {
+    return `
+      <section class="analyst-dialogue">
+        <h4>分析师对话</h4>
+        <p class="compact-empty">暂无可展示的中文分析对话。</p>
+      </section>
+    `;
+  }
+  return `
+    <section class="analyst-dialogue">
+      <h4>分析师对话</h4>
+      <div class="dialogue-list">
+        ${rows.map((row) => `
+          <div class="dialogue-row">
+            <strong>${escapeHtml(row.label)}</strong>
+            <span>${escapeHtml(row.text)}</span>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderFinalConclusion(holding) {
+  return `
+    <section class="final-conclusion">
+      <h4>最终结论</h4>
+      <div class="final-conclusion-list">
+        ${finalConclusionItems(holding).map((item) => `
+          <article>
+            <span>${escapeHtml(item.label)}</span>
+            <strong>${escapeHtml(formatPlain(item.text))}</strong>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderSourceReview(holding) {
+  const sourceText = sourceReviewText(holding);
+  if (!hasValue(sourceText)) {
+    return "";
+  }
+  return `
+    <section class="source-review">
+      <button class="raw-toggle english-source-toggle" type="button" data-toggle-raw-report>查看英文原文</button>
+      ${renderSplitSourceRows(sourceText)}
+    </section>
+  `;
 }
 
 function renderTradeDecisionBand(action, holding) {
@@ -840,11 +954,11 @@ function renderTradeDecisionBand(action, holding) {
       <article class="decision-block">
         <h4>操作方向与价位</h4>
         <dl class="compact-kv">
-          ${renderCompactKv("动作", actionCardStatusLabel(action))}
-          ${renderCompactKv("限价", firstPresent(action.limit_price, action.last_price))}
-          ${renderCompactKv("数量", firstPresent(action.suggested_quantity, action.target_quantity, action.quantity))}
-          ${renderCompactKv("金额", actionNotionalText(action))}
-          ${renderCompactKv("止损", action.stop_price)}
+          ${renderCompactKv("动作", reportActionStatusLabel(action))}
+          ${renderCompactKv("限价", firstSafePrimaryValue(action.limit_price, action.last_price))}
+          ${renderCompactKv("数量", firstSafePrimaryValue(action.suggested_quantity, action.target_quantity, action.quantity))}
+          ${renderCompactKv("金额", safeActionNotionalText(action))}
+          ${renderCompactKv("止损", firstSafePrimaryValue(action.stop_price))}
         </dl>
       </article>
       <article class="decision-block">
@@ -857,10 +971,10 @@ function renderTradeDecisionBand(action, holding) {
 
 function renderTradeImpactGrid(action, holding) {
   const cells = [
-    ["当前数量", firstPresent(action.current_quantity, holding.total_quantity)],
-    ["交易后数量", action.post_trade_quantity],
-    ["建议金额", actionNotionalText(action)],
-    ["交易后权重", action.post_trade_weight],
+    ["当前数量", firstSafePrimaryValue(action.current_quantity, holding.total_quantity)],
+    ["交易后数量", firstSafePrimaryValue(action.post_trade_quantity)],
+    ["建议金额", safeActionNotionalText(action)],
+    ["交易后权重", firstSafePrimaryValue(action.post_trade_weight)],
     ["下一触发", nextTriggerText(action, holding)],
   ];
   return `
@@ -882,7 +996,7 @@ function renderRationaleDialogue(holding) {
       text: chineseDisplayText(row.text),
     }))
     .filter((row) => {
-      return hasValue(row.text) && row.text !== "-" && !hasRawEnglishProse(row.text);
+      return hasValue(row.text) && row.text !== "-" && safePrimaryValue(row.text);
     });
   if (!rows.length) {
     return "";
@@ -937,7 +1051,7 @@ function renderCompactKv(label, value) {
 
 function strategyHeadline(action, holding) {
   const symbol = actionSymbol(action) !== "-" ? actionSymbol(action) : `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
-  const actionText = formatAction(action.action || action.suggested_action);
+  const actionText = firstMappedActionLabel(action.action, action.suggested_action);
   if (actionText === "-") {
     return `${symbol} 交易策略`;
   }
@@ -946,8 +1060,8 @@ function strategyHeadline(action, holding) {
 
 function strategySubline(action, holding) {
   const strategy = holding.strategy || {};
-  const view = formatAction(strategy.view || strategy.stance || strategy.signal || strategy.rating);
-  const status = formatActionStatus(action.status);
+  const view = firstMappedActionLabel(strategy.view, strategy.stance, strategy.signal, strategy.rating);
+  const status = mappedActionStatusLabel(action.status);
   const parts = [view, status].filter((part) => part && part !== "-");
   if (parts.length) {
     return `${parts.join(" · ")}；执行前保持人工确认。`;
@@ -956,25 +1070,334 @@ function strategySubline(action, holding) {
 }
 
 function nextTriggerText(action, holding) {
-  const watchTrigger = safeChineseDisplayText(
-    firstAvailableText(action.watch_trigger_zh, action.watch_trigger),
-  ) || firstMappedLabel(TRIGGER_STATUS_LABELS, action.watch_trigger)
-    || firstMappedLabel(REASON_LABELS, action.watch_trigger);
+  const watchTrigger = primaryChineseText(action.watch_trigger_zh)
+    || firstMappedLabel(TRIGGER_STATUS_LABELS, action.watch_trigger)
+    || firstMappedLabel(REASON_LABELS, action.watch_trigger)
+    || safePrimaryValue(action.watch_trigger);
   if (watchTrigger) {
     return watchTrigger;
   }
   const strategy = holding.strategy || {};
-  const targetText = joinRange(strategy.target_1, strategy.target_2) || strategy.target_range;
+  const targetText = safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range);
   if (hasValue(targetText)) {
     return `目标价 ${targetText}`;
   }
-  const planText = safeChineseDisplayText(
-    firstAvailableText(strategy.plan_text_zh, strategy.rationale_zh, strategy.plan_text),
-  );
+  const planText = primaryChineseText(strategy.plan_text_zh, strategy.rationale_zh)
+    || firstSafePrimaryValue(strategy.plan_text);
   if (planText) {
     return compactSentence(planText, 48);
   }
   return "";
+}
+
+function currentDecisionAction(holding) {
+  const tradeAction = holding.trade_action || {};
+  if (sectionAvailable(tradeAction)) {
+    return tradeAction;
+  }
+  const premarketAction = holding.premarket_action || {};
+  if (sectionAvailable(premarketAction)) {
+    return premarketAction;
+  }
+  return {};
+}
+
+function desiredActionText(holding) {
+  const action = currentDecisionAction(holding);
+  const symbol = detailSymbol(holding);
+  const actionText = firstMappedActionLabel(action.action, action.suggested_action);
+  if (actionText === "-") {
+    return `今天暂无触发中的交易动作`;
+  }
+  const quantity = firstSafePrimaryValue(action.suggested_quantity, action.target_quantity, action.quantity);
+  const quantityText = quantity ? `，数量 ${quantity}` : "";
+  return `${actionText} ${symbol}${quantityText}`;
+}
+
+function detailSymbol(holding) {
+  const market = formatPlain(holding.market);
+  const symbol = formatPlain(holding.symbol);
+  if (market === "-" && symbol === "-") {
+    return "-";
+  }
+  if (market === "-") {
+    return symbol;
+  }
+  if (symbol === "-") {
+    return market;
+  }
+  return `${market}.${symbol}`;
+}
+
+function decisionTriggerText(action) {
+  const mappedTrigger = firstMappedLabel(TRIGGER_STATUS_LABELS, action.trigger_status, action.watch_trigger);
+  if (mappedTrigger) {
+    return mappedTrigger;
+  }
+  const direct = primaryChineseText(action.trigger_status_zh, action.watch_trigger_zh);
+  if (direct) {
+    return direct;
+  }
+  return safePrimaryValue(action.watch_trigger) || "-";
+}
+
+function primaryChineseText(...values) {
+  for (const value of values) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (text && /[\u3400-\u9fff]/.test(text) && !hasRawEnglishProse(text)) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function safePrimaryValue(value) {
+  const text = formatPlain(value);
+  if (text === "-") {
+    return "";
+  }
+  if (/[\u3400-\u9fff]/.test(text)) {
+    return hasRawEnglishProse(text) ? "" : text;
+  }
+  const englishWords = text.match(/\b[A-Za-z][A-Za-z'-]*\b/g) || [];
+  if (!englishWords.length) {
+    return text;
+  }
+  const allowedTokens = new Set(["HKD", "USD", "ETF", "ETFS", "MACD", "RSI", "YOY", "QOQ", "OPENAI", "IPHONE"]);
+  const hasUnsafeEnglish = englishWords.some((word) => !allowedTokens.has(word.toUpperCase()));
+  if (hasUnsafeEnglish) {
+    return "";
+  }
+  return text;
+}
+
+function firstSafePrimaryValue(...values) {
+  for (const value of values) {
+    const safe = safePrimaryValue(value);
+    if (safe) {
+      return safe;
+    }
+  }
+  return "";
+}
+
+function safeRangeText(low, high) {
+  const safeLow = safePrimaryValue(low);
+  const safeHigh = safePrimaryValue(high);
+  return joinRange(safeLow, safeHigh);
+}
+
+function mappedActionLabel(value) {
+  const mapped = firstMappedLabel(ACTION_LABELS, value);
+  if (mapped) {
+    return mapped;
+  }
+  const safe = safePrimaryValue(value);
+  return safe || "-";
+}
+
+function firstMappedActionLabel(...values) {
+  for (const value of values) {
+    const label = mappedActionLabel(value);
+    if (label !== "-") {
+      return label;
+    }
+  }
+  return "-";
+}
+
+function mappedActionStatusLabel(value) {
+  const mapped = firstMappedLabel(ACTION_STATUS_LABELS, value);
+  return mapped || "-";
+}
+
+function reportActionStatusLabel(action) {
+  const actionText = firstMappedActionLabel(action.action, action.suggested_action);
+  const statusText = mappedActionStatusLabel(action.status);
+  if (actionText === "-" && statusText === "-") {
+    return "-";
+  }
+  if (actionText === "-") {
+    return statusText;
+  }
+  if (statusText === "-") {
+    return actionText;
+  }
+  return `${actionText} · ${statusText}`;
+}
+
+function decisionSubline(holding) {
+  const action = currentDecisionAction(holding);
+  if (!sectionAvailable(action)) {
+    const view = analystViewText(holding);
+    return view === "-" ? "暂无触发动作，继续观察。" : `${view}，暂无触发动作，继续观察。`;
+  }
+  const trigger = decisionTriggerText(action);
+  const reason = shortActionReason(action);
+  const parts = [trigger, reason].filter((part) => part && part !== "-");
+  if (!parts.length) {
+    return "执行前保持人工确认。";
+  }
+  return `${parts.join("；")} 执行前保持人工确认。`;
+}
+
+function operationRows(holding) {
+  const action = currentDecisionAction(holding);
+  const strategy = holding.strategy || {};
+  return [
+    ["动作", reportActionStatusLabel(action)],
+    ["价格", firstSafePrimaryValue(action.limit_price, action.last_price, strategy.target_1, strategy.target_range)],
+    ["仓位", firstSafePrimaryValue(action.suggested_quantity, action.suggested_notional, strategy.max_weight, strategy.target_weight)],
+    ["止损", firstSafePrimaryValue(action.stop_price, strategy.stop_loss)],
+  ];
+}
+
+function watchPointText(holding) {
+  const action = currentDecisionAction(holding);
+  const strategy = holding.strategy || {};
+  const direct = primaryChineseText(
+    action.trigger_reason_zh,
+    action.watch_trigger_zh,
+    strategy.catalyst_zh,
+    strategy.plan_text_zh,
+    strategy.rationale_zh,
+  );
+  if (direct) {
+    return compactSentence(direct, 92);
+  }
+  const mappedTrigger = firstMappedLabel(TRIGGER_STATUS_LABELS, action.trigger_status, action.watch_trigger);
+  if (mappedTrigger && mappedTrigger !== "未触发") {
+    const reviewText = nextReviewText(holding);
+    const reviewSuffix = reviewText && reviewText !== "-"
+      ? `继续观察 ${reviewText}。`
+      : "执行前保持人工确认。";
+    return compactSentence(`${mappedTrigger}；${reviewSuffix}`, 92);
+  }
+  const catalyst = firstSafePrimaryValue(strategy.catalyst, strategy.time_horizon, strategy.plan_text);
+  if (catalyst) {
+    return compactSentence(catalyst, 92);
+  }
+  return "暂无新的触发条件，继续观察。";
+}
+
+function decisionMetricCells(holding) {
+  const action = currentDecisionAction(holding);
+  const strategy = holding.strategy || {};
+  return [
+    ["观点", analystViewText(holding)],
+    ["目标价", safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)],
+    ["触发状态", decisionTriggerText(action)],
+    ["动作状态", mappedActionStatusLabel(action.status)],
+    ["下次复评", nextReviewText(holding)],
+  ];
+}
+
+function analystViewText(holding) {
+  const strategy = holding.strategy || {};
+  const report = holding.agent_report || {};
+  return firstMappedActionLabel(strategy.view, strategy.stance, strategy.signal, strategy.rating, report.rating, report.advice_action);
+}
+
+function nextReviewText(holding) {
+  const strategy = holding.strategy || {};
+  const action = currentDecisionAction(holding);
+  const direct = primaryChineseText(strategy.catalyst_zh, strategy.time_horizon_zh, action.watch_trigger_zh);
+  if (direct) {
+    return compactSentence(direct, 32);
+  }
+  const text = firstSafePrimaryValue(strategy.catalyst, strategy.time_horizon, action.watch_trigger);
+  return text ? compactSentence(text, 32) : "-";
+}
+
+function finalConclusionItems(holding) {
+  const action = currentDecisionAction(holding);
+  const strategy = holding.strategy || {};
+  const stopValue = firstSafePrimaryValue(action.stop_price, strategy.stop_loss);
+  return [
+    ["结论", finalConclusionText(holding)],
+    ["理由", finalReasonText(holding)],
+    ["条件", finalConditionText(holding)],
+    ["失败条件", stopValue ? `跌破 ${stopValue} 后进入防守复核。` : "触发风险条件后进入人工复核。"],
+  ].map(([label, text]) => ({ label, text: formatPlain(text) }));
+}
+
+function finalConclusionText(holding) {
+  const action = currentDecisionAction(holding);
+  const view = analystViewText(holding);
+  const actionText = firstMappedActionLabel(action.action, action.suggested_action);
+  if (actionText === "-" && view === "-") {
+    return "暂无明确结论。";
+  }
+  if (actionText === "-") {
+    return `${view}，但今天暂无触发动作。`;
+  }
+  if (view === "-") {
+    return `${actionText}，执行前保持人工确认。`;
+  }
+  return `${view}，当前动作是${actionText}。`;
+}
+
+function finalReasonText(holding) {
+  const action = currentDecisionAction(holding);
+  const reason = primaryChineseText(
+    action.trigger_reason_zh,
+    action.reason_zh,
+    action.agent_reason_zh,
+    holding.strategy && holding.strategy.agent_reason_zh,
+    holding.agent_report && holding.agent_report.summary_zh,
+  );
+  if (reason) {
+    return compactSentence(reason, 82);
+  }
+  const mapped = firstMappedLabel(REASON_LABELS, action.trigger_reason, action.reason);
+  return mapped || "理由见分析师对话。";
+}
+
+function finalConditionText(holding) {
+  const strategy = holding.strategy || {};
+  const action = currentDecisionAction(holding);
+  const text = primaryChineseText(strategy.plan_text_zh, strategy.catalyst_zh, action.watch_trigger_zh);
+  if (text) {
+    return compactSentence(text, 82);
+  }
+  const trigger = firstMappedLabel(TRIGGER_STATUS_LABELS, action.watch_trigger, action.trigger_status);
+  return trigger ? `${trigger} 后复核。` : "出现新的价格或事件触发后复核。";
+}
+
+function sourceReviewText(holding) {
+  const report = holding.agent_report || {};
+  const strategy = holding.strategy || {};
+  const action = currentDecisionAction(holding);
+  return uniqueSourceText(
+    report.raw_decision,
+    report.raw_report,
+    report.full_report,
+    report.summary,
+    strategy.agent_excerpt,
+    strategy.plan_text,
+    strategy.rationale,
+    strategy.agent_reason,
+    strategy.notes,
+    action.agent_excerpt,
+    action.agent_reason,
+    action.reason,
+    action.trigger_reason,
+    action.watch_trigger,
+  );
+}
+
+function uniqueSourceText(...values) {
+  const seen = new Set();
+  const parts = [];
+  for (const value of values) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text || seen.has(text)) {
+      continue;
+    }
+    seen.add(text);
+    parts.push(text);
+  }
+  return parts.join("\n");
 }
 
 function suggestedNotionalText(action) {
@@ -990,7 +1413,7 @@ function suggestedNotionalText(action) {
 
 function renderBrokerDetailSection(details) {
   if (!Array.isArray(details) || details.length === 0) {
-    return renderDetailSection("券商账户明细", renderStatusMessage("暂无券商账户明细"));
+    return renderDetailSection("券商账户明细", renderStatusMessage("暂无券商账户明细"), "broker-detail-section");
   }
   const rows = details.map((detail) => `
     <tr>
@@ -1020,12 +1443,13 @@ function renderBrokerDetailSection(details) {
         <tbody>${rows}</tbody>
       </table>
     </div>
-  `);
+  `, "broker-detail-section");
 }
 
-function renderDetailSection(title, body) {
+function renderDetailSection(title, body, extraClass = "") {
+  const classes = ["detail-section", extraClass].filter(Boolean).join(" ");
   return `
-    <section class="detail-section">
+    <section class="${escapeHtml(classes)}">
       <h3>${escapeHtml(title)}</h3>
       ${body}
     </section>
@@ -1076,6 +1500,14 @@ function renderChineseTerm(label, value) {
   return renderRequiredTerm(label, text);
 }
 
+function renderSafeChineseTerm(label, ...values) {
+  const text = firstSafePrimaryValue(...values);
+  if (!hasValue(text) || text === "-") {
+    return "";
+  }
+  return renderRequiredTerm(label, text);
+}
+
 function chineseDisplayText(value) {
   const raw = formatPlain(value);
   if (raw === "-") {
@@ -1107,7 +1539,7 @@ function safeChineseDisplayText(value) {
 }
 
 function safeChineseReason(action, strategy, report) {
-  return safeChineseDisplayText(firstAvailableText(
+  return primaryChineseText(
     action.reason_zh,
     action.agent_reason_zh,
     action.trigger_reason_zh,
@@ -1118,7 +1550,7 @@ function safeChineseReason(action, strategy, report) {
     report.summary_zh,
     report.analysis_zh,
     report.report_zh,
-  )) || firstMappedLabel(
+  ) || firstMappedLabel(
     REASON_LABELS,
     action.reason,
     action.agent_reason,
@@ -1131,7 +1563,6 @@ function safeChineseReason(action, strategy, report) {
 
 function hasRawEnglishProse(text) {
   const residual = String(text || "")
-    .replace(/\b[A-Z]{2,8}\b/g, "")
     .replace(/\b(?:HKD|USD|ETF|ETFs|MACD|RSI|YoY|QoQ|OpenAI|iPhone)\b/gi, "");
   const words = residual.match(/\b[A-Za-z][A-Za-z'-]{2,}\b/g) || [];
   return words.length >= 2;
@@ -1305,7 +1736,7 @@ function actionSourceContext(action) {
 }
 
 function shortActionReason(action) {
-  const translatedReason = firstChineseText(
+  const translatedReason = primaryChineseText(
     action.trigger_reason_zh,
     action.reason_zh,
     action.agent_reason_zh,
@@ -1396,6 +1827,19 @@ function actionNotionalText(action) {
     return formatMoney(action.order_value_hkd, "HKD");
   }
   return "-";
+}
+
+function safeActionNotionalText(action) {
+  const notional = safePrimaryValue(action.suggested_notional);
+  if (notional) {
+    const currency = safePrimaryValue(action.notional_currency);
+    return currency ? `${currency} ${notional}` : notional;
+  }
+  const orderValueHkd = safePrimaryValue(action.order_value_hkd);
+  if (orderValueHkd) {
+    return formatMoney(orderValueHkd, "HKD");
+  }
+  return "";
 }
 
 function actionCardStatusLabel(action) {

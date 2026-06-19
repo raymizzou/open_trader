@@ -137,6 +137,32 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "renderEnglishSourceBlock" in js
     assert "renderChineseStrategyTerms" in js
     assert "summary_zh" in js
+    assert "renderAnalysisStrategySection" in js
+    assert "currentDecisionAction" in js
+    assert "desiredActionText" in js
+    assert "operationRows" in js
+    assert "watchPointText" in js
+    assert "decisionMetricCells" in js
+    assert "finalConclusionItems" in js
+    assert "renderAnalystDialogue" in js
+    assert "sourceReviewText" in js
+    assert "分析与交易策略" in js
+    assert "当前希望你做什么" in js
+    assert "操作指令" in js
+    assert "今天重点关注" in js
+    assert "分析师对话" in js
+    assert "最终结论" in js
+    assert "失败条件" in js
+    assert "只读 · 需要人工确认" in js
+    assert "今天暂无触发中的交易动作" in js
+    assert "查看英文原文" in js
+    assert ".analysis-strategy-section" in css
+    assert ".decision-dashboard" in css
+    assert ".decision-card.primary" in css
+    assert ".decision-metric-strip" in css
+    assert ".analyst-dialogue" in css
+    assert ".final-conclusion-list" in css
+    assert ".broker-detail-section" in css
     assert "holding_value_hkd" in js
     assert "cash_like_value_hkd" in js
     assert "percentBarWidth" in js
@@ -184,6 +210,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".language-toggle" in css
     assert ".english-source" in css
     assert ".detail-metric-grid" in css
+    assert "renderAgentReportSection(holding.agent_report, holding)" not in js
+    assert "renderStrategySection(holding.strategy, holding)" not in js
+    assert "renderTradeActionSection(holding)" not in js
     assert ".raw-report" in css
     assert "renderActionQueueSummary" in js
     assert "sortedTradeActions" in js
@@ -284,6 +313,157 @@ if (chineseDisplayText("Risk is elevated.") !== "") {
 }
 if (chineseDisplayText("YoY 增速稳定，OpenAI 影响有限。") === "") {
   throw new Error("Chinese text with business tokens should remain visible");
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_report_readability_helpers_build_decision_first_sections() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+state.detailLanguage = "zh";
+const holding = {
+  market: "US",
+  symbol: "DRAM",
+  name: "DRAM Test",
+  total_quantity: "100",
+  strategy: {
+    available: true,
+    rating: "Underweight",
+    target_1: "51",
+    target_2: "53",
+    stop_loss: "60",
+    catalyst: "6 月 24 日财报后复评",
+    time_horizon: "1-3 个月",
+    plan_text_zh: "财报前先锁定收益，财报后重新评估。",
+    agent_reason_zh: "MACD 背离，仓位风险上升。财报是下一判断点。因此先减半而非清仓。",
+  },
+  agent_report: {
+    available: true,
+    rating: "Underweight",
+    status: "ok",
+    run_date: "2026-06-19",
+    source_status: "fallback",
+    summary_zh: "评级低配。趋势派认为 MACD 背离。组合结论是减仓而非清仓。",
+    raw_decision: "The bull case remains possible, but risk is elevated.",
+  },
+  trade_action: {
+    available: true,
+    action: "TRIM",
+    status: "ready",
+    trigger_status: "target_1_hit",
+    limit_price: "51",
+    suggested_quantity: "50",
+    suggested_notional: "2550",
+    notional_currency: "USD",
+    stop_price: "60",
+    trigger_reason_zh: "达到第一目标价，先锁定部分收益。",
+    agent_reason_zh: "MACD 背离，仓位风险上升。财报是下一判断点。因此先减半而非清仓。",
+  },
+  premarket_action: { available: false },
+};
+const action = currentDecisionAction(holding);
+if (action.action !== "TRIM") {
+  throw new Error("trade_action should lead the decision row");
+}
+const desired = desiredActionText(holding);
+if (!desired.includes("减仓") || !desired.includes("DRAM")) {
+  throw new Error("desired action should be Chinese and symbol-specific: " + desired);
+}
+const watch = watchPointText(holding);
+if (!watch.includes("达到第一目标价") && !watch.includes("财报")) {
+  throw new Error("watch point should use trigger or catalyst: " + watch);
+}
+const metricMap = Object.fromEntries(decisionMetricCells(holding));
+if (!String(metricMap["目标价"] || "").includes("51") || !String(metricMap["触发状态"] || "").includes("达到第一目标价")) {
+  throw new Error("metrics missing decision values: " + JSON.stringify(metricMap));
+}
+const conclusionText = JSON.stringify(finalConclusionItems(holding));
+if (!conclusionText.includes("低配") || !conclusionText.includes("减仓") || !conclusionText.includes("60")) {
+  throw new Error("conclusion missing decision text: " + conclusionText);
+}
+const html = renderAnalysisStrategySection(holding);
+for (const required of ["分析与交易策略", "当前希望你做什么", "操作指令", "今天重点关注", "分析师对话", "最终结论", "查看英文原文", "正常", "使用历史报告回退"]) {
+  if (!html.includes(required)) {
+    throw new Error("missing rendered label " + required + " in " + html);
+  }
+}
+const primaryHtml = html.split("source-review", 1)[0];
+if (primaryHtml.includes("risk is elevated") || primaryHtml.includes("The bull case")) {
+  throw new Error("raw English leaked into primary Chinese UI: " + primaryHtml);
+}
+const sourceSection = html.includes("source-review") ? html.slice(html.indexOf("source-review")) : "";
+if (!sourceSection.includes("english-source") || !sourceSection.includes("hidden") || !sourceSection.includes("The bull case")) {
+  throw new Error("English source should remain collapsed and preserved: " + sourceSection);
+}
+const sourceOnlyHolding = {
+  market: "US",
+  symbol: "SRC",
+  strategy: { available: true, plan_text: "Wait for earnings confirmation before adding." },
+  agent_report: { available: false },
+  trade_action: {
+    available: true,
+    action: "HOLD",
+    status: "manual_review",
+    agent_reason: "Risk remains elevated until earnings.",
+  },
+  premarket_action: { available: false },
+};
+const sourceOnlyHtml = renderAnalysisStrategySection(sourceOnlyHolding);
+const sourceOnlyPrimary = sourceOnlyHtml.split("source-review", 1)[0];
+const sourceOnlySource = sourceOnlyHtml.includes("source-review") ? sourceOnlyHtml.slice(sourceOnlyHtml.indexOf("source-review")) : "";
+if (sourceOnlyPrimary.includes("Risk remains elevated") || sourceOnlyPrimary.includes("Wait for earnings")) {
+  throw new Error("English-only rationale leaked into primary Chinese UI: " + sourceOnlyPrimary);
+}
+if (!sourceOnlyPrimary.includes("需复核") || !sourceOnlySource.includes("Risk remains elevated")) {
+  throw new Error("manual_review/source preservation failed: " + sourceOnlyHtml);
+}
+const uppercaseLeakHolding = {
+  market: "US",
+  symbol: "CAPS",
+  strategy: { available: false },
+  agent_report: { available: false },
+  trade_action: { available: false },
+  premarket_action: {
+    available: true,
+    suggested_action: "reduce",
+    watch_trigger_zh: "OPEN BELOW PRIOR CLOSE 后复评",
+  },
+};
+const uppercaseOutputs = [
+  decisionTriggerText(currentDecisionAction(uppercaseLeakHolding)),
+  watchPointText(uppercaseLeakHolding),
+  nextReviewText(uppercaseLeakHolding),
+  finalConditionText(uppercaseLeakHolding),
+  renderAnalysisStrategySection(uppercaseLeakHolding).split("source-review", 1)[0],
+].join(" ");
+if (uppercaseOutputs.includes("OPEN BELOW PRIOR CLOSE") || safePrimaryValue("BULLISH") || safePrimaryValue("BREAKOUT")) {
+  throw new Error("all-caps English trading prose leaked into primary UI: " + uppercaseOutputs);
+}
+if (primaryChineseText("TSLA 财报后复评") !== "TSLA 财报后复评" || safePrimaryValue("AAPL 财报后复评") !== "AAPL 财报后复评") {
+  throw new Error("normal ticker tokens should remain visible in Chinese helper text");
+}
+const noActionHtml = renderAnalysisStrategySection({
+  market: "US",
+  symbol: "CASH",
+  strategy: { available: false },
+  agent_report: { available: false },
+  trade_action: { available: false },
+  premarket_action: { available: false },
+});
+if (!noActionHtml.includes("今天暂无触发中的交易动作")) {
+  throw new Error("missing explicit no-action state: " + noActionHtml);
 }
 `, sandbox);
 """
