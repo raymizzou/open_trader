@@ -134,6 +134,27 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".english-source" in css
     assert ".detail-metric-grid" in css
     assert ".raw-report" in css
+    assert "renderActionQueueSummary" in js
+    assert "sortedTradeActions" in js
+    assert "tradeActionCounts" in js
+    assert "openTradeActionDetail" in js
+    assert "renderTradeDecisionBand" in js
+    assert "renderTradeImpactGrid" in js
+    assert "renderRationaleDialogue" in js
+    assert "rationaleRows" in js
+    assert "短触发理由" in js
+    assert "清晰交易策略" in js
+    assert "操作方向与价位" in js
+    assert "理由对话" in js
+    assert "查看完整策略" in js
+    assert "需复核" in js
+    assert "待处理" in js
+    assert "未知值显示 -" not in js
+    assert ".action-summary-grid" in css
+    assert ".action-card" in css
+    assert ".decision-band" in css
+    assert ".impact-grid" in css
+    assert ".dialogue-row" in css
 
 
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
