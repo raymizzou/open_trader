@@ -91,6 +91,20 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "刷新行情" in html
     assert "全部市场" in html
     assert "symbol-detail-panel" in html
+    assert "dashboard-header" in html
+    assert "header-market-filters" in html
+    assert "header-broker-filters" in html
+    assert "current-view-value" in html
+    assert "broker-summary-cards" in html
+    assert "source-status-list" in html
+    assert "cash-detail-panel" in html
+    assert "filter-panel" not in html
+    assert "summary-grid" not in html
+    assert "数据健康" not in html
+    assert "当前视图" in html
+    assert "富途" in html
+    assert "老虎" in html
+    assert "辉立" in html
     assert "缺行情" in js
     assert "数据已过期" in js
     assert "dashboardError" in js
@@ -107,10 +121,6 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "renderEnglishSourceBlock" in js
     assert "renderChineseStrategyTerms" in js
     assert "summary_zh" in js
-    assert "summary-holding-bar" in html
-    assert "summary-holding-value" in html
-    assert "summary-holding-weight" in html
-    assert "summary-cash-note" in html
     assert "holding_value_hkd" in js
     assert "cash_like_value_hkd" in js
     assert "percentBarWidth" in js
