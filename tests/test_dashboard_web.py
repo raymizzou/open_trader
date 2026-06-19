@@ -397,11 +397,17 @@ const englishLeakHolding = {
     plan_text_zh: "译文：Place a hard stop at $60.",
   },
   agent_report: { available: false },
-  trade_action: { available: false },
+  trade_action: {
+    available: false,
+    action: "Open below prior close.",
+    trigger_status: "Open below prior close.",
+    stop_price: "Place a hard stop at $60.",
+  },
   premarket_action: {
     available: true,
     suggested_action: "Open below prior close.",
     limit_price: "Buy below 90",
+    last_price: "Buy below 90",
     stop_price: "Place a hard stop at $60.",
   },
 };
@@ -412,6 +418,10 @@ const primaryOutputs = [
   ...operationRows(englishLeakHolding).flat(),
   ...decisionMetricCells(englishLeakHolding).flat(),
   ...finalConclusionItems(englishLeakHolding).flatMap((item) => [item.label, item.text]),
+  nextTriggerText(englishLeakHolding.premarket_action || {}, englishLeakHolding),
+  renderChineseAgentSummary(englishLeakHolding.agent_report || {}, englishLeakHolding),
+  renderChineseStrategyTerms(englishLeakHolding.strategy || {}, englishLeakHolding),
+  strategyHeadline(currentDecisionAction(englishLeakHolding), englishLeakHolding),
 ].join(" ");
 if (primaryOutputs.includes("Buy below") || primaryOutputs.includes("Sell above") || primaryOutputs.includes("Place a hard stop") || primaryOutputs.includes("Open below prior close")) {
   throw new Error("raw English leaked from primary helper outputs: " + primaryOutputs);

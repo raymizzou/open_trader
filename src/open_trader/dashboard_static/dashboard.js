@@ -527,15 +527,15 @@ function renderChineseAgentSummary(report, holding) {
   const action = holding.trade_action || holding.premarket_action || {};
   const reason = safeChineseReason(action, strategy, report);
   const terms = [
-    renderRequiredTerm("观点", formatAction(report.rating || report.advice_action)),
-    renderRequiredTerm("报告状态", formatActionStatus(report.status)),
+    renderRequiredTerm("观点", firstMappedActionLabel(report.rating, report.advice_action)),
+    renderRequiredTerm("报告状态", mappedActionStatusLabel(report.status)),
     renderRequiredTerm("生成时间", report.generated_at || report.run_date),
-    renderChineseTerm("交易动作", action.action),
-    renderChineseTerm("动作状态", action.status),
-    renderChineseTerm("触发状态", action.trigger_status),
+    renderChineseTerm("交易动作", firstMappedActionLabel(action.action, action.suggested_action)),
+    renderChineseTerm("动作状态", mappedActionStatusLabel(action.status)),
+    renderChineseTerm("触发状态", decisionTriggerText(action)),
     renderChineseTerm("核心理由", reason),
-    renderChineseTerm("目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range),
-    renderChineseTerm("止损价", strategy.stop_loss || action.stop_price),
+    renderChineseTerm("目标价", safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)),
+    renderChineseTerm("止损价", firstSafePrimaryValue(strategy.stop_loss, action.stop_price)),
   ].filter(Boolean).join("");
   return terms ? `<dl class="detail-dl translated-summary">${terms}</dl>` : "";
 }
@@ -570,17 +570,17 @@ function renderStrategySection(strategy, holding) {
 function renderChineseStrategyTerms(strategy, holding) {
   const action = holding.trade_action || {};
   const terms = [
-    renderRequiredTerm("观点", formatAction(strategy.view || strategy.stance || strategy.signal || strategy.rating)),
-    renderChineseTerm("买入区间", joinRange(strategy.entry_min, strategy.entry_max) || joinRange(strategy.entry_zone_low, strategy.entry_zone_high) || strategy.entry_range),
-    renderChineseTerm("加仓价", strategy.add_price),
-    renderChineseTerm("止损价", strategy.stop_loss || action.stop_price),
-    renderChineseTerm("目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range),
-    renderChineseTerm("仓位上限", strategy.target_weight || strategy.target_position || strategy.max_weight),
+    renderRequiredTerm("观点", firstMappedActionLabel(strategy.view, strategy.stance, strategy.signal, strategy.rating)),
+    renderChineseTerm("买入区间", safeRangeText(strategy.entry_min, strategy.entry_max) || safeRangeText(strategy.entry_zone_low, strategy.entry_zone_high) || safePrimaryValue(strategy.entry_range)),
+    renderChineseTerm("加仓价", safePrimaryValue(strategy.add_price)),
+    renderChineseTerm("止损价", firstSafePrimaryValue(strategy.stop_loss, action.stop_price)),
+    renderChineseTerm("目标价", safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)),
+    renderChineseTerm("仓位上限", firstSafePrimaryValue(strategy.target_weight, strategy.target_position, strategy.max_weight)),
     renderChineseTerm("时间周期", strategy.time_horizon),
     renderChineseTerm("催化因素", strategy.catalyst),
     renderChineseTerm("风险", strategy.risk_level || strategy.risk),
-    renderChineseTerm("当前动作", action.action),
-    renderChineseTerm("触发状态", action.trigger_status),
+    renderChineseTerm("当前动作", firstMappedActionLabel(action.action, action.suggested_action)),
+    renderChineseTerm("触发状态", decisionTriggerText(action)),
     renderChineseTerm("说明", action.agent_reason || strategy.agent_reason || strategy.notes),
   ].filter(Boolean).join("");
   if (!terms) {
@@ -724,7 +724,7 @@ function renderCompactKv(label, value) {
 
 function strategyHeadline(action, holding) {
   const symbol = actionSymbol(action) !== "-" ? actionSymbol(action) : `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
-  const actionText = formatAction(action.action || action.suggested_action);
+  const actionText = firstMappedActionLabel(action.action, action.suggested_action);
   if (actionText === "-") {
     return `${symbol} 交易策略`;
   }
@@ -733,8 +733,8 @@ function strategyHeadline(action, holding) {
 
 function strategySubline(action, holding) {
   const strategy = holding.strategy || {};
-  const view = formatAction(strategy.view || strategy.stance || strategy.signal || strategy.rating);
-  const status = formatActionStatus(action.status);
+  const view = firstMappedActionLabel(strategy.view, strategy.stance, strategy.signal, strategy.rating);
+  const status = mappedActionStatusLabel(action.status);
   const parts = [view, status].filter((part) => part && part !== "-");
   if (parts.length) {
     return `${parts.join(" · ")}；执行前保持人工确认。`;
@@ -751,7 +751,7 @@ function nextTriggerText(action, holding) {
     return watchTrigger;
   }
   const strategy = holding.strategy || {};
-  const targetText = joinRange(strategy.target_1, strategy.target_2) || strategy.target_range;
+  const targetText = safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range);
   if (hasValue(targetText)) {
     return `目标价 ${targetText}`;
   }
