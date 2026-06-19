@@ -576,12 +576,12 @@ function renderChineseStrategyTerms(strategy, holding) {
     renderChineseTerm("止损价", firstSafePrimaryValue(strategy.stop_loss, action.stop_price)),
     renderChineseTerm("目标价", safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)),
     renderChineseTerm("仓位上限", firstSafePrimaryValue(strategy.target_weight, strategy.target_position, strategy.max_weight)),
-    renderChineseTerm("时间周期", strategy.time_horizon),
-    renderChineseTerm("催化因素", strategy.catalyst),
-    renderChineseTerm("风险", strategy.risk_level || strategy.risk),
+    renderSafeChineseTerm("时间周期", strategy.time_horizon_zh, strategy.time_horizon),
+    renderSafeChineseTerm("催化因素", strategy.catalyst_zh, strategy.catalyst),
+    renderSafeChineseTerm("风险", strategy.risk_level_zh, strategy.risk_zh, strategy.risk_level, strategy.risk),
     renderChineseTerm("当前动作", firstMappedActionLabel(action.action, action.suggested_action)),
     renderChineseTerm("触发状态", decisionTriggerText(action)),
-    renderChineseTerm("说明", action.agent_reason || strategy.agent_reason || strategy.notes),
+    renderSafeChineseTerm("说明", action.agent_reason_zh, strategy.agent_reason_zh, strategy.notes_zh, action.agent_reason, strategy.agent_reason, strategy.notes),
   ].filter(Boolean).join("");
   if (!terms) {
     return renderStatusMessage("暂无交易策略", strategy);
@@ -1143,6 +1143,14 @@ function renderChineseTerm(label, value) {
   return renderRequiredTerm(label, text);
 }
 
+function renderSafeChineseTerm(label, ...values) {
+  const text = firstSafePrimaryValue(...values);
+  if (!hasValue(text) || text === "-") {
+    return "";
+  }
+  return renderRequiredTerm(label, text);
+}
+
 function chineseDisplayText(value) {
   const raw = formatPlain(value);
   if (raw === "-") {
@@ -1174,7 +1182,7 @@ function safeChineseDisplayText(value) {
 }
 
 function safeChineseReason(action, strategy, report) {
-  return safeChineseDisplayText(firstAvailableText(
+  return primaryChineseText(
     action.reason_zh,
     action.agent_reason_zh,
     action.trigger_reason_zh,
@@ -1185,7 +1193,7 @@ function safeChineseReason(action, strategy, report) {
     report.summary_zh,
     report.analysis_zh,
     report.report_zh,
-  )) || firstMappedLabel(
+  ) || firstMappedLabel(
     REASON_LABELS,
     action.reason,
     action.agent_reason,
