@@ -39,15 +39,15 @@
           </article>
           <div id="broker-summary-cards" class="broker-summary-cards">
             <article class="broker-summary-card" data-broker-placeholder="futu">
-              <span class="summary-label">富途</span>
+              <span class="summary-label">富途暂无数据</span>
               <strong>-</strong>
             </article>
             <article class="broker-summary-card" data-broker-placeholder="tiger">
-              <span class="summary-label">老虎</span>
+              <span class="summary-label">老虎暂无数据</span>
               <strong>-</strong>
             </article>
             <article class="broker-summary-card" data-broker-placeholder="phillip">
-              <span class="summary-label">辉立</span>
+              <span class="summary-label">辉立暂无数据</span>
               <strong>-</strong>
             </article>
           </div>
@@ -62,6 +62,27 @@
           <span id="last-refresh" class="last-refresh">尚未刷新</span>
         </section>
       </header>
+
+      <div class="runtime-compatibility hidden" hidden aria-hidden="true">
+        <div id="market-filters">
+          <button class="filter-button active" type="button" data-market="ALL">全部市场</button>
+          <button class="filter-button" type="button" data-market="US">US</button>
+          <button class="filter-button" type="button" data-market="HK">HK</button>
+          <button class="filter-button" type="button" data-market="CASH">现金</button>
+        </div>
+        <div id="broker-filters"></div>
+        <strong id="summary-value">-</strong>
+        <span id="summary-holding-bar"></span>
+        <span id="summary-holding-value"></span>
+        <strong id="summary-holding-weight">-</strong>
+        <span id="summary-cash-note"></span>
+        <strong id="summary-refresh-status">-</strong>
+        <span id="summary-refresh-note"></span>
+        <strong id="summary-brokers">-</strong>
+        <span id="summary-detail-month"></span>
+        <strong id="summary-health">-</strong>
+        <span id="summary-health-note"></span>
+      </div>
 
       <main class="workspace-grid">
         <section class="holdings-panel">

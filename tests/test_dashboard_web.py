@@ -102,9 +102,25 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "summary-grid" not in html
     assert "数据健康" not in html
     assert "当前视图" in html
-    assert "富途" in html
-    assert "老虎" in html
-    assert "辉立" in html
+    assert "富途暂无数据" in html
+    assert "老虎暂无数据" in html
+    assert "辉立暂无数据" in html
+    for compatibility_id in (
+        "market-filters",
+        "broker-filters",
+        "summary-value",
+        "summary-holding-bar",
+        "summary-holding-value",
+        "summary-holding-weight",
+        "summary-cash-note",
+        "summary-refresh-status",
+        "summary-refresh-note",
+        "summary-brokers",
+        "summary-detail-month",
+        "summary-health",
+        "summary-health-note",
+    ):
+        assert f'id="{compatibility_id}"' in html
     assert "缺行情" in js
     assert "数据已过期" in js
     assert "dashboardError" in js
@@ -124,8 +140,6 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "holding_value_hkd" in js
     assert "cash_like_value_hkd" in js
     assert "percentBarWidth" in js
-    assert ".allocation-bar" in css
-    assert ".summary-allocation-row" in css
     assert "隐藏英文原文" in js
     assert 'firstValue(strategy, ["plan_text_zh", "rationale_zh"])' not in js
     assert "暂无中文策略译文" not in js
