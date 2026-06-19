@@ -555,6 +555,25 @@ for (const required of ["低配", "减仓", "60"]) {
     throw new Error("fallback conclusion missing " + required + ": " + conclusionSection);
   }
 }
+for (const placeholder of ["-", "暂无明确结论。"]) {
+  const placeholderHolding = {
+    ...holding,
+    research_view: {
+      available: true,
+      tradingagents_conclusion: {status: "present", content: placeholder},
+      user_llm_conclusion: {status: "missing", content: ""},
+    },
+  };
+  const placeholderHtml = renderAnalysisStrategySection(placeholderHolding);
+  const placeholderSection = placeholderHtml.includes("research-conclusion-grid")
+    ? placeholderHtml.slice(placeholderHtml.indexOf("research-conclusion-grid"), placeholderHtml.indexOf("source-review") === -1 ? undefined : placeholderHtml.indexOf("source-review"))
+    : "";
+  for (const required of ["低配", "减仓", "60"]) {
+    if (!placeholderSection.includes(required)) {
+      throw new Error("placeholder research conclusion blocked fallback " + required + ": " + placeholderSection);
+    }
+  }
+}
 const primaryHtml = html.split("source-review", 1)[0];
 if (primaryHtml.includes("risk is elevated") || primaryHtml.includes("The bull case")) {
   throw new Error("raw English leaked into primary Chinese UI: " + primaryHtml);
@@ -733,6 +752,55 @@ if (state.researchChat.sessionId !== "session-b") {
 }
 if (calls.join(",") !== "AAA,BBB") {
   throw new Error("unexpected call order: " + calls.join(","));
+}
+const classes = new Set();
+elements["research-chat-layer"] = {
+  hidden: true,
+  classList: {
+    add(name) { classes.add(name); },
+    remove(name) { classes.delete(name); },
+  },
+};
+elements["research-chat-title"] = { textContent: "" };
+elements["research-chat-context-note"] = { textContent: "" };
+elements["research-chat-context-list"] = { innerHTML: "" };
+elements["research-chat-input"] = { value: "", focus() {} };
+state.dashboard = {
+  holdings: [
+    {
+      market: "US",
+      symbol: "AAA",
+      name: "Available",
+      research_view: {
+        available: true,
+        tradingagents_conclusion: {status: "present", content: "有上下文"},
+        user_llm_conclusion: {status: "missing", content: ""},
+      },
+    },
+    {
+      market: "US",
+      symbol: "CCC",
+      name: "Missing",
+      research_view: {available: false},
+    },
+  ],
+};
+state.marketFilter = "ALL";
+state.brokerFilter = "ALL";
+postDashboardJson = () => new Promise(() => {});
+openResearchChat(holdingKey(state.dashboard.holdings[0]));
+if (!state.researchChat.busy) {
+  throw new Error("available chat should be busy while context request is pending");
+}
+await openResearchChat(holdingKey(state.dashboard.holdings[1]));
+if (state.researchChat.busy) {
+  throw new Error("missing context chat should clear busy state");
+}
+if (state.researchChat.sessionId) {
+  throw new Error("missing context chat should clear stale session id: " + state.researchChat.sessionId);
+}
+if (!String(elements["research-chat-status"].textContent).includes("暂无投研上下文")) {
+  throw new Error("missing context status not shown: " + elements["research-chat-status"].textContent);
 }
 })()
 `, sandbox);

@@ -982,7 +982,7 @@ function renderResearchConclusions(holding) {
 
 function researchConclusion(value) {
   const conclusion = value && typeof value === "object" ? value : {};
-  const content = formatPlain(conclusion.content || "");
+  const content = meaningfulConclusionText(conclusion.content || "");
   return {
     present: conclusion.status === "present" && hasValue(content),
     content,
@@ -1098,7 +1098,8 @@ async function openResearchChat(detailKey) {
   renderResearchChatMessages([]);
   openResearchChatLayer();
   if (!researchView.available) {
-    setResearchChatStatus("暂无投研上下文，无法开始讨论");
+    state.researchChat.sessionId = "";
+    setResearchChatBusy(false, "暂无投研上下文，无法开始讨论");
     return;
   }
   await createResearchChatSession(holding);
