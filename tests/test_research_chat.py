@@ -85,6 +85,84 @@ def test_load_research_view_supports_symbol_scoped_legacy_bundle(tmp_path: Path)
     assert view["tradingagents_conclusion"]["content"] == "legacy"
 
 
+def test_load_research_view_market_scoped_bundle_beats_newer_legacy_bundle(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    market_bundle = data_dir / "research_data" / "US" / "VIXY" / "2026-06-19"
+    legacy_bundle = data_dir / "research_data" / "VIXY" / "2026-06-20"
+    write_json(
+        market_bundle / "dashboard_view.json",
+        {
+            "schema_version": "dashboard.research_view.v1",
+            "market": "US",
+            "symbol": "VIXY",
+            "research_date": "2026-06-19",
+            "tradingagents_conclusion": {"status": "present", "content": "market"},
+            "user_llm_conclusion": {"status": "missing", "content": ""},
+        },
+    )
+    write_json(
+        legacy_bundle / "dashboard_view.json",
+        {
+            "schema_version": "dashboard.research_view.v1",
+            "market": "US",
+            "symbol": "VIXY",
+            "research_date": "2026-06-20",
+            "tradingagents_conclusion": {"status": "present", "content": "legacy"},
+            "user_llm_conclusion": {"status": "missing", "content": ""},
+        },
+    )
+
+    view = load_research_view_for_holding(
+        data_dir=data_dir,
+        market="US",
+        symbol="VIXY",
+    )
+
+    assert view["available"] is True
+    assert view["bundle_dir"].endswith("data/research_data/US/VIXY/2026-06-19")
+    assert view["tradingagents_conclusion"]["content"] == "market"
+
+
+def test_load_research_view_ignores_non_date_directories(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    dated_bundle = data_dir / "research_data" / "US" / "VIXY" / "2026-06-19"
+    latest_bundle = data_dir / "research_data" / "US" / "VIXY" / "latest"
+    write_json(
+        dated_bundle / "dashboard_view.json",
+        {
+            "schema_version": "dashboard.research_view.v1",
+            "market": "US",
+            "symbol": "VIXY",
+            "research_date": "2026-06-19",
+            "tradingagents_conclusion": {"status": "present", "content": "dated"},
+            "user_llm_conclusion": {"status": "missing", "content": ""},
+        },
+    )
+    write_json(
+        latest_bundle / "dashboard_view.json",
+        {
+            "schema_version": "dashboard.research_view.v1",
+            "market": "US",
+            "symbol": "VIXY",
+            "research_date": "latest",
+            "tradingagents_conclusion": {"status": "present", "content": "latest"},
+            "user_llm_conclusion": {"status": "missing", "content": ""},
+        },
+    )
+
+    view = load_research_view_for_holding(
+        data_dir=data_dir,
+        market="US",
+        symbol="VIXY",
+    )
+
+    assert view["available"] is True
+    assert view["bundle_dir"].endswith("data/research_data/US/VIXY/2026-06-19")
+    assert view["tradingagents_conclusion"]["content"] == "dated"
+
+
 def test_missing_research_view_is_explicit() -> None:
     assert missing_research_view("US", "VIXY") == {
         "schema_version": "dashboard.research_view.v1",

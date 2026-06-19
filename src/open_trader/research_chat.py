@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ from typing import Any
 RESEARCH_VIEW_SCHEMA = "dashboard.research_view.v1"
 SESSION_SCHEMA = "open_trader.research_chat_session.v1"
 FINAL_CONCLUSION_SCHEMA = "user.llm_conclusion.v1"
+RESEARCH_BUNDLE_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class ResearchChatError(RuntimeError):
@@ -74,17 +76,28 @@ def latest_research_bundle_dir(
     symbol: str,
 ) -> Path | None:
     research_root = data_dir / "research_data"
-    candidates = [
+    candidate_parents = [
         research_root / market.strip().upper() / symbol.strip().upper(),
         research_root / symbol.strip().upper(),
     ]
+    for parent in candidate_parents:
+        latest_dir = _latest_dated_bundle_dir(parent)
+        if latest_dir is not None:
+            return latest_dir
+    return None
+
+
+def _latest_dated_bundle_dir(parent: Path) -> Path | None:
+    if not parent.is_dir():
+        return None
     dated_dirs: list[Path] = []
-    for parent in candidates:
-        if not parent.is_dir():
-            continue
-        for child in parent.iterdir():
-            if child.is_dir() and (child / "dashboard_view.json").is_file():
-                dated_dirs.append(child)
+    for child in parent.iterdir():
+        if (
+            child.is_dir()
+            and RESEARCH_BUNDLE_DATE_PATTERN.fullmatch(child.name)
+            and (child / "dashboard_view.json").is_file()
+        ):
+            dated_dirs.append(child)
     return max(dated_dirs, key=lambda path: path.name) if dated_dirs else None
 
 
