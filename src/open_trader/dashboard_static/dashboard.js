@@ -760,6 +760,203 @@ function firstAvailableText(...values) {
   return "";
 }
 
+function sortedTradeActions(actions) {
+  return [...actions].sort((left, right) => {
+    const statusDelta = actionStatusRank(left.status) - actionStatusRank(right.status);
+    if (statusDelta !== 0) {
+      return statusDelta;
+    }
+    const priorityDelta = priorityRank(left.priority) - priorityRank(right.priority);
+    if (priorityDelta !== 0) {
+      return priorityDelta;
+    }
+    return `${left.market || ""}.${left.symbol || ""}`.localeCompare(`${right.market || ""}.${right.symbol || ""}`);
+  });
+}
+
+function actionStatusRank(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "ready") {
+    return 0;
+  }
+  if (normalized === "review") {
+    return 1;
+  }
+  if (normalized === "watch") {
+    return 2;
+  }
+  return 3;
+}
+
+function priorityRank(priority) {
+  const normalized = String(priority || "").trim().toLowerCase();
+  const ranks = { critical: 0, high: 1, medium: 2, low: 3 };
+  return Object.prototype.hasOwnProperty.call(ranks, normalized) ? ranks[normalized] : 4;
+}
+
+function tradeActionCounts(actions) {
+  const counts = { ready: 0, review: 0, watch: 0 };
+  for (const action of actions) {
+    const status = String(action.status || "").trim().toLowerCase();
+    if (status === "ready") {
+      counts.ready += 1;
+    } else if (status === "review") {
+      counts.review += 1;
+    } else if (status === "watch") {
+      counts.watch += 1;
+    }
+  }
+  return counts;
+}
+
+function actionSymbol(action) {
+  const futu = formatPlain(action.futu_symbol);
+  if (futu !== "-") {
+    return futu;
+  }
+  const market = formatPlain(action.market);
+  const symbol = formatPlain(action.symbol);
+  if (market === "-" && symbol === "-") {
+    return "-";
+  }
+  return `${market}.${symbol}`;
+}
+
+function actionSourceContext(action) {
+  const parts = [
+    formatTriggerStatus(action.trigger_status),
+    formatPriority(action.priority),
+  ].filter((part) => part && part !== "-");
+  return parts.join(" · ") || "交易计划触发";
+}
+
+function shortActionReason(action) {
+  const reason = formatActionReason(
+    firstAvailableText(
+      action.trigger_reason,
+      action.reason,
+      action.agent_reason,
+      action.rationale,
+      action.watch_trigger,
+    ),
+  );
+  if (reason === "-") {
+    return "暂无简短理由。";
+  }
+  return compactSentence(reason, 96);
+}
+
+function compactSentence(text, maxLength) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trim()}…`;
+}
+
+function actionNotionalText(action) {
+  if (hasValue(action.suggested_notional)) {
+    const currency = formatPlain(action.notional_currency);
+    return currency === "-" ? action.suggested_notional : `${action.suggested_notional} ${currency}`;
+  }
+  return "-";
+}
+
+function actionCardStatusLabel(action) {
+  const actionText = formatAction(action.action || action.suggested_action);
+  const statusText = formatActionStatus(action.status);
+  if (actionText === "-" && statusText === "-") {
+    return "-";
+  }
+  if (actionText === "-") {
+    return statusText;
+  }
+  if (statusText === "-") {
+    return actionText;
+  }
+  return `${actionText} · ${statusText}`;
+}
+
+function rationaleSource(holding) {
+  const action = holding.trade_action || holding.premarket_action || {};
+  const strategy = holding.strategy || {};
+  const report = holding.agent_report || {};
+  return firstAvailableText(
+    action.agent_reason,
+    strategy.agent_reason,
+    report.summary_zh,
+    action.agent_excerpt,
+    strategy.agent_excerpt,
+    report.raw_decision,
+  );
+}
+
+function rationaleRows(text) {
+  const sentences = splitRationaleText(text);
+  const rows = sentences.map((sentence, index) => ({
+    label: rationaleLabel(sentence, index, sentences.length),
+    text: sentence,
+  }));
+  if (rows.length === 0) {
+    return [];
+  }
+  return rows.slice(0, 8);
+}
+
+function splitRationaleText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) {
+    return [];
+  }
+  const lineParts = raw
+    .split(/\r?\n+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const sourceParts = lineParts.length > 1 ? lineParts : raw.split(/(?<=[。！？!?])\s+|(?<=[。！？!?])/);
+  const parts = sourceParts
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => part.replace(/^[-*•\d.\s]+/, "").trim())
+    .filter(Boolean);
+  const rows = [];
+  let buffer = "";
+  for (const part of parts) {
+    const candidate = buffer ? `${buffer} ${part}` : part;
+    if (candidate.length <= 120) {
+      buffer = candidate;
+    } else {
+      if (buffer) {
+        rows.push(buffer);
+      }
+      buffer = part;
+    }
+  }
+  if (buffer) {
+    rows.push(buffer);
+  }
+  return rows;
+}
+
+function rationaleLabel(text, index, total) {
+  const lower = String(text || "").toLowerCase();
+  if (/(macd|rsi|趋势|反弹|突破|阻力|支撑|均线|technical|trend|momentum)/i.test(lower)) {
+    return "趋势派";
+  }
+  if (/(风险|止损|回撤|衰减|升水|仓位|风控|risk|stop|drawdown|decay|contango|position)/i.test(lower)) {
+    return "风控派";
+  }
+  if (/(宏观|政策|财报|油|利率|伊朗|地缘|事件|macro|policy|earnings|oil|rate|geopolitical)/i.test(lower)) {
+    return "事件派";
+  }
+  if (index === total - 1 || /(结论|因此|所以|减仓|买入|卖出|持有|配置|action|trim|buy|sell|hold|allocation)/i.test(lower)) {
+    return "组合结论";
+  }
+  return `依据${index + 1}`;
+}
+
 function renderTradeActions() {
   const actions = (state.dashboard && state.dashboard.trade_actions) || [];
   elements["action-count"].textContent = `${actions.length} 条`;
