@@ -173,24 +173,53 @@ Response includes the appended assistant message and current transcript.
 
 ## Frontend Design
 
-The frontend stays as static HTML/CSS/JavaScript.
+The frontend stays as static HTML/CSS/JavaScript and keeps the current dashboard
+main layout. Do not introduce a new landing page, a permanent right drawer, or a
+separate research workspace for the first version.
+
+The approved mock is:
+
+- `docs/superpowers/mockups/llm-research-chat-main.html`
+- `docs/superpowers/mockups/llm-research-chat-main-desktop.png`
+- `docs/superpowers/mockups/llm-research-chat-main-chat.png`
+- `docs/superpowers/mockups/llm-research-chat-main-mobile.png`
 
 Symbol detail view changes:
 
-- Add a `投研结论` section with two cards.
-- Add a `开始讨论` or `继续讨论` button.
-- Show `缺失` for the user/LLM conclusion until a finalized conclusion exists.
+- Reuse the existing `分析与交易策略` detail area.
+- Replace or extend the existing `最终结论` block with a two-card conclusion
+  grid.
+- Card 1 is `投研给出的结论`. It renders TradingAgents' original conclusion as
+  soon as `research_view` exists.
+- Card 2 is `我和 LLM 探讨后的结论`. It renders `缺失` until a validated
+  finalized conclusion exists.
+- Put `开始讨论` on card 2 when there is no session, and `继续讨论` once a
+  session exists.
+- Keep `生成最终结论` inside the chat panel. The conclusion card should not look
+  like a draft editor and should not update from ordinary chat turns.
 
 Chat panel:
 
-- Opens over or beside the symbol detail panel.
-- Shows the selected market/symbol and latest research date.
+- Opens as a modal or inline overlay from the current symbol detail page.
+- Shows the selected market/symbol, latest research date, and a compact
+  `上下文已自动加载` status.
+- Shows a compact context rail with TradingAgents conclusion, user context, and
+  finalization target.
 - Shows the transcript.
 - Provides a message input and send button.
 - Provides a `生成最终结论` button.
 - Shows a loading state while chat or finalization calls are running.
 - Keeps the finalization button disabled while there is no assistant/user
   discussion content.
+
+Visual constraints:
+
+- Match the existing dashboard style: light background, subtle borders, 8px
+  radius or less, dense Chinese labels, and restrained green/orange accents.
+- Avoid nested cards inside page sections. The two conclusion cards are the only
+  new framed items in this area.
+- Long conclusions must wrap inside their cards on desktop and mobile.
+- On mobile, the two conclusion cards and chat content collapse to one column.
 
 Rendering rules:
 

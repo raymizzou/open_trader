@@ -1,0 +1,819 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mock UI - LLM 投研讨论工作流</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f4f1eb;
+        --surface: #ffffff;
+        --surface-soft: #f7f8f4;
+        --text: #202124;
+        --muted: #6f766d;
+        --line: #d9ddd2;
+        --accent: #1f6f5b;
+        --accent-strong: #145443;
+        --warning: #a15c10;
+        --ok: #216e46;
+        --shadow: 0 8px 24px rgba(35, 42, 32, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 14px;
+        letter-spacing: 0;
+        margin: 0;
+      }
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      .dashboard-shell {
+        min-height: 100vh;
+        padding: 18px;
+      }
+
+      .mock-note {
+        align-items: center;
+        color: var(--muted);
+        display: flex;
+        gap: 10px;
+        justify-content: space-between;
+        margin: 0 0 12px;
+      }
+
+      .mock-note strong {
+        color: var(--text);
+      }
+
+      .symbol-detail-panel {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        display: grid;
+        gap: 14px;
+        padding: 14px;
+      }
+
+      .metric-grid {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .metric-card,
+      .decision-card,
+      .metric-cell,
+      .conclusion-card,
+      .broker-table-wrap {
+        background: var(--surface-soft);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        min-width: 0;
+      }
+
+      .metric-card {
+        display: grid;
+        gap: 12px;
+        min-height: 78px;
+        padding: 12px;
+      }
+
+      .label {
+        color: var(--muted);
+        display: block;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .metric-card strong {
+        font-size: 20px;
+      }
+
+      .section {
+        border-top: 1px solid var(--line);
+        display: grid;
+        gap: 12px;
+        padding-top: 14px;
+      }
+
+      .section:first-of-type {
+        border-top: 0;
+        padding-top: 0;
+      }
+
+      .section h2,
+      .section h3 {
+        font-size: 17px;
+        line-height: 1.3;
+        margin: 0;
+      }
+
+      .status-line {
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .decision-dashboard {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: minmax(300px, 1.35fr) minmax(220px, 1fr) minmax(220px, 1fr);
+      }
+
+      .decision-card {
+        display: grid;
+        gap: 10px;
+        min-height: 148px;
+        padding: 14px;
+      }
+
+      .decision-card.primary {
+        background: #fffaf1;
+        border-color: #efc47e;
+      }
+
+      .decision-card strong {
+        font-size: 22px;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+      }
+
+      .decision-card p {
+        line-height: 1.55;
+        margin: 0;
+      }
+
+      .operation-list {
+        display: grid;
+        gap: 8px;
+        margin: 0;
+      }
+
+      .operation-list div {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: 42px minmax(0, 1fr);
+      }
+
+      .operation-list dt {
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .operation-list dd {
+        margin: 0;
+      }
+
+      .decision-metric-strip {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+      }
+
+      .metric-cell {
+        display: grid;
+        gap: 6px;
+        padding: 10px;
+      }
+
+      .metric-cell strong {
+        overflow-wrap: anywhere;
+      }
+
+      .dialogue-grid {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .dialogue-row {
+        background: var(--surface-soft);
+        border-left: 3px solid var(--accent);
+        border-radius: 6px;
+        display: grid;
+        gap: 4px;
+        padding: 10px 12px;
+      }
+
+      .dialogue-row strong {
+        color: var(--accent-strong);
+      }
+
+      .dialogue-row span {
+        line-height: 1.55;
+      }
+
+      .research-conclusion-header {
+        align-items: center;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+      }
+
+      .research-conclusion-grid {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .conclusion-card {
+        display: grid;
+        gap: 12px;
+        min-height: 168px;
+        padding: 14px;
+      }
+
+      .conclusion-card-header {
+        align-items: start;
+        display: flex;
+        gap: 10px;
+        justify-content: space-between;
+      }
+
+      .conclusion-card h3 {
+        font-size: 16px;
+      }
+
+      .status-pill {
+        align-self: start;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--muted);
+        display: inline-flex;
+        flex: 0 0 auto;
+        font-size: 12px;
+        font-weight: 700;
+        justify-self: start;
+        min-height: 26px;
+        padding: 4px 9px;
+      }
+
+      .status-present {
+        background: #eef7f1;
+        border-color: #b8dac6;
+        color: var(--ok);
+      }
+
+      .status-missing {
+        background: #fbfcf8;
+      }
+
+      .conclusion-body {
+        display: grid;
+        gap: 8px;
+      }
+
+      .conclusion-body strong {
+        font-size: 18px;
+        line-height: 1.4;
+        overflow-wrap: anywhere;
+      }
+
+      .conclusion-body p {
+        line-height: 1.6;
+        margin: 0;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .conclusion-fields {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .conclusion-fields div {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        display: grid;
+        gap: 5px;
+        padding: 8px;
+      }
+
+      .conclusion-actions {
+        align-items: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .primary-button,
+      .secondary-button,
+      .ghost-button {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        cursor: pointer;
+        font-weight: 700;
+        min-height: 34px;
+        padding: 7px 12px;
+      }
+
+      .primary-button {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #ffffff;
+      }
+
+      .secondary-button {
+        background: #fffaf1;
+        border-color: #efc47e;
+        color: var(--warning);
+      }
+
+      .ghost-button {
+        background: var(--surface);
+        color: var(--accent-strong);
+      }
+
+      .broker-table-wrap {
+        overflow-x: auto;
+      }
+
+      table {
+        border-collapse: collapse;
+        min-width: 880px;
+        width: 100%;
+      }
+
+      th,
+      td {
+        border-bottom: 1px solid var(--line);
+        padding: 10px;
+        text-align: left;
+        white-space: nowrap;
+      }
+
+      th {
+        background: var(--surface-soft);
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .chat-layer {
+        align-items: center;
+        background: rgba(32, 33, 36, 0.28);
+        display: none;
+        inset: 0;
+        justify-content: center;
+        padding: 18px;
+        position: fixed;
+        z-index: 20;
+      }
+
+      body.chat-open .chat-layer {
+        display: flex;
+      }
+
+      .chat-modal {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: 0 24px 70px rgba(35, 42, 32, 0.22);
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr) auto;
+        max-height: min(760px, calc(100vh - 36px));
+        max-width: 980px;
+        min-height: 620px;
+        overflow: hidden;
+        width: min(980px, 100%);
+      }
+
+      .chat-header,
+      .chat-footer {
+        background: var(--surface-soft);
+        border-bottom: 1px solid var(--line);
+        padding: 14px;
+      }
+
+      .chat-header {
+        align-items: start;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+      }
+
+      .chat-header h2 {
+        font-size: 18px;
+        margin: 0 0 5px;
+      }
+
+      .chat-header p {
+        color: var(--muted);
+        margin: 0;
+      }
+
+      .chat-body {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: minmax(220px, 0.34fr) minmax(0, 1fr);
+        min-height: 0;
+        padding: 14px;
+      }
+
+      .context-rail {
+        background: var(--surface-soft);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+      }
+
+      .context-rail dl {
+        display: grid;
+        gap: 9px;
+        margin: 0;
+      }
+
+      .context-rail div {
+        display: grid;
+        gap: 3px;
+      }
+
+      .context-rail dt {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .context-rail dd {
+        line-height: 1.45;
+        margin: 0;
+      }
+
+      .message-list {
+        display: grid;
+        gap: 10px;
+        min-height: 0;
+        overflow-y: auto;
+      }
+
+      .message {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        display: grid;
+        gap: 5px;
+        line-height: 1.55;
+        padding: 10px 12px;
+      }
+
+      .message.user {
+        background: #fffaf1;
+        border-color: #efc47e;
+      }
+
+      .message.assistant {
+        background: var(--surface-soft);
+      }
+
+      .message strong {
+        color: var(--accent-strong);
+      }
+
+      .chat-footer {
+        border-bottom: 0;
+        border-top: 1px solid var(--line);
+        display: grid;
+        gap: 10px;
+      }
+
+      .chat-input-row {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: minmax(0, 1fr) auto;
+      }
+
+      .chat-input-row input {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        min-height: 38px;
+        min-width: 0;
+        padding: 8px 10px;
+      }
+
+      .chat-action-row {
+        align-items: center;
+        display: flex;
+        gap: 8px;
+        justify-content: space-between;
+      }
+
+      .chat-action-row span {
+        color: var(--muted);
+      }
+
+      .finalized-demo .llm-missing {
+        display: none;
+      }
+
+      .llm-present {
+        display: none;
+      }
+
+      .finalized-demo .llm-present {
+        display: grid;
+      }
+
+      @media (max-width: 980px) {
+        .metric-grid,
+        .decision-dashboard,
+        .research-conclusion-grid,
+        .chat-body {
+          grid-template-columns: 1fr;
+        }
+
+        .decision-metric-strip,
+        .dialogue-grid,
+        .conclusion-fields {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .chat-modal {
+          min-height: 0;
+        }
+      }
+
+      @media (max-width: 640px) {
+        .dashboard-shell,
+        .chat-layer {
+          padding: 10px;
+        }
+
+        .decision-metric-strip,
+        .dialogue-grid,
+        .conclusion-fields,
+        .metric-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .research-conclusion-header,
+        .chat-header,
+        .chat-action-row {
+          align-items: stretch;
+          display: grid;
+          grid-template-columns: 1fr;
+        }
+
+        .chat-input-row {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="dashboard-shell">
+      <p class="mock-note">
+        <span><strong>Mock UI</strong> · 基于当前 symbol detail 主面板，不改变页面主结构</span>
+        <span>状态：TradingAgents 已完成 · LLM 最终结论未生成</span>
+      </p>
+
+      <main class="symbol-detail-panel" aria-label="US.DRAM 分析详情">
+        <section class="metric-grid" aria-label="持仓摘要">
+          <article class="metric-card">
+            <span class="label">盈亏</span>
+            <strong>18.22%</strong>
+          </article>
+          <article class="metric-card">
+            <span class="label">组合权重</span>
+            <strong>7.11%</strong>
+          </article>
+          <article class="metric-card">
+            <span class="label">数据健康</span>
+            <strong>high · normal</strong>
+          </article>
+        </section>
+
+        <section class="section">
+          <h2>分析与交易策略</h2>
+          <div class="status-line">低配 · 正常 · 待确认 · 2026-06-19 · 只读 · 需要人工确认</div>
+          <div class="decision-dashboard">
+            <article class="decision-card primary">
+              <span class="label">当前希望你做什么</span>
+              <strong>减仓 US.DRAM，数量 100</strong>
+              <p>达到第一目标价；当前价格已达到或高于第一目标价。执行前保持人工确认。</p>
+            </article>
+            <article class="decision-card">
+              <span class="label">操作指令</span>
+              <dl class="operation-list">
+                <div><dt>动作</dt><dd>减仓 · 待确认</dd></div>
+                <div><dt>价格</dt><dd>76.71</dd></div>
+                <div><dt>仓位</dt><dd>100</dd></div>
+                <div><dt>止损</dt><dd>-</dd></div>
+              </dl>
+            </article>
+            <article class="decision-card">
+              <span class="label">今天重点关注</span>
+              <p>达到第一目标价；执行前保持人工确认。后续讨论应重点确认是否需要留部分仓位等待财报。</p>
+            </article>
+          </div>
+
+          <div class="decision-metric-strip" aria-label="分析指标">
+            <article class="metric-cell"><span class="label">观点</span><strong>低配</strong></article>
+            <article class="metric-cell"><span class="label">目标价</span><strong>&gt;= 51</strong></article>
+            <article class="metric-cell"><span class="label">触发状态</span><strong>达到第一目标价</strong></article>
+            <article class="metric-cell"><span class="label">动作状态</span><strong>待确认</strong></article>
+            <article class="metric-cell"><span class="label">下次复评</span><strong>-</strong></article>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>分析师对话</h2>
+          <div class="dialogue-grid">
+            <div class="dialogue-row">
+              <strong>依据 1</strong>
+              <span>评级：低配（低配）。</span>
+            </div>
+            <div class="dialogue-row">
+              <strong>趋势派</strong>
+              <span>操作计划：在当前位置立即将现有 DRAM 敞口减少 50%，锁定目标价触发后的收益。</span>
+            </div>
+            <div class="dialogue-row">
+              <strong>风控派</strong>
+              <span>仓位：催化剂；目标价：51.0；时间窗口：1-3 个月。</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="section research-conclusion-section">
+          <div class="research-conclusion-header">
+            <div>
+              <h2>最终结论</h2>
+              <div class="status-line">展示两个来源：投研原始结论，以及你和 LLM 讨论后的最终结论。</div>
+            </div>
+            <button class="ghost-button" type="button" id="reset-demo">重置状态</button>
+          </div>
+
+          <div class="research-conclusion-grid">
+            <article class="conclusion-card">
+              <div class="conclusion-card-header">
+                <h3>投研给出的结论</h3>
+                <span class="status-pill status-present">已生成</span>
+              </div>
+              <div class="conclusion-body">
+                <strong>低配，当前动作为减仓。</strong>
+                <p>当前价格已达到或高于第一目标价。达到第一目标价后复核；触发风险条件后进入人工复核。</p>
+              </div>
+              <div class="conclusion-fields">
+                <div><span class="label">理由</span><strong>达到第一目标价。</strong></div>
+                <div><span class="label">条件</span><strong>财报后复评。</strong></div>
+              </div>
+              <div class="conclusion-actions">
+                <button class="ghost-button" type="button">查看英文原文</button>
+              </div>
+            </article>
+
+            <article class="conclusion-card" id="llm-conclusion-card">
+              <div class="conclusion-card-header">
+                <h3>我和 LLM 探讨后的结论</h3>
+                <span class="status-pill status-missing llm-missing">缺失</span>
+                <span class="status-pill status-present llm-present">已生成</span>
+              </div>
+
+              <div class="conclusion-body llm-missing">
+                <strong>缺失</strong>
+                <p class="muted">打开聊天窗口后，系统会自动加载投研结论、原始资料、你的仓位与关注点。多轮讨论不会直接更新这里，只有点击“生成最终结论”后才写入。</p>
+              </div>
+
+              <div class="conclusion-body llm-present">
+                <strong>确认减仓 100 股，但保留复评窗口。</strong>
+                <p>结合当前仓位、目标价已触发和你对财报波动的关注，先执行减仓，剩余仓位等财报后用最新现金流和订单指引重新评估。</p>
+              </div>
+
+              <div class="conclusion-fields llm-present">
+                <div><span class="label">执行条件</span><strong>限价不低于 76.00</strong></div>
+                <div><span class="label">失败条件</span><strong>盘前跌破 72.00 则暂停</strong></div>
+              </div>
+
+              <div class="conclusion-actions">
+                <button class="primary-button" type="button" id="open-chat">开始讨论</button>
+                <button class="ghost-button" type="button" id="open-chat-secondary">继续讨论</button>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>券商账户明细</h2>
+          <div class="broker-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>券商</th>
+                  <th>账户</th>
+                  <th>数量</th>
+                  <th>成本价</th>
+                  <th>持仓价</th>
+                  <th>市值</th>
+                  <th>盈亏</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>tiger</td>
+                  <td>tiger_5683</td>
+                  <td>200.0</td>
+                  <td>66.1057</td>
+                  <td>78.1485</td>
+                  <td>15629.7</td>
+                  <td>2408.56</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="chat-layer" role="dialog" aria-modal="true" aria-label="LLM 深度讨论">
+      <section class="chat-modal">
+        <header class="chat-header">
+          <div>
+            <h2>LLM 深度讨论 · US.DRAM</h2>
+            <p>上下文已自动加载：TradingAgents 原始结论、原始资料、当前仓位、你的关注点。</p>
+          </div>
+          <button class="ghost-button" type="button" id="close-chat">关闭</button>
+        </header>
+
+        <div class="chat-body">
+          <aside class="context-rail" aria-label="已加载上下文">
+            <span class="status-pill status-present">上下文已加载</span>
+            <dl>
+              <div>
+                <dt>投研结论</dt>
+                <dd>低配；达到第一目标价；建议减仓。</dd>
+              </div>
+              <div>
+                <dt>用户上下文</dt>
+                <dd>当前组合权重 7.11%；关注财报后是否还有上行空间。</dd>
+              </div>
+              <div>
+                <dt>输出目标</dt>
+                <dd>最终生成 user_llm_conclusion.json，再由前端渲染。</dd>
+              </div>
+            </dl>
+          </aside>
+
+          <div class="message-list">
+            <div class="message assistant">
+              <strong>LLM</strong>
+              <span>我已加载投研结论和你的持仓上下文。当前最需要确认的是：你更倾向于锁定收益，还是保留一部分仓位等待财报后的二次判断？</span>
+            </div>
+            <div class="message user">
+              <strong>你</strong>
+              <span>我担心完全卖出后，如果财报超预期会错过第二波上涨。这个风险怎么处理？</span>
+            </div>
+            <div class="message assistant">
+              <strong>LLM</strong>
+              <span>可以把“执行减仓”和“保留复评权”分开：先减掉已触发目标价对应的 100 股，剩余仓位等待财报后重新评估；如果盘前跌破关键价格则暂停执行。</span>
+            </div>
+          </div>
+        </div>
+
+        <footer class="chat-footer">
+          <div class="chat-input-row">
+            <input type="text" value="如果只减一半，失败条件应该怎么写？" aria-label="输入消息">
+            <button class="primary-button" type="button">发送</button>
+          </div>
+          <div class="chat-action-row">
+            <span>多轮对话不会自动写入看板；只有标准化最终结论会更新右侧卡片。</span>
+            <button class="secondary-button" type="button" id="finalize-demo">生成最终结论</button>
+          </div>
+        </footer>
+      </section>
+    </div>
+
+    <script>
+      const openButtons = [document.getElementById("open-chat"), document.getElementById("open-chat-secondary")];
+      const closeButton = document.getElementById("close-chat");
+      const finalizeButton = document.getElementById("finalize-demo");
+      const resetButton = document.getElementById("reset-demo");
+
+      openButtons.forEach((button) => {
+        button.addEventListener("click", () => document.body.classList.add("chat-open"));
+      });
+      closeButton.addEventListener("click", () => document.body.classList.remove("chat-open"));
+      finalizeButton.addEventListener("click", () => {
+        document.body.classList.add("finalized-demo");
+        document.body.classList.remove("chat-open");
+      });
+      resetButton.addEventListener("click", () => {
+        document.body.classList.remove("finalized-demo", "chat-open");
+      });
+    </script>
+  </body>
+</html>
