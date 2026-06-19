@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 from open_trader.advice.models import (
@@ -498,6 +499,58 @@ def test_load_dashboard_state_reads_large_agent_report_fields(
 
     vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
     assert vixy["agent_report"]["raw_decision"] == raw_decision
+
+
+def test_load_dashboard_state_attaches_research_view(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    bundle = config.data_dir / "research_data" / "US" / "VIXY" / "2026-06-19"
+    bundle.mkdir(parents=True)
+    (bundle / "dashboard_view.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "dashboard.research_view.v1",
+                "market": "US",
+                "symbol": "VIXY",
+                "research_date": "2026-06-19",
+                "tradingagents_conclusion": {
+                    "status": "present",
+                    "content": "低配，当前动作为减仓。",
+                },
+                "user_llm_conclusion": {"status": "missing", "content": ""},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["research_view"]["available"] is True
+    assert vixy["research_view"]["research_date"] == "2026-06-19"
+    assert (
+        vixy["research_view"]["tradingagents_conclusion"]["content"]
+        == "低配，当前动作为减仓。"
+    )
+    assert vixy["research_view"]["user_llm_conclusion"] == {
+        "status": "missing",
+        "content": "",
+    }
+
+
+def test_load_dashboard_state_marks_missing_research_view(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["research_view"]["available"] is False
+    assert vixy["research_view"]["tradingagents_conclusion"] == {
+        "status": "missing",
+        "content": "",
+    }
 
 
 def test_load_dashboard_state_prefers_latest_daily_sync_details(

@@ -8,6 +8,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from .research_chat import load_research_view_for_holding
+
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
 BROKERS = ("futu", "tiger", "phillips")
@@ -105,6 +107,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
     holdings = [
         _merge_holding(
             row,
+            config.data_dir,
             positions_by_holding,
             agent_reports_by_holding,
             strategies_by_holding,
@@ -223,6 +226,7 @@ def _is_cash_like_row(row: dict[str, str]) -> bool:
 
 def _merge_holding(
     row: dict[str, str],
+    data_dir: Path,
     positions_by_holding: dict[tuple[str, str], list[dict[str, str]]],
     agent_reports_by_holding: dict[tuple[str, str], dict[str, str]],
     strategies_by_holding: dict[tuple[str, str], dict[str, str]],
@@ -246,6 +250,19 @@ def _merge_holding(
     holding["strategy"] = _strategy_detail(strategy)
     holding["premarket_action"] = _row_detail(premarket_action)
     holding["trade_action"] = _row_detail(trade_action)
+    holding["research_view"] = (
+        load_research_view_for_holding(
+            data_dir=data_dir,
+            market=key[0],
+            symbol=key[1],
+        )
+        if key is not None
+        else load_research_view_for_holding(
+            data_dir=data_dir,
+            market=row.get("market", ""),
+            symbol=row.get("symbol", ""),
+        )
+    )
     return holding
 
 
