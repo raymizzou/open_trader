@@ -267,6 +267,125 @@ if (chineseDisplayText("YoY 增速稳定，OpenAI 影响有限。") === "") {
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
+def test_dashboard_header_helpers_filter_assets_and_render_sources() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+state.dashboard = {
+  holdings: [
+    {
+      market: "US",
+      symbol: "MSFT",
+      name: "Microsoft",
+      brokers: "futu",
+      market_value_hkd: "37830.00",
+    },
+    {
+      market: "HK",
+      symbol: "00700",
+      name: "Tencent",
+      brokers: "phillip",
+      market_value_hkd: "15982.00",
+    },
+  ],
+  cash_rows: [
+    {
+      market: "CASH",
+      symbol: "HKD_CASH",
+      name: "HKD Cash",
+      broker: "futu",
+      brokers: "futu",
+      currency: "HKD",
+      market_value_hkd: "15982.00",
+    },
+    {
+      market: "CASH",
+      symbol: "USD_CASH",
+      name: "USD Cash",
+      broker: "phillip",
+      brokers: "phillip",
+      currency: "USD",
+      market_value_hkd: "8000.00",
+    },
+  ],
+  broker_summaries: [
+    {
+      broker: "futu",
+      display_name: "富途",
+      portfolio_value_hkd: "15982.00",
+      holding_count: 1,
+      source_status: "real_time",
+    },
+    {
+      broker: "phillip",
+      display_name: "辉立",
+      portfolio_value_hkd: "8000.00",
+      holding_count: 1,
+      source_status: "statement",
+    },
+  ],
+  source_statuses: [
+    {
+      broker: "futu",
+      display_name: "富途",
+      status: "real_time",
+      updated_at: "2026-06-19T09:30:00+08:00",
+    },
+    {
+      broker: "phillip",
+      display_name: "辉立",
+      status: "statement",
+      value: "非实时",
+      updated_at: "2026-05",
+    },
+  ],
+};
+state.marketFilter = "US";
+state.brokerFilter = "futu";
+const summary = currentViewSummary();
+if (summary.portfolio_value_hkd !== "37830.00") {
+  throw new Error("unexpected portfolio value: " + JSON.stringify(summary));
+}
+if (summary.holding_count !== 1) {
+  throw new Error("unexpected holding count: " + JSON.stringify(summary));
+}
+const brokerCards = renderBrokerSummaryCards();
+if (!brokerCards.includes("富途") || !brokerCards.includes("HKD 15982.00")) {
+  throw new Error("broker card missing expected text: " + brokerCards);
+}
+let sourceList = renderSourceStatusList();
+if (!sourceList.includes("辉立") || !sourceList.includes("非实时")) {
+  throw new Error("source list missing statement status: " + sourceList);
+}
+state.quotePayload = {
+  status: "failed",
+  stale: true,
+  diagnostic: { message: "网络中断" },
+};
+sourceList = renderSourceStatusList();
+if (!sourceList.includes("富途") || !sourceList.includes("网络中断")) {
+  throw new Error("source list missing quote diagnostic: " + sourceList);
+}
+state.marketFilter = "CASH";
+state.brokerFilter = "futu";
+const cashRows = filteredCashRows();
+if (cashRows.length !== 1 || cashRows[0].symbol !== "HKD_CASH") {
+  throw new Error("unexpected cash rows: " + JSON.stringify(cashRows));
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
     from open_trader.dashboard_web import build_dashboard_payload
 

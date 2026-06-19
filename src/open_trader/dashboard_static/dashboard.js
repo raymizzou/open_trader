@@ -93,6 +93,16 @@ function bindElements() {
     "quote-status",
     "last-refresh",
     "refresh-quotes",
+    "header-market-filters",
+    "header-broker-filters",
+    "current-view-label",
+    "current-view-value",
+    "current-view-holding-value",
+    "current-view-holding-weight",
+    "current-view-cash-note",
+    "broker-summary-cards",
+    "source-status-list",
+    "cash-detail-panel",
     "summary-value",
     "summary-holding-bar",
     "summary-holding-value",
@@ -125,23 +135,25 @@ function bindElements() {
 
 function bindEvents() {
   elements["refresh-quotes"].addEventListener("click", refreshQuotes);
-  elements["market-filters"].addEventListener("click", (event) => {
+  elements["header-market-filters"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-market]");
     if (!button) {
       return;
     }
     state.marketFilter = button.dataset.market || "ALL";
-    setActiveFilter(elements["market-filters"], button);
-    renderHoldings();
+    state.selectedHoldingKey = "";
+    setActiveFilter(elements["header-market-filters"], button);
+    renderDashboardViews();
   });
-  elements["broker-filters"].addEventListener("click", (event) => {
+  elements["header-broker-filters"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-broker]");
     if (!button) {
       return;
     }
     state.brokerFilter = button.dataset.broker || "ALL";
-    setActiveFilter(elements["broker-filters"], button);
-    renderHoldings();
+    state.selectedHoldingKey = "";
+    setActiveFilter(elements["header-broker-filters"], button);
+    renderDashboardViews();
   });
   elements["holdings-body"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-detail-key]");
@@ -255,11 +267,55 @@ async function refreshQuotes() {
 }
 
 function renderDashboard() {
-  renderSummary();
   renderBrokerFilters();
-  renderHoldings();
+  renderBrokerCards();
+  renderSourceStatusListIntoHeader();
+  renderDashboardViews();
   renderTradeActions();
   renderConnectionPanel();
+}
+
+function renderDashboardViews() {
+  renderHeaderSummary();
+  renderHoldings();
+}
+
+function renderHeaderSummary() {
+  const summary = currentViewSummary();
+  elements["current-view-value"].textContent = formatMoney(summary.portfolio_value_hkd, "HKD");
+  elements["current-view-holding-value"].textContent = `持仓资产 ${formatMoney(summary.holding_value_hkd, "HKD")}`;
+  elements["current-view-holding-weight"].textContent = summary.holding_weight_hkd;
+  elements["current-view-cash-note"].textContent = `现金类资产 ${formatMoney(summary.cash_like_value_hkd, "HKD")} · 持仓 ${formatPlain(summary.holding_count)}`;
+  elements["current-view-label"].textContent = currentViewLabel(summary.holding_count);
+}
+
+function currentViewSummary() {
+  const rows = state.marketFilter === "CASH" ? filteredCashRows() : filteredHoldings();
+  let validValueCount = 0;
+  const total = rows.reduce((sum, row) => {
+    const value = numericValue(row.market_value_hkd);
+    if (value === null) {
+      return sum;
+    }
+    validValueCount += 1;
+    return sum + value;
+  }, 0);
+  const valueText = validValueCount > 0 ? moneyValue(total) : "";
+  const holdingValue = state.marketFilter === "CASH" ? "" : valueText;
+  const cashValue = state.marketFilter === "CASH" ? valueText : "";
+  return {
+    portfolio_value_hkd: valueText,
+    holding_value_hkd: holdingValue,
+    cash_like_value_hkd: cashValue,
+    holding_weight_hkd: percentValue(state.marketFilter === "CASH" ? 0 : total, total),
+    holding_count: rows.length,
+  };
+}
+
+function currentViewLabel(count) {
+  const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CASH" ? "现金" : state.marketFilter;
+  const brokerLabel = state.brokerFilter === "ALL" ? "全部券商" : brokerDisplayName(state.brokerFilter);
+  return `当前视图：${marketLabel} · ${brokerLabel} · ${formatPlain(count)} 条`;
 }
 
 function renderSummary() {
@@ -294,24 +350,56 @@ function firstPresent(...values) {
 }
 
 function renderBrokerFilters() {
-  const brokers = new Set();
+  const brokers = new Map();
   for (const holding of getHoldings()) {
     for (const broker of splitList(holding.brokers)) {
-      brokers.add(broker);
+      brokers.set(broker, brokerDisplayName(broker));
+    }
+  }
+  for (const row of getCashRows()) {
+    for (const broker of rowBrokers(row)) {
+      brokers.set(broker, brokerDisplayName(broker));
+    }
+  }
+  for (const summary of brokerSummaries()) {
+    const broker = brokerKey(summary);
+    if (broker) {
+      brokers.set(broker, brokerDisplayName(summary));
+    }
+  }
+  for (const status of sourceStatuses()) {
+    const broker = brokerKey(status);
+    if (broker) {
+      brokers.set(broker, brokerDisplayName(status));
     }
   }
   const buttons = [
     `<button class="filter-button active" type="button" data-broker="ALL">全部券商</button>`,
   ];
-  for (const broker of [...brokers].sort()) {
+  for (const [broker, label] of [...brokers.entries()].sort((left, right) => left[1].localeCompare(right[1]))) {
     buttons.push(
-      `<button class="filter-button" type="button" data-broker="${escapeHtml(broker)}">${escapeHtml(broker)}</button>`,
+      `<button class="filter-button" type="button" data-broker="${escapeHtml(broker)}">${escapeHtml(label)}</button>`,
     );
   }
-  elements["broker-filters"].innerHTML = buttons.join("");
+  elements["header-broker-filters"].innerHTML = buttons.join("");
+  setFilterActiveByDataset(elements["header-broker-filters"], "broker", state.brokerFilter);
 }
 
 function renderHoldings() {
+  if (state.marketFilter === "CASH") {
+    const cashRows = filteredCashRows();
+    elements["visible-count"].textContent = `${cashRows.length} 条`;
+    elements["workspace-grid"].classList.remove("detail-mode");
+    elements["right-rail"].classList.remove("hidden");
+    elements["holdings-table-wrap"].classList.add("hidden");
+    elements["symbol-detail-panel"].classList.add("hidden");
+    elements["symbol-detail-panel"].innerHTML = "";
+    elements["cash-detail-panel"].classList.remove("hidden");
+    renderCashDetailPanel(cashRows);
+    return;
+  }
+  elements["cash-detail-panel"].classList.add("hidden");
+  elements["cash-detail-panel"].innerHTML = "";
   const holdings = filteredHoldings();
   elements["visible-count"].textContent = `${holdings.length} 条`;
   const selected = selectedHolding(holdings);
@@ -405,7 +493,7 @@ function openTradeActionDetail(actionKey) {
     if (holdingActionKeys(holding).includes(normalizedActionKey)) {
       resetHoldingFilters();
       state.selectedHoldingKey = holdingKey(holding, index);
-      renderHoldings();
+      renderDashboardViews();
       return;
     }
   }
@@ -414,8 +502,8 @@ function openTradeActionDetail(actionKey) {
 function resetHoldingFilters() {
   state.marketFilter = "ALL";
   state.brokerFilter = "ALL";
-  setFilterActiveByDataset(elements["market-filters"], "market", "ALL");
-  setFilterActiveByDataset(elements["broker-filters"], "broker", "ALL");
+  setFilterActiveByDataset(elements["header-market-filters"], "market", "ALL");
+  setFilterActiveByDataset(elements["header-broker-filters"], "broker", "ALL");
 }
 
 function setFilterActiveByDataset(container, datasetKey, value) {
@@ -1379,10 +1467,7 @@ function renderQuoteStatus(payload) {
   elements["last-refresh"].textContent = payload.last_success_at
     ? `上次成功 ${payload.last_success_at}`
     : "尚无成功行情";
-  elements["summary-refresh-status"].textContent = label;
-  elements["summary-refresh-note"].textContent = stale && payload.last_success_at
-    ? `数据已过期 · ${payload.last_success_at}`
-    : formatDiagnostic(payload);
+  renderSourceStatusListIntoHeader();
   renderConnectionPanel();
 }
 
@@ -1404,9 +1489,12 @@ function renderLoadError(error) {
     window.clearInterval(state.quoteIntervalId);
     state.quoteIntervalId = null;
   }
-  elements["summary-health"].textContent = "加载失败";
-  elements["summary-health-note"].textContent = error.message || "无法读取看板数据";
+  elements["last-refresh"].textContent = error.message
+    ? `看板加载失败：${error.message}`
+    : "看板加载失败";
   elements["connection-poll"].textContent = "-";
+  renderHeaderSummary();
+  renderSourceStatusListIntoHeader();
   renderDashboardErrorState();
 }
 
@@ -1417,7 +1505,7 @@ function renderDashboardErrorState() {
 function filteredHoldings() {
   return getHoldings().filter((holding) => {
     const market = String(holding.market || "").toUpperCase();
-    const brokers = splitList(holding.brokers);
+    const brokers = rowBrokers(holding);
     const marketMatches = state.marketFilter === "ALL" || market === state.marketFilter;
     const brokerMatches = state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
     return marketMatches && brokerMatches;
@@ -1428,6 +1516,241 @@ function getHoldings() {
   return (state.dashboard && Array.isArray(state.dashboard.holdings))
     ? state.dashboard.holdings
     : [];
+}
+
+function numericValue(value) {
+  if (!hasValue(value)) {
+    return null;
+  }
+  const parsed = Number.parseFloat(String(value).replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function moneyValue(value) {
+  return Number.isFinite(value) ? value.toFixed(2) : "";
+}
+
+function percentValue(numerator, denominator) {
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) {
+    return "-";
+  }
+  return `${((numerator / denominator) * 100).toFixed(2)}%`;
+}
+
+function isCashLikeRow(row) {
+  if (!row || typeof row !== "object") {
+    return false;
+  }
+  const market = String(row.market || "").trim().toUpperCase();
+  const assetClass = String(row.asset_class || "").trim().toLowerCase();
+  const symbol = String(row.symbol || "").trim().toUpperCase();
+  return market === "CASH"
+    || assetClass === "cash"
+    || assetClass === "money_market_fund"
+    || symbol.endsWith("_CASH");
+}
+
+function brokerSummaries() {
+  return (state.dashboard && Array.isArray(state.dashboard.broker_summaries))
+    ? state.dashboard.broker_summaries
+    : [];
+}
+
+function renderBrokerCards() {
+  elements["broker-summary-cards"].innerHTML = renderBrokerSummaryCards();
+}
+
+function renderBrokerSummaryCards() {
+  const summaries = brokerSummaries();
+  if (!summaries.length) {
+    return `<article class="broker-summary-card"><span class="summary-label">券商暂无数据</span><strong>-</strong></article>`;
+  }
+  return summaries.map((summary) => `
+    <article class="broker-summary-card" data-broker="${escapeHtml(brokerKey(summary))}">
+      <span class="summary-label">${escapeHtml(brokerDisplayName(summary))}</span>
+      <strong>${escapeHtml(formatMoney(summary.portfolio_value_hkd, "HKD"))}</strong>
+      <span class="summary-note">持仓 ${escapeHtml(formatPlain(summary.holding_count))} · ${escapeHtml(sourceKindText(summary.source_kind || summary.source_status))}</span>
+    </article>
+  `).join("");
+}
+
+function renderSourceStatusListIntoHeader() {
+  elements["source-status-list"].innerHTML = renderSourceStatusList();
+}
+
+function renderSourceStatusList() {
+  const rows = sourceStatuses();
+  if (!rows.length) {
+    return `<div class="source-status-row status-muted"><strong>数据来源</strong><span>-</span></div>`;
+  }
+  return rows.map((row) => {
+    const status = sourceStatusValue(row);
+    return `
+      <div class="source-status-row ${escapeHtml(sourceStatusClass(row.status))}" data-broker="${escapeHtml(brokerKey(row))}">
+        <strong>${escapeHtml(sourceStatusLabel(row))}</strong>
+        <span>${escapeHtml(status)}</span>
+      </div>
+    `;
+  }).join("");
+}
+
+function sourceStatuses() {
+  return (state.dashboard && Array.isArray(state.dashboard.source_statuses))
+    ? state.dashboard.source_statuses
+    : [];
+}
+
+function sourceStatusLabel(row) {
+  return brokerDisplayName(row);
+}
+
+function sourceStatusValue(row) {
+  if (brokerKey(row) === "futu" && quoteDiagnosticActive()) {
+    const diagnostic = formatDiagnostic(state.quotePayload);
+    if (state.quotePayload && state.quotePayload.stale && diagnostic === quoteStatusLabel(state.quotePayload.status)) {
+      return state.quotePayload.last_success_at
+        ? `数据已过期 · ${state.quotePayload.last_success_at}`
+        : "数据已过期";
+    }
+    return diagnostic;
+  }
+  return sourceDisplayText(row);
+}
+
+function sourceDisplayText(row) {
+  return firstPresent(row.display_text, row.value, sourceKindText(row.status));
+}
+
+function sourceStatusClass(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "ok" || normalized === "real_time" || normalized === "fresh") {
+    return "status-ok";
+  }
+  if (normalized === "non_realtime" || normalized === "statement") {
+    return "status-partial";
+  }
+  if (normalized === "missing" || normalized === "failed" || normalized === "error") {
+    return "status-failed";
+  }
+  return "status-muted";
+}
+
+function filteredCashRows() {
+  return getCashRows().filter((row) => {
+    if (!isCashLikeRow(row)) {
+      return false;
+    }
+    const brokers = rowBrokers(row);
+    return state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
+  });
+}
+
+function getCashRows() {
+  return (state.dashboard && Array.isArray(state.dashboard.cash_rows))
+    ? state.dashboard.cash_rows
+    : [];
+}
+
+function renderCashDetailPanel(rows) {
+  if (state.dashboardError) {
+    elements["cash-detail-panel"].innerHTML = `<div class="empty-state">看板数据加载失败</div>`;
+    return;
+  }
+  if (!state.dashboard) {
+    elements["cash-detail-panel"].innerHTML = `<div class="empty-state">加载中</div>`;
+    return;
+  }
+  if (!rows.length) {
+    elements["cash-detail-panel"].innerHTML = `<div class="empty-state">没有匹配的现金资产</div>`;
+    return;
+  }
+  elements["cash-detail-panel"].innerHTML = `
+    <div class="compact-detail-table">
+      <table>
+        <thead>
+          <tr>
+            <th>券商</th>
+            <th>币种</th>
+            <th>标的</th>
+            <th>名称</th>
+            <th>港元市值</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((row) => `
+            <tr>
+              <td>${escapeHtml(rowBrokers(row).map(brokerDisplayName).join("; ") || "-")}</td>
+              <td>${escapeHtml(formatPlain(row.currency))}</td>
+              <td>${escapeHtml(formatPlain(row.symbol))}</td>
+              <td>${escapeHtml(formatPlain(row.name))}</td>
+              <td class="number-cell">${escapeHtml(formatMoney(row.market_value_hkd, "HKD"))}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function quoteDiagnosticActive() {
+  const payload = state.quotePayload || {};
+  return payload.status === "failed" || Boolean(payload.stale);
+}
+
+function sourceKindText(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "live_account" || normalized === "real_time" || normalized === "ok" || normalized === "fresh") {
+    return "实时";
+  }
+  if (normalized === "quote_and_live_account") {
+    return "行情与账户";
+  }
+  if (normalized === "statement" || normalized === "non_realtime") {
+    return "非实时";
+  }
+  if (normalized === "missing") {
+    return "暂无数据";
+  }
+  return formatPlain(value);
+}
+
+function rowBrokers(row) {
+  if (!row || typeof row !== "object") {
+    return [];
+  }
+  const brokers = splitList(row.brokers);
+  const broker = brokerKey(row);
+  if (broker && !brokers.includes(broker)) {
+    brokers.push(broker);
+  }
+  return brokers;
+}
+
+function brokerKey(value) {
+  const raw = typeof value === "object" && value !== null
+    ? firstPresent(value.broker, value.broker_key)
+    : value;
+  const normalized = String(raw || "").trim().toLowerCase();
+  if (normalized === "phillip") {
+    return "phillips";
+  }
+  return normalized;
+}
+
+function brokerDisplayName(value) {
+  if (typeof value === "object" && value !== null) {
+    const label = firstPresent(value.label, value.display_name);
+    if (hasValue(label)) {
+      return label;
+    }
+  }
+  const key = brokerKey(value);
+  const labels = {
+    futu: "富途",
+    tiger: "老虎",
+    phillips: "辉立",
+  };
+  return labels[key] || formatPlain(value);
 }
 
 function quoteForHolding(holding) {
