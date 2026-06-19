@@ -341,13 +341,29 @@ const watch = watchPointText(holding);
 if (!watch.includes("达到第一目标价") && !watch.includes("财报")) {
   throw new Error("watch point should use trigger or catalyst: " + watch);
 }
-const metrics = decisionMetricCells(holding).map((cell) => cell[0]).join(",");
-if (!metrics.includes("观点") || !metrics.includes("下次复评")) {
-  throw new Error("metrics missing required labels: " + metrics);
+const metricCells = decisionMetricCells(holding);
+const metricLabels = metricCells.map((cell) => cell[0]).join(",");
+const metricText = metricCells.flat().join(",");
+if (!metricLabels.includes("观点") || !metricLabels.includes("下次复评")) {
+  throw new Error("metrics missing required labels: " + metricText);
 }
-const conclusion = finalConclusionItems(holding).map((item) => item.label).join(",");
-if (!conclusion.includes("结论") || !conclusion.includes("失败条件")) {
-  throw new Error("conclusion missing required labels: " + conclusion);
+if (!metricText.includes("51") || !metricText.includes("53")) {
+  throw new Error("metrics missing target prices: " + metricText);
+}
+if (!metricText.includes("财报") && !metricText.includes("复评")) {
+  throw new Error("metrics missing next review text: " + metricText);
+}
+const conclusionItems = finalConclusionItems(holding);
+const conclusionLabels = conclusionItems.map((item) => item.label).join(",");
+const conclusionText = JSON.stringify(conclusionItems);
+if (!conclusionLabels.includes("结论") || !conclusionLabels.includes("失败条件")) {
+  throw new Error("conclusion missing required labels: " + conclusionText);
+}
+if (!conclusionText.includes("低配") && !conclusionText.includes("减仓")) {
+  throw new Error("conclusion missing decision text: " + conclusionText);
+}
+if (!conclusionText.includes("60")) {
+  throw new Error("conclusion missing failure condition: " + conclusionText);
 }
 const html = renderAnalysisStrategySection(holding);
 for (const required of ["分析与交易策略", "当前希望你做什么", "操作指令", "今天重点关注", "分析师对话", "最终结论", "查看英文原文"]) {
@@ -355,17 +371,30 @@ for (const required of ["分析与交易策略", "当前希望你做什么", "�
     throw new Error("missing rendered label " + required + " in " + html);
   }
 }
-if (html.includes("risk is elevated") || html.includes("The bull case")) {
-  throw new Error("raw English leaked into primary Chinese UI: " + html);
+const primaryHtml = html.split("source-review", 1)[0];
+if (primaryHtml.includes("risk is elevated") || primaryHtml.includes("The bull case")) {
+  throw new Error("raw English leaked into primary Chinese UI: " + primaryHtml);
 }
-const noActionHtml = renderAnalysisStrategySection({
+if (!html.includes("english-source") || !html.includes("hidden")) {
+  throw new Error("English source should remain collapsed: " + html);
+}
+const noActionHolding = {
   market: "US",
   symbol: "CASH",
   strategy: { available: false },
   agent_report: { available: false },
   trade_action: { available: false },
   premarket_action: { available: false },
-});
+};
+const noAction = currentDecisionAction(noActionHolding) || {};
+if (noAction.action || noAction.suggested_action || noAction.limit_price || noAction.suggested_quantity || noAction.suggested_notional) {
+  throw new Error("no-action holding should not expose actionable fields: " + JSON.stringify(noAction));
+}
+const noActionDesired = desiredActionText(noActionHolding);
+if (!noActionDesired.includes("今天暂无触发中的交易动作")) {
+  throw new Error("no-action desired text should be explicit: " + noActionDesired);
+}
+const noActionHtml = renderAnalysisStrategySection(noActionHolding);
 if (!noActionHtml.includes("今天暂无触发中的交易动作")) {
   throw new Error("missing explicit no-action state: " + noActionHtml);
 }
