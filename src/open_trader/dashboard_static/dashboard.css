@@ -474,6 +474,88 @@ tbody tr:hover {
   margin: 0 0 10px;
 }
 
+.decision-band {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1.05fr 1.15fr 1fr;
+}
+
+.decision-block {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.decision-block h4,
+.impact-cell span,
+.compact-kv dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  margin: 0 0 7px;
+}
+
+.decision-block strong {
+  display: block;
+  font-size: 18px;
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+}
+
+.decision-block p,
+.decision-reason {
+  line-height: 1.55;
+  margin: 0;
+}
+
+.compact-kv {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+}
+
+.compact-kv div {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding-bottom: 6px;
+}
+
+.compact-kv div:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.compact-kv dd {
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.impact-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.impact-cell {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-height: 66px;
+  padding: 9px;
+}
+
+.impact-cell strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
 .report-text {
   background: var(--surface-soft);
   border-radius: 6px;

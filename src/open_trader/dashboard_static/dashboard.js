@@ -603,21 +603,103 @@ function renderTradeActionSection(holding) {
     return renderDetailSection("当前交易动作", renderStatusMessage("暂无触发中的交易动作", tradeAction));
   }
   const action = sectionAvailable(tradeAction) ? tradeAction : premarketAction;
-  const terms = [
-    renderRequiredTerm("动作", formatAction(action.action || action.suggested_action)),
-    renderRequiredTerm("状态", formatActionStatus(action.status)),
-    renderRequiredTerm("优先级", formatPriority(action.priority)),
-    renderRequiredTerm("触发状态", formatTriggerStatus(action.trigger_status)),
-    renderRequiredTerm("建议数量", action.suggested_quantity || action.target_quantity || action.quantity),
-    renderRequiredTerm("建议金额", suggestedNotionalText(action)),
-    renderRequiredTerm("限价", action.limit_price),
-    renderRequiredTerm("止损", action.stop_price),
-    renderRequiredTerm("当前数量", action.current_quantity),
-    renderRequiredTerm("交易后数量", action.post_trade_quantity),
-    renderRequiredTerm("原因", formatActionReason(action.reason || action.rationale || action.trigger_reason)),
-    renderRequiredTerm("观察触发", formatActionReason(action.watch_trigger)),
-  ].filter(Boolean).join("");
-  return renderDetailSection("当前交易动作", `${renderStatusWarning(action)}${terms ? `<dl class="detail-dl">${terms}</dl>` : renderStatusMessage("暂无触发中的交易动作", action)}`);
+  const body = `
+    ${renderStatusWarning(action)}
+    ${renderTradeDecisionBand(action, holding)}
+    ${renderTradeImpactGrid(action, holding)}
+    ${renderRationaleDialogue(holding)}
+  `;
+  return renderDetailSection("当前交易动作", body);
+}
+
+function renderTradeDecisionBand(action, holding) {
+  return `
+    <div class="decision-band">
+      <article class="decision-block">
+        <h4>清晰交易策略</h4>
+        <strong>${escapeHtml(strategyHeadline(action, holding))}</strong>
+        <p>${escapeHtml(strategySubline(action, holding))}</p>
+      </article>
+      <article class="decision-block">
+        <h4>操作方向与价位</h4>
+        <dl class="compact-kv">
+          ${renderCompactKv("动作", actionCardStatusLabel(action))}
+          ${renderCompactKv("限价", action.limit_price || action.last_price)}
+          ${renderCompactKv("数量", action.suggested_quantity || action.target_quantity || action.quantity)}
+          ${renderCompactKv("金额", actionNotionalText(action))}
+          ${renderCompactKv("止损", action.stop_price)}
+        </dl>
+      </article>
+      <article class="decision-block">
+        <h4>简短触发理由</h4>
+        <p class="decision-reason">${escapeHtml(shortActionReason(action))}</p>
+      </article>
+    </div>
+  `;
+}
+
+function renderTradeImpactGrid(action, holding) {
+  const cells = [
+    ["当前数量", action.current_quantity || holding.total_quantity],
+    ["交易后数量", action.post_trade_quantity],
+    ["建议金额", actionNotionalText(action)],
+    ["交易后权重", action.post_trade_weight],
+    ["下一触发", nextTriggerText(action, holding)],
+  ];
+  return `
+    <div class="impact-grid" aria-label="交易影响">
+      ${cells.map(([label, value]) => `
+        <article class="impact-cell">
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(formatPlain(value))}</strong>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderCompactKv(label, value) {
+  return `
+    <div>
+      <dt>${escapeHtml(label)}</dt>
+      <dd>${escapeHtml(formatPlain(value))}</dd>
+    </div>
+  `;
+}
+
+function strategyHeadline(action, holding) {
+  const symbol = actionSymbol(action) !== "-" ? actionSymbol(action) : `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
+  const actionText = formatAction(action.action || action.suggested_action);
+  if (actionText === "-") {
+    return `${symbol} 交易策略`;
+  }
+  return `${actionText} ${symbol}`;
+}
+
+function strategySubline(action, holding) {
+  const strategy = holding.strategy || {};
+  const view = formatAction(strategy.view || strategy.stance || strategy.signal || strategy.rating);
+  const status = formatActionStatus(action.status);
+  const parts = [view, status].filter((part) => part && part !== "-");
+  if (parts.length) {
+    return `${parts.join(" · ")}；执行前保持人工确认。`;
+  }
+  return "执行前保持人工确认。";
+}
+
+function nextTriggerText(action, holding) {
+  if (hasValue(action.watch_trigger)) {
+    return formatActionReason(action.watch_trigger);
+  }
+  const strategy = holding.strategy || {};
+  const targetText = joinRange(strategy.target_1, strategy.target_2) || strategy.target_range;
+  if (hasValue(targetText)) {
+    return `目标价 ${targetText}`;
+  }
+  if (hasValue(strategy.plan_text)) {
+    return compactSentence(strategy.plan_text, 48);
+  }
+  return "";
 }
 
 function suggestedNotionalText(action) {
