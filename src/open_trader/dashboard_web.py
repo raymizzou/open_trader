@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from .dashboard import DashboardConfig, load_dashboard_state
 from .dashboard_quotes import DashboardQuoteService
+from .research_chat import ResearchChatError, ResearchChatService
 
 
 STATIC_DIR = Path(__file__).with_name("dashboard_static")
@@ -27,8 +28,10 @@ def create_dashboard_server(
     host: str,
     port: int,
     quote_service: DashboardQuoteService | None = None,
+    research_chat_service: ResearchChatService | None = None,
 ) -> ThreadingHTTPServer:
     service = quote_service or DashboardQuoteService(config=config)
+    chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
 
     class DashboardRequestHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -57,10 +60,59 @@ def create_dashboard_server(
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
+            if path.startswith("/api/research-chat/sessions/"):
+                session_id = path.rsplit("/", 1)[-1]
+                try:
+                    self._send_json(chat_service.get_session(session_id))
+                except Exception as exc:
+                    self._send_error_json(exc)
+                return
+            self._send_not_found()
+
+        def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            try:
+                if path == "/api/research-chat/sessions":
+                    payload = self._read_json_body()
+                    self._send_json(
+                        chat_service.create_session(
+                            market=str(payload.get("market") or ""),
+                            symbol=str(payload.get("symbol") or ""),
+                        )
+                    )
+                    return
+                if path.startswith("/api/research-chat/sessions/"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) == 5 and parts[4] == "messages":
+                        payload = self._read_json_body()
+                        self._send_json(
+                            chat_service.append_message(
+                                session_id=parts[3],
+                                content=str(payload.get("content") or ""),
+                            )
+                        )
+                        return
+                    if len(parts) == 5 and parts[4] == "finalize":
+                        self._read_json_body()
+                        self._send_json(
+                            chat_service.finalize_session(session_id=parts[3])
+                        )
+                        return
+            except Exception as exc:
+                self._send_error_json(exc)
+                return
             self._send_not_found()
 
         def log_message(self, format: str, *args: Any) -> None:
             return
+
+        def _read_json_body(self) -> dict[str, Any]:
+            content_length = int(self.headers.get("Content-Length") or "0")
+            body = self.rfile.read(content_length) if content_length else b"{}"
+            payload = json.loads(body.decode("utf-8") or "{}")
+            if not isinstance(payload, dict):
+                raise ResearchChatError("request body must be a JSON object")
+            return payload
 
         def _send_json(
             self,

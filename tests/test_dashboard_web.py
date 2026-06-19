@@ -67,6 +67,20 @@ def read_json(url: str) -> dict[str, Any]:
         return json.loads(payload.decode("utf-8"))
 
 
+def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        assert response.status == 200
+        assert response.headers["Content-Type"] == "application/json; charset=utf-8"
+        return json.loads(response.read().decode("utf-8"))
+
+
 def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
     try:
         urllib.request.urlopen(url, timeout=5)
@@ -79,6 +93,67 @@ def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
             json.loads(payload.decode("utf-8")),
         )
     raise AssertionError("expected HTTPError")
+
+
+class FakeResearchChatService:
+    def __init__(self) -> None:
+        self.created: list[dict[str, str]] = []
+        self.messages: list[dict[str, str]] = []
+        self.finalized: list[str] = []
+
+    def create_session(self, *, market: str, symbol: str) -> dict[str, Any]:
+        self.created.append({"market": market, "symbol": symbol})
+        return {
+            "schema_version": "open_trader.research_chat_session.v1",
+            "session_id": "20260620T103000-US-VIXY",
+            "market": market,
+            "symbol": symbol,
+            "research_bundle_dir": "data/research_data/US/VIXY/2026-06-19",
+            "status": "active",
+            "created_at": "2026-06-20T10:30:00+08:00",
+            "updated_at": "2026-06-20T10:30:00+08:00",
+            "messages": [],
+        }
+
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        return {
+            "schema_version": "open_trader.research_chat_session.v1",
+            "session_id": session_id,
+            "market": "US",
+            "symbol": "VIXY",
+            "research_bundle_dir": "data/research_data/US/VIXY/2026-06-19",
+            "status": "active",
+            "created_at": "2026-06-20T10:30:00+08:00",
+            "updated_at": "2026-06-20T10:30:00+08:00",
+            "messages": [],
+        }
+
+    def append_message(self, *, session_id: str, content: str) -> dict[str, Any]:
+        self.messages.append({"session_id": session_id, "content": content})
+        return {
+            **self.get_session(session_id),
+            "messages": [
+                {"role": "user", "content": content},
+                {"role": "assistant", "content": "assistant reply"},
+            ],
+        }
+
+    def finalize_session(self, *, session_id: str) -> dict[str, Any]:
+        self.finalized.append(session_id)
+        return {
+            "status": "ok",
+            "conclusion": {
+                "schema_version": "user.llm_conclusion.v1",
+                "status": "present",
+                "content": "确认减仓 100 股。",
+            },
+            "dashboard_view": {
+                "schema_version": "dashboard.research_view.v1",
+                "available": True,
+                "market": "US",
+                "symbol": "VIXY",
+            },
+        }
 
 
 def test_dashboard_static_assets_include_local_shell() -> None:
@@ -842,6 +917,55 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
     assert dashboard_payload["holdings"][0]["symbol"] == "VIXY"
     assert quotes_payload["quotes"]["US.MSFT"]["last_price"] == "500"
     assert quote_service.refresh_count == 1
+
+
+def test_dashboard_server_serves_research_chat_apis(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+    chat_service = FakeResearchChatService()
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=chat_service,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        session = post_json(
+            f"{base}/api/research-chat/sessions",
+            {"market": "US", "symbol": "VIXY"},
+        )
+        loaded = read_json(f"{base}/api/research-chat/sessions/{session['session_id']}")
+        message_payload = post_json(
+            f"{base}/api/research-chat/sessions/{session['session_id']}/messages",
+            {"content": "请解释风险。"},
+        )
+        finalize_payload = post_json(
+            f"{base}/api/research-chat/sessions/{session['session_id']}/finalize",
+            {},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert session["session_id"] == "20260620T103000-US-VIXY"
+    assert loaded["session_id"] == "20260620T103000-US-VIXY"
+    assert message_payload["messages"][1]["content"] == "assistant reply"
+    assert finalize_payload["conclusion"]["content"] == "确认减仓 100 股。"
+    assert chat_service.created == [{"market": "US", "symbol": "VIXY"}]
+    assert chat_service.messages == [
+        {"session_id": "20260620T103000-US-VIXY", "content": "请解释风险。"}
+    ]
+    assert chat_service.finalized == ["20260620T103000-US-VIXY"]
 
 
 def test_dashboard_server_returns_json_500_when_quotes_refresh_raises(
