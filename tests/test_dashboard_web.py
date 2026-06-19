@@ -81,6 +81,26 @@ def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def post_error_json(url: str, body: bytes) -> tuple[int, str, dict[str, Any]]:
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=5)
+    except urllib.error.HTTPError as error:
+        payload = error.read()
+        assert error.headers["Content-Length"] == str(len(payload))
+        return (
+            error.code,
+            error.headers["Content-Type"],
+            json.loads(payload.decode("utf-8")),
+        )
+    raise AssertionError("expected HTTPError")
+
+
 def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
     try:
         urllib.request.urlopen(url, timeout=5)
@@ -91,6 +111,20 @@ def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
             error.code,
             error.headers["Content-Type"],
             json.loads(payload.decode("utf-8")),
+        )
+    raise AssertionError("expected HTTPError")
+
+
+def read_text_error(url: str) -> tuple[int, str, str]:
+    try:
+        urllib.request.urlopen(url, timeout=5)
+    except urllib.error.HTTPError as error:
+        payload = error.read()
+        assert error.headers["Content-Length"] == str(len(payload))
+        return (
+            error.code,
+            error.headers["Content-Type"],
+            payload.decode("utf-8"),
         )
     raise AssertionError("expected HTTPError")
 
@@ -154,6 +188,11 @@ class FakeResearchChatService:
                 "symbol": "VIXY",
             },
         }
+
+
+class RaisingResearchChatService(FakeResearchChatService):
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        raise RuntimeError(f"chat boom: {session_id}")
 
 
 def test_dashboard_static_assets_include_local_shell() -> None:
@@ -966,6 +1005,123 @@ def test_dashboard_server_serves_research_chat_apis(tmp_path) -> None:
         {"session_id": "20260620T103000-US-VIXY", "content": "请解释风险。"}
     ]
     assert chat_service.finalized == ["20260620T103000-US-VIXY"]
+
+
+@pytest.mark.parametrize(
+    ("body", "error_type"),
+    [
+        (b"", "ResearchChatError"),
+        (b"{bad json", "JSONDecodeError"),
+        (b'["not", "object"]', "ResearchChatError"),
+        (b'"not object"', "ResearchChatError"),
+    ],
+)
+def test_dashboard_server_returns_json_error_for_bad_research_chat_create_body(
+    tmp_path,
+    body: bytes,
+    error_type: str,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=FakeResearchChatService(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        status, content_type, payload = post_error_json(
+            f"{base}/api/research-chat/sessions",
+            body,
+        )
+        dashboard_payload = read_json(f"{base}/api/dashboard")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 500
+    assert content_type == "application/json; charset=utf-8"
+    assert payload["status"] == "error"
+    assert payload["error_type"] == error_type
+    assert dashboard_payload["summary"]["holding_count"] == 1
+
+
+def test_dashboard_server_returns_404_for_invalid_research_chat_get_subroute(
+    tmp_path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=FakeResearchChatService(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        status, content_type, body = read_text_error(
+            f"http://{host}:{port}/api/research-chat/sessions/id/messages"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 404
+    assert content_type == "text/plain; charset=utf-8"
+    assert body == "not found"
+
+
+def test_dashboard_server_returns_json_500_when_research_chat_service_raises(
+    tmp_path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=RaisingResearchChatService(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        status, content_type, payload = read_error_json(
+            f"http://{host}:{port}/api/research-chat/sessions/boom"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 500
+    assert content_type == "application/json; charset=utf-8"
+    assert payload == {
+        "status": "error",
+        "error_type": "RuntimeError",
+        "message": "chat boom: boom",
+    }
 
 
 def test_dashboard_server_returns_json_500_when_quotes_refresh_raises(

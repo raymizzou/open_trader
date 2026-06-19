@@ -60,8 +60,8 @@ def create_dashboard_server(
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
-            if path.startswith("/api/research-chat/sessions/"):
-                session_id = path.rsplit("/", 1)[-1]
+            session_id = self._research_chat_session_id(path)
+            if session_id is not None:
                 try:
                     self._send_json(chat_service.get_session(session_id))
                 except Exception as exc:
@@ -74,10 +74,14 @@ def create_dashboard_server(
             try:
                 if path == "/api/research-chat/sessions":
                     payload = self._read_json_body()
+                    market = str(payload.get("market") or "")
+                    symbol = str(payload.get("symbol") or "")
+                    if not market or not symbol:
+                        raise ResearchChatError("market and symbol are required")
                     self._send_json(
                         chat_service.create_session(
-                            market=str(payload.get("market") or ""),
-                            symbol=str(payload.get("symbol") or ""),
+                            market=market,
+                            symbol=symbol,
                         )
                     )
                     return
@@ -113,6 +117,12 @@ def create_dashboard_server(
             if not isinstance(payload, dict):
                 raise ResearchChatError("request body must be a JSON object")
             return payload
+
+        def _research_chat_session_id(self, path: str) -> str | None:
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[:3] == ["api", "research-chat", "sessions"]:
+                return parts[3]
+            return None
 
         def _send_json(
             self,
