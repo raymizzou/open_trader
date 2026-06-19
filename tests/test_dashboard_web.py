@@ -383,6 +383,30 @@ const premarketMetricMap = Object.fromEntries(decisionMetricCells(premarketOnly)
 if (premarketSubline.includes("Open below prior close") || String(premarketMetricMap["触发状态"] || "").includes("Open below prior close")) {
   throw new Error("premarket English watch trigger leaked into Chinese UI");
 }
+const englishLeakHolding = {
+  market: "US",
+  symbol: "LEAK",
+  strategy: {
+    available: true,
+    rating: "Underweight",
+    target_range: "Buy below 90",
+    plan_text_zh: "译文：Place a hard stop at $60.",
+  },
+  agent_report: { available: false },
+  trade_action: { available: false },
+  premarket_action: { available: false },
+};
+const primaryOutputs = [
+  desiredActionText(englishLeakHolding),
+  decisionSubline(englishLeakHolding),
+  watchPointText(englishLeakHolding),
+  ...operationRows(englishLeakHolding).flat(),
+  ...decisionMetricCells(englishLeakHolding).flat(),
+  ...finalConclusionItems(englishLeakHolding).flatMap((item) => [item.label, item.text]),
+].join(" ");
+if (primaryOutputs.includes("Buy below") || primaryOutputs.includes("Place a hard stop")) {
+  throw new Error("raw English leaked from primary helper outputs: " + primaryOutputs);
+}
 const html = renderAnalysisStrategySection(holding);
 for (const required of ["分析与交易策略", "当前希望你做什么", "操作指令", "今天重点关注", "分析师对话", "最终结论", "查看英文原文"]) {
   if (!html.includes(required)) {

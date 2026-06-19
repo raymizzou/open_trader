@@ -808,11 +808,32 @@ function decisionTriggerText(action) {
   if (mappedTrigger) {
     return mappedTrigger;
   }
-  const direct = firstChineseText(action.trigger_status_zh, action.watch_trigger_zh);
+  const direct = primaryChineseText(action.trigger_status_zh, action.watch_trigger_zh);
   if (direct) {
     return direct;
   }
   return safeChineseDisplayText(action.watch_trigger) || "-";
+}
+
+function primaryChineseText(...values) {
+  for (const value of values) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (text && /[\u3400-\u9fff]/.test(text) && !hasRawEnglishProse(text)) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function safePrimaryValue(value) {
+  const text = formatPlain(value);
+  if (text === "-") {
+    return "";
+  }
+  if (hasRawEnglishProse(text)) {
+    return "";
+  }
+  return text;
 }
 
 function decisionSubline(holding) {
@@ -835,7 +856,7 @@ function operationRows(holding) {
   const strategy = holding.strategy || {};
   return [
     ["动作", actionCardStatusLabel(action)],
-    ["价格", firstPresent(action.limit_price, action.last_price, strategy.target_1, strategy.target_range)],
+    ["价格", firstPresent(action.limit_price, action.last_price, strategy.target_1, safePrimaryValue(strategy.target_range))],
     ["仓位", firstPresent(action.suggested_quantity, action.suggested_notional, strategy.max_weight, strategy.target_weight)],
     ["止损", firstPresent(action.stop_price, strategy.stop_loss)],
   ];
@@ -844,7 +865,7 @@ function operationRows(holding) {
 function watchPointText(holding) {
   const action = currentDecisionAction(holding);
   const strategy = holding.strategy || {};
-  const direct = firstChineseText(
+  const direct = primaryChineseText(
     action.trigger_reason_zh,
     action.watch_trigger_zh,
     strategy.catalyst_zh,
@@ -870,7 +891,7 @@ function decisionMetricCells(holding) {
   const strategy = holding.strategy || {};
   return [
     ["观点", analystViewText(holding)],
-    ["目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range],
+    ["目标价", joinRange(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)],
     ["触发状态", decisionTriggerText(action)],
     ["动作状态", formatActionStatus(action.status)],
     ["下次复评", nextReviewText(holding)],
@@ -886,7 +907,7 @@ function analystViewText(holding) {
 function nextReviewText(holding) {
   const strategy = holding.strategy || {};
   const action = currentDecisionAction(holding);
-  const direct = firstChineseText(strategy.catalyst_zh, strategy.time_horizon_zh, action.watch_trigger_zh);
+  const direct = primaryChineseText(strategy.catalyst_zh, strategy.time_horizon_zh, action.watch_trigger_zh);
   if (direct) {
     return compactSentence(direct, 32);
   }
@@ -923,7 +944,7 @@ function finalConclusionText(holding) {
 
 function finalReasonText(holding) {
   const action = currentDecisionAction(holding);
-  const reason = firstChineseText(
+  const reason = primaryChineseText(
     action.trigger_reason_zh,
     action.reason_zh,
     action.agent_reason_zh,
@@ -940,7 +961,7 @@ function finalReasonText(holding) {
 function finalConditionText(holding) {
   const strategy = holding.strategy || {};
   const action = currentDecisionAction(holding);
-  const text = firstChineseText(strategy.plan_text_zh, strategy.catalyst_zh, action.watch_trigger_zh);
+  const text = primaryChineseText(strategy.plan_text_zh, strategy.catalyst_zh, action.watch_trigger_zh);
   if (text) {
     return compactSentence(text, 82);
   }
@@ -1290,7 +1311,7 @@ function actionSourceContext(action) {
 }
 
 function shortActionReason(action) {
-  const translatedReason = firstChineseText(
+  const translatedReason = primaryChineseText(
     action.trigger_reason_zh,
     action.reason_zh,
     action.agent_reason_zh,
