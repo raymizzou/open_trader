@@ -101,6 +101,26 @@ def post_error_json(url: str, body: bytes) -> tuple[int, str, dict[str, Any]]:
     raise AssertionError("expected HTTPError")
 
 
+def post_text_error(url: str, body: bytes) -> tuple[int, str, str]:
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=5)
+    except urllib.error.HTTPError as error:
+        payload = error.read()
+        assert error.headers["Content-Length"] == str(len(payload))
+        return (
+            error.code,
+            error.headers["Content-Type"],
+            payload.decode("utf-8"),
+        )
+    raise AssertionError("expected HTTPError")
+
+
 def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
     try:
         urllib.request.urlopen(url, timeout=5)
@@ -1086,6 +1106,51 @@ def test_dashboard_server_returns_404_for_invalid_research_chat_get_subroute(
     assert status == 404
     assert content_type == "text/plain; charset=utf-8"
     assert body == "not found"
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/research-chat/sessions//messages", b'{"content": "hello"}'),
+        ("/api/research-chat/sessions//finalize", b"{}"),
+    ],
+)
+def test_dashboard_server_returns_404_for_empty_session_research_chat_post_routes(
+    tmp_path,
+    path: str,
+    body: bytes,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    chat_service = FakeResearchChatService()
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=chat_service,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        status, content_type, response_body = post_text_error(
+            f"http://{host}:{port}{path}",
+            body,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 404
+    assert content_type == "text/plain; charset=utf-8"
+    assert response_body == "not found"
+    assert chat_service.messages == []
+    assert chat_service.finalized == []
 
 
 def test_dashboard_server_returns_json_500_when_research_chat_service_raises(

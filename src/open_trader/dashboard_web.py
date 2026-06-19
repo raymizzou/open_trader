@@ -86,20 +86,24 @@ def create_dashboard_server(
                     )
                     return
                 if path.startswith("/api/research-chat/sessions/"):
-                    parts = path.strip("/").split("/")
-                    if len(parts) == 5 and parts[4] == "messages":
+                    route = self._research_chat_session_action(path)
+                    if route is None:
+                        self._send_not_found()
+                        return
+                    session_id, action = route
+                    if action == "messages":
                         payload = self._read_json_body()
                         self._send_json(
                             chat_service.append_message(
-                                session_id=parts[3],
+                                session_id=session_id,
                                 content=str(payload.get("content") or ""),
                             )
                         )
                         return
-                    if len(parts) == 5 and parts[4] == "finalize":
+                    if action == "finalize":
                         self._read_json_body()
                         self._send_json(
-                            chat_service.finalize_session(session_id=parts[3])
+                            chat_service.finalize_session(session_id=session_id)
                         )
                         return
             except Exception as exc:
@@ -122,6 +126,17 @@ def create_dashboard_server(
             parts = path.strip("/").split("/")
             if len(parts) == 4 and parts[:3] == ["api", "research-chat", "sessions"]:
                 return parts[3]
+            return None
+
+        def _research_chat_session_action(self, path: str) -> tuple[str, str] | None:
+            parts = path.strip("/").split("/")
+            if (
+                len(parts) == 5
+                and parts[:3] == ["api", "research-chat", "sessions"]
+                and parts[3]
+                and parts[4] in {"messages", "finalize"}
+            ):
+                return parts[3], parts[4]
             return None
 
         def _send_json(
