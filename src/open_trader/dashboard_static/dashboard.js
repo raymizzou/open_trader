@@ -290,8 +290,8 @@ function renderHeaderSummary() {
 }
 
 function currentViewSummary() {
-  const cashRows = filteredCashRows();
   if (state.marketFilter === "CASH") {
+    const cashRows = filteredCashRows();
     const cashTotal = sumMoneyValues(cashRows);
     const hasCashTotal = cashTotal.complete && cashTotal.hasValue;
     return {
@@ -302,9 +302,25 @@ function currentViewSummary() {
       holding_count: cashRows.length,
     };
   }
+  if (state.marketFilter === "ALL" && state.brokerFilter !== "ALL") {
+    const summary = currentBrokerSummary();
+    if (summary) {
+      return {
+        portfolio_value_hkd: firstPresent(summary.portfolio_value_hkd, ""),
+        holding_value_hkd: firstPresent(summary.holding_value_hkd, ""),
+        cash_like_value_hkd: firstPresent(summary.cash_like_value_hkd, ""),
+        holding_weight_hkd: brokerSummaryHoldingWeight(summary),
+        holding_count: numericValue(summary.holding_count) === null
+          ? firstPresent(summary.holding_count, 0)
+          : Number(summary.holding_count),
+      };
+    }
+  }
   const holdingRows = filteredHoldings();
   const holdingTotal = sumHoldingValues(holdingRows);
-  const cashTotal = sumMoneyValues(cashRows);
+  const cashTotal = state.marketFilter === "ALL"
+    ? sumMoneyValues(filteredCashRows())
+    : emptyMoneySummary(true);
   const totalsComplete = holdingTotal.complete && cashTotal.complete;
   const hasTotal = totalsComplete && (holdingTotal.hasValue || cashTotal.hasValue);
   const portfolioTotal = holdingTotal.value + cashTotal.value;
@@ -315,6 +331,19 @@ function currentViewSummary() {
     holding_weight_hkd: hasTotal ? percentValue(holdingTotal.value, portfolioTotal) : "-",
     holding_count: holdingRows.length,
   };
+}
+
+function currentBrokerSummary() {
+  return brokerSummaries().find((summary) => brokerKey(summary) === state.brokerFilter) || null;
+}
+
+function brokerSummaryHoldingWeight(summary) {
+  const holdingValue = numericValue(summary.holding_value_hkd);
+  const portfolioValue = numericValue(summary.portfolio_value_hkd);
+  if (holdingValue === null || portfolioValue === null) {
+    return "-";
+  }
+  return percentValue(holdingValue, portfolioValue);
 }
 
 function sumHoldingValues(rows) {
@@ -1739,6 +1768,12 @@ function sourceStatusClass(status) {
 }
 
 function filteredCashRows() {
+  if (state.brokerFilter !== "ALL") {
+    const detailRows = brokerCashDetailRows();
+    if (detailRows.length) {
+      return detailRows;
+    }
+  }
   return getCashRows().filter((row) => {
     if (!isCashLikeRow(row)) {
       return false;
@@ -1751,6 +1786,21 @@ function filteredCashRows() {
 function getCashRows() {
   return (state.dashboard && Array.isArray(state.dashboard.cash_rows))
     ? state.dashboard.cash_rows
+    : [];
+}
+
+function brokerCashDetailRows() {
+  return getCashDetails().filter((row) => {
+    if (!isCashLikeRow(row)) {
+      return false;
+    }
+    return brokerKey(row) === state.brokerFilter;
+  });
+}
+
+function getCashDetails() {
+  return (state.dashboard && Array.isArray(state.dashboard.cash_details))
+    ? state.dashboard.cash_details
     : [];
 }
 

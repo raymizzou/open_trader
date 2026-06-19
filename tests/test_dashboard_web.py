@@ -343,18 +343,36 @@ state.dashboard = {
       market: "CASH",
       symbol: "HKD_CASH",
       name: "HKD Cash",
-      broker: "futu",
-      brokers: "futu",
+      brokers: "futu;phillips;tiger",
       currency: "HKD",
-      market_value_hkd: "850.00",
+      market_value_hkd: "90061.99",
     },
     {
       market: "CASH",
       symbol: "USD_CASH",
       name: "USD Cash",
-      broker: "phillips",
-      brokers: "phillips",
+      brokers: "futu;phillips;tiger",
       currency: "USD",
+      market_value_hkd: "-200205.54",
+    },
+  ],
+  cash_details: [
+    {
+      broker: "futu",
+      currency: "HKD",
+      cash_balance: "-125409.59",
+      market_value_hkd: "-125409.59",
+    },
+    {
+      broker: "futu",
+      currency: "USD",
+      cash_balance: "1435.80",
+      market_value_hkd: "11206.24",
+    },
+    {
+      broker: "phillips",
+      currency: "HKD",
+      cash_balance: "8000.00",
       market_value_hkd: "8000.00",
     },
   ],
@@ -362,7 +380,9 @@ state.dashboard = {
     {
       broker: "futu",
       display_name: "富途",
-      portfolio_value_hkd: "15982.00",
+      holding_value_hkd: "15132.00",
+      cash_like_value_hkd: "-114203.35",
+      portfolio_value_hkd: "-99071.35",
       holding_count: 1,
       source_status: "real_time",
     },
@@ -393,16 +413,16 @@ state.dashboard = {
 state.marketFilter = "US";
 state.brokerFilter = "futu";
 const summary = currentViewSummary();
-if (summary.portfolio_value_hkd !== "15982.00") {
+if (summary.portfolio_value_hkd !== "15132.00") {
   throw new Error("unexpected portfolio value: " + JSON.stringify(summary));
 }
 if (summary.holding_value_hkd !== "15132.00") {
   throw new Error("unexpected holding value: " + JSON.stringify(summary));
 }
-if (summary.cash_like_value_hkd !== "850.00") {
+if (summary.cash_like_value_hkd !== "") {
   throw new Error("unexpected cash value: " + JSON.stringify(summary));
 }
-if (summary.holding_weight_hkd !== "94.68%") {
+if (summary.holding_weight_hkd !== "100.00%") {
   throw new Error("unexpected holding weight: " + JSON.stringify(summary));
 }
 if (summary.holding_count !== 1) {
@@ -411,16 +431,16 @@ if (summary.holding_count !== 1) {
 state.marketFilter = "ALL";
 state.brokerFilter = "futu";
 const allFutuSummary = currentViewSummary();
-if (allFutuSummary.portfolio_value_hkd !== "15982.00") {
-  throw new Error("ALL/futu should include holding plus cash: " + JSON.stringify(allFutuSummary));
+if (allFutuSummary.portfolio_value_hkd !== "-99071.35") {
+  throw new Error("ALL/futu should use broker summary: " + JSON.stringify(allFutuSummary));
 }
 if (allFutuSummary.holding_value_hkd !== "15132.00") {
   throw new Error("ALL/futu holding value mismatch: " + JSON.stringify(allFutuSummary));
 }
-if (allFutuSummary.cash_like_value_hkd !== "850.00") {
+if (allFutuSummary.cash_like_value_hkd !== "-114203.35") {
   throw new Error("ALL/futu cash value mismatch: " + JSON.stringify(allFutuSummary));
 }
-if (allFutuSummary.holding_weight_hkd !== "94.68%") {
+if (allFutuSummary.holding_weight_hkd !== "-") {
   throw new Error("ALL/futu holding weight mismatch: " + JSON.stringify(allFutuSummary));
 }
 const singleBrokerFallback = brokerHoldingValue({
@@ -447,6 +467,7 @@ state.dashboard.holdings.push({
   market_value_hkd: "780.00",
   broker_details: [],
 });
+state.marketFilter = "US";
 const missingDetailSummary = currentViewSummary();
 if (missingDetailSummary.portfolio_value_hkd !== "" || formatMoney(missingDetailSummary.portfolio_value_hkd, "HKD") !== "-") {
   throw new Error("missing multi-broker detail should make broker summary unknown: " + JSON.stringify(missingDetailSummary));
@@ -459,13 +480,14 @@ state.dashboard.holdings.push({
   brokers: "futu",
   market_value_hkd: "123abc",
 });
+state.marketFilter = "US";
 const malformedSummary = currentViewSummary();
 if (malformedSummary.portfolio_value_hkd !== "" || formatMoney(malformedSummary.portfolio_value_hkd, "HKD") !== "-") {
   throw new Error("malformed holding value should make summary unknown: " + JSON.stringify(malformedSummary));
 }
 state.dashboard.holdings.pop();
 const brokerCards = renderBrokerSummaryCards();
-if (!brokerCards.includes("富途") || !brokerCards.includes("HKD 15982.00")) {
+if (!brokerCards.includes("富途") || !brokerCards.includes("HKD -99071.35")) {
   throw new Error("broker card missing expected text: " + brokerCards);
 }
 let sourceList = renderSourceStatusList();
@@ -493,7 +515,7 @@ if (!sourceList.includes("富途") || !sourceList.includes("缺失 1 个标的�
 state.marketFilter = "CASH";
 state.brokerFilter = "futu";
 const cashRows = filteredCashRows();
-if (cashRows.length !== 1 || cashRows[0].symbol !== "HKD_CASH") {
+if (cashRows.length !== 2 || cashRows[0].symbol !== "HKD_CASH" || cashRows[1].symbol !== "USD_CASH") {
   throw new Error("unexpected cash rows: " + JSON.stringify(cashRows));
 }
 function makeElement() {
@@ -553,7 +575,7 @@ if (elements["cash-detail-panel"].classList.contains("hidden")) {
 if (!elements["cash-detail-panel"].innerHTML.includes("现金明细") || !elements["cash-detail-panel"].innerHTML.includes("HKD_CASH")) {
   throw new Error("cash detail panel missing expected rows: " + elements["cash-detail-panel"].innerHTML);
 }
-if (elements["visible-count"].textContent !== "1 条") {
+if (elements["visible-count"].textContent !== "2 条") {
   throw new Error("cash view visible count mismatch: " + elements["visible-count"].textContent);
 }
 state.marketFilter = "ALL";

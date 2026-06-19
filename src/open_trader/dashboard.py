@@ -82,11 +82,12 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         if detail_dir is not None
         else []
     )
-    cash_details = (
+    raw_cash_details = (
         _read_csv_rows(detail_dir / "extracted_cash.csv")
         if detail_dir is not None
         else []
     )
+    cash_details = [_cash_detail_row(row) for row in raw_cash_details]
     trade_actions = _read_csv_rows(config.data_dir / "latest" / "trade_actions.csv")
     trading_advice = _read_csv_rows(config.data_dir / "latest" / "trading_advice.csv")
     trading_plan = _read_csv_rows(config.data_dir / "latest" / "trading_plan.csv")
@@ -251,6 +252,19 @@ def _merge_holding(
 def _broker_detail_row(row: dict[str, str]) -> dict[str, str]:
     detail = dict(row)
     value = _detail_value_hkd(row, "market_value")
+    detail["market_value_hkd"] = _money_text(value) if value is not None else ""
+    return detail
+
+
+def _cash_detail_row(row: dict[str, str]) -> dict[str, str]:
+    detail = dict(row)
+    value = _detail_value_hkd(row, "cash_balance")
+    currency = row.get("currency", "").strip().upper()
+    detail["market"] = "CASH"
+    detail["asset_class"] = "cash"
+    detail["symbol"] = f"{currency}_CASH" if currency else "CASH"
+    detail["name"] = f"{currency} Cash" if currency else "Cash"
+    detail["brokers"] = row.get("broker", "")
     detail["market_value_hkd"] = _money_text(value) if value is not None else ""
     return detail
 
