@@ -887,7 +887,7 @@ function actionCardStatusLabel(action) {
 }
 
 function rationaleSource(holding) {
-  const action = holding.trade_action || holding.premarket_action || {};
+  const action = sectionAvailable(holding.trade_action) ? holding.trade_action : (holding.premarket_action || {});
   const strategy = holding.strategy || {};
   const report = holding.agent_report || {};
   return firstAvailableText(
