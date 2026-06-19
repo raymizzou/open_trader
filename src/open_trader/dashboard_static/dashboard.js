@@ -289,6 +289,10 @@ function percentBarWidth(value) {
   return `${Math.min(100, Math.max(0, parsed))}%`;
 }
 
+function firstPresent(...values) {
+  return values.find((value) => hasValue(value));
+}
+
 function renderBrokerFilters() {
   const brokers = new Set();
   for (const holding of getHoldings()) {
@@ -607,7 +611,7 @@ function renderTradeActionSection(holding) {
     ${renderStatusWarning(action)}
     ${renderTradeDecisionBand(action, holding)}
     ${renderTradeImpactGrid(action, holding)}
-    ${renderRationaleDialogue(holding)}
+    ${typeof renderRationaleDialogue === "function" ? renderRationaleDialogue(holding) : ""}
   `;
   return renderDetailSection("当前交易动作", body);
 }
@@ -624,8 +628,8 @@ function renderTradeDecisionBand(action, holding) {
         <h4>操作方向与价位</h4>
         <dl class="compact-kv">
           ${renderCompactKv("动作", actionCardStatusLabel(action))}
-          ${renderCompactKv("限价", action.limit_price || action.last_price)}
-          ${renderCompactKv("数量", action.suggested_quantity || action.target_quantity || action.quantity)}
+          ${renderCompactKv("限价", firstPresent(action.limit_price, action.last_price))}
+          ${renderCompactKv("数量", firstPresent(action.suggested_quantity, action.target_quantity, action.quantity))}
           ${renderCompactKv("金额", actionNotionalText(action))}
           ${renderCompactKv("止损", action.stop_price)}
         </dl>
@@ -640,7 +644,7 @@ function renderTradeDecisionBand(action, holding) {
 
 function renderTradeImpactGrid(action, holding) {
   const cells = [
-    ["当前数量", action.current_quantity || holding.total_quantity],
+    ["当前数量", firstPresent(action.current_quantity, holding.total_quantity)],
     ["交易后数量", action.post_trade_quantity],
     ["建议金额", actionNotionalText(action)],
     ["交易后权重", action.post_trade_weight],
@@ -1081,6 +1085,9 @@ function actionNotionalText(action) {
     const currency = formatPlain(action.notional_currency);
     return currency === "-" ? action.suggested_notional : `${currency} ${action.suggested_notional}`;
   }
+  if (hasValue(action.order_value_hkd)) {
+    return formatMoney(action.order_value_hkd, "HKD");
+  }
   return "-";
 }
 
@@ -1254,7 +1261,7 @@ function renderActionCard(action) {
         <span class="badge">${escapeHtml(actionCardStatusLabel(action))}</span>
       </div>
       <div class="action-card-metrics">
-        <div><span>限价</span><strong>${escapeHtml(formatPlain(action.limit_price || action.last_price))}</strong></div>
+        <div><span>限价</span><strong>${escapeHtml(formatPlain(firstPresent(action.limit_price, action.last_price)))}</strong></div>
         <div><span>数量</span><strong>${escapeHtml(formatPlain(action.suggested_quantity))}</strong></div>
         <div><span>金额</span><strong>${escapeHtml(actionNotionalText(action))}</strong></div>
       </div>
