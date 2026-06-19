@@ -411,6 +411,11 @@ const englishLeakHolding = {
     suggested_action: "Breakout",
     limit_price: "Buy below 90",
     last_price: "Buy below 90",
+    suggested_quantity: "Resistance",
+    suggested_notional: "Buy below 90",
+    notional_currency: "USD",
+    post_trade_quantity: "Breakout",
+    post_trade_weight: "Bullish",
     stop_price: "Place a hard stop at $60.",
     watch_trigger: "Breakout",
   },
@@ -427,6 +432,9 @@ const primaryOutputs = [
   renderChineseStrategyTerms(englishLeakHolding.strategy || {}, englishLeakHolding),
   strategyHeadline(currentDecisionAction(englishLeakHolding), englishLeakHolding),
   strategySubline(currentDecisionAction(englishLeakHolding), englishLeakHolding),
+  renderTradeDecisionBand(currentDecisionAction(englishLeakHolding), englishLeakHolding),
+  renderTradeImpactGrid(currentDecisionAction(englishLeakHolding), englishLeakHolding),
+  renderTradeActionSection(englishLeakHolding),
 ].join(" ");
 if (primaryOutputs.includes("Buy below") || primaryOutputs.includes("Sell above") || primaryOutputs.includes("Place a hard stop") || primaryOutputs.includes("Open below prior close") || primaryOutputs.includes("Breakout") || primaryOutputs.includes("Bullish") || primaryOutputs.includes("Resistance")) {
   throw new Error("raw English leaked from primary helper outputs: " + primaryOutputs);

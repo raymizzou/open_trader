@@ -627,11 +627,11 @@ function renderTradeDecisionBand(action, holding) {
       <article class="decision-block">
         <h4>操作方向与价位</h4>
         <dl class="compact-kv">
-          ${renderCompactKv("动作", actionCardStatusLabel(action))}
-          ${renderCompactKv("限价", firstPresent(action.limit_price, action.last_price))}
-          ${renderCompactKv("数量", firstPresent(action.suggested_quantity, action.target_quantity, action.quantity))}
-          ${renderCompactKv("金额", actionNotionalText(action))}
-          ${renderCompactKv("止损", action.stop_price)}
+          ${renderCompactKv("动作", reportActionStatusLabel(action))}
+          ${renderCompactKv("限价", firstSafePrimaryValue(action.limit_price, action.last_price))}
+          ${renderCompactKv("数量", firstSafePrimaryValue(action.suggested_quantity, action.target_quantity, action.quantity))}
+          ${renderCompactKv("金额", safeActionNotionalText(action))}
+          ${renderCompactKv("止损", firstSafePrimaryValue(action.stop_price))}
         </dl>
       </article>
       <article class="decision-block">
@@ -644,10 +644,10 @@ function renderTradeDecisionBand(action, holding) {
 
 function renderTradeImpactGrid(action, holding) {
   const cells = [
-    ["当前数量", firstPresent(action.current_quantity, holding.total_quantity)],
-    ["交易后数量", action.post_trade_quantity],
-    ["建议金额", actionNotionalText(action)],
-    ["交易后权重", action.post_trade_weight],
+    ["当前数量", firstSafePrimaryValue(action.current_quantity, holding.total_quantity)],
+    ["交易后数量", firstSafePrimaryValue(action.post_trade_quantity)],
+    ["建议金额", safeActionNotionalText(action)],
+    ["交易后权重", firstSafePrimaryValue(action.post_trade_weight)],
     ["下一触发", nextTriggerText(action, holding)],
   ];
   return `
@@ -669,7 +669,7 @@ function renderRationaleDialogue(holding) {
       text: chineseDisplayText(row.text),
     }))
     .filter((row) => {
-      return hasValue(row.text) && row.text !== "-" && !hasRawEnglishProse(row.text);
+      return hasValue(row.text) && row.text !== "-" && safePrimaryValue(row.text);
     });
   if (!rows.length) {
     return "";
@@ -1471,6 +1471,19 @@ function actionNotionalText(action) {
     return formatMoney(action.order_value_hkd, "HKD");
   }
   return "-";
+}
+
+function safeActionNotionalText(action) {
+  const notional = safePrimaryValue(action.suggested_notional);
+  if (notional) {
+    const currency = safePrimaryValue(action.notional_currency);
+    return currency ? `${currency} ${notional}` : notional;
+  }
+  const orderValueHkd = safePrimaryValue(action.order_value_hkd);
+  if (orderValueHkd) {
+    return formatMoney(orderValueHkd, "HKD");
+  }
+  return "";
 }
 
 function actionCardStatusLabel(action) {
