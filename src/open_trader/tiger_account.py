@@ -16,6 +16,36 @@ from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
 from .models import AssetClass, CashBalance, Market, Position
 
 
+POSITION_DETAIL_FIELDNAMES = [
+    "statement_id",
+    "broker",
+    "account_alias",
+    "market",
+    "asset_class",
+    "symbol",
+    "name",
+    "currency",
+    "quantity",
+    "cost_price",
+    "last_price",
+    "market_value",
+    "cost_value",
+    "unrealized_pnl",
+    "confidence",
+    "notes",
+]
+CASH_DETAIL_FIELDNAMES = [
+    "statement_id",
+    "broker",
+    "account_alias",
+    "currency",
+    "cash_balance",
+    "available_balance",
+    "confidence",
+    "notes",
+]
+
+
 class TigerAccountError(RuntimeError):
     def __init__(
         self,
@@ -82,22 +112,38 @@ def sync_tiger_portfolio(
     update_latest: bool,
 ) -> TigerPortfolioSyncResult:
     existing_rows = _read_portfolio_rows(portfolio_path)
-    _raise_for_mixed_tiger_broker_rows(existing_rows)
     fx_provider = _fx_provider_from_existing_rows(run_date, existing_rows)
-    preserved_rows = [row for row in existing_rows if not _has_tiger_broker(row)]
+    preserved_positions, preserved_cash = _latest_non_tiger_detail_inputs(
+        data_dir,
+        run_date,
+    )
+    use_detail_rows = bool(preserved_positions or preserved_cash)
+    if not use_detail_rows:
+        _raise_for_mixed_tiger_broker_rows(existing_rows)
+        preserved_rows = [row for row in existing_rows if not _has_tiger_broker(row)]
+    else:
+        preserved_rows = []
     positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
         snapshot,
         run_date=run_date,
     )
-    tiger_rows = build_portfolio_rows(
-        run_date[:7],
-        positions,
-        cash_balances,
-        fx_provider,
-    )
-    merged_rows = _recalculate_combined_portfolio_rows(
-        [*preserved_rows, *tiger_rows]
-    )
+    if use_detail_rows:
+        merged_rows = build_portfolio_rows(
+            run_date[:7],
+            [*preserved_positions, *positions],
+            [*preserved_cash, *cash_balances],
+            fx_provider,
+        )
+    else:
+        tiger_rows = build_portfolio_rows(
+            run_date[:7],
+            positions,
+            cash_balances,
+            fx_provider,
+        )
+        merged_rows = _recalculate_combined_portfolio_rows(
+            [*preserved_rows, *tiger_rows]
+        )
 
     run_dir = data_dir / "runs" / run_date
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -106,6 +152,8 @@ def sync_tiger_portfolio(
 
     snapshot_path = run_dir / "tiger_account_snapshot.json"
     merged_portfolio_path = run_dir / "portfolio.csv"
+    extracted_positions_path = run_dir / "extracted_positions.csv"
+    extracted_cash_path = run_dir / "extracted_cash.csv"
     report_path = report_dir / f"{run_date}.md"
     latest_path = data_dir / "latest" / "portfolio.csv"
     updated_latest = False
@@ -114,6 +162,20 @@ def sync_tiger_portfolio(
         snapshot_path,
         json.dumps(_snapshot_to_json(snapshot), ensure_ascii=False, indent=2),
     )
+    if use_detail_rows:
+        write_rows(
+            extracted_positions_path,
+            POSITION_DETAIL_FIELDNAMES,
+            (
+                _position_to_detail_row(position)
+                for position in [*preserved_positions, *positions]
+            ),
+        )
+        write_rows(
+            extracted_cash_path,
+            CASH_DETAIL_FIELDNAMES,
+            (_cash_to_detail_row(cash) for cash in [*preserved_cash, *cash_balances]),
+        )
     _write_portfolio_rows_atomic(merged_portfolio_path, merged_rows)
     _write_text_file_atomic(
         report_path,
@@ -878,6 +940,150 @@ def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
 def _read_portfolio_rows(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _latest_non_tiger_detail_inputs(
+    data_dir: Path,
+    run_date: str,
+) -> tuple[list[Position], list[CashBalance]]:
+    detail_dir = _detail_dir_for_tiger_sync(data_dir, run_date)
+    if detail_dir is None:
+        return [], []
+    positions = [
+        _position_from_detail_row(row)
+        for row in _read_csv_rows(detail_dir / "extracted_positions.csv")
+        if row.get("broker", "").strip().lower() != "tiger"
+    ]
+    cash_balances = [
+        _cash_from_detail_row(row)
+        for row in _read_csv_rows(detail_dir / "extracted_cash.csv")
+        if row.get("broker", "").strip().lower() != "tiger"
+    ]
+    return positions, cash_balances
+
+
+def _detail_dir_for_tiger_sync(data_dir: Path, run_date: str) -> Path | None:
+    exact_dir = data_dir / "runs" / run_date
+    if (exact_dir / "extracted_positions.csv").is_file():
+        return exact_dir
+    runs_dir = data_dir / "runs"
+    if not runs_dir.exists():
+        return None
+    detail_dirs = [
+        path
+        for path in runs_dir.iterdir()
+        if path.is_dir() and (path / "extracted_positions.csv").is_file()
+    ]
+    return max(detail_dirs, key=lambda path: path.name) if detail_dirs else None
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _position_from_detail_row(row: dict[str, str]) -> Position:
+    quantity, quantity_ok, _ = _required_decimal(row, ("quantity",))
+    return Position(
+        statement_id=row.get("statement_id", ""),
+        broker=row.get("broker", ""),
+        account_alias=row.get("account_alias", ""),
+        market=_market_from_text(row.get("market", "")),
+        asset_class=_asset_class_from_text(row.get("asset_class", "")),
+        symbol=row.get("symbol", ""),
+        name=row.get("name", ""),
+        currency=row.get("currency", "").upper(),
+        quantity=quantity,
+        cost_price=_optional_decimal(row, ("cost_price",)),
+        last_price=_optional_decimal(row, ("last_price",)),
+        market_value=_optional_decimal(row, ("market_value",)),
+        cost_value=_optional_decimal(row, ("cost_value",)),
+        unrealized_pnl=_optional_decimal(row, ("unrealized_pnl",)),
+        confidence=_confidence(row.get("confidence", ""), quantity_ok),
+        notes=row.get("notes", ""),
+    )
+
+
+def _cash_from_detail_row(row: dict[str, str]) -> CashBalance:
+    cash_balance, cash_ok, _ = _required_decimal(row, ("cash_balance",))
+    return CashBalance(
+        statement_id=row.get("statement_id", ""),
+        broker=row.get("broker", ""),
+        account_alias=row.get("account_alias", ""),
+        currency=row.get("currency", "").upper(),
+        cash_balance=cash_balance,
+        available_balance=_optional_decimal(row, ("available_balance",)),
+        confidence=_confidence(row.get("confidence", ""), cash_ok),
+        notes=row.get("notes", ""),
+    )
+
+
+def _position_to_detail_row(position: Position) -> dict[str, str]:
+    return {
+        "statement_id": position.statement_id,
+        "broker": position.broker,
+        "account_alias": position.account_alias,
+        "market": position.market.value,
+        "asset_class": position.asset_class.value,
+        "symbol": position.symbol,
+        "name": position.name,
+        "currency": position.currency,
+        "quantity": _decimal_to_str(position.quantity),
+        "cost_price": _decimal_to_str(position.cost_price),
+        "last_price": _decimal_to_str(position.last_price),
+        "market_value": _decimal_to_str(position.market_value),
+        "cost_value": _decimal_to_str(position.cost_value),
+        "unrealized_pnl": _decimal_to_str(position.unrealized_pnl),
+        "confidence": position.confidence,
+        "notes": position.notes,
+    }
+
+
+def _cash_to_detail_row(cash: CashBalance) -> dict[str, str]:
+    return {
+        "statement_id": cash.statement_id,
+        "broker": cash.broker,
+        "account_alias": cash.account_alias,
+        "currency": cash.currency,
+        "cash_balance": _decimal_to_str(cash.cash_balance),
+        "available_balance": _decimal_to_str(cash.available_balance),
+        "confidence": cash.confidence,
+        "notes": cash.notes,
+    }
+
+
+def _market_from_text(value: str) -> Market:
+    normalized = str(value or "").strip().upper()
+    if normalized == "US":
+        return Market.US
+    if normalized == "HK":
+        return Market.HK
+    if normalized == "CASH":
+        return Market.CASH
+    return Market.OTHER
+
+
+def _asset_class_from_text(value: str) -> AssetClass:
+    normalized = str(value or "").strip().lower()
+    for asset_class in AssetClass:
+        if asset_class.value == normalized:
+            return asset_class
+    return AssetClass.UNKNOWN
+
+
+def _confidence(value: str, required_fields_ok: bool) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"high", "medium", "low"} and required_fields_ok:
+        return normalized
+    return "high" if required_fields_ok else "low"
+
+
+def _decimal_to_str(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    return format(value, "f")
 
 
 def _atomic_temp_path(path: Path) -> Path:

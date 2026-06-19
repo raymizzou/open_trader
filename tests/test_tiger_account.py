@@ -33,6 +33,14 @@ def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def read_portfolio(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle))
@@ -1625,6 +1633,181 @@ def test_sync_tiger_portfolio_updates_latest_when_requested(
     latest_rows = read_portfolio(result.latest_path)
     assert {row["symbol"] for row in latest_rows} == {"MSFT"}
     assert result.updated_latest is True
+
+
+def test_sync_tiger_portfolio_replaces_tiger_details_when_latest_has_mixed_live_rows(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            base_portfolio_row(
+                symbol="VIXY",
+                total_quantity="135",
+                brokers="futu;tiger",
+                accounts="futu_live;tiger_old",
+                notes="Futu live account position",
+            )
+        ],
+    )
+    write_csv(
+        tmp_path / "data/runs/2026-06-19/extracted_positions.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "market",
+            "asset_class",
+            "symbol",
+            "name",
+            "currency",
+            "quantity",
+            "cost_price",
+            "last_price",
+            "market_value",
+            "cost_value",
+            "unrealized_pnl",
+            "confidence",
+            "notes",
+        ],
+        [
+            {
+                "statement_id": "2026-06-19-futu-live",
+                "broker": "futu",
+                "account_alias": "futu_live",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "VIXY",
+                "name": "VIXY",
+                "currency": "USD",
+                "quantity": "100",
+                "cost_price": "42.00",
+                "last_price": "22.00",
+                "market_value": "2200",
+                "cost_value": "4200",
+                "unrealized_pnl": "-2000",
+                "confidence": "high",
+                "notes": "Futu live account position",
+            },
+            {
+                "statement_id": "2026-05-tiger",
+                "broker": "tiger",
+                "account_alias": "tiger_old",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "VIXY",
+                "name": "VIXY",
+                "currency": "USD",
+                "quantity": "35",
+                "cost_price": "42.00",
+                "last_price": "22.00",
+                "market_value": "770",
+                "cost_value": "1470",
+                "unrealized_pnl": "-700",
+                "confidence": "high",
+                "notes": "Old Tiger statement position",
+            },
+            {
+                "statement_id": "2026-05-phillips",
+                "broker": "phillips",
+                "account_alias": "phillips_main",
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "02476",
+                "name": "SHENGHONG",
+                "currency": "HKD",
+                "quantity": "400",
+                "cost_price": "",
+                "last_price": "400",
+                "market_value": "160000",
+                "cost_value": "",
+                "unrealized_pnl": "",
+                "confidence": "high",
+                "notes": "",
+            },
+        ],
+    )
+    write_csv(
+        tmp_path / "data/runs/2026-06-19/extracted_cash.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "currency",
+            "cash_balance",
+            "available_balance",
+            "confidence",
+            "notes",
+        ],
+        [
+            {
+                "statement_id": "2026-06-19-futu-live",
+                "broker": "futu",
+                "account_alias": "futu_live",
+                "currency": "USD",
+                "cash_balance": "1000",
+                "available_balance": "1000",
+                "confidence": "high",
+                "notes": "Futu live account cash",
+            },
+            {
+                "statement_id": "2026-05-tiger",
+                "broker": "tiger",
+                "account_alias": "tiger_old",
+                "currency": "USD",
+                "cash_balance": "500",
+                "available_balance": "500",
+                "confidence": "high",
+                "notes": "Old Tiger statement cash",
+            },
+        ],
+    )
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "88.50",
+                "available_balance": "88.50",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-19",
+        update_latest=True,
+    )
+
+    latest_rows = read_portfolio(result.latest_path)
+    vixy = next(row for row in latest_rows if row["symbol"] == "VIXY")
+    assert vixy["total_quantity"] == "100"
+    assert vixy["brokers"] == "futu"
+    assert "tiger" not in vixy["accounts"]
+    assert "MSFT" in {row["symbol"] for row in latest_rows}
+    usd_cash = next(row for row in latest_rows if row["symbol"] == "USD_CASH")
+    assert usd_cash["brokers"] == "futu;tiger"
+    assert Decimal(usd_cash["market_value"]) == Decimal("1088.50")
 
 
 def test_sync_tiger_portfolio_blocks_mixed_tiger_broker_rows(
