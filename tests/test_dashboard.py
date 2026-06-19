@@ -666,3 +666,180 @@ def test_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
     assert [row["symbol"] for row in state["cash_rows"]] == ["HKD_CASH"]
     assert state["cash_rows"][0]["market_value_hkd"] == "850.00"
     assert state["cash_rows"][0]["brokers"] == "futu"
+
+
+def test_load_dashboard_state_discovers_cash_only_detail_runs(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "runs" / "2026-06-19" / "extracted_cash.csv",
+        CASH_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-06-19-tiger",
+                "broker": "tiger",
+                "account_alias": "growth",
+                "currency": "USD",
+                "cash_balance": "10.00",
+                "available_balance": "10.00",
+                "confidence": "high",
+                "notes": "",
+            }
+        ],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    assert state["broker_detail_month"] == "2026-06-19"
+    assert state["detail_available"] is True
+    assert len(state["cash_details"]) == 1
+    summaries = {row["broker"]: row for row in state["broker_summaries"]}
+    assert summaries["tiger"]["detail_available"] is True
+    assert summaries["tiger"]["holding_value_hkd"] == "0.00"
+    assert summaries["tiger"]["cash_like_value_hkd"] == "78.00"
+    assert summaries["tiger"]["portfolio_value_hkd"] == "78.00"
+    statuses = {row["broker"]: row for row in state["source_statuses"]}
+    assert statuses["tiger"]["status"] == "ok"
+    assert statuses["tiger"]["display_text"] == "账户实时同步，行情走富途"
+
+
+def test_load_dashboard_state_ignores_unsupported_or_malformed_detail_money(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    run_dir = config.data_dir / "runs" / "2026-06-19"
+    write_csv(
+        run_dir / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-06-19-futu",
+                "broker": "futu",
+                "account_alias": "main",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "VIXY",
+                "name": "VIXY",
+                "currency": "USD",
+                "quantity": "1",
+                "cost_price": "",
+                "last_price": "",
+                "market_value": "10.00",
+                "cost_value": "",
+                "unrealized_pnl": "",
+                "confidence": "high",
+                "notes": "",
+            },
+            {
+                "statement_id": "2026-06-19-futu",
+                "broker": "futu",
+                "account_alias": "main",
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "00001",
+                "name": "Unsupported Currency",
+                "currency": "EUR",
+                "quantity": "1",
+                "cost_price": "",
+                "last_price": "",
+                "market_value": "100.00",
+                "cost_value": "",
+                "unrealized_pnl": "",
+                "confidence": "low",
+                "notes": "",
+            },
+            {
+                "statement_id": "2026-06-19-futu",
+                "broker": "futu",
+                "account_alias": "main",
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "00002",
+                "name": "Malformed Value",
+                "currency": "HKD",
+                "quantity": "1",
+                "cost_price": "",
+                "last_price": "",
+                "market_value": "not-money",
+                "cost_value": "",
+                "unrealized_pnl": "",
+                "confidence": "low",
+                "notes": "",
+            },
+        ],
+    )
+    write_csv(
+        run_dir / "extracted_cash.csv",
+        CASH_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-06-19-futu",
+                "broker": "futu",
+                "account_alias": "main",
+                "currency": "USD",
+                "cash_balance": "bad-cash",
+                "available_balance": "bad-cash",
+                "confidence": "low",
+                "notes": "",
+            },
+            {
+                "statement_id": "2026-06-19-futu",
+                "broker": "futu",
+                "account_alias": "main",
+                "currency": "CNY",
+                "cash_balance": "100.00",
+                "available_balance": "100.00",
+                "confidence": "high",
+                "notes": "",
+            },
+        ],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    summaries = {row["broker"]: row for row in state["broker_summaries"]}
+    assert summaries["futu"]["holding_value_hkd"] == "78.00"
+    assert summaries["futu"]["cash_like_value_hkd"] == "108.00"
+    assert summaries["futu"]["portfolio_value_hkd"] == "186.00"
+
+
+def test_load_dashboard_state_uses_single_broker_portfolio_fallback(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    rows = [
+        {**portfolio_rows()[0], "brokers": "phillips", "accounts": "cash"},
+        {**portfolio_rows()[1], "brokers": "phillips", "accounts": "cash"},
+    ]
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+
+    state = load_dashboard_state(config).to_dict()
+
+    summaries = {row["broker"]: row for row in state["broker_summaries"]}
+    assert summaries["phillips"]["detail_available"] is False
+    assert summaries["phillips"]["holding_value_hkd"] == "37830.00"
+    assert summaries["phillips"]["cash_like_value_hkd"] == "850.00"
+    assert summaries["phillips"]["portfolio_value_hkd"] == "38680.00"
+    assert summaries["phillips"]["holding_count"] == 1
+
+
+def test_load_dashboard_state_blanks_multi_broker_portfolio_fallback(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+
+    state = load_dashboard_state(config).to_dict()
+
+    summaries = {row["broker"]: row for row in state["broker_summaries"]}
+    assert summaries["futu"]["holding_value_hkd"] == ""
+    assert summaries["futu"]["cash_like_value_hkd"] == ""
+    assert summaries["futu"]["portfolio_value_hkd"] == ""
+    assert summaries["futu"]["holding_count"] == 0
+    assert summaries["tiger"]["holding_value_hkd"] == ""
+    assert summaries["tiger"]["cash_like_value_hkd"] == ""
+    assert summaries["tiger"]["portfolio_value_hkd"] == ""
+    assert summaries["tiger"]["holding_count"] == 0

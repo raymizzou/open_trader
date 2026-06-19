@@ -146,9 +146,16 @@ def latest_broker_detail_month(data_dir: Path) -> str:
         for path in runs_dir.iterdir()
         if path.is_dir()
         and DETAIL_DIR_PATTERN.fullmatch(path.name)
-        and (path / "extracted_positions.csv").is_file()
+        and _has_broker_detail_files(path)
     ]
     return max(months) if months else ""
+
+
+def _has_broker_detail_files(path: Path) -> bool:
+    return (
+        (path / "extracted_positions.csv").is_file()
+        or (path / "extracted_cash.csv").is_file()
+    )
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -419,11 +426,12 @@ def _build_source_statuses(
     cash_details: list[dict[str, str]],
     detail_month: str,
 ) -> list[dict[str, str]]:
-    detail_brokers = {
-        _broker_key(row.get("broker", ""))
-        for row in [*broker_positions, *cash_details]
-        if _broker_key(row.get("broker", ""))
-    }
+    detail_brokers: set[str] = set()
+    for row in [*broker_positions, *cash_details]:
+        broker = _broker_key(row.get("broker", ""))
+        if broker:
+            detail_brokers.add(broker)
+
     statuses: list[dict[str, str]] = []
     for broker in BROKERS:
         detail_available = broker in detail_brokers
