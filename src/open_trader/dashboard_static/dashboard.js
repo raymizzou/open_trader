@@ -150,6 +150,13 @@ function bindEvents() {
     }
     showSymbolDetail(button.dataset.detailKey || "");
   });
+  elements["trade-actions"].addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action-detail]");
+    if (!button) {
+      return;
+    }
+    openTradeActionDetail(button.dataset.actionDetail || "");
+  });
   elements["symbol-detail-panel"].addEventListener("click", (event) => {
     const backButton = event.target.closest("[data-back-to-holdings]");
     if (backButton) {
@@ -282,6 +289,10 @@ function percentBarWidth(value) {
   return `${Math.min(100, Math.max(0, parsed))}%`;
 }
 
+function firstPresent(...values) {
+  return values.find((value) => hasValue(value));
+}
+
 function renderBrokerFilters() {
   const brokers = new Set();
   for (const holding of getHoldings()) {
@@ -383,6 +394,39 @@ function showSymbolDetail(detailKey) {
   renderHoldings();
 }
 
+function openTradeActionDetail(actionKey) {
+  const normalizedActionKey = normalizeActionKey("", actionKey);
+  if (!normalizedActionKey) {
+    return;
+  }
+  const holdings = getHoldings();
+  for (let index = 0; index < holdings.length; index += 1) {
+    const holding = holdings[index];
+    if (holdingActionKeys(holding).includes(normalizedActionKey)) {
+      resetHoldingFilters();
+      state.selectedHoldingKey = holdingKey(holding, index);
+      renderHoldings();
+      return;
+    }
+  }
+}
+
+function resetHoldingFilters() {
+  state.marketFilter = "ALL";
+  state.brokerFilter = "ALL";
+  setFilterActiveByDataset(elements["market-filters"], "market", "ALL");
+  setFilterActiveByDataset(elements["broker-filters"], "broker", "ALL");
+}
+
+function setFilterActiveByDataset(container, datasetKey, value) {
+  if (!container) {
+    return;
+  }
+  container.querySelectorAll(".filter-button").forEach((button) => {
+    button.classList.toggle("active", button.dataset[datasetKey] === value);
+  });
+}
+
 function renderSymbolDetail(holding, index) {
   const quote = quoteForHolding(holding);
   const livePrice = detailLivePrice(holding, quote);
@@ -481,7 +525,7 @@ function renderAgentReportSection(report, holding) {
 function renderChineseAgentSummary(report, holding) {
   const strategy = holding.strategy || {};
   const action = holding.trade_action || holding.premarket_action || {};
-  const reason = action.reason || strategy.agent_reason || report.agent_reason || "";
+  const reason = safeChineseReason(action, strategy, report);
   const terms = [
     renderRequiredTerm("观点", formatAction(report.rating || report.advice_action)),
     renderRequiredTerm("报告状态", formatActionStatus(report.status)),
@@ -546,13 +590,13 @@ function renderChineseStrategyTerms(strategy, holding) {
 }
 
 function renderEnglishSourceBlock(text, rawText, buttonText) {
-  const sourceText = firstAvailableText(text, rawText);
+  const sourceText = firstAvailableText(rawText, text);
   if (!hasValue(sourceText)) {
     return "";
   }
   return `
     <button class="raw-toggle english-source-toggle" type="button" data-toggle-raw-report>${escapeHtml(buttonText)}</button>
-    <pre class="raw-report english-source hidden">${escapeHtml(sourceText)}</pre>
+    ${renderSplitSourceRows(sourceText)}
   `;
 }
 
@@ -563,21 +607,161 @@ function renderTradeActionSection(holding) {
     return renderDetailSection("当前交易动作", renderStatusMessage("暂无触发中的交易动作", tradeAction));
   }
   const action = sectionAvailable(tradeAction) ? tradeAction : premarketAction;
-  const terms = [
-    renderRequiredTerm("动作", formatAction(action.action || action.suggested_action)),
-    renderRequiredTerm("状态", formatActionStatus(action.status)),
-    renderRequiredTerm("优先级", formatPriority(action.priority)),
-    renderRequiredTerm("触发状态", formatTriggerStatus(action.trigger_status)),
-    renderRequiredTerm("建议数量", action.suggested_quantity || action.target_quantity || action.quantity),
-    renderRequiredTerm("建议金额", suggestedNotionalText(action)),
-    renderRequiredTerm("限价", action.limit_price),
-    renderRequiredTerm("止损", action.stop_price),
-    renderRequiredTerm("当前数量", action.current_quantity),
-    renderRequiredTerm("交易后数量", action.post_trade_quantity),
-    renderRequiredTerm("原因", formatActionReason(action.reason || action.rationale || action.trigger_reason)),
-    renderRequiredTerm("观察触发", formatActionReason(action.watch_trigger)),
-  ].filter(Boolean).join("");
-  return renderDetailSection("当前交易动作", `${renderStatusWarning(action)}${terms ? `<dl class="detail-dl">${terms}</dl>` : renderStatusMessage("暂无触发中的交易动作", action)}`);
+  const body = `
+    ${renderStatusWarning(action)}
+    ${renderTradeDecisionBand(action, holding)}
+    ${renderTradeImpactGrid(action, holding)}
+    ${typeof renderRationaleDialogue === "function" ? renderRationaleDialogue(holding) : ""}
+  `;
+  return renderDetailSection("当前交易动作", body);
+}
+
+function renderTradeDecisionBand(action, holding) {
+  return `
+    <div class="decision-band">
+      <article class="decision-block">
+        <h4>清晰交易策略</h4>
+        <strong>${escapeHtml(strategyHeadline(action, holding))}</strong>
+        <p>${escapeHtml(strategySubline(action, holding))}</p>
+      </article>
+      <article class="decision-block">
+        <h4>操作方向与价位</h4>
+        <dl class="compact-kv">
+          ${renderCompactKv("动作", actionCardStatusLabel(action))}
+          ${renderCompactKv("限价", firstPresent(action.limit_price, action.last_price))}
+          ${renderCompactKv("数量", firstPresent(action.suggested_quantity, action.target_quantity, action.quantity))}
+          ${renderCompactKv("金额", actionNotionalText(action))}
+          ${renderCompactKv("止损", action.stop_price)}
+        </dl>
+      </article>
+      <article class="decision-block">
+        <h4>简短触发理由</h4>
+        <p class="decision-reason">${escapeHtml(shortActionReason(action))}</p>
+      </article>
+    </div>
+  `;
+}
+
+function renderTradeImpactGrid(action, holding) {
+  const cells = [
+    ["当前数量", firstPresent(action.current_quantity, holding.total_quantity)],
+    ["交易后数量", action.post_trade_quantity],
+    ["建议金额", actionNotionalText(action)],
+    ["交易后权重", action.post_trade_weight],
+    ["下一触发", nextTriggerText(action, holding)],
+  ];
+  return `
+    <div class="impact-grid" aria-label="交易影响">
+      ${cells.map(([label, value]) => `
+        <article class="impact-cell">
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(formatPlain(value))}</strong>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderRationaleDialogue(holding) {
+  const rows = rationaleRows(rationaleSource(holding))
+    .map((row) => ({
+      label: row.label,
+      text: chineseDisplayText(row.text),
+    }))
+    .filter((row) => {
+      return hasValue(row.text) && row.text !== "-" && !hasRawEnglishProse(row.text);
+    });
+  if (!rows.length) {
+    return "";
+  }
+  return `
+    <div class="rationale-dialogue">
+      <h4>理由对话</h4>
+      <div class="dialogue-list">
+        ${rows.map((row) => `
+          <div class="dialogue-row">
+            <strong>${escapeHtml(row.label)}</strong>
+            <span>${escapeHtml(row.text)}</span>
+          </div>
+        `).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderSplitSourceRows(text) {
+  const rows = sourceRows(text);
+  if (!rows.length) {
+    return `<pre class="raw-report english-source hidden">${escapeHtml(text)}</pre>`;
+  }
+  return `
+    <div class="raw-report english-source split-source hidden">
+      ${rows.map((row) => `
+        <div class="dialogue-row">
+          <strong>${escapeHtml(row.label)}</strong>
+          <span>${escapeHtml(row.text)}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function sourceRows(text) {
+  return splitRationaleText(text).map((sentence, index, sentences) => ({
+    label: rationaleLabel(sentence, index, sentences.length),
+    text: sentence,
+  }));
+}
+
+function renderCompactKv(label, value) {
+  return `
+    <div>
+      <dt>${escapeHtml(label)}</dt>
+      <dd>${escapeHtml(formatPlain(value))}</dd>
+    </div>
+  `;
+}
+
+function strategyHeadline(action, holding) {
+  const symbol = actionSymbol(action) !== "-" ? actionSymbol(action) : `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
+  const actionText = formatAction(action.action || action.suggested_action);
+  if (actionText === "-") {
+    return `${symbol} 交易策略`;
+  }
+  return `${actionText} ${symbol}`;
+}
+
+function strategySubline(action, holding) {
+  const strategy = holding.strategy || {};
+  const view = formatAction(strategy.view || strategy.stance || strategy.signal || strategy.rating);
+  const status = formatActionStatus(action.status);
+  const parts = [view, status].filter((part) => part && part !== "-");
+  if (parts.length) {
+    return `${parts.join(" · ")}；执行前保持人工确认。`;
+  }
+  return "执行前保持人工确认。";
+}
+
+function nextTriggerText(action, holding) {
+  const watchTrigger = safeChineseDisplayText(
+    firstAvailableText(action.watch_trigger_zh, action.watch_trigger),
+  ) || firstMappedLabel(TRIGGER_STATUS_LABELS, action.watch_trigger)
+    || firstMappedLabel(REASON_LABELS, action.watch_trigger);
+  if (watchTrigger) {
+    return watchTrigger;
+  }
+  const strategy = holding.strategy || {};
+  const targetText = joinRange(strategy.target_1, strategy.target_2) || strategy.target_range;
+  if (hasValue(targetText)) {
+    return `目标价 ${targetText}`;
+  }
+  const planText = safeChineseDisplayText(
+    firstAvailableText(strategy.plan_text_zh, strategy.rationale_zh, strategy.plan_text),
+  );
+  if (planText) {
+    return compactSentence(planText, 48);
+  }
+  return "";
 }
 
 function suggestedNotionalText(action) {
@@ -698,10 +882,46 @@ function chineseDisplayText(value) {
     .replace(/\bmonth\b/gi, "个月")
     .replace(/\breassess\b/gi, "复评")
     .replace(/\bearnings\b/gi, "财报");
-  if (/[A-Za-z]{3,}/.test(text) && text.length > 32) {
+  if (hasRawEnglishProse(text)) {
     return "";
   }
   return text;
+}
+
+function safeChineseDisplayText(value) {
+  const text = chineseDisplayText(value);
+  return hasValue(text) && text !== "-" ? text : "";
+}
+
+function safeChineseReason(action, strategy, report) {
+  return safeChineseDisplayText(firstAvailableText(
+    action.reason_zh,
+    action.agent_reason_zh,
+    action.trigger_reason_zh,
+    action.watch_trigger_zh,
+    strategy.agent_reason_zh,
+    strategy.rationale_zh,
+    strategy.plan_text_zh,
+    report.summary_zh,
+    report.analysis_zh,
+    report.report_zh,
+  )) || firstMappedLabel(
+    REASON_LABELS,
+    action.reason,
+    action.agent_reason,
+    action.trigger_reason,
+    action.watch_trigger,
+    strategy.agent_reason,
+    report.agent_reason,
+  ) || firstMappedLabel(TRIGGER_STATUS_LABELS, action.trigger_status);
+}
+
+function hasRawEnglishProse(text) {
+  const residual = String(text || "")
+    .replace(/\b[A-Z]{2,8}\b/g, "")
+    .replace(/\b(?:HKD|USD|ETF|ETFs|MACD|RSI|YoY|QoQ|OpenAI|iPhone)\b/gi, "");
+  const words = residual.match(/\b[A-Za-z][A-Za-z'-]{2,}\b/g) || [];
+  return words.length >= 2;
 }
 
 function dataHealthText(holding) {
@@ -760,24 +980,392 @@ function firstAvailableText(...values) {
   return "";
 }
 
+function sortedTradeActions(actions) {
+  return [...actions].sort((left, right) => {
+    const statusDelta = actionStatusRank(left.status) - actionStatusRank(right.status);
+    if (statusDelta !== 0) {
+      return statusDelta;
+    }
+    const priorityDelta = priorityRank(left.priority) - priorityRank(right.priority);
+    if (priorityDelta !== 0) {
+      return priorityDelta;
+    }
+    return `${left.market || ""}.${left.symbol || ""}`.localeCompare(`${right.market || ""}.${right.symbol || ""}`);
+  });
+}
+
+function actionStatusRank(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "ready") {
+    return 0;
+  }
+  if (normalized === "review") {
+    return 1;
+  }
+  if (normalized === "watch") {
+    return 2;
+  }
+  return 3;
+}
+
+function priorityRank(priority) {
+  const normalized = String(priority || "").trim().toLowerCase();
+  const ranks = { critical: 0, high: 1, medium: 2, low: 3 };
+  return Object.prototype.hasOwnProperty.call(ranks, normalized) ? ranks[normalized] : 4;
+}
+
+function tradeActionCounts(actions) {
+  const counts = { ready: 0, review: 0, watch: 0 };
+  for (const action of actions) {
+    const status = String(action.status || "").trim().toLowerCase();
+    if (status === "ready") {
+      counts.ready += 1;
+    } else if (status === "review") {
+      counts.review += 1;
+    } else if (status === "watch") {
+      counts.watch += 1;
+    }
+  }
+  return counts;
+}
+
+function actionDetailKey(action) {
+  if (!action) {
+    return "";
+  }
+  return normalizeActionKey("", action.futu_symbol)
+    || normalizeActionKey(action.market, action.symbol);
+}
+
+function holdingActionKeys(holding) {
+  const keys = [
+    normalizeActionKey("", holding && holding.futu_symbol),
+    normalizeActionKey(holding && holding.market, holding && holding.symbol),
+    actionDetailKey(holding && holding.trade_action),
+    actionDetailKey(holding && holding.premarket_action),
+  ].filter(Boolean);
+  return Array.from(new Set(keys));
+}
+
+function normalizeActionKey(market, symbol) {
+  let normalizedMarket = String(market || "").trim().toUpperCase();
+  let normalizedSymbol = String(symbol || "").trim().toUpperCase();
+  if (!normalizedMarket && normalizedSymbol.includes(".")) {
+    const parts = normalizedSymbol.split(".");
+    normalizedMarket = parts.shift() || "";
+    normalizedSymbol = parts.join(".");
+  }
+  if (!normalizedMarket || !normalizedSymbol) {
+    return "";
+  }
+  if (normalizedMarket === "HK" && /^\d+$/.test(normalizedSymbol)) {
+    normalizedSymbol = normalizedSymbol.padStart(5, "0");
+  }
+  return `${normalizedMarket}.${normalizedSymbol}`;
+}
+
+function actionSymbol(action) {
+  const futu = formatPlain(action.futu_symbol);
+  if (futu !== "-") {
+    return futu;
+  }
+  const market = formatPlain(action.market);
+  const symbol = formatPlain(action.symbol);
+  if (market === "-" && symbol === "-") {
+    return "-";
+  }
+  if (market === "-") {
+    return symbol;
+  }
+  if (symbol === "-") {
+    return market;
+  }
+  return `${market}.${symbol}`;
+}
+
+function actionSourceContext(action) {
+  const parts = [
+    formatTriggerStatus(action.trigger_status),
+    formatPriority(action.priority),
+  ].filter((part) => part && part !== "-");
+  return parts.join(" · ") || "交易计划触发";
+}
+
+function shortActionReason(action) {
+  const translatedReason = firstChineseText(
+    action.trigger_reason_zh,
+    action.reason_zh,
+    action.agent_reason_zh,
+    action.watch_trigger_zh,
+  );
+  if (translatedReason) {
+    return compactSentence(translatedReason, 96);
+  }
+
+  const mappedReason = firstMappedLabel(
+    REASON_LABELS,
+    action.trigger_reason,
+    action.reason,
+    action.agent_reason,
+    action.rationale,
+    action.watch_trigger,
+  );
+  if (mappedReason) {
+    return compactSentence(mappedReason, 96);
+  }
+
+  const mappedTrigger = firstMappedLabel(TRIGGER_STATUS_LABELS, action.trigger_status, action.watch_trigger);
+  if (mappedTrigger && mappedTrigger !== "未触发") {
+    return compactSentence(`${mappedTrigger}，请查看完整策略。`, 96);
+  }
+
+  return fallbackShortActionReason(action);
+}
+
+function firstChineseText(...values) {
+  for (const value of values) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (text && /[\u3400-\u9fff]/.test(text)) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function firstMappedLabel(map, ...values) {
+  for (const value of values) {
+    const mapped = mappedLabel(map, value);
+    if (mapped) {
+      return mapped;
+    }
+  }
+  return "";
+}
+
+function mappedLabel(map, value) {
+  const raw = formatPlain(value);
+  if (raw === "-") {
+    return "";
+  }
+  return map[raw] || map[raw.toLowerCase()] || "";
+}
+
+function fallbackShortActionReason(action) {
+  const status = String(action.status || "").trim().toLowerCase();
+  const actionType = String(action.action || action.suggested_action || "").trim().toLowerCase();
+  const trigger = String(action.trigger_status || action.watch_trigger || "").trim().toLowerCase();
+  if (status === "review" || actionType === "review" || status === "error" || trigger === "missing_quote") {
+    return "需要人工复核后再决定。";
+  }
+  if (status === "watch" || actionType === "hold" || actionType === "watch" || trigger === "watch" || trigger === "no_trigger") {
+    return "暂无触发中的交易计划。";
+  }
+  return "交易计划已触发，请查看完整策略。";
+}
+
+function compactSentence(text, maxLength) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trim()}…`;
+}
+
+function actionNotionalText(action) {
+  if (hasValue(action.suggested_notional)) {
+    const currency = formatPlain(action.notional_currency);
+    return currency === "-" ? action.suggested_notional : `${currency} ${action.suggested_notional}`;
+  }
+  if (hasValue(action.order_value_hkd)) {
+    return formatMoney(action.order_value_hkd, "HKD");
+  }
+  return "-";
+}
+
+function actionCardStatusLabel(action) {
+  const actionText = formatAction(action.action || action.suggested_action);
+  const statusText = formatActionStatus(action.status);
+  if (actionText === "-" && statusText === "-") {
+    return "-";
+  }
+  if (actionText === "-") {
+    return statusText;
+  }
+  if (statusText === "-") {
+    return actionText;
+  }
+  return `${actionText} · ${statusText}`;
+}
+
+function rationaleSource(holding) {
+  const action = sectionAvailable(holding.trade_action) ? holding.trade_action : (holding.premarket_action || {});
+  const strategy = holding.strategy || {};
+  const report = holding.agent_report || {};
+  return firstAvailableText(
+    action.agent_reason_zh,
+    action.reason_zh,
+    action.trigger_reason_zh,
+    action.agent_excerpt_zh,
+    strategy.plan_text_zh,
+    strategy.rationale_zh,
+    strategy.agent_reason_zh,
+    strategy.agent_excerpt_zh,
+    report.summary_zh,
+    report.report_zh,
+    report.analysis_zh,
+    action.agent_reason,
+    action.reason,
+    action.trigger_reason,
+    action.agent_excerpt,
+    strategy.plan_text,
+    strategy.rationale,
+    strategy.agent_reason,
+    strategy.agent_excerpt,
+    report.summary,
+    report.raw_decision,
+  );
+}
+
+function rationaleRows(text) {
+  const sentences = splitRationaleText(text);
+  const rows = sentences.map((sentence, index) => ({
+    label: rationaleLabel(sentence, index, sentences.length),
+    text: sentence,
+  }));
+  if (rows.length === 0) {
+    return [];
+  }
+  return rows.slice(0, 8);
+}
+
+function splitRationaleText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) {
+    return [];
+  }
+  const lineParts = raw
+    .split(/\r?\n+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const sourceParts = lineParts.length > 1 ? lineParts : splitOnSentenceEnd(raw);
+  const parts = sourceParts
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => cleanListMarker(part))
+    .filter(Boolean);
+  const rows = [];
+  let buffer = "";
+  for (const part of parts) {
+    const candidate = buffer ? `${buffer} ${part}` : part;
+    if (candidate.length <= 120) {
+      buffer = candidate;
+    } else {
+      if (buffer) {
+        rows.push(buffer);
+      }
+      buffer = part;
+    }
+  }
+  if (buffer) {
+    rows.push(buffer);
+  }
+  return rows;
+}
+
+function splitOnSentenceEnd(text) {
+  const parts = [];
+  let buffer = "";
+  for (const character of String(text || "")) {
+    buffer += character;
+    if ("。！？!?".includes(character)) {
+      parts.push(buffer.trim());
+      buffer = "";
+    }
+  }
+  if (buffer.trim()) {
+    parts.push(buffer.trim());
+  }
+  return parts;
+}
+
+function cleanListMarker(text) {
+  return String(text || "")
+    .replace(/^\s*(?:[-*•]\s+|\d{1,3}(?:[.)]\s+|、\s*))/, "")
+    .trim();
+}
+
+function rationaleLabel(text, index, total) {
+  const lower = String(text || "").toLowerCase();
+  if (/(macd|rsi|趋势|反弹|突破|阻力|支撑|均线|technical|trend|momentum)/i.test(lower)) {
+    return "趋势派";
+  }
+  if (/(风险|止损|回撤|衰减|升水|仓位|风控|risk|stop|drawdown|decay|contango|position)/i.test(lower)) {
+    return "风控派";
+  }
+  if (/(宏观|政策|财报|油|利率|伊朗|地缘|事件|macro|policy|earnings|oil|rate|geopolitical)/i.test(lower)) {
+    return "事件派";
+  }
+  if (index === total - 1 || /(结论|因此|所以|减仓|买入|卖出|持有|配置|action|trim|buy|sell|hold|allocation)/i.test(lower)) {
+    return "组合结论";
+  }
+  return `依据${index + 1}`;
+}
+
 function renderTradeActions() {
-  const actions = (state.dashboard && state.dashboard.trade_actions) || [];
-  elements["action-count"].textContent = `${actions.length} 条`;
+  const actions = sortedTradeActions((state.dashboard && state.dashboard.trade_actions) || []);
+  const counts = tradeActionCounts(actions);
+  const pendingCount = counts.ready + counts.review;
+  elements["action-count"].textContent = `${pendingCount} 待处理`;
   if (!actions.length) {
     elements["trade-actions"].innerHTML = `<div class="empty-state">暂无交易动作</div>`;
     return;
   }
-  elements["trade-actions"].innerHTML = actions.map((action) => `
-    <article class="action-item">
-      <strong>${escapeHtml(formatPlain(action.market))}.${escapeHtml(formatPlain(action.symbol))}</strong>
-      <span class="meta-text">${escapeHtml(formatActionReason(action.reason))}</span>
-      <div class="action-meta">
-        ${renderActionBadge(action.action, action.status)}
-        <span class="badge">${escapeHtml(formatPriority(action.priority))}</span>
-        <span class="badge">${escapeHtml(formatTriggerStatus(action.trigger_status))}</span>
+  elements["trade-actions"].innerHTML = `
+    ${renderActionQueueSummary(counts)}
+    <div class="action-card-list">
+      ${actions.map(renderActionCard).join("")}
+    </div>
+  `;
+}
+
+function renderActionQueueSummary(counts) {
+  return `
+    <div class="action-summary-grid" role="group" aria-label="交易动作摘要">
+      <div><span>待确认</span><strong>${escapeHtml(String(counts.ready))}</strong></div>
+      <div><span>复核</span><strong>${escapeHtml(String(counts.review))}</strong></div>
+      <div><span>观察</span><strong>${escapeHtml(String(counts.watch))}</strong></div>
+    </div>
+  `;
+}
+
+function renderActionCard(action) {
+  const key = actionDetailKey(action);
+  const status = String(action.status || "").toLowerCase();
+  const statusClass = status === "review" ? "review" : status === "ready" ? "ready" : "watch";
+  return `
+    <article class="action-card ${statusClass}">
+      <div class="action-card-header">
+        <div>
+          <strong>${escapeHtml(actionSymbol(action))}</strong>
+          <span>${escapeHtml(actionSourceContext(action))}</span>
+        </div>
+        <span class="badge">${escapeHtml(actionCardStatusLabel(action))}</span>
       </div>
+      <div class="action-card-metrics">
+        <div><span>限价</span><strong>${escapeHtml(formatPlain(firstPresent(action.limit_price, action.last_price)))}</strong></div>
+        <div><span>数量</span><strong>${escapeHtml(formatPlain(action.suggested_quantity))}</strong></div>
+        <div><span>金额</span><strong>${escapeHtml(actionNotionalText(action))}</strong></div>
+      </div>
+      <div class="action-card-reason">
+        <span>短触发理由</span>
+        <p>${escapeHtml(shortActionReason(action))}</p>
+      </div>
+      <button class="raw-toggle action-detail-button" type="button" data-action-detail="${escapeHtml(key)}">查看完整策略</button>
     </article>
-  `).join("");
+  `;
 }
 
 function renderQuoteStatus(payload) {

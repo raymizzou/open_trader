@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
 from typing import Any
+
+import pytest
 
 from open_trader.dashboard_quotes import QuoteRefreshResult
 from open_trader.dashboard_web import STATIC_DIR
@@ -134,6 +138,109 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".english-source" in css
     assert ".detail-metric-grid" in css
     assert ".raw-report" in css
+    assert "renderActionQueueSummary" in js
+    assert "sortedTradeActions" in js
+    assert "tradeActionCounts" in js
+    assert "openTradeActionDetail" in js
+    assert "renderTradeDecisionBand" in js
+    assert "renderTradeImpactGrid" in js
+    assert "renderRationaleDialogue" in js
+    assert "rationaleRows" in js
+    assert "sourceRows" in js
+    assert "hasRawEnglishProse" in js
+    assert "firstAvailableText(rawText, text)" in js
+    assert "短触发理由" in js
+    assert "清晰交易策略" in js
+    assert "操作方向与价位" in js
+    assert "理由对话" in js
+    assert "查看完整策略" in js
+    assert "需复核" in js
+    assert "待处理" in js
+    assert "未知值显示 -" not in js
+    assert ".action-summary-grid" in css
+    assert ".action-card" in css
+    assert ".decision-band" in css
+    assert ".impact-grid" in css
+    assert ".dialogue-row" in css
+    wide_css = css.split("@media (max-width: 1180px)", 1)[1].split(
+        "@media (max-width: 760px)", 1
+    )[0]
+    mobile_css = css.split("@media (max-width: 760px)", 1)[1]
+    assert (
+        ".decision-band,\n"
+        "  .impact-grid {\n"
+        "    grid-template-columns: repeat(2, minmax(0, 1fr));\n"
+        "  }"
+    ) in wide_css
+    assert (
+        ".action-card-metrics,\n"
+        "  .action-summary-grid,\n"
+        "  .decision-band,\n"
+        "  .impact-grid {\n"
+        "    grid-template-columns: 1fr;\n"
+        "  }"
+    ) in mobile_css
+    assert ".workspace-grid.detail-mode,\n  .right-rail {" in mobile_css
+    assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
+    assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
+
+
+def test_dashboard_display_helpers_keep_raw_english_out_of_chinese_ui() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+const holding = {
+  strategy: {
+    agent_reason: "trim into strength",
+    plan_text: "Wait for pullback",
+  },
+  trade_action: {
+    action: "TRIM",
+    status: "review",
+    trigger_status: "target_1_hit",
+    reason: "trim into strength",
+    watch_trigger: "wait for confirmation",
+  },
+};
+const report = {
+  rating: "reduce",
+  status: "ok",
+  run_date: "2026-06-19",
+  agent_reason: "Risk is elevated.",
+};
+const summary = renderChineseAgentSummary(report, holding);
+if (summary.includes("trim into strength") || summary.includes("Risk is elevated")) {
+  throw new Error("raw English leaked into Chinese summary: " + summary);
+}
+const trigger = nextTriggerText(holding.trade_action, holding);
+if (trigger.includes("wait for confirmation") || trigger.includes("Wait for pullback")) {
+  throw new Error("raw English leaked into next trigger: " + trigger);
+}
+const translatedTrigger = nextTriggerText(
+  { watch_trigger: "wait for confirmation" },
+  { strategy: { plan_text_zh: "重新站回均线后复评", plan_text: "Wait for pullback" } },
+);
+if (!translatedTrigger.includes("重新站回均线后复评")) {
+  throw new Error("Chinese fallback was not used: " + translatedTrigger);
+}
+if (chineseDisplayText("Risk is elevated.") !== "") {
+  throw new Error("short English prose should be suppressed");
+}
+if (chineseDisplayText("YoY 增速稳定，OpenAI 影响有限。") === "") {
+  throw new Error("Chinese text with business tokens should remain visible");
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:

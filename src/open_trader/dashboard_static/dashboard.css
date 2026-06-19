@@ -339,8 +339,7 @@ tbody tr:hover {
   min-width: 34px;
 }
 
-.symbol-cell strong,
-.action-item strong {
+.symbol-cell strong {
   display: block;
   margin-bottom: 4px;
   overflow-wrap: anywhere;
@@ -475,6 +474,88 @@ tbody tr:hover {
   margin: 0 0 10px;
 }
 
+.decision-band {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1.05fr 1.15fr 1fr;
+}
+
+.decision-block {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.decision-block h4,
+.impact-cell span,
+.compact-kv dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  margin: 0 0 7px;
+}
+
+.decision-block strong {
+  display: block;
+  font-size: 18px;
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+}
+
+.decision-block p,
+.decision-reason {
+  line-height: 1.55;
+  margin: 0;
+}
+
+.compact-kv {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+}
+
+.compact-kv div {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding-bottom: 6px;
+}
+
+.compact-kv div:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.compact-kv dd {
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.impact-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.impact-cell {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-height: 66px;
+  padding: 9px;
+}
+
+.impact-cell strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
 .report-text {
   background: var(--surface-soft);
   border-radius: 6px;
@@ -505,6 +586,41 @@ tbody tr:hover {
   overflow: auto;
   padding: 10px;
   white-space: pre-wrap;
+}
+
+.rationale-dialogue {
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.rationale-dialogue h4 {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 8px;
+}
+
+.dialogue-list,
+.split-source {
+  display: grid;
+  gap: 8px;
+}
+
+.dialogue-row {
+  background: var(--surface-soft);
+  border-left: 3px solid var(--line);
+  border-radius: 7px;
+  line-height: 1.55;
+  padding: 8px 10px;
+}
+
+.dialogue-row strong {
+  color: var(--accent-strong);
+  margin-right: 8px;
+}
+
+.dialogue-row span {
+  overflow-wrap: anywhere;
 }
 
 .english-source {
@@ -557,19 +673,100 @@ tbody tr:hover {
   gap: 10px;
 }
 
-.action-item {
+.action-summary-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.action-summary-grid div,
+.action-card-metrics div {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  min-width: 0;
+  padding: 8px;
+}
+
+.action-summary-grid span,
+.action-card-metrics span,
+.action-card-reason span {
+  color: var(--muted);
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.action-card-list {
+  display: grid;
+  gap: 10px;
+}
+
+.action-card {
   background: var(--surface-soft);
   border: 1px solid var(--line);
   border-radius: 8px;
+  display: grid;
+  gap: 10px;
   padding: 10px;
 }
 
-.action-meta {
-  align-items: center;
+.action-card.ready {
+  background: #fffaf1;
+  border-color: #efc47e;
+}
+
+.action-card.review {
+  background: #fae8e6;
+  border-color: #e3aaa3;
+}
+
+.action-card-header {
+  align-items: start;
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.action-card-header strong {
+  display: block;
+  font-size: 15px;
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+
+.action-card-header span:not(.badge) {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.action-card-metrics {
+  display: grid;
+  gap: 7px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.action-card-metrics strong {
+  display: block;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.action-card-reason {
+  border-left: 3px solid var(--accent);
+  background: var(--surface);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.action-card-reason p {
+  line-height: 1.5;
+  margin: 0;
+}
+
+.action-detail-button {
+  width: max-content;
 }
 
 .connection-list {
@@ -603,6 +800,11 @@ tbody tr:hover {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .decision-band,
+  .impact-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .workspace-grid {
     grid-template-columns: 190px minmax(0, 1fr);
   }
@@ -620,6 +822,7 @@ tbody tr:hover {
 
   .topbar,
   .workspace-grid,
+  .workspace-grid.detail-mode,
   .right-rail {
     grid-template-columns: 1fr;
   }
@@ -642,6 +845,22 @@ tbody tr:hover {
 
   .summary-grid {
     grid-template-columns: 1fr;
+  }
+
+  .action-card-metrics,
+  .action-summary-grid,
+  .decision-band,
+  .impact-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .compact-kv div {
+    display: grid;
+    gap: 3px;
+  }
+
+  .compact-kv dd {
+    text-align: left;
   }
 
   .detail-header,
