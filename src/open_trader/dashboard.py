@@ -349,11 +349,21 @@ def _build_broker_summary(
     if detail_available:
         holding_value = _sum_detail_hkd(detail_positions, "market_value")
         cash_like_value = _sum_detail_hkd(detail_cash_rows, "cash_balance")
-        portfolio_value = holding_value + cash_like_value
+        portfolio_value = (
+            holding_value + cash_like_value
+            if holding_value is not None and cash_like_value is not None
+            else None
+        )
         money = {
-            "holding_value_hkd": _money_text(holding_value),
-            "cash_like_value_hkd": _money_text(cash_like_value),
-            "portfolio_value_hkd": _money_text(portfolio_value),
+            "holding_value_hkd": _money_text(holding_value)
+            if holding_value is not None
+            else "",
+            "cash_like_value_hkd": _money_text(cash_like_value)
+            if cash_like_value is not None
+            else "",
+            "portfolio_value_hkd": _money_text(portfolio_value)
+            if portfolio_value is not None
+            else "",
             "holding_count": len(detail_positions),
         }
     else:
@@ -368,13 +378,31 @@ def _build_broker_summary(
     }
 
 
-def _sum_detail_hkd(rows: list[dict[str, str]], value_field: str) -> Decimal:
+def _sum_detail_hkd(
+    rows: list[dict[str, str]], value_field: str
+) -> Decimal | None:
     total = Decimal("0")
     for row in rows:
-        value = _detail_value_hkd(row, value_field)
+        value, complete = _detail_value_hkd_for_summary(row, value_field)
+        if not complete:
+            return None
         if value is not None:
             total += value
     return total
+
+
+def _detail_value_hkd_for_summary(
+    row: dict[str, str], value_field: str
+) -> tuple[Decimal | None, bool]:
+    raw_value = row.get(value_field, "").strip()
+    if not raw_value:
+        return None, True
+    value = _optional_decimal(raw_value)
+    currency = row.get("currency", "").strip().upper()
+    fx_rate = DETAIL_FX_TO_HKD.get(currency)
+    if value is None or fx_rate is None:
+        return None, False
+    return value * fx_rate, True
 
 
 def _detail_value_hkd(row: dict[str, str], value_field: str) -> Decimal | None:
@@ -506,12 +534,12 @@ def _build_source_statuses(
 
 
 def _has_live_statement_row(rows: list[dict[str, str]], broker: str) -> bool:
-    marker = f"{broker}-live"
+    suffix = f"-{broker}-live"
     for row in rows:
         if _broker_key(row.get("broker", "")) != broker:
             continue
         statement_id = row.get("statement_id", "").strip().lower()
-        if marker in statement_id:
+        if statement_id.endswith(suffix):
             return True
     return False
 

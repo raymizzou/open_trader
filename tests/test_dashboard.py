@@ -768,6 +768,51 @@ def test_load_dashboard_state_marks_futu_and_tiger_live_only_from_live_statement
     assert statuses["tiger"]["display_text"] == "账户实时同步，行情走富途"
 
 
+def test_load_dashboard_state_rejects_live_marker_unless_statement_id_suffix(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    run_dir = config.data_dir / "runs" / "2026-06-19"
+    row = {
+        "statement_id": "2026-05-futu-live-statement-import",
+        "broker": "futu",
+        "account_alias": "main",
+        "market": "US",
+        "asset_class": "etf",
+        "symbol": "VIXY",
+        "name": "ProShares VIX Short-Term Futures ETF",
+        "currency": "USD",
+        "quantity": "40",
+        "cost_price": "44.00",
+        "last_price": "48.50",
+        "market_value": "1940.00",
+        "cost_value": "1760.00",
+        "unrealized_pnl": "180.00",
+        "confidence": "high",
+        "notes": "",
+    }
+    write_csv(run_dir / "extracted_positions.csv", POSITION_FIELDNAMES, [row])
+
+    state = load_dashboard_state(config).to_dict()
+
+    statuses = {row["broker"]: row for row in state["source_statuses"]}
+    assert statuses["futu"]["status"] == "non_realtime"
+    assert statuses["futu"]["display_text"] == "仅月结单明细"
+
+    write_csv(
+        run_dir / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [{**row, "statement_id": "2026-06-19-futu-live"}],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    statuses = {row["broker"]: row for row in state["source_statuses"]}
+    assert statuses["futu"]["status"] == "ok"
+    assert statuses["futu"]["display_text"] == "账户实时同步"
+
+
 def test_load_dashboard_state_uses_phillips_statement_id_for_source_status(
     tmp_path: Path,
 ) -> None:
@@ -804,7 +849,7 @@ def test_load_dashboard_state_uses_phillips_statement_id_for_source_status(
     assert statuses["phillips"]["display_text"] == "2026-05 月结单导入"
 
 
-def test_load_dashboard_state_ignores_unsupported_or_malformed_detail_money(
+def test_load_dashboard_state_blanks_unsupported_or_malformed_detail_money(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -900,9 +945,9 @@ def test_load_dashboard_state_ignores_unsupported_or_malformed_detail_money(
     state = load_dashboard_state(config).to_dict()
 
     summaries = {row["broker"]: row for row in state["broker_summaries"]}
-    assert summaries["futu"]["holding_value_hkd"] == "78.00"
-    assert summaries["futu"]["cash_like_value_hkd"] == "108.00"
-    assert summaries["futu"]["portfolio_value_hkd"] == "186.00"
+    assert summaries["futu"]["holding_value_hkd"] == ""
+    assert summaries["futu"]["cash_like_value_hkd"] == ""
+    assert summaries["futu"]["portfolio_value_hkd"] == ""
 
 
 def test_load_dashboard_state_uses_single_broker_portfolio_fallback(
