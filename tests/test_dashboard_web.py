@@ -232,6 +232,10 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "broker-summary-cards" in html
     assert "source-status-list" in html
     assert "cash-detail-panel" in html
+    assert "research-chat-modal" in html
+    assert "research-chat-messages" in html
+    assert "research-chat-input" in html
+    assert "生成最终结论" in html
     assert "filter-panel" not in html
     assert "summary-grid" not in html
     assert "数据健康" not in html
@@ -278,6 +282,12 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "watchPointText" in js
     assert "decisionMetricCells" in js
     assert "finalConclusionItems" in js
+    assert "renderResearchConclusions" in js
+    assert "openResearchChat" in js
+    assert "sendResearchChatMessage" in js
+    assert "finalizeResearchChat" in js
+    assert "投研给出的结论" in js
+    assert "我和 LLM 探讨后的结论" in js
     assert "renderAnalystDialogue" in js
     assert "sourceReviewText" in js
     assert "分析与交易策略" in js
@@ -296,6 +306,8 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".decision-metric-strip" in css
     assert ".analyst-dialogue" in css
     assert ".final-conclusion-list" in css
+    assert ".research-conclusion-grid" in css
+    assert ".research-chat-layer" in css
     assert ".broker-detail-section" in css
     assert "holding_value_hkd" in js
     assert "cash_like_value_hkd" in js
@@ -598,6 +610,69 @@ const noActionHtml = renderAnalysisStrategySection({
 });
 if (!noActionHtml.includes("今天暂无触发中的交易动作")) {
   throw new Error("missing explicit no-action state: " + noActionHtml);
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_research_conclusions_render_missing_and_present_states() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+state.dashboard = {
+  holdings: [{
+    market: "US",
+    symbol: "VIXY",
+    portfolio_weight_hkd: "7.11%",
+    risk_flag: "normal",
+    broker_details: [],
+    agent_report: {available: false},
+    strategy: {available: false},
+    premarket_action: {available: false},
+    trade_action: {available: false},
+    research_view: {
+      available: true,
+      research_date: "2026-06-19",
+      tradingagents_conclusion: {
+        status: "present",
+        content: "低配，当前动作为减仓。",
+        reason: "达到第一目标价。",
+        condition: "财报后复评。"
+      },
+      user_llm_conclusion: {status: "missing", content: ""}
+    }
+  }]
+};
+const html = renderResearchConclusions(state.dashboard.holdings[0]);
+if (!html.includes("投研给出的结论") || !html.includes("我和 LLM 探讨后的结论")) {
+  throw new Error("research conclusion labels missing: " + html);
+}
+if (!html.includes("低配，当前动作为减仓。") || !html.includes("缺失")) {
+  throw new Error("research conclusion content missing: " + html);
+}
+if (!html.includes("开始讨论")) {
+  throw new Error("missing start chat button: " + html);
+}
+state.dashboard.holdings[0].research_view.user_llm_conclusion = {
+  status: "present",
+  content: "确认减仓 100 股。",
+};
+const finalizedHtml = renderResearchConclusions(state.dashboard.holdings[0]);
+if (!finalizedHtml.includes("确认减仓 100 股。") || finalizedHtml.includes("<strong>缺失</strong>")) {
+  throw new Error("finalized user conclusion did not render: " + finalizedHtml);
+}
+if (!finalizedHtml.includes("继续讨论")) {
+  throw new Error("missing continue chat button: " + finalizedHtml);
 }
 `, sandbox);
 """
