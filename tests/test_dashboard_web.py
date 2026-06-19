@@ -284,8 +284,8 @@ state.dashboard = {
   holdings: [
     {
       market: "US",
-      symbol: "MSFT",
-      name: "Microsoft",
+      symbol: "VIXY",
+      name: "ProShares VIX Short-Term Futures ETF",
       brokers: "futu",
       market_value_hkd: "37830.00",
     },
@@ -305,7 +305,7 @@ state.dashboard = {
       broker: "futu",
       brokers: "futu",
       currency: "HKD",
-      market_value_hkd: "15982.00",
+      market_value_hkd: "850.00",
     },
     {
       market: "CASH",
@@ -352,11 +352,46 @@ state.dashboard = {
 state.marketFilter = "US";
 state.brokerFilter = "futu";
 const summary = currentViewSummary();
-if (summary.portfolio_value_hkd !== "37830.00") {
+if (summary.portfolio_value_hkd !== "38680.00") {
   throw new Error("unexpected portfolio value: " + JSON.stringify(summary));
+}
+if (summary.holding_value_hkd !== "37830.00") {
+  throw new Error("unexpected holding value: " + JSON.stringify(summary));
+}
+if (summary.cash_like_value_hkd !== "850.00") {
+  throw new Error("unexpected cash value: " + JSON.stringify(summary));
+}
+if (summary.holding_weight_hkd !== "97.80%") {
+  throw new Error("unexpected holding weight: " + JSON.stringify(summary));
 }
 if (summary.holding_count !== 1) {
   throw new Error("unexpected holding count: " + JSON.stringify(summary));
+}
+state.marketFilter = "ALL";
+state.brokerFilter = "futu";
+const allFutuSummary = currentViewSummary();
+if (allFutuSummary.portfolio_value_hkd !== "38680.00") {
+  throw new Error("ALL/futu should include holding plus cash: " + JSON.stringify(allFutuSummary));
+}
+if (allFutuSummary.holding_value_hkd !== "37830.00") {
+  throw new Error("ALL/futu holding value mismatch: " + JSON.stringify(allFutuSummary));
+}
+if (allFutuSummary.cash_like_value_hkd !== "850.00") {
+  throw new Error("ALL/futu cash value mismatch: " + JSON.stringify(allFutuSummary));
+}
+if (allFutuSummary.holding_weight_hkd !== "97.80%") {
+  throw new Error("ALL/futu holding weight mismatch: " + JSON.stringify(allFutuSummary));
+}
+state.dashboard.holdings.push({
+  market: "US",
+  symbol: "BAD",
+  name: "Malformed",
+  brokers: "futu",
+  market_value_hkd: "123abc",
+});
+const malformedSummary = currentViewSummary();
+if (malformedSummary.portfolio_value_hkd !== "38680.00") {
+  throw new Error("malformed holding value should be ignored: " + JSON.stringify(malformedSummary));
 }
 const brokerCards = renderBrokerSummaryCards();
 if (!brokerCards.includes("富途") || !brokerCards.includes("HKD 15982.00")) {

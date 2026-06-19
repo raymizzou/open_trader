@@ -290,7 +290,32 @@ function renderHeaderSummary() {
 }
 
 function currentViewSummary() {
-  const rows = state.marketFilter === "CASH" ? filteredCashRows() : filteredHoldings();
+  const cashRows = filteredCashRows();
+  if (state.marketFilter === "CASH") {
+    const cashTotal = sumMoneyValues(cashRows);
+    return {
+      portfolio_value_hkd: cashTotal.text,
+      holding_value_hkd: "",
+      cash_like_value_hkd: cashTotal.text,
+      holding_weight_hkd: percentValue(0, cashTotal.value),
+      holding_count: cashRows.length,
+    };
+  }
+  const holdingRows = filteredHoldings();
+  const holdingTotal = sumMoneyValues(holdingRows);
+  const cashTotal = sumMoneyValues(cashRows);
+  const hasTotal = holdingTotal.hasValue || cashTotal.hasValue;
+  const portfolioTotal = holdingTotal.value + cashTotal.value;
+  return {
+    portfolio_value_hkd: hasTotal ? moneyValue(portfolioTotal) : "",
+    holding_value_hkd: holdingTotal.text,
+    cash_like_value_hkd: cashTotal.text,
+    holding_weight_hkd: hasTotal ? percentValue(holdingTotal.value, portfolioTotal) : "-",
+    holding_count: holdingRows.length,
+  };
+}
+
+function sumMoneyValues(rows) {
   let validValueCount = 0;
   const total = rows.reduce((sum, row) => {
     const value = numericValue(row.market_value_hkd);
@@ -300,15 +325,10 @@ function currentViewSummary() {
     validValueCount += 1;
     return sum + value;
   }, 0);
-  const valueText = validValueCount > 0 ? moneyValue(total) : "";
-  const holdingValue = state.marketFilter === "CASH" ? "" : valueText;
-  const cashValue = state.marketFilter === "CASH" ? valueText : "";
   return {
-    portfolio_value_hkd: valueText,
-    holding_value_hkd: holdingValue,
-    cash_like_value_hkd: cashValue,
-    holding_weight_hkd: percentValue(state.marketFilter === "CASH" ? 0 : total, total),
-    holding_count: rows.length,
+    value: total,
+    hasValue: validValueCount > 0,
+    text: validValueCount > 0 ? moneyValue(total) : "",
   };
 }
 
@@ -1522,7 +1542,14 @@ function numericValue(value) {
   if (!hasValue(value)) {
     return null;
   }
-  const parsed = Number.parseFloat(String(value).replace(/,/g, ""));
+  const raw = String(value).trim();
+  const validNumber = raw.includes(",")
+    ? /^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$/.test(raw)
+    : /^[+-]?(?:\d+|\d*\.\d+)$/.test(raw);
+  if (!validNumber) {
+    return null;
+  }
+  const parsed = Number(raw.replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : null;
 }
 
