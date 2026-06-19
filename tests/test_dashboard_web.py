@@ -272,6 +272,108 @@ if (chineseDisplayText("YoY 增速稳定，OpenAI 影响有限。") === "") {
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
+def test_dashboard_report_readability_helpers_build_decision_first_sections() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+state.detailLanguage = "zh";
+const holding = {
+  market: "US",
+  symbol: "DRAM",
+  name: "DRAM Test",
+  total_quantity: "100",
+  strategy: {
+    available: true,
+    rating: "Underweight",
+    target_1: "51",
+    target_2: "53",
+    stop_loss: "60",
+    catalyst: "6 月 24 日财报后复评",
+    time_horizon: "1-3 个月",
+    plan_text_zh: "财报前先锁定收益，财报后重新评估。",
+    agent_reason_zh: "MACD 背离，仓位风险上升。财报是下一判断点。因此先减半而非清仓。",
+  },
+  agent_report: {
+    available: true,
+    rating: "Underweight",
+    status: "ok",
+    run_date: "2026-06-19",
+    summary_zh: "评级低配。趋势派认为 MACD 背离。风控派建议锁定部分收益。组合结论是减仓而非清仓。",
+    raw_decision: "The bull case remains possible, but risk is elevated.",
+  },
+  premarket_action: {
+    available: true,
+    suggested_action: "reduce",
+    watch_trigger_zh: "跌回 50 日均线需要复核。",
+  },
+  trade_action: {
+    available: true,
+    action: "TRIM",
+    status: "ready",
+    trigger_status: "target_1_hit",
+    limit_price: "51",
+    suggested_quantity: "50",
+    suggested_notional: "2550",
+    notional_currency: "USD",
+    stop_price: "60",
+    trigger_reason_zh: "达到第一目标价，先锁定部分收益。",
+    agent_reason_zh: "MACD 背离，仓位风险上升。财报是下一判断点。因此先减半而非清仓。",
+  },
+};
+const action = currentDecisionAction(holding);
+if (action.action !== "TRIM") {
+  throw new Error("trade_action should lead the decision row");
+}
+const desired = desiredActionText(holding);
+if (!desired.includes("减仓") || !desired.includes("DRAM")) {
+  throw new Error("desired action should be Chinese and symbol-specific: " + desired);
+}
+const watch = watchPointText(holding);
+if (!watch.includes("达到第一目标价") && !watch.includes("财报")) {
+  throw new Error("watch point should use trigger or catalyst: " + watch);
+}
+const metrics = decisionMetricCells(holding).map((cell) => cell[0]).join(",");
+if (!metrics.includes("观点") || !metrics.includes("下次复评")) {
+  throw new Error("metrics missing required labels: " + metrics);
+}
+const conclusion = finalConclusionItems(holding).map((item) => item.label).join(",");
+if (!conclusion.includes("结论") || !conclusion.includes("失败条件")) {
+  throw new Error("conclusion missing required labels: " + conclusion);
+}
+const html = renderAnalysisStrategySection(holding);
+for (const required of ["分析与交易策略", "当前希望你做什么", "操作指令", "今天重点关注", "分析师对话", "最终结论", "查看英文原文"]) {
+  if (!html.includes(required)) {
+    throw new Error("missing rendered label " + required + " in " + html);
+  }
+}
+if (html.includes("risk is elevated") || html.includes("The bull case")) {
+  throw new Error("raw English leaked into primary Chinese UI: " + html);
+}
+const noActionHtml = renderAnalysisStrategySection({
+  market: "US",
+  symbol: "CASH",
+  strategy: { available: false },
+  agent_report: { available: false },
+  trade_action: { available: false },
+  premarket_action: { available: false },
+});
+if (!noActionHtml.includes("今天暂无触发中的交易动作")) {
+  throw new Error("missing explicit no-action state: " + noActionHtml);
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
     from open_trader.dashboard_web import build_dashboard_payload
 
