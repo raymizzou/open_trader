@@ -43,6 +43,7 @@ const ACTION_STATUS_LABELS = {
   active: "有效",
   error: "错误",
   ok: "正常",
+  manual_review: "需复核",
   ready: "待确认",
   review: "需复核",
   watch: "观察中",
@@ -453,9 +454,7 @@ function renderSymbolDetail(holding, index) {
       ${renderMetric("数据健康", dataHealthText(holding))}
     </section>
     <div class="detail-grid">
-      ${renderAgentReportSection(holding.agent_report, holding)}
-      ${renderStrategySection(holding.strategy, holding)}
-      ${renderTradeActionSection(holding)}
+      ${renderAnalysisStrategySection(holding)}
       ${renderBrokerDetailSection(holding.broker_details)}
     </div>
   `;
@@ -600,20 +599,135 @@ function renderEnglishSourceBlock(text, rawText, buttonText) {
   `;
 }
 
-function renderTradeActionSection(holding) {
-  const premarketAction = holding.premarket_action || {};
-  const tradeAction = holding.trade_action || {};
+function renderTradeActionSection(detailHolding) {
+  const premarketAction = detailHolding.premarket_action || {};
+  const tradeAction = detailHolding.trade_action || {};
   if (!sectionAvailable(tradeAction) && !sectionAvailable(premarketAction)) {
     return renderDetailSection("当前交易动作", renderStatusMessage("暂无触发中的交易动作", tradeAction));
   }
   const action = sectionAvailable(tradeAction) ? tradeAction : premarketAction;
   const body = `
     ${renderStatusWarning(action)}
-    ${renderTradeDecisionBand(action, holding)}
-    ${renderTradeImpactGrid(action, holding)}
-    ${typeof renderRationaleDialogue === "function" ? renderRationaleDialogue(holding) : ""}
+    ${renderTradeDecisionBand(action, detailHolding)}
+    ${renderTradeImpactGrid(action, detailHolding)}
+    ${typeof renderRationaleDialogue === "function" ? renderRationaleDialogue(detailHolding) : ""}
   `;
   return renderDetailSection("当前交易动作", body);
+}
+
+function renderAnalysisStrategySection(holding) {
+  const body = `
+    ${renderReportStatusLine(holding)}
+    <div class="decision-dashboard">
+      <article class="decision-card primary">
+        <span>当前希望你做什么</span>
+        <strong>${escapeHtml(desiredActionText(holding))}</strong>
+        <p>${escapeHtml(decisionSubline(holding))}</p>
+      </article>
+      <article class="decision-card">
+        <span>操作指令</span>
+        <dl class="operation-list">
+          ${operationRows(holding).map(([label, value]) => renderCompactKv(label, value)).join("")}
+        </dl>
+      </article>
+      <article class="decision-card">
+        <span>今天重点关注</span>
+        <p>${escapeHtml(watchPointText(holding))}</p>
+      </article>
+    </div>
+    <div class="decision-metric-strip" aria-label="分析指标">
+      ${decisionMetricCells(holding).map(([label, value]) => `
+        <article>
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(formatPlain(value))}</strong>
+        </article>
+      `).join("")}
+    </div>
+    ${renderAnalystDialogue(holding)}
+    ${renderFinalConclusion(holding)}
+    ${renderSourceReview(holding)}
+  `;
+  return renderDetailSection("分析与交易策略", body, "analysis-strategy-section");
+}
+
+function renderReportStatusLine(holding) {
+  const report = holding.agent_report || {};
+  const action = currentDecisionAction(holding);
+  const usedFallback = report.fallback_used || report.used_fallback || report.source_status === "fallback";
+  const parts = [
+    analystViewText(holding),
+    mappedActionStatusLabel(report.status),
+    usedFallback ? "使用历史报告回退" : "",
+    mappedActionStatusLabel(action.status),
+    report.generated_at || report.run_date,
+    "只读 · 需要人工确认",
+  ].filter((part) => hasValue(part) && part !== "-");
+  const fallbackWarning = renderStatusWarning(report) || renderStatusWarning(action);
+  return `
+    <div class="report-status-line">
+      <span>${escapeHtml(parts.join(" · ") || "只读 · 需要人工确认")}</span>
+      ${fallbackWarning}
+    </div>
+  `;
+}
+
+function renderAnalystDialogue(holding) {
+  const rows = rationaleRows(rationaleSource(holding))
+    .map((row) => ({
+      label: row.label,
+      text: chineseDisplayText(row.text),
+    }))
+    .filter((row) => hasValue(row.text) && row.text !== "-" && safePrimaryValue(row.text));
+  if (!rows.length) {
+    return `
+      <section class="analyst-dialogue">
+        <h4>分析师对话</h4>
+        <p class="compact-empty">暂无可展示的中文分析对话。</p>
+      </section>
+    `;
+  }
+  return `
+    <section class="analyst-dialogue">
+      <h4>分析师对话</h4>
+      <div class="dialogue-list">
+        ${rows.map((row) => `
+          <div class="dialogue-row">
+            <strong>${escapeHtml(row.label)}</strong>
+            <span>${escapeHtml(row.text)}</span>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderFinalConclusion(holding) {
+  return `
+    <section class="final-conclusion">
+      <h4>最终结论</h4>
+      <div class="final-conclusion-list">
+        ${finalConclusionItems(holding).map((item) => `
+          <article>
+            <span>${escapeHtml(item.label)}</span>
+            <strong>${escapeHtml(formatPlain(item.text))}</strong>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderSourceReview(holding) {
+  const sourceText = sourceReviewText(holding);
+  if (!hasValue(sourceText)) {
+    return "";
+  }
+  return `
+    <section class="source-review">
+      <button class="raw-toggle english-source-toggle" type="button" data-toggle-raw-report>查看英文原文</button>
+      ${renderSplitSourceRows(sourceText)}
+    </section>
+  `;
 }
 
 function renderTradeDecisionBand(action, holding) {
@@ -756,7 +870,7 @@ function nextTriggerText(action, holding) {
     return `目标价 ${targetText}`;
   }
   const planText = primaryChineseText(strategy.plan_text_zh, strategy.rationale_zh)
-    || safePrimaryValue(strategy.plan_text);
+    || firstSafePrimaryValue(strategy.plan_text);
   if (planText) {
     return compactSentence(planText, 48);
   }
@@ -817,7 +931,7 @@ function decisionTriggerText(action) {
 function primaryChineseText(...values) {
   for (const value of values) {
     const text = String(value || "").replace(/\s+/g, " ").trim();
-    if (text && /[\u3400-\u9fff]/.test(text) && safePrimaryValue(text)) {
+    if (text && /[\u3400-\u9fff]/.test(text) && !hasRawEnglishProse(text)) {
       return text;
     }
   }
@@ -828,6 +942,9 @@ function safePrimaryValue(value) {
   const text = formatPlain(value);
   if (text === "-") {
     return "";
+  }
+  if (/[\u3400-\u9fff]/.test(text)) {
+    return hasRawEnglishProse(text) ? "" : text;
   }
   const englishWords = text.match(/\b[A-Za-z][A-Za-z'-]*\b/g) || [];
   if (!englishWords.length) {
@@ -937,9 +1054,13 @@ function watchPointText(holding) {
   }
   const mappedTrigger = firstMappedLabel(TRIGGER_STATUS_LABELS, action.trigger_status, action.watch_trigger);
   if (mappedTrigger && mappedTrigger !== "未触发") {
-    return compactSentence(`${mappedTrigger}；继续观察 ${nextReviewText(holding)}。`, 92);
+    const reviewText = nextReviewText(holding);
+    const reviewSuffix = reviewText && reviewText !== "-"
+      ? `继续观察 ${reviewText}。`
+      : "执行前保持人工确认。";
+    return compactSentence(`${mappedTrigger}；${reviewSuffix}`, 92);
   }
-  const catalyst = safePrimaryValue(firstAvailableText(strategy.catalyst, strategy.time_horizon, strategy.plan_text));
+  const catalyst = firstSafePrimaryValue(strategy.catalyst, strategy.time_horizon, strategy.plan_text);
   if (catalyst) {
     return compactSentence(catalyst, 92);
   }
@@ -971,7 +1092,7 @@ function nextReviewText(holding) {
   if (direct) {
     return compactSentence(direct, 32);
   }
-  const text = safePrimaryValue(firstAvailableText(strategy.catalyst, strategy.time_horizon, action.watch_trigger));
+  const text = firstSafePrimaryValue(strategy.catalyst, strategy.time_horizon, action.watch_trigger);
   return text ? compactSentence(text, 32) : "-";
 }
 
@@ -1034,14 +1155,36 @@ function sourceReviewText(holding) {
   const report = holding.agent_report || {};
   const strategy = holding.strategy || {};
   const action = currentDecisionAction(holding);
-  return firstAvailableText(
+  return uniqueSourceText(
     report.raw_decision,
     report.raw_report,
     report.full_report,
     report.summary,
     strategy.agent_excerpt,
+    strategy.plan_text,
+    strategy.rationale,
+    strategy.agent_reason,
+    strategy.notes,
     action.agent_excerpt,
+    action.agent_reason,
+    action.reason,
+    action.trigger_reason,
+    action.watch_trigger,
   );
+}
+
+function uniqueSourceText(...values) {
+  const seen = new Set();
+  const parts = [];
+  for (const value of values) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text || seen.has(text)) {
+      continue;
+    }
+    seen.add(text);
+    parts.push(text);
+  }
+  return parts.join("\n");
 }
 
 function suggestedNotionalText(action) {
@@ -1057,7 +1200,7 @@ function suggestedNotionalText(action) {
 
 function renderBrokerDetailSection(details) {
   if (!Array.isArray(details) || details.length === 0) {
-    return renderDetailSection("券商账户明细", renderStatusMessage("暂无券商账户明细"));
+    return renderDetailSection("券商账户明细", renderStatusMessage("暂无券商账户明细"), "broker-detail-section");
   }
   const rows = details.map((detail) => `
     <tr>
@@ -1087,12 +1230,13 @@ function renderBrokerDetailSection(details) {
         <tbody>${rows}</tbody>
       </table>
     </div>
-  `);
+  `, "broker-detail-section");
 }
 
-function renderDetailSection(title, body) {
+function renderDetailSection(title, body, extraClass = "") {
+  const classes = ["detail-section", extraClass].filter(Boolean).join(" ");
   return `
-    <section class="detail-section">
+    <section class="${escapeHtml(classes)}">
       <h3>${escapeHtml(title)}</h3>
       ${body}
     </section>
@@ -1206,7 +1350,6 @@ function safeChineseReason(action, strategy, report) {
 
 function hasRawEnglishProse(text) {
   const residual = String(text || "")
-    .replace(/\b[A-Z]{2,8}\b/g, "")
     .replace(/\b(?:HKD|USD|ETF|ETFs|MACD|RSI|YoY|QoQ|OpenAI|iPhone)\b/gi, "");
   const words = residual.match(/\b[A-Za-z][A-Za-z'-]{2,}\b/g) || [];
   return words.length >= 2;

@@ -307,6 +307,7 @@ const holding = {
     rating: "Underweight",
     status: "ok",
     run_date: "2026-06-19",
+    source_status: "fallback",
     summary_zh: "评级低配。趋势派认为 MACD 背离。风控派建议锁定部分收益。组合结论是减仓而非清仓。",
     raw_decision: "The bull case remains possible, but risk is elevated.",
   },
@@ -383,6 +384,23 @@ const premarketMetricMap = Object.fromEntries(decisionMetricCells(premarketOnly)
 if (premarketSubline.includes("Open below prior close") || String(premarketMetricMap["触发状态"] || "").includes("Open below prior close")) {
   throw new Error("premarket English watch trigger leaked into Chinese UI");
 }
+const triggeredWithoutReview = {
+  market: "US",
+  symbol: "NOWATCH",
+  strategy: { available: false },
+  agent_report: { available: false },
+  trade_action: {
+    available: true,
+    action: "TRIM",
+    status: "ready",
+    trigger_status: "target_1_hit",
+  },
+  premarket_action: { available: false },
+};
+const noReviewWatchPoint = watchPointText(triggeredWithoutReview);
+if (noReviewWatchPoint.includes(" -") || !noReviewWatchPoint.includes("执行前保持人工确认")) {
+  throw new Error("watch point should not render placeholder review text: " + noReviewWatchPoint);
+}
 const englishLeakHolding = {
   market: "US",
   symbol: "LEAK",
@@ -417,7 +435,7 @@ const englishLeakHolding = {
     post_trade_quantity: "Breakout",
     post_trade_weight: "Bullish",
     stop_price: "Place a hard stop at $60.",
-    watch_trigger: "Breakout",
+    watch_trigger: "OPEN BELOW PRIOR CLOSE",
   },
 };
 const primaryOutputs = [
@@ -436,14 +454,61 @@ const primaryOutputs = [
   renderTradeImpactGrid(currentDecisionAction(englishLeakHolding), englishLeakHolding),
   renderTradeActionSection(englishLeakHolding),
 ].join(" ");
-if (primaryOutputs.includes("Buy below") || primaryOutputs.includes("Sell above") || primaryOutputs.includes("Place a hard stop") || primaryOutputs.includes("Open below prior close") || primaryOutputs.includes("Breakout") || primaryOutputs.includes("Bullish") || primaryOutputs.includes("Resistance")) {
+if (primaryOutputs.includes("Buy below") || primaryOutputs.includes("Sell above") || primaryOutputs.includes("Place a hard stop") || primaryOutputs.includes("Open below prior close") || primaryOutputs.includes("OPEN BELOW PRIOR CLOSE") || primaryOutputs.includes("Breakout") || primaryOutputs.includes("Bullish") || primaryOutputs.includes("Resistance")) {
   throw new Error("raw English leaked from primary helper outputs: " + primaryOutputs);
+}
+if (safePrimaryValue("OPEN BELOW PRIOR CLOSE") !== "" || safePrimaryValue("BULLISH") !== "" || safePrimaryValue("BREAKOUT") !== "") {
+  throw new Error("all-caps English trading prose must be suppressed in primary helper values");
 }
 if (primaryChineseText("MACD 背离") !== "MACD 背离" || primaryChineseText("OpenAI 影响有限") !== "OpenAI 影响有限" || safePrimaryValue("ETF") !== "ETF") {
   throw new Error("allowed business tokens should remain visible in primary helper text");
 }
+if (primaryChineseText("TSLA 财报后复评") !== "TSLA 财报后复评" || safePrimaryValue("AAPL 财报后复评") !== "AAPL 财报后复评") {
+  throw new Error("normal tickers should remain visible in Chinese helper text");
+}
+const mixedFallbackHolding = {
+  market: "US",
+  symbol: "MIX",
+  strategy: {
+    available: true,
+    catalyst: "Breakout",
+    time_horizon: "1-3 个月",
+    plan_text: "财报后复评",
+  },
+  agent_report: { available: false },
+  trade_action: { available: false },
+  premarket_action: { available: false },
+};
+if (!watchPointText(mixedFallbackHolding).includes("1-3 个月")) {
+  throw new Error("watch point should skip unsafe English and use later safe fallback: " + watchPointText(mixedFallbackHolding));
+}
+if (!nextReviewText(mixedFallbackHolding).includes("1-3 个月")) {
+  throw new Error("review text should skip unsafe English and use later safe fallback: " + nextReviewText(mixedFallbackHolding));
+}
+const mixedUppercaseLeakHolding = {
+  market: "US",
+  symbol: "CAPS",
+  strategy: { available: false },
+  agent_report: { available: false },
+  trade_action: { available: false },
+  premarket_action: {
+    available: true,
+    suggested_action: "reduce",
+    watch_trigger_zh: "OPEN BELOW PRIOR CLOSE 后复评",
+  },
+};
+const mixedUppercaseOutputs = [
+  decisionTriggerText(currentDecisionAction(mixedUppercaseLeakHolding)),
+  watchPointText(mixedUppercaseLeakHolding),
+  nextReviewText(mixedUppercaseLeakHolding),
+  finalConditionText(mixedUppercaseLeakHolding),
+  renderAnalysisStrategySection(mixedUppercaseLeakHolding).split("source-review", 1)[0],
+].join(" ");
+if (mixedUppercaseOutputs.includes("OPEN BELOW PRIOR CLOSE")) {
+  throw new Error("mixed Chinese/all-caps English prose leaked into primary UI: " + mixedUppercaseOutputs);
+}
 const html = renderAnalysisStrategySection(holding);
-for (const required of ["分析与交易策略", "当前希望你做什么", "操作指令", "今天重点关注", "分析师对话", "最终结论", "查看英文原文"]) {
+for (const required of ["分析与交易策略", "当前希望你做什么", "操作指令", "今天重点关注", "分析师对话", "最终结论", "查看英文原文", "正常", "使用历史报告回退"]) {
   if (!html.includes(required)) {
     throw new Error("missing rendered label " + required + " in " + html);
   }
@@ -455,6 +520,34 @@ if (primaryHtml.includes("risk is elevated") || primaryHtml.includes("The bull c
 const sourceSection = html.includes("source-review") ? html.slice(html.indexOf("source-review")) : "";
 if (!sourceSection.includes("english-source") || !sourceSection.includes("hidden") || !sourceSection.includes("The bull case")) {
   throw new Error("English source should remain collapsed and preserved: " + sourceSection);
+}
+const sourceOnlyHolding = {
+  market: "US",
+  symbol: "SRC",
+  strategy: {
+    available: true,
+    plan_text: "Wait for earnings confirmation before adding.",
+  },
+  agent_report: { available: false },
+  trade_action: {
+    available: true,
+    action: "HOLD",
+    status: "manual_review",
+    agent_reason: "Risk remains elevated until earnings.",
+  },
+  premarket_action: { available: false },
+};
+const sourceOnlyHtml = renderAnalysisStrategySection(sourceOnlyHolding);
+const sourceOnlyPrimary = sourceOnlyHtml.split("source-review", 1)[0];
+const sourceOnlySource = sourceOnlyHtml.includes("source-review") ? sourceOnlyHtml.slice(sourceOnlyHtml.indexOf("source-review")) : "";
+if (sourceOnlyPrimary.includes("Risk remains elevated") || sourceOnlyPrimary.includes("Wait for earnings")) {
+  throw new Error("English-only rationale leaked into primary Chinese UI: " + sourceOnlyPrimary);
+}
+if (!sourceOnlyPrimary.includes("需复核")) {
+  throw new Error("manual_review status should render as 需复核: " + sourceOnlyPrimary);
+}
+if (!sourceOnlySource.includes("english-source") || !sourceOnlySource.includes("Risk remains elevated")) {
+  throw new Error("English-only rationale should remain collapsed in source review: " + sourceOnlySource);
 }
 const noActionHolding = {
   market: "US",
