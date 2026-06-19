@@ -783,8 +783,8 @@ function desiredActionText(holding) {
   if (actionText === "-") {
     return `今天暂无触发中的交易动作`;
   }
-  const quantity = firstPresent(action.suggested_quantity, action.target_quantity, action.quantity);
-  const quantityText = hasValue(quantity) ? `，数量 ${formatPlain(quantity)}` : "";
+  const quantity = firstSafePrimaryValue(action.suggested_quantity, action.target_quantity, action.quantity);
+  const quantityText = quantity ? `，数量 ${quantity}` : "";
   return `${actionText} ${symbol}${quantityText}`;
 }
 
@@ -834,6 +834,22 @@ function safePrimaryValue(value) {
     return "";
   }
   return text;
+}
+
+function firstSafePrimaryValue(...values) {
+  for (const value of values) {
+    const safe = safePrimaryValue(value);
+    if (safe) {
+      return safe;
+    }
+  }
+  return "";
+}
+
+function safeRangeText(low, high) {
+  const safeLow = safePrimaryValue(low);
+  const safeHigh = safePrimaryValue(high);
+  return joinRange(safeLow, safeHigh);
 }
 
 function mappedActionLabel(value) {
@@ -895,9 +911,9 @@ function operationRows(holding) {
   const strategy = holding.strategy || {};
   return [
     ["动作", reportActionStatusLabel(action)],
-    ["价格", firstPresent(action.limit_price, action.last_price, strategy.target_1, safePrimaryValue(strategy.target_range))],
-    ["仓位", firstPresent(action.suggested_quantity, action.suggested_notional, strategy.max_weight, strategy.target_weight)],
-    ["止损", firstPresent(action.stop_price, strategy.stop_loss)],
+    ["价格", firstSafePrimaryValue(action.limit_price, action.last_price, strategy.target_1, strategy.target_range)],
+    ["仓位", firstSafePrimaryValue(action.suggested_quantity, action.suggested_notional, strategy.max_weight, strategy.target_weight)],
+    ["止损", firstSafePrimaryValue(action.stop_price, strategy.stop_loss)],
   ];
 }
 
@@ -930,7 +946,7 @@ function decisionMetricCells(holding) {
   const strategy = holding.strategy || {};
   return [
     ["观点", analystViewText(holding)],
-    ["目标价", joinRange(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)],
+    ["目标价", safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)],
     ["触发状态", decisionTriggerText(action)],
     ["动作状态", mappedActionStatusLabel(action.status)],
     ["下次复评", nextReviewText(holding)],
@@ -957,11 +973,12 @@ function nextReviewText(holding) {
 function finalConclusionItems(holding) {
   const action = currentDecisionAction(holding);
   const strategy = holding.strategy || {};
+  const stopValue = firstSafePrimaryValue(action.stop_price, strategy.stop_loss);
   return [
     ["结论", finalConclusionText(holding)],
     ["理由", finalReasonText(holding)],
     ["条件", finalConditionText(holding)],
-    ["失败条件", firstPresent(action.stop_price, strategy.stop_loss) ? `跌破 ${firstPresent(action.stop_price, strategy.stop_loss)} 后进入防守复核。` : "触发风险条件后进入人工复核。"],
+    ["失败条件", stopValue ? `跌破 ${stopValue} 后进入防守复核。` : "触发风险条件后进入人工复核。"],
   ].map(([label, text]) => ({ label, text: formatPlain(text) }));
 }
 

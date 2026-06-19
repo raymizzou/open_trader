@@ -390,7 +390,10 @@ const englishLeakHolding = {
     available: true,
     view: "Buy below 90",
     rating: "Underweight",
+    target_1: "Buy below 90",
+    target_2: "Sell above 120",
     target_range: "Buy below 90",
+    stop_loss: "Place a hard stop at $60.",
     plan_text_zh: "译文：Place a hard stop at $60.",
   },
   agent_report: { available: false },
@@ -398,6 +401,8 @@ const englishLeakHolding = {
   premarket_action: {
     available: true,
     suggested_action: "Open below prior close.",
+    limit_price: "Buy below 90",
+    stop_price: "Place a hard stop at $60.",
   },
 };
 const primaryOutputs = [
@@ -408,7 +413,7 @@ const primaryOutputs = [
   ...decisionMetricCells(englishLeakHolding).flat(),
   ...finalConclusionItems(englishLeakHolding).flatMap((item) => [item.label, item.text]),
 ].join(" ");
-if (primaryOutputs.includes("Buy below") || primaryOutputs.includes("Place a hard stop") || primaryOutputs.includes("Open below prior close")) {
+if (primaryOutputs.includes("Buy below") || primaryOutputs.includes("Sell above") || primaryOutputs.includes("Place a hard stop") || primaryOutputs.includes("Open below prior close")) {
   throw new Error("raw English leaked from primary helper outputs: " + primaryOutputs);
 }
 const html = renderAnalysisStrategySection(holding);
