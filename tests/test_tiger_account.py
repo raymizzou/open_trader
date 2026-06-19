@@ -1546,6 +1546,68 @@ def test_sync_tiger_portfolio_replaces_tiger_only_rows_and_writes_artifacts(
     assert "# 老虎账户同步" in report
 
 
+def test_sync_tiger_portfolio_reconciles_prime_account_total_assets(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [base_portfolio_row(fx_to_hkd="7.85")])
+
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "100.25",
+                "available_balance": "88.50",
+                "source": "get_prime_assets",
+            },
+            {
+                "record_type": "account_total",
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "account_total": "1200",
+                "source": "get_prime_assets",
+            },
+        ],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-19",
+        update_latest=False,
+    )
+
+    rows = {row["symbol"]: row for row in read_portfolio(result.portfolio_path)}
+    adjustment = rows["TIGER_UNMAPPED_ASSETS"]
+    assert adjustment["market"] == "CASH"
+    assert adjustment["asset_class"] == "cash"
+    assert adjustment["currency"] == "HKD"
+    assert adjustment["market_value_hkd"] == "2196.04"
+    assert adjustment["brokers"] == "tiger"
+    assert (
+        adjustment["notes"]
+        == "Tiger account_total reconciliation for locked funds or fund assets not returned as positions"
+    )
+
+
 def test_sync_tiger_portfolio_masks_numeric_account_values_in_snapshot_artifact(
     tmp_path: Path,
 ) -> None:

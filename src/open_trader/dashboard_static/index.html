@@ -9,65 +9,82 @@
   </head>
   <body>
     <div class="dashboard-shell">
-      <header class="topbar">
-        <div class="brand-block">
-          <span class="brand">Open Trader</span>
-          <span class="page-title">持仓实时看板</span>
-        </div>
-        <div class="topbar-actions">
-          <span id="quote-status" class="status-pill status-muted">等待行情</span>
-          <span id="last-refresh" class="last-refresh">尚未刷新</span>
-          <button id="refresh-quotes" class="primary-button" type="button">刷新行情</button>
-        </div>
-      </header>
-
-      <section class="summary-grid" aria-label="组合摘要">
-        <article class="summary-card">
-          <span class="summary-label">组合总资产 HKD</span>
-          <strong id="summary-value">-</strong>
-          <div class="allocation-bar" aria-hidden="true">
-            <span id="summary-holding-bar"></span>
+      <header class="dashboard-header">
+        <section class="header-brand-panel" aria-label="看板筛选">
+          <div class="brand-block">
+            <span class="brand">Open Trader</span>
+            <span class="page-title">持仓实时看板</span>
           </div>
-          <div class="summary-allocation-row">
-            <span id="summary-holding-value">持仓资产 -</span>
-            <strong id="summary-holding-weight">-</strong>
-          </div>
-          <span id="summary-cash-note" class="summary-note">现金类资产 -</span>
-        </article>
-        <article class="summary-card">
-          <span class="summary-label">实时刷新状态</span>
-          <strong id="summary-refresh-status">等待行情</strong>
-          <span id="summary-refresh-note" class="summary-note">-</span>
-        </article>
-        <article class="summary-card">
-          <span class="summary-label">券商账户</span>
-          <strong id="summary-brokers">-</strong>
-          <span id="summary-detail-month" class="summary-note">明细月份 -</span>
-        </article>
-        <article class="summary-card">
-          <span class="summary-label">数据健康</span>
-          <strong id="summary-health">加载中</strong>
-          <span id="summary-health-note" class="summary-note">-</span>
-        </article>
-      </section>
-
-      <main class="workspace-grid">
-        <aside class="filter-panel" aria-label="筛选">
-          <section class="panel-section">
-            <h2>筛选</h2>
-            <div class="filter-group" id="market-filters">
+          <div class="header-filter-block">
+            <div id="header-market-filters" class="segmented-control" aria-label="市场筛选">
               <button class="filter-button active" type="button" data-market="ALL">全部市场</button>
               <button class="filter-button" type="button" data-market="US">US</button>
               <button class="filter-button" type="button" data-market="HK">HK</button>
               <button class="filter-button" type="button" data-market="CASH">现金</button>
             </div>
-          </section>
-          <section class="panel-section">
-            <h2>券商</h2>
-            <div id="broker-filters" class="filter-group dynamic-filters"></div>
-          </section>
-        </aside>
+            <div id="header-broker-filters" class="segmented-control dynamic-filters" aria-label="券商筛选"></div>
+          </div>
+          <span id="current-view-label" class="current-view-label">当前视图：全部市场 · 全部券商</span>
+        </section>
 
+        <section class="header-assets-panel" aria-label="当前视图资产">
+          <article class="current-view-card">
+            <span class="summary-label">当前视图总资产 HKD</span>
+            <strong id="current-view-value">-</strong>
+            <div class="current-view-breakdown">
+              <span id="current-view-holding-value">持仓资产 -</span>
+              <strong id="current-view-holding-weight">-</strong>
+            </div>
+            <span id="current-view-cash-note" class="summary-note">现金类资产 -</span>
+          </article>
+          <div id="broker-summary-cards" class="broker-summary-cards">
+            <article class="broker-summary-card" data-broker-placeholder="futu">
+              <span class="summary-label">富途暂无数据</span>
+              <strong>-</strong>
+            </article>
+            <article class="broker-summary-card" data-broker-placeholder="tiger">
+              <span class="summary-label">老虎暂无数据</span>
+              <strong>-</strong>
+            </article>
+            <article class="broker-summary-card" data-broker-placeholder="phillip">
+              <span class="summary-label">辉立暂无数据</span>
+              <strong>-</strong>
+            </article>
+          </div>
+        </section>
+
+        <section class="header-source-panel" aria-label="连接与数据来源">
+          <div class="source-header-row">
+            <span id="quote-status" class="status-pill status-muted">等待行情</span>
+            <button id="refresh-quotes" class="primary-button" type="button">刷新行情</button>
+          </div>
+          <div id="source-status-list" class="source-status-list"></div>
+          <span id="last-refresh" class="last-refresh">尚未刷新</span>
+        </section>
+      </header>
+
+      <div class="runtime-compatibility hidden" hidden aria-hidden="true">
+        <div id="market-filters">
+          <button class="filter-button active" type="button" data-market="ALL">全部市场</button>
+          <button class="filter-button" type="button" data-market="US">US</button>
+          <button class="filter-button" type="button" data-market="HK">HK</button>
+          <button class="filter-button" type="button" data-market="CASH">现金</button>
+        </div>
+        <div id="broker-filters"></div>
+        <strong id="summary-value">-</strong>
+        <span id="summary-holding-bar"></span>
+        <span id="summary-holding-value"></span>
+        <strong id="summary-holding-weight">-</strong>
+        <span id="summary-cash-note"></span>
+        <strong id="summary-refresh-status">-</strong>
+        <span id="summary-refresh-note"></span>
+        <strong id="summary-brokers">-</strong>
+        <span id="summary-detail-month"></span>
+        <strong id="summary-health">-</strong>
+        <span id="summary-health-note"></span>
+      </div>
+
+      <main class="workspace-grid">
         <section class="holdings-panel">
           <div class="section-heading">
             <div>
@@ -99,6 +116,7 @@
               </tbody>
             </table>
           </div>
+          <div id="cash-detail-panel" class="cash-detail-panel hidden" aria-live="polite"></div>
           <div id="symbol-detail-panel" class="symbol-detail-panel hidden" aria-live="polite"></div>
         </section>
 
