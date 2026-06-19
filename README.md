@@ -246,13 +246,21 @@ report, then blocks latest promotion.
   --date 2026-06-16
 ```
 
-### Run Realtime Portfolio Dashboard
+### Deploy Local Frontend Dashboard
 
 ```bash
-.venv/bin/python -m open_trader dashboard --portfolio data/latest/portfolio.csv --poll-seconds 5
+.venv/bin/python -m open_trader dashboard \
+  --portfolio data/latest/portfolio.csv \
+  --data-dir data \
+  --reports-dir reports \
+  --poll-seconds 5 \
+  --host 127.0.0.1 \
+  --port 8766
 ```
 
-The dashboard serves locally at `http://127.0.0.1:8765` by default. It reads
+The dashboard serves locally at `http://127.0.0.1:8765` by default; the example
+above pins it to `http://127.0.0.1:8766` so the local deployment URL stays
+stable. It reads
 `data/latest/portfolio.csv`, broker detail artifacts under
 `data/broker_positions/`, and the latest trade actions and reports when present.
 
@@ -262,11 +270,36 @@ a failure or stale warning instead of hiding the problem.
 
 The dashboard is read-only: it does not place orders or modify data.
 
+To keep the local frontend running after the terminal closes, start it in a
+detached `screen` session:
+
+```bash
+screen -dmS open_trader_dashboard_8766 zsh -lc \
+  'cd /Users/ray/projects/open_trader && export PYTHONPATH=src && exec .venv/bin/python -m open_trader dashboard --portfolio data/latest/portfolio.csv --data-dir data --reports-dir reports --poll-seconds 5 --host 127.0.0.1 --port 8766'
+```
+
+Verify the deployment:
+
+```bash
+curl -sS http://127.0.0.1:8766/ | head
+curl -sS http://127.0.0.1:8766/api/dashboard | head -c 500
+ps aux | rg 'open_trader dashboard'
+```
+
+Stop the detached dashboard when needed:
+
+```bash
+screen -S open_trader_dashboard_8766 -X quit
+```
+
 ## Daily Automation
+
+### Deploy Daily Premarket Jobs
 
 Install the macOS user-level `launchd` jobs:
 
 ```bash
+scripts/install_daily_premarket_launchd.sh --dry-run --market all
 scripts/install_daily_premarket_launchd.sh
 ```
 
@@ -299,6 +332,31 @@ Uninstall the job:
 
 ```bash
 scripts/uninstall_daily_premarket_launchd.sh
+```
+
+Verify the scheduled deployment:
+
+```bash
+launchctl list | rg 'open-trader|premarket'
+plutil -lint \
+  ~/Library/LaunchAgents/com.open-trader.premarket.hk.plist \
+  ~/Library/LaunchAgents/com.open-trader.premarket.us.plist
+```
+
+Expected loaded labels:
+
+```text
+com.open-trader.premarket.hk
+com.open-trader.premarket.us
+```
+
+Check scheduler logs after a run:
+
+```bash
+tail -n 100 logs/daily_premarket/launchd-HK.out.log
+tail -n 100 logs/daily_premarket/launchd-HK.err.log
+tail -n 100 logs/daily_premarket/launchd-US.out.log
+tail -n 100 logs/daily_premarket/launchd-US.err.log
 ```
 
 ## Outputs
