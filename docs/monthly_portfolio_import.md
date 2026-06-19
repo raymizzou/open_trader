@@ -5,13 +5,13 @@ Run this once per month after placing the latest broker statement PDFs on disk.
 ```bash
 .venv/bin/python -m open_trader import-statements \
   --month 2026-05 \
-  --futu /Users/ray/Downloads/futu.pdf \
-  --tiger /Users/ray/Downloads/tiger.pdf \
   --phillips /Users/ray/Downloads/phillips.pdf \
   --usd-hkd 7.85
 ```
 
-Update `--month` and `--usd-hkd` for the target statement month. Replace the PDF paths if the files are stored elsewhere.
+Update `--month` and `--usd-hkd` for the target statement month. Replace the
+Phillips PDF path if the file is stored elsewhere. Futu and Tiger current
+holdings are refreshed through their live account sync commands.
 
 Main output:
 
@@ -183,11 +183,9 @@ at a stop loss, at a target, or only on watch.
 
 ## Futu Live Account Sync
 
-Current limitation: `import-statements` still requires all statement inputs,
-including Futu. Until an other-broker-only import exists,
 `sync-futu-portfolio` operates on the current `data/latest/portfolio.csv` and
-replaces its Futu-only rows with live Futu holdings and cash from Futu OpenD.
-It keeps non-Futu broker rows from the current portfolio.
+replaces Futu-only rows with live Futu holdings and cash from Futu OpenD. It
+keeps non-Futu broker rows from the current portfolio.
 
 Operational order today: keep `data/latest/portfolio.csv` current enough to
 preserve non-Futu rows, verify read-only account access, write dated sync
@@ -229,11 +227,9 @@ store a trading password, and does not place orders.
 
 ## Tiger Live Account Sync
 
-Current limitation: `import-statements` still requires all statement inputs,
-including Tiger. `sync-tiger-portfolio` is a separate live-account sync. It
-operates on the current `data/latest/portfolio.csv`, replaces Tiger-only rows
-with current Tiger OpenAPI holdings and cash, and preserves non-Tiger rows from
-the current portfolio.
+`sync-tiger-portfolio` operates on the current `data/latest/portfolio.csv`,
+replaces Tiger-only rows with current Tiger OpenAPI holdings and cash, and
+preserves non-Tiger rows from the current portfolio.
 
 The command is read-only against Tiger OpenAPI. It fetches account, position,
 and cash data, writes review artifacts, and does not place orders.

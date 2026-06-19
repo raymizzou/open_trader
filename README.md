@@ -135,8 +135,6 @@ private key environment value.
 ```bash
 .venv/bin/python -m open_trader import-statements \
   --month 2026-05 \
-  --futu /path/to/futu.pdf \
-  --tiger /path/to/tiger.pdf \
   --phillips /path/to/phillips.pdf \
   --usd-hkd 7.85
 ```
@@ -146,6 +144,9 @@ Main output:
 ```text
 data/latest/portfolio.csv
 ```
+
+Futu and Tiger current holdings are refreshed through live account sync
+commands, not monthly statement import.
 
 ### Run Premarket Advice Manually
 
@@ -209,8 +210,8 @@ plan symbols.
 Tiger live account sync is read-only and does not place orders. It works from
 the current `data/latest/portfolio.csv`, replaces Tiger-only rows with current
 Tiger OpenAPI holdings and cash, and preserves non-Tiger rows. Monthly
-`import-statements` still requires statement inputs; Tiger sync is a separate
-current-account refresh.
+`import-statements` handles brokers that still rely on statements; Tiger sync
+is the current-account refresh path.
 
 ```bash
 .venv/bin/python -m open_trader check-tiger-account
