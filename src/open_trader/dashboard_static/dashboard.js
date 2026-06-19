@@ -764,6 +764,192 @@ function nextTriggerText(action, holding) {
   return "";
 }
 
+function currentDecisionAction(holding) {
+  const tradeAction = holding.trade_action || {};
+  if (sectionAvailable(tradeAction)) {
+    return tradeAction;
+  }
+  const premarketAction = holding.premarket_action || {};
+  if (sectionAvailable(premarketAction)) {
+    return premarketAction;
+  }
+  return {};
+}
+
+function desiredActionText(holding) {
+  const action = currentDecisionAction(holding);
+  const symbol = detailSymbol(holding);
+  const actionText = formatAction(action.action || action.suggested_action);
+  if (actionText === "-") {
+    return `今天暂无触发中的交易动作`;
+  }
+  const quantity = firstPresent(action.suggested_quantity, action.target_quantity, action.quantity);
+  const quantityText = hasValue(quantity) ? `，数量 ${formatPlain(quantity)}` : "";
+  return `${actionText} ${symbol}${quantityText}`;
+}
+
+function detailSymbol(holding) {
+  const market = formatPlain(holding.market);
+  const symbol = formatPlain(holding.symbol);
+  if (market === "-" && symbol === "-") {
+    return "-";
+  }
+  if (market === "-") {
+    return symbol;
+  }
+  if (symbol === "-") {
+    return market;
+  }
+  return `${market}.${symbol}`;
+}
+
+function decisionSubline(holding) {
+  const action = currentDecisionAction(holding);
+  if (!sectionAvailable(action)) {
+    const view = analystViewText(holding);
+    return view === "-" ? "暂无触发动作，继续观察。" : `${view}，暂无触发动作，继续观察。`;
+  }
+  const trigger = formatTriggerStatus(action.trigger_status || action.watch_trigger);
+  const reason = shortActionReason(action);
+  const parts = [trigger, reason].filter((part) => part && part !== "-");
+  if (!parts.length) {
+    return "执行前保持人工确认。";
+  }
+  return `${parts.join("；")} 执行前保持人工确认。`;
+}
+
+function operationRows(holding) {
+  const action = currentDecisionAction(holding);
+  const strategy = holding.strategy || {};
+  return [
+    ["动作", actionCardStatusLabel(action)],
+    ["价格", firstPresent(action.limit_price, action.last_price, strategy.target_1, strategy.target_range)],
+    ["仓位", firstPresent(action.suggested_quantity, action.suggested_notional, strategy.max_weight, strategy.target_weight)],
+    ["止损", firstPresent(action.stop_price, strategy.stop_loss)],
+  ];
+}
+
+function watchPointText(holding) {
+  const action = currentDecisionAction(holding);
+  const strategy = holding.strategy || {};
+  const direct = firstChineseText(
+    action.trigger_reason_zh,
+    action.watch_trigger_zh,
+    strategy.catalyst_zh,
+    strategy.plan_text_zh,
+    strategy.rationale_zh,
+  );
+  if (direct) {
+    return compactSentence(direct, 92);
+  }
+  const mappedTrigger = firstMappedLabel(TRIGGER_STATUS_LABELS, action.trigger_status, action.watch_trigger);
+  if (mappedTrigger && mappedTrigger !== "未触发") {
+    return compactSentence(`${mappedTrigger}；继续观察 ${nextReviewText(holding)}。`, 92);
+  }
+  const catalyst = safeChineseDisplayText(firstAvailableText(strategy.catalyst, strategy.time_horizon, strategy.plan_text));
+  if (catalyst) {
+    return compactSentence(catalyst, 92);
+  }
+  return "暂无新的触发条件，继续观察。";
+}
+
+function decisionMetricCells(holding) {
+  const action = currentDecisionAction(holding);
+  const strategy = holding.strategy || {};
+  return [
+    ["观点", analystViewText(holding)],
+    ["目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range],
+    ["触发状态", formatTriggerStatus(action.trigger_status || action.watch_trigger)],
+    ["动作状态", formatActionStatus(action.status)],
+    ["下次复评", nextReviewText(holding)],
+  ];
+}
+
+function analystViewText(holding) {
+  const strategy = holding.strategy || {};
+  const report = holding.agent_report || {};
+  return formatAction(strategy.view || strategy.stance || strategy.signal || strategy.rating || report.rating || report.advice_action);
+}
+
+function nextReviewText(holding) {
+  const strategy = holding.strategy || {};
+  const action = currentDecisionAction(holding);
+  const direct = firstChineseText(strategy.catalyst_zh, strategy.time_horizon_zh, action.watch_trigger_zh);
+  if (direct) {
+    return compactSentence(direct, 32);
+  }
+  const text = safeChineseDisplayText(firstAvailableText(strategy.catalyst, strategy.time_horizon, action.watch_trigger));
+  return text ? compactSentence(text, 32) : "-";
+}
+
+function finalConclusionItems(holding) {
+  const action = currentDecisionAction(holding);
+  const strategy = holding.strategy || {};
+  return [
+    ["结论", finalConclusionText(holding)],
+    ["理由", finalReasonText(holding)],
+    ["条件", finalConditionText(holding)],
+    ["失败条件", firstPresent(action.stop_price, strategy.stop_loss) ? `跌破 ${firstPresent(action.stop_price, strategy.stop_loss)} 后进入防守复核。` : "触发风险条件后进入人工复核。"],
+  ].map(([label, text]) => ({ label, text: formatPlain(text) }));
+}
+
+function finalConclusionText(holding) {
+  const action = currentDecisionAction(holding);
+  const view = analystViewText(holding);
+  const actionText = formatAction(action.action || action.suggested_action);
+  if (actionText === "-" && view === "-") {
+    return "暂无明确结论。";
+  }
+  if (actionText === "-") {
+    return `${view}，但今天暂无触发动作。`;
+  }
+  if (view === "-") {
+    return `${actionText}，执行前保持人工确认。`;
+  }
+  return `${view}，当前动作是${actionText}。`;
+}
+
+function finalReasonText(holding) {
+  const action = currentDecisionAction(holding);
+  const reason = firstChineseText(
+    action.trigger_reason_zh,
+    action.reason_zh,
+    action.agent_reason_zh,
+    holding.strategy && holding.strategy.agent_reason_zh,
+    holding.agent_report && holding.agent_report.summary_zh,
+  );
+  if (reason) {
+    return compactSentence(reason, 82);
+  }
+  const mapped = firstMappedLabel(REASON_LABELS, action.trigger_reason, action.reason);
+  return mapped || "理由见分析师对话。";
+}
+
+function finalConditionText(holding) {
+  const strategy = holding.strategy || {};
+  const action = currentDecisionAction(holding);
+  const text = firstChineseText(strategy.plan_text_zh, strategy.catalyst_zh, action.watch_trigger_zh);
+  if (text) {
+    return compactSentence(text, 82);
+  }
+  const trigger = firstMappedLabel(TRIGGER_STATUS_LABELS, action.watch_trigger, action.trigger_status);
+  return trigger ? `${trigger} 后复核。` : "出现新的价格或事件触发后复核。";
+}
+
+function sourceReviewText(holding) {
+  const report = holding.agent_report || {};
+  const strategy = holding.strategy || {};
+  const action = currentDecisionAction(holding);
+  return firstAvailableText(
+    report.raw_decision,
+    report.raw_report,
+    report.full_report,
+    report.summary,
+    strategy.agent_excerpt,
+    action.agent_excerpt,
+  );
+}
+
 function suggestedNotionalText(action) {
   if (hasValue(action.suggested_notional)) {
     const currency = formatPlain(action.notional_currency);
