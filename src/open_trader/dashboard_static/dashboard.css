@@ -588,6 +588,41 @@ tbody tr:hover {
   white-space: pre-wrap;
 }
 
+.rationale-dialogue {
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.rationale-dialogue h4 {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 8px;
+}
+
+.dialogue-list,
+.split-source {
+  display: grid;
+  gap: 8px;
+}
+
+.dialogue-row {
+  background: var(--surface-soft);
+  border-left: 3px solid var(--line);
+  border-radius: 7px;
+  line-height: 1.55;
+  padding: 8px 10px;
+}
+
+.dialogue-row strong {
+  color: var(--accent-strong);
+  margin-right: 8px;
+}
+
+.dialogue-row span {
+  overflow-wrap: anywhere;
+}
+
 .english-source {
   margin-top: 8px;
 }

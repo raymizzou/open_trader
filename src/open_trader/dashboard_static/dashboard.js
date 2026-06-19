@@ -596,7 +596,7 @@ function renderEnglishSourceBlock(text, rawText, buttonText) {
   }
   return `
     <button class="raw-toggle english-source-toggle" type="button" data-toggle-raw-report>${escapeHtml(buttonText)}</button>
-    <pre class="raw-report english-source hidden">${escapeHtml(sourceText)}</pre>
+    ${renderSplitSourceRows(sourceText)}
   `;
 }
 
@@ -657,6 +657,52 @@ function renderTradeImpactGrid(action, holding) {
           <span>${escapeHtml(label)}</span>
           <strong>${escapeHtml(formatPlain(value))}</strong>
         </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderRationaleDialogue(holding) {
+  const rows = rationaleRows(rationaleSource(holding))
+    .map((row) => ({
+      label: row.label,
+      text: chineseDisplayText(row.text),
+    }))
+    .filter((row) => {
+      const hasLongEnglish = /[A-Za-z]{3,}/.test(row.text);
+      const hasChinese = /[\u3400-\u9fff]/.test(row.text);
+      return hasValue(row.text) && row.text !== "-" && (!hasLongEnglish || hasChinese);
+    });
+  if (!rows.length) {
+    return "";
+  }
+  return `
+    <div class="rationale-dialogue">
+      <h4>理由对话</h4>
+      <div class="dialogue-list">
+        ${rows.map((row) => `
+          <div class="dialogue-row">
+            <strong>${escapeHtml(row.label)}</strong>
+            <span>${escapeHtml(row.text)}</span>
+          </div>
+        `).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderSplitSourceRows(text) {
+  const rows = rationaleRows(text);
+  if (!rows.length) {
+    return `<pre class="raw-report english-source hidden">${escapeHtml(text)}</pre>`;
+  }
+  return `
+    <div class="raw-report english-source split-source hidden">
+      ${rows.map((row) => `
+        <div class="dialogue-row">
+          <strong>${escapeHtml(row.label)}</strong>
+          <span>${escapeHtml(row.text)}</span>
+        </div>
       `).join("")}
     </div>
   `;
