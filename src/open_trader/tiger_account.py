@@ -45,6 +45,8 @@ CASH_DETAIL_FIELDNAMES = [
     "notes",
 ]
 
+TIGER_UNMAPPED_ASSETS_SYMBOL = "TIGER_UNMAPPED_ASSETS"
+
 
 class TigerAccountError(RuntimeError):
     def __init__(
@@ -127,6 +129,16 @@ def sync_tiger_portfolio(
         snapshot,
         run_date=run_date,
     )
+    positions = [
+        *positions,
+        *_unmapped_total_asset_positions(
+            snapshot=snapshot,
+            positions=positions,
+            cash_balances=cash_balances,
+            fx_provider=fx_provider,
+            run_date=run_date,
+        ),
+    ]
     if use_detail_rows:
         merged_rows = build_portfolio_rows(
             run_date[:7],
@@ -645,6 +657,28 @@ class TigerAccountClient:
         if segment is None:
             return records
 
+        account_total = _first_present_value(
+            segment,
+            "equity_with_loan",
+            "net_liquidation",
+        )
+        if account_total is not None:
+            records.append(
+                {
+                    "record_type": "account_total",
+                    "account": account.account,
+                    "account_alias": account.account_alias,
+                    "currency": _text(segment, "currency"),
+                    "account_total": account_total,
+                    "segment_category": _text(segment, "category"),
+                    "net_liquidation": _text(segment, "net_liquidation"),
+                    "equity_with_loan": _text(segment, "equity_with_loan"),
+                    "locked_funds": _text(segment, "locked_funds"),
+                    "uncollected": _text(segment, "uncollected"),
+                    "source": account.asset_method,
+                }
+            )
+
         currency_assets = _get_attr(segment, "currency_assets", {})
         if not isinstance(currency_assets, dict):
             return records
@@ -827,6 +861,9 @@ def _cash_balances_from_record(
     statement_id: str,
     blocking_errors: list[str],
 ) -> list[CashBalance]:
+    if _text(record, "record_type") == "account_total":
+        return []
+
     currency = _text(record, "currency").upper()
     if currency in {"", "N/A"}:
         return []
@@ -861,6 +898,80 @@ def _cash_balances_from_record(
             notes="Tiger live account cash",
         )
     ]
+
+
+def _unmapped_total_asset_positions(
+    *,
+    snapshot: TigerAccountSnapshot,
+    positions: list[Position],
+    cash_balances: list[CashBalance],
+    fx_provider: StaticMonthEndFxProvider,
+    run_date: str,
+) -> list[Position]:
+    mapped_hkd_by_account: dict[str, Decimal] = {}
+    for position in positions:
+        if position.market_value is None:
+            continue
+        mapped_hkd_by_account[position.account_alias] = mapped_hkd_by_account.get(
+            position.account_alias,
+            Decimal("0"),
+        ) + (
+            position.market_value
+            * fx_provider.get_rate_to_hkd(position.currency.upper()).rate
+        )
+    for cash in cash_balances:
+        mapped_hkd_by_account[cash.account_alias] = mapped_hkd_by_account.get(
+            cash.account_alias,
+            Decimal("0"),
+        ) + (
+            cash.cash_balance * fx_provider.get_rate_to_hkd(cash.currency.upper()).rate
+        )
+
+    adjustments: list[Position] = []
+    statement_id = f"{run_date}-tiger-live"
+    for record in snapshot.cash_records:
+        if _text(record, "record_type") != "account_total":
+            continue
+        account_total = _optional_decimal(record, ("account_total",))
+        if account_total is None:
+            continue
+        account_alias = _text(record, "account_alias", "tiger_unknown")
+        total_currency = _text(record, "currency", "USD").upper()
+        if total_currency in {"", "N/A"}:
+            total_currency = "USD"
+        total_assets_hkd = (
+            account_total * fx_provider.get_rate_to_hkd(total_currency).rate
+        )
+        residual_hkd = total_assets_hkd - mapped_hkd_by_account.get(
+            account_alias,
+            Decimal("0"),
+        )
+        if abs(residual_hkd) < Decimal("0.01"):
+            continue
+        adjustments.append(
+            Position(
+                statement_id=statement_id,
+                broker="tiger",
+                account_alias=account_alias,
+                market=Market.CASH,
+                asset_class=AssetClass.CASH,
+                symbol=TIGER_UNMAPPED_ASSETS_SYMBOL,
+                name="老虎未明细账户资产",
+                currency="HKD",
+                quantity=Decimal("1"),
+                cost_price=residual_hkd,
+                last_price=residual_hkd,
+                market_value=residual_hkd,
+                cost_value=residual_hkd,
+                unrealized_pnl=Decimal("0"),
+                confidence="high",
+                notes=(
+                    "Tiger account_total reconciliation for locked funds "
+                    "or fund assets not returned as positions"
+                ),
+            )
+        )
+    return adjustments
 
 
 def _required_decimal(
