@@ -1074,4 +1074,3 @@ git commit -m "fix: verify trade report ui redesign"
 ```
 
 If no fixes were required, do not create an empty commit.
-
