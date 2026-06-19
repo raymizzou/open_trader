@@ -150,6 +150,13 @@ function bindEvents() {
     }
     showSymbolDetail(button.dataset.detailKey || "");
   });
+  elements["trade-actions"].addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action-detail]");
+    if (!button) {
+      return;
+    }
+    openTradeActionDetail(button.dataset.actionDetail || "");
+  });
   elements["symbol-detail-panel"].addEventListener("click", (event) => {
     const backButton = event.target.closest("[data-back-to-holdings]");
     if (backButton) {
@@ -381,6 +388,28 @@ function selectedHolding(holdings = filteredHoldings()) {
 function showSymbolDetail(detailKey) {
   state.selectedHoldingKey = detailKey;
   renderHoldings();
+}
+
+function openTradeActionDetail(actionKey) {
+  if (!actionKey) {
+    return;
+  }
+  const holdings = filteredHoldings();
+  for (let index = 0; index < holdings.length; index += 1) {
+    const holding = holdings[index];
+    const tradeAction = holding.trade_action || {};
+    const premarketAction = holding.premarket_action || {};
+    const candidates = [
+      `${String(tradeAction.market || "").toUpperCase()}.${String(tradeAction.symbol || "").toUpperCase()}`,
+      `${String(premarketAction.market || "").toUpperCase()}.${String(premarketAction.symbol || "").toUpperCase()}`,
+      `${String(holding.market || "").toUpperCase()}.${String(holding.symbol || "").toUpperCase()}`,
+    ];
+    if (candidates.includes(actionKey)) {
+      state.selectedHoldingKey = holdingKey(holding, index);
+      renderHoldings();
+      return;
+    }
+  }
 }
 
 function renderSymbolDetail(holding, index) {
@@ -1001,23 +1030,57 @@ function rationaleLabel(text, index, total) {
 }
 
 function renderTradeActions() {
-  const actions = (state.dashboard && state.dashboard.trade_actions) || [];
-  elements["action-count"].textContent = `${actions.length} 条`;
+  const actions = sortedTradeActions((state.dashboard && state.dashboard.trade_actions) || []);
+  const counts = tradeActionCounts(actions);
+  const pendingCount = counts.ready + counts.review;
+  elements["action-count"].textContent = `${pendingCount} 待处理`;
   if (!actions.length) {
     elements["trade-actions"].innerHTML = `<div class="empty-state">暂无交易动作</div>`;
     return;
   }
-  elements["trade-actions"].innerHTML = actions.map((action) => `
-    <article class="action-item">
-      <strong>${escapeHtml(formatPlain(action.market))}.${escapeHtml(formatPlain(action.symbol))}</strong>
-      <span class="meta-text">${escapeHtml(formatActionReason(action.reason))}</span>
-      <div class="action-meta">
-        ${renderActionBadge(action.action, action.status)}
-        <span class="badge">${escapeHtml(formatPriority(action.priority))}</span>
-        <span class="badge">${escapeHtml(formatTriggerStatus(action.trigger_status))}</span>
+  elements["trade-actions"].innerHTML = `
+    ${renderActionQueueSummary(counts)}
+    <div class="action-card-list">
+      ${actions.map(renderActionCard).join("")}
+    </div>
+  `;
+}
+
+function renderActionQueueSummary(counts) {
+  return `
+    <div class="action-summary-grid" aria-label="交易动作摘要">
+      <div><span>待确认</span><strong>${escapeHtml(String(counts.ready))}</strong></div>
+      <div><span>复核</span><strong>${escapeHtml(String(counts.review))}</strong></div>
+      <div><span>观察</span><strong>${escapeHtml(String(counts.watch))}</strong></div>
+    </div>
+  `;
+}
+
+function renderActionCard(action) {
+  const key = `${String(action.market || "").toUpperCase()}.${String(action.symbol || "").toUpperCase()}`;
+  const status = String(action.status || "").toLowerCase();
+  const statusClass = status === "review" ? "review" : status === "ready" ? "ready" : "watch";
+  return `
+    <article class="action-card ${statusClass}">
+      <div class="action-card-header">
+        <div>
+          <strong>${escapeHtml(actionSymbol(action))}</strong>
+          <span>${escapeHtml(actionSourceContext(action))}</span>
+        </div>
+        <span class="badge">${escapeHtml(actionCardStatusLabel(action))}</span>
       </div>
+      <div class="action-card-metrics">
+        <div><span>限价</span><strong>${escapeHtml(formatPlain(action.limit_price || action.last_price))}</strong></div>
+        <div><span>数量</span><strong>${escapeHtml(formatPlain(action.suggested_quantity))}</strong></div>
+        <div><span>金额</span><strong>${escapeHtml(actionNotionalText(action))}</strong></div>
+      </div>
+      <div class="action-card-reason">
+        <span>短触发理由</span>
+        <p>${escapeHtml(shortActionReason(action))}</p>
+      </div>
+      <button class="raw-toggle action-detail-button" type="button" data-action-detail="${escapeHtml(key)}">查看完整策略</button>
     </article>
-  `).join("");
+  `;
 }
 
 function renderQuoteStatus(payload) {

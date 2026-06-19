@@ -572,6 +572,102 @@ tbody tr:hover {
   margin-top: 8px;
 }
 
+.action-summary-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.action-summary-grid div,
+.action-card-metrics div {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  min-width: 0;
+  padding: 8px;
+}
+
+.action-summary-grid span,
+.action-card-metrics span,
+.action-card-reason span {
+  color: var(--muted);
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.action-card-list {
+  display: grid;
+  gap: 10px;
+}
+
+.action-card {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+}
+
+.action-card.ready {
+  background: #fffaf1;
+  border-color: #efc47e;
+}
+
+.action-card.review {
+  background: #fae8e6;
+  border-color: #e3aaa3;
+}
+
+.action-card-header {
+  align-items: start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.action-card-header strong {
+  display: block;
+  font-size: 15px;
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+
+.action-card-header span:not(.badge) {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.action-card-metrics {
+  display: grid;
+  gap: 7px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.action-card-metrics strong {
+  display: block;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.action-card-reason {
+  border-left: 3px solid var(--accent);
+  background: var(--surface);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.action-card-reason p {
+  line-height: 1.5;
+  margin: 0;
+}
+
+.action-detail-button {
+  width: max-content;
+}
+
 .connection-list {
   display: grid;
   gap: 10px;
