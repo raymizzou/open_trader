@@ -779,7 +779,7 @@ function currentDecisionAction(holding) {
 function desiredActionText(holding) {
   const action = currentDecisionAction(holding);
   const symbol = detailSymbol(holding);
-  const actionText = formatAction(action.action || action.suggested_action);
+  const actionText = firstMappedActionLabel(action.action, action.suggested_action);
   if (actionText === "-") {
     return `今天暂无触发中的交易动作`;
   }
@@ -836,6 +836,45 @@ function safePrimaryValue(value) {
   return text;
 }
 
+function mappedActionLabel(value) {
+  const mapped = firstMappedLabel(ACTION_LABELS, value);
+  if (mapped) {
+    return mapped;
+  }
+  const safe = safePrimaryValue(value);
+  return safe || "-";
+}
+
+function firstMappedActionLabel(...values) {
+  for (const value of values) {
+    const label = mappedActionLabel(value);
+    if (label !== "-") {
+      return label;
+    }
+  }
+  return "-";
+}
+
+function mappedActionStatusLabel(value) {
+  const mapped = firstMappedLabel(ACTION_STATUS_LABELS, value);
+  return mapped || "-";
+}
+
+function reportActionStatusLabel(action) {
+  const actionText = firstMappedActionLabel(action.action, action.suggested_action);
+  const statusText = mappedActionStatusLabel(action.status);
+  if (actionText === "-" && statusText === "-") {
+    return "-";
+  }
+  if (actionText === "-") {
+    return statusText;
+  }
+  if (statusText === "-") {
+    return actionText;
+  }
+  return `${actionText} · ${statusText}`;
+}
+
 function decisionSubline(holding) {
   const action = currentDecisionAction(holding);
   if (!sectionAvailable(action)) {
@@ -855,7 +894,7 @@ function operationRows(holding) {
   const action = currentDecisionAction(holding);
   const strategy = holding.strategy || {};
   return [
-    ["动作", actionCardStatusLabel(action)],
+    ["动作", reportActionStatusLabel(action)],
     ["价格", firstPresent(action.limit_price, action.last_price, strategy.target_1, safePrimaryValue(strategy.target_range))],
     ["仓位", firstPresent(action.suggested_quantity, action.suggested_notional, strategy.max_weight, strategy.target_weight)],
     ["止损", firstPresent(action.stop_price, strategy.stop_loss)],
@@ -893,7 +932,7 @@ function decisionMetricCells(holding) {
     ["观点", analystViewText(holding)],
     ["目标价", joinRange(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)],
     ["触发状态", decisionTriggerText(action)],
-    ["动作状态", formatActionStatus(action.status)],
+    ["动作状态", mappedActionStatusLabel(action.status)],
     ["下次复评", nextReviewText(holding)],
   ];
 }
@@ -901,7 +940,7 @@ function decisionMetricCells(holding) {
 function analystViewText(holding) {
   const strategy = holding.strategy || {};
   const report = holding.agent_report || {};
-  return formatAction(strategy.view || strategy.stance || strategy.signal || strategy.rating || report.rating || report.advice_action);
+  return firstMappedActionLabel(strategy.view, strategy.stance, strategy.signal, strategy.rating, report.rating, report.advice_action);
 }
 
 function nextReviewText(holding) {
@@ -929,7 +968,7 @@ function finalConclusionItems(holding) {
 function finalConclusionText(holding) {
   const action = currentDecisionAction(holding);
   const view = analystViewText(holding);
-  const actionText = formatAction(action.action || action.suggested_action);
+  const actionText = firstMappedActionLabel(action.action, action.suggested_action);
   if (actionText === "-" && view === "-") {
     return "暂无明确结论。";
   }
