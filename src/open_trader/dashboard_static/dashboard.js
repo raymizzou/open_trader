@@ -803,13 +803,25 @@ function detailSymbol(holding) {
   return `${market}.${symbol}`;
 }
 
+function decisionTriggerText(action) {
+  const mappedTrigger = firstMappedLabel(TRIGGER_STATUS_LABELS, action.trigger_status, action.watch_trigger);
+  if (mappedTrigger) {
+    return mappedTrigger;
+  }
+  const direct = firstChineseText(action.trigger_status_zh, action.watch_trigger_zh);
+  if (direct) {
+    return direct;
+  }
+  return safeChineseDisplayText(action.watch_trigger) || "-";
+}
+
 function decisionSubline(holding) {
   const action = currentDecisionAction(holding);
   if (!sectionAvailable(action)) {
     const view = analystViewText(holding);
     return view === "-" ? "暂无触发动作，继续观察。" : `${view}，暂无触发动作，继续观察。`;
   }
-  const trigger = formatTriggerStatus(action.trigger_status || action.watch_trigger);
+  const trigger = decisionTriggerText(action);
   const reason = shortActionReason(action);
   const parts = [trigger, reason].filter((part) => part && part !== "-");
   if (!parts.length) {
@@ -859,7 +871,7 @@ function decisionMetricCells(holding) {
   return [
     ["观点", analystViewText(holding)],
     ["目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range],
-    ["触发状态", formatTriggerStatus(action.trigger_status || action.watch_trigger)],
+    ["触发状态", decisionTriggerText(action)],
     ["动作状态", formatActionStatus(action.status)],
     ["下次复评", nextReviewText(holding)],
   ];

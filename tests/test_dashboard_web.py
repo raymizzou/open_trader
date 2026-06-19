@@ -366,6 +366,23 @@ if (!conclusionText.includes("低配") && !conclusionText.includes("减仓")) {
 if (!conclusionText.includes("60")) {
   throw new Error("conclusion missing failure condition: " + conclusionText);
 }
+const premarketOnly = {
+  market: "US",
+  symbol: "ABC",
+  strategy: { available: false },
+  agent_report: { available: false },
+  trade_action: { available: false },
+  premarket_action: {
+    available: true,
+    suggested_action: "reduce",
+    watch_trigger: "Open below prior close.",
+  },
+};
+const premarketSubline = decisionSubline(premarketOnly);
+const premarketMetricMap = Object.fromEntries(decisionMetricCells(premarketOnly));
+if (premarketSubline.includes("Open below prior close") || String(premarketMetricMap["触发状态"] || "").includes("Open below prior close")) {
+  throw new Error("premarket English watch trigger leaked into Chinese UI");
+}
 const html = renderAnalysisStrategySection(holding);
 for (const required of ["分析与交易策略", "当前希望你做什么", "操作指令", "今天重点关注", "分析师对话", "最终结论", "查看英文原文"]) {
   if (!html.includes(required)) {
