@@ -525,7 +525,7 @@ function renderAgentReportSection(report, holding) {
 function renderChineseAgentSummary(report, holding) {
   const strategy = holding.strategy || {};
   const action = holding.trade_action || holding.premarket_action || {};
-  const reason = action.reason || strategy.agent_reason || report.agent_reason || "";
+  const reason = safeChineseReason(action, strategy, report);
   const terms = [
     renderRequiredTerm("观点", formatAction(report.rating || report.advice_action)),
     renderRequiredTerm("报告状态", formatActionStatus(report.status)),
@@ -743,16 +743,23 @@ function strategySubline(action, holding) {
 }
 
 function nextTriggerText(action, holding) {
-  if (hasValue(action.watch_trigger)) {
-    return formatActionReason(action.watch_trigger);
+  const watchTrigger = safeChineseDisplayText(
+    firstAvailableText(action.watch_trigger_zh, action.watch_trigger),
+  ) || firstMappedLabel(TRIGGER_STATUS_LABELS, action.watch_trigger)
+    || firstMappedLabel(REASON_LABELS, action.watch_trigger);
+  if (watchTrigger) {
+    return watchTrigger;
   }
   const strategy = holding.strategy || {};
   const targetText = joinRange(strategy.target_1, strategy.target_2) || strategy.target_range;
   if (hasValue(targetText)) {
     return `目标价 ${targetText}`;
   }
-  if (hasValue(strategy.plan_text)) {
-    return compactSentence(strategy.plan_text, 48);
+  const planText = safeChineseDisplayText(
+    firstAvailableText(strategy.plan_text_zh, strategy.rationale_zh, strategy.plan_text),
+  );
+  if (planText) {
+    return compactSentence(planText, 48);
   }
   return "";
 }
@@ -875,10 +882,38 @@ function chineseDisplayText(value) {
     .replace(/\bmonth\b/gi, "个月")
     .replace(/\breassess\b/gi, "复评")
     .replace(/\bearnings\b/gi, "财报");
-  if (text.length > 32 && hasRawEnglishProse(text)) {
+  if (hasRawEnglishProse(text)) {
     return "";
   }
   return text;
+}
+
+function safeChineseDisplayText(value) {
+  const text = chineseDisplayText(value);
+  return hasValue(text) && text !== "-" ? text : "";
+}
+
+function safeChineseReason(action, strategy, report) {
+  return safeChineseDisplayText(firstAvailableText(
+    action.reason_zh,
+    action.agent_reason_zh,
+    action.trigger_reason_zh,
+    action.watch_trigger_zh,
+    strategy.agent_reason_zh,
+    strategy.rationale_zh,
+    strategy.plan_text_zh,
+    report.summary_zh,
+    report.analysis_zh,
+    report.report_zh,
+  )) || firstMappedLabel(
+    REASON_LABELS,
+    action.reason,
+    action.agent_reason,
+    action.trigger_reason,
+    action.watch_trigger,
+    strategy.agent_reason,
+    report.agent_reason,
+  ) || firstMappedLabel(TRIGGER_STATUS_LABELS, action.trigger_status);
 }
 
 function hasRawEnglishProse(text) {
