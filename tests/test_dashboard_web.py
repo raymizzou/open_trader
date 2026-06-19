@@ -342,16 +342,17 @@ if (!watch.includes("达到第一目标价") && !watch.includes("财报")) {
   throw new Error("watch point should use trigger or catalyst: " + watch);
 }
 const metricCells = decisionMetricCells(holding);
+const metricMap = Object.fromEntries(metricCells);
 const metricLabels = metricCells.map((cell) => cell[0]).join(",");
 const metricText = metricCells.flat().join(",");
 if (!metricLabels.includes("观点") || !metricLabels.includes("下次复评")) {
   throw new Error("metrics missing required labels: " + metricText);
 }
-if (!metricText.includes("51") || !metricText.includes("53")) {
-  throw new Error("metrics missing target prices: " + metricText);
+if (!String(metricMap["目标价"] || "").includes("51") || !String(metricMap["目标价"] || "").includes("53")) {
+  throw new Error("target metric should include target prices: " + JSON.stringify(metricMap));
 }
-if (!metricText.includes("财报") && !metricText.includes("复评")) {
-  throw new Error("metrics missing next review text: " + metricText);
+if (!String(metricMap["下次复评"] || "").includes("财报") && !String(metricMap["下次复评"] || "").includes("复评")) {
+  throw new Error("review metric should include review timing: " + JSON.stringify(metricMap));
 }
 const conclusionItems = finalConclusionItems(holding);
 const conclusionLabels = conclusionItems.map((item) => item.label).join(",");
@@ -375,8 +376,9 @@ const primaryHtml = html.split("source-review", 1)[0];
 if (primaryHtml.includes("risk is elevated") || primaryHtml.includes("The bull case")) {
   throw new Error("raw English leaked into primary Chinese UI: " + primaryHtml);
 }
-if (!html.includes("english-source") || !html.includes("hidden")) {
-  throw new Error("English source should remain collapsed: " + html);
+const sourceSection = html.includes("source-review") ? html.slice(html.indexOf("source-review")) : "";
+if (!sourceSection.includes("english-source") || !sourceSection.includes("hidden") || !sourceSection.includes("The bull case")) {
+  throw new Error("English source should remain collapsed and preserved: " + sourceSection);
 }
 const noActionHolding = {
   market: "US",
