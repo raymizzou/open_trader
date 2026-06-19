@@ -107,6 +107,32 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "renderEnglishSourceBlock" in js
     assert "renderChineseStrategyTerms" in js
     assert "summary_zh" in js
+    assert "renderAnalysisStrategySection" in js
+    assert "currentDecisionAction" in js
+    assert "desiredActionText" in js
+    assert "operationRows" in js
+    assert "watchPointText" in js
+    assert "decisionMetricCells" in js
+    assert "finalConclusionItems" in js
+    assert "renderAnalystDialogue" in js
+    assert "sourceReviewText" in js
+    assert "分析与交易策略" in js
+    assert "当前希望你做什么" in js
+    assert "操作指令" in js
+    assert "今天重点关注" in js
+    assert "分析师对话" in js
+    assert "最终结论" in js
+    assert "失败条件" in js
+    assert "只读 · 需要人工确认" in js
+    assert "今天暂无触发中的交易动作" in js
+    assert "查看英文原文" in js
+    assert ".analysis-strategy-section" in css
+    assert ".decision-dashboard" in css
+    assert ".decision-card.primary" in css
+    assert ".decision-metric-strip" in css
+    assert ".analyst-dialogue" in css
+    assert ".final-conclusion-list" in css
+    assert ".broker-detail-section" in css
     assert "summary-holding-bar" in html
     assert "summary-holding-value" in html
     assert "summary-holding-weight" in html
@@ -137,6 +163,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".language-toggle" in css
     assert ".english-source" in css
     assert ".detail-metric-grid" in css
+    assert "renderAgentReportSection(holding.agent_report, holding)" not in js
+    assert "renderStrategySection(holding.strategy, holding)" not in js
+    assert "renderTradeActionSection(holding)" not in js
     assert ".raw-report" in css
     assert "renderActionQueueSummary" in js
     assert "sortedTradeActions" in js
