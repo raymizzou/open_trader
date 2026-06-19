@@ -44,6 +44,7 @@ button {
   display: grid;
   gap: 12px;
   grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(260px, 0.8fr);
+  grid-template-areas: "brand assets source";
   margin-bottom: 14px;
 }
 
@@ -61,17 +62,20 @@ button {
 .header-brand-panel {
   display: grid;
   gap: 10px;
+  grid-area: brand;
 }
 
 .header-assets-panel {
   display: grid;
   gap: 10px;
+  grid-area: assets;
   grid-template-columns: minmax(180px, 0.9fr) minmax(220px, 1.1fr);
 }
 
 .header-source-panel {
   display: grid;
   gap: 10px;
+  grid-area: source;
 }
 
 .topbar {
@@ -986,10 +990,7 @@ tbody tr:hover {
 @media (max-width: 1180px) {
   .dashboard-header {
     grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
-  }
-
-  .header-assets-panel {
-    grid-column: 1 / -1;
+    grid-template-areas: "brand source" "assets assets";
   }
 
   .summary-grid {
@@ -1031,6 +1032,7 @@ tbody tr:hover {
 
   .dashboard-header {
     gap: 10px;
+    grid-template-areas: "brand" "assets" "source";
   }
 
   .header-brand-panel,

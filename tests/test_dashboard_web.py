@@ -158,9 +158,13 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "暂无触发中的交易计划" in js
     assert ".dashboard-shell" in css
     assert ".dashboard-header" in css
+    assert 'grid-template-areas: "brand assets source";' in css
     assert ".header-brand-panel" in css
+    assert "grid-area: brand;" in css
     assert ".header-assets-panel" in css
+    assert "grid-area: assets;" in css
     assert ".header-source-panel" in css
+    assert "grid-area: source;" in css
     assert ".header-filter-block" in css
     assert ".segmented-control" in css
     assert ".current-view-label" in css
@@ -173,14 +177,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".source-status-list" in css
     assert ".source-status-row" in css
     assert ".cash-detail-panel" in css
-    assert (
-        ".workspace-grid {\n"
-        "  align-items: start;\n"
-        "  display: grid;\n"
-        "  gap: 14px;\n"
-        "  grid-template-columns: minmax(0, 1fr) 300px;\n"
-        "}"
-    ) in css
+    assert "grid-template-columns: minmax(0, 1fr) 300px;" in css
+    assert 'grid-template-areas: "brand source" "assets assets";' in css
+    assert 'grid-template-areas: "brand" "assets" "source";' in css
     assert ".symbol-detail-panel" in css
     assert ".language-toggle" in css
     assert ".english-source" in css
