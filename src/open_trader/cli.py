@@ -25,9 +25,7 @@ from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
 from .market_scope import parse_market_scope
-from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
-from .parsers.tiger import TigerStatementParser
 from .pipeline import run_import, validate_month
 from .tiger_account import (
     TigerAccountClient,
@@ -177,8 +175,6 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Statement month, YYYY-MM",
     )
-    import_parser.add_argument("--futu", type=Path, required=True)
-    import_parser.add_argument("--tiger", type=Path, required=True)
     import_parser.add_argument("--phillips", type=Path, required=True)
     import_parser.add_argument("--data-dir", type=Path, default=Path("data"))
     import_parser.add_argument(
@@ -530,13 +526,9 @@ def main(argv: list[str] | None = None) -> int:
         result = run_import(
             month=args.month,
             statement_paths={
-                "futu": args.futu,
-                "tiger": args.tiger,
                 "phillips": args.phillips,
             },
             parsers=[
-                FutuStatementParser(),
-                TigerStatementParser(),
                 PhillipsStatementParser(),
             ],
             data_dir=args.data_dir,

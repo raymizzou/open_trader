@@ -635,7 +635,11 @@ def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[s
         parser.parse_args(["import-statements", "--help"])
 
     assert exc_info.value.code == 0
-    assert "--usd-hkd" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "--usd-hkd" in output
+    assert "--phillips" in output
+    assert "--futu" not in output
+    assert "--tiger" not in output
 
 
 @pytest.mark.parametrize("month", ["2026-5", "2026-00", "2026-13", "26-05"])
@@ -651,10 +655,6 @@ def test_import_statements_rejects_invalid_month(
                 "import-statements",
                 "--month",
                 month,
-                "--futu",
-                "futu.pdf",
-                "--tiger",
-                "tiger.pdf",
                 "--phillips",
                 "phillips.pdf",
                 "--usd-hkd",
@@ -679,10 +679,6 @@ def test_import_statements_rejects_invalid_usd_hkd(
                 "import-statements",
                 "--month",
                 "2026-05",
-                "--futu",
-                "futu.pdf",
-                "--tiger",
-                "tiger.pdf",
                 "--phillips",
                 "phillips.pdf",
                 "--usd-hkd",
@@ -721,10 +717,6 @@ def test_import_statements_main_calls_pipeline_and_prints_summary(
             "import-statements",
             "--month",
             "2026-05",
-            "--futu",
-            "futu.pdf",
-            "--tiger",
-            "tiger.pdf",
             "--phillips",
             "phillips.pdf",
             "--data-dir",
@@ -737,8 +729,6 @@ def test_import_statements_main_calls_pipeline_and_prints_summary(
     assert result == 0
     assert captured["month"] == "2026-05"
     assert captured["statement_paths"] == {
-        "futu": Path("futu.pdf"),
-        "tiger": Path("tiger.pdf"),
         "phillips": Path("phillips.pdf"),
     }
     assert captured["fx_provider"].get_rate_to_hkd("USD").rate == Decimal("7.8")
