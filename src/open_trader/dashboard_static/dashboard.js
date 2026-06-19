@@ -94,7 +94,10 @@ function bindElements() {
     "last-refresh",
     "refresh-quotes",
     "summary-value",
-    "summary-holding-count",
+    "summary-holding-bar",
+    "summary-holding-value",
+    "summary-holding-weight",
+    "summary-cash-note",
     "summary-refresh-status",
     "summary-refresh-note",
     "summary-brokers",
@@ -256,13 +259,27 @@ function renderSummary() {
   const dashboard = state.dashboard || {};
   const summary = dashboard.summary || {};
   elements["summary-value"].textContent = formatMoney(summary.portfolio_value_hkd, "HKD");
-  elements["summary-holding-count"].textContent = `持仓 ${formatPlain(summary.holding_count)}`;
+  elements["summary-holding-value"].textContent = `持仓资产 ${formatMoney(summary.holding_value_hkd, "HKD")}`;
+  elements["summary-holding-weight"].textContent = formatPlain(summary.holding_weight_hkd);
+  elements["summary-cash-note"].textContent = `现金类资产 ${formatMoney(summary.cash_like_value_hkd, "HKD")} · ${formatPlain(summary.cash_like_weight_hkd)} · 持仓 ${formatPlain(summary.holding_count)}`;
+  elements["summary-holding-bar"].style.width = percentBarWidth(summary.holding_weight_hkd);
   elements["summary-brokers"].textContent = `${formatPlain(summary.broker_count)} 个`;
   elements["summary-detail-month"].textContent = dashboard.broker_detail_month
     ? `明细月份 ${dashboard.broker_detail_month}`
     : "暂无券商明细";
   elements["summary-health"].textContent = dashboard.detail_available ? "明细可用" : "仅组合汇总";
   elements["summary-health-note"].textContent = dashboard.portfolio_path || "-";
+}
+
+function percentBarWidth(value) {
+  if (!hasValue(value)) {
+    return "0%";
+  }
+  const parsed = Number.parseFloat(String(value).replace("%", ""));
+  if (!Number.isFinite(parsed)) {
+    return "0%";
+  }
+  return `${Math.min(100, Math.max(0, parsed))}%`;
 }
 
 function renderBrokerFilters() {

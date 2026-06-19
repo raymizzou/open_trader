@@ -217,8 +217,12 @@ def test_load_dashboard_state_merges_portfolio_details_cash_and_trade_actions(
     assert state["futu_port"] == 11111
     assert state["broker_detail_month"] == "2026-05"
     assert state["detail_available"] is True
-    assert state["summary"]["holding_count"] == 2
+    assert state["summary"]["holding_count"] == 1
     assert state["summary"]["portfolio_value_hkd"] == "38680.00"
+    assert state["summary"]["holding_value_hkd"] == "37830.00"
+    assert state["summary"]["cash_like_value_hkd"] == "850.00"
+    assert state["summary"]["holding_weight_hkd"] == "97.80%"
+    assert state["summary"]["cash_like_weight_hkd"] == "2.20%"
     assert state["summary"]["broker_count"] == 2
     assert len(state["broker_positions"]) == 2
     assert len(state["cash_details"]) == 1
@@ -261,12 +265,60 @@ def test_load_dashboard_state_uses_portfolio_when_monthly_details_are_absent(
 
     assert state["broker_detail_month"] == ""
     assert state["detail_available"] is False
-    assert state["summary"]["holding_count"] == 2
+    assert state["summary"]["holding_count"] == 1
     holdings_by_symbol = {row["symbol"]: row for row in state["holdings"]}
     assert "VIXY" in holdings_by_symbol
     assert holdings_by_symbol["VIXY"]["broker_detail_count"] == 0
     assert holdings_by_symbol["VIXY"]["broker_details"] == []
     assert holdings_by_symbol["VIXY"]["trade_action"] == {"available": False, "error": ""}
+
+
+def test_load_dashboard_state_excludes_cash_like_rows_from_holdings(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    rows = [
+        portfolio_rows()[0],
+        {
+            **portfolio_rows()[0],
+            "sort_group": "3",
+            "market": "HK",
+            "asset_class": "money_market_fund",
+            "symbol": "HK0000951506.HKD",
+            "name": "华泰港元货币市场基金A",
+            "currency": "HKD",
+            "market_value_hkd": "597524.58",
+            "portfolio_weight_hkd": "35.14%",
+            "brokers": "tiger",
+            "ai_eligible": "false",
+            "analysis_symbol": "",
+        },
+        {
+            **portfolio_rows()[1],
+            "symbol": "FUTU_UNMAPPED_ASSETS",
+            "name": "富途未明细账户资产",
+            "market_value_hkd": "849884.06",
+            "portfolio_weight_hkd": "49.98%",
+        },
+        {
+            **portfolio_rows()[1],
+            "symbol": "USD_CASH",
+            "name": "USD Cash",
+            "market_value_hkd": "-87760.17",
+            "portfolio_weight_hkd": "-5.16%",
+        },
+    ]
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+
+    state = load_dashboard_state(config).to_dict()
+
+    assert state["summary"]["holding_count"] == 1
+    assert state["summary"]["portfolio_value_hkd"] == "1397478.47"
+    assert state["summary"]["holding_value_hkd"] == "37830.00"
+    assert state["summary"]["cash_like_value_hkd"] == "1359648.47"
+    assert state["summary"]["holding_weight_hkd"] == "2.71%"
+    assert state["summary"]["cash_like_weight_hkd"] == "97.29%"
+    assert [row["symbol"] for row in state["holdings"]] == ["VIXY"]
 
 
 def test_load_dashboard_state_merges_agent_report_strategy_and_actions(

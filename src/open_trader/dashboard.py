@@ -77,6 +77,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
     premarket_actions_by_holding = _latest_by_market_symbol(premarket_actions)
     actions_by_holding = _latest_by_market_symbol(trade_actions)
+    holding_rows = [row for row in portfolio_rows if _is_dashboard_holding(row)]
     holdings = [
         _merge_holding(
             row,
@@ -86,14 +87,14 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             premarket_actions_by_holding,
             actions_by_holding,
         )
-        for row in portfolio_rows
+        for row in holding_rows
     ]
 
     return DashboardState(
         config=config,
         broker_detail_month=detail_month,
         detail_available=bool(detail_month),
-        summary=_build_summary(portfolio_rows),
+        summary=_build_summary(portfolio_rows, holding_rows),
         holdings=holdings,
         broker_positions=broker_positions,
         cash_details=cash_details,
@@ -164,6 +165,16 @@ def _market_symbol_key(row: dict[str, str]) -> tuple[str, str] | None:
     return (market, symbol)
 
 
+def _is_dashboard_holding(row: dict[str, str]) -> bool:
+    market = row.get("market", "").strip().upper()
+    asset_class = row.get("asset_class", "").strip().lower()
+    if market == "CASH":
+        return False
+    if asset_class in {"cash", "money_market_fund"}:
+        return False
+    return True
+
+
 def _merge_holding(
     row: dict[str, str],
     positions_by_holding: dict[tuple[str, str], list[dict[str, str]]],
@@ -222,16 +233,30 @@ def _strategy_detail(row: dict[str, str] | None) -> dict[str, Any]:
     return _row_detail(row)
 
 
-def _build_summary(rows: list[dict[str, str]]) -> dict[str, Any]:
+def _build_summary(
+    rows: list[dict[str, str]],
+    holding_rows: list[dict[str, str]],
+) -> dict[str, Any]:
     total = Decimal("0")
     for row in rows:
         market_value = _optional_decimal(row.get("market_value_hkd", ""))
         if market_value is not None:
             total += market_value
 
+    holding_total = Decimal("0")
+    for row in holding_rows:
+        market_value = _optional_decimal(row.get("market_value_hkd", ""))
+        if market_value is not None:
+            holding_total += market_value
+    cash_like_total = total - holding_total
+
     return {
-        "holding_count": len(rows),
+        "holding_count": len(holding_rows),
         "portfolio_value_hkd": _money_text(total),
+        "holding_value_hkd": _money_text(holding_total),
+        "cash_like_value_hkd": _money_text(cash_like_total),
+        "holding_weight_hkd": _pct_text(_ratio(holding_total, total)),
+        "cash_like_weight_hkd": _pct_text(_ratio(cash_like_total, total)),
         "broker_count": _broker_count(rows),
     }
 
@@ -260,3 +285,17 @@ def _optional_decimal(value: str) -> Decimal | None:
 
 def _money_text(value: Decimal) -> str:
     return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _pct_text(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    return (
+        f"{(value * Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}%"
+    )
+
+
+def _ratio(numerator: Decimal, denominator: Decimal) -> Decimal | None:
+    if denominator == Decimal("0"):
+        return None
+    return numerator / denominator

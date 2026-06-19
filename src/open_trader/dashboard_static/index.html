@@ -25,7 +25,14 @@
         <article class="summary-card">
           <span class="summary-label">组合总资产 HKD</span>
           <strong id="summary-value">-</strong>
-          <span id="summary-holding-count" class="summary-note">持仓 -</span>
+          <div class="allocation-bar" aria-hidden="true">
+            <span id="summary-holding-bar"></span>
+          </div>
+          <div class="summary-allocation-row">
+            <span id="summary-holding-value">持仓资产 -</span>
+            <strong id="summary-holding-weight">-</strong>
+          </div>
+          <span id="summary-cash-note" class="summary-note">现金类资产 -</span>
         </article>
         <article class="summary-card">
           <span class="summary-label">实时刷新状态</span>

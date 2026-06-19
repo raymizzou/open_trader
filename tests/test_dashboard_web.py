@@ -103,6 +103,15 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "renderEnglishSourceBlock" in js
     assert "renderChineseStrategyTerms" in js
     assert "summary_zh" in js
+    assert "summary-holding-bar" in html
+    assert "summary-holding-value" in html
+    assert "summary-holding-weight" in html
+    assert "summary-cash-note" in html
+    assert "holding_value_hkd" in js
+    assert "cash_like_value_hkd" in js
+    assert "percentBarWidth" in js
+    assert ".allocation-bar" in css
+    assert ".summary-allocation-row" in css
     assert "隐藏英文原文" in js
     assert 'firstValue(strategy, ["plan_text_zh", "rationale_zh"])' not in js
     assert "暂无中文策略译文" not in js
