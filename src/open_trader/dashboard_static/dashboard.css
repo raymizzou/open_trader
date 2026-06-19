@@ -1018,9 +1018,10 @@ tbody tr:hover {
   box-shadow: 0 24px 70px rgba(35, 42, 32, 0.22);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
+  height: min(760px, calc(100vh - 36px));
   max-height: min(760px, calc(100vh - 36px));
   max-width: 980px;
-  min-height: 620px;
+  min-height: min(620px, calc(100vh - 36px));
   overflow: hidden;
   width: min(980px, 100%);
 }

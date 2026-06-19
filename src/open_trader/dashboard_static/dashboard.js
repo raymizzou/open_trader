@@ -950,7 +950,10 @@ function renderFinalConclusion(holding) {
 
 function renderResearchConclusions(holding) {
   const researchView = holding.research_view || {};
-  const original = researchConclusion(researchView.tradingagents_conclusion);
+  const original = researchConclusionWithFallback(
+    researchView.tradingagents_conclusion,
+    holding,
+  );
   const userConclusion = researchConclusion(researchView.user_llm_conclusion);
   const detailKey = holdingKey(holding);
   return `
@@ -987,6 +990,36 @@ function researchConclusion(value) {
     condition: formatPlain(conclusion.condition || conclusion.conditions || ""),
     failure: formatPlain(conclusion.failure_condition || conclusion.failure || ""),
   };
+}
+
+function researchConclusionWithFallback(value, holding) {
+  const conclusion = researchConclusion(value);
+  if (conclusion.present) {
+    return conclusion;
+  }
+  return legacyFinalConclusion(holding);
+}
+
+function legacyFinalConclusion(holding) {
+  const fields = Object.fromEntries(
+    finalConclusionItems(holding).map((item) => [item.label, formatPlain(item.text)]),
+  );
+  const content = meaningfulConclusionText(fields["结论"]);
+  return {
+    present: hasValue(content),
+    content,
+    reason: meaningfulConclusionText(fields["理由"]),
+    condition: meaningfulConclusionText(fields["条件"]),
+    failure: meaningfulConclusionText(fields["失败条件"]),
+  };
+}
+
+function meaningfulConclusionText(value) {
+  const text = formatPlain(value);
+  if (!hasValue(text) || text === "-" || text === "暂无明确结论。") {
+    return "";
+  }
+  return text;
 }
 
 function renderResearchConclusionCard({ title, conclusion, actionHtml, missingText }) {
@@ -1093,19 +1126,27 @@ function renderResearchChatContext(holding) {
 }
 
 async function createResearchChatSession(holding) {
+  const requestKey = state.researchChat.holdingKey || holdingKey(holding);
   setResearchChatBusy(true, "正在加载上下文...");
   try {
     const session = await postDashboardJson("/api/research-chat/sessions", {
       market: holding.market,
       symbol: holding.symbol,
     });
+    if (state.researchChat.holdingKey !== requestKey) {
+      return;
+    }
     state.researchChat.sessionId = session.session_id || "";
     renderResearchChatMessages(session.messages || []);
     setResearchChatStatus("上下文已自动加载。");
   } catch (error) {
-    setResearchChatStatus(error.message || String(error));
+    if (state.researchChat.holdingKey === requestKey) {
+      setResearchChatStatus(error.message || String(error));
+    }
   } finally {
-    setResearchChatBusy(false);
+    if (state.researchChat.holdingKey === requestKey) {
+      setResearchChatBusy(false);
+    }
   }
 }
 

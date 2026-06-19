@@ -308,6 +308,8 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".final-conclusion-list" in css
     assert ".research-conclusion-grid" in css
     assert ".research-chat-layer" in css
+    assert "height: min(760px, calc(100vh - 36px));" in css
+    assert "min-height: min(620px, calc(100vh - 36px));" in css
     assert ".broker-detail-section" in css
     assert "holding_value_hkd" in js
     assert "cash_like_value_hkd" in js
@@ -545,6 +547,14 @@ for (const required of ["分析与交易策略", "当前希望你做什么", "�
     throw new Error("missing rendered label " + required + " in " + html);
   }
 }
+const conclusionSection = html.includes("research-conclusion-grid")
+  ? html.slice(html.indexOf("research-conclusion-grid"), html.indexOf("source-review") === -1 ? undefined : html.indexOf("source-review"))
+  : "";
+for (const required of ["低配", "减仓", "60"]) {
+  if (!conclusionSection.includes(required)) {
+    throw new Error("fallback conclusion missing " + required + ": " + conclusionSection);
+  }
+}
 const primaryHtml = html.split("source-review", 1)[0];
 if (primaryHtml.includes("risk is elevated") || primaryHtml.includes("The bull case")) {
   throw new Error("raw English leaked into primary Chinese UI: " + primaryHtml);
@@ -674,6 +684,57 @@ if (!finalizedHtml.includes("确认减仓 100 股。") || finalizedHtml.includes
 if (!finalizedHtml.includes("继续讨论")) {
   throw new Error("missing continue chat button: " + finalizedHtml);
 }
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_research_chat_ignores_stale_session_response() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+(async () => {
+const calls = [];
+let resolveA;
+let resolveB;
+postDashboardJson = (url, payload) => {
+  calls.push(payload.symbol);
+  return new Promise((resolve) => {
+    if (payload.symbol === "AAA") resolveA = resolve;
+    if (payload.symbol === "BBB") resolveB = resolve;
+  });
+};
+elements["research-chat-send"] = { disabled: false };
+elements["research-chat-finalize"] = { disabled: false };
+elements["research-chat-status"] = { textContent: "" };
+elements["research-chat-messages"] = { innerHTML: "" };
+state.researchChat.holdingKey = "US|AAA";
+const first = createResearchChatSession({ market: "US", symbol: "AAA" });
+state.researchChat.holdingKey = "US|BBB";
+const second = createResearchChatSession({ market: "US", symbol: "BBB" });
+resolveB({ session_id: "session-b", messages: [{role: "user", content: "b"}, {role: "assistant", content: "reply b"}] });
+await second;
+if (state.researchChat.sessionId !== "session-b") {
+  throw new Error("active session did not use latest response: " + state.researchChat.sessionId);
+}
+resolveA({ session_id: "session-a", messages: [{role: "user", content: "a"}, {role: "assistant", content: "reply a"}] });
+await first;
+if (state.researchChat.sessionId !== "session-b") {
+  throw new Error("stale session overwrote active session: " + state.researchChat.sessionId);
+}
+if (calls.join(",") !== "AAA,BBB") {
+  throw new Error("unexpected call order: " + calls.join(","));
+}
+})()
 `, sandbox);
 """
     subprocess.run([node, "-e", script, str(js_path)], check=True)
