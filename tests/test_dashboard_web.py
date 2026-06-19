@@ -157,6 +157,19 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "达到第一目标价" in js
     assert "暂无触发中的交易计划" in js
     assert ".dashboard-shell" in css
+    assert ".dashboard-header" in css
+    assert ".header-assets-panel" in css
+    assert ".broker-summary-cards" in css
+    assert ".source-status-row" in css
+    assert ".cash-detail-panel" in css
+    assert (
+        ".workspace-grid {\n"
+        "  align-items: start;\n"
+        "  display: grid;\n"
+        "  gap: 14px;\n"
+        "  grid-template-columns: minmax(0, 1fr) 300px;\n"
+        "}"
+    ) in css
     assert ".symbol-detail-panel" in css
     assert ".language-toggle" in css
     assert ".english-source" in css
