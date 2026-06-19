@@ -629,6 +629,13 @@ def test_load_dashboard_state_builds_broker_summaries_from_detail_rows(
 
     state = load_dashboard_state(config).to_dict()
 
+    holdings_by_symbol = {row["symbol"]: row for row in state["holdings"]}
+    vixy_details = {
+        row["broker"]: row for row in holdings_by_symbol["VIXY"]["broker_details"]
+    }
+    assert vixy_details["futu"]["market_value_hkd"] == "15132.00"
+    assert vixy_details["tiger"]["market_value_hkd"] == "22698.00"
+
     summaries = {row["broker"]: row for row in state["broker_summaries"]}
     assert summaries["futu"]["label"] == "富途"
     assert summaries["futu"]["source_kind"] == "live_account"
@@ -647,10 +654,10 @@ def test_load_dashboard_state_builds_broker_summaries_from_detail_rows(
     assert summaries["phillips"]["detail_available"] is False
 
     statuses = {row["broker"]: row for row in state["source_statuses"]}
-    assert statuses["futu"]["display_text"] == "账户实时同步"
-    assert statuses["futu"]["status"] == "ok"
-    assert statuses["tiger"]["display_text"] == "账户实时同步，行情走富途"
-    assert statuses["tiger"]["status"] == "ok"
+    assert statuses["futu"]["display_text"] == "仅月结单明细"
+    assert statuses["futu"]["status"] == "non_realtime"
+    assert statuses["tiger"]["display_text"] == "仅月结单明细"
+    assert statuses["tiger"]["status"] == "non_realtime"
     assert statuses["phillips"]["display_text"] == "暂无月结单明细"
     assert statuses["phillips"]["status"] == "non_realtime"
 
@@ -701,8 +708,100 @@ def test_load_dashboard_state_discovers_cash_only_detail_runs(
     assert summaries["tiger"]["cash_like_value_hkd"] == "78.00"
     assert summaries["tiger"]["portfolio_value_hkd"] == "78.00"
     statuses = {row["broker"]: row for row in state["source_statuses"]}
+    assert statuses["tiger"]["status"] == "non_realtime"
+    assert statuses["tiger"]["display_text"] == "仅月结单明细"
+
+
+def test_load_dashboard_state_marks_futu_and_tiger_live_only_from_live_statement_ids(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    run_dir = config.data_dir / "runs" / "2026-06-19"
+    write_csv(
+        run_dir / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-06-19-futu-live",
+                "broker": "futu",
+                "account_alias": "main",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "VIXY",
+                "name": "ProShares VIX Short-Term Futures ETF",
+                "currency": "USD",
+                "quantity": "40",
+                "cost_price": "44.00",
+                "last_price": "48.50",
+                "market_value": "1940.00",
+                "cost_value": "1760.00",
+                "unrealized_pnl": "180.00",
+                "confidence": "high",
+                "notes": "",
+            },
+        ],
+    )
+    write_csv(
+        run_dir / "extracted_cash.csv",
+        CASH_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-06-19-tiger-live",
+                "broker": "tiger",
+                "account_alias": "growth",
+                "currency": "USD",
+                "cash_balance": "10.00",
+                "available_balance": "10.00",
+                "confidence": "high",
+                "notes": "",
+            }
+        ],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    statuses = {row["broker"]: row for row in state["source_statuses"]}
+    assert statuses["futu"]["status"] == "ok"
+    assert statuses["futu"]["display_text"] == "账户实时同步"
     assert statuses["tiger"]["status"] == "ok"
     assert statuses["tiger"]["display_text"] == "账户实时同步，行情走富途"
+
+
+def test_load_dashboard_state_uses_phillips_statement_id_for_source_status(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "runs" / "2026-06-19" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-05-phillips",
+                "broker": "phillips",
+                "account_alias": "cash",
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "00700",
+                "name": "Tencent",
+                "currency": "HKD",
+                "quantity": "100",
+                "cost_price": "100.00",
+                "last_price": "150.00",
+                "market_value": "15000.00",
+                "cost_value": "10000.00",
+                "unrealized_pnl": "5000.00",
+                "confidence": "high",
+                "notes": "",
+            }
+        ],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    statuses = {row["broker"]: row for row in state["source_statuses"]}
+    assert statuses["phillips"]["display_text"] == "2026-05 月结单导入"
 
 
 def test_load_dashboard_state_ignores_unsupported_or_malformed_detail_money(

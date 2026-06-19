@@ -309,8 +309,26 @@ state.dashboard = {
       market: "US",
       symbol: "VIXY",
       name: "ProShares VIX Short-Term Futures ETF",
-      brokers: "futu",
+      brokers: "futu;tiger",
       market_value_hkd: "37830.00",
+      broker_details: [
+        {
+          broker: "futu",
+          market: "US",
+          symbol: "VIXY",
+          currency: "USD",
+          market_value: "1940.00",
+          market_value_hkd: "15132.00",
+        },
+        {
+          broker: "tiger",
+          market: "US",
+          symbol: "VIXY",
+          currency: "USD",
+          market_value: "2910.00",
+          market_value_hkd: "22698.00",
+        },
+      ],
     },
     {
       market: "HK",
@@ -375,16 +393,16 @@ state.dashboard = {
 state.marketFilter = "US";
 state.brokerFilter = "futu";
 const summary = currentViewSummary();
-if (summary.portfolio_value_hkd !== "38680.00") {
+if (summary.portfolio_value_hkd !== "15982.00") {
   throw new Error("unexpected portfolio value: " + JSON.stringify(summary));
 }
-if (summary.holding_value_hkd !== "37830.00") {
+if (summary.holding_value_hkd !== "15132.00") {
   throw new Error("unexpected holding value: " + JSON.stringify(summary));
 }
 if (summary.cash_like_value_hkd !== "850.00") {
   throw new Error("unexpected cash value: " + JSON.stringify(summary));
 }
-if (summary.holding_weight_hkd !== "97.80%") {
+if (summary.holding_weight_hkd !== "94.68%") {
   throw new Error("unexpected holding weight: " + JSON.stringify(summary));
 }
 if (summary.holding_count !== 1) {
@@ -393,18 +411,47 @@ if (summary.holding_count !== 1) {
 state.marketFilter = "ALL";
 state.brokerFilter = "futu";
 const allFutuSummary = currentViewSummary();
-if (allFutuSummary.portfolio_value_hkd !== "38680.00") {
+if (allFutuSummary.portfolio_value_hkd !== "15982.00") {
   throw new Error("ALL/futu should include holding plus cash: " + JSON.stringify(allFutuSummary));
 }
-if (allFutuSummary.holding_value_hkd !== "37830.00") {
+if (allFutuSummary.holding_value_hkd !== "15132.00") {
   throw new Error("ALL/futu holding value mismatch: " + JSON.stringify(allFutuSummary));
 }
 if (allFutuSummary.cash_like_value_hkd !== "850.00") {
   throw new Error("ALL/futu cash value mismatch: " + JSON.stringify(allFutuSummary));
 }
-if (allFutuSummary.holding_weight_hkd !== "97.80%") {
+if (allFutuSummary.holding_weight_hkd !== "94.68%") {
   throw new Error("ALL/futu holding weight mismatch: " + JSON.stringify(allFutuSummary));
 }
+const singleBrokerFallback = brokerHoldingValue({
+  market: "US",
+  symbol: "SINGLE_DETAIL_BLANK",
+  brokers: "futu",
+  market_value_hkd: "780.00",
+  broker_details: [
+    {
+      broker: "futu",
+      market: "US",
+      market_value_hkd: "",
+    },
+  ],
+});
+if (!singleBrokerFallback.complete || singleBrokerFallback.text !== "780.00") {
+  throw new Error("single-broker detail gap should fall back to row value: " + JSON.stringify(singleBrokerFallback));
+}
+state.dashboard.holdings.push({
+  market: "US",
+  symbol: "MISSING_DETAIL",
+  name: "Missing detail",
+  brokers: "futu;tiger",
+  market_value_hkd: "780.00",
+  broker_details: [],
+});
+const missingDetailSummary = currentViewSummary();
+if (missingDetailSummary.portfolio_value_hkd !== "" || formatMoney(missingDetailSummary.portfolio_value_hkd, "HKD") !== "-") {
+  throw new Error("missing multi-broker detail should make broker summary unknown: " + JSON.stringify(missingDetailSummary));
+}
+state.dashboard.holdings.pop();
 state.dashboard.holdings.push({
   market: "US",
   symbol: "BAD",
@@ -413,9 +460,10 @@ state.dashboard.holdings.push({
   market_value_hkd: "123abc",
 });
 const malformedSummary = currentViewSummary();
-if (malformedSummary.portfolio_value_hkd !== "38680.00") {
-  throw new Error("malformed holding value should be ignored: " + JSON.stringify(malformedSummary));
+if (malformedSummary.portfolio_value_hkd !== "" || formatMoney(malformedSummary.portfolio_value_hkd, "HKD") !== "-") {
+  throw new Error("malformed holding value should make summary unknown: " + JSON.stringify(malformedSummary));
 }
+state.dashboard.holdings.pop();
 const brokerCards = renderBrokerSummaryCards();
 if (!brokerCards.includes("富途") || !brokerCards.includes("HKD 15982.00")) {
   throw new Error("broker card missing expected text: " + brokerCards);

@@ -230,7 +230,11 @@ def _merge_holding(
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
-    broker_details = positions_by_holding.get(key, []) if key is not None else []
+    broker_details = (
+        [_broker_detail_row(row) for row in positions_by_holding.get(key, [])]
+        if key is not None
+        else []
+    )
     holding["broker_detail_count"] = len(broker_details)
     holding["broker_details"] = broker_details
     agent_report = agent_reports_by_holding.get(key) if key is not None else None
@@ -242,6 +246,13 @@ def _merge_holding(
     holding["premarket_action"] = _row_detail(premarket_action)
     holding["trade_action"] = _row_detail(trade_action)
     return holding
+
+
+def _broker_detail_row(row: dict[str, str]) -> dict[str, str]:
+    detail = dict(row)
+    value = _detail_value_hkd(row, "market_value")
+    detail["market_value_hkd"] = _money_text(value) if value is not None else ""
+    return detail
 
 
 def _unavailable_detail() -> dict[str, Any]:
@@ -426,8 +437,9 @@ def _build_source_statuses(
     cash_details: list[dict[str, str]],
     detail_month: str,
 ) -> list[dict[str, str]]:
+    detail_rows = [*broker_positions, *cash_details]
     detail_brokers: set[str] = set()
-    for row in [*broker_positions, *cash_details]:
+    for row in detail_rows:
         broker = _broker_key(row.get("broker", ""))
         if broker:
             detail_brokers.add(broker)
@@ -436,34 +448,49 @@ def _build_source_statuses(
     for broker in BROKERS:
         detail_available = broker in detail_brokers
         if broker == "futu":
+            live_available = _has_live_statement_row(detail_rows, broker)
+            status = "ok" if live_available else "non_realtime" if detail_available else "missing"
+            display_text = (
+                "账户实时同步"
+                if live_available
+                else "仅月结单明细"
+                if detail_available
+                else "未检测到账户同步"
+            )
             statuses.append(
                 {
                     "broker": broker,
                     "label": BROKER_LABELS[broker],
                     "capability": "quote_and_live_account",
-                    "status": "ok" if detail_available else "missing",
-                    "display_text": "账户实时同步"
-                    if detail_available
-                    else "未检测到账户同步",
+                    "status": status,
+                    "display_text": display_text,
                 }
             )
             continue
         if broker == "tiger":
+            live_available = _has_live_statement_row(detail_rows, broker)
+            status = "ok" if live_available else "non_realtime" if detail_available else "missing"
+            display_text = (
+                "账户实时同步，行情走富途"
+                if live_available
+                else "仅月结单明细"
+                if detail_available
+                else "未检测到账户同步"
+            )
             statuses.append(
                 {
                     "broker": broker,
                     "label": BROKER_LABELS[broker],
                     "capability": "live_account",
-                    "status": "ok" if detail_available else "missing",
-                    "display_text": "账户实时同步，行情走富途"
-                    if detail_available
-                    else "未检测到账户同步",
+                    "status": status,
+                    "display_text": display_text,
                 }
             )
             continue
+        statement_period = _latest_statement_period(detail_rows, broker) or detail_month
         display_text = (
-            f"{detail_month} 月结单导入"
-            if detail_available and detail_month
+            f"{statement_period} 月结单导入"
+            if detail_available and statement_period
             else "暂无月结单明细"
         )
         statuses.append(
@@ -476,6 +503,29 @@ def _build_source_statuses(
             }
         )
     return statuses
+
+
+def _has_live_statement_row(rows: list[dict[str, str]], broker: str) -> bool:
+    marker = f"{broker}-live"
+    for row in rows:
+        if _broker_key(row.get("broker", "")) != broker:
+            continue
+        statement_id = row.get("statement_id", "").strip().lower()
+        if marker in statement_id:
+            return True
+    return False
+
+
+def _latest_statement_period(rows: list[dict[str, str]], broker: str) -> str:
+    periods: list[str] = []
+    for row in rows:
+        if _broker_key(row.get("broker", "")) != broker:
+            continue
+        statement_id = row.get("statement_id", "")
+        match = re.search(r"\d{4}-(?:0[1-9]|1[0-2])(?:-(?:[0-2]\d|3[01]))?", statement_id)
+        if match:
+            periods.append(match.group(0))
+    return max(periods) if periods else ""
 
 
 def _broker_list(value: str) -> list[str]:
