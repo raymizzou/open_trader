@@ -819,6 +819,12 @@ function actionSymbol(action) {
   if (market === "-" && symbol === "-") {
     return "-";
   }
+  if (market === "-") {
+    return symbol;
+  }
+  if (symbol === "-") {
+    return market;
+  }
   return `${market}.${symbol}`;
 }
 
@@ -860,7 +866,7 @@ function compactSentence(text, maxLength) {
 function actionNotionalText(action) {
   if (hasValue(action.suggested_notional)) {
     const currency = formatPlain(action.notional_currency);
-    return currency === "-" ? action.suggested_notional : `${action.suggested_notional} ${currency}`;
+    return currency === "-" ? action.suggested_notional : `${currency} ${action.suggested_notional}`;
   }
   return "-";
 }
@@ -885,11 +891,26 @@ function rationaleSource(holding) {
   const strategy = holding.strategy || {};
   const report = holding.agent_report || {};
   return firstAvailableText(
-    action.agent_reason,
-    strategy.agent_reason,
+    action.agent_reason_zh,
+    action.reason_zh,
+    action.trigger_reason_zh,
+    action.agent_excerpt_zh,
+    strategy.plan_text_zh,
+    strategy.rationale_zh,
+    strategy.agent_reason_zh,
+    strategy.agent_excerpt_zh,
     report.summary_zh,
+    report.report_zh,
+    report.analysis_zh,
+    action.agent_reason,
+    action.reason,
+    action.trigger_reason,
     action.agent_excerpt,
+    strategy.plan_text,
+    strategy.rationale,
+    strategy.agent_reason,
     strategy.agent_excerpt,
+    report.summary,
     report.raw_decision,
   );
 }
@@ -915,11 +936,11 @@ function splitRationaleText(text) {
     .split(/\r?\n+/)
     .map((part) => part.trim())
     .filter(Boolean);
-  const sourceParts = lineParts.length > 1 ? lineParts : raw.split(/(?<=[。！？!?])\s+|(?<=[。！？!?])/);
+  const sourceParts = lineParts.length > 1 ? lineParts : splitOnSentenceEnd(raw);
   const parts = sourceParts
     .map((part) => part.trim())
     .filter(Boolean)
-    .map((part) => part.replace(/^[-*•\d.\s]+/, "").trim())
+    .map((part) => cleanListMarker(part))
     .filter(Boolean);
   const rows = [];
   let buffer = "";
@@ -938,6 +959,28 @@ function splitRationaleText(text) {
     rows.push(buffer);
   }
   return rows;
+}
+
+function splitOnSentenceEnd(text) {
+  const parts = [];
+  let buffer = "";
+  for (const character of String(text || "")) {
+    buffer += character;
+    if ("。！？!?".includes(character)) {
+      parts.push(buffer.trim());
+      buffer = "";
+    }
+  }
+  if (buffer.trim()) {
+    parts.push(buffer.trim());
+  }
+  return parts;
+}
+
+function cleanListMarker(text) {
+  return String(text || "")
+    .replace(/^\s*(?:[-*•]\s+|\d{1,3}(?:[.)]\s+|、\s*))/, "")
+    .trim();
 }
 
 function rationaleLabel(text, index, total) {
