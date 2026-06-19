@@ -31,6 +31,10 @@ button {
   font: inherit;
 }
 
+.hidden {
+  display: none !important;
+}
+
 .dashboard-shell {
   min-height: 100vh;
   padding: 18px;
@@ -142,6 +146,10 @@ button {
   display: grid;
   gap: 14px;
   grid-template-columns: 210px minmax(0, 1fr) 300px;
+}
+
+.workspace-grid.detail-mode {
+  grid-template-columns: 210px minmax(0, 1fr);
 }
 
 .filter-panel,
@@ -307,20 +315,195 @@ tbody tr:hover {
   font-weight: 700;
 }
 
-.detail-row td {
-  background: #fbfaf5;
-  padding: 0;
+.symbol-detail-panel {
+  border-top: 1px solid var(--line);
+  padding: 14px;
 }
 
-.detail-table {
-  margin: 8px 12px 12px 46px;
+.detail-header {
+  align-items: start;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.detail-header h2 {
+  font-size: 22px;
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+
+.detail-header p {
+  color: var(--muted);
+  margin: 6px 0 0;
+}
+
+.detail-header-actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.language-toggle {
+  align-items: center;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  display: inline-flex;
+  overflow: hidden;
+}
+
+.language-toggle button {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.language-toggle button + button {
+  border-left: 1px solid var(--line);
+}
+
+.language-toggle button.active {
+  background: #e4efe9;
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.disabled-button {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  min-height: 34px;
+  padding: 0 12px;
+}
+
+.disabled-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.75;
+}
+
+.detail-metric-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 14px;
+}
+
+.detail-metric {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  min-height: 76px;
+  padding: 10px;
+}
+
+.detail-metric span,
+.detail-dl dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.detail-metric strong {
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+
+.detail-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 14px;
+}
+
+.detail-section {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.detail-section h3 {
+  font-size: 15px;
+  margin: 0 0 10px;
+}
+
+.report-text {
+  background: var(--surface-soft);
+  border-radius: 6px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  padding: 10px;
+  white-space: pre-wrap;
+}
+
+.raw-toggle {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--accent-strong);
+  cursor: pointer;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.raw-report {
+  background: #f8faf6;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  line-height: 1.5;
+  margin: 10px 0 0;
+  max-height: 360px;
+  overflow: auto;
+  padding: 10px;
+  white-space: pre-wrap;
+}
+
+.english-source {
+  margin-top: 8px;
+}
+
+.detail-dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.detail-dl div {
+  display: grid;
+  gap: 3px;
+}
+
+.detail-dl dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.detail-warning {
+  color: var(--warning);
+  display: block;
+  font-weight: 700;
+  margin-top: 6px;
+}
+
+.compact-empty {
+  color: var(--muted);
+  margin: 0;
+}
+
+.compact-detail-table {
+  overflow-x: auto;
+}
+
+.compact-detail-table table {
   min-width: 720px;
-  width: calc(100% - 58px);
-}
-
-.detail-table th,
-.detail-table td {
-  padding: 8px 10px;
 }
 
 .right-rail {
@@ -375,6 +558,10 @@ tbody tr:hover {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .detail-metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .workspace-grid {
     grid-template-columns: 190px minmax(0, 1fr);
   }
@@ -413,6 +600,25 @@ tbody tr:hover {
   }
 
   .summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-header,
+  .detail-header-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .language-toggle {
+    width: 100%;
+  }
+
+  .language-toggle button {
+    flex: 1;
+  }
+
+  .detail-metric-grid,
+  .detail-grid {
     grid-template-columns: 1fr;
   }
 }

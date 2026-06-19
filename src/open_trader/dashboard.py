@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import re
+import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -65,11 +66,26 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         else []
     )
     trade_actions = _read_csv_rows(config.data_dir / "latest" / "trade_actions.csv")
+    trading_advice = _read_csv_rows(config.data_dir / "latest" / "trading_advice.csv")
+    trading_plan = _read_csv_rows(config.data_dir / "latest" / "trading_plan.csv")
+    premarket_actions = _read_csv_rows(
+        config.data_dir / "latest" / "premarket_actions.csv"
+    )
 
     positions_by_holding = _group_by_market_symbol(broker_positions)
+    agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
+    strategies_by_holding = _latest_by_market_symbol(trading_plan)
+    premarket_actions_by_holding = _latest_by_market_symbol(premarket_actions)
     actions_by_holding = _latest_by_market_symbol(trade_actions)
     holdings = [
-        _merge_holding(row, positions_by_holding, actions_by_holding)
+        _merge_holding(
+            row,
+            positions_by_holding,
+            agent_reports_by_holding,
+            strategies_by_holding,
+            premarket_actions_by_holding,
+            actions_by_holding,
+        )
         for row in portfolio_rows
     ]
 
@@ -104,6 +120,7 @@ def _read_csv_rows(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
 
+    csv.field_size_limit(sys.maxsize)
     with path.open(encoding="utf-8-sig", newline="") as handle:
         return [_json_safe_row(row) for row in csv.DictReader(handle)]
 
@@ -150,6 +167,9 @@ def _market_symbol_key(row: dict[str, str]) -> tuple[str, str] | None:
 def _merge_holding(
     row: dict[str, str],
     positions_by_holding: dict[tuple[str, str], list[dict[str, str]]],
+    agent_reports_by_holding: dict[tuple[str, str], dict[str, str]],
+    strategies_by_holding: dict[tuple[str, str], dict[str, str]],
+    premarket_actions_by_holding: dict[tuple[str, str], dict[str, str]],
     actions_by_holding: dict[tuple[str, str], dict[str, str]],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
@@ -157,8 +177,49 @@ def _merge_holding(
     broker_details = positions_by_holding.get(key, []) if key is not None else []
     holding["broker_detail_count"] = len(broker_details)
     holding["broker_details"] = broker_details
-    holding["trade_action"] = actions_by_holding.get(key, {}) if key is not None else {}
+    agent_report = agent_reports_by_holding.get(key) if key is not None else None
+    strategy = strategies_by_holding.get(key) if key is not None else None
+    premarket_action = premarket_actions_by_holding.get(key) if key is not None else None
+    trade_action = actions_by_holding.get(key) if key is not None else None
+    holding["agent_report"] = _agent_report_detail(agent_report)
+    holding["strategy"] = _strategy_detail(strategy)
+    holding["premarket_action"] = _row_detail(premarket_action)
+    holding["trade_action"] = _row_detail(trade_action)
     return holding
+
+
+def _unavailable_detail() -> dict[str, Any]:
+    return {"available": False, "error": ""}
+
+
+def _row_detail(row: dict[str, str] | None) -> dict[str, Any]:
+    if row is None:
+        return _unavailable_detail()
+    return {"available": True, **row}
+
+
+def _agent_report_detail(row: dict[str, str] | None) -> dict[str, Any]:
+    if row is None:
+        return _unavailable_detail()
+    return {
+        "available": True,
+        "run_date": row.get("run_date", ""),
+        "market": row.get("market", ""),
+        "symbol": row.get("symbol", ""),
+        "rating": row.get("advice_action", ""),
+        "summary": row.get("advice_summary", ""),
+        "summary_zh": row.get("advice_summary_zh", ""),
+        "raw_decision": row.get("raw_decision", ""),
+        "source_status": row.get("source_status", ""),
+        "fallback_reason": row.get("fallback_reason", ""),
+        "fallback_from_date": row.get("fallback_from_date", ""),
+        "status": row.get("status", ""),
+        "error": row.get("error", ""),
+    }
+
+
+def _strategy_detail(row: dict[str, str] | None) -> dict[str, Any]:
+    return _row_detail(row)
 
 
 def _build_summary(rows: list[dict[str, str]]) -> dict[str, Any]:

@@ -29,6 +29,7 @@ from .parsers.futu import FutuStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.tiger import TigerStatementParser
 from .pipeline import run_import, validate_month
+from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
 from .trade_actions import generate_trade_actions
 from .trading_plan import (
     TradingPlanRow,
@@ -395,6 +396,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write run output but do not update latest trading plan",
     )
 
+    translate_reports_parser = subparsers.add_parser(
+        "translate-agent-reports",
+        help="Translate TradingAgents report fields into Chinese columns",
+    )
+    translate_reports_parser.add_argument(
+        "--advice",
+        type=Path,
+        default=Path("data/latest/trading_advice.csv"),
+    )
+    translate_reports_parser.add_argument(
+        "--plan",
+        type=Path,
+        default=Path("data/latest/trading_plan.csv"),
+    )
+    translate_reports_parser.add_argument(
+        "--model",
+        default="deepseek-v4-flash",
+        help="DeepSeek model for report translation",
+    )
+    translate_reports_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Retranslate fields even when Chinese columns already exist",
+    )
+
     check_futu_plan_parser = subparsers.add_parser(
         "check-futu-plan",
         help="Evaluate live Futu quotes against trading_plan.csv",
@@ -729,6 +755,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"plans: {result.plan_count}")
         print(f"plan_csv: {result.plan_path}")
         print(f"latest: {result.latest_path}")
+        return 0
+
+    if args.command == "translate-agent-reports":
+        try:
+            result = translate_agent_report_files(
+                advice_path=args.advice,
+                plan_path=args.plan,
+                translator=DeepSeekReportTranslator(model=args.model),
+                force=args.force,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            parser.error(str(exc))
+        print(f"advice: {result.advice_path}")
+        print(f"plan: {result.plan_path}")
+        print(f"translated_fields: {result.translated_fields}")
         return 0
 
     if args.command == "check-futu-plan":

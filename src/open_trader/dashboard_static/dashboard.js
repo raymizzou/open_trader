@@ -7,7 +7,8 @@ const state = {
   quotePayload: null,
   marketFilter: "ALL",
   brokerFilter: "ALL",
-  expanded: new Set(),
+  selectedHoldingKey: "",
+  detailLanguage: "zh",
   refreshActive: false,
   quoteIntervalId: null,
 };
@@ -22,12 +23,34 @@ const ACTION_LABELS = {
   SELL_STOP: "止损卖出",
   TAKE_PROFIT: "止盈",
   TRIM: "减仓",
+  accumulate: "加仓",
+  buy: "买入",
+  hold: "观察",
+  reduce: "减仓",
+  review: "人工复核",
+  sell: "卖出",
+  trim: "减仓",
+  watch: "观察",
+  Neutral: "中性",
+  Overweight: "超配",
+  Underweight: "低配",
+  neutral: "中性",
+  overweight: "超配",
+  underweight: "低配",
 };
 
 const ACTION_STATUS_LABELS = {
+  active: "有效",
+  error: "错误",
+  ok: "正常",
   ready: "待确认",
   review: "需复核",
   watch: "观察中",
+};
+
+const DETAIL_LANGUAGE_LABELS = {
+  zh: "中文",
+  en: "English",
 };
 
 const PRIORITY_LABELS = {
@@ -81,6 +104,7 @@ function bindElements() {
     "market-filters",
     "broker-filters",
     "visible-count",
+    "symbol-detail-panel",
     "holdings-body",
     "action-count",
     "trade-actions",
@@ -91,6 +115,9 @@ function bindElements() {
   ].forEach((id) => {
     elements[id] = document.getElementById(id);
   });
+  elements["holdings-table-wrap"] = document.querySelector(".table-wrap");
+  elements["workspace-grid"] = document.querySelector(".workspace-grid");
+  elements["right-rail"] = document.querySelector(".right-rail");
 }
 
 function bindEvents() {
@@ -114,17 +141,40 @@ function bindEvents() {
     renderHoldings();
   });
   elements["holdings-body"].addEventListener("click", (event) => {
-    const button = event.target.closest("[data-expand-key]");
+    const button = event.target.closest("[data-detail-key]");
     if (!button) {
       return;
     }
-    const key = button.dataset.expandKey;
-    if (state.expanded.has(key)) {
-      state.expanded.delete(key);
-    } else {
-      state.expanded.add(key);
+    showSymbolDetail(button.dataset.detailKey || "");
+  });
+  elements["symbol-detail-panel"].addEventListener("click", (event) => {
+    const backButton = event.target.closest("[data-back-to-holdings]");
+    if (backButton) {
+      state.selectedHoldingKey = "";
+      renderHoldings();
+      return;
     }
-    renderHoldings();
+    const languageButton = event.target.closest("[data-detail-language]");
+    if (languageButton) {
+      state.detailLanguage = languageButton.dataset.detailLanguage === "en" ? "en" : "zh";
+      renderHoldings();
+      return;
+    }
+    const rawButton = event.target.closest("[data-toggle-raw-report]");
+    if (!rawButton) {
+      return;
+    }
+    const section = rawButton.closest(".detail-section") || elements["symbol-detail-panel"];
+    const rawReport = section.querySelector(".raw-report");
+    if (!rawReport) {
+      return;
+    }
+    const isHidden = rawReport.classList.toggle("hidden");
+    if (rawButton.classList.contains("english-source-toggle")) {
+      rawButton.textContent = isHidden ? "查看英文原文" : "隐藏英文原文";
+    } else {
+      rawButton.textContent = isHidden ? "查看原始报告" : "隐藏原始报告";
+    }
   });
 }
 
@@ -236,6 +286,20 @@ function renderBrokerFilters() {
 function renderHoldings() {
   const holdings = filteredHoldings();
   elements["visible-count"].textContent = `${holdings.length} 条`;
+  const selected = selectedHolding(holdings);
+  if (selected) {
+    elements["workspace-grid"].classList.add("detail-mode");
+    elements["right-rail"].classList.add("hidden");
+    elements["holdings-table-wrap"].classList.add("hidden");
+    elements["symbol-detail-panel"].classList.remove("hidden");
+    elements["symbol-detail-panel"].innerHTML = renderSymbolDetail(selected.holding, selected.index);
+    return;
+  }
+  elements["workspace-grid"].classList.remove("detail-mode");
+  elements["right-rail"].classList.remove("hidden");
+  elements["holdings-table-wrap"].classList.remove("hidden");
+  elements["symbol-detail-panel"].classList.add("hidden");
+  elements["symbol-detail-panel"].innerHTML = "";
   if (state.dashboardError) {
     renderDashboardErrorState();
     return;
@@ -251,15 +315,13 @@ function renderHoldings() {
 
   const rows = [];
   holdings.forEach((holding, index) => {
-    const rowKey = `${holding.market || ""}:${holding.symbol || ""}:${index}`;
-    const details = Array.isArray(holding.broker_details) ? holding.broker_details : [];
-    const expanded = state.expanded.has(rowKey);
+    const rowKey = holdingKey(holding, index);
     const quote = quoteForHolding(holding);
     const action = holding.trade_action || {};
     const actionText = action.action ? action.action : "-";
     rows.push(`
       <tr>
-        <td>${renderExpandButton(rowKey, details.length, expanded)}</td>
+        <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}">详情</button></td>
         <td>${escapeHtml(formatPlain(holding.market))}</td>
         <td class="symbol-cell">
           <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
@@ -274,23 +336,249 @@ function renderHoldings() {
         <td>${renderActionBadge(actionText, action.status)}</td>
       </tr>
     `);
-    if (expanded) {
-      rows.push(renderDetailRow(details));
-    }
   });
   elements["holdings-body"].innerHTML = rows.join("");
 }
 
-function renderExpandButton(rowKey, count, expanded) {
-  if (!count) {
-    return `<span class="meta-text">-</span>`;
-  }
-  const label = expanded ? "收起" : "展开";
-  return `<button class="expand-button" type="button" data-expand-key="${escapeHtml(rowKey)}">${label}</button>`;
+function holdingKey(holding, index) {
+  return [
+    holding.market || "",
+    holding.symbol || "",
+    holding.name || "",
+    index,
+  ].map((part) => String(part)).join(":");
 }
 
-function renderDetailRow(details) {
-  const detailRows = details.map((detail) => `
+function selectedHolding(holdings = filteredHoldings()) {
+  if (!state.selectedHoldingKey) {
+    return null;
+  }
+  for (let index = 0; index < holdings.length; index += 1) {
+    if (holdingKey(holdings[index], index) === state.selectedHoldingKey) {
+      return { holding: holdings[index], index };
+    }
+  }
+  return null;
+}
+
+function showSymbolDetail(detailKey) {
+  state.selectedHoldingKey = detailKey;
+  renderHoldings();
+}
+
+function renderSymbolDetail(holding, index) {
+  const quote = quoteForHolding(holding);
+  const livePrice = detailLivePrice(holding, quote);
+  const title = `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
+  return `
+    <div class="detail-header">
+      <div>
+        <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
+        <h2>${escapeHtml(title)}</h2>
+        <p>${escapeHtml(formatPlain(holding.name))}</p>
+      </div>
+      <div class="detail-header-actions">
+        ${renderLanguageToggle()}
+        <button class="disabled-button" type="button" disabled>重新分析 · 未启用</button>
+      </div>
+    </div>
+    <section class="detail-metric-grid" aria-label="标的概览">
+      ${renderMetric("数量", holding.total_quantity)}
+      ${renderMetric("成本价", holding.avg_cost_price)}
+      ${renderMetric("实时价", livePrice)}
+      ${renderMetric("港元市值", formatMoney(holding.market_value_hkd, "HKD"))}
+      ${renderMetric("盈亏", holding.unrealized_pnl_pct)}
+      ${renderMetric("组合权重", holding.portfolio_weight_hkd)}
+      ${renderMetric("数据健康", dataHealthText(holding))}
+    </section>
+    <div class="detail-grid">
+      ${renderAgentReportSection(holding.agent_report, holding)}
+      ${renderStrategySection(holding.strategy, holding)}
+      ${renderTradeActionSection(holding)}
+      ${renderBrokerDetailSection(holding.broker_details)}
+    </div>
+  `;
+}
+
+function renderLanguageToggle() {
+  return `
+    <div class="language-toggle" role="group" aria-label="详情语言">
+      ${Object.entries(DETAIL_LANGUAGE_LABELS).map(([value, label]) => `
+        <button
+          class="${state.detailLanguage === value ? "active" : ""}"
+          type="button"
+          data-detail-language="${value}"
+        >${escapeHtml(label)}</button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderMetric(label, value) {
+  return `
+    <article class="detail-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(formatPlain(value))}</strong>
+    </article>
+  `;
+}
+
+function renderAgentReportSection(report, holding) {
+  if (!sectionAvailable(report)) {
+    return renderDetailSection("TradingAgents 报告", renderStatusMessage("暂无 TradingAgents 报告", report));
+  }
+  const reportText = firstValue(report, ["summary", "report", "analysis", "content", "markdown"]);
+  const rawText = firstValue(report, ["raw_report", "raw_decision", "raw", "full_report"]);
+  if (state.detailLanguage !== "en") {
+    const translatedText = firstValue(report, ["summary_zh", "report_zh", "analysis_zh", "content_zh", "markdown_zh"]);
+    const body = `
+      ${renderChineseAgentSummary(report, holding)}
+      ${hasValue(translatedText) ? `<div class="report-text translated-report">${escapeHtml(translatedText)}</div>` : renderStatusMessage("暂无中文译文，请先运行 translate-agent-reports", report)}
+      ${renderEnglishSourceBlock(reportText, rawText, "查看英文原文")}
+    `;
+    return renderDetailSection("TradingAgents 报告", body);
+  }
+  const usedFallback = report.fallback_used || report.used_fallback || report.source_status === "fallback";
+  const terms = [
+    renderTerm("观点", report.rating || report.advice_action),
+    renderTerm("状态", report.status),
+    renderTerm("生成时间", report.generated_at || report.run_date),
+    renderTerm("来源", report.source),
+    renderTerm("来源状态", report.source_status),
+    renderTerm("回退", usedFallback ? "使用历史报告回退" : ""),
+    renderTerm("回退原因", report.fallback_reason),
+    renderTerm("回退日期", report.fallback_from_date),
+  ].filter(Boolean).join("");
+  const rawReport = hasValue(rawText)
+    ? `<button class="raw-toggle" type="button" data-toggle-raw-report>查看原始报告</button><pre class="raw-report hidden">${escapeHtml(rawText)}</pre>`
+    : "";
+  const body = `
+    ${terms ? `<dl class="detail-dl">${terms}</dl>` : ""}
+    ${renderStatusWarning(report)}
+    ${hasValue(reportText) ? `<div class="report-text">${escapeHtml(reportText)}</div>` : renderStatusMessage("暂无 TradingAgents 报告", report)}
+    ${rawReport}
+  `;
+  return renderDetailSection("TradingAgents 报告", body);
+}
+
+function renderChineseAgentSummary(report, holding) {
+  const strategy = holding.strategy || {};
+  const action = holding.trade_action || holding.premarket_action || {};
+  const reason = action.reason || strategy.agent_reason || report.agent_reason || "";
+  const terms = [
+    renderRequiredTerm("观点", formatAction(report.rating || report.advice_action)),
+    renderRequiredTerm("报告状态", formatActionStatus(report.status)),
+    renderRequiredTerm("生成时间", report.generated_at || report.run_date),
+    renderChineseTerm("交易动作", action.action),
+    renderChineseTerm("动作状态", action.status),
+    renderChineseTerm("触发状态", action.trigger_status),
+    renderChineseTerm("核心理由", reason),
+    renderChineseTerm("目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range),
+    renderChineseTerm("止损价", strategy.stop_loss || action.stop_price),
+  ].filter(Boolean).join("");
+  return terms ? `<dl class="detail-dl translated-summary">${terms}</dl>` : "";
+}
+
+function renderStrategySection(strategy, holding) {
+  if (!sectionAvailable(strategy)) {
+    return renderDetailSection("交易策略", renderStatusMessage("暂无交易策略", strategy));
+  }
+  if (state.detailLanguage !== "en") {
+    const englishText = firstValue(strategy, ["plan_text", "rationale", "agent_excerpt"]);
+    return renderDetailSection(
+      "交易策略",
+      `${renderStatusWarning(strategy)}${renderChineseStrategyTerms(strategy, holding)}${renderEnglishSourceBlock(englishText, "", "查看英文原文")}`,
+    );
+  }
+  const terms = [
+    renderRequiredTerm("观点", strategy.view || strategy.stance || strategy.signal || strategy.rating),
+    renderRequiredTerm("买入区间", joinRange(strategy.entry_min, strategy.entry_max) || joinRange(strategy.entry_zone_low, strategy.entry_zone_high) || strategy.entry_range),
+    renderRequiredTerm("加仓价", strategy.add_price),
+    renderRequiredTerm("止损价", strategy.stop_loss),
+    renderRequiredTerm("目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range),
+    renderRequiredTerm("仓位上限", strategy.target_weight || strategy.target_position || strategy.max_weight),
+    renderRequiredTerm("催化因素", strategy.catalyst),
+    renderRequiredTerm("时间周期", strategy.time_horizon),
+    renderTerm("风险", strategy.risk_level || strategy.risk),
+    renderRequiredTerm("计划", strategy.plan_text),
+    renderTerm("说明", strategy.rationale || strategy.agent_reason || strategy.agent_excerpt || strategy.notes),
+  ].filter(Boolean).join("");
+  return renderDetailSection("交易策略", `${renderStatusWarning(strategy)}${terms ? `<dl class="detail-dl">${terms}</dl>` : renderStatusMessage("暂无交易策略", strategy)}`);
+}
+
+function renderChineseStrategyTerms(strategy, holding) {
+  const action = holding.trade_action || {};
+  const terms = [
+    renderRequiredTerm("观点", formatAction(strategy.view || strategy.stance || strategy.signal || strategy.rating)),
+    renderChineseTerm("买入区间", joinRange(strategy.entry_min, strategy.entry_max) || joinRange(strategy.entry_zone_low, strategy.entry_zone_high) || strategy.entry_range),
+    renderChineseTerm("加仓价", strategy.add_price),
+    renderChineseTerm("止损价", strategy.stop_loss || action.stop_price),
+    renderChineseTerm("目标价", joinRange(strategy.target_1, strategy.target_2) || strategy.target_range),
+    renderChineseTerm("仓位上限", strategy.target_weight || strategy.target_position || strategy.max_weight),
+    renderChineseTerm("时间周期", strategy.time_horizon),
+    renderChineseTerm("催化因素", strategy.catalyst),
+    renderChineseTerm("风险", strategy.risk_level || strategy.risk),
+    renderChineseTerm("当前动作", action.action),
+    renderChineseTerm("触发状态", action.trigger_status),
+    renderChineseTerm("说明", action.agent_reason || strategy.agent_reason || strategy.notes),
+  ].filter(Boolean).join("");
+  if (!terms) {
+    return renderStatusMessage("暂无交易策略", strategy);
+  }
+  return `<dl class="detail-dl translated-summary">${terms}</dl>`;
+}
+
+function renderEnglishSourceBlock(text, rawText, buttonText) {
+  const sourceText = firstAvailableText(text, rawText);
+  if (!hasValue(sourceText)) {
+    return "";
+  }
+  return `
+    <button class="raw-toggle english-source-toggle" type="button" data-toggle-raw-report>${escapeHtml(buttonText)}</button>
+    <pre class="raw-report english-source hidden">${escapeHtml(sourceText)}</pre>
+  `;
+}
+
+function renderTradeActionSection(holding) {
+  const premarketAction = holding.premarket_action || {};
+  const tradeAction = holding.trade_action || {};
+  if (!sectionAvailable(tradeAction) && !sectionAvailable(premarketAction)) {
+    return renderDetailSection("当前交易动作", renderStatusMessage("暂无触发中的交易动作", tradeAction));
+  }
+  const action = sectionAvailable(tradeAction) ? tradeAction : premarketAction;
+  const terms = [
+    renderRequiredTerm("动作", formatAction(action.action || action.suggested_action)),
+    renderRequiredTerm("状态", formatActionStatus(action.status)),
+    renderRequiredTerm("优先级", formatPriority(action.priority)),
+    renderRequiredTerm("触发状态", formatTriggerStatus(action.trigger_status)),
+    renderRequiredTerm("建议数量", action.suggested_quantity || action.target_quantity || action.quantity),
+    renderRequiredTerm("建议金额", suggestedNotionalText(action)),
+    renderRequiredTerm("限价", action.limit_price),
+    renderRequiredTerm("止损", action.stop_price),
+    renderRequiredTerm("当前数量", action.current_quantity),
+    renderRequiredTerm("交易后数量", action.post_trade_quantity),
+    renderRequiredTerm("原因", formatActionReason(action.reason || action.rationale || action.trigger_reason)),
+    renderRequiredTerm("观察触发", formatActionReason(action.watch_trigger)),
+  ].filter(Boolean).join("");
+  return renderDetailSection("当前交易动作", `${renderStatusWarning(action)}${terms ? `<dl class="detail-dl">${terms}</dl>` : renderStatusMessage("暂无触发中的交易动作", action)}`);
+}
+
+function suggestedNotionalText(action) {
+  if (hasValue(action.suggested_notional)) {
+    const currency = formatPlain(action.notional_currency);
+    return currency === "-" ? action.suggested_notional : `${action.suggested_notional} ${currency}`;
+  }
+  if (hasValue(action.order_value_hkd)) {
+    return formatMoney(action.order_value_hkd, "HKD");
+  }
+  return "";
+}
+
+function renderBrokerDetailSection(details) {
+  if (!Array.isArray(details) || details.length === 0) {
+    return renderDetailSection("券商账户明细", renderStatusMessage("暂无券商账户明细"));
+  }
+  const rows = details.map((detail) => `
     <tr>
       <td>${escapeHtml(formatPlain(detail.broker))}</td>
       <td>${escapeHtml(formatPlain(detail.account_alias))}</td>
@@ -300,27 +588,159 @@ function renderDetailRow(details) {
       <td class="number-cell">${escapeHtml(formatPlain(detail.market_value))}</td>
       <td class="number-cell">${escapeHtml(formatPlain(detail.unrealized_pnl))}</td>
     </tr>
+  `).join("");
+  return renderDetailSection("券商账户明细", `
+    <div class="compact-detail-table">
+      <table>
+        <thead>
+          <tr>
+            <th>券商</th>
+            <th>账户</th>
+            <th>数量</th>
+            <th>成本价</th>
+            <th>持仓价</th>
+            <th>市值</th>
+            <th>盈亏</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
   `);
+}
+
+function renderDetailSection(title, body) {
   return `
-    <tr class="detail-row">
-      <td colspan="10">
-        <table class="detail-table">
-          <thead>
-            <tr>
-              <th>券商</th>
-              <th>账户</th>
-              <th>数量</th>
-              <th>成本价</th>
-              <th>持仓价</th>
-              <th>市值</th>
-              <th>盈亏</th>
-            </tr>
-          </thead>
-          <tbody>${detailRows.join("")}</tbody>
-        </table>
-      </td>
-    </tr>
+    <section class="detail-section">
+      <h3>${escapeHtml(title)}</h3>
+      ${body}
+    </section>
   `;
+}
+
+function renderStatusMessage(emptyText, section) {
+  const error = section && hasValue(section.error)
+    ? `<span class="detail-warning">${escapeHtml(section.error)}</span>`
+    : "";
+  return `<p class="compact-empty">${escapeHtml(emptyText)}${error}</p>`;
+}
+
+function renderStatusWarning(section) {
+  if (!section || typeof section !== "object") {
+    return "";
+  }
+  if (section.status === "manual_review") {
+    return `<div class="detail-warning">需要人工复核${hasValue(section.error) ? `：${escapeHtml(section.error)}` : ""}</div>`;
+  }
+  if (section.status === "error") {
+    return `<div class="detail-warning">${escapeHtml(formatPlain(section.error || "数据读取错误"))}</div>`;
+  }
+  return "";
+}
+
+function renderTerm(label, value) {
+  if (!hasValue(value) || value === "-") {
+    return "";
+  }
+  return renderRequiredTerm(label, value);
+}
+
+function renderRequiredTerm(label, value) {
+  return `
+    <div>
+      <dt>${escapeHtml(label)}</dt>
+      <dd>${escapeHtml(formatPlain(value))}</dd>
+    </div>
+  `;
+}
+
+function renderChineseTerm(label, value) {
+  const text = chineseDisplayText(value);
+  if (!hasValue(text) || text === "-") {
+    return "";
+  }
+  return renderRequiredTerm(label, text);
+}
+
+function chineseDisplayText(value) {
+  const raw = formatPlain(value);
+  if (raw === "-") {
+    return raw;
+  }
+  const mapped = formatActionReason(formatTriggerStatus(formatActionStatus(formatAction(raw))));
+  let text = mapped
+    .replace(/\bOverweight\b/gi, "超配")
+    .replace(/\bUnderweight\b/gi, "低配")
+    .replace(/\bNeutral\b/gi, "中性")
+    .replace(/\bHold\b/gi, "持有")
+    .replace(/\bReduce\b/gi, "减仓")
+    .replace(/\bTrim\b/gi, "减仓")
+    .replace(/\bBuy\b/gi, "买入")
+    .replace(/\bSell\b/gi, "卖出")
+    .replace(/\bmonths\b/gi, "个月")
+    .replace(/\bmonth\b/gi, "个月")
+    .replace(/\breassess\b/gi, "复评")
+    .replace(/\bearnings\b/gi, "财报");
+  if (/[A-Za-z]{3,}/.test(text) && text.length > 32) {
+    return "";
+  }
+  return text;
+}
+
+function dataHealthText(holding) {
+  const confidence = formatPlain(holding.confidence);
+  const riskFlag = formatPlain(holding.risk_flag);
+  if (confidence !== "-" && riskFlag !== "-") {
+    return `${confidence} · ${riskFlag}`;
+  }
+  if (confidence !== "-") {
+    return confidence;
+  }
+  return riskFlag;
+}
+
+function joinRange(min, max) {
+  if (hasValue(min) && hasValue(max)) {
+    return `${min} - ${max}`;
+  }
+  if (hasValue(min)) {
+    return `>= ${min}`;
+  }
+  if (hasValue(max)) {
+    return `<= ${max}`;
+  }
+  return "";
+}
+
+function sectionAvailable(section) {
+  if (!section || typeof section !== "object") {
+    return false;
+  }
+  if (section.available === false) {
+    return false;
+  }
+  return section.available === true || Object.keys(section).some((key) => key !== "available" && key !== "error" && hasValue(section[key]));
+}
+
+function firstValue(source, keys) {
+  if (!source || typeof source !== "object") {
+    return "";
+  }
+  for (const key of keys) {
+    if (hasValue(source[key])) {
+      return source[key];
+    }
+  }
+  return "";
+}
+
+function firstAvailableText(...values) {
+  for (const value of values) {
+    if (hasValue(value)) {
+      return value;
+    }
+  }
+  return "";
 }
 
 function renderTradeActions() {
@@ -413,6 +833,19 @@ function quoteForHolding(holding) {
   return state.quotes[key] || null;
 }
 
+function quoteNotApplicable(holding) {
+  const market = String(holding.market || "").toUpperCase();
+  const assetClass = String(holding.asset_class || "").toLowerCase();
+  return market === "CASH" || assetClass === "cash" || assetClass === "money_market_fund";
+}
+
+function detailLivePrice(holding, quote) {
+  if (quoteNotApplicable(holding)) {
+    return "-";
+  }
+  return quote && hasValue(quote.last_price) ? quote.last_price : "缺行情";
+}
+
 function futuSymbolForHolding(holding) {
   const market = String(holding.market || "").trim().toUpperCase();
   let symbol = String(holding.symbol || "").trim().toUpperCase();
@@ -426,9 +859,7 @@ function futuSymbolForHolding(holding) {
 }
 
 function renderQuotePrice(holding, quote) {
-  const market = String(holding.market || "").toUpperCase();
-  const assetClass = String(holding.asset_class || "").toLowerCase();
-  if (market === "CASH" || assetClass === "cash" || assetClass === "money_market_fund") {
+  if (quoteNotApplicable(holding)) {
     return escapeHtml("-");
   }
   if (!quote || !hasValue(quote.last_price)) {
