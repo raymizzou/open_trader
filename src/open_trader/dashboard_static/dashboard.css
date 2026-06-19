@@ -339,8 +339,7 @@ tbody tr:hover {
   min-width: 34px;
 }
 
-.symbol-cell strong,
-.action-item strong {
+.symbol-cell strong {
   display: block;
   margin-bottom: 4px;
   overflow-wrap: anywhere;
@@ -555,21 +554,6 @@ tbody tr:hover {
 .action-list {
   display: grid;
   gap: 10px;
-}
-
-.action-item {
-  background: var(--surface-soft);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 10px;
-}
-
-.action-meta {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
 }
 
 .action-summary-grid {

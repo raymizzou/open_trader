@@ -391,25 +391,36 @@ function showSymbolDetail(detailKey) {
 }
 
 function openTradeActionDetail(actionKey) {
-  if (!actionKey) {
+  const normalizedActionKey = normalizeActionKey("", actionKey);
+  if (!normalizedActionKey) {
     return;
   }
-  const holdings = filteredHoldings();
+  const holdings = getHoldings();
   for (let index = 0; index < holdings.length; index += 1) {
     const holding = holdings[index];
-    const tradeAction = holding.trade_action || {};
-    const premarketAction = holding.premarket_action || {};
-    const candidates = [
-      `${String(tradeAction.market || "").toUpperCase()}.${String(tradeAction.symbol || "").toUpperCase()}`,
-      `${String(premarketAction.market || "").toUpperCase()}.${String(premarketAction.symbol || "").toUpperCase()}`,
-      `${String(holding.market || "").toUpperCase()}.${String(holding.symbol || "").toUpperCase()}`,
-    ];
-    if (candidates.includes(actionKey)) {
+    if (holdingActionKeys(holding).includes(normalizedActionKey)) {
+      resetHoldingFilters();
       state.selectedHoldingKey = holdingKey(holding, index);
       renderHoldings();
       return;
     }
   }
+}
+
+function resetHoldingFilters() {
+  state.marketFilter = "ALL";
+  state.brokerFilter = "ALL";
+  setFilterActiveByDataset(elements["market-filters"], "market", "ALL");
+  setFilterActiveByDataset(elements["broker-filters"], "broker", "ALL");
+}
+
+function setFilterActiveByDataset(container, datasetKey, value) {
+  if (!container) {
+    return;
+  }
+  container.querySelectorAll(".filter-button").forEach((button) => {
+    button.classList.toggle("active", button.dataset[datasetKey] === value);
+  });
 }
 
 function renderSymbolDetail(holding, index) {
@@ -838,6 +849,41 @@ function tradeActionCounts(actions) {
   return counts;
 }
 
+function actionDetailKey(action) {
+  if (!action) {
+    return "";
+  }
+  return normalizeActionKey("", action.futu_symbol)
+    || normalizeActionKey(action.market, action.symbol);
+}
+
+function holdingActionKeys(holding) {
+  const keys = [
+    normalizeActionKey("", holding && holding.futu_symbol),
+    normalizeActionKey(holding && holding.market, holding && holding.symbol),
+    actionDetailKey(holding && holding.trade_action),
+    actionDetailKey(holding && holding.premarket_action),
+  ].filter(Boolean);
+  return Array.from(new Set(keys));
+}
+
+function normalizeActionKey(market, symbol) {
+  let normalizedMarket = String(market || "").trim().toUpperCase();
+  let normalizedSymbol = String(symbol || "").trim().toUpperCase();
+  if (!normalizedMarket && normalizedSymbol.includes(".")) {
+    const parts = normalizedSymbol.split(".");
+    normalizedMarket = parts.shift() || "";
+    normalizedSymbol = parts.join(".");
+  }
+  if (!normalizedMarket || !normalizedSymbol) {
+    return "";
+  }
+  if (normalizedMarket === "HK" && /^\d+$/.test(normalizedSymbol)) {
+    normalizedSymbol = normalizedSymbol.padStart(5, "0");
+  }
+  return `${normalizedMarket}.${normalizedSymbol}`;
+}
+
 function actionSymbol(action) {
   const futu = formatPlain(action.futu_symbol);
   if (futu !== "-") {
@@ -866,19 +912,75 @@ function actionSourceContext(action) {
 }
 
 function shortActionReason(action) {
-  const reason = formatActionReason(
-    firstAvailableText(
-      action.trigger_reason,
-      action.reason,
-      action.agent_reason,
-      action.rationale,
-      action.watch_trigger,
-    ),
+  const translatedReason = firstChineseText(
+    action.trigger_reason_zh,
+    action.reason_zh,
+    action.agent_reason_zh,
+    action.watch_trigger_zh,
   );
-  if (reason === "-") {
-    return "暂无简短理由。";
+  if (translatedReason) {
+    return compactSentence(translatedReason, 96);
   }
-  return compactSentence(reason, 96);
+
+  const mappedReason = firstMappedLabel(
+    REASON_LABELS,
+    action.trigger_reason,
+    action.reason,
+    action.agent_reason,
+    action.rationale,
+    action.watch_trigger,
+  );
+  if (mappedReason) {
+    return compactSentence(mappedReason, 96);
+  }
+
+  const mappedTrigger = firstMappedLabel(TRIGGER_STATUS_LABELS, action.trigger_status, action.watch_trigger);
+  if (mappedTrigger && mappedTrigger !== "未触发") {
+    return compactSentence(`${mappedTrigger}，请查看完整策略。`, 96);
+  }
+
+  return fallbackShortActionReason(action);
+}
+
+function firstChineseText(...values) {
+  for (const value of values) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (text && /[\u3400-\u9fff]/.test(text)) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function firstMappedLabel(map, ...values) {
+  for (const value of values) {
+    const mapped = mappedLabel(map, value);
+    if (mapped) {
+      return mapped;
+    }
+  }
+  return "";
+}
+
+function mappedLabel(map, value) {
+  const raw = formatPlain(value);
+  if (raw === "-") {
+    return "";
+  }
+  return map[raw] || map[raw.toLowerCase()] || "";
+}
+
+function fallbackShortActionReason(action) {
+  const status = String(action.status || "").trim().toLowerCase();
+  const actionType = String(action.action || action.suggested_action || "").trim().toLowerCase();
+  const trigger = String(action.trigger_status || action.watch_trigger || "").trim().toLowerCase();
+  if (status === "review" || actionType === "review" || status === "error" || trigger === "missing_quote") {
+    return "需要人工复核后再决定。";
+  }
+  if (status === "watch" || actionType === "hold" || actionType === "watch" || trigger === "watch" || trigger === "no_trigger") {
+    return "暂无触发中的交易计划。";
+  }
+  return "交易计划已触发，请查看完整策略。";
 }
 
 function compactSentence(text, maxLength) {
@@ -1048,7 +1150,7 @@ function renderTradeActions() {
 
 function renderActionQueueSummary(counts) {
   return `
-    <div class="action-summary-grid" aria-label="交易动作摘要">
+    <div class="action-summary-grid" role="group" aria-label="交易动作摘要">
       <div><span>待确认</span><strong>${escapeHtml(String(counts.ready))}</strong></div>
       <div><span>复核</span><strong>${escapeHtml(String(counts.review))}</strong></div>
       <div><span>观察</span><strong>${escapeHtml(String(counts.watch))}</strong></div>
@@ -1057,7 +1159,7 @@ function renderActionQueueSummary(counts) {
 }
 
 function renderActionCard(action) {
-  const key = `${String(action.market || "").toUpperCase()}.${String(action.symbol || "").toUpperCase()}`;
+  const key = actionDetailKey(action);
   const status = String(action.status || "").toLowerCase();
   const statusClass = status === "review" ? "review" : status === "ready" ? "ready" : "watch";
   return `
