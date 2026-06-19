@@ -1692,6 +1692,7 @@ function renderCashDetailPanel(rows) {
     return;
   }
   elements["cash-detail-panel"].innerHTML = `
+    <h2>现金明细</h2>
     <div class="compact-detail-table">
       <table>
         <thead>
@@ -1721,7 +1722,13 @@ function renderCashDetailPanel(rows) {
 
 function quoteDiagnosticActive() {
   const payload = state.quotePayload || {};
-  return payload.status === "failed" || Boolean(payload.stale);
+  const diagnostic = payload.diagnostic || {};
+  return payload.status === "failed"
+    || payload.status === "partial"
+    || Boolean(payload.stale)
+    || hasValue(diagnostic.message)
+    || hasValue(diagnostic.reason)
+    || hasValue(diagnostic.next_step);
 }
 
 function sourceKindText(value) {
@@ -1868,6 +1875,9 @@ function formatDiagnostic(payload) {
   }
   if (diagnostic.message) {
     return formatDiagnosticMessage(diagnostic.message);
+  }
+  if (diagnostic.next_step) {
+    return formatDiagnosticMessage(diagnostic.next_step);
   }
   return quoteStatusLabel(payload.status);
 }

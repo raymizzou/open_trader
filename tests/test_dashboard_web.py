@@ -293,7 +293,7 @@ state.dashboard = {
       market: "HK",
       symbol: "00700",
       name: "Tencent",
-      brokers: "phillip",
+      brokers: "phillips",
       market_value_hkd: "15982.00",
     },
   ],
@@ -311,8 +311,8 @@ state.dashboard = {
       market: "CASH",
       symbol: "USD_CASH",
       name: "USD Cash",
-      broker: "phillip",
-      brokers: "phillip",
+      broker: "phillips",
+      brokers: "phillips",
       currency: "USD",
       market_value_hkd: "8000.00",
     },
@@ -326,7 +326,7 @@ state.dashboard = {
       source_status: "real_time",
     },
     {
-      broker: "phillip",
+      broker: "phillips",
       display_name: "辉立",
       portfolio_value_hkd: "8000.00",
       holding_count: 1,
@@ -341,7 +341,7 @@ state.dashboard = {
       updated_at: "2026-06-19T09:30:00+08:00",
     },
     {
-      broker: "phillip",
+      broker: "phillips",
       display_name: "辉立",
       status: "statement",
       value: "非实时",
@@ -410,11 +410,85 @@ sourceList = renderSourceStatusList();
 if (!sourceList.includes("富途") || !sourceList.includes("网络中断")) {
   throw new Error("source list missing quote diagnostic: " + sourceList);
 }
+state.quotePayload = {
+  status: "partial",
+  stale: false,
+  diagnostic: { message: "缺失 1 个标的行情。" },
+};
+sourceList = renderSourceStatusList();
+if (!sourceList.includes("富途") || !sourceList.includes("缺失 1 个标的行情。")) {
+  throw new Error("source list missing partial quote diagnostic: " + sourceList);
+}
 state.marketFilter = "CASH";
 state.brokerFilter = "futu";
 const cashRows = filteredCashRows();
 if (cashRows.length !== 1 || cashRows[0].symbol !== "HKD_CASH") {
   throw new Error("unexpected cash rows: " + JSON.stringify(cashRows));
+}
+function makeElement() {
+  const classes = new Set();
+  return {
+    innerHTML: "",
+    textContent: "",
+    classList: {
+      add(...names) {
+        names.forEach((name) => classes.add(name));
+      },
+      remove(...names) {
+        names.forEach((name) => classes.delete(name));
+      },
+      contains(name) {
+        return classes.has(name);
+      },
+      toggle(name, force) {
+        if (force === undefined) {
+          classes.has(name) ? classes.delete(name) : classes.add(name);
+        } else if (force) {
+          classes.add(name);
+        } else {
+          classes.delete(name);
+        }
+        return classes.has(name);
+      },
+    },
+    querySelectorAll() {
+      return [];
+    },
+  };
+}
+elements["visible-count"] = makeElement();
+elements["workspace-grid"] = makeElement();
+elements["right-rail"] = makeElement();
+elements["holdings-table-wrap"] = makeElement();
+elements["symbol-detail-panel"] = makeElement();
+elements["cash-detail-panel"] = makeElement();
+elements["holdings-body"] = makeElement();
+state.selectedHoldingKey = "";
+state.dashboardError = null;
+state.quotes = {};
+renderHoldings();
+if (!elements["holdings-table-wrap"].classList.contains("hidden")) {
+  throw new Error("cash view should hide holdings table");
+}
+if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
+  throw new Error("cash view should hide symbol detail panel");
+}
+if (elements["symbol-detail-panel"].innerHTML !== "") {
+  throw new Error("cash view should clear symbol detail panel");
+}
+if (elements["cash-detail-panel"].classList.contains("hidden")) {
+  throw new Error("cash view should show cash detail panel");
+}
+if (!elements["cash-detail-panel"].innerHTML.includes("现金明细") || !elements["cash-detail-panel"].innerHTML.includes("HKD_CASH")) {
+  throw new Error("cash detail panel missing expected rows: " + elements["cash-detail-panel"].innerHTML);
+}
+if (elements["visible-count"].textContent !== "1 条") {
+  throw new Error("cash view visible count mismatch: " + elements["visible-count"].textContent);
+}
+state.marketFilter = "ALL";
+renderHoldings();
+if (!elements["cash-detail-panel"].classList.contains("hidden")) {
+  throw new Error("non-cash view should hide cash detail panel");
 }
 `, sandbox);
 """
