@@ -743,10 +743,10 @@ function strategySubline(action, holding) {
 }
 
 function nextTriggerText(action, holding) {
-  const watchTrigger = safeChineseDisplayText(
-    firstAvailableText(action.watch_trigger_zh, action.watch_trigger),
-  ) || firstMappedLabel(TRIGGER_STATUS_LABELS, action.watch_trigger)
-    || firstMappedLabel(REASON_LABELS, action.watch_trigger);
+  const watchTrigger = primaryChineseText(action.watch_trigger_zh)
+    || firstMappedLabel(TRIGGER_STATUS_LABELS, action.watch_trigger)
+    || firstMappedLabel(REASON_LABELS, action.watch_trigger)
+    || safePrimaryValue(action.watch_trigger);
   if (watchTrigger) {
     return watchTrigger;
   }
@@ -755,9 +755,8 @@ function nextTriggerText(action, holding) {
   if (hasValue(targetText)) {
     return `目标价 ${targetText}`;
   }
-  const planText = safeChineseDisplayText(
-    firstAvailableText(strategy.plan_text_zh, strategy.rationale_zh, strategy.plan_text),
-  );
+  const planText = primaryChineseText(strategy.plan_text_zh, strategy.rationale_zh)
+    || safePrimaryValue(strategy.plan_text);
   if (planText) {
     return compactSentence(planText, 48);
   }
@@ -812,13 +811,13 @@ function decisionTriggerText(action) {
   if (direct) {
     return direct;
   }
-  return safeChineseDisplayText(action.watch_trigger) || "-";
+  return safePrimaryValue(action.watch_trigger) || "-";
 }
 
 function primaryChineseText(...values) {
   for (const value of values) {
     const text = String(value || "").replace(/\s+/g, " ").trim();
-    if (text && /[\u3400-\u9fff]/.test(text) && !hasRawEnglishProse(text)) {
+    if (text && /[\u3400-\u9fff]/.test(text) && safePrimaryValue(text)) {
       return text;
     }
   }
@@ -830,7 +829,13 @@ function safePrimaryValue(value) {
   if (text === "-") {
     return "";
   }
-  if (hasRawEnglishProse(text)) {
+  const englishWords = text.match(/\b[A-Za-z][A-Za-z'-]*\b/g) || [];
+  if (!englishWords.length) {
+    return text;
+  }
+  const allowedTokens = new Set(["HKD", "USD", "ETF", "ETFS", "MACD", "RSI", "YOY", "QOQ", "OPENAI", "IPHONE"]);
+  const hasUnsafeEnglish = englishWords.some((word) => !allowedTokens.has(word.toUpperCase()));
+  if (hasUnsafeEnglish) {
     return "";
   }
   return text;
@@ -934,7 +939,7 @@ function watchPointText(holding) {
   if (mappedTrigger && mappedTrigger !== "未触发") {
     return compactSentence(`${mappedTrigger}；继续观察 ${nextReviewText(holding)}。`, 92);
   }
-  const catalyst = safeChineseDisplayText(firstAvailableText(strategy.catalyst, strategy.time_horizon, strategy.plan_text));
+  const catalyst = safePrimaryValue(firstAvailableText(strategy.catalyst, strategy.time_horizon, strategy.plan_text));
   if (catalyst) {
     return compactSentence(catalyst, 92);
   }
@@ -966,7 +971,7 @@ function nextReviewText(holding) {
   if (direct) {
     return compactSentence(direct, 32);
   }
-  const text = safeChineseDisplayText(firstAvailableText(strategy.catalyst, strategy.time_horizon, action.watch_trigger));
+  const text = safePrimaryValue(firstAvailableText(strategy.catalyst, strategy.time_horizon, action.watch_trigger));
   return text ? compactSentence(text, 32) : "-";
 }
 

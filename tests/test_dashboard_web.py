@@ -388,10 +388,10 @@ const englishLeakHolding = {
   symbol: "LEAK",
   strategy: {
     available: true,
-    view: "Buy below 90",
+    view: "Bullish",
     rating: "Underweight",
-    target_1: "Buy below 90",
-    target_2: "Sell above 120",
+    target_1: "Breakout",
+    target_2: "Resistance",
     target_range: "Buy below 90",
     stop_loss: "Place a hard stop at $60.",
     plan_text_zh: "译文：Place a hard stop at $60.",
@@ -405,10 +405,11 @@ const englishLeakHolding = {
   },
   premarket_action: {
     available: true,
-    suggested_action: "Open below prior close.",
+    suggested_action: "Breakout",
     limit_price: "Buy below 90",
     last_price: "Buy below 90",
     stop_price: "Place a hard stop at $60.",
+    watch_trigger: "Breakout",
   },
 };
 const primaryOutputs = [
@@ -422,9 +423,13 @@ const primaryOutputs = [
   renderChineseAgentSummary(englishLeakHolding.agent_report || {}, englishLeakHolding),
   renderChineseStrategyTerms(englishLeakHolding.strategy || {}, englishLeakHolding),
   strategyHeadline(currentDecisionAction(englishLeakHolding), englishLeakHolding),
+  strategySubline(currentDecisionAction(englishLeakHolding), englishLeakHolding),
 ].join(" ");
-if (primaryOutputs.includes("Buy below") || primaryOutputs.includes("Sell above") || primaryOutputs.includes("Place a hard stop") || primaryOutputs.includes("Open below prior close")) {
+if (primaryOutputs.includes("Buy below") || primaryOutputs.includes("Sell above") || primaryOutputs.includes("Place a hard stop") || primaryOutputs.includes("Open below prior close") || primaryOutputs.includes("Breakout") || primaryOutputs.includes("Bullish") || primaryOutputs.includes("Resistance")) {
   throw new Error("raw English leaked from primary helper outputs: " + primaryOutputs);
+}
+if (primaryChineseText("MACD 背离") !== "MACD 背离" || primaryChineseText("OpenAI 影响有限") !== "OpenAI 影响有限" || safePrimaryValue("ETF") !== "ETF") {
+  throw new Error("allowed business tokens should remain visible in primary helper text");
 }
 const html = renderAnalysisStrategySection(holding);
 for (const required of ["分析与交易策略", "当前希望你做什么", "操作指令", "今天重点关注", "分析师对话", "最终结论", "查看英文原文"]) {
