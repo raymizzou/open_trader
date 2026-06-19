@@ -10,6 +10,22 @@ from typing import Any
 
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
+BROKERS = ("futu", "tiger", "phillips")
+BROKER_LABELS = {
+    "futu": "富途",
+    "tiger": "老虎",
+    "phillips": "辉立",
+}
+BROKER_SOURCE_KINDS = {
+    "futu": "live_account",
+    "tiger": "live_account",
+    "phillips": "statement",
+}
+DETAIL_FX_TO_HKD = {
+    "HKD": Decimal("1"),
+    "USD": Decimal("7.8"),
+    "CNY": Decimal("1.08"),
+}
 
 
 @dataclass(frozen=True)
@@ -29,6 +45,9 @@ class DashboardState:
     detail_available: bool
     summary: dict[str, Any]
     holdings: list[dict[str, Any]]
+    broker_summaries: list[dict[str, Any]]
+    source_statuses: list[dict[str, str]]
+    cash_rows: list[dict[str, str]]
     broker_positions: list[dict[str, str]]
     cash_details: list[dict[str, str]]
     trade_actions: list[dict[str, str]]
@@ -45,6 +64,9 @@ class DashboardState:
             "detail_available": self.detail_available,
             "summary": self.summary,
             "holdings": self.holdings,
+            "broker_summaries": self.broker_summaries,
+            "source_statuses": self.source_statuses,
+            "cash_rows": self.cash_rows,
             "broker_positions": self.broker_positions,
             "cash_details": self.cash_details,
             "trade_actions": self.trade_actions,
@@ -78,6 +100,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
     premarket_actions_by_holding = _latest_by_market_symbol(premarket_actions)
     actions_by_holding = _latest_by_market_symbol(trade_actions)
     holding_rows = [row for row in portfolio_rows if _is_dashboard_holding(row)]
+    cash_rows = [row for row in portfolio_rows if _is_cash_like_row(row)]
     holdings = [
         _merge_holding(
             row,
@@ -96,6 +119,17 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         detail_available=bool(detail_month),
         summary=_build_summary(portfolio_rows, holding_rows),
         holdings=holdings,
+        broker_summaries=_build_broker_summaries(
+            portfolio_rows,
+            broker_positions,
+            cash_details,
+        ),
+        source_statuses=_build_source_statuses(
+            broker_positions,
+            cash_details,
+            detail_month,
+        ),
+        cash_rows=cash_rows,
         broker_positions=broker_positions,
         cash_details=cash_details,
         trade_actions=trade_actions,
@@ -166,13 +200,17 @@ def _market_symbol_key(row: dict[str, str]) -> tuple[str, str] | None:
 
 
 def _is_dashboard_holding(row: dict[str, str]) -> bool:
+    return not _is_cash_like_row(row)
+
+
+def _is_cash_like_row(row: dict[str, str]) -> bool:
     market = row.get("market", "").strip().upper()
     asset_class = row.get("asset_class", "").strip().lower()
     if market == "CASH":
-        return False
+        return True
     if asset_class in {"cash", "money_market_fund"}:
-        return False
-    return True
+        return True
+    return False
 
 
 def _merge_holding(
@@ -259,6 +297,189 @@ def _build_summary(
         "cash_like_weight_hkd": _pct_text(_ratio(cash_like_total, total)),
         "broker_count": _broker_count(rows),
     }
+
+
+def _build_broker_summaries(
+    portfolio_rows: list[dict[str, str]],
+    broker_positions: list[dict[str, str]],
+    cash_details: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    return [
+        _build_broker_summary(
+            broker,
+            portfolio_rows,
+            broker_positions,
+            cash_details,
+        )
+        for broker in BROKERS
+    ]
+
+
+def _build_broker_summary(
+    broker: str,
+    portfolio_rows: list[dict[str, str]],
+    broker_positions: list[dict[str, str]],
+    cash_details: list[dict[str, str]],
+) -> dict[str, Any]:
+    detail_positions = [
+        row for row in broker_positions if _broker_key(row.get("broker", "")) == broker
+    ]
+    detail_cash_rows = [
+        row for row in cash_details if _broker_key(row.get("broker", "")) == broker
+    ]
+    detail_available = bool(detail_positions or detail_cash_rows)
+    if detail_available:
+        holding_value = _sum_detail_hkd(detail_positions, "market_value")
+        cash_like_value = _sum_detail_hkd(detail_cash_rows, "cash_balance")
+        portfolio_value = holding_value + cash_like_value
+        money = {
+            "holding_value_hkd": _money_text(holding_value),
+            "cash_like_value_hkd": _money_text(cash_like_value),
+            "portfolio_value_hkd": _money_text(portfolio_value),
+            "holding_count": len(detail_positions),
+        }
+    else:
+        money = _build_portfolio_fallback_summary(portfolio_rows, broker)
+
+    return {
+        "broker": broker,
+        "label": BROKER_LABELS[broker],
+        "source_kind": BROKER_SOURCE_KINDS[broker],
+        "detail_available": detail_available,
+        **money,
+    }
+
+
+def _sum_detail_hkd(rows: list[dict[str, str]], value_field: str) -> Decimal:
+    total = Decimal("0")
+    for row in rows:
+        value = _detail_value_hkd(row, value_field)
+        if value is not None:
+            total += value
+    return total
+
+
+def _detail_value_hkd(row: dict[str, str], value_field: str) -> Decimal | None:
+    value = _optional_decimal(row.get(value_field, ""))
+    currency = row.get("currency", "").strip().upper()
+    fx_rate = DETAIL_FX_TO_HKD.get(currency)
+    if value is None or fx_rate is None:
+        return None
+    return value * fx_rate
+
+
+def _build_portfolio_fallback_summary(
+    portfolio_rows: list[dict[str, str]],
+    broker: str,
+) -> dict[str, Any]:
+    broker_rows: list[dict[str, str]] = []
+    for row in portfolio_rows:
+        brokers = _broker_list(row.get("brokers", ""))
+        if broker not in brokers:
+            continue
+        if len(brokers) != 1 or brokers[0] != broker:
+            return _empty_broker_money()
+        broker_rows.append(row)
+
+    if not broker_rows:
+        return _empty_broker_money()
+
+    holding_value = Decimal("0")
+    cash_like_value = Decimal("0")
+    holding_count = 0
+    for row in broker_rows:
+        market_value = _optional_decimal(row.get("market_value_hkd", ""))
+        if market_value is None:
+            return _empty_broker_money()
+        if _is_cash_like_row(row):
+            cash_like_value += market_value
+        else:
+            holding_value += market_value
+            holding_count += 1
+
+    return {
+        "holding_value_hkd": _money_text(holding_value),
+        "cash_like_value_hkd": _money_text(cash_like_value),
+        "portfolio_value_hkd": _money_text(holding_value + cash_like_value),
+        "holding_count": holding_count,
+    }
+
+
+def _empty_broker_money() -> dict[str, Any]:
+    return {
+        "holding_value_hkd": "",
+        "cash_like_value_hkd": "",
+        "portfolio_value_hkd": "",
+        "holding_count": 0,
+    }
+
+
+def _build_source_statuses(
+    broker_positions: list[dict[str, str]],
+    cash_details: list[dict[str, str]],
+    detail_month: str,
+) -> list[dict[str, str]]:
+    detail_brokers = {
+        _broker_key(row.get("broker", ""))
+        for row in [*broker_positions, *cash_details]
+        if _broker_key(row.get("broker", ""))
+    }
+    statuses: list[dict[str, str]] = []
+    for broker in BROKERS:
+        detail_available = broker in detail_brokers
+        if broker == "futu":
+            statuses.append(
+                {
+                    "broker": broker,
+                    "label": BROKER_LABELS[broker],
+                    "capability": "quote_and_live_account",
+                    "status": "ok" if detail_available else "missing",
+                    "display_text": "账户实时同步"
+                    if detail_available
+                    else "未检测到账户同步",
+                }
+            )
+            continue
+        if broker == "tiger":
+            statuses.append(
+                {
+                    "broker": broker,
+                    "label": BROKER_LABELS[broker],
+                    "capability": "live_account",
+                    "status": "ok" if detail_available else "missing",
+                    "display_text": "账户实时同步，行情走富途"
+                    if detail_available
+                    else "未检测到账户同步",
+                }
+            )
+            continue
+        display_text = (
+            f"{detail_month} 月结单导入"
+            if detail_available and detail_month
+            else "暂无月结单明细"
+        )
+        statuses.append(
+            {
+                "broker": broker,
+                "label": BROKER_LABELS[broker],
+                "capability": "statement",
+                "status": "non_realtime",
+                "display_text": display_text,
+            }
+        )
+    return statuses
+
+
+def _broker_list(value: str) -> list[str]:
+    return [
+        broker
+        for broker in (_broker_key(part) for part in value.split(";"))
+        if broker
+    ]
+
+
+def _broker_key(value: str) -> str:
+    return value.strip().lower()
 
 
 def _broker_count(rows: list[dict[str, str]]) -> int:
