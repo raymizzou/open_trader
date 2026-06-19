@@ -158,8 +158,19 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "暂无触发中的交易计划" in js
     assert ".dashboard-shell" in css
     assert ".dashboard-header" in css
+    assert ".header-brand-panel" in css
     assert ".header-assets-panel" in css
+    assert ".header-source-panel" in css
+    assert ".header-filter-block" in css
+    assert ".segmented-control" in css
+    assert ".current-view-label" in css
+    assert ".current-view-card" in css
+    assert ".current-view-breakdown" in css
     assert ".broker-summary-cards" in css
+    assert ".broker-summary-card" in css
+    assert ".broker-summary-empty" in css
+    assert ".source-header-row" in css
+    assert ".source-status-list" in css
     assert ".source-status-row" in css
     assert ".cash-detail-panel" in css
     assert (
