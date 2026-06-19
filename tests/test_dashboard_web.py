@@ -142,6 +142,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "renderTradeImpactGrid" in js
     assert "renderRationaleDialogue" in js
     assert "rationaleRows" in js
+    assert "sourceRows" in js
+    assert "hasRawEnglishProse" in js
+    assert "firstAvailableText(rawText, text)" in js
     assert "短触发理由" in js
     assert "清晰交易策略" in js
     assert "操作方向与价位" in js

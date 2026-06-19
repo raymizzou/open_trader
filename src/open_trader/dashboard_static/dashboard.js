@@ -590,7 +590,7 @@ function renderChineseStrategyTerms(strategy, holding) {
 }
 
 function renderEnglishSourceBlock(text, rawText, buttonText) {
-  const sourceText = firstAvailableText(text, rawText);
+  const sourceText = firstAvailableText(rawText, text);
   if (!hasValue(sourceText)) {
     return "";
   }
@@ -669,9 +669,7 @@ function renderRationaleDialogue(holding) {
       text: chineseDisplayText(row.text),
     }))
     .filter((row) => {
-      const hasLongEnglish = /[A-Za-z]{3,}/.test(row.text);
-      const hasChinese = /[\u3400-\u9fff]/.test(row.text);
-      return hasValue(row.text) && row.text !== "-" && (!hasLongEnglish || hasChinese);
+      return hasValue(row.text) && row.text !== "-" && !hasRawEnglishProse(row.text);
     });
   if (!rows.length) {
     return "";
@@ -692,7 +690,7 @@ function renderRationaleDialogue(holding) {
 }
 
 function renderSplitSourceRows(text) {
-  const rows = rationaleRows(text);
+  const rows = sourceRows(text);
   if (!rows.length) {
     return `<pre class="raw-report english-source hidden">${escapeHtml(text)}</pre>`;
   }
@@ -706,6 +704,13 @@ function renderSplitSourceRows(text) {
       `).join("")}
     </div>
   `;
+}
+
+function sourceRows(text) {
+  return splitRationaleText(text).map((sentence, index, sentences) => ({
+    label: rationaleLabel(sentence, index, sentences.length),
+    text: sentence,
+  }));
 }
 
 function renderCompactKv(label, value) {
@@ -870,10 +875,18 @@ function chineseDisplayText(value) {
     .replace(/\bmonth\b/gi, "个月")
     .replace(/\breassess\b/gi, "复评")
     .replace(/\bearnings\b/gi, "财报");
-  if (/[A-Za-z]{3,}/.test(text) && text.length > 32) {
+  if (text.length > 32 && hasRawEnglishProse(text)) {
     return "";
   }
   return text;
+}
+
+function hasRawEnglishProse(text) {
+  const residual = String(text || "")
+    .replace(/\b[A-Z]{2,8}\b/g, "")
+    .replace(/\b(?:HKD|USD|ETF|ETFs|MACD|RSI|YoY|QoQ|OpenAI|iPhone)\b/gi, "");
+  const words = residual.match(/\b[A-Za-z][A-Za-z'-]{2,}\b/g) || [];
+  return words.length >= 2;
 }
 
 function dataHealthText(holding) {
