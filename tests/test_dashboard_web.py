@@ -158,6 +158,27 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".decision-band" in css
     assert ".impact-grid" in css
     assert ".dialogue-row" in css
+    wide_css = css.split("@media (max-width: 1180px)", 1)[1].split(
+        "@media (max-width: 760px)", 1
+    )[0]
+    mobile_css = css.split("@media (max-width: 760px)", 1)[1]
+    assert (
+        ".decision-band,\n"
+        "  .impact-grid {\n"
+        "    grid-template-columns: repeat(2, minmax(0, 1fr));\n"
+        "  }"
+    ) in wide_css
+    assert (
+        ".action-card-metrics,\n"
+        "  .action-summary-grid,\n"
+        "  .decision-band,\n"
+        "  .impact-grid {\n"
+        "    grid-template-columns: 1fr;\n"
+        "  }"
+    ) in mobile_css
+    assert ".workspace-grid.detail-mode,\n  .right-rail {" in mobile_css
+    assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
+    assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
 
 
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:

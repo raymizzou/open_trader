@@ -800,6 +800,11 @@ tbody tr:hover {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .decision-band,
+  .impact-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .workspace-grid {
     grid-template-columns: 190px minmax(0, 1fr);
   }
@@ -817,6 +822,7 @@ tbody tr:hover {
 
   .topbar,
   .workspace-grid,
+  .workspace-grid.detail-mode,
   .right-rail {
     grid-template-columns: 1fr;
   }
@@ -839,6 +845,22 @@ tbody tr:hover {
 
   .summary-grid {
     grid-template-columns: 1fr;
+  }
+
+  .action-card-metrics,
+  .action-summary-grid,
+  .decision-band,
+  .impact-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .compact-kv div {
+    display: grid;
+    gap: 3px;
+  }
+
+  .compact-kv dd {
+    text-align: left;
   }
 
   .detail-header,
