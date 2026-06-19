@@ -84,6 +84,7 @@ class DeepSeekResearchChatClient:
             system_prompt=system_prompt,
             combined_input=combined_input,
             messages=messages,
+            finalization_instruction=True,
             response_format={"type": "json_object"},
         )
 
@@ -93,6 +94,7 @@ class DeepSeekResearchChatClient:
         system_prompt: str,
         combined_input: dict[str, object],
         messages: list[dict[str, str]],
+        finalization_instruction: bool = False,
         response_format: dict[str, str] | None = None,
     ) -> str:
         request_messages: list[dict[str, str]] = [
@@ -105,8 +107,12 @@ class DeepSeekResearchChatClient:
                     sort_keys=True,
                 ),
             },
-            *messages,
         ]
+        if finalization_instruction:
+            request_messages.append(
+                {"role": "user", "content": _finalization_instruction()}
+            )
+        request_messages.extend(messages)
         kwargs: dict[str, object] = {
             "model": self._model,
             "messages": request_messages,
@@ -198,6 +204,8 @@ class ResearchChatService:
     def finalize_session(self, *, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id)
         messages = _session_messages(session)
+        if session.get("status") == "finalized":
+            raise ResearchChatError("chat session already finalized")
         if len(messages) < 2:
             raise ResearchChatError("chat session has insufficient messages")
         bundle_dir = Path(str(session.get("research_bundle_dir", "")))
@@ -212,10 +220,11 @@ class ResearchChatService:
         )
         conversation_reference = str(self._session_path(session_id))
         conclusion["conversation_reference"] = conversation_reference
-        _write_json_atomic(bundle_dir / "user_llm_conclusion.json", conclusion)
 
         dashboard_view = self._load_dashboard_view(bundle_dir)
         dashboard_view["user_llm_conclusion"] = conclusion
+
+        _write_json_atomic(bundle_dir / "user_llm_conclusion.json", conclusion)
         _write_json_atomic(bundle_dir / "dashboard_view.json", dashboard_view)
 
         session["status"] = "finalized"
@@ -431,6 +440,34 @@ def _parse_final_conclusion(raw: str) -> dict[str, Any]:
     normalized = {str(key): value for key, value in payload.items() if isinstance(key, str)}
     normalized["content"] = content.strip()
     return normalized
+
+
+def _finalization_instruction() -> str:
+    payload = {
+        "task": "summarize_context_and_transcript_into_user_final_conclusion",
+        "language": "zh-CN",
+        "output_schema": FINAL_CONCLUSION_SCHEMA,
+        "required_fields": [
+            "schema_version",
+            "status",
+            "content",
+            "updated_at",
+            "source",
+        ],
+        "field_requirements": {
+            "schema_version": FINAL_CONCLUSION_SCHEMA,
+            "status": "present",
+            "content": "用中文给出用户确认后的最终投研结论，不要留空。",
+            "updated_at": "ISO-8601 timestamp with timezone",
+            "source": "downstream_llm_conversation",
+        },
+        "instructions": [
+            "结合 combined_input、系统上下文和完整对话记录。",
+            "提炼用户最终确认或修正后的投研结论。",
+            "只输出一个 JSON object，不要输出 Markdown 或解释文字。",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:

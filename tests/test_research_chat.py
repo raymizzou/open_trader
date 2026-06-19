@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from open_trader.research_chat import (
+    DeepSeekResearchChatClient,
     ResearchChatError,
     ResearchChatService,
     missing_research_view,
@@ -310,6 +312,19 @@ def test_research_chat_service_appends_message_and_assistant_reply(tmp_path: Pat
     assert llm.chat_calls[0]["system_prompt"] == "你是投研讨论助手。"
 
 
+def test_research_chat_service_rejects_empty_assistant_reply(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_bundle(data_dir)
+    service = ResearchChatService(data_dir=data_dir, llm=FakeLLM(reply="  "))
+    session = service.create_session(market="US", symbol="VIXY")
+
+    with pytest.raises(ResearchChatError, match="assistant reply is empty"):
+        service.append_message(
+            session_id=session["session_id"],
+            content="如果财报超预期怎么办？",
+        )
+
+
 def test_research_chat_service_finalizes_and_updates_dashboard_view(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     bundle = write_bundle(data_dir)
@@ -330,6 +345,24 @@ def test_research_chat_service_finalizes_and_updates_dashboard_view(tmp_path: Pa
     )
 
 
+def test_research_chat_service_does_not_partially_finalize_on_bad_dashboard(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    bundle = write_bundle(data_dir)
+    service = ResearchChatService(data_dir=data_dir, llm=FakeLLM())
+    session = service.create_session(market="US", symbol="VIXY")
+    service.append_message(session_id=session["session_id"], content="请给最终结论。")
+    session_before = service.get_session(session["session_id"])
+    (bundle / "dashboard_view.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ResearchChatError, match="invalid research view"):
+        service.finalize_session(session_id=session["session_id"])
+
+    assert not (bundle / "user_llm_conclusion.json").exists()
+    assert service.get_session(session["session_id"]) == session_before
+
+
 def test_research_chat_service_rejects_invalid_finalization_json(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     bundle = write_bundle(data_dir)
@@ -342,6 +375,21 @@ def test_research_chat_service_rejects_invalid_finalization_json(tmp_path: Path)
 
     dashboard_view = json.loads((bundle / "dashboard_view.json").read_text(encoding="utf-8"))
     assert dashboard_view["user_llm_conclusion"] == {"status": "missing", "content": ""}
+
+
+def test_research_chat_service_rejects_refinalizing_session(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_bundle(data_dir)
+    llm = FakeLLM()
+    service = ResearchChatService(data_dir=data_dir, llm=llm)
+    session = service.create_session(market="US", symbol="VIXY")
+    service.append_message(session_id=session["session_id"], content="请给最终结论。")
+    service.finalize_session(session_id=session["session_id"])
+
+    with pytest.raises(ResearchChatError, match="chat session already finalized"):
+        service.finalize_session(session_id=session["session_id"])
+
+    assert len(llm.finalize_calls) == 1
 
 
 def test_research_chat_service_requires_context_files(tmp_path: Path) -> None:
@@ -362,3 +410,55 @@ def test_research_chat_service_requires_context_files(tmp_path: Path) -> None:
 
     with pytest.raises(ResearchChatError, match="missing research context file"):
         service.create_session(market="US", symbol="VIXY")
+
+
+def test_deepseek_research_chat_finalize_requests_json_schema_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeMessage:
+        content = '{"schema_version":"user.llm_conclusion.v1","status":"present","content":"结论","updated_at":"2026-06-20T10:40:00+08:00","source":"downstream_llm_conversation"}'
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> FakeResponse:
+            calls.append(kwargs)
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            self.chat = FakeChat()
+
+    class FakeOpenAIModule:
+        OpenAI = FakeOpenAI
+
+    monkeypatch.setitem(sys.modules, "openai", FakeOpenAIModule())
+    client = DeepSeekResearchChatClient(api_key="test-key")
+
+    client.finalize(
+        system_prompt="你是投研讨论助手。",
+        combined_input={"holding": {"market": "US", "symbol": "VIXY"}},
+        messages=[
+            {"role": "user", "content": "请给最终结论。"},
+            {"role": "assistant", "content": "可以减仓。"},
+        ],
+    )
+
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    request_messages = calls[0]["messages"]
+    assert isinstance(request_messages, list)
+    serialized_messages = json.dumps(request_messages, ensure_ascii=False)
+    assert "user.llm_conclusion.v1" in serialized_messages
+    assert "schema_version" in serialized_messages
+    assert "updated_at" in serialized_messages
+    assert "source" in serialized_messages
+    assert "最终结论" in serialized_messages
