@@ -817,6 +817,75 @@ if (!String(elements["research-chat-status"].textContent).includes("暂无投研
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
+def test_dashboard_research_chat_renders_user_message_before_reply() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+(async () => {
+let resolveMessage;
+postDashboardJson = () => new Promise((resolve) => { resolveMessage = resolve; });
+elements["research-chat-send"] = { disabled: false };
+elements["research-chat-finalize"] = { disabled: false };
+elements["research-chat-status"] = { textContent: "" };
+elements["research-chat-messages"] = { innerHTML: "" };
+elements["research-chat-input"] = { value: "为什么要减仓？" };
+state.researchChat.sessionId = "session-1";
+state.researchChat.busy = false;
+state.researchChat.messages = [
+  {role: "user", content: "结合我的仓位，我已经做什么动作？"},
+  {role: "assistant", content: "建议先减仓。"},
+];
+state.researchChat.messageCount = 2;
+
+const pending = sendResearchChatMessage();
+if (elements["research-chat-input"].value !== "") {
+  throw new Error("input should clear immediately");
+}
+const htmlWhilePending = elements["research-chat-messages"].innerHTML;
+if (!htmlWhilePending.includes("为什么要减仓？")) {
+  throw new Error("user message did not render before reply: " + htmlWhilePending);
+}
+if (!htmlWhilePending.includes("LLM 正在处理")) {
+  throw new Error("pending assistant message missing: " + htmlWhilePending);
+}
+if (!elements["research-chat-send"].disabled) {
+  throw new Error("send button should be disabled while request is pending");
+}
+resolveMessage({
+  session_id: "session-1",
+  messages: [
+    {role: "user", content: "结合我的仓位，我已经做什么动作？"},
+    {role: "assistant", content: "建议先减仓。"},
+    {role: "user", content: "为什么要减仓？"},
+    {role: "assistant", content: "因为已达到第一目标价。"},
+  ],
+});
+await pending;
+const htmlAfterReply = elements["research-chat-messages"].innerHTML;
+if (!htmlAfterReply.includes("因为已达到第一目标价。")) {
+  throw new Error("assistant reply did not render after response: " + htmlAfterReply);
+}
+if (htmlAfterReply.includes("LLM 正在处理")) {
+  throw new Error("pending message should be replaced after response: " + htmlAfterReply);
+}
+if (state.researchChat.messageCount !== 4) {
+  throw new Error("persisted message count should update after response: " + state.researchChat.messageCount);
+}
+})()
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
 def test_dashboard_header_helpers_filter_assets_and_render_sources() -> None:
     node = shutil.which("node")
     if node is None:

@@ -16,6 +16,7 @@ const state = {
     sessionId: "",
     busy: false,
     messageCount: 0,
+    messages: [],
   },
 };
 
@@ -1158,16 +1159,30 @@ async function sendResearchChatMessage() {
   if (!content || !state.researchChat.sessionId || state.researchChat.busy) {
     return;
   }
-  setResearchChatBusy(true, "正在发送...");
+  const optimisticMessages = [
+    ...state.researchChat.messages,
+    { role: "user", content, localOnly: true },
+    { role: "assistant", content: "LLM 正在处理...", pending: true },
+  ];
+  elements["research-chat-input"].value = "";
+  renderResearchChatMessages(optimisticMessages);
+  setResearchChatBusy(true, "LLM 正在处理...");
   try {
     const session = await postDashboardJson(
       `/api/research-chat/sessions/${encodeURIComponent(state.researchChat.sessionId)}/messages`,
       { content },
     );
-    elements["research-chat-input"].value = "";
     renderResearchChatMessages(session.messages || []);
     setResearchChatStatus("对话已保存。");
   } catch (error) {
+    renderResearchChatMessages([
+      ...state.researchChat.messages.filter((message) => !message.pending),
+      {
+        role: "assistant",
+        content: `发送失败：${error.message || String(error)}`,
+        localOnly: true,
+      },
+    ]);
     setResearchChatStatus(error.message || String(error));
   } finally {
     setResearchChatBusy(false);
@@ -1196,16 +1211,18 @@ async function finalizeResearchChat() {
 
 function renderResearchChatMessages(messages) {
   const rows = Array.isArray(messages) ? messages : [];
+  state.researchChat.messages = rows;
   elements["research-chat-messages"].innerHTML = rows.length
     ? rows.map((message) => `
-      <div class="research-chat-message ${message.role === "user" ? "user" : "assistant"}">
+      <div class="research-chat-message ${message.role === "user" ? "user" : "assistant"}${message.pending ? " pending" : ""}">
         <strong>${message.role === "user" ? "你" : "LLM"}</strong>
         <span>${escapeHtml(message.content || "")}</span>
       </div>
     `).join("")
     : `<p class="compact-empty">上下文已加载，可以开始讨论。</p>`;
-  state.researchChat.messageCount = rows.length;
-  elements["research-chat-finalize"].disabled = rows.length < 2;
+  state.researchChat.messageCount = rows.filter((message) => !message.pending && !message.localOnly).length;
+  elements["research-chat-finalize"].disabled = state.researchChat.messageCount < 2;
+  elements["research-chat-messages"].scrollTop = elements["research-chat-messages"].scrollHeight;
 }
 
 function setResearchChatBusy(busy, statusText) {
