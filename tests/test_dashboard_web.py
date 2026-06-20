@@ -67,6 +67,60 @@ def read_json(url: str) -> dict[str, Any]:
         return json.loads(payload.decode("utf-8"))
 
 
+def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        assert response.status == 200
+        assert response.headers["Content-Type"] == "application/json; charset=utf-8"
+        return json.loads(response.read().decode("utf-8"))
+
+
+def post_error_json(url: str, body: bytes) -> tuple[int, str, dict[str, Any]]:
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=5)
+    except urllib.error.HTTPError as error:
+        payload = error.read()
+        assert error.headers["Content-Length"] == str(len(payload))
+        return (
+            error.code,
+            error.headers["Content-Type"],
+            json.loads(payload.decode("utf-8")),
+        )
+    raise AssertionError("expected HTTPError")
+
+
+def post_text_error(url: str, body: bytes) -> tuple[int, str, str]:
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=5)
+    except urllib.error.HTTPError as error:
+        payload = error.read()
+        assert error.headers["Content-Length"] == str(len(payload))
+        return (
+            error.code,
+            error.headers["Content-Type"],
+            payload.decode("utf-8"),
+        )
+    raise AssertionError("expected HTTPError")
+
+
 def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
     try:
         urllib.request.urlopen(url, timeout=5)
@@ -79,6 +133,86 @@ def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
             json.loads(payload.decode("utf-8")),
         )
     raise AssertionError("expected HTTPError")
+
+
+def read_text_error(url: str) -> tuple[int, str, str]:
+    try:
+        urllib.request.urlopen(url, timeout=5)
+    except urllib.error.HTTPError as error:
+        payload = error.read()
+        assert error.headers["Content-Length"] == str(len(payload))
+        return (
+            error.code,
+            error.headers["Content-Type"],
+            payload.decode("utf-8"),
+        )
+    raise AssertionError("expected HTTPError")
+
+
+class FakeResearchChatService:
+    def __init__(self) -> None:
+        self.created: list[dict[str, str]] = []
+        self.messages: list[dict[str, str]] = []
+        self.finalized: list[str] = []
+
+    def create_session(self, *, market: str, symbol: str) -> dict[str, Any]:
+        self.created.append({"market": market, "symbol": symbol})
+        return {
+            "schema_version": "open_trader.research_chat_session.v1",
+            "session_id": "20260620T103000-US-VIXY",
+            "market": market,
+            "symbol": symbol,
+            "research_bundle_dir": "data/research_data/US/VIXY/2026-06-19",
+            "status": "active",
+            "created_at": "2026-06-20T10:30:00+08:00",
+            "updated_at": "2026-06-20T10:30:00+08:00",
+            "messages": [],
+        }
+
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        return {
+            "schema_version": "open_trader.research_chat_session.v1",
+            "session_id": session_id,
+            "market": "US",
+            "symbol": "VIXY",
+            "research_bundle_dir": "data/research_data/US/VIXY/2026-06-19",
+            "status": "active",
+            "created_at": "2026-06-20T10:30:00+08:00",
+            "updated_at": "2026-06-20T10:30:00+08:00",
+            "messages": [],
+        }
+
+    def append_message(self, *, session_id: str, content: str) -> dict[str, Any]:
+        self.messages.append({"session_id": session_id, "content": content})
+        return {
+            **self.get_session(session_id),
+            "messages": [
+                {"role": "user", "content": content},
+                {"role": "assistant", "content": "assistant reply"},
+            ],
+        }
+
+    def finalize_session(self, *, session_id: str) -> dict[str, Any]:
+        self.finalized.append(session_id)
+        return {
+            "status": "ok",
+            "conclusion": {
+                "schema_version": "user.llm_conclusion.v1",
+                "status": "present",
+                "content": "确认减仓 100 股。",
+            },
+            "dashboard_view": {
+                "schema_version": "dashboard.research_view.v1",
+                "available": True,
+                "market": "US",
+                "symbol": "VIXY",
+            },
+        }
+
+
+class RaisingResearchChatService(FakeResearchChatService):
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        raise RuntimeError(f"chat boom: {session_id}")
 
 
 def test_dashboard_static_assets_include_local_shell() -> None:
@@ -98,6 +232,10 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "broker-summary-cards" in html
     assert "source-status-list" in html
     assert "cash-detail-panel" in html
+    assert "research-chat-modal" in html
+    assert "research-chat-messages" in html
+    assert "research-chat-input" in html
+    assert "生成最终结论" in html
     assert "filter-panel" not in html
     assert "summary-grid" not in html
     assert "数据健康" not in html
@@ -144,6 +282,12 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "watchPointText" in js
     assert "decisionMetricCells" in js
     assert "finalConclusionItems" in js
+    assert "renderResearchConclusions" in js
+    assert "openResearchChat" in js
+    assert "sendResearchChatMessage" in js
+    assert "finalizeResearchChat" in js
+    assert "投研给出的结论" in js
+    assert "我和 LLM 探讨后的结论" in js
     assert "renderAnalystDialogue" in js
     assert "sourceReviewText" in js
     assert "分析与交易策略" in js
@@ -162,6 +306,10 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".decision-metric-strip" in css
     assert ".analyst-dialogue" in css
     assert ".final-conclusion-list" in css
+    assert ".research-conclusion-grid" in css
+    assert ".research-chat-layer" in css
+    assert "height: min(760px, calc(100vh - 36px));" in css
+    assert "min-height: min(620px, calc(100vh - 36px));" in css
     assert ".broker-detail-section" in css
     assert "holding_value_hkd" in js
     assert "cash_like_value_hkd" in js
@@ -399,6 +547,33 @@ for (const required of ["分析与交易策略", "当前希望你做什么", "�
     throw new Error("missing rendered label " + required + " in " + html);
   }
 }
+const conclusionSection = html.includes("research-conclusion-grid")
+  ? html.slice(html.indexOf("research-conclusion-grid"), html.indexOf("source-review") === -1 ? undefined : html.indexOf("source-review"))
+  : "";
+for (const required of ["低配", "减仓", "60"]) {
+  if (!conclusionSection.includes(required)) {
+    throw new Error("fallback conclusion missing " + required + ": " + conclusionSection);
+  }
+}
+for (const placeholder of ["-", "暂无明确结论。"]) {
+  const placeholderHolding = {
+    ...holding,
+    research_view: {
+      available: true,
+      tradingagents_conclusion: {status: "present", content: placeholder},
+      user_llm_conclusion: {status: "missing", content: ""},
+    },
+  };
+  const placeholderHtml = renderAnalysisStrategySection(placeholderHolding);
+  const placeholderSection = placeholderHtml.includes("research-conclusion-grid")
+    ? placeholderHtml.slice(placeholderHtml.indexOf("research-conclusion-grid"), placeholderHtml.indexOf("source-review") === -1 ? undefined : placeholderHtml.indexOf("source-review"))
+    : "";
+  for (const required of ["低配", "减仓", "60"]) {
+    if (!placeholderSection.includes(required)) {
+      throw new Error("placeholder research conclusion blocked fallback " + required + ": " + placeholderSection);
+    }
+  }
+}
 const primaryHtml = html.split("source-review", 1)[0];
 if (primaryHtml.includes("risk is elevated") || primaryHtml.includes("The bull case")) {
   throw new Error("raw English leaked into primary Chinese UI: " + primaryHtml);
@@ -465,6 +640,247 @@ const noActionHtml = renderAnalysisStrategySection({
 if (!noActionHtml.includes("今天暂无触发中的交易动作")) {
   throw new Error("missing explicit no-action state: " + noActionHtml);
 }
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_research_conclusions_render_missing_and_present_states() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+state.dashboard = {
+  holdings: [{
+    market: "US",
+    symbol: "VIXY",
+    portfolio_weight_hkd: "7.11%",
+    risk_flag: "normal",
+    broker_details: [],
+    agent_report: {available: false},
+    strategy: {available: false},
+    premarket_action: {available: false},
+    trade_action: {available: false},
+    research_view: {
+      available: true,
+      research_date: "2026-06-19",
+      tradingagents_conclusion: {
+        status: "present",
+        content: "低配，当前动作为减仓。",
+        reason: "达到第一目标价。",
+        condition: "财报后复评。"
+      },
+      user_llm_conclusion: {status: "missing", content: ""}
+    }
+  }]
+};
+const html = renderResearchConclusions(state.dashboard.holdings[0]);
+if (!html.includes("投研给出的结论") || !html.includes("我和 LLM 探讨后的结论")) {
+  throw new Error("research conclusion labels missing: " + html);
+}
+if (!html.includes("低配，当前动作为减仓。") || !html.includes("缺失")) {
+  throw new Error("research conclusion content missing: " + html);
+}
+if (!html.includes("开始讨论")) {
+  throw new Error("missing start chat button: " + html);
+}
+state.dashboard.holdings[0].research_view.user_llm_conclusion = {
+  status: "present",
+  content: "确认减仓 100 股。",
+};
+const finalizedHtml = renderResearchConclusions(state.dashboard.holdings[0]);
+if (!finalizedHtml.includes("确认减仓 100 股。") || finalizedHtml.includes("<strong>缺失</strong>")) {
+  throw new Error("finalized user conclusion did not render: " + finalizedHtml);
+}
+if (!finalizedHtml.includes("继续讨论")) {
+  throw new Error("missing continue chat button: " + finalizedHtml);
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_research_chat_ignores_stale_session_response() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+(async () => {
+const calls = [];
+let resolveA;
+let resolveB;
+postDashboardJson = (url, payload) => {
+  calls.push(payload.symbol);
+  return new Promise((resolve) => {
+    if (payload.symbol === "AAA") resolveA = resolve;
+    if (payload.symbol === "BBB") resolveB = resolve;
+  });
+};
+elements["research-chat-send"] = { disabled: false };
+elements["research-chat-finalize"] = { disabled: false };
+elements["research-chat-status"] = { textContent: "" };
+elements["research-chat-messages"] = { innerHTML: "" };
+state.researchChat.holdingKey = "US|AAA";
+const first = createResearchChatSession({ market: "US", symbol: "AAA" });
+state.researchChat.holdingKey = "US|BBB";
+const second = createResearchChatSession({ market: "US", symbol: "BBB" });
+resolveB({ session_id: "session-b", messages: [{role: "user", content: "b"}, {role: "assistant", content: "reply b"}] });
+await second;
+if (state.researchChat.sessionId !== "session-b") {
+  throw new Error("active session did not use latest response: " + state.researchChat.sessionId);
+}
+resolveA({ session_id: "session-a", messages: [{role: "user", content: "a"}, {role: "assistant", content: "reply a"}] });
+await first;
+if (state.researchChat.sessionId !== "session-b") {
+  throw new Error("stale session overwrote active session: " + state.researchChat.sessionId);
+}
+if (calls.join(",") !== "AAA,BBB") {
+  throw new Error("unexpected call order: " + calls.join(","));
+}
+const classes = new Set();
+elements["research-chat-layer"] = {
+  hidden: true,
+  classList: {
+    add(name) { classes.add(name); },
+    remove(name) { classes.delete(name); },
+  },
+};
+elements["research-chat-title"] = { textContent: "" };
+elements["research-chat-context-note"] = { textContent: "" };
+elements["research-chat-context-list"] = { innerHTML: "" };
+elements["research-chat-input"] = { value: "", focus() {} };
+state.dashboard = {
+  holdings: [
+    {
+      market: "US",
+      symbol: "AAA",
+      name: "Available",
+      research_view: {
+        available: true,
+        tradingagents_conclusion: {status: "present", content: "有上下文"},
+        user_llm_conclusion: {status: "missing", content: ""},
+      },
+    },
+    {
+      market: "US",
+      symbol: "CCC",
+      name: "Missing",
+      research_view: {available: false},
+    },
+  ],
+};
+state.marketFilter = "ALL";
+state.brokerFilter = "ALL";
+postDashboardJson = () => new Promise(() => {});
+openResearchChat(holdingKey(state.dashboard.holdings[0]));
+if (!state.researchChat.busy) {
+  throw new Error("available chat should be busy while context request is pending");
+}
+await openResearchChat(holdingKey(state.dashboard.holdings[1]));
+if (state.researchChat.busy) {
+  throw new Error("missing context chat should clear busy state");
+}
+if (!elements["research-chat-send"].disabled) {
+  throw new Error("missing context chat should disable send button");
+}
+if (!String(elements["research-chat-context-note"].textContent).includes("暂无投研上下文")) {
+  throw new Error("missing context note should not claim loaded context: " + elements["research-chat-context-note"].textContent);
+}
+if (!String(elements["research-chat-messages"].innerHTML).includes("暂无投研上下文")) {
+  throw new Error("missing context message should explain unavailable context: " + elements["research-chat-messages"].innerHTML);
+}
+if (state.researchChat.sessionId) {
+  throw new Error("missing context chat should clear stale session id: " + state.researchChat.sessionId);
+}
+if (!String(elements["research-chat-status"].textContent).includes("暂无投研上下文")) {
+  throw new Error("missing context status not shown: " + elements["research-chat-status"].textContent);
+}
+})()
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_research_chat_renders_user_message_before_reply() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+(async () => {
+let resolveMessage;
+postDashboardJson = () => new Promise((resolve) => { resolveMessage = resolve; });
+elements["research-chat-send"] = { disabled: false };
+elements["research-chat-finalize"] = { disabled: false };
+elements["research-chat-status"] = { textContent: "" };
+elements["research-chat-messages"] = { innerHTML: "" };
+elements["research-chat-input"] = { value: "为什么要减仓？" };
+state.researchChat.sessionId = "session-1";
+state.researchChat.busy = false;
+state.researchChat.messages = [
+  {role: "user", content: "结合我的仓位，我已经做什么动作？"},
+  {role: "assistant", content: "建议先减仓。"},
+];
+state.researchChat.messageCount = 2;
+
+const pending = sendResearchChatMessage();
+if (elements["research-chat-input"].value !== "") {
+  throw new Error("input should clear immediately");
+}
+const htmlWhilePending = elements["research-chat-messages"].innerHTML;
+if (!htmlWhilePending.includes("为什么要减仓？")) {
+  throw new Error("user message did not render before reply: " + htmlWhilePending);
+}
+if (!htmlWhilePending.includes("LLM 正在处理")) {
+  throw new Error("pending assistant message missing: " + htmlWhilePending);
+}
+if (!elements["research-chat-send"].disabled) {
+  throw new Error("send button should be disabled while request is pending");
+}
+resolveMessage({
+  session_id: "session-1",
+  messages: [
+    {role: "user", content: "结合我的仓位，我已经做什么动作？"},
+    {role: "assistant", content: "建议先减仓。"},
+    {role: "user", content: "为什么要减仓？"},
+    {role: "assistant", content: "因为已达到第一目标价。"},
+  ],
+});
+await pending;
+const htmlAfterReply = elements["research-chat-messages"].innerHTML;
+if (!htmlAfterReply.includes("因为已达到第一目标价。")) {
+  throw new Error("assistant reply did not render after response: " + htmlAfterReply);
+}
+if (htmlAfterReply.includes("LLM 正在处理")) {
+  throw new Error("pending message should be replaced after response: " + htmlAfterReply);
+}
+if (state.researchChat.messageCount !== 4) {
+  throw new Error("persisted message count should update after response: " + state.researchChat.messageCount);
+}
+})()
 `, sandbox);
 """
     subprocess.run([node, "-e", script, str(js_path)], check=True)
@@ -842,6 +1258,217 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
     assert dashboard_payload["holdings"][0]["symbol"] == "VIXY"
     assert quotes_payload["quotes"]["US.MSFT"]["last_price"] == "500"
     assert quote_service.refresh_count == 1
+
+
+def test_dashboard_server_serves_research_chat_apis(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+    chat_service = FakeResearchChatService()
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=chat_service,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        session = post_json(
+            f"{base}/api/research-chat/sessions",
+            {"market": "US", "symbol": "VIXY"},
+        )
+        loaded = read_json(f"{base}/api/research-chat/sessions/{session['session_id']}")
+        message_payload = post_json(
+            f"{base}/api/research-chat/sessions/{session['session_id']}/messages",
+            {"content": "请解释风险。"},
+        )
+        finalize_payload = post_json(
+            f"{base}/api/research-chat/sessions/{session['session_id']}/finalize",
+            {},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert session["session_id"] == "20260620T103000-US-VIXY"
+    assert loaded["session_id"] == "20260620T103000-US-VIXY"
+    assert message_payload["messages"][1]["content"] == "assistant reply"
+    assert finalize_payload["conclusion"]["content"] == "确认减仓 100 股。"
+    assert chat_service.created == [{"market": "US", "symbol": "VIXY"}]
+    assert chat_service.messages == [
+        {"session_id": "20260620T103000-US-VIXY", "content": "请解释风险。"}
+    ]
+    assert chat_service.finalized == ["20260620T103000-US-VIXY"]
+
+
+@pytest.mark.parametrize(
+    ("body", "error_type"),
+    [
+        (b"", "ResearchChatError"),
+        (b"{bad json", "JSONDecodeError"),
+        (b'["not", "object"]', "ResearchChatError"),
+        (b'"not object"', "ResearchChatError"),
+    ],
+)
+def test_dashboard_server_returns_json_error_for_bad_research_chat_create_body(
+    tmp_path,
+    body: bytes,
+    error_type: str,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=FakeResearchChatService(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        status, content_type, payload = post_error_json(
+            f"{base}/api/research-chat/sessions",
+            body,
+        )
+        dashboard_payload = read_json(f"{base}/api/dashboard")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 500
+    assert content_type == "application/json; charset=utf-8"
+    assert payload["status"] == "error"
+    assert payload["error_type"] == error_type
+    assert dashboard_payload["summary"]["holding_count"] == 1
+
+
+def test_dashboard_server_returns_404_for_invalid_research_chat_get_subroute(
+    tmp_path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=FakeResearchChatService(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        status, content_type, body = read_text_error(
+            f"http://{host}:{port}/api/research-chat/sessions/id/messages"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 404
+    assert content_type == "text/plain; charset=utf-8"
+    assert body == "not found"
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/research-chat/sessions//messages", b'{"content": "hello"}'),
+        ("/api/research-chat/sessions//finalize", b"{}"),
+    ],
+)
+def test_dashboard_server_returns_404_for_empty_session_research_chat_post_routes(
+    tmp_path,
+    path: str,
+    body: bytes,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    chat_service = FakeResearchChatService()
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=chat_service,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        status, content_type, response_body = post_text_error(
+            f"http://{host}:{port}{path}",
+            body,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 404
+    assert content_type == "text/plain; charset=utf-8"
+    assert response_body == "not found"
+    assert chat_service.messages == []
+    assert chat_service.finalized == []
+
+
+def test_dashboard_server_returns_json_500_when_research_chat_service_raises(
+    tmp_path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        research_chat_service=RaisingResearchChatService(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        status, content_type, payload = read_error_json(
+            f"http://{host}:{port}/api/research-chat/sessions/boom"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 500
+    assert content_type == "application/json; charset=utf-8"
+    assert payload == {
+        "status": "error",
+        "error_type": "RuntimeError",
+        "message": "chat boom: boom",
+    }
 
 
 def test_dashboard_server_returns_json_500_when_quotes_refresh_raises(

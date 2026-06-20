@@ -270,6 +270,27 @@ a failure or stale warning instead of hiding the problem.
 
 The dashboard is read-only: it does not place orders or modify data.
 
+### Research Chat Workflow
+
+The dashboard can display a TradingAgents research bundle for each holding when
+the bundle exists under `data/research_data/<market>/<symbol>/<date>/`.
+
+Required bundle files:
+
+- `dashboard_view.json`: dashboard-facing conclusions.
+- `combined_input.json`: raw TradingAgents output plus local user context.
+- `llm_system_prompt.md`: the system prompt loaded automatically when chat starts.
+
+The symbol detail page shows two conclusion cards:
+
+- `投研给出的结论`: the original TradingAgents conclusion.
+- `我和 LLM 探讨后的结论`: missing until the user clicks `生成最终结论` in chat.
+
+Chat transcripts are stored under `data/research_chat/sessions/`. Finalization
+writes `user_llm_conclusion.json` into the research bundle and updates that
+bundle's `dashboard_view.json`. This workflow is read-only for trading: it does
+not place orders and does not modify trade action files.
+
 To keep the local frontend running after the terminal closes, start it in a
 detached `screen` session:
 

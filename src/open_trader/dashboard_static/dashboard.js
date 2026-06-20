@@ -11,6 +11,13 @@ const state = {
   detailLanguage: "zh",
   refreshActive: false,
   quoteIntervalId: null,
+  researchChat: {
+    holdingKey: "",
+    sessionId: "",
+    busy: false,
+    messageCount: 0,
+    messages: [],
+  },
 };
 
 const elements = {};
@@ -126,6 +133,16 @@ function bindElements() {
     "connection-success",
     "connection-poll",
     "connection-task",
+    "research-chat-layer",
+    "research-chat-title",
+    "research-chat-context-note",
+    "research-chat-context-list",
+    "research-chat-messages",
+    "research-chat-input",
+    "research-chat-send",
+    "research-chat-close",
+    "research-chat-finalize",
+    "research-chat-status",
   ].forEach((id) => {
     elements[id] = document.getElementById(id);
   });
@@ -170,6 +187,15 @@ function bindEvents() {
     }
     openTradeActionDetail(button.dataset.actionDetail || "");
   });
+  elements["research-chat-close"].addEventListener("click", closeResearchChat);
+  elements["research-chat-send"].addEventListener("click", sendResearchChatMessage);
+  elements["research-chat-finalize"].addEventListener("click", finalizeResearchChat);
+  elements["research-chat-input"].addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      sendResearchChatMessage();
+    }
+  });
   elements["symbol-detail-panel"].addEventListener("click", (event) => {
     const backButton = event.target.closest("[data-back-to-holdings]");
     if (backButton) {
@@ -181,6 +207,11 @@ function bindEvents() {
     if (languageButton) {
       state.detailLanguage = languageButton.dataset.detailLanguage === "en" ? "en" : "zh";
       renderHoldings();
+      return;
+    }
+    const chatButton = event.target.closest("[data-research-chat]");
+    if (chatButton) {
+      openResearchChat(chatButton.dataset.researchChat || "");
       return;
     }
     const rawButton = event.target.closest("[data-toggle-raw-report]");
@@ -915,19 +946,128 @@ function renderAnalystDialogue(holding) {
 }
 
 function renderFinalConclusion(holding) {
+  return renderResearchConclusions(holding);
+}
+
+function renderResearchConclusions(holding) {
+  const researchView = holding.research_view || {};
+  const original = researchConclusionWithFallback(
+    researchView.tradingagents_conclusion,
+    holding,
+  );
+  const userConclusion = researchConclusion(researchView.user_llm_conclusion);
+  const detailKey = holdingKey(holding);
   return `
-    <section class="final-conclusion">
-      <h4>最终结论</h4>
-      <div class="final-conclusion-list">
-        ${finalConclusionItems(holding).map((item) => `
-          <article>
-            <span>${escapeHtml(item.label)}</span>
-            <strong>${escapeHtml(formatPlain(item.text))}</strong>
-          </article>
-        `).join("")}
+    <section class="final-conclusion research-conclusion-section">
+      <div class="research-conclusion-header">
+        <h4>最终结论</h4>
+        <span>展示两个来源：投研原始结论，以及你和 LLM 讨论后的最终结论。</span>
+      </div>
+      <div class="research-conclusion-grid">
+        ${renderResearchConclusionCard({
+          title: "投研给出的结论",
+          conclusion: original,
+          actionHtml: renderSourceReviewButton(holding),
+          missingText: "缺失",
+        })}
+        ${renderResearchConclusionCard({
+          title: "我和 LLM 探讨后的结论",
+          conclusion: userConclusion,
+          actionHtml: `<button class="raw-toggle" type="button" data-research-chat="${escapeHtml(detailKey)}">${userConclusion.present ? "继续讨论" : "开始讨论"}</button>`,
+          missingText: "缺失",
+        })}
       </div>
     </section>
   `;
+}
+
+function researchConclusion(value) {
+  const conclusion = value && typeof value === "object" ? value : {};
+  const content = meaningfulConclusionText(conclusion.content || "");
+  return {
+    present: conclusion.status === "present" && hasValue(content),
+    content,
+    reason: formatPlain(conclusion.reason || ""),
+    condition: formatPlain(conclusion.condition || conclusion.conditions || ""),
+    failure: formatPlain(conclusion.failure_condition || conclusion.failure || ""),
+  };
+}
+
+function researchConclusionWithFallback(value, holding) {
+  const conclusion = researchConclusion(value);
+  if (conclusion.present) {
+    return conclusion;
+  }
+  return legacyFinalConclusion(holding);
+}
+
+function legacyFinalConclusion(holding) {
+  const fields = Object.fromEntries(
+    finalConclusionItems(holding).map((item) => [item.label, formatPlain(item.text)]),
+  );
+  const content = meaningfulConclusionText(fields["结论"]);
+  return {
+    present: hasValue(content),
+    content,
+    reason: meaningfulConclusionText(fields["理由"]),
+    condition: meaningfulConclusionText(fields["条件"]),
+    failure: meaningfulConclusionText(fields["失败条件"]),
+  };
+}
+
+function meaningfulConclusionText(value) {
+  const text = formatPlain(value);
+  if (!hasValue(text) || text === "-" || text === "暂无明确结论。") {
+    return "";
+  }
+  return text;
+}
+
+function renderResearchConclusionCard({ title, conclusion, actionHtml, missingText }) {
+  const statusText = conclusion.present ? "已生成" : "缺失";
+  const body = conclusion.present
+    ? `
+      <div class="research-conclusion-body">
+        <strong>${escapeHtml(conclusion.content)}</strong>
+        ${renderResearchConclusionField("理由", conclusion.reason)}
+        ${renderResearchConclusionField("条件", conclusion.condition)}
+        ${renderResearchConclusionField("失败条件", conclusion.failure)}
+      </div>
+    `
+    : `
+      <div class="research-conclusion-body missing">
+        <strong>${escapeHtml(missingText)}</strong>
+        <p>打开聊天窗口后，系统会自动加载投研结论、原始资料、你的仓位与关注点。只有点击“生成最终结论”后才写入这里。</p>
+      </div>
+    `;
+  return `
+    <article class="research-conclusion-card">
+      <div class="research-conclusion-card-header">
+        <h5>${escapeHtml(title)}</h5>
+        <span class="status-pill ${conclusion.present ? "status-ok" : "status-muted"}">${escapeHtml(statusText)}</span>
+      </div>
+      ${body}
+      <div class="research-conclusion-actions">${actionHtml}</div>
+    </article>
+  `;
+}
+
+function renderResearchConclusionField(label, value) {
+  if (!hasValue(value) || value === "-") {
+    return "";
+  }
+  return `
+    <div class="research-conclusion-field">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
+  `;
+}
+
+function renderSourceReviewButton(holding) {
+  return hasValue(sourceReviewText(holding))
+    ? `<button class="raw-toggle english-source-toggle" type="button" data-toggle-raw-report>查看英文原文</button>`
+    : "";
 }
 
 function renderSourceReview(holding) {
@@ -937,10 +1077,187 @@ function renderSourceReview(holding) {
   }
   return `
     <section class="source-review">
-      <button class="raw-toggle english-source-toggle" type="button" data-toggle-raw-report>查看英文原文</button>
       ${renderSplitSourceRows(sourceText)}
     </section>
   `;
+}
+
+async function openResearchChat(detailKey) {
+  const holding = holdingByKey(detailKey);
+  if (!holding) {
+    return;
+  }
+  const researchView = holding.research_view || {};
+  const previousKey = state.researchChat.holdingKey;
+  state.researchChat.holdingKey = detailKey;
+  if (previousKey !== detailKey) {
+    state.researchChat.sessionId = "";
+  }
+  elements["research-chat-title"].textContent = `LLM 深度讨论 · ${holding.market}.${holding.symbol}`;
+  elements["research-chat-context-note"].textContent = `上下文已自动加载 · ${researchView.research_date || "-"}`;
+  renderResearchChatContext(holding);
+  renderResearchChatMessages([]);
+  openResearchChatLayer();
+  if (!researchView.available) {
+    state.researchChat.sessionId = "";
+    elements["research-chat-context-note"].textContent = "暂无投研上下文";
+    elements["research-chat-messages"].innerHTML = `<p class="compact-empty">暂无投研上下文，无法开始讨论。</p>`;
+    setResearchChatBusy(false, "暂无投研上下文，无法开始讨论");
+    return;
+  }
+  await createResearchChatSession(holding);
+}
+
+function openResearchChatLayer() {
+  elements["research-chat-layer"].hidden = false;
+  elements["research-chat-layer"].classList.remove("hidden");
+  elements["research-chat-input"].focus();
+}
+
+function closeResearchChat() {
+  elements["research-chat-layer"].hidden = true;
+  elements["research-chat-layer"].classList.add("hidden");
+}
+
+function renderResearchChatContext(holding) {
+  const researchView = holding.research_view || {};
+  const original = researchConclusion(researchView.tradingagents_conclusion);
+  elements["research-chat-context-list"].innerHTML = `
+    <div><dt>投研结论</dt><dd>${escapeHtml(original.content || "缺失")}</dd></div>
+    <div><dt>用户上下文</dt><dd>组合权重 ${escapeHtml(formatPlain(holding.portfolio_weight_hkd || "-"))}；风险标记 ${escapeHtml(formatPlain(holding.risk_flag || "-"))}</dd></div>
+    <div><dt>输出目标</dt><dd>生成 user_llm_conclusion.json 后刷新看板。</dd></div>
+  `;
+}
+
+async function createResearchChatSession(holding) {
+  const requestKey = state.researchChat.holdingKey || holdingKey(holding);
+  setResearchChatBusy(true, "正在加载上下文...");
+  try {
+    const session = await postDashboardJson("/api/research-chat/sessions", {
+      market: holding.market,
+      symbol: holding.symbol,
+    });
+    if (state.researchChat.holdingKey !== requestKey) {
+      return;
+    }
+    state.researchChat.sessionId = session.session_id || "";
+    renderResearchChatMessages(session.messages || []);
+    setResearchChatStatus("上下文已自动加载。");
+  } catch (error) {
+    if (state.researchChat.holdingKey === requestKey) {
+      setResearchChatStatus(error.message || String(error));
+    }
+  } finally {
+    if (state.researchChat.holdingKey === requestKey) {
+      setResearchChatBusy(false);
+    }
+  }
+}
+
+async function sendResearchChatMessage() {
+  const content = elements["research-chat-input"].value.trim();
+  if (!content || !state.researchChat.sessionId || state.researchChat.busy) {
+    return;
+  }
+  const optimisticMessages = [
+    ...state.researchChat.messages,
+    { role: "user", content, localOnly: true },
+    { role: "assistant", content: "LLM 正在处理...", pending: true },
+  ];
+  elements["research-chat-input"].value = "";
+  renderResearchChatMessages(optimisticMessages);
+  setResearchChatBusy(true, "LLM 正在处理...");
+  try {
+    const session = await postDashboardJson(
+      `/api/research-chat/sessions/${encodeURIComponent(state.researchChat.sessionId)}/messages`,
+      { content },
+    );
+    renderResearchChatMessages(session.messages || []);
+    setResearchChatStatus("对话已保存。");
+  } catch (error) {
+    renderResearchChatMessages([
+      ...state.researchChat.messages.filter((message) => !message.pending),
+      {
+        role: "assistant",
+        content: `发送失败：${error.message || String(error)}`,
+        localOnly: true,
+      },
+    ]);
+    setResearchChatStatus(error.message || String(error));
+  } finally {
+    setResearchChatBusy(false);
+  }
+}
+
+async function finalizeResearchChat() {
+  if (!state.researchChat.sessionId || state.researchChat.busy) {
+    return;
+  }
+  setResearchChatBusy(true, "正在生成最终结论...");
+  try {
+    await postDashboardJson(
+      `/api/research-chat/sessions/${encodeURIComponent(state.researchChat.sessionId)}/finalize`,
+      {},
+    );
+    setResearchChatStatus("最终结论已生成。");
+    closeResearchChat();
+    await loadDashboard();
+  } catch (error) {
+    setResearchChatStatus(error.message || String(error));
+  } finally {
+    setResearchChatBusy(false);
+  }
+}
+
+function renderResearchChatMessages(messages) {
+  const rows = Array.isArray(messages) ? messages : [];
+  state.researchChat.messages = rows;
+  elements["research-chat-messages"].innerHTML = rows.length
+    ? rows.map((message) => `
+      <div class="research-chat-message ${message.role === "user" ? "user" : "assistant"}${message.pending ? " pending" : ""}">
+        <strong>${message.role === "user" ? "你" : "LLM"}</strong>
+        <span>${escapeHtml(message.content || "")}</span>
+      </div>
+    `).join("")
+    : `<p class="compact-empty">上下文已加载，可以开始讨论。</p>`;
+  state.researchChat.messageCount = rows.filter((message) => !message.pending && !message.localOnly).length;
+  elements["research-chat-finalize"].disabled = state.researchChat.messageCount < 2;
+  elements["research-chat-messages"].scrollTop = elements["research-chat-messages"].scrollHeight;
+}
+
+function setResearchChatBusy(busy, statusText) {
+  state.researchChat.busy = busy;
+  elements["research-chat-send"].disabled = busy || !state.researchChat.sessionId;
+  elements["research-chat-finalize"].disabled = busy
+    || !state.researchChat.sessionId
+    || state.researchChat.messageCount < 2;
+  if (statusText) {
+    setResearchChatStatus(statusText);
+  }
+}
+
+function setResearchChatStatus(text) {
+  elements["research-chat-status"].textContent = text;
+}
+
+async function postDashboardJson(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+    body: JSON.stringify(payload || {}),
+  });
+  const data = await response.json();
+  if (!response.ok || data.status === "error") {
+    throw new Error(data.message || `request ${response.status}`);
+  }
+  return data;
+}
+
+function holdingByKey(detailKey) {
+  return filteredHoldings().find((holding) => holdingKey(holding) === detailKey)
+    || (state.dashboard && Array.isArray(state.dashboard.holdings)
+      ? state.dashboard.holdings.find((holding) => holdingKey(holding) === detailKey)
+      : null);
 }
 
 function renderTradeDecisionBand(action, holding) {

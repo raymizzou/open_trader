@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from .dashboard import DashboardConfig, load_dashboard_state
 from .dashboard_quotes import DashboardQuoteService
+from .research_chat import ResearchChatError, ResearchChatService
 
 
 STATIC_DIR = Path(__file__).with_name("dashboard_static")
@@ -27,8 +28,10 @@ def create_dashboard_server(
     host: str,
     port: int,
     quote_service: DashboardQuoteService | None = None,
+    research_chat_service: ResearchChatService | None = None,
 ) -> ThreadingHTTPServer:
     service = quote_service or DashboardQuoteService(config=config)
+    chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
 
     class DashboardRequestHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -57,10 +60,84 @@ def create_dashboard_server(
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
+            session_id = self._research_chat_session_id(path)
+            if session_id is not None:
+                try:
+                    self._send_json(chat_service.get_session(session_id))
+                except Exception as exc:
+                    self._send_error_json(exc)
+                return
+            self._send_not_found()
+
+        def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            try:
+                if path == "/api/research-chat/sessions":
+                    payload = self._read_json_body()
+                    market = str(payload.get("market") or "")
+                    symbol = str(payload.get("symbol") or "")
+                    if not market or not symbol:
+                        raise ResearchChatError("market and symbol are required")
+                    self._send_json(
+                        chat_service.create_session(
+                            market=market,
+                            symbol=symbol,
+                        )
+                    )
+                    return
+                if path.startswith("/api/research-chat/sessions/"):
+                    route = self._research_chat_session_action(path)
+                    if route is None:
+                        self._send_not_found()
+                        return
+                    session_id, action = route
+                    if action == "messages":
+                        payload = self._read_json_body()
+                        self._send_json(
+                            chat_service.append_message(
+                                session_id=session_id,
+                                content=str(payload.get("content") or ""),
+                            )
+                        )
+                        return
+                    if action == "finalize":
+                        self._read_json_body()
+                        self._send_json(
+                            chat_service.finalize_session(session_id=session_id)
+                        )
+                        return
+            except Exception as exc:
+                self._send_error_json(exc)
+                return
             self._send_not_found()
 
         def log_message(self, format: str, *args: Any) -> None:
             return
+
+        def _read_json_body(self) -> dict[str, Any]:
+            content_length = int(self.headers.get("Content-Length") or "0")
+            body = self.rfile.read(content_length) if content_length else b"{}"
+            payload = json.loads(body.decode("utf-8") or "{}")
+            if not isinstance(payload, dict):
+                raise ResearchChatError("request body must be a JSON object")
+            return payload
+
+        def _research_chat_session_id(self, path: str) -> str | None:
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[:3] == ["api", "research-chat", "sessions"]:
+                return parts[3]
+            return None
+
+        def _research_chat_session_action(self, path: str) -> tuple[str, str] | None:
+            parts = path.strip("/").split("/")
+            if (
+                len(parts) == 5
+                and parts[:3] == ["api", "research-chat", "sessions"]
+                and parts[3]
+                and parts[4] in {"messages", "finalize"}
+            ):
+                return parts[3], parts[4]
+            return None
 
         def _send_json(
             self,

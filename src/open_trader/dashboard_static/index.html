@@ -155,5 +155,33 @@
         </aside>
       </main>
     </div>
+    <div id="research-chat-layer" class="research-chat-layer hidden" hidden role="dialog" aria-modal="true" aria-label="LLM 深度讨论">
+      <section class="research-chat-modal">
+        <header class="research-chat-header">
+          <div>
+            <h2 id="research-chat-title">LLM 深度讨论</h2>
+            <p id="research-chat-context-note">上下文已自动加载。</p>
+          </div>
+          <button id="research-chat-close" class="raw-toggle" type="button">关闭</button>
+        </header>
+        <div class="research-chat-body">
+          <aside class="research-chat-context">
+            <span class="status-pill status-ok">上下文已加载</span>
+            <dl id="research-chat-context-list"></dl>
+          </aside>
+          <div id="research-chat-messages" class="research-chat-messages"></div>
+        </div>
+        <footer class="research-chat-footer">
+          <div class="research-chat-input-row">
+            <input id="research-chat-input" type="text" autocomplete="off" aria-label="输入讨论消息">
+            <button id="research-chat-send" class="primary-button" type="button">发送</button>
+          </div>
+          <div class="research-chat-action-row">
+            <span id="research-chat-status">多轮对话不会自动写入看板。</span>
+            <button id="research-chat-finalize" class="raw-toggle" type="button" disabled>生成最终结论</button>
+          </div>
+        </footer>
+      </section>
+    </div>
   </body>
 </html>
