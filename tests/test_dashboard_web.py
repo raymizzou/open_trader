@@ -243,6 +243,11 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "富途暂无数据" in html
     assert "老虎暂无数据" in html
     assert "辉立暂无数据" in html
+    assert "right-rail" not in html
+    assert "今日交易动作" not in html
+    assert "实时连接与任务" not in html
+    assert 'id="trade-actions"' not in html
+    assert 'id="action-count"' not in html
     for compatibility_id in (
         "market-filters",
         "broker-filters",
@@ -317,8 +322,12 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "隐藏英文原文" in js
     assert 'firstValue(strategy, ["plan_text_zh", "rationale_zh"])' not in js
     assert "暂无中文策略译文" not in js
-    assert "重新分析" in js
-    assert "未启用" in js
+    assert "交易决策" in js
+    assert "插件模块" in js
+    assert "大模型决策模板" in js
+    assert "当前仅 TradingAgents 有真实决策数据" in js
+    assert "插件管理" not in js
+    assert "策略阈值" not in js
     assert "暂无 TradingAgents 报告" in js
     assert "暂无交易策略" in js
     assert "暂无触发中的交易动作" in js
@@ -351,7 +360,8 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".source-status-list" in css
     assert ".source-status-row" in css
     assert ".cash-detail-panel" in css
-    assert "grid-template-columns: minmax(0, 1fr) 300px;" in css
+    assert "grid-template-columns: minmax(0, 1fr) 300px;" not in css
+    assert ".right-rail" not in css
     assert 'grid-template-areas: "brand source" "assets assets";' in css
     assert 'grid-template-areas: "brand" "assets" "source";' in css
     assert ".symbol-detail-panel" in css
@@ -404,7 +414,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
         "    grid-template-columns: 1fr;\n"
         "  }"
     ) in mobile_css
-    assert ".workspace-grid.detail-mode,\n  .right-rail {" in mobile_css
+    assert ".workspace-grid.detail-mode {" in mobile_css
     assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
 
@@ -1164,7 +1174,6 @@ function makeElement() {
 }
 elements["visible-count"] = makeElement();
 elements["workspace-grid"] = makeElement();
-elements["right-rail"] = makeElement();
 elements["holdings-table-wrap"] = makeElement();
 elements["symbol-detail-panel"] = makeElement();
 elements["cash-detail-panel"] = makeElement();
@@ -1195,6 +1204,31 @@ state.marketFilter = "ALL";
 renderHoldings();
 if (!elements["cash-detail-panel"].classList.contains("hidden")) {
   throw new Error("non-cash view should hide cash detail panel");
+}
+state.brokerFilter = "ALL";
+state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
+renderHoldings();
+if (elements["holdings-table-wrap"].classList.contains("hidden")) {
+  throw new Error("trading decision should keep holdings table visible");
+}
+if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
+  throw new Error("trading decision should keep bottom symbol detail panel hidden");
+}
+if (!elements["holdings-body"].innerHTML.includes("交易决策") || elements["holdings-body"].innerHTML.includes(">详情<")) {
+  throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
+}
+if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
+  throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
+}
+for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "当前仅 TradingAgents 有真实决策数据", "占位"]) {
+  if (!elements["holdings-body"].innerHTML.includes(required)) {
+    throw new Error("trading decision detail missing " + required + ": " + elements["holdings-body"].innerHTML);
+  }
+}
+for (const unexpected of ["插件管理", "策略阈值"]) {
+  if (elements["holdings-body"].innerHTML.includes(unexpected)) {
+    throw new Error("trading decision detail should not render extra panel " + unexpected);
+  }
 }
 `, sandbox);
 """

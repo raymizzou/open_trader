@@ -148,7 +148,6 @@ function bindElements() {
   });
   elements["holdings-table-wrap"] = document.querySelector(".table-wrap");
   elements["workspace-grid"] = document.querySelector(".workspace-grid");
-  elements["right-rail"] = document.querySelector(".right-rail");
 }
 
 function bindEvents() {
@@ -175,18 +174,21 @@ function bindEvents() {
   });
   elements["holdings-body"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-detail-key]");
-    if (!button) {
+    if (button) {
+      showSymbolDetail(button.dataset.detailKey || "");
       return;
     }
-    showSymbolDetail(button.dataset.detailKey || "");
+    handleSymbolDetailClick(event);
   });
-  elements["trade-actions"].addEventListener("click", (event) => {
-    const button = event.target.closest("[data-action-detail]");
-    if (!button) {
-      return;
-    }
-    openTradeActionDetail(button.dataset.actionDetail || "");
-  });
+  if (elements["trade-actions"]) {
+    elements["trade-actions"].addEventListener("click", (event) => {
+      const button = event.target.closest("[data-action-detail]");
+      if (!button) {
+        return;
+      }
+      openTradeActionDetail(button.dataset.actionDetail || "");
+    });
+  }
   elements["research-chat-close"].addEventListener("click", closeResearchChat);
   elements["research-chat-send"].addEventListener("click", sendResearchChatMessage);
   elements["research-chat-finalize"].addEventListener("click", finalizeResearchChat);
@@ -196,40 +198,42 @@ function bindEvents() {
       sendResearchChatMessage();
     }
   });
-  elements["symbol-detail-panel"].addEventListener("click", (event) => {
-    const backButton = event.target.closest("[data-back-to-holdings]");
-    if (backButton) {
-      state.selectedHoldingKey = "";
-      renderHoldings();
-      return;
-    }
-    const languageButton = event.target.closest("[data-detail-language]");
-    if (languageButton) {
-      state.detailLanguage = languageButton.dataset.detailLanguage === "en" ? "en" : "zh";
-      renderHoldings();
-      return;
-    }
-    const chatButton = event.target.closest("[data-research-chat]");
-    if (chatButton) {
-      openResearchChat(chatButton.dataset.researchChat || "");
-      return;
-    }
-    const rawButton = event.target.closest("[data-toggle-raw-report]");
-    if (!rawButton) {
-      return;
-    }
-    const section = rawButton.closest(".detail-section") || elements["symbol-detail-panel"];
-    const rawReport = section.querySelector(".raw-report");
-    if (!rawReport) {
-      return;
-    }
-    const isHidden = rawReport.classList.toggle("hidden");
-    if (rawButton.classList.contains("english-source-toggle")) {
-      rawButton.textContent = isHidden ? "查看英文原文" : "隐藏英文原文";
-    } else {
-      rawButton.textContent = isHidden ? "查看原始报告" : "隐藏原始报告";
-    }
-  });
+  elements["symbol-detail-panel"].addEventListener("click", handleSymbolDetailClick);
+}
+
+function handleSymbolDetailClick(event) {
+  const backButton = event.target.closest("[data-back-to-holdings]");
+  if (backButton) {
+    state.selectedHoldingKey = "";
+    renderHoldings();
+    return;
+  }
+  const languageButton = event.target.closest("[data-detail-language]");
+  if (languageButton) {
+    state.detailLanguage = languageButton.dataset.detailLanguage === "en" ? "en" : "zh";
+    renderHoldings();
+    return;
+  }
+  const chatButton = event.target.closest("[data-research-chat]");
+  if (chatButton) {
+    openResearchChat(chatButton.dataset.researchChat || "");
+    return;
+  }
+  const rawButton = event.target.closest("[data-toggle-raw-report]");
+  if (!rawButton) {
+    return;
+  }
+  const section = rawButton.closest(".detail-section") || elements["symbol-detail-panel"];
+  const rawReport = section.querySelector(".raw-report");
+  if (!rawReport) {
+    return;
+  }
+  const isHidden = rawReport.classList.toggle("hidden");
+  if (rawButton.classList.contains("english-source-toggle")) {
+    rawButton.textContent = isHidden ? "查看英文原文" : "隐藏英文原文";
+  } else {
+    rawButton.textContent = isHidden ? "查看原始报告" : "隐藏原始报告";
+  }
 }
 
 async function loadDashboard() {
@@ -255,12 +259,12 @@ function scheduleQuotePolling(pollSeconds) {
 
   const seconds = Number(pollSeconds);
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    elements["connection-poll"].textContent = "-";
+    setElementText("connection-poll", "-");
     return;
   }
 
   const intervalMs = Math.max(1000, seconds * 1000);
-  elements["connection-poll"].textContent = `${intervalMs / 1000} 秒`;
+  setElementText("connection-poll", `${intervalMs / 1000} 秒`);
   state.quoteIntervalId = window.setInterval(refreshQuotes, intervalMs);
 }
 
@@ -547,7 +551,6 @@ function renderHoldings() {
     const cashRows = filteredCashRows();
     elements["visible-count"].textContent = `${cashRows.length} 条`;
     elements["workspace-grid"].classList.remove("detail-mode");
-    elements["right-rail"].classList.remove("hidden");
     elements["holdings-table-wrap"].classList.add("hidden");
     elements["symbol-detail-panel"].classList.add("hidden");
     elements["symbol-detail-panel"].innerHTML = "";
@@ -560,16 +563,7 @@ function renderHoldings() {
   const holdings = filteredHoldings();
   elements["visible-count"].textContent = `${holdings.length} 条`;
   const selected = selectedHolding(holdings);
-  if (selected) {
-    elements["workspace-grid"].classList.add("detail-mode");
-    elements["right-rail"].classList.add("hidden");
-    elements["holdings-table-wrap"].classList.add("hidden");
-    elements["symbol-detail-panel"].classList.remove("hidden");
-    elements["symbol-detail-panel"].innerHTML = renderSymbolDetail(selected.holding, selected.index);
-    return;
-  }
   elements["workspace-grid"].classList.remove("detail-mode");
-  elements["right-rail"].classList.remove("hidden");
   elements["holdings-table-wrap"].classList.remove("hidden");
   elements["symbol-detail-panel"].classList.add("hidden");
   elements["symbol-detail-panel"].innerHTML = "";
@@ -589,12 +583,13 @@ function renderHoldings() {
   const rows = [];
   holdings.forEach((holding, index) => {
     const rowKey = holdingKey(holding, index);
+    const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
     const quote = quoteForHolding(holding);
     const action = holding.trade_action || {};
     const actionText = action.action ? action.action : "-";
     rows.push(`
-      <tr>
-        <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}">详情</button></td>
+      <tr class="${selectedClass}">
+        <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}">交易决策</button></td>
         <td>${escapeHtml(formatPlain(holding.market))}</td>
         <td class="symbol-cell">
           <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
@@ -609,6 +604,17 @@ function renderHoldings() {
         <td>${renderActionBadge(actionText, action.status)}</td>
       </tr>
     `);
+    if (selected && rowKey === state.selectedHoldingKey) {
+      rows.push(`
+        <tr class="decision-detail-row">
+          <td colspan="10">
+            <div class="symbol-detail-panel inline-symbol-detail">
+              ${renderSymbolDetail(selected.holding, selected.index)}
+            </div>
+          </td>
+        </tr>
+      `);
+    }
   });
   elements["holdings-body"].innerHTML = rows.join("");
 }
@@ -673,34 +679,182 @@ function setFilterActiveByDataset(container, datasetKey, value) {
 }
 
 function renderSymbolDetail(holding, index) {
-  const quote = quoteForHolding(holding);
-  const livePrice = detailLivePrice(holding, quote);
   const title = `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
   return `
-    <div class="detail-header">
+    <div class="detail-header trading-decision-header">
       <div>
         <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
-        <h2>${escapeHtml(title)}</h2>
-        <p>${escapeHtml(formatPlain(holding.name))}</p>
+        <h2>交易决策 · ${escapeHtml(title)}</h2>
+        <p>${escapeHtml(formatPlain(holding.name))} · 基于现有持仓数据展示；除 TradingAgents 外，插件模块目前仅为 UI 占位。</p>
       </div>
-      <div class="detail-header-actions">
-        ${renderLanguageToggle()}
-        <button class="disabled-button" type="button" disabled>重新分析 · 未启用</button>
-      </div>
+      <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
     </div>
-    <section class="detail-metric-grid" aria-label="标的概览">
-      ${renderMetric("数量", holding.total_quantity)}
-      ${renderMetric("成本价", holding.avg_cost_price)}
-      ${renderMetric("实时价", livePrice)}
-      ${renderMetric("港元市值", formatMoney(holding.market_value_hkd, "HKD"))}
-      ${renderMetric("盈亏", holding.unrealized_pnl_pct)}
-      ${renderMetric("组合权重", holding.portfolio_weight_hkd)}
-      ${renderMetric("数据健康", dataHealthText(holding))}
+    <div class="trading-decision-layout">
+      ${renderTradingDecisionPlugins(holding)}
+      ${renderLLMDecisionTemplate(holding)}
+    </div>
+  `;
+}
+
+function renderTradingDecisionPlugins(holding) {
+  const action = currentDecisionAction(holding);
+  const hasTradingAgents = sectionAvailable(holding.agent_report)
+    || sectionAvailable(holding.strategy)
+    || sectionAvailable(action);
+  const plugins = [
+    {
+      title: "趋势 / K 线",
+      status: "占位",
+      tone: "muted",
+      score: "-",
+      headline: "待接入",
+      detail: "未来确认价格趋势、关键均线、短线是否偏热。",
+      condition: "条件：当前价是否达到目标价、是否出现趋势背离或跌破保护价。",
+    },
+    {
+      title: "新闻 / 舆论",
+      status: "占位",
+      tone: "muted",
+      score: "-",
+      headline: "待接入",
+      detail: "未来确认最新新闻与舆论方向是否影响今日动作。",
+      condition: "事实确认：是否存在重大利空、监管消息、供应链变化或异常舆论。",
+    },
+    {
+      title: "公司行动",
+      status: "占位",
+      tone: "muted",
+      score: "-",
+      headline: "待接入",
+      detail: "未来确认分红、拆股、增发、回购、停牌等事件。",
+      condition: "事实确认：是否有会改变交易计划的公司行动公告。",
+    },
+    {
+      title: "基本面",
+      status: "占位",
+      tone: "muted",
+      score: "-",
+      headline: "待接入",
+      detail: "未来确认估值、增长假设和业务趋势是否支持继续持仓。",
+      condition: "条件：基本面证据是否足以支持当前仓位或需要降低风险。",
+    },
+    {
+      title: "TradingAgents",
+      status: hasTradingAgents ? "已接入" : "缺失",
+      tone: hasTradingAgents ? "ok" : "partial",
+      score: hasTradingAgents ? "TA" : "-",
+      headline: finalConclusionText(holding),
+      detail: decisionSubline(holding),
+      condition: "条件：TradingAgents 结论与当前交易动作是否支持下一步策略。",
+    },
+    {
+      title: "财报",
+      status: "占位",
+      tone: "muted",
+      score: "-",
+      headline: "待接入",
+      detail: "未来确认财报发布日期、业绩预期和财报后复评要求。",
+      condition: "事实确认：财报是否临近，以及是否必须等财报后再执行。",
+    },
+    {
+      title: "大盘 / 行业",
+      status: "占位",
+      tone: "muted",
+      score: "-",
+      headline: "待接入",
+      detail: "未来确认大盘和半导体行业环境是否支持继续持仓。",
+      condition: "条件：大盘与行业趋势是否对当前仓位形成顺风或逆风。",
+    },
+    {
+      title: "组合风险",
+      status: "占位",
+      tone: "muted",
+      score: "-",
+      headline: `当前权重 ${formatPlain(holding.portfolio_weight_hkd || "-")}`,
+      detail: "这里只展示现有字段，尚未接入独立组合风险插件。",
+      condition: "条件：单一标的权重是否过高、波动是否需要降仓。",
+    },
+  ];
+  return `
+    <section class="detail-section trading-decision-section">
+      <div class="trading-decision-section-header">
+        <div>
+          <h3>插件模块</h3>
+          <p>每个模块说明条件是否达成，或正在确认的事实；当前仅 TradingAgents 有真实决策数据。</p>
+        </div>
+      </div>
+      <div class="decision-plugin-grid">
+        ${plugins.map((plugin) => renderDecisionPluginCard(plugin)).join("")}
+      </div>
     </section>
-    <div class="detail-grid">
-      ${renderAnalysisStrategySection(holding)}
-      ${renderBrokerDetailSection(holding.broker_details)}
-    </div>
+  `;
+}
+
+function renderDecisionPluginCard(plugin) {
+  return `
+    <article class="decision-plugin-card">
+      <div class="decision-plugin-card-header">
+        <h4>${escapeHtml(plugin.title)}</h4>
+        <span class="status-pill status-${escapeHtml(plugin.tone)}">${escapeHtml(plugin.status)}</span>
+      </div>
+      <div class="decision-plugin-output">
+        <strong>${escapeHtml(plugin.score)}</strong>
+        <div>
+          <b>${escapeHtml(plugin.headline)}</b>
+          <span>${escapeHtml(plugin.detail)}</span>
+        </div>
+      </div>
+      <p class="condition-box">${escapeHtml(plugin.condition)}</p>
+    </article>
+  `;
+}
+
+function renderLLMDecisionTemplate(holding) {
+  const action = currentDecisionAction(holding);
+  const actionRows = operationRows(holding);
+  const price = firstSafePrimaryValue(action.limit_price, action.last_price, holding.last_price);
+  const quantity = firstSafePrimaryValue(action.suggested_quantity, action.target_quantity, action.quantity);
+  const stopValue = firstSafePrimaryValue(action.stop_price, holding.strategy && holding.strategy.stop_loss);
+  const templateRows = [
+    ["最终动作", desiredActionText(holding)],
+    ["执行方式", "人工确认后执行；不自动下单。"],
+    ["执行时机", price ? `当前价格仍满足策略价位 ${price} 时。` : "价格信息确认后再执行。"],
+    ["执行前检查", `确认实时持仓仍为 ${formatPlain(holding.total_quantity || "-")}，行情正常，订单数量 ${quantity || "需人工确认"}。`],
+    ["不执行条件", stopValue ? `行情缺失、持仓不一致、价格跌破 ${stopValue}、出现重大新公告。` : "行情缺失、持仓不一致、价格跌破保护价、出现重大新公告。"],
+    ["复评安排", nextReviewText(holding)],
+  ];
+  return `
+    <section class="detail-section trading-decision-section llm-decision-template">
+      <div class="trading-decision-section-header">
+        <div>
+          <h3>大模型决策模板</h3>
+          <p>基于已接入的 TradingAgents 交易决策生成，作为执行前复核模板。</p>
+        </div>
+        <span class="status-pill status-partial">人工确认</span>
+      </div>
+      <div class="llm-template-summary">
+        <strong>${escapeHtml(finalConclusionText(holding))}</strong>
+        <span>${escapeHtml(finalReasonText(holding))}</span>
+      </div>
+      <div class="llm-template-grid">
+        ${templateRows.map(([label, value]) => renderLLMTemplateField(label, value)).join("")}
+      </div>
+      <div class="llm-template-actions">
+        <dl class="compact-kv">
+          ${actionRows.map(([label, value]) => renderCompactKv(label, value)).join("")}
+        </dl>
+      </div>
+      <p class="condition-box strong-condition">${escapeHtml(finalConditionText(holding))}</p>
+    </section>
+  `;
+}
+
+function renderLLMTemplateField(label, value) {
+  return `
+    <article class="llm-template-field">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(formatPlain(value))}</strong>
+    </article>
   `;
 }
 
@@ -2289,6 +2443,9 @@ function rationaleLabel(text, index, total) {
 }
 
 function renderTradeActions() {
+  if (!elements["action-count"] || !elements["trade-actions"]) {
+    return;
+  }
   const actions = sortedTradeActions((state.dashboard && state.dashboard.trade_actions) || []);
   const counts = tradeActionCounts(actions);
   const pendingCount = counts.ready + counts.review;
@@ -2359,13 +2516,15 @@ function renderQuoteStatus(payload) {
 
 function renderConnectionPanel() {
   const payload = state.quotePayload || {};
-  elements["connection-status"].textContent = payload.status
-    ? quoteStatusLabel(payload.status)
-    : "等待行情";
-  elements["connection-success"].textContent = payload.last_success_at || "-";
-  elements["connection-task"].textContent = payload.stale && payload.last_success_at
-    ? "数据已过期"
-    : formatDiagnostic(payload);
+  setElementText(
+    "connection-status",
+    payload.status ? quoteStatusLabel(payload.status) : "等待行情",
+  );
+  setElementText("connection-success", payload.last_success_at || "-");
+  setElementText(
+    "connection-task",
+    payload.stale && payload.last_success_at ? "数据已过期" : formatDiagnostic(payload),
+  );
 }
 
 function renderLoadError(error) {
@@ -2378,10 +2537,16 @@ function renderLoadError(error) {
   elements["last-refresh"].textContent = error.message
     ? `看板加载失败：${error.message}`
     : "看板加载失败";
-  elements["connection-poll"].textContent = "-";
+  setElementText("connection-poll", "-");
   renderHeaderSummary();
   renderSourceStatusListIntoHeader();
   renderDashboardErrorState();
+}
+
+function setElementText(id, text) {
+  if (elements[id]) {
+    elements[id].textContent = text;
+  }
 }
 
 function renderDashboardErrorState() {

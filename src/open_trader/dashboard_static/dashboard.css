@@ -372,7 +372,7 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   align-items: start;
   display: grid;
   gap: 14px;
-  grid-template-columns: minmax(0, 1fr) 300px;
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .workspace-grid.detail-mode {
@@ -519,10 +519,23 @@ tbody tr:hover {
   background: #fbfcf8;
 }
 
+tbody tr.active-row {
+  background: #fffaf1;
+}
+
+.decision-detail-row > td {
+  background: var(--surface);
+  padding: 0;
+}
+
+.decision-detail-row:hover {
+  background: var(--surface);
+}
+
 .expand-button {
   background: var(--surface);
   height: 30px;
-  min-width: 34px;
+  min-width: 70px;
 }
 
 .symbol-cell strong {
@@ -544,6 +557,10 @@ tbody tr:hover {
 .symbol-detail-panel {
   border-top: 1px solid var(--line);
   padding: 14px;
+}
+
+.inline-symbol-detail {
+  border-top: 0;
 }
 
 .cash-detail-panel {
@@ -668,6 +685,161 @@ tbody tr:hover {
 .detail-section h3 {
   font-size: 15px;
   margin: 0 0 10px;
+}
+
+.trading-decision-layout {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.trading-decision-section {
+  background: var(--surface);
+}
+
+.trading-decision-section-header {
+  align-items: start;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.trading-decision-section-header h3 {
+  margin-bottom: 4px;
+}
+
+.trading-decision-section-header p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.decision-plugin-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.decision-plugin-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.decision-plugin-card-header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.decision-plugin-card h4 {
+  font-size: 14px;
+  margin: 0;
+}
+
+.decision-plugin-output {
+  align-items: start;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 46px minmax(0, 1fr);
+}
+
+.decision-plugin-output > strong {
+  align-items: center;
+  background: #e4efe9;
+  border-radius: 999px;
+  color: var(--accent-strong);
+  display: inline-flex;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  height: 42px;
+  justify-content: center;
+  width: 42px;
+}
+
+.decision-plugin-output b,
+.decision-plugin-output span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.decision-plugin-output span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: 3px;
+}
+
+.condition-box {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 0;
+  overflow-wrap: anywhere;
+  padding: 9px;
+}
+
+.llm-template-summary {
+  border-left: 3px solid var(--accent);
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding-left: 10px;
+}
+
+.llm-template-summary strong {
+  font-size: 17px;
+  overflow-wrap: anywhere;
+}
+
+.llm-template-summary span {
+  color: var(--muted);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.llm-template-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.llm-template-field {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  min-height: 74px;
+  padding: 10px;
+}
+
+.llm-template-field span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.llm-template-field strong {
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.llm-template-actions {
+  margin-top: 10px;
+}
+
+.strong-condition {
+  border-left: 3px solid var(--accent);
+  margin-top: 10px;
 }
 
 .analysis-strategy-section {
@@ -1205,11 +1377,6 @@ tbody tr:hover {
   min-width: 720px;
 }
 
-.right-rail {
-  display: grid;
-  gap: 14px;
-}
-
 .action-list {
   display: grid;
   gap: 10px;
@@ -1354,7 +1521,9 @@ tbody tr:hover {
 
   .decision-dashboard,
   .decision-metric-strip,
+  .decision-plugin-grid,
   .final-conclusion-list,
+  .llm-template-grid,
   .research-conclusion-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1363,9 +1532,6 @@ tbody tr:hover {
     grid-template-columns: 1fr;
   }
 
-  .right-rail {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 @media (max-width: 760px) {
@@ -1378,8 +1544,7 @@ tbody tr:hover {
   .broker-summary-cards,
   .topbar,
   .workspace-grid,
-  .workspace-grid.detail-mode,
-  .right-rail {
+  .workspace-grid.detail-mode {
     grid-template-columns: 1fr;
   }
 
@@ -1450,8 +1615,10 @@ tbody tr:hover {
 
   .decision-dashboard,
   .decision-metric-strip,
+  .decision-plugin-grid,
   .analyst-dialogue .dialogue-list,
-  .final-conclusion-list {
+  .final-conclusion-list,
+  .llm-template-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1466,6 +1633,7 @@ tbody tr:hover {
 
   .detail-header,
   .detail-header-actions,
+  .trading-decision-section-header,
   .research-chat-header,
   .research-chat-action-row,
   .research-conclusion-header {
