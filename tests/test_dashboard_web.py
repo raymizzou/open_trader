@@ -799,6 +799,12 @@ if (state.researchChat.busy) {
 if (!elements["research-chat-send"].disabled) {
   throw new Error("missing context chat should disable send button");
 }
+if (!String(elements["research-chat-context-note"].textContent).includes("暂无投研上下文")) {
+  throw new Error("missing context note should not claim loaded context: " + elements["research-chat-context-note"].textContent);
+}
+if (!String(elements["research-chat-messages"].innerHTML).includes("暂无投研上下文")) {
+  throw new Error("missing context message should explain unavailable context: " + elements["research-chat-messages"].innerHTML);
+}
 if (state.researchChat.sessionId) {
   throw new Error("missing context chat should clear stale session id: " + state.researchChat.sessionId);
 }

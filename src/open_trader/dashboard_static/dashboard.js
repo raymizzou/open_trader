@@ -1099,6 +1099,8 @@ async function openResearchChat(detailKey) {
   openResearchChatLayer();
   if (!researchView.available) {
     state.researchChat.sessionId = "";
+    elements["research-chat-context-note"].textContent = "暂无投研上下文";
+    elements["research-chat-messages"].innerHTML = `<p class="compact-empty">暂无投研上下文，无法开始讨论。</p>`;
     setResearchChatBusy(false, "暂无投研上下文，无法开始讨论");
     return;
   }
