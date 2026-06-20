@@ -1208,7 +1208,7 @@ function renderResearchChatMessages(messages) {
 
 function setResearchChatBusy(busy, statusText) {
   state.researchChat.busy = busy;
-  elements["research-chat-send"].disabled = busy;
+  elements["research-chat-send"].disabled = busy || !state.researchChat.sessionId;
   elements["research-chat-finalize"].disabled = busy
     || !state.researchChat.sessionId
     || state.researchChat.messageCount < 2;

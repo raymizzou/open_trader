@@ -796,6 +796,9 @@ await openResearchChat(holdingKey(state.dashboard.holdings[1]));
 if (state.researchChat.busy) {
   throw new Error("missing context chat should clear busy state");
 }
+if (!elements["research-chat-send"].disabled) {
+  throw new Error("missing context chat should disable send button");
+}
 if (state.researchChat.sessionId) {
   throw new Error("missing context chat should clear stale session id: " + state.researchChat.sessionId);
 }
