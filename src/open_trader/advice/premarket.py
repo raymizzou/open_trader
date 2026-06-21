@@ -212,11 +212,11 @@ def run_premarket(
         update_latest=False,
         market=market_scope,
     )
-    _generate_technical_facts_after_advice(
+    technical_facts_result = _generate_technical_facts_after_advice(
         advice_path=advice_path,
         data_dir=data_dir,
         run_date=run_date,
-        update_latest=update_latest,
+        update_latest=False,
         market=market_scope,
         technical_facts_generator=technical_facts_generator,
     )
@@ -224,6 +224,7 @@ def run_premarket(
         _promote_latest_outputs(
             advice_path=advice_path,
             actions_path=actions_path,
+            technical_facts_path=technical_facts_result.run_path,
             data_dir=data_dir,
             market=market_scope,
         )
@@ -505,6 +506,7 @@ def _promote_latest_outputs(
     *,
     advice_path: Path,
     actions_path: Path,
+    technical_facts_path: Path | None = None,
     data_dir: Path,
     market: MarketScope | None,
 ) -> None:
@@ -520,6 +522,13 @@ def _promote_latest_outputs(
             latest_path=latest_dir / "premarket_actions.csv",
         ),
     ]
+    if technical_facts_path is not None:
+        promotions.append(
+            _LatestPromotion(
+                source_path=technical_facts_path,
+                latest_path=latest_dir / "technical_facts.json",
+            )
+        )
 
     try:
         for promotion in promotions:

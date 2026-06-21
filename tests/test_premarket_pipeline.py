@@ -185,7 +185,10 @@ class FakeTechnicalFactsGenerator:
         )
         run_path = advice_path.with_name("technical_facts.json")
         run_path.write_text(
-            '{"schema_version":"open_trader.technical_facts_cache.v1","records":[]}\n',
+            (
+                '{"schema_version":"open_trader.technical_facts_cache.v1",'
+                f'"run_date":"{run_date}","records":[]}}\n'
+            ),
             encoding="utf-8",
         )
         latest_path = data_dir / "latest" / "technical_facts.json"
@@ -427,7 +430,7 @@ def test_run_premarket_generates_technical_facts_after_advice(
             "advice_path": result.advice_path,
             "data_dir": data_dir,
             "run_date": "2026-06-19",
-            "update_latest": True,
+            "update_latest": False,
             "market": None,
         }
     ]
@@ -802,6 +805,72 @@ def test_run_premarket_latest_promotion_failure_restores_previous_latest_files(
     ) == original_actions
     assert list((data_dir / "latest").glob("*.backup")) == []
     assert list((data_dir / "latest").glob(".*.tmp")) == []
+
+
+def test_run_premarket_latest_promotion_failure_restores_previous_technical_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    data_dir = tmp_path / "data"
+    write_previous_latest_advice(data_dir)
+    write_previous_latest_actions(data_dir)
+    original_advice = (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    )
+    original_actions = (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    )
+    latest_technical_facts = data_dir / "latest" / "technical_facts.json"
+    latest_technical_facts.write_text(
+        (
+            '{"schema_version":"open_trader.technical_facts_cache.v1",'
+            '"run_date":"2026-06-15","records":[]}\n'
+        ),
+        encoding="utf-8",
+    )
+    original_technical_facts = latest_technical_facts.read_text(encoding="utf-8")
+    original_replace = Path.replace
+
+    def fail_technical_facts_latest_replace(self: Path, target: Path) -> Path:
+        if target == latest_technical_facts:
+            assert (data_dir / "latest" / "trading_advice.csv").read_text(
+                encoding="utf-8"
+            ) != original_advice
+            assert (data_dir / "latest" / "premarket_actions.csv").read_text(
+                encoding="utf-8"
+            ) != original_actions
+            raise OSError("simulated technical facts latest promotion failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_technical_facts_latest_replace)
+
+    with pytest.raises(
+        OSError,
+        match="simulated technical facts latest promotion failure",
+    ):
+        run_premarket(
+            run_date="2026-06-16",
+            portfolio_path=portfolio_path,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            advice_runner=FakeAdviceRunner(),
+            classifier=FakeClassifier(),
+            symbols=None,
+            update_latest=True,
+            technical_facts_generator=FakeTechnicalFactsGenerator(),
+        )
+
+    assert (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    ) == original_advice
+    assert (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    ) == original_actions
+    assert (
+        latest_technical_facts.read_text(encoding="utf-8") == original_technical_facts
+    )
 
 
 def test_run_premarket_converts_advice_runner_failure_and_continues(
