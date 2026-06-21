@@ -144,7 +144,7 @@ def build_freshness(
         }
     if has_unknown_timeframe:
         return {
-            "status": "unknown_timeframe",
+            "status": "missing_timeframe",
             "message": "指标周期缺失，需复核",
         }
     return {

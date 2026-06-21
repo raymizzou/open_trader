@@ -188,7 +188,7 @@ def test_build_freshness_marks_missing_timeframe_with_exact_review_message() -> 
         has_unknown_timeframe=True,
     )
 
-    assert freshness["status"] == "unknown_timeframe"
+    assert freshness["status"] == "missing_timeframe"
     assert freshness["message"] == "指标周期缺失，需复核"
 
 
