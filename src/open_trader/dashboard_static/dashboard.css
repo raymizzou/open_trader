@@ -776,6 +776,42 @@ tbody tr.active-row {
   margin-top: 3px;
 }
 
+.technical-facts-meta {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.technical-fact-grid {
+  display: grid;
+  gap: 7px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.technical-fact-row {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px;
+}
+
+.technical-fact-row span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.technical-fact-row strong {
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .condition-box {
   background: var(--surface-soft);
   border: 1px solid var(--line);
@@ -1524,7 +1560,8 @@ tbody tr.active-row {
   .decision-plugin-grid,
   .final-conclusion-list,
   .llm-template-grid,
-  .research-conclusion-grid {
+  .research-conclusion-grid,
+  .technical-fact-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1618,7 +1655,8 @@ tbody tr.active-row {
   .decision-plugin-grid,
   .analyst-dialogue .dialogue-list,
   .final-conclusion-list,
-  .llm-template-grid {
+  .llm-template-grid,
+  .technical-fact-grid {
     grid-template-columns: 1fr;
   }
 
