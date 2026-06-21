@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from .research_chat import load_research_view_for_holding
+from .technical_facts import (
+    extract_market_report,
+    load_latest_technical_facts_by_market_symbol,
+    source_hash,
+    technical_facts_has_missing_timeframe,
+    technical_facts_latest_path,
+)
 
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
@@ -96,6 +103,11 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
     premarket_actions = _read_csv_rows(
         config.data_dir / "latest" / "premarket_actions.csv"
     )
+    technical_facts_path = technical_facts_latest_path(config.data_dir)
+    technical_facts_file_exists = technical_facts_path.exists()
+    technical_facts_by_holding = load_latest_technical_facts_by_market_symbol(
+        config.data_dir
+    )
 
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
@@ -113,6 +125,8 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             strategies_by_holding,
             premarket_actions_by_holding,
             actions_by_holding,
+            technical_facts_by_holding,
+            technical_facts_file_exists,
         )
         for row in holding_rows
     ]
@@ -232,6 +246,8 @@ def _merge_holding(
     strategies_by_holding: dict[tuple[str, str], dict[str, str]],
     premarket_actions_by_holding: dict[tuple[str, str], dict[str, str]],
     actions_by_holding: dict[tuple[str, str], dict[str, str]],
+    technical_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
+    technical_facts_file_exists: bool,
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -250,6 +266,11 @@ def _merge_holding(
     holding["strategy"] = _strategy_detail(strategy)
     holding["premarket_action"] = _row_detail(premarket_action)
     holding["trade_action"] = _row_detail(trade_action)
+    holding["technical_facts"] = _technical_facts_detail(
+        technical_facts_by_holding.get(key) if key is not None else None,
+        agent_report,
+        cache_file_exists=technical_facts_file_exists,
+    )
     holding["research_view"] = (
         load_research_view_for_holding(
             data_dir=data_dir,
@@ -318,6 +339,118 @@ def _agent_report_detail(row: dict[str, str] | None) -> dict[str, Any]:
 
 def _strategy_detail(row: dict[str, str] | None) -> dict[str, Any]:
     return _row_detail(row)
+
+
+def _technical_facts_detail(
+    record: dict[str, Any] | None,
+    advice_row: dict[str, str] | None,
+    *,
+    cache_file_exists: bool,
+) -> dict[str, Any]:
+    if not cache_file_exists:
+        return _technical_facts_unavailable(
+            "missing_file",
+            error="technical_facts.json not found",
+        )
+    if record is None:
+        return _technical_facts_unavailable(
+            "missing_record",
+            error="technical facts record not found",
+            current_source_hash=_current_advice_source_hash(advice_row),
+        )
+
+    facts = record.get("facts")
+    facts_payload: dict[str, object] = facts if isinstance(facts, dict) else {}
+    freshness = record.get("freshness")
+    freshness_payload: dict[str, Any] = freshness if isinstance(freshness, dict) else {}
+    run_date = str(record.get("run_date") or "")
+    data_date = str(facts_payload.get("market_data_as_of") or "")
+    record_source_hash = str(
+        record.get("source_hash") or record.get("source_advice_hash") or ""
+    ).strip()
+    current_source_hash = _current_advice_source_hash(advice_row)
+
+    common = {
+        "run_date": run_date,
+        "data_date": data_date,
+        "source_hash": record_source_hash,
+        "current_source_hash": current_source_hash,
+        "freshness": freshness_payload,
+    }
+    if not current_source_hash:
+        return _technical_facts_unavailable(
+            "missing_source_hash",
+            error="latest advice market report source hash unavailable",
+            **common,
+        )
+    if record_source_hash != current_source_hash:
+        return _technical_facts_unavailable(
+            "stale_source_hash",
+            error="technical facts source hash does not match latest advice",
+            **common,
+        )
+
+    extraction_status = str(record.get("extraction_status") or "").strip()
+    if extraction_status != "ok":
+        status = (
+            "missing_source"
+            if extraction_status == "missing_source"
+            else "extraction_error"
+        )
+        return _technical_facts_unavailable(
+            status,
+            error=str(record.get("error") or extraction_status or "extraction failed"),
+            **common,
+        )
+    if (
+        freshness_payload.get("status") == "missing_timeframe"
+        or technical_facts_has_missing_timeframe(facts_payload)
+    ):
+        return _technical_facts_unavailable(
+            "missing_timeframe",
+            error="technical facts timeframe missing",
+            **common,
+        )
+
+    return {
+        "available": True,
+        "status": "usable",
+        "error": "",
+        **common,
+        "facts": facts_payload,
+    }
+
+
+def _technical_facts_unavailable(
+    status: str,
+    *,
+    run_date: str = "",
+    data_date: str = "",
+    source_hash: str = "",
+    current_source_hash: str = "",
+    error: str = "",
+    freshness: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": status,
+        "run_date": run_date,
+        "data_date": data_date,
+        "source_hash": source_hash,
+        "current_source_hash": current_source_hash,
+        "error": error,
+        "freshness": freshness or {},
+        "facts": {},
+    }
+
+
+def _current_advice_source_hash(row: dict[str, str] | None) -> str:
+    if row is None:
+        return ""
+    market_report = extract_market_report(row.get("raw_decision", ""))
+    if not market_report:
+        return ""
+    return source_hash(market_report)
 
 
 def _build_summary(

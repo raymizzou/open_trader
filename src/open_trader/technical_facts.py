@@ -203,6 +203,35 @@ def load_technical_facts_cache(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def load_latest_technical_facts_by_market_symbol(
+    data_dir: Path,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    return index_technical_facts_by_market_symbol(
+        load_technical_facts_cache(technical_facts_latest_path(data_dir))
+    )
+
+
+def index_technical_facts_by_market_symbol(
+    cache: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    records = cache.get("records")
+    if not isinstance(records, list):
+        return {}
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        market = str(record.get("market") or "").strip().upper()
+        symbol = str(record.get("symbol") or "").strip().upper()
+        if market and symbol:
+            indexed[(market, symbol)] = record
+    return indexed
+
+
+def technical_facts_has_missing_timeframe(facts: dict[str, object]) -> bool:
+    return _has_unknown_timeframe(facts)
+
+
 def build_freshness(
     *,
     market_data_as_of: str,
