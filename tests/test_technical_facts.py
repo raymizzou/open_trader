@@ -4,11 +4,54 @@ import csv
 import json
 from pathlib import Path
 
+from open_trader.market_scope import MarketScope
 from open_trader.technical_facts import (
+    TechnicalFactsExtractor,
+    build_freshness,
     extract_market_report,
+    generate_technical_facts,
     load_advice_sources,
+    load_technical_facts_cache,
     source_hash,
+    technical_facts_latest_path,
+    technical_facts_run_path,
 )
+
+
+class FakeExtractor(TechnicalFactsExtractor):
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def extract(
+        self, *, market: str, symbol: str, run_date: str, market_report: str
+    ) -> dict[str, object]:
+        self.calls.append(market_report)
+        assert "FINAL TRANSACTION PROPOSAL" not in market_report
+        return {
+            "schema_version": "open_trader.technical_facts.v1",
+            "status": "present",
+            "source_date": run_date,
+            "market_data_as_of": "2026-06-18",
+            "symbol": f"{market}.{symbol}",
+            "timeframes": [
+                {
+                    "timeframe": "daily",
+                    "timeframe_label": "日线",
+                    "current_price": "411.60",
+                    "trend_summary": "价格高于主要均线。",
+                    "moving_averages": {"ema_10": "398.15", "sma_50": "368.24"},
+                    "macd": {"crossover": "6月17日金叉"},
+                    "rsi": {"value": "56.88"},
+                    "bollinger": {},
+                    "atr": {"value": "33.17", "percent_of_price": "8.1%"},
+                    "volume": {},
+                    "support_resistance": {"support_levels": [], "resistance_levels": []},
+                    "price_action": {"timeline": []},
+                    "risks": [],
+                    "evidence_quotes": ["MACD line crossed above Signal line on June 17."],
+                }
+            ],
+        }
 
 
 def write_advice(path: Path, rows: list[dict[str, str]]) -> None:
@@ -92,3 +135,138 @@ def test_load_advice_sources_reads_rows_with_market_report(tmp_path: Path) -> No
     assert sources[0].run_date == "2026-06-19"
     assert sources[0].market_report == "Daily RSI 56.88"
     assert sources[0].source_advice_hash == source_hash("Daily RSI 56.88")
+
+
+def test_build_freshness_prefers_timeframe_and_market_data_date() -> None:
+    freshness = build_freshness(
+        market_data_as_of="2026-06-18",
+        run_date="2026-06-19",
+        has_unknown_timeframe=False,
+    )
+
+    assert freshness == {
+        "status": "fresh",
+        "message": "日线数据截至 2026-06-18",
+    }
+
+
+def test_build_freshness_marks_missing_date() -> None:
+    freshness = build_freshness(
+        market_data_as_of="",
+        run_date="2026-06-19",
+        has_unknown_timeframe=False,
+    )
+
+    assert freshness["status"] == "missing_date"
+    assert freshness["message"] == "行情日期缺失，报告生成于 2026-06-19"
+
+
+def test_generate_technical_facts_writes_run_and_latest_cache(tmp_path: Path) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Buy",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report(
+                    "Daily MACD crossed. FINAL TRANSACTION PROPOSAL: BUY"
+                ),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    extractor = FakeExtractor()
+
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=extractor,
+        update_latest=True,
+        market=None,
+    )
+
+    assert result.records == 1
+    assert result.extracted == 1
+    assert result.reused == 0
+    assert result.run_path == tmp_path / "data/runs/2026-06-19/technical_facts.json"
+    assert result.latest_path == tmp_path / "data/latest/technical_facts.json"
+    cache = load_technical_facts_cache(result.latest_path)
+    row = cache["records"][0]
+    assert row["market"] == "HK"
+    assert row["symbol"] == "02476"
+    assert row["extraction_status"] == "ok"
+    assert row["freshness"]["message"] == "日线数据截至 2026-06-18"
+    assert "BUY" not in json.dumps(row["facts"], ensure_ascii=False)
+
+
+def test_generate_technical_facts_reuses_matching_latest_cache(tmp_path: Path) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    report = "Daily RSI 56.88"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report(report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    extractor = FakeExtractor()
+    first = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=extractor,
+        update_latest=True,
+        market=None,
+    )
+
+    second_extractor = FakeExtractor()
+    second = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=second_extractor,
+        update_latest=True,
+        market=None,
+    )
+
+    assert first.extracted == 1
+    assert second.extracted == 0
+    assert second.reused == 1
+    assert second_extractor.calls == []
+
+
+def test_technical_facts_paths_support_market_scope(tmp_path: Path) -> None:
+    assert technical_facts_run_path(
+        tmp_path / "data", "2026-06-19", MarketScope.HK
+    ) == tmp_path / "data/runs/2026-06-19/HK/technical_facts.json"
+    assert technical_facts_latest_path(
+        tmp_path / "data", MarketScope.HK
+    ) == tmp_path / "data/latest/HK/technical_facts.json"
