@@ -702,15 +702,7 @@ function renderTradingDecisionPlugins(holding) {
     || sectionAvailable(holding.strategy)
     || sectionAvailable(action);
   const plugins = [
-    {
-      title: "趋势 / K 线",
-      status: "占位",
-      tone: "muted",
-      score: "-",
-      headline: "待接入",
-      detail: "未来确认价格趋势、关键均线、短线是否偏热。",
-      condition: "条件：当前价是否达到目标价、是否出现趋势背离或跌破保护价。",
-    },
+    klineTechnicalFactsPlugin(holding),
     {
       title: "新闻 / 舆论",
       status: "占位",
@@ -780,7 +772,7 @@ function renderTradingDecisionPlugins(holding) {
       <div class="trading-decision-section-header">
         <div>
           <h3>插件模块</h3>
-          <p>每个模块说明条件是否达成，或正在确认的事实；当前仅 TradingAgents 有真实决策数据。</p>
+          <p>每个模块说明条件是否达成，或正在确认的事实；趋势 / K 线读取技术事实，其余插件仍为占位。</p>
         </div>
       </div>
       <div class="decision-plugin-grid">
@@ -804,9 +796,264 @@ function renderDecisionPluginCard(plugin) {
           <span>${escapeHtml(plugin.detail)}</span>
         </div>
       </div>
+      ${plugin.bodyHtml || ""}
       <p class="condition-box">${escapeHtml(plugin.condition)}</p>
     </article>
   `;
+}
+
+function klineTechnicalFactsPlugin(holding) {
+  const detail = holding && typeof holding.technical_facts === "object"
+    ? holding.technical_facts
+    : null;
+  if (technicalFactsUsable(detail)) {
+    const rows = technicalFactRows(detail.facts);
+    const dateText = technicalFactsDateText(detail);
+    return {
+      title: "趋势 / K 线",
+      status: "可用",
+      tone: "ok",
+      score: "K线",
+      headline: dateText || "当前可用",
+      detail: technicalFactsFreshnessText(detail) || "技术面事实已按最新 TradingAgents 来源校验。",
+      bodyHtml: renderTechnicalFactRows(rows),
+      condition: technicalFactsRunText(detail) || "条件：技术面事实与最新报告来源一致。",
+    };
+  }
+  const unavailable = technicalFactsUnavailableText(detail);
+  return {
+    title: "趋势 / K 线",
+    status: "不可用",
+    tone: unavailable.tone,
+    score: "-",
+    headline: unavailable.label,
+    detail: unavailable.detail,
+    bodyHtml: renderTechnicalFactsMeta(detail),
+    condition: "条件：只有技术事实可用、来源未过期且周期完整时，才作为当前 K 线依据。",
+  };
+}
+
+function technicalFactsUsable(detail) {
+  return Boolean(
+    detail
+    && detail.available === true
+    && detail.status === "usable"
+    && detail.facts
+    && Array.isArray(detail.facts.timeframes)
+    && detail.facts.timeframes.length,
+  );
+}
+
+function technicalFactsUnavailableText(detail) {
+  const status = detail && hasValue(detail.status) ? String(detail.status) : "missing_file";
+  const labels = {
+    missing_file: "缺少文件",
+    missing_record: "缺少记录",
+    stale_source_hash: "来源已过期",
+    extraction_error: "抽取失败",
+    missing_source: "缺少来源",
+    missing_source_hash: "缺少来源哈希",
+    missing_timeframe: "缺少周期",
+  };
+  const tones = {
+    missing_file: "partial",
+    missing_record: "partial",
+    stale_source_hash: "stale",
+    extraction_error: "failed",
+    missing_source: "failed",
+    missing_source_hash: "failed",
+    missing_timeframe: "failed",
+  };
+  return {
+    label: labels[status] || "不可用",
+    tone: tones[status] || "partial",
+    detail: firstPresent(detail && detail.error, technicalFactsFreshnessText(detail), "暂无可用 K 线技术事实。"),
+  };
+}
+
+function technicalFactsDateText(detail) {
+  const parts = [];
+  if (detail && hasValue(detail.data_date)) {
+    parts.push(`数据日 ${detail.data_date}`);
+  }
+  if (detail && hasValue(detail.run_date)) {
+    parts.push(`运行 ${detail.run_date}`);
+  }
+  return parts.join(" · ");
+}
+
+function technicalFactsRunText(detail) {
+  const dates = technicalFactsDateText(detail);
+  if (!dates) {
+    return "";
+  }
+  return `条件：${dates}；来源哈希已与最新报告校验。`;
+}
+
+function technicalFactsFreshnessText(detail) {
+  const freshness = detail && detail.freshness && typeof detail.freshness === "object"
+    ? detail.freshness
+    : {};
+  return firstPresent(freshness.message, freshness.status);
+}
+
+function renderTechnicalFactsMeta(detail) {
+  const dates = technicalFactsDateText(detail);
+  if (!dates) {
+    return "";
+  }
+  return `<div class="technical-facts-meta">${escapeHtml(dates)}</div>`;
+}
+
+function renderTechnicalFactRows(rows) {
+  if (!rows.length) {
+    return `<p class="compact-empty">暂无可展示的周期指标。</p>`;
+  }
+  return `
+    <div class="technical-fact-grid">
+      ${rows.map((row) => `
+        <div class="technical-fact-row">
+          <span>${escapeHtml(row.label)}</span>
+          <strong>${escapeHtml(row.value)}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function technicalFactRows(facts) {
+  const timeframes = facts && Array.isArray(facts.timeframes) ? facts.timeframes : [];
+  return timeframes.flatMap((timeframe) => technicalFactRowsForTimeframe(timeframe));
+}
+
+function technicalFactRowsForTimeframe(timeframe) {
+  if (!timeframe || typeof timeframe !== "object") {
+    return [];
+  }
+  const label = timeframeLabel(timeframe);
+  const rows = [];
+  addTechnicalFactRow(rows, `${label} 当前价`, indicatorValue(timeframe.current_price));
+  addTechnicalFactRow(rows, `${label} RSI`, indicatorValue(timeframe.rsi));
+  addTechnicalFactRow(rows, `${label} MACD`, macdValue(timeframe.macd));
+  addTechnicalFactRow(rows, `${label} MACD`, indicatorValue(timeframe.macd_golden_cross));
+  addTechnicalFactRow(rows, `${label} 金叉`, goldenCrossText(timeframe.golden_cross));
+  addTechnicalFactRow(rows, `${label} 趋势`, indicatorValue(timeframe.trend_summary || timeframe.trend));
+  addTechnicalFactRow(rows, `${label} ATR`, atrValue(timeframe.atr));
+  addTechnicalFactRow(rows, `${label} 支撑`, supportResistanceValue(timeframe, "support"));
+  addTechnicalFactRow(rows, `${label} 阻力`, supportResistanceValue(timeframe, "resistance"));
+  addTechnicalFactRow(rows, `${label} 均线`, movingAverageValue(timeframe));
+  return rows;
+}
+
+function addTechnicalFactRow(rows, label, value) {
+  if (hasValue(value)) {
+    rows.push({ label, value: formatPlain(value) });
+  }
+}
+
+function timeframeLabel(timeframe) {
+  const explicit = timeframe.timeframe_label || timeframe.label;
+  if (hasValue(explicit)) {
+    return formatPlain(explicit);
+  }
+  const key = String(timeframe.timeframe || timeframe.period || "").toLowerCase();
+  const labels = {
+    daily: "日线",
+    day: "日线",
+    "1d": "日线",
+    weekly: "周线",
+    week: "周线",
+    "1w": "周线",
+    monthly: "月线",
+    month: "月线",
+    "1m": "月线",
+    yearly: "年线",
+    year: "年线",
+    "1y": "年线",
+  };
+  return labels[key] || formatPlain(timeframe.timeframe || timeframe.period || "未标明周期");
+}
+
+function indicatorValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  return firstPresent(value.value, value.text, value.status, value.signal, value.summary);
+}
+
+function macdValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const macdLine = firstPresent(value.macd, value.value);
+  const parts = [
+    hasValue(macdLine) ? `MACD ${macdLine}` : "",
+    hasValue(value.signal) ? `Signal ${value.signal}` : "",
+    hasValue(value.histogram) ? `Hist ${value.histogram}` : "",
+    indicatorValue(value.crossover),
+    goldenCrossText(value.golden_cross),
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function atrValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  return [
+    indicatorValue(value.value),
+    indicatorValue(value.percent_of_price),
+  ].filter((part) => hasValue(part)).join(" · ");
+}
+
+function supportResistanceValue(timeframe, kind) {
+  const payload = timeframe.support_resistance && typeof timeframe.support_resistance === "object"
+    ? timeframe.support_resistance
+    : {};
+  const schemaValue = kind === "support"
+    ? payload.support_levels
+    : payload.resistance_levels;
+  const legacyValue = kind === "support" ? timeframe.support : timeframe.resistance;
+  return listValue(firstPresent(schemaValue, legacyValue));
+}
+
+function listValue(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => indicatorValue(item))
+      .filter((item) => hasValue(item))
+      .map((item) => formatPlain(item))
+      .join(" · ");
+  }
+  return indicatorValue(value);
+}
+
+function goldenCrossText(value) {
+  if (value === true) {
+    return "金叉";
+  }
+  if (value === false) {
+    return "未金叉";
+  }
+  return indicatorValue(value);
+}
+
+function movingAverageValue(timeframe) {
+  const averages = timeframe.moving_averages || timeframe.ma || timeframe.averages;
+  if (averages && typeof averages === "object" && !Array.isArray(averages)) {
+    const parts = Object.entries(averages)
+      .filter(([, value]) => hasValue(value))
+      .map(([key, value]) => `${key.toUpperCase()} ${formatPlain(value)}`);
+    if (parts.length) {
+      return parts.join(" · ");
+    }
+  }
+  const parts = [
+    hasValue(timeframe.ma20) ? `MA20 ${timeframe.ma20}` : "",
+    hasValue(timeframe.ma50) ? `MA50 ${timeframe.ma50}` : "",
+    hasValue(timeframe.ma200) ? `MA200 ${timeframe.ma200}` : "",
+  ].filter(Boolean);
+  return parts.join(" · ");
 }
 
 function renderLLMDecisionTemplate(holding) {

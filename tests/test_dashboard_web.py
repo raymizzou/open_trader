@@ -309,6 +309,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".decision-dashboard" in css
     assert ".decision-card.primary" in css
     assert ".decision-metric-strip" in css
+    assert ".technical-fact-grid" in css
     assert ".analyst-dialogue" in css
     assert ".final-conclusion-list" in css
     assert ".research-conclusion-grid" in css
@@ -325,7 +326,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "交易决策" in js
     assert "插件模块" in js
     assert "大模型决策模板" in js
-    assert "当前仅 TradingAgents 有真实决策数据" in js
+    assert "趋势 / K 线读取技术事实，其余插件仍为占位" in js
+    assert "technical_facts" in js
+    assert "technicalFactRows" in js
     assert "插件管理" not in js
     assert "策略阈值" not in js
     assert "暂无 TradingAgents 报告" in js
@@ -649,6 +652,179 @@ const noActionHtml = renderAnalysisStrategySection({
 });
 if (!noActionHtml.includes("今天暂无触发中的交易动作")) {
   throw new Error("missing explicit no-action state: " + noActionHtml);
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_renders_usable_kline_technical_facts_with_timeframe_labels() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+function klineCard(html) {
+  const start = html.indexOf("<h4>趋势 / K 线</h4>");
+  const end = html.indexOf("新闻 / 舆论");
+  if (start < 0 || end < 0 || end <= start) {
+    throw new Error("K-line card boundaries missing: " + html);
+  }
+  return html.slice(start, end);
+}
+const holding = {
+  market: "HK",
+  symbol: "02476",
+  portfolio_weight_hkd: "8.97%",
+  agent_report: {available: false},
+  strategy: {available: false},
+  trade_action: {available: false},
+  premarket_action: {available: false},
+  technical_facts: {
+    available: true,
+    status: "usable",
+    run_date: "2026-06-19",
+    data_date: "2026-06-18",
+    error: "",
+    freshness: {status: "fresh", message: "日线数据截至 2026-06-18"},
+    facts: {
+      status: "present",
+      market_data_as_of: "2026-06-18",
+      timeframes: [
+        {
+          timeframe: "daily",
+          timeframe_label: "日线",
+          current_price: "411.60",
+          trend_summary: "价格高于主要均线。",
+          rsi: {value: "56.88"},
+          macd: {macd: "0.22", signal: "0.15", histogram: "0.07", crossover: "bullish crossover / 金叉"},
+          atr: {value: "33.17", percent_of_price: "8.1%"},
+          support_resistance: {
+            support_levels: ["398.15", "368.24"],
+            resistance_levels: ["430.00", "445.50"]
+          }
+        },
+        {
+          timeframe: "weekly",
+          timeframe_label: "周线",
+          current_price: "409.20",
+          trend_summary: "周线仍在上行通道。",
+          macd: {crossover: "形成金叉"},
+          atr: "41.10",
+          support_resistance: {
+            support_levels: ["380.00"],
+            resistance_levels: ["455.00"]
+          }
+        },
+        {
+          timeframe: "monthly",
+          timeframe_label: "月线",
+          rsi: "61.20"
+        }
+      ]
+    }
+  }
+};
+const card = klineCard(renderTradingDecisionPlugins(holding));
+for (const required of [
+  "可用",
+  "数据日 2026-06-18",
+  "运行 2026-06-19",
+  "日线 RSI",
+  "56.88",
+  "日线 MACD",
+  "MACD 0.22",
+  "金叉",
+  "日线 当前价",
+  "411.60",
+  "日线 趋势",
+  "价格高于主要均线。",
+  "日线 ATR",
+  "33.17 · 8.1%",
+  "日线 支撑",
+  "398.15 · 368.24",
+  "日线 阻力",
+  "430.00 · 445.50",
+  "周线 MACD",
+  "形成金叉",
+  "周线 当前价",
+  "409.20",
+  "周线 ATR",
+  "41.10",
+  "周线 支撑",
+  "380.00",
+  "周线 阻力",
+  "455.00",
+  "月线 RSI",
+  "61.20"
+]) {
+  if (!card.includes(required)) {
+    throw new Error("missing K-line technical fact " + required + ": " + card);
+  }
+}
+if (card.includes("待接入") || card.includes("占位") || card.includes("rsi:")) {
+  throw new Error("usable technical facts rendered as placeholder/raw field: " + card);
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_renders_kline_technical_fact_unavailable_states() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+function klineCard(html) {
+  const start = html.indexOf("<h4>趋势 / K 线</h4>");
+  const end = html.indexOf("新闻 / 舆论");
+  if (start < 0 || end < 0 || end <= start) {
+    throw new Error("K-line card boundaries missing: " + html);
+  }
+  return html.slice(start, end);
+}
+const cases = [
+  [{available: false, status: "missing_file", error: "technical_facts.json not found"}, "缺少文件"],
+  [{available: false, status: "missing_record", error: "technical facts record not found"}, "缺少记录"],
+  [{available: false, status: "stale_source_hash", run_date: "2026-06-19", data_date: "2026-06-18", error: "technical facts source hash does not match latest advice"}, "来源已过期"],
+  [{available: false, status: "extraction_error", run_date: "2026-06-19", data_date: "2026-06-18", error: "llm unavailable"}, "抽取失败"],
+  [{available: false, status: "missing_timeframe", run_date: "2026-06-19", data_date: "2026-06-18", error: "technical facts timeframe missing"}, "缺少周期"],
+];
+for (const [technicalFacts, label] of cases) {
+  const card = klineCard(renderTradingDecisionPlugins({
+    market: "US",
+    symbol: "VIXY",
+    portfolio_weight_hkd: "7.11%",
+    agent_report: {available: false},
+    strategy: {available: false},
+    trade_action: {available: false},
+    premarket_action: {available: false},
+    technical_facts: technicalFacts,
+  }));
+  if (!card.includes(label) || !card.includes("不可用")) {
+    throw new Error("missing unavailable state " + label + ": " + card);
+  }
+  if (technicalFacts.run_date && (!card.includes("运行 2026-06-19") || !card.includes("数据日 2026-06-18"))) {
+    throw new Error("unavailable state should preserve dates: " + card);
+  }
+  if (card.includes("日线 RSI") || card.includes("当前可用")) {
+    throw new Error("unavailable facts presented as current: " + card);
+  }
 }
 `, sandbox);
 """
@@ -1220,7 +1396,7 @@ if (!elements["holdings-body"].innerHTML.includes("交易决策") || elements["h
 if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
   throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
 }
-for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "当前仅 TradingAgents 有真实决策数据", "占位"]) {
+for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "趋势 / K 线读取技术事实，其余插件仍为占位", "占位"]) {
   if (!elements["holdings-body"].innerHTML.includes(required)) {
     throw new Error("trading decision detail missing " + required + ": " + elements["holdings-body"].innerHTML);
   }

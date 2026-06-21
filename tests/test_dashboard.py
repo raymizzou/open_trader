@@ -10,6 +10,7 @@ from open_trader.advice.models import (
 )
 from open_trader.dashboard import DashboardConfig, load_dashboard_state
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
+from open_trader.technical_facts import source_hash
 from open_trader.trade_actions import TRADE_ACTION_FIELDNAMES
 from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 
@@ -61,6 +62,64 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
         poll_seconds=1.5,
         futu_host="127.0.0.1",
         futu_port=11111,
+    )
+
+
+def raw_decision_with_market_report(report: str) -> str:
+    return json.dumps({"state": {"market_report": report}}, ensure_ascii=False)
+
+
+def write_technical_facts(
+    path: Path,
+    *,
+    report_hash: str,
+    market: str = "US",
+    extraction_status: str = "ok",
+    timeframes: list[dict[str, object]] | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.technical_facts_cache.v1",
+                "generated_at": "2026-06-19T08:30:00+08:00",
+                "run_date": "2026-06-19",
+                "market": "",
+                "records": [
+                    {
+                        "run_date": "2026-06-19",
+                        "market": market,
+                        "symbol": "VIXY",
+                        "source_status": "ok",
+                        "source_advice_hash": report_hash,
+                        "extraction_status": extraction_status,
+                        "error": "" if extraction_status == "ok" else "llm unavailable",
+                        "facts": {
+                            "schema_version": "open_trader.technical_facts.v1",
+                            "status": "present",
+                            "source_date": "2026-06-19",
+                            "market_data_as_of": "2026-06-18",
+                            "symbol": f"{market}.VIXY",
+                            "timeframes": timeframes
+                            if timeframes is not None
+                            else [
+                                {
+                                    "timeframe": "daily",
+                                    "timeframe_label": "日线",
+                                    "rsi": {"value": "56.88"},
+                                }
+                            ],
+                        },
+                        "freshness": {
+                            "status": "fresh",
+                            "message": "日线数据截至 2026-06-18",
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
 
 
@@ -447,6 +506,258 @@ def test_load_dashboard_state_merges_agent_report_strategy_and_actions(
     assert vixy["trade_action"]["available"] is True
     assert vixy["trade_action"]["action"] == "TRIM"
     assert vixy["trade_action"]["suggested_quantity"] == "50"
+
+
+def test_load_dashboard_state_attaches_fresh_technical_facts(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    report = "Daily RSI is 56.88 with price above the 50 day average."
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Watch volatility.",
+                "raw_decision": raw_decision_with_market_report(report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_technical_facts(
+        config.data_dir / "latest" / "technical_facts.json",
+        report_hash=source_hash(report),
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["technical_facts"]["available"] is True
+    assert vixy["technical_facts"]["status"] == "usable"
+    assert vixy["technical_facts"]["run_date"] == "2026-06-19"
+    assert vixy["technical_facts"]["data_date"] == "2026-06-18"
+    assert vixy["technical_facts"]["source_hash"] == source_hash(report)
+    assert vixy["technical_facts"]["facts"]["timeframes"][0]["timeframe"] == "daily"
+
+
+def test_load_dashboard_state_marks_missing_technical_facts_file_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["technical_facts"] == {
+        "available": False,
+        "status": "missing_file",
+        "run_date": "",
+        "data_date": "",
+        "source_hash": "",
+        "current_source_hash": "",
+        "error": "technical_facts.json not found",
+        "freshness": {},
+        "facts": {},
+    }
+
+
+def test_load_dashboard_state_marks_stale_technical_facts_hash_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    current_report = "Current report says RSI is 40."
+    old_report = "Old report says RSI is 70."
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Watch volatility.",
+                "raw_decision": raw_decision_with_market_report(current_report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_technical_facts(
+        config.data_dir / "latest" / "technical_facts.json",
+        report_hash=source_hash(old_report),
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["technical_facts"]["available"] is False
+    assert vixy["technical_facts"]["status"] == "stale_source_hash"
+    assert vixy["technical_facts"]["run_date"] == "2026-06-19"
+    assert vixy["technical_facts"]["data_date"] == "2026-06-18"
+    assert vixy["technical_facts"]["source_hash"] == source_hash(old_report)
+    assert vixy["technical_facts"]["current_source_hash"] == source_hash(current_report)
+    assert vixy["technical_facts"]["facts"] == {}
+
+
+def test_load_dashboard_state_prefers_market_scoped_technical_facts_and_advice(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    old_report = "Old unscoped report says RSI is 70."
+    current_report = "Current scoped US report says RSI is 40."
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-18",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Old advice.",
+                "raw_decision": raw_decision_with_market_report(old_report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Scoped advice.",
+                "raw_decision": raw_decision_with_market_report(current_report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_technical_facts(
+        config.data_dir / "latest" / "technical_facts.json",
+        report_hash=source_hash(old_report),
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["agent_report"]["run_date"] == "2026-06-19"
+    assert vixy["technical_facts"]["available"] is False
+    assert vixy["technical_facts"]["status"] == "missing_file"
+    assert vixy["technical_facts"]["current_source_hash"] == source_hash(current_report)
+
+
+def test_load_dashboard_state_uses_scoped_facts_when_both_latest_layouts_exist(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    old_report = "Old unscoped report says RSI is 70."
+    current_report = "Current scoped US report says RSI is 40."
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-18",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Old advice.",
+                "raw_decision": raw_decision_with_market_report(old_report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Scoped advice.",
+                "raw_decision": raw_decision_with_market_report(current_report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_technical_facts(
+        config.data_dir / "latest" / "technical_facts.json",
+        report_hash=source_hash(old_report),
+    )
+    write_technical_facts(
+        config.data_dir / "latest" / "US" / "technical_facts.json",
+        report_hash=source_hash(current_report),
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["technical_facts"]["available"] is True
+    assert vixy["technical_facts"]["status"] == "usable"
+    assert vixy["technical_facts"]["source_hash"] == source_hash(current_report)
+    assert vixy["technical_facts"]["current_source_hash"] == source_hash(current_report)
 
 
 def test_load_dashboard_state_marks_missing_agent_sections_unavailable(

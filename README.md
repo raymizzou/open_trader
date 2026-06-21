@@ -19,6 +19,8 @@ OpenD, and writes reports. It does not place orders automatically.
   while preserving non-Tiger rows.
 - Generate per-symbol premarket advice with TradingAgents and DeepSeek.
 - Preserve raw model output and normalized trader templates for auditability.
+- Extract K-line technical facts from TradingAgents advice/report output into
+  cacheable `technical_facts.json` artifacts.
 - Fall back to the latest prior successful advice when a daily run misses the
   hard deadline or a symbol analysis fails.
 - Build machine-readable trading plans from the advice summaries.
@@ -159,6 +161,30 @@ commands, not monthly statement import.
   --ta-max-retries 1
 ```
 
+Premarket advice runs extract K-line technical facts from each TradingAgents
+advice/report row after advice generation. The cache is written as
+`technical_facts.json`; daily market-scoped runs promote it with the rest of the
+latest set when the run is successful.
+
+### Backfill Technical Facts
+
+Use the extractor CLI when you need to rebuild technical facts from an existing
+advice CSV:
+
+```bash
+open-trader extract-technical-facts \
+  --advice data/runs/2026-06-19/US/trading_advice.csv \
+  --data-dir data \
+  --date 2026-06-19 \
+  --market US \
+  --update-latest
+```
+
+With `--market HK` or `--market US`, the dated cache is written under that
+market's run directory and `--update-latest` promotes it to the matching latest
+market path, such as `data/latest/HK/technical_facts.json` or
+`data/latest/US/technical_facts.json`.
+
 ### Build Trading Plan
 
 ```bash
@@ -267,6 +293,12 @@ stable. It reads
 When Futu OpenD quotes are available, the dashboard refreshes prices from OpenD.
 If a quote refresh fails, it keeps the last successful quote snapshot and shows
 a failure or stale warning instead of hiding the problem.
+
+The dashboard also reads technical facts from `technical_facts.json` when
+available. Symbol details show both the facts run date and the underlying market
+data date. Missing files, missing records, stale source hashes, extraction
+errors, or incomplete timeframe data are marked unavailable, so stale technical
+facts are not presented as current.
 
 The dashboard is read-only: it does not place orders or modify data.
 
@@ -390,12 +422,14 @@ data/runs/<YYYY-MM-DD>/HK/change_classifications.csv
 data/runs/<YYYY-MM-DD>/HK/premarket_actions.csv
 data/runs/<YYYY-MM-DD>/HK/trading_plan.csv
 data/runs/<YYYY-MM-DD>/HK/trade_actions.csv
+data/runs/<YYYY-MM-DD>/HK/technical_facts.json
 data/runs/<YYYY-MM-DD>/HK/daily_run_status.json
 data/runs/<YYYY-MM-DD>/US/trading_advice.csv
 data/runs/<YYYY-MM-DD>/US/change_classifications.csv
 data/runs/<YYYY-MM-DD>/US/premarket_actions.csv
 data/runs/<YYYY-MM-DD>/US/trading_plan.csv
 data/runs/<YYYY-MM-DD>/US/trade_actions.csv
+data/runs/<YYYY-MM-DD>/US/technical_facts.json
 data/runs/<YYYY-MM-DD>/US/daily_run_status.json
 reports/daily_runs/<YYYY-MM-DD>-HK.md
 reports/daily_runs/<YYYY-MM-DD>-US.md
@@ -411,10 +445,12 @@ data/latest/HK/trading_advice.csv
 data/latest/HK/premarket_actions.csv
 data/latest/HK/trading_plan.csv
 data/latest/HK/trade_actions.csv
+data/latest/HK/technical_facts.json
 data/latest/US/trading_advice.csv
 data/latest/US/premarket_actions.csv
 data/latest/US/trading_plan.csv
 data/latest/US/trade_actions.csv
+data/latest/US/technical_facts.json
 ```
 
 ## Development

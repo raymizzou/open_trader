@@ -36,6 +36,7 @@ from .tiger_account import (
     mask_account_id,
     sync_tiger_portfolio,
 )
+from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_facts
 from .trade_actions import generate_trade_actions
 from .trading_plan import (
     TradingPlanRow,
@@ -327,6 +328,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Write run output but do not update latest watchlist",
+    )
+
+    technical_facts_parser = subparsers.add_parser(
+        "extract-technical-facts",
+        help="Extract structured technical facts from TradingAgents advice CSV",
+    )
+    technical_facts_parser.add_argument(
+        "--advice",
+        type=Path,
+        required=True,
+        help="TradingAgents trading advice CSV path",
+    )
+    technical_facts_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    technical_facts_parser.add_argument(
+        "--date",
+        type=canonical_date,
+        help="Run date, YYYY-MM-DD. Defaults to latest run_date in advice rows.",
+    )
+    technical_facts_parser.add_argument(
+        "--market",
+        type=canonical_market,
+        choices=["HK", "US"],
+        help="Optional market scope: HK or US",
+    )
+    technical_facts_parser.add_argument(
+        "--update-latest",
+        action="store_true",
+        help="Update data/latest technical_facts.json after writing dated artifact",
     )
 
     watch_futu_parser = subparsers.add_parser(
@@ -684,6 +713,33 @@ def main(argv: list[str] | None = None) -> int:
         print(f"run_date: {result.run_date}")
         print(f"watchlist: {result.watchlist_count}")
         print(f"watchlist_csv: {result.watchlist_path}")
+        print(f"latest: {result.latest_path}")
+        return 0
+
+    if args.command == "extract-technical-facts":
+        if not args.advice.exists():
+            parser.error(f"advice CSV not found: {args.advice}")
+        try:
+            extractor = LLMTechnicalFactsExtractor()
+        except Exception as exc:
+            parser.error(str(exc))
+        try:
+            result = generate_technical_facts(
+                advice_path=args.advice,
+                data_dir=args.data_dir,
+                run_date=args.date,
+                extractor=extractor,
+                update_latest=args.update_latest,
+                market=args.market,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"run_date: {result.run_date}")
+        print(f"technical_facts: {result.records}")
+        print(f"extracted: {result.extracted}")
+        print(f"failed: {result.failed}")
+        print(f"reused: {result.reused}")
+        print(f"technical_facts_json: {result.run_path}")
         print(f"latest: {result.latest_path}")
         return 0
 

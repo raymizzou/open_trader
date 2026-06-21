@@ -1,0 +1,561 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any, Protocol
+from zoneinfo import ZoneInfo
+
+from openai import OpenAI
+
+from .advice.change_classifier import DEEPSEEK_BASE_URL, DEFAULT_CLASSIFIER_MODEL
+from open_trader.market_scope import (
+    MarketScope,
+    market_run_dir,
+    market_scoped_latest_path,
+    parse_market_scope,
+)
+
+
+TECHNICAL_FACTS_SCHEMA_VERSION = "open_trader.technical_facts_cache.v1"
+FACTS_SCHEMA_VERSION = "open_trader.technical_facts.v1"
+RUN_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+UNKNOWN_TIMEFRAME_VALUES = {
+    "unknown",
+    "unknown timeframe",
+    "timeframe unknown",
+    "周期缺失",
+}
+
+
+@dataclass(frozen=True)
+class AdviceSource:
+    run_date: str
+    market: str
+    symbol: str
+    source_status: str
+    market_report: str
+    source_advice_hash: str
+
+
+@dataclass(frozen=True)
+class TechnicalFactsResult:
+    run_date: str
+    records: int
+    extracted: int
+    failed: int
+    reused: int
+    run_path: Path
+    latest_path: Path
+
+
+class TechnicalFactsExtractor(Protocol):
+    def extract(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        run_date: str,
+        market_report: str,
+    ) -> dict[str, object]:
+        ...
+
+
+class OpenAITextClient:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str = DEEPSEEK_BASE_URL,
+        model: str = DEFAULT_CLASSIFIER_MODEL,
+    ) -> None:
+        self.model = model
+        self.client = OpenAI(
+            api_key=api_key or os.environ.get("DEEPSEEK_API_KEY"),
+            base_url=base_url,
+        )
+
+    def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content
+        return content or ""
+
+
+class LLMTechnicalFactsExtractor:
+    def __init__(self, *, client: object | None = None) -> None:
+        self.client = client or OpenAITextClient()
+
+    def extract(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        run_date: str,
+        market_report: str,
+    ) -> dict[str, object]:
+        messages = [
+            {
+                "role": "system",
+                "content": _technical_facts_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "market": market,
+                        "symbol": symbol,
+                        "run_date": run_date,
+                        "market_report": _strip_transaction_proposal(market_report),
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        content = self.client.create(messages=messages, temperature=0)
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("LLM technical facts response must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("LLM technical facts response must be a JSON object")
+        _validate_facts(payload)
+        return payload
+
+
+def extract_market_report(raw_decision: str) -> str:
+    try:
+        payload = json.loads(raw_decision or "{}")
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        return ""
+    report = state.get("market_report")
+    return report if isinstance(report, str) else ""
+
+
+def source_hash(text: str) -> str:
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def load_advice_sources(advice_path: Path) -> list[AdviceSource]:
+    if not advice_path.exists():
+        raise FileNotFoundError(f"advice CSV not found: {advice_path}")
+    csv.field_size_limit(sys.maxsize)
+    sources: list[AdviceSource] = []
+    with advice_path.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            market = (row.get("market") or "").strip().upper()
+            symbol = (row.get("symbol") or "").strip().upper()
+            run_date = (row.get("run_date") or "").strip()
+            if not market or not symbol:
+                continue
+            market_report = extract_market_report(row.get("raw_decision") or "")
+            sources.append(
+                AdviceSource(
+                    run_date=run_date,
+                    market=market,
+                    symbol=symbol,
+                    source_status=(row.get("source_status") or row.get("status") or "").strip(),
+                    market_report=market_report,
+                    source_advice_hash=source_hash(market_report),
+                )
+            )
+    return sources
+
+
+def technical_facts_run_path(
+    data_dir: Path,
+    run_date: str,
+    market: MarketScope | None = None,
+) -> Path:
+    if market is not None:
+        return market_run_dir(data_dir, run_date, market) / "technical_facts.json"
+    return data_dir / "runs" / run_date / "technical_facts.json"
+
+
+def technical_facts_latest_path(
+    data_dir: Path,
+    market: MarketScope | None = None,
+) -> Path:
+    if market is not None:
+        return market_scoped_latest_path(data_dir, market, "technical_facts.json")
+    return data_dir / "latest" / "technical_facts.json"
+
+
+def load_technical_facts_cache(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open(encoding="utf-8-sig") as handle:
+            payload = json.load(handle)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def load_latest_technical_facts_by_market_symbol(
+    data_dir: Path,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    return index_technical_facts_by_market_symbol(
+        load_technical_facts_cache(technical_facts_latest_path(data_dir))
+    )
+
+
+def index_technical_facts_by_market_symbol(
+    cache: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    records = cache.get("records")
+    if not isinstance(records, list):
+        return {}
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        market = str(record.get("market") or "").strip().upper()
+        symbol = str(record.get("symbol") or "").strip().upper()
+        if market and symbol:
+            indexed[(market, symbol)] = record
+    return indexed
+
+
+def technical_facts_has_missing_timeframe(facts: dict[str, object]) -> bool:
+    return _has_unknown_timeframe(facts)
+
+
+def build_freshness(
+    *,
+    market_data_as_of: str,
+    run_date: str,
+    has_unknown_timeframe: bool,
+) -> dict[str, str]:
+    if not market_data_as_of:
+        return {
+            "status": "missing_date",
+            "message": f"行情日期缺失，报告生成于 {run_date}",
+        }
+    if has_unknown_timeframe:
+        return {
+            "status": "missing_timeframe",
+            "message": "指标周期缺失，需复核",
+        }
+    return {
+        "status": "fresh",
+        "message": f"日线数据截至 {market_data_as_of}",
+    }
+
+
+def generate_technical_facts(
+    *,
+    advice_path: Path,
+    data_dir: Path,
+    run_date: str | None,
+    extractor: TechnicalFactsExtractor,
+    update_latest: bool,
+    market: str | None = None,
+) -> TechnicalFactsResult:
+    sources = load_advice_sources(advice_path)
+    _validate_source_run_dates(sources)
+    market_scope = parse_market_scope(market) if market is not None else None
+    market_sources = (
+        [source for source in sources if source.market == market_scope.value]
+        if market_scope is not None
+        else sources
+    )
+    if run_date is not None and run_date.strip():
+        effective_run_date = _validate_run_date(run_date.strip())
+    else:
+        effective_run_date = _latest_run_date(market_sources)
+    filtered_sources = [
+        source
+        for source in market_sources
+        if not source.run_date or source.run_date == effective_run_date
+    ]
+    if run_date is not None and not filtered_sources:
+        raise ValueError(f"no advice rows match run_date {effective_run_date}")
+
+    run_path = technical_facts_run_path(data_dir, effective_run_date, market_scope)
+    latest_path = technical_facts_latest_path(data_dir, market_scope)
+    reusable_records = _records_by_identity(load_technical_facts_cache(latest_path))
+
+    rows: list[dict[str, Any]] = []
+    extracted = 0
+    failed = 0
+    reused = 0
+    for source in filtered_sources:
+        identity = (source.market, source.symbol, source.source_advice_hash)
+        reusable = reusable_records.get(identity)
+        if reusable is not None and reusable.get("extraction_status") == "ok":
+            rows.append(
+                _normalize_reused_record(
+                    reusable,
+                    source=source,
+                    run_date=effective_run_date,
+                )
+            )
+            reused += 1
+            continue
+        rows.append(
+            _extract_record(
+                source=source,
+                run_date=effective_run_date,
+                extractor=extractor,
+            )
+        )
+        extraction_status = rows[-1].get("extraction_status")
+        if extraction_status == "ok":
+            extracted += 1
+        elif extraction_status in {"missing_source", "extraction_failed"}:
+            failed += 1
+
+    payload = {
+        "schema_version": TECHNICAL_FACTS_SCHEMA_VERSION,
+        "generated_at": _now_text(),
+        "run_date": effective_run_date,
+        "market": market_scope.value if market_scope is not None else "",
+        "records": rows,
+    }
+    _atomic_write_json(run_path, payload)
+    if update_latest:
+        _atomic_write_json(latest_path, payload)
+    return TechnicalFactsResult(
+        run_date=effective_run_date,
+        records=len(rows),
+        extracted=extracted,
+        failed=failed,
+        reused=reused,
+        run_path=run_path,
+        latest_path=latest_path,
+    )
+
+
+def _extract_record(
+    *,
+    source: AdviceSource,
+    run_date: str,
+    extractor: TechnicalFactsExtractor,
+) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "run_date": run_date,
+        "market": source.market,
+        "symbol": source.symbol,
+        "source_status": source.source_status,
+        "source_advice_hash": source.source_advice_hash,
+    }
+    market_report = _strip_transaction_proposal(source.market_report)
+    if not market_report:
+        facts = _missing_facts(source, run_date, "market_report_missing")
+        return {
+            **base,
+            "extraction_status": "missing_source",
+            "error": "market_report_missing",
+            "facts": facts,
+            "freshness": build_freshness(
+                market_data_as_of="",
+                run_date=run_date,
+                has_unknown_timeframe=True,
+            ),
+        }
+    try:
+        facts = extractor.extract(
+            market=source.market,
+            symbol=source.symbol,
+            run_date=run_date,
+            market_report=market_report,
+        )
+        _validate_facts(facts)
+    except Exception as exc:
+        error = str(exc) or exc.__class__.__name__
+        facts = _missing_facts(source, run_date, error)
+        return {
+            **base,
+            "extraction_status": "extraction_failed",
+            "error": error,
+            "facts": facts,
+            "freshness": build_freshness(
+                market_data_as_of="",
+                run_date=run_date,
+                has_unknown_timeframe=True,
+            ),
+        }
+
+    market_data_as_of = str(facts.get("market_data_as_of") or "").strip()
+    return {
+        **base,
+        "extraction_status": "ok",
+        "error": "",
+        "facts": facts,
+        "freshness": build_freshness(
+            market_data_as_of=market_data_as_of,
+            run_date=run_date,
+            has_unknown_timeframe=_has_unknown_timeframe(facts),
+        ),
+    }
+
+
+def _records_by_identity(
+    cache: dict[str, Any],
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    records = cache.get("records")
+    if not isinstance(records, list):
+        return {}
+    indexed: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        market = str(record.get("market") or "").strip().upper()
+        symbol = str(record.get("symbol") or "").strip().upper()
+        source_advice_hash = str(record.get("source_advice_hash") or "").strip()
+        if market and symbol and source_advice_hash:
+            indexed[(market, symbol, source_advice_hash)] = record
+    return indexed
+
+
+def _normalize_reused_record(
+    record: dict[str, Any],
+    *,
+    source: AdviceSource,
+    run_date: str,
+) -> dict[str, Any]:
+    normalized = dict(record)
+    normalized.update(
+        {
+            "run_date": source.run_date or run_date,
+            "market": source.market,
+            "symbol": source.symbol,
+            "source_status": source.source_status,
+            "source_advice_hash": source.source_advice_hash,
+            "reused_from_cache": True,
+        }
+    )
+    return normalized
+
+
+def _validate_facts(facts: dict[str, object]) -> None:
+    if not isinstance(facts, dict):
+        raise ValueError("technical facts must be an object")
+    if facts.get("schema_version") != FACTS_SCHEMA_VERSION:
+        raise ValueError("technical facts schema_version is invalid")
+    if not isinstance(facts.get("status"), str) or not facts.get("status"):
+        raise ValueError("technical facts status is missing")
+    timeframes = facts.get("timeframes")
+    if not isinstance(timeframes, list):
+        raise ValueError("technical facts timeframes must be a list")
+
+
+def _has_unknown_timeframe(facts: dict[str, object]) -> bool:
+    timeframes = facts.get("timeframes")
+    if not isinstance(timeframes, list) or not timeframes:
+        return True
+    for timeframe in timeframes:
+        if not isinstance(timeframe, dict):
+            return True
+        value = str(timeframe.get("timeframe") or "").strip()
+        if not value or value.casefold() in UNKNOWN_TIMEFRAME_VALUES:
+            return True
+    return False
+
+
+def _strip_transaction_proposal(report: str) -> str:
+    marker = "FINAL TRANSACTION PROPOSAL"
+    index = report.upper().find(marker)
+    if index == -1:
+        return report
+    return report[:index].rstrip()
+
+
+def _technical_facts_system_prompt() -> str:
+    return (
+        "你是 open_trader 的技术面事实抽取器。只抽取客观技术面事实，输出严格 JSON。"
+        "忽略 FINAL TRANSACTION PROPOSAL、BUY、SELL、HOLD、Underweight、仓位建议、"
+        "交易建议和执行建议。每个 RSI、MACD、均线、布林带、ATR、成交量信号都必须带"
+        "timeframe。若报告没有明确周期，timeframe 使用 unknown，timeframe_label 使用"
+        "\"周期缺失\"。缺失字段使用空字符串或空数组，不要猜测。schema_version 必须是 "
+        f"{FACTS_SCHEMA_VERSION}。"
+    )
+
+
+def _missing_facts(source: AdviceSource, run_date: str, reason: str) -> dict[str, Any]:
+    return {
+        "schema_version": FACTS_SCHEMA_VERSION,
+        "status": "missing",
+        "source_date": run_date,
+        "market_data_as_of": "",
+        "symbol": f"{source.market}.{source.symbol}",
+        "timeframes": [],
+        "reason": reason,
+    }
+
+
+def _latest_run_date(sources: list[AdviceSource]) -> str:
+    dates = sorted(
+        {
+            source.run_date
+            for source in sources
+            if source.run_date
+        }
+    )
+    if not dates:
+        raise ValueError("run_date must be YYYY-MM-DD")
+    return dates[-1]
+
+
+def _validate_source_run_dates(sources: list[AdviceSource]) -> None:
+    for source in sources:
+        if source.run_date and not _is_valid_run_date(source.run_date):
+            raise ValueError("run_date must be YYYY-MM-DD")
+
+
+def _validate_run_date(run_date: str) -> str:
+    if not _is_valid_run_date(run_date):
+        raise ValueError("run_date must be YYYY-MM-DD")
+    return run_date
+
+
+def _is_valid_run_date(run_date: str) -> bool:
+    if not RUN_DATE_PATTERN.fullmatch(run_date):
+        return False
+    try:
+        datetime.strptime(run_date, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+        json.dump(payload, temp_file, ensure_ascii=False, indent=2, sort_keys=True)
+        temp_file.write("\n")
+    try:
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _now_text() -> str:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")

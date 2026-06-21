@@ -498,6 +498,7 @@ class FakePremarket:
             run_dir = data_dir / "runs" / run_date
         advice_path = run_dir / "trading_advice.csv"
         actions_path = run_dir / "premarket_actions.csv"
+        technical_facts_path = run_dir / "technical_facts.json"
         advice_path.parent.mkdir(parents=True, exist_ok=True)
         with advice_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
@@ -545,6 +546,13 @@ class FakePremarket:
             f"{run_date},{self.symbol},{self.market},ok\n",
             encoding="utf-8",
         )
+        technical_facts_path.write_text(
+            (
+                '{"schema_version":"open_trader.technical_facts_cache.v1",'
+                f'"run_date":"{run_date}","records":[]}}\n'
+            ),
+            encoding="utf-8",
+        )
         if kwargs["update_latest"]:
             latest_dir = data_dir / "latest"
             latest_dir.mkdir(parents=True, exist_ok=True)
@@ -569,6 +577,7 @@ class FakePremarket:
                 / run_date
                 / "change_classifications.csv",
                 "actions_path": actions_path,
+                "technical_facts_path": technical_facts_path,
                 "report_path": Path("reports/premarket") / f"{run_date}.md",
             },
         )()
@@ -1691,6 +1700,11 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     ) == (tmp_path / "data/runs/2026-06-17/US/trade_actions.csv").read_text(
         encoding="utf-8"
     )
+    assert (tmp_path / "data/latest/US/technical_facts.json").read_text(
+        encoding="utf-8"
+    ) == (tmp_path / "data/runs/2026-06-17/US/technical_facts.json").read_text(
+        encoding="utf-8"
+    )
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["artifacts"]["latest_advice"] == str(
         tmp_path / "data/latest/US/trading_advice.csv"
@@ -1703,6 +1717,9 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     )
     assert status["artifacts"]["latest_trade_actions"] == str(
         tmp_path / "data/latest/US/trade_actions.csv"
+    )
+    assert status["artifacts"]["latest_technical_facts"] == str(
+        tmp_path / "data/latest/US/technical_facts.json"
     )
 
 
@@ -1828,6 +1845,86 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["status"] == "failed"
     assert "replace failed" in status["error"]
+
+
+def test_daily_runner_rolls_back_latest_set_when_technical_facts_promotion_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    latest_dir = tmp_path / "data/latest/US"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
+    (latest_dir / "premarket_actions.csv").write_text(
+        "old actions\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+    (latest_dir / "trade_actions.csv").write_text(
+        "old trade actions\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "technical_facts.json").write_text(
+        '{"run_date":"2026-06-16","records":[]}\n',
+        encoding="utf-8",
+    )
+
+    def fail_on_technical_facts_replace(source_path: Path, latest_path: Path) -> None:
+        if latest_path.name == "technical_facts.json":
+            raise RuntimeError("technical facts replace failed")
+        source_path.replace(latest_path)
+
+    monkeypatch.setattr(
+        daily_premarket,
+        "_replace_latest_path",
+        fail_on_technical_facts_replace,
+        raising=False,
+    )
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17", market="US")
+
+    assert result.status == "failed"
+    assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "old advice\n"
+    )
+    assert (latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
+        "old actions\n"
+    )
+    assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
+        "old plan\n"
+    )
+    assert (latest_dir / "trade_actions.csv").read_text(encoding="utf-8") == (
+        "old trade actions\n"
+    )
+    assert (latest_dir / "technical_facts.json").read_text(encoding="utf-8") == (
+        '{"run_date":"2026-06-16","records":[]}\n'
+    )
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "failed"
+    assert "technical facts replace failed" in status["error"]
 
 
 def test_daily_runner_does_not_promote_latest_when_report_write_fails(

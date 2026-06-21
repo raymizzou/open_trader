@@ -13,6 +13,7 @@ from open_trader.advice.models import (
     TradingAdvice,
 )
 from open_trader.advice.premarket import PremarketResult, run_premarket
+from open_trader.technical_facts import TechnicalFactsResult
 
 
 PORTFOLIO_FIELDNAMES = [
@@ -158,6 +159,79 @@ class BlockingAdviceRunner(FakeAdviceRunner):
             )
 
         return super().analyze(row, run_date)
+
+
+class FakeTechnicalFactsGenerator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(
+        self,
+        *,
+        advice_path: Path,
+        data_dir: Path,
+        run_date: str,
+        update_latest: bool,
+        market,
+    ) -> TechnicalFactsResult:
+        self.calls.append(
+            {
+                "advice_path": advice_path,
+                "data_dir": data_dir,
+                "run_date": run_date,
+                "update_latest": update_latest,
+                "market": market,
+            }
+        )
+        run_path = advice_path.with_name("technical_facts.json")
+        run_path.write_text(
+            (
+                '{"schema_version":"open_trader.technical_facts_cache.v1",'
+                f'"run_date":"{run_date}","records":[]}}\n'
+            ),
+            encoding="utf-8",
+        )
+        latest_path = data_dir / "latest" / "technical_facts.json"
+        if update_latest:
+            latest_path.parent.mkdir(parents=True, exist_ok=True)
+            latest_path.write_text(run_path.read_text(encoding="utf-8"), encoding="utf-8")
+        return TechnicalFactsResult(
+            run_date=run_date,
+            records=0,
+            extracted=0,
+            reused=0,
+            failed=0,
+            run_path=run_path,
+            latest_path=latest_path,
+        )
+
+
+class FakeTechnicalFactsExtractor:
+    def extract(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        run_date: str,
+        market_report: str,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": "open_trader.technical_facts.v1",
+            "status": "ok",
+            "source_date": run_date,
+            "market_data_as_of": run_date,
+            "symbol": f"{market}.{symbol}",
+            "timeframes": [],
+        }
+
+
+@pytest.fixture(autouse=True)
+def no_real_technical_facts_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        premarket,
+        "LLMTechnicalFactsExtractor",
+        FakeTechnicalFactsExtractor,
+    )
 
 
 def portfolio_row(
@@ -330,6 +404,38 @@ def test_run_premarket_writes_full_advice_classifications_and_actions(
 
     advice_rows = list(csv.DictReader(result.advice_path.open(encoding="utf-8")))
     assert [row["symbol"] for row in advice_rows] == ["VIXY", "QQQ"]
+
+
+def test_run_premarket_generates_technical_facts_after_advice(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports"
+    portfolio_path = data_dir / "latest" / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    generator = FakeTechnicalFactsGenerator()
+
+    result = run_premarket(
+        run_date="2026-06-19",
+        portfolio_path=portfolio_path,
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        advice_runner=FakeAdviceRunner(),
+        classifier=FakeClassifier(),
+        technical_facts_generator=generator,
+    )
+
+    assert generator.calls == [
+        {
+            "advice_path": result.advice_path,
+            "data_dir": data_dir,
+            "run_date": "2026-06-19",
+            "update_latest": False,
+            "market": None,
+        }
+    ]
+    assert (data_dir / "runs/2026-06-19/technical_facts.json").exists()
+    assert (data_dir / "latest/technical_facts.json").exists()
 
 
 def test_run_premarket_filters_hk_market_and_writes_market_scoped_outputs(
@@ -699,6 +805,72 @@ def test_run_premarket_latest_promotion_failure_restores_previous_latest_files(
     ) == original_actions
     assert list((data_dir / "latest").glob("*.backup")) == []
     assert list((data_dir / "latest").glob(".*.tmp")) == []
+
+
+def test_run_premarket_latest_promotion_failure_restores_previous_technical_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    data_dir = tmp_path / "data"
+    write_previous_latest_advice(data_dir)
+    write_previous_latest_actions(data_dir)
+    original_advice = (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    )
+    original_actions = (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    )
+    latest_technical_facts = data_dir / "latest" / "technical_facts.json"
+    latest_technical_facts.write_text(
+        (
+            '{"schema_version":"open_trader.technical_facts_cache.v1",'
+            '"run_date":"2026-06-15","records":[]}\n'
+        ),
+        encoding="utf-8",
+    )
+    original_technical_facts = latest_technical_facts.read_text(encoding="utf-8")
+    original_replace = Path.replace
+
+    def fail_technical_facts_latest_replace(self: Path, target: Path) -> Path:
+        if target == latest_technical_facts:
+            assert (data_dir / "latest" / "trading_advice.csv").read_text(
+                encoding="utf-8"
+            ) != original_advice
+            assert (data_dir / "latest" / "premarket_actions.csv").read_text(
+                encoding="utf-8"
+            ) != original_actions
+            raise OSError("simulated technical facts latest promotion failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_technical_facts_latest_replace)
+
+    with pytest.raises(
+        OSError,
+        match="simulated technical facts latest promotion failure",
+    ):
+        run_premarket(
+            run_date="2026-06-16",
+            portfolio_path=portfolio_path,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            advice_runner=FakeAdviceRunner(),
+            classifier=FakeClassifier(),
+            symbols=None,
+            update_latest=True,
+            technical_facts_generator=FakeTechnicalFactsGenerator(),
+        )
+
+    assert (data_dir / "latest" / "trading_advice.csv").read_text(
+        encoding="utf-8"
+    ) == original_advice
+    assert (data_dir / "latest" / "premarket_actions.csv").read_text(
+        encoding="utf-8"
+    ) == original_actions
+    assert (
+        latest_technical_facts.read_text(encoding="utf-8") == original_technical_facts
+    )
 
 
 def test_run_premarket_converts_advice_runner_failure_and_continues(
