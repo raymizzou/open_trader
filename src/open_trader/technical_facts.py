@@ -27,6 +27,12 @@ from open_trader.market_scope import (
 TECHNICAL_FACTS_SCHEMA_VERSION = "open_trader.technical_facts_cache.v1"
 FACTS_SCHEMA_VERSION = "open_trader.technical_facts.v1"
 RUN_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+UNKNOWN_TIMEFRAME_VALUES = {
+    "unknown",
+    "unknown timeframe",
+    "timeframe unknown",
+    "周期缺失",
+}
 
 
 @dataclass(frozen=True)
@@ -265,20 +271,21 @@ def generate_technical_facts(
 ) -> TechnicalFactsResult:
     sources = load_advice_sources(advice_path)
     _validate_source_run_dates(sources)
+    market_scope = parse_market_scope(market) if market is not None else None
+    market_sources = (
+        [source for source in sources if source.market == market_scope.value]
+        if market_scope is not None
+        else sources
+    )
     if run_date is not None and run_date.strip():
         effective_run_date = _validate_run_date(run_date.strip())
     else:
-        effective_run_date = _latest_run_date(sources)
-    market_scope = parse_market_scope(market) if market is not None else None
+        effective_run_date = _latest_run_date(market_sources)
     filtered_sources = [
         source
-        for source in sources
+        for source in market_sources
         if not source.run_date or source.run_date == effective_run_date
     ]
-    if market_scope is not None:
-        filtered_sources = [
-            source for source in filtered_sources if source.market == market_scope.value
-        ]
     if run_date is not None and not filtered_sources:
         raise ValueError(f"no advice rows match run_date {effective_run_date}")
 
@@ -458,7 +465,8 @@ def _has_unknown_timeframe(facts: dict[str, object]) -> bool:
     for timeframe in timeframes:
         if not isinstance(timeframe, dict):
             return True
-        if not str(timeframe.get("timeframe") or "").strip():
+        value = str(timeframe.get("timeframe") or "").strip()
+        if not value or value.casefold() in UNKNOWN_TIMEFRAME_VALUES:
             return True
     return False
 

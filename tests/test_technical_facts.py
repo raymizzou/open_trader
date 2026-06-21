@@ -17,6 +17,7 @@ from open_trader.technical_facts import (
     load_advice_sources,
     load_technical_facts_cache,
     source_hash,
+    technical_facts_has_missing_timeframe,
     technical_facts_latest_path,
     technical_facts_run_path,
 )
@@ -75,6 +76,26 @@ class MissingTimeframesExtractor(TechnicalFactsExtractor):
             "source_date": run_date,
             "market_data_as_of": "2026-06-18",
             "symbol": f"{market}.{symbol}",
+        }
+
+
+class UnknownTimeframeExtractor(TechnicalFactsExtractor):
+    def extract(
+        self, *, market: str, symbol: str, run_date: str, market_report: str
+    ) -> dict[str, object]:
+        return {
+            "schema_version": "open_trader.technical_facts.v1",
+            "status": "present",
+            "source_date": run_date,
+            "market_data_as_of": "2026-06-18",
+            "symbol": f"{market}.{symbol}",
+            "timeframes": [
+                {
+                    "timeframe": "unknown",
+                    "timeframe_label": "周期缺失",
+                    "current_price": "411.60",
+                }
+            ],
         }
 
 
@@ -205,6 +226,32 @@ def test_build_freshness_marks_missing_timeframe_with_exact_review_message() -> 
     assert freshness["message"] == "指标周期缺失，需复核"
 
 
+@pytest.mark.parametrize(
+    ("timeframe", "timeframe_label"),
+    [
+        ("unknown", "周期缺失"),
+        ("UNKNOWN", ""),
+        ("unknown timeframe", ""),
+        ("周期缺失", ""),
+        ("", ""),
+    ],
+)
+def test_technical_facts_has_missing_timeframe_rejects_placeholder_values(
+    timeframe: str,
+    timeframe_label: str,
+) -> None:
+    facts: dict[str, object] = {
+        "timeframes": [
+            {
+                "timeframe": timeframe,
+                "timeframe_label": timeframe_label,
+            }
+        ]
+    }
+
+    assert technical_facts_has_missing_timeframe(facts) is True
+
+
 def test_load_technical_facts_cache_returns_empty_for_invalid_json(tmp_path: Path) -> None:
     cache_path = tmp_path / "technical_facts.json"
     cache_path.write_text("{not-json", encoding="utf-8")
@@ -262,6 +309,50 @@ def test_generate_technical_facts_writes_run_and_latest_cache(tmp_path: Path) ->
     assert row["extraction_status"] == "ok"
     assert row["freshness"]["message"] == "日线数据截至 2026-06-18"
     assert "BUY" not in json.dumps(row["facts"], ensure_ascii=False)
+
+
+def test_generate_technical_facts_marks_unknown_timeframe_as_missing_timeframe(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Buy",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report(
+                    "RSI report without explicit period"
+                ),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=UnknownTimeframeExtractor(),
+        update_latest=True,
+        market=None,
+    )
+
+    cache = load_technical_facts_cache(result.latest_path)
+    row = cache["records"][0]
+    assert result.extracted == 1
+    assert row["freshness"]["status"] == "missing_timeframe"
 
 
 def test_generate_technical_facts_rejects_malformed_explicit_run_date(
@@ -498,6 +589,69 @@ def test_generate_technical_facts_accepts_valid_run_date(tmp_path: Path) -> None
     assert result.extracted == 1
     assert result.run_path == tmp_path / "data/runs/2026-06-19/technical_facts.json"
     assert result.run_path.exists()
+
+
+def test_generate_technical_facts_defaults_to_latest_run_date_within_market(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/latest/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-18",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report("HK Daily RSI 56.88"),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            },
+            {
+                "run_date": "2026-06-19",
+                "symbol": "AAPL",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "10.00%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Hold",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report("US Daily RSI 60.00"),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            },
+        ],
+    )
+
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date=None,
+        extractor=FakeExtractor(),
+        update_latest=True,
+        market="HK",
+    )
+
+    assert result.run_date == "2026-06-18"
+    assert result.records == 1
+    assert result.run_path == tmp_path / "data/runs/2026-06-18/HK/technical_facts.json"
+    assert result.latest_path == tmp_path / "data/latest/HK/technical_facts.json"
+    assert not (tmp_path / "data/runs/2026-06-19/HK/technical_facts.json").exists()
+    latest = load_technical_facts_cache(result.latest_path)
+    assert latest["run_date"] == "2026-06-18"
+    assert latest["records"][0]["market"] == "HK"
 
 
 def test_generate_technical_facts_reuses_matching_latest_cache(tmp_path: Path) -> None:
