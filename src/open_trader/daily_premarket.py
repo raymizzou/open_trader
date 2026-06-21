@@ -412,6 +412,15 @@ class DailyPremarketRunner:
         )
         advice_path = Path(getattr(premarket_result, "advice_path"))
         actions_path = Path(getattr(premarket_result, "actions_path"))
+        technical_facts_path = Path(
+            getattr(
+                premarket_result,
+                "technical_facts_path",
+                advice_path.with_name("technical_facts.json"),
+            )
+        )
+        if not technical_facts_path.exists():
+            technical_facts_path = None
         plan_result = self.plan_builder(
             advice_path=advice_path,
             data_dir=config.data_dir,
@@ -451,11 +460,13 @@ class DailyPremarketRunner:
         latest_actions_path = latest_dir / "premarket_actions.csv"
         latest_plan_path = latest_dir / "trading_plan.csv"
         latest_trade_actions_path = latest_dir / "trade_actions.csv"
+        latest_technical_facts_path = latest_dir / "technical_facts.json"
         artifacts = {
             "advice": str(advice_path),
             "classifications": str(getattr(premarket_result, "classifications_path")),
             "actions": str(actions_path),
             "premarket_report": str(getattr(premarket_result, "report_path")),
+            "technical_facts": str(technical_facts_path) if technical_facts_path else "",
             "trading_plan": str(plan_result.plan_path),
             "trade_actions": str(trade_actions_result.actions_path),
             "trade_actions_report": str(trade_actions_result.report_path),
@@ -463,6 +474,7 @@ class DailyPremarketRunner:
             "latest_actions": str(latest_actions_path),
             "latest_trading_plan": str(latest_plan_path),
             "latest_trade_actions": str(latest_trade_actions_path),
+            "latest_technical_facts": str(latest_technical_facts_path),
             "status": str(status_path),
             "report": str(report_path),
             "log": str(log_path),
@@ -495,6 +507,7 @@ class DailyPremarketRunner:
                 actions_path=actions_path,
                 plan_path=plan_result.plan_path,
                 trade_actions_path=trade_actions_result.actions_path,
+                technical_facts_path=technical_facts_path,
                 data_dir=config.data_dir,
                 market=market,
             )
@@ -778,10 +791,12 @@ class DailyPremarketRunner:
                 "trading_plan": "",
                 "trade_actions": "",
                 "trade_actions_report": "",
+                "technical_facts": "",
                 "latest_advice": "",
                 "latest_actions": "",
                 "latest_trading_plan": "",
                 "latest_trade_actions": "",
+                "latest_technical_facts": "",
                 "status": str(status_path),
                 "report": str(report_path),
                 "log": str(log_path),
@@ -1041,6 +1056,7 @@ def _promote_latest_set(
     actions_path: Path,
     plan_path: Path,
     trade_actions_path: Path,
+    technical_facts_path: Path | None = None,
     data_dir: Path,
     market: str | None = None,
 ) -> None:
@@ -1064,6 +1080,13 @@ def _promote_latest_set(
             latest_path=latest_dir / "trade_actions.csv",
         ),
     ]
+    if technical_facts_path is not None:
+        promotions.append(
+            _LatestPromotion(
+                source_path=technical_facts_path,
+                latest_path=latest_dir / "technical_facts.json",
+            )
+        )
 
     try:
         for promotion in promotions:
@@ -1278,9 +1301,11 @@ def _render_daily_report(payload: dict[str, object]) -> str:
         "classifications",
         "actions",
         "premarket_report",
+        "technical_facts",
         "trading_plan",
         "trade_actions",
         "trade_actions_report",
+        "latest_technical_facts",
         "latest_trading_plan",
         "latest_trade_actions",
         "status",
