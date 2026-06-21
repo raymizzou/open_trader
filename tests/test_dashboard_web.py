@@ -701,15 +701,27 @@ const holding = {
         {
           timeframe: "daily",
           timeframe_label: "日线",
+          current_price: "411.60",
+          trend_summary: "价格高于主要均线。",
           rsi: {value: "56.88"},
-          macd: {value: "0.22", signal: "0.15", histogram: "0.07", golden_cross: true},
-          trend: "收盘价站上 20 日均线"
+          macd: {macd: "0.22", signal: "0.15", histogram: "0.07", crossover: "bullish crossover / 金叉"},
+          atr: {value: "33.17", percent_of_price: "8.1%"},
+          support_resistance: {
+            support_levels: ["398.15", "368.24"],
+            resistance_levels: ["430.00", "445.50"]
+          }
         },
         {
           timeframe: "weekly",
           timeframe_label: "周线",
-          macd_golden_cross: "形成金叉",
-          resistance: "430.00"
+          current_price: "409.20",
+          trend_summary: "周线仍在上行通道。",
+          macd: {crossover: "形成金叉"},
+          atr: "41.10",
+          support_resistance: {
+            support_levels: ["380.00"],
+            resistance_levels: ["455.00"]
+          }
         },
         {
           timeframe: "monthly",
@@ -728,9 +740,28 @@ for (const required of [
   "日线 RSI",
   "56.88",
   "日线 MACD",
+  "MACD 0.22",
   "金叉",
+  "日线 当前价",
+  "411.60",
+  "日线 趋势",
+  "价格高于主要均线。",
+  "日线 ATR",
+  "33.17 · 8.1%",
+  "日线 支撑",
+  "398.15 · 368.24",
+  "日线 阻力",
+  "430.00 · 445.50",
   "周线 MACD",
   "形成金叉",
+  "周线 当前价",
+  "409.20",
+  "周线 ATR",
+  "41.10",
+  "周线 支撑",
+  "380.00",
+  "周线 阻力",
+  "455.00",
   "月线 RSI",
   "61.20"
 ]) {

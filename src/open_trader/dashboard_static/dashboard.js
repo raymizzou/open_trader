@@ -932,13 +932,15 @@ function technicalFactRowsForTimeframe(timeframe) {
   }
   const label = timeframeLabel(timeframe);
   const rows = [];
+  addTechnicalFactRow(rows, `${label} 当前价`, indicatorValue(timeframe.current_price));
   addTechnicalFactRow(rows, `${label} RSI`, indicatorValue(timeframe.rsi));
   addTechnicalFactRow(rows, `${label} MACD`, macdValue(timeframe.macd));
   addTechnicalFactRow(rows, `${label} MACD`, indicatorValue(timeframe.macd_golden_cross));
   addTechnicalFactRow(rows, `${label} 金叉`, goldenCrossText(timeframe.golden_cross));
-  addTechnicalFactRow(rows, `${label} 趋势`, indicatorValue(timeframe.trend));
-  addTechnicalFactRow(rows, `${label} 支撑`, indicatorValue(timeframe.support));
-  addTechnicalFactRow(rows, `${label} 阻力`, indicatorValue(timeframe.resistance));
+  addTechnicalFactRow(rows, `${label} 趋势`, indicatorValue(timeframe.trend_summary || timeframe.trend));
+  addTechnicalFactRow(rows, `${label} ATR`, atrValue(timeframe.atr));
+  addTechnicalFactRow(rows, `${label} 支撑`, supportResistanceValue(timeframe, "support"));
+  addTechnicalFactRow(rows, `${label} 阻力`, supportResistanceValue(timeframe, "resistance"));
   addTechnicalFactRow(rows, `${label} 均线`, movingAverageValue(timeframe));
   return rows;
 }
@@ -983,13 +985,47 @@ function macdValue(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return value;
   }
+  const macdLine = firstPresent(value.macd, value.value);
   const parts = [
-    hasValue(value.value) ? `MACD ${value.value}` : "",
+    hasValue(macdLine) ? `MACD ${macdLine}` : "",
     hasValue(value.signal) ? `Signal ${value.signal}` : "",
     hasValue(value.histogram) ? `Hist ${value.histogram}` : "",
+    indicatorValue(value.crossover),
     goldenCrossText(value.golden_cross),
   ].filter(Boolean);
   return parts.join(" · ");
+}
+
+function atrValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  return [
+    indicatorValue(value.value),
+    indicatorValue(value.percent_of_price),
+  ].filter((part) => hasValue(part)).join(" · ");
+}
+
+function supportResistanceValue(timeframe, kind) {
+  const payload = timeframe.support_resistance && typeof timeframe.support_resistance === "object"
+    ? timeframe.support_resistance
+    : {};
+  const schemaValue = kind === "support"
+    ? payload.support_levels
+    : payload.resistance_levels;
+  const legacyValue = kind === "support" ? timeframe.support : timeframe.resistance;
+  return listValue(firstPresent(schemaValue, legacyValue));
+}
+
+function listValue(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => indicatorValue(item))
+      .filter((item) => hasValue(item))
+      .map((item) => formatPlain(item))
+      .join(" · ");
+  }
+  return indicatorValue(value);
 }
 
 function goldenCrossText(value) {
