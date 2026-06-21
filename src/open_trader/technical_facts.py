@@ -165,6 +165,7 @@ def generate_technical_facts(
     market: str | None = None,
 ) -> TechnicalFactsResult:
     sources = load_advice_sources(advice_path)
+    _validate_source_run_dates(sources)
     if run_date is not None and run_date.strip():
         effective_run_date = _validate_run_date(run_date.strip())
     else:
@@ -384,9 +385,6 @@ def _missing_facts(source: AdviceSource, run_date: str, reason: str) -> dict[str
 
 
 def _latest_run_date(sources: list[AdviceSource]) -> str:
-    for source in sources:
-        if source.run_date and not _is_valid_run_date(source.run_date):
-            raise ValueError("run_date must be YYYY-MM-DD")
     dates = sorted(
         {
             source.run_date
@@ -397,6 +395,12 @@ def _latest_run_date(sources: list[AdviceSource]) -> str:
     if not dates:
         raise ValueError("run_date must be YYYY-MM-DD")
     return dates[-1]
+
+
+def _validate_source_run_dates(sources: list[AdviceSource]) -> None:
+    for source in sources:
+        if source.run_date and not _is_valid_run_date(source.run_date):
+            raise ValueError("run_date must be YYYY-MM-DD")
 
 
 def _validate_run_date(run_date: str) -> str:
