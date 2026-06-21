@@ -54,6 +54,26 @@ class FakeExtractor(TechnicalFactsExtractor):
         }
 
 
+class FailingExtractor(TechnicalFactsExtractor):
+    def extract(
+        self, *, market: str, symbol: str, run_date: str, market_report: str
+    ) -> dict[str, object]:
+        raise RuntimeError("llm unavailable")
+
+
+class MissingTimeframesExtractor(TechnicalFactsExtractor):
+    def extract(
+        self, *, market: str, symbol: str, run_date: str, market_report: str
+    ) -> dict[str, object]:
+        return {
+            "schema_version": "open_trader.technical_facts.v1",
+            "status": "present",
+            "source_date": run_date,
+            "market_data_as_of": "2026-06-18",
+            "symbol": f"{market}.{symbol}",
+        }
+
+
 def write_advice(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -161,6 +181,24 @@ def test_build_freshness_marks_missing_date() -> None:
     assert freshness["message"] == "行情日期缺失，报告生成于 2026-06-19"
 
 
+def test_build_freshness_marks_missing_timeframe_with_exact_review_message() -> None:
+    freshness = build_freshness(
+        market_data_as_of="2026-06-18",
+        run_date="2026-06-19",
+        has_unknown_timeframe=True,
+    )
+
+    assert freshness["status"] == "unknown_timeframe"
+    assert freshness["message"] == "指标周期缺失，需复核"
+
+
+def test_load_technical_facts_cache_returns_empty_for_invalid_json(tmp_path: Path) -> None:
+    cache_path = tmp_path / "technical_facts.json"
+    cache_path.write_text("{not-json", encoding="utf-8")
+
+    assert load_technical_facts_cache(cache_path) == {}
+
+
 def test_generate_technical_facts_writes_run_and_latest_cache(tmp_path: Path) -> None:
     advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
     write_advice(
@@ -200,6 +238,7 @@ def test_generate_technical_facts_writes_run_and_latest_cache(tmp_path: Path) ->
 
     assert result.records == 1
     assert result.extracted == 1
+    assert result.failed == 0
     assert result.reused == 0
     assert result.run_path == tmp_path / "data/runs/2026-06-19/technical_facts.json"
     assert result.latest_path == tmp_path / "data/latest/technical_facts.json"
@@ -259,8 +298,137 @@ def test_generate_technical_facts_reuses_matching_latest_cache(tmp_path: Path) -
 
     assert first.extracted == 1
     assert second.extracted == 0
+    assert second.failed == 0
     assert second.reused == 1
     assert second_extractor.calls == []
+
+
+def test_generate_technical_facts_counts_missing_source_as_failed(tmp_path: Path) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report(""),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=FakeExtractor(),
+        update_latest=True,
+        market=None,
+    )
+
+    cache = load_technical_facts_cache(result.latest_path)
+    row = cache["records"][0]
+    assert result.extracted == 0
+    assert result.failed == 1
+    assert row["extraction_status"] == "missing_source"
+
+
+def test_generate_technical_facts_counts_extraction_failure_as_failed(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report("Daily RSI 56.88"),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=FailingExtractor(),
+        update_latest=True,
+        market=None,
+    )
+
+    cache = load_technical_facts_cache(result.latest_path)
+    row = cache["records"][0]
+    assert result.extracted == 0
+    assert result.failed == 1
+    assert row["extraction_status"] == "extraction_failed"
+
+
+def test_generate_technical_facts_rejects_missing_timeframes_as_extraction_failed(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report("Daily RSI 56.88"),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=MissingTimeframesExtractor(),
+        update_latest=True,
+        market=None,
+    )
+
+    cache = load_technical_facts_cache(result.latest_path)
+    row = cache["records"][0]
+    assert result.extracted == 0
+    assert result.failed == 1
+    assert row["extraction_status"] == "extraction_failed"
+    assert row["error"] == "technical facts timeframes must be a list"
 
 
 def test_technical_facts_paths_support_market_scope(tmp_path: Path) -> None:

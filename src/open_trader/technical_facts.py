@@ -38,6 +38,7 @@ class TechnicalFactsResult:
     run_date: str
     records: int
     extracted: int
+    failed: int
     reused: int
     run_path: Path
     latest_path: Path
@@ -122,8 +123,11 @@ def technical_facts_latest_path(
 def load_technical_facts_cache(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    with path.open(encoding="utf-8-sig") as handle:
-        payload = json.load(handle)
+    try:
+        with path.open(encoding="utf-8-sig") as handle:
+            payload = json.load(handle)
+    except json.JSONDecodeError:
+        return {}
     return payload if isinstance(payload, dict) else {}
 
 
@@ -141,7 +145,7 @@ def build_freshness(
     if has_unknown_timeframe:
         return {
             "status": "unknown_timeframe",
-            "message": f"行情数据截至 {market_data_as_of}，周期未知",
+            "message": "指标周期缺失，需复核",
         }
     return {
         "status": "fresh",
@@ -179,6 +183,7 @@ def generate_technical_facts(
 
     rows: list[dict[str, Any]] = []
     extracted = 0
+    failed = 0
     reused = 0
     for source in filtered_sources:
         identity = (source.market, source.symbol, source.source_advice_hash)
@@ -194,7 +199,11 @@ def generate_technical_facts(
                 extractor=extractor,
             )
         )
-        extracted += 1
+        extraction_status = rows[-1].get("extraction_status")
+        if extraction_status == "ok":
+            extracted += 1
+        elif extraction_status in {"missing_source", "extraction_failed"}:
+            failed += 1
 
     payload = {
         "schema_version": TECHNICAL_FACTS_SCHEMA_VERSION,
@@ -210,6 +219,7 @@ def generate_technical_facts(
         run_date=effective_run_date,
         records=len(rows),
         extracted=extracted,
+        failed=failed,
         reused=reused,
         run_path=run_path,
         latest_path=latest_path,
@@ -256,7 +266,7 @@ def _extract_record(
         facts = _missing_facts(source, run_date, error)
         return {
             **base,
-            "extraction_status": "error",
+            "extraction_status": "extraction_failed",
             "error": error,
             "facts": facts,
             "freshness": build_freshness(
@@ -306,7 +316,7 @@ def _validate_facts(facts: dict[str, object]) -> None:
     if not isinstance(facts.get("status"), str) or not facts.get("status"):
         raise ValueError("technical facts status is missing")
     timeframes = facts.get("timeframes")
-    if timeframes is not None and not isinstance(timeframes, list):
+    if not isinstance(timeframes, list):
         raise ValueError("technical facts timeframes must be a list")
 
 
