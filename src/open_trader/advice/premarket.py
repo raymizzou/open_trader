@@ -16,6 +16,11 @@ from open_trader.market_scope import (
     market_scoped_latest_path,
     parse_market_scope,
 )
+from open_trader.technical_facts import (
+    LLMTechnicalFactsExtractor,
+    TechnicalFactsResult,
+    generate_technical_facts,
+)
 
 from .models import (
     CHANGE_CLASSIFICATION_FIELDNAMES,
@@ -37,6 +42,7 @@ class AdviceRunner(Protocol):
 
 AdviceRunnerFactory = Callable[[], AdviceRunner]
 DeadlineReached = Callable[[], bool]
+TechnicalFactsGenerator = Callable[..., TechnicalFactsResult]
 DEFAULT_EXCLUDED_SYMBOLS = {"AGRZ", "ARGG"}
 
 
@@ -96,6 +102,7 @@ def run_premarket(
     use_fallback: bool = False,
     deadline_reached: DeadlineReached | None = None,
     market: str | None = None,
+    technical_facts_generator: TechnicalFactsGenerator | None = None,
 ) -> PremarketResult:
     if max_workers < 1:
         raise ValueError("max_workers must be at least 1")
@@ -205,6 +212,14 @@ def run_premarket(
         update_latest=False,
         market=market_scope,
     )
+    _generate_technical_facts_after_advice(
+        advice_path=advice_path,
+        data_dir=data_dir,
+        run_date=run_date,
+        update_latest=update_latest,
+        market=market_scope,
+        technical_facts_generator=technical_facts_generator,
+    )
     if update_latest:
         _promote_latest_outputs(
             advice_path=advice_path,
@@ -221,6 +236,31 @@ def run_premarket(
         classifications_path=classifications_path,
         actions_path=actions_path,
         report_path=report_path,
+    )
+
+
+def _generate_technical_facts_after_advice(
+    *,
+    advice_path: Path,
+    data_dir: Path,
+    run_date: str,
+    update_latest: bool,
+    market: MarketScope | None,
+    technical_facts_generator: TechnicalFactsGenerator | None,
+) -> TechnicalFactsResult:
+    generator = technical_facts_generator
+    if generator is None:
+        extractor = LLMTechnicalFactsExtractor()
+
+        def generator(**kwargs: object) -> TechnicalFactsResult:
+            return generate_technical_facts(extractor=extractor, **kwargs)  # type: ignore[arg-type]
+
+    return generator(
+        advice_path=advice_path,
+        data_dir=data_dir,
+        run_date=run_date,
+        update_latest=update_latest,
+        market=market,
     )
 
 
