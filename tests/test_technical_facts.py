@@ -8,6 +8,7 @@ import pytest
 
 from open_trader.market_scope import MarketScope
 from open_trader.technical_facts import (
+    LLMTechnicalFactsExtractor,
     TechnicalFactsExtractor,
     build_freshness,
     extract_market_report,
@@ -758,6 +759,67 @@ def test_generate_technical_facts_counts_extraction_failure_as_failed(
     assert result.extracted == 0
     assert result.failed == 1
     assert row["extraction_status"] == "extraction_failed"
+
+
+class FakeLLMClient:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.messages: list[list[dict[str, str]]] = []
+
+    def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+        self.messages.append(messages)
+        return self.content
+
+
+def test_llm_extractor_parses_strict_json() -> None:
+    client = FakeLLMClient(
+        json.dumps(
+            {
+                "schema_version": "open_trader.technical_facts.v1",
+                "status": "present",
+                "source_date": "2026-06-19",
+                "market_data_as_of": "2026-06-18",
+                "symbol": "HK.02476",
+                "timeframes": [
+                    {
+                        "timeframe": "daily",
+                        "timeframe_label": "日线",
+                        "current_price": "411.60",
+                    }
+                ],
+            }
+        )
+    )
+    extractor = LLMTechnicalFactsExtractor(client=client)
+
+    facts = extractor.extract(
+        market="HK",
+        symbol="02476",
+        run_date="2026-06-19",
+        market_report="Daily technical report. FINAL TRANSACTION PROPOSAL: BUY",
+    )
+
+    assert facts["schema_version"] == "open_trader.technical_facts.v1"
+    assert facts["market_data_as_of"] == "2026-06-18"
+    prompt_text = json.dumps(client.messages, ensure_ascii=False)
+    assert "只抽取客观技术面事实" in prompt_text
+    assert "忽略 FINAL TRANSACTION PROPOSAL" in prompt_text
+
+
+def test_llm_extractor_rejects_non_json_response() -> None:
+    extractor = LLMTechnicalFactsExtractor(client=FakeLLMClient("not json"))
+
+    try:
+        extractor.extract(
+            market="HK",
+            symbol="02476",
+            run_date="2026-06-19",
+            market_report="Daily technical report",
+        )
+    except ValueError as exc:
+        assert "valid JSON" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_generate_technical_facts_rejects_missing_timeframes_as_extraction_failed(

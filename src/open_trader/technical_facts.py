@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -12,6 +13,9 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from openai import OpenAI
+
+from .advice.change_classifier import DEEPSEEK_BASE_URL, DEFAULT_CLASSIFIER_MODEL
 from open_trader.market_scope import (
     MarketScope,
     market_run_dir,
@@ -56,6 +60,71 @@ class TechnicalFactsExtractor(Protocol):
         market_report: str,
     ) -> dict[str, object]:
         ...
+
+
+class OpenAITextClient:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str = DEEPSEEK_BASE_URL,
+        model: str = DEFAULT_CLASSIFIER_MODEL,
+    ) -> None:
+        self.model = model
+        self.client = OpenAI(
+            api_key=api_key or os.environ.get("DEEPSEEK_API_KEY"),
+            base_url=base_url,
+        )
+
+    def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+        )
+        content = response.choices[0].message.content
+        return content or ""
+
+
+class LLMTechnicalFactsExtractor:
+    def __init__(self, *, client: object | None = None) -> None:
+        self.client = client or OpenAITextClient()
+
+    def extract(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        run_date: str,
+        market_report: str,
+    ) -> dict[str, object]:
+        messages = [
+            {
+                "role": "system",
+                "content": _technical_facts_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "market": market,
+                        "symbol": symbol,
+                        "run_date": run_date,
+                        "market_report": _strip_transaction_proposal(market_report),
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        content = self.client.create(messages=messages, temperature=0)
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("LLM technical facts response must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("LLM technical facts response must be a JSON object")
+        _validate_facts(payload)
+        return payload
 
 
 def extract_market_report(raw_decision: str) -> str:
@@ -370,6 +439,17 @@ def _strip_transaction_proposal(report: str) -> str:
     if index == -1:
         return report
     return report[:index].rstrip()
+
+
+def _technical_facts_system_prompt() -> str:
+    return (
+        "你是 open_trader 的技术面事实抽取器。只抽取客观技术面事实，输出严格 JSON。"
+        "忽略 FINAL TRANSACTION PROPOSAL、BUY、SELL、HOLD、Underweight、仓位建议、"
+        "交易建议和执行建议。每个 RSI、MACD、均线、布林带、ATR、成交量信号都必须带"
+        "timeframe。若报告没有明确周期，timeframe 使用 unknown，timeframe_label 使用"
+        "\"周期缺失\"。缺失字段使用空字符串或空数组，不要猜测。schema_version 必须是 "
+        f"{FACTS_SCHEMA_VERSION}。"
+    )
 
 
 def _missing_facts(source: AdviceSource, run_date: str, reason: str) -> dict[str, Any]:
