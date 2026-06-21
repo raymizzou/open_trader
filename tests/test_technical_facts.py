@@ -4,6 +4,8 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
+
 from open_trader.market_scope import MarketScope
 from open_trader.technical_facts import (
     TechnicalFactsExtractor,
@@ -249,6 +251,126 @@ def test_generate_technical_facts_writes_run_and_latest_cache(tmp_path: Path) ->
     assert row["extraction_status"] == "ok"
     assert row["freshness"]["message"] == "日线数据截至 2026-06-18"
     assert "BUY" not in json.dumps(row["facts"], ensure_ascii=False)
+
+
+def test_generate_technical_facts_rejects_malformed_explicit_run_date(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report("Daily RSI 56.88"),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="run_date must be YYYY-MM-DD"):
+        generate_technical_facts(
+            advice_path=advice_path,
+            data_dir=tmp_path / "data",
+            run_date="../latest",
+            extractor=FakeExtractor(),
+            update_latest=False,
+            market=None,
+        )
+
+    assert not (tmp_path / "data/latest/technical_facts.json").exists()
+
+
+def test_generate_technical_facts_rejects_malformed_csv_run_date(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/input/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "../latest",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report("Daily RSI 56.88"),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="run_date must be YYYY-MM-DD"):
+        generate_technical_facts(
+            advice_path=advice_path,
+            data_dir=tmp_path / "data",
+            run_date="",
+            extractor=FakeExtractor(),
+            update_latest=False,
+            market=None,
+        )
+
+    assert not (tmp_path / "data/latest/technical_facts.json").exists()
+    assert not (tmp_path / "data/technical_facts.json").exists()
+
+
+def test_generate_technical_facts_accepts_valid_run_date(tmp_path: Path) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report("Daily RSI 56.88"),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=FakeExtractor(),
+        update_latest=False,
+        market=None,
+    )
+
+    assert result.extracted == 1
+    assert result.run_path == tmp_path / "data/runs/2026-06-19/technical_facts.json"
+    assert result.run_path.exists()
 
 
 def test_generate_technical_facts_reuses_matching_latest_cache(tmp_path: Path) -> None:

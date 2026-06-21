@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,6 +22,7 @@ from open_trader.market_scope import (
 
 TECHNICAL_FACTS_SCHEMA_VERSION = "open_trader.technical_facts_cache.v1"
 FACTS_SCHEMA_VERSION = "open_trader.technical_facts.v1"
+RUN_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @dataclass(frozen=True)
@@ -163,7 +165,10 @@ def generate_technical_facts(
     market: str | None = None,
 ) -> TechnicalFactsResult:
     sources = load_advice_sources(advice_path)
-    effective_run_date = run_date or _latest_run_date(sources)
+    if run_date is not None and run_date.strip():
+        effective_run_date = _validate_run_date(run_date.strip())
+    else:
+        effective_run_date = _latest_run_date(sources)
     market_scope = parse_market_scope(market) if market is not None else None
     filtered_sources = [
         source
@@ -379,10 +384,32 @@ def _missing_facts(source: AdviceSource, run_date: str, reason: str) -> dict[str
 
 
 def _latest_run_date(sources: list[AdviceSource]) -> str:
-    dates = sorted({source.run_date for source in sources if source.run_date})
+    dates = sorted(
+        {
+            source.run_date
+            for source in sources
+            if source.run_date and _is_valid_run_date(source.run_date)
+        }
+    )
     if not dates:
-        raise ValueError("--date is required when advice file has no run_date rows")
+        raise ValueError("run_date must be YYYY-MM-DD")
     return dates[-1]
+
+
+def _validate_run_date(run_date: str) -> str:
+    if not _is_valid_run_date(run_date):
+        raise ValueError("run_date must be YYYY-MM-DD")
+    return run_date
+
+
+def _is_valid_run_date(run_date: str) -> bool:
+    if not RUN_DATE_PATTERN.fullmatch(run_date):
+        return False
+    try:
+        datetime.strptime(run_date, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
