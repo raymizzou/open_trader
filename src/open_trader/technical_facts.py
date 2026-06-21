@@ -384,11 +384,14 @@ def _missing_facts(source: AdviceSource, run_date: str, reason: str) -> dict[str
 
 
 def _latest_run_date(sources: list[AdviceSource]) -> str:
+    for source in sources:
+        if source.run_date and not _is_valid_run_date(source.run_date):
+            raise ValueError("run_date must be YYYY-MM-DD")
     dates = sorted(
         {
             source.run_date
             for source in sources
-            if source.run_date and _is_valid_run_date(source.run_date)
+            if source.run_date
         }
     )
     if not dates:

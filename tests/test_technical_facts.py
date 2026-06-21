@@ -334,6 +334,64 @@ def test_generate_technical_facts_rejects_malformed_csv_run_date(
     assert not (tmp_path / "data/technical_facts.json").exists()
 
 
+def test_generate_technical_facts_rejects_mixed_malformed_and_valid_csv_run_dates(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/input/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "../latest",
+                "symbol": "09988",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "5.00%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report("Weekly trend"),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            },
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report("Daily RSI 56.88"),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="run_date must be YYYY-MM-DD"):
+        generate_technical_facts(
+            advice_path=advice_path,
+            data_dir=tmp_path / "data",
+            run_date="",
+            extractor=FakeExtractor(),
+            update_latest=False,
+            market=None,
+        )
+
+    assert not (tmp_path / "data/runs/2026-06-19/technical_facts.json").exists()
+    assert not (tmp_path / "data/latest/technical_facts.json").exists()
+
+
 def test_generate_technical_facts_accepts_valid_run_date(tmp_path: Path) -> None:
     advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
     write_advice(
