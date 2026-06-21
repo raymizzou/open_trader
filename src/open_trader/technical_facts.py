@@ -188,8 +188,14 @@ def generate_technical_facts(
     for source in filtered_sources:
         identity = (source.market, source.symbol, source.source_advice_hash)
         reusable = reusable_records.get(identity)
-        if reusable is not None:
-            rows.append(reusable)
+        if reusable is not None and reusable.get("extraction_status") == "ok":
+            rows.append(
+                _normalize_reused_record(
+                    reusable,
+                    source=source,
+                    run_date=effective_run_date,
+                )
+            )
             reused += 1
             continue
         rows.append(
@@ -306,6 +312,26 @@ def _records_by_identity(
         if market and symbol and source_advice_hash:
             indexed[(market, symbol, source_advice_hash)] = record
     return indexed
+
+
+def _normalize_reused_record(
+    record: dict[str, Any],
+    *,
+    source: AdviceSource,
+    run_date: str,
+) -> dict[str, Any]:
+    normalized = dict(record)
+    normalized.update(
+        {
+            "run_date": source.run_date or run_date,
+            "market": source.market,
+            "symbol": source.symbol,
+            "source_status": source.source_status,
+            "source_advice_hash": source.source_advice_hash,
+            "reused_from_cache": True,
+        }
+    )
+    return normalized
 
 
 def _validate_facts(facts: dict[str, object]) -> None:

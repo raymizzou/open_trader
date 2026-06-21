@@ -303,6 +303,141 @@ def test_generate_technical_facts_reuses_matching_latest_cache(tmp_path: Path) -
     assert second_extractor.calls == []
 
 
+def test_generate_technical_facts_does_not_reuse_failed_latest_cache(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    report = "Daily RSI 56.88"
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report(report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    first = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=FailingExtractor(),
+        update_latest=True,
+        market=None,
+    )
+
+    second_extractor = FakeExtractor()
+    second = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=second_extractor,
+        update_latest=True,
+        market=None,
+    )
+
+    cache = load_technical_facts_cache(second.latest_path)
+    row = cache["records"][0]
+    assert first.failed == 1
+    assert second.extracted == 1
+    assert second.reused == 0
+    assert second.failed == 0
+    assert second_extractor.calls == [report]
+    assert row["extraction_status"] == "ok"
+
+
+def test_generate_technical_facts_normalizes_reused_record_to_current_run(
+    tmp_path: Path,
+) -> None:
+    report = "Daily RSI 56.88"
+    old_advice_path = tmp_path / "data/runs/2026-06-18/trading_advice.csv"
+    write_advice(
+        old_advice_path,
+        [
+            {
+                "run_date": "2026-06-18",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report(report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    generate_technical_facts(
+        advice_path=old_advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-18",
+        extractor=FakeExtractor(),
+        update_latest=True,
+        market=None,
+    )
+    new_advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    write_advice(
+        new_advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "02476",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report(report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    second_extractor = FakeExtractor()
+    second = generate_technical_facts(
+        advice_path=new_advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=second_extractor,
+        update_latest=True,
+        market=None,
+    )
+
+    cache = load_technical_facts_cache(second.run_path)
+    row = cache["records"][0]
+    assert second.extracted == 0
+    assert second.reused == 1
+    assert second.failed == 0
+    assert second_extractor.calls == []
+    assert row["run_date"] == "2026-06-19"
+    assert row["reused_from_cache"] is True
+
+
 def test_generate_technical_facts_counts_missing_source_as_failed(tmp_path: Path) -> None:
     advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
     write_advice(
