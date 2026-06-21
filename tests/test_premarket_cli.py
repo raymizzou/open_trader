@@ -607,3 +607,46 @@ def test_extract_technical_facts_main_wires_generator(
     assert "reused: 0" in output
     assert "technical_facts_json:" in output
     assert "latest:" in output
+
+
+def test_extract_technical_facts_missing_advice_reports_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakeExtractor:
+        pass
+
+    advice_path = tmp_path / "missing_trading_advice.csv"
+    monkeypatch.setattr(cli, "LLMTechnicalFactsExtractor", FakeExtractor)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["extract-technical-facts", "--advice", str(advice_path)])
+
+    assert exc_info.value.code == 2
+    error = capsys.readouterr().err
+    assert str(advice_path) in error
+    assert "Traceback" not in error
+
+
+def test_extract_technical_facts_extractor_init_failure_reports_clean_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    advice_path = tmp_path / "trading_advice.csv"
+    advice_path.write_text("run_date,symbol,market,raw_decision\n", encoding="utf-8")
+
+    class FailingExtractor:
+        def __init__(self) -> None:
+            raise Exception("missing LLM credentials")
+
+    monkeypatch.setattr(cli, "LLMTechnicalFactsExtractor", FailingExtractor)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["extract-technical-facts", "--advice", str(advice_path)])
+
+    assert exc_info.value.code == 2
+    error = capsys.readouterr().err
+    assert "missing LLM credentials" in error
+    assert "Traceback" not in error

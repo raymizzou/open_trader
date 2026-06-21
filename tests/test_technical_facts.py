@@ -161,6 +161,15 @@ def test_load_advice_sources_reads_rows_with_market_report(tmp_path: Path) -> No
     assert sources[0].source_advice_hash == source_hash("Daily RSI 56.88")
 
 
+def test_load_advice_sources_rejects_missing_path(tmp_path: Path) -> None:
+    advice_path = tmp_path / "missing_trading_advice.csv"
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        load_advice_sources(advice_path)
+
+    assert str(advice_path) in str(exc_info.value)
+
+
 def test_build_freshness_prefers_timeframe_and_market_data_date() -> None:
     freshness = build_freshness(
         market_data_as_of="2026-06-18",

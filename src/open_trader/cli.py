@@ -718,11 +718,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "extract-technical-facts":
         try:
+            extractor = LLMTechnicalFactsExtractor()
+        except Exception as exc:
+            parser.error(str(exc))
+        try:
             result = generate_technical_facts(
                 advice_path=args.advice,
                 data_dir=args.data_dir,
                 run_date=args.date,
-                extractor=LLMTechnicalFactsExtractor(),
+                extractor=extractor,
                 update_latest=args.update_latest,
                 market=args.market,
             )

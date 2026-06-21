@@ -149,7 +149,7 @@ def source_hash(text: str) -> str:
 
 def load_advice_sources(advice_path: Path) -> list[AdviceSource]:
     if not advice_path.exists():
-        return []
+        raise FileNotFoundError(f"advice CSV not found: {advice_path}")
     csv.field_size_limit(sys.maxsize)
     sources: list[AdviceSource] = []
     with advice_path.open(encoding="utf-8-sig", newline="") as handle:
