@@ -9,6 +9,7 @@ import pytest
 from open_trader.market_scope import MarketScope
 from open_trader.technical_facts import (
     LLMTechnicalFactsExtractor,
+    OpenAITextClient,
     TechnicalFactsExtractor,
     build_freshness,
     extract_market_report,
@@ -820,6 +821,40 @@ def test_llm_extractor_rejects_non_json_response() -> None:
         assert "valid JSON" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+class FakeOpenAICompletions:
+    def __init__(self) -> None:
+        self.kwargs: dict[str, object] = {}
+
+    def create(self, **kwargs: object) -> object:
+        self.kwargs = kwargs
+        message = type("Message", (), {"content": "{}"})()
+        choice = type("Choice", (), {"message": message})()
+        return type("Response", (), {"choices": [choice]})()
+
+
+class FakeOpenAIChat:
+    def __init__(self) -> None:
+        self.completions = FakeOpenAICompletions()
+
+
+class FakeOpenAI:
+    def __init__(self) -> None:
+        self.chat = FakeOpenAIChat()
+
+
+def test_openai_text_client_requests_json_response_format() -> None:
+    fake_openai = FakeOpenAI()
+    client = object.__new__(OpenAITextClient)
+    client.model = "test"
+    client.client = fake_openai
+
+    client.create(messages=[{"role": "user", "content": "report"}], temperature=0)
+
+    assert fake_openai.chat.completions.kwargs["response_format"] == {
+        "type": "json_object"
+    }
 
 
 def test_generate_technical_facts_rejects_missing_timeframes_as_extraction_failed(
