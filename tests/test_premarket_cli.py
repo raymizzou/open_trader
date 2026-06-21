@@ -558,6 +558,8 @@ def test_extract_technical_facts_main_wires_generator(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured: dict[str, object] = {}
+    advice_path = tmp_path / "trading_advice.csv"
+    advice_path.write_text("run_date,symbol,market,raw_decision\n", encoding="utf-8")
 
     class FakeExtractor:
         pass
@@ -581,7 +583,7 @@ def test_extract_technical_facts_main_wires_generator(
         [
             "extract-technical-facts",
             "--advice",
-            str(tmp_path / "trading_advice.csv"),
+            str(advice_path),
             "--data-dir",
             str(tmp_path / "data"),
             "--date",
@@ -593,7 +595,7 @@ def test_extract_technical_facts_main_wires_generator(
     )
 
     assert result == 0
-    assert captured["advice_path"] == tmp_path / "trading_advice.csv"
+    assert captured["advice_path"] == advice_path
     assert captured["data_dir"] == tmp_path / "data"
     assert captured["run_date"] == "2026-06-19"
     assert captured["market"] == "HK"
@@ -614,18 +616,25 @@ def test_extract_technical_facts_missing_advice_reports_path(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    class FakeExtractor:
-        pass
+    constructed = False
+
+    class FailingExtractor:
+        def __init__(self) -> None:
+            nonlocal constructed
+            constructed = True
+            raise Exception("LLM should not be initialized for a missing advice file")
 
     advice_path = tmp_path / "missing_trading_advice.csv"
-    monkeypatch.setattr(cli, "LLMTechnicalFactsExtractor", FakeExtractor)
+    monkeypatch.setattr(cli, "LLMTechnicalFactsExtractor", FailingExtractor)
 
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["extract-technical-facts", "--advice", str(advice_path)])
 
     assert exc_info.value.code == 2
+    assert constructed is False
     error = capsys.readouterr().err
     assert str(advice_path) in error
+    assert "LLM should not be initialized" not in error
     assert "Traceback" not in error
 
 

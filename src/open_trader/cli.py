@@ -717,6 +717,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "extract-technical-facts":
+        if not args.advice.exists():
+            parser.error(f"advice CSV not found: {args.advice}")
         try:
             extractor = LLMTechnicalFactsExtractor()
         except Exception as exc:
