@@ -513,3 +513,97 @@ def test_run_daily_premarket_today_reports_invalid_timezone(
     assert exc_info.value.code == 2
     error = capsys.readouterr().err
     assert "Invalid/Timezone" in error
+
+
+def test_extract_technical_facts_help_includes_expected_options(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["extract-technical-facts", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--advice" in output
+    assert "--data-dir" in output
+    assert "--date" in output
+    assert "--market" in output
+    assert "--update-latest" in output
+
+
+def test_extract_technical_facts_requires_advice() -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["extract-technical-facts"])
+
+    assert exc_info.value.code == 2
+
+
+def test_extract_technical_facts_rejects_invalid_market() -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(
+            ["extract-technical-facts", "--advice", "advice.csv", "--market", "CN"]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_extract_technical_facts_main_wires_generator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeExtractor:
+        pass
+
+    def fake_generate_technical_facts(**kwargs: object):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            run_date="2026-06-19",
+            records=3,
+            extracted=2,
+            failed=1,
+            reused=0,
+            run_path=tmp_path / "data/runs/2026-06-19/HK/technical_facts.json",
+            latest_path=tmp_path / "data/latest/HK/technical_facts.json",
+        )
+
+    monkeypatch.setattr(cli, "LLMTechnicalFactsExtractor", FakeExtractor)
+    monkeypatch.setattr(cli, "generate_technical_facts", fake_generate_technical_facts)
+
+    result = cli.main(
+        [
+            "extract-technical-facts",
+            "--advice",
+            str(tmp_path / "trading_advice.csv"),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--date",
+            "2026-06-19",
+            "--market",
+            "hk",
+            "--update-latest",
+        ]
+    )
+
+    assert result == 0
+    assert captured["advice_path"] == tmp_path / "trading_advice.csv"
+    assert captured["data_dir"] == tmp_path / "data"
+    assert captured["run_date"] == "2026-06-19"
+    assert captured["market"] == "HK"
+    assert captured["update_latest"] is True
+    assert isinstance(captured["extractor"], FakeExtractor)
+    output = capsys.readouterr().out
+    assert "run_date: 2026-06-19" in output
+    assert "technical_facts: 3" in output
+    assert "extracted: 2" in output
+    assert "failed: 1" in output
+    assert "reused: 0" in output
+    assert "technical_facts_json:" in output
+    assert "latest:" in output
