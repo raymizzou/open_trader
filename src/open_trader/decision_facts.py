@@ -128,15 +128,6 @@ class LLMDecisionFactsExtractor:
                         "market": market,
                         "symbol": symbol,
                         "run_date": run_date,
-                        "source_status": "",
-                        "kline_source_hash": source_hash(kline_source)
-                        if kline_source
-                        else "",
-                        "news_sentiment_source_hash": source_hash(
-                            news_sentiment_source
-                        )
-                        if news_sentiment_source
-                        else "",
                         "kline_source": kline_source,
                         "news_sentiment_source": news_sentiment_source,
                     },
@@ -151,7 +142,7 @@ class LLMDecisionFactsExtractor:
             raise ValueError("LLM decision facts response must be valid JSON") from exc
         if not isinstance(payload, dict):
             raise ValueError("LLM decision facts response must be a JSON object")
-        validate_decision_facts_record(payload)
+        _validate_llm_payload(payload)
         return payload
 
 
@@ -268,6 +259,7 @@ def validate_decision_facts_record(record: dict[str, object]) -> None:
         raise ValueError("decision facts record must be an object")
     if record.get("schema_version") != DECISION_FACTS_SCHEMA_VERSION:
         raise ValueError("decision facts schema_version is invalid")
+    _validate_persisted_record_metadata(record)
     _validate_module(record.get("kline"), "kline", KLINE_FIELDS)
     _validate_module(
         record.get("news_sentiment"),
@@ -356,14 +348,14 @@ def _combine_news_sentiment_sources(*, sentiment_report: str, news_report: str) 
 def _decision_facts_system_prompt() -> str:
     return (
         "你是 open_trader 的决策事实抽取器。只输出严格 JSON 对象，不输出 Markdown、解释或"
-        "任何 JSON 外文本。除 schema_version、status、source_hash、run_date、market、"
-        "symbol、source_status、error 等固定字段外，所有可读字段必须使用中文；禁止输出原始"
-        "英文段落或英文分析文字。schema_version 必须是 "
-        f"{DECISION_FACTS_SCHEMA_VERSION}。顶层字段必须包含 schema_version、run_date、"
-        "market、symbol、source_status、kline、news_sentiment、error。kline 和 "
-        "news_sentiment 均为对象，字段为 status、source_hash、fields。kline.fields 必须"
-        "且只能包含 trend、position、momentum、key_levels、risk；news_sentiment.fields "
-        "必须且只能包含 direction、change、catalyst、risk、attention。status 只能使用 "
+        "任何 JSON 外文本。除 schema_version、status 等固定字段外，所有可读字段必须使用"
+        "中文；禁止输出原始英文段落或英文分析文字。schema_version 必须是 "
+        f"{DECISION_FACTS_SCHEMA_VERSION}。顶层字段只能包含 schema_version、kline、"
+        "news_sentiment。不要输出 run_date、market、symbol、source_status、error 或任何 "
+        "source_hash；系统会在本地补充这些可信字段。kline 和 news_sentiment 均为对象，"
+        "只能包含 status 和 fields。kline.fields 必须且只能包含 trend、position、momentum、"
+        "key_levels、risk；news_sentiment.fields 必须且只能包含 direction、change、"
+        "catalyst、risk、attention。status 只能使用 "
         "ok、missing_source、extraction_failed 或 error。缺失来源使用 status=missing_source；"
         "无法可靠抽取使用 status=extraction_failed；字段缺失写 缺失。严禁编造事实，严禁加入"
         "输入材料没有明确支持的信息。严禁输出交易建议、下单建议、仓位或头寸规模建议、目标价、"
@@ -544,7 +536,39 @@ def _validate_module(
         source_hash_value
     ):
         raise ValueError(f"{module_name} source_hash is invalid")
-    fields = module.get("fields")
+    _validate_module_fields(module.get("fields"), module_name, expected_fields)
+
+
+def _validate_llm_payload(payload: dict[str, object]) -> None:
+    if payload.get("schema_version") != DECISION_FACTS_SCHEMA_VERSION:
+        raise ValueError("decision facts schema_version is invalid")
+    _validate_llm_module(payload.get("kline"), "kline", KLINE_FIELDS)
+    _validate_llm_module(
+        payload.get("news_sentiment"),
+        "news_sentiment",
+        NEWS_SENTIMENT_FIELDS,
+    )
+
+
+def _validate_llm_module(
+    module: object,
+    module_name: str,
+    expected_fields: tuple[str, ...],
+) -> None:
+    if not isinstance(module, dict):
+        raise ValueError(f"{module_name} module is invalid")
+    status = module.get("status")
+    status_text = status.strip() if isinstance(status, str) else ""
+    if status_text not in VALID_MODULE_STATUSES:
+        raise ValueError(f"{module_name} status is invalid")
+    _validate_module_fields(module.get("fields"), module_name, expected_fields)
+
+
+def _validate_module_fields(
+    fields: object,
+    module_name: str,
+    expected_fields: tuple[str, ...],
+) -> None:
     if not isinstance(fields, dict) or set(fields) != set(expected_fields):
         raise ValueError(f"{module_name} fields are invalid")
     for value in fields.values():
@@ -552,6 +576,17 @@ def _validate_module(
             raise ValueError(f"{module_name} field values are invalid")
         if value != MISSING_VALUE and not CHINESE_TEXT_PATTERN.search(value):
             raise ValueError("field values must be Chinese or 缺失")
+
+
+def _validate_persisted_record_metadata(record: dict[str, object]) -> None:
+    for field in ("run_date", "market", "symbol", "source_status", "error"):
+        value = record.get(field)
+        if not isinstance(value, str):
+            raise ValueError(f"decision facts {field} is missing")
+        if field in {"run_date", "market", "symbol"} and not value.strip():
+            raise ValueError(f"decision facts {field} is missing")
+    if not _is_valid_run_date(record["run_date"]):
+        raise ValueError("decision facts run_date is invalid")
 
 
 def _latest_run_date(sources: list[AdviceSource]) -> str:

@@ -12,6 +12,7 @@ from open_trader.decision_facts import (
     NEWS_SENTIMENT_FIELDS,
     MISSING_VALUE,
     DecisionFactsExtractor,
+    LLMDecisionFactsExtractor,
     build_missing_fields,
     decision_facts_latest_path,
     decision_facts_run_path,
@@ -136,6 +137,27 @@ def advice_row(symbol: str = "SOXX", raw: str | None = None) -> dict[str, str]:
     }
 
 
+def valid_decision_facts_record() -> dict[str, object]:
+    return {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "run_date": "2026-06-22",
+        "market": "US",
+        "symbol": "SOXX",
+        "source_status": "ok",
+        "kline": {
+            "status": "ok",
+            "source_hash": source_hash("kline"),
+            "fields": build_missing_fields(KLINE_FIELDS),
+        },
+        "news_sentiment": {
+            "status": "ok",
+            "source_hash": source_hash("news"),
+            "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
+        },
+        "error": "",
+    }
+
+
 def test_extract_decision_sources_reads_tradingagents_state() -> None:
     sources = extract_decision_sources(
         raw_decision(
@@ -165,19 +187,7 @@ def test_build_missing_fields_uses_fixed_missing_value() -> None:
 
 
 def test_validate_decision_facts_record_rejects_missing_fixed_field() -> None:
-    record = {
-        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
-        "kline": {
-            "status": "ok",
-            "source_hash": source_hash("kline"),
-            "fields": build_missing_fields(KLINE_FIELDS),
-        },
-        "news_sentiment": {
-            "status": "ok",
-            "source_hash": source_hash("news"),
-            "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
-        },
-    }
+    record = valid_decision_facts_record()
     del record["kline"]["fields"]["trend"]
 
     with pytest.raises(ValueError, match="kline fields are invalid"):
@@ -185,19 +195,7 @@ def test_validate_decision_facts_record_rejects_missing_fixed_field() -> None:
 
 
 def test_validate_decision_facts_record_rejects_english_only_value() -> None:
-    record = {
-        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
-        "kline": {
-            "status": "ok",
-            "source_hash": source_hash("kline"),
-            "fields": build_missing_fields(KLINE_FIELDS),
-        },
-        "news_sentiment": {
-            "status": "ok",
-            "source_hash": source_hash("news"),
-            "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
-        },
-    }
+    record = valid_decision_facts_record()
     record["news_sentiment"]["fields"]["direction"] = "Bullish retail sentiment"
 
     with pytest.raises(ValueError, match="field values must be Chinese or 缺失"):
@@ -218,41 +216,77 @@ def test_validate_decision_facts_record_rejects_english_only_value() -> None:
 def test_validate_decision_facts_record_rejects_ok_module_with_invalid_source_hash(
     bad_hash: object,
 ) -> None:
-    record = {
-        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
-        "kline": {
-            "status": "ok",
-            "source_hash": bad_hash,
-            "fields": build_missing_fields(KLINE_FIELDS),
-        },
-        "news_sentiment": {
-            "status": "missing_source",
-            "source_hash": "",
-            "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
-        },
-    }
+    record = valid_decision_facts_record()
+    record["kline"]["source_hash"] = bad_hash
+    record["news_sentiment"]["status"] = "missing_source"
+    record["news_sentiment"]["source_hash"] = ""
 
     with pytest.raises(ValueError, match="kline source_hash is invalid"):
         validate_decision_facts_record(record)
 
 
 def test_validate_decision_facts_record_rejects_unknown_status() -> None:
-    record = {
-        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
-        "kline": {
-            "status": "unexpected",
-            "source_hash": source_hash("kline"),
-            "fields": build_missing_fields(KLINE_FIELDS),
-        },
-        "news_sentiment": {
-            "status": "missing_source",
-            "source_hash": "",
-            "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
-        },
-    }
+    record = valid_decision_facts_record()
+    record["kline"]["status"] = "unexpected"
+    record["news_sentiment"]["status"] = "missing_source"
+    record["news_sentiment"]["source_hash"] = ""
 
     with pytest.raises(ValueError, match="kline status is invalid"):
         validate_decision_facts_record(record)
+
+
+def test_validate_decision_facts_record_rejects_missing_top_level_field() -> None:
+    record = valid_decision_facts_record()
+    del record["symbol"]
+
+    with pytest.raises(ValueError, match="decision facts symbol is missing"):
+        validate_decision_facts_record(record)
+
+
+def test_llm_decision_facts_extractor_accepts_hashless_module_payload() -> None:
+    class FakeClient:
+        def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+            assert temperature == 0
+            user_payload = json.loads(messages[1]["content"])
+            assert "kline_source_hash" not in user_payload
+            assert "news_sentiment_source_hash" not in user_payload
+            return json.dumps(
+                {
+                    "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+                    "kline": {
+                        "status": "ok",
+                        "fields": {
+                            "trend": "趋势偏强",
+                            "position": "位于均线上方",
+                            "momentum": "动量改善",
+                            "key_levels": "关键位缺失",
+                            "risk": "波动风险",
+                        },
+                    },
+                    "news_sentiment": {
+                        "status": "ok",
+                        "fields": {
+                            "direction": "偏多",
+                            "change": "情绪改善",
+                            "catalyst": "需求预期改善",
+                            "risk": "估值压力",
+                            "attention": "关注度升高",
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            )
+
+    payload = LLMDecisionFactsExtractor(client=FakeClient()).extract(
+        market="US",
+        symbol="SOXX",
+        run_date="2026-06-22",
+        kline_source="technical source",
+        news_sentiment_source="news source",
+    )
+
+    assert payload["kline"]["fields"]["trend"] == "趋势偏强"
+    assert "source_hash" not in payload["kline"]
 
 
 def test_generate_decision_facts_writes_run_and_latest_artifacts(tmp_path: Path) -> None:
