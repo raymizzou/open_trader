@@ -1,17 +1,31 @@
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+import re
+import sys
+from tempfile import NamedTemporaryFile
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 from open_trader.technical_facts import source_hash
+from open_trader.market_scope import (
+    MarketScope,
+    market_run_dir,
+    market_scoped_latest_path,
+    parse_market_scope,
+)
 
 
 DECISION_FACTS_SCHEMA_VERSION = "open_trader.decision_facts.v1"
 MISSING_VALUE = "缺失"
 KLINE_FIELDS = ("trend", "position", "momentum", "key_levels", "risk")
 NEWS_SENTIMENT_FIELDS = ("direction", "change", "catalyst", "risk", "attention")
+RUN_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CHINESE_TEXT_PATTERN = re.compile(r"[\u3400-\u9fff]")
 
 
 @dataclass(frozen=True)
@@ -89,24 +103,157 @@ def build_missing_fields(fields: tuple[str, ...]) -> dict[str, str]:
     return {field: MISSING_VALUE for field in fields}
 
 
-def decision_facts_run_path(*args: object, **kwargs: object) -> Path:
-    raise NotImplementedError("decision facts run path is implemented in a later task")
+def load_advice_sources(advice_path: Path) -> list[AdviceSource]:
+    if not advice_path.exists():
+        raise FileNotFoundError(f"advice CSV not found: {advice_path}")
+    csv.field_size_limit(sys.maxsize)
+    sources: list[AdviceSource] = []
+    with advice_path.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            market = (row.get("market") or "").strip().upper()
+            symbol = (row.get("symbol") or "").strip().upper()
+            run_date = (row.get("run_date") or "").strip()
+            if not market or not symbol:
+                continue
+            decision_sources = extract_decision_sources(row.get("raw_decision") or "")
+            sources.append(
+                AdviceSource(
+                    run_date=run_date,
+                    market=market,
+                    symbol=symbol,
+                    source_status=(row.get("source_status") or row.get("status") or "").strip(),
+                    kline_source=decision_sources.kline_source,
+                    news_sentiment_source=decision_sources.news_sentiment_source,
+                    kline_hash=decision_sources.kline_hash,
+                    news_sentiment_hash=decision_sources.news_sentiment_hash,
+                )
+            )
+    return sources
 
 
-def decision_facts_latest_path(*args: object, **kwargs: object) -> Path:
-    raise NotImplementedError("decision facts latest path is implemented in a later task")
+def decision_facts_run_path(
+    data_dir: Path,
+    run_date: str,
+    market: MarketScope | str | None = None,
+) -> Path:
+    scope = _market_scope(market)
+    if scope is not None:
+        return market_run_dir(data_dir, run_date, scope) / "decision_facts.json"
+    return data_dir / "runs" / run_date / "decision_facts.json"
 
 
-def generate_decision_facts(*args: object, **kwargs: object) -> DecisionFactsResult:
-    raise NotImplementedError("decision facts generation is implemented in a later task")
+def decision_facts_latest_path(
+    data_dir: Path,
+    market: MarketScope | str | None = None,
+) -> Path:
+    scope = _market_scope(market)
+    if scope is not None:
+        return market_scoped_latest_path(data_dir, scope, "decision_facts.json")
+    return data_dir / "latest" / "decision_facts.json"
 
 
-def load_decision_facts_cache(*args: object, **kwargs: object) -> dict[str, Any]:
-    return {}
+def load_decision_facts_cache(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open(encoding="utf-8-sig") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
-def validate_decision_facts_record(*args: object, **kwargs: object) -> None:
-    raise NotImplementedError("decision facts validation is implemented in a later task")
+def index_decision_facts_by_market_symbol(
+    cache: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    records = cache.get("records")
+    if not isinstance(records, list):
+        return {}
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        market = str(record.get("market") or "").strip().upper()
+        symbol = str(record.get("symbol") or "").strip().upper()
+        if market and symbol:
+            indexed[(market, symbol)] = record
+    return indexed
+
+
+def validate_decision_facts_record(record: dict[str, object]) -> None:
+    if not isinstance(record, dict):
+        raise ValueError("decision facts record must be an object")
+    if record.get("schema_version") != DECISION_FACTS_SCHEMA_VERSION:
+        raise ValueError("decision facts schema_version is invalid")
+    _validate_module(record.get("kline"), "kline", KLINE_FIELDS)
+    _validate_module(
+        record.get("news_sentiment"),
+        "news_sentiment",
+        NEWS_SENTIMENT_FIELDS,
+    )
+
+
+def generate_decision_facts(
+    *,
+    advice_path: Path,
+    data_dir: Path,
+    run_date: str | None,
+    extractor: DecisionFactsExtractor,
+    update_latest: bool,
+    market: MarketScope | str | None = None,
+) -> DecisionFactsResult:
+    sources = load_advice_sources(advice_path)
+    _validate_source_run_dates(sources)
+    market_scope = _market_scope(market)
+    market_sources = (
+        [source for source in sources if source.market == market_scope.value]
+        if market_scope is not None
+        else sources
+    )
+    if run_date is not None and run_date.strip():
+        effective_run_date = _validate_run_date(run_date.strip())
+    else:
+        effective_run_date = _latest_run_date(market_sources)
+    filtered_sources = [
+        source
+        for source in market_sources
+        if not source.run_date or source.run_date == effective_run_date
+    ]
+    if run_date is not None and not filtered_sources:
+        raise ValueError(f"no advice rows match run_date {effective_run_date}")
+
+    run_path = decision_facts_run_path(data_dir, effective_run_date, market_scope)
+    latest_path = decision_facts_latest_path(data_dir, market_scope)
+
+    records = [
+        _build_record(
+            source=source,
+            run_date=effective_run_date,
+            extractor=extractor,
+        )
+        for source in filtered_sources
+    ]
+    extracted = sum(1 for record in records if not str(record.get("error") or ""))
+    failed = len(records) - extracted
+    payload = {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "generated_at": _now_text(),
+        "run_date": effective_run_date,
+        "market": market_scope.value if market_scope is not None else "",
+        "records": records,
+    }
+    _atomic_write_json(run_path, payload)
+    if update_latest:
+        _atomic_write_json(latest_path, payload)
+    return DecisionFactsResult(
+        run_date=effective_run_date,
+        records=len(records),
+        extracted=extracted,
+        failed=failed,
+        reused=0,
+        run_path=run_path,
+        latest_path=latest_path,
+    )
 
 
 def _state_string(state: dict[object, object], key: str) -> str:
@@ -121,3 +268,197 @@ def _combine_news_sentiment_sources(*, sentiment_report: str, news_report: str) 
     if news_report:
         parts.append(f"## news_report\n\n{news_report}")
     return "\n\n".join(parts)
+
+
+def _build_record(
+    *,
+    source: AdviceSource,
+    run_date: str,
+    extractor: DecisionFactsExtractor,
+) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "run_date": run_date,
+        "market": source.market,
+        "symbol": source.symbol,
+        "source_status": source.source_status,
+    }
+    kline_missing = not source.kline_source.strip()
+    news_sentiment_missing = not source.news_sentiment_source.strip()
+    if kline_missing and news_sentiment_missing:
+        record = {
+            **base,
+            "kline": _module_missing_source(KLINE_FIELDS, source.kline_hash),
+            "news_sentiment": _module_missing_source(
+                NEWS_SENTIMENT_FIELDS,
+                source.news_sentiment_hash,
+            ),
+            "error": "",
+        }
+        validate_decision_facts_record(record)
+        return record
+
+    try:
+        extracted = extractor.extract(
+            market=source.market,
+            symbol=source.symbol,
+            run_date=run_date,
+            kline_source=source.kline_source,
+            news_sentiment_source=source.news_sentiment_source,
+        )
+        if not isinstance(extracted, dict):
+            raise ValueError("decision facts extractor response must be an object")
+        record = {
+            **base,
+            "kline": (
+                _module_missing_source(KLINE_FIELDS, source.kline_hash)
+                if kline_missing
+                else _normalize_extracted_module(
+                    extracted.get("kline"),
+                    source_hash_value=source.kline_hash,
+                    fields=KLINE_FIELDS,
+                    module_name="kline",
+                )
+            ),
+            "news_sentiment": (
+                _module_missing_source(NEWS_SENTIMENT_FIELDS, source.news_sentiment_hash)
+                if news_sentiment_missing
+                else _normalize_extracted_module(
+                    extracted.get("news_sentiment"),
+                    source_hash_value=source.news_sentiment_hash,
+                    fields=NEWS_SENTIMENT_FIELDS,
+                    module_name="news_sentiment",
+                )
+            ),
+            "error": "",
+        }
+        validate_decision_facts_record(record)
+        return record
+    except Exception as exc:
+        error = str(exc) or exc.__class__.__name__
+        record = {
+            **base,
+            "kline": _module_error(KLINE_FIELDS, source.kline_hash),
+            "news_sentiment": _module_error(
+                NEWS_SENTIMENT_FIELDS,
+                source.news_sentiment_hash,
+            ),
+            "error": error,
+        }
+        validate_decision_facts_record(record)
+        return record
+
+
+def _normalize_extracted_module(
+    module: object,
+    *,
+    source_hash_value: str,
+    fields: tuple[str, ...],
+    module_name: str,
+) -> dict[str, Any]:
+    if not isinstance(module, dict):
+        raise ValueError(f"{module_name} module is missing")
+    normalized = dict(module)
+    normalized["source_hash"] = source_hash_value
+    if "status" not in normalized:
+        normalized["status"] = "ok"
+    if "fields" not in normalized:
+        normalized["fields"] = build_missing_fields(fields)
+    return normalized
+
+
+def _module_missing_source(fields: tuple[str, ...], source_hash_value: str) -> dict[str, Any]:
+    return {
+        "status": "missing_source",
+        "source_hash": source_hash_value,
+        "fields": build_missing_fields(fields),
+    }
+
+
+def _module_error(fields: tuple[str, ...], source_hash_value: str) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "source_hash": source_hash_value,
+        "fields": build_missing_fields(fields),
+    }
+
+
+def _validate_module(
+    module: object,
+    module_name: str,
+    expected_fields: tuple[str, ...],
+) -> None:
+    if not isinstance(module, dict):
+        raise ValueError(f"{module_name} module is invalid")
+    status = module.get("status")
+    if not isinstance(status, str) or not status.strip():
+        raise ValueError(f"{module_name} status is invalid")
+    fields = module.get("fields")
+    if not isinstance(fields, dict) or set(fields) != set(expected_fields):
+        raise ValueError(f"{module_name} fields are invalid")
+    for value in fields.values():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{module_name} field values are invalid")
+        if value != MISSING_VALUE and not CHINESE_TEXT_PATTERN.search(value):
+            raise ValueError("field values must be Chinese or 缺失")
+
+
+def _latest_run_date(sources: list[AdviceSource]) -> str:
+    dates = sorted({source.run_date for source in sources if source.run_date})
+    if not dates:
+        raise ValueError("run_date must be YYYY-MM-DD")
+    return dates[-1]
+
+
+def _validate_source_run_dates(sources: list[AdviceSource]) -> None:
+    for source in sources:
+        if source.run_date and not _is_valid_run_date(source.run_date):
+            raise ValueError("run_date must be YYYY-MM-DD")
+
+
+def _validate_run_date(run_date: str) -> str:
+    if not _is_valid_run_date(run_date):
+        raise ValueError("run_date must be YYYY-MM-DD")
+    return run_date
+
+
+def _is_valid_run_date(run_date: str) -> bool:
+    if not RUN_DATE_PATTERN.fullmatch(run_date):
+        return False
+    try:
+        datetime.strptime(run_date, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _market_scope(market: MarketScope | str | None) -> MarketScope | None:
+    if market is None:
+        return None
+    if isinstance(market, MarketScope):
+        return market
+    return parse_market_scope(market)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+        json.dump(payload, temp_file, ensure_ascii=False, indent=2, sort_keys=True)
+        temp_file.write("\n")
+    try:
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _now_text() -> str:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")

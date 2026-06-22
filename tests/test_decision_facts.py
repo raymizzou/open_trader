@@ -162,3 +162,88 @@ def test_build_missing_fields_uses_fixed_missing_value() -> None:
         "risk": MISSING_VALUE,
     }
     assert build_missing_fields(NEWS_SENTIMENT_FIELDS)["direction"] == MISSING_VALUE
+
+
+def test_validate_decision_facts_record_rejects_missing_fixed_field() -> None:
+    record = {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "kline": {"status": "ok", "fields": build_missing_fields(KLINE_FIELDS)},
+        "news_sentiment": {
+            "status": "ok",
+            "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
+        },
+    }
+    del record["kline"]["fields"]["trend"]
+
+    with pytest.raises(ValueError, match="kline fields are invalid"):
+        validate_decision_facts_record(record)
+
+
+def test_validate_decision_facts_record_rejects_english_only_value() -> None:
+    record = {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "kline": {"status": "ok", "fields": build_missing_fields(KLINE_FIELDS)},
+        "news_sentiment": {
+            "status": "ok",
+            "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
+        },
+    }
+    record["news_sentiment"]["fields"]["direction"] = "Bullish retail sentiment"
+
+    with pytest.raises(ValueError, match="field values must be Chinese or 缺失"):
+        validate_decision_facts_record(record)
+
+
+def test_generate_decision_facts_writes_run_and_latest_artifacts(tmp_path: Path) -> None:
+    advice_path = tmp_path / "data/latest/US/trading_advice.csv"
+    write_advice(advice_path, [advice_row()])
+    extractor = FakeExtractor()
+
+    result = generate_decision_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-22",
+        extractor=extractor,
+        update_latest=True,
+        market="US",
+    )
+
+    assert result.run_date == "2026-06-22"
+    assert result.records == 1
+    assert result.extracted == 1
+    assert result.failed == 0
+    assert result.run_path == tmp_path / "data/runs/2026-06-22/US/decision_facts.json"
+    assert result.latest_path == tmp_path / "data/latest/US/decision_facts.json"
+    cache = load_decision_facts_cache(result.latest_path)
+    record = cache["records"][0]
+    assert cache["schema_version"] == DECISION_FACTS_SCHEMA_VERSION
+    assert record["kline"]["fields"]["trend"] == "过热拉升"
+    assert record["news_sentiment"]["fields"]["direction"] == "偏多"
+    assert record["kline"]["source_hash"] == source_hash("K line source")
+    assert record["news_sentiment"]["source_hash"] == source_hash(
+        "## sentiment_report\n\nSentiment source\n\n## news_report\n\nNews source"
+    )
+    assert extractor.calls[0]["symbol"] == "SOXX"
+
+
+def test_generate_decision_facts_missing_sources_use_missing_values(tmp_path: Path) -> None:
+    advice_path = tmp_path / "data/latest/US/trading_advice.csv"
+    write_advice(
+        advice_path,
+        [advice_row(raw=json.dumps({"state": {}}, ensure_ascii=False))],
+    )
+
+    result = generate_decision_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-22",
+        extractor=FakeExtractor(),
+        update_latest=False,
+        market="US",
+    )
+
+    record = load_decision_facts_cache(result.run_path)["records"][0]
+    assert record["kline"]["status"] == "missing_source"
+    assert set(record["kline"]["fields"].values()) == {MISSING_VALUE}
+    assert record["news_sentiment"]["status"] == "missing_source"
+    assert set(record["news_sentiment"]["fields"].values()) == {MISSING_VALUE}
