@@ -13,6 +13,7 @@ from open_trader.advice.models import (
     TradingAdvice,
 )
 from open_trader.advice.premarket import PremarketResult, run_premarket
+from open_trader.decision_facts import DecisionFactsResult
 from open_trader.technical_facts import TechnicalFactsResult
 
 
@@ -196,6 +197,51 @@ class FakeTechnicalFactsGenerator:
             latest_path.parent.mkdir(parents=True, exist_ok=True)
             latest_path.write_text(run_path.read_text(encoding="utf-8"), encoding="utf-8")
         return TechnicalFactsResult(
+            run_date=run_date,
+            records=0,
+            extracted=0,
+            reused=0,
+            failed=0,
+            run_path=run_path,
+            latest_path=latest_path,
+        )
+
+
+class FakeDecisionFactsGenerator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(
+        self,
+        *,
+        advice_path: Path,
+        data_dir: Path,
+        run_date: str,
+        update_latest: bool,
+        market,
+    ) -> DecisionFactsResult:
+        self.calls.append(
+            {
+                "advice_path": advice_path,
+                "data_dir": data_dir,
+                "run_date": run_date,
+                "update_latest": update_latest,
+                "market": market,
+            }
+        )
+        run_path = advice_path.with_name("decision_facts.json")
+        run_path.write_text(
+            (
+                '{"schema_version":"open_trader.decision_facts.v1",'
+                f'"run_date":"{run_date}","records":[]}}\n'
+            ),
+            encoding="utf-8",
+        )
+        latest_path = data_dir / "latest" / "decision_facts.json"
+        if update_latest:
+            latest_path.parent.mkdir(parents=True, exist_ok=True)
+            latest_path.write_text(run_path.read_text(encoding="utf-8"), encoding="utf-8")
+        return DecisionFactsResult(
             run_date=run_date,
             records=0,
             extracted=0,
@@ -436,6 +482,43 @@ def test_run_premarket_generates_technical_facts_after_advice(
     ]
     assert (data_dir / "runs/2026-06-19/technical_facts.json").exists()
     assert (data_dir / "latest/technical_facts.json").exists()
+
+
+def test_run_premarket_generates_decision_facts_after_advice(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports"
+    portfolio_path = data_dir / "latest" / "portfolio.csv"
+    write_portfolio(portfolio_path)
+    generator = FakeDecisionFactsGenerator()
+
+    result = run_premarket(
+        run_date="2026-06-19",
+        portfolio_path=portfolio_path,
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        advice_runner=FakeAdviceRunner(),
+        classifier=FakeClassifier(),
+        decision_facts_generator=generator,
+    )
+
+    assert generator.calls == [
+        {
+            "advice_path": result.advice_path,
+            "data_dir": data_dir,
+            "run_date": "2026-06-19",
+            "update_latest": False,
+            "market": None,
+        }
+    ]
+    assert result.decision_facts_path == (
+        data_dir / "runs/2026-06-19/decision_facts.json"
+    )
+    assert result.decision_facts_path.exists()
+    assert (data_dir / "latest/decision_facts.json").read_text(
+        encoding="utf-8"
+    ) == result.decision_facts_path.read_text(encoding="utf-8")
 
 
 def test_run_premarket_filters_hk_market_and_writes_market_scoped_outputs(

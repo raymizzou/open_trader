@@ -499,6 +499,7 @@ class FakePremarket:
         advice_path = run_dir / "trading_advice.csv"
         actions_path = run_dir / "premarket_actions.csv"
         technical_facts_path = run_dir / "technical_facts.json"
+        decision_facts_path = run_dir / "decision_facts.json"
         advice_path.parent.mkdir(parents=True, exist_ok=True)
         with advice_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
@@ -553,6 +554,13 @@ class FakePremarket:
             ),
             encoding="utf-8",
         )
+        decision_facts_path.write_text(
+            (
+                '{"schema_version":"open_trader.decision_facts.v1",'
+                f'"run_date":"{run_date}","records":[]}}\n'
+            ),
+            encoding="utf-8",
+        )
         if kwargs["update_latest"]:
             latest_dir = data_dir / "latest"
             latest_dir.mkdir(parents=True, exist_ok=True)
@@ -578,6 +586,7 @@ class FakePremarket:
                 / "change_classifications.csv",
                 "actions_path": actions_path,
                 "technical_facts_path": technical_facts_path,
+                "decision_facts_path": decision_facts_path,
                 "report_path": Path("reports/premarket") / f"{run_date}.md",
             },
         )()
@@ -1721,6 +1730,43 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     assert status["artifacts"]["latest_technical_facts"] == str(
         tmp_path / "data/latest/US/technical_facts.json"
     )
+
+
+def test_daily_runner_promotes_decision_facts(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+
+    result = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=NullNotifier(),
+    ).run("2026-06-17", market="US")
+
+    run_decision_facts = tmp_path / "data/runs/2026-06-17/US/decision_facts.json"
+    latest_decision_facts = tmp_path / "data/latest/US/decision_facts.json"
+    assert result.status == "success"
+    assert latest_decision_facts.read_text(encoding="utf-8") == (
+        run_decision_facts.read_text(encoding="utf-8")
+    )
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["artifacts"]["decision_facts"] == str(run_decision_facts)
+    assert status["artifacts"]["latest_decision_facts"] == str(latest_decision_facts)
 
 
 def test_daily_runner_does_not_promote_latest_when_plan_build_fails(
