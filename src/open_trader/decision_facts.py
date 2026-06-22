@@ -26,6 +26,7 @@ KLINE_FIELDS = ("trend", "position", "momentum", "key_levels", "risk")
 NEWS_SENTIMENT_FIELDS = ("direction", "change", "catalyst", "risk", "attention")
 RUN_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CHINESE_TEXT_PATTERN = re.compile(r"[\u3400-\u9fff]")
+VALID_MODULE_STATUSES = {"ok", "missing_source", "extraction_failed", "error"}
 
 
 @dataclass(frozen=True)
@@ -308,45 +309,80 @@ def _build_record(
         )
         if not isinstance(extracted, dict):
             raise ValueError("decision facts extractor response must be an object")
+    except Exception as exc:
+        error = str(exc) or exc.__class__.__name__
         record = {
             **base,
             "kline": (
                 _module_missing_source(KLINE_FIELDS, source.kline_hash)
                 if kline_missing
-                else _normalize_extracted_module(
-                    extracted.get("kline"),
-                    source_hash_value=source.kline_hash,
-                    fields=KLINE_FIELDS,
-                    module_name="kline",
-                )
+                else _module_error(KLINE_FIELDS, source.kline_hash)
             ),
             "news_sentiment": (
                 _module_missing_source(NEWS_SENTIMENT_FIELDS, source.news_sentiment_hash)
                 if news_sentiment_missing
-                else _normalize_extracted_module(
-                    extracted.get("news_sentiment"),
-                    source_hash_value=source.news_sentiment_hash,
-                    fields=NEWS_SENTIMENT_FIELDS,
-                    module_name="news_sentiment",
+                else _module_error(
+                    NEWS_SENTIMENT_FIELDS,
+                    source.news_sentiment_hash,
                 )
-            ),
-            "error": "",
-        }
-        validate_decision_facts_record(record)
-        return record
-    except Exception as exc:
-        error = str(exc) or exc.__class__.__name__
-        record = {
-            **base,
-            "kline": _module_error(KLINE_FIELDS, source.kline_hash),
-            "news_sentiment": _module_error(
-                NEWS_SENTIMENT_FIELDS,
-                source.news_sentiment_hash,
             ),
             "error": error,
         }
         validate_decision_facts_record(record)
         return record
+
+    kline_module, kline_error = _build_extracted_module(
+        extracted.get("kline"),
+        fields=KLINE_FIELDS,
+        source_hash_value=source.kline_hash,
+        module_name="kline",
+        missing_source=kline_missing,
+    )
+    news_sentiment_module, news_sentiment_error = _build_extracted_module(
+        extracted.get("news_sentiment"),
+        fields=NEWS_SENTIMENT_FIELDS,
+        source_hash_value=source.news_sentiment_hash,
+        module_name="news_sentiment",
+        missing_source=news_sentiment_missing,
+    )
+    errors = [
+        error
+        for error in (kline_error, news_sentiment_error)
+        if error
+    ]
+    record = {
+        **base,
+        "kline": kline_module,
+        "news_sentiment": news_sentiment_module,
+        "error": "; ".join(errors),
+    }
+    validate_decision_facts_record(record)
+    return record
+
+
+def _build_extracted_module(
+    module: object,
+    *,
+    fields: tuple[str, ...],
+    source_hash_value: str,
+    module_name: str,
+    missing_source: bool,
+) -> tuple[dict[str, Any], str]:
+    if missing_source:
+        return _module_missing_source(fields, source_hash_value), ""
+    try:
+        normalized = _normalize_extracted_module(
+            module,
+            source_hash_value=source_hash_value,
+            fields=fields,
+            module_name=module_name,
+        )
+        _validate_module(normalized, module_name, fields)
+    except Exception as exc:
+        return _module_error(fields, source_hash_value), (
+            f"{module_name}: {str(exc) or exc.__class__.__name__}"
+        )
+    return normalized, ""
 
 
 def _normalize_extracted_module(
@@ -362,8 +398,9 @@ def _normalize_extracted_module(
     normalized["source_hash"] = source_hash_value
     if "status" not in normalized:
         normalized["status"] = "ok"
-    if "fields" not in normalized:
-        normalized["fields"] = build_missing_fields(fields)
+    raw_fields = normalized.get("fields")
+    if not isinstance(raw_fields, dict) or set(raw_fields) != set(fields):
+        raise ValueError(f"{module_name} fields are invalid")
     return normalized
 
 
@@ -391,8 +428,25 @@ def _validate_module(
     if not isinstance(module, dict):
         raise ValueError(f"{module_name} module is invalid")
     status = module.get("status")
-    if not isinstance(status, str) or not status.strip():
+    status_text = status.strip() if isinstance(status, str) else ""
+    if status_text not in VALID_MODULE_STATUSES:
         raise ValueError(f"{module_name} status is invalid")
+    source_hash_value = module.get("source_hash")
+    if status_text == "missing_source":
+        if not isinstance(source_hash_value, str) or (
+            source_hash_value
+            and (
+                not source_hash_value.startswith("sha256:")
+                or len(source_hash_value) <= len("sha256:")
+            )
+        ):
+            raise ValueError(f"{module_name} source_hash is invalid")
+    elif (
+        not isinstance(source_hash_value, str)
+        or not source_hash_value.startswith("sha256:")
+        or len(source_hash_value) <= len("sha256:")
+    ):
+        raise ValueError(f"{module_name} source_hash is invalid")
     fields = module.get("fields")
     if not isinstance(fields, dict) or set(fields) != set(expected_fields):
         raise ValueError(f"{module_name} fields are invalid")

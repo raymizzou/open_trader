@@ -167,9 +167,14 @@ def test_build_missing_fields_uses_fixed_missing_value() -> None:
 def test_validate_decision_facts_record_rejects_missing_fixed_field() -> None:
     record = {
         "schema_version": DECISION_FACTS_SCHEMA_VERSION,
-        "kline": {"status": "ok", "fields": build_missing_fields(KLINE_FIELDS)},
+        "kline": {
+            "status": "ok",
+            "source_hash": source_hash("kline"),
+            "fields": build_missing_fields(KLINE_FIELDS),
+        },
         "news_sentiment": {
             "status": "ok",
+            "source_hash": source_hash("news"),
             "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
         },
     }
@@ -182,15 +187,61 @@ def test_validate_decision_facts_record_rejects_missing_fixed_field() -> None:
 def test_validate_decision_facts_record_rejects_english_only_value() -> None:
     record = {
         "schema_version": DECISION_FACTS_SCHEMA_VERSION,
-        "kline": {"status": "ok", "fields": build_missing_fields(KLINE_FIELDS)},
+        "kline": {
+            "status": "ok",
+            "source_hash": source_hash("kline"),
+            "fields": build_missing_fields(KLINE_FIELDS),
+        },
         "news_sentiment": {
             "status": "ok",
+            "source_hash": source_hash("news"),
             "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
         },
     }
     record["news_sentiment"]["fields"]["direction"] = "Bullish retail sentiment"
 
     with pytest.raises(ValueError, match="field values must be Chinese or 缺失"):
+        validate_decision_facts_record(record)
+
+
+@pytest.mark.parametrize("bad_hash", [None, "", "not-a-source-hash"])
+def test_validate_decision_facts_record_rejects_ok_module_with_invalid_source_hash(
+    bad_hash: object,
+) -> None:
+    record = {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "kline": {
+            "status": "ok",
+            "source_hash": bad_hash,
+            "fields": build_missing_fields(KLINE_FIELDS),
+        },
+        "news_sentiment": {
+            "status": "missing_source",
+            "source_hash": "",
+            "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
+        },
+    }
+
+    with pytest.raises(ValueError, match="kline source_hash is invalid"):
+        validate_decision_facts_record(record)
+
+
+def test_validate_decision_facts_record_rejects_unknown_status() -> None:
+    record = {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "kline": {
+            "status": "unexpected",
+            "source_hash": source_hash("kline"),
+            "fields": build_missing_fields(KLINE_FIELDS),
+        },
+        "news_sentiment": {
+            "status": "missing_source",
+            "source_hash": "",
+            "fields": build_missing_fields(NEWS_SENTIMENT_FIELDS),
+        },
+    }
+
+    with pytest.raises(ValueError, match="kline status is invalid"):
         validate_decision_facts_record(record)
 
 
@@ -247,3 +298,44 @@ def test_generate_decision_facts_missing_sources_use_missing_values(tmp_path: Pa
     assert set(record["kline"]["fields"].values()) == {MISSING_VALUE}
     assert record["news_sentiment"]["status"] == "missing_source"
     assert set(record["news_sentiment"]["fields"].values()) == {MISSING_VALUE}
+
+
+def test_generate_decision_facts_malformed_kline_keeps_valid_news_sentiment(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/latest/US/trading_advice.csv"
+    write_advice(advice_path, [advice_row()])
+    extractor = FakeExtractor(
+        {
+            "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+            "kline": {"status": "ok"},
+            "news_sentiment": {
+                "status": "ok",
+                "fields": {
+                    "direction": "偏多",
+                    "change": "较上次转强",
+                    "catalyst": "AI 基建需求",
+                    "risk": "估值过高",
+                    "attention": "关注度升高",
+                },
+            },
+        }
+    )
+
+    result = generate_decision_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-22",
+        extractor=extractor,
+        update_latest=False,
+        market="US",
+    )
+
+    record = load_decision_facts_cache(result.run_path)["records"][0]
+    assert result.extracted == 0
+    assert result.failed == 1
+    assert record["kline"]["status"] == "error"
+    assert set(record["kline"]["fields"].values()) == {MISSING_VALUE}
+    assert record["news_sentiment"]["status"] == "ok"
+    assert record["news_sentiment"]["fields"]["direction"] == "偏多"
+    assert "kline" in record["error"]
