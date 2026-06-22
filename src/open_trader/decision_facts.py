@@ -38,7 +38,8 @@ DISALLOWED_ENGLISH_PHRASE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DISALLOWED_CHINESE_TRADING_PHRASE_PATTERN = re.compile(
-    r"(?:建议买入|建议卖出|下单|加仓|减仓|仓位|目标价|止损价|自动执行)"
+    r"(?:建议买入|建议卖出|请下单|下单|自动执行|加仓至|加仓到|减仓至|减仓到|"
+    r"减仓一半|目标价\s*[\d.]+[^，。；;]*买入|止损价\s*[\d.]+[^，。；;]*卖出)"
 )
 
 

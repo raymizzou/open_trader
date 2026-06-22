@@ -210,9 +210,43 @@ def test_validate_decision_facts_record_rejects_chinese_trading_instruction() ->
         validate_decision_facts_record(record)
 
 
-def test_validate_decision_facts_record_allows_common_indicator_acronyms() -> None:
+@pytest.mark.parametrize(
+    "value",
+    [
+        "建议买入",
+        "建议卖出",
+        "请下单",
+        "自动执行",
+        "加仓至五成",
+        "减仓一半",
+        "目标价 100 后买入",
+        "止损价 90 自动卖出",
+    ],
+)
+def test_validate_decision_facts_record_rejects_chinese_trading_instructions(
+    value: str,
+) -> None:
     record = valid_decision_facts_record()
-    record["kline"]["fields"]["momentum"] = "RSI 高位，MACD 偏强"
+    record["news_sentiment"]["fields"]["direction"] = value
+
+    with pytest.raises(ValueError, match="field values must not contain trading guidance"):
+        validate_decision_facts_record(record)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "RSI 高位，MACD 偏强",
+        "机构仓位拥挤带来波动风险",
+        "期权仓位显示避险需求上升",
+        "目标价上调带动关注度升高",
+    ],
+)
+def test_validate_decision_facts_record_allows_neutral_facts(
+    value: str,
+) -> None:
+    record = valid_decision_facts_record()
+    record["kline"]["fields"]["momentum"] = value
 
     validate_decision_facts_record(record)
 
