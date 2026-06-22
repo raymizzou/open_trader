@@ -1973,6 +1973,110 @@ def test_daily_runner_rolls_back_latest_set_when_technical_facts_promotion_fails
     assert "technical facts replace failed" in status["error"]
 
 
+def test_daily_runner_rolls_back_latest_set_when_decision_facts_promotion_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    latest_dir = tmp_path / "data/latest/US"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    (latest_dir / "trading_advice.csv").write_text("old advice\n", encoding="utf-8")
+    (latest_dir / "premarket_actions.csv").write_text(
+        "old actions\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "trading_plan.csv").write_text("old plan\n", encoding="utf-8")
+    (latest_dir / "trade_actions.csv").write_text(
+        "old trade actions\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "technical_facts.json").write_text(
+        '{"run_date":"2026-06-16","records":[]}\n',
+        encoding="utf-8",
+    )
+    (latest_dir / "decision_facts.json").write_text(
+        '{"run_date":"2026-06-16","records":[]}\n',
+        encoding="utf-8",
+    )
+
+    def fail_on_decision_facts_replace(source_path: Path, latest_path: Path) -> None:
+        if latest_path.name == "decision_facts.json":
+            assert (latest_dir / "trading_advice.csv").read_text(
+                encoding="utf-8"
+            ) != "old advice\n"
+            assert (latest_dir / "premarket_actions.csv").read_text(
+                encoding="utf-8"
+            ) != "old actions\n"
+            assert (latest_dir / "trading_plan.csv").read_text(
+                encoding="utf-8"
+            ) != "old plan\n"
+            assert (latest_dir / "trade_actions.csv").read_text(
+                encoding="utf-8"
+            ) != "old trade actions\n"
+            assert (latest_dir / "technical_facts.json").read_text(
+                encoding="utf-8"
+            ) != '{"run_date":"2026-06-16","records":[]}\n'
+            raise RuntimeError("decision facts replace failed")
+        source_path.replace(latest_path)
+
+    monkeypatch.setattr(
+        daily_premarket,
+        "_replace_latest_path",
+        fail_on_decision_facts_replace,
+        raising=False,
+    )
+
+    runner = DailyPremarketRunner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17", market="US")
+
+    assert result.status == "failed"
+    assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "old advice\n"
+    )
+    assert (latest_dir / "premarket_actions.csv").read_text(encoding="utf-8") == (
+        "old actions\n"
+    )
+    assert (latest_dir / "trading_plan.csv").read_text(encoding="utf-8") == (
+        "old plan\n"
+    )
+    assert (latest_dir / "trade_actions.csv").read_text(encoding="utf-8") == (
+        "old trade actions\n"
+    )
+    assert (latest_dir / "technical_facts.json").read_text(encoding="utf-8") == (
+        '{"run_date":"2026-06-16","records":[]}\n'
+    )
+    assert (latest_dir / "decision_facts.json").read_text(encoding="utf-8") == (
+        '{"run_date":"2026-06-16","records":[]}\n'
+    )
+    assert list(latest_dir.glob("*.backup")) == []
+    assert list(latest_dir.glob(".*.tmp")) == []
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "failed"
+    assert "decision facts replace failed" in status["error"]
+
+
 def test_daily_runner_does_not_promote_latest_when_report_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
