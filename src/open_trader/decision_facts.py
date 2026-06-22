@@ -33,9 +33,16 @@ CHINESE_TEXT_PATTERN = re.compile(r"[\u3400-\u9fff]")
 SOURCE_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 VALID_MODULE_STATUSES = {"ok", "missing_source", "extraction_failed", "error"}
 DISALLOWED_ENGLISH_PHRASE_PATTERN = re.compile(
-    r"\b(?:buy\s+now|target\s+price|sell|stop\s+loss|take\s+profit|"
-    r"place\s+order|position\s+sizing|sizing)\b",
-    re.IGNORECASE,
+    r"""
+    \b(?:buy\s+now|target\s+price|stop\s+loss|take\s+profit|position\s+sizing|sizing)\b
+    |
+    \b(?:buy|sell|add|reduce|trim|hold)\b
+    |
+    \b(?:orders?|shares?|positions?)\b
+    |
+    \b(?:place|submit|enter|execute)\b(?:\W+\w+){0,5}\W+\b(?:buy|sell|orders?)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 DISALLOWED_CHINESE_TRADING_PHRASE_PATTERN = re.compile(
     r"(?:建议买入|建议卖出|请下单|下单|自动执行|加仓至|加仓到|减仓至|减仓到|"

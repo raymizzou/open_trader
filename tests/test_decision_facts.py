@@ -236,7 +236,30 @@ def test_validate_decision_facts_record_rejects_chinese_trading_instructions(
 @pytest.mark.parametrize(
     "value",
     [
+        "趋势偏强 buy 100 shares",
+        "趋势偏强 place a buy order for 100 shares",
+        "趋势偏强 add 100 shares",
+        "趋势偏强 reduce position by half",
+        "趋势偏强 trim half the position",
+    ],
+)
+def test_validate_decision_facts_record_rejects_mixed_english_trading_prose(
+    value: str,
+) -> None:
+    record = valid_decision_facts_record()
+    record["kline"]["fields"]["trend"] = value
+
+    with pytest.raises(ValueError, match="field values must not contain trading guidance"):
+        validate_decision_facts_record(record)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
         "RSI 高位，MACD 偏强",
+        "AI 基建需求增强",
+        "ETF 资金流入增加",
+        "IPO 预期提升热度",
         "机构仓位拥挤带来波动风险",
         "期权仓位显示避险需求上升",
         "目标价上调带动关注度升高",
