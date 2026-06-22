@@ -289,6 +289,52 @@ def test_llm_decision_facts_extractor_accepts_hashless_module_payload() -> None:
     assert "source_hash" not in payload["kline"]
 
 
+def test_llm_decision_facts_extractor_strips_extra_keys() -> None:
+    class FakeClient:
+        def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+            return json.dumps(
+                {
+                    "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+                    "raw_english": "Buy now target price 100",
+                    "kline": {
+                        "status": "ok",
+                        "raw_english": "Buy now target price 100",
+                        "fields": {
+                            "trend": "趋势偏强",
+                            "position": "位于均线上方",
+                            "momentum": "动量改善",
+                            "key_levels": "关键位缺失",
+                            "risk": "波动风险",
+                        },
+                    },
+                    "news_sentiment": {
+                        "status": "ok",
+                        "raw_english": "Buy now target price 100",
+                        "fields": {
+                            "direction": "偏多",
+                            "change": "情绪改善",
+                            "catalyst": "需求预期改善",
+                            "risk": "估值压力",
+                            "attention": "关注度升高",
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            )
+
+    payload = LLMDecisionFactsExtractor(client=FakeClient()).extract(
+        market="US",
+        symbol="SOXX",
+        run_date="2026-06-22",
+        kline_source="technical source",
+        news_sentiment_source="news source",
+    )
+
+    assert set(payload) == {"schema_version", "kline", "news_sentiment"}
+    assert set(payload["kline"]) == {"status", "fields"}
+    assert set(payload["news_sentiment"]) == {"status", "fields"}
+
+
 def test_generate_decision_facts_writes_run_and_latest_artifacts(tmp_path: Path) -> None:
     advice_path = tmp_path / "data/latest/US/trading_advice.csv"
     write_advice(advice_path, [advice_row()])
@@ -342,6 +388,53 @@ def test_generate_decision_facts_missing_sources_use_missing_values(tmp_path: Pa
     assert set(record["kline"]["fields"].values()) == {MISSING_VALUE}
     assert record["news_sentiment"]["status"] == "missing_source"
     assert set(record["news_sentiment"]["fields"].values()) == {MISSING_VALUE}
+
+
+def test_generate_decision_facts_does_not_persist_extra_module_keys(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/latest/US/trading_advice.csv"
+    write_advice(advice_path, [advice_row()])
+    extractor = FakeExtractor(
+        {
+            "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+            "kline": {
+                "status": "ok",
+                "raw_english": "Buy now target price 100",
+                "fields": {
+                    "trend": "趋势偏强",
+                    "position": "位于均线上方",
+                    "momentum": "动量改善",
+                    "key_levels": "关键位缺失",
+                    "risk": "波动风险",
+                },
+            },
+            "news_sentiment": {
+                "status": "ok",
+                "raw_english": "Buy now target price 100",
+                "fields": {
+                    "direction": "偏多",
+                    "change": "情绪改善",
+                    "catalyst": "需求预期改善",
+                    "risk": "估值压力",
+                    "attention": "关注度升高",
+                },
+            },
+        }
+    )
+
+    result = generate_decision_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-22",
+        extractor=extractor,
+        update_latest=False,
+        market="US",
+    )
+
+    record = load_decision_facts_cache(result.run_path)["records"][0]
+    assert set(record["kline"]) == {"status", "source_hash", "fields"}
+    assert set(record["news_sentiment"]) == {"status", "source_hash", "fields"}
 
 
 def test_generate_decision_facts_malformed_kline_keeps_valid_news_sentiment(

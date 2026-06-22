@@ -142,8 +142,7 @@ class LLMDecisionFactsExtractor:
             raise ValueError("LLM decision facts response must be valid JSON") from exc
         if not isinstance(payload, dict):
             raise ValueError("LLM decision facts response must be a JSON object")
-        _validate_llm_payload(payload)
-        return payload
+        return _validate_llm_payload(payload)
 
 
 def extract_decision_sources(raw_decision: str) -> DecisionSources:
@@ -489,14 +488,16 @@ def _normalize_extracted_module(
 ) -> dict[str, Any]:
     if not isinstance(module, dict):
         raise ValueError(f"{module_name} module is missing")
-    normalized = dict(module)
-    normalized["source_hash"] = source_hash_value
-    if "status" not in normalized:
-        normalized["status"] = "ok"
-    raw_fields = normalized.get("fields")
+    raw_fields = module.get("fields")
     if not isinstance(raw_fields, dict) or set(raw_fields) != set(fields):
         raise ValueError(f"{module_name} fields are invalid")
-    return normalized
+    status = module.get("status")
+    status_text = status.strip() if isinstance(status, str) and status.strip() else "ok"
+    return {
+        "status": status_text,
+        "source_hash": source_hash_value,
+        "fields": {field: raw_fields[field] for field in fields},
+    }
 
 
 def _module_missing_source(fields: tuple[str, ...], source_hash_value: str) -> dict[str, Any]:
@@ -539,36 +540,43 @@ def _validate_module(
     _validate_module_fields(module.get("fields"), module_name, expected_fields)
 
 
-def _validate_llm_payload(payload: dict[str, object]) -> None:
+def _validate_llm_payload(payload: dict[str, object]) -> dict[str, object]:
     if payload.get("schema_version") != DECISION_FACTS_SCHEMA_VERSION:
         raise ValueError("decision facts schema_version is invalid")
-    _validate_llm_module(payload.get("kline"), "kline", KLINE_FIELDS)
-    _validate_llm_module(
-        payload.get("news_sentiment"),
-        "news_sentiment",
-        NEWS_SENTIMENT_FIELDS,
+    kline = _validate_llm_module(payload.get("kline"), "kline", KLINE_FIELDS)
+    news_sentiment = _validate_llm_module(
+        payload.get("news_sentiment"), "news_sentiment", NEWS_SENTIMENT_FIELDS
     )
+    return {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "kline": kline,
+        "news_sentiment": news_sentiment,
+    }
 
 
 def _validate_llm_module(
     module: object,
     module_name: str,
     expected_fields: tuple[str, ...],
-) -> None:
+) -> dict[str, object]:
     if not isinstance(module, dict):
         raise ValueError(f"{module_name} module is invalid")
     status = module.get("status")
     status_text = status.strip() if isinstance(status, str) else ""
     if status_text not in VALID_MODULE_STATUSES:
         raise ValueError(f"{module_name} status is invalid")
-    _validate_module_fields(module.get("fields"), module_name, expected_fields)
+    fields = _validate_module_fields(module.get("fields"), module_name, expected_fields)
+    return {
+        "status": status_text,
+        "fields": {field: fields[field] for field in expected_fields},
+    }
 
 
 def _validate_module_fields(
     fields: object,
     module_name: str,
     expected_fields: tuple[str, ...],
-) -> None:
+) -> dict[str, str]:
     if not isinstance(fields, dict) or set(fields) != set(expected_fields):
         raise ValueError(f"{module_name} fields are invalid")
     for value in fields.values():
@@ -576,6 +584,7 @@ def _validate_module_fields(
             raise ValueError(f"{module_name} field values are invalid")
         if value != MISSING_VALUE and not CHINESE_TEXT_PATTERN.search(value):
             raise ValueError("field values must be Chinese or 缺失")
+    return {field: fields[field] for field in expected_fields}
 
 
 def _validate_persisted_record_metadata(record: dict[str, object]) -> None:
