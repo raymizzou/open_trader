@@ -204,7 +204,17 @@ def test_validate_decision_facts_record_rejects_english_only_value() -> None:
         validate_decision_facts_record(record)
 
 
-@pytest.mark.parametrize("bad_hash", [None, "", "not-a-source-hash"])
+@pytest.mark.parametrize(
+    "bad_hash",
+    [
+        None,
+        "",
+        "not-a-source-hash",
+        "sha256:x",
+        "sha256:" + ("g" * 64),
+        "sha256:" + ("a" * 63),
+    ],
+)
 def test_validate_decision_facts_record_rejects_ok_module_with_invalid_source_hash(
     bad_hash: object,
 ) -> None:
@@ -335,6 +345,50 @@ def test_generate_decision_facts_malformed_kline_keeps_valid_news_sentiment(
     assert result.extracted == 0
     assert result.failed == 1
     assert record["kline"]["status"] == "error"
+    assert set(record["kline"]["fields"].values()) == {MISSING_VALUE}
+    assert record["news_sentiment"]["status"] == "ok"
+    assert record["news_sentiment"]["fields"]["direction"] == "偏多"
+    assert "kline" in record["error"]
+
+
+def test_generate_decision_facts_extractor_failure_status_counts_as_failed(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/latest/US/trading_advice.csv"
+    write_advice(advice_path, [advice_row()])
+    extractor = FakeExtractor(
+        {
+            "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+            "kline": {
+                "status": "extraction_failed",
+                "fields": build_missing_fields(KLINE_FIELDS),
+            },
+            "news_sentiment": {
+                "status": "ok",
+                "fields": {
+                    "direction": "偏多",
+                    "change": "较上次转强",
+                    "catalyst": "AI 基建需求",
+                    "risk": "估值过高",
+                    "attention": "关注度升高",
+                },
+            },
+        }
+    )
+
+    result = generate_decision_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-22",
+        extractor=extractor,
+        update_latest=False,
+        market="US",
+    )
+
+    record = load_decision_facts_cache(result.run_path)["records"][0]
+    assert result.extracted == 0
+    assert result.failed == 1
+    assert record["kline"]["status"] == "extraction_failed"
     assert set(record["kline"]["fields"].values()) == {MISSING_VALUE}
     assert record["news_sentiment"]["status"] == "ok"
     assert record["news_sentiment"]["fields"]["direction"] == "偏多"

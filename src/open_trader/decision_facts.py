@@ -26,6 +26,7 @@ KLINE_FIELDS = ("trend", "position", "momentum", "key_levels", "risk")
 NEWS_SENTIMENT_FIELDS = ("direction", "change", "catalyst", "risk", "attention")
 RUN_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CHINESE_TEXT_PATTERN = re.compile(r"[\u3400-\u9fff]")
+SOURCE_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 VALID_MODULE_STATUSES = {"ok", "missing_source", "extraction_failed", "error"}
 
 
@@ -378,6 +379,9 @@ def _build_extracted_module(
             module_name=module_name,
         )
         _validate_module(normalized, module_name, fields)
+        status = str(normalized.get("status") or "").strip()
+        if status != "ok":
+            return normalized, f"{module_name}: status {status}"
     except Exception as exc:
         return _module_error(fields, source_hash_value), (
             f"{module_name}: {str(exc) or exc.__class__.__name__}"
@@ -434,17 +438,11 @@ def _validate_module(
     source_hash_value = module.get("source_hash")
     if status_text == "missing_source":
         if not isinstance(source_hash_value, str) or (
-            source_hash_value
-            and (
-                not source_hash_value.startswith("sha256:")
-                or len(source_hash_value) <= len("sha256:")
-            )
+            source_hash_value and not SOURCE_HASH_PATTERN.fullmatch(source_hash_value)
         ):
             raise ValueError(f"{module_name} source_hash is invalid")
-    elif (
-        not isinstance(source_hash_value, str)
-        or not source_hash_value.startswith("sha256:")
-        or len(source_hash_value) <= len("sha256:")
+    elif not isinstance(source_hash_value, str) or not SOURCE_HASH_PATTERN.fullmatch(
+        source_hash_value
     ):
         raise ValueError(f"{module_name} source_hash is invalid")
     fields = module.get("fields")
