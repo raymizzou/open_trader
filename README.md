@@ -185,6 +185,31 @@ market's run directory and `--update-latest` promotes it to the matching latest
 market path, such as `data/latest/HK/technical_facts.json` or
 `data/latest/US/technical_facts.json`.
 
+### Fixed decision facts
+
+After a market-scoped TradingAgents run, Open Trader extracts fixed Chinese
+decision fields for the dashboard:
+
+```text
+data/runs/<YYYY-MM-DD>/<MARKET>/decision_facts.json
+data/latest/<MARKET>/decision_facts.json
+```
+
+Manual command:
+
+```bash
+.venv/bin/python -m open_trader extract-decision-facts \
+  --advice data/latest/US/trading_advice.csv \
+  --data-dir data \
+  --date 2026-06-22 \
+  --market US \
+  --update-latest
+```
+
+The dashboard uses fixed fields for `Trend / K-line` and `News / Sentiment`.
+Missing field values are rendered as `缺失`; the dashboard does not display raw
+English TradingAgents prose in those plugin fields.
+
 ### Build Trading Plan
 
 ```bash

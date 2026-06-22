@@ -172,6 +172,29 @@ open-trader extract-technical-facts \
 `data/latest/HK/technical_facts.json` 或
 `data/latest/US/technical_facts.json`。
 
+### 固定交易事实字段
+
+按市场运行 TradingAgents 后，Open Trader 会为看板抽取固定中文字段：
+
+```text
+data/runs/<YYYY-MM-DD>/<MARKET>/decision_facts.json
+data/latest/<MARKET>/decision_facts.json
+```
+
+手动命令：
+
+```bash
+.venv/bin/python -m open_trader extract-decision-facts \
+  --advice data/latest/US/trading_advice.csv \
+  --data-dir data \
+  --date 2026-06-22 \
+  --market US \
+  --update-latest
+```
+
+看板的 `趋势 / K 线` 和 `新闻 / 舆论` 只展示固定字段。缺少字段值时显示
+`缺失`，不会在这些插件字段中直接展示 TradingAgents 英文原文。
+
 ### 生成 Trading Plan
 
 ```bash
