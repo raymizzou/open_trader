@@ -875,6 +875,54 @@ def test_dashboard_attaches_hash_checked_decision_facts(
     )
 
 
+def test_dashboard_falls_back_to_unscoped_decision_facts(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    raw_decision = raw_decision_with_all_reports()
+    decision_sources = extract_decision_sources(raw_decision)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Watch volatility.",
+                "raw_decision": raw_decision,
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_decision_facts(
+        config.data_dir / "latest" / "decision_facts.json",
+        decision_sources.kline_hash,
+        decision_sources.news_sentiment_hash,
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["decision_facts"]["kline"]["available"] is True
+    assert vixy["decision_facts"]["kline"]["fields"]["trend"] == "趋势偏强"
+    assert vixy["decision_facts"]["news_sentiment"]["available"] is True
+    assert (
+        vixy["decision_facts"]["news_sentiment"]["fields"]["direction"]
+        == "情绪偏谨慎"
+    )
+
+
 def test_dashboard_stale_decision_facts_render_missing_fields(
     tmp_path: Path,
 ) -> None:

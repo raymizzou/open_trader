@@ -273,18 +273,30 @@ def _latest_decision_facts_for_markets(
     data_dir: Path,
     markets: set[str],
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, bool]]:
+    unscoped_path = data_dir / "latest" / "decision_facts.json"
+    unscoped_exists = unscoped_path.exists()
+    unscoped_records = index_decision_facts_by_market_symbol(
+        load_decision_facts_cache(unscoped_path)
+    )
     records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     file_exists_by_market: dict[str, bool] = {}
     for market in markets:
         scoped_path = data_dir / "latest" / market / "decision_facts.json"
-        file_exists_by_market[market] = scoped_path.exists()
-        if not scoped_path.exists():
-            continue
-        records_by_key.update(
-            index_decision_facts_by_market_symbol(
-                load_decision_facts_cache(scoped_path)
+        if scoped_path.exists():
+            file_exists_by_market[market] = True
+            records_by_key.update(
+                index_decision_facts_by_market_symbol(
+                    load_decision_facts_cache(scoped_path)
+                )
             )
-        )
+            continue
+        market_unscoped_records = {
+            key: record
+            for key, record in unscoped_records.items()
+            if key[0] == market
+        }
+        file_exists_by_market[market] = unscoped_exists and bool(market_unscoped_records)
+        records_by_key.update(market_unscoped_records)
     return records_by_key, file_exists_by_market
 
 

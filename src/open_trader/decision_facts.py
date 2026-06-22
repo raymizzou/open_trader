@@ -559,15 +559,29 @@ def _validate_module(
 def _validate_llm_payload(payload: dict[str, object]) -> dict[str, object]:
     if payload.get("schema_version") != DECISION_FACTS_SCHEMA_VERSION:
         raise ValueError("decision facts schema_version is invalid")
-    kline = _validate_llm_module(payload.get("kline"), "kline", KLINE_FIELDS)
-    news_sentiment = _validate_llm_module(
-        payload.get("news_sentiment"), "news_sentiment", NEWS_SENTIMENT_FIELDS
-    )
     return {
         "schema_version": DECISION_FACTS_SCHEMA_VERSION,
-        "kline": kline,
-        "news_sentiment": news_sentiment,
+        "kline": _coerce_llm_module(payload.get("kline"), "kline", KLINE_FIELDS),
+        "news_sentiment": _coerce_llm_module(
+            payload.get("news_sentiment"),
+            "news_sentiment",
+            NEWS_SENTIMENT_FIELDS,
+        ),
     }
+
+
+def _coerce_llm_module(
+    module: object,
+    module_name: str,
+    expected_fields: tuple[str, ...],
+) -> dict[str, object]:
+    try:
+        return _validate_llm_module(module, module_name, expected_fields)
+    except ValueError:
+        return {
+            "status": "error",
+            "fields": build_missing_fields(expected_fields),
+        }
 
 
 def _validate_llm_module(

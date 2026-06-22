@@ -407,7 +407,7 @@ def test_llm_decision_facts_extractor_strips_extra_keys() -> None:
     assert set(payload["news_sentiment"]) == {"status", "fields"}
 
 
-def test_llm_decision_facts_extractor_rejects_mixed_trading_english() -> None:
+def test_llm_decision_facts_extractor_coerces_bad_module_and_keeps_good_module() -> None:
     class FakeClient:
         def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
             return json.dumps(
@@ -437,14 +437,18 @@ def test_llm_decision_facts_extractor_rejects_mixed_trading_english() -> None:
                 ensure_ascii=False,
             )
 
-    with pytest.raises(ValueError, match="field values must not contain trading guidance"):
-        LLMDecisionFactsExtractor(client=FakeClient()).extract(
-            market="US",
-            symbol="SOXX",
-            run_date="2026-06-22",
-            kline_source="technical source",
-            news_sentiment_source="news source",
-        )
+    payload = LLMDecisionFactsExtractor(client=FakeClient()).extract(
+        market="US",
+        symbol="SOXX",
+        run_date="2026-06-22",
+        kline_source="technical source",
+        news_sentiment_source="news source",
+    )
+
+    assert payload["kline"]["status"] == "error"
+    assert payload["kline"]["fields"] == build_missing_fields(KLINE_FIELDS)
+    assert payload["news_sentiment"]["status"] == "ok"
+    assert payload["news_sentiment"]["fields"]["direction"] == "偏多"
 
 
 def test_generate_decision_facts_writes_run_and_latest_artifacts(tmp_path: Path) -> None:
