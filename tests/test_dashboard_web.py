@@ -309,6 +309,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".decision-dashboard" in css
     assert ".decision-card.primary" in css
     assert ".decision-metric-strip" in css
+    assert ".decision-fact-grid" in css
     assert ".technical-fact-grid" in css
     assert ".analyst-dialogue" in css
     assert ".final-conclusion-list" in css
@@ -326,7 +327,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "交易决策" in js
     assert "插件模块" in js
     assert "大模型决策模板" in js
-    assert "趋势 / K 线读取技术事实，其余插件仍为占位" in js
+    assert "趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位" in js
+    assert "decisionFactsPlugin" in js
+    assert "decision_facts" in js
     assert "technical_facts" in js
     assert "technicalFactRows" in js
     assert "插件管理" not in js
@@ -658,6 +661,144 @@ if (!noActionHtml.includes("今天暂无触发中的交易动作")) {
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
+def test_dashboard_renders_fixed_decision_fact_cards_in_chinese() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+function fixedDecisionFactCards(html) {
+  const klineStart = html.indexOf("<h4>趋势 / K 线</h4>");
+  const newsStart = html.indexOf("<h4>新闻 / 舆论</h4>");
+  const nextStart = html.indexOf("<h4>公司行动</h4>");
+  if (klineStart < 0 || newsStart < 0 || nextStart < 0 || !(klineStart < newsStart && newsStart < nextStart)) {
+    throw new Error("fixed decision fact card boundaries missing: " + html);
+  }
+  return html.slice(klineStart, nextStart);
+}
+const holding = {
+  market: "US",
+  symbol: "SOXX",
+  name: "iShares Semiconductor ETF",
+  agent_report: {available: true},
+  strategy: {available: false},
+  trade_action: {available: false},
+  decision_facts: {
+    kline: {
+      available: true,
+      fields: {
+        trend: "过热拉升",
+        position: "显著高于均线",
+        momentum: "RSI 高位",
+        key_levels: "支撑 580",
+        risk: "超买风险"
+      }
+    },
+    news_sentiment: {
+      available: true,
+      fields: {
+        direction: "偏多",
+        change: "较上次转强",
+        catalyst: "AI 基建需求",
+        risk: "估值过高",
+        attention: "关注度升高"
+      }
+    }
+  }
+};
+const cards = fixedDecisionFactCards(renderTradingDecisionPlugins(holding));
+for (const required of [
+  "趋势 / K 线",
+  "新闻 / 舆论",
+  "趋势",
+  "位置",
+  "动能",
+  "关键位",
+  "风险",
+  "方向",
+  "变化",
+  "催化",
+  "热度",
+  "过热拉升",
+  "偏多"
+]) {
+  if (!cards.includes(required)) {
+    throw new Error("missing fixed decision fact content " + required + ": " + cards);
+  }
+}
+if (cards.includes("Bullish")) {
+  throw new Error("raw English decision fact leaked into Chinese cards: " + cards);
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_missing_decision_facts_show_only_missing_values() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+function fixedDecisionFactCards(html) {
+  const klineStart = html.indexOf("<h4>趋势 / K 线</h4>");
+  const newsStart = html.indexOf("<h4>新闻 / 舆论</h4>");
+  const nextStart = html.indexOf("<h4>公司行动</h4>");
+  if (klineStart < 0 || newsStart < 0 || nextStart < 0 || !(klineStart < newsStart && newsStart < nextStart)) {
+    throw new Error("fixed decision fact card boundaries missing: " + html);
+  }
+  return html.slice(klineStart, nextStart);
+}
+const holding = {
+  market: "US",
+  symbol: "SOXX",
+  name: "iShares Semiconductor ETF",
+  agent_report: {available: false},
+  strategy: {available: false},
+  trade_action: {available: false},
+  technical_facts: {
+    available: true,
+    status: "usable",
+    facts: {
+      timeframes: [
+        {timeframe_label: "日线", rsi: {value: "66.66"}, trend_summary: "不应显示"}
+      ]
+    }
+  },
+  decision_facts: {
+    kline: {available: false, fields: {trend: "缺失", position: "缺失", momentum: "缺失", key_levels: "缺失", risk: "缺失"}},
+    news_sentiment: {available: false, fields: {direction: "缺失", change: "缺失", catalyst: "缺失", risk: "缺失", attention: "缺失"}}
+  }
+};
+const cards = fixedDecisionFactCards(renderTradingDecisionPlugins(holding));
+const missingMatches = cards.match(/缺失/g) || [];
+if (missingMatches.length < 14) {
+  throw new Error("missing fixed fields should render 缺失 values: " + cards);
+}
+for (const forbidden of ["待接入", "未来确认", "暂无可用 K 线技术事实", "日线 RSI", "66.66", "不应显示"]) {
+  if (cards.includes(forbidden)) {
+    throw new Error("placeholder or old technical fact content leaked into fixed cards: " + forbidden + ": " + cards);
+  }
+}
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
 def test_dashboard_renders_usable_kline_technical_facts_with_timeframe_labels() -> None:
     node = shutil.which("node")
     if node is None:
@@ -671,14 +812,6 @@ const sandbox = { document: { addEventListener() {} } };
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox);
 vm.runInContext(`
-function klineCard(html) {
-  const start = html.indexOf("<h4>趋势 / K 线</h4>");
-  const end = html.indexOf("新闻 / 舆论");
-  if (start < 0 || end < 0 || end <= start) {
-    throw new Error("K-line card boundaries missing: " + html);
-  }
-  return html.slice(start, end);
-}
 const holding = {
   market: "HK",
   symbol: "02476",
@@ -732,7 +865,7 @@ const holding = {
     }
   }
 };
-const card = klineCard(renderTradingDecisionPlugins(holding));
+const card = renderDecisionPluginCard(klineTechnicalFactsPlugin(holding));
 for (const required of [
   "可用",
   "数据日 2026-06-18",
@@ -790,14 +923,6 @@ const sandbox = { document: { addEventListener() {} } };
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox);
 vm.runInContext(`
-function klineCard(html) {
-  const start = html.indexOf("<h4>趋势 / K 线</h4>");
-  const end = html.indexOf("新闻 / 舆论");
-  if (start < 0 || end < 0 || end <= start) {
-    throw new Error("K-line card boundaries missing: " + html);
-  }
-  return html.slice(start, end);
-}
 const cases = [
   [{available: false, status: "missing_file", error: "technical_facts.json not found"}, "缺少文件"],
   [{available: false, status: "missing_record", error: "technical facts record not found"}, "缺少记录"],
@@ -806,7 +931,7 @@ const cases = [
   [{available: false, status: "missing_timeframe", run_date: "2026-06-19", data_date: "2026-06-18", error: "technical facts timeframe missing"}, "缺少周期"],
 ];
 for (const [technicalFacts, label] of cases) {
-  const card = klineCard(renderTradingDecisionPlugins({
+  const card = renderDecisionPluginCard(klineTechnicalFactsPlugin({
     market: "US",
     symbol: "VIXY",
     portfolio_weight_hkd: "7.11%",
@@ -1396,7 +1521,7 @@ if (!elements["holdings-body"].innerHTML.includes("交易决策") || elements["h
 if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
   throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
 }
-for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "趋势 / K 线读取技术事实，其余插件仍为占位", "占位"]) {
+for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位", "占位"]) {
   if (!elements["holdings-body"].innerHTML.includes(required)) {
     throw new Error("trading decision detail missing " + required + ": " + elements["holdings-body"].innerHTML);
   }

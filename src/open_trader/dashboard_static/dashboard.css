@@ -789,6 +789,13 @@ tbody tr.active-row {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.decision-fact-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
 .technical-fact-row {
   background: var(--surface-soft);
   border: 1px solid var(--line);
@@ -799,8 +806,28 @@ tbody tr.active-row {
   padding: 8px;
 }
 
+.decision-fact-row {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  min-height: 84px;
+  min-width: 0;
+  padding: 10px;
+  word-break: break-word;
+}
+
 .technical-fact-row span {
   color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.decision-fact-row span {
+  color: var(--muted);
+  display: block;
   font-size: 12px;
   font-weight: 700;
   overflow-wrap: anywhere;
@@ -810,6 +837,14 @@ tbody tr.active-row {
   font-size: 13px;
   line-height: 1.35;
   overflow-wrap: anywhere;
+}
+
+.decision-fact-row strong {
+  display: block;
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .condition-box {
@@ -1558,6 +1593,7 @@ tbody tr.active-row {
   .decision-dashboard,
   .decision-metric-strip,
   .decision-plugin-grid,
+  .decision-fact-grid,
   .final-conclusion-list,
   .llm-template-grid,
   .research-conclusion-grid,
@@ -1653,6 +1689,7 @@ tbody tr.active-row {
   .decision-dashboard,
   .decision-metric-strip,
   .decision-plugin-grid,
+  .decision-fact-grid,
   .analyst-dialogue .dialogue-list,
   .final-conclusion-list,
   .llm-template-grid,

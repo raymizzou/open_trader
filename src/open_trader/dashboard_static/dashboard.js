@@ -702,16 +702,30 @@ function renderTradingDecisionPlugins(holding) {
     || sectionAvailable(holding.strategy)
     || sectionAvailable(action);
   const plugins = [
-    klineTechnicalFactsPlugin(holding),
-    {
+    decisionFactsPlugin(holding, {
+      title: "趋势 / K 线",
+      moduleKey: "kline",
+      fieldOrder: [
+        ["trend", "趋势"],
+        ["position", "位置"],
+        ["momentum", "动能"],
+        ["key_levels", "关键位"],
+        ["risk", "风险"],
+      ],
+      score: "K线",
+    }),
+    decisionFactsPlugin(holding, {
       title: "新闻 / 舆论",
-      status: "占位",
-      tone: "muted",
-      score: "-",
-      headline: "待接入",
-      detail: "未来确认最新新闻与舆论方向是否影响今日动作。",
-      condition: "事实确认：是否存在重大利空、监管消息、供应链变化或异常舆论。",
-    },
+      moduleKey: "news_sentiment",
+      fieldOrder: [
+        ["direction", "方向"],
+        ["change", "变化"],
+        ["catalyst", "催化"],
+        ["risk", "风险"],
+        ["attention", "热度"],
+      ],
+      score: "舆论",
+    }),
     {
       title: "公司行动",
       status: "占位",
@@ -772,13 +786,56 @@ function renderTradingDecisionPlugins(holding) {
       <div class="trading-decision-section-header">
         <div>
           <h3>插件模块</h3>
-          <p>每个模块说明条件是否达成，或正在确认的事实；趋势 / K 线读取技术事实，其余插件仍为占位。</p>
+          <p>每个模块说明条件是否达成，或正在确认的事实；趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位。</p>
         </div>
       </div>
       <div class="decision-plugin-grid">
         ${plugins.map((plugin) => renderDecisionPluginCard(plugin)).join("")}
       </div>
     </section>
+  `;
+}
+
+function decisionFactsPlugin(holding, config) {
+  const module = decisionFactsModule(holding, config.moduleKey);
+  const fields = module && module.fields && typeof module.fields === "object"
+    ? module.fields
+    : {};
+  const rows = config.fieldOrder.map(([key, label]) => ({
+    label,
+    value: hasValue(fields[key]) ? formatPlain(fields[key]) : "缺失",
+  }));
+  const available = Boolean(module && module.available === true);
+  return {
+    title: config.title,
+    status: available ? "可用" : "缺失",
+    tone: available ? "ok" : "partial",
+    score: config.score,
+    headline: rows[0] ? rows[0].value : "缺失",
+    detail: "",
+    bodyHtml: renderDecisionFactRows(rows),
+    condition: "缺失",
+  };
+}
+
+function decisionFactsModule(holding, moduleKey) {
+  const detail = holding && holding.decision_facts && typeof holding.decision_facts === "object"
+    ? holding.decision_facts
+    : {};
+  const module = detail[moduleKey];
+  return module && typeof module === "object" ? module : null;
+}
+
+function renderDecisionFactRows(rows) {
+  return `
+    <div class="decision-fact-grid">
+      ${rows.map((row) => `
+        <div class="decision-fact-row">
+          <span>${escapeHtml(row.label)}</span>
+          <strong>${escapeHtml(row.value)}</strong>
+        </div>
+      `).join("")}
+    </div>
   `;
 }
 
