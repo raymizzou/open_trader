@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,9 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from openai import OpenAI
+
+from .advice.change_classifier import DEEPSEEK_BASE_URL, DEFAULT_CLASSIFIER_MODEL
 from open_trader.technical_facts import source_hash
 from open_trader.market_scope import (
     MarketScope,
@@ -72,6 +76,83 @@ class DecisionFactsExtractor(Protocol):
         news_sentiment_source: str,
     ) -> dict[str, object]:
         ...
+
+
+class OpenAITextClient:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str = DEEPSEEK_BASE_URL,
+        model: str = DEFAULT_CLASSIFIER_MODEL,
+    ) -> None:
+        self.model = model
+        self.client = OpenAI(
+            api_key=api_key or os.environ.get("DEEPSEEK_API_KEY"),
+            base_url=base_url,
+        )
+
+    def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content
+        return content or ""
+
+
+class LLMDecisionFactsExtractor:
+    def __init__(self, *, client: object | None = None) -> None:
+        self.client = client or OpenAITextClient()
+
+    def extract(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        run_date: str,
+        kline_source: str,
+        news_sentiment_source: str,
+    ) -> dict[str, object]:
+        messages = [
+            {
+                "role": "system",
+                "content": _decision_facts_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "market": market,
+                        "symbol": symbol,
+                        "run_date": run_date,
+                        "source_status": "",
+                        "kline_source_hash": source_hash(kline_source)
+                        if kline_source
+                        else "",
+                        "news_sentiment_source_hash": source_hash(
+                            news_sentiment_source
+                        )
+                        if news_sentiment_source
+                        else "",
+                        "kline_source": kline_source,
+                        "news_sentiment_source": news_sentiment_source,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        content = self.client.create(messages=messages, temperature=0)
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("LLM decision facts response must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("LLM decision facts response must be a JSON object")
+        validate_decision_facts_record(payload)
+        return payload
 
 
 def extract_decision_sources(raw_decision: str) -> DecisionSources:
@@ -270,6 +351,24 @@ def _combine_news_sentiment_sources(*, sentiment_report: str, news_report: str) 
     if news_report:
         parts.append(f"## news_report\n\n{news_report}")
     return "\n\n".join(parts)
+
+
+def _decision_facts_system_prompt() -> str:
+    return (
+        "你是 open_trader 的决策事实抽取器。只输出严格 JSON 对象，不输出 Markdown、解释或"
+        "任何 JSON 外文本。除 schema_version、status、source_hash、run_date、market、"
+        "symbol、source_status、error 等固定字段外，所有可读字段必须使用中文；禁止输出原始"
+        "英文段落或英文分析文字。schema_version 必须是 "
+        f"{DECISION_FACTS_SCHEMA_VERSION}。顶层字段必须包含 schema_version、run_date、"
+        "market、symbol、source_status、kline、news_sentiment、error。kline 和 "
+        "news_sentiment 均为对象，字段为 status、source_hash、fields。kline.fields 必须"
+        "且只能包含 trend、position、momentum、key_levels、risk；news_sentiment.fields "
+        "必须且只能包含 direction、change、catalyst、risk、attention。status 只能使用 "
+        "ok、missing_source、extraction_failed 或 error。缺失来源使用 status=missing_source；"
+        "无法可靠抽取使用 status=extraction_failed；字段缺失写 缺失。严禁编造事实，严禁加入"
+        "输入材料没有明确支持的信息。严禁输出交易建议、下单建议、仓位或头寸规模建议、目标价、"
+        "自动执行建议，严禁使用买入、卖出、加仓、减仓、自动执行等指令性表达。"
+    )
 
 
 def _build_record(

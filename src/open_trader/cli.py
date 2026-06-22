@@ -19,6 +19,7 @@ from .daily_premarket import (
 )
 from .dashboard import DashboardConfig
 from .dashboard_web import serve_dashboard
+from .decision_facts import LLMDecisionFactsExtractor, generate_decision_facts
 from .futu_account import FutuAccountClient, FutuAccountError, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_universe import load_futu_quote_universe
@@ -356,6 +357,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--update-latest",
         action="store_true",
         help="Update data/latest technical_facts.json after writing dated artifact",
+    )
+
+    decision_facts_parser = subparsers.add_parser(
+        "extract-decision-facts",
+        help="Extract structured decision facts from TradingAgents advice CSV",
+    )
+    decision_facts_parser.add_argument(
+        "--advice",
+        type=Path,
+        required=True,
+        help="TradingAgents trading advice CSV path",
+    )
+    decision_facts_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    decision_facts_parser.add_argument(
+        "--date",
+        type=canonical_date,
+        help="Run date, YYYY-MM-DD. Defaults to latest run_date in advice rows.",
+    )
+    decision_facts_parser.add_argument(
+        "--market",
+        type=canonical_market,
+        choices=["HK", "US"],
+        help="Optional market scope: HK or US",
+    )
+    decision_facts_parser.add_argument(
+        "--update-latest",
+        action="store_true",
+        help="Update data/latest decision_facts.json after writing dated artifact",
     )
 
     watch_futu_parser = subparsers.add_parser(
@@ -740,6 +769,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"failed: {result.failed}")
         print(f"reused: {result.reused}")
         print(f"technical_facts_json: {result.run_path}")
+        print(f"latest: {result.latest_path}")
+        return 0
+
+    if args.command == "extract-decision-facts":
+        if not args.advice.exists():
+            parser.error(f"advice CSV not found: {args.advice}")
+        try:
+            extractor = LLMDecisionFactsExtractor()
+        except Exception as exc:
+            parser.error(str(exc))
+        try:
+            result = generate_decision_facts(
+                advice_path=args.advice,
+                data_dir=args.data_dir,
+                run_date=args.date,
+                extractor=extractor,
+                update_latest=args.update_latest,
+                market=args.market,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"run_date: {result.run_date}")
+        print(f"decision_facts: {result.records}")
+        print(f"extracted: {result.extracted}")
+        print(f"failed: {result.failed}")
+        print(f"decision_facts_json: {result.run_path}")
         print(f"latest: {result.latest_path}")
         return 0
 

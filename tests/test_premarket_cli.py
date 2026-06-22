@@ -659,3 +659,70 @@ def test_extract_technical_facts_extractor_init_failure_reports_clean_error(
     error = capsys.readouterr().err
     assert "missing LLM credentials" in error
     assert "Traceback" not in error
+
+
+def test_extract_decision_facts_help_includes_expected_options(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["extract-decision-facts", "--help"])
+
+    assert excinfo.value.code == 0
+    output = capsys.readouterr().out
+    assert "--advice" in output
+    assert "--data-dir" in output
+    assert "--date" in output
+    assert "--market" in output
+    assert "--update-latest" in output
+
+
+def test_extract_decision_facts_main_wires_generator(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    advice = tmp_path / "trading_advice.csv"
+    advice.write_text("run_date,symbol,market,raw_decision\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class FakeExtractor:
+        pass
+
+    def fake_generate_decision_facts(**kwargs: object):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            run_date="2026-06-22",
+            records=2,
+            extracted=2,
+            failed=0,
+            run_path=tmp_path / "data/runs/2026-06-22/US/decision_facts.json",
+            latest_path=tmp_path / "data/latest/US/decision_facts.json",
+        )
+
+    monkeypatch.setattr(cli, "LLMDecisionFactsExtractor", lambda: FakeExtractor())
+    monkeypatch.setattr(cli, "generate_decision_facts", fake_generate_decision_facts)
+
+    result = cli.main(
+        [
+            "extract-decision-facts",
+            "--advice",
+            str(advice),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--date",
+            "2026-06-22",
+            "--market",
+            "US",
+            "--update-latest",
+        ]
+    )
+
+    assert result == 0
+    assert captured["advice_path"] == advice
+    assert captured["data_dir"] == tmp_path / "data"
+    assert captured["run_date"] == "2026-06-22"
+    assert captured["market"] == "US"
+    assert captured["update_latest"] is True
+    output = capsys.readouterr().out
+    assert "decision_facts: 2" in output
+    assert "decision_facts_json:" in output
