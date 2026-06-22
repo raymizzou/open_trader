@@ -8,6 +8,14 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from .decision_facts import (
+    KLINE_FIELDS,
+    NEWS_SENTIMENT_FIELDS,
+    build_missing_fields,
+    extract_decision_sources,
+    index_decision_facts_by_market_symbol,
+    load_decision_facts_cache,
+)
 from .research_chat import load_research_view_for_holding
 from .technical_facts import (
     extract_market_report,
@@ -117,6 +125,12 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             scoped_advice_markets=scoped_advice_markets,
         )
     )
+    decision_facts_by_holding, decision_facts_file_exists_by_market = (
+        _latest_decision_facts_for_markets(
+            data_dir=config.data_dir,
+            markets=holding_markets,
+        )
+    )
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
@@ -134,6 +148,8 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             actions_by_holding,
             technical_facts_by_holding,
             technical_facts_file_exists_by_market,
+            decision_facts_by_holding,
+            decision_facts_file_exists_by_market,
         )
         for row in holding_rows
     ]
@@ -252,6 +268,26 @@ def _latest_technical_facts_for_markets(
     return records_by_key, file_exists_by_market
 
 
+def _latest_decision_facts_for_markets(
+    *,
+    data_dir: Path,
+    markets: set[str],
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, bool]]:
+    records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    file_exists_by_market: dict[str, bool] = {}
+    for market in markets:
+        scoped_path = data_dir / "latest" / market / "decision_facts.json"
+        file_exists_by_market[market] = scoped_path.exists()
+        if not scoped_path.exists():
+            continue
+        records_by_key.update(
+            index_decision_facts_by_market_symbol(
+                load_decision_facts_cache(scoped_path)
+            )
+        )
+    return records_by_key, file_exists_by_market
+
+
 def _markets_from_rows(rows: list[dict[str, str]]) -> set[str]:
     markets: set[str] = set()
     for row in rows:
@@ -324,6 +360,8 @@ def _merge_holding(
     actions_by_holding: dict[tuple[str, str], dict[str, str]],
     technical_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
     technical_facts_file_exists_by_market: dict[str, bool],
+    decision_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
+    decision_facts_file_exists_by_market: dict[str, bool],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -347,6 +385,15 @@ def _merge_holding(
         agent_report,
         cache_file_exists=(
             technical_facts_file_exists_by_market.get(key[0], False)
+            if key is not None
+            else False
+        ),
+    )
+    holding["decision_facts"] = _decision_facts_detail(
+        decision_facts_by_holding.get(key) if key is not None else None,
+        agent_report,
+        cache_file_exists=(
+            decision_facts_file_exists_by_market.get(key[0], False)
             if key is not None
             else False
         ),
@@ -522,6 +569,84 @@ def _technical_facts_unavailable(
         "error": error,
         "freshness": freshness or {},
         "facts": {},
+    }
+
+
+def _decision_facts_detail(
+    record: dict[str, Any] | None,
+    advice_row: dict[str, str] | None,
+    *,
+    cache_file_exists: bool,
+) -> dict[str, Any]:
+    decision_sources = extract_decision_sources(
+        advice_row.get("raw_decision", "") if advice_row is not None else ""
+    )
+    return {
+        "kline": _decision_module_detail(
+            record.get("kline") if record is not None else None,
+            fields=KLINE_FIELDS,
+            current_source_hash=decision_sources.kline_hash,
+            cache_file_exists=cache_file_exists,
+        ),
+        "news_sentiment": _decision_module_detail(
+            record.get("news_sentiment") if record is not None else None,
+            fields=NEWS_SENTIMENT_FIELDS,
+            current_source_hash=decision_sources.news_sentiment_hash,
+            cache_file_exists=cache_file_exists,
+        ),
+    }
+
+
+def _decision_module_detail(
+    module: object,
+    *,
+    fields: tuple[str, ...],
+    current_source_hash: str,
+    cache_file_exists: bool,
+) -> dict[str, Any]:
+    if not cache_file_exists or not isinstance(module, dict):
+        return _decision_module_missing(
+            fields,
+            current_source_hash=current_source_hash,
+        )
+
+    source_hash_value = str(module.get("source_hash") or "").strip()
+    raw_fields = module.get("fields")
+    module_status = str(module.get("status") or "").strip()
+    if (
+        not current_source_hash
+        or source_hash_value != current_source_hash
+        or module_status != "ok"
+        or not isinstance(raw_fields, dict)
+        or set(raw_fields) != set(fields)
+    ):
+        return _decision_module_missing(
+            fields,
+            source_hash_value=source_hash_value,
+            current_source_hash=current_source_hash,
+        )
+
+    return {
+        "available": True,
+        "status": "usable",
+        "source_hash": source_hash_value,
+        "current_source_hash": current_source_hash,
+        "fields": {field: str(raw_fields[field]) for field in fields},
+    }
+
+
+def _decision_module_missing(
+    fields: tuple[str, ...],
+    *,
+    source_hash_value: str = "",
+    current_source_hash: str = "",
+) -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": "missing",
+        "source_hash": source_hash_value,
+        "current_source_hash": current_source_hash,
+        "fields": build_missing_fields(fields),
     }
 
 

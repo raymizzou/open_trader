@@ -9,6 +9,12 @@ from open_trader.advice.models import (
     TRADING_ADVICE_FIELDNAMES,
 )
 from open_trader.dashboard import DashboardConfig, load_dashboard_state
+from open_trader.decision_facts import (
+    KLINE_FIELDS,
+    MISSING_VALUE,
+    NEWS_SENTIMENT_FIELDS,
+    extract_decision_sources,
+)
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.technical_facts import source_hash
 from open_trader.trade_actions import TRADE_ACTION_FIELDNAMES
@@ -67,6 +73,67 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
 
 def raw_decision_with_market_report(report: str) -> str:
     return json.dumps({"state": {"market_report": report}}, ensure_ascii=False)
+
+
+def raw_decision_with_all_reports() -> str:
+    return json.dumps(
+        {
+            "state": {
+                "market_report": "K report",
+                "sentiment_report": "Sentiment report",
+                "news_report": "News report",
+            }
+        },
+        ensure_ascii=False,
+    )
+
+
+def write_decision_facts(path: Path, kline_hash: str, news_hash: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.decision_facts.v1",
+                "generated_at": "2026-06-19T08:31:00+08:00",
+                "run_date": "2026-06-19",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.decision_facts.v1",
+                        "run_date": "2026-06-19",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "source_status": "ok",
+                        "kline": {
+                            "status": "ok",
+                            "source_hash": kline_hash,
+                            "fields": {
+                                "trend": "趋势偏强",
+                                "position": "价格处于均线附近",
+                                "momentum": "动能温和",
+                                "key_levels": "关键位置明确",
+                                "risk": "波动风险较高",
+                            },
+                        },
+                        "news_sentiment": {
+                            "status": "ok",
+                            "source_hash": news_hash,
+                            "fields": {
+                                "direction": "情绪偏谨慎",
+                                "change": "变化有限",
+                                "catalyst": "新闻催化有限",
+                                "risk": "消息面风险存在",
+                                "attention": "关注宏观波动",
+                            },
+                        },
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
 
 def write_technical_facts(
@@ -758,6 +825,108 @@ def test_load_dashboard_state_uses_scoped_facts_when_both_latest_layouts_exist(
     assert vixy["technical_facts"]["status"] == "usable"
     assert vixy["technical_facts"]["source_hash"] == source_hash(current_report)
     assert vixy["technical_facts"]["current_source_hash"] == source_hash(current_report)
+
+
+def test_dashboard_attaches_hash_checked_decision_facts(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    raw_decision = raw_decision_with_all_reports()
+    decision_sources = extract_decision_sources(raw_decision)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Watch volatility.",
+                "raw_decision": raw_decision,
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_decision_facts(
+        config.data_dir / "latest" / "US" / "decision_facts.json",
+        decision_sources.kline_hash,
+        decision_sources.news_sentiment_hash,
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["decision_facts"]["kline"]["available"] is True
+    assert vixy["decision_facts"]["kline"]["fields"]["trend"] == "趋势偏强"
+    assert vixy["decision_facts"]["news_sentiment"]["available"] is True
+    assert (
+        vixy["decision_facts"]["news_sentiment"]["fields"]["direction"]
+        == "情绪偏谨慎"
+    )
+
+
+def test_dashboard_stale_decision_facts_render_missing_fields(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    raw_decision = raw_decision_with_all_reports()
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Watch volatility.",
+                "raw_decision": raw_decision,
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_decision_facts(
+        config.data_dir / "latest" / "US" / "decision_facts.json",
+        source_hash("old K report"),
+        source_hash("old news report"),
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["decision_facts"]["kline"]["available"] is False
+    assert vixy["decision_facts"]["news_sentiment"]["available"] is False
+    assert set(vixy["decision_facts"]["kline"]["fields"]) == set(KLINE_FIELDS)
+    assert set(vixy["decision_facts"]["news_sentiment"]["fields"]) == set(
+        NEWS_SENTIMENT_FIELDS
+    )
+    assert all(
+        value == MISSING_VALUE
+        for value in vixy["decision_facts"]["kline"]["fields"].values()
+    )
+    assert all(
+        value == MISSING_VALUE
+        for value in vixy["decision_facts"]["news_sentiment"]["fields"].values()
+    )
 
 
 def test_load_dashboard_state_marks_missing_agent_sections_unavailable(
