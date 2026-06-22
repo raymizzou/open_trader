@@ -32,6 +32,14 @@ RUN_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CHINESE_TEXT_PATTERN = re.compile(r"[\u3400-\u9fff]")
 SOURCE_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 VALID_MODULE_STATUSES = {"ok", "missing_source", "extraction_failed", "error"}
+DISALLOWED_ENGLISH_PHRASE_PATTERN = re.compile(
+    r"\b(?:buy\s+now|target\s+price|sell|stop\s+loss|take\s+profit|"
+    r"place\s+order|position\s+sizing|sizing)\b",
+    re.IGNORECASE,
+)
+DISALLOWED_CHINESE_TRADING_PHRASE_PATTERN = re.compile(
+    r"(?:建议买入|建议卖出|下单|加仓|减仓|仓位|目标价|止损价|自动执行)"
+)
 
 
 @dataclass(frozen=True)
@@ -584,7 +592,16 @@ def _validate_module_fields(
             raise ValueError(f"{module_name} field values are invalid")
         if value != MISSING_VALUE and not CHINESE_TEXT_PATTERN.search(value):
             raise ValueError("field values must be Chinese or 缺失")
+        if _contains_trading_guidance(value):
+            raise ValueError("field values must not contain trading guidance")
     return {field: fields[field] for field in expected_fields}
+
+
+def _contains_trading_guidance(value: str) -> bool:
+    return bool(
+        DISALLOWED_ENGLISH_PHRASE_PATTERN.search(value)
+        or DISALLOWED_CHINESE_TRADING_PHRASE_PATTERN.search(value)
+    )
 
 
 def _validate_persisted_record_metadata(record: dict[str, object]) -> None:

@@ -202,6 +202,21 @@ def test_validate_decision_facts_record_rejects_english_only_value() -> None:
         validate_decision_facts_record(record)
 
 
+def test_validate_decision_facts_record_rejects_chinese_trading_instruction() -> None:
+    record = valid_decision_facts_record()
+    record["news_sentiment"]["fields"]["direction"] = "建议买入"
+
+    with pytest.raises(ValueError, match="field values must not contain trading guidance"):
+        validate_decision_facts_record(record)
+
+
+def test_validate_decision_facts_record_allows_common_indicator_acronyms() -> None:
+    record = valid_decision_facts_record()
+    record["kline"]["fields"]["momentum"] = "RSI 高位，MACD 偏强"
+
+    validate_decision_facts_record(record)
+
+
 @pytest.mark.parametrize(
     "bad_hash",
     [
@@ -333,6 +348,46 @@ def test_llm_decision_facts_extractor_strips_extra_keys() -> None:
     assert set(payload) == {"schema_version", "kline", "news_sentiment"}
     assert set(payload["kline"]) == {"status", "fields"}
     assert set(payload["news_sentiment"]) == {"status", "fields"}
+
+
+def test_llm_decision_facts_extractor_rejects_mixed_trading_english() -> None:
+    class FakeClient:
+        def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+            return json.dumps(
+                {
+                    "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+                    "kline": {
+                        "status": "ok",
+                        "fields": {
+                            "trend": "趋势偏强 Buy now target price 100",
+                            "position": "位于均线上方",
+                            "momentum": "RSI 高位，MACD 偏强",
+                            "key_levels": "关键位缺失",
+                            "risk": "波动风险",
+                        },
+                    },
+                    "news_sentiment": {
+                        "status": "ok",
+                        "fields": {
+                            "direction": "偏多",
+                            "change": "情绪改善",
+                            "catalyst": "需求预期改善",
+                            "risk": "估值压力",
+                            "attention": "关注度升高",
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            )
+
+    with pytest.raises(ValueError, match="field values must not contain trading guidance"):
+        LLMDecisionFactsExtractor(client=FakeClient()).extract(
+            market="US",
+            symbol="SOXX",
+            run_date="2026-06-22",
+            kline_source="technical source",
+            news_sentiment_source="news source",
+        )
 
 
 def test_generate_decision_facts_writes_run_and_latest_artifacts(tmp_path: Path) -> None:
