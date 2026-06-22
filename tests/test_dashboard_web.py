@@ -683,6 +683,30 @@ function fixedDecisionFactCards(html) {
   }
   return html.slice(klineStart, nextStart);
 }
+function cardBefore(cards, nextTitle) {
+  const end = cards.indexOf(nextTitle);
+  if (end < 0) {
+    throw new Error("card boundary missing before " + nextTitle + ": " + cards);
+  }
+  return cards.slice(0, end);
+}
+function cardFrom(cards, title) {
+  const start = cards.indexOf(title);
+  if (start < 0) {
+    throw new Error("card boundary missing for " + title + ": " + cards);
+  }
+  return cards.slice(start);
+}
+function assertOrdered(card, labels) {
+  let cursor = -1;
+  for (const label of labels) {
+    const next = card.indexOf("<span>" + label + "</span>", cursor + 1);
+    if (next <= cursor) {
+      throw new Error("label order mismatch for " + label + ": " + card);
+    }
+    cursor = next;
+  }
+}
 const holding = {
   market: "US",
   symbol: "SOXX",
@@ -714,6 +738,10 @@ const holding = {
   }
 };
 const cards = fixedDecisionFactCards(renderTradingDecisionPlugins(holding));
+const klineCard = cardBefore(cards, "<h4>新闻 / 舆论</h4>");
+const newsCard = cardFrom(cards, "<h4>新闻 / 舆论</h4>");
+assertOrdered(klineCard, ["趋势", "位置", "动能", "关键位", "风险"]);
+assertOrdered(newsCard, ["方向", "变化", "催化", "风险", "热度"]);
 for (const required of [
   "趋势 / K 线",
   "新闻 / 舆论",
@@ -733,8 +761,16 @@ for (const required of [
     throw new Error("missing fixed decision fact content " + required + ": " + cards);
   }
 }
-if (cards.includes("Bullish")) {
-  throw new Error("raw English decision fact leaked into Chinese cards: " + cards);
+for (const forbidden of ["Bullish", "condition-box"]) {
+  if (cards.includes(forbidden)) {
+    throw new Error("unexpected fixed decision fact content " + forbidden + ": " + cards);
+  }
+}
+if (!klineCard.includes("status-pill status-ok") || !klineCard.includes(">可用</span>")) {
+  throw new Error("complete K-line card should be usable: " + klineCard);
+}
+if (!newsCard.includes("status-pill status-ok") || !newsCard.includes(">可用</span>")) {
+  throw new Error("complete news card should be usable: " + newsCard);
 }
 `, sandbox);
 """
@@ -763,7 +799,36 @@ function fixedDecisionFactCards(html) {
   }
   return html.slice(klineStart, nextStart);
 }
-const holding = {
+function cardBefore(cards, nextTitle) {
+  const end = cards.indexOf(nextTitle);
+  if (end < 0) {
+    throw new Error("card boundary missing before " + nextTitle + ": " + cards);
+  }
+  return cards.slice(0, end);
+}
+function cardFrom(cards, title) {
+  const start = cards.indexOf(title);
+  if (start < 0) {
+    throw new Error("card boundary missing for " + title + ": " + cards);
+  }
+  return cards.slice(start);
+}
+function assertOrdered(card, labels) {
+  let cursor = -1;
+  for (const label of labels) {
+    const next = card.indexOf("<span>" + label + "</span>", cursor + 1);
+    if (next <= cursor) {
+      throw new Error("label order mismatch for " + label + ": " + card);
+    }
+    cursor = next;
+  }
+}
+function assertStatus(card, status, tone) {
+  if (!card.includes("status-pill status-" + tone) || !card.includes(">" + status + "</span>")) {
+    throw new Error("expected " + status + "/" + tone + " status: " + card);
+  }
+}
+const baseHolding = {
   market: "US",
   symbol: "SOXX",
   name: "iShares Semiconductor ETF",
@@ -779,17 +844,51 @@ const holding = {
       ]
     }
   },
+};
+const completeCards = fixedDecisionFactCards(renderTradingDecisionPlugins({
+  ...baseHolding,
+  decision_facts: {
+    kline: {available: true, fields: {trend: "过热拉升", position: "显著高于均线", momentum: "RSI 高位", key_levels: "支撑 580", risk: "超买风险"}},
+    news_sentiment: {available: true, fields: {direction: "偏多", change: "较上次转强", catalyst: "AI 基建需求", risk: "估值过高", attention: "关注度升高"}}
+  }
+}));
+assertStatus(cardBefore(completeCards, "<h4>新闻 / 舆论</h4>"), "可用", "ok");
+assertStatus(cardFrom(completeCards, "<h4>新闻 / 舆论</h4>"), "可用", "ok");
+const partialCards = fixedDecisionFactCards(renderTradingDecisionPlugins({
+  ...baseHolding,
+  decision_facts: {
+    kline: {available: true, fields: {trend: "过热拉升", position: "", momentum: "缺失"}},
+    news_sentiment: {available: true, fields: {direction: "偏多", change: "较上次转强", catalyst: "AI 基建需求", risk: "估值过高", attention: "关注度升高"}}
+  }
+}));
+const partialKlineCard = cardBefore(partialCards, "<h4>新闻 / 舆论</h4>");
+assertStatus(partialKlineCard, "不完整", "partial");
+assertOrdered(partialKlineCard, ["趋势", "位置", "动能", "关键位", "风险"]);
+for (const required of ["过热拉升", "<strong>缺失</strong>"]) {
+  if (!partialKlineCard.includes(required)) {
+    throw new Error("partial K-line card missing fixed field value " + required + ": " + partialKlineCard);
+  }
+}
+const missingCards = fixedDecisionFactCards(renderTradingDecisionPlugins({
+  ...baseHolding,
   decision_facts: {
     kline: {available: false, fields: {trend: "缺失", position: "缺失", momentum: "缺失", key_levels: "缺失", risk: "缺失"}},
-    news_sentiment: {available: false, fields: {direction: "缺失", change: "缺失", catalyst: "缺失", risk: "缺失", attention: "缺失"}}
+    news_sentiment: {}
   }
-};
-const cards = fixedDecisionFactCards(renderTradingDecisionPlugins(holding));
-const missingMatches = cards.match(/缺失/g) || [];
-if (missingMatches.length < 14) {
-  throw new Error("missing fixed fields should render 缺失 values: " + cards);
+}));
+const missingKlineCard = cardBefore(missingCards, "<h4>新闻 / 舆论</h4>");
+const missingNewsCard = cardFrom(missingCards, "<h4>新闻 / 舆论</h4>");
+assertStatus(missingKlineCard, "缺失", "partial");
+assertStatus(missingNewsCard, "缺失", "partial");
+assertOrdered(missingKlineCard, ["趋势", "位置", "动能", "关键位", "风险"]);
+assertOrdered(missingNewsCard, ["方向", "变化", "催化", "风险", "热度"]);
+const cards = partialCards + missingCards;
+for (const required of ["<strong>缺失</strong>", "<b>缺失</b>"]) {
+  if (!cards.includes(required)) {
+    throw new Error("missing fixed fields should render 缺失 values: " + cards);
+  }
 }
-for (const forbidden of ["待接入", "未来确认", "暂无可用 K 线技术事实", "日线 RSI", "66.66", "不应显示"]) {
+for (const forbidden of ["待接入", "未来确认", "暂无可用 K 线技术事实", "日线 RSI", "66.66", "不应显示", "condition-box"]) {
   if (cards.includes(forbidden)) {
     throw new Error("placeholder or old technical fact content leaked into fixed cards: " + forbidden + ": " + cards);
   }

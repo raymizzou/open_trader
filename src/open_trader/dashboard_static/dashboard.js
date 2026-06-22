@@ -805,16 +805,18 @@ function decisionFactsPlugin(holding, config) {
     label,
     value: hasValue(fields[key]) ? formatPlain(fields[key]) : "缺失",
   }));
+  const missingLabels = missingDecisionFactFieldLabels(fields, config.fieldOrder);
   const available = Boolean(module && module.available === true);
+  const complete = available && missingLabels.length === 0;
   return {
     title: config.title,
-    status: available ? "可用" : "缺失",
-    tone: available ? "ok" : "partial",
+    status: complete ? "可用" : (available ? "不完整" : "缺失"),
+    tone: complete ? "ok" : "partial",
     score: config.score,
     headline: rows[0] ? rows[0].value : "缺失",
     detail: "",
     bodyHtml: renderDecisionFactRows(rows),
-    condition: "缺失",
+    condition: "",
   };
 }
 
@@ -824,6 +826,12 @@ function decisionFactsModule(holding, moduleKey) {
     : {};
   const module = detail[moduleKey];
   return module && typeof module === "object" ? module : null;
+}
+
+function missingDecisionFactFieldLabels(fields, fieldOrder) {
+  return fieldOrder
+    .filter(([key]) => !hasValue(fields[key]) || formatPlain(fields[key]) === "缺失")
+    .map(([, label]) => label);
 }
 
 function renderDecisionFactRows(rows) {
@@ -854,7 +862,7 @@ function renderDecisionPluginCard(plugin) {
         </div>
       </div>
       ${plugin.bodyHtml || ""}
-      <p class="condition-box">${escapeHtml(plugin.condition)}</p>
+      ${hasValue(plugin.condition) ? `<p class="condition-box">${escapeHtml(plugin.condition)}</p>` : ""}
     </article>
   `;
 }
