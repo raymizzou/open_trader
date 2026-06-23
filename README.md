@@ -207,8 +207,14 @@ Manual command:
 ```
 
 The dashboard uses fixed fields for `Trend / K-line` and `News / Sentiment`.
+Every symbol uses the same field layout:
+
+- `Trend / K-line`: `趋势`, `位置`, `动能`, `关键位`, `风险`
+- `News / Sentiment`: `方向`, `变化`, `催化`, `风险`, `热度`
+
 Missing field values are rendered as `缺失`; the dashboard does not display raw
-English TradingAgents prose in those plugin fields.
+English TradingAgents prose, generic "not mentioned" explanations, or manual
+review filler in those plugin fields.
 
 ### Build Trading Plan
 
@@ -352,6 +358,8 @@ To keep the local frontend running after the terminal closes, start it in a
 detached `screen` session:
 
 ```bash
+screen -S open_trader_dashboard_8766 -X quit 2>/dev/null || true
+
 screen -dmS open_trader_dashboard_8766 zsh -lc \
   'cd /Users/ray/projects/open_trader && export PYTHONPATH=src && exec .venv/bin/python -m open_trader dashboard --portfolio data/latest/portfolio.csv --data-dir data --reports-dir reports --poll-seconds 5 --host 127.0.0.1 --port 8766'
 ```
@@ -362,6 +370,30 @@ Verify the deployment:
 curl -sS http://127.0.0.1:8766/ | head
 curl -sS http://127.0.0.1:8766/api/dashboard | head -c 500
 ps aux | rg 'open_trader dashboard'
+```
+
+For a structured API check, run:
+
+```bash
+.venv/bin/python - <<'PY'
+import json
+from urllib.request import urlopen
+
+with urlopen("http://127.0.0.1:8766/api/dashboard", timeout=10) as response:
+    payload = json.load(response)
+
+print("holding_count", payload.get("summary", {}).get("holding_count"))
+print("detail_available", payload.get("detail_available"))
+print(
+    "has_soxx_decision_facts",
+    any(
+        holding.get("market") == "US"
+        and holding.get("symbol") == "SOXX"
+        and bool(holding.get("decision_facts"))
+        for holding in payload.get("holdings", [])
+    ),
+)
+PY
 ```
 
 Stop the detached dashboard when needed:
@@ -448,6 +480,7 @@ data/runs/<YYYY-MM-DD>/HK/premarket_actions.csv
 data/runs/<YYYY-MM-DD>/HK/trading_plan.csv
 data/runs/<YYYY-MM-DD>/HK/trade_actions.csv
 data/runs/<YYYY-MM-DD>/HK/technical_facts.json
+data/runs/<YYYY-MM-DD>/HK/decision_facts.json
 data/runs/<YYYY-MM-DD>/HK/daily_run_status.json
 data/runs/<YYYY-MM-DD>/US/trading_advice.csv
 data/runs/<YYYY-MM-DD>/US/change_classifications.csv
@@ -455,6 +488,7 @@ data/runs/<YYYY-MM-DD>/US/premarket_actions.csv
 data/runs/<YYYY-MM-DD>/US/trading_plan.csv
 data/runs/<YYYY-MM-DD>/US/trade_actions.csv
 data/runs/<YYYY-MM-DD>/US/technical_facts.json
+data/runs/<YYYY-MM-DD>/US/decision_facts.json
 data/runs/<YYYY-MM-DD>/US/daily_run_status.json
 reports/daily_runs/<YYYY-MM-DD>-HK.md
 reports/daily_runs/<YYYY-MM-DD>-US.md
@@ -471,11 +505,13 @@ data/latest/HK/premarket_actions.csv
 data/latest/HK/trading_plan.csv
 data/latest/HK/trade_actions.csv
 data/latest/HK/technical_facts.json
+data/latest/HK/decision_facts.json
 data/latest/US/trading_advice.csv
 data/latest/US/premarket_actions.csv
 data/latest/US/trading_plan.csv
 data/latest/US/trade_actions.csv
 data/latest/US/technical_facts.json
+data/latest/US/decision_facts.json
 ```
 
 ## Development
@@ -497,6 +533,10 @@ Package CLI entrypoint:
 ```bash
 open-trader --help
 ```
+
+Before pushing `main`, add one dated entry to `CHANGELOG.md` for the change
+being pushed. The entry should summarize user-visible behavior, affected
+workflows, and verification.
 
 ## License
 
