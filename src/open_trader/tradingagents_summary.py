@@ -33,6 +33,7 @@ REASON_FIELDS = (
     "risk_or_counterpoint",
     "action_logic",
 )
+REASON_FIELD_NAMES = REASON_FIELDS
 DISPLAY_FIELDS = (
     "ta_view",
     "current_action",
@@ -40,11 +41,24 @@ DISPLAY_FIELDS = (
     "ta_report_date",
     "latest_run_date",
 )
+RECORD_FIELD_NAMES = {
+    "schema_version",
+    "market",
+    "symbol",
+    "latest_run_date",
+    "ta_report_date",
+    "ta_view",
+    "current_action",
+    "core_reason",
+    "reason_fields",
+    "source_hash",
+    "error",
+}
 RUN_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CHINESE_TEXT_PATTERN = re.compile(r"[\u3400-\u9fff]")
 SOURCE_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 PRICE_TRIGGER_ONLY_PATTERN = re.compile(
-    r"(?:当前价格|价格|现价).{0,16}(?:达到|高于|低于|跌破|突破).{0,16}"
+    r"(?:(?:当前价格|价格|现价).{0,16})?(?:达到|高于|低于|跌破|突破).{0,16}"
     r"(?:目标价|第一目标价|第二目标价|target|止损|stop)",
     re.IGNORECASE,
 )
@@ -56,7 +70,7 @@ ENGLISH_PRICE_TRIGGER_ONLY_PATTERN = re.compile(
 
 
 @dataclass(frozen=True)
-class SummarySource:
+class AdviceSummarySource:
     run_date: str
     market: str
     symbol: str
@@ -64,6 +78,34 @@ class SummarySource:
     advice_summary: str
     raw_decision: str
     fallback_from_date: str
+
+
+@dataclass(frozen=True)
+class PlanSummarySource:
+    run_date: str
+    market: str
+    symbol: str
+    fallback_from_date: str
+    rating: str
+    plan_text: str
+    agent_reason: str
+    agent_excerpt: str
+
+
+@dataclass(frozen=True)
+class ActionSummarySource:
+    run_date: str
+    market: str
+    symbol: str
+    action: str
+    current_action: str
+    agent_reason: str
+    agent_excerpt: str
+    trigger_reason: str
+    reason: str
+
+
+SummarySource = AdviceSummarySource
 
 
 @dataclass(frozen=True)
@@ -202,9 +244,38 @@ def load_tradingagents_summary_cache(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def index_tradingagents_summary_by_market_symbol(
+    cache: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    records = cache.get("records")
+    if not isinstance(records, list):
+        return {}
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        market = str(record.get("market") or "").strip().upper()
+        symbol = str(record.get("symbol") or "").strip().upper()
+        if market and symbol:
+            indexed[(market, symbol)] = record
+    return indexed
+
+
 def validate_tradingagents_summary_record(record: dict[str, object]) -> None:
     if not isinstance(record, dict):
         raise ValueError("TradingAgents summary record must be an object")
+    unexpected_fields = set(record) - RECORD_FIELD_NAMES
+    missing_fields = RECORD_FIELD_NAMES - set(record)
+    if unexpected_fields:
+        raise ValueError(
+            "TradingAgents summary record has unexpected field(s): "
+            + ", ".join(sorted(unexpected_fields))
+        )
+    if missing_fields:
+        raise ValueError(
+            "TradingAgents summary record is missing field(s): "
+            + ", ".join(sorted(missing_fields))
+        )
     if record.get("schema_version") != TRADINGAGENTS_SUMMARY_SCHEMA_VERSION:
         raise ValueError("TradingAgents summary schema_version is invalid")
     for field in ("market", "symbol", "error", *DISPLAY_FIELDS):
@@ -245,7 +316,7 @@ def generate_tradingagents_summary(
     extractor: TradingAgentsSummaryExtractor | None = None,
     update_latest: bool,
 ) -> TradingAgentsSummaryResult:
-    sources = _load_advice_sources(advice_path)
+    sources = load_advice_summary_sources(advice_path)
     _validate_source_run_dates(sources)
     market_scope = _market_scope(market)
     market_sources = (
@@ -317,9 +388,9 @@ def _summary_system_prompt() -> str:
     )
 
 
-def _load_advice_sources(advice_path: Path) -> list[SummarySource]:
+def load_advice_summary_sources(advice_path: Path) -> list[AdviceSummarySource]:
     rows = _load_csv_rows(advice_path)
-    sources: list[SummarySource] = []
+    sources: list[AdviceSummarySource] = []
     for row in rows:
         market = (row.get("market") or "").strip().upper()
         symbol = (row.get("symbol") or "").strip().upper()
@@ -327,7 +398,7 @@ def _load_advice_sources(advice_path: Path) -> list[SummarySource]:
         if not market or not symbol:
             continue
         sources.append(
-            SummarySource(
+            AdviceSummarySource(
                 run_date=run_date,
                 market=market,
                 symbol=symbol,
@@ -335,6 +406,52 @@ def _load_advice_sources(advice_path: Path) -> list[SummarySource]:
                 advice_summary=(row.get("advice_summary") or "").strip(),
                 raw_decision=(row.get("raw_decision") or "").strip(),
                 fallback_from_date=(row.get("fallback_from_date") or "").strip(),
+            )
+        )
+    return sources
+
+
+def load_plan_summary_sources(plan_path: Path) -> list[PlanSummarySource]:
+    sources: list[PlanSummarySource] = []
+    for row in _load_csv_rows(plan_path):
+        market = (row.get("market") or "").strip().upper()
+        symbol = (row.get("symbol") or "").strip().upper()
+        if not market or not symbol:
+            continue
+        sources.append(
+            PlanSummarySource(
+                run_date=(row.get("run_date") or "").strip(),
+                market=market,
+                symbol=symbol,
+                fallback_from_date=(row.get("fallback_from_date") or "").strip(),
+                rating=(row.get("rating") or "").strip(),
+                plan_text=(row.get("plan_text") or "").strip(),
+                agent_reason=(row.get("agent_reason") or "").strip(),
+                agent_excerpt=(row.get("agent_excerpt") or "").strip(),
+            )
+        )
+    return sources
+
+
+def load_action_summary_sources(actions_path: Path) -> list[ActionSummarySource]:
+    sources: list[ActionSummarySource] = []
+    for row in _load_csv_rows(actions_path):
+        market = (row.get("market") or "").strip().upper()
+        symbol = (row.get("symbol") or "").strip().upper()
+        action = (row.get("action") or "").strip()
+        if not market or not symbol:
+            continue
+        sources.append(
+            ActionSummarySource(
+                run_date=(row.get("run_date") or "").strip(),
+                market=market,
+                symbol=symbol,
+                action=action,
+                current_action=normalize_current_action(action),
+                agent_reason=(row.get("agent_reason") or "").strip(),
+                agent_excerpt=(row.get("agent_excerpt") or "").strip(),
+                trigger_reason=(row.get("trigger_reason") or "").strip(),
+                reason=(row.get("reason") or "").strip(),
             )
         )
     return sources
@@ -377,8 +494,8 @@ def _build_record(
     extractor: TradingAgentsSummaryExtractor,
 ) -> dict[str, Any]:
     ta_report_date = _resolve_ta_report_date(source, plan)
-    ta_view = _normalize_view(source.advice_action or plan.get("rating", ""))
-    current_action = _normalize_action(action.get("action", ""))
+    ta_view = normalize_ta_view(source.advice_action or plan.get("rating", ""))
+    current_action = normalize_current_action(action.get("action", ""))
     final_trade_decision = extract_final_trade_decision(source.raw_decision)
     base_source = json.dumps(
         {
@@ -481,7 +598,7 @@ def _resolve_ta_report_date(source: SummarySource, plan: dict[str, str]) -> str:
     return MISSING_VALUE
 
 
-def _normalize_view(value: str) -> str:
+def normalize_ta_view(value: str) -> str:
     normalized = value.strip().lower().replace("_", " ").replace("-", " ")
     mapping = {
         "underweight": "低配",
@@ -499,7 +616,7 @@ def _normalize_view(value: str) -> str:
     return mapping.get(normalized, MISSING_VALUE)
 
 
-def _normalize_action(value: str) -> str:
+def normalize_current_action(value: str) -> str:
     normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
     mapping = {
         "BUY": "买入",
@@ -527,9 +644,18 @@ def _fallback_core_reason(plan: dict[str, str], action: dict[str, str]) -> str:
         plan.get("agent_excerpt", ""),
     ):
         text = (value or "").strip()
-        if text and not _is_price_trigger_only(text):
+        if _is_usable_core_reason(text):
             return text
     return MISSING_VALUE
+
+
+def _is_usable_core_reason(value: str) -> bool:
+    return bool(
+        value
+        and value != MISSING_VALUE
+        and CHINESE_TEXT_PATTERN.search(value)
+        and not _is_price_trigger_only(value)
+    )
 
 
 def _string_or_missing(value: object) -> str:

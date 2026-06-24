@@ -9,10 +9,20 @@ import pytest
 from open_trader.trade_actions import TRADE_ACTION_FIELDNAMES
 from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 from open_trader.tradingagents_summary import (
+    REASON_FIELD_NAMES,
     TRADINGAGENTS_SUMMARY_SCHEMA_VERSION,
+    ActionSummarySource,
+    AdviceSummarySource,
+    PlanSummarySource,
     build_missing_reason_fields,
     generate_tradingagents_summary,
+    index_tradingagents_summary_by_market_symbol,
+    load_action_summary_sources,
+    load_advice_summary_sources,
+    load_plan_summary_sources,
     load_tradingagents_summary_cache,
+    normalize_current_action,
+    normalize_ta_view,
     tradingagents_summary_latest_path,
     tradingagents_summary_run_path,
     validate_tradingagents_summary_record,
@@ -210,6 +220,48 @@ def test_paths_are_market_scoped(tmp_path: Path) -> None:
     )
 
 
+def test_public_helpers_load_and_index_sources(tmp_path: Path) -> None:
+    advice_path = tmp_path / "trading_advice.csv"
+    plan_path = tmp_path / "trading_plan.csv"
+    actions_path = tmp_path / "trade_actions.csv"
+    write_csv(advice_path, ADVICE_FIELDS, [advice_row()])
+    write_csv(plan_path, TRADING_PLAN_FIELDNAMES, [plan_row()])
+    write_csv(actions_path, list(TRADE_ACTION_FIELDNAMES), [action_row()])
+
+    advice_sources = load_advice_summary_sources(advice_path)
+    plan_sources = load_plan_summary_sources(plan_path)
+    action_sources = load_action_summary_sources(actions_path)
+
+    assert REASON_FIELD_NAMES == (
+        "main_judgment",
+        "evidence_1",
+        "evidence_2",
+        "risk_or_counterpoint",
+        "action_logic",
+    )
+    assert isinstance(advice_sources[0], AdviceSummarySource)
+    assert isinstance(plan_sources[0], PlanSummarySource)
+    assert isinstance(action_sources[0], ActionSummarySource)
+    assert advice_sources[0].symbol == "DRAM"
+    assert plan_sources[0].agent_reason.startswith("TradingAgents建议减仓")
+    assert action_sources[0].current_action == "减仓"
+    assert normalize_ta_view("Underweight") == "低配"
+    assert normalize_current_action("TRIM") == "减仓"
+
+    indexed = index_tradingagents_summary_by_market_symbol(
+        {
+            "records": [
+                {
+                    "market": "US",
+                    "symbol": "DRAM",
+                    "core_reason": "结构性主题仍成立，但短期风险回报转差。",
+                }
+            ]
+        }
+    )
+    assert indexed[("US", "DRAM")]["core_reason"].startswith("结构性主题")
+
+
 def test_generate_summary_uses_fallback_date_and_fixed_fields(tmp_path: Path) -> None:
     advice_path = tmp_path / "data" / "latest" / "US" / "trading_advice.csv"
     plan_path = tmp_path / "data" / "latest" / "US" / "trading_plan.csv"
@@ -266,6 +318,30 @@ def test_validate_rejects_price_trigger_only_reason() -> None:
     with pytest.raises(ValueError, match="price trigger"):
         validate_tradingagents_summary_record(record)
 
+    record["core_reason"] = "达到第一目标价"
+    with pytest.raises(ValueError, match="price trigger"):
+        validate_tradingagents_summary_record(record)
+
+
+def test_validate_rejects_unexpected_top_level_fields() -> None:
+    record = {
+        "schema_version": TRADINGAGENTS_SUMMARY_SCHEMA_VERSION,
+        "market": "US",
+        "symbol": "DRAM",
+        "latest_run_date": "2026-06-23",
+        "ta_report_date": "2026-06-22",
+        "ta_view": "低配",
+        "current_action": "减仓",
+        "core_reason": "结构性主题仍成立，但短期风险回报转差。",
+        "reason_fields": build_missing_reason_fields(),
+        "source_hash": "sha256:" + "a" * 64,
+        "error": "",
+        "source_status": "fallback",
+    }
+
+    with pytest.raises(ValueError, match="unexpected"):
+        validate_tradingagents_summary_record(record)
+
 
 def test_failed_llm_keeps_all_display_fields(tmp_path: Path) -> None:
     advice_path = tmp_path / "data" / "latest" / "US" / "trading_advice.csv"
@@ -298,4 +374,54 @@ def test_failed_llm_keeps_all_display_fields(tmp_path: Path) -> None:
     assert record["core_reason"].startswith("TradingAgents建议减仓")
     assert record["ta_report_date"] == "2026-06-22"
     assert record["latest_run_date"] == "2026-06-23"
+    assert record["error"] == "bad json"
+
+
+def test_failed_llm_uses_missing_when_fallback_reason_is_english(tmp_path: Path) -> None:
+    advice_path = tmp_path / "data" / "latest" / "US" / "trading_advice.csv"
+    plan_path = tmp_path / "data" / "latest" / "US" / "trading_plan.csv"
+    actions_path = tmp_path / "data" / "latest" / "US" / "trade_actions.csv"
+    write_csv(advice_path, ADVICE_FIELDS, [advice_row()])
+    write_csv(
+        plan_path,
+        TRADING_PLAN_FIELDNAMES,
+        [
+            plan_row(
+                agent_reason="The memory supercycle is intact, but price is extended.",
+                plan_text="Current price is at or above target 1.",
+                agent_excerpt="Current price is at or above target 1.",
+            )
+        ],
+    )
+    write_csv(
+        actions_path,
+        list(TRADE_ACTION_FIELDNAMES),
+        [
+            action_row(
+                agent_reason="Current price is at or above target 1.",
+                agent_excerpt="Current price is at or above target 1.",
+            )
+        ],
+    )
+
+    class BrokenExtractor:
+        def extract(self, **kwargs: str) -> dict[str, object]:
+            raise ValueError("bad json")
+
+    result = generate_tradingagents_summary(
+        advice_path=advice_path,
+        plan_path=plan_path,
+        actions_path=actions_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-23",
+        market="US",
+        extractor=BrokenExtractor(),
+        update_latest=False,
+    )
+
+    record = load_tradingagents_summary_cache(result.run_path)["records"][0]
+    assert all(field in record for field in DISPLAY_FIELDS)
+    assert record["core_reason"] == "缺失"
+    assert record["ta_view"] == "低配"
+    assert record["current_action"] == "减仓"
     assert record["error"] == "bad json"
