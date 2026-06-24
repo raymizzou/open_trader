@@ -525,7 +525,11 @@ class DailyPremarketRunner:
             "latest_trade_actions": str(latest_trade_actions_path),
             "latest_technical_facts": str(latest_technical_facts_path),
             "latest_decision_facts": str(latest_decision_facts_path),
-            "latest_tradingagents_summary": str(latest_tradingagents_summary_path),
+            "latest_tradingagents_summary": (
+                str(latest_tradingagents_summary_path)
+                if tradingagents_summary_path
+                else ""
+            ),
             "status": str(status_path),
             "report": str(report_path),
             "log": str(log_path),

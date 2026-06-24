@@ -1272,9 +1272,7 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
         tmp_path / "data/runs/2026-06-17/US/trade_actions.csv"
     )
     assert artifacts["tradingagents_summary"] == ""
-    assert artifacts["latest_tradingagents_summary"] == str(
-        latest_dir / "tradingagents_summary.json"
-    )
+    assert artifacts["latest_tradingagents_summary"] == ""
     assert (latest_dir / "trading_advice.csv").exists()
     assert (latest_dir / "premarket_actions.csv").exists()
     assert (latest_dir / "trading_plan.csv").exists()
@@ -1286,10 +1284,7 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
     assert "- Status: partial" in report
     assert "TradingAgents 摘要生成异常" in report
     assert "- tradingagents_summary: " in report
-    assert (
-        f"- latest_tradingagents_summary: {latest_dir / 'tradingagents_summary.json'}"
-        in report
-    )
+    assert f"- latest_tradingagents_summary: {latest_dir}" not in report
 
 
 def test_daily_runner_sends_feishu_order_review_after_trade_actions(
