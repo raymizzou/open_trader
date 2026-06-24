@@ -25,6 +25,13 @@ from .technical_facts import (
     technical_facts_has_missing_timeframe,
     technical_facts_latest_path,
 )
+from .tradingagents_summary import (
+    index_tradingagents_summary_by_market_symbol,
+    load_tradingagents_summary_cache,
+    normalize_current_action,
+    normalize_ta_view,
+    tradingagents_summary_latest_path,
+)
 
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
@@ -106,13 +113,23 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         else []
     )
     cash_details = [_cash_detail_row(row) for row in raw_cash_details]
-    trade_actions = _read_csv_rows(config.data_dir / "latest" / "trade_actions.csv")
-    trading_plan = _read_csv_rows(config.data_dir / "latest" / "trading_plan.csv")
-    premarket_actions = _read_csv_rows(
-        config.data_dir / "latest" / "premarket_actions.csv"
-    )
     holding_rows = [row for row in portfolio_rows if _is_dashboard_holding(row)]
     holding_markets = _markets_from_rows(holding_rows)
+    trade_actions, _ = _latest_rows_for_markets(
+        data_dir=config.data_dir,
+        filename="trade_actions.csv",
+        markets=holding_markets,
+    )
+    trading_plan, _ = _latest_rows_for_markets(
+        data_dir=config.data_dir,
+        filename="trading_plan.csv",
+        markets=holding_markets,
+    )
+    premarket_actions, _ = _latest_rows_for_markets(
+        data_dir=config.data_dir,
+        filename="premarket_actions.csv",
+        markets=holding_markets,
+    )
     trading_advice, scoped_advice_markets = _latest_rows_for_markets(
         data_dir=config.data_dir,
         filename="trading_advice.csv",
@@ -130,6 +147,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             data_dir=config.data_dir,
             markets=holding_markets,
         )
+    )
+    tradingagents_summary_by_holding = _latest_tradingagents_summary_for_markets(
+        data_dir=config.data_dir,
+        markets=holding_markets,
     )
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
@@ -150,6 +171,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             technical_facts_file_exists_by_market,
             decision_facts_by_holding,
             decision_facts_file_exists_by_market,
+            tradingagents_summary_by_holding,
         )
         for row in holding_rows
     ]
@@ -300,6 +322,24 @@ def _latest_decision_facts_for_markets(
     return records_by_key, file_exists_by_market
 
 
+def _latest_tradingagents_summary_for_markets(
+    *,
+    data_dir: Path,
+    markets: set[str],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for market in markets:
+        path = tradingagents_summary_latest_path(data_dir, market)
+        if not path.exists():
+            continue
+        records_by_key.update(
+            index_tradingagents_summary_by_market_symbol(
+                load_tradingagents_summary_cache(path)
+            )
+        )
+    return records_by_key
+
+
 def _markets_from_rows(rows: list[dict[str, str]]) -> set[str]:
     markets: set[str] = set()
     for row in rows:
@@ -374,6 +414,7 @@ def _merge_holding(
     technical_facts_file_exists_by_market: dict[str, bool],
     decision_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
     decision_facts_file_exists_by_market: dict[str, bool],
+    tradingagents_summary_by_holding: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -389,6 +430,11 @@ def _merge_holding(
     premarket_action = premarket_actions_by_holding.get(key) if key is not None else None
     trade_action = actions_by_holding.get(key) if key is not None else None
     holding["agent_report"] = _agent_report_detail(agent_report)
+    holding["tradingagents_summary"] = _tradingagents_summary_detail(
+        tradingagents_summary_by_holding.get(key) if key is not None else None,
+        agent_report,
+        trade_action or premarket_action,
+    )
     holding["strategy"] = _strategy_detail(strategy)
     holding["premarket_action"] = _row_detail(premarket_action)
     holding["trade_action"] = _row_detail(trade_action)
@@ -474,6 +520,73 @@ def _agent_report_detail(row: dict[str, str] | None) -> dict[str, Any]:
         "status": row.get("status", ""),
         "error": row.get("error", ""),
     }
+
+
+def _tradingagents_summary_detail(
+    record: dict[str, Any] | None,
+    agent_report: dict[str, str] | None,
+    action: dict[str, str] | None,
+) -> dict[str, Any]:
+    if record is not None:
+        return {
+            "available": True,
+            "ta_view": _display_or_missing(record.get("ta_view")),
+            "current_action": _display_or_missing(record.get("current_action")),
+            "core_reason": _display_or_missing(record.get("core_reason")),
+            "ta_report_date": _display_or_missing(record.get("ta_report_date")),
+            "latest_run_date": _display_or_missing(record.get("latest_run_date")),
+        }
+
+    return {
+        "available": False,
+        "ta_view": _fallback_ta_view(agent_report),
+        "current_action": _fallback_current_action(action),
+        "core_reason": "缺失",
+        "ta_report_date": _fallback_ta_report_date(agent_report),
+        "latest_run_date": _fallback_latest_run_date(agent_report, action),
+    }
+
+
+def _display_or_missing(value: object) -> str:
+    text = str(value or "").strip()
+    return text or "缺失"
+
+
+def _fallback_ta_view(agent_report: dict[str, str] | None) -> str:
+    if agent_report is None:
+        return "缺失"
+    return normalize_ta_view(agent_report.get("advice_action", ""))
+
+
+def _fallback_current_action(action: dict[str, str] | None) -> str:
+    if action is None:
+        return "缺失"
+    return normalize_current_action(
+        action.get("action", "") or action.get("suggested_action", "")
+    )
+
+
+def _fallback_ta_report_date(agent_report: dict[str, str] | None) -> str:
+    if agent_report is None:
+        return "缺失"
+    return (
+        agent_report.get("fallback_from_date", "").strip()
+        or agent_report.get("run_date", "").strip()
+        or "缺失"
+    )
+
+
+def _fallback_latest_run_date(
+    agent_report: dict[str, str] | None,
+    action: dict[str, str] | None,
+) -> str:
+    for row in (action, agent_report):
+        if row is None:
+            continue
+        run_date = row.get("run_date", "").strip()
+        if run_date:
+            return run_date
+    return "缺失"
 
 
 def _strategy_detail(row: dict[str, str] | None) -> dict[str, Any]:

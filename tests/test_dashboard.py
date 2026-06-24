@@ -190,6 +190,43 @@ def write_technical_facts(
     )
 
 
+def write_tradingagents_summary(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.tradingagents_summary.v1",
+                "generated_at": "2026-06-23T18:37:04+08:00",
+                "latest_run_date": "2026-06-23",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.tradingagents_summary.v1",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "latest_run_date": "2026-06-23",
+                        "ta_report_date": "2026-06-22",
+                        "ta_view": "低配",
+                        "current_action": "减仓",
+                        "core_reason": "波动率仓位短期风险回报转差，所以 TA 建议降低仓位。",
+                        "reason_fields": {
+                            "main_judgment": "短期风险回报转差",
+                            "evidence_1": "技术风险上升",
+                            "evidence_2": "估值压力上升",
+                            "risk_or_counterpoint": "长期主题仍在",
+                            "action_logic": "降低仓位而不是清仓",
+                        },
+                        "source_hash": "sha256:" + "a" * 64,
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def portfolio_rows() -> list[dict[str, str]]:
     return [
         {
@@ -573,6 +610,95 @@ def test_load_dashboard_state_merges_agent_report_strategy_and_actions(
     assert vixy["trade_action"]["available"] is True
     assert vixy["trade_action"]["action"] == "TRIM"
     assert vixy["trade_action"]["suggested_quantity"] == "50"
+
+
+def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallback(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    rows = [
+        portfolio_rows()[0],
+        {
+            **portfolio_rows()[0],
+            "symbol": "DRAM",
+            "name": "DRAM ETF",
+            "portfolio_weight_hkd": "7.11%",
+        },
+    ]
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-23",
+                "symbol": "DRAM",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "7.11%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "Trim memory exposure.",
+                "raw_decision": '{"rating":"Underweight"}',
+                "status": "ok",
+                "error": "",
+                "source_status": "fallback",
+                "fallback_reason": "rate limited",
+                "fallback_from_date": "2026-06-22",
+            }
+        ],
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trade_actions.csv",
+        TRADE_ACTION_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-23",
+                "symbol": "DRAM",
+                "market": "US",
+                "futu_symbol": "US.DRAM",
+                "action": "TRIM",
+                "priority": "medium",
+                "last_price": "80.00",
+                "trigger_status": "target_1_hit",
+                "suggested_quantity": "10",
+                "status": "ready",
+                "reason": "target hit",
+            }
+        ],
+    )
+    write_tradingagents_summary(
+        config.data_dir / "latest" / "US" / "tradingagents_summary.json"
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    holdings = {row["symbol"]: row for row in state["holdings"]}
+    assert holdings["VIXY"]["tradingagents_summary"] == {
+        "available": True,
+        "ta_view": "低配",
+        "current_action": "减仓",
+        "core_reason": "波动率仓位短期风险回报转差，所以 TA 建议降低仓位。",
+        "ta_report_date": "2026-06-22",
+        "latest_run_date": "2026-06-23",
+    }
+    assert set(holdings["VIXY"]["tradingagents_summary"]) == {
+        "available",
+        "ta_view",
+        "current_action",
+        "core_reason",
+        "ta_report_date",
+        "latest_run_date",
+    }
+    assert holdings["DRAM"]["tradingagents_summary"] == {
+        "available": False,
+        "ta_view": "低配",
+        "current_action": "减仓",
+        "core_reason": "缺失",
+        "ta_report_date": "2026-06-22",
+        "latest_run_date": "2026-06-23",
+    }
 
 
 def test_load_dashboard_state_attaches_fresh_technical_facts(
