@@ -6,13 +6,17 @@ from pathlib import Path
 
 import pytest
 
+import open_trader.tradingagents_summary as tradingagents_summary_module
 from open_trader.trade_actions import TRADE_ACTION_FIELDNAMES
 from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 from open_trader.tradingagents_summary import (
+    MISSING_VALUE,
     REASON_FIELD_NAMES,
     TRADINGAGENTS_SUMMARY_SCHEMA_VERSION,
     ActionSummarySource,
     AdviceSummarySource,
+    LLMTradingAgentsSummaryExtractor,
+    OpenAITextClient,
     PlanSummarySource,
     build_missing_reason_fields,
     generate_tradingagents_summary,
@@ -113,6 +117,11 @@ def write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> 
         writer.writerows(rows)
 
 
+def write_raw_csv(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
 def raw_decision(final_trade_decision: str = "FINAL TRANSACTION PROPOSAL: HOLD") -> str:
     return json.dumps(
         {"state": {"final_trade_decision": final_trade_decision}},
@@ -211,6 +220,25 @@ def action_row(**overrides: str) -> dict[str, str]:
     return row
 
 
+def valid_llm_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": TRADINGAGENTS_SUMMARY_SCHEMA_VERSION,
+        "core_reason": (
+            "内存超级周期仍在，但价格极度延伸、MACD 背离且财报前情绪拥挤，"
+            "所以 TA 建议降低仓位而非清仓。"
+        ),
+        "reason_fields": {
+            "main_judgment": "结构性主题仍成立，但短期风险回报转差",
+            "evidence_1": "价格远高于均线并出现 MACD 背离",
+            "evidence_2": "财报前情绪拥挤，失望风险放大",
+            "risk_or_counterpoint": "AI 内存超级周期仍支撑保留部分仓位",
+            "action_logic": "减仓锁定收益，而不是完全清仓",
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_paths_are_market_scoped(tmp_path: Path) -> None:
     assert tradingagents_summary_run_path(tmp_path, "2026-06-23", "US") == (
         tmp_path / "runs" / "2026-06-23" / "US" / "tradingagents_summary.json"
@@ -260,6 +288,257 @@ def test_public_helpers_load_and_index_sources(tmp_path: Path) -> None:
         }
     )
     assert indexed[("US", "DRAM")]["core_reason"].startswith("结构性主题")
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("Underweight", "低配"),
+        ("UNDERWEIGHT", "低配"),
+        ("under_weight", "低配"),
+        ("over-weight", "超配"),
+        ("Buy", "买入"),
+        ("hold", "持有"),
+        ("低配", "低配"),
+        ("unknown", MISSING_VALUE),
+    ],
+)
+def test_normalize_ta_view_variants(raw_value: str, expected: str) -> None:
+    assert normalize_ta_view(raw_value) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("trim", "减仓"),
+        ("TRIM", "减仓"),
+        ("sell-stop", "止损卖出"),
+        ("sell stop", "止损卖出"),
+        ("take_profit", "止盈"),
+        ("Review", "人工复核"),
+        ("持有", "持有"),
+        ("unknown", MISSING_VALUE),
+    ],
+)
+def test_normalize_current_action_variants(raw_value: str, expected: str) -> None:
+    assert normalize_current_action(raw_value) == expected
+
+
+@pytest.mark.parametrize(
+    ("loader_name", "fieldnames", "row", "missing_column", "match"),
+    [
+        (
+            "load_advice_summary_sources",
+            ADVICE_FIELDS,
+            advice_row(),
+            "raw_decision",
+            "advice CSV missing required column\\(s\\): raw_decision",
+        ),
+        (
+            "load_plan_summary_sources",
+            TRADING_PLAN_FIELDNAMES,
+            plan_row(),
+            "agent_excerpt",
+            "plan CSV missing required column\\(s\\): agent_excerpt",
+        ),
+        (
+            "load_action_summary_sources",
+            list(TRADE_ACTION_FIELDNAMES),
+            action_row(),
+            "agent_reason",
+            "action CSV missing required column\\(s\\): agent_reason",
+        ),
+    ],
+)
+def test_summary_source_loaders_reject_missing_required_columns(
+    tmp_path: Path,
+    loader_name: str,
+    fieldnames: list[str],
+    row: dict[str, str],
+    missing_column: str,
+    match: str,
+) -> None:
+    path = tmp_path / f"{loader_name}.csv"
+    reduced_fields = [field for field in fieldnames if field != missing_column]
+    write_csv(path, reduced_fields, [{field: value for field, value in row.items() if field != missing_column}])
+
+    loader = getattr(tradingagents_summary_module, loader_name)
+    with pytest.raises(ValueError, match=match):
+        loader(path)
+
+
+@pytest.mark.parametrize(
+    ("content", "match"),
+    [
+        (
+            "run_date,symbol,symbol,market,advice_action,advice_summary,raw_decision\n"
+            "2026-06-23,DRAM,DRAM,US,Underweight,summary,{}\n",
+            "advice CSV has duplicate header\\(s\\): symbol",
+        ),
+        (
+            "run_date,,symbol,market,advice_action,advice_summary,raw_decision\n"
+            "2026-06-23,,DRAM,US,Underweight,summary,{}\n",
+            "advice CSV has blank header",
+        ),
+        (
+            "run_date,symbol,market,advice_action,advice_summary,raw_decision\n"
+            "2026-06-23,DRAM,US,Underweight,summary,{},extra\n",
+            "advice CSV row 2 has extra cell\\(s\\)",
+        ),
+    ],
+)
+def test_advice_loader_rejects_malformed_csv_schema(
+    tmp_path: Path,
+    content: str,
+    match: str,
+) -> None:
+    path = tmp_path / "advice.csv"
+    write_raw_csv(path, content)
+
+    with pytest.raises(ValueError, match=match):
+        load_advice_summary_sources(path)
+
+
+def test_summary_source_loaders_tolerate_additive_columns(tmp_path: Path) -> None:
+    advice_path = tmp_path / "advice.csv"
+    plan_path = tmp_path / "plan.csv"
+    actions_path = tmp_path / "actions.csv"
+    write_csv(advice_path, [*ADVICE_FIELDS, "extra_context"], [{**advice_row(), "extra_context": "ok"}])
+    write_csv(plan_path, [*TRADING_PLAN_FIELDNAMES, "extra_context"], [{**plan_row(), "extra_context": "ok"}])
+    write_csv(
+        actions_path,
+        [*list(TRADE_ACTION_FIELDNAMES), "extra_context"],
+        [{**action_row(), "extra_context": "ok"}],
+    )
+
+    assert load_advice_summary_sources(advice_path)[0].symbol == "DRAM"
+    assert load_plan_summary_sources(plan_path)[0].symbol == "DRAM"
+    assert load_action_summary_sources(actions_path)[0].symbol == "DRAM"
+
+
+class FakeTextClient:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+        self.calls.append({"messages": messages, "temperature": temperature})
+        return self.content
+
+
+def test_llm_extractor_sends_prompt_payload_and_parses_valid_json() -> None:
+    client = FakeTextClient(json.dumps(valid_llm_payload(), ensure_ascii=False))
+    extractor = LLMTradingAgentsSummaryExtractor(client=client)
+
+    result = extractor.extract(
+        market="US",
+        symbol="DRAM",
+        latest_run_date="2026-06-23",
+        ta_report_date="2026-06-22",
+        advice_action="Underweight",
+        current_action="减仓",
+        advice_summary="完整 TradingAgents advice summary",
+        final_trade_decision="final decision text",
+    )
+
+    assert result["schema_version"] == TRADINGAGENTS_SUMMARY_SCHEMA_VERSION
+    assert result["core_reason"] != MISSING_VALUE
+    assert client.calls[0]["temperature"] == 0
+    messages = client.calls[0]["messages"]
+    user_payload = json.loads(messages[1]["content"])
+    assert user_payload["advice_summary"] == "完整 TradingAgents advice summary"
+    assert user_payload["final_trade_decision"] == "final decision text"
+
+
+@pytest.mark.parametrize(
+    ("content", "match"),
+    [
+        ("not json", "must be valid JSON"),
+        ("[]", "must be a JSON object"),
+        (
+            json.dumps(valid_llm_payload(schema_version="wrong"), ensure_ascii=False),
+            "schema_version is invalid",
+        ),
+        (
+            json.dumps(
+                valid_llm_payload(reason_fields={"main_judgment": "结构性主题仍成立"}),
+                ensure_ascii=False,
+            ),
+            "reason_fields are invalid",
+        ),
+        (
+            json.dumps(
+                valid_llm_payload(
+                    reason_fields={
+                        "main_judgment": "not Chinese",
+                        "evidence_1": "价格远高于均线",
+                        "evidence_2": "财报前情绪拥挤",
+                        "risk_or_counterpoint": "仍有结构性支撑",
+                        "action_logic": "减仓锁定收益",
+                    }
+                ),
+                ensure_ascii=False,
+            ),
+            "must be Chinese",
+        ),
+    ],
+)
+def test_llm_extractor_rejects_invalid_responses(content: str, match: str) -> None:
+    extractor = LLMTradingAgentsSummaryExtractor(client=FakeTextClient(content))
+
+    with pytest.raises(ValueError, match=match):
+        extractor.extract(
+            market="US",
+            symbol="DRAM",
+            latest_run_date="2026-06-23",
+            ta_report_date="2026-06-22",
+            advice_action="Underweight",
+            current_action="减仓",
+            advice_summary="完整 TradingAgents advice summary",
+            final_trade_decision="final decision text",
+        )
+
+
+def test_openai_text_client_uses_json_response_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> object:
+            captured.update(kwargs)
+
+            class Message:
+                content = '{"ok": true}'
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str | None, base_url: str) -> None:
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            self.chat = type(
+                "Chat",
+                (),
+                {"completions": FakeCompletions()},
+            )()
+
+    monkeypatch.setattr(tradingagents_summary_module, "OpenAI", FakeOpenAI)
+
+    client = OpenAITextClient(api_key="test-key", base_url="https://example.test", model="model-x")
+    content = client.create(messages=[{"role": "user", "content": "hi"}], temperature=0)
+
+    assert content == '{"ok": true}'
+    assert captured["api_key"] == "test-key"
+    assert captured["base_url"] == "https://example.test"
+    assert captured["model"] == "model-x"
+    assert captured["messages"] == [{"role": "user", "content": "hi"}]
+    assert captured["temperature"] == 0
+    assert captured["response_format"] == {"type": "json_object"}
 
 
 def test_generate_summary_uses_fallback_date_and_fixed_fields(tmp_path: Path) -> None:

@@ -54,6 +54,30 @@ RECORD_FIELD_NAMES = {
     "source_hash",
     "error",
 }
+ADVICE_REQUIRED_COLUMNS = (
+    "run_date",
+    "symbol",
+    "market",
+    "advice_action",
+    "advice_summary",
+    "raw_decision",
+)
+PLAN_REQUIRED_COLUMNS = (
+    "run_date",
+    "symbol",
+    "market",
+    "rating",
+    "agent_reason",
+    "agent_excerpt",
+)
+ACTION_REQUIRED_COLUMNS = (
+    "run_date",
+    "symbol",
+    "market",
+    "action",
+    "reason",
+    "agent_reason",
+)
 RUN_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CHINESE_TEXT_PATTERN = re.compile(r"[\u3400-\u9fff]")
 SOURCE_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -336,8 +360,16 @@ def generate_tradingagents_summary(
     if run_date is not None and not filtered_sources:
         raise ValueError(f"no advice rows match run_date {latest_run_date}")
 
-    plans = _index_rows(_load_csv_rows(plan_path), market_scope, latest_run_date)
-    actions = _index_rows(_load_csv_rows(actions_path), market_scope, latest_run_date)
+    plans = _index_plan_sources(
+        load_plan_summary_sources(plan_path),
+        market_scope,
+        latest_run_date,
+    )
+    actions = _index_action_sources(
+        load_action_summary_sources(actions_path),
+        market_scope,
+        latest_run_date,
+    )
     summary_extractor = extractor or LLMTradingAgentsSummaryExtractor()
 
     records = [
@@ -389,7 +421,11 @@ def _summary_system_prompt() -> str:
 
 
 def load_advice_summary_sources(advice_path: Path) -> list[AdviceSummarySource]:
-    rows = _load_csv_rows(advice_path)
+    rows = _load_csv_rows(
+        advice_path,
+        required_columns=ADVICE_REQUIRED_COLUMNS,
+        source_name="advice CSV",
+    )
     sources: list[AdviceSummarySource] = []
     for row in rows:
         market = (row.get("market") or "").strip().upper()
@@ -413,7 +449,11 @@ def load_advice_summary_sources(advice_path: Path) -> list[AdviceSummarySource]:
 
 def load_plan_summary_sources(plan_path: Path) -> list[PlanSummarySource]:
     sources: list[PlanSummarySource] = []
-    for row in _load_csv_rows(plan_path):
+    for row in _load_csv_rows(
+        plan_path,
+        required_columns=PLAN_REQUIRED_COLUMNS,
+        source_name="plan CSV",
+    ):
         market = (row.get("market") or "").strip().upper()
         symbol = (row.get("symbol") or "").strip().upper()
         if not market or not symbol:
@@ -435,7 +475,11 @@ def load_plan_summary_sources(plan_path: Path) -> list[PlanSummarySource]:
 
 def load_action_summary_sources(actions_path: Path) -> list[ActionSummarySource]:
     sources: list[ActionSummarySource] = []
-    for row in _load_csv_rows(actions_path):
+    for row in _load_csv_rows(
+        actions_path,
+        required_columns=ACTION_REQUIRED_COLUMNS,
+        source_name="action CSV",
+    ):
         market = (row.get("market") or "").strip().upper()
         symbol = (row.get("symbol") or "").strip().upper()
         action = (row.get("action") or "").strip()
@@ -457,31 +501,96 @@ def load_action_summary_sources(actions_path: Path) -> list[ActionSummarySource]
     return sources
 
 
-def _load_csv_rows(path: Path) -> list[dict[str, str]]:
+def _load_csv_rows(
+    path: Path,
+    *,
+    required_columns: tuple[str, ...],
+    source_name: str,
+) -> list[dict[str, str]]:
     if not path.exists():
         raise FileNotFoundError(f"CSV not found: {path}")
     csv.field_size_limit(sys.maxsize)
     with path.open(encoding="utf-8-sig", newline="") as handle:
-        return [dict(row) for row in csv.DictReader(handle)]
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames
+        if fieldnames is None:
+            raise ValueError(f"{source_name} missing header")
+        normalized_fieldnames = [field.strip() if field is not None else "" for field in fieldnames]
+        if any(not field for field in normalized_fieldnames):
+            raise ValueError(f"{source_name} has blank header")
+        duplicates = _duplicate_values(normalized_fieldnames)
+        if duplicates:
+            raise ValueError(
+                f"{source_name} has duplicate header(s): {', '.join(duplicates)}"
+            )
+        missing = [field for field in required_columns if field not in normalized_fieldnames]
+        if missing:
+            raise ValueError(
+                f"{source_name} missing required column(s): {', '.join(missing)}"
+            )
+        rows: list[dict[str, str]] = []
+        for row_number, row in enumerate(reader, start=2):
+            if None in row:
+                raise ValueError(f"{source_name} row {row_number} has extra cell(s)")
+            rows.append({str(key).strip(): value for key, value in row.items()})
+        return rows
 
 
-def _index_rows(
-    rows: list[dict[str, str]],
+def _duplicate_values(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for value in values:
+        if value in seen and value not in duplicates:
+            duplicates.append(value)
+        seen.add(value)
+    return duplicates
+
+
+def _index_plan_sources(
+    sources: list[PlanSummarySource],
     market_scope: MarketScope | None,
     run_date: str,
 ) -> dict[tuple[str, str], dict[str, str]]:
     indexed: dict[tuple[str, str], dict[str, str]] = {}
-    for row in rows:
-        market = (row.get("market") or "").strip().upper()
-        symbol = (row.get("symbol") or "").strip().upper()
-        row_run_date = (row.get("run_date") or "").strip()
-        if not market or not symbol:
+    for source in sources:
+        if market_scope is not None and source.market != market_scope.value:
             continue
-        if market_scope is not None and market != market_scope.value:
+        if source.run_date and source.run_date != run_date:
             continue
-        if row_run_date and row_run_date != run_date:
+        indexed[(source.market, source.symbol)] = {
+            "run_date": source.run_date,
+            "market": source.market,
+            "symbol": source.symbol,
+            "fallback_from_date": source.fallback_from_date,
+            "rating": source.rating,
+            "plan_text": source.plan_text,
+            "agent_reason": source.agent_reason,
+            "agent_excerpt": source.agent_excerpt,
+        }
+    return indexed
+
+
+def _index_action_sources(
+    sources: list[ActionSummarySource],
+    market_scope: MarketScope | None,
+    run_date: str,
+) -> dict[tuple[str, str], dict[str, str]]:
+    indexed: dict[tuple[str, str], dict[str, str]] = {}
+    for source in sources:
+        if market_scope is not None and source.market != market_scope.value:
             continue
-        indexed[(market, symbol)] = row
+        if source.run_date and source.run_date != run_date:
+            continue
+        indexed[(source.market, source.symbol)] = {
+            "run_date": source.run_date,
+            "market": source.market,
+            "symbol": source.symbol,
+            "action": source.action,
+            "agent_reason": source.agent_reason,
+            "agent_excerpt": source.agent_excerpt,
+            "trigger_reason": source.trigger_reason,
+            "reason": source.reason,
+        }
     return indexed
 
 
@@ -600,11 +709,14 @@ def _resolve_ta_report_date(source: SummarySource, plan: dict[str, str]) -> str:
 
 def normalize_ta_view(value: str) -> str:
     normalized = value.strip().lower().replace("_", " ").replace("-", " ")
+    compact = normalized.replace(" ", "")
     mapping = {
         "underweight": "低配",
+        "under weight": "低配",
         "reduce": "低配",
         "trim": "低配",
         "overweight": "超配",
+        "over weight": "超配",
         "add": "超配",
         "buy": "买入",
         "hold": "持有",
@@ -613,7 +725,7 @@ def normalize_ta_view(value: str) -> str:
     }
     if value.strip() in {"低配", "超配", "买入", "持有", "卖出"}:
         return value.strip()
-    return mapping.get(normalized, MISSING_VALUE)
+    return mapping.get(normalized, mapping.get(compact, MISSING_VALUE))
 
 
 def normalize_current_action(value: str) -> str:
@@ -721,22 +833,24 @@ def _market_scope(market: MarketScope | str | None) -> MarketScope | None:
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as temp_file:
-        temp_path = Path(temp_file.name)
-        json.dump(payload, temp_file, ensure_ascii=False, indent=2, sort_keys=True)
-        temp_file.write("\n")
+    temp_path: Path | None = None
     try:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(payload, temp_file, ensure_ascii=False, indent=2, sort_keys=True)
+            temp_file.write("\n")
         temp_path.replace(path)
-    finally:
-        if temp_path.exists():
+    except Exception:
+        if temp_path is not None and temp_path.exists():
             temp_path.unlink()
+        raise
 
 
 def _now_text() -> str:
