@@ -740,7 +740,7 @@ function renderTradingDecisionPlugins(holding) {
       detail: "未来确认估值、增长假设和业务趋势是否支持继续持仓。",
       condition: "条件：基本面证据是否足以支持当前仓位或需要降低风险。",
     },
-    tradingAgentsSummaryPlugin(holding),
+    renderTradingAgentsSummaryCard(holding),
     {
       title: "财报",
       status: "占位",
@@ -778,13 +778,13 @@ function renderTradingDecisionPlugins(holding) {
         </div>
       </div>
       <div class="decision-plugin-grid">
-        ${plugins.map((plugin) => renderDecisionPluginCard(plugin)).join("")}
+        ${plugins.map((plugin) => typeof plugin === "string" ? plugin : renderDecisionPluginCard(plugin)).join("")}
       </div>
     </section>
   `;
 }
 
-function tradingAgentsSummaryPlugin(holding) {
+function renderTradingAgentsSummaryCard(holding) {
   const summary = holding && holding.tradingagents_summary && typeof holding.tradingagents_summary === "object"
     ? holding.tradingagents_summary
     : {};
@@ -796,19 +796,20 @@ function tradingAgentsSummaryPlugin(holding) {
     ["latest_run_date", "当前 latest"],
   ].map(([key, label]) => ({
     label,
-    value: formatPlain(summary[key]),
+    value: formatTradingAgentsSummaryValue(summary[key]),
   }));
-  const available = Boolean(summary.available === true);
-  return {
-    title: "TradingAgents",
-    status: available ? "已接入" : "缺失",
-    tone: available ? "ok" : "partial",
-    score: available ? "TA" : "-",
-    headline: rows[0] ? rows[0].value : "-",
-    detail: "",
-    bodyHtml: renderDecisionFactRows(rows),
-    condition: "",
-  };
+  return `
+    <article class="decision-plugin-card">
+      <div class="decision-plugin-card-header">
+        <h4>TradingAgents</h4>
+      </div>
+      ${renderDecisionFactRows(rows)}
+    </article>
+  `;
+}
+
+function formatTradingAgentsSummaryValue(value) {
+  return hasValue(value) ? formatPlain(value) : "缺失";
 }
 
 function decisionFactsPlugin(holding, config) {

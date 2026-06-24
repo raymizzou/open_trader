@@ -989,6 +989,11 @@ assertOrderedValues(card, [
   ["当前 latest", "2026-06-23"],
 ]);
 for (const forbidden of [
+  "status-pill",
+  "已接入",
+  "<strong>TA</strong>",
+  "decision-plugin-output",
+  "<b>",
   "来源状态",
   "history",
   "历史",
@@ -1021,11 +1026,11 @@ if (JSON.stringify(missingLabels) !== JSON.stringify(expectedLabels)) {
   throw new Error("missing summary should still render all labels: " + missingCard);
 }
 assertOrderedValues(missingCard, [
-  ["TA 观点", "-"],
-  ["当前动作", "-"],
-  ["核心理由", "-"],
-  ["TA 报告日期", "-"],
-  ["当前 latest", "-"],
+  ["TA 观点", "缺失"],
+  ["当前动作", "缺失"],
+  ["核心理由", "缺失"],
+  ["TA 报告日期", "缺失"],
+  ["当前 latest", "缺失"],
 ]);
 `, sandbox);
 """
