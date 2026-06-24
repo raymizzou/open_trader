@@ -898,6 +898,140 @@ for (const forbidden of ["待接入", "未来确认", "暂无可用 K 线技术�
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
+def test_dashboard_tradingagents_card_renders_fixed_summary_fields_only() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+function tradingAgentsCard(html) {
+  const start = html.indexOf("<h4>TradingAgents</h4>");
+  const end = html.indexOf("<h4>财报</h4>");
+  if (start < 0 || end < 0 || start >= end) {
+    throw new Error("TradingAgents card boundaries missing: " + html);
+  }
+  return html.slice(start, end);
+}
+function rowLabels(card) {
+  return card
+    .split("<span>")
+    .slice(1)
+    .filter((part) => part.includes("</span>") && part.split("</span>", 2)[1].includes("<strong>"))
+    .map((part) => part.split("</span>", 1)[0]);
+}
+function assertOrderedValues(card, pairs) {
+  let cursor = -1;
+  for (const [label, value] of pairs) {
+    const fragment = "<span>" + label + "</span>\\n          <strong>" + value + "</strong>";
+    const next = card.indexOf(fragment, cursor + 1);
+    if (next <= cursor) {
+      throw new Error("missing or out-of-order row " + label + "=" + value + ": " + card);
+    }
+    cursor = next;
+  }
+}
+const html = renderTradingDecisionPlugins({
+  market: "US",
+  symbol: "DRAM",
+  portfolio_weight_hkd: "7.11%",
+  agent_report: {
+    available: true,
+    rating: "Underweight",
+    source_status: "fallback",
+    raw_decision: "FINAL TRANSACTION PROPOSAL: REDUCE",
+  },
+  strategy: {
+    available: true,
+    rating: "Underweight",
+    agent_reason: "price target hit",
+  },
+  trade_action: {
+    available: true,
+    action: "TRIM",
+    reason: "target_1_hit",
+    trigger_status: "target_1_hit",
+  },
+  tradingagents_summary: {
+    available: true,
+    ta_view: "低配",
+    current_action: "减仓",
+    core_reason: "内存超级周期仍在，但价格极度延伸、MACD 背离且财报前情绪拥挤，所以 TA 建议降低仓位而非清仓。",
+    ta_report_date: "2026-06-22",
+    latest_run_date: "2026-06-23",
+    reason_fields: {
+      main_judgment: "不应渲染",
+    },
+    source_hash: "sha256:debug",
+    error: "debug only",
+    history: ["2026-06-20"],
+    artifact_path: "data/latest/US/tradingagents_summary.json",
+    source_status: "fallback",
+  },
+});
+const card = tradingAgentsCard(html);
+const expectedLabels = ["TA 观点", "当前动作", "核心理由", "TA 报告日期", "当前 latest"];
+const labels = rowLabels(card);
+if (JSON.stringify(labels) !== JSON.stringify(expectedLabels)) {
+  throw new Error("unexpected TradingAgents labels " + JSON.stringify(labels) + ": " + card);
+}
+assertOrderedValues(card, [
+  ["TA 观点", "低配"],
+  ["当前动作", "减仓"],
+  ["核心理由", "内存超级周期仍在，但价格极度延伸、MACD 背离且财报前情绪拥挤，所以 TA 建议降低仓位而非清仓。"],
+  ["TA 报告日期", "2026-06-22"],
+  ["当前 latest", "2026-06-23"],
+]);
+for (const forbidden of [
+  "来源状态",
+  "history",
+  "历史",
+  "reason_fields",
+  "main_judgment",
+  "source_hash",
+  "artifact_path",
+  "data/latest",
+  "FINAL TRANSACTION PROPOSAL",
+  "Underweight",
+  "target_1_hit",
+  "条件：",
+  "condition-box",
+  "price target hit",
+]) {
+  if (card.includes(forbidden)) {
+    throw new Error("forbidden TradingAgents content leaked " + forbidden + ": " + card);
+  }
+}
+const missingCard = tradingAgentsCard(renderTradingDecisionPlugins({
+  market: "US",
+  symbol: "MISSING",
+  agent_report: {available: false},
+  strategy: {available: false},
+  trade_action: {available: false},
+  tradingagents_summary: {available: false},
+}));
+const missingLabels = rowLabels(missingCard);
+if (JSON.stringify(missingLabels) !== JSON.stringify(expectedLabels)) {
+  throw new Error("missing summary should still render all labels: " + missingCard);
+}
+assertOrderedValues(missingCard, [
+  ["TA 观点", "-"],
+  ["当前动作", "-"],
+  ["核心理由", "-"],
+  ["TA 报告日期", "-"],
+  ["当前 latest", "-"],
+]);
+`, sandbox);
+"""
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
 def test_dashboard_renders_usable_kline_technical_facts_with_timeframe_labels() -> None:
     node = shutil.which("node")
     if node is None:

@@ -697,10 +697,6 @@ function renderSymbolDetail(holding, index) {
 }
 
 function renderTradingDecisionPlugins(holding) {
-  const action = currentDecisionAction(holding);
-  const hasTradingAgents = sectionAvailable(holding.agent_report)
-    || sectionAvailable(holding.strategy)
-    || sectionAvailable(action);
   const plugins = [
     decisionFactsPlugin(holding, {
       title: "趋势 / K 线",
@@ -744,15 +740,7 @@ function renderTradingDecisionPlugins(holding) {
       detail: "未来确认估值、增长假设和业务趋势是否支持继续持仓。",
       condition: "条件：基本面证据是否足以支持当前仓位或需要降低风险。",
     },
-    {
-      title: "TradingAgents",
-      status: hasTradingAgents ? "已接入" : "缺失",
-      tone: hasTradingAgents ? "ok" : "partial",
-      score: hasTradingAgents ? "TA" : "-",
-      headline: finalConclusionText(holding),
-      detail: decisionSubline(holding),
-      condition: "条件：TradingAgents 结论与当前交易动作是否支持下一步策略。",
-    },
+    tradingAgentsSummaryPlugin(holding),
     {
       title: "财报",
       status: "占位",
@@ -794,6 +782,33 @@ function renderTradingDecisionPlugins(holding) {
       </div>
     </section>
   `;
+}
+
+function tradingAgentsSummaryPlugin(holding) {
+  const summary = holding && holding.tradingagents_summary && typeof holding.tradingagents_summary === "object"
+    ? holding.tradingagents_summary
+    : {};
+  const rows = [
+    ["ta_view", "TA 观点"],
+    ["current_action", "当前动作"],
+    ["core_reason", "核心理由"],
+    ["ta_report_date", "TA 报告日期"],
+    ["latest_run_date", "当前 latest"],
+  ].map(([key, label]) => ({
+    label,
+    value: formatPlain(summary[key]),
+  }));
+  const available = Boolean(summary.available === true);
+  return {
+    title: "TradingAgents",
+    status: available ? "已接入" : "缺失",
+    tone: available ? "ok" : "partial",
+    score: available ? "TA" : "-",
+    headline: rows[0] ? rows[0].value : "-",
+    detail: "",
+    bodyHtml: renderDecisionFactRows(rows),
+    condition: "",
+  };
 }
 
 function decisionFactsPlugin(holding, config) {
