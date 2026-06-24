@@ -283,6 +283,11 @@ class DailyPremarketRunner:
             ...,
             TradeActionsResult,
         ] = generate_trade_actions,
+        summary_generator: Callable[..., object] = generate_tradingagents_summary,
+        summary_extractor_factory: Callable[
+            [],
+            object,
+        ] = LLMTradingAgentsSummaryExtractor,
         notifier: Notifier | None = None,
     ) -> None:
         self.config = config
@@ -290,6 +295,8 @@ class DailyPremarketRunner:
         self.plan_builder = plan_builder
         self.quote_client_factory = quote_client_factory
         self.trade_action_generator = trade_action_generator
+        self.summary_generator = summary_generator
+        self.summary_extractor_factory = summary_extractor_factory
         self.notifier = notifier or NullNotifier()
 
     def run(
@@ -457,17 +464,29 @@ class DailyPremarketRunner:
             "review": trade_actions_result.review_count,
             "watch": trade_actions_result.watch_count,
         }
-        tradingagents_summary_result = generate_tradingagents_summary(
-            advice_path=advice_path,
-            plan_path=plan_result.plan_path,
-            actions_path=trade_actions_result.actions_path,
-            data_dir=config.data_dir,
-            run_date=run_date,
-            market=market,
-            extractor=LLMTradingAgentsSummaryExtractor(),
-            update_latest=False,
-        )
-        tradingagents_summary_path = tradingagents_summary_result.run_path
+        tradingagents_summary_path: Path | None = None
+        tradingagents_summary_failed = False
+        try:
+            tradingagents_summary_result = self.summary_generator(
+                advice_path=advice_path,
+                plan_path=plan_result.plan_path,
+                actions_path=trade_actions_result.actions_path,
+                data_dir=config.data_dir,
+                run_date=run_date,
+                market=market,
+                extractor=self.summary_extractor_factory(),
+                update_latest=False,
+            )
+        except Exception:
+            tradingagents_summary_failed = True
+            LOGGER.warning(
+                "TradingAgents summary generation failed",
+                exc_info=True,
+            )
+        else:
+            tradingagents_summary_path = Path(
+                getattr(tradingagents_summary_result, "run_path")
+            )
         advice_counts = _count_advice(advice_path)
         plan_counts = _count_plan(plan_result.plan_path)
         daily_state = _derive_daily_state(
@@ -475,6 +494,7 @@ class DailyPremarketRunner:
             plan_counts=plan_counts,
             futu_status=futu_status,
             trade_actions=trade_action_counts,
+            tradingagents_summary_failed=tradingagents_summary_failed,
         )
         status = str(daily_state["status"])
 
@@ -496,7 +516,9 @@ class DailyPremarketRunner:
             "trading_plan": str(plan_result.plan_path),
             "trade_actions": str(trade_actions_result.actions_path),
             "trade_actions_report": str(trade_actions_result.report_path),
-            "tradingagents_summary": str(tradingagents_summary_path),
+            "tradingagents_summary": (
+                str(tradingagents_summary_path) if tradingagents_summary_path else ""
+            ),
             "latest_advice": str(latest_advice_path),
             "latest_actions": str(latest_actions_path),
             "latest_trading_plan": str(latest_plan_path),
@@ -1487,6 +1509,7 @@ def _derive_daily_state(
     trade_actions: dict[str, int],
     run_failed: bool = False,
     already_running: bool = False,
+    tradingagents_summary_failed: bool = False,
 ) -> dict[str, object]:
     reasons: list[str] = []
     if run_failed:
@@ -1507,6 +1530,8 @@ def _derive_daily_state(
         reasons.append("missing_quotes")
     if int(trade_actions.get("review", 0) or 0) > 0:
         reasons.append("trade_action_review")
+    if tradingagents_summary_failed:
+        reasons.append("tradingagents_summary_failed")
 
     if run_failed:
         status = "failed"
@@ -1633,6 +1658,7 @@ def _status_reason_label(reason: str) -> str:
         "futu_error": "Futu 行情异常",
         "missing_quotes": "缺失行情",
         "trade_action_review": "交易动作需要人工复核",
+        "tradingagents_summary_failed": "TradingAgents 摘要生成异常",
         "run_failed": "运行失败",
         "already_running": "已有任务运行中",
     }.get(reason.strip().lower(), "其他原因")

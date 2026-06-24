@@ -14,7 +14,7 @@ import pytest
 import open_trader.daily_premarket as daily_premarket
 from open_trader.daily_premarket import (
     DailyPremarketConfig,
-    DailyPremarketRunner,
+    DailyPremarketRunner as _DailyPremarketRunner,
     NullNotifier,
     RunLock,
     build_notifier,
@@ -252,9 +252,14 @@ def test_daily_runner_defaults_to_generate_trade_actions(tmp_path: Path) -> None
         portfolio=tmp_path / "data/latest/portfolio.csv",
     )
 
-    runner = DailyPremarketRunner(config=config)
+    runner = _DailyPremarketRunner(config=config)
 
     assert runner.trade_action_generator is daily_premarket.generate_trade_actions
+    assert runner.summary_generator is daily_premarket.generate_tradingagents_summary
+    assert (
+        runner.summary_extractor_factory
+        is daily_premarket.LLMTradingAgentsSummaryExtractor
+    )
 
 
 def test_snapshots_from_futu_status_ignores_nonfinite_last_prices() -> None:
@@ -838,6 +843,16 @@ class FakeTradingAgentsSummaryGenerator:
         )
 
 
+class FailingTradingAgentsSummaryGenerator:
+    def __init__(self, message: str = "summary failed") -> None:
+        self.message = message
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, **kwargs: object) -> TradingAgentsSummaryResult:
+        self.calls.append(kwargs)
+        raise RuntimeError(self.message)
+
+
 class FailingNotifier:
     def notify(self, title: str, message: str) -> None:
         raise RuntimeError("delivery failed")
@@ -858,21 +873,16 @@ def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
     )
 
 
-@pytest.fixture(autouse=True)
-def _fake_tradingagents_summary_pipeline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        daily_premarket,
-        "LLMTradingAgentsSummaryExtractor",
-        FakeSummaryExtractor,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        daily_premarket,
-        "generate_tradingagents_summary",
-        FakeTradingAgentsSummaryGenerator(),
-        raising=False,
+def _daily_runner(
+    *,
+    summary_generator: object | None = None,
+    summary_extractor_factory: object = FakeSummaryExtractor,
+    **kwargs: object,
+) -> _DailyPremarketRunner:
+    return _DailyPremarketRunner(
+        **kwargs,
+        summary_generator=summary_generator or FakeTradingAgentsSummaryGenerator(),
+        summary_extractor_factory=summary_extractor_factory,
     )
 
 
@@ -937,7 +947,7 @@ def test_daily_runner_hk_uses_market_scoped_paths_and_calls_market_filter(
     plan_builder = FakePlanBuilder(market="HK", symbol="00700")
     trade_actions = FakeTradeActionGenerator(market="HK", symbol="00700")
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=premarket,
         plan_builder=plan_builder,
@@ -984,7 +994,7 @@ def test_hk_daily_runner_uses_market_notification_titles(
     config.portfolio.write_text("portfolio\n", encoding="utf-8")
     notifier = CapturingNotifier()
 
-    DailyPremarketRunner(
+    _daily_runner(
         config=config,
         premarket_runner=FakePremarket(market="HK", symbol="00700"),
         plan_builder=FakePlanBuilder(market="HK", symbol="00700"),
@@ -1010,7 +1020,7 @@ def test_daily_notify_logs_success(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     notifier = CapturingNotifier()
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=_daily_config(tmp_path),
         notifier=notifier,
     )
@@ -1037,7 +1047,7 @@ def test_daily_notify_logs_failure_without_raising(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=_daily_config(tmp_path),
         notifier=FailingNotifier(),
     )
@@ -1071,7 +1081,7 @@ def test_daily_notify_logs_composite_child_failure_without_raising(
         def notify(self, title: str, message: str) -> None:
             pass
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=_daily_config(tmp_path),
         notifier=CompositeNotifier([FailingNotifier(), WorkingNotifier()]),
     )
@@ -1119,19 +1129,14 @@ def test_daily_runner_writes_success_status_and_report(
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     fake_trade_actions = FakeTradeActionGenerator()
     fake_summary = FakeTradingAgentsSummaryGenerator()
-    monkeypatch.setattr(
-        daily_premarket,
-        "generate_tradingagents_summary",
-        fake_summary,
-        raising=False,
-    )
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
         trade_action_generator=fake_trade_actions,
+        summary_generator=fake_summary,
         notifier=NullNotifier(),
     )
 
@@ -1212,6 +1217,81 @@ def test_daily_runner_writes_success_status_and_report(
     assert (tmp_path / "reports/daily_runs/2026-06-17-US.md").exists()
 
 
+def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    latest_dir = tmp_path / "data/latest/US"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    (latest_dir / "tradingagents_summary.json").write_text(
+        '{"old": true}\n',
+        encoding="utf-8",
+    )
+    failing_summary = FailingTradingAgentsSummaryGenerator("summary boom")
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        summary_generator=failing_summary,
+        notifier=NullNotifier(),
+    ).run("2026-06-17", market="US")
+
+    assert result.status == "partial"
+    assert len(failing_summary.calls) == 1
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    artifacts = status["artifacts"]
+    assert status["status"] == "partial"
+    assert status["readiness"] == "review_required"
+    assert "tradingagents_summary_failed" in status["status_reasons"]
+    assert "error" not in status
+    assert artifacts["advice"] == str(
+        tmp_path / "data/runs/2026-06-17/US/trading_advice.csv"
+    )
+    assert artifacts["trading_plan"] == str(
+        tmp_path / "data/runs/2026-06-17/US/trading_plan.csv"
+    )
+    assert artifacts["trade_actions"] == str(
+        tmp_path / "data/runs/2026-06-17/US/trade_actions.csv"
+    )
+    assert artifacts["tradingagents_summary"] == ""
+    assert artifacts["latest_tradingagents_summary"] == str(
+        latest_dir / "tradingagents_summary.json"
+    )
+    assert (latest_dir / "trading_advice.csv").exists()
+    assert (latest_dir / "premarket_actions.csv").exists()
+    assert (latest_dir / "trading_plan.csv").exists()
+    assert (latest_dir / "trade_actions.csv").exists()
+    assert (latest_dir / "tradingagents_summary.json").read_text(
+        encoding="utf-8"
+    ) == '{"old": true}\n'
+    report = result.report_path.read_text(encoding="utf-8")
+    assert "- Status: partial" in report
+    assert "TradingAgents 摘要生成异常" in report
+    assert "- tradingagents_summary: " in report
+    assert (
+        f"- latest_tradingagents_summary: {latest_dir / 'tradingagents_summary.json'}"
+        in report
+    )
+
+
 def test_daily_runner_sends_feishu_order_review_after_trade_actions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1237,7 +1317,7 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     notifier = CapturingNotifier()
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1282,7 +1362,7 @@ def test_daily_runner_sends_blocker_notification_when_futu_is_unavailable(
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     notifier = CapturingNotifier()
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1330,7 +1410,7 @@ def test_daily_runner_sends_blocker_notification_when_futu_quote_is_missing(
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     notifier = CapturingNotifier()
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1376,7 +1456,7 @@ def test_daily_runner_blocker_notification_uses_chinese_readiness_text(
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     notifier = CapturingNotifier()
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1419,7 +1499,7 @@ def test_daily_runner_sends_blocker_notification_when_run_fails(
     )
     notifier = CapturingNotifier()
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1473,7 +1553,7 @@ def test_daily_runner_keeps_partial_status_when_blocker_rendering_fails(
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     notifier = CapturingNotifier()
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1534,7 +1614,7 @@ def test_daily_runner_keeps_success_status_when_order_review_rendering_fails(
         FakeQuoteClient if expected_status == "success" else MissingQuoteClient
     )
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1583,7 +1663,7 @@ def test_daily_runner_skips_daily_notification_when_report_notify_disabled(
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     notifier = CapturingNotifier()
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1619,7 +1699,7 @@ def test_daily_runner_skips_daily_notification_in_dry_run(tmp_path: Path) -> Non
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     notifier = CapturingNotifier()
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1660,7 +1740,7 @@ def test_daily_runner_skips_partial_notification_when_env_report_notify_zero(
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     notifier = CapturingNotifier()
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1694,7 +1774,7 @@ def test_daily_runner_skips_failure_notification_when_report_notify_disabled(
         notify_daily_report=False,
     )
     notifier = CapturingNotifier()
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1724,7 +1804,7 @@ def test_daily_runner_skips_failure_notification_in_dry_run(tmp_path: Path) -> N
         notify_daily_report=True,
     )
     notifier = CapturingNotifier()
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1764,7 +1844,7 @@ def test_daily_runner_deadline_uses_requested_run_date(
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     premarket = FakePremarket()
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=premarket,
         plan_builder=FakePlanBuilder(),
@@ -1804,7 +1884,7 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     plan_builder = FakePlanBuilder()
     fake_trade_actions = FakeTradeActionGenerator()
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=premarket,
         plan_builder=plan_builder,
@@ -1879,7 +1959,7 @@ def test_daily_runner_promotes_decision_facts(tmp_path: Path) -> None:
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -1930,7 +2010,7 @@ def test_daily_runner_does_not_promote_latest_when_plan_build_fails(
         encoding="utf-8",
     )
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FailingPlanBuilder(),
@@ -1994,7 +2074,7 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
         raising=False,
     )
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2071,7 +2151,7 @@ def test_daily_runner_rolls_back_latest_set_when_technical_facts_promotion_fails
         raising=False,
     )
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2170,7 +2250,7 @@ def test_daily_runner_rolls_back_latest_set_when_decision_facts_promotion_fails(
         raising=False,
     )
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2259,7 +2339,7 @@ def test_daily_runner_does_not_promote_latest_when_report_write_fails(
         fail_first_success_report_write,
     )
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2323,7 +2403,7 @@ def test_daily_runner_returns_failed_when_failure_reporting_writes_fail(
 
     monkeypatch.setattr(daily_premarket, "_write_text", always_fail_write)
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2380,7 +2460,7 @@ def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None
     premarket = FakePremarket()
     plan_builder = FakePlanBuilder()
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=premarket,
         plan_builder=plan_builder,
@@ -2440,7 +2520,7 @@ def test_daily_runner_dry_run_argument_overrides_config(
         encoding="utf-8",
     )
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2492,7 +2572,7 @@ def test_daily_runner_lock_contention_does_not_overwrite_run_artifacts(
     report_path.write_text("# active run\n", encoding="utf-8")
     log_path.write_text('{"status": "active"}\n', encoding="utf-8")
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2539,7 +2619,7 @@ def test_daily_runner_returns_already_running_when_lock_log_write_fails(
         path.write_text(text, encoding="utf-8")
 
     monkeypatch.setattr(daily_premarket, "_write_text", fail_lock_log_write)
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2605,7 +2685,7 @@ def test_daily_runner_marks_partial_when_futu_is_unavailable(
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2646,7 +2726,7 @@ def test_daily_runner_writes_futu_diagnostic_when_opend_is_unavailable(
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2690,7 +2770,7 @@ def test_daily_runner_writes_futu_diagnostic_when_snapshot_is_interrupted(
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2748,7 +2828,7 @@ def test_daily_runner_marks_partial_when_futu_quote_is_missing(
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2790,7 +2870,7 @@ def test_daily_runner_marks_missing_quote_as_review_required(
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
 
-    result = DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2826,7 +2906,7 @@ def test_daily_runner_ignores_quote_client_close_failure(tmp_path: Path) -> None
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2861,7 +2941,7 @@ def test_daily_runner_writes_failed_status_when_portfolio_is_missing(
         dry_run=False,
     )
 
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2904,7 +2984,7 @@ def test_daily_runner_writes_failed_status_when_deadline_is_malformed(
         portfolio=tmp_path / "data/latest/portfolio.csv",
         dry_run=False,
     )
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
@@ -2943,7 +3023,7 @@ def test_daily_runner_rejects_malformed_run_dates_without_escaped_writes(
     )
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
-    runner = DailyPremarketRunner(
+    runner = _daily_runner(
         config=config,
         premarket_runner=FakePremarket(),
         plan_builder=FakePlanBuilder(),
