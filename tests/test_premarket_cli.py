@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -726,3 +728,147 @@ def test_extract_decision_facts_main_wires_generator(
     output = capsys.readouterr().out
     assert "decision_facts: 2" in output
     assert "decision_facts_json:" in output
+
+
+def test_extract_tradingagents_summary_main_writes_summary_with_fake_extractor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    advice = tmp_path / "trading_advice.csv"
+    plan = tmp_path / "trading_plan.csv"
+    actions = tmp_path / "trade_actions.csv"
+
+    def write_csv(
+        path: Path,
+        fieldnames: list[str],
+        rows: list[dict[str, str]],
+    ) -> None:
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    write_csv(
+        advice,
+        [
+            "run_date",
+            "symbol",
+            "market",
+            "advice_action",
+            "advice_summary",
+            "raw_decision",
+            "fallback_from_date",
+        ],
+        [
+            {
+                "run_date": "2026-06-23",
+                "symbol": "DRAM",
+                "market": "US",
+                "advice_action": "Underweight",
+                "advice_summary": "TradingAgents 认为价格延伸且财报前风险回报转弱。",
+                "raw_decision": json.dumps(
+                    {"state": {"final_trade_decision": "Underweight DRAM"}},
+                    ensure_ascii=False,
+                ),
+                "fallback_from_date": "2026-06-22",
+            }
+        ],
+    )
+    write_csv(
+        plan,
+        [
+            "run_date",
+            "symbol",
+            "market",
+            "rating",
+            "agent_reason",
+            "agent_excerpt",
+        ],
+        [
+            {
+                "run_date": "2026-06-23",
+                "symbol": "DRAM",
+                "market": "US",
+                "rating": "Underweight",
+                "agent_reason": "TradingAgents建议减仓，理由是技术动能转弱、风险回报不利。",
+                "agent_excerpt": "Price is extended.",
+            }
+        ],
+    )
+    write_csv(
+        actions,
+        ["run_date", "symbol", "market", "action", "reason", "agent_reason"],
+        [
+            {
+                "run_date": "2026-06-23",
+                "symbol": "DRAM",
+                "market": "US",
+                "action": "TRIM",
+                "reason": "Current price is at or above target 1.",
+                "agent_reason": "TradingAgents建议减仓，理由是技术动能转弱、风险回报不利。",
+            }
+        ],
+    )
+
+    class FakeExtractor:
+        def extract(self, **kwargs: str) -> dict[str, object]:
+            assert kwargs["market"] == "US"
+            assert kwargs["symbol"] == "DRAM"
+            return {
+                "schema_version": "open_trader.tradingagents_summary.v1",
+                "core_reason": (
+                    "内存周期仍具支撑，但价格涨幅过快、技术动能转弱且财报前波动风险上升，"
+                    "所以 TA 建议先降低仓位保留弹性。"
+                ),
+                "reason_fields": {
+                    "main_judgment": "结构性主题仍成立但短期风险回报转弱",
+                    "evidence_1": "价格涨幅过快且技术动能转弱",
+                    "evidence_2": "财报前波动风险上升",
+                    "risk_or_counterpoint": "内存周期仍具支撑",
+                    "action_logic": "减仓控制风险并保留后续弹性",
+                },
+            }
+
+    monkeypatch.setattr(cli, "LLMTradingAgentsSummaryExtractor", FakeExtractor)
+
+    result = cli.main(
+        [
+            "extract-tradingagents-summary",
+            "--advice",
+            str(advice),
+            "--plan",
+            str(plan),
+            "--actions",
+            str(actions),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--date",
+            "2026-06-23",
+            "--market",
+            "US",
+            "--update-latest",
+        ]
+    )
+
+    assert result == 0
+    summary_path = (
+        tmp_path
+        / "data"
+        / "runs"
+        / "2026-06-23"
+        / "US"
+        / "tradingagents_summary.json"
+    )
+    latest_path = tmp_path / "data" / "latest" / "US" / "tradingagents_summary.json"
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert payload["latest_run_date"] == "2026-06-23"
+    assert payload["records"][0]["ta_report_date"] == "2026-06-22"
+    assert latest_path.exists()
+    output = capsys.readouterr().out
+    assert "run_date: 2026-06-23" in output
+    assert "summaries: 1" in output
+    assert "extracted: 1" in output
+    assert "failed: 0" in output
+    assert f"summary_json: {summary_path}" in output
+    assert f"latest: {latest_path}" in output
