@@ -701,6 +701,34 @@ def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallb
     }
 
 
+def test_dashboard_attaches_unscoped_tradingagents_summary_latest(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_tradingagents_summary(config.data_dir / "latest" / "tradingagents_summary.json")
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["tradingagents_summary"] == {
+        "available": True,
+        "ta_view": "低配",
+        "current_action": "减仓",
+        "core_reason": "波动率仓位短期风险回报转差，所以 TA 建议降低仓位。",
+        "ta_report_date": "2026-06-22",
+        "latest_run_date": "2026-06-23",
+    }
+    assert set(vixy["tradingagents_summary"]) == {
+        "available",
+        "ta_view",
+        "current_action",
+        "core_reason",
+        "ta_report_date",
+        "latest_run_date",
+    }
+
+
 def test_load_dashboard_state_attaches_fresh_technical_facts(
     tmp_path: Path,
 ) -> None:

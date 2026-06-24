@@ -327,15 +327,27 @@ def _latest_tradingagents_summary_for_markets(
     data_dir: Path,
     markets: set[str],
 ) -> dict[tuple[str, str], dict[str, Any]]:
+    unscoped_records = index_tradingagents_summary_by_market_symbol(
+        load_tradingagents_summary_cache(
+            tradingagents_summary_latest_path(data_dir)
+        )
+    )
     records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for market in markets:
         path = tradingagents_summary_latest_path(data_dir, market)
-        if not path.exists():
+        if path.exists():
+            records_by_key.update(
+                index_tradingagents_summary_by_market_symbol(
+                    load_tradingagents_summary_cache(path)
+                )
+            )
             continue
         records_by_key.update(
-            index_tradingagents_summary_by_market_symbol(
-                load_tradingagents_summary_cache(path)
-            )
+            {
+                key: record
+                for key, record in unscoped_records.items()
+                if key[0] == market
+            }
         )
     return records_by_key
 
