@@ -28,6 +28,7 @@ from open_trader.notifications import (
     FeishuWebhookNotifier,
 )
 from open_trader.trade_actions import TradeActionsResult
+from open_trader.tradingagents_summary import TradingAgentsSummaryResult
 from open_trader.trading_plan import (
     TRADING_PLAN_FIELDNAMES,
     TradingPlanBuildResult,
@@ -442,6 +443,38 @@ def test_render_daily_report_legacy_payload_uses_blocker_next_step() -> None:
     assert "- 下一步：请启动或重启 Futu OpenD，确认行情连接恢复后重新运行每日盘前流程。" in report
 
 
+def test_daily_premarket_includes_tradingagents_summary_artifact(
+    tmp_path: Path,
+) -> None:
+    summary_path = tmp_path / "data/runs/2026-06-23/US/tradingagents_summary.json"
+    latest_summary_path = tmp_path / "data/latest/US/tradingagents_summary.json"
+    payload = {
+        "run_date": "2026-06-23",
+        "market": "US",
+        "started_at": "2026-06-23T18:30:00+08:00",
+        "finished_at": "2026-06-23T18:35:00+08:00",
+        "deadline_at": "2026-06-23T21:10:00+08:00",
+        "status": "ok",
+        "readiness": "ready",
+        "status_reasons": [],
+        "premarket": {},
+        "trading_plan": {},
+        "futu_plan_check": {},
+        "trade_actions": {},
+        "artifacts": {
+            "tradingagents_summary": str(summary_path),
+            "latest_tradingagents_summary": str(latest_summary_path),
+        },
+    }
+
+    report = daily_premarket._render_daily_report(payload)
+
+    assert "tradingagents_summary" in report
+    assert str(summary_path) in report
+    assert "latest_tradingagents_summary" in report
+    assert str(latest_summary_path) in report
+
+
 def test_blocker_notification_readiness_label_without_readiness_uses_chinese_fallback() -> None:
     body = daily_premarket._blocker_notification_message(
         run_date="2026-06-17",
@@ -761,6 +794,50 @@ class CapturingNotifier:
         self.calls.append((title, message))
 
 
+class FakeSummaryExtractor:
+    pass
+
+
+class FakeTradingAgentsSummaryGenerator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, **kwargs: object) -> TradingAgentsSummaryResult:
+        self.calls.append(kwargs)
+        data_dir = kwargs["data_dir"]
+        run_date = kwargs["run_date"]
+        market = kwargs["market"]
+        assert isinstance(data_dir, Path)
+        assert isinstance(run_date, str)
+        assert isinstance(market, str)
+        run_path = data_dir / "runs" / run_date / market / "tradingagents_summary.json"
+        latest_path = data_dir / "latest" / market / "tradingagents_summary.json"
+        run_path.parent.mkdir(parents=True, exist_ok=True)
+        run_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "open_trader.tradingagents_summary.v1",
+                    "generated_at": "2026-06-17T21:05:00+08:00",
+                    "latest_run_date": run_date,
+                    "market": market,
+                    "records": [],
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return TradingAgentsSummaryResult(
+            run_date=run_date,
+            records=0,
+            extracted=0,
+            failed=0,
+            reused=0,
+            run_path=run_path,
+            latest_path=latest_path,
+        )
+
+
 class FailingNotifier:
     def notify(self, title: str, message: str) -> None:
         raise RuntimeError("delivery failed")
@@ -778,6 +855,24 @@ def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
         reports_dir=tmp_path / "reports",
         logs_dir=tmp_path / "logs",
         portfolio=tmp_path / "data/latest/portfolio.csv",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _fake_tradingagents_summary_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        daily_premarket,
+        "LLMTradingAgentsSummaryExtractor",
+        FakeSummaryExtractor,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daily_premarket,
+        "generate_tradingagents_summary",
+        FakeTradingAgentsSummaryGenerator(),
+        raising=False,
     )
 
 
@@ -1023,6 +1118,13 @@ def test_daily_runner_writes_success_status_and_report(
     config.portfolio.parent.mkdir(parents=True, exist_ok=True)
     config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
     fake_trade_actions = FakeTradeActionGenerator()
+    fake_summary = FakeTradingAgentsSummaryGenerator()
+    monkeypatch.setattr(
+        daily_premarket,
+        "generate_tradingagents_summary",
+        fake_summary,
+        raising=False,
+    )
 
     runner = DailyPremarketRunner(
         config=config,
@@ -1059,6 +1161,21 @@ def test_daily_runner_writes_success_status_and_report(
             last_price=Decimal("399"),
         )
     }
+    assert len(fake_summary.calls) == 1
+    assert fake_summary.calls[0]["advice_path"] == (
+        tmp_path / "data/runs/2026-06-17/US/trading_advice.csv"
+    )
+    assert fake_summary.calls[0]["plan_path"] == (
+        tmp_path / "data/runs/2026-06-17/US/trading_plan.csv"
+    )
+    assert fake_summary.calls[0]["actions_path"] == (
+        tmp_path / "data/runs/2026-06-17/US/trade_actions.csv"
+    )
+    assert fake_summary.calls[0]["data_dir"] == tmp_path / "data"
+    assert fake_summary.calls[0]["run_date"] == "2026-06-17"
+    assert fake_summary.calls[0]["market"] == "US"
+    assert isinstance(fake_summary.calls[0]["extractor"], FakeSummaryExtractor)
+    assert fake_summary.calls[0]["update_latest"] is False
     assert status["trade_actions"] == {
         "actions": 1,
         "ready": 1,
@@ -1074,11 +1191,24 @@ def test_daily_runner_writes_success_status_and_report(
     assert status["artifacts"]["latest_trade_actions"] == str(
         tmp_path / "data/latest/US/trade_actions.csv"
     )
+    assert status["artifacts"]["tradingagents_summary"] == str(
+        tmp_path / "data/runs/2026-06-17/US/tradingagents_summary.json"
+    )
+    assert status["artifacts"]["latest_tradingagents_summary"] == str(
+        tmp_path / "data/latest/US/tradingagents_summary.json"
+    )
+    assert (tmp_path / "data/latest/US/tradingagents_summary.json").read_text(
+        encoding="utf-8"
+    ) == (
+        tmp_path / "data/runs/2026-06-17/US/tradingagents_summary.json"
+    ).read_text(encoding="utf-8")
     report = (tmp_path / "reports/daily_runs/2026-06-17-US.md").read_text(
         encoding="utf-8"
     )
     assert "- trade_actions: " in report
     assert "- trade_actions_report: " in report
+    assert "- tradingagents_summary: " in report
+    assert "- latest_tradingagents_summary: " in report
     assert (tmp_path / "reports/daily_runs/2026-06-17-US.md").exists()
 
 

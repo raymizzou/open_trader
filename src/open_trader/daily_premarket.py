@@ -31,6 +31,10 @@ from .notifications import (
 from .futu_watch import QuoteSnapshot
 from .market_scope import MarketScope, parse_market_scope
 from .trade_actions import TradeActionsResult, generate_trade_actions
+from .tradingagents_summary import (
+    LLMTradingAgentsSummaryExtractor,
+    generate_tradingagents_summary,
+)
 from .trading_plan import (
     TradingPlanBuildResult,
     build_trading_plan,
@@ -453,6 +457,17 @@ class DailyPremarketRunner:
             "review": trade_actions_result.review_count,
             "watch": trade_actions_result.watch_count,
         }
+        tradingagents_summary_result = generate_tradingagents_summary(
+            advice_path=advice_path,
+            plan_path=plan_result.plan_path,
+            actions_path=trade_actions_result.actions_path,
+            data_dir=config.data_dir,
+            run_date=run_date,
+            market=market,
+            extractor=LLMTradingAgentsSummaryExtractor(),
+            update_latest=False,
+        )
+        tradingagents_summary_path = tradingagents_summary_result.run_path
         advice_counts = _count_advice(advice_path)
         plan_counts = _count_plan(plan_result.plan_path)
         daily_state = _derive_daily_state(
@@ -470,6 +485,7 @@ class DailyPremarketRunner:
         latest_trade_actions_path = latest_dir / "trade_actions.csv"
         latest_technical_facts_path = latest_dir / "technical_facts.json"
         latest_decision_facts_path = latest_dir / "decision_facts.json"
+        latest_tradingagents_summary_path = latest_dir / "tradingagents_summary.json"
         artifacts = {
             "advice": str(advice_path),
             "classifications": str(getattr(premarket_result, "classifications_path")),
@@ -480,12 +496,14 @@ class DailyPremarketRunner:
             "trading_plan": str(plan_result.plan_path),
             "trade_actions": str(trade_actions_result.actions_path),
             "trade_actions_report": str(trade_actions_result.report_path),
+            "tradingagents_summary": str(tradingagents_summary_path),
             "latest_advice": str(latest_advice_path),
             "latest_actions": str(latest_actions_path),
             "latest_trading_plan": str(latest_plan_path),
             "latest_trade_actions": str(latest_trade_actions_path),
             "latest_technical_facts": str(latest_technical_facts_path),
             "latest_decision_facts": str(latest_decision_facts_path),
+            "latest_tradingagents_summary": str(latest_tradingagents_summary_path),
             "status": str(status_path),
             "report": str(report_path),
             "log": str(log_path),
@@ -520,6 +538,7 @@ class DailyPremarketRunner:
                 trade_actions_path=trade_actions_result.actions_path,
                 technical_facts_path=technical_facts_path,
                 decision_facts_path=decision_facts_path,
+                tradingagents_summary_path=tradingagents_summary_path,
                 data_dir=config.data_dir,
                 market=market,
             )
@@ -1072,6 +1091,7 @@ def _promote_latest_set(
     trade_actions_path: Path,
     technical_facts_path: Path | None = None,
     decision_facts_path: Path | None = None,
+    tradingagents_summary_path: Path | None = None,
     data_dir: Path,
     market: str | None = None,
 ) -> None:
@@ -1107,6 +1127,13 @@ def _promote_latest_set(
             _LatestPromotion(
                 source_path=decision_facts_path,
                 latest_path=latest_dir / "decision_facts.json",
+            )
+        )
+    if tradingagents_summary_path is not None:
+        promotions.append(
+            _LatestPromotion(
+                source_path=tradingagents_summary_path,
+                latest_path=latest_dir / "tradingagents_summary.json",
             )
         )
 
@@ -1325,11 +1352,13 @@ def _render_daily_report(payload: dict[str, object]) -> str:
         "premarket_report",
         "technical_facts",
         "decision_facts",
+        "tradingagents_summary",
         "trading_plan",
         "trade_actions",
         "trade_actions_report",
         "latest_technical_facts",
         "latest_decision_facts",
+        "latest_tradingagents_summary",
         "latest_trading_plan",
         "latest_trade_actions",
         "status",
