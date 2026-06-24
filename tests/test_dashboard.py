@@ -632,6 +632,23 @@ def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallb
         [
             {
                 "run_date": "2026-06-23",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "Trim volatility exposure.",
+                "raw_decision": '{"rating":"Underweight"}',
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            },
+            {
+                "run_date": "2026-06-23",
                 "symbol": "DRAM",
                 "market": "US",
                 "asset_class": "etf",
@@ -701,11 +718,111 @@ def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallb
     }
 
 
+def test_dashboard_ignores_stale_tradingagents_summary_latest(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    dram = {
+        **portfolio_rows()[0],
+        "symbol": "DRAM",
+        "name": "DRAM ETF",
+        "portfolio_weight_hkd": "7.11%",
+    }
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [dram])
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-24",
+                "symbol": "DRAM",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "7.11%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Overweight",
+                "advice_summary": "Memory exposure remains constructive.",
+                "raw_decision": '{"rating":"Overweight"}',
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    summary_path = config.data_dir / "latest" / "US" / "tradingagents_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.tradingagents_summary.v1",
+                "generated_at": "2026-06-23T18:37:04+08:00",
+                "latest_run_date": "2026-06-23",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.tradingagents_summary.v1",
+                        "market": "US",
+                        "symbol": "DRAM",
+                        "latest_run_date": "2026-06-23",
+                        "ta_report_date": "2026-06-22",
+                        "ta_view": "低配",
+                        "current_action": "减仓",
+                        "core_reason": "旧摘要仍会被展示。",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    dram_holding = next(row for row in state["holdings"] if row["symbol"] == "DRAM")
+    assert dram_holding["tradingagents_summary"] == {
+        "available": False,
+        "ta_view": "超配",
+        "current_action": "缺失",
+        "core_reason": "缺失",
+        "ta_report_date": "2026-06-24",
+        "latest_run_date": "2026-06-24",
+    }
+    assert "旧摘要仍会被展示。" not in json.dumps(
+        dram_holding["tradingagents_summary"], ensure_ascii=False
+    )
+
+
 def test_dashboard_attaches_unscoped_tradingagents_summary_latest(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-23",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Underweight",
+                "advice_summary": "Trim volatility exposure.",
+                "raw_decision": '{"rating":"Underweight"}',
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
     write_tradingagents_summary(config.data_dir / "latest" / "tradingagents_summary.json")
 
     state = load_dashboard_state(config).to_dict()

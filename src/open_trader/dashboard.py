@@ -539,7 +539,7 @@ def _tradingagents_summary_detail(
     agent_report: dict[str, str] | None,
     action: dict[str, str] | None,
 ) -> dict[str, Any]:
-    if record is not None:
+    if _is_current_tradingagents_summary(record, agent_report):
         return {
             "available": True,
             "ta_view": _display_or_missing(record.get("ta_view")),
@@ -557,6 +557,21 @@ def _tradingagents_summary_detail(
         "ta_report_date": _fallback_ta_report_date(agent_report),
         "latest_run_date": _fallback_latest_run_date(agent_report, action),
     }
+
+
+def _is_current_tradingagents_summary(
+    record: dict[str, Any] | None,
+    agent_report: dict[str, str] | None,
+) -> bool:
+    if record is None or agent_report is None:
+        return False
+    latest_run_date = str(record.get("latest_run_date") or "").strip()
+    current_run_date = agent_report.get("run_date", "").strip()
+    return bool(
+        latest_run_date
+        and current_run_date
+        and latest_run_date == current_run_date
+    )
 
 
 def _display_or_missing(value: object) -> str:
