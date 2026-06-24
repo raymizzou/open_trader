@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from open_trader.trade_actions import TRADE_ACTION_FIELDNAMES
+from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 from open_trader.tradingagents_summary import (
     TRADINGAGENTS_SUMMARY_SCHEMA_VERSION,
     build_missing_reason_fields,
@@ -33,50 +35,6 @@ ADVICE_FIELDS = [
     "source_status",
     "fallback_reason",
     "fallback_from_date",
-]
-
-PLAN_FIELDS = [
-    "run_date",
-    "symbol",
-    "market",
-    "source_status",
-    "fallback_reason",
-    "fallback_from_date",
-    "rating",
-    "entry_zone_low",
-    "entry_zone_high",
-    "add_price",
-    "stop_loss",
-    "target_1",
-    "target_2",
-    "max_weight",
-    "catalyst",
-    "time_horizon",
-    "plan_text",
-    "agent_reason",
-    "agent_excerpt",
-    "status",
-    "error",
-]
-
-ACTION_FIELDS = [
-    "run_date",
-    "symbol",
-    "market",
-    "futu_symbol",
-    "action",
-    "status",
-    "trigger_status",
-    "reason",
-    "agent_reason",
-    "agent_excerpt",
-    "suggested_quantity",
-    "suggested_notional",
-    "notional_currency",
-    "limit_price",
-    "stop_price",
-    "priority",
-    "invalid_fields",
 ]
 
 DISPLAY_FIELDS = [
@@ -118,6 +76,10 @@ class FakeExtractor:
         advice_summary: str,
         final_trade_decision: str,
     ) -> dict[str, object]:
+        if "memory supercycle is intact" not in advice_summary:
+            raise AssertionError("TradingAgents rationale was not passed to extractor")
+        if advice_summary == "Current price is at or above target 1.":
+            raise AssertionError("extractor received price-trigger reason only")
         self.calls.append(
             {
                 "market": market,
@@ -210,18 +172,30 @@ def action_row(**overrides: str) -> dict[str, str]:
         "market": "US",
         "futu_symbol": "US.DRAM",
         "action": "TRIM",
-        "status": "ready",
+        "priority": "normal",
+        "last_price": "80",
         "trigger_status": "target_1_hit",
-        "reason": "Current price is at or above target 1.",
-        "agent_reason": "TradingAgents建议减仓，理由是技术动能转弱、风险回报不利。",
-        "agent_excerpt": "",
         "suggested_quantity": "10",
         "suggested_notional": "800",
         "notional_currency": "USD",
+        "current_quantity": "100",
+        "current_weight": "7.11%",
+        "avg_cost_price": "55",
+        "target_max_weight": "5.00%",
+        "cash_available": "1000",
         "limit_price": "80",
         "stop_price": "70",
-        "priority": "normal",
-        "invalid_fields": "",
+        "post_trade_quantity": "90",
+        "post_trade_weight": "5.00%",
+        "post_trade_avg_cost": "55",
+        "risk_to_stop": "10",
+        "agent_reason": "TradingAgents建议减仓，理由是技术动能转弱、风险回报不利。",
+        "agent_excerpt": "",
+        "trigger_reason": "Current price is at or above target 1.",
+        "reason": "Current price is at or above target 1.",
+        "source_plan": "trading_plan.csv",
+        "status": "ready",
+        "error": "",
     }
     row.update(overrides)
     return row
@@ -241,8 +215,8 @@ def test_generate_summary_uses_fallback_date_and_fixed_fields(tmp_path: Path) ->
     plan_path = tmp_path / "data" / "latest" / "US" / "trading_plan.csv"
     actions_path = tmp_path / "data" / "latest" / "US" / "trade_actions.csv"
     write_csv(advice_path, ADVICE_FIELDS, [advice_row()])
-    write_csv(plan_path, PLAN_FIELDS, [plan_row()])
-    write_csv(actions_path, ACTION_FIELDS, [action_row()])
+    write_csv(plan_path, TRADING_PLAN_FIELDNAMES, [plan_row()])
+    write_csv(actions_path, list(TRADE_ACTION_FIELDNAMES), [action_row()])
 
     extractor = FakeExtractor()
     result = generate_tradingagents_summary(
@@ -266,10 +240,12 @@ def test_generate_summary_uses_fallback_date_and_fixed_fields(tmp_path: Path) ->
     assert record["ta_report_date"] == "2026-06-22"
     assert record["ta_view"] == "低配"
     assert record["current_action"] == "减仓"
-    assert "目标价" not in record["core_reason"]
     assert result.records == 1
     assert result.extracted == 1
-    assert extractor.calls[0]["final_trade_decision"].startswith("Rating: Underweight")
+    call = extractor.calls[0]
+    assert "memory supercycle is intact" in call["advice_summary"]
+    assert call["advice_summary"] != action_row()["reason"]
+    assert call["final_trade_decision"].startswith("Rating: Underweight")
 
 
 def test_validate_rejects_price_trigger_only_reason() -> None:
@@ -296,8 +272,8 @@ def test_failed_llm_keeps_all_display_fields(tmp_path: Path) -> None:
     plan_path = tmp_path / "data" / "latest" / "US" / "trading_plan.csv"
     actions_path = tmp_path / "data" / "latest" / "US" / "trade_actions.csv"
     write_csv(advice_path, ADVICE_FIELDS, [advice_row()])
-    write_csv(plan_path, PLAN_FIELDS, [plan_row()])
-    write_csv(actions_path, ACTION_FIELDS, [action_row()])
+    write_csv(plan_path, TRADING_PLAN_FIELDNAMES, [plan_row()])
+    write_csv(actions_path, list(TRADE_ACTION_FIELDNAMES), [action_row()])
 
     class BrokenExtractor:
         def extract(self, **kwargs: str) -> dict[str, object]:
