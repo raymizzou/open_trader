@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .dashboard import DashboardConfig, load_dashboard_state
+from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
 from .research_chat import ResearchChatError, ResearchChatService
 
@@ -19,8 +20,19 @@ def build_dashboard_payload(config: DashboardConfig) -> dict[str, Any]:
     return load_dashboard_state(config).to_dict()
 
 
-def build_quotes_payload(quote_service: DashboardQuoteService) -> dict[str, Any]:
-    return quote_service.refresh().to_dict()
+def build_quotes_payload(
+    quote_service: DashboardQuoteService,
+    account_sync_service: DashboardAccountSyncService | None = None,
+) -> dict[str, Any]:
+    account_sync_payload = (
+        account_sync_service.refresh_if_due().to_dict()
+        if account_sync_service is not None
+        else {}
+    )
+    payload = quote_service.refresh().to_dict()
+    if account_sync_payload:
+        payload["account_sync"] = account_sync_payload
+    return payload
 
 
 def create_dashboard_server(
@@ -28,6 +40,7 @@ def create_dashboard_server(
     host: str,
     port: int,
     quote_service: DashboardQuoteService | None = None,
+    account_sync_service: DashboardAccountSyncService | None = None,
     research_chat_service: ResearchChatService | None = None,
 ) -> ThreadingHTTPServer:
     service = quote_service or DashboardQuoteService(config=config)
@@ -56,7 +69,12 @@ def create_dashboard_server(
                 return
             if path == "/api/quotes":
                 try:
-                    self._send_json(build_quotes_payload(service))
+                    self._send_json(
+                        build_quotes_payload(
+                            service,
+                            account_sync_service=account_sync_service,
+                        )
+                    )
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
@@ -185,13 +203,20 @@ def create_dashboard_server(
 
 
 def serve_dashboard(config: DashboardConfig, *, host: str, port: int) -> None:
-    server = create_dashboard_server(config=config, host=host, port=port)
+    account_sync_service = DashboardAccountSyncService(config=config)
+    server = create_dashboard_server(
+        config=config,
+        host=host,
+        port=port,
+        account_sync_service=account_sync_service,
+    )
     _, actual_port = server.server_address
     try:
         print(f"dashboard_url: http://{host}:{actual_port}")
         print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")
         print(f"poll_seconds: {config.poll_seconds}")
+        print(f"account_sync_seconds: {account_sync_service.interval_seconds}")
         server.serve_forever()
     finally:
         server.server_close()

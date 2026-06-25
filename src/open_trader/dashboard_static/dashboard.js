@@ -283,6 +283,9 @@ async function refreshQuotes() {
     const payload = await response.json();
     state.quotePayload = payload;
     state.quotes = payload.quotes || {};
+    if (accountSyncReloadNeeded(payload.account_sync)) {
+      await loadDashboard();
+    }
     renderQuoteStatus(payload);
     renderHoldings();
   } catch (error) {
@@ -298,8 +301,16 @@ async function refreshQuotes() {
   } finally {
     state.refreshActive = false;
     elements["refresh-quotes"].disabled = false;
-    elements["refresh-quotes"].textContent = "刷新行情";
+    elements["refresh-quotes"].textContent = "刷新账户与行情";
   }
+}
+
+function accountSyncReloadNeeded(accountSync) {
+  if (!accountSync || typeof accountSync !== "object") {
+    return false;
+  }
+  const status = String(accountSync.status || "").trim();
+  return Boolean(status) && status !== "skipped";
 }
 
 function renderDashboard() {

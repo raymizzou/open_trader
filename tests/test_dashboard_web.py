@@ -32,6 +32,21 @@ class RaisingQuoteService:
         raise RuntimeError("boom")
 
 
+class FakeAccountSyncService:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.refresh_count = 0
+
+    def refresh_if_due(self) -> object:
+        self.refresh_count += 1
+
+        class Result:
+            def to_dict(inner_self) -> dict[str, Any]:
+                return dict(self.payload)
+
+        return Result()
+
+
 def quote_result() -> QuoteRefreshResult:
     return QuoteRefreshResult(
         status="ok",
@@ -222,7 +237,8 @@ def test_dashboard_static_assets_include_local_shell() -> None:
 
     assert "Open Trader" in html
     assert "持仓实时看板" in html
-    assert "刷新行情" in html
+    assert "刷新账户与行情" in html
+    assert "accountSyncReloadNeeded" in js
     assert "全部市场" in html
     assert "symbol-detail-panel" in html
     assert "dashboard-header" in html
@@ -1792,12 +1808,16 @@ def test_build_quotes_payload_returns_service_refresh() -> None:
     from open_trader.dashboard_web import build_quotes_payload
 
     service = FakeQuoteService(quote_result())
+    account_sync = FakeAccountSyncService({"status": "ok", "interval_seconds": 60})
 
-    payload = build_quotes_payload(service)
+    payload = build_quotes_payload(service, account_sync_service=account_sync)
 
     json.dumps(payload)
     assert service.refresh_count == 1
+    assert account_sync.refresh_count == 1
     assert payload["status"] == "ok"
+    assert payload["account_sync"]["status"] == "ok"
+    assert payload["account_sync"]["interval_seconds"] == 60
     assert list(payload["quotes"]) == ["US.MSFT"]
     assert payload["quotes"]["US.MSFT"]["last_price"] == "500"
 
@@ -1808,11 +1828,13 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
     quote_service = FakeQuoteService(quote_result())
+    account_sync = FakeAccountSyncService({"status": "skipped", "interval_seconds": 60})
     server = create_dashboard_server(
         config=config,
         host="127.0.0.1",
         port=0,
         quote_service=quote_service,
+        account_sync_service=account_sync,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1830,7 +1852,9 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
     assert dashboard_payload["summary"]["holding_count"] == 1
     assert dashboard_payload["holdings"][0]["symbol"] == "VIXY"
     assert quotes_payload["quotes"]["US.MSFT"]["last_price"] == "500"
+    assert quotes_payload["account_sync"]["status"] == "skipped"
     assert quote_service.refresh_count == 1
+    assert account_sync.refresh_count == 1
 
 
 def test_dashboard_server_serves_research_chat_apis(tmp_path) -> None:
