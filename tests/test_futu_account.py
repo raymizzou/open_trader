@@ -737,6 +737,45 @@ def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
     assert "未更新 latest" in report
 
 
+def test_sync_futu_portfolio_builds_live_only_portfolio_without_existing_portfolio(
+    tmp_path: Path,
+) -> None:
+    missing_portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    snapshot = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "US.DRAM",
+                "stock_name": "Roundhill Memory ETF",
+                "qty": "300",
+                "cost_price": "70",
+                "nominal_price": "79",
+                "market_val": "23700",
+                "pl_val": "2700",
+                "currency": "USD",
+                "stock_type": "STOCK",
+            }
+        ],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=missing_portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-25",
+        update_latest=False,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "DRAM"
+    assert rows[0]["total_quantity"] == "300"
+    assert rows[0]["fx_to_hkd"] == "7.85"
+    assert missing_portfolio_path.exists() is False
+
+
 def test_sync_futu_portfolio_rebuilds_mixed_symbols_from_statement_details(
     tmp_path: Path,
 ) -> None:

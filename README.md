@@ -264,11 +264,13 @@ plan symbols.
 
 ### Sync Tiger OpenAPI Portfolio
 
-Tiger live account sync is read-only and does not place orders. It works from
-the current `data/latest/portfolio.csv`, replaces Tiger-only rows with current
-Tiger OpenAPI holdings and cash, and preserves non-Tiger rows. Monthly
-`import-statements` handles brokers that still rely on statements; Tiger sync
-is the current-account refresh path.
+Tiger live account sync is read-only and does not place orders. Real holdings
+and cash come directly from Tiger OpenAPI, not from `portfolio.csv`.
+`data/latest/portfolio.csv` is only the default merge baseline: when present it
+preserves non-Tiger rows and replaces Tiger-only rows; when missing the sync
+still writes a dated broker-only portfolio from live Tiger data. Monthly
+`import-statements` handles brokers that still rely on statements; Tiger sync is
+the current-account refresh path.
 
 ```bash
 .venv/bin/python -m open_trader check-tiger-account

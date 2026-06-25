@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 
+DEFAULT_RATES_TO_HKD = {"USD": Decimal("7.85")}
+
+
 @dataclass(frozen=True)
 class FxQuote:
     currency: str

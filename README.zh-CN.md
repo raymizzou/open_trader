@@ -241,9 +241,10 @@ open /Applications/FutuOpenD_10.7.6718_Mac/FutuOpenD.app
 
 ### 同步 Tiger OpenAPI 持仓
 
-Tiger 实时账户同步是只读流程，不会下单。它基于当前
-`data/latest/portfolio.csv` 运行，用 Tiger OpenAPI 当前持仓和现金替换
-Tiger-only 行，并保留非 Tiger 行。月度 `import-statements` 只处理仍依赖
+Tiger 实时账户同步是只读流程，不会下单。真实持仓和现金直接来自
+Tiger OpenAPI，不依赖 `portfolio.csv` 作为数据源。`data/latest/portfolio.csv`
+只是默认合并基线：存在时用来保留非 Tiger 行并替换 Tiger-only 行；缺失时仍会
+生成只包含 Tiger 实时数据的 dated portfolio。月度 `import-statements` 只处理仍依赖
 statement 的券商；Tiger sync 是当前账户刷新流程。
 
 ```bash

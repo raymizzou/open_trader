@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from .csv_io import write_rows
-from .fx import StaticMonthEndFxProvider
+from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
 from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
 from .models import AssetClass, CashBalance, Market, Position
 
@@ -1049,6 +1049,8 @@ def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
 
 
 def _read_portfolio_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
     with path.open(encoding="utf-8-sig", newline="") as handle:
         return [dict(row) for row in csv.DictReader(handle)]
 
@@ -1277,7 +1279,7 @@ def _fx_provider_from_existing_rows(
             continue
         if rate.is_finite() and rate > 0:
             rates[currency] = rate
-    return StaticMonthEndFxProvider(run_date[:7], rates)
+    return StaticMonthEndFxProvider(run_date[:7], {**DEFAULT_RATES_TO_HKD, **rates})
 
 
 def _recalculate_combined_portfolio_rows(

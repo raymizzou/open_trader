@@ -1546,6 +1546,46 @@ def test_sync_tiger_portfolio_replaces_tiger_only_rows_and_writes_artifacts(
     assert "# 老虎账户同步" in report
 
 
+def test_sync_tiger_portfolio_builds_live_only_portfolio_without_existing_portfolio(
+    tmp_path: Path,
+) -> None:
+    missing_portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "DRAM",
+                "name": "Roundhill Memory ETF",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "300",
+                "average_cost": "70",
+                "market_price": "79",
+                "market_value": "23700",
+                "unrealized_pnl": "2700",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=missing_portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-25",
+        update_latest=False,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "DRAM"
+    assert rows[0]["total_quantity"] == "300"
+    assert rows[0]["fx_to_hkd"] == "7.85"
+    assert missing_portfolio_path.exists() is False
+
+
 def test_sync_tiger_portfolio_reconciles_prime_account_total_assets(
     tmp_path: Path,
 ) -> None:
