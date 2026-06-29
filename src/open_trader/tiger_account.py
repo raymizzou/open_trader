@@ -114,12 +114,17 @@ def sync_tiger_portfolio(
     update_latest: bool,
 ) -> TigerPortfolioSyncResult:
     existing_rows = _read_portfolio_rows(portfolio_path)
-    fx_provider = _fx_provider_from_existing_rows(run_date, existing_rows)
     preserved_positions, preserved_cash = _latest_non_tiger_detail_inputs(
         data_dir,
         run_date,
     )
     use_detail_rows = bool(preserved_positions or preserved_cash)
+    fx_rows = (
+        existing_rows
+        if use_detail_rows
+        else _fallback_fx_source_rows(existing_rows)
+    )
+    fx_provider = _fx_provider_from_existing_rows(run_date, fx_rows)
     if not use_detail_rows:
         preserved_rows = existing_rows
     else:
@@ -1764,6 +1769,10 @@ def _raise_mixed_tiger_broker_row(row: dict[str, str]) -> None:
         f"portfolio row {symbol} mixes Tiger with other brokers: {brokers}",
         error_type="mixed_tiger_broker_row",
     )
+
+
+def _fallback_fx_source_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [row for row in rows if _broker_parts(row) != {"tiger"}]
 
 
 def _fx_provider_from_existing_rows(

@@ -2392,6 +2392,70 @@ def test_sync_tiger_portfolio_no_detail_ignores_invalid_stale_tiger_row(
     assert rows["MSFT"]["portfolio_weight_hkd"] != ""
 
 
+def test_sync_tiger_portfolio_no_detail_ignores_stale_tiger_fx_row(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    stale_tiger = base_portfolio_row(
+        market="US",
+        asset_class="stock",
+        symbol="OLD",
+        name="Old Tiger",
+        currency="USD",
+        market_value="1",
+        fx_to_hkd="99",
+        market_value_hkd="99.00",
+        brokers="tiger",
+        accounts="tiger_old",
+    )
+    preserved = base_portfolio_row(
+        market="US",
+        asset_class="etf",
+        symbol="QQQ",
+        name="Invesco QQQ",
+        currency="USD",
+        market_value="400",
+        fx_to_hkd="7.80",
+        market_value_hkd="3120.00",
+        brokers="phillips",
+        accounts="phillips_main",
+    )
+    write_portfolio(portfolio_path, [preserved, stale_tiger])
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_5683",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-29",
+        update_latest=True,
+    )
+
+    rows = {row["symbol"]: row for row in read_portfolio(result.portfolio_path)}
+    assert "OLD" not in rows
+    assert rows["QQQ"]["fx_to_hkd"] in {"7.8", "7.80"}
+    assert rows["MSFT"]["fx_to_hkd"] in {"7.8", "7.80"}
+    assert rows["MSFT"]["market_value_hkd"] == "6396.00"
+
+
 def test_sync_tiger_portfolio_no_detail_accepts_canonical_mixed_tiger_row(
     tmp_path: Path,
 ) -> None:
