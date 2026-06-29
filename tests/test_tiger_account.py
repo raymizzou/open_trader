@@ -2120,6 +2120,97 @@ def test_sync_tiger_portfolio_no_detail_fallback_deduplicates_preserved_futu_row
     )
 
 
+def test_sync_tiger_portfolio_no_detail_deduplicates_preserved_only_rows(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            base_portfolio_row(
+                market="HK",
+                asset_class="unknown",
+                symbol="09999",
+                name="Unknown HK Position",
+                currency="HKD",
+                total_quantity="0",
+                avg_cost_price="0",
+                last_price="12",
+                market_value="0",
+                cost_value="0",
+                unrealized_pnl="0",
+                fx_to_hkd="1",
+                market_value_hkd="0.00",
+                cost_value_hkd="0.00",
+                brokers="futu",
+                accounts="futu_111",
+                ai_eligible="false",
+                analysis_symbol="",
+                risk_flag="normal",
+            ),
+            base_portfolio_row(
+                market="HK",
+                asset_class="stock",
+                symbol="09999",
+                name="Real HK Position",
+                currency="HKD",
+                total_quantity="100",
+                avg_cost_price="10",
+                last_price="12",
+                market_value="1200",
+                cost_value="1000",
+                unrealized_pnl="200",
+                fx_to_hkd="1",
+                market_value_hkd="1200.00",
+                cost_value_hkd="1000.00",
+                brokers="phillips",
+                accounts="phillips_main",
+                ai_eligible="true",
+                analysis_symbol="09999",
+                risk_flag="normal",
+            ),
+        ],
+    )
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_5683",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-29",
+        update_latest=True,
+    )
+
+    rows = [
+        row
+        for row in read_portfolio(result.portfolio_path)
+        if row["market"] == "HK" and row["symbol"] == "09999"
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["asset_class"] == "stock"
+    assert row["brokers"] == "futu;phillips"
+    assert row["total_quantity"] == "100"
+
+
 def test_sync_tiger_portfolio_no_detail_blocks_plain_phillips_tiger_collision(
     tmp_path: Path,
 ) -> None:

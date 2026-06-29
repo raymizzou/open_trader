@@ -162,6 +162,7 @@ def sync_tiger_portfolio(
             preserved_portfolio_positions,
             preserved_portfolio_cash,
             preserved_has_invalid_market_value,
+            preserved_safety_rows,
         ) = _portfolio_inputs_from_preserved_rows(
             preserved_rows,
             positions,
@@ -173,6 +174,7 @@ def sync_tiger_portfolio(
             [*preserved_portfolio_cash, *cash_balances],
             fx_provider,
         )
+        _apply_preserved_safety_metadata(merged_rows, preserved_safety_rows)
         merged_rows = _recalculate_combined_portfolio_rows(
             [*preserved_portfolio_rows, *merged_rows]
         )
@@ -1217,10 +1219,17 @@ def _portfolio_inputs_from_preserved_rows(
     rows: list[dict[str, str]],
     tiger_positions: list[Position],
     tiger_cash_balances: list[CashBalance],
-) -> tuple[list[dict[str, str]], list[Position], list[CashBalance], bool]:
+) -> tuple[
+    list[dict[str, str]],
+    list[Position],
+    list[CashBalance],
+    bool,
+    list[dict[str, str]],
+]:
     preserved_rows: list[dict[str, str]] = []
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
+    preserved_safety_rows: list[dict[str, str]] = []
     has_invalid_market_value = False
     tiger_positions_by_key = _tiger_positions_by_portfolio_key(tiger_positions)
     tiger_cash_by_key = _tiger_cash_by_portfolio_key(tiger_cash_balances)
@@ -1244,7 +1253,12 @@ def _portfolio_inputs_from_preserved_rows(
             if is_cash_row:
                 key = _cash_portfolio_key_from_row(row)
                 if key not in tiger_cash_by_key:
-                    preserved_rows.append(row)
+                    has_invalid_market_value = (
+                        has_invalid_market_value
+                        or _portfolio_row_has_invalid_market_value(row)
+                    )
+                    cash_balances.append(_cash_from_portfolio_row(row))
+                    preserved_safety_rows.append(row)
                     continue
                 if broker_parts != {"futu"}:
                     _raise_mixed_tiger_broker_row(
@@ -1256,9 +1270,17 @@ def _portfolio_inputs_from_preserved_rows(
                 )
                 cash_balances.append(_cash_from_portfolio_row(row))
             else:
+                if market == Market.CASH and asset_class == AssetClass.CASH:
+                    preserved_rows.append(row)
+                    continue
                 key = _position_portfolio_key_from_row(row)
                 if key not in tiger_positions_by_key:
-                    preserved_rows.append(row)
+                    has_invalid_market_value = (
+                        has_invalid_market_value
+                        or _portfolio_row_has_invalid_market_value(row)
+                    )
+                    positions.append(_position_from_portfolio_row(row))
+                    preserved_safety_rows.append(row)
                     continue
                 if broker_parts != {"futu"}:
                     _raise_mixed_tiger_broker_row(
@@ -1307,7 +1329,46 @@ def _portfolio_inputs_from_preserved_rows(
         has_invalid_market_value = (
             has_invalid_market_value or residual_has_invalid_market_value
         )
-    return preserved_rows, positions, cash_balances, has_invalid_market_value
+    return (
+        preserved_rows,
+        positions,
+        cash_balances,
+        has_invalid_market_value,
+        preserved_safety_rows,
+    )
+
+
+def _apply_preserved_safety_metadata(
+    rows: list[dict[str, str]],
+    preserved_safety_rows: list[dict[str, str]],
+) -> None:
+    safety_by_key: dict[tuple[str, str, str], list[dict[str, str]]] = {}
+    for row in preserved_safety_rows:
+        safety_by_key.setdefault(_portfolio_row_output_key(row), []).append(row)
+
+    for row in rows:
+        source_rows = safety_by_key.get(_portfolio_row_output_key(row))
+        if not source_rows:
+            continue
+        if any(
+            source.get("risk_flag", "").strip() == "data_check"
+            for source in source_rows
+        ):
+            row["risk_flag"] = "data_check"
+        if any(
+            source.get("ai_eligible", "").strip().lower() == "false"
+            for source in source_rows
+        ):
+            row["ai_eligible"] = "false"
+            row["analysis_symbol"] = ""
+
+
+def _portfolio_row_output_key(row: dict[str, str]) -> tuple[str, str, str]:
+    return (
+        row.get("market", "").strip().upper(),
+        row.get("symbol", "").strip().upper(),
+        row.get("currency", "").strip().upper(),
+    )
 
 
 def _portfolio_row_has_invalid_market_value(row: dict[str, str]) -> bool:
