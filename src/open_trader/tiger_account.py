@@ -1219,8 +1219,18 @@ def _portfolio_inputs_from_preserved_rows(
         )
         if not has_tiger:
             if is_cash_row:
+                key = _cash_portfolio_key_from_row(row)
+                if key in tiger_cash_by_key and broker_parts != {"futu"}:
+                    _raise_mixed_tiger_broker_row(
+                        _mixed_tiger_row_for_key(row, broker_parts)
+                    )
                 cash_balances.append(_cash_from_portfolio_row(row))
             else:
+                key = _position_portfolio_key_from_row(row)
+                if key in tiger_positions_by_key and broker_parts != {"futu"}:
+                    _raise_mixed_tiger_broker_row(
+                        _mixed_tiger_row_for_key(row, broker_parts)
+                    )
                 positions.append(_position_from_portfolio_row(row))
             continue
         if not has_other_brokers:
@@ -1259,6 +1269,16 @@ def _is_currency_cash_portfolio_row(row: dict[str, str]) -> bool:
     currency = row.get("currency", "").strip().upper()
     symbol = row.get("symbol", "").strip().upper()
     return bool(currency) and symbol == f"{currency}_CASH"
+
+
+def _mixed_tiger_row_for_key(
+    row: dict[str, str],
+    broker_parts: set[str],
+) -> dict[str, str]:
+    return {
+        "symbol": row.get("symbol", ""),
+        "brokers": ";".join(sorted({*broker_parts, "tiger"})),
+    }
 
 
 def _position_portfolio_key_from_row(row: dict[str, str]) -> tuple[Market, str, str]:
