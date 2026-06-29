@@ -89,6 +89,74 @@ def _merged_confidence(confidences: Iterable[str]) -> str:
     return "high"
 
 
+class PortfolioBuildError(ValueError):
+    pass
+
+
+_ASSET_CLASS_PRIORITY = {
+    AssetClass.STOCK: 50,
+    AssetClass.ETF: 40,
+    AssetClass.FUND: 30,
+    AssetClass.OPTION: 20,
+    AssetClass.MONEY_MARKET_FUND: 10,
+    AssetClass.UNKNOWN: 0,
+}
+
+
+def _canonical_position_key(position: Position) -> tuple[Market, str, str]:
+    return (
+        position.market,
+        position.symbol.upper(),
+        position.currency.upper(),
+    )
+
+
+def _known_asset_classes(group: list[Position]) -> set[AssetClass]:
+    return {
+        position.asset_class
+        for position in group
+        if position.asset_class != AssetClass.UNKNOWN
+    }
+
+
+def _canonical_asset_class(
+    market: Market,
+    symbol: str,
+    group: list[Position],
+) -> AssetClass:
+    known_classes = _known_asset_classes(group)
+    if len(known_classes) > 1:
+        class_names = ", ".join(sorted(asset_class.value for asset_class in known_classes))
+        raise PortfolioBuildError(
+            f"conflicting asset classes for {market.value}.{symbol}: {class_names}"
+        )
+    if known_classes:
+        return next(iter(known_classes))
+    return max(
+        (position.asset_class for position in group),
+        key=lambda asset_class: _ASSET_CLASS_PRIORITY[asset_class],
+    )
+
+
+def _raise_for_conflicting_position_currencies(
+    grouped: dict[tuple[Market, str, str], list[Position]],
+) -> None:
+    currencies_by_symbol: dict[tuple[Market, str], set[str]] = defaultdict(set)
+    for market, symbol, currency in grouped:
+        currencies_by_symbol[(market, symbol)].add(currency)
+
+    for (market, symbol), currencies in sorted(
+        currencies_by_symbol.items(),
+        key=lambda item: (item[0][0].value, item[0][1]),
+    ):
+        if len(currencies) <= 1:
+            continue
+        currency_text = ", ".join(sorted(currencies))
+        raise PortfolioBuildError(
+            f"conflicting currencies for {market.value}.{symbol}: {currency_text}"
+        )
+
+
 def build_portfolio_rows(
     month: str,
     positions: Iterable[Position],
@@ -101,12 +169,14 @@ def build_portfolio_rows(
             f"{fx_provider.month}"
         )
 
-    grouped: dict[tuple[Market, AssetClass, str, str], list[Position]] = defaultdict(list)
+    grouped: dict[tuple[Market, str, str], list[Position]] = defaultdict(list)
     for position in positions:
-        grouped[position.identity_key()].append(position)
+        grouped[_canonical_position_key(position)].append(position)
+    _raise_for_conflicting_position_currencies(grouped)
 
     raw_rows: list[dict[str, object]] = []
-    for (market, asset_class, symbol, currency), group in grouped.items():
+    for (market, symbol, currency), group in grouped.items():
+        asset_class = _canonical_asset_class(market, symbol, group)
         total_quantity = sum((position.quantity for position in group), Decimal("0"))
         has_missing_required_data = any(
             position.market_value is None or position.cost_value is None

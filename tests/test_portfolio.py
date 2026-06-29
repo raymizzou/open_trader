@@ -63,6 +63,124 @@ def test_build_portfolio_rows_merges_same_us_symbol_across_brokers():
     assert nvda["analysis_symbol"] == "NVDA"
 
 
+def test_build_portfolio_rows_merges_same_symbol_when_one_asset_class_is_unknown():
+    fx = StaticMonthEndFxProvider("2026-06", {"HKD": Decimal("1")})
+    positions = [
+        position(
+            "tiger",
+            "01688",
+            "2640",
+            "26875.2",
+            "25634.4",
+            market=Market.HK,
+            asset_class=AssetClass.STOCK,
+            currency="HKD",
+            unrealized_pnl="-1240.8",
+        ),
+        position(
+            "futu",
+            "01688",
+            "0",
+            "0",
+            "0",
+            market=Market.HK,
+            asset_class=AssetClass.UNKNOWN,
+            currency="HKD",
+            unrealized_pnl="-277.2",
+        ),
+    ]
+
+    rows = build_portfolio_rows("2026-06", positions, [], fx)
+
+    assert len([row for row in rows if row["symbol"] == "01688"]) == 1
+    row = next(row for row in rows if row["symbol"] == "01688")
+    assert row["market"] == "HK"
+    assert row["asset_class"] == "stock"
+    assert row["total_quantity"] == "2640"
+    assert row["market_value"] == "25634.4"
+    assert row["cost_value"] == "26875.2"
+    assert row["market_value_hkd"] == "25634.40"
+    assert row["brokers"] == "futu;tiger"
+    assert row["accounts"] == "futu_main;tiger_main"
+    assert row["ai_eligible"] == "true"
+    assert row["analysis_symbol"] == "01688"
+
+
+def test_build_portfolio_rows_rejects_conflicting_known_asset_classes_for_same_identity():
+    fx = StaticMonthEndFxProvider("2026-06", {"HKD": Decimal("1")})
+
+    with pytest.raises(
+        ValueError,
+        match=r"conflicting asset classes for HK\.01688: etf, stock",
+    ):
+        build_portfolio_rows(
+            "2026-06",
+            [
+                position(
+                    "tiger",
+                    "01688",
+                    "10",
+                    "100",
+                    "120",
+                    market=Market.HK,
+                    asset_class=AssetClass.STOCK,
+                    currency="HKD",
+                ),
+                position(
+                    "futu",
+                    "01688",
+                    "5",
+                    "50",
+                    "60",
+                    market=Market.HK,
+                    asset_class=AssetClass.ETF,
+                    currency="HKD",
+                ),
+            ],
+            [],
+            fx,
+        )
+
+
+def test_build_portfolio_rows_rejects_same_symbol_with_multiple_currencies():
+    fx = StaticMonthEndFxProvider(
+        "2026-06",
+        {"HKD": Decimal("1"), "USD": Decimal("7.8")},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"conflicting currencies for HK\.01688: HKD, USD",
+    ):
+        build_portfolio_rows(
+            "2026-06",
+            [
+                position(
+                    "tiger",
+                    "01688",
+                    "10",
+                    "100",
+                    "120",
+                    market=Market.HK,
+                    asset_class=AssetClass.STOCK,
+                    currency="HKD",
+                ),
+                position(
+                    "futu",
+                    "01688",
+                    "5",
+                    "50",
+                    "60",
+                    market=Market.HK,
+                    asset_class=AssetClass.STOCK,
+                    currency="USD",
+                ),
+            ],
+            [],
+            fx,
+        )
+
+
 def test_cash_is_included_in_weight_denominator_but_not_overweight():
     fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
     positions = [position("futu", "NVDA", "10", "1000", "2000")]
