@@ -2006,6 +2006,81 @@ def test_sync_tiger_portfolio_no_detail_accepts_canonical_mixed_tiger_row(
     assert row["brokers"] == "futu;tiger"
 
 
+@pytest.mark.parametrize(
+    ("brokers", "accounts"),
+    [
+        ("phillips;tiger", "phillips_main;tiger_5683"),
+        ("futu;phillips;tiger", "futu_111;phillips_main;tiger_5683"),
+    ],
+)
+def test_sync_tiger_portfolio_no_detail_blocks_unsupported_mixed_tiger_rows(
+    tmp_path: Path,
+    brokers: str,
+    accounts: str,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            base_portfolio_row(
+                sort_group="1",
+                market="HK",
+                asset_class="stock",
+                symbol="01688",
+                name="领益智造",
+                currency="HKD",
+                total_quantity="3000",
+                avg_cost_price="10.18",
+                last_price="9.71",
+                market_value="29130",
+                cost_value="30540",
+                unrealized_pnl="-1410",
+                unrealized_pnl_pct="-4.62%",
+                fx_to_hkd="1",
+                market_value_hkd="29130.00",
+                cost_value_hkd="30540.00",
+                portfolio_weight_hkd="100.00%",
+                brokers=brokers,
+                accounts=accounts,
+                ai_eligible="true",
+                analysis_symbol="01688",
+                risk_flag="overweight",
+                notes="Imported mixed broker row",
+            )
+        ],
+    )
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_5683",
+                "symbol": "01688",
+                "sec_type": "STK",
+                "currency": "HKD",
+                "market": "HK",
+                "position_qty": "2640",
+                "average_cost": "10.18",
+                "market_price": "9.71",
+                "market_value": "25634.4",
+                "unrealized_pnl": "-1240.8",
+            }
+        ],
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-29",
+            update_latest=True,
+        )
+
+    assert exc_info.value.error_type == "mixed_tiger_broker_row"
+    assert "01688" in str(exc_info.value)
+
+
 def test_sync_tiger_portfolio_replaces_tiger_details_when_latest_has_mixed_live_rows(
     tmp_path: Path,
 ) -> None:

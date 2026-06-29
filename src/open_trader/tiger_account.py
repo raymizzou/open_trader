@@ -1174,6 +1174,8 @@ def _portfolio_inputs_from_preserved_rows(
             continue
         if not has_other_brokers:
             continue
+        if broker_parts != {"futu", "tiger"}:
+            _raise_mixed_tiger_broker_row(row)
 
         if is_cash_row:
             key = _cash_portfolio_key_from_row(row)
