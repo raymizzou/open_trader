@@ -755,6 +755,7 @@ def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
         cash_records=[
             {
                 "_account_alias": "futu_111",
+                "_acc_id": 111,
                 "currency": "USD",
                 "cash": "100",
                 "available_cash": "90",
@@ -763,6 +764,7 @@ def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
         position_records=[
             {
                 "_account_alias": "futu_111",
+                "_acc_id": 111,
                 "code": "US.MSFT",
                 "stock_name": "Microsoft",
                 "qty": "2",
@@ -805,7 +807,14 @@ def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
     assert result.updated_latest is False
 
     snapshot_payload = json.loads(result.snapshot_path.read_text(encoding="utf-8"))
-    assert snapshot_payload["accounts"][0]["acc_id"] == 111
+    snapshot_text = result.snapshot_path.read_text(encoding="utf-8")
+    assert snapshot_payload["accounts"][0]["acc_id"] == "***"
+    assert snapshot_payload["accounts"][0]["account_alias"] == "futu_***"
+    assert snapshot_payload["cash_records"][0]["_acc_id"] == "***"
+    assert snapshot_payload["cash_records"][0]["_account_alias"] == "futu_***"
+    assert snapshot_payload["position_records"][0]["_acc_id"] == "***"
+    assert snapshot_payload["position_records"][0]["_account_alias"] == "futu_***"
+    assert "111" not in snapshot_text
     report = result.report_path.read_text(encoding="utf-8")
     assert "富途账户同步" in report
     assert "真实账户：1" in report

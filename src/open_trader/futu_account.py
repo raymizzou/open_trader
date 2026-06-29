@@ -1031,20 +1031,55 @@ def _snapshot_to_json(snapshot: FutuAccountSnapshot) -> dict[str, object]:
     return {
         "accounts": [
             {
-                "acc_id": account.acc_id,
+                "acc_id": _mask_account_id(account.acc_id),
                 "acc_index": account.acc_index,
                 "trd_env": account.trd_env,
                 "acc_type": account.acc_type,
                 "acc_status": account.acc_status,
-                "account_alias": account.account_alias,
+                "account_alias": _mask_futu_account_alias(account.account_alias),
             }
             for account in snapshot.accounts
         ],
-        "cash_records": [_json_safe_record(record) for record in snapshot.cash_records],
+        "cash_records": [
+            _json_safe_record(_mask_snapshot_record(record))
+            for record in snapshot.cash_records
+        ],
         "position_records": [
-            _json_safe_record(record) for record in snapshot.position_records
+            _json_safe_record(_mask_snapshot_record(record))
+            for record in snapshot.position_records
         ],
     }
+
+
+def _mask_account_id(account_id: object) -> str:
+    text = str(account_id).strip()
+    if not text:
+        return ""
+    if len(text) <= 4:
+        return "*" * len(text)
+    if len(text) <= 8:
+        return f"{'*' * 3}{text[-4:]}"
+    return f"{'*' * (len(text) - 4)}{text[-4:]}"
+
+
+def _mask_futu_account_alias(account_alias: object) -> str:
+    text = str(account_alias).strip()
+    prefix = "futu_"
+    if not text.lower().startswith(prefix):
+        return text
+    return f"{text[:len(prefix)]}{_mask_account_id(text[len(prefix):])}"
+
+
+def _mask_snapshot_record(record: dict[str, object]) -> dict[str, object]:
+    output: dict[str, object] = {}
+    for key, value in record.items():
+        if key == "_acc_id" and value is not None:
+            output[key] = _mask_account_id(value)
+        elif key == "_account_alias" and value is not None:
+            output[key] = _mask_futu_account_alias(value)
+        else:
+            output[key] = value
+    return output
 
 
 def _json_safe_record(record: dict[str, object]) -> dict[str, object]:

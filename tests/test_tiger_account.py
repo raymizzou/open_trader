@@ -1097,6 +1097,37 @@ def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:
     assert cash.confidence == "high"
 
 
+def test_map_snapshot_to_portfolio_inputs_defaults_hk_currency_from_symbol() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "00700.HK",
+                "name": "Tencent",
+                "sec_type": "STK",
+                "currency": "",
+                "position_qty": "100",
+                "average_cost": "300",
+                "market_price": "310",
+                "market_value": "31000",
+                "unrealized_pnl": "1000",
+            }
+        ],
+    )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-06-29",
+    )
+
+    assert blocking_errors == []
+    assert cash_balances == []
+    assert len(positions) == 1
+    assert positions[0].market == Market.HK
+    assert positions[0].currency == "HKD"
+
+
 @pytest.mark.parametrize(
     (
         "position_records",
@@ -2547,7 +2578,114 @@ def test_sync_tiger_portfolio_no_detail_ignores_stale_tiger_fx_row(
     assert rows["MSFT"]["market_value_hkd"] == "6396.00"
 
 
-def test_sync_tiger_portfolio_no_detail_accepts_canonical_mixed_tiger_row(
+def test_sync_tiger_portfolio_detail_path_ignores_stale_tiger_fx_row(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    stale_tiger = base_portfolio_row(
+        market="US",
+        asset_class="stock",
+        symbol="OLD",
+        name="Old Tiger",
+        currency="USD",
+        market_value="1",
+        fx_to_hkd="99",
+        market_value_hkd="99.00",
+        brokers="tiger",
+        accounts="tiger_old",
+    )
+    write_portfolio(portfolio_path, [stale_tiger])
+    run_dir = tmp_path / "data/runs/2026-06-29"
+    write_csv(
+        run_dir / "extracted_positions.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "market",
+            "asset_class",
+            "symbol",
+            "name",
+            "currency",
+            "quantity",
+            "cost_price",
+            "last_price",
+            "market_value",
+            "cost_value",
+            "unrealized_pnl",
+            "confidence",
+            "notes",
+        ],
+        [
+            {
+                "statement_id": "2026-06-29-futu-live",
+                "broker": "futu",
+                "account_alias": "futu_111",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "QQQ",
+                "name": "Invesco QQQ",
+                "currency": "USD",
+                "quantity": "1",
+                "cost_price": "300",
+                "last_price": "400",
+                "market_value": "400",
+                "cost_value": "300",
+                "unrealized_pnl": "100",
+                "confidence": "high",
+                "notes": "Futu live account position",
+            }
+        ],
+    )
+    write_csv(
+        run_dir / "extracted_cash.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "currency",
+            "cash_balance",
+            "available_balance",
+            "confidence",
+            "notes",
+        ],
+        [],
+    )
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_5683",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-29",
+        update_latest=True,
+    )
+
+    rows = {row["symbol"]: row for row in read_portfolio(result.portfolio_path)}
+    assert "OLD" not in rows
+    assert rows["MSFT"]["fx_to_hkd"] == "7.85"
+    assert rows["MSFT"]["market_value_hkd"] == "6437.00"
+
+
+def test_sync_tiger_portfolio_no_detail_blocks_canonical_mixed_tiger_row(
     tmp_path: Path,
 ) -> None:
     portfolio_path = tmp_path / "data/latest/portfolio.csv"
@@ -2599,24 +2737,18 @@ def test_sync_tiger_portfolio_no_detail_accepts_canonical_mixed_tiger_row(
         ],
     )
 
-    result = sync_tiger_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-29",
-        update_latest=True,
-    )
+    with pytest.raises(TigerAccountError) as exc_info:
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-29",
+            update_latest=True,
+        )
 
-    rows = read_portfolio(result.portfolio_path)
-    matching = [
-        row for row in rows if row["market"] == "HK" and row["symbol"] == "01688"
-    ]
-    assert len(matching) == 1
-    row = matching[0]
-    assert row["total_quantity"] == "2640"
-    assert row["market_value_hkd"] == "25634.40"
-    assert row["brokers"] == "futu;tiger"
+    assert exc_info.value.error_type == "mixed_tiger_broker_row"
+    assert "01688" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

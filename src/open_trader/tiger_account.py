@@ -119,11 +119,7 @@ def sync_tiger_portfolio(
         run_date,
     )
     use_detail_rows = bool(preserved_positions or preserved_cash)
-    fx_rows = (
-        existing_rows
-        if use_detail_rows
-        else _fallback_fx_source_rows(existing_rows)
-    )
+    fx_rows = _fallback_fx_source_rows(existing_rows)
     fx_provider = _fx_provider_from_existing_rows(run_date, fx_rows)
     if not use_detail_rows:
         preserved_rows = existing_rows
@@ -856,15 +852,16 @@ def _position_from_record(
     cost_value = (
         cost_price * quantity if cost_price is not None else None
     )
+    market = _market_from_record(record)
     return Position(
         statement_id=statement_id,
         broker="tiger",
         account_alias=_text(record, "account_alias", "tiger_unknown"),
-        market=_market_from_record(record),
+        market=market,
         asset_class=_asset_class_from_record(record),
         symbol=symbol,
         name=_text(record, "name", symbol),
-        currency=_text(record, "currency").upper(),
+        currency=_currency_from_record(record, market),
         quantity=quantity,
         cost_price=cost_price,
         last_price=_optional_decimal(record, ("market_price", "last_price")),
@@ -1063,6 +1060,17 @@ def _market_from_record(record: dict[str, object]) -> Market:
     return Market.OTHER
 
 
+def _currency_from_record(record: dict[str, object], market: Market) -> str:
+    currency = _text(record, "currency").upper()
+    if currency and currency != "N/A":
+        return currency
+    if market == Market.HK:
+        return "HKD"
+    if market == Market.US:
+        return "USD"
+    return currency
+
+
 def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
     raw_type = _text(record, "sec_type", "").upper()
     if raw_type in {"STK", "STOCK", "EQUITY", "COMMON_STOCK"}:
@@ -1238,7 +1246,7 @@ def _portfolio_inputs_from_preserved_rows(
         _raise_for_unsupported_preserved_mixed_brokers(
             symbol=row.get("symbol", ""),
             broker_parts=broker_parts,
-            allow_futu_tiger_split=True,
+            allow_futu_tiger_split=False,
         )
         has_tiger = "tiger" in broker_parts
         has_other_brokers = bool(broker_parts - {"tiger"})
