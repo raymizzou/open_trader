@@ -729,6 +729,23 @@ def usd_cash_row() -> dict[str, str]:
     }
 
 
+def tiger_unmapped_assets_row() -> dict[str, str]:
+    return {
+        **usd_cash_row(),
+        "symbol": "TIGER_UNMAPPED_ASSETS",
+        "name": "Tiger unmapped assets",
+        "currency": "HKD",
+        "market_value": "900",
+        "cost_value": "900",
+        "fx_to_hkd": "1",
+        "market_value_hkd": "900.00",
+        "cost_value_hkd": "900.00",
+        "brokers": "tiger",
+        "accounts": "tiger_main",
+        "notes": "Tiger account_total reconciliation for locked funds or fund assets not returned as positions",
+    }
+
+
 def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
     tmp_path: Path,
 ) -> None:
@@ -1318,6 +1335,51 @@ def test_sync_futu_portfolio_preserves_malformed_cash_value_from_valid_hkd_value
         row for row in read_portfolio(result.latest_path) if row["symbol"] == "USD_CASH"
     )
     assert latest_usd_cash["market_value_hkd"] == "7800.00"
+
+
+def test_sync_futu_portfolio_preserves_special_cash_class_position_rows(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [tiger_unmapped_assets_row()])
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "HKD",
+                "cash": "100",
+                "available_cash": "90",
+            }
+        ],
+        position_records=[],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-18",
+        update_latest=True,
+    )
+
+    rows = {row["symbol"]: row for row in read_portfolio(result.portfolio_path)}
+    assert "TIGER_UNMAPPED_ASSETS" in rows
+    assert rows["TIGER_UNMAPPED_ASSETS"]["name"] == "Tiger unmapped assets"
+    assert rows["TIGER_UNMAPPED_ASSETS"]["market"] == "CASH"
+    assert rows["TIGER_UNMAPPED_ASSETS"]["asset_class"] == "cash"
+    assert rows["TIGER_UNMAPPED_ASSETS"]["market_value"] == "900"
+    assert rows["TIGER_UNMAPPED_ASSETS"]["cost_value"] == "900"
+    assert rows["TIGER_UNMAPPED_ASSETS"]["market_value_hkd"] == "900.00"
+    assert rows["TIGER_UNMAPPED_ASSETS"]["cost_value_hkd"] == "900.00"
+    assert rows["TIGER_UNMAPPED_ASSETS"]["brokers"] == "tiger"
+    assert rows["HKD_CASH"]["market_value_hkd"] == "100.00"
+    latest_rows = {
+        row["symbol"]: row for row in read_portfolio(result.latest_path)
+    }
+    assert "TIGER_UNMAPPED_ASSETS" in latest_rows
+    assert latest_rows["TIGER_UNMAPPED_ASSETS"]["market_value_hkd"] == "900.00"
+    assert latest_rows["TIGER_UNMAPPED_ASSETS"]["cost_value_hkd"] == "900.00"
 
 
 def test_sync_futu_portfolio_blocks_mixed_futu_broker_rows(tmp_path: Path) -> None:

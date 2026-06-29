@@ -784,11 +784,21 @@ def _portfolio_inputs_from_preserved_rows(
             has_invalid_market_value = True
         market = _market_from_text(row.get("market", ""))
         asset_class = _asset_class_from_text(row.get("asset_class", ""))
-        if market == Market.CASH and asset_class == AssetClass.CASH:
+        if (
+            market == Market.CASH
+            and asset_class == AssetClass.CASH
+            and _is_currency_cash_portfolio_row(row)
+        ):
             cash_balances.append(_cash_from_portfolio_row(row))
             continue
         positions.append(_position_from_portfolio_row(row))
     return positions, cash_balances, has_invalid_market_value
+
+
+def _is_currency_cash_portfolio_row(row: dict[str, str]) -> bool:
+    currency = row.get("currency", "").strip().upper()
+    symbol = row.get("symbol", "").strip().upper()
+    return bool(currency) and symbol == f"{currency}_CASH"
 
 
 def _position_from_portfolio_row(row: dict[str, str]) -> Position:
