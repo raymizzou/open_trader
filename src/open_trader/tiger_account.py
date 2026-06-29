@@ -153,6 +153,7 @@ def sync_tiger_portfolio(
         )
     else:
         (
+            preserved_portfolio_rows,
             preserved_portfolio_positions,
             preserved_portfolio_cash,
             preserved_has_invalid_market_value,
@@ -166,6 +167,9 @@ def sync_tiger_portfolio(
             [*preserved_portfolio_positions, *positions],
             [*preserved_portfolio_cash, *cash_balances],
             fx_provider,
+        )
+        merged_rows = _recalculate_combined_portfolio_rows(
+            [*preserved_portfolio_rows, *merged_rows]
         )
         if preserved_has_invalid_market_value:
             _mark_all_rows_data_check(merged_rows)
@@ -1208,18 +1212,14 @@ def _portfolio_inputs_from_preserved_rows(
     rows: list[dict[str, str]],
     tiger_positions: list[Position],
     tiger_cash_balances: list[CashBalance],
-) -> tuple[list[Position], list[CashBalance], bool]:
+) -> tuple[list[dict[str, str]], list[Position], list[CashBalance], bool]:
+    preserved_rows: list[dict[str, str]] = []
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
     has_invalid_market_value = False
     tiger_positions_by_key = _tiger_positions_by_portfolio_key(tiger_positions)
     tiger_cash_by_key = _tiger_cash_by_portfolio_key(tiger_cash_balances)
     for row in rows:
-        if _parse_finite_decimal(row.get("market_value_hkd", "").strip()) is None:
-            has_invalid_market_value = True
-        if _parse_finite_decimal(row.get("market_value", "").strip()) is None:
-            has_invalid_market_value = True
-
         broker_parts = _broker_parts(row)
         _raise_for_unsupported_preserved_mixed_brokers(
             symbol=row.get("symbol", ""),
@@ -1238,17 +1238,31 @@ def _portfolio_inputs_from_preserved_rows(
         if not has_tiger:
             if is_cash_row:
                 key = _cash_portfolio_key_from_row(row)
-                if key in tiger_cash_by_key and broker_parts != {"futu"}:
+                if key not in tiger_cash_by_key:
+                    preserved_rows.append(row)
+                    continue
+                if broker_parts != {"futu"}:
                     _raise_mixed_tiger_broker_row(
                         _mixed_tiger_row_for_key(row, broker_parts)
                     )
+                has_invalid_market_value = (
+                    has_invalid_market_value
+                    or _portfolio_row_has_invalid_market_value(row)
+                )
                 cash_balances.append(_cash_from_portfolio_row(row))
             else:
                 key = _position_portfolio_key_from_row(row)
-                if key in tiger_positions_by_key and broker_parts != {"futu"}:
+                if key not in tiger_positions_by_key:
+                    preserved_rows.append(row)
+                    continue
+                if broker_parts != {"futu"}:
                     _raise_mixed_tiger_broker_row(
                         _mixed_tiger_row_for_key(row, broker_parts)
                     )
+                has_invalid_market_value = (
+                    has_invalid_market_value
+                    or _portfolio_row_has_invalid_market_value(row)
+                )
                 positions.append(_position_from_portfolio_row(row))
             continue
         if not has_other_brokers:
@@ -1261,6 +1275,10 @@ def _portfolio_inputs_from_preserved_rows(
             tiger_cash_balance = tiger_cash_by_key.get(key)
             if tiger_cash_balance is None:
                 _raise_mixed_tiger_broker_row(row)
+            has_invalid_market_value = (
+                has_invalid_market_value
+                or _portfolio_row_has_invalid_market_value(row)
+            )
             cash_balances.append(
                 _non_tiger_cash_residual_from_portfolio_row(
                     row,
@@ -1273,6 +1291,10 @@ def _portfolio_inputs_from_preserved_rows(
         tiger_position = tiger_positions_by_key.get(key)
         if tiger_position is None:
             _raise_mixed_tiger_broker_row(row)
+        has_invalid_market_value = (
+            has_invalid_market_value
+            or _portfolio_row_has_invalid_market_value(row)
+        )
         residual_position, residual_has_invalid_market_value = (
             _non_tiger_position_residual_from_portfolio_row(row, tiger_position)
         )
@@ -1280,7 +1302,14 @@ def _portfolio_inputs_from_preserved_rows(
         has_invalid_market_value = (
             has_invalid_market_value or residual_has_invalid_market_value
         )
-    return positions, cash_balances, has_invalid_market_value
+    return preserved_rows, positions, cash_balances, has_invalid_market_value
+
+
+def _portfolio_row_has_invalid_market_value(row: dict[str, str]) -> bool:
+    return (
+        _parse_finite_decimal(row.get("market_value_hkd", "").strip()) is None
+        or _parse_finite_decimal(row.get("market_value", "").strip()) is None
+    )
 
 
 def _is_currency_cash_portfolio_row(row: dict[str, str]) -> bool:

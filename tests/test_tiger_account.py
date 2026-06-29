@@ -2250,6 +2250,148 @@ def test_sync_tiger_portfolio_no_detail_blocks_non_colliding_mixed_broker_row(
     assert "09999" in str(exc_info.value)
 
 
+def test_sync_tiger_portfolio_no_detail_preserves_manual_safety_metadata(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            base_portfolio_row(
+                sort_group="1",
+                market="US",
+                asset_class="etf",
+                symbol="QQQ",
+                name="Invesco QQQ",
+                currency="USD",
+                total_quantity="10",
+                avg_cost_price="300",
+                last_price="400",
+                market_value="4000",
+                cost_value="3000",
+                unrealized_pnl="1000",
+                unrealized_pnl_pct="33.33%",
+                fx_to_hkd="7.80",
+                market_value_hkd="31200.00",
+                cost_value_hkd="23400.00",
+                portfolio_weight_hkd="80.00%",
+                brokers="phillips",
+                accounts="phillips_main",
+                ai_eligible="false",
+                analysis_symbol="",
+                risk_flag="data_check",
+                notes="Manual review required",
+            )
+        ],
+    )
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_5683",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-29",
+        update_latest=True,
+    )
+
+    rows = {row["symbol"]: row for row in read_portfolio(result.portfolio_path)}
+    qqq = rows["QQQ"]
+    assert qqq["brokers"] == "phillips"
+    assert qqq["risk_flag"] == "data_check"
+    assert qqq["ai_eligible"] == "false"
+    assert qqq["analysis_symbol"] == ""
+
+
+def test_sync_tiger_portfolio_no_detail_ignores_invalid_stale_tiger_row(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    stale_tiger = base_portfolio_row(
+        market="US",
+        asset_class="stock",
+        symbol="OLD",
+        name="Old Tiger",
+        currency="USD",
+        market_value="bad",
+        market_value_hkd="bad",
+        brokers="tiger",
+        accounts="tiger_old",
+    )
+    preserved = base_portfolio_row(
+        market="US",
+        asset_class="etf",
+        symbol="QQQ",
+        name="Invesco QQQ",
+        currency="USD",
+        total_quantity="1",
+        avg_cost_price="300",
+        last_price="400",
+        market_value="400",
+        cost_value="300",
+        unrealized_pnl="100",
+        unrealized_pnl_pct="33.33%",
+        fx_to_hkd="7.80",
+        market_value_hkd="3120.00",
+        cost_value_hkd="2340.00",
+        brokers="phillips",
+        accounts="phillips_main",
+        risk_flag="normal",
+    )
+    write_portfolio(portfolio_path, [stale_tiger, preserved])
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_5683",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+                "unrealized_pnl": "220",
+            }
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-29",
+        update_latest=True,
+    )
+
+    rows = {row["symbol"]: row for row in read_portfolio(result.portfolio_path)}
+    assert "OLD" not in rows
+    assert rows["QQQ"]["risk_flag"] != "data_check"
+    assert rows["QQQ"]["portfolio_weight_hkd"] != ""
+    assert rows["MSFT"]["risk_flag"] != "data_check"
+    assert rows["MSFT"]["portfolio_weight_hkd"] != ""
+
+
 def test_sync_tiger_portfolio_no_detail_accepts_canonical_mixed_tiger_row(
     tmp_path: Path,
 ) -> None:
