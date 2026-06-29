@@ -12,7 +12,7 @@ from typing import Any, Callable
 from .csv_io import write_rows
 from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
 from .models import AssetClass, CashBalance, Market, Position
-from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
+from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows
 
 
 TRD_ENV_REAL = "REAL"
@@ -613,13 +613,19 @@ def sync_futu_portfolio(
             fx_provider,
         )
     else:
-        futu_rows = build_portfolio_rows(
+        (
+            preserved_portfolio_positions,
+            preserved_portfolio_cash,
+            preserved_has_invalid_hkd_value,
+        ) = _portfolio_inputs_from_preserved_rows(preserved_rows)
+        merged_rows = build_portfolio_rows(
             run_date[:7],
-            futu_positions,
-            cash_balances,
+            [*preserved_portfolio_positions, *futu_positions],
+            [*preserved_portfolio_cash, *cash_balances],
             fx_provider,
         )
-        merged_rows = _recalculate_combined_portfolio_rows([*preserved_rows, *futu_rows])
+        if preserved_has_invalid_hkd_value:
+            _mark_all_rows_data_check(merged_rows)
     run_dir = data_dir / "runs" / run_date
     run_dir.mkdir(parents=True, exist_ok=True)
     report_dir = reports_dir / "futu_account"
@@ -760,6 +766,65 @@ def _cash_from_statement_row(row: dict[str, str]) -> CashBalance:
         currency=row.get("currency", "").upper(),
         cash_balance=cash_balance,
         available_balance=_optional_decimal(row, ("available_balance",)),
+        confidence=_confidence(row.get("confidence", ""), cash_ok),
+        notes=row.get("notes", ""),
+    )
+
+
+def _portfolio_inputs_from_preserved_rows(
+    rows: list[dict[str, str]],
+) -> tuple[list[Position], list[CashBalance], bool]:
+    positions: list[Position] = []
+    cash_balances: list[CashBalance] = []
+    has_invalid_hkd_value = False
+    for row in rows:
+        if _parse_finite_decimal(row.get("market_value_hkd", "").strip()) is None:
+            has_invalid_hkd_value = True
+        market = _market_from_text(row.get("market", ""))
+        asset_class = _asset_class_from_text(row.get("asset_class", ""))
+        if market == Market.CASH and asset_class == AssetClass.CASH:
+            cash_balances.append(_cash_from_portfolio_row(row))
+            continue
+        positions.append(_position_from_portfolio_row(row))
+    return positions, cash_balances, has_invalid_hkd_value
+
+
+def _position_from_portfolio_row(row: dict[str, str]) -> Position:
+    quantity, quantity_ok = _required_decimal(row, ("total_quantity",))
+    market_value = _optional_decimal(row, ("market_value",))
+    cost_value = _optional_decimal(row, ("cost_value",))
+    required_fields_ok = (
+        quantity_ok and market_value is not None and cost_value is not None
+    )
+    return Position(
+        statement_id="preserved-portfolio",
+        broker=row.get("brokers", ""),
+        account_alias=row.get("accounts", ""),
+        market=_market_from_text(row.get("market", "")),
+        asset_class=_asset_class_from_text(row.get("asset_class", "")),
+        symbol=row.get("symbol", ""),
+        name=row.get("name", ""),
+        currency=row.get("currency", "").upper(),
+        quantity=quantity,
+        cost_price=_optional_decimal(row, ("avg_cost_price",)),
+        last_price=_optional_decimal(row, ("last_price",)),
+        market_value=market_value,
+        cost_value=cost_value,
+        unrealized_pnl=_optional_decimal(row, ("unrealized_pnl",)),
+        confidence=_confidence(row.get("confidence", ""), required_fields_ok),
+        notes=row.get("notes", ""),
+    )
+
+
+def _cash_from_portfolio_row(row: dict[str, str]) -> CashBalance:
+    cash_balance, cash_ok = _required_decimal(row, ("market_value",))
+    return CashBalance(
+        statement_id="preserved-portfolio",
+        broker=row.get("brokers", ""),
+        account_alias=row.get("accounts", ""),
+        currency=row.get("currency", "").upper(),
+        cash_balance=cash_balance,
+        available_balance=None,
         confidence=_confidence(row.get("confidence", ""), cash_ok),
         notes=row.get("notes", ""),
     )
@@ -918,52 +983,6 @@ def _fx_provider_from_existing_rows(
     return StaticMonthEndFxProvider(run_date[:7], {**DEFAULT_RATES_TO_HKD, **rates})
 
 
-def _recalculate_combined_portfolio_rows(
-    rows: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    normalized_rows = [
-        {field: str(row.get(field, "")) for field in PORTFOLIO_FIELDNAMES}
-        for row in rows
-    ]
-    parsed_market_values: list[Decimal | None] = []
-    values: list[Decimal] = []
-    has_missing_value = False
-    for row in normalized_rows:
-        value = _parse_finite_decimal(row.get("market_value_hkd", "").strip())
-        parsed_market_values.append(value)
-        if value is None:
-            has_missing_value = True
-            continue
-        values.append(value)
-    total = sum(values, Decimal("0"))
-    for row, market_value_hkd in zip(normalized_rows, parsed_market_values):
-        if has_missing_value:
-            row["portfolio_weight_hkd"] = ""
-            row["risk_flag"] = "data_check"
-            continue
-        market_value_hkd = market_value_hkd or Decimal("0")
-        weight = market_value_hkd / total if total else Decimal("0")
-        row["portfolio_weight_hkd"] = pct(weight)
-        if row["risk_flag"] == "data_check":
-            continue
-        if row["asset_class"] not in {"cash", "money_market_fund"} and weight > Decimal(
-            "0.10"
-        ):
-            row["risk_flag"] = "overweight"
-        else:
-            row["risk_flag"] = "normal"
-    return [
-        row
-        for row, _ in sorted(
-            zip(normalized_rows, parsed_market_values),
-            key=lambda item: (
-                int(item[0].get("sort_group") or "9"),
-                -(item[1] or Decimal("0")),
-            ),
-        )
-    ]
-
-
 def _parse_finite_decimal(value_text: str) -> Decimal | None:
     if not value_text:
         return None
@@ -974,6 +993,12 @@ def _parse_finite_decimal(value_text: str) -> Decimal | None:
     if not value.is_finite():
         return None
     return value
+
+
+def _mark_all_rows_data_check(rows: list[dict[str, str]]) -> None:
+    for row in rows:
+        row["portfolio_weight_hkd"] = ""
+        row["risk_flag"] = "data_check"
 
 
 def _snapshot_to_json(snapshot: FutuAccountSnapshot) -> dict[str, object]:

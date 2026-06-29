@@ -671,6 +671,33 @@ def tiger_row() -> dict[str, str]:
     }
 
 
+def hk_tiger_stock_row() -> dict[str, str]:
+    return {
+        **tiger_row(),
+        "sort_group": "1",
+        "market": "HK",
+        "asset_class": "stock",
+        "symbol": "01688",
+        "name": "领益智造",
+        "currency": "HKD",
+        "total_quantity": "2640",
+        "avg_cost_price": "10.18",
+        "last_price": "9.71",
+        "market_value": "25634.4",
+        "cost_value": "26875.2",
+        "unrealized_pnl": "-1240.80",
+        "unrealized_pnl_pct": "-4.62%",
+        "fx_to_hkd": "1",
+        "market_value_hkd": "25634.40",
+        "cost_value_hkd": "26875.20",
+        "portfolio_weight_hkd": "100.00%",
+        "brokers": "tiger",
+        "accounts": "tiger_5683",
+        "analysis_symbol": "01688",
+        "notes": "Tiger live account position",
+    }
+
+
 def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
     tmp_path: Path,
 ) -> None:
@@ -774,6 +801,62 @@ def test_sync_futu_portfolio_builds_live_only_portfolio_without_existing_portfol
     assert rows[0]["total_quantity"] == "300"
     assert rows[0]["fx_to_hkd"] == "7.85"
     assert missing_portfolio_path.exists() is False
+
+
+def test_sync_futu_portfolio_deduplicates_unknown_zero_position_against_tiger_stock(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [hk_tiger_stock_row()])
+    snapshot = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "HK.01688",
+                "stock_name": "领益智造",
+                "qty": "0",
+                "cost_price": "0",
+                "nominal_price": "9.71",
+                "market_val": "0",
+                "cost_value": "0",
+                "pl_val": "-277.2",
+                "currency": "HKD",
+            }
+        ],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-29",
+        update_latest=True,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    matching = [
+        row for row in rows if row["market"] == "HK" and row["symbol"] == "01688"
+    ]
+    assert len(matching) == 1
+    row = matching[0]
+    assert row["asset_class"] == "stock"
+    assert row["total_quantity"] == "2640"
+    assert row["market_value_hkd"] == "25634.40"
+    assert row["brokers"] == "futu;tiger"
+    assert result.updated_latest is True
+    latest_rows = read_portfolio(result.latest_path)
+    assert (
+        len(
+            [
+                row
+                for row in latest_rows
+                if row["market"] == "HK" and row["symbol"] == "01688"
+            ]
+        )
+        == 1
+    )
 
 
 def test_sync_futu_portfolio_rebuilds_mixed_symbols_from_statement_details(
