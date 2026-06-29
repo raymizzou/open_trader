@@ -1196,7 +1196,7 @@ def _raise_for_unsupported_detail_tiger_collisions(
             _broker_parts_from_text(position.broker)
         )
     for key, broker_parts in preserved_position_brokers.items():
-        if broker_parts != {"futu"}:
+        if len(broker_parts) != 1:
             _raise_mixed_tiger_broker_row(
                 {
                     "symbol": key[1],
@@ -1214,7 +1214,7 @@ def _raise_for_unsupported_detail_tiger_collisions(
             _broker_parts_from_text(cash.broker)
         )
     for key, broker_parts in preserved_cash_brokers.items():
-        if broker_parts != {"futu"}:
+        if len(broker_parts) != 1:
             _raise_mixed_tiger_broker_row(
                 {
                     "symbol": key[0],
@@ -1268,10 +1268,6 @@ def _portfolio_inputs_from_preserved_rows(
                     cash_balances.append(_cash_from_portfolio_row(row))
                     preserved_safety_rows.append(row)
                     continue
-                if broker_parts != {"futu"}:
-                    _raise_mixed_tiger_broker_row(
-                        _mixed_tiger_row_for_key(row, broker_parts)
-                    )
                 has_invalid_market_value = (
                     has_invalid_market_value
                     or _portfolio_row_has_invalid_market_value(row)
@@ -1290,10 +1286,6 @@ def _portfolio_inputs_from_preserved_rows(
                     positions.append(_position_from_portfolio_row(row))
                     preserved_safety_rows.append(row)
                     continue
-                if broker_parts != {"futu"}:
-                    _raise_mixed_tiger_broker_row(
-                        _mixed_tiger_row_for_key(row, broker_parts)
-                    )
                 has_invalid_market_value = (
                     has_invalid_market_value
                     or _portfolio_row_has_invalid_market_value(row)
@@ -1302,41 +1294,7 @@ def _portfolio_inputs_from_preserved_rows(
             continue
         if not has_other_brokers:
             continue
-        if broker_parts != {"futu", "tiger"}:
-            _raise_mixed_tiger_broker_row(row)
-
-        if is_cash_row:
-            key = _cash_portfolio_key_from_row(row)
-            tiger_cash_balance = tiger_cash_by_key.get(key)
-            if tiger_cash_balance is None:
-                _raise_mixed_tiger_broker_row(row)
-            has_invalid_market_value = (
-                has_invalid_market_value
-                or _portfolio_row_has_invalid_market_value(row)
-            )
-            cash_balances.append(
-                _non_tiger_cash_residual_from_portfolio_row(
-                    row,
-                    tiger_cash_balance,
-                )
-            )
-            continue
-
-        key = _position_portfolio_key_from_row(row)
-        tiger_position = tiger_positions_by_key.get(key)
-        if tiger_position is None:
-            _raise_mixed_tiger_broker_row(row)
-        has_invalid_market_value = (
-            has_invalid_market_value
-            or _portfolio_row_has_invalid_market_value(row)
-        )
-        residual_position, residual_has_invalid_market_value = (
-            _non_tiger_position_residual_from_portfolio_row(row, tiger_position)
-        )
-        positions.append(residual_position)
-        has_invalid_market_value = (
-            has_invalid_market_value or residual_has_invalid_market_value
-        )
+        _raise_mixed_tiger_broker_row(row)
     return (
         preserved_rows,
         positions,
@@ -1390,16 +1348,6 @@ def _is_currency_cash_portfolio_row(row: dict[str, str]) -> bool:
     currency = row.get("currency", "").strip().upper()
     symbol = row.get("symbol", "").strip().upper()
     return bool(currency) and symbol == f"{currency}_CASH"
-
-
-def _mixed_tiger_row_for_key(
-    row: dict[str, str],
-    broker_parts: set[str],
-) -> dict[str, str]:
-    return {
-        "symbol": row.get("symbol", ""),
-        "brokers": ";".join(sorted({*broker_parts, "tiger"})),
-    }
 
 
 def _raise_for_unsupported_preserved_mixed_brokers(
@@ -1579,81 +1527,6 @@ def _cash_from_portfolio_row(row: dict[str, str]) -> CashBalance:
     )
 
 
-def _non_tiger_position_residual_from_portfolio_row(
-    row: dict[str, str],
-    tiger_position: Position,
-) -> tuple[Position, bool]:
-    position = _position_from_portfolio_row(row)
-    quantity, quantity_ok, _ = _required_decimal(row, ("total_quantity",))
-    market_value, market_value_ok = _market_value_from_portfolio_row(row)
-    cost_value = _optional_decimal(row, ("cost_value",))
-    unrealized_pnl = _optional_decimal(row, ("unrealized_pnl",))
-    residual_market_value = _subtract_optional_decimal(
-        market_value,
-        tiger_position.market_value,
-    )
-    residual_cost_value = _subtract_optional_decimal(
-        cost_value,
-        tiger_position.cost_value,
-    )
-    residual_unrealized_pnl = _subtract_optional_decimal(
-        unrealized_pnl,
-        tiger_position.unrealized_pnl,
-    )
-    residuals_are_valid = (
-        quantity_ok
-        and market_value_ok
-        and residual_market_value is not None
-        and residual_cost_value is not None
-        and residual_market_value >= 0
-        and residual_cost_value >= 0
-        and quantity - tiger_position.quantity >= 0
-    )
-    if not residuals_are_valid:
-        _raise_mixed_tiger_broker_row(row)
-    return (
-        Position(
-            statement_id=position.statement_id,
-            broker=_non_tiger_brokers_text(row),
-            account_alias=_non_tiger_accounts_text(row),
-            market=position.market,
-            asset_class=position.asset_class,
-            symbol=position.symbol,
-            name=position.name,
-            currency=position.currency,
-            quantity=quantity - tiger_position.quantity,
-            cost_price=position.cost_price,
-            last_price=position.last_price,
-            market_value=residual_market_value,
-            cost_value=residual_cost_value,
-            unrealized_pnl=residual_unrealized_pnl,
-            confidence=_confidence(row.get("confidence", ""), residuals_are_valid),
-            notes=_non_tiger_notes_text(row),
-        ),
-        not market_value_ok,
-    )
-
-
-def _non_tiger_cash_residual_from_portfolio_row(
-    row: dict[str, str],
-    tiger_cash_balance: CashBalance,
-) -> CashBalance:
-    cash_balance = _cash_from_portfolio_row(row)
-    residual_cash_balance = cash_balance.cash_balance - tiger_cash_balance.cash_balance
-    if residual_cash_balance < 0:
-        _raise_mixed_tiger_broker_row(row)
-    return CashBalance(
-        statement_id=cash_balance.statement_id,
-        broker=_non_tiger_brokers_text(row),
-        account_alias=_non_tiger_accounts_text(row),
-        currency=cash_balance.currency,
-        cash_balance=residual_cash_balance,
-        available_balance=None,
-        confidence=cash_balance.confidence,
-        notes=_non_tiger_notes_text(row),
-    )
-
-
 def _market_value_from_portfolio_row(row: dict[str, str]) -> tuple[Decimal | None, bool]:
     market_value = _parse_finite_decimal(row.get("market_value", "").strip())
     if market_value is not None:
@@ -1663,38 +1536,6 @@ def _market_value_from_portfolio_row(row: dict[str, str]) -> tuple[Decimal | Non
     if market_value_hkd is not None and fx_to_hkd is not None and fx_to_hkd > 0:
         return market_value_hkd / fx_to_hkd, False
     return None, False
-
-
-def _subtract_optional_decimal(
-    total: Decimal | None,
-    value: Decimal | None,
-) -> Decimal | None:
-    if total is None or value is None:
-        return None
-    return total - value
-
-
-def _non_tiger_brokers_text(row: dict[str, str]) -> str:
-    return ";".join(sorted(_broker_parts(row) - {"tiger"}))
-
-
-def _non_tiger_accounts_text(row: dict[str, str]) -> str:
-    accounts = [
-        part.strip()
-        for chunk in row.get("accounts", "").split(",")
-        for part in chunk.split(";")
-        if part.strip() and "tiger" not in part.strip().lower()
-    ]
-    return ";".join(sorted(accounts))
-
-
-def _non_tiger_notes_text(row: dict[str, str]) -> str:
-    notes = [
-        part.strip()
-        for part in row.get("notes", "").split(";")
-        if part.strip() and "tiger" not in part.strip().lower()
-    ]
-    return "; ".join(notes)
 
 
 def _mark_all_rows_data_check(rows: list[dict[str, str]]) -> None:

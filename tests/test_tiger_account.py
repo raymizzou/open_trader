@@ -1882,7 +1882,7 @@ def test_sync_tiger_portfolio_deduplicates_stock_against_preserved_futu_unknown(
     )
 
 
-def test_sync_tiger_portfolio_detail_path_blocks_phillips_tiger_collision(
+def test_sync_tiger_portfolio_detail_path_merges_phillips_tiger_collision(
     tmp_path: Path,
 ) -> None:
     portfolio_path = tmp_path / "data/latest/portfolio.csv"
@@ -1961,18 +1961,25 @@ def test_sync_tiger_portfolio_detail_path_blocks_phillips_tiger_collision(
         ],
     )
 
-    with pytest.raises(TigerAccountError) as exc_info:
-        sync_tiger_portfolio(
-            snapshot=snapshot,
-            portfolio_path=portfolio_path,
-            data_dir=tmp_path / "data",
-            reports_dir=tmp_path / "reports",
-            run_date="2026-06-29",
-            update_latest=True,
-        )
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-29",
+        update_latest=True,
+    )
 
-    assert exc_info.value.error_type == "mixed_tiger_broker_row"
-    assert "01688" in str(exc_info.value)
+    rows = [
+        row
+        for row in read_portfolio(result.portfolio_path)
+        if row["market"] == "HK" and row["symbol"] == "01688"
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["brokers"] == "phillips;tiger"
+    assert row["total_quantity"] == "3000"
+    assert row["market_value_hkd"] == "29130.00"
 
 
 def test_sync_tiger_portfolio_detail_path_blocks_non_colliding_mixed_broker_row(
@@ -2242,7 +2249,7 @@ def test_sync_tiger_portfolio_no_detail_deduplicates_preserved_only_rows(
     assert row["total_quantity"] == "100"
 
 
-def test_sync_tiger_portfolio_no_detail_blocks_plain_phillips_tiger_collision(
+def test_sync_tiger_portfolio_no_detail_merges_plain_phillips_tiger_collision(
     tmp_path: Path,
 ) -> None:
     portfolio_path = tmp_path / "data/latest/portfolio.csv"
@@ -2293,18 +2300,25 @@ def test_sync_tiger_portfolio_no_detail_blocks_plain_phillips_tiger_collision(
         ],
     )
 
-    with pytest.raises(TigerAccountError) as exc_info:
-        sync_tiger_portfolio(
-            snapshot=snapshot,
-            portfolio_path=portfolio_path,
-            data_dir=tmp_path / "data",
-            reports_dir=tmp_path / "reports",
-            run_date="2026-06-29",
-            update_latest=True,
-        )
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-29",
+        update_latest=True,
+    )
 
-    assert exc_info.value.error_type == "mixed_tiger_broker_row"
-    assert "01688" in str(exc_info.value)
+    rows = [
+        row
+        for row in read_portfolio(result.portfolio_path)
+        if row["market"] == "HK" and row["symbol"] == "01688"
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["brokers"] == "phillips;tiger"
+    assert row["total_quantity"] == "3000"
+    assert row["market_value_hkd"] == "29130.00"
 
 
 def test_sync_tiger_portfolio_no_detail_blocks_non_colliding_mixed_broker_row(
