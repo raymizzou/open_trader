@@ -1152,6 +1152,19 @@ def _raise_for_unsupported_detail_tiger_collisions(
     tiger_positions: list[Position],
     tiger_cash_balances: list[CashBalance],
 ) -> None:
+    for position in preserved_positions:
+        _raise_for_unsupported_preserved_mixed_brokers(
+            symbol=position.symbol,
+            broker_parts=_broker_parts_from_text(position.broker),
+            allow_futu_tiger_split=False,
+        )
+    for cash in preserved_cash:
+        _raise_for_unsupported_preserved_mixed_brokers(
+            symbol=cash.symbol,
+            broker_parts=_broker_parts_from_text(cash.broker),
+            allow_futu_tiger_split=False,
+        )
+
     tiger_position_keys = {
         _position_portfolio_key(position) for position in tiger_positions
     }
@@ -1208,6 +1221,11 @@ def _portfolio_inputs_from_preserved_rows(
             has_invalid_market_value = True
 
         broker_parts = _broker_parts(row)
+        _raise_for_unsupported_preserved_mixed_brokers(
+            symbol=row.get("symbol", ""),
+            broker_parts=broker_parts,
+            allow_futu_tiger_split=True,
+        )
         has_tiger = "tiger" in broker_parts
         has_other_brokers = bool(broker_parts - {"tiger"})
         market = _market_from_text(row.get("market", ""))
@@ -1279,6 +1297,24 @@ def _mixed_tiger_row_for_key(
         "symbol": row.get("symbol", ""),
         "brokers": ";".join(sorted({*broker_parts, "tiger"})),
     }
+
+
+def _raise_for_unsupported_preserved_mixed_brokers(
+    *,
+    symbol: str,
+    broker_parts: set[str],
+    allow_futu_tiger_split: bool,
+) -> None:
+    if len(broker_parts) <= 1:
+        return
+    if allow_futu_tiger_split and broker_parts == {"futu", "tiger"}:
+        return
+    _raise_mixed_tiger_broker_row(
+        {
+            "symbol": symbol,
+            "brokers": ";".join(sorted(broker_parts)),
+        }
+    )
 
 
 def _position_portfolio_key_from_row(row: dict[str, str]) -> tuple[Market, str, str]:

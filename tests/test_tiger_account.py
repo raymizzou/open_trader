@@ -1944,6 +1944,99 @@ def test_sync_tiger_portfolio_detail_path_blocks_phillips_tiger_collision(
     assert "01688" in str(exc_info.value)
 
 
+def test_sync_tiger_portfolio_detail_path_blocks_non_colliding_mixed_broker_row(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [])
+    run_dir = tmp_path / "data/runs/2026-06-29"
+    write_csv(
+        run_dir / "extracted_positions.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "market",
+            "asset_class",
+            "symbol",
+            "name",
+            "currency",
+            "quantity",
+            "cost_price",
+            "last_price",
+            "market_value",
+            "cost_value",
+            "unrealized_pnl",
+            "confidence",
+            "notes",
+        ],
+        [
+            {
+                "statement_id": "2026-05-mixed",
+                "broker": "phillips;tiger",
+                "account_alias": "phillips_main;tiger_old",
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "09999",
+                "name": "Mixed Imported Position",
+                "currency": "HKD",
+                "quantity": "100",
+                "cost_price": "10",
+                "last_price": "11",
+                "market_value": "1100",
+                "cost_value": "1000",
+                "unrealized_pnl": "100",
+                "confidence": "high",
+                "notes": "Unsupported mixed broker detail row",
+            }
+        ],
+    )
+    write_csv(
+        run_dir / "extracted_cash.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "currency",
+            "cash_balance",
+            "available_balance",
+            "confidence",
+            "notes",
+        ],
+        [],
+    )
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_5683",
+                "symbol": "01688",
+                "sec_type": "STK",
+                "currency": "HKD",
+                "market": "HK",
+                "position_qty": "2640",
+                "average_cost": "10.18",
+                "market_price": "9.71",
+                "market_value": "25634.4",
+                "unrealized_pnl": "-1240.8",
+            }
+        ],
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-29",
+            update_latest=True,
+        )
+
+    assert exc_info.value.error_type == "mixed_tiger_broker_row"
+    assert "09999" in str(exc_info.value)
+
+
 def test_sync_tiger_portfolio_no_detail_fallback_deduplicates_preserved_futu_row(
     tmp_path: Path,
 ) -> None:
@@ -2090,6 +2183,71 @@ def test_sync_tiger_portfolio_no_detail_blocks_plain_phillips_tiger_collision(
 
     assert exc_info.value.error_type == "mixed_tiger_broker_row"
     assert "01688" in str(exc_info.value)
+
+
+def test_sync_tiger_portfolio_no_detail_blocks_non_colliding_mixed_broker_row(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            base_portfolio_row(
+                market="HK",
+                asset_class="stock",
+                symbol="09999",
+                name="Mixed Imported Position",
+                currency="HKD",
+                total_quantity="100",
+                avg_cost_price="10",
+                last_price="11",
+                market_value="1100",
+                cost_value="1000",
+                unrealized_pnl="100",
+                unrealized_pnl_pct="10.00%",
+                fx_to_hkd="1",
+                market_value_hkd="1100.00",
+                cost_value_hkd="1000.00",
+                portfolio_weight_hkd="100.00%",
+                brokers="futu;phillips",
+                accounts="futu_111;phillips_main",
+                ai_eligible="true",
+                analysis_symbol="09999",
+                risk_flag="overweight",
+                notes="Unsupported mixed broker portfolio row",
+            )
+        ],
+    )
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_5683",
+                "symbol": "01688",
+                "sec_type": "STK",
+                "currency": "HKD",
+                "market": "HK",
+                "position_qty": "2640",
+                "average_cost": "10.18",
+                "market_price": "9.71",
+                "market_value": "25634.4",
+                "unrealized_pnl": "-1240.8",
+            }
+        ],
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        sync_tiger_portfolio(
+            snapshot=snapshot,
+            portfolio_path=portfolio_path,
+            data_dir=tmp_path / "data",
+            reports_dir=tmp_path / "reports",
+            run_date="2026-06-29",
+            update_latest=True,
+        )
+
+    assert exc_info.value.error_type == "mixed_tiger_broker_row"
+    assert "09999" in str(exc_info.value)
 
 
 def test_sync_tiger_portfolio_no_detail_accepts_canonical_mixed_tiger_row(
