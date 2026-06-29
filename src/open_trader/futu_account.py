@@ -616,7 +616,7 @@ def sync_futu_portfolio(
         (
             preserved_portfolio_positions,
             preserved_portfolio_cash,
-            preserved_has_invalid_hkd_value,
+            preserved_has_invalid_market_value,
         ) = _portfolio_inputs_from_preserved_rows(preserved_rows)
         merged_rows = build_portfolio_rows(
             run_date[:7],
@@ -624,7 +624,7 @@ def sync_futu_portfolio(
             [*preserved_portfolio_cash, *cash_balances],
             fx_provider,
         )
-        if preserved_has_invalid_hkd_value:
+        if preserved_has_invalid_market_value:
             _mark_all_rows_data_check(merged_rows)
     run_dir = data_dir / "runs" / run_date
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -776,25 +776,30 @@ def _portfolio_inputs_from_preserved_rows(
 ) -> tuple[list[Position], list[CashBalance], bool]:
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
-    has_invalid_hkd_value = False
+    has_invalid_market_value = False
     for row in rows:
         if _parse_finite_decimal(row.get("market_value_hkd", "").strip()) is None:
-            has_invalid_hkd_value = True
+            has_invalid_market_value = True
+        if _parse_finite_decimal(row.get("market_value", "").strip()) is None:
+            has_invalid_market_value = True
         market = _market_from_text(row.get("market", ""))
         asset_class = _asset_class_from_text(row.get("asset_class", ""))
         if market == Market.CASH and asset_class == AssetClass.CASH:
             cash_balances.append(_cash_from_portfolio_row(row))
             continue
         positions.append(_position_from_portfolio_row(row))
-    return positions, cash_balances, has_invalid_hkd_value
+    return positions, cash_balances, has_invalid_market_value
 
 
 def _position_from_portfolio_row(row: dict[str, str]) -> Position:
     quantity, quantity_ok = _required_decimal(row, ("total_quantity",))
-    market_value = _optional_decimal(row, ("market_value",))
+    market_value, market_value_ok = _market_value_from_portfolio_row(row)
     cost_value = _optional_decimal(row, ("cost_value",))
     required_fields_ok = (
-        quantity_ok and market_value is not None and cost_value is not None
+        quantity_ok
+        and market_value_ok
+        and market_value is not None
+        and cost_value is not None
     )
     return Position(
         statement_id="preserved-portfolio",
@@ -817,17 +822,28 @@ def _position_from_portfolio_row(row: dict[str, str]) -> Position:
 
 
 def _cash_from_portfolio_row(row: dict[str, str]) -> CashBalance:
-    cash_balance, cash_ok = _required_decimal(row, ("market_value",))
+    cash_balance, cash_ok = _market_value_from_portfolio_row(row)
     return CashBalance(
         statement_id="preserved-portfolio",
         broker=row.get("brokers", ""),
         account_alias=row.get("accounts", ""),
         currency=row.get("currency", "").upper(),
-        cash_balance=cash_balance,
+        cash_balance=cash_balance or Decimal("0"),
         available_balance=None,
         confidence=_confidence(row.get("confidence", ""), cash_ok),
         notes=row.get("notes", ""),
     )
+
+
+def _market_value_from_portfolio_row(row: dict[str, str]) -> tuple[Decimal | None, bool]:
+    market_value = _parse_finite_decimal(row.get("market_value", "").strip())
+    if market_value is not None:
+        return market_value, True
+    market_value_hkd = _parse_finite_decimal(row.get("market_value_hkd", "").strip())
+    fx_to_hkd = _parse_finite_decimal(row.get("fx_to_hkd", "").strip())
+    if market_value_hkd is not None and fx_to_hkd is not None and fx_to_hkd > 0:
+        return market_value_hkd / fx_to_hkd, False
+    return None, False
 
 
 def _position_to_statement_row(position: Position) -> dict[str, str]:

@@ -698,6 +698,37 @@ def hk_tiger_stock_row() -> dict[str, str]:
     }
 
 
+def usd_cash_row() -> dict[str, str]:
+    return {
+        "sort_group": "6",
+        "market": "CASH",
+        "asset_class": "cash",
+        "symbol": "USD_CASH",
+        "name": "USD Cash",
+        "currency": "USD",
+        "total_quantity": "1",
+        "avg_cost_price": "",
+        "last_price": "",
+        "market_value": "1000",
+        "cost_value": "",
+        "unrealized_pnl": "",
+        "unrealized_pnl_pct": "",
+        "fx_source": "external_month_end_static",
+        "fx_date": "2026-06-30",
+        "fx_to_hkd": "7.8",
+        "market_value_hkd": "7800.00",
+        "cost_value_hkd": "",
+        "portfolio_weight_hkd": "100.00%",
+        "brokers": "tiger",
+        "accounts": "tiger_main",
+        "ai_eligible": "false",
+        "analysis_symbol": "",
+        "risk_flag": "normal",
+        "confidence": "high",
+        "notes": "",
+    }
+
+
 def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
     tmp_path: Path,
 ) -> None:
@@ -1247,6 +1278,46 @@ def test_sync_futu_portfolio_marks_all_rows_data_check_when_preserved_hkd_value_
     rows = read_portfolio(result.portfolio_path)
     assert {row["portfolio_weight_hkd"] for row in rows} == {""}
     assert {row["risk_flag"] for row in rows} == {"data_check"}
+
+
+def test_sync_futu_portfolio_preserves_malformed_cash_value_from_valid_hkd_value(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    malformed_cash = {**usd_cash_row(), "market_value": "bad"}
+    write_portfolio(portfolio_path, [malformed_cash])
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "HKD",
+                "cash": "100",
+                "available_cash": "90",
+            }
+        ],
+        position_records=[],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-18",
+        update_latest=True,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    usd_cash = next(row for row in rows if row["symbol"] == "USD_CASH")
+    assert usd_cash["market_value_hkd"] == "7800.00"
+    assert usd_cash["market_value_hkd"] != "0.00"
+    assert {row["portfolio_weight_hkd"] for row in rows} == {""}
+    assert {row["risk_flag"] for row in rows} == {"data_check"}
+    assert result.updated_latest is True
+    latest_usd_cash = next(
+        row for row in read_portfolio(result.latest_path) if row["symbol"] == "USD_CASH"
+    )
+    assert latest_usd_cash["market_value_hkd"] == "7800.00"
 
 
 def test_sync_futu_portfolio_blocks_mixed_futu_broker_rows(tmp_path: Path) -> None:
