@@ -126,8 +126,13 @@ class RunLock:
             return
         handle = self._handle
         self._handle = None
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
 
 def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfig:

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from open_trader import technical_facts as technical_facts_module
 from open_trader.market_scope import MarketScope
 from open_trader.technical_facts import (
     LLMTechnicalFactsExtractor,
@@ -1007,17 +1008,42 @@ class FakeOpenAI:
         self.chat = FakeOpenAIChat()
 
 
-def test_openai_text_client_requests_json_response_format() -> None:
-    fake_openai = FakeOpenAI()
-    client = object.__new__(OpenAITextClient)
-    client.model = "test"
-    client.client = fake_openai
+def test_openai_text_client_requests_json_response_format_and_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingFakeOpenAI(FakeOpenAI):
+        def __init__(
+            self,
+            *,
+            api_key: str | None,
+            base_url: str,
+            timeout: float,
+        ) -> None:
+            super().__init__()
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            captured["client_timeout"] = timeout
+
+    monkeypatch.setattr(technical_facts_module, "OpenAI", CapturingFakeOpenAI)
+
+    client = OpenAITextClient(
+        api_key="test-key",
+        base_url="https://example.test",
+        model="test",
+        timeout_seconds=12.5,
+    )
 
     client.create(messages=[{"role": "user", "content": "report"}], temperature=0)
 
-    assert fake_openai.chat.completions.kwargs["response_format"] == {
+    assert captured["api_key"] == "test-key"
+    assert captured["base_url"] == "https://example.test"
+    assert captured["client_timeout"] == 12.5
+    assert client.client.chat.completions.kwargs["response_format"] == {
         "type": "json_object"
     }
+    assert client.client.chat.completions.kwargs["timeout"] == 12.5
 
 
 def test_generate_technical_facts_rejects_missing_timeframes_as_extraction_failed(

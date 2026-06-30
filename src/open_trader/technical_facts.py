@@ -75,11 +75,14 @@ class OpenAITextClient:
         api_key: str | None = None,
         base_url: str = DEEPSEEK_BASE_URL,
         model: str = DEFAULT_CLASSIFIER_MODEL,
+        timeout_seconds: float = 60.0,
     ) -> None:
         self.model = model
+        self.timeout_seconds = timeout_seconds
         self.client = OpenAI(
             api_key=api_key or os.environ.get("DEEPSEEK_API_KEY"),
             base_url=base_url,
+            timeout=timeout_seconds,
         )
 
     def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
@@ -88,6 +91,7 @@ class OpenAITextClient:
             messages=messages,
             temperature=temperature,
             response_format={"type": "json_object"},
+            timeout=self.timeout_seconds,
         )
         content = response.choices[0].message.content
         return content or ""

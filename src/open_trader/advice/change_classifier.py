@@ -188,14 +188,21 @@ def validate_classifier_output(raw: str) -> _ParsedClassification:
 
 
 class OpenAIClassifierClient:
-    def __init__(self, *, model: str = DEFAULT_CLASSIFIER_MODEL) -> None:
+    def __init__(
+        self,
+        *,
+        model: str = DEFAULT_CLASSIFIER_MODEL,
+        timeout_seconds: float = 60.0,
+    ) -> None:
         from openai import OpenAI
 
         self._client = OpenAI(
             api_key=os.environ.get("DEEPSEEK_API_KEY"),
             base_url=DEEPSEEK_BASE_URL,
+            timeout=timeout_seconds,
         )
         self._model = model
+        self._timeout_seconds = timeout_seconds
 
     def classify(self, prompt: str, payload: dict[str, object]) -> str:
         response = self._client.chat.completions.create(
@@ -208,6 +215,7 @@ class OpenAIClassifierClient:
                 },
             ],
             response_format={"type": "json_object"},
+            timeout=self._timeout_seconds,
         )
         content = response.choices[0].message.content
         if not content:

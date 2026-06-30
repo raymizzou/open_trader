@@ -1184,44 +1184,6 @@ def _raise_for_unsupported_detail_tiger_collisions(
             allow_futu_tiger_split=False,
         )
 
-    tiger_position_keys = {
-        _position_portfolio_key(position) for position in tiger_positions
-    }
-    preserved_position_brokers: dict[tuple[Market, str, str], set[str]] = {}
-    for position in preserved_positions:
-        key = _position_portfolio_key(position)
-        if key not in tiger_position_keys:
-            continue
-        preserved_position_brokers.setdefault(key, set()).update(
-            _broker_parts_from_text(position.broker)
-        )
-    for key, broker_parts in preserved_position_brokers.items():
-        if len(broker_parts) != 1:
-            _raise_mixed_tiger_broker_row(
-                {
-                    "symbol": key[1],
-                    "brokers": ";".join(sorted({*broker_parts, "tiger"})),
-                }
-            )
-
-    tiger_cash_keys = {_cash_portfolio_key(cash) for cash in tiger_cash_balances}
-    preserved_cash_brokers: dict[tuple[str, str], set[str]] = {}
-    for cash in preserved_cash:
-        key = _cash_portfolio_key(cash)
-        if key not in tiger_cash_keys:
-            continue
-        preserved_cash_brokers.setdefault(key, set()).update(
-            _broker_parts_from_text(cash.broker)
-        )
-    for key, broker_parts in preserved_cash_brokers.items():
-        if len(broker_parts) != 1:
-            _raise_mixed_tiger_broker_row(
-                {
-                    "symbol": key[0],
-                    "brokers": ";".join(sorted({*broker_parts, "tiger"})),
-                }
-            )
-
 
 def _portfolio_inputs_from_preserved_rows(
     rows: list[dict[str, str]],

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from open_trader import decision_facts as decision_facts_module
 from open_trader.decision_facts import (
     DECISION_FACTS_SCHEMA_VERSION,
     KLINE_FIELDS,
@@ -13,6 +14,7 @@ from open_trader.decision_facts import (
     MISSING_VALUE,
     DecisionFactsExtractor,
     LLMDecisionFactsExtractor,
+    OpenAITextClient,
     build_missing_fields,
     decision_facts_latest_path,
     decision_facts_run_path,
@@ -184,6 +186,58 @@ def test_build_missing_fields_uses_fixed_missing_value() -> None:
         "risk": MISSING_VALUE,
     }
     assert build_missing_fields(NEWS_SENTIMENT_FIELDS)["direction"] == MISSING_VALUE
+
+
+def test_openai_text_client_sets_sdk_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> object:
+            captured.update(kwargs)
+
+            class Message:
+                content = "{}"
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeOpenAI:
+        def __init__(
+            self,
+            *,
+            api_key: str | None,
+            base_url: str,
+            timeout: float,
+        ) -> None:
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            captured["client_timeout"] = timeout
+            self.chat = type(
+                "Chat",
+                (),
+                {"completions": FakeCompletions()},
+            )()
+
+    monkeypatch.setattr(decision_facts_module, "OpenAI", FakeOpenAI)
+
+    client = OpenAITextClient(
+        api_key="test-key",
+        base_url="https://example.test",
+        model="model-x",
+        timeout_seconds=12.5,
+    )
+    content = client.create(messages=[{"role": "user", "content": "hi"}], temperature=0)
+
+    assert content == "{}"
+    assert captured["api_key"] == "test-key"
+    assert captured["base_url"] == "https://example.test"
+    assert captured["client_timeout"] == 12.5
+    assert captured["timeout"] == 12.5
 
 
 def test_validate_decision_facts_record_rejects_missing_fixed_field() -> None:

@@ -227,20 +227,29 @@ def test_openai_classifier_client_uses_deepseek_compatible_api(
             )
 
     class FakeOpenAI:
-        def __init__(self, *, api_key: str | None = None, base_url: str | None = None):
+        def __init__(
+            self,
+            *,
+            api_key: str | None = None,
+            base_url: str | None = None,
+            timeout: float | None = None,
+        ):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
+            captured["client_timeout"] = timeout
             self.chat = SimpleNamespace(completions=FakeCompletions())
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
 
-    client = OpenAIClassifierClient()
+    client = OpenAIClassifierClient(timeout_seconds=12.5)
     content = client.classify("Return JSON.", {"symbol": "QQQ"})
 
     assert content == '{"ok": true}'
     assert captured["api_key"] == "deepseek-secret"
     assert captured["base_url"] == "https://api.deepseek.com"
+    assert captured["client_timeout"] == 12.5
     request = captured["request"]
     assert request["model"] == "deepseek-v4-flash"
     assert request["response_format"] == {"type": "json_object"}
+    assert request["timeout"] == 12.5

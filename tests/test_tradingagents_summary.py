@@ -518,9 +518,16 @@ def test_openai_text_client_uses_json_response_format(monkeypatch: pytest.Monkey
             return Response()
 
     class FakeOpenAI:
-        def __init__(self, *, api_key: str | None, base_url: str) -> None:
+        def __init__(
+            self,
+            *,
+            api_key: str | None,
+            base_url: str,
+            timeout: float,
+        ) -> None:
             captured["api_key"] = api_key
             captured["base_url"] = base_url
+            captured["client_timeout"] = timeout
             self.chat = type(
                 "Chat",
                 (),
@@ -529,16 +536,23 @@ def test_openai_text_client_uses_json_response_format(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(tradingagents_summary_module, "OpenAI", FakeOpenAI)
 
-    client = OpenAITextClient(api_key="test-key", base_url="https://example.test", model="model-x")
+    client = OpenAITextClient(
+        api_key="test-key",
+        base_url="https://example.test",
+        model="model-x",
+        timeout_seconds=12.5,
+    )
     content = client.create(messages=[{"role": "user", "content": "hi"}], temperature=0)
 
     assert content == '{"ok": true}'
     assert captured["api_key"] == "test-key"
     assert captured["base_url"] == "https://example.test"
+    assert captured["client_timeout"] == 12.5
     assert captured["model"] == "model-x"
     assert captured["messages"] == [{"role": "user", "content": "hi"}]
     assert captured["temperature"] == 0
     assert captured["response_format"] == {"type": "json_object"}
+    assert captured["timeout"] == 12.5
 
 
 def test_generate_summary_uses_fallback_date_and_fixed_fields(tmp_path: Path) -> None:

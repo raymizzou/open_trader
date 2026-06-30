@@ -518,6 +518,15 @@ def test_run_lock_rejects_second_owner(tmp_path: Path) -> None:
                 pass
 
 
+def test_run_lock_removes_lock_file_after_release(tmp_path: Path) -> None:
+    lock_path = tmp_path / "run.lock"
+
+    with RunLock(lock_path):
+        assert lock_path.exists()
+
+    assert not lock_path.exists()
+
+
 class FakePremarket:
     def __init__(self, *, market: str = "US", symbol: str = "MSFT") -> None:
         self.market = market

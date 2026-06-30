@@ -1982,6 +1982,101 @@ def test_sync_tiger_portfolio_detail_path_merges_phillips_tiger_collision(
     assert row["market_value_hkd"] == "29130.00"
 
 
+def test_sync_tiger_portfolio_detail_path_merges_multiple_non_tiger_cash_sources(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [])
+    run_dir = tmp_path / "data/runs/2026-06-30"
+    write_csv(
+        run_dir / "extracted_positions.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "market",
+            "asset_class",
+            "symbol",
+            "name",
+            "currency",
+            "quantity",
+            "cost_price",
+            "last_price",
+            "market_value",
+            "cost_value",
+            "unrealized_pnl",
+            "confidence",
+            "notes",
+        ],
+        [],
+    )
+    write_csv(
+        run_dir / "extracted_cash.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "currency",
+            "cash_balance",
+            "available_balance",
+            "confidence",
+            "notes",
+        ],
+        [
+            {
+                "statement_id": "2026-06-30-futu-live",
+                "broker": "futu",
+                "account_alias": "futu_live",
+                "currency": "HKD",
+                "cash_balance": "100",
+                "available_balance": "100",
+                "confidence": "high",
+                "notes": "Futu live account cash",
+            },
+            {
+                "statement_id": "2026-05-phillips",
+                "broker": "phillips",
+                "account_alias": "phillips_main",
+                "currency": "HKD",
+                "cash_balance": "-20",
+                "available_balance": "",
+                "confidence": "high",
+                "notes": "Phillips statement cash",
+            },
+        ],
+    )
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_5683",
+                "currency": "HKD",
+                "cash_balance": "50",
+                "available_balance": "50",
+                "source": "get_prime_assets",
+            }
+        ],
+        position_records=[],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-30",
+        update_latest=True,
+    )
+
+    rows = {
+        row["symbol"]: row
+        for row in read_portfolio(result.portfolio_path)
+        if row["market"] == "CASH"
+    }
+    assert rows["HKD_CASH"]["brokers"] == "futu;phillips;tiger"
+    assert rows["HKD_CASH"]["market_value"] == "130"
+    assert rows["HKD_CASH"]["market_value_hkd"] == "130.00"
+
+
 def test_sync_tiger_portfolio_detail_path_blocks_non_colliding_mixed_broker_row(
     tmp_path: Path,
 ) -> None:
