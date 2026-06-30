@@ -578,6 +578,7 @@ class DailyPremarketRunner:
                 status=status,
                 futu_status=futu_status,
                 trade_actions=trade_action_counts,
+                status_reasons=list(daily_state["status_reasons"]),
             ):
                 try:
                     blocker_message = _blocker_notification_message(
@@ -1570,8 +1571,18 @@ def _should_notify_blocker(
     status: str,
     futu_status: dict[str, object],
     trade_actions: dict[str, int],
+    status_reasons: list[str] | None = None,
 ) -> bool:
     if status == "failed":
+        return True
+    report_reasons = {
+        "advice_fallback",
+        "advice_error",
+        "plan_fallback",
+        "plan_error",
+        "tradingagents_summary_failed",
+    }
+    if report_reasons.intersection(status_reasons or []):
         return True
     if str(futu_status.get("error", "")).strip():
         return True

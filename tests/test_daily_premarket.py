@@ -1243,6 +1243,7 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
         logs_dir=tmp_path / "logs",
         portfolio=tmp_path / "data/latest/portfolio.csv",
         dry_run=False,
+        notify_daily_report=True,
     )
     latest_dir = tmp_path / "data/latest/US"
     latest_dir.mkdir(parents=True, exist_ok=True)
@@ -1252,6 +1253,7 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
         encoding="utf-8",
     )
     failing_summary = FailingTradingAgentsSummaryGenerator("summary boom")
+    notifier = CapturingNotifier()
 
     result = _daily_runner(
         config=config,
@@ -1260,7 +1262,7 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
         quote_client_factory=FakeQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
         summary_generator=failing_summary,
-        notifier=NullNotifier(),
+        notifier=notifier,
     ).run("2026-06-17", market="US")
 
     assert result.status == "partial"
@@ -1294,6 +1296,14 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
     assert "TradingAgents 摘要生成异常" in report
     assert "- tradingagents_summary: " in report
     assert f"- latest_tradingagents_summary: {latest_dir}" not in report
+    blocker_calls = [
+        call for call in notifier.calls if call[0] == "Open Trader 美股阻塞通知"
+    ]
+    assert len(blocker_calls) == 1
+    _, body = blocker_calls[0]
+    assert "Open Trader｜阻塞通知" in body
+    assert "原因：TradingAgents 摘要生成异常" in body
+    assert "报告：" in body
 
 
 def test_daily_runner_sends_feishu_order_review_after_trade_actions(
