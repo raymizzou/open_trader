@@ -721,7 +721,7 @@ function renderTradingDecisionPlugins(holding) {
       ],
       score: "K线",
     }),
-    decisionFactsPlugin(holding, {
+    futuSkillNewsSentimentPlugin(holding) || decisionFactsPlugin(holding, {
       title: "新闻 / 舆论",
       moduleKey: "news_sentiment",
       fieldOrder: [
@@ -845,6 +845,92 @@ function decisionFactsPlugin(holding, config) {
     bodyHtml: renderDecisionFactRows(rows),
     condition: "",
   };
+}
+
+function futuSkillNewsSentimentPlugin(holding) {
+  const module = futuSkillNewsSentimentModule(holding);
+  if (!module || module.available !== true) {
+    return null;
+  }
+  const signal = formatFutuSkillSignal(module.signal);
+  const confidence = formatFutuSkillConfidence(module.confidence);
+  const evidence = Array.isArray(module.evidence) ? module.evidence : [];
+  const rows = [
+    { label: "方向", value: signal },
+    { label: "变化", value: formatPlain(module.status) },
+    { label: "催化", value: firstEvidenceSummary(evidence) },
+    { label: "风险", value: formatPlain(module.blocking_reason || module.suggested_constraint || "未触发阻断") },
+    { label: "热度", value: confidence },
+  ];
+  return {
+    title: "新闻 / 舆论",
+    status: "可用",
+    tone: "ok",
+    score: "舆论",
+    headline: signal,
+    detail: "Futu Skill 证据",
+    bodyHtml: renderDecisionFactRows(rows) + renderFutuSkillEvidence(evidence),
+    condition: "",
+  };
+}
+
+function futuSkillNewsSentimentModule(holding) {
+  const facts = holding && holding.futu_skill_facts && typeof holding.futu_skill_facts === "object"
+    ? holding.futu_skill_facts
+    : {};
+  const module = facts.news_sentiment;
+  return module && typeof module === "object" ? module : null;
+}
+
+function renderFutuSkillEvidence(evidence) {
+  const items = evidence
+    .filter((item) => item && typeof item === "object")
+    .slice(0, 3);
+  if (!items.length) {
+    return "";
+  }
+  return `
+    <div class="decision-fact-grid">
+      ${items.map((item, index) => `
+        <div class="decision-fact-row">
+          <span>${index === 0 ? "Futu Skill 证据" : "证据"}</span>
+          <strong>${escapeHtml(formatEvidenceText(item))}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function formatEvidenceText(item) {
+  const title = formatPlain(item.title);
+  const summary = formatPlain(item.summary);
+  const url = formatPlain(item.url);
+  return [title, summary, url].filter((value) => value !== "-").join(" · ") || "-";
+}
+
+function firstEvidenceSummary(evidence) {
+  const first = evidence.find((item) => item && typeof item === "object" && hasValue(item.summary));
+  return first ? formatPlain(first.summary) : "缺失";
+}
+
+function formatFutuSkillSignal(signal) {
+  const labels = {
+    supportive: "支持",
+    opposing: "反对",
+    neutral: "中性",
+    risk_up: "风险升高",
+    mixed: "分歧",
+  };
+  return labels[formatPlain(signal)] || formatPlain(signal);
+}
+
+function formatFutuSkillConfidence(confidence) {
+  const labels = {
+    high: "置信度高",
+    medium: "置信度中",
+    low: "置信度低",
+  };
+  return labels[formatPlain(confidence)] || formatPlain(confidence);
 }
 
 function decisionFactsModule(holding, moduleKey) {

@@ -136,6 +136,50 @@ def write_decision_facts(path: Path, kline_hash: str, news_hash: str) -> None:
     )
 
 
+def write_futu_skill_facts(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.futu_skill_facts.v1",
+                "generated_at": "2026-07-01T09:15:00+08:00",
+                "run_date": "2026-07-01",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.futu_skill_facts.v1",
+                        "run_date": "2026-07-01",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "name": "ProShares VIX Short-Term Futures ETF",
+                        "news_sentiment": {
+                            "status": "ok",
+                            "signal": "supportive",
+                            "confidence": "medium",
+                            "freshness": {
+                                "generated_at": "2026-07-01T09:10:00+08:00",
+                                "source_window": "latest",
+                            },
+                            "evidence": [
+                                {
+                                    "title": "Volatility ETF news digest",
+                                    "summary": "市场波动相关讨论升温。",
+                                    "url": "https://example.com/vixy",
+                                }
+                            ],
+                            "blocking_reason": "",
+                            "suggested_constraint": "",
+                        },
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def write_technical_facts(
     path: Path,
     *,
@@ -1246,6 +1290,23 @@ def test_dashboard_stale_decision_facts_render_missing_fields(
         value == MISSING_VALUE
         for value in vixy["decision_facts"]["news_sentiment"]["fields"].values()
     )
+
+
+def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_futu_skill_facts(
+        config.data_dir / "latest" / "US" / "futu_skill_facts.json",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = state["holdings"][0]
+    news_sentiment = vixy["futu_skill_facts"]["news_sentiment"]
+    assert news_sentiment["available"] is True
+    assert news_sentiment["signal"] == "supportive"
+    assert news_sentiment["confidence"] == "medium"
+    assert news_sentiment["evidence"][0]["url"] == "https://example.com/vixy"
 
 
 def test_load_dashboard_state_marks_missing_agent_sections_unavailable(

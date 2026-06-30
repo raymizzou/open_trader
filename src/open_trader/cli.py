@@ -22,6 +22,7 @@ from .dashboard_web import serve_dashboard
 from .decision_facts import LLMDecisionFactsExtractor, generate_decision_facts
 from .futu_account import FutuAccountClient, FutuAccountError, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
+from .futu_skill_facts import FutuNewsSentimentExtractor, generate_futu_skill_facts
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
@@ -389,6 +390,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--update-latest",
         action="store_true",
         help="Update data/latest decision_facts.json after writing dated artifact",
+    )
+
+    futu_skill_facts_parser = subparsers.add_parser(
+        "extract-futu-skill-facts",
+        help="Extract Futu Skills-backed facts for dashboard plugin cards",
+    )
+    futu_skill_facts_parser.add_argument(
+        "--portfolio",
+        type=Path,
+        required=True,
+        help="Portfolio CSV path",
+    )
+    futu_skill_facts_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    futu_skill_facts_parser.add_argument(
+        "--date",
+        type=canonical_date,
+        required=True,
+        help="Run date, YYYY-MM-DD",
+    )
+    futu_skill_facts_parser.add_argument(
+        "--market",
+        type=canonical_market,
+        choices=["HK", "US"],
+        help="Optional market scope: HK or US",
+    )
+    futu_skill_facts_parser.add_argument(
+        "--update-latest",
+        action="store_true",
+        help="Update data/latest futu_skill_facts.json after writing dated artifact",
     )
 
     tradingagents_summary_parser = subparsers.add_parser(
@@ -843,6 +873,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"extracted: {result.extracted}")
         print(f"failed: {result.failed}")
         print(f"decision_facts_json: {result.run_path}")
+        print(f"latest: {result.latest_path}")
+        return 0
+
+    if args.command == "extract-futu-skill-facts":
+        if not args.portfolio.exists():
+            parser.error(f"portfolio CSV not found: {args.portfolio}")
+        try:
+            extractor = FutuNewsSentimentExtractor()
+        except Exception as exc:
+            parser.error(str(exc))
+        try:
+            result = generate_futu_skill_facts(
+                portfolio_path=args.portfolio,
+                data_dir=args.data_dir,
+                run_date=args.date,
+                market=args.market,
+                extractor=extractor,
+                update_latest=args.update_latest,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"run_date: {result.run_date}")
+        print(f"futu_skill_facts: {result.records}")
+        print(f"generated: {result.generated}")
+        print(f"failed: {result.failed}")
+        print(f"futu_skill_facts_json: {result.run_path}")
         print(f"latest: {result.latest_path}")
         return 0
 

@@ -346,6 +346,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位" in js
     assert "decisionFactsPlugin" in js
     assert "decision_facts" in js
+    assert "futuSkillNewsSentimentPlugin" in js
+    assert "futu_skill_facts" in js
+    assert "Futu Skill 证据" in js
     assert "technical_facts" in js
     assert "technicalFactRows" in js
     assert "插件管理" not in js

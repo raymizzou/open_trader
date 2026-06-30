@@ -16,6 +16,10 @@ from .decision_facts import (
     index_decision_facts_by_market_symbol,
     load_decision_facts_cache,
 )
+from .futu_skill_facts import (
+    index_futu_skill_facts_by_market_symbol,
+    load_futu_skill_facts_cache,
+)
 from .research_chat import load_research_view_for_holding
 from .technical_facts import (
     extract_market_report,
@@ -148,6 +152,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             markets=holding_markets,
         )
     )
+    futu_skill_facts_by_holding = _latest_futu_skill_facts_for_markets(
+        data_dir=config.data_dir,
+        markets=holding_markets,
+    )
     tradingagents_summary_by_holding = _latest_tradingagents_summary_for_markets(
         data_dir=config.data_dir,
         markets=holding_markets,
@@ -171,6 +179,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             technical_facts_file_exists_by_market,
             decision_facts_by_holding,
             decision_facts_file_exists_by_market,
+            futu_skill_facts_by_holding,
             tradingagents_summary_by_holding,
         )
         for row in holding_rows
@@ -322,6 +331,34 @@ def _latest_decision_facts_for_markets(
     return records_by_key, file_exists_by_market
 
 
+def _latest_futu_skill_facts_for_markets(
+    *,
+    data_dir: Path,
+    markets: set[str],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    unscoped_records = index_futu_skill_facts_by_market_symbol(
+        load_futu_skill_facts_cache(data_dir / "latest" / "futu_skill_facts.json")
+    )
+    records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for market in markets:
+        scoped_path = data_dir / "latest" / market / "futu_skill_facts.json"
+        if scoped_path.exists():
+            records_by_key.update(
+                index_futu_skill_facts_by_market_symbol(
+                    load_futu_skill_facts_cache(scoped_path)
+                )
+            )
+            continue
+        records_by_key.update(
+            {
+                key: record
+                for key, record in unscoped_records.items()
+                if key[0] == market
+            }
+        )
+    return records_by_key
+
+
 def _latest_tradingagents_summary_for_markets(
     *,
     data_dir: Path,
@@ -426,6 +463,7 @@ def _merge_holding(
     technical_facts_file_exists_by_market: dict[str, bool],
     decision_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
     decision_facts_file_exists_by_market: dict[str, bool],
+    futu_skill_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
     tradingagents_summary_by_holding: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
@@ -467,6 +505,9 @@ def _merge_holding(
             if key is not None
             else False
         ),
+    )
+    holding["futu_skill_facts"] = _futu_skill_facts_detail(
+        futu_skill_facts_by_holding.get(key) if key is not None else None,
     )
     holding["research_view"] = (
         load_research_view_for_holding(
@@ -784,6 +825,53 @@ def _decision_module_detail(
         "source_hash": source_hash_value,
         "current_source_hash": current_source_hash,
         "fields": {field: str(raw_fields[field]) for field in fields},
+    }
+
+
+def _futu_skill_facts_detail(record: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "news_sentiment": _futu_skill_news_sentiment_detail(
+            record.get("news_sentiment") if isinstance(record, dict) else None
+        )
+    }
+
+
+def _futu_skill_news_sentiment_detail(module: object) -> dict[str, Any]:
+    if not isinstance(module, dict):
+        return _missing_futu_skill_news_sentiment()
+    status = str(module.get("status") or "").strip()
+    signal = str(module.get("signal") or "").strip()
+    confidence = str(module.get("confidence") or "").strip()
+    if not status or status in {"missing", "error"}:
+        return {
+            **_missing_futu_skill_news_sentiment(),
+            "status": status or "missing",
+            "signal": signal,
+            "confidence": confidence,
+        }
+    evidence = module.get("evidence")
+    return {
+        "available": True,
+        "status": status,
+        "signal": signal,
+        "confidence": confidence,
+        "freshness": module.get("freshness") if isinstance(module.get("freshness"), dict) else {},
+        "evidence": evidence if isinstance(evidence, list) else [],
+        "blocking_reason": str(module.get("blocking_reason") or ""),
+        "suggested_constraint": str(module.get("suggested_constraint") or ""),
+    }
+
+
+def _missing_futu_skill_news_sentiment() -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": "missing",
+        "signal": "",
+        "confidence": "",
+        "freshness": {},
+        "evidence": [],
+        "blocking_reason": "",
+        "suggested_constraint": "",
     }
 
 

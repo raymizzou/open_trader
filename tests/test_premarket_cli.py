@@ -730,6 +730,74 @@ def test_extract_decision_facts_main_wires_generator(
     assert "decision_facts_json:" in output
 
 
+def test_extract_futu_skill_facts_help_includes_expected_options(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["extract-futu-skill-facts", "--help"])
+
+    assert excinfo.value.code == 0
+    output = capsys.readouterr().out
+    assert "--portfolio" in output
+    assert "--data-dir" in output
+    assert "--date" in output
+    assert "--market" in output
+    assert "--update-latest" in output
+
+
+def test_extract_futu_skill_facts_main_wires_generator(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text("market,symbol,asset_class\nUS,NVDA,stock\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class FakeExtractor:
+        pass
+
+    def fake_generate_futu_skill_facts(**kwargs: object):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            run_date="2026-07-01",
+            records=1,
+            generated=1,
+            failed=0,
+            run_path=tmp_path / "data/runs/2026-07-01/US/futu_skill_facts.json",
+            latest_path=tmp_path / "data/latest/US/futu_skill_facts.json",
+        )
+
+    monkeypatch.setattr(cli, "FutuNewsSentimentExtractor", lambda: FakeExtractor())
+    monkeypatch.setattr(cli, "generate_futu_skill_facts", fake_generate_futu_skill_facts)
+
+    result = cli.main(
+        [
+            "extract-futu-skill-facts",
+            "--portfolio",
+            str(portfolio),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--date",
+            "2026-07-01",
+            "--market",
+            "US",
+            "--update-latest",
+        ]
+    )
+
+    assert result == 0
+    assert captured["portfolio_path"] == portfolio
+    assert captured["data_dir"] == tmp_path / "data"
+    assert captured["run_date"] == "2026-07-01"
+    assert captured["market"] == "US"
+    assert captured["update_latest"] is True
+    assert isinstance(captured["extractor"], FakeExtractor)
+    output = capsys.readouterr().out
+    assert "futu_skill_facts: 1" in output
+    assert "futu_skill_facts_json:" in output
+
+
 def test_extract_tradingagents_summary_main_writes_summary_with_fake_extractor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
