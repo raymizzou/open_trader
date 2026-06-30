@@ -3,6 +3,23 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-06-30
+
+- Canonicalized `portfolio.csv` grouping so daily HK/US workflows consume
+  deduplicated current holdings instead of repeated broker rows.
+- Hardened Futu and Tiger portfolio sync merges, including malformed cash rows,
+  stale Tiger FX rows, mixed-broker fallback safety, and multi-broker cash detail
+  preservation.
+- Stabilized daily startup by clearing successful run locks and adding bounded
+  OpenAI-compatible request timeouts for classifier, facts, and TradingAgents
+  summary post-processing.
+- Added blocker notifications when TradingAgents advice, trading plans, or
+  summaries degrade to fallback/error so missing US reports are visible to the
+  operator.
+- Verified with live Futu/Tiger syncs, `data/latest/portfolio.csv` duplicate
+  count `0`, US daily runner `success / ready`, local dashboard deployment on
+  `127.0.0.1:8766`, Playwright desktop/mobile checks, and `832` passing tests.
+
 ## 2026-06-23
 
 - Added fixed TradingAgents decision facts for dashboard display:
