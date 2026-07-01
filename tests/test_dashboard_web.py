@@ -410,7 +410,18 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".market-section-us" in css
     assert ".market-section-hk" in css
     assert ".symbol-cell" in css
+    scoped_table_selector = ".holdings-panel > .table-wrap > table"
+    assert scoped_table_selector in css
+    global_table_css = css.split(scoped_table_selector, 1)[0]
+    assert "table-layout: fixed;" not in global_table_css
+    assert "min-width: 1120px;" in css
     assert "table-layout: fixed;" in css
+    assert ".holdings-panel > .table-wrap > table th:nth-child(3) {" in css
+    assert "width: 170px;" in css
+    number_cell_css = css.split(".number-cell {", 1)[1].split("}", 1)[0]
+    assert "text-align: right;" in number_cell_css
+    market_section_other_css = css.split(".market-section-other td {", 1)[1].split("}", 1)[0]
+    assert "border-bottom-color: var(--line);" in market_section_other_css
     assert "grid-template-columns: minmax(0, 1fr) 300px;" not in css
     assert ".right-rail" not in css
     assert 'grid-template-areas: "brand source" "assets assets";' in css

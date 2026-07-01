@@ -494,9 +494,52 @@ h2 {
 
 table {
   border-collapse: collapse;
+  width: 100%;
+}
+
+.holdings-panel > .table-wrap > table {
   min-width: 1120px;
   table-layout: fixed;
-  width: 100%;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(1) {
+  width: 84px;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(2) {
+  width: 58px;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(3) {
+  width: 170px;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(4) {
+  width: 92px;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(5) {
+  width: 96px;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(6) {
+  width: 96px;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(7) {
+  width: 130px;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(8) {
+  width: 136px;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(9) {
+  width: 138px;
+}
+
+.holdings-panel > .table-wrap > table th:nth-child(10) {
+  width: 120px;
 }
 
 th,
@@ -558,6 +601,7 @@ tbody tr.active-row {
 
 .market-section-other td {
   background: var(--surface-soft);
+  border-bottom-color: var(--line);
   border-top-color: var(--line);
   color: var(--muted);
 }
@@ -598,6 +642,7 @@ tbody tr.active-row {
 
 .number-cell {
   font-variant-numeric: tabular-nums;
+  text-align: right;
   white-space: nowrap;
 }
 
