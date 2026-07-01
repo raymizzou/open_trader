@@ -416,8 +416,15 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "table-layout: fixed;" not in global_table_css
     assert "min-width: 1120px;" in css
     assert "table-layout: fixed;" in css
-    assert ".holdings-panel > .table-wrap > table th:nth-child(3) {" in css
-    assert "width: 170px;" in css
+    symbol_column_selector = (
+        ".holdings-panel > .table-wrap > table > thead > tr > th:nth-child(3) {"
+    )
+    assert symbol_column_selector in css
+    assert ".holdings-panel > .table-wrap > table th:nth-child(3) {" not in css
+    assert ".holdings-panel > .table-wrap > table > thead > tr > th:nth-child(1) {" in css
+    assert ".holdings-panel > .table-wrap > table > thead > tr > th:nth-child(10) {" in css
+    symbol_column_css = css.split(symbol_column_selector, 1)[1].split("}", 1)[0]
+    assert "width: 170px;" in symbol_column_css
     number_cell_css = css.split(".number-cell {", 1)[1].split("}", 1)[0]
     assert "text-align: right;" in number_cell_css
     market_section_other_css = css.split(".market-section-other td {", 1)[1].split("}", 1)[0]
