@@ -3,18 +3,12 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import sys
 import threading
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Any
 
 import pytest
-
-PROJECT_SRC = Path(__file__).resolve().parents[1] / "src"
-if str(PROJECT_SRC) not in sys.path:
-    sys.path.insert(0, str(PROJECT_SRC))
 
 from open_trader.dashboard_quotes import QuoteRefreshResult
 from open_trader.dashboard_web import STATIC_DIR
