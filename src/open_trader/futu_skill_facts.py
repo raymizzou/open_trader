@@ -6,7 +6,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Protocol
@@ -24,6 +24,9 @@ from open_trader.market_scope import (
 
 
 FUTU_SKILL_FACTS_SCHEMA_VERSION = "open_trader.futu_skill_facts.v1"
+FUTU_STOCK_FEED_CACHE_FILENAME = "futu_stock_feed_cache.json"
+FUTU_STOCK_FEED_CACHE_DAYS = 7
+FUTU_STOCK_FEED_SIZE = 50
 VALID_MODULE_STATUSES = {"ok", "partial", "missing", "error", "stale"}
 VALID_SIGNALS = {"supportive", "opposing", "neutral", "risk_up", "mixed"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
@@ -40,6 +43,54 @@ GENERIC_COMMUNITY_TERMS = {
     "ltd",
     "the",
     "trust",
+}
+RELATED_COMMUNITY_TERMS_BY_SYMBOL = {
+    "DRAM": {
+        "dram",
+        "memory",
+        "mu",
+        "mu.us",
+        "美光",
+        "美光科技",
+        "sndk",
+        "sndk.us",
+        "闪迪",
+        "sk海力士",
+        "海力士",
+        "000660",
+        "000660.kr",
+        "存储",
+        "内存",
+        "存储链",
+    },
+    "RAM": {
+        "dram",
+        "memory",
+        "mu",
+        "mu.us",
+        "美光",
+        "美光科技",
+        "sndk",
+        "sndk.us",
+        "闪迪",
+        "sk海力士",
+        "海力士",
+        "000660",
+        "000660.kr",
+        "存储",
+        "内存",
+        "存储链",
+    },
+    "07709": {
+        "07709",
+        "sk海力士",
+        "海力士",
+        "000660",
+        "000660.kr",
+        "hynix",
+        "存储",
+        "内存",
+    },
 }
 BULLISH_CUES = (
     "bullish",
@@ -188,6 +239,53 @@ class FutuNewsSentimentExtractor:
         self.domestic_summarizer = (
             domestic_summarizer or LLMFutuDomesticDiscussionSummarizer()
         )
+        self._prepared_feed_items_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._prepared_feed_counts_by_key: dict[tuple[str, str], int] = {}
+
+    def prepare_sources(
+        self,
+        *,
+        sources: list[FutuSkillSource],
+        data_dir: Path,
+        run_date: str,
+        market: MarketScope | str | None,
+    ) -> None:
+        market_scope = _market_scope(market)
+        fetched_items: list[dict[str, Any]] = []
+        for source in sources:
+            try:
+                payload = self.http_get_json(
+                    f"{FUTU_AI_SEARCH_BASE_URL}/stock_feed",
+                    {
+                        "keyword": source.symbol,
+                        "size": FUTU_STOCK_FEED_SIZE,
+                    },
+                )
+            except Exception:
+                continue
+            fetched_items.extend(
+                _feed_items_from_payload(payload, query_symbol=source.symbol)
+            )
+        cache_path = futu_stock_feed_cache_path(data_dir, market_scope)
+        cached_items = _load_stock_feed_cache_items(cache_path)
+        window_items = _merge_stock_feed_cache_items(
+            cached_items=cached_items,
+            fetched_items=fetched_items,
+            run_date=run_date,
+        )
+        _write_stock_feed_cache(
+            cache_path,
+            market=market_scope.value if market_scope is not None else "",
+            items=window_items,
+        )
+        self._prepared_feed_counts_by_key = {
+            (source.market.upper(), source.symbol.upper()): len(window_items)
+            for source in sources
+        }
+        self._prepared_feed_items_by_key = _assign_feed_items_to_sources(
+            window_items,
+            sources=sources,
+        )
 
     def extract_news_sentiment(
         self,
@@ -199,7 +297,6 @@ class FutuNewsSentimentExtractor:
     ) -> dict[str, object]:
         del run_date
         news_keyword = name.strip() or symbol
-        feed_keyword = symbol.strip() or news_keyword
         news_payload = self.http_get_json(
             f"{FUTU_AI_SEARCH_BASE_URL}/news_search",
             {
@@ -210,27 +307,36 @@ class FutuNewsSentimentExtractor:
                 "sort_type": 2,
             },
         )
-        feed_payload = self.http_get_json(
-            f"{FUTU_AI_SEARCH_BASE_URL}/stock_feed",
-            {
-                "keyword": feed_keyword,
-                "size": 30,
-            },
-        )
         news_evidence = _evidence_from_news_payload(news_payload)
-        feed_items = _feed_items_from_payload(feed_payload)
-        community_evidence = _relevant_community_evidence(
-            feed_items,
-            symbol=symbol,
-            name=name,
-        )
+        prepared_key = (market.upper(), symbol.upper())
+        if prepared_key in self._prepared_feed_items_by_key:
+            feed_items = self._prepared_feed_items_by_key[prepared_key]
+            community_evidence = [_public_feed_item(item) for item in feed_items]
+            post_count = self._prepared_feed_counts_by_key.get(prepared_key, len(feed_items))
+            source_window = f"rolling_{FUTU_STOCK_FEED_CACHE_DAYS}d"
+        else:
+            feed_payload = self.http_get_json(
+                f"{FUTU_AI_SEARCH_BASE_URL}/stock_feed",
+                {
+                    "keyword": symbol.strip() or news_keyword,
+                    "size": 30,
+                },
+            )
+            feed_items = _feed_items_from_payload(feed_payload, query_symbol=symbol)
+            community_evidence = _relevant_community_evidence(
+                feed_items,
+                symbol=symbol,
+                name=name,
+            )
+            post_count = len(feed_items)
+            source_window = "latest"
         domestic_discussion = self._summarize_domestic_discussion(
             market=market,
             symbol=symbol,
             name=name,
             news_items=news_evidence,
             community_items=community_evidence,
-            post_count=len(feed_items),
+            post_count=post_count,
             relevant_post_count=len(community_evidence),
         )
         evidence = [
@@ -247,7 +353,7 @@ class FutuNewsSentimentExtractor:
             "status": "ok",
             "signal": signal,
             "confidence": "medium" if len(evidence) >= 2 else "low",
-            "freshness": {"generated_at": _now_text(), "source_window": "latest"},
+            "freshness": {"generated_at": _now_text(), "source_window": source_window},
             "evidence": evidence,
             "domestic_discussion": domestic_discussion,
             "blocking_reason": "",
@@ -313,6 +419,16 @@ def futu_skill_facts_latest_path(
     return data_dir / "latest" / "futu_skill_facts.json"
 
 
+def futu_stock_feed_cache_path(
+    data_dir: Path,
+    market: MarketScope | str | None = None,
+) -> Path:
+    scope = _market_scope(market)
+    if scope is not None:
+        return market_scoped_latest_path(data_dir, scope, FUTU_STOCK_FEED_CACHE_FILENAME)
+    return data_dir / "latest" / FUTU_STOCK_FEED_CACHE_FILENAME
+
+
 def load_futu_skill_facts_cache(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -372,6 +488,14 @@ def generate_futu_skill_facts(
     sources = _load_portfolio_sources(portfolio_path, market_scope)
     run_path = futu_skill_facts_run_path(data_dir, effective_run_date, market_scope)
     latest_path = futu_skill_facts_latest_path(data_dir, market_scope)
+    prepare_sources = getattr(extractor, "prepare_sources", None)
+    if callable(prepare_sources):
+        prepare_sources(
+            sources=sources,
+            data_dir=data_dir,
+            run_date=effective_run_date,
+            market=market_scope,
+        )
     records = [
         _build_record(
             source=source,
@@ -530,6 +654,124 @@ def _default_http_get_json(url: str, params: dict[str, object]) -> dict[str, obj
     return payload if isinstance(payload, dict) else {}
 
 
+def _load_stock_feed_cache_items(path: Path) -> list[dict[str, Any]]:
+    payload = load_futu_skill_facts_cache(path)
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        normalized.append(_normalize_cached_feed_item(item))
+    return normalized
+
+
+def _normalize_cached_feed_item(item: dict[str, object]) -> dict[str, Any]:
+    query_symbols = item.get("query_symbols")
+    stock_terms = item.get("stock_terms")
+    return {
+        "id": _optional_text(item.get("id")) or _feed_item_fallback_id(
+            item.get("title"),
+            item.get("summary"),
+            item.get("publish_time"),
+        ),
+        "title": _optional_text(item.get("title")),
+        "summary": _optional_text(item.get("summary")),
+        "url": _optional_text(item.get("url")),
+        "source": "community",
+        "publish_time": _optional_text(item.get("publish_time")),
+        "query_symbols": [
+            _optional_text(value).upper()
+            for value in query_symbols
+            if isinstance(value, str) and _optional_text(value)
+        ] if isinstance(query_symbols, list) else [],
+        "stock_terms": sorted(
+            {
+                _normalize_stock_term(value)
+                for value in stock_terms
+                if isinstance(value, str) and _normalize_stock_term(value)
+            }
+        ) if isinstance(stock_terms, list) else [],
+    }
+
+
+def _merge_stock_feed_cache_items(
+    *,
+    cached_items: list[dict[str, Any]],
+    fetched_items: list[dict[str, Any]],
+    run_date: str,
+) -> list[dict[str, Any]]:
+    cutoff = _stock_feed_cache_cutoff(run_date)
+    merged: dict[str, dict[str, Any]] = {}
+    for item in [*cached_items, *fetched_items]:
+        normalized = _normalize_cached_feed_item(item)
+        if not normalized["title"] and not normalized["summary"]:
+            continue
+        if not _feed_item_is_in_window(normalized, cutoff):
+            continue
+        key = _optional_text(normalized.get("id")) or _feed_item_fallback_id(
+            normalized.get("title"),
+            normalized.get("summary"),
+            normalized.get("publish_time"),
+        )
+        if key in merged:
+            merged[key]["query_symbols"] = sorted(
+                set(merged[key].get("query_symbols", []))
+                | set(normalized.get("query_symbols", []))
+            )
+            merged[key]["stock_terms"] = sorted(
+                set(merged[key].get("stock_terms", []))
+                | set(normalized.get("stock_terms", []))
+            )
+            continue
+        merged[key] = normalized
+    return sorted(
+        merged.values(),
+        key=lambda item: _feed_item_timestamp(item),
+        reverse=True,
+    )
+
+
+def _write_stock_feed_cache(path: Path, *, market: str, items: list[dict[str, Any]]) -> None:
+    payload = {
+        "schema_version": FUTU_SKILL_FACTS_SCHEMA_VERSION,
+        "generated_at": _now_text(),
+        "market": market,
+        "window_days": FUTU_STOCK_FEED_CACHE_DAYS,
+        "items": items,
+    }
+    _atomic_write_json(path, payload)
+
+
+def _stock_feed_cache_cutoff(run_date: str) -> datetime:
+    start = datetime.strptime(run_date, "%Y-%m-%d").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return start - timedelta(days=FUTU_STOCK_FEED_CACHE_DAYS - 1)
+
+
+def _feed_item_is_in_window(item: dict[str, Any], cutoff: datetime) -> bool:
+    timestamp = _feed_item_datetime(item)
+    return timestamp is None or timestamp >= cutoff
+
+
+def _feed_item_timestamp(item: dict[str, Any]) -> int:
+    timestamp = _feed_item_datetime(item)
+    return int(timestamp.timestamp()) if timestamp is not None else 0
+
+
+def _feed_item_datetime(item: dict[str, Any]) -> datetime | None:
+    raw = _optional_text(item.get("publish_time"))
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value > 10**12:
+        value //= 1000
+    return datetime.fromtimestamp(value, tz=ZoneInfo("Asia/Shanghai"))
+
+
 def _evidence_from_news_payload(payload: dict[str, object]) -> list[dict[str, str]]:
     if payload.get("code") not in (0, "0"):
         return []
@@ -548,7 +790,11 @@ def _evidence_from_news_payload(payload: dict[str, object]) -> list[dict[str, st
     return evidence
 
 
-def _feed_items_from_payload(payload: dict[str, object]) -> list[dict[str, str]]:
+def _feed_items_from_payload(
+    payload: dict[str, object],
+    *,
+    query_symbol: str = "",
+) -> list[dict[str, Any]]:
     if payload.get("code") not in (0, "0"):
         return []
     data = payload.get("data")
@@ -558,6 +804,8 @@ def _feed_items_from_payload(payload: dict[str, object]) -> list[dict[str, str]]
     for item in data:
         if not isinstance(item, dict):
             continue
+        raw_title = _optional_text(item.get("title"))
+        raw_desc = _optional_text(item.get("desc"))
         title = _clean_text(item.get("title"))
         desc = _clean_text(item.get("desc"))
         summary = title if not desc or desc == title else " ".join(
@@ -567,13 +815,26 @@ def _feed_items_from_payload(payload: dict[str, object]) -> list[dict[str, str]]
             continue
         evidence.append(
             {
+                "id": _optional_text(item.get("id")) or _feed_item_fallback_id(title, summary, item.get("publish_time")),
                 "title": title or summary,
                 "summary": summary or title,
                 "url": _optional_text(item.get("url")),
                 "source": "community",
+                "publish_time": _optional_text(item.get("publish_time")),
+                "query_symbols": [query_symbol.strip().upper()] if query_symbol.strip() else [],
+                "stock_terms": sorted(_stock_terms_from_raw_text(f"{raw_title} {raw_desc}")),
             }
         )
     return evidence
+
+
+def _public_feed_item(item: dict[str, Any]) -> dict[str, str]:
+    return {
+        "title": _optional_text(item.get("title")),
+        "summary": _optional_text(item.get("summary")),
+        "url": _optional_text(item.get("url")),
+        "source": "community",
+    }
 
 
 def _relevant_community_evidence(
@@ -588,18 +849,98 @@ def _relevant_community_evidence(
     relevant = []
     for item in feed_items:
         text = f"{item.get('title', '')} {item.get('summary', '')}".casefold()
-        if any(term in text for term in terms):
-            relevant.append(item)
+        stock_terms = {
+            _normalize_stock_term(term)
+            for term in item.get("stock_terms", [])
+            if isinstance(term, str)
+        }
+        if any(term in text for term in terms) or terms.intersection(stock_terms):
+            relevant.append(_public_feed_item(item))
     return relevant
 
 
 def _community_relevance_terms(*, symbol: str, name: str) -> set[str]:
-    terms = {symbol.strip().casefold()} if symbol.strip() else set()
+    normalized_symbol = symbol.strip().upper()
+    terms = {_normalize_stock_term(normalized_symbol)} if normalized_symbol else set()
+    terms.update(RELATED_COMMUNITY_TERMS_BY_SYMBOL.get(normalized_symbol, set()))
     for token in re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", name):
-        text = token.strip().casefold()
+        text = _normalize_stock_term(token)
         if len(text) >= 3:
             terms.add(text)
     return {term for term in terms if term and term not in GENERIC_COMMUNITY_TERMS}
+
+
+def _assign_feed_items_to_sources(
+    feed_items: list[dict[str, Any]],
+    *,
+    sources: list[FutuSkillSource],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    assigned: dict[tuple[str, str], list[dict[str, Any]]] = {
+        (source.market.upper(), source.symbol.upper()): [] for source in sources
+    }
+    seen_by_key: dict[tuple[str, str], set[str]] = {
+        key: set() for key in assigned
+    }
+    for item in feed_items:
+        text = f"{item.get('title', '')} {item.get('summary', '')}".casefold()
+        stock_terms = {
+            _normalize_stock_term(term)
+            for term in item.get("stock_terms", [])
+            if isinstance(term, str)
+        }
+        item_id = _optional_text(item.get("id")) or _feed_item_fallback_id(
+            item.get("title"),
+            item.get("summary"),
+            item.get("publish_time"),
+        )
+        for source in sources:
+            key = (source.market.upper(), source.symbol.upper())
+            terms = _community_relevance_terms(symbol=source.symbol, name=source.name)
+            if any(term in text for term in terms) or terms.intersection(stock_terms):
+                if item_id not in seen_by_key[key]:
+                    assigned[key].append(item)
+                    seen_by_key[key].add(item_id)
+    return assigned
+
+
+def _stock_terms_from_raw_text(raw_text: str) -> set[str]:
+    text = html.unescape(raw_text or "")
+    terms: set[str] = set()
+    for attr in ("stocksymbol", "stockcode", "stockname"):
+        for match in re.findall(rf'{attr}=["\']([^"\']+)["\']', text, flags=re.IGNORECASE):
+            terms.update(_stock_term_variants(match))
+    for name, code in re.findall(r"\$([^$()]+)\s*\(([A-Za-z0-9.]+)\)\$", text):
+        terms.update(_stock_term_variants(name))
+        terms.update(_stock_term_variants(code))
+    return {term for term in terms if term}
+
+
+def _stock_term_variants(value: object) -> set[str]:
+    term = _normalize_stock_term(value)
+    if not term:
+        return set()
+    terms = {term}
+    if "." in term:
+        terms.add(term.split(".", 1)[0])
+    return terms
+
+
+def _normalize_stock_term(value: object) -> str:
+    text = _optional_text(value).casefold()
+    text = text.replace("$", "").strip()
+    return text
+
+
+def _feed_item_fallback_id(title: object, summary: object, publish_time: object) -> str:
+    return "|".join(
+        part
+        for part in (
+            _optional_text(title),
+            _optional_text(summary),
+            _optional_text(publish_time),
+        )
+        if part
+    )
 
 
 def _classify_signal(evidence: list[dict[str, str]]) -> str:

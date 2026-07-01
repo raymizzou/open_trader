@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -355,6 +357,182 @@ def test_generate_futu_skill_facts_skips_missing_symbols_and_cash(tmp_path: Path
     payload = load_futu_skill_facts_cache(result.run_path)
     assert [record["symbol"] for record in payload["records"]] == ["MSFT"]
     assert [call["symbol"] for call in extractor.calls] == ["MSFT"]
+
+
+def test_generate_futu_skill_facts_assigns_shared_feed_posts_to_multiple_symbols(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio,
+        [
+            {"market": "US", "symbol": "MU", "name": "美光科技", "asset_class": "stock"},
+            {"market": "US", "symbol": "NVDA", "name": "NVIDIA", "asset_class": "stock"},
+            {"market": "US", "symbol": "DRAM", "name": "Roundhill Memory ETF", "asset_class": "stock"},
+        ],
+    )
+    calls: list[dict[str, object]] = []
+    publish_time = str(int(datetime(2026, 7, 1, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()))
+
+    def fake_get_json(url: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append({"url": url, "params": params})
+        if url.endswith("/news_search"):
+            return {"code": 0, "data": []}
+        if url.endswith("/stock_feed"):
+            return {
+                "code": 0,
+                "data": [
+                    {
+                        "id": "shared-memory-post",
+                        "title": (
+                            '<p><nnstock stocksymbol="MU.US" stockname="美光科技" '
+                            'stockcode="MU">$美光科技 (MU.US)$</nnstock> '
+                            '<nnstock stocksymbol="NVDA.US" stockname="英伟达" '
+                            'stockcode="NVDA">$英伟达 (NVDA.US)$</nnstock> '
+                            "AI 内存需求继续升温</p>"
+                        ),
+                        "desc": "美光和英伟达都受 AI 服务器需求影响，存储链震荡。",
+                        "publish_time": publish_time,
+                        "url": "https://feed.example/shared-memory-post",
+                    }
+                ],
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    summarizer = FakeDomesticSummarizer()
+    extractor = FutuNewsSentimentExtractor(
+        http_get_json=fake_get_json,
+        domestic_summarizer=summarizer,
+    )
+
+    result = generate_futu_skill_facts(
+        portfolio_path=portfolio,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-01",
+        market="US",
+        extractor=extractor,
+        update_latest=True,
+    )
+
+    assert result.failed == 0
+    by_symbol = {call["symbol"]: call for call in summarizer.calls}
+    assert sorted(by_symbol) == ["DRAM", "MU", "NVDA"]
+    for symbol in ("MU", "NVDA", "DRAM"):
+        assert by_symbol[symbol]["relevant_post_count"] == 1
+        assert by_symbol[symbol]["community_items"][0]["url"] == "https://feed.example/shared-memory-post"
+    stock_feed_calls = [call for call in calls if call["url"].endswith("/stock_feed")]
+    assert [call["params"]["keyword"] for call in stock_feed_calls] == ["MU", "NVDA", "DRAM"]
+    cache_path = tmp_path / "data/latest/US/futu_stock_feed_cache.json"
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert len(cache["items"]) == 1
+    assert cache["items"][0]["id"] == "shared-memory-post"
+
+
+def test_generate_futu_skill_facts_reuses_recent_feed_cache_when_api_snapshot_is_empty(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio,
+        [{"market": "US", "symbol": "NVDA", "name": "NVIDIA", "asset_class": "stock"}],
+    )
+    cache_path = tmp_path / "data/latest/US/futu_stock_feed_cache.json"
+    cache_path.parent.mkdir(parents=True)
+    publish_time = str(int(datetime(2026, 6, 30, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()))
+    cache_path.write_text(
+        json.dumps(
+            {
+                "schema_version": FUTU_SKILL_FACTS_SCHEMA_VERSION,
+                "market": "US",
+                "items": [
+                    {
+                        "id": "cached-nvda-post",
+                        "title": "$NVIDIA (NVDA.US)$ AI 需求仍强",
+                        "summary": "$NVIDIA (NVDA.US)$ AI 需求仍强",
+                        "url": "https://feed.example/cached-nvda",
+                        "source": "community",
+                        "publish_time": publish_time,
+                        "query_symbols": ["NVDA"],
+                        "stock_terms": ["nvda", "nvidia"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_get_json(url: str, params: dict[str, object]) -> dict[str, object]:
+        if url.endswith("/news_search"):
+            return {"code": 0, "data": []}
+        if url.endswith("/stock_feed"):
+            return {"code": 0, "data": []}
+        raise AssertionError(f"unexpected URL {url}")
+
+    summarizer = FakeDomesticSummarizer()
+    extractor = FutuNewsSentimentExtractor(
+        http_get_json=fake_get_json,
+        domestic_summarizer=summarizer,
+    )
+
+    result = generate_futu_skill_facts(
+        portfolio_path=portfolio,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-01",
+        market="US",
+        extractor=extractor,
+        update_latest=False,
+    )
+
+    assert result.failed == 0
+    assert summarizer.calls[0]["symbol"] == "NVDA"
+    assert summarizer.calls[0]["post_count"] == 1
+    assert summarizer.calls[0]["relevant_post_count"] == 1
+    assert summarizer.calls[0]["community_items"][0]["url"] == "https://feed.example/cached-nvda"
+
+
+def test_generate_futu_skill_facts_ignores_transient_stock_feed_prepare_failure(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio,
+        [
+            {"market": "US", "symbol": "NVDA", "name": "NVIDIA", "asset_class": "stock"},
+            {"market": "US", "symbol": "MSFT", "name": "Microsoft", "asset_class": "stock"},
+        ],
+    )
+
+    def fake_get_json(url: str, params: dict[str, object]) -> dict[str, object]:
+        if url.endswith("/news_search"):
+            return {
+                "code": 0,
+                "data": [{"title": f"{params['keyword']} news", "url": "https://news.example/item"}],
+            }
+        if url.endswith("/stock_feed") and params["keyword"] == "NVDA":
+            raise OSError("temporary ssl failure")
+        if url.endswith("/stock_feed"):
+            return {"code": 0, "data": []}
+        raise AssertionError(f"unexpected URL {url}")
+
+    extractor = FutuNewsSentimentExtractor(
+        http_get_json=fake_get_json,
+        domestic_summarizer=FakeDomesticSummarizer(),
+    )
+
+    result = generate_futu_skill_facts(
+        portfolio_path=portfolio,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-01",
+        market="US",
+        extractor=extractor,
+        update_latest=True,
+    )
+
+    payload = load_futu_skill_facts_cache(result.run_path)
+    assert result.failed == 0
+    assert [record["symbol"] for record in payload["records"]] == ["NVDA", "MSFT"]
+    assert all(record["news_sentiment"]["status"] == "ok" for record in payload["records"])
 
 
 def test_index_futu_skill_facts_by_market_symbol() -> None:
