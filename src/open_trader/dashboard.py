@@ -884,6 +884,7 @@ def _missing_futu_skill_news_sentiment() -> dict[str, Any]:
 def _missing_futu_domestic_discussion() -> dict[str, Any]:
     return {
         "status": "missing",
+        "keyword_counts": [],
         "summary": "富途社区未找到足够相关讨论。",
         "focus": "缺失",
         "divergence_risk": "缺失",

@@ -684,6 +684,7 @@ def _normalize_domestic_discussion(value: object) -> dict[str, object]:
         return _missing_domestic_discussion()
     normalized: dict[str, object] = {
         "status": _required_enum(value, "status", VALID_DOMESTIC_STATUSES, "domestic_discussion"),
+        "keyword_counts": _normalize_keyword_counts(value.get("keyword_counts")),
         "summary": _optional_text(value.get("summary")),
         "focus": _optional_text(value.get("focus")),
         "divergence_risk": _optional_text(value.get("divergence_risk")),
@@ -699,6 +700,7 @@ def _normalize_domestic_discussion(value: object) -> dict[str, object]:
 def _missing_domestic_discussion() -> dict[str, object]:
     return {
         "status": "missing",
+        "keyword_counts": [],
         "summary": "富途社区未找到足够相关讨论。",
         "focus": "缺失",
         "divergence_risk": "缺失",
@@ -713,6 +715,15 @@ def _validate_domestic_discussion(value: object) -> None:
     if not isinstance(value, dict):
         raise ValueError("domestic_discussion is invalid")
     _validate_enum(value, "status", VALID_DOMESTIC_STATUSES, "domestic_discussion")
+    if not isinstance(value.get("keyword_counts"), list):
+        raise ValueError("domestic_discussion keyword_counts is invalid")
+    for item in value["keyword_counts"]:
+        if not isinstance(item, dict):
+            raise ValueError("domestic_discussion keyword_counts item is invalid")
+        if not isinstance(item.get("keyword"), str) or not item["keyword"].strip():
+            raise ValueError("domestic_discussion keyword_counts keyword is invalid")
+        if not isinstance(item.get("count"), int) or item["count"] < 1:
+            raise ValueError("domestic_discussion keyword_counts count is invalid")
     for field in (
         "summary",
         "focus",
@@ -757,6 +768,23 @@ def _optional_int(value: object) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
 
 
+def _normalize_keyword_counts(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        keyword = _optional_text(item.get("keyword"))
+        count = item.get("count")
+        if not keyword or not isinstance(count, int) or count < 1:
+            continue
+        normalized.append({"keyword": keyword[:12], "count": count})
+        if len(normalized) >= 3:
+            break
+    return normalized
+
+
 def _fallback_domestic_discussion(
     *,
     symbol: str,
@@ -766,6 +794,7 @@ def _fallback_domestic_discussion(
     if relevant_post_count == 0:
         return {
             "status": "missing",
+            "keyword_counts": [],
             "summary": "富途社区未找到足够相关讨论。",
             "focus": "缺失",
             "divergence_risk": "缺失",
@@ -776,6 +805,7 @@ def _fallback_domestic_discussion(
         }
     return {
         "status": "ok",
+        "keyword_counts": [],
         "summary": f"富途社区相关讨论较少，{post_count} 条 feed 中 {relevant_post_count} 条与 {symbol} 明确相关。",
         "focus": f"少量讨论关注 {symbol} 的短线走势或 ETF 结构问题。",
         "divergence_risk": "社区样本少且噪声高，不能代表稳定共识。",
@@ -792,8 +822,13 @@ def _domestic_discussion_system_prompt() -> str:
         "你只负责把富途 API 返回的新闻标题和社区帖子总结成固定字段，不给买卖建议。"
         "社区帖子优先，新闻标题只作为背景。"
         "必须输出 JSON object，字段为："
-        "status, summary, focus, divergence_risk, credibility, trading_constraint。"
-        "字段中文含义：国内讨论结论、主要关注点、分歧 / 风险、可信度、交易约束。"
+        "status, keyword_counts, summary, focus, divergence_risk, credibility, trading_constraint。"
+        "字段中文含义：状态、讨论关键词、国内讨论结论、主要关注点、分歧 / 风险、可信度、交易约束。"
+        "keyword_counts 必须是最多 3 个对象的数组，每个对象包含 keyword 和 count；"
+        "keyword 是当天关于该标的国内讨论的交易可读主题词，count 是每个关键词对应多少条相关社区帖子，按 count 从高到低排序。"
+        "关键词要归一成 2 到 6 个汉字的交易主题，例如 看空、震荡、损耗、跟踪偏离、不透明、离场、加仓；"
+        "不要直接摘取 亏麻了、坑人、看不懂、快跑 等情绪化口头禅，除非无法归一。"
+        "count 统计帖子条数，不统计词频；没有足够相关讨论时 keyword_counts 输出空数组。"
         "credibility 只能使用 高、中、低、噪声高、缺失。"
         "trading_constraint 必须明确这类信息是否能影响交易动作；默认不能单独支持加仓或减仓。"
         "所有字段必须使用简体中文，不能包含 URL，不能复制长篇原帖。"

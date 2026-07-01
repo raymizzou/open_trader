@@ -854,6 +854,45 @@ tbody tr.active-row {
   border-color: #ead7a5;
 }
 
+.domestic-keyword-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.domestic-keyword {
+  align-items: center;
+  background: #e8f4ee;
+  border: 1px solid #bddccf;
+  border-radius: 999px;
+  color: #12382c;
+  display: inline-flex;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 900;
+  gap: 5px;
+  line-height: 1;
+  max-width: 100%;
+  padding: 5px 8px;
+}
+
+.domestic-keyword span {
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  overflow-wrap: anywhere;
+}
+
+.domestic-keyword em {
+  background: #ffffff;
+  border-radius: 999px;
+  color: #27644f;
+  font-style: normal;
+  min-width: 18px;
+  padding: 3px 5px;
+  text-align: center;
+}
+
 .technical-fact-row {
   background: var(--surface-soft);
   border: 1px solid var(--line);

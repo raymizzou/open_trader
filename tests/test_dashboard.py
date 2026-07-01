@@ -170,6 +170,10 @@ def write_futu_skill_facts(path: Path) -> None:
                             ],
                             "domestic_discussion": {
                                 "status": "ok",
+                                "keyword_counts": [
+                                    {"keyword": "震荡", "count": 2},
+                                    {"keyword": "看空", "count": 1},
+                                ],
                                 "summary": "富途社区相关讨论较少，主要关注波动率 ETF 的短线风险。",
                                 "focus": "关注波动率 ETF 与美股风险偏好的联动。",
                                 "divergence_risk": "样本少且噪声高，不能代表稳定共识。",
@@ -1318,6 +1322,10 @@ def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     assert news_sentiment["signal"] == "supportive"
     assert news_sentiment["confidence"] == "medium"
     assert news_sentiment["evidence"][0]["url"] == "https://example.com/vixy"
+    assert news_sentiment["domestic_discussion"]["keyword_counts"] == [
+        {"keyword": "震荡", "count": 2},
+        {"keyword": "看空", "count": 1},
+    ]
     assert news_sentiment["domestic_discussion"]["summary"] == "富途社区相关讨论较少，主要关注波动率 ETF 的短线风险。"
     assert news_sentiment["domestic_discussion"]["credibility"] == "低"
 

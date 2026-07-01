@@ -349,9 +349,12 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "futuSkillNewsSentimentPlugin" in js
     assert "futu_skill_facts" in js
     assert "富途社区 / 国内讨论" in js
+    assert "讨论关键词" in js
     assert "国内讨论结论" in js
     assert "domestic-list" in js
+    assert "domestic-keyword-list" in js
     assert ".domestic-list" in css
+    assert ".domestic-keyword-list" in css
     assert "technical_facts" in js
     assert "technicalFactRows" in js
     assert "插件管理" not in js
@@ -763,6 +766,11 @@ const holding = {
       available: true,
       domestic_discussion: {
         status: "ok",
+        keyword_counts: [
+          { keyword: "震荡", count: 3 },
+          { keyword: "看空", count: 2 },
+          { keyword: "损耗", count: 1 }
+        ],
         summary: "富途社区相关讨论较少，少量用户关注 DRAM ETF 与成分股走势联动。",
         focus: "ETF 夜盘可能受韩股存储链影响，盘中更受美光、闪迪等美股成分影响。",
         divergence_risk: "社区样本少且噪声高，不能代表稳定共识。",
@@ -779,7 +787,7 @@ const klineCard = cardBefore(cards, "<h4>新闻 / 舆论</h4>");
 const newsCard = cardFrom(cards, "<h4>新闻 / 舆论</h4>");
 assertOrdered(klineCard, ["趋势", "位置", "动能", "关键位", "风险"]);
 assertOrdered(newsCard, ["方向", "变化", "催化", "风险", "热度"]);
-assertOrdered(newsCard, ["国内讨论结论", "主要关注点", "分歧 / 风险", "可信度", "交易约束"]);
+assertOrdered(newsCard, ["讨论关键词", "国内讨论结论", "主要关注点", "分歧 / 风险", "可信度", "交易约束"]);
 for (const required of [
   "趋势 / K 线",
   "新闻 / 舆论",
@@ -796,6 +804,13 @@ for (const required of [
   "偏多",
   "AI 基建需求",
   "富途社区 / 国内讨论",
+  "讨论关键词",
+  "震荡",
+  "3",
+  "看空",
+  "2",
+  "损耗",
+  "1",
   "国内讨论结论",
   "主要关注点",
   "分歧 / 风险",

@@ -865,6 +865,10 @@ function futuSkillNewsSentimentPlugin(holding) {
     ? module.domestic_discussion
     : {};
   const rows = [
+    {
+      label: "讨论关键词",
+      htmlValue: renderDomesticKeywordTags(discussion.keyword_counts),
+    },
     { label: "国内讨论结论", value: formatPlain(discussion.summary) },
     { label: "主要关注点", value: formatPlain(discussion.focus) },
     { label: "分歧 / 风险", value: formatPlain(discussion.divergence_risk) },
@@ -896,8 +900,29 @@ function renderDomesticDiscussionRows(rows) {
       ${rows.map((row) => `
         <div class="domestic-row ${row.tone === "warn" ? "warn" : ""}">
           <span>${escapeHtml(row.label)}</span>
-          <strong>${escapeHtml(row.value)}</strong>
+          ${row.htmlValue || `<strong>${escapeHtml(row.value)}</strong>`}
         </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderDomesticKeywordTags(keywordCounts) {
+  const items = Array.isArray(keywordCounts)
+    ? keywordCounts
+        .filter((item) => item && hasValue(item.keyword) && Number.isInteger(item.count) && item.count > 0)
+        .slice(0, 3)
+    : [];
+  if (!items.length) {
+    return `<strong>缺失</strong>`;
+  }
+  return `
+    <div class="domestic-keyword-list">
+      ${items.map((item) => `
+        <b class="domestic-keyword">
+          <span>${escapeHtml(formatPlain(item.keyword))}</span>
+          <em>${escapeHtml(formatPlain(item.count))}</em>
+        </b>
       `).join("")}
     </div>
   `;

@@ -112,6 +112,10 @@ class FakeDomesticSummarizer:
         )
         return {
             "status": "ok",
+            "keyword_counts": [
+                {"keyword": "AI需求", "count": 1},
+                {"keyword": "看多", "count": 1},
+            ],
             "summary": "国内讨论认为 AI 需求仍强，但样本有限。",
             "focus": "关注 NVIDIA 与 AI 服务器需求。",
             "divergence_risk": "讨论样本偏少，不能代表稳定共识。",
@@ -196,6 +200,10 @@ def test_futu_news_sentiment_extractor_builds_evidence_from_futu_apis() -> None:
     assert result["freshness"]["source_window"] == "latest"
     assert result["domestic_discussion"] == {
         "status": "ok",
+        "keyword_counts": [
+            {"keyword": "AI需求", "count": 1},
+            {"keyword": "看多", "count": 1},
+        ],
         "summary": "国内讨论认为 AI 需求仍强，但样本有限。",
         "focus": "关注 NVIDIA 与 AI 服务器需求。",
         "divergence_risk": "讨论样本偏少，不能代表稳定共识。",
@@ -410,6 +418,7 @@ def test_futu_news_sentiment_extractor_marks_noisy_feed_as_unusable() -> None:
 
     assert result["domestic_discussion"] == {
         "status": "ok",
+        "keyword_counts": [],
         "summary": "富途社区相关讨论较少，3 条 feed 中 1 条与 DRAM 明确相关。",
         "focus": "少量讨论关注 DRAM 的短线走势或 ETF 结构问题。",
         "divergence_risk": "社区样本少且噪声高，不能代表稳定共识。",
@@ -429,6 +438,11 @@ def test_llm_domestic_discussion_summarizer_sends_fixed_schema_prompt() -> None:
             self.calls.append({"messages": messages, "temperature": temperature})
             return json.dumps(
                 {
+                    "keyword_counts": [
+                        {"keyword": "震荡", "count": 3},
+                        {"keyword": "看空", "count": 2},
+                        {"keyword": "损耗", "count": 1},
+                    ],
                     "summary": "富途社区相关讨论较少，主要关注 ETF 与存储链成分股联动。",
                     "focus": "关注海力士、三星、美光对 DRAM ETF 的影响。",
                     "divergence_risk": "样本少且噪声高，不能代表稳定共识。",
@@ -467,6 +481,11 @@ def test_llm_domestic_discussion_summarizer_sends_fixed_schema_prompt() -> None:
 
     assert result == {
         "status": "ok",
+        "keyword_counts": [
+            {"keyword": "震荡", "count": 3},
+            {"keyword": "看空", "count": 2},
+            {"keyword": "损耗", "count": 1},
+        ],
         "summary": "富途社区相关讨论较少，主要关注 ETF 与存储链成分股联动。",
         "focus": "关注海力士、三星、美光对 DRAM ETF 的影响。",
         "divergence_risk": "样本少且噪声高，不能代表稳定共识。",
@@ -478,6 +497,9 @@ def test_llm_domestic_discussion_summarizer_sends_fixed_schema_prompt() -> None:
     assert client.calls[0]["temperature"] == 0
     messages = client.calls[0]["messages"]
     assert "国内讨论结论" in messages[0]["content"]
+    assert "keyword_counts" in messages[0]["content"]
+    assert "每个关键词对应多少条相关社区帖子" in messages[0]["content"]
+    assert "交易可读主题词" in messages[0]["content"]
     user_payload = json.loads(messages[1]["content"])
     assert user_payload["symbol"] == "DRAM"
     assert user_payload["community_items"][0]["summary"] == "$DRAM.US$ 为什么比成分股跌得多？"
