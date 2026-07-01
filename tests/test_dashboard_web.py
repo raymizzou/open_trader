@@ -3,12 +3,18 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 import pytest
+
+PROJECT_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(PROJECT_SRC) not in sys.path:
+    sys.path.insert(0, str(PROJECT_SRC))
 
 from open_trader.dashboard_quotes import QuoteRefreshResult
 from open_trader.dashboard_web import STATIC_DIR
@@ -134,6 +140,15 @@ def post_text_error(url: str, body: bytes) -> tuple[int, str, str]:
             payload.decode("utf-8"),
         )
     raise AssertionError("expected HTTPError")
+
+
+def holdings_table_header_labels(html: str) -> list[str]:
+    table_prefix = html.split('<tbody id="holdings-body">', 1)[0]
+    thead = table_prefix.rsplit("<thead>", 1)[1].split("</thead>", 1)[0]
+    labels: list[str] = []
+    for segment in thead.split("<th>")[1:]:
+        labels.append(segment.split("</th>", 1)[0].strip())
+    return labels
 
 
 def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
@@ -448,6 +463,27 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".workspace-grid.detail-mode {" in mobile_css
     assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
+
+
+def test_dashboard_holdings_table_uses_compact_asset_columns() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert holdings_table_header_labels(html) == [
+        "明细",
+        "市场",
+        "标的",
+        "数量",
+        "成本价",
+        "实时价",
+        "美元市值",
+        "港元市值",
+        "持仓占总资产的占比",
+        "盈亏",
+    ]
+    assert "<th>券商</th>" not in html
+    assert "<th>动作</th>" not in html
+    assert "<th>持仓价</th>" not in html
+    assert '<td colspan="10" class="empty-state">加载中</td>' in html
 
 
 def test_dashboard_display_helpers_keep_raw_english_out_of_chinese_ui() -> None:
