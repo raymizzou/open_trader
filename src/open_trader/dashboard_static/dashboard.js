@@ -22,6 +22,14 @@ const state = {
 
 const elements = {};
 
+const HOLDINGS_TABLE_COLUMN_COUNT = 10;
+
+const MARKET_SECTION_CONFIGS = [
+  { market: "US", label: "US 美股持仓", className: "market-section-us" },
+  { market: "HK", label: "HK 港股持仓", className: "market-section-hk" },
+  { market: "OTHER", label: "其他市场持仓", className: "market-section-other" },
+];
+
 const ACTION_LABELS = {
   ADD: "加仓",
   BUY: "买入",
@@ -583,49 +591,52 @@ function renderHoldings() {
     return;
   }
   if (!state.dashboard) {
-    elements["holdings-body"].innerHTML = `<tr><td colspan="10" class="empty-state">加载中</td></tr>`;
+    elements["holdings-body"].innerHTML = holdingsEmptyRow("加载中");
     return;
   }
   if (holdings.length === 0) {
-    elements["holdings-body"].innerHTML = `<tr><td colspan="10" class="empty-state">没有匹配的持仓</td></tr>`;
+    elements["holdings-body"].innerHTML = holdingsEmptyRow("没有匹配的持仓");
     return;
   }
 
   const rows = [];
-  holdings.forEach((holding, index) => {
-    const rowKey = holdingKey(holding, index);
-    const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
-    const quote = quoteForHolding(holding);
-    const action = holding.trade_action || {};
-    const actionText = action.action ? action.action : "-";
-    rows.push(`
-      <tr class="${selectedClass}">
-        <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}">交易决策</button></td>
-        <td>${escapeHtml(formatPlain(holding.market))}</td>
-        <td class="symbol-cell">
-          <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
-          <span class="meta-text">${escapeHtml(formatPlain(holding.name))}</span>
-        </td>
-        <td>${escapeHtml(formatPlain(holding.brokers))}</td>
-        <td class="number-cell">${escapeHtml(formatPlain(holding.total_quantity))}</td>
-        <td class="number-cell">${escapeHtml(formatPlain(holding.last_price))}</td>
-        <td class="number-cell">${renderQuotePrice(holding, quote)}</td>
-        <td class="number-cell">${escapeHtml(formatMoney(holding.market_value_hkd, "HKD"))}</td>
-        <td class="number-cell">${escapeHtml(formatPlain(holding.unrealized_pnl_pct))}</td>
-        <td>${renderActionBadge(actionText, action.status)}</td>
-      </tr>
-    `);
-    if (selected && rowKey === state.selectedHoldingKey) {
+  groupedHoldingsByMarketSection(holdings).forEach((section) => {
+    rows.push(renderMarketSectionRow(section));
+    section.rows.forEach((entry) => {
+      const holding = entry.holding;
+      const index = entry.index;
+      const rowKey = holdingKey(holding, index);
+      const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
+      const quote = quoteForHolding(holding);
       rows.push(`
-        <tr class="decision-detail-row">
-          <td colspan="10">
-            <div class="symbol-detail-panel inline-symbol-detail">
-              ${renderSymbolDetail(selected.holding, selected.index)}
-            </div>
+        <tr class="${selectedClass}">
+          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}">交易决策</button></td>
+          <td>${escapeHtml(formatPlain(holding.market))}</td>
+          <td class="symbol-cell">
+            <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
+            <span class="meta-text">${escapeHtml(formatPlain(holding.name))}</span>
           </td>
+          <td class="number-cell">${escapeHtml(formatPlain(holding.total_quantity))}</td>
+          <td class="number-cell">${escapeHtml(formatPlain(holding.avg_cost_price))}</td>
+          <td class="number-cell">${renderQuotePrice(holding, quote)}</td>
+          <td class="number-cell">${escapeHtml(renderUsdMarketValue(holding))}</td>
+          <td class="number-cell">${escapeHtml(formatMoney(holding.market_value_hkd, "HKD"))}</td>
+          <td class="number-cell">${escapeHtml(formatPlain(holding.portfolio_weight_hkd))}</td>
+          <td class="number-cell">${escapeHtml(formatPlain(holding.unrealized_pnl_pct))}</td>
         </tr>
       `);
-    }
+      if (selected && rowKey === state.selectedHoldingKey) {
+        rows.push(`
+          <tr class="decision-detail-row">
+            <td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}">
+              <div class="symbol-detail-panel inline-symbol-detail">
+                ${renderSymbolDetail(selected.holding, selected.index)}
+              </div>
+            </td>
+          </tr>
+        `);
+      }
+    });
   });
   elements["holdings-body"].innerHTML = rows.join("");
 }
@@ -2970,7 +2981,7 @@ function setElementText(id, text) {
 }
 
 function renderDashboardErrorState() {
-  elements["holdings-body"].innerHTML = `<tr><td colspan="10" class="empty-state">看板数据加载失败</td></tr>`;
+  elements["holdings-body"].innerHTML = holdingsEmptyRow("看板数据加载失败");
 }
 
 function filteredHoldings() {
@@ -2981,6 +2992,90 @@ function filteredHoldings() {
     const brokerMatches = state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
     return marketMatches && brokerMatches;
   });
+}
+
+function holdingsEmptyRow(message) {
+  return `<tr><td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}" class="empty-state">${escapeHtml(message)}</td></tr>`;
+}
+
+function marketSectionKey(holding) {
+  const market = String(holding && holding.market || "").trim().toUpperCase();
+  if (market === "US" || market === "HK") {
+    return market;
+  }
+  return "OTHER";
+}
+
+function groupedHoldingsByMarketSection(holdings) {
+  const sections = MARKET_SECTION_CONFIGS.map((config) => ({
+    ...config,
+    rows: [],
+  }));
+  const sectionByMarket = new Map(sections.map((section) => [section.market, section]));
+  holdings.forEach((holding, index) => {
+    const section = sectionByMarket.get(marketSectionKey(holding)) || sectionByMarket.get("OTHER");
+    section.rows.push({ holding, index });
+  });
+  return sections.filter((section) => section.rows.length > 0);
+}
+
+function sectionRowHolding(row) {
+  return row && row.holding ? row.holding : row;
+}
+
+function sumNumericField(rows, fieldName) {
+  let total = 0;
+  for (const row of rows) {
+    const value = numericValue(sectionRowHolding(row)[fieldName]);
+    if (value === null) {
+      return null;
+    }
+    total += value;
+  }
+  return rows.length ? total : null;
+}
+
+function sumPercentField(rows, fieldName) {
+  let total = 0;
+  for (const row of rows) {
+    const value = sectionRowHolding(row)[fieldName];
+    if (!hasValue(value)) {
+      return null;
+    }
+    const raw = String(value).trim();
+    if (!/^[+-]?(?:\d+|\d*\.\d+)%$/.test(raw)) {
+      return null;
+    }
+    const parsed = Number(raw.slice(0, -1));
+    if (!Number.isFinite(parsed)) {
+      return null;
+    }
+    total += parsed;
+  }
+  return rows.length ? total : null;
+}
+
+function renderMarketSectionRow(section) {
+  const hkdTotal = sumNumericField(section.rows, "market_value_hkd");
+  const weightTotal = sumPercentField(section.rows, "portfolio_weight_hkd");
+  const hkdText = hkdTotal === null ? "-" : formatMoney(moneyValue(hkdTotal), "HKD");
+  const weightText = weightTotal === null ? "-" : `${weightTotal.toFixed(2)}%`;
+  return `
+    <tr class="market-section-row ${escapeHtml(section.className)}">
+      <td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}">
+        <strong>${escapeHtml(section.label)}</strong>
+        <span class="meta-text">${escapeHtml(`${section.rows.length} 个标的 · 港元市值 ${hkdText} · 权重 ${weightText}`)}</span>
+      </td>
+    </tr>
+  `;
+}
+
+function renderUsdMarketValue(holding) {
+  const currency = String(holding && holding.currency || "").trim().toUpperCase();
+  if (currency !== "USD") {
+    return "-";
+  }
+  return formatMoney(holding.market_value, "USD");
 }
 
 function getHoldings() {

@@ -1535,7 +1535,7 @@ if (state.researchChat.messageCount !== 4) {
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
-def test_dashboard_header_helpers_filter_assets_and_render_sources() -> None:
+def test_dashboard_header_filters_and_cash_view_helpers() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for dashboard helper runtime checks")
@@ -1555,7 +1555,9 @@ state.dashboard = {
       symbol: "VIXY",
       name: "ProShares VIX Short-Term Futures ETF",
       brokers: "futu;tiger",
-      market_value_hkd: "37830.00",
+      currency: "USD",
+      market_value: "6250.00",
+      market_value_hkd: "49062.50",
       broker_details: [
         {
           broker: "futu",
@@ -1580,6 +1582,8 @@ state.dashboard = {
       symbol: "00700",
       name: "Tencent",
       brokers: "phillips",
+      currency: "HKD",
+      market_value: "15982.00",
       market_value_hkd: "15982.00",
     },
   ],
@@ -1855,6 +1859,32 @@ if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
 }
 if (!elements["holdings-body"].innerHTML.includes("交易决策") || elements["holdings-body"].innerHTML.includes(">详情<")) {
   throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
+}
+const renderedHoldings = elements["holdings-body"].innerHTML;
+const usSectionIndex = renderedHoldings.indexOf("US 美股持仓");
+const hkSectionIndex = renderedHoldings.indexOf("HK 港股持仓");
+if (usSectionIndex === -1 || hkSectionIndex === -1 || usSectionIndex > hkSectionIndex) {
+  throw new Error("holdings should render US section before HK section: " + renderedHoldings);
+}
+for (const required of ["成本价", "美元市值", "港元市值", "持仓占总资产的占比"]) {
+  if (renderedHoldings.includes("<th>" + required + "</th>")) {
+    throw new Error("body should not render table headers inside market sections: " + renderedHoldings);
+  }
+}
+if (!renderedHoldings.includes("USD 6250.00")) {
+  throw new Error("USD holding should show original USD market value: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("HKD 49062.50")) {
+  throw new Error("HKD converted market value should remain visible: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("<td class=\\"number-cell\\">-</td>")) {
+  throw new Error("non-USD holding should show dash in USD market value column: " + renderedHoldings);
+}
+if (renderedHoldings.includes("<td>futu</td>") || renderedHoldings.includes("<td>tiger</td>")) {
+  throw new Error("main holdings table should not render broker column: " + renderedHoldings);
+}
+if (renderedHoldings.includes("观察 ·") || renderedHoldings.includes("人工复核 ·")) {
+  throw new Error("main holdings table should not render action badges: " + renderedHoldings);
 }
 if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
   throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
