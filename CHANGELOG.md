@@ -3,6 +3,16 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-02
+
+- Reworked the dashboard holdings table around the operator fields: quantity,
+  cost price, live price, USD/HKD market value, portfolio weight, and P/L.
+- Split holdings into clear `US` then `HK` sections, removed the broker/action
+  columns from the main table, and kept broker context inside the trading
+  decision detail.
+- Verified the dashboard with full pytest plus Playwright desktop/mobile checks
+  for section order, market filters, horizontal scrolling, and detail expansion.
+
 ## 2026-07-01
 
 - Fixed Phillips statement parsing for `UT OTCU` money-market-fund rows so the
