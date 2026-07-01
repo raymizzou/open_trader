@@ -1551,13 +1551,30 @@ vm.runInContext(`
 state.dashboard = {
   holdings: [
     {
+      market: "HK",
+      symbol: "00700",
+      name: "Tencent",
+      brokers: "phillips",
+      currency: "HKD",
+      total_quantity: "100",
+      avg_cost_price: "150.00",
+      market_value: "15982.00",
+      market_value_hkd: "15982.00",
+      portfolio_weight_hkd: "3.25%",
+      unrealized_pnl_pct: "2.00%",
+    },
+    {
       market: "US",
       symbol: "VIXY",
       name: "ProShares VIX Short-Term Futures ETF",
       brokers: "futu;tiger",
       currency: "USD",
+      total_quantity: "10",
+      avg_cost_price: "12.34",
       market_value: "6250.00",
       market_value_hkd: "49062.50",
+      portfolio_weight_hkd: "7.50%",
+      unrealized_pnl_pct: "5.00%",
       broker_details: [
         {
           broker: "futu",
@@ -1578,13 +1595,17 @@ state.dashboard = {
       ],
     },
     {
-      market: "HK",
-      symbol: "00700",
-      name: "Tencent",
-      brokers: "phillips",
+      market: "US",
+      symbol: "BND",
+      name: "Vanguard Total Bond Market ETF",
+      brokers: "tiger",
       currency: "HKD",
-      market_value: "15982.00",
-      market_value_hkd: "15982.00",
+      total_quantity: "2",
+      avg_cost_price: "50.00",
+      market_value: "100.00",
+      market_value_hkd: "100.00",
+      portfolio_weight_hkd: "2.50%",
+      unrealized_pnl_pct: "-1.00%",
     },
   ],
   cash_rows: [
@@ -1849,7 +1870,7 @@ if (!elements["cash-detail-panel"].classList.contains("hidden")) {
   throw new Error("non-cash view should hide cash detail panel");
 }
 state.brokerFilter = "ALL";
-state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
+state.selectedHoldingKey = holdingKey(state.dashboard.holdings[1], 1);
 renderHoldings();
 if (elements["holdings-table-wrap"].classList.contains("hidden")) {
   throw new Error("trading decision should keep holdings table visible");
@@ -1866,6 +1887,15 @@ const hkSectionIndex = renderedHoldings.indexOf("HK 港股持仓");
 if (usSectionIndex === -1 || hkSectionIndex === -1 || usSectionIndex > hkSectionIndex) {
   throw new Error("holdings should render US section before HK section: " + renderedHoldings);
 }
+if (!renderedHoldings.includes("2 个标的 · 港元市值 HKD 49162.50 · 权重 10.00%")) {
+  throw new Error("US section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 15982.00 · 权重 3.25%")) {
+  throw new Error("HK section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (renderedHoldings.includes("其他市场持仓")) {
+  throw new Error("OTHER section should not render without an OTHER-market holding: " + renderedHoldings);
+}
 for (const required of ["成本价", "美元市值", "港元市值", "持仓占总资产的占比"]) {
   if (renderedHoldings.includes("<th>" + required + "</th>")) {
     throw new Error("body should not render table headers inside market sections: " + renderedHoldings);
@@ -1880,11 +1910,35 @@ if (!renderedHoldings.includes("HKD 49062.50")) {
 if (!renderedHoldings.includes("<td class=\\"number-cell\\">-</td>")) {
   throw new Error("non-USD holding should show dash in USD market value column: " + renderedHoldings);
 }
-if (renderedHoldings.includes("<td>futu</td>") || renderedHoldings.includes("<td>tiger</td>")) {
-  throw new Error("main holdings table should not render broker column: " + renderedHoldings);
+const holdingRows = Array.from(renderedHoldings.matchAll(/<tr class="[^"]*">\\s*<td><button class="expand-button"[\\s\\S]*?<\\/tr>/g)).map((match) => match[0]);
+if (holdingRows.length !== 3) {
+  throw new Error("main holdings table should render exactly 3 holding rows: " + renderedHoldings);
+}
+for (const row of holdingRows) {
+  const cellCount = (row.match(/<td(?:\\s|>)/g) || []).length;
+  if (cellCount !== 10) {
+    throw new Error("holding row should render exactly 10 cells: " + row);
+  }
+}
+for (const unexpected of ["<td>futu;tiger</td>", "<td>phillips</td>", "<td>futu</td>", "<td>tiger</td>", "<span class=\\"badge\\">"]) {
+  if (renderedHoldings.includes(unexpected)) {
+    throw new Error("main holdings table should not render broker/action cell " + unexpected + ": " + renderedHoldings);
+  }
 }
 if (renderedHoldings.includes("观察 ·") || renderedHoldings.includes("人工复核 ·")) {
   throw new Error("main holdings table should not render action badges: " + renderedHoldings);
+}
+const malformedSection = renderMarketSectionRow({
+  market: "OTHER",
+  label: "其他市场持仓",
+  className: "market-section-other",
+  rows: [
+    { holding: { market_value_hkd: "bad", portfolio_weight_hkd: "1.00%" }, index: 99 },
+    { holding: { market_value_hkd: "300.00", portfolio_weight_hkd: "" }, index: 100 },
+  ],
+});
+if (!malformedSection.includes("2 个标的 · 港元市值 - · 权重 -") || malformedSection.includes("HKD 0.00")) {
+  throw new Error("malformed section subtotal data should render dash instead of zero: " + malformedSection);
 }
 if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
   throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
@@ -1898,6 +1952,25 @@ for (const unexpected of ["插件管理", "策略阈值"]) {
   if (elements["holdings-body"].innerHTML.includes(unexpected)) {
     throw new Error("trading decision detail should not render extra panel " + unexpected);
   }
+}
+state.dashboard.holdings.push({
+  market: "JP",
+  symbol: "7203",
+  name: "Toyota",
+  brokers: "phillips",
+  currency: "JPY",
+  total_quantity: "1",
+  avg_cost_price: "3000",
+  market_value: "300.00",
+  market_value_hkd: "300.00",
+  portfolio_weight_hkd: "1.50%",
+  unrealized_pnl_pct: "0.00%",
+});
+state.selectedHoldingKey = "";
+renderHoldings();
+const renderedWithOther = elements["holdings-body"].innerHTML;
+if (!renderedWithOther.includes("其他市场持仓") || !renderedWithOther.includes("1 个标的 · 港元市值 HKD 300.00 · 权重 1.50%")) {
+  throw new Error("OTHER section should render only when an OTHER-market holding exists: " + renderedWithOther);
 }
 `, sandbox);
 """
