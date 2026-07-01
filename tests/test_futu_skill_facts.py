@@ -151,16 +151,28 @@ def test_futu_news_sentiment_extractor_builds_evidence_from_futu_apis() -> None:
     assert result["confidence"] == "medium"
     assert result["suggested_constraint"] == ""
     assert result["freshness"]["source_window"] == "latest"
+    assert result["domestic_discussion"] == {
+        "status": "ok",
+        "direction": "bullish",
+        "quality": "usable",
+        "representative_view": "继续看好 NVIDIA AI 需求仍强。",
+        "risk_point": "未见明确国内风险点",
+        "constraint": "富途社区讨论仅作国内讨论温度参考，不单独作为交易依据",
+        "post_count": 1,
+        "relevant_post_count": 1,
+    }
     assert result["evidence"] == [
         {
             "title": "NVIDIA AI demand boosts chip outlook",
             "summary": "NVIDIA AI demand boosts chip outlook",
             "url": "https://news.example/nvda-ai",
+            "source": "news",
         },
         {
             "title": "继续看好 NVIDIA",
             "summary": "继续看好 NVIDIA AI 需求仍强。",
             "url": "https://feed.example/nvda",
+            "source": "community",
         },
     ]
     assert calls == [
@@ -174,13 +186,13 @@ def test_futu_news_sentiment_extractor_builds_evidence_from_futu_apis() -> None:
                 "sort_type": 2,
             },
         },
-        {
-            "url": "https://ai-news-search.futunn.com/stock_feed",
-            "params": {
-                "keyword": "NVIDIA",
-                "size": 30,
+            {
+                "url": "https://ai-news-search.futunn.com/stock_feed",
+                "params": {
+                    "keyword": "NVDA",
+                    "size": 30,
+                },
             },
-        },
     ]
 
 
@@ -283,6 +295,54 @@ def test_validate_futu_skill_fact_record_rejects_invalid_module_status() -> None
 
     with pytest.raises(ValueError, match="news_sentiment status is invalid"):
         validate_futu_skill_fact_record(record)
+
+
+def test_futu_news_sentiment_extractor_marks_noisy_feed_as_unusable() -> None:
+    def fake_get_json(url: str, params: dict[str, object]) -> dict[str, object]:
+        if url.endswith("/news_search"):
+            return {"code": 0, "data": []}
+        if url.endswith("/stock_feed"):
+            return {
+                "code": 0,
+                "data": [
+                    {
+                        "title": "$SPY.US$ unrelated market chatter",
+                        "desc": "general comment",
+                        "publish_time": "1782869556",
+                    },
+                    {
+                        "title": "$DRAM.US$ 为什么 ETF 跌幅大于成分股？",
+                        "desc": "",
+                        "publish_time": "1782869555",
+                    },
+                    {
+                        "title": "$SOXL.US$ 半导体 ETF 开始下跌趋势了吗？",
+                        "desc": "",
+                        "publish_time": "1782869554",
+                    },
+                ],
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    extractor = FutuNewsSentimentExtractor(http_get_json=fake_get_json)
+
+    result = extractor.extract_news_sentiment(
+        market="US",
+        symbol="DRAM",
+        name="Roundhill Memory ETF",
+        run_date="2026-07-01",
+    )
+
+    assert result["domestic_discussion"] == {
+        "status": "ok",
+        "direction": "noisy",
+        "quality": "noisy",
+        "representative_view": "$DRAM.US$ 为什么 ETF 跌幅大于成分股？",
+        "risk_point": "$DRAM.US$ 为什么 ETF 跌幅大于成分股？",
+        "constraint": "富途社区匹配噪声高，仅作风险提示，不作为交易依据",
+        "post_count": 3,
+        "relevant_post_count": 1,
+    }
 
 
 def valid_record() -> dict[str, object]:

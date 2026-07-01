@@ -27,9 +27,21 @@ VALID_MODULE_STATUSES = {"ok", "partial", "missing", "error", "stale"}
 VALID_SIGNALS = {"supportive", "opposing", "neutral", "risk_up", "mixed"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_CONSTRAINTS = {"", "review", "reduce_only", "wait_for_event", "no_add"}
+VALID_DOMESTIC_STATUSES = {"ok", "missing", "error"}
+VALID_DOMESTIC_DIRECTIONS = {"bullish", "bearish", "neutral", "mixed", "noisy"}
+VALID_DOMESTIC_QUALITIES = {"usable", "weak", "noisy", "missing"}
 RUN_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 FUTU_AI_SEARCH_BASE_URL = "https://ai-news-search.futunn.com"
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+GENERIC_COMMUNITY_TERMS = {
+    "adr",
+    "ai",
+    "etf",
+    "inc",
+    "ltd",
+    "the",
+    "trust",
+}
 BULLISH_CUES = (
     "bullish",
     "boost",
@@ -112,12 +124,13 @@ class FutuNewsSentimentExtractor:
         name: str,
         run_date: str,
     ) -> dict[str, object]:
-        del market, symbol, run_date
-        keyword = name.strip() or symbol
+        del market, run_date
+        news_keyword = name.strip() or symbol
+        feed_keyword = symbol.strip() or news_keyword
         news_payload = self.http_get_json(
             f"{FUTU_AI_SEARCH_BASE_URL}/news_search",
             {
-                "keyword": keyword,
+                "keyword": news_keyword,
                 "size": 10,
                 "news_type": 1,
                 "lang": "zh-CN",
@@ -127,16 +140,27 @@ class FutuNewsSentimentExtractor:
         feed_payload = self.http_get_json(
             f"{FUTU_AI_SEARCH_BASE_URL}/stock_feed",
             {
-                "keyword": keyword,
+                "keyword": feed_keyword,
                 "size": 30,
             },
         )
+        news_evidence = _evidence_from_news_payload(news_payload)
+        feed_items = _feed_items_from_payload(feed_payload)
+        community_evidence = _relevant_community_evidence(
+            feed_items,
+            symbol=symbol,
+            name=name,
+        )
+        domestic_discussion = _domestic_discussion(feed_items, community_evidence)
         evidence = [
-            *_evidence_from_news_payload(news_payload),
-            *_evidence_from_feed_payload(feed_payload),
+            *news_evidence,
+            *community_evidence,
         ][:6]
         if not evidence:
-            return _missing_news_sentiment_module()
+            return {
+                **_missing_news_sentiment_module(),
+                "domestic_discussion": domestic_discussion,
+            }
         signal = _classify_signal(evidence)
         return {
             "status": "ok",
@@ -144,6 +168,7 @@ class FutuNewsSentimentExtractor:
             "confidence": "medium" if len(evidence) >= 2 else "low",
             "freshness": {"generated_at": _now_text(), "source_window": "latest"},
             "evidence": evidence,
+            "domestic_discussion": domestic_discussion,
             "blocking_reason": "",
             "suggested_constraint": "",
         }
@@ -302,6 +327,9 @@ def _normalize_news_sentiment_module(module: object) -> dict[str, Any]:
         "confidence": _required_enum(module, "confidence", VALID_CONFIDENCES, "news_sentiment"),
         "freshness": _normalize_freshness(module.get("freshness")),
         "evidence": _normalize_evidence(module.get("evidence")),
+        "domestic_discussion": _normalize_domestic_discussion(
+            module.get("domestic_discussion")
+        ),
         "blocking_reason": _optional_text(module.get("blocking_reason")),
         "suggested_constraint": _required_enum(
             module,
@@ -338,6 +366,8 @@ def _validate_news_sentiment_module(module: object) -> None:
                 raise ValueError(f"news_sentiment evidence {field} is invalid")
     if not isinstance(module.get("blocking_reason"), str):
         raise ValueError("news_sentiment blocking_reason is invalid")
+    if "domestic_discussion" in module:
+        _validate_domestic_discussion(module.get("domestic_discussion"))
 
 
 def _load_portfolio_sources(
@@ -399,11 +429,11 @@ def _evidence_from_news_payload(payload: dict[str, object]) -> list[dict[str, st
         url = _optional_text(item.get("url"))
         if not title:
             continue
-        evidence.append({"title": title, "summary": title, "url": url})
+        evidence.append({"title": title, "summary": title, "url": url, "source": "news"})
     return evidence
 
 
-def _evidence_from_feed_payload(payload: dict[str, object]) -> list[dict[str, str]]:
+def _feed_items_from_payload(payload: dict[str, object]) -> list[dict[str, str]]:
     if payload.get("code") not in (0, "0"):
         return []
     data = payload.get("data")
@@ -415,18 +445,113 @@ def _evidence_from_feed_payload(payload: dict[str, object]) -> list[dict[str, st
             continue
         title = _clean_text(item.get("title"))
         desc = _clean_text(item.get("desc"))
-        summary = " ".join(part for part in (title, desc) if part).strip()
-        url = _optional_text(item.get("url"))
+        summary = title if not desc or desc == title else " ".join(
+            part for part in (title, desc) if part
+        ).strip()
         if not title and not summary:
             continue
         evidence.append(
             {
                 "title": title or summary,
                 "summary": summary or title,
-                "url": url,
+                "url": _optional_text(item.get("url")),
+                "source": "community",
             }
         )
     return evidence
+
+
+def _relevant_community_evidence(
+    feed_items: list[dict[str, str]],
+    *,
+    symbol: str,
+    name: str,
+) -> list[dict[str, str]]:
+    terms = _community_relevance_terms(symbol=symbol, name=name)
+    if not terms:
+        return []
+    relevant = []
+    for item in feed_items:
+        text = f"{item.get('title', '')} {item.get('summary', '')}".casefold()
+        if any(term in text for term in terms):
+            relevant.append(item)
+    return relevant
+
+
+def _community_relevance_terms(*, symbol: str, name: str) -> set[str]:
+    terms = {symbol.strip().casefold()} if symbol.strip() else set()
+    for token in re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", name):
+        text = token.strip().casefold()
+        if len(text) >= 3:
+            terms.add(text)
+    return {term for term in terms if term and term not in GENERIC_COMMUNITY_TERMS}
+
+
+def _domestic_discussion(
+    feed_items: list[dict[str, str]],
+    relevant_items: list[dict[str, str]],
+) -> dict[str, object]:
+    post_count = len(feed_items)
+    relevant_count = len(relevant_items)
+    if relevant_count == 0:
+        return {
+            "status": "missing",
+            "direction": "noisy",
+            "quality": "noisy" if post_count else "missing",
+            "representative_view": "缺失",
+            "risk_point": "缺失",
+            "constraint": "富途社区未找到足够相关讨论，不作为交易依据",
+            "post_count": post_count,
+            "relevant_post_count": 0,
+        }
+    noisy = post_count > relevant_count and relevant_count / post_count <= 0.5
+    quality = "noisy" if noisy else ("usable" if relevant_count == post_count else "weak")
+    return {
+        "status": "ok",
+        "direction": "noisy" if noisy else _classify_community_direction(relevant_items),
+        "quality": quality,
+        "representative_view": _representative_community_view(relevant_items),
+        "risk_point": _community_risk_point(relevant_items),
+        "constraint": (
+            "富途社区匹配噪声高，仅作风险提示，不作为交易依据"
+            if noisy
+            else "富途社区讨论仅作国内讨论温度参考，不单独作为交易依据"
+        ),
+        "post_count": post_count,
+        "relevant_post_count": relevant_count,
+    }
+
+
+def _classify_community_direction(items: list[dict[str, str]]) -> str:
+    text = " ".join(
+        f"{item.get('title', '')} {item.get('summary', '')}" for item in items
+    ).casefold()
+    bullish_count = sum(1 for cue in BULLISH_CUES if cue.casefold() in text)
+    bearish_count = sum(1 for cue in (*BEARISH_CUES, "跌", "回落", "亏") if cue.casefold() in text)
+    if bullish_count and bearish_count:
+        return "mixed"
+    if bullish_count:
+        return "bullish"
+    if bearish_count:
+        return "bearish"
+    return "neutral"
+
+
+def _representative_community_view(items: list[dict[str, str]]) -> str:
+    for item in items:
+        summary = _optional_text(item.get("summary"))
+        if summary:
+            return summary[:120]
+    return "缺失"
+
+
+def _community_risk_point(items: list[dict[str, str]]) -> str:
+    for item in items:
+        summary = _optional_text(item.get("summary"))
+        text = summary.casefold()
+        if any(cue.casefold() in text for cue in (*BEARISH_CUES, "跌", "回落", "亏", "为什么")):
+            return summary[:120]
+    return "未见明确国内风险点"
 
 
 def _classify_signal(evidence: list[dict[str, str]]) -> str:
@@ -460,6 +585,7 @@ def _missing_news_sentiment_module() -> dict[str, Any]:
         "confidence": "low",
         "freshness": {"generated_at": _now_text(), "source_window": ""},
         "evidence": [],
+        "domestic_discussion": _missing_domestic_discussion(),
         "blocking_reason": "",
         "suggested_constraint": "review",
     }
@@ -472,6 +598,7 @@ def _error_news_sentiment_module() -> dict[str, Any]:
         "confidence": "low",
         "freshness": {"generated_at": _now_text(), "source_window": ""},
         "evidence": [],
+        "domestic_discussion": _missing_domestic_discussion(),
         "blocking_reason": "",
         "suggested_constraint": "review",
     }
@@ -498,9 +625,59 @@ def _normalize_evidence(value: object) -> list[dict[str, str]]:
                 "title": _optional_text(item.get("title")),
                 "summary": _optional_text(item.get("summary")),
                 "url": _optional_text(item.get("url")),
+                "source": _optional_text(item.get("source")),
             }
         )
     return evidence
+
+
+def _normalize_domestic_discussion(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return _missing_domestic_discussion()
+    normalized: dict[str, object] = {
+        "status": _required_enum(value, "status", VALID_DOMESTIC_STATUSES, "domestic_discussion"),
+        "direction": _required_enum(
+            value,
+            "direction",
+            VALID_DOMESTIC_DIRECTIONS,
+            "domestic_discussion",
+        ),
+        "quality": _required_enum(value, "quality", VALID_DOMESTIC_QUALITIES, "domestic_discussion"),
+        "representative_view": _optional_text(value.get("representative_view")),
+        "risk_point": _optional_text(value.get("risk_point")),
+        "constraint": _optional_text(value.get("constraint")),
+        "post_count": _optional_int(value.get("post_count")),
+        "relevant_post_count": _optional_int(value.get("relevant_post_count")),
+    }
+    _validate_domestic_discussion(normalized)
+    return normalized
+
+
+def _missing_domestic_discussion() -> dict[str, object]:
+    return {
+        "status": "missing",
+        "direction": "noisy",
+        "quality": "missing",
+        "representative_view": "缺失",
+        "risk_point": "缺失",
+        "constraint": "富途社区未找到足够相关讨论，不作为交易依据",
+        "post_count": 0,
+        "relevant_post_count": 0,
+    }
+
+
+def _validate_domestic_discussion(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("domestic_discussion is invalid")
+    _validate_enum(value, "status", VALID_DOMESTIC_STATUSES, "domestic_discussion")
+    _validate_enum(value, "direction", VALID_DOMESTIC_DIRECTIONS, "domestic_discussion")
+    _validate_enum(value, "quality", VALID_DOMESTIC_QUALITIES, "domestic_discussion")
+    for field in ("representative_view", "risk_point", "constraint"):
+        if not isinstance(value.get(field), str):
+            raise ValueError(f"domestic_discussion {field} is invalid")
+    for field in ("post_count", "relevant_post_count"):
+        if not isinstance(value.get(field), int):
+            raise ValueError(f"domestic_discussion {field} is invalid")
 
 
 def _required_enum(
@@ -527,6 +704,10 @@ def _validate_enum(
 
 def _optional_text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _optional_int(value: object) -> int:
+    return value if isinstance(value, int) and value >= 0 else 0
 
 
 def _validate_run_date(value: str) -> str:

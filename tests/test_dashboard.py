@@ -165,8 +165,19 @@ def write_futu_skill_facts(path: Path) -> None:
                                     "title": "Volatility ETF news digest",
                                     "summary": "市场波动相关讨论升温。",
                                     "url": "https://example.com/vixy",
+                                    "source": "news",
                                 }
                             ],
+                            "domestic_discussion": {
+                                "status": "ok",
+                                "direction": "mixed",
+                                "quality": "weak",
+                                "representative_view": "有用户讨论波动率 ETF 的短线风险。",
+                                "risk_point": "讨论样本较少。",
+                                "constraint": "富途社区讨论仅作国内讨论温度参考，不单独作为交易依据",
+                                "post_count": 3,
+                                "relevant_post_count": 1,
+                            },
                             "blocking_reason": "",
                             "suggested_constraint": "",
                         },
@@ -1307,6 +1318,8 @@ def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     assert news_sentiment["signal"] == "supportive"
     assert news_sentiment["confidence"] == "medium"
     assert news_sentiment["evidence"][0]["url"] == "https://example.com/vixy"
+    assert news_sentiment["domestic_discussion"]["direction"] == "mixed"
+    assert news_sentiment["domestic_discussion"]["quality"] == "weak"
 
 
 def test_load_dashboard_state_marks_missing_agent_sections_unavailable(

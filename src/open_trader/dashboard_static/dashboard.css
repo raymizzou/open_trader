@@ -796,6 +796,19 @@ tbody tr.active-row {
   margin-top: 12px;
 }
 
+.decision-fact-source-block {
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+  padding-top: 10px;
+}
+
+.decision-fact-source-block > b {
+  color: var(--text);
+  display: block;
+  font-size: 13px;
+  margin-bottom: 2px;
+}
+
 .technical-fact-row {
   background: var(--surface-soft);
   border: 1px solid var(--line);

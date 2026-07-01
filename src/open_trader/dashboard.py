@@ -857,6 +857,11 @@ def _futu_skill_news_sentiment_detail(module: object) -> dict[str, Any]:
         "confidence": confidence,
         "freshness": module.get("freshness") if isinstance(module.get("freshness"), dict) else {},
         "evidence": evidence if isinstance(evidence, list) else [],
+        "domestic_discussion": (
+            module.get("domestic_discussion")
+            if isinstance(module.get("domestic_discussion"), dict)
+            else _missing_futu_domestic_discussion()
+        ),
         "blocking_reason": str(module.get("blocking_reason") or ""),
         "suggested_constraint": str(module.get("suggested_constraint") or ""),
     }
@@ -870,8 +875,22 @@ def _missing_futu_skill_news_sentiment() -> dict[str, Any]:
         "confidence": "",
         "freshness": {},
         "evidence": [],
+        "domestic_discussion": _missing_futu_domestic_discussion(),
         "blocking_reason": "",
         "suggested_constraint": "",
+    }
+
+
+def _missing_futu_domestic_discussion() -> dict[str, Any]:
+    return {
+        "status": "missing",
+        "direction": "noisy",
+        "quality": "missing",
+        "representative_view": "缺失",
+        "risk_point": "缺失",
+        "constraint": "富途社区未找到足够相关讨论，不作为交易依据",
+        "post_count": 0,
+        "relevant_post_count": 0,
     }
 
 

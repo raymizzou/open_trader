@@ -721,18 +721,7 @@ function renderTradingDecisionPlugins(holding) {
       ],
       score: "K线",
     }),
-    futuSkillNewsSentimentPlugin(holding) || decisionFactsPlugin(holding, {
-      title: "新闻 / 舆论",
-      moduleKey: "news_sentiment",
-      fieldOrder: [
-        ["direction", "方向"],
-        ["change", "变化"],
-        ["catalyst", "催化"],
-        ["risk", "风险"],
-        ["attention", "热度"],
-      ],
-      score: "舆论",
-    }),
+    newsSentimentPlugin(holding),
     {
       title: "公司行动",
       status: "占位",
@@ -847,31 +836,47 @@ function decisionFactsPlugin(holding, config) {
   };
 }
 
+function newsSentimentPlugin(holding) {
+  const plugin = decisionFactsPlugin(holding, {
+    title: "新闻 / 舆论",
+    moduleKey: "news_sentiment",
+    fieldOrder: [
+      ["direction", "方向"],
+      ["change", "变化"],
+      ["catalyst", "催化"],
+      ["risk", "风险"],
+      ["attention", "热度"],
+    ],
+    score: "舆论",
+  });
+  const domesticHtml = futuSkillNewsSentimentPlugin(holding);
+  return {
+    ...plugin,
+    bodyHtml: plugin.bodyHtml + domesticHtml,
+  };
+}
+
 function futuSkillNewsSentimentPlugin(holding) {
   const module = futuSkillNewsSentimentModule(holding);
   if (!module || module.available !== true) {
-    return null;
+    return "";
   }
-  const signal = formatFutuSkillSignal(module.signal);
-  const confidence = formatFutuSkillConfidence(module.confidence);
-  const evidence = Array.isArray(module.evidence) ? module.evidence : [];
+  const discussion = module.domestic_discussion && typeof module.domestic_discussion === "object"
+    ? module.domestic_discussion
+    : {};
   const rows = [
-    { label: "方向", value: signal },
-    { label: "变化", value: formatPlain(module.status) },
-    { label: "催化", value: firstEvidenceSummary(evidence) },
-    { label: "风险", value: formatPlain(module.blocking_reason || module.suggested_constraint || "未触发阻断") },
-    { label: "热度", value: confidence },
+    { label: "国内讨论方向", value: formatFutuDomesticDirection(discussion.direction) },
+    { label: "讨论质量", value: formatFutuDomesticQuality(discussion.quality) },
+    { label: "代表观点", value: formatPlain(discussion.representative_view) },
+    { label: "国内风险点", value: formatPlain(discussion.risk_point) },
+    { label: "数据约束", value: formatPlain(discussion.constraint) },
   ];
-  return {
-    title: "新闻 / 舆论",
-    status: "可用",
-    tone: "ok",
-    score: "舆论",
-    headline: signal,
-    detail: "Futu Skill 证据",
-    bodyHtml: renderDecisionFactRows(rows) + renderFutuSkillEvidence(evidence),
-    condition: "",
-  };
+  return `
+    <div class="decision-fact-source-block">
+      <b>富途社区 / 国内讨论</b>
+      ${renderDecisionFactRows(rows)}
+    </div>
+  `;
 }
 
 function futuSkillNewsSentimentModule(holding) {
@@ -882,55 +887,25 @@ function futuSkillNewsSentimentModule(holding) {
   return module && typeof module === "object" ? module : null;
 }
 
-function renderFutuSkillEvidence(evidence) {
-  const items = evidence
-    .filter((item) => item && typeof item === "object")
-    .slice(0, 3);
-  if (!items.length) {
-    return "";
-  }
-  return `
-    <div class="decision-fact-grid">
-      ${items.map((item, index) => `
-        <div class="decision-fact-row">
-          <span>${index === 0 ? "Futu Skill 证据" : "证据"}</span>
-          <strong>${escapeHtml(formatEvidenceText(item))}</strong>
-        </div>
-      `).join("")}
-    </div>
-  `;
-}
-
-function formatEvidenceText(item) {
-  const title = formatPlain(item.title);
-  const summary = formatPlain(item.summary);
-  const url = formatPlain(item.url);
-  return [title, summary, url].filter((value) => value !== "-").join(" · ") || "-";
-}
-
-function firstEvidenceSummary(evidence) {
-  const first = evidence.find((item) => item && typeof item === "object" && hasValue(item.summary));
-  return first ? formatPlain(first.summary) : "缺失";
-}
-
-function formatFutuSkillSignal(signal) {
+function formatFutuDomesticDirection(direction) {
   const labels = {
-    supportive: "支持",
-    opposing: "反对",
+    bullish: "偏多",
+    bearish: "偏空",
     neutral: "中性",
-    risk_up: "风险升高",
     mixed: "分歧",
+    noisy: "噪声高",
   };
-  return labels[formatPlain(signal)] || formatPlain(signal);
+  return labels[formatPlain(direction)] || formatPlain(direction);
 }
 
-function formatFutuSkillConfidence(confidence) {
+function formatFutuDomesticQuality(quality) {
   const labels = {
-    high: "置信度高",
-    medium: "置信度中",
-    low: "置信度低",
+    usable: "可用",
+    weak: "讨论较弱",
+    noisy: "噪声高",
+    missing: "缺失",
   };
-  return labels[formatPlain(confidence)] || formatPlain(confidence);
+  return labels[formatPlain(quality)] || formatPlain(quality);
 }
 
 function decisionFactsModule(holding, moduleKey) {

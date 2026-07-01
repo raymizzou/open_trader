@@ -348,7 +348,8 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "decision_facts" in js
     assert "futuSkillNewsSentimentPlugin" in js
     assert "futu_skill_facts" in js
-    assert "Futu Skill 证据" in js
+    assert "富途社区 / 国内讨论" in js
+    assert "国内讨论方向" in js
     assert "technical_facts" in js
     assert "technicalFactRows" in js
     assert "插件管理" not in js
@@ -754,6 +755,21 @@ const holding = {
         attention: "关注度升高"
       }
     }
+  },
+  futu_skill_facts: {
+    news_sentiment: {
+      available: true,
+      domestic_discussion: {
+        status: "ok",
+        direction: "mixed",
+        quality: "weak",
+        representative_view: "有用户质疑 DRAM ETF 跌幅大于成分股。",
+        risk_point: "ETF 结构与成分股偏离需要确认。",
+        constraint: "富途社区讨论仅作国内讨论温度参考，不单独作为交易依据",
+        post_count: 8,
+        relevant_post_count: 2
+      }
+    }
   }
 };
 const cards = fixedDecisionFactCards(renderTradingDecisionPlugins(holding));
@@ -761,6 +777,7 @@ const klineCard = cardBefore(cards, "<h4>新闻 / 舆论</h4>");
 const newsCard = cardFrom(cards, "<h4>新闻 / 舆论</h4>");
 assertOrdered(klineCard, ["趋势", "位置", "动能", "关键位", "风险"]);
 assertOrdered(newsCard, ["方向", "变化", "催化", "风险", "热度"]);
+assertOrdered(newsCard, ["国内讨论方向", "讨论质量", "代表观点", "国内风险点", "数据约束"]);
 for (const required of [
   "趋势 / K 线",
   "新闻 / 舆论",
@@ -774,13 +791,24 @@ for (const required of [
   "催化",
   "热度",
   "过热拉升",
-  "偏多"
+  "偏多",
+  "AI 基建需求",
+  "富途社区 / 国内讨论",
+  "国内讨论方向",
+  "讨论质量",
+  "代表观点",
+  "国内风险点",
+  "数据约束",
+  "分歧",
+  "讨论较弱",
+  "有用户质疑 DRAM ETF 跌幅大于成分股。",
+  "ETF 结构与成分股偏离需要确认。"
 ]) {
   if (!cards.includes(required)) {
     throw new Error("missing fixed decision fact content " + required + ": " + cards);
   }
 }
-for (const forbidden of ["Bullish", "condition-box"]) {
+for (const forbidden of ["Bullish", "condition-box", "Futu Skill 证据", "https://news.futunn.com"]) {
   if (cards.includes(forbidden)) {
     throw new Error("unexpected fixed decision fact content " + forbidden + ": " + cards);
   }
