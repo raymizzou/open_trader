@@ -494,7 +494,8 @@ h2 {
 
 table {
   border-collapse: collapse;
-  min-width: 1040px;
+  min-width: 1120px;
+  table-layout: fixed;
   width: 100%;
 }
 
@@ -523,6 +524,44 @@ tbody tr.active-row {
   background: #fffaf1;
 }
 
+.market-section-row td {
+  background: #eef3ed;
+  border-bottom: 1px solid #b8dac6;
+  border-top: 2px solid var(--accent);
+  color: var(--accent-strong);
+  padding: 9px 12px;
+}
+
+.market-section-row strong {
+  margin-right: 10px;
+}
+
+.market-section-row span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.market-section-us td {
+  background: #eef3ed;
+  border-bottom-color: #b8dac6;
+  border-top-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.market-section-hk td {
+  background: #fffaf1;
+  border-bottom-color: #e1c18e;
+  border-top-color: var(--warning);
+  color: #7b4208;
+}
+
+.market-section-other td {
+  background: var(--surface-soft);
+  border-top-color: var(--line);
+  color: var(--muted);
+}
+
 .decision-detail-row > td {
   background: var(--surface);
   padding: 0;
@@ -538,10 +577,23 @@ tbody tr.active-row {
   min-width: 70px;
 }
 
+.symbol-cell {
+  max-width: 170px;
+  min-width: 120px;
+}
+
 .symbol-cell strong {
   display: block;
   margin-bottom: 4px;
   overflow-wrap: anywhere;
+}
+
+.symbol-cell .meta-text {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .number-cell {

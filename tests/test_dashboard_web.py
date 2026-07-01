@@ -406,6 +406,11 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".source-status-list" in css
     assert ".source-status-row" in css
     assert ".cash-detail-panel" in css
+    assert ".market-section-row" in css
+    assert ".market-section-us" in css
+    assert ".market-section-hk" in css
+    assert ".symbol-cell" in css
+    assert "table-layout: fixed;" in css
     assert "grid-template-columns: minmax(0, 1fr) 300px;" not in css
     assert ".right-rail" not in css
     assert 'grid-template-areas: "brand source" "assets assets";' in css
