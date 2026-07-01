@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>富途异动信号卡片 Mock</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f3;
+      --surface: #fffffc;
+      --surface-soft: #f8faf6;
+      --text: #202523;
+      --muted: #6d766e;
+      --line: #dde4da;
+      --accent: #23614f;
+      --accent-soft: #e6f3ed;
+      --ok: #1f6b47;
+      --warn: #a16613;
+      --danger: #a44242;
+      --neutral: #5f6870;
+      --blue: #2f5f98;
+      --shadow: 0 10px 28px rgba(32, 37, 35, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+      margin: 0;
+      padding: 24px;
+    }
+
+    .canvas {
+      display: grid;
+      gap: 14px;
+      margin: 0 auto;
+      max-width: 1180px;
+    }
+
+    .symbol-strip,
+    .decision-panel,
+    .signals-panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      min-width: 0;
+      padding: 14px;
+    }
+
+    .symbol-strip {
+      align-items: center;
+      display: flex;
+      gap: 12px;
+      justify-content: space-between;
+    }
+
+    .symbol-title {
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .symbol-title strong {
+      font-size: 18px;
+      overflow-wrap: anywhere;
+    }
+
+    .symbol-title span,
+    .meta-line,
+    .source-note,
+    .small-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      justify-content: flex-end;
+    }
+
+    .pill {
+      align-items: center;
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--neutral);
+      display: inline-flex;
+      font-size: 12px;
+      font-weight: 800;
+      min-height: 28px;
+      padding: 0 10px;
+      white-space: nowrap;
+    }
+
+    .pill.ok {
+      background: #e8f5ee;
+      border-color: #b9ddc9;
+      color: var(--ok);
+    }
+
+    .pill.warn {
+      background: #fff4de;
+      border-color: #ead3a2;
+      color: var(--warn);
+    }
+
+    .pill.blue {
+      background: #e8f0fa;
+      border-color: #bed1e8;
+      color: var(--blue);
+    }
+
+    .decision-panel {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: minmax(180px, 0.72fr) minmax(0, 1.28fr);
+    }
+
+    .decision-main {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+    }
+
+    .decision-main b {
+      font-size: 16px;
+    }
+
+    .decision-facts {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .fact-cell {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      display: grid;
+      gap: 6px;
+      min-height: 78px;
+      min-width: 0;
+      padding: 10px;
+    }
+
+    .fact-cell strong {
+      font-size: 13px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
+    .signals-panel {
+      display: grid;
+      gap: 12px;
+    }
+
+    .panel-header,
+    .module-header,
+    .category-header {
+      align-items: center;
+      display: flex;
+      gap: 10px;
+      justify-content: space-between;
+      min-width: 0;
+    }
+
+    h2,
+    h3 {
+      font-size: 16px;
+      margin: 0;
+    }
+
+    .overall-signal {
+      background: var(--accent-soft);
+      border: 1px solid #c5dfd3;
+      border-radius: 8px;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 72px minmax(0, 1fr) auto;
+      padding: 12px;
+    }
+
+    .score-badge {
+      align-items: center;
+      background: var(--accent);
+      border-radius: 999px;
+      color: #fff;
+      display: inline-flex;
+      font-size: 13px;
+      font-weight: 900;
+      height: 54px;
+      justify-content: center;
+      width: 54px;
+    }
+
+    .overall-copy {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .overall-copy strong {
+      font-size: 15px;
+      overflow-wrap: anywhere;
+    }
+
+    .overall-copy span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
+    .module-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .signal-module {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+      padding: 12px;
+    }
+
+    .module-header h3 {
+      font-size: 15px;
+    }
+
+    .module-summary {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .metric {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      display: grid;
+      gap: 4px;
+      min-height: 62px;
+      padding: 8px;
+    }
+
+    .metric strong {
+      color: var(--text);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+
+    .category-list {
+      display: grid;
+      gap: 7px;
+    }
+
+    .category-row {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--neutral);
+      border-radius: 7px;
+      display: grid;
+      gap: 5px;
+      padding: 9px;
+    }
+
+    .category-row.supportive {
+      border-left-color: var(--ok);
+    }
+
+    .category-row.opposing {
+      border-left-color: var(--danger);
+    }
+
+    .category-row.watch {
+      border-left-color: var(--warn);
+    }
+
+    .category-row.none {
+      border-left-color: #aab3aa;
+    }
+
+    .category-row strong,
+    .category-row span {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+
+    .category-row strong {
+      font-size: 13px;
+    }
+
+    .category-row span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .template-note {
+      background: #f2f5f0;
+      border: 1px dashed #c8d2c5;
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+      padding: 10px;
+    }
+
+    @media (max-width: 960px) {
+      body {
+        padding: 14px;
+      }
+
+      .symbol-strip,
+      .panel-header {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .pill-row {
+        justify-content: flex-start;
+      }
+
+      .decision-panel,
+      .overall-signal,
+      .module-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .decision-facts,
+      .module-summary {
+        grid-template-columns: 1fr;
+      }
+
+      .overall-signal {
+        gap: 8px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="canvas">
+    <section class="symbol-strip" aria-label="holding context">
+      <div class="symbol-title">
+        <strong>NVDA · 英伟达</strong>
+        <span>美股 · 股票 · 运行日 2026-07-02 · 信号窗口 7 天</span>
+      </div>
+      <div class="pill-row">
+        <span class="pill blue">交易智能体：加仓</span>
+        <span class="pill ok">信号层: 支持</span>
+        <span class="pill warn">执行约束：不加仓</span>
+      </div>
+    </section>
+
+    <section class="decision-panel" aria-label="existing decision context">
+      <div class="decision-main">
+        <span class="small-label">交易智能体主结论</span>
+        <b>逢回调加仓，但不追高。</b>
+        <span class="meta-line">主结论仍来自交易智能体；富途信号只做独立佐证和约束提示。</span>
+      </div>
+      <div class="decision-facts">
+        <div class="fact-cell">
+          <span class="small-label">当前交易动作</span>
+          <strong>加仓 · 目标仓位上限 9.5%</strong>
+        </div>
+        <div class="fact-cell">
+          <span class="small-label">关键条件</span>
+          <strong>回踩 154.00 附近且量能不放大。</strong>
+        </div>
+        <div class="fact-cell">
+          <span class="small-label">失败条件</span>
+          <strong>跌破 148.50 或资金信号继续转弱。</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="signals-panel" aria-label="futu anomaly signals">
+      <div class="panel-header">
+        <div>
+          <h2>市场信号 · 富途异动信号</h2>
+          <div class="source-note">固定模板输出：技术异动、资金异动、衍生品异动。缺失、无异常和权限失败都必须显式展示。</div>
+        </div>
+        <div class="pill-row">
+          <span class="pill ok">3/3 模块可用</span>
+          <span class="pill">模板 v1</span>
+        </div>
+      </div>
+
+      <div class="overall-signal">
+        <div class="score-badge">支持</div>
+        <div class="overall-copy">
+          <strong>技术信号支持趋势，但资金和期权信号提示不宜追高。</strong>
+          <span>统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。</span>
+        </div>
+        <div class="pill-row">
+          <span class="pill ok">支持</span>
+          <span class="pill warn">不加仓</span>
+        </div>
+      </div>
+
+      <div class="module-grid">
+        <article class="signal-module">
+          <div class="module-header">
+            <h3>技术异动</h3>
+            <span class="pill ok">正常</span>
+          </div>
+          <div class="module-summary">
+            <div class="metric">
+              <span class="small-label">方向</span>
+              <strong>支持</strong>
+            </div>
+            <div class="metric">
+              <span class="small-label">置信度</span>
+              <strong>中等</strong>
+            </div>
+          </div>
+          <div class="category-list">
+            <div class="category-row supportive">
+              <div class="category-header">
+                <strong>MACD</strong>
+                <span>偏多 · 2026-07-01</span>
+              </div>
+              <span>金叉后继续放大，支持短线趋势延续。</span>
+            </div>
+            <div class="category-row watch">
+              <div class="category-header">
+                <strong>RSI</strong>
+                <span>风险上升 · 2026-07-02</span>
+              </div>
+              <span>接近超买区，追高风险上升。</span>
+            </div>
+            <div class="category-row none">
+              <div class="category-header">
+                <strong>K线形态</strong>
+                <span>无异常</span>
+              </div>
+              <span>窗口内无异常。</span>
+            </div>
+          </div>
+        </article>
+
+        <article class="signal-module">
+          <div class="module-header">
+            <h3>资金异动</h3>
+            <span class="pill ok">正常</span>
+          </div>
+          <div class="module-summary">
+            <div class="metric">
+              <span class="small-label">方向</span>
+              <strong>分歧</strong>
+            </div>
+            <div class="metric">
+              <span class="small-label">约束</span>
+              <strong>不加仓</strong>
+            </div>
+          </div>
+          <div class="category-list">
+            <div class="category-row opposing">
+              <div class="category-header">
+                <strong>资金流向</strong>
+                <span>偏空 · 2026-07-02</span>
+              </div>
+              <span>主力资金连续净流出，和加仓动作冲突。</span>
+            </div>
+            <div class="category-row supportive">
+              <div class="category-header">
+                <strong>买卖经纪商</strong>
+                <span>偏多 · 2026-07-01</span>
+              </div>
+              <span>买入经纪商集中度上升，但持续性仍需观察。</span>
+            </div>
+            <div class="category-row none">
+              <div class="category-header">
+                <strong>卖空情况</strong>
+                <span>无异常</span>
+              </div>
+              <span>窗口内无异常。</span>
+            </div>
+          </div>
+        </article>
+
+        <article class="signal-module">
+          <div class="module-header">
+            <h3>衍生品异动</h3>
+            <span class="pill warn">部分可用</span>
+          </div>
+          <div class="module-summary">
+            <div class="metric">
+              <span class="small-label">方向</span>
+              <strong>风险上升</strong>
+            </div>
+            <div class="metric">
+              <span class="small-label">市场差异</span>
+              <strong>美股期权类</strong>
+            </div>
+          </div>
+          <div class="category-list">
+            <div class="category-row watch">
+              <div class="category-header">
+                <strong>期权波动率</strong>
+                <span>风险上升 · 2026-07-02</span>
+              </div>
+              <span>IV 位于高位，短线波动定价偏贵。</span>
+            </div>
+            <div class="category-row supportive">
+              <div class="category-header">
+                <strong>期权大单</strong>
+                <span>偏多 · 2026-07-01</span>
+              </div>
+              <span>出现看涨大单，但不能单独覆盖资金分歧。</span>
+            </div>
+            <div class="category-row none">
+              <div class="category-header">
+                <strong>牛熊证街货</strong>
+                <span>不适用</span>
+              </div>
+              <span>美股不展示港股牛熊证类别；港股标的会固定显示。</span>
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <div class="template-note">
+        模板约束：模块标题、状态、方向、置信度、约束、类别顺序固定；每个类别必须落到
+        异常 / 无异常 / 不适用 / 错误 之一。UI 不读取原始长文本生成结构，原始内容只进入详情或调试产物。
+      </div>
+    </section>
+  </main>
+</body>
+</html>
