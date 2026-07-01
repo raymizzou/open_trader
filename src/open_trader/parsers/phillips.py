@@ -7,7 +7,7 @@ import re
 
 import pdfplumber
 
-from open_trader.models import CashBalance, Market, Position
+from open_trader.models import AssetClass, CashBalance, Market, Position
 from open_trader.parsers.base import (
     ParseResult,
     StatementParser,
@@ -51,6 +51,8 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
             line == "Securities Portfolio"
             or "證券投資組合" in line
             or "证券投资组合" in line
+            or "股票投資組合" in line
+            or "股票投资组合" in line
             or "SSeeccuurriittiieess PPoorrttffoolliioo" in line
             or "股股票票投投資資組組合合" in line
         ):
@@ -86,6 +88,29 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
 
 
 def _parse_position_line(line: str, statement_id: str) -> Position | None:
+    ut_match = _match_unit_trust_position_line(line)
+    if ut_match is not None:
+        market = _detect_phillips_market(ut_match.group("market"))
+        symbol = ut_match.group("symbol").upper()
+        return Position(
+            statement_id=statement_id,
+            broker=BROKER,
+            account_alias=ACCOUNT_ALIAS,
+            market=market,
+            asset_class=AssetClass.MONEY_MARKET_FUND,
+            symbol=symbol,
+            name=ut_match.group("name").strip(),
+            currency=_currency_for_market(market),
+            quantity=parse_decimal(ut_match.group("quantity")) or Decimal("0"),
+            cost_price=None,
+            last_price=parse_decimal(ut_match.group("last_price")),
+            market_value=parse_decimal(ut_match.group("market_value")),
+            cost_value=None,
+            unrealized_pnl=None,
+            confidence="medium",
+            notes="currency inferred from market in Phillips statement",
+        )
+
     match = _match_stock_position_line(line) or _match_equity_position_line(line)
     if match is None:
         return None
@@ -148,8 +173,24 @@ def _match_equity_position_line(line: str) -> re.Match[str] | None:
     )
 
 
+def _match_unit_trust_position_line(line: str) -> re.Match[str] | None:
+    return re.fullmatch(
+        r"UT\s+"
+        r"(?P<market>OTCU|XHKG|HK)\s+"
+        r"(?P<symbol>[A-Z0-9.-]+)\s+"
+        r"(?P<name>.+?)\s+"
+        rf"(?P<previous_quantity>{NUMERIC})\s+"
+        rf"(?P<quantity>{NUMERIC})\s+"
+        rf"(?P<last_price>{NUMERIC})\s+"
+        rf"(?P<market_value>{NUMERIC})\s+"
+        rf"(?P<margin_ratio>{NUMERIC})\s+"
+        rf"(?P<margin_value>{NUMERIC})",
+        line,
+    )
+
+
 def _detect_phillips_market(value: str) -> Market:
-    if value == "XHKG":
+    if value in {"XHKG", "OTCU"}:
         return Market.HK
     if value in {"XNAS", "XNYS"}:
         return Market.US

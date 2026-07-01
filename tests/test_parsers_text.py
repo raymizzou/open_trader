@@ -250,6 +250,30 @@ Equity XHKG 002476 VGT 300 12/05/26 300 378.8000 113,640.00 0.5000 56,820.00
     assert position.market_value == Decimal("113640.00")
 
 
+def test_parse_phillips_text_extracts_ut_money_market_fund_row() -> None:
+    result = parse_phillips_text(
+        """股票投資組合 Securities Portfolio
+產品 市場 產品代號 代號名稱 上日存貨 最後買貨日期 是日存貨 收市價 市值 按貨比率 按倉值
+Product Market InstrumentCd DisplayName Qty B/F LastBoughtOn Qty C/F ClsPrice Market Value MgnRatio Margin Value
+Normal 普通戶口 Currency : HKD
+UT OTCU UT.480010 Phillip HKD Money 39,208.8100 45,021.1600 11.5654 520,687.72 0.0000 0.00
+Market Fund (A Ac
+""",
+        "2026-06",
+    )
+
+    assert len(result.positions) == 1
+    fund = result.positions[0]
+    assert fund.symbol == "UT.480010"
+    assert fund.name == "Phillip HKD Money"
+    assert fund.market == Market.HK
+    assert fund.asset_class == AssetClass.MONEY_MARKET_FUND
+    assert fund.currency == "HKD"
+    assert fund.quantity == Decimal("45021.1600")
+    assert fund.last_price == Decimal("11.5654")
+    assert fund.market_value == Decimal("520687.72")
+
+
 def test_parse_phillips_text_enters_account_details_from_currency_balance_header() -> None:
     result = parse_phillips_text(
         """Currency Balance C/F Unsettled Balance Unsettled Balance Unsettled Balance ≥ T+3 Accrued Interest Available Balance Ref ExRate DR Int Rate

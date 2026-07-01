@@ -3,6 +3,15 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-01
+
+- Fixed Phillips statement parsing for `UT OTCU` money-market-fund rows so the
+  Phillip HKD Money Market Fund is included in monthly holdings refreshes.
+- Refreshed the local Phillips monthly baseline from the 2026-06 statement and
+  verified live Futu/Tiger sync preserves the updated statement rows.
+- Verified with focused parser/account-sync tests and dashboard API checks for
+  `2026-06 月结单导入`.
+
 ## 2026-06-30
 
 - Canonicalized `portfolio.csv` grouping so daily HK/US workflows consume
