@@ -10,6 +10,7 @@ from open_trader.futu_skill_facts import (
     FUTU_SKILL_FACTS_SCHEMA_VERSION,
     FutuNewsSentimentExtractor,
     FutuSkillNewsSentimentExtractor,
+    LLMFutuDomesticDiscussionSummarizer,
     futu_skill_facts_latest_path,
     futu_skill_facts_run_path,
     generate_futu_skill_facts,
@@ -83,6 +84,44 @@ class FakeExtractor:
         }
 
 
+class FakeDomesticSummarizer:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def summarize(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        news_items: list[dict[str, str]],
+        community_items: list[dict[str, str]],
+        post_count: int,
+        relevant_post_count: int,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "market": market,
+                "symbol": symbol,
+                "name": name,
+                "news_items": news_items,
+                "community_items": community_items,
+                "post_count": post_count,
+                "relevant_post_count": relevant_post_count,
+            }
+        )
+        return {
+            "status": "ok",
+            "summary": "国内讨论认为 AI 需求仍强，但样本有限。",
+            "focus": "关注 NVIDIA 与 AI 服务器需求。",
+            "divergence_risk": "讨论样本偏少，不能代表稳定共识。",
+            "credibility": "低",
+            "trading_constraint": "仅作为国内讨论温度参考，不作为单独交易依据。",
+            "post_count": post_count,
+            "relevant_post_count": relevant_post_count,
+        }
+
+
 def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized_rows = []
@@ -111,6 +150,7 @@ def test_futu_skill_news_sentiment_extractor_protocol_accepts_fake() -> None:
 
 def test_futu_news_sentiment_extractor_builds_evidence_from_futu_apis() -> None:
     calls: list[dict[str, object]] = []
+    summarizer = FakeDomesticSummarizer()
 
     def fake_get_json(url: str, params: dict[str, object]) -> dict[str, object]:
         calls.append({"url": url, "params": params})
@@ -137,7 +177,10 @@ def test_futu_news_sentiment_extractor_builds_evidence_from_futu_apis() -> None:
             }
         raise AssertionError(f"unexpected URL {url}")
 
-    extractor = FutuNewsSentimentExtractor(http_get_json=fake_get_json)
+    extractor = FutuNewsSentimentExtractor(
+        http_get_json=fake_get_json,
+        domestic_summarizer=summarizer,
+    )
 
     result = extractor.extract_news_sentiment(
         market="US",
@@ -153,14 +196,39 @@ def test_futu_news_sentiment_extractor_builds_evidence_from_futu_apis() -> None:
     assert result["freshness"]["source_window"] == "latest"
     assert result["domestic_discussion"] == {
         "status": "ok",
-        "direction": "bullish",
-        "quality": "usable",
-        "representative_view": "继续看好 NVIDIA AI 需求仍强。",
-        "risk_point": "未见明确国内风险点",
-        "constraint": "富途社区讨论仅作国内讨论温度参考，不单独作为交易依据",
+        "summary": "国内讨论认为 AI 需求仍强，但样本有限。",
+        "focus": "关注 NVIDIA 与 AI 服务器需求。",
+        "divergence_risk": "讨论样本偏少，不能代表稳定共识。",
+        "credibility": "低",
+        "trading_constraint": "仅作为国内讨论温度参考，不作为单独交易依据。",
         "post_count": 1,
         "relevant_post_count": 1,
     }
+    assert summarizer.calls == [
+        {
+            "market": "US",
+            "symbol": "NVDA",
+            "name": "NVIDIA",
+            "news_items": [
+                {
+                    "title": "NVIDIA AI demand boosts chip outlook",
+                    "summary": "NVIDIA AI demand boosts chip outlook",
+                    "url": "https://news.example/nvda-ai",
+                    "source": "news",
+                }
+            ],
+            "community_items": [
+                {
+                    "title": "继续看好 NVIDIA",
+                    "summary": "继续看好 NVIDIA AI 需求仍强。",
+                    "url": "https://feed.example/nvda",
+                    "source": "community",
+                }
+            ],
+            "post_count": 1,
+            "relevant_post_count": 1,
+        }
+    ]
     assert result["evidence"] == [
         {
             "title": "NVIDIA AI demand boosts chip outlook",
@@ -324,7 +392,14 @@ def test_futu_news_sentiment_extractor_marks_noisy_feed_as_unusable() -> None:
             }
         raise AssertionError(f"unexpected URL {url}")
 
-    extractor = FutuNewsSentimentExtractor(http_get_json=fake_get_json)
+    class BrokenSummarizer:
+        def summarize(self, **kwargs: object) -> dict[str, object]:
+            raise RuntimeError("llm unavailable")
+
+    extractor = FutuNewsSentimentExtractor(
+        http_get_json=fake_get_json,
+        domestic_summarizer=BrokenSummarizer(),
+    )
 
     result = extractor.extract_news_sentiment(
         market="US",
@@ -335,14 +410,77 @@ def test_futu_news_sentiment_extractor_marks_noisy_feed_as_unusable() -> None:
 
     assert result["domestic_discussion"] == {
         "status": "ok",
-        "direction": "noisy",
-        "quality": "noisy",
-        "representative_view": "$DRAM.US$ 为什么 ETF 跌幅大于成分股？",
-        "risk_point": "$DRAM.US$ 为什么 ETF 跌幅大于成分股？",
-        "constraint": "富途社区匹配噪声高，仅作风险提示，不作为交易依据",
+        "summary": "富途社区相关讨论较少，3 条 feed 中 1 条与 DRAM 明确相关。",
+        "focus": "少量讨论关注 DRAM 的短线走势或 ETF 结构问题。",
+        "divergence_risk": "社区样本少且噪声高，不能代表稳定共识。",
+        "credibility": "噪声高",
+        "trading_constraint": "仅作为国内讨论温度和 ETF 结构风险提示，不支持单独加仓或减仓。",
         "post_count": 3,
         "relevant_post_count": 1,
     }
+
+
+def test_llm_domestic_discussion_summarizer_sends_fixed_schema_prompt() -> None:
+    class FakeTextClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+            self.calls.append({"messages": messages, "temperature": temperature})
+            return json.dumps(
+                {
+                    "summary": "富途社区相关讨论较少，主要关注 ETF 与存储链成分股联动。",
+                    "focus": "关注海力士、三星、美光对 DRAM ETF 的影响。",
+                    "divergence_risk": "样本少且噪声高，不能代表稳定共识。",
+                    "credibility": "低",
+                    "trading_constraint": "仅作为国内讨论温度和 ETF 结构风险提示，不支持单独加仓或减仓。",
+                },
+                ensure_ascii=False,
+            )
+
+    client = FakeTextClient()
+    summarizer = LLMFutuDomesticDiscussionSummarizer(client=client)
+
+    result = summarizer.summarize(
+        market="US",
+        symbol="DRAM",
+        name="Roundhill Memory ETF",
+        news_items=[
+            {
+                "title": "DRAM ETF attracts AI memory flows",
+                "summary": "DRAM ETF attracts AI memory flows",
+                "url": "https://news.example/dram",
+                "source": "news",
+            }
+        ],
+        community_items=[
+            {
+                "title": "$DRAM.US$ 为什么比成分股跌得多？",
+                "summary": "$DRAM.US$ 为什么比成分股跌得多？",
+                "url": "",
+                "source": "community",
+            }
+        ],
+        post_count=30,
+        relevant_post_count=1,
+    )
+
+    assert result == {
+        "status": "ok",
+        "summary": "富途社区相关讨论较少，主要关注 ETF 与存储链成分股联动。",
+        "focus": "关注海力士、三星、美光对 DRAM ETF 的影响。",
+        "divergence_risk": "样本少且噪声高，不能代表稳定共识。",
+        "credibility": "低",
+        "trading_constraint": "仅作为国内讨论温度和 ETF 结构风险提示，不支持单独加仓或减仓。",
+        "post_count": 30,
+        "relevant_post_count": 1,
+    }
+    assert client.calls[0]["temperature"] == 0
+    messages = client.calls[0]["messages"]
+    assert "国内讨论结论" in messages[0]["content"]
+    user_payload = json.loads(messages[1]["content"])
+    assert user_payload["symbol"] == "DRAM"
+    assert user_payload["community_items"][0]["summary"] == "$DRAM.US$ 为什么比成分股跌得多？"
 
 
 def valid_record() -> dict[str, object]:

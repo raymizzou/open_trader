@@ -798,15 +798,60 @@ tbody tr.active-row {
 
 .decision-fact-source-block {
   border-top: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
   margin-top: 12px;
   padding-top: 10px;
 }
 
-.decision-fact-source-block > b {
+.domestic-section-header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.domestic-section-header b {
   color: var(--text);
   display: block;
   font-size: 13px;
-  margin-bottom: 2px;
+}
+
+.domestic-section-header span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.domestic-list {
+  display: grid;
+  gap: 7px;
+}
+
+.domestic-row {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  display: grid;
+  gap: 5px;
+  padding: 9px 10px;
+}
+
+.domestic-row span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.domestic-row strong {
+  font-size: 13px;
+  line-height: 1.42;
+  overflow-wrap: anywhere;
+}
+
+.domestic-row.warn {
+  background: #fff3da;
+  border-color: #ead7a5;
 }
 
 .technical-fact-row {

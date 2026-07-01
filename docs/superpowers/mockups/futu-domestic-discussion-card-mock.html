@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Futu Domestic Discussion Card Mock</title>
+  <style>
+    :root {
+      --bg: #f7f8f4;
+      --surface: #fffffb;
+      --surface-soft: #f7f8f4;
+      --line: #dfe5dc;
+      --text: #202523;
+      --muted: #737d73;
+      --accent: #dff0e8;
+      --accent-strong: #21604c;
+      --warn: #fff3da;
+      --warn-line: #ead7a5;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 24px;
+    }
+
+    .canvas {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: minmax(360px, 520px) minmax(360px, 520px);
+      margin: 0 auto;
+      max-width: 1080px;
+    }
+
+    .decision-plugin-card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+      padding: 12px;
+    }
+
+    .decision-plugin-card-header {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+    }
+
+    h4 {
+      font-size: 15px;
+      margin: 0;
+    }
+
+    .status-pill {
+      background: #e7f5ed;
+      border: 1px solid #b9dccb;
+      border-radius: 7px;
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 800;
+      padding: 5px 8px;
+    }
+
+    .decision-plugin-output {
+      align-items: start;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 46px minmax(0, 1fr);
+    }
+
+    .decision-plugin-output > strong {
+      align-items: center;
+      background: var(--accent);
+      border-radius: 999px;
+      color: var(--accent-strong);
+      display: inline-flex;
+      font-size: 13px;
+      font-weight: 800;
+      height: 42px;
+      justify-content: center;
+      width: 42px;
+    }
+
+    .decision-plugin-output b,
+    .decision-plugin-output span {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+
+    .decision-plugin-output span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin-top: 3px;
+    }
+
+    .decision-fact-grid {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-top: 4px;
+    }
+
+    .decision-fact-row {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      display: grid;
+      gap: 6px;
+      min-height: 82px;
+      min-width: 0;
+      padding: 10px;
+      word-break: break-word;
+    }
+
+    .decision-fact-row span {
+      color: var(--muted);
+      display: block;
+      font-size: 12px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+
+    .decision-fact-row strong {
+      display: block;
+      font-size: 14px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+
+    .domestic-section {
+      border-top: 1px solid var(--line);
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+      padding-top: 12px;
+    }
+
+    .domestic-section-header {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+    }
+
+    .domestic-section-header b {
+      font-size: 14px;
+    }
+
+    .source-tag {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .domestic-list {
+      display: grid;
+      gap: 7px;
+    }
+
+    .domestic-row {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      display: grid;
+      gap: 5px;
+      padding: 9px 10px;
+    }
+
+    .domestic-row span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .domestic-row strong {
+      font-size: 13px;
+      line-height: 1.42;
+      overflow-wrap: anywhere;
+    }
+
+    .domestic-row.warn {
+      background: var(--warn);
+      border-color: var(--warn-line);
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+      margin: 0;
+    }
+
+    @media (max-width: 860px) {
+      body {
+        padding: 14px;
+      }
+
+      .canvas {
+        grid-template-columns: 1fr;
+      }
+
+      .decision-fact-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="canvas">
+    <article class="decision-plugin-card">
+      <div class="decision-plugin-card-header">
+        <h4>新闻 / 舆论</h4>
+        <span class="status-pill">可用</span>
+      </div>
+
+      <div class="decision-plugin-output">
+        <strong>舆论</strong>
+        <div>
+          <b>总体看涨，但存在分歧（新闻负面，散户看涨）</b>
+          <span>TradingAgents 新闻舆论结论保留为主结论。</span>
+        </div>
+      </div>
+
+      <div class="decision-fact-grid">
+        <div class="decision-fact-row">
+          <span>方向</span>
+          <strong>总体看涨，但存在分歧（新闻负面，散户看涨）</strong>
+        </div>
+        <div class="decision-fact-row">
+          <span>变化</span>
+          <strong>从周初的看跌转为周末的看涨</strong>
+        </div>
+        <div class="decision-fact-row">
+          <span>催化</span>
+          <strong>韩国半导体扩张投资、苹果确认内存涨价、Micron 强劲业绩、AI 建设需求</strong>
+        </div>
+        <div class="decision-fact-row">
+          <span>风险</span>
+          <strong>韩国市场波动、中国竞争威胁、估值过高、美联储鹰派转向、地缘政治风险</strong>
+        </div>
+        <div class="decision-fact-row">
+          <span>热度</span>
+          <strong>中国内存竞争进展、美联储新任主席政策、韩国市场稳定性、ETF 资金流入持续性</strong>
+        </div>
+      </div>
+
+      <section class="domestic-section">
+        <div class="domestic-section-header">
+          <b>富途社区 / 国内讨论</b>
+          <span class="source-tag">LLM 总结 · stock_feed</span>
+        </div>
+        <div class="domestic-list">
+          <div class="domestic-row">
+            <span>国内讨论结论</span>
+            <strong>相关讨论较少，少量用户关注 DRAM ETF 与海力士、三星、美光等成分股走势的联动。</strong>
+          </div>
+          <div class="domestic-row">
+            <span>主要关注点</span>
+            <strong>ETF 夜盘可能受韩股存储链影响，盘中则更受美光、闪迪等美股成分影响。</strong>
+          </div>
+          <div class="domestic-row">
+            <span>分歧 / 风险</span>
+            <strong>社区样本少且噪声高，不能代表稳定共识；但提示 ETF 与底层成分的偏离风险需要复核。</strong>
+          </div>
+          <div class="domestic-row warn">
+            <span>可信度</span>
+            <strong>低：30 条富途 feed 中仅 1 条与 DRAM 明确相关。</strong>
+          </div>
+          <div class="domestic-row warn">
+            <span>交易约束</span>
+            <strong>仅作为国内讨论温度和 ETF 结构风险提示，不支持单独加仓或减仓。</strong>
+          </div>
+        </div>
+      </section>
+    </article>
+
+    <article class="decision-plugin-card">
+      <div class="decision-plugin-card-header">
+        <h4>单列压缩态示例</h4>
+        <span class="status-pill">推荐</span>
+      </div>
+      <p class="note">
+        左侧是完整卡片。富途区块采用单列，是为了避免长句和中文社区观点把两列卡片撑乱。
+        真实 dashboard 可以只改富途区块为单列，保留上方 TradingAgents 五字段的原有布局。
+      </p>
+      <section class="domestic-section">
+        <div class="domestic-section-header">
+          <b>富途社区 / 国内讨论</b>
+          <span class="source-tag">单列固定字段</span>
+        </div>
+        <div class="domestic-list">
+          <div class="domestic-row">
+            <span>国内讨论结论</span>
+            <strong>一句话告诉你国内社区声音是否有用。</strong>
+          </div>
+          <div class="domestic-row">
+            <span>主要关注点</span>
+            <strong>国内用户到底在看价格、ETF 结构、公司消息，还是只是在闲聊。</strong>
+          </div>
+          <div class="domestic-row">
+            <span>分歧 / 风险</span>
+            <strong>把有交易价值的问题留下来，而不是展示原始帖子。</strong>
+          </div>
+          <div class="domestic-row warn">
+            <span>可信度</span>
+            <strong>高 / 中 / 低 / 噪声高。</strong>
+          </div>
+          <div class="domestic-row warn">
+            <span>交易约束</span>
+            <strong>明确这条信息能不能影响交易动作。</strong>
+          </div>
+        </div>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

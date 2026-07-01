@@ -865,16 +865,19 @@ function futuSkillNewsSentimentPlugin(holding) {
     ? module.domestic_discussion
     : {};
   const rows = [
-    { label: "国内讨论方向", value: formatFutuDomesticDirection(discussion.direction) },
-    { label: "讨论质量", value: formatFutuDomesticQuality(discussion.quality) },
-    { label: "代表观点", value: formatPlain(discussion.representative_view) },
-    { label: "国内风险点", value: formatPlain(discussion.risk_point) },
-    { label: "数据约束", value: formatPlain(discussion.constraint) },
+    { label: "国内讨论结论", value: formatPlain(discussion.summary) },
+    { label: "主要关注点", value: formatPlain(discussion.focus) },
+    { label: "分歧 / 风险", value: formatPlain(discussion.divergence_risk) },
+    { label: "可信度", value: formatPlain(discussion.credibility), tone: "warn" },
+    { label: "交易约束", value: formatPlain(discussion.trading_constraint), tone: "warn" },
   ];
   return `
     <div class="decision-fact-source-block">
-      <b>富途社区 / 国内讨论</b>
-      ${renderDecisionFactRows(rows)}
+      <div class="domestic-section-header">
+        <b>富途社区 / 国内讨论</b>
+        <span>LLM 总结 · stock_feed</span>
+      </div>
+      ${renderDomesticDiscussionRows(rows)}
     </div>
   `;
 }
@@ -887,25 +890,17 @@ function futuSkillNewsSentimentModule(holding) {
   return module && typeof module === "object" ? module : null;
 }
 
-function formatFutuDomesticDirection(direction) {
-  const labels = {
-    bullish: "偏多",
-    bearish: "偏空",
-    neutral: "中性",
-    mixed: "分歧",
-    noisy: "噪声高",
-  };
-  return labels[formatPlain(direction)] || formatPlain(direction);
-}
-
-function formatFutuDomesticQuality(quality) {
-  const labels = {
-    usable: "可用",
-    weak: "讨论较弱",
-    noisy: "噪声高",
-    missing: "缺失",
-  };
-  return labels[formatPlain(quality)] || formatPlain(quality);
+function renderDomesticDiscussionRows(rows) {
+  return `
+    <div class="domestic-list">
+      ${rows.map((row) => `
+        <div class="domestic-row ${row.tone === "warn" ? "warn" : ""}">
+          <span>${escapeHtml(row.label)}</span>
+          <strong>${escapeHtml(row.value)}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
 }
 
 function decisionFactsModule(holding, moduleKey) {

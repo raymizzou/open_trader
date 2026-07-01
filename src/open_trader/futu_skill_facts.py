@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from .decision_facts import OpenAITextClient
 from open_trader.market_scope import (
     MarketScope,
     market_run_dir,
@@ -28,8 +29,6 @@ VALID_SIGNALS = {"supportive", "opposing", "neutral", "risk_up", "mixed"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_CONSTRAINTS = {"", "review", "reduce_only", "wait_for_event", "no_add"}
 VALID_DOMESTIC_STATUSES = {"ok", "missing", "error"}
-VALID_DOMESTIC_DIRECTIONS = {"bullish", "bearish", "neutral", "mixed", "noisy"}
-VALID_DOMESTIC_QUALITIES = {"usable", "weak", "noisy", "missing"}
 RUN_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 FUTU_AI_SEARCH_BASE_URL = "https://ai-news-search.futunn.com"
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
@@ -108,13 +107,87 @@ class FutuSkillNewsSentimentExtractor(Protocol):
         ...
 
 
+class FutuDomesticDiscussionSummarizer(Protocol):
+    def summarize(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        news_items: list[dict[str, str]],
+        community_items: list[dict[str, str]],
+        post_count: int,
+        relevant_post_count: int,
+    ) -> dict[str, object]:
+        ...
+
+
+class LLMFutuDomesticDiscussionSummarizer:
+    def __init__(self, *, client: object | None = None) -> None:
+        self.client = client or OpenAITextClient()
+
+    def summarize(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        news_items: list[dict[str, str]],
+        community_items: list[dict[str, str]],
+        post_count: int,
+        relevant_post_count: int,
+    ) -> dict[str, object]:
+        messages = [
+            {
+                "role": "system",
+                "content": _domestic_discussion_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "market": market,
+                        "symbol": symbol,
+                        "name": name,
+                        "post_count": post_count,
+                        "relevant_post_count": relevant_post_count,
+                        "news_items": news_items[:8],
+                        "community_items": community_items[:8],
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        content = self.client.create(messages=messages, temperature=0)
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("LLM domestic discussion response must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("LLM domestic discussion response must be a JSON object")
+        status = _optional_text(payload.get("status"))
+        normalized = _normalize_domestic_discussion(
+            {
+                **payload,
+                "status": status if status in VALID_DOMESTIC_STATUSES else "ok",
+                "post_count": post_count,
+                "relevant_post_count": relevant_post_count,
+            }
+        )
+        return normalized
+
+
 class FutuNewsSentimentExtractor:
     def __init__(
         self,
         *,
         http_get_json: Callable[[str, dict[str, object]], dict[str, object]] | None = None,
+        domestic_summarizer: FutuDomesticDiscussionSummarizer | None = None,
     ) -> None:
         self.http_get_json = http_get_json or _default_http_get_json
+        self.domestic_summarizer = (
+            domestic_summarizer or LLMFutuDomesticDiscussionSummarizer()
+        )
 
     def extract_news_sentiment(
         self,
@@ -124,7 +197,7 @@ class FutuNewsSentimentExtractor:
         name: str,
         run_date: str,
     ) -> dict[str, object]:
-        del market, run_date
+        del run_date
         news_keyword = name.strip() or symbol
         feed_keyword = symbol.strip() or news_keyword
         news_payload = self.http_get_json(
@@ -151,7 +224,15 @@ class FutuNewsSentimentExtractor:
             symbol=symbol,
             name=name,
         )
-        domestic_discussion = _domestic_discussion(feed_items, community_evidence)
+        domestic_discussion = self._summarize_domestic_discussion(
+            market=market,
+            symbol=symbol,
+            name=name,
+            news_items=news_evidence,
+            community_items=community_evidence,
+            post_count=len(feed_items),
+            relevant_post_count=len(community_evidence),
+        )
         evidence = [
             *news_evidence,
             *community_evidence,
@@ -172,6 +253,40 @@ class FutuNewsSentimentExtractor:
             "blocking_reason": "",
             "suggested_constraint": "",
         }
+
+    def _summarize_domestic_discussion(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        news_items: list[dict[str, str]],
+        community_items: list[dict[str, str]],
+        post_count: int,
+        relevant_post_count: int,
+    ) -> dict[str, object]:
+        if relevant_post_count == 0:
+            return _fallback_domestic_discussion(
+                symbol=symbol,
+                post_count=post_count,
+                relevant_post_count=0,
+            )
+        try:
+            return self.domestic_summarizer.summarize(
+                market=market,
+                symbol=symbol,
+                name=name,
+                news_items=news_items,
+                community_items=community_items,
+                post_count=post_count,
+                relevant_post_count=relevant_post_count,
+            )
+        except Exception:
+            return _fallback_domestic_discussion(
+                symbol=symbol,
+                post_count=post_count,
+                relevant_post_count=relevant_post_count,
+            )
 
 
 LLMFutuNewsSentimentExtractor = FutuNewsSentimentExtractor
@@ -487,73 +602,6 @@ def _community_relevance_terms(*, symbol: str, name: str) -> set[str]:
     return {term for term in terms if term and term not in GENERIC_COMMUNITY_TERMS}
 
 
-def _domestic_discussion(
-    feed_items: list[dict[str, str]],
-    relevant_items: list[dict[str, str]],
-) -> dict[str, object]:
-    post_count = len(feed_items)
-    relevant_count = len(relevant_items)
-    if relevant_count == 0:
-        return {
-            "status": "missing",
-            "direction": "noisy",
-            "quality": "noisy" if post_count else "missing",
-            "representative_view": "缺失",
-            "risk_point": "缺失",
-            "constraint": "富途社区未找到足够相关讨论，不作为交易依据",
-            "post_count": post_count,
-            "relevant_post_count": 0,
-        }
-    noisy = post_count > relevant_count and relevant_count / post_count <= 0.5
-    quality = "noisy" if noisy else ("usable" if relevant_count == post_count else "weak")
-    return {
-        "status": "ok",
-        "direction": "noisy" if noisy else _classify_community_direction(relevant_items),
-        "quality": quality,
-        "representative_view": _representative_community_view(relevant_items),
-        "risk_point": _community_risk_point(relevant_items),
-        "constraint": (
-            "富途社区匹配噪声高，仅作风险提示，不作为交易依据"
-            if noisy
-            else "富途社区讨论仅作国内讨论温度参考，不单独作为交易依据"
-        ),
-        "post_count": post_count,
-        "relevant_post_count": relevant_count,
-    }
-
-
-def _classify_community_direction(items: list[dict[str, str]]) -> str:
-    text = " ".join(
-        f"{item.get('title', '')} {item.get('summary', '')}" for item in items
-    ).casefold()
-    bullish_count = sum(1 for cue in BULLISH_CUES if cue.casefold() in text)
-    bearish_count = sum(1 for cue in (*BEARISH_CUES, "跌", "回落", "亏") if cue.casefold() in text)
-    if bullish_count and bearish_count:
-        return "mixed"
-    if bullish_count:
-        return "bullish"
-    if bearish_count:
-        return "bearish"
-    return "neutral"
-
-
-def _representative_community_view(items: list[dict[str, str]]) -> str:
-    for item in items:
-        summary = _optional_text(item.get("summary"))
-        if summary:
-            return summary[:120]
-    return "缺失"
-
-
-def _community_risk_point(items: list[dict[str, str]]) -> str:
-    for item in items:
-        summary = _optional_text(item.get("summary"))
-        text = summary.casefold()
-        if any(cue.casefold() in text for cue in (*BEARISH_CUES, "跌", "回落", "亏", "为什么")):
-            return summary[:120]
-    return "未见明确国内风险点"
-
-
 def _classify_signal(evidence: list[dict[str, str]]) -> str:
     text = " ".join(
         f"{item.get('title', '')} {item.get('summary', '')}" for item in evidence
@@ -636,16 +684,11 @@ def _normalize_domestic_discussion(value: object) -> dict[str, object]:
         return _missing_domestic_discussion()
     normalized: dict[str, object] = {
         "status": _required_enum(value, "status", VALID_DOMESTIC_STATUSES, "domestic_discussion"),
-        "direction": _required_enum(
-            value,
-            "direction",
-            VALID_DOMESTIC_DIRECTIONS,
-            "domestic_discussion",
-        ),
-        "quality": _required_enum(value, "quality", VALID_DOMESTIC_QUALITIES, "domestic_discussion"),
-        "representative_view": _optional_text(value.get("representative_view")),
-        "risk_point": _optional_text(value.get("risk_point")),
-        "constraint": _optional_text(value.get("constraint")),
+        "summary": _optional_text(value.get("summary")),
+        "focus": _optional_text(value.get("focus")),
+        "divergence_risk": _optional_text(value.get("divergence_risk")),
+        "credibility": _optional_text(value.get("credibility")),
+        "trading_constraint": _optional_text(value.get("trading_constraint")),
         "post_count": _optional_int(value.get("post_count")),
         "relevant_post_count": _optional_int(value.get("relevant_post_count")),
     }
@@ -656,11 +699,11 @@ def _normalize_domestic_discussion(value: object) -> dict[str, object]:
 def _missing_domestic_discussion() -> dict[str, object]:
     return {
         "status": "missing",
-        "direction": "noisy",
-        "quality": "missing",
-        "representative_view": "缺失",
-        "risk_point": "缺失",
-        "constraint": "富途社区未找到足够相关讨论，不作为交易依据",
+        "summary": "富途社区未找到足够相关讨论。",
+        "focus": "缺失",
+        "divergence_risk": "缺失",
+        "credibility": "缺失",
+        "trading_constraint": "富途社区未找到足够相关讨论，不作为交易依据。",
         "post_count": 0,
         "relevant_post_count": 0,
     }
@@ -670,9 +713,13 @@ def _validate_domestic_discussion(value: object) -> None:
     if not isinstance(value, dict):
         raise ValueError("domestic_discussion is invalid")
     _validate_enum(value, "status", VALID_DOMESTIC_STATUSES, "domestic_discussion")
-    _validate_enum(value, "direction", VALID_DOMESTIC_DIRECTIONS, "domestic_discussion")
-    _validate_enum(value, "quality", VALID_DOMESTIC_QUALITIES, "domestic_discussion")
-    for field in ("representative_view", "risk_point", "constraint"):
+    for field in (
+        "summary",
+        "focus",
+        "divergence_risk",
+        "credibility",
+        "trading_constraint",
+    ):
         if not isinstance(value.get(field), str):
             raise ValueError(f"domestic_discussion {field} is invalid")
     for field in ("post_count", "relevant_post_count"):
@@ -708,6 +755,49 @@ def _optional_text(value: object) -> str:
 
 def _optional_int(value: object) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _fallback_domestic_discussion(
+    *,
+    symbol: str,
+    post_count: int,
+    relevant_post_count: int,
+) -> dict[str, object]:
+    if relevant_post_count == 0:
+        return {
+            "status": "missing",
+            "summary": "富途社区未找到足够相关讨论。",
+            "focus": "缺失",
+            "divergence_risk": "缺失",
+            "credibility": "缺失" if post_count == 0 else "噪声高",
+            "trading_constraint": "富途社区未找到足够相关讨论，不作为交易依据。",
+            "post_count": post_count,
+            "relevant_post_count": 0,
+        }
+    return {
+        "status": "ok",
+        "summary": f"富途社区相关讨论较少，{post_count} 条 feed 中 {relevant_post_count} 条与 {symbol} 明确相关。",
+        "focus": f"少量讨论关注 {symbol} 的短线走势或 ETF 结构问题。",
+        "divergence_risk": "社区样本少且噪声高，不能代表稳定共识。",
+        "credibility": "噪声高" if relevant_post_count / max(post_count, 1) <= 0.5 else "低",
+        "trading_constraint": "仅作为国内讨论温度和 ETF 结构风险提示，不支持单独加仓或减仓。",
+        "post_count": post_count,
+        "relevant_post_count": relevant_post_count,
+    }
+
+
+def _domestic_discussion_system_prompt() -> str:
+    return (
+        "你是交易仪表盘的富途社区讨论摘要器。"
+        "你只负责把富途 API 返回的新闻标题和社区帖子总结成固定字段，不给买卖建议。"
+        "社区帖子优先，新闻标题只作为背景。"
+        "必须输出 JSON object，字段为："
+        "status, summary, focus, divergence_risk, credibility, trading_constraint。"
+        "字段中文含义：国内讨论结论、主要关注点、分歧 / 风险、可信度、交易约束。"
+        "credibility 只能使用 高、中、低、噪声高、缺失。"
+        "trading_constraint 必须明确这类信息是否能影响交易动作；默认不能单独支持加仓或减仓。"
+        "所有字段必须使用简体中文，不能包含 URL，不能复制长篇原帖。"
+    )
 
 
 def _validate_run_date(value: str) -> str:

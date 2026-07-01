@@ -349,7 +349,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "futuSkillNewsSentimentPlugin" in js
     assert "futu_skill_facts" in js
     assert "富途社区 / 国内讨论" in js
-    assert "国内讨论方向" in js
+    assert "国内讨论结论" in js
+    assert "domestic-list" in js
+    assert ".domestic-list" in css
     assert "technical_facts" in js
     assert "technicalFactRows" in js
     assert "插件管理" not in js
@@ -761,11 +763,11 @@ const holding = {
       available: true,
       domestic_discussion: {
         status: "ok",
-        direction: "mixed",
-        quality: "weak",
-        representative_view: "有用户质疑 DRAM ETF 跌幅大于成分股。",
-        risk_point: "ETF 结构与成分股偏离需要确认。",
-        constraint: "富途社区讨论仅作国内讨论温度参考，不单独作为交易依据",
+        summary: "富途社区相关讨论较少，少量用户关注 DRAM ETF 与成分股走势联动。",
+        focus: "ETF 夜盘可能受韩股存储链影响，盘中更受美光、闪迪等美股成分影响。",
+        divergence_risk: "社区样本少且噪声高，不能代表稳定共识。",
+        credibility: "低",
+        trading_constraint: "仅作为国内讨论温度和 ETF 结构风险提示，不支持单独加仓或减仓。",
         post_count: 8,
         relevant_post_count: 2
       }
@@ -777,7 +779,7 @@ const klineCard = cardBefore(cards, "<h4>新闻 / 舆论</h4>");
 const newsCard = cardFrom(cards, "<h4>新闻 / 舆论</h4>");
 assertOrdered(klineCard, ["趋势", "位置", "动能", "关键位", "风险"]);
 assertOrdered(newsCard, ["方向", "变化", "催化", "风险", "热度"]);
-assertOrdered(newsCard, ["国内讨论方向", "讨论质量", "代表观点", "国内风险点", "数据约束"]);
+assertOrdered(newsCard, ["国内讨论结论", "主要关注点", "分歧 / 风险", "可信度", "交易约束"]);
 for (const required of [
   "趋势 / K 线",
   "新闻 / 舆论",
@@ -794,21 +796,21 @@ for (const required of [
   "偏多",
   "AI 基建需求",
   "富途社区 / 国内讨论",
-  "国内讨论方向",
-  "讨论质量",
-  "代表观点",
-  "国内风险点",
-  "数据约束",
-  "分歧",
-  "讨论较弱",
-  "有用户质疑 DRAM ETF 跌幅大于成分股。",
-  "ETF 结构与成分股偏离需要确认。"
+  "国内讨论结论",
+  "主要关注点",
+  "分歧 / 风险",
+  "可信度",
+  "交易约束",
+  "富途社区相关讨论较少，少量用户关注 DRAM ETF 与成分股走势联动。",
+  "ETF 夜盘可能受韩股存储链影响，盘中更受美光、闪迪等美股成分影响。",
+  "社区样本少且噪声高，不能代表稳定共识。",
+  "仅作为国内讨论温度和 ETF 结构风险提示，不支持单独加仓或减仓。"
 ]) {
   if (!cards.includes(required)) {
     throw new Error("missing fixed decision fact content " + required + ": " + cards);
   }
 }
-for (const forbidden of ["Bullish", "condition-box", "Futu Skill 证据", "https://news.futunn.com"]) {
+for (const forbidden of ["Bullish", "condition-box", "Futu Skill 证据", "https://news.futunn.com", "代表观点", "国内风险点", "数据约束"]) {
   if (cards.includes(forbidden)) {
     throw new Error("unexpected fixed decision fact content " + forbidden + ": " + cards);
   }

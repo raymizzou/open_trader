@@ -170,11 +170,11 @@ def write_futu_skill_facts(path: Path) -> None:
                             ],
                             "domestic_discussion": {
                                 "status": "ok",
-                                "direction": "mixed",
-                                "quality": "weak",
-                                "representative_view": "有用户讨论波动率 ETF 的短线风险。",
-                                "risk_point": "讨论样本较少。",
-                                "constraint": "富途社区讨论仅作国内讨论温度参考，不单独作为交易依据",
+                                "summary": "富途社区相关讨论较少，主要关注波动率 ETF 的短线风险。",
+                                "focus": "关注波动率 ETF 与美股风险偏好的联动。",
+                                "divergence_risk": "样本少且噪声高，不能代表稳定共识。",
+                                "credibility": "低",
+                                "trading_constraint": "仅作为国内讨论温度参考，不作为单独交易依据。",
                                 "post_count": 3,
                                 "relevant_post_count": 1,
                             },
@@ -1318,8 +1318,8 @@ def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     assert news_sentiment["signal"] == "supportive"
     assert news_sentiment["confidence"] == "medium"
     assert news_sentiment["evidence"][0]["url"] == "https://example.com/vixy"
-    assert news_sentiment["domestic_discussion"]["direction"] == "mixed"
-    assert news_sentiment["domestic_discussion"]["quality"] == "weak"
+    assert news_sentiment["domestic_discussion"]["summary"] == "富途社区相关讨论较少，主要关注波动率 ETF 的短线风险。"
+    assert news_sentiment["domestic_discussion"]["credibility"] == "低"
 
 
 def test_load_dashboard_state_marks_missing_agent_sections_unavailable(
