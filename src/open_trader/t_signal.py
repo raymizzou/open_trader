@@ -209,6 +209,8 @@ class TMarketFacts:
 def to_futu_symbol(market: str, symbol: str) -> str:
     normalized_market = market.upper()
     normalized_symbol = symbol.strip().upper()
+    if normalized_symbol.startswith(f"{normalized_market}."):
+        return normalized_symbol
     if normalized_market == "HK" and normalized_symbol.isdigit():
         return f"HK.{normalized_symbol.zfill(5)}"
     if normalized_market == "US":
@@ -254,6 +256,12 @@ def build_t_signal_from_facts(
         suggested_ratio = ratio_from_score(score)
         status = "ok"
         current_status = "BUY_T 条件满足，等待执行确认。"
+        event_type = "signal_created"
+    elif technical.price_position == "above_vwap_reject" and score > 0:
+        action = "SELL_T"
+        suggested_ratio = ratio_from_score(score)
+        status = "ok"
+        current_status = "SELL_T 条件满足，等待执行确认。"
         event_type = "signal_created"
     else:
         action = "HOLD"
@@ -325,7 +333,7 @@ def _build_liquidity(facts: TMarketFacts) -> TSignalLiquidity:
 
 
 def _spread_pct(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
-    if bid is None or ask is None or bid <= 0 or ask <= 0:
+    if bid is None or ask is None or bid <= 0 or ask <= bid:
         return None
     midpoint = (bid + ask) / Decimal("2")
     if midpoint <= 0:
@@ -435,6 +443,16 @@ def _build_evidence(
             )
         )
         score += 1
+    if technical.price_position == "above_vwap_reject":
+        evidence.append(
+            TSignalEvidence(
+                name="vwap_reject",
+                direction="sell",
+                strength="medium",
+                message_zh="价格高于 VWAP 后受压，出现高抛做T信号。",
+            )
+        )
+        score += 1
     if facts.rsi_5m is not None and facts.rsi_5m <= Decimal("40"):
         evidence.append(
             TSignalEvidence(
@@ -445,13 +463,29 @@ def _build_evidence(
             )
         )
         score += 1
+    if facts.rsi_5m is not None and facts.rsi_5m >= Decimal("60"):
+        evidence.append(
+            TSignalEvidence(
+                name="rsi_reject_zone",
+                direction="sell",
+                strength="medium",
+                message_zh="5分钟 RSI 处于偏高区间，回落信号更明确。",
+            )
+        )
+        score += 1
     if facts.volume_ratio_5m is not None and facts.volume_ratio_5m >= Decimal("1.20"):
+        direction = "sell" if technical.price_position == "above_vwap_reject" else "buy"
+        message_zh = (
+            "5分钟量比放大，价格受压具备成交配合。"
+            if direction == "sell"
+            else "5分钟量比放大，价格回收具备成交配合。"
+        )
         evidence.append(
             TSignalEvidence(
                 name="volume_confirm",
-                direction="buy",
+                direction=direction,
                 strength="low",
-                message_zh="5分钟量比放大，价格回收具备成交配合。",
+                message_zh=message_zh,
             )
         )
         score += 1

@@ -181,6 +181,8 @@ def regular_facts(**overrides: object) -> TMarketFacts:
 def test_to_futu_symbol_normalizes_hk_numeric_symbol() -> None:
     assert to_futu_symbol("HK", "700") == "HK.00700"
     assert to_futu_symbol("US", "msft") == "US.MSFT"
+    assert to_futu_symbol("HK", "HK.00700") == "HK.00700"
+    assert to_futu_symbol("US", "US.MSFT") == "US.MSFT"
 
 
 @pytest.mark.parametrize(
@@ -203,6 +205,25 @@ def test_regular_rebound_builds_buy_signal_with_ratio() -> None:
     assert signal.suggested_ratio in {"6", "10", "15", "20"}
     assert signal.technical.price_position == "below_vwap_reclaim"
     assert any(item.name == "vwap_reclaim" for item in signal.evidence)
+    assert signal.status == "ok"
+
+
+def test_regular_reject_builds_sell_signal_with_ratio() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(
+            last_price=Decimal("380"),
+            vwap=Decimal("378.10"),
+            rsi_5m=Decimal("66"),
+        ),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="价格高于 VWAP 后回落，接近压力。",
+    )
+
+    assert signal.action == "SELL_T"
+    assert signal.suggested_ratio in {"6", "10", "15", "20"}
+    assert signal.technical.price_position == "above_vwap_reject"
+    assert any(item.name == "vwap_reject" for item in signal.evidence)
     assert signal.status == "ok"
 
 
@@ -235,6 +256,75 @@ def test_wide_spread_blocks_action() -> None:
     assert signal.action == "REVIEW"
     assert signal.liquidity.depth_status == "wide_spread"
     assert signal.suggested_ratio == ""
+
+
+def test_crossed_bid_ask_blocks_action() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(bid=Decimal("376.40"), ask=Decimal("376.35")),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="买卖盘倒挂。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.liquidity.depth_status == "missing"
+    assert any(
+        gate.name == "liquidity" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"bid": None},
+        {"ask": None},
+        {"bid_depth": None},
+        {"ask_depth": None},
+    ],
+)
+def test_missing_liquidity_blocks_action(overrides: dict[str, object]) -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(**overrides),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="流动性数据缺失。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.liquidity.depth_status == "missing"
+    assert any(
+        gate.name == "liquidity" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"bid_depth": Decimal("0")},
+        {"ask_depth": Decimal("0")},
+        {"bid_depth": Decimal("-1")},
+        {"ask_depth": Decimal("-1")},
+    ],
+)
+def test_non_positive_depth_blocks_action(overrides: dict[str, object]) -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(**overrides),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="买卖盘深度不足。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.liquidity.depth_status == "thin"
+    assert any(
+        gate.name == "liquidity" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
 
 
 def test_missing_baseline_blocks_action() -> None:
