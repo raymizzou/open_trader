@@ -309,6 +309,20 @@ class LLMFutuAnomalyModuleSummarizer:
         return _apply_anomaly_summary_payload(module, payload, module_name)
 
 
+class CompactFutuAnomalyModuleSummarizer:
+    def summarize(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        module_name: str,
+        module: dict[str, object],
+    ) -> dict[str, object]:
+        del market, symbol, name
+        return _compact_anomaly_module_details(module, module_name)
+
+
 class LLMFutuDomesticDiscussionSummarizer:
     def __init__(self, *, client: object | None = None) -> None:
         self.client = client or OpenAITextClient()
@@ -688,6 +702,12 @@ def _balanced_json_object_text(text: str, start: int) -> str:
     return ""
 
 
+def _default_anomaly_summarizer() -> FutuAnomalyModuleSummarizer:
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return LLMFutuAnomalyModuleSummarizer()
+    return CompactFutuAnomalyModuleSummarizer()
+
+
 class FutuSkillFactsExtractor:
     def __init__(
         self,
@@ -698,7 +718,7 @@ class FutuSkillFactsExtractor:
     ) -> None:
         self.news_extractor = news_extractor or FutuNewsSentimentExtractor()
         self.anomaly_client = anomaly_client or FutuAnomalyScriptClient()
-        self.anomaly_summarizer = anomaly_summarizer or LLMFutuAnomalyModuleSummarizer()
+        self.anomaly_summarizer = anomaly_summarizer or _default_anomaly_summarizer()
 
     def prepare_sources(
         self,

@@ -1058,6 +1058,47 @@ def test_futu_skill_facts_extractor_compacts_long_anomaly_content_when_llm_fails
     assert long_content not in anomaly_details
 
 
+def test_futu_skill_facts_extractor_defaults_to_compact_summary_without_llm_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    long_content = "期权大单异动：" + "出现多笔买入看涨期权交易，成交量和金额明显放大。" * 12
+
+    class FakeAnomalyClient:
+        def run(
+            self,
+            module: str,
+            *,
+            market: str,
+            symbol: str,
+            window_days: int,
+        ) -> dict[str, object]:
+            del module, market, symbol, window_days
+            return {"data": {"err_code": 0, "content": long_content}}
+
+    extractor = FutuSkillFactsExtractor(
+        news_extractor=FakeExtractor(),
+        anomaly_client=FakeAnomalyClient(),
+    )
+
+    result = extractor.extract_derivatives_anomaly(
+        market="US",
+        symbol="DRAM",
+        name="DRAM ETF",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+
+    anomaly_details = [
+        category["detail"]
+        for category in result["categories"]
+        if category["state"] == "anomaly"
+    ]
+    assert anomaly_details
+    assert all(len(detail) <= 90 for detail in anomaly_details)
+    assert long_content not in anomaly_details
+
+
 def test_futu_skill_facts_extractor_preserves_structured_sdk_row_details() -> None:
     class FakeAnomalyClient:
         def run(
