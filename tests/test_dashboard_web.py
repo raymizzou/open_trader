@@ -136,6 +136,15 @@ def post_text_error(url: str, body: bytes) -> tuple[int, str, str]:
     raise AssertionError("expected HTTPError")
 
 
+def holdings_table_header_labels(html: str) -> list[str]:
+    table_prefix = html.split('<tbody id="holdings-body">', 1)[0]
+    thead = table_prefix.rsplit("<thead>", 1)[1].split("</thead>", 1)[0]
+    labels: list[str] = []
+    for segment in thead.split("<th>")[1:]:
+        labels.append(segment.split("</th>", 1)[0].strip())
+    return labels
+
+
 def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
     try:
         urllib.request.urlopen(url, timeout=5)
@@ -421,6 +430,29 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".source-status-list" in css
     assert ".source-status-row" in css
     assert ".cash-detail-panel" in css
+    assert ".market-section-row" in css
+    assert ".market-section-us" in css
+    assert ".market-section-hk" in css
+    assert ".symbol-cell" in css
+    scoped_table_selector = ".holdings-panel > .table-wrap > table"
+    assert scoped_table_selector in css
+    global_table_css = css.split(scoped_table_selector, 1)[0]
+    assert "table-layout: fixed;" not in global_table_css
+    assert "min-width: 1120px;" in css
+    assert "table-layout: fixed;" in css
+    symbol_column_selector = (
+        ".holdings-panel > .table-wrap > table > thead > tr > th:nth-child(3) {"
+    )
+    assert symbol_column_selector in css
+    assert ".holdings-panel > .table-wrap > table th:nth-child(3) {" not in css
+    assert ".holdings-panel > .table-wrap > table > thead > tr > th:nth-child(1) {" in css
+    assert ".holdings-panel > .table-wrap > table > thead > tr > th:nth-child(10) {" in css
+    symbol_column_css = css.split(symbol_column_selector, 1)[1].split("}", 1)[0]
+    assert "width: 170px;" in symbol_column_css
+    number_cell_css = css.split(".number-cell {", 1)[1].split("}", 1)[0]
+    assert "text-align: right;" in number_cell_css
+    market_section_other_css = css.split(".market-section-other td {", 1)[1].split("}", 1)[0]
+    assert "border-bottom-color: var(--line);" in market_section_other_css
     assert "grid-template-columns: minmax(0, 1fr) 300px;" not in css
     assert ".right-rail" not in css
     assert 'grid-template-areas: "brand source" "assets assets";' in css
@@ -788,6 +820,27 @@ console.log(html.slice(start, end));
         "strange_direction",
     ]:
         assert forbidden not in output
+
+
+def test_dashboard_holdings_table_uses_compact_asset_columns() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert holdings_table_header_labels(html) == [
+        "明细",
+        "市场",
+        "标的",
+        "数量",
+        "成本价",
+        "实时价",
+        "美元市值",
+        "港元市值",
+        "持仓占总资产的占比",
+        "盈亏",
+    ]
+    assert "<th>券商</th>" not in html
+    assert "<th>动作</th>" not in html
+    assert "<th>持仓价</th>" not in html
+    assert '<td colspan="10" class="empty-state">加载中</td>' in html
 
 
 def test_dashboard_display_helpers_keep_raw_english_out_of_chinese_ui() -> None:
@@ -1839,7 +1892,7 @@ if (state.researchChat.messageCount !== 4) {
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
-def test_dashboard_header_helpers_filter_assets_and_render_sources() -> None:
+def test_dashboard_header_filters_and_cash_view_helpers() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for dashboard helper runtime checks")
@@ -1855,11 +1908,30 @@ vm.runInContext(`
 state.dashboard = {
   holdings: [
     {
+      market: "HK",
+      symbol: "00700",
+      name: "Tencent",
+      brokers: "phillips",
+      currency: "HKD",
+      total_quantity: "100",
+      avg_cost_price: "150.00",
+      market_value: "15982.00",
+      market_value_hkd: "15982.00",
+      portfolio_weight_hkd: "3.25%",
+      unrealized_pnl_pct: "2.00%",
+    },
+    {
       market: "US",
       symbol: "VIXY",
       name: "ProShares VIX Short-Term Futures ETF",
       brokers: "futu;tiger",
-      market_value_hkd: "37830.00",
+      currency: "USD",
+      total_quantity: "10",
+      avg_cost_price: "12.34",
+      market_value: "6250.00",
+      market_value_hkd: "49062.50",
+      portfolio_weight_hkd: "7.50%",
+      unrealized_pnl_pct: "5.00%",
       broker_details: [
         {
           broker: "futu",
@@ -1880,11 +1952,17 @@ state.dashboard = {
       ],
     },
     {
-      market: "HK",
-      symbol: "00700",
-      name: "Tencent",
-      brokers: "phillips",
-      market_value_hkd: "15982.00",
+      market: "US",
+      symbol: "BND",
+      name: "Vanguard Total Bond Market ETF",
+      brokers: "tiger",
+      currency: "HKD",
+      total_quantity: "2",
+      avg_cost_price: "50.00",
+      market_value: "100.00",
+      market_value_hkd: "100.00",
+      portfolio_weight_hkd: "2.50%",
+      unrealized_pnl_pct: "-1.00%",
     },
   ],
   cash_rows: [
@@ -2149,7 +2227,7 @@ if (!elements["cash-detail-panel"].classList.contains("hidden")) {
   throw new Error("non-cash view should hide cash detail panel");
 }
 state.brokerFilter = "ALL";
-state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
+state.selectedHoldingKey = holdingKey(state.dashboard.holdings[1], 1);
 renderHoldings();
 if (elements["holdings-table-wrap"].classList.contains("hidden")) {
   throw new Error("trading decision should keep holdings table visible");
@@ -2159,6 +2237,65 @@ if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
 }
 if (!elements["holdings-body"].innerHTML.includes("交易决策") || elements["holdings-body"].innerHTML.includes(">详情<")) {
   throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
+}
+const renderedHoldings = elements["holdings-body"].innerHTML;
+const usSectionIndex = renderedHoldings.indexOf("US 美股持仓");
+const hkSectionIndex = renderedHoldings.indexOf("HK 港股持仓");
+if (usSectionIndex === -1 || hkSectionIndex === -1 || usSectionIndex > hkSectionIndex) {
+  throw new Error("holdings should render US section before HK section: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("2 个标的 · 港元市值 HKD 49162.50 · 权重 10.00%")) {
+  throw new Error("US section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 15982.00 · 权重 3.25%")) {
+  throw new Error("HK section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (renderedHoldings.includes("其他市场持仓")) {
+  throw new Error("OTHER section should not render without an OTHER-market holding: " + renderedHoldings);
+}
+for (const required of ["成本价", "美元市值", "港元市值", "持仓占总资产的占比"]) {
+  if (renderedHoldings.includes("<th>" + required + "</th>")) {
+    throw new Error("body should not render table headers inside market sections: " + renderedHoldings);
+  }
+}
+if (!renderedHoldings.includes("USD 6250.00")) {
+  throw new Error("USD holding should show original USD market value: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("HKD 49062.50")) {
+  throw new Error("HKD converted market value should remain visible: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("<td class=\\"number-cell\\">-</td>")) {
+  throw new Error("non-USD holding should show dash in USD market value column: " + renderedHoldings);
+}
+const holdingRows = Array.from(renderedHoldings.matchAll(/<tr class="[^"]*">\\s*<td><button class="expand-button"[\\s\\S]*?<\\/tr>/g)).map((match) => match[0]);
+if (holdingRows.length !== 3) {
+  throw new Error("main holdings table should render exactly 3 holding rows: " + renderedHoldings);
+}
+for (const row of holdingRows) {
+  const cellCount = (row.match(/<td(?:\\s|>)/g) || []).length;
+  if (cellCount !== 10) {
+    throw new Error("holding row should render exactly 10 cells: " + row);
+  }
+}
+for (const unexpected of ["<td>futu;tiger</td>", "<td>phillips</td>", "<td>futu</td>", "<td>tiger</td>", "<span class=\\"badge\\">"]) {
+  if (renderedHoldings.includes(unexpected)) {
+    throw new Error("main holdings table should not render broker/action cell " + unexpected + ": " + renderedHoldings);
+  }
+}
+if (renderedHoldings.includes("观察 ·") || renderedHoldings.includes("人工复核 ·")) {
+  throw new Error("main holdings table should not render action badges: " + renderedHoldings);
+}
+const malformedSection = renderMarketSectionRow({
+  market: "OTHER",
+  label: "其他市场持仓",
+  className: "market-section-other",
+  rows: [
+    { holding: { market_value_hkd: "bad", portfolio_weight_hkd: "1.00%" }, index: 99 },
+    { holding: { market_value_hkd: "300.00", portfolio_weight_hkd: "" }, index: 100 },
+  ],
+});
+if (!malformedSection.includes("2 个标的 · 港元市值 - · 权重 -") || malformedSection.includes("HKD 0.00")) {
+  throw new Error("malformed section subtotal data should render dash instead of zero: " + malformedSection);
 }
 if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
   throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
@@ -2172,6 +2309,25 @@ for (const unexpected of ["插件管理", "策略阈值"]) {
   if (elements["holdings-body"].innerHTML.includes(unexpected)) {
     throw new Error("trading decision detail should not render extra panel " + unexpected);
   }
+}
+state.dashboard.holdings.push({
+  market: "JP",
+  symbol: "7203",
+  name: "Toyota",
+  brokers: "phillips",
+  currency: "JPY",
+  total_quantity: "1",
+  avg_cost_price: "3000",
+  market_value: "300.00",
+  market_value_hkd: "300.00",
+  portfolio_weight_hkd: "1.50%",
+  unrealized_pnl_pct: "0.00%",
+});
+state.selectedHoldingKey = "";
+renderHoldings();
+const renderedWithOther = elements["holdings-body"].innerHTML;
+if (!renderedWithOther.includes("其他市场持仓") || !renderedWithOther.includes("1 个标的 · 港元市值 HKD 300.00 · 权重 1.50%")) {
+  throw new Error("OTHER section should render only when an OTHER-market holding exists: " + renderedWithOther);
 }
 `, sandbox);
 """
