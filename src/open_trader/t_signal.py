@@ -598,6 +598,8 @@ def _validate_visible_numeric_facts(text: str, signal: TSignal, field_name: str)
     allowed = _allowed_numeric_literals(signal)
     for match in NUMERIC_LITERAL_PATTERN.finditer(text):
         literal = match.group(0)
+        if _is_timeframe_label(text, match.end()):
+            continue
         if _canonical_decimal_text(literal) not in allowed:
             raise ValueError(
                 f"AI interpretation {field_name} invented numeric fact: {literal}"
@@ -606,17 +608,15 @@ def _validate_visible_numeric_facts(text: str, signal: TSignal, field_name: str)
 
 def _allowed_numeric_literals(signal: TSignal) -> set[str]:
     values = {signal.suggested_ratio}
-    for container in (
-        asdict(signal.price),
-        asdict(signal.liquidity),
-        asdict(signal.technical),
-    ):
-        values.update(str(value or "") for value in container.values())
     return {
         canonical
         for value in values
         if (canonical := _canonical_decimal_text(value))
     }
+
+
+def _is_timeframe_label(text: str, match_end: int) -> bool:
+    return text[match_end : match_end + 2] == "分钟"
 
 
 def _canonical_decimal_text(value: str) -> str:

@@ -717,6 +717,28 @@ def test_apply_ai_interpretation_updates_summary_without_changing_rule_action() 
     assert interpreted.error == ""
 
 
+def test_apply_ai_interpretation_allows_timeframe_labels_without_numeric_facts() -> None:
+    signal = sample_signal()
+
+    interpreted = apply_ai_interpretation(
+        signal,
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "5分钟 RSI 处于偏低区间，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert interpreted.action == "BUY_T"
+    assert interpreted.suggested_ratio == "10"
+    assert interpreted.status == "ok"
+
+
 def test_apply_ai_interpretation_degrades_invented_numeric_facts() -> None:
     signal = sample_signal()
 
@@ -727,6 +749,29 @@ def test_apply_ai_interpretation_degrades_invented_numeric_facts() -> None:
                 "action": "BUY_T",
                 "suggested_ratio": "10",
                 "signal_summary_zh": "当前价格 999.99，RSI 为 1，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert interpreted.action == "REVIEW"
+    assert interpreted.suggested_ratio == ""
+    assert interpreted.status == "review"
+    assert "invented numeric" in interpreted.error
+
+
+def test_apply_ai_interpretation_degrades_misattributed_numeric_facts() -> None:
+    signal = sample_signal()
+
+    interpreted = apply_ai_interpretation(
+        signal,
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "当前价格 34，RSI 为 376.40，短线反弹条件成立。",
                 "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
                 "evidence_refs": ["vwap_reclaim"],
             },
