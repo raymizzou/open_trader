@@ -1469,6 +1469,50 @@ def test_load_dashboard_state_hardens_malformed_cached_anomaly_module(
     )
 
 
+def test_load_dashboard_state_hardens_non_finite_anomaly_window_days(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    path = config.data_dir / "latest" / "US" / "futu_skill_facts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """
+{
+  "schema_version": "open_trader.futu_skill_facts.v1",
+  "generated_at": "2026-07-01T09:15:00+08:00",
+  "run_date": "2026-07-01",
+  "market": "US",
+  "records": [
+    {
+      "schema_version": "open_trader.futu_skill_facts.v1",
+      "run_date": "2026-07-01",
+      "market": "US",
+      "symbol": "VIXY",
+      "name": "ProShares VIX Short-Term Futures ETF",
+      "technical_anomaly": {
+        "status": "ok",
+        "signal": "supportive",
+        "confidence": "medium",
+        "suggested_constraint": "",
+        "window_days": Infinity,
+        "summary": "技术信号支持趋势。",
+        "categories": []
+      },
+      "error": ""
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    technical = state["holdings"][0]["futu_skill_facts"]["technical_anomaly"]
+    assert technical["window_days"] == 0
+
+
 def test_load_dashboard_state_marks_stale_anomaly_module_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -1531,6 +1575,78 @@ def test_load_dashboard_state_marks_stale_anomaly_module_unavailable(
             "evidence_date": "2026-06-28",
         }
     ]
+
+
+def test_load_dashboard_state_marks_stale_futu_news_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    path = config.data_dir / "latest" / "US" / "futu_skill_facts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.futu_skill_facts.v1",
+                "generated_at": "2026-07-01T09:15:00+08:00",
+                "run_date": "2026-07-01",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.futu_skill_facts.v1",
+                        "run_date": "2026-07-01",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "name": "ProShares VIX Short-Term Futures ETF",
+                        "news_sentiment": {
+                            "status": "stale",
+                            "signal": "supportive",
+                            "confidence": "medium",
+                            "freshness": {
+                                "generated_at": "2026-06-30T09:10:00+08:00",
+                                "source_window": "latest",
+                            },
+                            "evidence": [
+                                {
+                                    "title": "Old volatility digest",
+                                    "summary": "旧新闻仍可展示。",
+                                    "url": "https://example.com/old-vixy",
+                                }
+                            ],
+                            "domestic_discussion": {
+                                "status": "ok",
+                                "keyword_counts": [{"keyword": "波动", "count": 1}],
+                                "summary": "旧社区讨论。",
+                                "focus": "波动率 ETF",
+                                "divergence_risk": "样本旧。",
+                                "credibility": "低",
+                                "trading_constraint": "仅展示旧上下文。",
+                                "post_count": 1,
+                                "relevant_post_count": 1,
+                            },
+                            "blocking_reason": "旧缓存",
+                            "suggested_constraint": "no_add",
+                        },
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    news = state["holdings"][0]["futu_skill_facts"]["news_sentiment"]
+    assert news["available"] is False
+    assert news["status"] == "stale"
+    assert news["signal"] == "supportive"
+    assert news["confidence"] == "medium"
+    assert news["evidence"][0]["url"] == "https://example.com/old-vixy"
+    assert news["domestic_discussion"]["summary"] == "旧社区讨论。"
+    assert news["blocking_reason"] == "旧缓存"
+    assert news["suggested_constraint"] == "no_add"
 
 
 def test_load_dashboard_state_marks_missing_agent_sections_unavailable(

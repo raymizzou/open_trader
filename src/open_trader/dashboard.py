@@ -866,7 +866,7 @@ def _futu_skill_signal_detail(module: object) -> dict[str, Any]:
 def _safe_int(value: object) -> int:
     try:
         return int(value or 0)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return 0
 
 
@@ -904,7 +904,7 @@ def _futu_skill_news_sentiment_detail(module: object) -> dict[str, Any]:
         }
     evidence = module.get("evidence")
     return {
-        "available": True,
+        "available": status in {"ok", "partial"},
         "status": status,
         "signal": signal,
         "confidence": confidence,
