@@ -188,6 +188,18 @@ def test_to_futu_symbol_normalizes_hk_numeric_symbol() -> None:
 
 
 @pytest.mark.parametrize(
+    ("market", "symbol"),
+    [("HK", "US.MSFT"), ("CN", "600000"), ("US", "")],
+)
+def test_to_futu_symbol_rejects_invalid_market_or_prefix(
+    market: str,
+    symbol: str,
+) -> None:
+    with pytest.raises(ValueError):
+        to_futu_symbol(market, symbol)
+
+
+@pytest.mark.parametrize(
     ("score", "ratio"),
     [(0, ""), (1, "6"), (2, "10"), (3, "15"), (4, "20"), (8, "20")],
 )
@@ -271,6 +283,40 @@ def test_build_t_signal_canonicalizes_uncanonical_futu_symbol() -> None:
     assert signal.notification.dedupe_key.startswith("2026-07-02|HK.00700|")
 
 
+def test_build_t_signal_blocks_mismatched_futu_symbol_without_raising() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(futu_symbol="US.MSFT"),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="市场和代码前缀不匹配。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.status == "review"
+    assert any(
+        gate.name == "symbol" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
+def test_build_t_signal_blocks_unsupported_market_without_raising() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(market="CN", symbol="600000", futu_symbol=""),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="暂不支持该市场。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.status == "review"
+    assert any(
+        gate.name == "symbol" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
 @pytest.mark.parametrize("phase", ["pre_market", "post_market", "closed", "unknown"])
 def test_non_regular_session_blocks_buy_sell(phase: str) -> None:
     signal = build_t_signal_from_facts(
@@ -300,6 +346,45 @@ def test_wide_spread_blocks_action() -> None:
     assert signal.action == "REVIEW"
     assert signal.liquidity.depth_status == "wide_spread"
     assert signal.suggested_ratio == ""
+
+
+def test_missing_technical_facts_blocks_action() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(
+            ma_1m=None,
+            ma_5m=None,
+            rsi_5m=None,
+            volume_ratio_5m=None,
+        ),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="技术指标不完整。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.status == "review"
+    assert any(
+        gate.name == "technical" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
+def test_non_finite_last_price_blocks_action_without_raising() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(last_price=Decimal("NaN")),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="价格数据异常。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.status == "review"
+    assert any(
+        gate.name == "technical" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
 
 
 def test_crossed_bid_ask_blocks_action() -> None:
@@ -381,6 +466,23 @@ def test_missing_baseline_blocks_action() -> None:
 
     assert signal.action == "REVIEW"
     assert signal.suggested_ratio == ""
+    assert any(
+        gate.name == "baseline" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
+def test_non_finite_baseline_blocks_action_without_raising() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("NaN")),
+        previous=None,
+        ai_summary_zh="底仓数据异常。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.status == "review"
     assert any(
         gate.name == "baseline" and gate.status == "block"
         for gate in signal.hard_gates

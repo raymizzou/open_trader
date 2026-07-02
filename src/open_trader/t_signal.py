@@ -209,13 +209,21 @@ class TMarketFacts:
 def to_futu_symbol(market: str, symbol: str) -> str:
     normalized_market = market.strip().upper()
     normalized_symbol = symbol.strip().upper()
-    if normalized_symbol.startswith(f"{normalized_market}."):
-        normalized_symbol = normalized_symbol.split(".", 1)[1]
+    if normalized_market not in {"HK", "US"}:
+        raise ValueError(f"unsupported market for t signal: {market}")
+    if "." in normalized_symbol:
+        prefix, normalized_symbol = normalized_symbol.split(".", 1)
+        if prefix != normalized_market:
+            raise ValueError(
+                f"symbol prefix {prefix} does not match market {normalized_market}"
+            )
+    if not normalized_symbol:
+        raise ValueError(f"empty symbol for market {normalized_market}")
     if normalized_market == "HK" and normalized_symbol.isdigit():
         return f"HK.{normalized_symbol.zfill(5)}"
     if normalized_market == "US":
         return f"US.{normalized_symbol}"
-    return f"{normalized_market}.{normalized_symbol}"
+    raise ValueError(f"invalid symbol for market {normalized_market}: {symbol}")
 
 
 def ratio_from_score(score: int) -> str:
@@ -237,11 +245,18 @@ def build_t_signal_from_facts(
     previous: TSignal | None,
     ai_summary_zh: str,
 ) -> TSignal:
+    # Cycle state and duplicate suppression are handled by the watcher layer.
     del previous
 
+    try:
+        futu_symbol = to_futu_symbol(facts.market, facts.futu_symbol or facts.symbol)
+        symbol_error = ""
+    except ValueError as exc:
+        futu_symbol = ""
+        symbol_error = str(exc)
     liquidity = _build_liquidity(facts)
     technical = _build_technical(facts)
-    hard_gates = _build_hard_gates(facts, baseline, liquidity)
+    hard_gates = _build_hard_gates(facts, baseline, liquidity, symbol_error)
     evidence, buy_score, sell_score = _build_evidence(facts, technical)
     has_blocker = any(gate.status == "block" for gate in hard_gates)
 
@@ -270,7 +285,6 @@ def build_t_signal_from_facts(
         current_status = "暂无明确做T信号，继续观察。"
         event_type = "signal_created"
 
-    futu_symbol = to_futu_symbol(facts.market, facts.futu_symbol or facts.symbol)
     signal = TSignal(
         schema_version=SCHEMA_VERSION,
         run_date=facts.run_date,
@@ -333,7 +347,9 @@ def _build_liquidity(facts: TMarketFacts) -> TSignalLiquidity:
 
 
 def _spread_pct(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
-    if bid is None or ask is None or bid <= 0 or ask <= bid:
+    if not _is_positive_finite_decimal(bid) or not _is_positive_finite_decimal(ask):
+        return None
+    if ask <= bid:
         return None
     midpoint = (bid + ask) / Decimal("2")
     if midpoint <= 0:
@@ -347,6 +363,10 @@ def _depth_status(facts: TMarketFacts, spread_pct: Decimal | None) -> str:
         or facts.ask is None
         or facts.bid_depth is None
         or facts.ask_depth is None
+        or not _is_finite_decimal(facts.bid)
+        or not _is_finite_decimal(facts.ask)
+        or not _is_finite_decimal(facts.bid_depth)
+        or not _is_finite_decimal(facts.ask_depth)
         or spread_pct is None
     ):
         return "missing"
@@ -369,7 +389,7 @@ def _build_technical(facts: TMarketFacts) -> TSignalTechnical:
 
 
 def _price_position(facts: TMarketFacts) -> str:
-    if facts.last_price is None or facts.vwap is None:
+    if not _is_finite_decimal(facts.last_price) or not _is_finite_decimal(facts.vwap):
         return "unknown"
     if facts.last_price < facts.vwap:
         return "below_vwap_reclaim"
@@ -392,10 +412,15 @@ def _build_hard_gates(
     facts: TMarketFacts,
     baseline: TPortfolioBaseline,
     liquidity: TSignalLiquidity,
+    symbol_error: str,
 ) -> list[TSignalHardGate]:
     session_status = "pass" if facts.session_phase == "regular" else "block"
-    baseline_status = "pass" if baseline.total_quantity > 0 else "block"
+    baseline_status = (
+        "pass" if _is_positive_finite_decimal(baseline.total_quantity) else "block"
+    )
+    technical_status = "pass" if _has_required_technical_facts(facts) else "block"
     liquidity_status = "pass" if liquidity.depth_status == "pass" else "block"
+    symbol_status = "pass" if not symbol_error else "block"
     return [
         TSignalHardGate(
             name="session_phase",
@@ -416,12 +441,30 @@ def _build_hard_gates(
             ),
         ),
         TSignalHardGate(
+            name="technical",
+            status=technical_status,
+            message_zh=(
+                "盘中技术指标完整。"
+                if technical_status == "pass"
+                else "盘中技术指标缺失或异常，需要人工复核。"
+            ),
+        ),
+        TSignalHardGate(
             name="liquidity",
             status=liquidity_status,
             message_zh=(
                 "买卖盘和价差满足流动性要求。"
                 if liquidity_status == "pass"
                 else "买卖盘缺失、过薄或价差过大，需要人工复核。"
+            ),
+        ),
+        TSignalHardGate(
+            name="symbol",
+            status=symbol_status,
+            message_zh=(
+                "富途代码与市场匹配。"
+                if symbol_status == "pass"
+                else f"富途代码无法规范化：{symbol_error}"
             ),
         ),
     ]
@@ -454,7 +497,7 @@ def _build_evidence(
             )
         )
         sell_score += 1
-    if facts.rsi_5m is not None and facts.rsi_5m <= Decimal("40"):
+    if _is_finite_decimal(facts.rsi_5m) and facts.rsi_5m <= Decimal("40"):
         evidence.append(
             TSignalEvidence(
                 name="rsi_rebound_zone",
@@ -464,7 +507,7 @@ def _build_evidence(
             )
         )
         buy_score += 1
-    if facts.rsi_5m is not None and facts.rsi_5m >= Decimal("60"):
+    if _is_finite_decimal(facts.rsi_5m) and facts.rsi_5m >= Decimal("60"):
         evidence.append(
             TSignalEvidence(
                 name="rsi_reject_zone",
@@ -474,7 +517,10 @@ def _build_evidence(
             )
         )
         sell_score += 1
-    if facts.volume_ratio_5m is not None and facts.volume_ratio_5m >= Decimal("1.20"):
+    if (
+        _is_finite_decimal(facts.volume_ratio_5m)
+        and facts.volume_ratio_5m >= Decimal("1.20")
+    ):
         direction = "sell" if technical.price_position == "above_vwap_reject" else "buy"
         message_zh = (
             "5分钟量比放大，价格受压具备成交配合。"
@@ -529,6 +575,28 @@ def _timeline_message(action: str, suggested_ratio: str) -> str:
 
 
 def _decimal_text(value: Decimal | None) -> str:
-    if value is None:
+    if not _is_finite_decimal(value):
         return ""
     return format(value, "f")
+
+
+def _has_required_technical_facts(facts: TMarketFacts) -> bool:
+    return all(
+        _is_finite_decimal(value)
+        for value in (
+            facts.last_price,
+            facts.vwap,
+            facts.ma_1m,
+            facts.ma_5m,
+            facts.rsi_5m,
+            facts.volume_ratio_5m,
+        )
+    )
+
+
+def _is_positive_finite_decimal(value: Decimal | None) -> bool:
+    return _is_finite_decimal(value) and value > 0
+
+
+def _is_finite_decimal(value: Decimal | None) -> bool:
+    return value is not None and value.is_finite()
