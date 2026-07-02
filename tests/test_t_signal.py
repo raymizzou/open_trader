@@ -181,7 +181,9 @@ def regular_facts(**overrides: object) -> TMarketFacts:
 def test_to_futu_symbol_normalizes_hk_numeric_symbol() -> None:
     assert to_futu_symbol("HK", "700") == "HK.00700"
     assert to_futu_symbol("US", "msft") == "US.MSFT"
+    assert to_futu_symbol("HK", "HK.700") == "HK.00700"
     assert to_futu_symbol("HK", "HK.00700") == "HK.00700"
+    assert to_futu_symbol("US", "us.msft") == "US.MSFT"
     assert to_futu_symbol("US", "US.MSFT") == "US.MSFT"
 
 
@@ -202,7 +204,7 @@ def test_regular_rebound_builds_buy_signal_with_ratio() -> None:
     )
 
     assert signal.action == "BUY_T"
-    assert signal.suggested_ratio in {"6", "10", "15", "20"}
+    assert signal.suggested_ratio == "15"
     assert signal.technical.price_position == "below_vwap_reclaim"
     assert any(item.name == "vwap_reclaim" for item in signal.evidence)
     assert signal.status == "ok"
@@ -221,10 +223,52 @@ def test_regular_reject_builds_sell_signal_with_ratio() -> None:
     )
 
     assert signal.action == "SELL_T"
-    assert signal.suggested_ratio in {"6", "10", "15", "20"}
+    assert signal.suggested_ratio == "15"
     assert signal.technical.price_position == "above_vwap_reject"
     assert any(item.name == "vwap_reject" for item in signal.evidence)
     assert signal.status == "ok"
+
+
+def test_sell_signal_ratio_ignores_buy_side_evidence() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(
+            last_price=Decimal("380"),
+            vwap=Decimal("378.10"),
+            rsi_5m=Decimal("34"),
+        ),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="价格高于 VWAP 但 RSI 偏低，信号冲突。",
+    )
+
+    assert signal.action == "SELL_T"
+    assert signal.suggested_ratio == "10"
+    assert any(item.name == "vwap_reject" for item in signal.evidence)
+    assert any(item.name == "rsi_rebound_zone" for item in signal.evidence)
+
+
+def test_build_t_signal_canonicalizes_blank_futu_symbol() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(symbol="700", futu_symbol=""),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="使用标的代码规范化。",
+    )
+
+    assert signal.futu_symbol == "HK.00700"
+    assert signal.notification.dedupe_key.startswith("2026-07-02|HK.00700|")
+
+
+def test_build_t_signal_canonicalizes_uncanonical_futu_symbol() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(futu_symbol="HK.700"),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="使用富途代码规范化。",
+    )
+
+    assert signal.futu_symbol == "HK.00700"
+    assert signal.notification.dedupe_key.startswith("2026-07-02|HK.00700|")
 
 
 @pytest.mark.parametrize("phase", ["pre_market", "post_market", "closed", "unknown"])

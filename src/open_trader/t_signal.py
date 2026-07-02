@@ -207,10 +207,10 @@ class TMarketFacts:
 
 
 def to_futu_symbol(market: str, symbol: str) -> str:
-    normalized_market = market.upper()
+    normalized_market = market.strip().upper()
     normalized_symbol = symbol.strip().upper()
     if normalized_symbol.startswith(f"{normalized_market}."):
-        return normalized_symbol
+        normalized_symbol = normalized_symbol.split(".", 1)[1]
     if normalized_market == "HK" and normalized_symbol.isdigit():
         return f"HK.{normalized_symbol.zfill(5)}"
     if normalized_market == "US":
@@ -242,7 +242,7 @@ def build_t_signal_from_facts(
     liquidity = _build_liquidity(facts)
     technical = _build_technical(facts)
     hard_gates = _build_hard_gates(facts, baseline, liquidity)
-    evidence, score = _build_evidence(facts, technical)
+    evidence, buy_score, sell_score = _build_evidence(facts, technical)
     has_blocker = any(gate.status == "block" for gate in hard_gates)
 
     if has_blocker:
@@ -251,15 +251,15 @@ def build_t_signal_from_facts(
         status = "review"
         current_status = "硬性条件未通过，需要人工复核。"
         event_type = "review_required"
-    elif technical.price_position == "below_vwap_reclaim" and score > 0:
+    elif technical.price_position == "below_vwap_reclaim" and buy_score > 0:
         action = "BUY_T"
-        suggested_ratio = ratio_from_score(score)
+        suggested_ratio = ratio_from_score(buy_score)
         status = "ok"
         current_status = "BUY_T 条件满足，等待执行确认。"
         event_type = "signal_created"
-    elif technical.price_position == "above_vwap_reject" and score > 0:
+    elif technical.price_position == "above_vwap_reject" and sell_score > 0:
         action = "SELL_T"
-        suggested_ratio = ratio_from_score(score)
+        suggested_ratio = ratio_from_score(sell_score)
         status = "ok"
         current_status = "SELL_T 条件满足，等待执行确认。"
         event_type = "signal_created"
@@ -270,7 +270,7 @@ def build_t_signal_from_facts(
         current_status = "暂无明确做T信号，继续观察。"
         event_type = "signal_created"
 
-    futu_symbol = facts.futu_symbol or to_futu_symbol(facts.market, facts.symbol)
+    futu_symbol = to_futu_symbol(facts.market, facts.futu_symbol or facts.symbol)
     signal = TSignal(
         schema_version=SCHEMA_VERSION,
         run_date=facts.run_date,
@@ -430,9 +430,10 @@ def _build_hard_gates(
 def _build_evidence(
     facts: TMarketFacts,
     technical: TSignalTechnical,
-) -> tuple[list[TSignalEvidence], int]:
+) -> tuple[list[TSignalEvidence], int, int]:
     evidence: list[TSignalEvidence] = []
-    score = 0
+    buy_score = 0
+    sell_score = 0
     if technical.price_position == "below_vwap_reclaim":
         evidence.append(
             TSignalEvidence(
@@ -442,7 +443,7 @@ def _build_evidence(
                 message_zh="价格低于 VWAP 后回收，出现低吸做T信号。",
             )
         )
-        score += 1
+        buy_score += 1
     if technical.price_position == "above_vwap_reject":
         evidence.append(
             TSignalEvidence(
@@ -452,7 +453,7 @@ def _build_evidence(
                 message_zh="价格高于 VWAP 后受压，出现高抛做T信号。",
             )
         )
-        score += 1
+        sell_score += 1
     if facts.rsi_5m is not None and facts.rsi_5m <= Decimal("40"):
         evidence.append(
             TSignalEvidence(
@@ -462,7 +463,7 @@ def _build_evidence(
                 message_zh="5分钟 RSI 处于偏低区间，反弹信号更明确。",
             )
         )
-        score += 1
+        buy_score += 1
     if facts.rsi_5m is not None and facts.rsi_5m >= Decimal("60"):
         evidence.append(
             TSignalEvidence(
@@ -472,7 +473,7 @@ def _build_evidence(
                 message_zh="5分钟 RSI 处于偏高区间，回落信号更明确。",
             )
         )
-        score += 1
+        sell_score += 1
     if facts.volume_ratio_5m is not None and facts.volume_ratio_5m >= Decimal("1.20"):
         direction = "sell" if technical.price_position == "above_vwap_reject" else "buy"
         message_zh = (
@@ -488,7 +489,10 @@ def _build_evidence(
                 message_zh=message_zh,
             )
         )
-        score += 1
+        if direction == "sell":
+            sell_score += 1
+        else:
+            buy_score += 1
     if not evidence:
         evidence.append(
             TSignalEvidence(
@@ -498,7 +502,7 @@ def _build_evidence(
                 message_zh="当前技术条件没有形成明确做T优势。",
             )
         )
-    return evidence, score
+    return evidence, buy_score, sell_score
 
 
 def _build_summary(
