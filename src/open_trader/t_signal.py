@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol
 
 
 SCHEMA_VERSION = "open_trader.t_signal.v1"
@@ -40,6 +42,20 @@ TIMELINE_EVENT_TYPES = {
     "review_required",
 }
 STATUSES = {"ok", "review", "blocked", "error", "stale"}
+AI_INTERPRETATION_FIELDS = {
+    "action",
+    "suggested_ratio",
+    "signal_summary_zh",
+    "ratio_rationale_zh",
+    "evidence_refs",
+}
+T_SIGNAL_INTERPRETER_PROMPT = """你是做T信号解释器。
+只能解释系统给出的结构化信号，不得改写 action，不得改写 suggested_ratio。
+只能引用 payload.evidence 中已经存在的 name，不得编造价格、指标、盘口或成交量。
+用户可见字段必须使用中文，不要输出英文交易建议。
+返回 JSON object，字段固定为：
+action, suggested_ratio, signal_summary_zh, ratio_rationale_zh, evidence_refs。
+"""
 
 
 @dataclass(frozen=True)
@@ -133,6 +149,82 @@ class TSignal:
 
     def with_field(self, name: str, value: object) -> TSignal:
         return replace(self, **{name: value})
+
+
+@dataclass(frozen=True)
+class TSignalAIInterpretation:
+    action: str
+    suggested_ratio: str
+    signal_summary_zh: str
+    ratio_rationale_zh: str
+    evidence_refs: list[str]
+
+
+class TSignalInterpreterClient(Protocol):
+    def interpret(self, prompt: str, payload: dict[str, object]) -> str:
+        ...
+
+
+class OpenAITSignalInterpreterClient:
+    def __init__(
+        self,
+        *,
+        model: str | None = None,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        from openai import OpenAI
+
+        from .advice.change_classifier import DEEPSEEK_BASE_URL, DEFAULT_CLASSIFIER_MODEL
+
+        self._client = OpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url=DEEPSEEK_BASE_URL,
+            timeout=timeout_seconds,
+        )
+        self._model = model or DEFAULT_CLASSIFIER_MODEL
+        self._timeout_seconds = timeout_seconds
+
+    def interpret(self, prompt: str, payload: dict[str, object]) -> str:
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                },
+            ],
+            response_format={"type": "json_object"},
+            timeout=self._timeout_seconds,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("model returned empty content")
+        return content
+
+
+class TSignalInterpreter:
+    def __init__(
+        self,
+        *,
+        client: TSignalInterpreterClient | None = None,
+        prompt: str = T_SIGNAL_INTERPRETER_PROMPT,
+    ) -> None:
+        self._client = client or OpenAITSignalInterpreterClient()
+        self._prompt = prompt
+
+    def interpret(self, signal: TSignal) -> TSignal:
+        try:
+            raw = self._client.interpret(
+                self._prompt,
+                build_ai_interpretation_payload(signal),
+            )
+        except Exception as exc:
+            return _degrade_signal_for_ai_error(signal, str(exc))
+        return apply_ai_interpretation(
+            signal,
+            raw,
+        )
 
 
 def validate_t_signal(signal: TSignal) -> None:
@@ -339,6 +431,141 @@ def build_t_signal_from_facts(
     )
     validate_t_signal(signal)
     return signal
+
+
+def build_ai_interpretation_payload(signal: TSignal) -> dict[str, object]:
+    validate_t_signal(signal)
+    return {
+        "schema_version": signal.schema_version,
+        "run_date": signal.run_date,
+        "market": signal.market,
+        "symbol": signal.symbol,
+        "futu_symbol": signal.futu_symbol,
+        "name": signal.name,
+        "session_phase": signal.session_phase,
+        "updated_at": signal.updated_at,
+        "action": signal.action,
+        "suggested_ratio": signal.suggested_ratio,
+        "current_status": signal.current_status,
+        "price": asdict(signal.price),
+        "liquidity": asdict(signal.liquidity),
+        "technical": asdict(signal.technical),
+        "hard_gates": [asdict(gate) for gate in signal.hard_gates],
+        "evidence": [asdict(item) for item in signal.evidence],
+    }
+
+
+def validate_ai_interpretation_output(
+    raw: str,
+    signal: TSignal,
+) -> TSignalAIInterpretation:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"AI interpretation invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("AI interpretation must be an object")
+
+    fields = set(data)
+    missing = sorted(AI_INTERPRETATION_FIELDS - fields)
+    if missing:
+        raise ValueError(f"AI interpretation missing field(s): {', '.join(missing)}")
+    extra = sorted(fields - AI_INTERPRETATION_FIELDS)
+    if extra:
+        raise ValueError(f"AI interpretation unexpected field(s): {', '.join(extra)}")
+
+    action = data["action"]
+    suggested_ratio = data["suggested_ratio"]
+    if action not in ACTIONS:
+        raise ValueError(f"AI interpretation invalid action: {action}")
+    if suggested_ratio not in SUGGESTED_RATIOS:
+        raise ValueError(f"AI interpretation invalid suggested_ratio: {suggested_ratio}")
+    if action != signal.action:
+        raise ValueError("AI interpretation action does not match rule action")
+    if suggested_ratio != signal.suggested_ratio:
+        raise ValueError("AI interpretation ratio does not match rule ratio")
+
+    summary = _require_chinese_text(data["signal_summary_zh"], "signal_summary_zh")
+    rationale = _require_chinese_text(data["ratio_rationale_zh"], "ratio_rationale_zh")
+    evidence_refs = _validate_evidence_refs(data["evidence_refs"], signal)
+
+    return TSignalAIInterpretation(
+        action=action,
+        suggested_ratio=suggested_ratio,
+        signal_summary_zh=summary,
+        ratio_rationale_zh=rationale,
+        evidence_refs=evidence_refs,
+    )
+
+
+def apply_ai_interpretation(signal: TSignal, raw: str) -> TSignal:
+    try:
+        interpretation = validate_ai_interpretation_output(raw, signal)
+    except ValueError as exc:
+        return _degrade_signal_for_ai_error(signal, str(exc))
+
+    interpreted = replace(
+        signal,
+        signal_summary_zh=(
+            f"{interpretation.signal_summary_zh}"
+            f" 比例依据：{interpretation.ratio_rationale_zh}"
+        ),
+        error="",
+    )
+    validate_t_signal(interpreted)
+    return interpreted
+
+
+def _degrade_signal_for_ai_error(signal: TSignal, error: str) -> TSignal:
+    degraded = replace(
+        signal,
+        action="REVIEW",
+        suggested_ratio="",
+        current_status="AI 解读未通过验证，需要人工复核。",
+        signal_summary_zh=(
+            "AI 解读未通过验证，转入人工复核。"
+            f"规则信号：{signal.action}，建议比例 {signal.suggested_ratio or '无'}。"
+        ),
+        timeline=[
+            *signal.timeline,
+            TSignalTimelineEvent(
+                event_at=signal.updated_at,
+                event_type="review_required",
+                action="REVIEW",
+                suggested_ratio="",
+                message_zh="AI 解读未通过验证，转入人工复核。",
+            ),
+        ],
+        notification=replace(signal.notification, should_notify=False),
+        status="review",
+        error=f"AI interpretation invalid: {error}",
+    )
+    validate_t_signal(degraded)
+    return degraded
+
+
+def _require_chinese_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"AI interpretation {field_name} must be non-empty string")
+    text = value.strip()
+    if not any("\u3400" <= char <= "\u9fff" for char in text):
+        raise ValueError(f"AI interpretation {field_name} must be Chinese text")
+    return text
+
+
+def _validate_evidence_refs(value: object, signal: TSignal) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("AI interpretation evidence_refs must be a non-empty list")
+    evidence_names = {item.name for item in signal.evidence}
+    refs: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("AI interpretation evidence_refs must contain strings")
+        ref = item.strip()
+        if ref not in evidence_names:
+            raise ValueError(f"AI interpretation unknown evidence ref: {ref}")
+        refs.append(ref)
+    return refs
 
 
 def _build_liquidity(facts: TMarketFacts) -> TSignalLiquidity:

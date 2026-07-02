@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import sys
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,9 +18,14 @@ from open_trader.t_signal import (
     TSignalPrice,
     TSignalTechnical,
     TSignalTimelineEvent,
+    OpenAITSignalInterpreterClient,
+    TSignalInterpreter,
+    apply_ai_interpretation,
     build_t_signal_from_facts,
+    build_ai_interpretation_payload,
     ratio_from_score,
     to_futu_symbol,
+    validate_ai_interpretation_output,
     validate_t_signal,
 )
 
@@ -644,3 +652,214 @@ def test_non_finite_baseline_blocks_action_without_raising() -> None:
         gate.name == "baseline" and gate.status == "block"
         for gate in signal.hard_gates
     )
+
+
+def test_build_ai_interpretation_payload_uses_structured_signal_fields() -> None:
+    signal = sample_signal()
+
+    payload = build_ai_interpretation_payload(signal)
+
+    assert payload["action"] == "BUY_T"
+    assert payload["suggested_ratio"] == "10"
+    assert payload["price"]["last_price"] == "376.40"
+    assert payload["evidence"] == [
+        {
+            "name": "vwap_reclaim",
+            "direction": "buy",
+            "strength": "medium",
+            "message_zh": "价格低于 VWAP 后回收。",
+        }
+    ]
+    assert "notification" not in payload
+
+
+def test_validate_ai_interpretation_accepts_matching_chinese_output() -> None:
+    parsed = validate_ai_interpretation_output(
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+        sample_signal(),
+    )
+
+    assert parsed.action == "BUY_T"
+    assert parsed.suggested_ratio == "10"
+    assert parsed.evidence_refs == ["vwap_reclaim"]
+
+
+def test_apply_ai_interpretation_updates_summary_without_changing_rule_action() -> None:
+    signal = sample_signal()
+
+    interpreted = apply_ai_interpretation(
+        signal,
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert interpreted.action == "BUY_T"
+    assert interpreted.suggested_ratio == "10"
+    assert "短线反弹条件成立" in interpreted.signal_summary_zh
+    assert "比例依据" in interpreted.signal_summary_zh
+    assert interpreted.error == ""
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps(
+            {
+                "action": "SELL_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "20",
+                "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
+                "ratio_rationale_zh": "20% 来自模型判断。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "Price reclaimed VWAP, buy now.",
+                "ratio_rationale_zh": "Rule score supports 10%.",
+                "evidence_refs": ["vwap_reclaim"],
+            }
+        ),
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["invented_signal"],
+            },
+            ensure_ascii=False,
+        ),
+    ],
+)
+def test_apply_ai_interpretation_degrades_invalid_ai_output_to_review(raw: str) -> None:
+    signal = sample_signal()
+
+    interpreted = apply_ai_interpretation(signal, raw)
+
+    assert interpreted.action == "REVIEW"
+    assert interpreted.suggested_ratio == ""
+    assert interpreted.status == "review"
+    assert interpreted.notification.should_notify is False
+    assert interpreted.evidence == signal.evidence
+    assert interpreted.timeline[-1].event_type == "review_required"
+    assert interpreted.timeline[-1].action == "REVIEW"
+    assert "AI 解读未通过验证" in interpreted.signal_summary_zh
+    assert "AI interpretation invalid" in interpreted.error
+
+
+def test_t_signal_interpreter_calls_client_with_structured_payload() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def interpret(self, prompt: str, payload: dict[str, object]) -> str:
+            self.calls.append({"prompt": prompt, "payload": payload})
+            return json.dumps(
+                {
+                    "action": "BUY_T",
+                    "suggested_ratio": "10",
+                    "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
+                    "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                    "evidence_refs": ["vwap_reclaim"],
+                },
+                ensure_ascii=False,
+            )
+
+    client = FakeClient()
+    interpreted = TSignalInterpreter(client=client).interpret(sample_signal())
+
+    assert interpreted.action == "BUY_T"
+    assert "短线反弹条件成立" in interpreted.signal_summary_zh
+    assert len(client.calls) == 1
+    assert "不得改写 action" in str(client.calls[0]["prompt"])
+    assert client.calls[0]["payload"]["symbol"] == "00700"
+    assert "notification" not in client.calls[0]["payload"]
+
+
+def test_t_signal_interpreter_degrades_client_failure_to_review() -> None:
+    class RaisingClient:
+        def interpret(self, prompt: str, payload: dict[str, object]) -> str:
+            raise RuntimeError("llm unavailable")
+
+    interpreted = TSignalInterpreter(client=RaisingClient()).interpret(sample_signal())
+
+    assert interpreted.action == "REVIEW"
+    assert interpreted.suggested_ratio == ""
+    assert interpreted.status == "review"
+    assert interpreted.notification.should_notify is False
+    assert "llm unavailable" in interpreted.error
+
+
+def test_openai_t_signal_interpreter_client_uses_deepseek_json_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            captured["request"] = kwargs
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"action":"HOLD"}')
+                    )
+                ]
+            )
+
+    class FakeOpenAI:
+        def __init__(
+            self,
+            *,
+            api_key: str | None = None,
+            base_url: str | None = None,
+            timeout: float | None = None,
+        ) -> None:
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            captured["client_timeout"] = timeout
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+
+    client = OpenAITSignalInterpreterClient(timeout_seconds=8.0)
+    content = client.interpret("Return JSON.", {"symbol": "00700"})
+
+    assert content == '{"action":"HOLD"}'
+    assert captured["api_key"] == "deepseek-secret"
+    assert captured["base_url"] == "https://api.deepseek.com"
+    assert captured["client_timeout"] == 8.0
+    request = captured["request"]
+    assert request["model"] == "deepseek-v4-flash"
+    assert request["response_format"] == {"type": "json_object"}
+    assert request["timeout"] == 8.0
