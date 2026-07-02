@@ -96,6 +96,8 @@ def sample_signal(**overrides: object) -> TSignal:
             notified=True,
             dedupe_key="2026-07-02|HK.00700|cycle-1|BUY_T",
             last_notified_at="2026-07-02T14:21:36+08:00",
+            last_notified_dedupe_key="2026-07-02|HK.00700|cycle-1|BUY_T",
+            last_attempted_dedupe_key="2026-07-02|HK.00700|cycle-1|BUY_T",
         ),
         status="ok",
         error="",

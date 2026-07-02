@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from .notifications import Notifier, NullNotifier
 from .t_signal import (
+    TMarketFacts,
     TPortfolioBaseline,
     TSignal,
     TSignalInterpreter,
@@ -72,35 +73,45 @@ def run_t_signal_watch_once(
     normalized_market = market.strip().upper()
     now = now_fn()
     updated_at = now.isoformat(timespec="seconds")
-    previous_by_key = index_t_signals_by_market_symbol(
-        load_t_signals_cache(t_signals_latest_path(data_dir, normalized_market))
-    )
-    signal_interpreter = interpreter or TSignalInterpreter()
-    notification_target = notifier or NullNotifier()
     signals: list[TSignal] = []
     notified_count = 0
     try:
+        previous_by_key = index_t_signals_by_market_symbol(
+            load_t_signals_cache(t_signals_latest_path(data_dir, normalized_market))
+        )
+        signal_interpreter = interpreter or TSignalInterpreter()
+        notification_target = notifier or NullNotifier()
         for row in _load_t_signal_portfolio_rows(portfolio_path, normalized_market):
-            futu_symbol = to_futu_symbol(row["market"], row["symbol"])
-            facts = market_data_client.get_market_facts(
-                run_date=run_date,
-                market=row["market"],
-                symbol=row["symbol"],
-                futu_symbol=futu_symbol,
-                name=row["name"],
-                session_phase=session_phase,
-                updated_at=updated_at,
-            )
-            signal = build_t_signal_from_facts(
-                facts=facts,
-                baseline=TPortfolioBaseline(total_quantity=row["total_quantity"]),
-                previous=previous_by_key.get((row["market"], row["symbol"])),
-                ai_summary_zh="",
-            )
-            signal = signal_interpreter.interpret(signal)
+            previous = previous_by_key.get((row["market"], row["symbol"]))
+            try:
+                futu_symbol = to_futu_symbol(row["market"], row["symbol"])
+                facts = market_data_client.get_market_facts(
+                    run_date=run_date,
+                    market=row["market"],
+                    symbol=row["symbol"],
+                    futu_symbol=futu_symbol,
+                    name=row["name"],
+                    session_phase=session_phase,
+                    updated_at=updated_at,
+                )
+                signal = build_t_signal_from_facts(
+                    facts=facts,
+                    baseline=TPortfolioBaseline(total_quantity=row["total_quantity"]),
+                    previous=previous,
+                    ai_summary_zh="",
+                )
+                signal = signal_interpreter.interpret(signal)
+            except Exception as exc:
+                signal = _build_error_signal(
+                    row=row,
+                    run_date=run_date,
+                    session_phase=session_phase,
+                    updated_at=updated_at,
+                    error=exc,
+                )
             signal, sent = _apply_notification_state(
                 signal,
-                previous=previous_by_key.get((signal.market, signal.symbol)),
+                previous=previous,
                 notifier=notification_target,
                 notified_at=updated_at,
             )
@@ -174,21 +185,46 @@ def _apply_notification_state(
     notified_at: str,
 ) -> tuple[TSignal, bool]:
     if not signal.notification.should_notify:
-        return signal, False
-    if _previous_notification_matches(signal, previous):
+        return _carry_previous_notification_cycle(signal, previous), False
+    previous_match = _previous_notification_match_type(signal, previous)
+    if previous_match:
+        was_notified = previous_match == "notified"
         return _append_notification_event(
             signal,
             event_type="notification_suppressed",
-            message_zh=f"{signal.action} 信号已通知，本轮不重复发送。",
-            notified=True,
-            should_notify=False,
-            last_notified_at=str(
-                (previous or {}).get("notification", {}).get("last_notified_at") or ""
+            message_zh=(
+                f"{signal.action} 信号已通知，本轮不重复发送。"
+                if was_notified
+                else f"{signal.action} 通知已尝试发送，本轮不重复尝试。"
             ),
+            notified=was_notified,
+            should_notify=False,
+            last_notified_at=_previous_last_notified_at(previous),
+            last_notified_dedupe_key=(
+                signal.notification.dedupe_key
+                if was_notified
+                else _previous_last_notified_dedupe_key(previous)
+            ),
+            last_attempted_dedupe_key=signal.notification.dedupe_key,
             event_at=notified_at,
         ), False
 
-    notifier.notify(_notification_title(signal), _notification_message(signal))
+    try:
+        notifier.notify(_notification_title(signal), _notification_message(signal))
+    except Exception as exc:
+        return _append_notification_event(
+            signal,
+            event_type="notification_failed",
+            message_zh=f"{signal.action} 通知发送失败，信号已保留在 UI 中。",
+            notified=False,
+            should_notify=False,
+            last_notified_at=_previous_last_notified_at(previous),
+            last_notified_dedupe_key=_previous_last_notified_dedupe_key(previous),
+            last_attempted_dedupe_key=signal.notification.dedupe_key,
+            event_at=notified_at,
+            status="review",
+            error=f"notification failed: {exc}",
+        ), False
     return _append_notification_event(
         signal,
         event_type="notification_sent",
@@ -196,19 +232,74 @@ def _apply_notification_state(
         notified=True,
         should_notify=False,
         last_notified_at=notified_at,
+        last_notified_dedupe_key=signal.notification.dedupe_key,
+        last_attempted_dedupe_key=signal.notification.dedupe_key,
         event_at=notified_at,
     ), True
 
 
-def _previous_notification_matches(signal: TSignal, previous: dict[str, Any] | None) -> bool:
+def _previous_notification_match_type(
+    signal: TSignal,
+    previous: dict[str, Any] | None,
+) -> str:
+    if signal.notification.dedupe_key == _previous_last_notified_dedupe_key(previous):
+        return "notified"
+    if signal.notification.dedupe_key == _previous_last_attempted_dedupe_key(previous):
+        return "attempted"
+    return ""
+
+
+def _previous_notification(previous: dict[str, Any] | None) -> dict[str, Any]:
     if previous is None:
-        return False
+        return {}
     notification = previous.get("notification")
     if not isinstance(notification, dict):
-        return False
-    return (
-        notification.get("dedupe_key") == signal.notification.dedupe_key
-        and notification.get("notified") is True
+        return {}
+    return notification
+
+
+def _previous_last_notified_at(previous: dict[str, Any] | None) -> str:
+    return str(_previous_notification(previous).get("last_notified_at") or "")
+
+
+def _previous_last_notified_dedupe_key(previous: dict[str, Any] | None) -> str:
+    notification = _previous_notification(previous)
+    explicit = str(notification.get("last_notified_dedupe_key") or "")
+    if explicit:
+        return explicit
+    if notification.get("notified") is True:
+        return str(notification.get("dedupe_key") or "")
+    return ""
+
+
+def _previous_last_attempted_dedupe_key(previous: dict[str, Any] | None) -> str:
+    notification = _previous_notification(previous)
+    explicit = str(notification.get("last_attempted_dedupe_key") or "")
+    if explicit:
+        return explicit
+    if notification.get("notified") is True:
+        return str(notification.get("dedupe_key") or "")
+    return ""
+
+
+def _carry_previous_notification_cycle(
+    signal: TSignal,
+    previous: dict[str, Any] | None,
+) -> TSignal:
+    previous_notified_key = _previous_last_notified_dedupe_key(previous)
+    previous_attempted_key = _previous_last_attempted_dedupe_key(previous)
+    previous_notified_at = _previous_last_notified_at(previous)
+    if not previous_notified_key and not previous_attempted_key and not previous_notified_at:
+        return signal
+    return replace(
+        signal,
+        notification=replace(
+            signal.notification,
+            notified=signal.notification.dedupe_key == previous_notified_key,
+            last_notified_at=previous_notified_at,
+            last_notified_dedupe_key=previous_notified_key,
+            last_attempted_dedupe_key=previous_attempted_key,
+        ),
     )
 
 
@@ -220,7 +311,11 @@ def _append_notification_event(
     notified: bool,
     should_notify: bool,
     last_notified_at: str,
+    last_notified_dedupe_key: str,
+    last_attempted_dedupe_key: str,
     event_at: str,
+    status: str | None = None,
+    error: str | None = None,
 ) -> TSignal:
     return replace(
         signal,
@@ -239,7 +334,60 @@ def _append_notification_event(
             should_notify=should_notify,
             notified=notified,
             last_notified_at=last_notified_at,
+            last_notified_dedupe_key=last_notified_dedupe_key,
+            last_attempted_dedupe_key=last_attempted_dedupe_key,
         ),
+        status=status or signal.status,
+        error=error if error is not None else signal.error,
+    )
+
+
+def _build_error_signal(
+    *,
+    row: dict[str, Any],
+    run_date: str,
+    session_phase: str,
+    updated_at: str,
+    error: Exception,
+) -> TSignal:
+    try:
+        futu_symbol = to_futu_symbol(row["market"], row["symbol"])
+    except ValueError:
+        futu_symbol = f"{row['market']}.{row['symbol']}"
+    facts = TMarketFacts(
+        run_date=run_date,
+        market=row["market"],
+        symbol=row["symbol"],
+        futu_symbol=futu_symbol,
+        name=row["name"],
+        session_phase=session_phase,
+        updated_at=updated_at,
+        last_price=None,
+        day_change_pct=None,
+        vwap=None,
+        ma_1m=None,
+        ma_5m=None,
+        day_low=None,
+        day_high=None,
+        bid=None,
+        ask=None,
+        bid_depth=None,
+        ask_depth=None,
+        rsi_5m=None,
+        volume_ratio_5m=None,
+    )
+    signal = build_t_signal_from_facts(
+        facts=facts,
+        baseline=TPortfolioBaseline(total_quantity=row["total_quantity"]),
+        previous=None,
+        ai_summary_zh="",
+    )
+    return replace(
+        signal,
+        current_status="做T信号生成失败，需要人工复核。",
+        signal_summary_zh="做T信号生成失败，已转入人工复核。",
+        status="error",
+        error=str(error),
     )
 
 

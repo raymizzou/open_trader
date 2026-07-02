@@ -413,6 +413,8 @@ def write_t_signals(path: Path, *, symbol: str = "VIXY", action: str = "BUY_T") 
                             "notified": False,
                             "dedupe_key": f"2026-07-02|US.{symbol}|{action}|{suggested_ratio}",
                             "last_notified_at": "",
+                            "last_notified_dedupe_key": "",
+                            "last_attempted_dedupe_key": "",
                         },
                         "status": "ok",
                         "error": "",

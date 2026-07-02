@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
-from open_trader.t_signal import TMarketFacts
+from open_trader.t_signal import TMarketFacts, apply_ai_interpretation
 from open_trader.t_signal_runner import run_t_signal_watch_once
 from open_trader.t_signal_store import load_t_signals_cache
 
@@ -100,9 +100,25 @@ class FakeMarketDataClient:
         self.closed = True
 
 
+class HoldMarketDataClient(FakeMarketDataClient):
+    def get_market_facts(self, **kwargs) -> TMarketFacts:
+        facts = super().get_market_facts(**kwargs)
+        return facts.with_field("last_price", Decimal("49.10"))
+
+
+class FailingMarketDataClient(FakeMarketDataClient):
+    def get_market_facts(self, **kwargs) -> TMarketFacts:
+        raise RuntimeError("OpenD connection failed")
+
+
 class PassthroughInterpreter:
     def interpret(self, signal):
         return signal
+
+
+class RejectingInterpreter:
+    def interpret(self, signal):
+        return apply_ai_interpretation(signal, "{}")
 
 
 class CapturingNotifier:
@@ -111,6 +127,11 @@ class CapturingNotifier:
 
     def notify(self, title: str, message: str) -> None:
         self.messages.append((title, message))
+
+
+class FailingNotifier:
+    def notify(self, title: str, message: str) -> None:
+        raise RuntimeError("Feishu webhook failed")
 
 
 def fixed_now() -> datetime:
@@ -180,5 +201,169 @@ def test_t_signal_runner_suppresses_duplicate_notification(tmp_path: Path) -> No
 
     assert second.notified_count == 0
     assert second_notifier.messages == []
+    cache = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")
+    assert cache["records"][0]["timeline"][-1]["event_type"] == "notification_suppressed"
+
+
+def test_t_signal_runner_writes_error_artifact_when_market_data_fails(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path)
+    client = FailingMarketDataClient()
+
+    result = run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=client,
+        interpreter=PassthroughInterpreter(),
+        notifier=CapturingNotifier(),
+        now_fn=fixed_now,
+    )
+
+    assert result.signal_count == 1
+    assert result.notified_count == 0
+    assert client.closed is True
+    cache = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")
+    record = cache["records"][0]
+    assert record["action"] == "REVIEW"
+    assert record["status"] == "error"
+    assert record["notification"]["should_notify"] is False
+    assert "OpenD connection failed" in record["error"]
+
+
+def test_t_signal_runner_persists_notification_failure_without_traceback(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path)
+
+    result = run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=FakeMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=FailingNotifier(),
+        now_fn=fixed_now,
+    )
+
+    assert result.signal_count == 1
+    assert result.notified_count == 0
+    cache = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")
+    record = cache["records"][0]
+    assert record["action"] == "BUY_T"
+    assert record["status"] == "review"
+    assert record["notification"]["notified"] is False
+    assert record["notification"]["should_notify"] is False
+    assert record["notification"]["last_attempted_dedupe_key"] == record["notification"]["dedupe_key"]
+    assert record["timeline"][-1]["event_type"] == "notification_failed"
+    assert "Feishu webhook failed" in record["error"]
+
+
+def test_t_signal_runner_keeps_dedupe_across_hold_between_same_buy_signal(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path)
+    first_notifier = CapturingNotifier()
+    run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=FakeMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=first_notifier,
+        now_fn=fixed_now,
+    )
+
+    run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=HoldMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=CapturingNotifier(),
+        now_fn=fixed_now,
+    )
+    hold_cache = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")
+    hold_notification = hold_cache["records"][0]["notification"]
+    assert hold_cache["records"][0]["action"] == "HOLD"
+    assert hold_notification["last_notified_dedupe_key"].endswith("|BUY_T|15")
+
+    third_notifier = CapturingNotifier()
+    run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=FakeMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=third_notifier,
+        now_fn=fixed_now,
+    )
+
+    assert third_notifier.messages == []
+    cache = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")
+    assert cache["records"][0]["timeline"][-1]["event_type"] == "notification_suppressed"
+
+
+def test_t_signal_runner_keeps_dedupe_across_ai_review_between_same_buy_signal(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path)
+    run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=FakeMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=CapturingNotifier(),
+        now_fn=fixed_now,
+    )
+
+    run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=FakeMarketDataClient(),
+        interpreter=RejectingInterpreter(),
+        notifier=CapturingNotifier(),
+        now_fn=fixed_now,
+    )
+    review_cache = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")
+    review_notification = review_cache["records"][0]["notification"]
+    assert review_cache["records"][0]["action"] == "REVIEW"
+    assert review_notification["last_notified_dedupe_key"].endswith("|BUY_T|15")
+
+    notifier = CapturingNotifier()
+    run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=FakeMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=notifier,
+        now_fn=fixed_now,
+    )
+
+    assert notifier.messages == []
     cache = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")
     assert cache["records"][0]["timeline"][-1]["event_type"] == "notification_suppressed"

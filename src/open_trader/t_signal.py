@@ -39,6 +39,7 @@ TIMELINE_EVENT_TYPES = {
     "signal_changed",
     "notification_sent",
     "notification_suppressed",
+    "notification_failed",
     "signal_expired",
     "review_required",
 }
@@ -122,6 +123,8 @@ class TSignalNotification:
     notified: bool
     dedupe_key: str
     last_notified_at: str
+    last_notified_dedupe_key: str
+    last_attempted_dedupe_key: str
 
 
 @dataclass(frozen=True)
@@ -435,6 +438,8 @@ def build_t_signal_from_facts(
             notified=False,
             dedupe_key=f"{facts.run_date}|{futu_symbol}|{action}|{suggested_ratio}",
             last_notified_at="",
+            last_notified_dedupe_key="",
+            last_attempted_dedupe_key="",
         ),
         status=status,
         error="",

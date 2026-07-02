@@ -88,6 +88,8 @@ def sample_signal() -> TSignal:
             notified=False,
             dedupe_key="2026-07-02|US.VIXY|BUY_T|10",
             last_notified_at="",
+            last_notified_dedupe_key="",
+            last_attempted_dedupe_key="",
         ),
         status="ok",
         error="",
