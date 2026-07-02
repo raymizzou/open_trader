@@ -595,28 +595,31 @@ def _reject_disallowed_english_trading_phrase(text: str, field_name: str) -> Non
 
 
 def _validate_visible_numeric_facts(text: str, signal: TSignal, field_name: str) -> None:
-    allowed = _allowed_numeric_literals(signal)
+    allowed_ratio = _canonical_decimal_text(signal.suggested_ratio)
     for match in NUMERIC_LITERAL_PATTERN.finditer(text):
         literal = match.group(0)
         if _is_timeframe_label(text, match.end()):
             continue
-        if _canonical_decimal_text(literal) not in allowed:
-            raise ValueError(
-                f"AI interpretation {field_name} invented numeric fact: {literal}"
-            )
-
-
-def _allowed_numeric_literals(signal: TSignal) -> set[str]:
-    values = {signal.suggested_ratio}
-    return {
-        canonical
-        for value in values
-        if (canonical := _canonical_decimal_text(value))
-    }
+        if (
+            allowed_ratio
+            and _canonical_decimal_text(literal) == allowed_ratio
+            and _is_percent_literal(text, match.end())
+        ):
+            continue
+        raise ValueError(
+            f"AI interpretation {field_name} invented numeric fact: {literal}"
+        )
 
 
 def _is_timeframe_label(text: str, match_end: int) -> bool:
     return text[match_end : match_end + 2] == "分钟"
+
+
+def _is_percent_literal(text: str, match_end: int) -> bool:
+    index = match_end
+    while index < len(text) and text[index].isspace():
+        index += 1
+    return index < len(text) and text[index] == "%"
 
 
 def _canonical_decimal_text(value: str) -> str:

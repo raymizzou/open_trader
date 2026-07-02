@@ -785,6 +785,29 @@ def test_apply_ai_interpretation_degrades_misattributed_numeric_facts() -> None:
     assert "invented numeric" in interpreted.error
 
 
+def test_apply_ai_interpretation_degrades_ratio_used_as_price() -> None:
+    signal = sample_signal()
+
+    interpreted = apply_ai_interpretation(
+        signal,
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "当前价格 10，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert interpreted.action == "REVIEW"
+    assert interpreted.suggested_ratio == ""
+    assert interpreted.status == "review"
+    assert "invented numeric" in interpreted.error
+
+
 @pytest.mark.parametrize(
     "raw",
     [
