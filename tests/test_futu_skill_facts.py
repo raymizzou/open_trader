@@ -849,6 +849,54 @@ def test_futu_skill_facts_extractor_normalizes_sdk_content_payload() -> None:
     assert derivatives["signal"] != "neutral"
 
 
+def test_futu_skill_facts_extractor_preserves_structured_sdk_row_details() -> None:
+    class FakeAnomalyClient:
+        def run(
+            self,
+            module: str,
+            *,
+            market: str,
+            symbol: str,
+            window_days: int,
+        ) -> dict[str, object]:
+            del market, symbol, window_days
+            if module == "capital":
+                return {
+                    "data": [
+                        {
+                            "name": "资金流向",
+                            "direction": "bullish",
+                            "broker": "富途证券",
+                            "net_inflow": "1234000",
+                            "note": "卖空比例下降，资金净流入",
+                        }
+                    ]
+                }
+            return {"data": []}
+
+    extractor = FutuSkillFactsExtractor(
+        news_extractor=FakeExtractor(),
+        anomaly_client=FakeAnomalyClient(),
+    )
+
+    capital = extractor.extract_capital_anomaly(
+        market="US",
+        symbol="NVDA",
+        name="NVIDIA",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+    category = next(
+        item for item in capital["categories"] if item["name"] == "资金流向"
+    )
+
+    assert category["direction"] == "bullish"
+    assert "富途证券" in category["detail"]
+    assert "1234000" in category["detail"]
+    assert "卖空比例下降" in category["detail"]
+    assert category["detail"] != "资金流向"
+
+
 def test_generate_futu_skill_facts_records_error_for_zero_anomaly_window_days(
     tmp_path: Path,
 ) -> None:

@@ -988,6 +988,16 @@ function deriveFutuSignalOverall(modules) {
       detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
     };
   }
+  if (signals.includes("error") || signals.includes("missing") || signals.includes("stale")) {
+    return {
+      tone: "warn",
+      label: "需复核",
+      signal: signals.includes("error") ? "error" : (signals.includes("stale") ? "stale" : "missing"),
+      constraint: constraint || "review",
+      headline: "市场信号数据不可用，不能视为中性。",
+      detail: "缺失、错误或过期模块会保留数据质量状态，不会自动改写成交易方向。",
+    };
+  }
   return {
     tone: "muted",
     label: "中性",

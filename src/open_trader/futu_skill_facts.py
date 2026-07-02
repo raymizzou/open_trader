@@ -1277,6 +1277,9 @@ def _row_text(row: dict[str, object]) -> str:
 
 
 def _row_direction(row: dict[str, object]) -> str:
+    explicit = _explicit_row_direction(row)
+    if explicit:
+        return explicit
     text = _row_text(row)
     if "risk_up" in text or "风险" in text or "超买" in text:
         return "risk_up"
@@ -1292,11 +1295,55 @@ def _row_direction(row: dict[str, object]) -> str:
     return "neutral"
 
 
+def _explicit_row_direction(row: dict[str, object]) -> str:
+    direction = _optional_text(row.get("direction")).casefold()
+    labels = {
+        "bullish": "bullish",
+        "偏多": "bullish",
+        "看涨": "bullish",
+        "bearish": "bearish",
+        "偏空": "bearish",
+        "看跌": "bearish",
+        "risk_up": "risk_up",
+        "风险上升": "risk_up",
+        "mixed": "mixed",
+        "分歧": "mixed",
+        "neutral": "neutral",
+        "中性": "neutral",
+    }
+    return labels.get(direction, "")
+
+
 def _row_detail_text(row: dict[str, object]) -> str:
-    for field in ("description", "interpretation", "summary", "detail", "name"):
+    for field in ("description", "interpretation", "summary", "detail"):
         value = _optional_text(row.get(field))
         if value:
             return value
+    detail_fields = {
+        key: value
+        for key, value in row.items()
+        if key
+        not in {
+            "name",
+            "category",
+            "type",
+            "indicator",
+            "title",
+            "direction",
+            "date",
+            "datetime",
+            "time",
+            "occur_date",
+        }
+        and _optional_text(value)
+    }
+    if detail_fields:
+        return json.dumps(
+            detail_fields,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
     return _row_text(row)
 
 

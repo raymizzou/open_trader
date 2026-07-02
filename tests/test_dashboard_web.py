@@ -675,6 +675,59 @@ console.log(html.slice(start, end));
     assert "<strong>中性</strong>" not in output
 
 
+def test_dashboard_futu_anomaly_unavailable_modules_do_not_render_neutral_overall() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: false,
+      status: "missing",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "缺少富途技术异动数据。",
+      categories: []
+    },
+    capital_anomaly: {
+      available: false,
+      status: "error",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "富途资金异动查询失败。",
+      categories: []
+    },
+    derivatives_anomaly: {
+      available: false,
+      status: "stale",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "富途衍生品异动数据已过期。",
+      categories: []
+    }
+  }
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf('<div class="futu-signal-overall">');
+const end = html.indexOf('<div class="futu-signal-module-grid">');
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal overall boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    assert "需复核" in output
+    assert "市场信号数据不可用" in output
+    assert "窗口内未发现明显异动" not in output
+    assert "<strong>中性</strong>" not in output
+
+
 def test_dashboard_futu_anomaly_unknown_enums_render_safe_chinese_fallback() -> None:
     output = run_dashboard_js(
         """
