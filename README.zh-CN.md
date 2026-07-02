@@ -297,6 +297,23 @@ promotion。
 `data/latest/portfolio.csv`、`data/broker_positions/` 下的券商明细产物，
 以及已存在的最新交易动作和报告。
 
+生成盘中做 T 信号：
+
+```bash
+.venv/bin/python -m open_trader watch-t \
+  --portfolio data/latest/portfolio.csv \
+  --data-dir data \
+  --date 2026-07-02 \
+  --market US \
+  --session-phase regular \
+  --once
+```
+
+该命令会写入 `data/runs/<YYYY-MM-DD>/<market>/t_signals.json`，并更新
+`data/latest/<market>/t_signals.json`。持仓表每行会显示 `做T` 按钮；展开后可查看
+确定性的动作、比例、信号依据、当前状态和提醒 timeline。同一信号周期只提醒一次，
+整个流程只读，不会下单。
+
 Futu OpenD 行情可用时，仪表盘会用 OpenD 刷新价格。如果某次刷新失败，它会保留最近一次成功的行情快照，并显示刷新失败或数据陈旧警告，而不是隐藏问题。
 
 仪表盘还会在可用时读取 `technical_facts.json`。标的详情会显示技术事实的生成日期
