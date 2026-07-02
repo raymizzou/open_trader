@@ -555,7 +555,7 @@ class FutuAnomalyScriptClient:
                 or f"{module} anomaly script failed"
             )
         try:
-            payload = json.loads(stdout)
+            payload = _load_json_object_from_mixed_output(stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"{module} anomaly script returned invalid JSON") from exc
         if not isinstance(payload, dict):
@@ -586,6 +586,51 @@ class FutuAnomalyScriptClient:
             timeout=45,
             check=False,
         )
+
+
+def _load_json_object_from_mixed_output(output: str) -> object:
+    stripped = output.strip()
+    if not stripped:
+        raise json.JSONDecodeError("empty output", output, 0)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    start = stripped.find("{")
+    while start >= 0:
+        candidate = _balanced_json_object_text(stripped, start)
+        if candidate:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+        start = stripped.find("{", start + 1)
+    raise json.JSONDecodeError("no JSON object found", output, 0)
+
+
+def _balanced_json_object_text(text: str, start: int) -> str:
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return ""
 
 
 class FutuSkillFactsExtractor:

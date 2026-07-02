@@ -670,6 +670,37 @@ def test_futu_anomaly_script_client_invokes_expected_scripts(tmp_path: Path) -> 
     assert "handle_derivatives_anomaly.py" in calls[2][1]
 
 
+def test_futu_anomaly_script_client_extracts_json_from_sdk_logs(
+    tmp_path: Path,
+) -> None:
+    def fake_runner(command: list[str]) -> object:
+        del command
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "2026-07-02 10:33:56 | [open_context_base.py:411] "
+                "_init_connect_sync: New connect ready\n"
+                '{\n  "method": "get_technical_unusual",\n'
+                '  "stock_symbol": "US.DRAM",\n'
+                '  "data": {"content": "MACD 金叉，包含 {括号} 文本"}\n'
+                "}\n"
+                "2026-07-02 10:33:58 | [open_context_base.py:521] "
+                "on_disconnect: Disconnected\n"
+            ),
+            stderr="",
+        )
+
+    client = FutuAnomalyScriptClient(
+        skill_root=tmp_path / "skills",
+        runner=fake_runner,
+    )
+
+    payload = client.run("technical", market="US", symbol="DRAM", window_days=7)
+
+    assert payload["stock_symbol"] == "US.DRAM"
+    assert payload["data"]["content"] == "MACD 金叉，包含 {括号} 文本"
+
+
 def test_futu_anomaly_script_client_reports_script_failure(tmp_path: Path) -> None:
     def fake_runner(command: list[str]) -> object:
         return SimpleNamespace(
