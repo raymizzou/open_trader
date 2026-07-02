@@ -529,33 +529,6 @@ tbody tr.active-row {
   background: #fffaf1;
 }
 
-.market-divider-row > td {
-  background: #eef5ef;
-  border-bottom-color: #cfdfd4;
-  color: var(--accent-strong);
-  font-size: 12px;
-  font-weight: 800;
-  padding: 8px 12px;
-}
-
-.market-divider-row:hover {
-  background: #eef5ef;
-}
-
-.market-divider-content {
-  align-items: center;
-  display: flex;
-  gap: 10px;
-  justify-content: space-between;
-  min-height: 18px;
-}
-
-.market-divider-content strong {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
 .decision-detail-row > td {
   background: var(--surface);
   padding: 0;

@@ -2144,22 +2144,10 @@ if (elements["visible-count"].textContent !== "2 条") {
   throw new Error("cash view visible count mismatch: " + elements["visible-count"].textContent);
 }
 state.marketFilter = "ALL";
-state.brokerFilter = "ALL";
 renderHoldings();
 if (!elements["cash-detail-panel"].classList.contains("hidden")) {
   throw new Error("non-cash view should hide cash detail panel");
 }
-if (!elements["holdings-body"].innerHTML.includes("market-divider-row")
-  || !elements["holdings-body"].innerHTML.includes("美股")
-  || !elements["holdings-body"].innerHTML.includes("港股")) {
-  throw new Error("ALL market holdings should show market dividers: " + elements["holdings-body"].innerHTML);
-}
-state.marketFilter = "US";
-renderHoldings();
-if (elements["holdings-body"].innerHTML.includes("market-divider-row")) {
-  throw new Error("single-market holdings should not show market dividers: " + elements["holdings-body"].innerHTML);
-}
-state.marketFilter = "ALL";
 state.brokerFilter = "ALL";
 state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
 renderHoldings();
