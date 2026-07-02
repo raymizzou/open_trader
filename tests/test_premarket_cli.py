@@ -742,6 +742,7 @@ def test_extract_futu_skill_facts_help_includes_expected_options(
     assert "--data-dir" in output
     assert "--date" in output
     assert "--market" in output
+    assert "--window-days" in output
     assert "--update-latest" in output
 
 
@@ -754,7 +755,7 @@ def test_extract_futu_skill_facts_main_wires_generator(
     portfolio.write_text("market,symbol,asset_class\nUS,NVDA,stock\n", encoding="utf-8")
     captured: dict[str, object] = {}
 
-    class FakeExtractor:
+    class FakeCompositeExtractor:
         pass
 
     def fake_generate_futu_skill_facts(**kwargs: object):
@@ -768,7 +769,7 @@ def test_extract_futu_skill_facts_main_wires_generator(
             latest_path=tmp_path / "data/latest/US/futu_skill_facts.json",
         )
 
-    monkeypatch.setattr(cli, "FutuNewsSentimentExtractor", lambda: FakeExtractor())
+    monkeypatch.setattr(cli, "FutuSkillFactsExtractor", lambda: FakeCompositeExtractor())
     monkeypatch.setattr(cli, "generate_futu_skill_facts", fake_generate_futu_skill_facts)
 
     result = cli.main(
@@ -782,6 +783,8 @@ def test_extract_futu_skill_facts_main_wires_generator(
             "2026-07-01",
             "--market",
             "US",
+            "--window-days",
+            "14",
             "--update-latest",
         ]
     )
@@ -792,10 +795,33 @@ def test_extract_futu_skill_facts_main_wires_generator(
     assert captured["run_date"] == "2026-07-01"
     assert captured["market"] == "US"
     assert captured["update_latest"] is True
-    assert isinstance(captured["extractor"], FakeExtractor)
+    assert captured["window_days"] == 14
+    assert isinstance(captured["extractor"], FakeCompositeExtractor)
     output = capsys.readouterr().out
     assert "futu_skill_facts: 1" in output
     assert "futu_skill_facts_json:" in output
+
+
+def test_extract_futu_skill_facts_rejects_invalid_window_days(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text("market,symbol,asset_class\nUS,NVDA,stock\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            [
+                "extract-futu-skill-facts",
+                "--portfolio",
+                str(portfolio),
+                "--date",
+                "2026-07-02",
+                "--window-days",
+                "0",
+            ]
+        )
+
+    assert excinfo.value.code == 2
 
 
 def test_extract_tradingagents_summary_main_writes_summary_with_fake_extractor(

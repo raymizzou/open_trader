@@ -22,7 +22,7 @@ from .dashboard_web import serve_dashboard
 from .decision_facts import LLMDecisionFactsExtractor, generate_decision_facts
 from .futu_account import FutuAccountClient, FutuAccountError, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
-from .futu_skill_facts import FutuNewsSentimentExtractor, generate_futu_skill_facts
+from .futu_skill_facts import FutuSkillFactsExtractor, generate_futu_skill_facts
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
@@ -414,6 +414,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=canonical_market,
         choices=["HK", "US"],
         help="Optional market scope: HK or US",
+    )
+    futu_skill_facts_parser.add_argument(
+        "--window-days",
+        type=int,
+        default=7,
+        help="Natural-day anomaly window, 1-30 days. Defaults to 7.",
     )
     futu_skill_facts_parser.add_argument(
         "--update-latest",
@@ -879,8 +885,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "extract-futu-skill-facts":
         if not args.portfolio.exists():
             parser.error(f"portfolio CSV not found: {args.portfolio}")
+        if args.window_days < 1 or args.window_days > 30:
+            parser.error("window-days must be between 1 and 30")
         try:
-            extractor = FutuNewsSentimentExtractor()
+            extractor = FutuSkillFactsExtractor()
         except Exception as exc:
             parser.error(str(exc))
         try:
@@ -891,6 +899,7 @@ def main(argv: list[str] | None = None) -> int:
                 market=args.market,
                 extractor=extractor,
                 update_latest=args.update_latest,
+                window_days=args.window_days,
             )
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             parser.error(str(exc))
@@ -898,6 +907,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"futu_skill_facts: {result.records}")
         print(f"generated: {result.generated}")
         print(f"failed: {result.failed}")
+        print(f"window_days: {args.window_days}")
         print(f"futu_skill_facts_json: {result.run_path}")
         print(f"latest: {result.latest_path}")
         return 0
