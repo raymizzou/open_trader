@@ -8,6 +8,7 @@ const state = {
   marketFilter: "ALL",
   brokerFilter: "ALL",
   selectedHoldingKey: "",
+  selectedHoldingDetail: "decision",
   detailLanguage: "zh",
   refreshActive: false,
   quoteIntervalId: null,
@@ -169,6 +170,7 @@ function bindEvents() {
     }
     state.marketFilter = button.dataset.market || "ALL";
     state.selectedHoldingKey = "";
+    state.selectedHoldingDetail = "decision";
     setActiveFilter(elements["header-market-filters"], button);
     renderDashboardViews();
   });
@@ -179,13 +181,14 @@ function bindEvents() {
     }
     state.brokerFilter = button.dataset.broker || "ALL";
     state.selectedHoldingKey = "";
+    state.selectedHoldingDetail = "decision";
     setActiveFilter(elements["header-broker-filters"], button);
     renderDashboardViews();
   });
   elements["holdings-body"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-detail-key]");
     if (button) {
-      showSymbolDetail(button.dataset.detailKey || "");
+      showSymbolDetail(button.dataset.detailKey || "", button.dataset.detailMode || "decision");
       return;
     }
     handleSymbolDetailClick(event);
@@ -215,6 +218,7 @@ function handleSymbolDetailClick(event) {
   const backButton = event.target.closest("[data-back-to-holdings]");
   if (backButton) {
     state.selectedHoldingKey = "";
+    state.selectedHoldingDetail = "decision";
     renderHoldings();
     return;
   }
@@ -610,9 +614,12 @@ function renderHoldings() {
       const rowKey = holdingKey(holding, index);
       const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
       const quote = quoteForHolding(holding);
+      const selectedDetail = selected && rowKey === state.selectedHoldingKey
+        ? normalizeHoldingDetailMode(state.selectedHoldingDetail)
+        : "";
       rows.push(`
         <tr class="${selectedClass}">
-          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}">交易决策</button></td>
+          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="expand-button t-signal-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
           <td>${escapeHtml(formatPlain(holding.market))}</td>
           <td class="symbol-cell">
             <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
@@ -632,7 +639,9 @@ function renderHoldings() {
           <tr class="decision-detail-row">
             <td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}">
               <div class="symbol-detail-panel inline-symbol-detail">
-                ${renderSymbolDetail(selected.holding, selected.index)}
+                ${selectedDetail === "t_signal"
+                  ? renderTSignalDetail(selected.holding)
+                  : renderSymbolDetail(selected.holding, selected.index)}
               </div>
             </td>
           </tr>
@@ -664,9 +673,14 @@ function selectedHolding(holdings = filteredHoldings()) {
   return null;
 }
 
-function showSymbolDetail(detailKey) {
+function showSymbolDetail(detailKey, detailMode = "decision") {
   state.selectedHoldingKey = detailKey;
+  state.selectedHoldingDetail = normalizeHoldingDetailMode(detailMode);
   renderHoldings();
+}
+
+function normalizeHoldingDetailMode(mode) {
+  return mode === "t_signal" ? "t_signal" : "decision";
 }
 
 function openTradeActionDetail(actionKey) {
@@ -680,6 +694,7 @@ function openTradeActionDetail(actionKey) {
     if (holdingActionKeys(holding).includes(normalizedActionKey)) {
       resetHoldingFilters();
       state.selectedHoldingKey = holdingKey(holding, index);
+      state.selectedHoldingDetail = "decision";
       renderDashboardViews();
       return;
     }
@@ -718,6 +733,270 @@ function renderSymbolDetail(holding, index) {
       ${renderLLMDecisionTemplate(holding)}
     </div>
   `;
+}
+
+function renderTSignalDetail(holding) {
+  const title = `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
+  const signal = holding && holding.t_signal && typeof holding.t_signal === "object"
+    ? holding.t_signal
+    : null;
+  if (!signal || signal.available === false) {
+    const message = signal && signal.error ? signal.error : "暂无做T信号数据。";
+    return `
+      <div class="detail-header trading-decision-header">
+        <div>
+          <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
+          <h2>做T信号 · ${escapeHtml(title)}</h2>
+          <p>${escapeHtml(message)}</p>
+        </div>
+        <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
+      </div>
+      <section class="detail-section t-signal-section">
+        <h3>当前状态</h3>
+        <p class="muted-copy">该标的尚未生成做T信号，或本市场 latest 信号文件不存在。</p>
+      </section>
+    `;
+  }
+
+  return `
+    <div class="detail-header trading-decision-header">
+      <div>
+        <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
+        <h2>做T信号 · ${escapeHtml(title)}</h2>
+        <p>${escapeHtml(formatPlain(signal.signal_summary_zh || signal.current_status))}</p>
+      </div>
+      <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
+    </div>
+    <div class="t-signal-layout">
+      <section class="detail-section t-signal-section">
+        <div class="t-signal-status-row">
+          <div>
+            <h3>${escapeHtml(tSignalActionLabel(signal.action))}</h3>
+            <p>${escapeHtml(formatPlain(signal.current_status))}</p>
+          </div>
+          <span class="status-pill ${escapeHtml(tSignalStatusClass(signal.status))}">${escapeHtml(tSignalStatusLabel(signal.status))}</span>
+        </div>
+        <div class="t-signal-metric-grid">
+          ${renderTSignalMetric("确定比例", tSignalRatioText(signal.suggested_ratio))}
+          ${renderTSignalMetric("更新时间", signal.updated_at)}
+          ${renderTSignalMetric("交易时段", tSignalSessionLabel(signal.session_phase))}
+          ${renderTSignalMetric("提醒状态", tSignalNotificationText(signal.notification))}
+        </div>
+        ${signal.error ? `<p class="t-signal-error">${escapeHtml(signal.error)}</p>` : ""}
+      </section>
+      ${renderTSignalEvidence(signal)}
+      ${renderTSignalDetails(signal)}
+      ${renderTSignalTimeline(signal)}
+    </div>
+  `;
+}
+
+function renderTSignalMetric(label, value) {
+  return `
+    <div class="t-signal-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(formatPlain(value))}</strong>
+    </div>
+  `;
+}
+
+function renderTSignalEvidence(signal) {
+  const evidence = Array.isArray(signal.evidence) ? signal.evidence : [];
+  const gates = Array.isArray(signal.hard_gates) ? signal.hard_gates : [];
+  return `
+    <section class="detail-section t-signal-section">
+      <h3>信号依据</h3>
+      <div class="t-signal-evidence-list">
+        ${evidence.length > 0 ? evidence.map((item) => `
+          <div class="t-signal-evidence-item">
+            <strong>${escapeHtml(formatPlain(item.message_zh))}</strong>
+            <span>${escapeHtml(tSignalDirectionLabel(item.direction))} · ${escapeHtml(tSignalStrengthLabel(item.strength))}</span>
+          </div>
+        `).join("") : `<p class="muted-copy">暂无明确买卖依据。</p>`}
+      </div>
+      <div class="t-signal-gate-grid">
+        ${gates.map((gate) => `
+          <div class="t-signal-gate">
+            <span>${escapeHtml(formatPlain(gate.name))}</span>
+            <strong>${escapeHtml(tSignalGateStatusLabel(gate.status))}</strong>
+            <small>${escapeHtml(formatPlain(gate.message_zh))}</small>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderTSignalDetails(signal) {
+  return `
+    <section class="detail-section t-signal-section">
+      <h3>详细信息</h3>
+      <div class="t-signal-detail-grid">
+        <div>
+          <h4>价格</h4>
+          ${renderDecisionFactRows([
+            { label: "最新价", value: nestedValue(signal.price, "last_price") },
+            { label: "日内涨跌", value: percentText(nestedValue(signal.price, "day_change_pct")) },
+            { label: "VWAP", value: nestedValue(signal.price, "vwap") },
+            { label: "日内区间", value: rangeText(nestedValue(signal.price, "day_low"), nestedValue(signal.price, "day_high")) },
+          ])}
+        </div>
+        <div>
+          <h4>技术 / 盘口</h4>
+          ${renderDecisionFactRows([
+            { label: "5分钟 RSI", value: nestedValue(signal.technical, "rsi_5m") },
+            { label: "5分钟量比", value: nestedValue(signal.technical, "volume_ratio_5m") },
+            { label: "价格位置", value: tSignalPricePositionLabel(nestedValue(signal.technical, "price_position")) },
+            { label: "盘口状态", value: tSignalDepthStatusLabel(nestedValue(signal.liquidity, "depth_status")) },
+          ])}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderTSignalTimeline(signal) {
+  const timeline = Array.isArray(signal.timeline) ? signal.timeline : [];
+  return `
+    <section class="detail-section t-signal-section">
+      <h3>消息 timeline</h3>
+      <div class="t-signal-timeline">
+        ${timeline.length > 0 ? timeline.map((event) => `
+          <div class="t-signal-timeline-event">
+            <time>${escapeHtml(formatPlain(event.event_at))}</time>
+            <strong>${escapeHtml(tSignalTimelineLabel(event.event_type))}</strong>
+            <span>${escapeHtml(formatPlain(event.message_zh))}</span>
+          </div>
+        `).join("") : `<p class="muted-copy">暂无消息记录。</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function nestedValue(source, key) {
+  return source && typeof source === "object" ? source[key] : "";
+}
+
+function percentText(value) {
+  return hasValue(value) ? `${value}%` : "-";
+}
+
+function rangeText(low, high) {
+  return hasValue(low) || hasValue(high) ? `${formatPlain(low)} / ${formatPlain(high)}` : "-";
+}
+
+function tSignalRatioText(value) {
+  return hasValue(value) ? `${value}%` : "-";
+}
+
+function tSignalActionLabel(action) {
+  const labels = {
+    BUY_T: "买入做T",
+    SELL_T: "卖出做T",
+    HOLD: "观察",
+    REVIEW: "人工复核",
+  };
+  return labels[action] || formatPlain(action);
+}
+
+function tSignalStatusLabel(status) {
+  const labels = {
+    ok: "有效",
+    review: "需复核",
+    blocked: "已阻断",
+    error: "错误",
+    stale: "已过期",
+  };
+  return labels[status] || "未知";
+}
+
+function tSignalStatusClass(status) {
+  if (status === "ok") {
+    return "status-ok";
+  }
+  if (status === "review" || status === "blocked" || status === "stale") {
+    return "status-partial";
+  }
+  if (status === "error") {
+    return "status-failed";
+  }
+  return "status-muted";
+}
+
+function tSignalSessionLabel(value) {
+  const labels = {
+    pre_market: "盘前",
+    regular: "盘中",
+    post_market: "盘后",
+    closed: "休市",
+    unknown: "未知",
+  };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalNotificationText(notification) {
+  if (!notification || typeof notification !== "object") {
+    return "-";
+  }
+  if (notification.notified === true) {
+    return hasValue(notification.last_notified_at)
+      ? `已提醒 · ${notification.last_notified_at}`
+      : "已提醒";
+  }
+  if (hasValue(notification.last_attempted_dedupe_key)) {
+    return "已尝试提醒";
+  }
+  if (notification.should_notify === true) {
+    return "待提醒";
+  }
+  return "不提醒";
+}
+
+function tSignalDirectionLabel(value) {
+  const labels = { buy: "买入依据", sell: "卖出依据", neutral: "中性", risk: "风险" };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalStrengthLabel(value) {
+  const labels = { low: "弱", medium: "中", high: "强" };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalGateStatusLabel(value) {
+  const labels = { pass: "通过", block: "阻断", warn: "提醒", missing: "缺失" };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalPricePositionLabel(value) {
+  const labels = {
+    near_support: "接近支撑",
+    near_resistance: "接近压力",
+    below_vwap_reclaim: "低于 VWAP 后回收",
+    above_vwap_reject: "高于 VWAP 后受压",
+    middle_range: "区间中部",
+    breakout: "突破",
+    breakdown: "跌破",
+    unknown: "未知",
+  };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalDepthStatusLabel(value) {
+  const labels = { pass: "正常", thin: "深度不足", wide_spread: "价差偏大", missing: "缺失" };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalTimelineLabel(value) {
+  const labels = {
+    signal_created: "生成信号",
+    signal_changed: "信号变化",
+    notification_sent: "已发送提醒",
+    notification_suppressed: "已抑制重复提醒",
+    notification_failed: "提醒失败",
+    signal_expired: "信号过期",
+    review_required: "需要复核",
+  };
+  return labels[value] || formatPlain(value);
 }
 
 function renderTradingDecisionPlugins(holding) {

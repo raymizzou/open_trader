@@ -1952,6 +1952,90 @@ state.dashboard = {
           market_value_hkd: "22698.00",
         },
       ],
+      t_signal: {
+        schema_version: "open_trader.t_signal.v1",
+        run_date: "2026-07-02",
+        market: "US",
+        symbol: "VIXY",
+        futu_symbol: "US.VIXY",
+        name: "ProShares VIX Short-Term Futures ETF",
+        session_phase: "regular",
+        updated_at: "2026-07-02T22:32:00+08:00",
+        action: "BUY_T",
+        suggested_ratio: "15",
+        current_status: "BUY_T 条件满足，等待执行确认。",
+        signal_summary_zh: "低吸做T信号成立，确定比例 15%。",
+        price: {
+          last_price: "48.50",
+          day_change_pct: "-1.20",
+          vwap: "49.10",
+          ma_1m: "48.55",
+          ma_5m: "48.85",
+          day_low: "48.00",
+          day_high: "50.20",
+        },
+        liquidity: {
+          bid: "48.49",
+          ask: "48.50",
+          spread_pct: "0.02",
+          bid_depth: "5000",
+          ask_depth: "4700",
+          depth_status: "pass",
+        },
+        technical: {
+          rsi_5m: "34",
+          volume_ratio_5m: "1.30",
+          price_position: "below_vwap_reclaim",
+          trend_state: "range_rebound",
+        },
+        hard_gates: [
+          {
+            name: "session_phase",
+            status: "pass",
+            message_zh: "当前处于盘中交易时段。",
+          },
+        ],
+        evidence: [
+          {
+            name: "vwap_reclaim",
+            direction: "buy",
+            strength: "medium",
+            message_zh: "价格低于 VWAP 后回收，出现低吸做T信号。",
+          },
+          {
+            name: "rsi_low",
+            direction: "buy",
+            strength: "medium",
+            message_zh: "5分钟 RSI 偏低。",
+          },
+        ],
+        timeline: [
+          {
+            event_at: "2026-07-02T22:32:00+08:00",
+            event_type: "signal_created",
+            action: "BUY_T",
+            suggested_ratio: "15",
+            message_zh: "生成 BUY_T 信号，建议比例 15%。",
+          },
+          {
+            event_at: "2026-07-02T22:32:00+08:00",
+            event_type: "notification_sent",
+            action: "BUY_T",
+            suggested_ratio: "15",
+            message_zh: "已发送 BUY_T 通知。",
+          },
+        ],
+        notification: {
+          should_notify: false,
+          notified: true,
+          dedupe_key: "2026-07-02|US.VIXY|BUY_T|15",
+          last_notified_at: "2026-07-02T22:32:00+08:00",
+          last_notified_dedupe_key: "2026-07-02|US.VIXY|BUY_T|15",
+          last_attempted_dedupe_key: "2026-07-02|US.VIXY|BUY_T|15",
+        },
+        status: "ok",
+        error: "",
+      },
     },
     {
       market: "US",
@@ -2264,7 +2348,7 @@ if (elements["holdings-table-wrap"].classList.contains("hidden")) {
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
   throw new Error("trading decision should keep bottom symbol detail panel hidden");
 }
-if (!elements["holdings-body"].innerHTML.includes("交易决策") || elements["holdings-body"].innerHTML.includes(">详情<")) {
+if (!elements["holdings-body"].innerHTML.includes("交易决策") || !elements["holdings-body"].innerHTML.includes(">做T<") || elements["holdings-body"].innerHTML.includes(">详情<")) {
   throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
 }
 const renderedHoldings = elements["holdings-body"].innerHTML;
@@ -2376,6 +2460,19 @@ for (const unexpected of ["插件管理", "策略阈值"]) {
     throw new Error("trading decision detail should not render extra panel " + unexpected);
   }
 }
+state.selectedHoldingDetail = "t_signal";
+renderHoldings();
+for (const required of ["做T信号 ·", "买入做T", "确定比例", "15%", "信号依据", "价格低于 VWAP 后回收", "详细信息", "消息 timeline", "已发送 BUY_T 通知。", "已提醒 · 2026-07-02T22:32:00+08:00"]) {
+  if (!elements["holdings-body"].innerHTML.includes(required)) {
+    throw new Error("t signal detail missing " + required + ": " + elements["holdings-body"].innerHTML);
+  }
+}
+for (const unexpected of ["小T", "大T", "状态机"]) {
+  if (elements["holdings-body"].innerHTML.includes(unexpected)) {
+    throw new Error("t signal detail should not render ambiguous wording " + unexpected);
+  }
+}
+state.selectedHoldingDetail = "decision";
 state.dashboard.holdings.push({
   market: "JP",
   symbol: "7203",

@@ -641,6 +641,16 @@ tbody tr.active-row {
   min-width: 70px;
 }
 
+.expand-button + .expand-button {
+  margin-left: 6px;
+}
+
+.t-signal-button {
+  border-color: #b8dac6;
+  color: var(--accent);
+  min-width: 48px;
+}
+
 .symbol-cell {
   max-width: 170px;
   min-width: 120px;
@@ -808,6 +818,100 @@ tbody tr.active-row {
   display: grid;
   gap: 12px;
   margin-top: 14px;
+}
+
+.t-signal-layout {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.t-signal-section {
+  background: var(--surface);
+}
+
+.t-signal-status-row {
+  align-items: start;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.t-signal-status-row h3 {
+  font-size: 18px;
+  margin: 0 0 6px;
+}
+
+.t-signal-status-row p,
+.muted-copy {
+  color: var(--muted);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.t-signal-metric-grid,
+.t-signal-detail-grid,
+.t-signal-gate-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
+.t-signal-detail-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.t-signal-metric,
+.t-signal-gate,
+.t-signal-evidence-item,
+.t-signal-timeline-event {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.t-signal-metric span,
+.t-signal-gate span,
+.t-signal-evidence-item span,
+.t-signal-timeline-event time {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.t-signal-metric strong,
+.t-signal-gate strong,
+.t-signal-evidence-item strong,
+.t-signal-timeline-event strong {
+  overflow-wrap: anywhere;
+}
+
+.t-signal-evidence-list,
+.t-signal-timeline {
+  display: grid;
+  gap: 8px;
+}
+
+.t-signal-gate small,
+.t-signal-timeline-event span {
+  color: var(--muted);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.t-signal-detail-grid h4 {
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+
+.t-signal-error {
+  color: var(--danger);
+  font-weight: 700;
+  margin: 10px 0 0;
+  overflow-wrap: anywhere;
 }
 
 .trading-decision-section {
@@ -2110,7 +2214,10 @@ tbody tr.active-row {
   }
 
   .detail-metric-grid,
-  .detail-grid {
+  .detail-grid,
+  .t-signal-metric-grid,
+  .t-signal-detail-grid,
+  .t-signal-gate-grid {
     grid-template-columns: 1fr;
   }
 }
