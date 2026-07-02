@@ -590,7 +590,7 @@ def _build_evidence(
         )
         if direction == "sell":
             sell_score += 1
-        else:
+        elif direction == "buy":
             buy_score += 1
     if not evidence:
         evidence.append(
