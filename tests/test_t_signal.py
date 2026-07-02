@@ -181,6 +181,7 @@ def regular_facts(**overrides: object) -> TMarketFacts:
 def test_to_futu_symbol_normalizes_hk_numeric_symbol() -> None:
     assert to_futu_symbol("HK", "700") == "HK.00700"
     assert to_futu_symbol("US", "msft") == "US.MSFT"
+    assert to_futu_symbol("US", "BRK.B") == "US.BRK.B"
     assert to_futu_symbol("HK", "HK.700") == "HK.00700"
     assert to_futu_symbol("HK", "HK.00700") == "HK.00700"
     assert to_futu_symbol("US", "us.msft") == "US.MSFT"
@@ -320,6 +321,32 @@ def test_build_t_signal_blocks_unsupported_market_without_raising() -> None:
 @pytest.mark.parametrize(
     "facts",
     [
+        regular_facts(symbol="123456", futu_symbol=""),
+        regular_facts(symbol="123456", futu_symbol="HK.123456"),
+    ],
+)
+def test_build_t_signal_blocks_malformed_long_hk_symbol(
+    facts: TMarketFacts,
+) -> None:
+    signal = build_t_signal_from_facts(
+        facts=facts,
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="港股代码格式异常。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.status == "review"
+    assert any(
+        gate.name == "symbol" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
         regular_facts(symbol="00700", futu_symbol="HK.00701"),
         regular_facts(
             market="US",
@@ -345,6 +372,25 @@ def test_build_t_signal_blocks_symbol_identity_mismatch(
         gate.name == "symbol" and gate.status == "block"
         for gate in signal.hard_gates
     )
+
+
+def test_unsupported_session_phase_returns_review_without_raising() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(session_phase="auction"),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="集合竞价只观察。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.session_phase == "unknown"
+    assert signal.status == "review"
+    assert any(
+        gate.name == "session_phase" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+    assert any(item.name == "unsupported_session_phase" for item in signal.evidence)
 
 
 @pytest.mark.parametrize("phase", ["pre_market", "post_market", "closed", "unknown"])
@@ -376,6 +422,25 @@ def test_wide_spread_blocks_action() -> None:
     assert signal.action == "REVIEW"
     assert signal.liquidity.depth_status == "wide_spread"
     assert signal.suggested_ratio == ""
+
+
+def test_middle_range_high_volume_does_not_emit_directional_evidence() -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(
+            last_price=Decimal("378.10"),
+            vwap=Decimal("378.10"),
+            rsi_5m=Decimal("50"),
+            volume_ratio_5m=Decimal("1.30"),
+        ),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="价格位于 VWAP 附近，量能放大但方向不明确。",
+    )
+
+    assert signal.action == "HOLD"
+    assert signal.suggested_ratio == ""
+    assert signal.technical.price_position == "middle_range"
+    assert not any(item.direction in {"buy", "sell"} for item in signal.evidence)
 
 
 def test_missing_technical_facts_blocks_action() -> None:

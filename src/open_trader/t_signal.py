@@ -213,13 +213,19 @@ def to_futu_symbol(market: str, symbol: str) -> str:
         raise ValueError(f"unsupported market for t signal: {market}")
     if "." in normalized_symbol:
         prefix, normalized_symbol = normalized_symbol.split(".", 1)
-        if prefix != normalized_market:
+        if prefix == normalized_market:
+            pass
+        elif normalized_market == "US" and prefix not in {"HK", "US", "CN"}:
+            normalized_symbol = f"{prefix}.{normalized_symbol}"
+        else:
             raise ValueError(
                 f"symbol prefix {prefix} does not match market {normalized_market}"
             )
     if not normalized_symbol:
         raise ValueError(f"empty symbol for market {normalized_market}")
     if normalized_market == "HK" and normalized_symbol.isdigit():
+        if len(normalized_symbol) > 5:
+            raise ValueError(f"invalid HK symbol length: {symbol}")
         return f"HK.{normalized_symbol.zfill(5)}"
     if normalized_market == "US":
         return f"US.{normalized_symbol}"
@@ -248,10 +254,17 @@ def build_t_signal_from_facts(
     # Cycle state and duplicate suppression are handled by the watcher layer.
     del previous
 
+    session_phase = _normalize_session_phase(facts.session_phase)
     futu_symbol, symbol_error = _canonicalize_fact_symbols(facts)
     liquidity = _build_liquidity(facts)
     technical = _build_technical(facts)
-    hard_gates = _build_hard_gates(facts, baseline, liquidity, symbol_error)
+    hard_gates = _build_hard_gates(
+        facts,
+        baseline,
+        liquidity,
+        symbol_error,
+        session_phase,
+    )
     evidence, buy_score, sell_score = _build_evidence(facts, technical)
     has_blocker = any(gate.status == "block" for gate in hard_gates)
 
@@ -287,7 +300,7 @@ def build_t_signal_from_facts(
         symbol=_normalize_display_symbol(facts.market, facts.symbol),
         futu_symbol=futu_symbol,
         name=facts.name,
-        session_phase=facts.session_phase,
+        session_phase=session_phase,
         updated_at=facts.updated_at,
         action=action,
         suggested_ratio=suggested_ratio,
@@ -339,6 +352,12 @@ def _build_liquidity(facts: TMarketFacts) -> TSignalLiquidity:
         ask_depth=_decimal_text(facts.ask_depth),
         depth_status=depth_status,
     )
+
+
+def _normalize_session_phase(session_phase: str) -> str:
+    if session_phase in SESSION_PHASES:
+        return session_phase
+    return "unknown"
 
 
 def _canonicalize_fact_symbols(facts: TMarketFacts) -> tuple[str, str]:
@@ -434,8 +453,9 @@ def _build_hard_gates(
     baseline: TPortfolioBaseline,
     liquidity: TSignalLiquidity,
     symbol_error: str,
+    session_phase: str,
 ) -> list[TSignalHardGate]:
-    session_status = "pass" if facts.session_phase == "regular" else "block"
+    session_status = "pass" if session_phase == "regular" else "block"
     baseline_status = (
         "pass" if _is_positive_finite_decimal(baseline.total_quantity) else "block"
     )
@@ -498,6 +518,15 @@ def _build_evidence(
     evidence: list[TSignalEvidence] = []
     buy_score = 0
     sell_score = 0
+    if facts.session_phase not in SESSION_PHASES:
+        evidence.append(
+            TSignalEvidence(
+                name="unsupported_session_phase",
+                direction="risk",
+                strength="medium",
+                message_zh="交易时段无法识别，已转入人工复核。",
+            )
+        )
     if technical.price_position == "below_vwap_reclaim":
         evidence.append(
             TSignalEvidence(
@@ -542,12 +571,15 @@ def _build_evidence(
         _is_finite_decimal(facts.volume_ratio_5m)
         and facts.volume_ratio_5m >= Decimal("1.20")
     ):
-        direction = "sell" if technical.price_position == "above_vwap_reject" else "buy"
-        message_zh = (
-            "5分钟量比放大，价格受压具备成交配合。"
-            if direction == "sell"
-            else "5分钟量比放大，价格回收具备成交配合。"
-        )
+        if technical.price_position == "above_vwap_reject":
+            direction = "sell"
+            message_zh = "5分钟量比放大，价格受压具备成交配合。"
+        elif technical.price_position == "below_vwap_reclaim":
+            direction = "buy"
+            message_zh = "5分钟量比放大，价格回收具备成交配合。"
+        else:
+            direction = "neutral"
+            message_zh = "5分钟量比放大，但价格位置尚未形成明确方向。"
         evidence.append(
             TSignalEvidence(
                 name="volume_confirm",
