@@ -60,10 +60,7 @@ class FutuTSignalMarketDataClient(FutuQuoteClient):
             session_phase=session_phase,
             updated_at=updated_at,
             last_price=_decimal(snapshot.get("last_price")),
-            day_change_pct=_first_decimal(
-                snapshot,
-                ("change_rate", "change_rate_pct", "change_ratio"),
-            ),
+            day_change_pct=_day_change_pct(snapshot),
             vwap=_vwap(kline_1m),
             ma_1m=_average_close(kline_1m),
             ma_5m=_average_close(kline_5m),
@@ -187,6 +184,19 @@ def _first_decimal(
         if value is not None:
             return value
     return None
+
+
+def _day_change_pct(row: dict[str, object]) -> Decimal | None:
+    explicit = _first_decimal(row, ("change_rate", "change_rate_pct", "change_ratio"))
+    if explicit is not None:
+        return explicit
+    last_price = _decimal(row.get("last_price"))
+    prev_close = _decimal(row.get("prev_close_price"))
+    if last_price is None or prev_close is None or prev_close <= 0:
+        return None
+    return ((last_price - prev_close) / prev_close * Decimal("100")).quantize(
+        Decimal("0.01")
+    )
 
 
 def _decimal(value: object) -> Decimal | None:

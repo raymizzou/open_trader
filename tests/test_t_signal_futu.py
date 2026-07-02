@@ -122,6 +122,46 @@ def test_futu_t_signal_client_builds_market_facts() -> None:
     assert client.context.order_book_calls == [("US.VIXY", 1)]
 
 
+def test_futu_t_signal_client_derives_change_pct_from_prev_close() -> None:
+    class FutuShapedSnapshotContext(FakeTSignalContext):
+        def get_market_snapshot(self, symbols: list[str]) -> tuple[int, object]:
+            return (
+                0,
+                FakeDataFrame(
+                    [
+                        {
+                            "code": "US.VIXY",
+                            "last_price": "48.50",
+                            "prev_close_price": "50.00",
+                            "low_price": "48.00",
+                            "high_price": "50.20",
+                        }
+                    ]
+                ),
+            )
+
+    client = FutuTSignalMarketDataClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=FutuShapedSnapshotContext,
+        connectivity_checker=lambda host, port: True,
+        kline_type_1m="K_1M",
+        kline_type_5m="K_5M",
+    )
+
+    facts = client.get_market_facts(
+        run_date="2026-07-02",
+        market="US",
+        symbol="VIXY",
+        futu_symbol="US.VIXY",
+        name="Volatility ETF",
+        session_phase="regular",
+        updated_at="2026-07-02T22:31:00+08:00",
+    )
+
+    assert facts.day_change_pct == Decimal("-3.00")
+
+
 def test_futu_t_signal_client_wraps_kline_failure() -> None:
     class FailingKlineContext(FakeTSignalContext):
         def get_cur_kline(self, code: str, num: int, ktype: object) -> tuple[int, object]:
