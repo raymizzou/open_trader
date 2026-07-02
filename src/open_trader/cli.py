@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -23,6 +24,9 @@ from .decision_facts import LLMDecisionFactsExtractor, generate_decision_facts
 from .futu_account import FutuAccountClient, FutuAccountError, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_skill_facts import FutuSkillFactsExtractor, generate_futu_skill_facts
+from .t_signal import TSignalInterpreter
+from .t_signal_futu import FutuTSignalMarketDataClient
+from .t_signal_runner import run_t_signal_watch_once
 from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
@@ -495,6 +499,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch one quote snapshot and exit",
     )
 
+    watch_t_parser = subparsers.add_parser(
+        "watch-t",
+        help="Generate 做T signals for current HK/US holdings",
+    )
+    watch_t_parser.add_argument(
+        "--portfolio",
+        type=Path,
+        default=Path("data/latest/portfolio.csv"),
+    )
+    watch_t_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    watch_t_parser.add_argument("--date", type=canonical_date, required=True)
+    watch_t_parser.add_argument(
+        "--market",
+        type=canonical_market,
+        choices=["HK", "US"],
+        required=True,
+    )
+    watch_t_parser.add_argument(
+        "--session-phase",
+        choices=["pre_market", "regular", "post_market", "closed", "unknown"],
+        default="regular",
+    )
+    watch_t_parser.add_argument("--host", default="127.0.0.1")
+    watch_t_parser.add_argument("--port", type=positive_int, default=11111)
+    watch_t_parser.add_argument(
+        "--poll-seconds",
+        type=positive_float,
+        default=5.0,
+    )
+    watch_t_parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/daily_premarket.env"),
+        help="Notification config env file",
+    )
+    watch_t_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Fetch one market-data snapshot and exit",
+    )
+
     check_futu_quotes_parser = subparsers.add_parser(
         "check-futu-quotes",
         help="Fetch Futu quote snapshots for quoteable portfolio positions",
@@ -965,6 +1010,37 @@ def main(argv: list[str] | None = None) -> int:
         print(f"alerts: {result.alert_count}")
         print(f"alerts_csv: {result.alerts_path}")
         return 0
+
+    if args.command == "watch-t":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            while True:
+                result = run_t_signal_watch_once(
+                    portfolio_path=args.portfolio,
+                    data_dir=args.data_dir,
+                    run_date=args.date,
+                    market=args.market,
+                    session_phase=args.session_phase,
+                    market_data_client=FutuTSignalMarketDataClient(
+                        host=args.host,
+                        port=args.port,
+                    ),
+                    interpreter=TSignalInterpreter(),
+                    notifier=build_notifier(config),
+                )
+                print(f"run_date: {result.run_date}")
+                print(f"market: {result.market}")
+                print(f"signals: {result.signal_count}")
+                print(f"notified: {result.notified_count}")
+                print(f"signals_json: {result.run_path}")
+                print(f"latest: {result.latest_path}")
+                if args.once:
+                    return 0
+                time.sleep(args.poll_seconds)
+        except KeyboardInterrupt:
+            return 130
+        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+            parser.error(str(exc))
 
     if args.command == "check-futu-quotes":
         quote_client = None
