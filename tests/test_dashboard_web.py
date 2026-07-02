@@ -286,7 +286,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "translateFutuSignalValue" in js
     assert ".futu-signal-card" in css
     assert ".futu-signal-module-grid" in css
-
+    assert ".decision-plugin-grid .futu-signal-card" in css
 
     assert "辉立暂无数据" in html
     assert "right-rail" not in html
@@ -373,7 +373,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "交易决策" in js
     assert "插件模块" in js
     assert "大模型决策模板" in js
-    assert "趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位" in js
+    assert "趋势 / K 线、新闻 / 舆论与富途异动信号读取固定决策事实，其余插件仍为占位" in js
     assert "decisionFactsPlugin" in js
     assert "decision_facts" in js
     assert "futuSkillNewsSentimentPlugin" in js
@@ -565,6 +565,122 @@ console.log(html.slice(start, end));
         "bullish",
         "bearish",
         "schema",
+    ]:
+        assert forbidden not in output
+
+
+def test_dashboard_futu_anomaly_opposing_signal_affects_overall() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "opposing",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "技术信号反对追高。",
+      categories: [
+        {name: "MACD", state: "anomaly", direction: "bearish", detail: "动能转弱。", evidence_date: "2026-07-02"}
+      ]
+    },
+    capital_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "资金无明显方向。",
+      categories: []
+    },
+    derivatives_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "衍生品无明显方向。",
+      categories: []
+    }
+  }
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf('<div class="futu-signal-overall">');
+const end = html.indexOf('<div class="futu-signal-module-grid">');
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal overall boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    assert "反对" in output
+    assert "市场信号反对当前交易方向" in output
+    assert "中性" not in output
+
+
+def test_dashboard_futu_anomaly_unknown_enums_render_safe_chinese_fallback() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: true,
+      status: "schema",
+      signal: "schema_break",
+      confidence: "very_high",
+      suggested_constraint: "unsafe_add",
+      summary: "异常字段测试。",
+      categories: [
+        {name: "MACD", state: "invalid_state", direction: "strange_direction", detail: "未知枚举测试。", evidence_date: "2026-07-02"}
+      ]
+    },
+    capital_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "正常模块。",
+      categories: []
+    },
+    derivatives_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "正常模块。",
+      categories: []
+    }
+  }
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
+const end = html.indexOf("<h4>公司行动</h4>");
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal card boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    assert "未知" in output
+    assert "MACD" in output
+    for forbidden in [
+        "schema",
+        "schema_break",
+        "very_high",
+        "unsafe_add",
+        "invalid_state",
+        "strange_direction",
     ]:
         assert forbidden not in output
 
@@ -1942,7 +2058,7 @@ if (!elements["holdings-body"].innerHTML.includes("交易决策") || elements["h
 if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
   throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
 }
-for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位", "占位"]) {
+for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "趋势 / K 线、新闻 / 舆论与富途异动信号读取固定决策事实，其余插件仍为占位", "占位"]) {
   if (!elements["holdings-body"].innerHTML.includes(required)) {
     throw new Error("trading decision detail missing " + required + ": " + elements["holdings-body"].innerHTML);
   }

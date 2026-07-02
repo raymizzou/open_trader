@@ -775,7 +775,7 @@ function renderTradingDecisionPlugins(holding) {
       <div class="trading-decision-section-header">
         <div>
           <h3>插件模块</h3>
-          <p>每个模块说明条件是否达成，或正在确认的事实；趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位。</p>
+          <p>每个模块说明条件是否达成，或正在确认的事实；趋势 / K 线、新闻 / 舆论与富途异动信号读取固定决策事实，其余插件仍为占位。</p>
         </div>
       </div>
       <div class="decision-plugin-grid">
@@ -964,6 +964,16 @@ function deriveFutuSignalOverall(modules) {
       detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
     };
   }
+  if (signals.includes("opposing")) {
+    return {
+      tone: "warn",
+      label: "反对",
+      signal: "opposing",
+      constraint,
+      headline: "市场信号反对当前交易方向。",
+      detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
+    };
+  }
   if (signals.includes("supportive")) {
     return {
       tone: "ok",
@@ -1054,7 +1064,7 @@ function translateFutuSignalValue(value) {
     low: "低",
     "": "-",
   };
-  return labels[key] || key;
+  return Object.prototype.hasOwnProperty.call(labels, key) ? labels[key] : "未知";
 }
 
 function futuSignalStatusTone(status) {

@@ -782,8 +782,8 @@ tbody tr.active-row {
   margin-top: 3px;
 }
 
-.futu-signal-card {
-  grid-column: 1 / -1;
+.decision-plugin-grid .futu-signal-card {
+  grid-column: span 2;
 }
 
 .futu-signal-overall {
@@ -1956,6 +1956,10 @@ tbody tr.active-row {
   .llm-template-grid,
   .technical-fact-grid {
     grid-template-columns: 1fr;
+  }
+
+  .decision-plugin-grid .futu-signal-card {
+    grid-column: 1 / -1;
   }
 
   .futu-signal-pill-row {
