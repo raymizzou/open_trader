@@ -254,6 +254,61 @@ class FutuDomesticDiscussionSummarizer(Protocol):
         ...
 
 
+class FutuAnomalyModuleSummarizer(Protocol):
+    def summarize(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        module_name: str,
+        module: dict[str, object],
+    ) -> dict[str, object]:
+        ...
+
+
+class LLMFutuAnomalyModuleSummarizer:
+    def __init__(self, *, client: object | None = None) -> None:
+        self.client = client or OpenAITextClient()
+
+    def summarize(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        module_name: str,
+        module: dict[str, object],
+    ) -> dict[str, object]:
+        messages = [
+            {
+                "role": "system",
+                "content": _anomaly_module_summary_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "market": market,
+                        "symbol": symbol,
+                        "name": name,
+                        "module_name": module_name,
+                        "module": module,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        content = self.client.create(messages=messages, temperature=0)
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("LLM anomaly summary response must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("LLM anomaly summary response must be a JSON object")
+        return _apply_anomaly_summary_payload(module, payload, module_name)
+
+
 class LLMFutuDomesticDiscussionSummarizer:
     def __init__(self, *, client: object | None = None) -> None:
         self.client = client or OpenAITextClient()
@@ -639,9 +694,11 @@ class FutuSkillFactsExtractor:
         *,
         news_extractor: FutuSkillNewsSentimentExtractor | None = None,
         anomaly_client: FutuAnomalyScriptClient | None = None,
+        anomaly_summarizer: FutuAnomalyModuleSummarizer | None = None,
     ) -> None:
         self.news_extractor = news_extractor or FutuNewsSentimentExtractor()
         self.anomaly_client = anomaly_client or FutuAnomalyScriptClient()
+        self.anomaly_summarizer = anomaly_summarizer or LLMFutuAnomalyModuleSummarizer()
 
     def prepare_sources(
         self,
@@ -684,18 +741,25 @@ class FutuSkillFactsExtractor:
         run_date: str,
         window_days: int,
     ) -> dict[str, object]:
-        del name, run_date
+        del run_date
         payload = self.anomaly_client.run(
             "technical",
             market=market,
             symbol=symbol,
             window_days=window_days,
         )
-        return _normalize_anomaly_payload(
+        module = _normalize_anomaly_payload(
             payload,
             module_name="technical_anomaly",
             category_labels=TECHNICAL_ANOMALY_CATEGORY_LABELS,
             window_days=window_days,
+        )
+        return self._summarize_anomaly_module(
+            market=market,
+            symbol=symbol,
+            name=name,
+            module_name="technical_anomaly",
+            module=module,
         )
 
     def extract_capital_anomaly(
@@ -707,18 +771,25 @@ class FutuSkillFactsExtractor:
         run_date: str,
         window_days: int,
     ) -> dict[str, object]:
-        del name, run_date
+        del run_date
         payload = self.anomaly_client.run(
             "capital",
             market=market,
             symbol=symbol,
             window_days=window_days,
         )
-        return _normalize_anomaly_payload(
+        module = _normalize_anomaly_payload(
             payload,
             module_name="capital_anomaly",
             category_labels=CAPITAL_ANOMALY_CATEGORY_LABELS,
             window_days=window_days,
+        )
+        return self._summarize_anomaly_module(
+            market=market,
+            symbol=symbol,
+            name=name,
+            module_name="capital_anomaly",
+            module=module,
         )
 
     def extract_derivatives_anomaly(
@@ -730,7 +801,7 @@ class FutuSkillFactsExtractor:
         run_date: str,
         window_days: int,
     ) -> dict[str, object]:
-        del name, run_date
+        del run_date
         payload = self.anomaly_client.run(
             "derivatives",
             market=market,
@@ -742,12 +813,41 @@ class FutuSkillFactsExtractor:
             if market.upper() == "HK"
             else DERIVATIVES_ANOMALY_CATEGORY_LABELS_US
         )
-        return _normalize_anomaly_payload(
+        module = _normalize_anomaly_payload(
             payload,
             module_name="derivatives_anomaly",
             category_labels=labels,
             window_days=window_days,
         )
+        return self._summarize_anomaly_module(
+            market=market,
+            symbol=symbol,
+            name=name,
+            module_name="derivatives_anomaly",
+            module=module,
+        )
+
+    def _summarize_anomaly_module(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        module_name: str,
+        module: dict[str, object],
+    ) -> dict[str, object]:
+        if not _module_needs_detail_summary(module):
+            return module
+        try:
+            return self.anomaly_summarizer.summarize(
+                market=market,
+                symbol=symbol,
+                name=name,
+                module_name=module_name,
+                module=module,
+            )
+        except Exception:
+            return _compact_anomaly_module_details(module, module_name)
 
 
 def futu_skill_facts_run_path(
@@ -1088,6 +1188,91 @@ def _normalize_signal_categories(
             }
         )
     return normalized
+
+
+def _module_needs_detail_summary(module: dict[str, object]) -> bool:
+    categories = module.get("categories")
+    if not isinstance(categories, list):
+        return False
+    return any(
+        isinstance(category, dict)
+        and category.get("state") == "anomaly"
+        and len(_optional_text(category.get("detail"))) > 120
+        for category in categories
+    )
+
+
+def _apply_anomaly_summary_payload(
+    module: dict[str, object],
+    payload: dict[str, object],
+    module_name: str,
+) -> dict[str, object]:
+    summarized = dict(module)
+    summary = _optional_text(payload.get("summary"))
+    if summary:
+        summarized["summary"] = _bounded_text(summary, 120)
+    category_updates = {
+        _optional_text(item.get("name")): item
+        for item in payload.get("categories", [])
+        if isinstance(item, dict) and _optional_text(item.get("name"))
+    } if isinstance(payload.get("categories"), list) else {}
+    categories = []
+    for category in module.get("categories", []):
+        if not isinstance(category, dict):
+            continue
+        updated = dict(category)
+        replacement = category_updates.get(_optional_text(category.get("name")))
+        if isinstance(replacement, dict):
+            detail = _optional_text(replacement.get("detail"))
+            direction = _optional_text(replacement.get("direction"))
+            if detail:
+                updated["detail"] = _bounded_text(detail, 90)
+            if direction in VALID_CATEGORY_DIRECTIONS:
+                updated["direction"] = direction
+        categories.append(updated)
+    summarized["categories"] = categories
+    normalized = _normalize_signal_module(summarized, module_name)
+    _validate_signal_module(normalized, module_name)
+    return normalized
+
+
+def _compact_anomaly_module_details(
+    module: dict[str, object],
+    module_name: str,
+) -> dict[str, object]:
+    compacted = dict(module)
+    categories = []
+    for category in module.get("categories", []):
+        if not isinstance(category, dict):
+            continue
+        updated = dict(category)
+        detail = _optional_text(updated.get("detail"))
+        if len(detail) > 120:
+            updated["detail"] = _compact_anomaly_detail(detail)
+        categories.append(updated)
+    compacted["categories"] = categories
+    normalized = _normalize_signal_module(compacted, module_name)
+    _validate_signal_module(normalized, module_name)
+    return normalized
+
+
+def _compact_anomaly_detail(detail: str) -> str:
+    text = re.sub(r"\[timestamp:\s*\d+\]", "。", detail)
+    text = " ".join(text.split())
+    parts = [
+        part.strip(" ，,。")
+        for part in re.split(r"[。；;]\s*", text)
+        if part.strip(" ，,。")
+    ]
+    compact = "；".join(parts[:2]) if parts else text
+    return _bounded_text(compact, 90)
+
+
+def _bounded_text(text: str, max_chars: int) -> str:
+    value = " ".join(_optional_text(text).split())
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 1].rstrip(" ，,；;。") + "…"
 
 
 def _validate_signal_module(module: object, module_name: str) -> None:
@@ -2024,6 +2209,20 @@ def _domestic_discussion_system_prompt() -> str:
         "credibility 只能使用 高、中、低、噪声高、缺失。"
         "trading_constraint 必须明确这类信息是否能影响交易动作；默认不能单独支持加仓或减仓。"
         "所有字段必须使用简体中文，不能包含 URL，不能复制长篇原帖。"
+    )
+
+
+def _anomaly_module_summary_system_prompt() -> str:
+    return (
+        "你是交易仪表盘的富途异动信号摘要器。"
+        "你只把富途技术、资金、衍生品异动原文压缩成结构化短摘要，不给买卖建议，不生成下单动作。"
+        "必须输出 JSON object，字段为 summary 和 categories。"
+        "summary 是 1 句中文，总结这个模块的核心异常和交易约束，最长 60 个汉字。"
+        "categories 是数组，每项必须包含 name、detail，可选 direction。"
+        "name 必须使用输入里的原类别名，不得新增类别，不得改变类别顺序。"
+        "detail 每个类别最多 45 个汉字，只保留最重要的金额、方向、波动率、经纪商或时间信息。"
+        "direction 如输出，只能是 bullish、bearish、neutral、risk_up、mixed 或空字符串。"
+        "不能复制长篇原始流水，不能输出 URL，不能包含英文交易建议。"
     )
 
 

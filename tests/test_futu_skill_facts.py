@@ -880,6 +880,126 @@ def test_futu_skill_facts_extractor_normalizes_sdk_content_payload() -> None:
     assert derivatives["signal"] != "neutral"
 
 
+def test_futu_skill_facts_extractor_uses_llm_summary_for_long_anomaly_content() -> None:
+    long_content = "期权大单异动：" + "出现多笔买入看涨期权交易，成交量和金额明显放大。" * 12
+
+    class FakeAnomalyClient:
+        def run(
+            self,
+            module: str,
+            *,
+            market: str,
+            symbol: str,
+            window_days: int,
+        ) -> dict[str, object]:
+            del module, market, symbol, window_days
+            return {"data": {"err_code": 0, "content": long_content}}
+
+    class FakeAnomalySummarizer:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def summarize(
+            self,
+            *,
+            market: str,
+            symbol: str,
+            name: str,
+            module_name: str,
+            module: dict[str, object],
+        ) -> dict[str, object]:
+            self.calls.append(
+                {
+                    "market": market,
+                    "symbol": symbol,
+                    "name": name,
+                    "module_name": module_name,
+                    "module": module,
+                }
+            )
+            return {
+                **module,
+                "summary": "期权大单放大，波动风险上升。",
+                "categories": [
+                    {
+                        **category,
+                        "detail": "看涨期权大单密集，需关注波动。",
+                    }
+                    for category in module["categories"]
+                ],
+            }
+
+    summarizer = FakeAnomalySummarizer()
+    extractor = FutuSkillFactsExtractor(
+        news_extractor=FakeExtractor(),
+        anomaly_client=FakeAnomalyClient(),
+        anomaly_summarizer=summarizer,
+    )
+
+    result = extractor.extract_derivatives_anomaly(
+        market="US",
+        symbol="DRAM",
+        name="DRAM ETF",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+
+    assert summarizer.calls[0]["module_name"] == "derivatives_anomaly"
+    assert result["summary"] == "期权大单放大，波动风险上升。"
+    anomaly_details = [
+        category["detail"]
+        for category in result["categories"]
+        if category["state"] == "anomaly"
+    ]
+    assert anomaly_details
+    assert all(len(detail) <= 45 for detail in anomaly_details)
+    assert long_content not in anomaly_details
+
+
+def test_futu_skill_facts_extractor_compacts_long_anomaly_content_when_llm_fails() -> None:
+    long_content = "期权大单异动：" + "出现多笔买入看涨期权交易，成交量和金额明显放大。" * 12
+
+    class FakeAnomalyClient:
+        def run(
+            self,
+            module: str,
+            *,
+            market: str,
+            symbol: str,
+            window_days: int,
+        ) -> dict[str, object]:
+            del module, market, symbol, window_days
+            return {"data": {"err_code": 0, "content": long_content}}
+
+    class BrokenAnomalySummarizer:
+        def summarize(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            raise RuntimeError("llm unavailable")
+
+    extractor = FutuSkillFactsExtractor(
+        news_extractor=FakeExtractor(),
+        anomaly_client=FakeAnomalyClient(),
+        anomaly_summarizer=BrokenAnomalySummarizer(),
+    )
+
+    result = extractor.extract_derivatives_anomaly(
+        market="US",
+        symbol="DRAM",
+        name="DRAM ETF",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+
+    anomaly_details = [
+        category["detail"]
+        for category in result["categories"]
+        if category["state"] == "anomaly"
+    ]
+    assert anomaly_details
+    assert all(len(detail) <= 90 for detail in anomaly_details)
+    assert long_content not in anomaly_details
+
+
 def test_futu_skill_facts_extractor_preserves_structured_sdk_row_details() -> None:
     class FakeAnomalyClient:
         def run(
