@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from decimal import Decimal
 from typing import Any
 
 
@@ -171,3 +172,325 @@ def _validate_ratio_invariant(action: str, suggested_ratio: str) -> None:
 def _require_member(field_name: str, value: str, allowed: set[str]) -> None:
     if value not in allowed:
         raise ValueError(f"invalid {field_name}: {value}")
+
+
+@dataclass(frozen=True)
+class TPortfolioBaseline:
+    total_quantity: Decimal
+
+
+@dataclass(frozen=True)
+class TMarketFacts:
+    run_date: str
+    market: str
+    symbol: str
+    futu_symbol: str
+    name: str
+    session_phase: str
+    updated_at: str
+    last_price: Decimal | None
+    day_change_pct: Decimal | None
+    vwap: Decimal | None
+    ma_1m: Decimal | None
+    ma_5m: Decimal | None
+    day_low: Decimal | None
+    day_high: Decimal | None
+    bid: Decimal | None
+    ask: Decimal | None
+    bid_depth: Decimal | None
+    ask_depth: Decimal | None
+    rsi_5m: Decimal | None
+    volume_ratio_5m: Decimal | None
+
+    def with_field(self, name: str, value: object) -> TMarketFacts:
+        return replace(self, **{name: value})
+
+
+def to_futu_symbol(market: str, symbol: str) -> str:
+    normalized_market = market.upper()
+    normalized_symbol = symbol.strip().upper()
+    if normalized_market == "HK" and normalized_symbol.isdigit():
+        return f"HK.{normalized_symbol.zfill(5)}"
+    if normalized_market == "US":
+        return f"US.{normalized_symbol}"
+    return f"{normalized_market}.{normalized_symbol}"
+
+
+def ratio_from_score(score: int) -> str:
+    if score <= 0:
+        return ""
+    if score == 1:
+        return "6"
+    if score == 2:
+        return "10"
+    if score == 3:
+        return "15"
+    return "20"
+
+
+def build_t_signal_from_facts(
+    *,
+    facts: TMarketFacts,
+    baseline: TPortfolioBaseline,
+    previous: TSignal | None,
+    ai_summary_zh: str,
+) -> TSignal:
+    del previous
+
+    liquidity = _build_liquidity(facts)
+    technical = _build_technical(facts)
+    hard_gates = _build_hard_gates(facts, baseline, liquidity)
+    evidence, score = _build_evidence(facts, technical)
+    has_blocker = any(gate.status == "block" for gate in hard_gates)
+
+    if has_blocker:
+        action = "REVIEW"
+        suggested_ratio = ""
+        status = "review"
+        current_status = "硬性条件未通过，需要人工复核。"
+        event_type = "review_required"
+    elif technical.price_position == "below_vwap_reclaim" and score > 0:
+        action = "BUY_T"
+        suggested_ratio = ratio_from_score(score)
+        status = "ok"
+        current_status = "BUY_T 条件满足，等待执行确认。"
+        event_type = "signal_created"
+    else:
+        action = "HOLD"
+        suggested_ratio = ""
+        status = "ok"
+        current_status = "暂无明确做T信号，继续观察。"
+        event_type = "signal_created"
+
+    futu_symbol = facts.futu_symbol or to_futu_symbol(facts.market, facts.symbol)
+    signal = TSignal(
+        schema_version=SCHEMA_VERSION,
+        run_date=facts.run_date,
+        market=facts.market.upper(),
+        symbol=facts.symbol,
+        futu_symbol=futu_symbol,
+        name=facts.name,
+        session_phase=facts.session_phase,
+        updated_at=facts.updated_at,
+        action=action,
+        suggested_ratio=suggested_ratio,
+        current_status=current_status,
+        signal_summary_zh=_build_summary(action, suggested_ratio, ai_summary_zh, has_blocker),
+        price=TSignalPrice(
+            last_price=_decimal_text(facts.last_price),
+            day_change_pct=_decimal_text(facts.day_change_pct),
+            vwap=_decimal_text(facts.vwap),
+            ma_1m=_decimal_text(facts.ma_1m),
+            ma_5m=_decimal_text(facts.ma_5m),
+            day_low=_decimal_text(facts.day_low),
+            day_high=_decimal_text(facts.day_high),
+        ),
+        liquidity=liquidity,
+        technical=technical,
+        hard_gates=hard_gates,
+        evidence=evidence,
+        timeline=[
+            TSignalTimelineEvent(
+                event_at=facts.updated_at,
+                event_type=event_type,
+                action=action,
+                suggested_ratio=suggested_ratio,
+                message_zh=_timeline_message(action, suggested_ratio),
+            )
+        ],
+        notification=TSignalNotification(
+            should_notify=action in {"BUY_T", "SELL_T"},
+            notified=False,
+            dedupe_key=f"{facts.run_date}|{futu_symbol}|{action}|{suggested_ratio}",
+            last_notified_at="",
+        ),
+        status=status,
+        error="",
+    )
+    validate_t_signal(signal)
+    return signal
+
+
+def _build_liquidity(facts: TMarketFacts) -> TSignalLiquidity:
+    spread_pct = _spread_pct(facts.bid, facts.ask)
+    depth_status = _depth_status(facts, spread_pct)
+    return TSignalLiquidity(
+        bid=_decimal_text(facts.bid),
+        ask=_decimal_text(facts.ask),
+        spread_pct=_decimal_text(spread_pct),
+        bid_depth=_decimal_text(facts.bid_depth),
+        ask_depth=_decimal_text(facts.ask_depth),
+        depth_status=depth_status,
+    )
+
+
+def _spread_pct(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return None
+    midpoint = (bid + ask) / Decimal("2")
+    if midpoint <= 0:
+        return None
+    return ((ask - bid) / midpoint * Decimal("100")).quantize(Decimal("0.001"))
+
+
+def _depth_status(facts: TMarketFacts, spread_pct: Decimal | None) -> str:
+    if (
+        facts.bid is None
+        or facts.ask is None
+        or facts.bid_depth is None
+        or facts.ask_depth is None
+        or spread_pct is None
+    ):
+        return "missing"
+    if spread_pct > Decimal("0.30"):
+        return "wide_spread"
+    if facts.bid_depth <= 0 or facts.ask_depth <= 0:
+        return "thin"
+    return "pass"
+
+
+def _build_technical(facts: TMarketFacts) -> TSignalTechnical:
+    price_position = _price_position(facts)
+    trend_state = _trend_state(price_position)
+    return TSignalTechnical(
+        rsi_5m=_decimal_text(facts.rsi_5m),
+        volume_ratio_5m=_decimal_text(facts.volume_ratio_5m),
+        price_position=price_position,
+        trend_state=trend_state,
+    )
+
+
+def _price_position(facts: TMarketFacts) -> str:
+    if facts.last_price is None or facts.vwap is None:
+        return "unknown"
+    if facts.last_price < facts.vwap:
+        return "below_vwap_reclaim"
+    if facts.last_price > facts.vwap:
+        return "above_vwap_reject"
+    return "middle_range"
+
+
+def _trend_state(price_position: str) -> str:
+    if price_position == "below_vwap_reclaim":
+        return "range_rebound"
+    if price_position == "above_vwap_reject":
+        return "range_fade"
+    if price_position == "middle_range":
+        return "choppy"
+    return "unknown"
+
+
+def _build_hard_gates(
+    facts: TMarketFacts,
+    baseline: TPortfolioBaseline,
+    liquidity: TSignalLiquidity,
+) -> list[TSignalHardGate]:
+    session_status = "pass" if facts.session_phase == "regular" else "block"
+    baseline_status = "pass" if baseline.total_quantity > 0 else "block"
+    liquidity_status = "pass" if liquidity.depth_status == "pass" else "block"
+    return [
+        TSignalHardGate(
+            name="session_phase",
+            status=session_status,
+            message_zh=(
+                "当前处于盘中交易时段。"
+                if session_status == "pass"
+                else "非盘中交易时段，只允许观察。"
+            ),
+        ),
+        TSignalHardGate(
+            name="baseline",
+            status=baseline_status,
+            message_zh=(
+                "底仓数量满足做T前提。"
+                if baseline_status == "pass"
+                else "底仓数量为空或无效，不能生成买卖动作。"
+            ),
+        ),
+        TSignalHardGate(
+            name="liquidity",
+            status=liquidity_status,
+            message_zh=(
+                "买卖盘和价差满足流动性要求。"
+                if liquidity_status == "pass"
+                else "买卖盘缺失、过薄或价差过大，需要人工复核。"
+            ),
+        ),
+    ]
+
+
+def _build_evidence(
+    facts: TMarketFacts,
+    technical: TSignalTechnical,
+) -> tuple[list[TSignalEvidence], int]:
+    evidence: list[TSignalEvidence] = []
+    score = 0
+    if technical.price_position == "below_vwap_reclaim":
+        evidence.append(
+            TSignalEvidence(
+                name="vwap_reclaim",
+                direction="buy",
+                strength="medium",
+                message_zh="价格低于 VWAP 后回收，出现低吸做T信号。",
+            )
+        )
+        score += 1
+    if facts.rsi_5m is not None and facts.rsi_5m <= Decimal("40"):
+        evidence.append(
+            TSignalEvidence(
+                name="rsi_rebound_zone",
+                direction="buy",
+                strength="medium",
+                message_zh="5分钟 RSI 处于偏低区间，反弹信号更明确。",
+            )
+        )
+        score += 1
+    if facts.volume_ratio_5m is not None and facts.volume_ratio_5m >= Decimal("1.20"):
+        evidence.append(
+            TSignalEvidence(
+                name="volume_confirm",
+                direction="buy",
+                strength="low",
+                message_zh="5分钟量比放大，价格回收具备成交配合。",
+            )
+        )
+        score += 1
+    if not evidence:
+        evidence.append(
+            TSignalEvidence(
+                name="no_clear_edge",
+                direction="neutral",
+                strength="low",
+                message_zh="当前技术条件没有形成明确做T优势。",
+            )
+        )
+    return evidence, score
+
+
+def _build_summary(
+    action: str,
+    suggested_ratio: str,
+    ai_summary_zh: str,
+    has_blocker: bool,
+) -> str:
+    if has_blocker:
+        return f"硬性条件未通过，转入人工复核。{ai_summary_zh}"
+    if action == "BUY_T":
+        return f"触发 BUY_T，建议比例 {suggested_ratio}%。{ai_summary_zh}"
+    if action == "SELL_T":
+        return f"触发 SELL_T，建议比例 {suggested_ratio}%。{ai_summary_zh}"
+    return f"暂不操作，继续观察。{ai_summary_zh}"
+
+
+def _timeline_message(action: str, suggested_ratio: str) -> str:
+    if action in {"BUY_T", "SELL_T"}:
+        return f"生成 {action} 信号，建议比例 {suggested_ratio}%。"
+    if action == "REVIEW":
+        return "硬性条件阻断，转入人工复核。"
+    return "未形成交易动作，继续观察。"
+
+
+def _decimal_text(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    return format(value, "f")
