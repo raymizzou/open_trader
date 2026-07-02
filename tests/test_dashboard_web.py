@@ -2285,6 +2285,15 @@ for (const unexpected of ["<td>futu;tiger</td>", "<td>phillips</td>", "<td>futu<
 if (renderedHoldings.includes("观察 ·") || renderedHoldings.includes("人工复核 ·")) {
   throw new Error("main holdings table should not render action badges: " + renderedHoldings);
 }
+const sortedSections = groupedHoldingsByMarketSection([
+  { market: "US", symbol: "LOW", portfolio_weight_hkd: "1.00%" },
+  { market: "US", symbol: "HIGH", portfolio_weight_hkd: "9.00%" },
+  { market: "US", symbol: "MISSING", portfolio_weight_hkd: "" },
+]);
+const sortedSymbols = sortedSections[0].rows.map((row) => row.holding.symbol).join(",");
+if (sortedSymbols !== "HIGH,LOW,MISSING") {
+  throw new Error("holdings should sort by portfolio weight descending within market section: " + sortedSymbols);
+}
 const malformedSection = renderMarketSectionRow({
   market: "OTHER",
   label: "其他市场持仓",

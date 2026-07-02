@@ -3219,11 +3219,32 @@ function groupedHoldingsByMarketSection(holdings) {
     const section = sectionByMarket.get(marketSectionKey(holding)) || sectionByMarket.get("OTHER");
     section.rows.push({ holding, index });
   });
+  sections.forEach((section) => {
+    section.rows.sort(compareRowsByPortfolioWeight);
+  });
   return sections.filter((section) => section.rows.length > 0);
 }
 
 function sectionRowHolding(row) {
   return row && row.holding ? row.holding : row;
+}
+
+function compareRowsByPortfolioWeight(left, right) {
+  const leftWeight = numericPercentValue(sectionRowHolding(left).portfolio_weight_hkd);
+  const rightWeight = numericPercentValue(sectionRowHolding(right).portfolio_weight_hkd);
+  if (leftWeight === null && rightWeight === null) {
+    return left.index - right.index;
+  }
+  if (leftWeight === null) {
+    return 1;
+  }
+  if (rightWeight === null) {
+    return -1;
+  }
+  if (rightWeight !== leftWeight) {
+    return rightWeight - leftWeight;
+  }
+  return left.index - right.index;
 }
 
 function sumNumericField(rows, fieldName) {
@@ -3241,21 +3262,25 @@ function sumNumericField(rows, fieldName) {
 function sumPercentField(rows, fieldName) {
   let total = 0;
   for (const row of rows) {
-    const value = sectionRowHolding(row)[fieldName];
-    if (!hasValue(value)) {
-      return null;
-    }
-    const raw = String(value).trim();
-    if (!/^[+-]?(?:\d+|\d*\.\d+)%$/.test(raw)) {
-      return null;
-    }
-    const parsed = Number(raw.slice(0, -1));
-    if (!Number.isFinite(parsed)) {
+    const parsed = numericPercentValue(sectionRowHolding(row)[fieldName]);
+    if (parsed === null) {
       return null;
     }
     total += parsed;
   }
   return rows.length ? total : null;
+}
+
+function numericPercentValue(value) {
+  if (!hasValue(value)) {
+    return null;
+  }
+  const raw = String(value).trim();
+  if (!/^[+-]?(?:\d+|\d*\.\d+)%$/.test(raw)) {
+    return null;
+  }
+  const parsed = Number(raw.slice(0, -1));
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function renderMarketSectionRow(section) {
