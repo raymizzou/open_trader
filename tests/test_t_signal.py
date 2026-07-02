@@ -761,6 +761,36 @@ def test_apply_ai_interpretation_updates_summary_without_changing_rule_action() 
         ),
         json.dumps(
             {
+                "action": ["BUY_T"],
+                "suggested_ratio": "10",
+                "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": ["10"],
+                "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "价格回收 VWAP, enter a long trade near support after confirmation.",
+                "ratio_rationale_zh": "10% 来自规则层评分，the model sees acceptable risk.",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
                 "action": "BUY_T",
                 "suggested_ratio": "10",
                 "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
@@ -828,6 +858,34 @@ def test_t_signal_interpreter_degrades_client_failure_to_review() -> None:
     assert interpreted.status == "review"
     assert interpreted.notification.should_notify is False
     assert "llm unavailable" in interpreted.error
+
+
+def test_t_signal_interpreter_default_client_creation_failure_degrades_to_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RaisingOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            raise RuntimeError("missing deepseek key")
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=RaisingOpenAI))
+
+    interpreted = TSignalInterpreter().interpret(sample_signal())
+
+    assert interpreted.action == "REVIEW"
+    assert interpreted.suggested_ratio == ""
+    assert interpreted.status == "review"
+    assert "DEEPSEEK_API_KEY" in interpreted.error
+
+
+def test_openai_t_signal_interpreter_requires_deepseek_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+
+    with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
+        OpenAITSignalInterpreterClient()
 
 
 def test_openai_t_signal_interpreter_client_uses_deepseek_json_api(

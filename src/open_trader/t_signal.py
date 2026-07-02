@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from typing import Any, Protocol
@@ -49,6 +50,7 @@ AI_INTERPRETATION_FIELDS = {
     "ratio_rationale_zh",
     "evidence_refs",
 }
+RAW_ENGLISH_PROSE_PATTERN = re.compile(r"\b[A-Za-z]+(?:\s+[A-Za-z]+){2,}\b")
 T_SIGNAL_INTERPRETER_PROMPT = """你是做T信号解释器。
 只能解释系统给出的结构化信号，不得改写 action，不得改写 suggested_ratio。
 只能引用 payload.evidence 中已经存在的 name，不得编造价格、指标、盘口或成交量。
@@ -176,8 +178,12 @@ class OpenAITSignalInterpreterClient:
 
         from .advice.change_classifier import DEEPSEEK_BASE_URL, DEFAULT_CLASSIFIER_MODEL
 
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise ValueError("DEEPSEEK_API_KEY is required for t signal interpretation")
+
         self._client = OpenAI(
-            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            api_key=api_key,
             base_url=DEEPSEEK_BASE_URL,
             timeout=timeout_seconds,
         )
@@ -210,12 +216,13 @@ class TSignalInterpreter:
         client: TSignalInterpreterClient | None = None,
         prompt: str = T_SIGNAL_INTERPRETER_PROMPT,
     ) -> None:
-        self._client = client or OpenAITSignalInterpreterClient()
+        self._client = client
         self._prompt = prompt
 
     def interpret(self, signal: TSignal) -> TSignal:
         try:
-            raw = self._client.interpret(
+            client = self._client or OpenAITSignalInterpreterClient()
+            raw = client.interpret(
                 self._prompt,
                 build_ai_interpretation_payload(signal),
             )
@@ -476,6 +483,10 @@ def validate_ai_interpretation_output(
 
     action = data["action"]
     suggested_ratio = data["suggested_ratio"]
+    if not isinstance(action, str):
+        raise ValueError("AI interpretation action must be string")
+    if not isinstance(suggested_ratio, str):
+        raise ValueError("AI interpretation suggested_ratio must be string")
     if action not in ACTIONS:
         raise ValueError(f"AI interpretation invalid action: {action}")
     if suggested_ratio not in SUGGESTED_RATIOS:
@@ -570,6 +581,10 @@ def _reject_disallowed_english_trading_phrase(text: str, field_name: str) -> Non
             raise ValueError(
                 f"AI interpretation {field_name} contains disallowed English phrase"
             )
+    if RAW_ENGLISH_PROSE_PATTERN.search(text):
+        raise ValueError(
+            f"AI interpretation {field_name} contains raw English prose"
+        )
 
 
 def _validate_evidence_refs(value: object, signal: TSignal) -> list[str]:
