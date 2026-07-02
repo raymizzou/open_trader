@@ -185,6 +185,57 @@ def write_futu_skill_facts(path: Path) -> None:
                             "blocking_reason": "",
                             "suggested_constraint": "",
                         },
+                        "technical_anomaly": {
+                            "status": "ok",
+                            "signal": "supportive",
+                            "confidence": "medium",
+                            "suggested_constraint": "",
+                            "window_days": 7,
+                            "summary": "技术信号支持趋势。",
+                            "categories": [
+                                {
+                                    "name": "MACD",
+                                    "state": "anomaly",
+                                    "direction": "bullish",
+                                    "detail": "金叉后继续放大。",
+                                    "evidence_date": "2026-07-01",
+                                }
+                            ],
+                        },
+                        "capital_anomaly": {
+                            "status": "ok",
+                            "signal": "mixed",
+                            "confidence": "medium",
+                            "suggested_constraint": "no_add",
+                            "window_days": 7,
+                            "summary": "资金流向与加仓动作存在分歧。",
+                            "categories": [
+                                {
+                                    "name": "资金流向",
+                                    "state": "anomaly",
+                                    "direction": "bearish",
+                                    "detail": "主力资金连续净流出。",
+                                    "evidence_date": "2026-07-02",
+                                }
+                            ],
+                        },
+                        "derivatives_anomaly": {
+                            "status": "partial",
+                            "signal": "risk_up",
+                            "confidence": "low",
+                            "suggested_constraint": "no_add",
+                            "window_days": 7,
+                            "summary": "期权波动率偏高。",
+                            "categories": [
+                                {
+                                    "name": "期权波动率",
+                                    "state": "anomaly",
+                                    "direction": "risk_up",
+                                    "detail": "IV 位于高位。",
+                                    "evidence_date": "2026-07-02",
+                                }
+                            ],
+                        },
                         "error": "",
                     }
                 ],
@@ -1328,6 +1379,28 @@ def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     ]
     assert news_sentiment["domestic_discussion"]["summary"] == "富途社区相关讨论较少，主要关注波动率 ETF 的短线风险。"
     assert news_sentiment["domestic_discussion"]["credibility"] == "低"
+    technical = vixy["futu_skill_facts"]["technical_anomaly"]
+    capital = vixy["futu_skill_facts"]["capital_anomaly"]
+    derivatives = vixy["futu_skill_facts"]["derivatives_anomaly"]
+    assert technical["available"] is True
+    assert technical["signal"] == "supportive"
+    assert technical["categories"][0]["name"] == "MACD"
+    assert capital["suggested_constraint"] == "no_add"
+    assert derivatives["status"] == "partial"
+
+
+def test_load_dashboard_state_marks_missing_anomaly_modules_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+
+    state = load_dashboard_state(config).to_dict()
+    vixy = state["holdings"][0]
+
+    assert vixy["futu_skill_facts"]["technical_anomaly"]["available"] is False
+    assert vixy["futu_skill_facts"]["technical_anomaly"]["status"] == "missing"
+    assert vixy["futu_skill_facts"]["capital_anomaly"]["categories"] == []
 
 
 def test_load_dashboard_state_marks_missing_agent_sections_unavailable(

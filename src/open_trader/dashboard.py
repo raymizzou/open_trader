@@ -832,7 +832,35 @@ def _futu_skill_facts_detail(record: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "news_sentiment": _futu_skill_news_sentiment_detail(
             record.get("news_sentiment") if isinstance(record, dict) else None
-        )
+        ),
+        "technical_anomaly": _futu_skill_signal_detail(
+            record.get("technical_anomaly") if isinstance(record, dict) else None
+        ),
+        "capital_anomaly": _futu_skill_signal_detail(
+            record.get("capital_anomaly") if isinstance(record, dict) else None
+        ),
+        "derivatives_anomaly": _futu_skill_signal_detail(
+            record.get("derivatives_anomaly") if isinstance(record, dict) else None
+        ),
+    }
+
+
+def _futu_skill_signal_detail(module: object) -> dict[str, Any]:
+    if not isinstance(module, dict):
+        return _missing_futu_skill_signal()
+    status = str(module.get("status") or "").strip()
+    signal = str(module.get("signal") or "").strip()
+    confidence = str(module.get("confidence") or "").strip()
+    categories = module.get("categories")
+    return {
+        "available": bool(status and status not in {"missing", "error"}),
+        "status": status or "missing",
+        "signal": signal,
+        "confidence": confidence,
+        "suggested_constraint": str(module.get("suggested_constraint") or ""),
+        "window_days": int(module.get("window_days") or 0),
+        "summary": str(module.get("summary") or ""),
+        "categories": categories if isinstance(categories, list) else [],
     }
 
 
@@ -878,6 +906,19 @@ def _missing_futu_skill_news_sentiment() -> dict[str, Any]:
         "domestic_discussion": _missing_futu_domestic_discussion(),
         "blocking_reason": "",
         "suggested_constraint": "",
+    }
+
+
+def _missing_futu_skill_signal() -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": "missing",
+        "signal": "",
+        "confidence": "",
+        "suggested_constraint": "",
+        "window_days": 0,
+        "summary": "",
+        "categories": [],
     }
 
 
