@@ -7,11 +7,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - Reworked the dashboard holdings table around the operator fields: quantity,
   cost price, live price, USD/HKD market value, portfolio weight, and P/L.
-- Split holdings into clear `US` then `HK` sections, removed the broker/action
-  columns from the main table, and kept broker context inside the trading
-  decision detail.
-- Verified the dashboard with full pytest plus Playwright desktop/mobile checks
-  for section order, market filters, horizontal scrolling, and detail expansion.
+- Split holdings into `美股正股`, `美股期权`, `港股正股`, and `港股期权`
+  sections, kept each section sorted by portfolio weight, and kept broker
+  context inside the trading decision detail.
+- Added the Futu anomaly signal card to the trading decision detail so
+  technical, capital-flow, and derivatives anomaly signals display in Chinese
+  without leaking raw enum/schema text.
+- Verified with focused dashboard/Futu facts pytest, live local dashboard
+  deployment on `127.0.0.1:8766`, and Playwright checks for section order,
+  section weight sorting, detail expansion, and the anomaly signal card.
 
 ## 2026-07-01
 
