@@ -550,7 +550,26 @@ def _require_chinese_text(value: object, field_name: str) -> str:
     text = value.strip()
     if not any("\u3400" <= char <= "\u9fff" for char in text):
         raise ValueError(f"AI interpretation {field_name} must be Chinese text")
+    _reject_disallowed_english_trading_phrase(text, field_name)
     return text
+
+
+def _reject_disallowed_english_trading_phrase(text: str, field_name: str) -> None:
+    lowered = text.lower()
+    blocked_phrases = (
+        "buy now",
+        "sell now",
+        "stop loss",
+        "take profit",
+        "position sizing",
+        "place order",
+        "submit order",
+    )
+    for phrase in blocked_phrases:
+        if phrase in lowered:
+            raise ValueError(
+                f"AI interpretation {field_name} contains disallowed English phrase"
+            )
 
 
 def _validate_evidence_refs(value: object, signal: TSignal) -> list[str]:

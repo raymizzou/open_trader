@@ -753,6 +753,16 @@ def test_apply_ai_interpretation_updates_summary_without_changing_rule_action() 
             {
                 "action": "BUY_T",
                 "suggested_ratio": "10",
+                "signal_summary_zh": "价格回收 VWAP，buy now before breakout。",
+                "ratio_rationale_zh": "10% 来自规则层评分，避免 position sizing 越权。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
                 "signal_summary_zh": "价格低于 VWAP 后回收，短线反弹条件成立。",
                 "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
                 "evidence_refs": ["invented_signal"],
