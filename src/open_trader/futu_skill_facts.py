@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import html
 import json
+import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -513,6 +515,196 @@ class FutuNewsSentimentExtractor:
 LLMFutuNewsSentimentExtractor = FutuNewsSentimentExtractor
 
 
+class FutuAnomalyScriptClient:
+    def __init__(
+        self,
+        *,
+        skill_root: Path | None = None,
+        runner: Callable[[list[str]], object] | None = None,
+    ) -> None:
+        codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+        self.skill_root = skill_root or codex_home / "skills"
+        self.runner = runner or self._run_subprocess
+
+    def run(
+        self,
+        module: str,
+        *,
+        market: str,
+        symbol: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        script = self._script_path(module)
+        stock_symbol = f"{market.upper()}.{symbol.upper()}"
+        command = [
+            sys.executable,
+            str(script),
+            stock_symbol,
+            "--time-range",
+            str(window_days),
+            "--json",
+        ]
+        result = self.runner(command)
+        returncode = int(getattr(result, "returncode", 1))
+        stdout = str(getattr(result, "stdout", "") or "")
+        stderr = str(getattr(result, "stderr", "") or "")
+        if returncode != 0:
+            raise RuntimeError(
+                stderr.strip()
+                or stdout.strip()
+                or f"{module} anomaly script failed"
+            )
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{module} anomaly script returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{module} anomaly script returned non-object JSON")
+        return payload
+
+    def _script_path(self, module: str) -> Path:
+        mapping = {
+            "technical": self.skill_root
+            / "futu-technical-anomaly/scripts/handle_technical_anomaly.py",
+            "capital": self.skill_root
+            / "futu-capital-anomaly/scripts/handle_capital_anomaly.py",
+            "derivatives": self.skill_root
+            / "futu-derivatives-anomaly/scripts/handle_derivatives_anomaly.py",
+        }
+        try:
+            return mapping[module]
+        except KeyError as exc:
+            raise ValueError(f"unknown anomaly module: {module}") from exc
+
+    @staticmethod
+    def _run_subprocess(command: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=45,
+            check=False,
+        )
+
+
+class FutuSkillFactsExtractor:
+    def __init__(
+        self,
+        *,
+        news_extractor: FutuSkillNewsSentimentExtractor | None = None,
+        anomaly_client: FutuAnomalyScriptClient | None = None,
+    ) -> None:
+        self.news_extractor = news_extractor or FutuNewsSentimentExtractor()
+        self.anomaly_client = anomaly_client or FutuAnomalyScriptClient()
+
+    def prepare_sources(
+        self,
+        *,
+        sources: list[FutuSkillSource],
+        data_dir: Path,
+        run_date: str,
+        market: MarketScope | str | None,
+    ) -> None:
+        prepare_sources = getattr(self.news_extractor, "prepare_sources", None)
+        if callable(prepare_sources):
+            prepare_sources(
+                sources=sources,
+                data_dir=data_dir,
+                run_date=run_date,
+                market=market,
+            )
+
+    def extract_news_sentiment(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+    ) -> dict[str, object]:
+        return self.news_extractor.extract_news_sentiment(
+            market=market,
+            symbol=symbol,
+            name=name,
+            run_date=run_date,
+        )
+
+    def extract_technical_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del name, run_date
+        payload = self.anomaly_client.run(
+            "technical",
+            market=market,
+            symbol=symbol,
+            window_days=window_days,
+        )
+        return _normalize_anomaly_payload(
+            payload,
+            module_name="technical_anomaly",
+            category_labels=TECHNICAL_ANOMALY_CATEGORY_LABELS,
+            window_days=window_days,
+        )
+
+    def extract_capital_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del name, run_date
+        payload = self.anomaly_client.run(
+            "capital",
+            market=market,
+            symbol=symbol,
+            window_days=window_days,
+        )
+        return _normalize_anomaly_payload(
+            payload,
+            module_name="capital_anomaly",
+            category_labels=CAPITAL_ANOMALY_CATEGORY_LABELS,
+            window_days=window_days,
+        )
+
+    def extract_derivatives_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del name, run_date
+        payload = self.anomaly_client.run(
+            "derivatives",
+            market=market,
+            symbol=symbol,
+            window_days=window_days,
+        )
+        labels = (
+            DERIVATIVES_ANOMALY_CATEGORY_LABELS_HK
+            if market.upper() == "HK"
+            else DERIVATIVES_ANOMALY_CATEGORY_LABELS_US
+        )
+        return _normalize_anomaly_payload(
+            payload,
+            module_name="derivatives_anomaly",
+            category_labels=labels,
+            window_days=window_days,
+        )
+
+
 def futu_skill_facts_run_path(
     data_dir: Path,
     run_date: str,
@@ -886,6 +1078,201 @@ def _validate_signal_module(module: object, module_name: str) -> None:
             VALID_CATEGORY_DIRECTIONS,
             f"{module_name} category",
         )
+
+
+def _normalize_anomaly_payload(
+    payload: dict[str, object],
+    *,
+    module_name: str,
+    category_labels: tuple[str, ...],
+    window_days: int,
+) -> dict[str, object]:
+    rows = _anomaly_rows(payload.get("data"))
+    categories = [
+        _category_from_rows(label, rows)
+        for label in category_labels
+    ]
+    anomaly_categories = [
+        item for item in categories if item["state"] == "anomaly"
+    ]
+    risk_categories = [
+        item
+        for item in anomaly_categories
+        if item["direction"] in {"bearish", "risk_up", "mixed"}
+    ]
+    supportive_categories = [
+        item for item in anomaly_categories if item["direction"] == "bullish"
+    ]
+    if risk_categories:
+        signal = "risk_up" if module_name == "derivatives_anomaly" else "mixed"
+        suggested_constraint = "no_add"
+    elif supportive_categories:
+        signal = "supportive"
+        suggested_constraint = ""
+    elif anomaly_categories:
+        signal = "mixed"
+        suggested_constraint = "review"
+    else:
+        signal = "neutral"
+        suggested_constraint = ""
+    module = {
+        "status": "ok",
+        "signal": signal,
+        "confidence": "medium" if anomaly_categories else "low",
+        "suggested_constraint": suggested_constraint,
+        "window_days": _validate_window_days(window_days),
+        "summary": _signal_summary(module_name, signal, suggested_constraint),
+        "categories": categories,
+    }
+    _validate_signal_module(module, module_name)
+    return module
+
+
+def _anomaly_rows(data: object) -> list[dict[str, object]]:
+    if isinstance(data, dict):
+        rows: list[dict[str, object]] = []
+        if any(
+            field in data
+            for field in (
+                "name",
+                "category",
+                "type",
+                "indicator",
+                "title",
+                "description",
+                "direction",
+                "date",
+                "detail",
+                "summary",
+            )
+        ):
+            rows.append(data)
+        for value in data.values():
+            rows.extend(_anomaly_rows(value))
+        return rows
+    if isinstance(data, list):
+        rows = []
+        for item in data:
+            if isinstance(item, dict):
+                rows.append(item)
+            else:
+                rows.extend(_anomaly_rows(item))
+        return rows
+    return []
+
+
+def _category_from_rows(
+    label: str,
+    rows: list[dict[str, object]],
+) -> dict[str, str]:
+    matches = [row for row in rows if _row_matches_category(row, label)]
+    if not matches:
+        return {
+            "name": label,
+            "state": "none",
+            "direction": "",
+            "detail": "窗口内无异常。",
+            "evidence_date": "",
+        }
+    first = matches[0]
+    detail = _row_detail_text(first)
+    return {
+        "name": label,
+        "state": "anomaly",
+        "direction": _row_direction(first),
+        "detail": detail or "发现异动，详情见原始富途返回。",
+        "evidence_date": _row_date(first),
+    }
+
+
+def _row_matches_category(row: dict[str, object], label: str) -> bool:
+    normalized_label = label.casefold()
+    for field in ("name", "category", "type", "indicator", "title"):
+        value = _optional_text(row.get(field)).casefold()
+        if value == normalized_label:
+            return True
+    text = _row_text(row)
+    aliases = {
+        "K线形态": ("k线", "形态", "pattern"),
+        "资金分布与买卖经纪商": (
+            "资金分布",
+            "经纪商",
+            "broker",
+            "funds_distribution",
+            "funds_broker",
+        ),
+        "资金流向": ("资金流向", "flow", "funds_flow"),
+        "卖空情况": ("卖空", "short"),
+        "牛熊证街货比例": ("牛熊证街货比例", "warrant_ratio"),
+        "牛熊证街货价格区间": (
+            "牛熊证街货价格区间",
+            "warrant_price_distribution",
+        ),
+        "期权大单": ("期权大单", "option_unusual"),
+        "期权波动率": ("期权波动率", "iv", "volatility", "option_volatility"),
+        "期权量价": ("期权量价", "volume", "option_volume_price"),
+        "期权情绪": ("期权情绪", "put/call", "pcr", "option_sentiment"),
+        "期权综合信号": ("期权综合", "option_comprehensive"),
+    }
+    terms = aliases.get(label, (normalized_label,))
+    return any(
+        len(term) > 2 and term.casefold() in text
+        for term in terms
+    )
+
+
+def _row_text(row: dict[str, object]) -> str:
+    return json.dumps(
+        row,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    ).casefold()
+
+
+def _row_direction(row: dict[str, object]) -> str:
+    text = _row_text(row)
+    if "risk_up" in text or "风险" in text or "超买" in text:
+        return "risk_up"
+    if any(
+        term in text
+        for term in ("bearish", "看跌", "偏空", "流出", "卖空", "short")
+    ):
+        return "bearish"
+    if any(term in text for term in ("mixed", "分歧")):
+        return "mixed"
+    if any(term in text for term in ("bullish", "看涨", "偏多", "流入", "金叉")):
+        return "bullish"
+    return "neutral"
+
+
+def _row_detail_text(row: dict[str, object]) -> str:
+    for field in ("description", "interpretation", "summary", "detail", "name"):
+        value = _optional_text(row.get(field))
+        if value:
+            return value
+    return _row_text(row)
+
+
+def _row_date(row: dict[str, object]) -> str:
+    for field in ("date", "datetime", "time", "occur_date"):
+        value = _optional_text(row.get(field))
+        if value:
+            return value
+    return ""
+
+
+def _signal_summary(module_name: str, signal: str, suggested_constraint: str) -> str:
+    del module_name
+    if signal == "supportive":
+        return "异动信号支持当前交易方向。"
+    if signal == "risk_up":
+        return "异动信号提示风险上升。"
+    if signal == "mixed":
+        return "异动信号存在分歧，需要结合主结论复核。"
+    if suggested_constraint:
+        return "异动信号触发执行约束。"
+    return "窗口内未发现明显异动。"
 
 
 def _load_portfolio_sources(

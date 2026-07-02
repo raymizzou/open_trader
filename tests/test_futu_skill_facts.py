@@ -4,6 +4,7 @@ import csv
 import json
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -13,7 +14,9 @@ from open_trader.futu_skill_facts import (
     DERIVATIVES_ANOMALY_CATEGORY_LABELS_HK,
     DERIVATIVES_ANOMALY_CATEGORY_LABELS_US,
     FUTU_SKILL_FACTS_SCHEMA_VERSION,
+    FutuAnomalyScriptClient,
     FutuNewsSentimentExtractor,
+    FutuSkillFactsExtractor,
     FutuSkillNewsSentimentExtractor,
     LLMFutuDomesticDiscussionSummarizer,
     TECHNICAL_ANOMALY_CATEGORY_LABELS,
@@ -621,6 +624,154 @@ def test_anomaly_category_templates_are_fixed() -> None:
         "牛熊证街货比例",
         "牛熊证街货价格区间",
     )
+
+
+def test_futu_anomaly_script_client_invokes_expected_scripts(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_runner(command: list[str]) -> object:
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "method": "get_technical_unusual",
+                    "stock_symbol": "US.NVDA",
+                    "time_range": 7,
+                    "data": [
+                        {
+                            "name": "MACD",
+                            "direction": "bullish",
+                            "date": "2026-07-01",
+                            "description": "MACD 金叉",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            stderr="",
+        )
+
+    client = FutuAnomalyScriptClient(
+        skill_root=tmp_path / "skills",
+        runner=fake_runner,
+    )
+
+    payload = client.run("technical", market="US", symbol="NVDA", window_days=7)
+    client.run("capital", market="HK", symbol="00700", window_days=14)
+    client.run("derivatives", market="US", symbol="AAPL", window_days=3)
+
+    assert payload["stock_symbol"] == "US.NVDA"
+    assert calls[0][2:] == ["US.NVDA", "--time-range", "7", "--json"]
+    assert "handle_technical_anomaly.py" in calls[0][1]
+    assert calls[1][2:] == ["HK.00700", "--time-range", "14", "--json"]
+    assert "handle_capital_anomaly.py" in calls[1][1]
+    assert calls[2][2:] == ["US.AAPL", "--time-range", "3", "--json"]
+    assert "handle_derivatives_anomaly.py" in calls[2][1]
+
+
+def test_futu_anomaly_script_client_reports_script_failure(tmp_path: Path) -> None:
+    def fake_runner(command: list[str]) -> object:
+        return SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="get_technical_unusual error: no permission",
+        )
+
+    client = FutuAnomalyScriptClient(
+        skill_root=tmp_path / "skills",
+        runner=fake_runner,
+    )
+
+    with pytest.raises(RuntimeError, match="no permission"):
+        client.run("technical", market="US", symbol="NVDA", window_days=7)
+
+
+def test_futu_skill_facts_extractor_normalizes_fake_anomaly_payloads() -> None:
+    class FakeAnomalyClient:
+        def run(
+            self,
+            module: str,
+            *,
+            market: str,
+            symbol: str,
+            window_days: int,
+        ) -> dict[str, object]:
+            del market, symbol, window_days
+            if module == "technical":
+                return {
+                    "data": [
+                        {
+                            "name": "MACD",
+                            "direction": "bullish",
+                            "date": "2026-07-01",
+                            "description": "MACD 金叉",
+                        },
+                        {
+                            "name": "RSI",
+                            "direction": "risk_up",
+                            "date": "2026-07-02",
+                            "description": "RSI 接近超买",
+                        },
+                    ]
+                }
+            if module == "capital":
+                return {
+                    "data": [
+                        {
+                            "name": "资金流向",
+                            "direction": "bearish",
+                            "date": "2026-07-02",
+                            "description": "主力资金连续净流出",
+                        }
+                    ]
+                }
+            return {
+                "data": [
+                    {
+                        "name": "期权波动率",
+                        "direction": "risk_up",
+                        "date": "2026-07-02",
+                        "description": "IV 位于高位",
+                    }
+                ]
+            }
+
+    extractor = FutuSkillFactsExtractor(
+        news_extractor=FakeExtractor(),
+        anomaly_client=FakeAnomalyClient(),
+    )
+
+    technical = extractor.extract_technical_anomaly(
+        market="US",
+        symbol="NVDA",
+        name="NVIDIA",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+    capital = extractor.extract_capital_anomaly(
+        market="US",
+        symbol="NVDA",
+        name="NVIDIA",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+    derivatives = extractor.extract_derivatives_anomaly(
+        market="US",
+        symbol="NVDA",
+        name="NVIDIA",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+
+    assert technical["categories"][1]["name"] == "MACD"
+    assert technical["categories"][1]["direction"] == "bullish"
+    assert technical["categories"][2]["name"] == "RSI"
+    assert technical["categories"][2]["direction"] == "risk_up"
+    assert technical["signal"] == "mixed"
+    assert technical["suggested_constraint"] == "no_add"
+    assert capital["suggested_constraint"] == "no_add"
+    assert derivatives["signal"] == "risk_up"
 
 
 def test_generate_futu_skill_facts_records_error_for_zero_anomaly_window_days(
