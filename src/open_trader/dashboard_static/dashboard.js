@@ -592,7 +592,25 @@ function renderHoldings() {
   }
 
   const rows = [];
+  const showMarketGroups = state.marketFilter === "ALL";
+  const segmentLengths = showMarketGroups ? marketSegmentLengths(holdings) : new Map();
+  let previousMarket = "";
   holdings.forEach((holding, index) => {
+    const market = normalizedMarket(holding.market);
+    if (showMarketGroups && (index === 0 || market !== previousMarket)) {
+      const segmentCount = segmentLengths.get(index) || 1;
+      rows.push(`
+        <tr class="market-divider-row" data-market="${escapeHtml(market)}">
+          <td colspan="10">
+            <div class="market-divider-content">
+              <span>${escapeHtml(marketGroupLabel(market))}</span>
+              <strong>${escapeHtml(`${segmentCount} 条`)}</strong>
+            </div>
+          </td>
+        </tr>
+      `);
+    }
+    previousMarket = market;
     const rowKey = holdingKey(holding, index);
     const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
     const quote = quoteForHolding(holding);
@@ -628,6 +646,32 @@ function renderHoldings() {
     }
   });
   elements["holdings-body"].innerHTML = rows.join("");
+}
+
+function marketSegmentLengths(holdings) {
+  const lengths = new Map();
+  let start = 0;
+  while (start < holdings.length) {
+    const market = normalizedMarket(holdings[start].market);
+    let end = start + 1;
+    while (end < holdings.length && normalizedMarket(holdings[end].market) === market) {
+      end += 1;
+    }
+    lengths.set(start, end - start);
+    start = end;
+  }
+  return lengths;
+}
+
+function normalizedMarket(market) {
+  return hasValue(market) ? String(market).trim().toUpperCase() : "";
+}
+
+function marketGroupLabel(market) {
+  if (market === "HK") return "港股";
+  if (market === "US") return "美股";
+  if (market === "CASH") return "现金";
+  return market ? `${market} 市场` : "未知市场";
 }
 
 function holdingKey(holding, index) {
