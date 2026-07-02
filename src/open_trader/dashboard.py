@@ -851,17 +851,42 @@ def _futu_skill_signal_detail(module: object) -> dict[str, Any]:
     status = str(module.get("status") or "").strip()
     signal = str(module.get("signal") or "").strip()
     confidence = str(module.get("confidence") or "").strip()
-    categories = module.get("categories")
     return {
-        "available": bool(status and status not in {"missing", "error"}),
+        "available": status in {"ok", "partial"},
         "status": status or "missing",
         "signal": signal,
         "confidence": confidence,
         "suggested_constraint": str(module.get("suggested_constraint") or ""),
-        "window_days": int(module.get("window_days") or 0),
+        "window_days": _safe_int(module.get("window_days")),
         "summary": str(module.get("summary") or ""),
-        "categories": categories if isinstance(categories, list) else [],
+        "categories": _futu_skill_signal_categories(module.get("categories")),
     }
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _futu_skill_signal_categories(categories: object) -> list[dict[str, str]]:
+    if not isinstance(categories, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        normalized.append(
+            {
+                "name": str(category.get("name") or ""),
+                "state": str(category.get("state") or ""),
+                "direction": str(category.get("direction") or ""),
+                "detail": str(category.get("detail") or ""),
+                "evidence_date": str(category.get("evidence_date") or ""),
+            }
+        )
+    return normalized
 
 
 def _futu_skill_news_sentiment_detail(module: object) -> dict[str, Any]:

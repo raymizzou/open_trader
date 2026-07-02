@@ -1403,6 +1403,136 @@ def test_load_dashboard_state_marks_missing_anomaly_modules_unavailable(
     assert vixy["futu_skill_facts"]["capital_anomaly"]["categories"] == []
 
 
+def test_load_dashboard_state_hardens_malformed_cached_anomaly_module(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    path = config.data_dir / "latest" / "US" / "futu_skill_facts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.futu_skill_facts.v1",
+                "generated_at": "2026-07-01T09:15:00+08:00",
+                "run_date": "2026-07-01",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.futu_skill_facts.v1",
+                        "run_date": "2026-07-01",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "name": "ProShares VIX Short-Term Futures ETF",
+                        "technical_anomaly": {
+                            "status": "ok",
+                            "signal": "supportive",
+                            "confidence": "medium",
+                            "suggested_constraint": "",
+                            "window_days": "7d",
+                            "summary": "技术信号支持趋势。",
+                            "categories": [
+                                None,
+                                {
+                                    "name": "MACD",
+                                    "state": "anomaly",
+                                },
+                            ],
+                        },
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    technical = state["holdings"][0]["futu_skill_facts"]["technical_anomaly"]
+    assert technical["window_days"] == 0
+    assert technical["categories"] == [
+        {
+            "name": "MACD",
+            "state": "anomaly",
+            "direction": "",
+            "detail": "",
+            "evidence_date": "",
+        }
+    ]
+    assert all(isinstance(category, dict) for category in technical["categories"])
+    assert all(
+        isinstance(category[field], str)
+        for category in technical["categories"]
+        for field in ("name", "state", "direction", "detail", "evidence_date")
+    )
+
+
+def test_load_dashboard_state_marks_stale_anomaly_module_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    path = config.data_dir / "latest" / "US" / "futu_skill_facts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.futu_skill_facts.v1",
+                "generated_at": "2026-07-01T09:15:00+08:00",
+                "run_date": "2026-07-01",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.futu_skill_facts.v1",
+                        "run_date": "2026-07-01",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "name": "ProShares VIX Short-Term Futures ETF",
+                        "technical_anomaly": {
+                            "status": "stale",
+                            "signal": "supportive",
+                            "confidence": "medium",
+                            "suggested_constraint": "",
+                            "window_days": 7,
+                            "summary": "技术信号来自旧缓存。",
+                            "categories": [
+                                {
+                                    "name": "MACD",
+                                    "state": "anomaly",
+                                    "direction": "bullish",
+                                    "detail": "旧窗口内金叉。",
+                                    "evidence_date": "2026-06-28",
+                                }
+                            ],
+                        },
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    technical = state["holdings"][0]["futu_skill_facts"]["technical_anomaly"]
+    assert technical["available"] is False
+    assert technical["status"] == "stale"
+    assert technical["summary"] == "技术信号来自旧缓存。"
+    assert technical["categories"] == [
+        {
+            "name": "MACD",
+            "state": "anomaly",
+            "direction": "bullish",
+            "detail": "旧窗口内金叉。",
+            "evidence_date": "2026-06-28",
+        }
+    ]
+
+
 def test_load_dashboard_state_marks_missing_agent_sections_unavailable(
     tmp_path: Path,
 ) -> None:
