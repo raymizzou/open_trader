@@ -585,9 +585,12 @@ def _has_required_technical_facts(facts: TMarketFacts) -> bool:
         _is_finite_decimal(value)
         for value in (
             facts.last_price,
+            facts.day_change_pct,
             facts.vwap,
             facts.ma_1m,
             facts.ma_5m,
+            facts.day_low,
+            facts.day_high,
             facts.rsi_5m,
             facts.volume_ratio_5m,
         )

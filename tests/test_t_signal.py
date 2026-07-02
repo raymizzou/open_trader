@@ -370,6 +370,36 @@ def test_missing_technical_facts_blocks_action() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"day_change_pct": None},
+        {"day_low": None},
+        {"day_high": None},
+        {"day_change_pct": Decimal("NaN")},
+        {"day_low": Decimal("NaN")},
+        {"day_high": Decimal("NaN")},
+    ],
+)
+def test_incomplete_market_price_facts_block_action(
+    overrides: dict[str, object],
+) -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(**overrides),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="行情价格字段不完整。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.status == "review"
+    assert any(
+        gate.name == "technical" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
 def test_non_finite_last_price_blocks_action_without_raising() -> None:
     signal = build_t_signal_from_facts(
         facts=regular_facts(last_price=Decimal("NaN")),
