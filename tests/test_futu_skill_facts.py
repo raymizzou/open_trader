@@ -18,6 +18,7 @@ from open_trader.futu_skill_facts import (
     FutuNewsSentimentExtractor,
     FutuSkillFactsExtractor,
     FutuSkillNewsSentimentExtractor,
+    LLMFutuAnomalyModuleSummarizer,
     LLMFutuDomesticDiscussionSummarizer,
     TECHNICAL_ANOMALY_CATEGORY_LABELS,
     futu_skill_facts_latest_path,
@@ -954,6 +955,63 @@ def test_futu_skill_facts_extractor_uses_llm_summary_for_long_anomaly_content() 
     assert anomaly_details
     assert all(len(detail) <= 45 for detail in anomaly_details)
     assert long_content not in anomaly_details
+
+
+def test_llm_anomaly_summarizer_sends_bounded_detail_prompt() -> None:
+    long_detail = "期权大单异动：" + "出现多笔买入看涨期权交易，成交量和金额明显放大。" * 80
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, str]] = []
+
+        def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+            del temperature
+            self.messages = messages
+            return json.dumps(
+                {
+                    "summary": "期权大单密集，波动风险上升。",
+                    "categories": [
+                        {
+                            "name": "期权大单",
+                            "detail": "看涨期权大单密集，成交金额放大。",
+                            "direction": "risk_up",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+
+    client = FakeClient()
+    summarizer = LLMFutuAnomalyModuleSummarizer(client=client)
+    result = summarizer.summarize(
+        market="US",
+        symbol="DRAM",
+        name="DRAM ETF",
+        module_name="derivatives_anomaly",
+        module={
+            "status": "ok",
+            "signal": "risk_up",
+            "confidence": "medium",
+            "suggested_constraint": "no_add",
+            "window_days": 7,
+            "summary": "异动信号提示风险上升。",
+            "categories": [
+                {
+                    "name": "期权大单",
+                    "state": "anomaly",
+                    "direction": "risk_up",
+                    "detail": long_detail,
+                    "evidence_date": "",
+                }
+            ],
+        },
+    )
+
+    user_payload = json.loads(client.messages[1]["content"])
+    sent_detail = user_payload["module"]["categories"][0]["detail"]
+    assert len(sent_detail) <= 1000
+    assert long_detail not in sent_detail
+    assert result["categories"][0]["detail"] == "看涨期权大单密集，成交金额放大。"
 
 
 def test_futu_skill_facts_extractor_compacts_long_anomaly_content_when_llm_fails() -> None:

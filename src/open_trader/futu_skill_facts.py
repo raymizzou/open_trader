@@ -269,7 +269,7 @@ class FutuAnomalyModuleSummarizer(Protocol):
 
 class LLMFutuAnomalyModuleSummarizer:
     def __init__(self, *, client: object | None = None) -> None:
-        self.client = client or OpenAITextClient()
+        self.client = client or OpenAITextClient(timeout_seconds=20)
 
     def summarize(
         self,
@@ -293,7 +293,7 @@ class LLMFutuAnomalyModuleSummarizer:
                         "symbol": symbol,
                         "name": name,
                         "module_name": module_name,
-                        "module": module,
+                        "module": _anomaly_summary_input_module(module),
                     },
                     ensure_ascii=False,
                 ),
@@ -1200,6 +1200,21 @@ def _module_needs_detail_summary(module: dict[str, object]) -> bool:
         and len(_optional_text(category.get("detail"))) > 120
         for category in categories
     )
+
+
+def _anomaly_summary_input_module(module: dict[str, object]) -> dict[str, object]:
+    payload = dict(module)
+    categories = []
+    for category in module.get("categories", []):
+        if not isinstance(category, dict):
+            continue
+        item = dict(category)
+        detail = _optional_text(item.get("detail"))
+        if len(detail) > 1000:
+            item["detail"] = _bounded_text(detail, 1000)
+        categories.append(item)
+    payload["categories"] = categories
+    return payload
 
 
 def _apply_anomaly_summary_payload(
