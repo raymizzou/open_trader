@@ -774,6 +774,81 @@ def test_futu_skill_facts_extractor_normalizes_fake_anomaly_payloads() -> None:
     assert derivatives["signal"] == "risk_up"
 
 
+def test_futu_skill_facts_extractor_normalizes_sdk_content_payload() -> None:
+    technical_content = "MACD 金叉，RSI 接近超买，风险上升"
+    capital_content = "资金流向显示主力资金连续净流出"
+    derivatives_content = "期权波动率 IV 位于高位，风险上升"
+
+    class FakeAnomalyClient:
+        def run(
+            self,
+            module: str,
+            *,
+            market: str,
+            symbol: str,
+            window_days: int,
+        ) -> dict[str, object]:
+            del market, symbol, window_days
+            content_by_module = {
+                "technical": technical_content,
+                "capital": capital_content,
+                "derivatives": derivatives_content,
+            }
+            return {
+                "data": {
+                    "err_code": 0,
+                    "time_range": 7,
+                    "content": content_by_module[module],
+                }
+            }
+
+    extractor = FutuSkillFactsExtractor(
+        news_extractor=FakeExtractor(),
+        anomaly_client=FakeAnomalyClient(),
+    )
+
+    technical = extractor.extract_technical_anomaly(
+        market="US",
+        symbol="NVDA",
+        name="NVIDIA",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+    capital = extractor.extract_capital_anomaly(
+        market="US",
+        symbol="NVDA",
+        name="NVIDIA",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+    derivatives = extractor.extract_derivatives_anomaly(
+        market="US",
+        symbol="NVDA",
+        name="NVIDIA",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+    categories = {item["name"]: item for item in technical["categories"]}
+    capital_categories = {item["name"]: item for item in capital["categories"]}
+    derivatives_categories = {
+        item["name"]: item for item in derivatives["categories"]
+    }
+
+    assert categories["MACD"]["state"] == "anomaly"
+    assert categories["MACD"]["detail"] == technical_content
+    assert categories["RSI"]["state"] == "anomaly"
+    assert categories["RSI"]["detail"] == technical_content
+    assert categories["MA"]["state"] == "none"
+    assert technical["signal"] != "neutral"
+    assert any(item["state"] == "anomaly" for item in technical["categories"])
+    assert capital_categories["资金流向"]["state"] == "anomaly"
+    assert capital_categories["资金流向"]["detail"] == capital_content
+    assert capital["signal"] != "neutral"
+    assert derivatives_categories["期权波动率"]["state"] == "anomaly"
+    assert derivatives_categories["期权波动率"]["detail"] == derivatives_content
+    assert derivatives["signal"] != "neutral"
+
+
 def test_generate_futu_skill_facts_records_error_for_zero_anomaly_window_days(
     tmp_path: Path,
 ) -> None:

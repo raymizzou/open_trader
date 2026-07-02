@@ -1087,7 +1087,14 @@ def _normalize_anomaly_payload(
     category_labels: tuple[str, ...],
     window_days: int,
 ) -> dict[str, object]:
-    rows = _anomaly_rows(payload.get("data"))
+    data = payload.get("data")
+    rows = [
+        *_anomaly_rows(data),
+        *_content_anomaly_rows(
+            _sdk_content_text(data),
+            category_labels=category_labels,
+        ),
+    ]
     categories = [
         _category_from_rows(label, rows)
         for label in category_labels
@@ -1126,6 +1133,29 @@ def _normalize_anomaly_payload(
     }
     _validate_signal_module(module, module_name)
     return module
+
+
+def _sdk_content_text(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    return _optional_text(data.get("content"))
+
+
+def _content_anomaly_rows(
+    content: str,
+    *,
+    category_labels: tuple[str, ...],
+) -> list[dict[str, object]]:
+    if not content:
+        return []
+    return [
+        {
+            "name": label,
+            "description": content,
+        }
+        for label in category_labels
+        if _text_matches_category(content, label)
+    ]
 
 
 def _anomaly_rows(data: object) -> list[dict[str, object]]:
@@ -1191,7 +1221,11 @@ def _row_matches_category(row: dict[str, object], label: str) -> bool:
         value = _optional_text(row.get(field)).casefold()
         if value == normalized_label:
             return True
-    text = _row_text(row)
+    return _text_matches_category(_row_text(row), label)
+
+
+def _text_matches_category(text: str, label: str) -> bool:
+    normalized_text = text.casefold()
     aliases = {
         "K线形态": ("k线", "形态", "pattern"),
         "资金分布与买卖经纪商": (
@@ -1214,11 +1248,23 @@ def _row_matches_category(row: dict[str, object], label: str) -> bool:
         "期权情绪": ("期权情绪", "put/call", "pcr", "option_sentiment"),
         "期权综合信号": ("期权综合", "option_comprehensive"),
     }
-    terms = aliases.get(label, (normalized_label,))
+    terms = aliases.get(label, (label.casefold(),))
     return any(
-        len(term) > 2 and term.casefold() in text
+        _term_matches_text(term, normalized_text)
         for term in terms
+        if term
     )
+
+
+def _term_matches_text(term: str, normalized_text: str) -> bool:
+    normalized_term = term.casefold()
+    if re.fullmatch(r"[a-z0-9/]+", normalized_term):
+        pattern = (
+            rf"(?<![a-z0-9]){re.escape(normalized_term)}"
+            rf"(?![a-z0-9])"
+        )
+        return re.search(pattern, normalized_text) is not None
+    return normalized_term in normalized_text
 
 
 def _row_text(row: dict[str, object]) -> str:
