@@ -299,6 +299,27 @@ class FakeFullFutuSkillExtractor:
         }
 
 
+class FakeInvalidAnomalyWindowExtractor(FakeFullFutuSkillExtractor):
+    def extract_technical_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        module = super().extract_technical_anomaly(
+            market=market,
+            symbol=symbol,
+            name=name,
+            run_date=run_date,
+            window_days=window_days,
+        )
+        module["window_days"] = 0
+        return module
+
+
 class FakeDomesticSummarizer:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -602,6 +623,36 @@ def test_anomaly_category_templates_are_fixed() -> None:
     )
 
 
+def test_generate_futu_skill_facts_records_error_for_zero_anomaly_window_days(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio,
+        [{"market": "US", "symbol": "NVDA", "name": "NVIDIA", "asset_class": "stock"}],
+    )
+
+    result = generate_futu_skill_facts(
+        portfolio_path=portfolio,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        extractor=FakeInvalidAnomalyWindowExtractor(),
+        update_latest=False,
+        window_days=7,
+    )
+
+    payload = load_futu_skill_facts_cache(result.run_path)
+    record = payload["records"][0]
+    assert result.records == 1
+    assert result.generated == 0
+    assert result.failed == 1
+    assert record["technical_anomaly"]["status"] == "error"
+    assert record["technical_anomaly"]["window_days"] == 7
+    assert record["technical_anomaly"]["categories"][0]["name"] == "技术异动"
+    assert "technical_anomaly: window_days must be between 1 and 30" in record["error"]
+
+
 def test_generate_futu_skill_facts_skips_missing_symbols_and_cash(tmp_path: Path) -> None:
     portfolio = tmp_path / "data/latest/portfolio.csv"
     write_portfolio(
@@ -825,6 +876,14 @@ def test_validate_futu_skill_fact_record_rejects_invalid_anomaly_category_state(
     record["technical_anomaly"]["categories"][0]["state"] = "maybe"
 
     with pytest.raises(ValueError, match="technical_anomaly category state is invalid"):
+        validate_futu_skill_fact_record(record)
+
+
+def test_validate_futu_skill_fact_record_rejects_invalid_anomaly_window_days() -> None:
+    record = valid_record()
+    record["technical_anomaly"]["window_days"] = 999
+
+    with pytest.raises(ValueError, match="window_days must be between 1 and 30"):
         validate_futu_skill_fact_record(record)
 
 

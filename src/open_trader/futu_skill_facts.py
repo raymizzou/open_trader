@@ -798,6 +798,8 @@ def _validate_news_sentiment_module(module: object) -> None:
 def _normalize_signal_module(module: object, module_name: str) -> dict[str, Any]:
     if not isinstance(module, dict):
         raise ValueError(f"{module_name} module is invalid")
+    raw_window_days = module.get("window_days")
+    window_days = 7 if raw_window_days is None or raw_window_days == "" else raw_window_days
     normalized = {
         "status": _required_enum(module, "status", VALID_MODULE_STATUSES, module_name),
         "signal": _required_enum(module, "signal", VALID_SIGNALS, module_name),
@@ -808,7 +810,7 @@ def _normalize_signal_module(module: object, module_name: str) -> dict[str, Any]
             VALID_CONSTRAINTS,
             module_name,
         ),
-        "window_days": _validate_window_days(module.get("window_days") or 7),
+        "window_days": _validate_window_days(window_days),
         "summary": _optional_text(module.get("summary")),
         "categories": _normalize_signal_categories(
             module.get("categories"),
@@ -860,6 +862,7 @@ def _validate_signal_module(module: object, module_name: str) -> None:
     _validate_enum(module, "suggested_constraint", VALID_CONSTRAINTS, module_name)
     if not isinstance(module.get("window_days"), int):
         raise ValueError(f"{module_name} window_days is invalid")
+    _validate_window_days(module["window_days"])
     if not isinstance(module.get("summary"), str):
         raise ValueError(f"{module_name} summary is invalid")
     categories = module.get("categories")
