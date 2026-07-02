@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .futu_quote import (
+    QUOTE_INTERRUPTED_NEXT_STEP,
     SNAPSHOT_FAILED_NEXT_STEP,
     FutuQuoteClient,
     FutuQuoteError,
@@ -104,8 +105,18 @@ class FutuTSignalMarketDataClient(FutuQuoteClient):
     def _raise_on_error(self, ret_code: int, data: object) -> None:
         if ret_code == 0:
             return
+        message = str(data)
+        if "网络中断" in message:
+            raise FutuQuoteError(
+                message,
+                error_type="quote_server_interrupted",
+                next_step=QUOTE_INTERRUPTED_NEXT_STEP,
+                opend_reachable=True,
+                context_ok=True,
+                snapshot_ok=False,
+            )
         raise FutuQuoteError(
-            str(data),
+            message,
             error_type="snapshot_failed",
             next_step=SNAPSHOT_FAILED_NEXT_STEP,
             opend_reachable=True,

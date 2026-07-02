@@ -151,6 +151,88 @@ def test_futu_t_signal_client_wraps_kline_failure() -> None:
     assert exc_info.value.error_type == "snapshot_failed"
 
 
+def test_futu_t_signal_client_classifies_quote_server_interruption() -> None:
+    class InterruptedContext(FakeTSignalContext):
+        def get_order_book(self, code: str, num: int) -> tuple[int, object]:
+            return -1, "网络中断"
+
+    client = FutuTSignalMarketDataClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=InterruptedContext,
+        connectivity_checker=lambda host, port: True,
+        kline_type_1m="K_1M",
+        kline_type_5m="K_5M",
+    )
+
+    with pytest.raises(FutuQuoteError) as exc_info:
+        client.get_market_facts(
+            run_date="2026-07-02",
+            market="US",
+            symbol="VIXY",
+            futu_symbol="US.VIXY",
+            name="Volatility ETF",
+            session_phase="regular",
+            updated_at="2026-07-02T22:31:00+08:00",
+        )
+
+    assert exc_info.value.error_type == "quote_server_interrupted"
+    assert "qot_logined=True" in exc_info.value.next_step
+
+
+def test_futu_t_signal_client_ignores_malformed_numeric_values() -> None:
+    class MalformedContext(FakeTSignalContext):
+        def get_market_snapshot(self, symbols: list[str]) -> tuple[int, object]:
+            return (
+                0,
+                FakeDataFrame(
+                    [
+                        {
+                            "code": "US.VIXY",
+                            "last_price": "bad",
+                            "change_rate": "NaN",
+                            "low_price": "",
+                            "high_price": None,
+                        }
+                    ]
+                ),
+            )
+
+        def get_cur_kline(self, code: str, num: int, ktype: object) -> tuple[int, object]:
+            return 0, FakeDataFrame([{"close": "bad", "volume": "NaN"}])
+
+        def get_order_book(self, code: str, num: int) -> tuple[int, object]:
+            return 0, {"Bid": [("bad", "NaN", 1)], "Ask": [(None, "", 1)]}
+
+    client = FutuTSignalMarketDataClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=MalformedContext,
+        connectivity_checker=lambda host, port: True,
+        kline_type_1m="K_1M",
+        kline_type_5m="K_5M",
+    )
+
+    facts = client.get_market_facts(
+        run_date="2026-07-02",
+        market="US",
+        symbol="VIXY",
+        futu_symbol="US.VIXY",
+        name="Volatility ETF",
+        session_phase="regular",
+        updated_at="2026-07-02T22:31:00+08:00",
+    )
+
+    assert facts.last_price is None
+    assert facts.day_change_pct is None
+    assert facts.vwap is None
+    assert facts.ma_1m is None
+    assert facts.ma_5m is None
+    assert facts.bid is None
+    assert facts.ask is None
+    assert facts.volume_ratio_5m is None
+
+
 def test_futu_t_signal_client_close_closes_context() -> None:
     client = FutuTSignalMarketDataClient(
         host="127.0.0.1",
