@@ -1217,8 +1217,16 @@ def _module_needs_detail_summary(module: dict[str, object]) -> bool:
     return any(
         isinstance(category, dict)
         and category.get("state") == "anomaly"
-        and len(_optional_text(category.get("detail"))) > 120
+        and _detail_needs_summary(_optional_text(category.get("detail")))
         for category in categories
+    )
+
+
+def _detail_needs_summary(detail: str) -> bool:
+    return (
+        len(detail) > 70
+        or "[timestamp:" in detail
+        or "\n" in detail
     )
 
 
@@ -1282,7 +1290,7 @@ def _compact_anomaly_module_details(
             continue
         updated = dict(category)
         detail = _optional_text(updated.get("detail"))
-        if len(detail) > 120:
+        if _detail_needs_summary(detail):
             updated["detail"] = _compact_anomaly_detail(detail)
         categories.append(updated)
     compacted["categories"] = categories

@@ -1099,6 +1099,53 @@ def test_futu_skill_facts_extractor_defaults_to_compact_summary_without_llm_key(
     assert long_content not in anomaly_details
 
 
+def test_futu_skill_facts_extractor_compacts_timestamp_details_without_llm_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    raw_content = (
+        "[timestamp: 1782748800]\n"
+        "MA指标呈现空头排列，表明价格可能持续下跌。\n"
+        "[timestamp: 1782662400]\n"
+        "KDJ指标从中性区间转为强超卖水平。"
+    )
+
+    class FakeAnomalyClient:
+        def run(
+            self,
+            module: str,
+            *,
+            market: str,
+            symbol: str,
+            window_days: int,
+        ) -> dict[str, object]:
+            del module, market, symbol, window_days
+            return {"data": {"err_code": 0, "content": raw_content}}
+
+    extractor = FutuSkillFactsExtractor(
+        news_extractor=FakeExtractor(),
+        anomaly_client=FakeAnomalyClient(),
+    )
+
+    result = extractor.extract_technical_anomaly(
+        market="HK",
+        symbol="02840",
+        name="SPDR 金 ETF",
+        run_date="2026-07-02",
+        window_days=7,
+    )
+    details = [
+        category["detail"]
+        for category in result["categories"]
+        if category["state"] == "anomaly"
+    ]
+
+    assert details
+    assert all("[timestamp:" not in detail for detail in details)
+    assert all("\n" not in detail for detail in details)
+    assert all(len(detail) <= 90 for detail in details)
+
+
 def test_futu_skill_facts_extractor_preserves_structured_sdk_row_details() -> None:
     class FakeAnomalyClient:
         def run(
