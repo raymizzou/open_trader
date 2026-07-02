@@ -623,6 +623,29 @@ console.log(html.slice(start, end));
     assert "中性" not in output
 
 
+def test_dashboard_futu_anomaly_missing_modules_do_not_render_neutral_direction() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  decision_facts: {},
+  futu_skill_facts: {}
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf('<div class="futu-signal-module-grid">');
+const end = html.indexOf('<p class="condition-box">');
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal module boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    assert output.count("<strong>缺失</strong>") >= 3
+    assert "<strong>中性</strong>" not in output
+
+
 def test_dashboard_futu_anomaly_unknown_enums_render_safe_chinese_fallback() -> None:
     output = run_dashboard_js(
         """
