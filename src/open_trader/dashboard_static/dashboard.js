@@ -934,12 +934,15 @@ function futuAnomalySignalsPlugin(holding) {
 function futuSignalModuleView(module, key, title) {
   const value = module && typeof module === "object" ? module : {};
   const status = hasValue(value.status) ? String(value.status) : "missing";
+  const signal = value.available === true && !["missing", "error", "stale"].includes(status) && hasValue(value.signal)
+    ? String(value.signal)
+    : status;
   return {
     key,
     title,
     available: value.available === true,
     status,
-    signal: hasValue(value.signal) ? String(value.signal) : status,
+    signal,
     confidence: hasValue(value.confidence) ? String(value.confidence) : "low",
     suggestedConstraint: hasValue(value.suggested_constraint) ? String(value.suggested_constraint) : "",
     summary: hasValue(value.summary) ? String(value.summary) : "缺失",

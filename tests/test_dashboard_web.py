@@ -630,7 +630,35 @@ const holding = {
   market: "US",
   symbol: "NVDA",
   decision_facts: {},
-  futu_skill_facts: {}
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: false,
+      status: "missing",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "缺少富途技术异动数据。",
+      categories: []
+    },
+    capital_anomaly: {
+      available: false,
+      status: "error",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "富途资金异动查询失败。",
+      categories: []
+    },
+    derivatives_anomaly: {
+      available: false,
+      status: "stale",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "富途衍生品异动数据已过期。",
+      categories: []
+    }
+  }
 };
 const html = renderTradingDecisionPlugins(holding);
 const start = html.indexOf('<div class="futu-signal-module-grid">');
@@ -642,7 +670,8 @@ console.log(html.slice(start, end));
 """
     )
 
-    assert output.count("<strong>缺失</strong>") >= 3
+    for required in ["<strong>缺失</strong>", "<strong>错误</strong>", "<strong>已过期</strong>"]:
+        assert required in output
     assert "<strong>中性</strong>" not in output
 
 
