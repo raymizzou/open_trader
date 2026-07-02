@@ -317,6 +317,36 @@ def test_build_t_signal_blocks_unsupported_market_without_raising() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "facts",
+    [
+        regular_facts(symbol="00700", futu_symbol="HK.00701"),
+        regular_facts(
+            market="US",
+            symbol="MSFT",
+            futu_symbol="US.AAPL",
+        ),
+    ],
+)
+def test_build_t_signal_blocks_symbol_identity_mismatch(
+    facts: TMarketFacts,
+) -> None:
+    signal = build_t_signal_from_facts(
+        facts=facts,
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="标的代码与富途代码不一致。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.status == "review"
+    assert any(
+        gate.name == "symbol" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
 @pytest.mark.parametrize("phase", ["pre_market", "post_market", "closed", "unknown"])
 def test_non_regular_session_blocks_buy_sell(phase: str) -> None:
     signal = build_t_signal_from_facts(
@@ -389,6 +419,38 @@ def test_incomplete_market_price_facts_block_action(
         baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
         previous=None,
         ai_summary_zh="行情价格字段不完整。",
+    )
+
+    assert signal.action == "REVIEW"
+    assert signal.suggested_ratio == ""
+    assert signal.status == "review"
+    assert any(
+        gate.name == "technical" and gate.status == "block"
+        for gate in signal.hard_gates
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"last_price": Decimal("0")},
+        {"last_price": Decimal("-1")},
+        {"vwap": Decimal("0")},
+        {"ma_1m": Decimal("0")},
+        {"ma_5m": Decimal("0")},
+        {"day_low": Decimal("0")},
+        {"day_high": Decimal("0")},
+        {"volume_ratio_5m": Decimal("0")},
+    ],
+)
+def test_non_positive_required_price_facts_block_action(
+    overrides: dict[str, object],
+) -> None:
+    signal = build_t_signal_from_facts(
+        facts=regular_facts(**overrides),
+        baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
+        previous=None,
+        ai_summary_zh="行情价格字段非正数。",
     )
 
     assert signal.action == "REVIEW"

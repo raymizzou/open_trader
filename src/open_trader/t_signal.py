@@ -248,12 +248,7 @@ def build_t_signal_from_facts(
     # Cycle state and duplicate suppression are handled by the watcher layer.
     del previous
 
-    try:
-        futu_symbol = to_futu_symbol(facts.market, facts.futu_symbol or facts.symbol)
-        symbol_error = ""
-    except ValueError as exc:
-        futu_symbol = ""
-        symbol_error = str(exc)
+    futu_symbol, symbol_error = _canonicalize_fact_symbols(facts)
     liquidity = _build_liquidity(facts)
     technical = _build_technical(facts)
     hard_gates = _build_hard_gates(facts, baseline, liquidity, symbol_error)
@@ -288,8 +283,8 @@ def build_t_signal_from_facts(
     signal = TSignal(
         schema_version=SCHEMA_VERSION,
         run_date=facts.run_date,
-        market=facts.market.upper(),
-        symbol=facts.symbol,
+        market=facts.market.strip().upper(),
+        symbol=_normalize_display_symbol(facts.market, facts.symbol),
         futu_symbol=futu_symbol,
         name=facts.name,
         session_phase=facts.session_phase,
@@ -344,6 +339,32 @@ def _build_liquidity(facts: TMarketFacts) -> TSignalLiquidity:
         ask_depth=_decimal_text(facts.ask_depth),
         depth_status=depth_status,
     )
+
+
+def _canonicalize_fact_symbols(facts: TMarketFacts) -> tuple[str, str]:
+    try:
+        symbol_futu = to_futu_symbol(facts.market, facts.symbol)
+        if not facts.futu_symbol:
+            return symbol_futu, ""
+        explicit_futu = to_futu_symbol(facts.market, facts.futu_symbol)
+    except ValueError as exc:
+        return "", str(exc)
+    if explicit_futu != symbol_futu:
+        return (
+            symbol_futu,
+            f"symbol {symbol_futu} does not match futu_symbol {explicit_futu}",
+        )
+    return explicit_futu, ""
+
+
+def _normalize_display_symbol(market: str, symbol: str) -> str:
+    normalized_market = market.strip().upper()
+    normalized_symbol = symbol.strip().upper()
+    if normalized_symbol.startswith(f"{normalized_market}."):
+        normalized_symbol = normalized_symbol.split(".", 1)[1]
+    if normalized_market == "HK" and normalized_symbol.isdigit():
+        return normalized_symbol.zfill(5)
+    return normalized_symbol
 
 
 def _spread_pct(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
@@ -581,19 +602,21 @@ def _decimal_text(value: Decimal | None) -> str:
 
 
 def _has_required_technical_facts(facts: TMarketFacts) -> bool:
-    return all(
-        _is_finite_decimal(value)
-        for value in (
-            facts.last_price,
-            facts.day_change_pct,
-            facts.vwap,
-            facts.ma_1m,
-            facts.ma_5m,
-            facts.day_low,
-            facts.day_high,
-            facts.rsi_5m,
-            facts.volume_ratio_5m,
+    return (
+        all(
+            _is_positive_finite_decimal(value)
+            for value in (
+                facts.last_price,
+                facts.vwap,
+                facts.ma_1m,
+                facts.ma_5m,
+                facts.day_low,
+                facts.day_high,
+                facts.volume_ratio_5m,
+            )
         )
+        and _is_finite_decimal(facts.day_change_pct)
+        and _is_finite_decimal(facts.rsi_5m)
     )
 
 
