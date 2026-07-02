@@ -21,6 +21,11 @@ from .futu_skill_facts import (
     load_futu_skill_facts_cache,
 )
 from .research_chat import load_research_view_for_holding
+from .t_signal_store import (
+    index_t_signals_by_market_symbol,
+    load_t_signals_cache,
+    t_signals_latest_path,
+)
 from .technical_facts import (
     extract_market_report,
     index_technical_facts_by_market_symbol,
@@ -160,6 +165,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         data_dir=config.data_dir,
         markets=holding_markets,
     )
+    t_signals_by_holding = _latest_t_signals_for_markets(
+        data_dir=config.data_dir,
+        markets=holding_markets,
+    )
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
@@ -181,6 +190,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             decision_facts_file_exists_by_market,
             futu_skill_facts_by_holding,
             tradingagents_summary_by_holding,
+            t_signals_by_holding,
         )
         for row in holding_rows
     ]
@@ -389,6 +399,21 @@ def _latest_tradingagents_summary_for_markets(
     return records_by_key
 
 
+def _latest_t_signals_for_markets(
+    *,
+    data_dir: Path,
+    markets: set[str],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for market in markets:
+        path = t_signals_latest_path(data_dir, market)
+        if path.exists():
+            records_by_key.update(
+                index_t_signals_by_market_symbol(load_t_signals_cache(path))
+            )
+    return records_by_key
+
+
 def _markets_from_rows(rows: list[dict[str, str]]) -> set[str]:
     markets: set[str] = set()
     for row in rows:
@@ -465,6 +490,7 @@ def _merge_holding(
     decision_facts_file_exists_by_market: dict[str, bool],
     futu_skill_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
     tradingagents_summary_by_holding: dict[tuple[str, str], dict[str, Any]],
+    t_signals_by_holding: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -508,6 +534,9 @@ def _merge_holding(
     )
     holding["futu_skill_facts"] = _futu_skill_facts_detail(
         futu_skill_facts_by_holding.get(key) if key is not None else None,
+    )
+    holding["t_signal"] = _t_signal_detail(
+        t_signals_by_holding.get(key) if key is not None else None,
     )
     holding["research_view"] = (
         load_research_view_for_holding(
@@ -553,6 +582,12 @@ def _row_detail(row: dict[str, str] | None) -> dict[str, Any]:
     if row is None:
         return _unavailable_detail()
     return {"available": True, **row}
+
+
+def _t_signal_detail(record: dict[str, Any] | None) -> dict[str, Any]:
+    if record is None:
+        return _unavailable_detail()
+    return {"available": True, **record}
 
 
 def _agent_report_detail(row: dict[str, str] | None) -> dict[str, Any]:

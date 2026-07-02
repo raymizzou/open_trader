@@ -337,6 +337,94 @@ def write_tradingagents_summary(path: Path) -> None:
     )
 
 
+def write_t_signals(path: Path, *, symbol: str = "VIXY", action: str = "BUY_T") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    suggested_ratio = "10" if action in {"BUY_T", "SELL_T"} else ""
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.t_signals_cache.v1",
+                "generated_at": "2026-07-02T22:32:00+08:00",
+                "run_date": "2026-07-02",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.t_signal.v1",
+                        "run_date": "2026-07-02",
+                        "market": "US",
+                        "symbol": symbol,
+                        "futu_symbol": f"US.{symbol}",
+                        "name": "Volatility ETF",
+                        "session_phase": "regular",
+                        "updated_at": "2026-07-02T22:31:00+08:00",
+                        "action": action,
+                        "suggested_ratio": suggested_ratio,
+                        "current_status": "BUY_T 条件满足，等待执行确认。",
+                        "signal_summary_zh": "价格低于 VWAP 后回收，适合按 10% 底仓比例低吸买回。",
+                        "price": {
+                            "last_price": "48.50",
+                            "day_change_pct": "-1.20",
+                            "vwap": "49.10",
+                            "ma_1m": "48.55",
+                            "ma_5m": "48.85",
+                            "day_low": "48.00",
+                            "day_high": "50.20",
+                        },
+                        "liquidity": {
+                            "bid": "48.49",
+                            "ask": "48.50",
+                            "spread_pct": "0.021",
+                            "bid_depth": "5000",
+                            "ask_depth": "4700",
+                            "depth_status": "pass",
+                        },
+                        "technical": {
+                            "rsi_5m": "34",
+                            "volume_ratio_5m": "1.30",
+                            "price_position": "below_vwap_reclaim",
+                            "trend_state": "range_rebound",
+                        },
+                        "hard_gates": [
+                            {
+                                "name": "session_phase",
+                                "status": "pass",
+                                "message_zh": "当前处于盘中交易时段。",
+                            }
+                        ],
+                        "evidence": [
+                            {
+                                "name": "vwap_reclaim",
+                                "direction": "buy",
+                                "strength": "medium",
+                                "message_zh": "价格低于 VWAP 后回收。",
+                            }
+                        ],
+                        "timeline": [
+                            {
+                                "event_at": "2026-07-02T22:31:00+08:00",
+                                "event_type": "signal_created",
+                                "action": action,
+                                "suggested_ratio": suggested_ratio,
+                                "message_zh": "生成 BUY_T 信号，建议比例 10%。",
+                            }
+                        ],
+                        "notification": {
+                            "should_notify": True,
+                            "notified": False,
+                            "dedupe_key": f"2026-07-02|US.{symbol}|{action}|{suggested_ratio}",
+                            "last_notified_at": "",
+                        },
+                        "status": "ok",
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def portfolio_rows() -> list[dict[str, str]]:
     return [
         {
@@ -720,6 +808,35 @@ def test_load_dashboard_state_merges_agent_report_strategy_and_actions(
     assert vixy["trade_action"]["available"] is True
     assert vixy["trade_action"]["action"] == "TRIM"
     assert vixy["trade_action"]["suggested_quantity"] == "50"
+
+
+def test_load_dashboard_state_attaches_t_signal_from_market_scoped_latest(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_t_signals(config.data_dir / "latest" / "US" / "t_signals.json")
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["t_signal"]["available"] is True
+    assert vixy["t_signal"]["action"] == "BUY_T"
+    assert vixy["t_signal"]["suggested_ratio"] == "10"
+    assert vixy["t_signal"]["signal_summary_zh"].startswith("价格低于 VWAP")
+    assert vixy["t_signal"]["timeline"][0]["event_type"] == "signal_created"
+
+
+def test_load_dashboard_state_marks_t_signal_unavailable_when_missing(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["t_signal"] == {"available": False, "error": ""}
 
 
 def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallback(
