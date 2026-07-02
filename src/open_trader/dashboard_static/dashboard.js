@@ -25,9 +25,11 @@ const elements = {};
 const HOLDINGS_TABLE_COLUMN_COUNT = 10;
 
 const MARKET_SECTION_CONFIGS = [
-  { market: "US", label: "US 美股持仓", className: "market-section-us" },
-  { market: "HK", label: "HK 港股持仓", className: "market-section-hk" },
-  { market: "OTHER", label: "其他市场持仓", className: "market-section-other" },
+  { market: "US_STOCK", marketGroup: "US", label: "美股正股", className: "market-section-us-stock" },
+  { market: "US_OPTION", marketGroup: "US", label: "美股期权", className: "market-section-us-option" },
+  { market: "HK_STOCK", marketGroup: "HK", label: "港股正股", className: "market-section-hk-stock" },
+  { market: "HK_OPTION", marketGroup: "HK", label: "港股期权", className: "market-section-hk-option" },
+  { market: "OTHER", marketGroup: "OTHER", label: "其他市场持仓", className: "market-section-other" },
 ];
 
 const ACTION_LABELS = {
@@ -3203,10 +3205,41 @@ function holdingsEmptyRow(message) {
 
 function marketSectionKey(holding) {
   const market = String(holding && holding.market || "").trim().toUpperCase();
-  if (market === "US" || market === "HK") {
-    return market;
+  if (market === "US") {
+    return isOptionHolding(holding) ? "US_OPTION" : "US_STOCK";
+  }
+  if (market === "HK") {
+    return isOptionHolding(holding) ? "HK_OPTION" : "HK_STOCK";
   }
   return "OTHER";
+}
+
+function isOptionHolding(holding) {
+  const optionFields = [
+    holding && holding.asset_class,
+    holding && holding.security_type,
+    holding && holding.sec_type,
+    holding && holding.instrument_type,
+    holding && holding.product_type,
+  ];
+  if (optionFields.some((value) => isOptionText(value))) {
+    return true;
+  }
+  const symbol = String(holding && holding.symbol || "").trim().toUpperCase();
+  if (/^[A-Z]{1,8}\d{6}[CP]\d{5,8}$/.test(symbol) || /^[A-Z]{1,8}\s+\d{6}[CP]\d{5,8}$/.test(symbol)) {
+    return true;
+  }
+  const name = String(holding && holding.name || "").trim();
+  const fundLike = /ETF|基金|FUND/i.test(name);
+  return !fundLike && /(?:CALL|PUT|OPTION|期权|期權|\d{6}\s+\d+(?:\.\d+)?[CP])/.test(name);
+}
+
+function isOptionText(value) {
+  if (!hasValue(value)) {
+    return false;
+  }
+  const text = String(value).trim();
+  return /^(option|options)$/i.test(text) || /(?:期权|期權)/.test(text);
 }
 
 function groupedHoldingsByMarketSection(holdings) {
@@ -3215,14 +3248,22 @@ function groupedHoldingsByMarketSection(holdings) {
     rows: [],
   }));
   const sectionByMarket = new Map(sections.map((section) => [section.market, section]));
+  const presentMarketGroups = new Set();
   holdings.forEach((holding, index) => {
-    const section = sectionByMarket.get(marketSectionKey(holding)) || sectionByMarket.get("OTHER");
+    const sectionKey = marketSectionKey(holding);
+    const section = sectionByMarket.get(sectionKey) || sectionByMarket.get("OTHER");
+    presentMarketGroups.add(section.marketGroup);
     section.rows.push({ holding, index });
   });
   sections.forEach((section) => {
     section.rows.sort(compareRowsByPortfolioWeight);
   });
-  return sections.filter((section) => section.rows.length > 0);
+  return sections.filter((section) => {
+    if (section.rows.length > 0) {
+      return true;
+    }
+    return section.marketGroup !== "OTHER" && presentMarketGroups.has(section.marketGroup);
+  });
 }
 
 function sectionRowHolding(row) {
@@ -3248,6 +3289,9 @@ function compareRowsByPortfolioWeight(left, right) {
 }
 
 function sumNumericField(rows, fieldName) {
+  if (rows.length === 0) {
+    return 0;
+  }
   let total = 0;
   for (const row of rows) {
     const value = numericValue(sectionRowHolding(row)[fieldName]);
@@ -3260,6 +3304,9 @@ function sumNumericField(rows, fieldName) {
 }
 
 function sumPercentField(rows, fieldName) {
+  if (rows.length === 0) {
+    return 0;
+  }
   let total = 0;
   for (const row of rows) {
     const parsed = numericPercentValue(sectionRowHolding(row)[fieldName]);

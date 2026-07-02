@@ -431,8 +431,10 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".source-status-row" in css
     assert ".cash-detail-panel" in css
     assert ".market-section-row" in css
-    assert ".market-section-us" in css
-    assert ".market-section-hk" in css
+    assert ".market-section-us-stock" in css
+    assert ".market-section-us-option" in css
+    assert ".market-section-hk-stock" in css
+    assert ".market-section-hk-option" in css
     assert ".symbol-cell" in css
     scoped_table_selector = ".holdings-panel > .table-wrap > table"
     assert scoped_table_selector in css
@@ -1964,6 +1966,33 @@ state.dashboard = {
       portfolio_weight_hkd: "2.50%",
       unrealized_pnl_pct: "-1.00%",
     },
+    {
+      market: "US",
+      symbol: "VIXY260821C22000",
+      name: "VIXY 260821 22.00C",
+      brokers: "futu",
+      currency: "USD",
+      total_quantity: "1",
+      avg_cost_price: "2.10",
+      market_value: "168.00",
+      market_value_hkd: "300.00",
+      portfolio_weight_hkd: "0.50%",
+      unrealized_pnl_pct: "-20.00%",
+    },
+    {
+      market: "HK",
+      symbol: "HKOPT",
+      name: "腾讯 260730 400.00C",
+      asset_class: "option",
+      brokers: "futu",
+      currency: "HKD",
+      total_quantity: "1",
+      avg_cost_price: "1.00",
+      market_value: "200.00",
+      market_value_hkd: "200.00",
+      portfolio_weight_hkd: "0.40%",
+      unrealized_pnl_pct: "1.00%",
+    },
   ],
   cash_rows: [
     {
@@ -2054,10 +2083,10 @@ state.dashboard = {
 state.marketFilter = "US";
 state.brokerFilter = "futu";
 const summary = currentViewSummary();
-if (summary.portfolio_value_hkd !== "15132.00") {
+if (summary.portfolio_value_hkd !== "15432.00") {
   throw new Error("unexpected portfolio value: " + JSON.stringify(summary));
 }
-if (summary.holding_value_hkd !== "15132.00") {
+if (summary.holding_value_hkd !== "15432.00") {
   throw new Error("unexpected holding value: " + JSON.stringify(summary));
 }
 if (summary.cash_like_value_hkd !== "") {
@@ -2066,7 +2095,7 @@ if (summary.cash_like_value_hkd !== "") {
 if (summary.holding_weight_hkd !== "100.00%") {
   throw new Error("unexpected holding weight: " + JSON.stringify(summary));
 }
-if (summary.holding_count !== 1) {
+if (summary.holding_count !== 2) {
   throw new Error("unexpected holding count: " + JSON.stringify(summary));
 }
 state.marketFilter = "ALL";
@@ -2239,16 +2268,32 @@ if (!elements["holdings-body"].innerHTML.includes("交易决策") || elements["h
   throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
 }
 const renderedHoldings = elements["holdings-body"].innerHTML;
-const usSectionIndex = renderedHoldings.indexOf("US 美股持仓");
-const hkSectionIndex = renderedHoldings.indexOf("HK 港股持仓");
-if (usSectionIndex === -1 || hkSectionIndex === -1 || usSectionIndex > hkSectionIndex) {
-  throw new Error("holdings should render US section before HK section: " + renderedHoldings);
+const usStockSectionIndex = renderedHoldings.indexOf("美股正股");
+const usOptionSectionIndex = renderedHoldings.indexOf("美股期权");
+const hkStockSectionIndex = renderedHoldings.indexOf("港股正股");
+const hkOptionSectionIndex = renderedHoldings.indexOf("港股期权");
+if (
+  usStockSectionIndex === -1
+  || usOptionSectionIndex === -1
+  || hkStockSectionIndex === -1
+  || hkOptionSectionIndex === -1
+  || usStockSectionIndex > usOptionSectionIndex
+  || usOptionSectionIndex > hkStockSectionIndex
+  || hkStockSectionIndex > hkOptionSectionIndex
+) {
+  throw new Error("holdings should render stock/option market sections in requested order: " + renderedHoldings);
 }
 if (!renderedHoldings.includes("2 个标的 · 港元市值 HKD 49162.50 · 权重 10.00%")) {
-  throw new Error("US section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+  throw new Error("US stock section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
 }
 if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 15982.00 · 权重 3.25%")) {
-  throw new Error("HK section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+  throw new Error("HK stock section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 300.00 · 权重 0.50%")) {
+  throw new Error("US option section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 200.00 · 权重 0.40%")) {
+  throw new Error("HK option section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
 }
 if (renderedHoldings.includes("其他市场持仓")) {
   throw new Error("OTHER section should not render without an OTHER-market holding: " + renderedHoldings);
@@ -2268,8 +2313,8 @@ if (!renderedHoldings.includes("<td class=\\"number-cell\\">-</td>")) {
   throw new Error("non-USD holding should show dash in USD market value column: " + renderedHoldings);
 }
 const holdingRows = Array.from(renderedHoldings.matchAll(/<tr class="[^"]*">\\s*<td><button class="expand-button"[\\s\\S]*?<\\/tr>/g)).map((match) => match[0]);
-if (holdingRows.length !== 3) {
-  throw new Error("main holdings table should render exactly 3 holding rows: " + renderedHoldings);
+if (holdingRows.length !== 5) {
+  throw new Error("main holdings table should render exactly 5 holding rows: " + renderedHoldings);
 }
 for (const row of holdingRows) {
   const cellCount = (row.match(/<td(?:\\s|>)/g) || []).length;
@@ -2293,6 +2338,18 @@ const sortedSections = groupedHoldingsByMarketSection([
 const sortedSymbols = sortedSections[0].rows.map((row) => row.holding.symbol).join(",");
 if (sortedSymbols !== "HIGH,LOW,MISSING") {
   throw new Error("holdings should sort by portfolio weight descending within market section: " + sortedSymbols);
+}
+const emptyOptionSections = groupedHoldingsByMarketSection([
+  { market: "US", symbol: "US_STOCK", portfolio_weight_hkd: "2.00%" },
+  { market: "HK", symbol: "HK_STOCK", portfolio_weight_hkd: "1.00%" },
+]);
+const emptyOptionKeys = emptyOptionSections.map((section) => section.market).join(",");
+if (emptyOptionKeys !== "US_STOCK,US_OPTION,HK_STOCK,HK_OPTION") {
+  throw new Error("stock/option sections should render in fixed order, including empty option sections: " + emptyOptionKeys);
+}
+const emptyOptionRow = renderMarketSectionRow(emptyOptionSections[3]);
+if (!emptyOptionRow.includes("0 个标的 · 港元市值 HKD 0.00 · 权重 0.00%")) {
+  throw new Error("empty option section should render explicit zero totals: " + emptyOptionRow);
 }
 const malformedSection = renderMarketSectionRow({
   market: "OTHER",

@@ -591,18 +591,32 @@ tbody tr.active-row {
   font-weight: 700;
 }
 
-.market-section-us td {
+.market-section-us-stock td {
   background: #eef3ed;
   border-bottom-color: #b8dac6;
   border-top-color: var(--accent);
   color: var(--accent-strong);
 }
 
-.market-section-hk td {
+.market-section-us-option td {
+  background: #f3f7f1;
+  border-bottom-color: #cbdcba;
+  border-top-color: #789a43;
+  color: #4f672b;
+}
+
+.market-section-hk-stock td {
   background: #fffaf1;
   border-bottom-color: #e1c18e;
   border-top-color: var(--warning);
   color: #7b4208;
+}
+
+.market-section-hk-option td {
+  background: #fff8ea;
+  border-bottom-color: #dfc083;
+  border-top-color: #a56705;
+  color: #6f3a04;
 }
 
 .market-section-other td {
