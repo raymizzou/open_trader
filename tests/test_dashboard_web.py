@@ -164,6 +164,30 @@ def read_text_error(url: str) -> tuple[int, str, str]:
     raise AssertionError("expected HTTPError")
 
 
+def run_dashboard_js(script: str) -> str:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    runner = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} }, console };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(process.argv[2], sandbox);
+"""
+    result = subprocess.run(
+        [node, "-e", runner, str(js_path), script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    return result.stdout
+
+
 class FakeResearchChatService:
     def __init__(self) -> None:
         self.created: list[dict[str, str]] = []
@@ -258,6 +282,12 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "当前视图" in html
     assert "富途暂无数据" in html
     assert "老虎暂无数据" in html
+    assert "futuAnomalySignalsPlugin" in js
+    assert "translateFutuSignalValue" in js
+    assert ".futu-signal-card" in css
+    assert ".futu-signal-module-grid" in css
+
+
     assert "辉立暂无数据" in html
     assert "right-rail" not in html
     assert "今日交易动作" not in html
@@ -448,6 +478,95 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".workspace-grid.detail-mode {" in mobile_css
     assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
+
+
+def test_dashboard_renders_futu_anomaly_signal_card_in_chinese() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  name: "英伟达",
+  portfolio_weight_hkd: "8.2%",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "supportive",
+      confidence: "medium",
+      suggested_constraint: "",
+      window_days: 7,
+      summary: "技术信号支持趋势。",
+      categories: [
+        {name: "MACD", state: "anomaly", direction: "bullish", detail: "金叉后继续放大。", evidence_date: "2026-07-01"},
+        {name: "RSI", state: "anomaly", direction: "risk_up", detail: "接近超买区。", evidence_date: "2026-07-02"},
+        {name: "K线形态", state: "none", direction: "", detail: "窗口内无异常。", evidence_date: ""}
+      ]
+    },
+    capital_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "mixed",
+      confidence: "medium",
+      suggested_constraint: "no_add",
+      window_days: 7,
+      summary: "资金流向与加仓动作存在分歧。",
+      categories: [
+        {name: "资金流向", state: "anomaly", direction: "bearish", detail: "主力资金连续净流出。", evidence_date: "2026-07-02"},
+        {name: "卖空情况", state: "none", direction: "", detail: "窗口内无异常。", evidence_date: ""}
+      ]
+    },
+    derivatives_anomaly: {
+      available: true,
+      status: "partial",
+      signal: "risk_up",
+      confidence: "low",
+      suggested_constraint: "no_add",
+      window_days: 7,
+      summary: "期权波动率偏高。",
+      categories: [
+        {name: "期权波动率", state: "anomaly", direction: "risk_up", detail: "IV 位于高位。", evidence_date: "2026-07-02"},
+        {name: "期权大单", state: "anomaly", direction: "bullish", detail: "出现看涨大单。", evidence_date: "2026-07-01"}
+      ]
+    }
+  }
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
+const end = html.indexOf("<h4>公司行动</h4>");
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal card boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    for required in [
+        "市场信号 · 富途异动信号",
+        "技术异动",
+        "资金异动",
+        "衍生品异动",
+        "支持",
+        "不加仓",
+        "部分可用",
+        "偏多",
+        "偏空",
+        "风险上升",
+        "无异常",
+    ]:
+        assert required in output
+
+    for forbidden in [
+        "supportive",
+        "no_add",
+        "partial",
+        "risk_up",
+        "bullish",
+        "bearish",
+        "schema",
+    ]:
+        assert forbidden not in output
 
 
 def test_dashboard_display_helpers_keep_raw_english_out_of_chinese_ui() -> None:
@@ -702,7 +821,7 @@ vm.runInContext(`
 function fixedDecisionFactCards(html) {
   const klineStart = html.indexOf("<h4>趋势 / K 线</h4>");
   const newsStart = html.indexOf("<h4>新闻 / 舆论</h4>");
-  const nextStart = html.indexOf("<h4>公司行动</h4>");
+  const nextStart = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
   if (klineStart < 0 || newsStart < 0 || nextStart < 0 || !(klineStart < newsStart && newsStart < nextStart)) {
     throw new Error("fixed decision fact card boundaries missing: " + html);
   }
@@ -857,7 +976,7 @@ vm.runInContext(`
 function fixedDecisionFactCards(html) {
   const klineStart = html.indexOf("<h4>趋势 / K 线</h4>");
   const newsStart = html.indexOf("<h4>新闻 / 舆论</h4>");
-  const nextStart = html.indexOf("<h4>公司行动</h4>");
+  const nextStart = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
   if (klineStart < 0 || newsStart < 0 || nextStart < 0 || !(klineStart < newsStart && newsStart < nextStart)) {
     throw new Error("fixed decision fact card boundaries missing: " + html);
   }

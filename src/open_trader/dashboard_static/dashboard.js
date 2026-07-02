@@ -722,6 +722,7 @@ function renderTradingDecisionPlugins(holding) {
       score: "K线",
     }),
     newsSentimentPlugin(holding),
+    futuAnomalySignalsPlugin(holding),
     {
       title: "公司行动",
       status: "占位",
@@ -892,6 +893,184 @@ function futuSkillNewsSentimentModule(holding) {
     : {};
   const module = facts.news_sentiment;
   return module && typeof module === "object" ? module : null;
+}
+
+function futuAnomalySignalsPlugin(holding) {
+  const facts = holding && holding.futu_skill_facts && typeof holding.futu_skill_facts === "object"
+    ? holding.futu_skill_facts
+    : {};
+  const modules = [
+    ["technical_anomaly", "技术异动"],
+    ["capital_anomaly", "资金异动"],
+    ["derivatives_anomaly", "衍生品异动"],
+  ].map(([key, title]) => futuSignalModuleView(facts[key], key, title));
+  const available = modules.filter((module) => module.available).length;
+  const overall = deriveFutuSignalOverall(modules);
+  return `
+    <article class="decision-plugin-card futu-signal-card">
+      <div class="decision-plugin-card-header">
+        <h4>市场信号 · 富途异动信号</h4>
+        <span class="status-pill status-${escapeHtml(overall.tone)}">${escapeHtml(available)}/3 模块可用</span>
+      </div>
+      <div class="futu-signal-overall">
+        <strong>${escapeHtml(overall.label)}</strong>
+        <div>
+          <b>${escapeHtml(overall.headline)}</b>
+          <span>${escapeHtml(overall.detail)}</span>
+        </div>
+        <div class="futu-signal-pill-row">
+          <span>${escapeHtml(translateFutuSignalValue(overall.signal))}</span>
+          <span>${escapeHtml(translateFutuSignalValue(overall.constraint))}</span>
+        </div>
+      </div>
+      <div class="futu-signal-module-grid">
+        ${modules.map(renderFutuSignalModule).join("")}
+      </div>
+      <p class="condition-box">模板约束：模块标题、状态、方向、置信度、约束、类别顺序固定；缺失、无异常和权限失败必须显式展示。</p>
+    </article>
+  `;
+}
+
+function futuSignalModuleView(module, key, title) {
+  const value = module && typeof module === "object" ? module : {};
+  return {
+    key,
+    title,
+    available: value.available === true,
+    status: hasValue(value.status) ? String(value.status) : "missing",
+    signal: hasValue(value.signal) ? String(value.signal) : "neutral",
+    confidence: hasValue(value.confidence) ? String(value.confidence) : "low",
+    suggestedConstraint: hasValue(value.suggested_constraint) ? String(value.suggested_constraint) : "",
+    summary: hasValue(value.summary) ? String(value.summary) : "缺失",
+    categories: Array.isArray(value.categories) ? value.categories.slice(0, 3) : [],
+  };
+}
+
+function deriveFutuSignalOverall(modules) {
+  const constraints = modules.map((module) => module.suggestedConstraint).filter(hasValue);
+  const signals = modules.map((module) => module.signal).filter(hasValue);
+  const constraint = constraints.includes("no_add")
+    ? "no_add"
+    : constraints.includes("review")
+      ? "review"
+      : "";
+  if (signals.includes("risk_up") || signals.includes("mixed")) {
+    return {
+      tone: constraint ? "warn" : "ok",
+      label: constraint ? "谨慎" : "分歧",
+      signal: signals.includes("risk_up") ? "risk_up" : "mixed",
+      constraint,
+      headline: "市场信号存在分歧，需要结合主结论复核。",
+      detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
+    };
+  }
+  if (signals.includes("supportive")) {
+    return {
+      tone: "ok",
+      label: "支持",
+      signal: "supportive",
+      constraint,
+      headline: "市场信号支持当前交易方向。",
+      detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
+    };
+  }
+  return {
+    tone: "muted",
+    label: "中性",
+    signal: "neutral",
+    constraint,
+    headline: "窗口内未发现明显异动。",
+    detail: "缺失、无异常和权限失败会在模块内显式展示。",
+  };
+}
+
+function renderFutuSignalModule(module) {
+  return `
+    <section class="futu-signal-module">
+      <div class="futu-signal-module-header">
+        <h5>${escapeHtml(module.title)}</h5>
+        <span class="status-pill status-${escapeHtml(futuSignalStatusTone(module.status))}">${escapeHtml(translateFutuSignalValue(module.status))}</span>
+      </div>
+      <div class="futu-signal-metrics">
+        <div><span>方向</span><strong>${escapeHtml(translateFutuSignalValue(module.signal))}</strong></div>
+        <div><span>${module.suggestedConstraint ? "约束" : "置信度"}</span><strong>${escapeHtml(translateFutuSignalValue(module.suggestedConstraint || module.confidence))}</strong></div>
+      </div>
+      <div class="futu-signal-category-list">
+        ${renderFutuSignalCategories(module.categories)}
+      </div>
+    </section>
+  `;
+}
+
+function renderFutuSignalCategories(categories) {
+  if (!categories.length) {
+    return `
+      <div class="futu-signal-category empty">
+        <div><strong>缺失</strong><span>缺失</span></div>
+        <p>未找到可展示的结构化类别。</p>
+      </div>
+    `;
+  }
+  return categories.map((category) => {
+    const state = hasValue(category.state) ? String(category.state) : "none";
+    const direction = hasValue(category.direction) ? String(category.direction) : "";
+    const date = hasValue(category.evidence_date) ? ` · ${category.evidence_date}` : "";
+    return `
+      <div class="futu-signal-category ${escapeHtml(futuSignalCategoryTone(state, direction))}">
+        <div>
+          <strong>${escapeHtml(category.name || "缺失")}</strong>
+          <span>${escapeHtml(translateFutuSignalValue(direction || state) + date)}</span>
+        </div>
+        <p>${escapeHtml(category.detail || "缺失")}</p>
+      </div>
+    `;
+  }).join("");
+}
+
+function translateFutuSignalValue(value) {
+  const key = hasValue(value) ? String(value) : "";
+  const labels = {
+    supportive: "支持",
+    opposing: "反对",
+    neutral: "中性",
+    risk_up: "风险上升",
+    mixed: "分歧",
+    no_add: "不加仓",
+    review: "需复核",
+    reduce_only: "只减不加",
+    wait_for_event: "等待事件",
+    ok: "正常",
+    partial: "部分可用",
+    missing: "缺失",
+    error: "错误",
+    stale: "已过期",
+    anomaly: "异常",
+    none: "无异常",
+    not_applicable: "不适用",
+    bullish: "偏多",
+    bearish: "偏空",
+    high: "高",
+    medium: "中等",
+    low: "低",
+    "": "-",
+  };
+  return labels[key] || key;
+}
+
+function futuSignalStatusTone(status) {
+  if (status === "ok") return "ok";
+  if (status === "partial") return "warn";
+  if (status === "stale") return "stale";
+  if (status === "error") return "failed";
+  return "muted";
+}
+
+function futuSignalCategoryTone(state, direction) {
+  if (state === "error") return "failed";
+  if (state === "none" || state === "not_applicable") return "empty";
+  if (direction === "bearish" || direction === "risk_up") return "watch";
+  if (direction === "bullish") return "positive";
+  return "mixed";
 }
 
 function renderDomesticDiscussionRows(rows) {
