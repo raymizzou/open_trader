@@ -717,6 +717,29 @@ def test_apply_ai_interpretation_updates_summary_without_changing_rule_action() 
     assert interpreted.error == ""
 
 
+def test_apply_ai_interpretation_degrades_invented_numeric_facts() -> None:
+    signal = sample_signal()
+
+    interpreted = apply_ai_interpretation(
+        signal,
+        json.dumps(
+            {
+                "action": "BUY_T",
+                "suggested_ratio": "10",
+                "signal_summary_zh": "当前价格 999.99，RSI 为 1，短线反弹条件成立。",
+                "ratio_rationale_zh": "10% 来自规则层评分，且硬性条件均通过。",
+                "evidence_refs": ["vwap_reclaim"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert interpreted.action == "REVIEW"
+    assert interpreted.suggested_ratio == ""
+    assert interpreted.status == "review"
+    assert "invented numeric" in interpreted.error
+
+
 @pytest.mark.parametrize(
     "raw",
     [
@@ -858,6 +881,19 @@ def test_t_signal_interpreter_degrades_client_failure_to_review() -> None:
     assert interpreted.status == "review"
     assert interpreted.notification.should_notify is False
     assert "llm unavailable" in interpreted.error
+
+
+def test_t_signal_interpreter_degrades_non_string_client_output() -> None:
+    class NoneClient:
+        def interpret(self, prompt: str, payload: dict[str, object]) -> str:
+            return None  # type: ignore[return-value]
+
+    interpreted = TSignalInterpreter(client=NoneClient()).interpret(sample_signal())
+
+    assert interpreted.action == "REVIEW"
+    assert interpreted.suggested_ratio == ""
+    assert interpreted.status == "review"
+    assert "must be string" in interpreted.error
 
 
 def test_t_signal_interpreter_default_client_creation_failure_degrades_to_review(

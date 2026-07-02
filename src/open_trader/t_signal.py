@@ -4,7 +4,7 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
 
@@ -51,6 +51,9 @@ AI_INTERPRETATION_FIELDS = {
     "evidence_refs",
 }
 RAW_ENGLISH_PROSE_PATTERN = re.compile(r"\b[A-Za-z]+(?:\s+[A-Za-z]+){2,}\b")
+NUMERIC_LITERAL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9])"
+)
 T_SIGNAL_INTERPRETER_PROMPT = """你是做T信号解释器。
 只能解释系统给出的结构化信号，不得改写 action，不得改写 suggested_ratio。
 只能引用 payload.evidence 中已经存在的 name，不得编造价格、指标、盘口或成交量。
@@ -466,6 +469,8 @@ def validate_ai_interpretation_output(
     raw: str,
     signal: TSignal,
 ) -> TSignalAIInterpretation:
+    if not isinstance(raw, str):
+        raise ValueError("AI interpretation response must be string")
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -498,6 +503,8 @@ def validate_ai_interpretation_output(
 
     summary = _require_chinese_text(data["signal_summary_zh"], "signal_summary_zh")
     rationale = _require_chinese_text(data["ratio_rationale_zh"], "ratio_rationale_zh")
+    _validate_visible_numeric_facts(summary, signal, "signal_summary_zh")
+    _validate_visible_numeric_facts(rationale, signal, "ratio_rationale_zh")
     evidence_refs = _validate_evidence_refs(data["evidence_refs"], signal)
 
     return TSignalAIInterpretation(
@@ -585,6 +592,44 @@ def _reject_disallowed_english_trading_phrase(text: str, field_name: str) -> Non
         raise ValueError(
             f"AI interpretation {field_name} contains raw English prose"
         )
+
+
+def _validate_visible_numeric_facts(text: str, signal: TSignal, field_name: str) -> None:
+    allowed = _allowed_numeric_literals(signal)
+    for match in NUMERIC_LITERAL_PATTERN.finditer(text):
+        literal = match.group(0)
+        if _canonical_decimal_text(literal) not in allowed:
+            raise ValueError(
+                f"AI interpretation {field_name} invented numeric fact: {literal}"
+            )
+
+
+def _allowed_numeric_literals(signal: TSignal) -> set[str]:
+    values = {signal.suggested_ratio}
+    for container in (
+        asdict(signal.price),
+        asdict(signal.liquidity),
+        asdict(signal.technical),
+    ):
+        values.update(str(value or "") for value in container.values())
+    return {
+        canonical
+        for value in values
+        if (canonical := _canonical_decimal_text(value))
+    }
+
+
+def _canonical_decimal_text(value: str) -> str:
+    text = str(value or "").strip().rstrip("%")
+    if not text:
+        return ""
+    try:
+        decimal = Decimal(text)
+    except InvalidOperation:
+        return ""
+    if not decimal.is_finite():
+        return ""
+    return format(decimal.normalize(), "f")
 
 
 def _validate_evidence_refs(value: object, signal: TSignal) -> list[str]:
