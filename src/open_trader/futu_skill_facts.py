@@ -31,7 +31,41 @@ VALID_MODULE_STATUSES = {"ok", "partial", "missing", "error", "stale"}
 VALID_SIGNALS = {"supportive", "opposing", "neutral", "risk_up", "mixed"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_CONSTRAINTS = {"", "review", "reduce_only", "wait_for_event", "no_add"}
+VALID_CATEGORY_STATES = {"anomaly", "none", "not_applicable", "error"}
+VALID_CATEGORY_DIRECTIONS = {"", "bullish", "bearish", "neutral", "risk_up", "mixed"}
 VALID_DOMESTIC_STATUSES = {"ok", "missing", "error"}
+TECHNICAL_ANOMALY_CATEGORY_LABELS = (
+    "K线形态",
+    "MACD",
+    "RSI",
+    "CCI",
+    "KDJ",
+    "BIAS",
+    "ARBR",
+    "VR",
+    "PSY",
+    "OSC",
+    "WMSR",
+    "BOLL",
+    "MA",
+)
+CAPITAL_ANOMALY_CATEGORY_LABELS = ("资金分布与买卖经纪商", "资金流向", "卖空情况")
+DERIVATIVES_ANOMALY_CATEGORY_LABELS_HK = (
+    "牛熊证街货比例",
+    "牛熊证街货价格区间",
+    "期权大单",
+    "期权波动率",
+    "期权量价",
+    "期权情绪",
+    "期权综合信号",
+)
+DERIVATIVES_ANOMALY_CATEGORY_LABELS_US = (
+    "期权大单",
+    "期权波动率",
+    "期权量价",
+    "期权情绪",
+    "期权综合信号",
+)
 RUN_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 FUTU_AI_SEARCH_BASE_URL = "https://ai-news-search.futunn.com"
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
@@ -154,6 +188,51 @@ class FutuSkillNewsSentimentExtractor(Protocol):
         symbol: str,
         name: str,
         run_date: str,
+    ) -> dict[str, object]:
+        ...
+
+
+class FutuSkillFactsExtractorProtocol(Protocol):
+    def extract_news_sentiment(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+    ) -> dict[str, object]:
+        ...
+
+    def extract_technical_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        ...
+
+    def extract_capital_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        ...
+
+    def extract_derivatives_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
     ) -> dict[str, object]:
         ...
 
@@ -360,6 +439,42 @@ class FutuNewsSentimentExtractor:
             "suggested_constraint": "",
         }
 
+    def extract_technical_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del market, symbol, name, run_date
+        return _missing_signal_module("technical_anomaly", window_days)
+
+    def extract_capital_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del market, symbol, name, run_date
+        return _missing_signal_module("capital_anomaly", window_days)
+
+    def extract_derivatives_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del market, symbol, name, run_date
+        return _missing_signal_module("derivatives_anomaly", window_days)
+
     def _summarize_domestic_discussion(
         self,
         *,
@@ -472,6 +587,9 @@ def validate_futu_skill_fact_record(record: dict[str, object]) -> None:
     if not record["symbol"].strip():
         raise ValueError("futu skill fact symbol is invalid")
     _validate_news_sentiment_module(record.get("news_sentiment"))
+    _validate_signal_module(record.get("technical_anomaly"), "technical_anomaly")
+    _validate_signal_module(record.get("capital_anomaly"), "capital_anomaly")
+    _validate_signal_module(record.get("derivatives_anomaly"), "derivatives_anomaly")
 
 
 def generate_futu_skill_facts(
@@ -480,10 +598,12 @@ def generate_futu_skill_facts(
     data_dir: Path,
     run_date: str,
     market: MarketScope | str | None,
-    extractor: FutuSkillNewsSentimentExtractor,
+    extractor: FutuSkillFactsExtractorProtocol,
     update_latest: bool,
+    window_days: int = 7,
 ) -> FutuSkillFactResult:
     effective_run_date = _validate_run_date(run_date)
+    effective_window_days = _validate_window_days(window_days)
     market_scope = _market_scope(market)
     sources = _load_portfolio_sources(portfolio_path, market_scope)
     run_path = futu_skill_facts_run_path(data_dir, effective_run_date, market_scope)
@@ -501,6 +621,7 @@ def generate_futu_skill_facts(
             source=source,
             run_date=effective_run_date,
             extractor=extractor,
+            window_days=effective_window_days,
         )
         for source in sources
     ]
@@ -510,6 +631,7 @@ def generate_futu_skill_facts(
         "generated_at": _now_text(),
         "run_date": effective_run_date,
         "market": market_scope.value if market_scope is not None else "",
+        "window_days": effective_window_days,
         "records": records,
     }
     _atomic_write_json(run_path, payload)
@@ -529,7 +651,8 @@ def _build_record(
     *,
     source: FutuSkillSource,
     run_date: str,
-    extractor: FutuSkillNewsSentimentExtractor,
+    extractor: FutuSkillFactsExtractorProtocol,
+    window_days: int,
 ) -> dict[str, Any]:
     base: dict[str, Any] = {
         "schema_version": FUTU_SKILL_FACTS_SCHEMA_VERSION,
@@ -538,6 +661,7 @@ def _build_record(
         "symbol": source.symbol,
         "name": source.name,
     }
+    errors: list[str] = []
     try:
         module = extractor.extract_news_sentiment(
             market=source.market,
@@ -545,14 +669,76 @@ def _build_record(
             name=source.name,
             run_date=run_date,
         )
-        normalized = _normalize_news_sentiment_module(module)
-        record = {**base, "news_sentiment": normalized, "error": ""}
+        news_sentiment = _normalize_news_sentiment_module(module)
     except Exception as exc:
-        record = {
-            **base,
-            "news_sentiment": _error_news_sentiment_module(),
-            "error": str(exc) or exc.__class__.__name__,
-        }
+        reason = str(exc) or exc.__class__.__name__
+        news_sentiment = _error_news_sentiment_module()
+        errors.append(f"news_sentiment: {reason}")
+    try:
+        technical_anomaly = _normalize_signal_module(
+            extractor.extract_technical_anomaly(
+                market=source.market,
+                symbol=source.symbol,
+                name=source.name,
+                run_date=run_date,
+                window_days=window_days,
+            ),
+            "technical_anomaly",
+        )
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        technical_anomaly = _error_signal_module(
+            "technical_anomaly",
+            window_days,
+            reason,
+        )
+        errors.append(f"technical_anomaly: {reason}")
+    try:
+        capital_anomaly = _normalize_signal_module(
+            extractor.extract_capital_anomaly(
+                market=source.market,
+                symbol=source.symbol,
+                name=source.name,
+                run_date=run_date,
+                window_days=window_days,
+            ),
+            "capital_anomaly",
+        )
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        capital_anomaly = _error_signal_module(
+            "capital_anomaly",
+            window_days,
+            reason,
+        )
+        errors.append(f"capital_anomaly: {reason}")
+    try:
+        derivatives_anomaly = _normalize_signal_module(
+            extractor.extract_derivatives_anomaly(
+                market=source.market,
+                symbol=source.symbol,
+                name=source.name,
+                run_date=run_date,
+                window_days=window_days,
+            ),
+            "derivatives_anomaly",
+        )
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        derivatives_anomaly = _error_signal_module(
+            "derivatives_anomaly",
+            window_days,
+            reason,
+        )
+        errors.append(f"derivatives_anomaly: {reason}")
+    record = {
+        **base,
+        "news_sentiment": news_sentiment,
+        "technical_anomaly": technical_anomaly,
+        "capital_anomaly": capital_anomaly,
+        "derivatives_anomaly": derivatives_anomaly,
+        "error": "; ".join(errors),
+    }
     validate_futu_skill_fact_record(record)
     return record
 
@@ -607,6 +793,96 @@ def _validate_news_sentiment_module(module: object) -> None:
         raise ValueError("news_sentiment blocking_reason is invalid")
     if "domestic_discussion" in module:
         _validate_domestic_discussion(module.get("domestic_discussion"))
+
+
+def _normalize_signal_module(module: object, module_name: str) -> dict[str, Any]:
+    if not isinstance(module, dict):
+        raise ValueError(f"{module_name} module is invalid")
+    normalized = {
+        "status": _required_enum(module, "status", VALID_MODULE_STATUSES, module_name),
+        "signal": _required_enum(module, "signal", VALID_SIGNALS, module_name),
+        "confidence": _required_enum(module, "confidence", VALID_CONFIDENCES, module_name),
+        "suggested_constraint": _required_enum(
+            module,
+            "suggested_constraint",
+            VALID_CONSTRAINTS,
+            module_name,
+        ),
+        "window_days": _validate_window_days(module.get("window_days") or 7),
+        "summary": _optional_text(module.get("summary")),
+        "categories": _normalize_signal_categories(
+            module.get("categories"),
+            module_name,
+        ),
+    }
+    _validate_signal_module(normalized, module_name)
+    return normalized
+
+
+def _normalize_signal_categories(
+    categories: object,
+    module_name: str,
+) -> list[dict[str, str]]:
+    if not isinstance(categories, list):
+        raise ValueError(f"{module_name} categories is invalid")
+    normalized: list[dict[str, str]] = []
+    for item in categories:
+        if not isinstance(item, dict):
+            raise ValueError(f"{module_name} category is invalid")
+        normalized.append(
+            {
+                "name": _required_text(item, "name", f"{module_name} category"),
+                "state": _required_enum(
+                    item,
+                    "state",
+                    VALID_CATEGORY_STATES,
+                    f"{module_name} category",
+                ),
+                "direction": _required_enum(
+                    item,
+                    "direction",
+                    VALID_CATEGORY_DIRECTIONS,
+                    f"{module_name} category",
+                ),
+                "detail": _required_text(item, "detail", f"{module_name} category"),
+                "evidence_date": _optional_text(item.get("evidence_date")),
+            }
+        )
+    return normalized
+
+
+def _validate_signal_module(module: object, module_name: str) -> None:
+    if not isinstance(module, dict):
+        raise ValueError(f"{module_name} module is invalid")
+    _validate_enum(module, "status", VALID_MODULE_STATUSES, module_name)
+    _validate_enum(module, "signal", VALID_SIGNALS, module_name)
+    _validate_enum(module, "confidence", VALID_CONFIDENCES, module_name)
+    _validate_enum(module, "suggested_constraint", VALID_CONSTRAINTS, module_name)
+    if not isinstance(module.get("window_days"), int):
+        raise ValueError(f"{module_name} window_days is invalid")
+    if not isinstance(module.get("summary"), str):
+        raise ValueError(f"{module_name} summary is invalid")
+    categories = module.get("categories")
+    if not isinstance(categories, list):
+        raise ValueError(f"{module_name} categories is invalid")
+    for category in categories:
+        if not isinstance(category, dict):
+            raise ValueError(f"{module_name} category is invalid")
+        for field in ("name", "state", "direction", "detail", "evidence_date"):
+            if not isinstance(category.get(field), str):
+                raise ValueError(f"{module_name} category {field} is invalid")
+        _validate_enum(
+            category,
+            "state",
+            VALID_CATEGORY_STATES,
+            f"{module_name} category",
+        )
+        _validate_enum(
+            category,
+            "direction",
+            VALID_CATEGORY_DIRECTIONS,
+            f"{module_name} category",
+        )
 
 
 def _load_portfolio_sources(
@@ -993,6 +1269,46 @@ def _error_news_sentiment_module() -> dict[str, Any]:
     }
 
 
+def _missing_signal_module(module_name: str, window_days: int) -> dict[str, Any]:
+    return {
+        "status": "missing",
+        "signal": "neutral",
+        "confidence": "low",
+        "suggested_constraint": "review",
+        "window_days": _validate_window_days(window_days),
+        "summary": f"{_default_error_category_name(module_name)}暂未接入。",
+        "categories": [],
+    }
+
+
+def _error_signal_module(module_name: str, window_days: int, reason: str) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "signal": "neutral",
+        "confidence": "low",
+        "suggested_constraint": "review",
+        "window_days": _validate_window_days(window_days),
+        "summary": reason,
+        "categories": [
+            {
+                "name": _default_error_category_name(module_name),
+                "state": "error",
+                "direction": "",
+                "detail": reason,
+                "evidence_date": "",
+            }
+        ],
+    }
+
+
+def _default_error_category_name(module_name: str) -> str:
+    return {
+        "technical_anomaly": "技术异动",
+        "capital_anomaly": "资金异动",
+        "derivatives_anomaly": "衍生品异动",
+    }[module_name]
+
+
 def _normalize_freshness(value: object) -> dict[str, str]:
     if not isinstance(value, dict):
         return {"generated_at": "", "source_window": ""}
@@ -1091,6 +1407,13 @@ def _required_enum(
     return value
 
 
+def _required_text(mapping: dict[str, object], field: str, context: str) -> str:
+    value = _optional_text(mapping.get(field))
+    if not value:
+        raise ValueError(f"{context} {field} is invalid")
+    return value
+
+
 def _validate_enum(
     mapping: dict[str, object],
     field: str,
@@ -1183,6 +1506,16 @@ def _validate_run_date(value: str) -> str:
     except ValueError as exc:
         raise ValueError(f"invalid run_date: {value}") from exc
     return text
+
+
+def _validate_window_days(window_days: int) -> int:
+    try:
+        value = int(window_days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("window_days must be an integer") from exc
+    if value < 1 or value > 30:
+        raise ValueError("window_days must be between 1 and 30")
+    return value
 
 
 def _market_scope(market: MarketScope | str | None) -> MarketScope | None:

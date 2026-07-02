@@ -9,10 +9,14 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from open_trader.futu_skill_facts import (
+    CAPITAL_ANOMALY_CATEGORY_LABELS,
+    DERIVATIVES_ANOMALY_CATEGORY_LABELS_HK,
+    DERIVATIVES_ANOMALY_CATEGORY_LABELS_US,
     FUTU_SKILL_FACTS_SCHEMA_VERSION,
     FutuNewsSentimentExtractor,
     FutuSkillNewsSentimentExtractor,
     LLMFutuDomesticDiscussionSummarizer,
+    TECHNICAL_ANOMALY_CATEGORY_LABELS,
     futu_skill_facts_latest_path,
     futu_skill_facts_run_path,
     generate_futu_skill_facts,
@@ -83,6 +87,215 @@ class FakeExtractor:
             ],
             "blocking_reason": "",
             "suggested_constraint": "",
+        }
+
+    def extract_technical_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        return self._missing_anomaly(window_days)
+
+    def extract_capital_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        return self._missing_anomaly(window_days)
+
+    def extract_derivatives_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        return self._missing_anomaly(window_days)
+
+    def _missing_anomaly(self, window_days: int) -> dict[str, object]:
+        return {
+            "status": "missing",
+            "signal": "neutral",
+            "confidence": "low",
+            "suggested_constraint": "review",
+            "window_days": window_days,
+            "summary": "测试未接入异动信号。",
+            "categories": [],
+        }
+
+
+class FakeFullFutuSkillExtractor:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def extract_news_sentiment(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+    ) -> dict[str, object]:
+        return {
+            "status": "ok",
+            "signal": "supportive",
+            "confidence": "medium",
+            "freshness": {
+                "generated_at": "2026-07-02T09:10:00+08:00",
+                "source_window": "latest",
+            },
+            "evidence": [
+                {
+                    "title": f"{symbol} news",
+                    "summary": "AI 需求继续支持市场关注。",
+                    "url": f"https://example.com/{symbol.lower()}",
+                }
+            ],
+            "blocking_reason": "",
+            "suggested_constraint": "",
+        }
+
+    def extract_technical_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "module": "technical",
+                "market": market,
+                "symbol": symbol,
+                "window_days": window_days,
+            }
+        )
+        return {
+            "status": "ok",
+            "signal": "supportive",
+            "confidence": "medium",
+            "suggested_constraint": "",
+            "window_days": window_days,
+            "summary": "技术信号支持趋势，但不构成单独买入理由。",
+            "categories": [
+                {
+                    "name": "MACD",
+                    "state": "anomaly",
+                    "direction": "bullish",
+                    "detail": "金叉后继续放大，支持短线趋势延续。",
+                    "evidence_date": "2026-07-01",
+                },
+                {
+                    "name": "RSI",
+                    "state": "anomaly",
+                    "direction": "risk_up",
+                    "detail": "接近超买区，追高风险上升。",
+                    "evidence_date": "2026-07-02",
+                },
+                {
+                    "name": "K线形态",
+                    "state": "none",
+                    "direction": "",
+                    "detail": "窗口内无异常。",
+                    "evidence_date": "",
+                },
+            ],
+        }
+
+    def extract_capital_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "module": "capital",
+                "market": market,
+                "symbol": symbol,
+                "window_days": window_days,
+            }
+        )
+        return {
+            "status": "ok",
+            "signal": "mixed",
+            "confidence": "medium",
+            "suggested_constraint": "no_add",
+            "window_days": window_days,
+            "summary": "资金流向与加仓动作存在分歧。",
+            "categories": [
+                {
+                    "name": "资金流向",
+                    "state": "anomaly",
+                    "direction": "bearish",
+                    "detail": "主力资金连续净流出，和加仓动作冲突。",
+                    "evidence_date": "2026-07-02",
+                },
+                {
+                    "name": "卖空情况",
+                    "state": "none",
+                    "direction": "",
+                    "detail": "窗口内无异常。",
+                    "evidence_date": "",
+                },
+            ],
+        }
+
+    def extract_derivatives_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "module": "derivatives",
+                "market": market,
+                "symbol": symbol,
+                "window_days": window_days,
+            }
+        )
+        return {
+            "status": "partial",
+            "signal": "risk_up",
+            "confidence": "low",
+            "suggested_constraint": "no_add",
+            "window_days": window_days,
+            "summary": "期权波动率偏高，不宜追高。",
+            "categories": [
+                {
+                    "name": "期权波动率",
+                    "state": "anomaly",
+                    "direction": "risk_up",
+                    "detail": "IV 位于高位，短线波动定价偏贵。",
+                    "evidence_date": "2026-07-02",
+                },
+                {
+                    "name": "期权大单",
+                    "state": "anomaly",
+                    "direction": "bullish",
+                    "detail": "出现看涨大单，但不能单独覆盖资金分歧。",
+                    "evidence_date": "2026-07-01",
+                },
+            ],
         }
 
 
@@ -333,6 +546,62 @@ def test_generate_futu_skill_facts_writes_news_sentiment_artifact(tmp_path: Path
     ]
 
 
+def test_generate_futu_skill_facts_writes_anomaly_modules(tmp_path: Path) -> None:
+    portfolio = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio,
+        [
+            {"market": "US", "symbol": "NVDA", "name": "NVIDIA", "asset_class": "stock"},
+            {"market": "HK", "symbol": "00700", "name": "腾讯控股", "asset_class": "stock"},
+        ],
+    )
+    extractor = FakeFullFutuSkillExtractor()
+
+    result = generate_futu_skill_facts(
+        portfolio_path=portfolio,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market=None,
+        extractor=extractor,
+        update_latest=True,
+        window_days=7,
+    )
+
+    payload = load_futu_skill_facts_cache(result.run_path)
+    assert result.records == 2
+    assert result.generated == 2
+    assert result.failed == 0
+    assert payload["schema_version"] == FUTU_SKILL_FACTS_SCHEMA_VERSION
+    assert payload["window_days"] == 7
+    nvda = next(record for record in payload["records"] if record["symbol"] == "NVDA")
+    assert nvda["technical_anomaly"]["signal"] == "supportive"
+    assert nvda["capital_anomaly"]["suggested_constraint"] == "no_add"
+    assert nvda["derivatives_anomaly"]["categories"][0]["name"] == "期权波动率"
+    assert [call["module"] for call in extractor.calls[:3]] == [
+        "technical",
+        "capital",
+        "derivatives",
+    ]
+    assert all(call["window_days"] == 7 for call in extractor.calls)
+    assert result.latest_path.read_text(encoding="utf-8") == result.run_path.read_text(encoding="utf-8")
+
+
+def test_anomaly_category_templates_are_fixed() -> None:
+    assert TECHNICAL_ANOMALY_CATEGORY_LABELS[:3] == ("K线形态", "MACD", "RSI")
+    assert CAPITAL_ANOMALY_CATEGORY_LABELS == ("资金分布与买卖经纪商", "资金流向", "卖空情况")
+    assert DERIVATIVES_ANOMALY_CATEGORY_LABELS_US == (
+        "期权大单",
+        "期权波动率",
+        "期权量价",
+        "期权情绪",
+        "期权综合信号",
+    )
+    assert DERIVATIVES_ANOMALY_CATEGORY_LABELS_HK[:2] == (
+        "牛熊证街货比例",
+        "牛熊证街货价格区间",
+    )
+
+
 def test_generate_futu_skill_facts_skips_missing_symbols_and_cash(tmp_path: Path) -> None:
     portfolio = tmp_path / "data/latest/portfolio.csv"
     write_portfolio(
@@ -551,6 +820,14 @@ def test_validate_futu_skill_fact_record_rejects_invalid_module_status() -> None
         validate_futu_skill_fact_record(record)
 
 
+def test_validate_futu_skill_fact_record_rejects_invalid_anomaly_category_state() -> None:
+    record = valid_record()
+    record["technical_anomaly"]["categories"][0]["state"] = "maybe"
+
+    with pytest.raises(ValueError, match="technical_anomaly category state is invalid"):
+        validate_futu_skill_fact_record(record)
+
+
 def test_futu_news_sentiment_extractor_marks_noisy_feed_as_unusable() -> None:
     def fake_get_json(url: str, params: dict[str, object]) -> dict[str, object]:
         if url.endswith("/news_search"):
@@ -707,6 +984,57 @@ def valid_record() -> dict[str, object]:
             ],
             "blocking_reason": "",
             "suggested_constraint": "",
+        },
+        "technical_anomaly": {
+            "status": "ok",
+            "signal": "supportive",
+            "confidence": "medium",
+            "suggested_constraint": "",
+            "window_days": 7,
+            "summary": "技术信号支持趋势。",
+            "categories": [
+                {
+                    "name": "MACD",
+                    "state": "anomaly",
+                    "direction": "bullish",
+                    "detail": "MACD 金叉。",
+                    "evidence_date": "2026-07-01",
+                }
+            ],
+        },
+        "capital_anomaly": {
+            "status": "ok",
+            "signal": "mixed",
+            "confidence": "medium",
+            "suggested_constraint": "no_add",
+            "window_days": 7,
+            "summary": "资金信号分歧。",
+            "categories": [
+                {
+                    "name": "资金流向",
+                    "state": "anomaly",
+                    "direction": "bearish",
+                    "detail": "主力资金净流出。",
+                    "evidence_date": "2026-07-01",
+                }
+            ],
+        },
+        "derivatives_anomaly": {
+            "status": "partial",
+            "signal": "risk_up",
+            "confidence": "low",
+            "suggested_constraint": "review",
+            "window_days": 7,
+            "summary": "衍生品风险上升。",
+            "categories": [
+                {
+                    "name": "期权波动率",
+                    "state": "anomaly",
+                    "direction": "risk_up",
+                    "detail": "IV 位于高位。",
+                    "evidence_date": "2026-07-01",
+                }
+            ],
         },
         "error": "",
     }
