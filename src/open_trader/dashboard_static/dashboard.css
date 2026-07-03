@@ -912,6 +912,54 @@ tbody tr.active-row {
   overflow-wrap: anywhere;
 }
 
+.t-signal-gate-status {
+  align-items: center;
+  display: inline-flex;
+  gap: 7px;
+}
+
+.t-signal-checkmark {
+  border: 2px solid var(--muted);
+  border-radius: 999px;
+  display: inline-block;
+  flex: 0 0 auto;
+  height: 18px;
+  position: relative;
+  width: 18px;
+}
+
+.t-signal-checkmark::after {
+  border-bottom: 2px solid currentColor;
+  border-right: 2px solid currentColor;
+  content: "";
+  display: block;
+  height: 8px;
+  left: 5px;
+  position: absolute;
+  top: 2px;
+  transform: rotate(45deg);
+  width: 4px;
+}
+
+.t-signal-checkmark-pass {
+  background: #e7f4ec;
+  border-color: #b8dac6;
+  color: var(--ok);
+}
+
+.t-signal-checkmark-warn {
+  background: #fff1dc;
+  border-color: #efc47e;
+  color: var(--warning);
+}
+
+.t-signal-checkmark-block,
+.t-signal-checkmark-missing {
+  background: #fae8e6;
+  border-color: #e3aaa3;
+  color: var(--danger);
+}
+
 .t-signal-evidence-list,
 .t-signal-timeline {
   display: grid;

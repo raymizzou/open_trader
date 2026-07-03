@@ -688,7 +688,11 @@ function tSignalButtonClass(holding) {
   const signal = holding && holding.t_signal && typeof holding.t_signal === "object"
     ? holding.t_signal
     : {};
-  const active = signal.status === "ok" && ["BUY_T", "SELL_T"].includes(signal.action);
+  const active = (
+    signal.status === "ok"
+    && signal.session_phase === "regular"
+    && ["BUY_T", "SELL_T"].includes(signal.action)
+  );
   return active
     ? "expand-button t-signal-button t-signal-button-active"
     : "expand-button t-signal-button";
@@ -838,7 +842,7 @@ function renderTSignalPrerequisites(signal) {
         ${gates.length > 0 ? gates.map((gate) => `
           <div class="t-signal-gate">
             <span>${escapeHtml(tSignalGateNameLabel(gate.name))}</span>
-            <strong>${escapeHtml(tSignalGateStatusLabel(gate.status))}</strong>
+            ${renderTSignalGateStatus(gate.status)}
             <small>${escapeHtml(formatPlain(gate.message_zh))}</small>
           </div>
         `).join("") : `<p class="muted-copy">暂无前置条件记录。</p>`}
@@ -985,6 +989,16 @@ function tSignalStrengthLabel(value) {
 function tSignalGateStatusLabel(value) {
   const labels = { pass: "通过", block: "阻断", warn: "提醒", missing: "缺失" };
   return labels[value] || formatPlain(value);
+}
+
+function renderTSignalGateStatus(status) {
+  const normalized = ["pass", "block", "warn", "missing"].includes(status) ? status : "missing";
+  return `
+    <strong class="t-signal-gate-status">
+      <span class="t-signal-checkmark t-signal-checkmark-${escapeHtml(normalized)}" aria-hidden="true"></span>
+      <span>${escapeHtml(tSignalGateStatusLabel(normalized))}</span>
+    </strong>
+  `;
 }
 
 function tSignalGateNameLabel(value) {

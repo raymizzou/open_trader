@@ -2354,6 +2354,13 @@ if (!elements["holdings-body"].innerHTML.includes("交易决策") || !elements["
 if (!elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
   throw new Error("active BUY_T/SELL_T signals should pulse the t signal button: " + elements["holdings-body"].innerHTML);
 }
+state.dashboard.holdings[1].t_signal.session_phase = "closed";
+renderHoldings();
+if (elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
+  throw new Error("non-regular t signals should not pulse the t signal button: " + elements["holdings-body"].innerHTML);
+}
+state.dashboard.holdings[1].t_signal.session_phase = "regular";
+renderHoldings();
 const renderedHoldings = elements["holdings-body"].innerHTML;
 const usStockSectionIndex = renderedHoldings.indexOf("美股正股");
 const usOptionSectionIndex = renderedHoldings.indexOf("美股期权");
@@ -2465,7 +2472,7 @@ for (const unexpected of ["插件管理", "策略阈值"]) {
 }
 state.selectedHoldingDetail = "t_signal";
 renderHoldings();
-for (const required of ["做T信号 ·", "买入做T", "确定比例", "15%", "信号依据", "价格低于 VWAP 后回收", "前置条件", "交易时段", "详细信息", "消息 timeline", "已发送 BUY_T 通知。", "已发起提醒 · 2026-07-02T22:32:00+08:00"]) {
+for (const required of ["做T信号 ·", "买入做T", "确定比例", "15%", "信号依据", "价格低于 VWAP 后回收", "前置条件", "t-signal-checkmark", "交易时段", "详细信息", "消息 timeline", "已发送 BUY_T 通知。", "已发起提醒 · 2026-07-02T22:32:00+08:00"]) {
   if (!elements["holdings-body"].innerHTML.includes(required)) {
     throw new Error("t signal detail missing " + required + ": " + elements["holdings-body"].innerHTML);
   }
