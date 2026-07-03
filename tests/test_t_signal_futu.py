@@ -22,11 +22,14 @@ class FakeTSignalContext:
         self.host = host
         self.port = port
         self.closed = False
+        self.events: list[tuple[str, object]] = []
         self.snapshot_calls: list[list[str]] = []
+        self.subscribe_calls: list[tuple[list[str], list[object], bool, bool]] = []
         self.kline_calls: list[tuple[str, int, object]] = []
         self.order_book_calls: list[tuple[str, int]] = []
 
     def get_market_snapshot(self, symbols: list[str]) -> tuple[int, object]:
+        self.events.append(("snapshot", tuple(symbols)))
         self.snapshot_calls.append(symbols)
         return (
             0,
@@ -43,7 +46,21 @@ class FakeTSignalContext:
             ),
         )
 
+    def subscribe(
+        self,
+        code_list: list[str],
+        subtype_list: list[object],
+        is_first_push: bool = True,
+        subscribe_push: bool = True,
+    ) -> tuple[int, object]:
+        self.events.append(("subscribe", (tuple(code_list), tuple(subtype_list))))
+        self.subscribe_calls.append(
+            (code_list, subtype_list, is_first_push, subscribe_push)
+        )
+        return 0, "ok"
+
     def get_cur_kline(self, code: str, num: int, ktype: object) -> tuple[int, object]:
+        self.events.append(("kline", ktype))
         self.kline_calls.append((code, num, ktype))
         if ktype == "K_1M":
             return (
@@ -89,6 +106,9 @@ def test_futu_t_signal_client_builds_market_facts() -> None:
         connectivity_checker=lambda host, port: True,
         kline_type_1m="K_1M",
         kline_type_5m="K_5M",
+        subtype_1m="K_1M",
+        subtype_5m="K_5M",
+        subtype_order_book="ORDER_BOOK",
     )
 
     facts = client.get_market_facts(
@@ -115,11 +135,60 @@ def test_futu_t_signal_client_builds_market_facts() -> None:
     assert facts.rsi_5m is not None
     assert facts.volume_ratio_5m == Decimal("1.80")
     assert client.context.snapshot_calls == [["US.VIXY"]]
+    assert client.context.subscribe_calls == [
+        (["US.VIXY"], ["K_1M", "K_5M", "ORDER_BOOK"], False, False)
+    ]
     assert client.context.kline_calls == [
         ("US.VIXY", 30, "K_1M"),
         ("US.VIXY", 30, "K_5M"),
     ]
+    assert client.context.events[:4] == [
+        ("snapshot", ("US.VIXY",)),
+        ("subscribe", (("US.VIXY",), ("K_1M", "K_5M", "ORDER_BOOK"))),
+        ("kline", "K_1M"),
+        ("kline", "K_5M"),
+    ]
     assert client.context.order_book_calls == [("US.VIXY", 1)]
+
+
+def test_futu_t_signal_client_wraps_subscribe_failure_before_kline() -> None:
+    class FailingSubscribeContext(FakeTSignalContext):
+        def subscribe(
+            self,
+            code_list: list[str],
+            subtype_list: list[object],
+            is_first_push: bool = True,
+            subscribe_push: bool = True,
+        ) -> tuple[int, object]:
+            super().subscribe(code_list, subtype_list, is_first_push, subscribe_push)
+            return -1, "subscribe failed"
+
+    client = FutuTSignalMarketDataClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=FailingSubscribeContext,
+        connectivity_checker=lambda host, port: True,
+        kline_type_1m="K_1M",
+        kline_type_5m="K_5M",
+        subtype_1m="K_1M",
+        subtype_5m="K_5M",
+        subtype_order_book="ORDER_BOOK",
+    )
+
+    with pytest.raises(FutuQuoteError) as exc_info:
+        client.get_market_facts(
+            run_date="2026-07-02",
+            market="US",
+            symbol="VIXY",
+            futu_symbol="US.VIXY",
+            name="Volatility ETF",
+            session_phase="regular",
+            updated_at="2026-07-02T22:31:00+08:00",
+        )
+
+    assert "subscribe failed" in str(exc_info.value)
+    assert exc_info.value.error_type == "snapshot_failed"
+    assert client.context.kline_calls == []
 
 
 def test_futu_t_signal_client_derives_change_pct_from_prev_close() -> None:

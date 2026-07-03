@@ -209,6 +209,9 @@ def _apply_notification_state(
             event_at=notified_at,
         ), False
 
+    if getattr(notifier, "records_delivery", True) is False:
+        return signal, False
+
     try:
         notifier.notify(_notification_title(signal), _notification_message(signal))
     except Exception as exc:

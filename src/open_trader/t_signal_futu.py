@@ -25,6 +25,9 @@ class FutuTSignalMarketDataClient(FutuQuoteClient):
         connectivity_checker: Callable[[str, int], bool] = _can_connect_to_opend,
         kline_type_1m: object | None = None,
         kline_type_5m: object | None = None,
+        subtype_1m: object | None = None,
+        subtype_5m: object | None = None,
+        subtype_order_book: object | None = None,
     ) -> None:
         super().__init__(
             host=host,
@@ -34,6 +37,9 @@ class FutuTSignalMarketDataClient(FutuQuoteClient):
         )
         self.kline_type_1m = kline_type_1m or _default_kline_type("K_1M")
         self.kline_type_5m = kline_type_5m or _default_kline_type("K_5M")
+        self.subtype_1m = subtype_1m or _default_subtype("K_1M")
+        self.subtype_5m = subtype_5m or _default_subtype("K_5M")
+        self.subtype_order_book = subtype_order_book or _default_subtype("ORDER_BOOK")
 
     def get_market_facts(
         self,
@@ -47,6 +53,7 @@ class FutuTSignalMarketDataClient(FutuQuoteClient):
         updated_at: str,
     ) -> TMarketFacts:
         snapshot = self._snapshot_row(futu_symbol)
+        self._subscribe_realtime_facts(futu_symbol)
         kline_1m = self._kline_rows(futu_symbol, self.kline_type_1m)
         kline_5m = self._kline_rows(futu_symbol, self.kline_type_5m)
         order_book = self._order_book(futu_symbol)
@@ -73,6 +80,15 @@ class FutuTSignalMarketDataClient(FutuQuoteClient):
             rsi_5m=_rsi_from_closes(kline_5m),
             volume_ratio_5m=_volume_ratio(kline_5m),
         )
+
+    def _subscribe_realtime_facts(self, futu_symbol: str) -> None:
+        ret_code, data = self.context.subscribe(
+            [futu_symbol],
+            [self.subtype_1m, self.subtype_5m, self.subtype_order_book],
+            is_first_push=False,
+            subscribe_push=False,
+        )
+        self._raise_on_error(ret_code, data)
 
     def _snapshot_row(self, futu_symbol: str) -> dict[str, object]:
         ret_code, data = self.context.get_market_snapshot([futu_symbol])
@@ -151,6 +167,22 @@ def _default_kline_type(name: str) -> object:
             snapshot_ok=False,
         ) from exc
     return getattr(KLType, name)
+
+
+def _default_subtype(name: str) -> object:
+    try:
+        from futu import SubType
+    except ImportError as exc:
+        raise FutuQuoteError(
+            "futu-api is not installed. Install it with: "
+            ".venv/bin/python -m pip install futu-api",
+            error_type="context_failed",
+            next_step="请在当前虚拟环境安装 futu-api 后重新运行每日盘前流程。",
+            opend_reachable=None,
+            context_ok=False,
+            snapshot_ok=False,
+        ) from exc
+    return getattr(SubType, name)
 
 
 def _records(data: object) -> list[dict[str, object]]:

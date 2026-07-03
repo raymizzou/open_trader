@@ -9,6 +9,7 @@ from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.t_signal import TMarketFacts, apply_ai_interpretation
 from open_trader.t_signal_runner import run_t_signal_watch_once
 from open_trader.t_signal_store import load_t_signals_cache
+from open_trader.notifications import NullNotifier
 
 
 def write_portfolio(path: Path) -> None:
@@ -168,6 +169,34 @@ def test_t_signal_runner_writes_artifact_and_sends_once(tmp_path: Path) -> None:
     assert record["notification"]["notified"] is True
     assert record["notification"]["should_notify"] is False
     assert record["timeline"][-1]["event_type"] == "notification_sent"
+
+
+def test_t_signal_runner_does_not_mark_null_notifier_as_sent(tmp_path: Path) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path)
+
+    result = run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=FakeMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=NullNotifier(),
+        now_fn=fixed_now,
+    )
+
+    assert result.signal_count == 1
+    assert result.notified_count == 0
+    cache = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")
+    record = cache["records"][0]
+    assert record["notification"]["notified"] is False
+    assert record["notification"]["should_notify"] is True
+    assert record["notification"]["last_notified_at"] == ""
+    assert record["notification"]["last_notified_dedupe_key"] == ""
+    assert record["notification"]["last_attempted_dedupe_key"] == ""
+    assert record["timeline"][-1]["event_type"] == "signal_created"
 
 
 def test_t_signal_runner_suppresses_duplicate_notification(tmp_path: Path) -> None:
