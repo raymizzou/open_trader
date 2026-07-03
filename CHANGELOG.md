@@ -3,6 +3,18 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-03
+
+- Added holdings-table 做T signal details with fixed ratio sizing, signal
+  evidence, precondition checks, notification timeline, and session-gated pulse
+  highlighting.
+- Enabled HK 做T signal generation through Futu realtime subscriptions for
+  1-minute K lines, 5-minute K lines, and order book data.
+- Changed 做T Feishu alerts to one structured Chinese message per symbol with
+  action, ratio, status, conclusion, numbered evidence, and timestamp.
+- Verified with the full pytest suite, Playwright against the local dashboard,
+  live HK Futu signal generation, and a real Feishu app notification send.
+
 ## 2026-07-02
 
 - Reworked the dashboard holdings table around the operator fields: quantity,
