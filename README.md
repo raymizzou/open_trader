@@ -323,6 +323,24 @@ stable. It reads
 `data/latest/portfolio.csv`, broker detail artifacts under
 `data/broker_positions/`, and the latest trade actions and reports when present.
 
+To generate intraday 做T signals for existing HK or US holdings:
+
+```bash
+.venv/bin/python -m open_trader watch-t \
+  --portfolio data/latest/portfolio.csv \
+  --data-dir data \
+  --date 2026-07-02 \
+  --market US \
+  --session-phase regular \
+  --once
+```
+
+The watcher writes `data/runs/<YYYY-MM-DD>/<market>/t_signals.json` and promotes
+`data/latest/<market>/t_signals.json`. The dashboard holdings table shows a
+`做T` button for each row; the expanded panel displays the deterministic action,
+ratio, evidence, current status, and notification timeline. Alerts are
+deduplicated by signal cycle, and the workflow remains read-only.
+
 When Futu OpenD quotes are available, the dashboard refreshes prices from OpenD.
 If a quote refresh fails, it keeps the last successful quote snapshot and shows
 a failure or stale warning instead of hiding the problem.

@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import html
 import json
+import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -31,7 +33,41 @@ VALID_MODULE_STATUSES = {"ok", "partial", "missing", "error", "stale"}
 VALID_SIGNALS = {"supportive", "opposing", "neutral", "risk_up", "mixed"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_CONSTRAINTS = {"", "review", "reduce_only", "wait_for_event", "no_add"}
+VALID_CATEGORY_STATES = {"anomaly", "none", "not_applicable", "error"}
+VALID_CATEGORY_DIRECTIONS = {"", "bullish", "bearish", "neutral", "risk_up", "mixed"}
 VALID_DOMESTIC_STATUSES = {"ok", "missing", "error"}
+TECHNICAL_ANOMALY_CATEGORY_LABELS = (
+    "K线形态",
+    "MACD",
+    "RSI",
+    "CCI",
+    "KDJ",
+    "BIAS",
+    "ARBR",
+    "VR",
+    "PSY",
+    "OSC",
+    "WMSR",
+    "BOLL",
+    "MA",
+)
+CAPITAL_ANOMALY_CATEGORY_LABELS = ("资金分布与买卖经纪商", "资金流向", "卖空情况")
+DERIVATIVES_ANOMALY_CATEGORY_LABELS_HK = (
+    "牛熊证街货比例",
+    "牛熊证街货价格区间",
+    "期权大单",
+    "期权波动率",
+    "期权量价",
+    "期权情绪",
+    "期权综合信号",
+)
+DERIVATIVES_ANOMALY_CATEGORY_LABELS_US = (
+    "期权大单",
+    "期权波动率",
+    "期权量价",
+    "期权情绪",
+    "期权综合信号",
+)
 RUN_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 FUTU_AI_SEARCH_BASE_URL = "https://ai-news-search.futunn.com"
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
@@ -158,6 +194,51 @@ class FutuSkillNewsSentimentExtractor(Protocol):
         ...
 
 
+class FutuSkillFactsExtractorProtocol(Protocol):
+    def extract_news_sentiment(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+    ) -> dict[str, object]:
+        ...
+
+    def extract_technical_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        ...
+
+    def extract_capital_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        ...
+
+    def extract_derivatives_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        ...
+
+
 class FutuDomesticDiscussionSummarizer(Protocol):
     def summarize(
         self,
@@ -171,6 +252,75 @@ class FutuDomesticDiscussionSummarizer(Protocol):
         relevant_post_count: int,
     ) -> dict[str, object]:
         ...
+
+
+class FutuAnomalyModuleSummarizer(Protocol):
+    def summarize(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        module_name: str,
+        module: dict[str, object],
+    ) -> dict[str, object]:
+        ...
+
+
+class LLMFutuAnomalyModuleSummarizer:
+    def __init__(self, *, client: object | None = None) -> None:
+        self.client = client or OpenAITextClient(timeout_seconds=20)
+
+    def summarize(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        module_name: str,
+        module: dict[str, object],
+    ) -> dict[str, object]:
+        messages = [
+            {
+                "role": "system",
+                "content": _anomaly_module_summary_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "market": market,
+                        "symbol": symbol,
+                        "name": name,
+                        "module_name": module_name,
+                        "module": _anomaly_summary_input_module(module),
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        content = self.client.create(messages=messages, temperature=0)
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("LLM anomaly summary response must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("LLM anomaly summary response must be a JSON object")
+        return _apply_anomaly_summary_payload(module, payload, module_name)
+
+
+class CompactFutuAnomalyModuleSummarizer:
+    def summarize(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        module_name: str,
+        module: dict[str, object],
+    ) -> dict[str, object]:
+        del market, symbol, name
+        return _compact_anomaly_module_details(module, module_name)
 
 
 class LLMFutuDomesticDiscussionSummarizer:
@@ -360,6 +510,42 @@ class FutuNewsSentimentExtractor:
             "suggested_constraint": "",
         }
 
+    def extract_technical_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del market, symbol, name, run_date
+        return _missing_signal_module("technical_anomaly", window_days)
+
+    def extract_capital_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del market, symbol, name, run_date
+        return _missing_signal_module("capital_anomaly", window_days)
+
+    def extract_derivatives_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del market, symbol, name, run_date
+        return _missing_signal_module("derivatives_anomaly", window_days)
+
     def _summarize_domestic_discussion(
         self,
         *,
@@ -396,6 +582,292 @@ class FutuNewsSentimentExtractor:
 
 
 LLMFutuNewsSentimentExtractor = FutuNewsSentimentExtractor
+
+
+class FutuAnomalyScriptClient:
+    def __init__(
+        self,
+        *,
+        skill_root: Path | None = None,
+        runner: Callable[[list[str]], object] | None = None,
+    ) -> None:
+        codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+        self.skill_root = skill_root or codex_home / "skills"
+        self.runner = runner or self._run_subprocess
+
+    def run(
+        self,
+        module: str,
+        *,
+        market: str,
+        symbol: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        script = self._script_path(module)
+        stock_symbol = f"{market.upper()}.{symbol.upper()}"
+        command = [
+            sys.executable,
+            str(script),
+            stock_symbol,
+            "--time-range",
+            str(window_days),
+            "--json",
+        ]
+        result = self.runner(command)
+        returncode = int(getattr(result, "returncode", 1))
+        stdout = str(getattr(result, "stdout", "") or "")
+        stderr = str(getattr(result, "stderr", "") or "")
+        if returncode != 0:
+            raise RuntimeError(
+                stderr.strip()
+                or stdout.strip()
+                or f"{module} anomaly script failed"
+            )
+        try:
+            payload = _load_json_object_from_mixed_output(stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{module} anomaly script returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{module} anomaly script returned non-object JSON")
+        return payload
+
+    def _script_path(self, module: str) -> Path:
+        mapping = {
+            "technical": self.skill_root
+            / "futu-technical-anomaly/scripts/handle_technical_anomaly.py",
+            "capital": self.skill_root
+            / "futu-capital-anomaly/scripts/handle_capital_anomaly.py",
+            "derivatives": self.skill_root
+            / "futu-derivatives-anomaly/scripts/handle_derivatives_anomaly.py",
+        }
+        try:
+            return mapping[module]
+        except KeyError as exc:
+            raise ValueError(f"unknown anomaly module: {module}") from exc
+
+    @staticmethod
+    def _run_subprocess(command: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=45,
+            check=False,
+        )
+
+
+def _load_json_object_from_mixed_output(output: str) -> object:
+    stripped = output.strip()
+    if not stripped:
+        raise json.JSONDecodeError("empty output", output, 0)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    start = stripped.find("{")
+    while start >= 0:
+        candidate = _balanced_json_object_text(stripped, start)
+        if candidate:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+        start = stripped.find("{", start + 1)
+    raise json.JSONDecodeError("no JSON object found", output, 0)
+
+
+def _balanced_json_object_text(text: str, start: int) -> str:
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return ""
+
+
+def _default_anomaly_summarizer() -> FutuAnomalyModuleSummarizer:
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return LLMFutuAnomalyModuleSummarizer()
+    return CompactFutuAnomalyModuleSummarizer()
+
+
+class FutuSkillFactsExtractor:
+    def __init__(
+        self,
+        *,
+        news_extractor: FutuSkillNewsSentimentExtractor | None = None,
+        anomaly_client: FutuAnomalyScriptClient | None = None,
+        anomaly_summarizer: FutuAnomalyModuleSummarizer | None = None,
+    ) -> None:
+        self.news_extractor = news_extractor or FutuNewsSentimentExtractor()
+        self.anomaly_client = anomaly_client or FutuAnomalyScriptClient()
+        self.anomaly_summarizer = anomaly_summarizer or _default_anomaly_summarizer()
+
+    def prepare_sources(
+        self,
+        *,
+        sources: list[FutuSkillSource],
+        data_dir: Path,
+        run_date: str,
+        market: MarketScope | str | None,
+    ) -> None:
+        prepare_sources = getattr(self.news_extractor, "prepare_sources", None)
+        if callable(prepare_sources):
+            prepare_sources(
+                sources=sources,
+                data_dir=data_dir,
+                run_date=run_date,
+                market=market,
+            )
+
+    def extract_news_sentiment(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+    ) -> dict[str, object]:
+        return self.news_extractor.extract_news_sentiment(
+            market=market,
+            symbol=symbol,
+            name=name,
+            run_date=run_date,
+        )
+
+    def extract_technical_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del run_date
+        payload = self.anomaly_client.run(
+            "technical",
+            market=market,
+            symbol=symbol,
+            window_days=window_days,
+        )
+        module = _normalize_anomaly_payload(
+            payload,
+            module_name="technical_anomaly",
+            category_labels=TECHNICAL_ANOMALY_CATEGORY_LABELS,
+            window_days=window_days,
+        )
+        return self._summarize_anomaly_module(
+            market=market,
+            symbol=symbol,
+            name=name,
+            module_name="technical_anomaly",
+            module=module,
+        )
+
+    def extract_capital_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del run_date
+        payload = self.anomaly_client.run(
+            "capital",
+            market=market,
+            symbol=symbol,
+            window_days=window_days,
+        )
+        module = _normalize_anomaly_payload(
+            payload,
+            module_name="capital_anomaly",
+            category_labels=CAPITAL_ANOMALY_CATEGORY_LABELS,
+            window_days=window_days,
+        )
+        return self._summarize_anomaly_module(
+            market=market,
+            symbol=symbol,
+            name=name,
+            module_name="capital_anomaly",
+            module=module,
+        )
+
+    def extract_derivatives_anomaly(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        run_date: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        del run_date
+        payload = self.anomaly_client.run(
+            "derivatives",
+            market=market,
+            symbol=symbol,
+            window_days=window_days,
+        )
+        labels = (
+            DERIVATIVES_ANOMALY_CATEGORY_LABELS_HK
+            if market.upper() == "HK"
+            else DERIVATIVES_ANOMALY_CATEGORY_LABELS_US
+        )
+        module = _normalize_anomaly_payload(
+            payload,
+            module_name="derivatives_anomaly",
+            category_labels=labels,
+            window_days=window_days,
+        )
+        return self._summarize_anomaly_module(
+            market=market,
+            symbol=symbol,
+            name=name,
+            module_name="derivatives_anomaly",
+            module=module,
+        )
+
+    def _summarize_anomaly_module(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        name: str,
+        module_name: str,
+        module: dict[str, object],
+    ) -> dict[str, object]:
+        if not _module_needs_detail_summary(module):
+            return module
+        try:
+            return self.anomaly_summarizer.summarize(
+                market=market,
+                symbol=symbol,
+                name=name,
+                module_name=module_name,
+                module=module,
+            )
+        except Exception:
+            return _compact_anomaly_module_details(module, module_name)
 
 
 def futu_skill_facts_run_path(
@@ -472,6 +944,9 @@ def validate_futu_skill_fact_record(record: dict[str, object]) -> None:
     if not record["symbol"].strip():
         raise ValueError("futu skill fact symbol is invalid")
     _validate_news_sentiment_module(record.get("news_sentiment"))
+    _validate_signal_module(record.get("technical_anomaly"), "technical_anomaly")
+    _validate_signal_module(record.get("capital_anomaly"), "capital_anomaly")
+    _validate_signal_module(record.get("derivatives_anomaly"), "derivatives_anomaly")
 
 
 def generate_futu_skill_facts(
@@ -480,10 +955,12 @@ def generate_futu_skill_facts(
     data_dir: Path,
     run_date: str,
     market: MarketScope | str | None,
-    extractor: FutuSkillNewsSentimentExtractor,
+    extractor: FutuSkillFactsExtractorProtocol,
     update_latest: bool,
+    window_days: int = 7,
 ) -> FutuSkillFactResult:
     effective_run_date = _validate_run_date(run_date)
+    effective_window_days = _validate_window_days(window_days)
     market_scope = _market_scope(market)
     sources = _load_portfolio_sources(portfolio_path, market_scope)
     run_path = futu_skill_facts_run_path(data_dir, effective_run_date, market_scope)
@@ -501,6 +978,7 @@ def generate_futu_skill_facts(
             source=source,
             run_date=effective_run_date,
             extractor=extractor,
+            window_days=effective_window_days,
         )
         for source in sources
     ]
@@ -510,6 +988,7 @@ def generate_futu_skill_facts(
         "generated_at": _now_text(),
         "run_date": effective_run_date,
         "market": market_scope.value if market_scope is not None else "",
+        "window_days": effective_window_days,
         "records": records,
     }
     _atomic_write_json(run_path, payload)
@@ -529,7 +1008,8 @@ def _build_record(
     *,
     source: FutuSkillSource,
     run_date: str,
-    extractor: FutuSkillNewsSentimentExtractor,
+    extractor: FutuSkillFactsExtractorProtocol,
+    window_days: int,
 ) -> dict[str, Any]:
     base: dict[str, Any] = {
         "schema_version": FUTU_SKILL_FACTS_SCHEMA_VERSION,
@@ -538,6 +1018,7 @@ def _build_record(
         "symbol": source.symbol,
         "name": source.name,
     }
+    errors: list[str] = []
     try:
         module = extractor.extract_news_sentiment(
             market=source.market,
@@ -545,14 +1026,76 @@ def _build_record(
             name=source.name,
             run_date=run_date,
         )
-        normalized = _normalize_news_sentiment_module(module)
-        record = {**base, "news_sentiment": normalized, "error": ""}
+        news_sentiment = _normalize_news_sentiment_module(module)
     except Exception as exc:
-        record = {
-            **base,
-            "news_sentiment": _error_news_sentiment_module(),
-            "error": str(exc) or exc.__class__.__name__,
-        }
+        reason = str(exc) or exc.__class__.__name__
+        news_sentiment = _error_news_sentiment_module()
+        errors.append(f"news_sentiment: {reason}")
+    try:
+        technical_anomaly = _normalize_signal_module(
+            extractor.extract_technical_anomaly(
+                market=source.market,
+                symbol=source.symbol,
+                name=source.name,
+                run_date=run_date,
+                window_days=window_days,
+            ),
+            "technical_anomaly",
+        )
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        technical_anomaly = _error_signal_module(
+            "technical_anomaly",
+            window_days,
+            reason,
+        )
+        errors.append(f"technical_anomaly: {reason}")
+    try:
+        capital_anomaly = _normalize_signal_module(
+            extractor.extract_capital_anomaly(
+                market=source.market,
+                symbol=source.symbol,
+                name=source.name,
+                run_date=run_date,
+                window_days=window_days,
+            ),
+            "capital_anomaly",
+        )
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        capital_anomaly = _error_signal_module(
+            "capital_anomaly",
+            window_days,
+            reason,
+        )
+        errors.append(f"capital_anomaly: {reason}")
+    try:
+        derivatives_anomaly = _normalize_signal_module(
+            extractor.extract_derivatives_anomaly(
+                market=source.market,
+                symbol=source.symbol,
+                name=source.name,
+                run_date=run_date,
+                window_days=window_days,
+            ),
+            "derivatives_anomaly",
+        )
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        derivatives_anomaly = _error_signal_module(
+            "derivatives_anomaly",
+            window_days,
+            reason,
+        )
+        errors.append(f"derivatives_anomaly: {reason}")
+    record = {
+        **base,
+        "news_sentiment": news_sentiment,
+        "technical_anomaly": technical_anomaly,
+        "capital_anomaly": capital_anomaly,
+        "derivatives_anomaly": derivatives_anomaly,
+        "error": "; ".join(errors),
+    }
     validate_futu_skill_fact_record(record)
     return record
 
@@ -607,6 +1150,495 @@ def _validate_news_sentiment_module(module: object) -> None:
         raise ValueError("news_sentiment blocking_reason is invalid")
     if "domestic_discussion" in module:
         _validate_domestic_discussion(module.get("domestic_discussion"))
+
+
+def _normalize_signal_module(module: object, module_name: str) -> dict[str, Any]:
+    if not isinstance(module, dict):
+        raise ValueError(f"{module_name} module is invalid")
+    raw_window_days = module.get("window_days")
+    window_days = 7 if raw_window_days is None or raw_window_days == "" else raw_window_days
+    normalized = {
+        "status": _required_enum(module, "status", VALID_MODULE_STATUSES, module_name),
+        "signal": _required_enum(module, "signal", VALID_SIGNALS, module_name),
+        "confidence": _required_enum(module, "confidence", VALID_CONFIDENCES, module_name),
+        "suggested_constraint": _required_enum(
+            module,
+            "suggested_constraint",
+            VALID_CONSTRAINTS,
+            module_name,
+        ),
+        "window_days": _validate_window_days(window_days),
+        "summary": _optional_text(module.get("summary")),
+        "categories": _normalize_signal_categories(
+            module.get("categories"),
+            module_name,
+        ),
+    }
+    _validate_signal_module(normalized, module_name)
+    return normalized
+
+
+def _normalize_signal_categories(
+    categories: object,
+    module_name: str,
+) -> list[dict[str, str]]:
+    if not isinstance(categories, list):
+        raise ValueError(f"{module_name} categories is invalid")
+    normalized: list[dict[str, str]] = []
+    for item in categories:
+        if not isinstance(item, dict):
+            raise ValueError(f"{module_name} category is invalid")
+        normalized.append(
+            {
+                "name": _required_text(item, "name", f"{module_name} category"),
+                "state": _required_enum(
+                    item,
+                    "state",
+                    VALID_CATEGORY_STATES,
+                    f"{module_name} category",
+                ),
+                "direction": _required_enum(
+                    item,
+                    "direction",
+                    VALID_CATEGORY_DIRECTIONS,
+                    f"{module_name} category",
+                ),
+                "detail": _required_text(item, "detail", f"{module_name} category"),
+                "evidence_date": _optional_text(item.get("evidence_date")),
+            }
+        )
+    return normalized
+
+
+def _module_needs_detail_summary(module: dict[str, object]) -> bool:
+    categories = module.get("categories")
+    if not isinstance(categories, list):
+        return False
+    return any(
+        isinstance(category, dict)
+        and category.get("state") == "anomaly"
+        and _detail_needs_summary(_optional_text(category.get("detail")))
+        for category in categories
+    )
+
+
+def _detail_needs_summary(detail: str) -> bool:
+    return (
+        len(detail) > 70
+        or "[timestamp:" in detail
+        or "\n" in detail
+    )
+
+
+def _anomaly_summary_input_module(module: dict[str, object]) -> dict[str, object]:
+    payload = dict(module)
+    categories = []
+    for category in module.get("categories", []):
+        if not isinstance(category, dict):
+            continue
+        item = dict(category)
+        detail = _optional_text(item.get("detail"))
+        if len(detail) > 1000:
+            item["detail"] = _bounded_text(detail, 1000)
+        categories.append(item)
+    payload["categories"] = categories
+    return payload
+
+
+def _apply_anomaly_summary_payload(
+    module: dict[str, object],
+    payload: dict[str, object],
+    module_name: str,
+) -> dict[str, object]:
+    summarized = dict(module)
+    summary = _optional_text(payload.get("summary"))
+    if summary:
+        summarized["summary"] = _bounded_text(summary, 120)
+    category_updates = {
+        _optional_text(item.get("name")): item
+        for item in payload.get("categories", [])
+        if isinstance(item, dict) and _optional_text(item.get("name"))
+    } if isinstance(payload.get("categories"), list) else {}
+    categories = []
+    for category in module.get("categories", []):
+        if not isinstance(category, dict):
+            continue
+        updated = dict(category)
+        replacement = category_updates.get(_optional_text(category.get("name")))
+        if isinstance(replacement, dict):
+            detail = _optional_text(replacement.get("detail"))
+            direction = _optional_text(replacement.get("direction"))
+            if detail:
+                updated["detail"] = _bounded_text(detail, 90)
+            if direction in VALID_CATEGORY_DIRECTIONS:
+                updated["direction"] = direction
+        categories.append(updated)
+    summarized["categories"] = categories
+    normalized = _normalize_signal_module(summarized, module_name)
+    _validate_signal_module(normalized, module_name)
+    return normalized
+
+
+def _compact_anomaly_module_details(
+    module: dict[str, object],
+    module_name: str,
+) -> dict[str, object]:
+    compacted = dict(module)
+    categories = []
+    for category in module.get("categories", []):
+        if not isinstance(category, dict):
+            continue
+        updated = dict(category)
+        detail = _optional_text(updated.get("detail"))
+        if _detail_needs_summary(detail):
+            updated["detail"] = _compact_anomaly_detail(detail)
+        categories.append(updated)
+    compacted["categories"] = categories
+    normalized = _normalize_signal_module(compacted, module_name)
+    _validate_signal_module(normalized, module_name)
+    return normalized
+
+
+def _compact_anomaly_detail(detail: str) -> str:
+    text = re.sub(r"\[timestamp:\s*\d+\]", "。", detail)
+    text = " ".join(text.split())
+    parts = [
+        part.strip(" ，,。")
+        for part in re.split(r"[。；;]\s*", text)
+        if part.strip(" ，,。")
+    ]
+    compact = "；".join(parts[:2]) if parts else text
+    return _bounded_text(compact, 90)
+
+
+def _bounded_text(text: str, max_chars: int) -> str:
+    value = " ".join(_optional_text(text).split())
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 1].rstrip(" ，,；;。") + "…"
+
+
+def _validate_signal_module(module: object, module_name: str) -> None:
+    if not isinstance(module, dict):
+        raise ValueError(f"{module_name} module is invalid")
+    _validate_enum(module, "status", VALID_MODULE_STATUSES, module_name)
+    _validate_enum(module, "signal", VALID_SIGNALS, module_name)
+    _validate_enum(module, "confidence", VALID_CONFIDENCES, module_name)
+    _validate_enum(module, "suggested_constraint", VALID_CONSTRAINTS, module_name)
+    if not isinstance(module.get("window_days"), int):
+        raise ValueError(f"{module_name} window_days is invalid")
+    _validate_window_days(module["window_days"])
+    if not isinstance(module.get("summary"), str):
+        raise ValueError(f"{module_name} summary is invalid")
+    categories = module.get("categories")
+    if not isinstance(categories, list):
+        raise ValueError(f"{module_name} categories is invalid")
+    for category in categories:
+        if not isinstance(category, dict):
+            raise ValueError(f"{module_name} category is invalid")
+        for field in ("name", "state", "direction", "detail", "evidence_date"):
+            if not isinstance(category.get(field), str):
+                raise ValueError(f"{module_name} category {field} is invalid")
+        _validate_enum(
+            category,
+            "state",
+            VALID_CATEGORY_STATES,
+            f"{module_name} category",
+        )
+        _validate_enum(
+            category,
+            "direction",
+            VALID_CATEGORY_DIRECTIONS,
+            f"{module_name} category",
+        )
+
+
+def _normalize_anomaly_payload(
+    payload: dict[str, object],
+    *,
+    module_name: str,
+    category_labels: tuple[str, ...],
+    window_days: int,
+) -> dict[str, object]:
+    data = payload.get("data")
+    rows = [
+        *_anomaly_rows(data),
+        *_content_anomaly_rows(
+            _sdk_content_text(data),
+            category_labels=category_labels,
+        ),
+    ]
+    categories = [
+        _category_from_rows(label, rows)
+        for label in category_labels
+    ]
+    anomaly_categories = [
+        item for item in categories if item["state"] == "anomaly"
+    ]
+    risk_categories = [
+        item
+        for item in anomaly_categories
+        if item["direction"] in {"bearish", "risk_up", "mixed"}
+    ]
+    supportive_categories = [
+        item for item in anomaly_categories if item["direction"] == "bullish"
+    ]
+    if risk_categories:
+        signal = "risk_up" if module_name == "derivatives_anomaly" else "mixed"
+        suggested_constraint = "no_add"
+    elif supportive_categories:
+        signal = "supportive"
+        suggested_constraint = ""
+    elif anomaly_categories:
+        signal = "mixed"
+        suggested_constraint = "review"
+    else:
+        signal = "neutral"
+        suggested_constraint = ""
+    module = {
+        "status": "ok",
+        "signal": signal,
+        "confidence": "medium" if anomaly_categories else "low",
+        "suggested_constraint": suggested_constraint,
+        "window_days": _validate_window_days(window_days),
+        "summary": _signal_summary(module_name, signal, suggested_constraint),
+        "categories": categories,
+    }
+    _validate_signal_module(module, module_name)
+    return module
+
+
+def _sdk_content_text(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    return _optional_text(data.get("content"))
+
+
+def _content_anomaly_rows(
+    content: str,
+    *,
+    category_labels: tuple[str, ...],
+) -> list[dict[str, object]]:
+    if not content:
+        return []
+    return [
+        {
+            "name": label,
+            "description": content,
+        }
+        for label in category_labels
+        if _text_matches_category(content, label)
+    ]
+
+
+def _anomaly_rows(data: object) -> list[dict[str, object]]:
+    if isinstance(data, dict):
+        rows: list[dict[str, object]] = []
+        if any(
+            field in data
+            for field in (
+                "name",
+                "category",
+                "type",
+                "indicator",
+                "title",
+                "description",
+                "direction",
+                "date",
+                "detail",
+                "summary",
+            )
+        ):
+            rows.append(data)
+        for value in data.values():
+            rows.extend(_anomaly_rows(value))
+        return rows
+    if isinstance(data, list):
+        rows = []
+        for item in data:
+            if isinstance(item, dict):
+                rows.append(item)
+            else:
+                rows.extend(_anomaly_rows(item))
+        return rows
+    return []
+
+
+def _category_from_rows(
+    label: str,
+    rows: list[dict[str, object]],
+) -> dict[str, str]:
+    matches = [row for row in rows if _row_matches_category(row, label)]
+    if not matches:
+        return {
+            "name": label,
+            "state": "none",
+            "direction": "",
+            "detail": "窗口内无异常。",
+            "evidence_date": "",
+        }
+    first = matches[0]
+    detail = _row_detail_text(first)
+    return {
+        "name": label,
+        "state": "anomaly",
+        "direction": _row_direction(first),
+        "detail": detail or "发现异动，详情见原始富途返回。",
+        "evidence_date": _row_date(first),
+    }
+
+
+def _row_matches_category(row: dict[str, object], label: str) -> bool:
+    normalized_label = label.casefold()
+    for field in ("name", "category", "type", "indicator", "title"):
+        value = _optional_text(row.get(field)).casefold()
+        if value == normalized_label:
+            return True
+    return _text_matches_category(_row_text(row), label)
+
+
+def _text_matches_category(text: str, label: str) -> bool:
+    normalized_text = text.casefold()
+    aliases = {
+        "K线形态": ("k线", "形态", "pattern"),
+        "资金分布与买卖经纪商": (
+            "资金分布",
+            "经纪商",
+            "broker",
+            "funds_distribution",
+            "funds_broker",
+        ),
+        "资金流向": ("资金流向", "flow", "funds_flow"),
+        "卖空情况": ("卖空", "short"),
+        "牛熊证街货比例": ("牛熊证街货比例", "warrant_ratio"),
+        "牛熊证街货价格区间": (
+            "牛熊证街货价格区间",
+            "warrant_price_distribution",
+        ),
+        "期权大单": ("期权大单", "option_unusual"),
+        "期权波动率": ("期权波动率", "iv", "volatility", "option_volatility"),
+        "期权量价": ("期权量价", "volume", "option_volume_price"),
+        "期权情绪": ("期权情绪", "put/call", "pcr", "option_sentiment"),
+        "期权综合信号": ("期权综合", "option_comprehensive"),
+    }
+    terms = aliases.get(label, (label.casefold(),))
+    return any(
+        _term_matches_text(term, normalized_text)
+        for term in terms
+        if term
+    )
+
+
+def _term_matches_text(term: str, normalized_text: str) -> bool:
+    normalized_term = term.casefold()
+    if re.fullmatch(r"[a-z0-9/]+", normalized_term):
+        pattern = (
+            rf"(?<![a-z0-9]){re.escape(normalized_term)}"
+            rf"(?![a-z0-9])"
+        )
+        return re.search(pattern, normalized_text) is not None
+    return normalized_term in normalized_text
+
+
+def _row_text(row: dict[str, object]) -> str:
+    return json.dumps(
+        row,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    ).casefold()
+
+
+def _row_direction(row: dict[str, object]) -> str:
+    explicit = _explicit_row_direction(row)
+    if explicit:
+        return explicit
+    text = _row_text(row)
+    if "risk_up" in text or "风险" in text or "超买" in text:
+        return "risk_up"
+    if any(
+        term in text
+        for term in ("bearish", "看跌", "偏空", "流出", "卖空", "short")
+    ):
+        return "bearish"
+    if any(term in text for term in ("mixed", "分歧")):
+        return "mixed"
+    if any(term in text for term in ("bullish", "看涨", "偏多", "流入", "金叉")):
+        return "bullish"
+    return "neutral"
+
+
+def _explicit_row_direction(row: dict[str, object]) -> str:
+    direction = _optional_text(row.get("direction")).casefold()
+    labels = {
+        "bullish": "bullish",
+        "偏多": "bullish",
+        "看涨": "bullish",
+        "bearish": "bearish",
+        "偏空": "bearish",
+        "看跌": "bearish",
+        "risk_up": "risk_up",
+        "风险上升": "risk_up",
+        "mixed": "mixed",
+        "分歧": "mixed",
+        "neutral": "neutral",
+        "中性": "neutral",
+    }
+    return labels.get(direction, "")
+
+
+def _row_detail_text(row: dict[str, object]) -> str:
+    for field in ("description", "interpretation", "summary", "detail"):
+        value = _optional_text(row.get(field))
+        if value:
+            return value
+    detail_fields = {
+        key: value
+        for key, value in row.items()
+        if key
+        not in {
+            "name",
+            "category",
+            "type",
+            "indicator",
+            "title",
+            "direction",
+            "date",
+            "datetime",
+            "time",
+            "occur_date",
+        }
+        and _optional_text(value)
+    }
+    if detail_fields:
+        return json.dumps(
+            detail_fields,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    return _row_text(row)
+
+
+def _row_date(row: dict[str, object]) -> str:
+    for field in ("date", "datetime", "time", "occur_date"):
+        value = _optional_text(row.get(field))
+        if value:
+            return value
+    return ""
+
+
+def _signal_summary(module_name: str, signal: str, suggested_constraint: str) -> str:
+    del module_name
+    if signal == "supportive":
+        return "异动信号支持当前交易方向。"
+    if signal == "risk_up":
+        return "异动信号提示风险上升。"
+    if signal == "mixed":
+        return "异动信号存在分歧，需要结合主结论复核。"
+    if suggested_constraint:
+        return "异动信号触发执行约束。"
+    return "窗口内未发现明显异动。"
 
 
 def _load_portfolio_sources(
@@ -993,6 +2025,46 @@ def _error_news_sentiment_module() -> dict[str, Any]:
     }
 
 
+def _missing_signal_module(module_name: str, window_days: int) -> dict[str, Any]:
+    return {
+        "status": "missing",
+        "signal": "neutral",
+        "confidence": "low",
+        "suggested_constraint": "review",
+        "window_days": _validate_window_days(window_days),
+        "summary": f"{_default_error_category_name(module_name)}暂未接入。",
+        "categories": [],
+    }
+
+
+def _error_signal_module(module_name: str, window_days: int, reason: str) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "signal": "neutral",
+        "confidence": "low",
+        "suggested_constraint": "review",
+        "window_days": _validate_window_days(window_days),
+        "summary": reason,
+        "categories": [
+            {
+                "name": _default_error_category_name(module_name),
+                "state": "error",
+                "direction": "",
+                "detail": reason,
+                "evidence_date": "",
+            }
+        ],
+    }
+
+
+def _default_error_category_name(module_name: str) -> str:
+    return {
+        "technical_anomaly": "技术异动",
+        "capital_anomaly": "资金异动",
+        "derivatives_anomaly": "衍生品异动",
+    }[module_name]
+
+
 def _normalize_freshness(value: object) -> dict[str, str]:
     if not isinstance(value, dict):
         return {"generated_at": "", "source_window": ""}
@@ -1091,6 +2163,13 @@ def _required_enum(
     return value
 
 
+def _required_text(mapping: dict[str, object], field: str, context: str) -> str:
+    value = _optional_text(mapping.get(field))
+    if not value:
+        raise ValueError(f"{context} {field} is invalid")
+    return value
+
+
 def _validate_enum(
     mapping: dict[str, object],
     field: str,
@@ -1176,6 +2255,20 @@ def _domestic_discussion_system_prompt() -> str:
     )
 
 
+def _anomaly_module_summary_system_prompt() -> str:
+    return (
+        "你是交易仪表盘的富途异动信号摘要器。"
+        "你只把富途技术、资金、衍生品异动原文压缩成结构化短摘要，不给买卖建议，不生成下单动作。"
+        "必须输出 JSON object，字段为 summary 和 categories。"
+        "summary 是 1 句中文，总结这个模块的核心异常和交易约束，最长 60 个汉字。"
+        "categories 是数组，每项必须包含 name、detail，可选 direction。"
+        "name 必须使用输入里的原类别名，不得新增类别，不得改变类别顺序。"
+        "detail 每个类别最多 45 个汉字，只保留最重要的金额、方向、波动率、经纪商或时间信息。"
+        "direction 如输出，只能是 bullish、bearish、neutral、risk_up、mixed 或空字符串。"
+        "不能复制长篇原始流水，不能输出 URL，不能包含英文交易建议。"
+    )
+
+
 def _validate_run_date(value: str) -> str:
     text = value.strip()
     try:
@@ -1183,6 +2276,16 @@ def _validate_run_date(value: str) -> str:
     except ValueError as exc:
         raise ValueError(f"invalid run_date: {value}") from exc
     return text
+
+
+def _validate_window_days(window_days: int) -> int:
+    try:
+        value = int(window_days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("window_days must be an integer") from exc
+    if value < 1 or value > 30:
+        raise ValueError("window_days must be between 1 and 30")
+    return value
 
 
 def _market_scope(market: MarketScope | str | None) -> MarketScope | None:

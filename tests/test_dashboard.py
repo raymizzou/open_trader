@@ -185,6 +185,57 @@ def write_futu_skill_facts(path: Path) -> None:
                             "blocking_reason": "",
                             "suggested_constraint": "",
                         },
+                        "technical_anomaly": {
+                            "status": "ok",
+                            "signal": "supportive",
+                            "confidence": "medium",
+                            "suggested_constraint": "",
+                            "window_days": 7,
+                            "summary": "技术信号支持趋势。",
+                            "categories": [
+                                {
+                                    "name": "MACD",
+                                    "state": "anomaly",
+                                    "direction": "bullish",
+                                    "detail": "金叉后继续放大。",
+                                    "evidence_date": "2026-07-01",
+                                }
+                            ],
+                        },
+                        "capital_anomaly": {
+                            "status": "ok",
+                            "signal": "mixed",
+                            "confidence": "medium",
+                            "suggested_constraint": "no_add",
+                            "window_days": 7,
+                            "summary": "资金流向与加仓动作存在分歧。",
+                            "categories": [
+                                {
+                                    "name": "资金流向",
+                                    "state": "anomaly",
+                                    "direction": "bearish",
+                                    "detail": "主力资金连续净流出。",
+                                    "evidence_date": "2026-07-02",
+                                }
+                            ],
+                        },
+                        "derivatives_anomaly": {
+                            "status": "partial",
+                            "signal": "risk_up",
+                            "confidence": "low",
+                            "suggested_constraint": "no_add",
+                            "window_days": 7,
+                            "summary": "期权波动率偏高。",
+                            "categories": [
+                                {
+                                    "name": "期权波动率",
+                                    "state": "anomaly",
+                                    "direction": "risk_up",
+                                    "detail": "IV 位于高位。",
+                                    "evidence_date": "2026-07-02",
+                                }
+                            ],
+                        },
                         "error": "",
                     }
                 ],
@@ -276,6 +327,96 @@ def write_tradingagents_summary(path: Path) -> None:
                             "action_logic": "降低仓位而不是清仓",
                         },
                         "source_hash": "sha256:" + "a" * 64,
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_t_signals(path: Path, *, symbol: str = "VIXY", action: str = "BUY_T") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    suggested_ratio = "10" if action in {"BUY_T", "SELL_T"} else ""
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.t_signals_cache.v1",
+                "generated_at": "2026-07-02T22:32:00+08:00",
+                "run_date": "2026-07-02",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.t_signal.v1",
+                        "run_date": "2026-07-02",
+                        "market": "US",
+                        "symbol": symbol,
+                        "futu_symbol": f"US.{symbol}",
+                        "name": "Volatility ETF",
+                        "session_phase": "regular",
+                        "updated_at": "2026-07-02T22:31:00+08:00",
+                        "action": action,
+                        "suggested_ratio": suggested_ratio,
+                        "current_status": "BUY_T 条件满足，等待执行确认。",
+                        "signal_summary_zh": "价格低于 VWAP 后回收，适合按 10% 底仓比例低吸买回。",
+                        "price": {
+                            "last_price": "48.50",
+                            "day_change_pct": "-1.20",
+                            "vwap": "49.10",
+                            "ma_1m": "48.55",
+                            "ma_5m": "48.85",
+                            "day_low": "48.00",
+                            "day_high": "50.20",
+                        },
+                        "liquidity": {
+                            "bid": "48.49",
+                            "ask": "48.50",
+                            "spread_pct": "0.021",
+                            "bid_depth": "5000",
+                            "ask_depth": "4700",
+                            "depth_status": "pass",
+                        },
+                        "technical": {
+                            "rsi_5m": "34",
+                            "volume_ratio_5m": "1.30",
+                            "price_position": "below_vwap_reclaim",
+                            "trend_state": "range_rebound",
+                        },
+                        "hard_gates": [
+                            {
+                                "name": "session_phase",
+                                "status": "pass",
+                                "message_zh": "当前处于盘中交易时段。",
+                            }
+                        ],
+                        "evidence": [
+                            {
+                                "name": "vwap_reclaim",
+                                "direction": "buy",
+                                "strength": "medium",
+                                "message_zh": "价格低于 VWAP 后回收。",
+                            }
+                        ],
+                        "timeline": [
+                            {
+                                "event_at": "2026-07-02T22:31:00+08:00",
+                                "event_type": "signal_created",
+                                "action": action,
+                                "suggested_ratio": suggested_ratio,
+                                "message_zh": "生成 BUY_T 信号，建议比例 10%。",
+                            }
+                        ],
+                        "notification": {
+                            "should_notify": True,
+                            "notified": False,
+                            "dedupe_key": f"2026-07-02|US.{symbol}|{action}|{suggested_ratio}",
+                            "last_notified_at": "",
+                            "last_notified_dedupe_key": "",
+                            "last_attempted_dedupe_key": "",
+                        },
+                        "status": "ok",
                         "error": "",
                     }
                 ],
@@ -669,6 +810,35 @@ def test_load_dashboard_state_merges_agent_report_strategy_and_actions(
     assert vixy["trade_action"]["available"] is True
     assert vixy["trade_action"]["action"] == "TRIM"
     assert vixy["trade_action"]["suggested_quantity"] == "50"
+
+
+def test_load_dashboard_state_attaches_t_signal_from_market_scoped_latest(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_t_signals(config.data_dir / "latest" / "US" / "t_signals.json")
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["t_signal"]["available"] is True
+    assert vixy["t_signal"]["action"] == "BUY_T"
+    assert vixy["t_signal"]["suggested_ratio"] == "10"
+    assert vixy["t_signal"]["signal_summary_zh"].startswith("价格低于 VWAP")
+    assert vixy["t_signal"]["timeline"][0]["event_type"] == "signal_created"
+
+
+def test_load_dashboard_state_marks_t_signal_unavailable_when_missing(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["t_signal"] == {"available": False, "error": ""}
 
 
 def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallback(
@@ -1328,6 +1498,274 @@ def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     ]
     assert news_sentiment["domestic_discussion"]["summary"] == "富途社区相关讨论较少，主要关注波动率 ETF 的短线风险。"
     assert news_sentiment["domestic_discussion"]["credibility"] == "低"
+    technical = vixy["futu_skill_facts"]["technical_anomaly"]
+    capital = vixy["futu_skill_facts"]["capital_anomaly"]
+    derivatives = vixy["futu_skill_facts"]["derivatives_anomaly"]
+    assert technical["available"] is True
+    assert technical["signal"] == "supportive"
+    assert technical["categories"][0]["name"] == "MACD"
+    assert capital["suggested_constraint"] == "no_add"
+    assert derivatives["status"] == "partial"
+
+
+def test_load_dashboard_state_marks_missing_anomaly_modules_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+
+    state = load_dashboard_state(config).to_dict()
+    vixy = state["holdings"][0]
+
+    assert vixy["futu_skill_facts"]["technical_anomaly"]["available"] is False
+    assert vixy["futu_skill_facts"]["technical_anomaly"]["status"] == "missing"
+    assert vixy["futu_skill_facts"]["capital_anomaly"]["categories"] == []
+
+
+def test_load_dashboard_state_hardens_malformed_cached_anomaly_module(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    path = config.data_dir / "latest" / "US" / "futu_skill_facts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.futu_skill_facts.v1",
+                "generated_at": "2026-07-01T09:15:00+08:00",
+                "run_date": "2026-07-01",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.futu_skill_facts.v1",
+                        "run_date": "2026-07-01",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "name": "ProShares VIX Short-Term Futures ETF",
+                        "technical_anomaly": {
+                            "status": "ok",
+                            "signal": "supportive",
+                            "confidence": "medium",
+                            "suggested_constraint": "",
+                            "window_days": "7d",
+                            "summary": "技术信号支持趋势。",
+                            "categories": [
+                                None,
+                                {
+                                    "name": "MACD",
+                                    "state": "anomaly",
+                                },
+                            ],
+                        },
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    technical = state["holdings"][0]["futu_skill_facts"]["technical_anomaly"]
+    assert technical["window_days"] == 0
+    assert technical["categories"] == [
+        {
+            "name": "MACD",
+            "state": "anomaly",
+            "direction": "",
+            "detail": "",
+            "evidence_date": "",
+        }
+    ]
+    assert all(isinstance(category, dict) for category in technical["categories"])
+    assert all(
+        isinstance(category[field], str)
+        for category in technical["categories"]
+        for field in ("name", "state", "direction", "detail", "evidence_date")
+    )
+
+
+def test_load_dashboard_state_hardens_non_finite_anomaly_window_days(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    path = config.data_dir / "latest" / "US" / "futu_skill_facts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """
+{
+  "schema_version": "open_trader.futu_skill_facts.v1",
+  "generated_at": "2026-07-01T09:15:00+08:00",
+  "run_date": "2026-07-01",
+  "market": "US",
+  "records": [
+    {
+      "schema_version": "open_trader.futu_skill_facts.v1",
+      "run_date": "2026-07-01",
+      "market": "US",
+      "symbol": "VIXY",
+      "name": "ProShares VIX Short-Term Futures ETF",
+      "technical_anomaly": {
+        "status": "ok",
+        "signal": "supportive",
+        "confidence": "medium",
+        "suggested_constraint": "",
+        "window_days": Infinity,
+        "summary": "技术信号支持趋势。",
+        "categories": []
+      },
+      "error": ""
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    technical = state["holdings"][0]["futu_skill_facts"]["technical_anomaly"]
+    assert technical["window_days"] == 0
+
+
+def test_load_dashboard_state_marks_stale_anomaly_module_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    path = config.data_dir / "latest" / "US" / "futu_skill_facts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.futu_skill_facts.v1",
+                "generated_at": "2026-07-01T09:15:00+08:00",
+                "run_date": "2026-07-01",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.futu_skill_facts.v1",
+                        "run_date": "2026-07-01",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "name": "ProShares VIX Short-Term Futures ETF",
+                        "technical_anomaly": {
+                            "status": "stale",
+                            "signal": "supportive",
+                            "confidence": "medium",
+                            "suggested_constraint": "",
+                            "window_days": 7,
+                            "summary": "技术信号来自旧缓存。",
+                            "categories": [
+                                {
+                                    "name": "MACD",
+                                    "state": "anomaly",
+                                    "direction": "bullish",
+                                    "detail": "旧窗口内金叉。",
+                                    "evidence_date": "2026-06-28",
+                                }
+                            ],
+                        },
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    technical = state["holdings"][0]["futu_skill_facts"]["technical_anomaly"]
+    assert technical["available"] is False
+    assert technical["status"] == "stale"
+    assert technical["summary"] == "技术信号来自旧缓存。"
+    assert technical["categories"] == [
+        {
+            "name": "MACD",
+            "state": "anomaly",
+            "direction": "bullish",
+            "detail": "旧窗口内金叉。",
+            "evidence_date": "2026-06-28",
+        }
+    ]
+
+
+def test_load_dashboard_state_marks_stale_futu_news_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    path = config.data_dir / "latest" / "US" / "futu_skill_facts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.futu_skill_facts.v1",
+                "generated_at": "2026-07-01T09:15:00+08:00",
+                "run_date": "2026-07-01",
+                "market": "US",
+                "records": [
+                    {
+                        "schema_version": "open_trader.futu_skill_facts.v1",
+                        "run_date": "2026-07-01",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "name": "ProShares VIX Short-Term Futures ETF",
+                        "news_sentiment": {
+                            "status": "stale",
+                            "signal": "supportive",
+                            "confidence": "medium",
+                            "freshness": {
+                                "generated_at": "2026-06-30T09:10:00+08:00",
+                                "source_window": "latest",
+                            },
+                            "evidence": [
+                                {
+                                    "title": "Old volatility digest",
+                                    "summary": "旧新闻仍可展示。",
+                                    "url": "https://example.com/old-vixy",
+                                }
+                            ],
+                            "domestic_discussion": {
+                                "status": "ok",
+                                "keyword_counts": [{"keyword": "波动", "count": 1}],
+                                "summary": "旧社区讨论。",
+                                "focus": "波动率 ETF",
+                                "divergence_risk": "样本旧。",
+                                "credibility": "低",
+                                "trading_constraint": "仅展示旧上下文。",
+                                "post_count": 1,
+                                "relevant_post_count": 1,
+                            },
+                            "blocking_reason": "旧缓存",
+                            "suggested_constraint": "no_add",
+                        },
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    news = state["holdings"][0]["futu_skill_facts"]["news_sentiment"]
+    assert news["available"] is False
+    assert news["status"] == "stale"
+    assert news["signal"] == "supportive"
+    assert news["confidence"] == "medium"
+    assert news["evidence"][0]["url"] == "https://example.com/old-vixy"
+    assert news["domestic_discussion"]["summary"] == "旧社区讨论。"
+    assert news["blocking_reason"] == "旧缓存"
+    assert news["suggested_constraint"] == "no_add"
 
 
 def test_load_dashboard_state_marks_missing_agent_sections_unavailable(

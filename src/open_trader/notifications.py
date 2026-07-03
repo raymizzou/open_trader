@@ -20,6 +20,8 @@ class Notifier(Protocol):
 
 
 class NullNotifier:
+    records_delivery = False
+
     def notify(self, title: str, message: str) -> None:
         pass
 

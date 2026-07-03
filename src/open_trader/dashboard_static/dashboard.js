@@ -8,6 +8,7 @@ const state = {
   marketFilter: "ALL",
   brokerFilter: "ALL",
   selectedHoldingKey: "",
+  selectedHoldingDetail: "decision",
   detailLanguage: "zh",
   refreshActive: false,
   quoteIntervalId: null,
@@ -21,6 +22,16 @@ const state = {
 };
 
 const elements = {};
+
+const HOLDINGS_TABLE_COLUMN_COUNT = 10;
+
+const MARKET_SECTION_CONFIGS = [
+  { market: "US_STOCK", marketGroup: "US", label: "美股正股", className: "market-section-us-stock" },
+  { market: "US_OPTION", marketGroup: "US", label: "美股期权", className: "market-section-us-option" },
+  { market: "HK_STOCK", marketGroup: "HK", label: "港股正股", className: "market-section-hk-stock" },
+  { market: "HK_OPTION", marketGroup: "HK", label: "港股期权", className: "market-section-hk-option" },
+  { market: "OTHER", marketGroup: "OTHER", label: "其他市场持仓", className: "market-section-other" },
+];
 
 const ACTION_LABELS = {
   ADD: "加仓",
@@ -159,6 +170,7 @@ function bindEvents() {
     }
     state.marketFilter = button.dataset.market || "ALL";
     state.selectedHoldingKey = "";
+    state.selectedHoldingDetail = "decision";
     setActiveFilter(elements["header-market-filters"], button);
     renderDashboardViews();
   });
@@ -169,13 +181,14 @@ function bindEvents() {
     }
     state.brokerFilter = button.dataset.broker || "ALL";
     state.selectedHoldingKey = "";
+    state.selectedHoldingDetail = "decision";
     setActiveFilter(elements["header-broker-filters"], button);
     renderDashboardViews();
   });
   elements["holdings-body"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-detail-key]");
     if (button) {
-      showSymbolDetail(button.dataset.detailKey || "");
+      showSymbolDetail(button.dataset.detailKey || "", button.dataset.detailMode || "decision");
       return;
     }
     handleSymbolDetailClick(event);
@@ -205,6 +218,7 @@ function handleSymbolDetailClick(event) {
   const backButton = event.target.closest("[data-back-to-holdings]");
   if (backButton) {
     state.selectedHoldingKey = "";
+    state.selectedHoldingDetail = "decision";
     renderHoldings();
     return;
   }
@@ -583,49 +597,58 @@ function renderHoldings() {
     return;
   }
   if (!state.dashboard) {
-    elements["holdings-body"].innerHTML = `<tr><td colspan="10" class="empty-state">加载中</td></tr>`;
+    elements["holdings-body"].innerHTML = holdingsEmptyRow("加载中");
     return;
   }
   if (holdings.length === 0) {
-    elements["holdings-body"].innerHTML = `<tr><td colspan="10" class="empty-state">没有匹配的持仓</td></tr>`;
+    elements["holdings-body"].innerHTML = holdingsEmptyRow("没有匹配的持仓");
     return;
   }
 
   const rows = [];
-  holdings.forEach((holding, index) => {
-    const rowKey = holdingKey(holding, index);
-    const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
-    const quote = quoteForHolding(holding);
-    const action = holding.trade_action || {};
-    const actionText = action.action ? action.action : "-";
-    rows.push(`
-      <tr class="${selectedClass}">
-        <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}">交易决策</button></td>
-        <td>${escapeHtml(formatPlain(holding.market))}</td>
-        <td class="symbol-cell">
-          <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
-          <span class="meta-text">${escapeHtml(formatPlain(holding.name))}</span>
-        </td>
-        <td>${escapeHtml(formatPlain(holding.brokers))}</td>
-        <td class="number-cell">${escapeHtml(formatPlain(holding.total_quantity))}</td>
-        <td class="number-cell">${escapeHtml(formatPlain(holding.last_price))}</td>
-        <td class="number-cell">${renderQuotePrice(holding, quote)}</td>
-        <td class="number-cell">${escapeHtml(formatMoney(holding.market_value_hkd, "HKD"))}</td>
-        <td class="number-cell">${escapeHtml(formatPlain(holding.unrealized_pnl_pct))}</td>
-        <td>${renderActionBadge(actionText, action.status)}</td>
-      </tr>
-    `);
-    if (selected && rowKey === state.selectedHoldingKey) {
+  groupedHoldingsByMarketSection(holdings).forEach((section) => {
+    rows.push(renderMarketSectionRow(section));
+    section.rows.forEach((entry) => {
+      const holding = entry.holding;
+      const index = entry.index;
+      const rowKey = holdingKey(holding, index);
+      const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
+      const quote = quoteForHolding(holding);
+      const selectedDetail = selected && rowKey === state.selectedHoldingKey
+        ? normalizeHoldingDetailMode(state.selectedHoldingDetail)
+        : "";
+      const tSignalClass = tSignalButtonClass(holding);
       rows.push(`
-        <tr class="decision-detail-row">
-          <td colspan="10">
-            <div class="symbol-detail-panel inline-symbol-detail">
-              ${renderSymbolDetail(selected.holding, selected.index)}
-            </div>
+        <tr class="${selectedClass}">
+          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
+          <td>${escapeHtml(formatPlain(holding.market))}</td>
+          <td class="symbol-cell">
+            <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
+            <span class="meta-text">${escapeHtml(formatPlain(holding.name))}</span>
           </td>
+          <td class="number-cell">${escapeHtml(formatPlain(holding.total_quantity))}</td>
+          <td class="number-cell">${escapeHtml(formatPlain(holding.avg_cost_price))}</td>
+          <td class="number-cell">${renderQuotePrice(holding, quote)}</td>
+          <td class="number-cell">${escapeHtml(renderUsdMarketValue(holding))}</td>
+          <td class="number-cell">${escapeHtml(formatMoney(holding.market_value_hkd, "HKD"))}</td>
+          <td class="number-cell">${escapeHtml(formatPlain(holding.portfolio_weight_hkd))}</td>
+          <td class="number-cell">${escapeHtml(formatPlain(holding.unrealized_pnl_pct))}</td>
         </tr>
       `);
-    }
+      if (selected && rowKey === state.selectedHoldingKey) {
+        rows.push(`
+          <tr class="decision-detail-row">
+            <td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}">
+              <div class="symbol-detail-panel inline-symbol-detail">
+                ${selectedDetail === "t_signal"
+                  ? renderTSignalDetail(selected.holding)
+                  : renderSymbolDetail(selected.holding, selected.index)}
+              </div>
+            </td>
+          </tr>
+        `);
+      }
+    });
   });
   elements["holdings-body"].innerHTML = rows.join("");
 }
@@ -651,9 +674,28 @@ function selectedHolding(holdings = filteredHoldings()) {
   return null;
 }
 
-function showSymbolDetail(detailKey) {
+function showSymbolDetail(detailKey, detailMode = "decision") {
   state.selectedHoldingKey = detailKey;
+  state.selectedHoldingDetail = normalizeHoldingDetailMode(detailMode);
   renderHoldings();
+}
+
+function normalizeHoldingDetailMode(mode) {
+  return mode === "t_signal" ? "t_signal" : "decision";
+}
+
+function tSignalButtonClass(holding) {
+  const signal = holding && holding.t_signal && typeof holding.t_signal === "object"
+    ? holding.t_signal
+    : {};
+  const active = (
+    signal.status === "ok"
+    && signal.session_phase === "regular"
+    && ["BUY_T", "SELL_T"].includes(signal.action)
+  );
+  return active
+    ? "expand-button t-signal-button t-signal-button-active"
+    : "expand-button t-signal-button";
 }
 
 function openTradeActionDetail(actionKey) {
@@ -667,6 +709,7 @@ function openTradeActionDetail(actionKey) {
     if (holdingActionKeys(holding).includes(normalizedActionKey)) {
       resetHoldingFilters();
       state.selectedHoldingKey = holdingKey(holding, index);
+      state.selectedHoldingDetail = "decision";
       renderDashboardViews();
       return;
     }
@@ -707,6 +750,300 @@ function renderSymbolDetail(holding, index) {
   `;
 }
 
+function renderTSignalDetail(holding) {
+  const title = `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
+  const signal = holding && holding.t_signal && typeof holding.t_signal === "object"
+    ? holding.t_signal
+    : null;
+  if (!signal || signal.available === false) {
+    const message = signal && signal.error ? signal.error : "暂无做T信号数据。";
+    return `
+      <div class="detail-header trading-decision-header">
+        <div>
+          <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
+          <h2>做T信号 · ${escapeHtml(title)}</h2>
+          <p>${escapeHtml(message)}</p>
+        </div>
+        <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
+      </div>
+      <section class="detail-section t-signal-section">
+        <h3>当前状态</h3>
+        <p class="muted-copy">该标的尚未生成做T信号，或本市场 latest 信号文件不存在。</p>
+      </section>
+    `;
+  }
+
+  return `
+    <div class="detail-header trading-decision-header">
+      <div>
+        <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
+        <h2>做T信号 · ${escapeHtml(title)}</h2>
+        <p>${escapeHtml(formatPlain(signal.signal_summary_zh || signal.current_status))}</p>
+      </div>
+      <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
+    </div>
+    <div class="t-signal-layout">
+      <section class="detail-section t-signal-section">
+        <div class="t-signal-status-row">
+          <div>
+            <h3>${escapeHtml(tSignalActionLabel(signal.action))}</h3>
+            <p>${escapeHtml(formatPlain(signal.current_status))}</p>
+          </div>
+          <span class="status-pill ${escapeHtml(tSignalStatusClass(signal.status))}">${escapeHtml(tSignalStatusLabel(signal.status))}</span>
+        </div>
+        <div class="t-signal-metric-grid">
+          ${renderTSignalMetric("确定比例", tSignalRatioText(signal.suggested_ratio))}
+          ${renderTSignalMetric("更新时间", signal.updated_at)}
+          ${renderTSignalMetric("交易时段", tSignalSessionLabel(signal.session_phase))}
+          ${renderTSignalMetric("提醒状态", tSignalNotificationText(signal.notification))}
+        </div>
+        ${signal.error ? `<p class="t-signal-error">${escapeHtml(signal.error)}</p>` : ""}
+      </section>
+      ${renderTSignalEvidence(signal)}
+      ${renderTSignalPrerequisites(signal)}
+      ${renderTSignalDetails(signal)}
+      ${renderTSignalTimeline(signal)}
+    </div>
+  `;
+}
+
+function renderTSignalMetric(label, value) {
+  return `
+    <div class="t-signal-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(formatPlain(value))}</strong>
+    </div>
+  `;
+}
+
+function renderTSignalEvidence(signal) {
+  const evidence = Array.isArray(signal.evidence) ? signal.evidence : [];
+  return `
+    <section class="detail-section t-signal-section">
+      <h3>信号依据</h3>
+      <div class="t-signal-evidence-list">
+        ${evidence.length > 0 ? evidence.map((item) => `
+          <div class="t-signal-evidence-item">
+            <strong>${escapeHtml(formatPlain(item.message_zh))}</strong>
+            <span>${escapeHtml(tSignalDirectionLabel(item.direction))} · ${escapeHtml(tSignalStrengthLabel(item.strength))}</span>
+          </div>
+        `).join("") : `<p class="muted-copy">暂无明确买卖依据。</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderTSignalPrerequisites(signal) {
+  const gates = Array.isArray(signal.hard_gates) ? signal.hard_gates : [];
+  return `
+    <section class="detail-section t-signal-section">
+      <h3>前置条件</h3>
+      <div class="t-signal-gate-grid">
+        ${gates.length > 0 ? gates.map((gate) => `
+          <div class="t-signal-gate">
+            <span>${escapeHtml(tSignalGateNameLabel(gate.name))}</span>
+            ${renderTSignalGateStatus(gate.status)}
+            <small>${escapeHtml(formatPlain(gate.message_zh))}</small>
+          </div>
+        `).join("") : `<p class="muted-copy">暂无前置条件记录。</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderTSignalDetails(signal) {
+  return `
+    <section class="detail-section t-signal-section">
+      <h3>详细信息</h3>
+      <div class="t-signal-detail-grid">
+        <div>
+          <h4>价格</h4>
+          ${renderDecisionFactRows([
+            { label: "最新价", value: nestedValue(signal.price, "last_price") },
+            { label: "日内涨跌", value: percentText(nestedValue(signal.price, "day_change_pct")) },
+            { label: "VWAP", value: nestedValue(signal.price, "vwap") },
+            { label: "日内区间", value: rangeText(nestedValue(signal.price, "day_low"), nestedValue(signal.price, "day_high")) },
+          ])}
+        </div>
+        <div>
+          <h4>技术 / 盘口</h4>
+          ${renderDecisionFactRows([
+            { label: "5分钟 RSI", value: nestedValue(signal.technical, "rsi_5m") },
+            { label: "5分钟量比", value: nestedValue(signal.technical, "volume_ratio_5m") },
+            { label: "价格位置", value: tSignalPricePositionLabel(nestedValue(signal.technical, "price_position")) },
+            { label: "盘口状态", value: tSignalDepthStatusLabel(nestedValue(signal.liquidity, "depth_status")) },
+          ])}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderTSignalTimeline(signal) {
+  const timeline = Array.isArray(signal.timeline) ? signal.timeline : [];
+  return `
+    <section class="detail-section t-signal-section">
+      <h3>消息 timeline</h3>
+      <div class="t-signal-timeline">
+        ${timeline.length > 0 ? timeline.map((event) => `
+          <div class="t-signal-timeline-event">
+            <time>${escapeHtml(formatPlain(event.event_at))}</time>
+            <strong>${escapeHtml(tSignalTimelineLabel(event.event_type))}</strong>
+            <span>${escapeHtml(formatPlain(event.message_zh))}</span>
+          </div>
+        `).join("") : `<p class="muted-copy">暂无消息记录。</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function nestedValue(source, key) {
+  return source && typeof source === "object" ? source[key] : "";
+}
+
+function percentText(value) {
+  return hasValue(value) ? `${value}%` : "-";
+}
+
+function rangeText(low, high) {
+  return hasValue(low) || hasValue(high) ? `${formatPlain(low)} / ${formatPlain(high)}` : "-";
+}
+
+function tSignalRatioText(value) {
+  return hasValue(value) ? `${value}%` : "-";
+}
+
+function tSignalActionLabel(action) {
+  const labels = {
+    BUY_T: "买入做T",
+    SELL_T: "卖出做T",
+    HOLD: "观察",
+    REVIEW: "人工复核",
+  };
+  return labels[action] || formatPlain(action);
+}
+
+function tSignalStatusLabel(status) {
+  const labels = {
+    ok: "有效",
+    review: "需复核",
+    blocked: "已阻断",
+    error: "错误",
+    stale: "已过期",
+  };
+  return labels[status] || "未知";
+}
+
+function tSignalStatusClass(status) {
+  if (status === "ok") {
+    return "status-ok";
+  }
+  if (status === "review" || status === "blocked" || status === "stale") {
+    return "status-partial";
+  }
+  if (status === "error") {
+    return "status-failed";
+  }
+  return "status-muted";
+}
+
+function tSignalSessionLabel(value) {
+  const labels = {
+    pre_market: "盘前",
+    regular: "盘中",
+    post_market: "盘后",
+    closed: "休市",
+    unknown: "未知",
+  };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalNotificationText(notification) {
+  if (!notification || typeof notification !== "object") {
+    return "-";
+  }
+  if (notification.notified === true) {
+    return hasValue(notification.last_notified_at)
+      ? `已发起提醒 · ${notification.last_notified_at}`
+      : "已发起提醒";
+  }
+  if (hasValue(notification.last_attempted_dedupe_key)) {
+    return "已尝试发起提醒";
+  }
+  if (notification.should_notify === true) {
+    return "待提醒";
+  }
+  return "不提醒";
+}
+
+function tSignalDirectionLabel(value) {
+  const labels = { buy: "买入依据", sell: "卖出依据", neutral: "中性", risk: "风险" };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalStrengthLabel(value) {
+  const labels = { low: "弱", medium: "中", high: "强" };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalGateStatusLabel(value) {
+  const labels = { pass: "通过", block: "阻断", warn: "提醒", missing: "缺失" };
+  return labels[value] || formatPlain(value);
+}
+
+function renderTSignalGateStatus(status) {
+  const normalized = ["pass", "block", "warn", "missing"].includes(status) ? status : "missing";
+  return `
+    <strong class="t-signal-gate-status">
+      <span class="t-signal-checkmark t-signal-checkmark-${escapeHtml(normalized)}" aria-hidden="true"></span>
+      <span>${escapeHtml(tSignalGateStatusLabel(normalized))}</span>
+    </strong>
+  `;
+}
+
+function tSignalGateNameLabel(value) {
+  const labels = {
+    session_phase: "交易时段",
+    baseline: "底仓数量",
+    technical: "技术完整性",
+    liquidity: "流动性",
+    symbol: "标的匹配",
+  };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalPricePositionLabel(value) {
+  const labels = {
+    near_support: "接近支撑",
+    near_resistance: "接近压力",
+    below_vwap_reclaim: "低于 VWAP 后回收",
+    above_vwap_reject: "高于 VWAP 后受压",
+    middle_range: "区间中部",
+    breakout: "突破",
+    breakdown: "跌破",
+    unknown: "未知",
+  };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalDepthStatusLabel(value) {
+  const labels = { pass: "正常", thin: "深度不足", wide_spread: "价差偏大", missing: "缺失" };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalTimelineLabel(value) {
+  const labels = {
+    signal_created: "生成信号",
+    signal_changed: "信号变化",
+    notification_sent: "已发送提醒",
+    notification_suppressed: "已抑制重复提醒",
+    notification_failed: "提醒失败",
+    signal_expired: "信号过期",
+    review_required: "需要复核",
+  };
+  return labels[value] || formatPlain(value);
+}
+
 function renderTradingDecisionPlugins(holding) {
   const plugins = [
     decisionFactsPlugin(holding, {
@@ -722,6 +1059,7 @@ function renderTradingDecisionPlugins(holding) {
       score: "K线",
     }),
     newsSentimentPlugin(holding),
+    futuAnomalySignalsPlugin(holding),
     {
       title: "公司行动",
       status: "占位",
@@ -774,7 +1112,7 @@ function renderTradingDecisionPlugins(holding) {
       <div class="trading-decision-section-header">
         <div>
           <h3>插件模块</h3>
-          <p>每个模块说明条件是否达成，或正在确认的事实；趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位。</p>
+          <p>每个模块说明条件是否达成，或正在确认的事实；趋势 / K 线、新闻 / 舆论与富途异动信号读取固定决策事实，其余插件仍为占位。</p>
         </div>
       </div>
       <div class="decision-plugin-grid">
@@ -892,6 +1230,208 @@ function futuSkillNewsSentimentModule(holding) {
     : {};
   const module = facts.news_sentiment;
   return module && typeof module === "object" ? module : null;
+}
+
+function futuAnomalySignalsPlugin(holding) {
+  const facts = holding && holding.futu_skill_facts && typeof holding.futu_skill_facts === "object"
+    ? holding.futu_skill_facts
+    : {};
+  const modules = [
+    ["technical_anomaly", "技术异动"],
+    ["capital_anomaly", "资金异动"],
+    ["derivatives_anomaly", "衍生品异动"],
+  ].map(([key, title]) => futuSignalModuleView(facts[key], key, title));
+  const available = modules.filter((module) => module.available).length;
+  const overall = deriveFutuSignalOverall(modules);
+  return `
+    <article class="decision-plugin-card futu-signal-card">
+      <div class="decision-plugin-card-header">
+        <h4>市场信号 · 富途异动信号</h4>
+        <span class="status-pill status-${escapeHtml(overall.tone)}">${escapeHtml(available)}/3 模块可用</span>
+      </div>
+      <div class="futu-signal-overall">
+        <strong>${escapeHtml(overall.label)}</strong>
+        <div>
+          <b>${escapeHtml(overall.headline)}</b>
+          <span>${escapeHtml(overall.detail)}</span>
+        </div>
+        <div class="futu-signal-pill-row">
+          <span>${escapeHtml(translateFutuSignalValue(overall.signal))}</span>
+          <span>${escapeHtml(translateFutuSignalValue(overall.constraint))}</span>
+        </div>
+      </div>
+      <div class="futu-signal-module-grid">
+        ${modules.map(renderFutuSignalModule).join("")}
+      </div>
+      <p class="condition-box">模板约束：模块标题、状态、方向、置信度、约束、类别顺序固定；缺失、无异常和权限失败必须显式展示。</p>
+    </article>
+  `;
+}
+
+function futuSignalModuleView(module, key, title) {
+  const value = module && typeof module === "object" ? module : {};
+  const status = hasValue(value.status) ? String(value.status) : "missing";
+  const signal = value.available === true && !["missing", "error", "stale"].includes(status) && hasValue(value.signal)
+    ? String(value.signal)
+    : status;
+  return {
+    key,
+    title,
+    available: value.available === true,
+    status,
+    signal,
+    confidence: hasValue(value.confidence) ? String(value.confidence) : "low",
+    suggestedConstraint: hasValue(value.suggested_constraint) ? String(value.suggested_constraint) : "",
+    summary: hasValue(value.summary) ? String(value.summary) : "缺失",
+    categories: Array.isArray(value.categories) ? value.categories.slice(0, 3) : [],
+  };
+}
+
+function deriveFutuSignalOverall(modules) {
+  const constraints = modules.map((module) => module.suggestedConstraint).filter(hasValue);
+  const signals = modules.map((module) => module.signal).filter(hasValue);
+  const constraint = constraints.includes("no_add")
+    ? "no_add"
+    : constraints.includes("review")
+      ? "review"
+      : "";
+  if (signals.includes("risk_up") || signals.includes("mixed")) {
+    return {
+      tone: constraint ? "warn" : "ok",
+      label: constraint ? "谨慎" : "分歧",
+      signal: signals.includes("risk_up") ? "risk_up" : "mixed",
+      constraint,
+      headline: "市场信号存在分歧，需要结合主结论复核。",
+      detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
+    };
+  }
+  if (signals.includes("opposing")) {
+    return {
+      tone: "warn",
+      label: "反对",
+      signal: "opposing",
+      constraint,
+      headline: "市场信号反对当前交易方向。",
+      detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
+    };
+  }
+  if (signals.includes("supportive")) {
+    return {
+      tone: "ok",
+      label: "支持",
+      signal: "supportive",
+      constraint,
+      headline: "市场信号支持当前交易方向。",
+      detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
+    };
+  }
+  if (signals.includes("error") || signals.includes("missing") || signals.includes("stale")) {
+    return {
+      tone: "warn",
+      label: "需复核",
+      signal: signals.includes("error") ? "error" : (signals.includes("stale") ? "stale" : "missing"),
+      constraint: constraint || "review",
+      headline: "市场信号数据不可用，不能视为中性。",
+      detail: "缺失、错误或过期模块会保留数据质量状态，不会自动改写成交易方向。",
+    };
+  }
+  return {
+    tone: "muted",
+    label: "中性",
+    signal: "neutral",
+    constraint,
+    headline: "窗口内未发现明显异动。",
+    detail: "缺失、无异常和权限失败会在模块内显式展示。",
+  };
+}
+
+function renderFutuSignalModule(module) {
+  return `
+    <section class="futu-signal-module">
+      <div class="futu-signal-module-header">
+        <h5>${escapeHtml(module.title)}</h5>
+        <span class="status-pill status-${escapeHtml(futuSignalStatusTone(module.status))}">${escapeHtml(translateFutuSignalValue(module.status))}</span>
+      </div>
+      <div class="futu-signal-metrics">
+        <div><span>方向</span><strong>${escapeHtml(translateFutuSignalValue(module.signal))}</strong></div>
+        <div><span>${module.suggestedConstraint ? "约束" : "置信度"}</span><strong>${escapeHtml(translateFutuSignalValue(module.suggestedConstraint || module.confidence))}</strong></div>
+      </div>
+      <div class="futu-signal-category-list">
+        ${renderFutuSignalCategories(module.categories)}
+      </div>
+    </section>
+  `;
+}
+
+function renderFutuSignalCategories(categories) {
+  if (!categories.length) {
+    return `
+      <div class="futu-signal-category empty">
+        <div><strong>缺失</strong><span>缺失</span></div>
+        <p>未找到可展示的结构化类别。</p>
+      </div>
+    `;
+  }
+  return categories.map((category) => {
+    const state = hasValue(category.state) ? String(category.state) : "none";
+    const direction = hasValue(category.direction) ? String(category.direction) : "";
+    const date = hasValue(category.evidence_date) ? ` · ${category.evidence_date}` : "";
+    return `
+      <div class="futu-signal-category ${escapeHtml(futuSignalCategoryTone(state, direction))}">
+        <div>
+          <strong>${escapeHtml(category.name || "缺失")}</strong>
+          <span>${escapeHtml(translateFutuSignalValue(direction || state) + date)}</span>
+        </div>
+        <p>${escapeHtml(category.detail || "缺失")}</p>
+      </div>
+    `;
+  }).join("");
+}
+
+function translateFutuSignalValue(value) {
+  const key = hasValue(value) ? String(value) : "";
+  const labels = {
+    supportive: "支持",
+    opposing: "反对",
+    neutral: "中性",
+    risk_up: "风险上升",
+    mixed: "分歧",
+    no_add: "不加仓",
+    review: "需复核",
+    reduce_only: "只减不加",
+    wait_for_event: "等待事件",
+    ok: "正常",
+    partial: "部分可用",
+    missing: "缺失",
+    error: "错误",
+    stale: "已过期",
+    anomaly: "异常",
+    none: "无异常",
+    not_applicable: "不适用",
+    bullish: "偏多",
+    bearish: "偏空",
+    high: "高",
+    medium: "中等",
+    low: "低",
+    "": "-",
+  };
+  return Object.prototype.hasOwnProperty.call(labels, key) ? labels[key] : "未知";
+}
+
+function futuSignalStatusTone(status) {
+  if (status === "ok") return "ok";
+  if (status === "partial") return "warn";
+  if (status === "stale") return "stale";
+  if (status === "error") return "failed";
+  return "muted";
+}
+
+function futuSignalCategoryTone(state, direction) {
+  if (state === "error") return "failed";
+  if (state === "none" || state === "not_applicable") return "empty";
+  if (direction === "bearish" || direction === "risk_up") return "watch";
+  if (direction === "bullish") return "positive";
+  return "mixed";
 }
 
 function renderDomesticDiscussionRows(rows) {
@@ -2970,7 +3510,7 @@ function setElementText(id, text) {
 }
 
 function renderDashboardErrorState() {
-  elements["holdings-body"].innerHTML = `<tr><td colspan="10" class="empty-state">看板数据加载失败</td></tr>`;
+  elements["holdings-body"].innerHTML = holdingsEmptyRow("看板数据加载失败");
 }
 
 function filteredHoldings() {
@@ -2981,6 +3521,160 @@ function filteredHoldings() {
     const brokerMatches = state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
     return marketMatches && brokerMatches;
   });
+}
+
+function holdingsEmptyRow(message) {
+  return `<tr><td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}" class="empty-state">${escapeHtml(message)}</td></tr>`;
+}
+
+function marketSectionKey(holding) {
+  const market = String(holding && holding.market || "").trim().toUpperCase();
+  if (market === "US") {
+    return isOptionHolding(holding) ? "US_OPTION" : "US_STOCK";
+  }
+  if (market === "HK") {
+    return isOptionHolding(holding) ? "HK_OPTION" : "HK_STOCK";
+  }
+  return "OTHER";
+}
+
+function isOptionHolding(holding) {
+  const optionFields = [
+    holding && holding.asset_class,
+    holding && holding.security_type,
+    holding && holding.sec_type,
+    holding && holding.instrument_type,
+    holding && holding.product_type,
+  ];
+  if (optionFields.some((value) => isOptionText(value))) {
+    return true;
+  }
+  const symbol = String(holding && holding.symbol || "").trim().toUpperCase();
+  if (/^[A-Z]{1,8}\d{6}[CP]\d{5,8}$/.test(symbol) || /^[A-Z]{1,8}\s+\d{6}[CP]\d{5,8}$/.test(symbol)) {
+    return true;
+  }
+  const name = String(holding && holding.name || "").trim();
+  const fundLike = /ETF|基金|FUND/i.test(name);
+  return !fundLike && /(?:CALL|PUT|OPTION|期权|期權|\d{6}\s+\d+(?:\.\d+)?[CP])/.test(name);
+}
+
+function isOptionText(value) {
+  if (!hasValue(value)) {
+    return false;
+  }
+  const text = String(value).trim();
+  return /^(option|options)$/i.test(text) || /(?:期权|期權)/.test(text);
+}
+
+function groupedHoldingsByMarketSection(holdings) {
+  const sections = MARKET_SECTION_CONFIGS.map((config) => ({
+    ...config,
+    rows: [],
+  }));
+  const sectionByMarket = new Map(sections.map((section) => [section.market, section]));
+  const presentMarketGroups = new Set();
+  holdings.forEach((holding, index) => {
+    const sectionKey = marketSectionKey(holding);
+    const section = sectionByMarket.get(sectionKey) || sectionByMarket.get("OTHER");
+    presentMarketGroups.add(section.marketGroup);
+    section.rows.push({ holding, index });
+  });
+  sections.forEach((section) => {
+    section.rows.sort(compareRowsByPortfolioWeight);
+  });
+  return sections.filter((section) => {
+    if (section.rows.length > 0) {
+      return true;
+    }
+    return section.marketGroup !== "OTHER" && presentMarketGroups.has(section.marketGroup);
+  });
+}
+
+function sectionRowHolding(row) {
+  return row && row.holding ? row.holding : row;
+}
+
+function compareRowsByPortfolioWeight(left, right) {
+  const leftWeight = numericPercentValue(sectionRowHolding(left).portfolio_weight_hkd);
+  const rightWeight = numericPercentValue(sectionRowHolding(right).portfolio_weight_hkd);
+  if (leftWeight === null && rightWeight === null) {
+    return left.index - right.index;
+  }
+  if (leftWeight === null) {
+    return 1;
+  }
+  if (rightWeight === null) {
+    return -1;
+  }
+  if (rightWeight !== leftWeight) {
+    return rightWeight - leftWeight;
+  }
+  return left.index - right.index;
+}
+
+function sumNumericField(rows, fieldName) {
+  if (rows.length === 0) {
+    return 0;
+  }
+  let total = 0;
+  for (const row of rows) {
+    const value = numericValue(sectionRowHolding(row)[fieldName]);
+    if (value === null) {
+      return null;
+    }
+    total += value;
+  }
+  return rows.length ? total : null;
+}
+
+function sumPercentField(rows, fieldName) {
+  if (rows.length === 0) {
+    return 0;
+  }
+  let total = 0;
+  for (const row of rows) {
+    const parsed = numericPercentValue(sectionRowHolding(row)[fieldName]);
+    if (parsed === null) {
+      return null;
+    }
+    total += parsed;
+  }
+  return rows.length ? total : null;
+}
+
+function numericPercentValue(value) {
+  if (!hasValue(value)) {
+    return null;
+  }
+  const raw = String(value).trim();
+  if (!/^[+-]?(?:\d+|\d*\.\d+)%$/.test(raw)) {
+    return null;
+  }
+  const parsed = Number(raw.slice(0, -1));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function renderMarketSectionRow(section) {
+  const hkdTotal = sumNumericField(section.rows, "market_value_hkd");
+  const weightTotal = sumPercentField(section.rows, "portfolio_weight_hkd");
+  const hkdText = hkdTotal === null ? "-" : formatMoney(moneyValue(hkdTotal), "HKD");
+  const weightText = weightTotal === null ? "-" : `${weightTotal.toFixed(2)}%`;
+  return `
+    <tr class="market-section-row ${escapeHtml(section.className)}">
+      <td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}">
+        <strong>${escapeHtml(section.label)}</strong>
+        <span class="meta-text">${escapeHtml(`${section.rows.length} 个标的 · 港元市值 ${hkdText} · 权重 ${weightText}`)}</span>
+      </td>
+    </tr>
+  `;
+}
+
+function renderUsdMarketValue(holding) {
+  const currency = String(holding && holding.currency || "").trim().toUpperCase();
+  if (currency !== "USD") {
+    return "-";
+  }
+  return formatMoney(holding.market_value, "USD");
 }
 
 function getHoldings() {

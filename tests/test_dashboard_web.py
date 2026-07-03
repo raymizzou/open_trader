@@ -136,6 +136,15 @@ def post_text_error(url: str, body: bytes) -> tuple[int, str, str]:
     raise AssertionError("expected HTTPError")
 
 
+def holdings_table_header_labels(html: str) -> list[str]:
+    table_prefix = html.split('<tbody id="holdings-body">', 1)[0]
+    thead = table_prefix.rsplit("<thead>", 1)[1].split("</thead>", 1)[0]
+    labels: list[str] = []
+    for segment in thead.split("<th>")[1:]:
+        labels.append(segment.split("</th>", 1)[0].strip())
+    return labels
+
+
 def read_error_json(url: str) -> tuple[int, str, dict[str, Any]]:
     try:
         urllib.request.urlopen(url, timeout=5)
@@ -162,6 +171,30 @@ def read_text_error(url: str) -> tuple[int, str, str]:
             payload.decode("utf-8"),
         )
     raise AssertionError("expected HTTPError")
+
+
+def run_dashboard_js(script: str) -> str:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    runner = r"""
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} }, console };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(process.argv[2], sandbox);
+"""
+    result = subprocess.run(
+        [node, "-e", runner, str(js_path), script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    return result.stdout
 
 
 class FakeResearchChatService:
@@ -258,6 +291,12 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "当前视图" in html
     assert "富途暂无数据" in html
     assert "老虎暂无数据" in html
+    assert "futuAnomalySignalsPlugin" in js
+    assert "translateFutuSignalValue" in js
+    assert ".futu-signal-card" in css
+    assert ".futu-signal-module-grid" in css
+    assert ".decision-plugin-grid .futu-signal-card" in css
+
     assert "辉立暂无数据" in html
     assert "right-rail" not in html
     assert "今日交易动作" not in html
@@ -343,7 +382,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "交易决策" in js
     assert "插件模块" in js
     assert "大模型决策模板" in js
-    assert "趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位" in js
+    assert "趋势 / K 线、新闻 / 舆论与富途异动信号读取固定决策事实，其余插件仍为占位" in js
     assert "decisionFactsPlugin" in js
     assert "decision_facts" in js
     assert "futuSkillNewsSentimentPlugin" in js
@@ -391,6 +430,31 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".source-status-list" in css
     assert ".source-status-row" in css
     assert ".cash-detail-panel" in css
+    assert ".market-section-row" in css
+    assert ".market-section-us-stock" in css
+    assert ".market-section-us-option" in css
+    assert ".market-section-hk-stock" in css
+    assert ".market-section-hk-option" in css
+    assert ".symbol-cell" in css
+    scoped_table_selector = ".holdings-panel > .table-wrap > table"
+    assert scoped_table_selector in css
+    global_table_css = css.split(scoped_table_selector, 1)[0]
+    assert "table-layout: fixed;" not in global_table_css
+    assert "min-width: 1120px;" in css
+    assert "table-layout: fixed;" in css
+    symbol_column_selector = (
+        ".holdings-panel > .table-wrap > table > thead > tr > th:nth-child(3) {"
+    )
+    assert symbol_column_selector in css
+    assert ".holdings-panel > .table-wrap > table th:nth-child(3) {" not in css
+    assert ".holdings-panel > .table-wrap > table > thead > tr > th:nth-child(1) {" in css
+    assert ".holdings-panel > .table-wrap > table > thead > tr > th:nth-child(10) {" in css
+    symbol_column_css = css.split(symbol_column_selector, 1)[1].split("}", 1)[0]
+    assert "width: 170px;" in symbol_column_css
+    number_cell_css = css.split(".number-cell {", 1)[1].split("}", 1)[0]
+    assert "text-align: right;" in number_cell_css
+    market_section_other_css = css.split(".market-section-other td {", 1)[1].split("}", 1)[0]
+    assert "border-bottom-color: var(--line);" in market_section_other_css
     assert "grid-template-columns: minmax(0, 1fr) 300px;" not in css
     assert ".right-rail" not in css
     assert 'grid-template-areas: "brand source" "assets assets";' in css
@@ -448,6 +512,337 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".workspace-grid.detail-mode {" in mobile_css
     assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
+
+
+def test_dashboard_renders_futu_anomaly_signal_card_in_chinese() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  name: "英伟达",
+  portfolio_weight_hkd: "8.2%",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "supportive",
+      confidence: "medium",
+      suggested_constraint: "",
+      window_days: 7,
+      summary: "技术信号支持趋势。",
+      categories: [
+        {name: "MACD", state: "anomaly", direction: "bullish", detail: "金叉后继续放大。", evidence_date: "2026-07-01"},
+        {name: "RSI", state: "anomaly", direction: "risk_up", detail: "接近超买区。", evidence_date: "2026-07-02"},
+        {name: "K线形态", state: "none", direction: "", detail: "窗口内无异常。", evidence_date: ""}
+      ]
+    },
+    capital_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "mixed",
+      confidence: "medium",
+      suggested_constraint: "no_add",
+      window_days: 7,
+      summary: "资金流向与加仓动作存在分歧。",
+      categories: [
+        {name: "资金流向", state: "anomaly", direction: "bearish", detail: "主力资金连续净流出。", evidence_date: "2026-07-02"},
+        {name: "卖空情况", state: "none", direction: "", detail: "窗口内无异常。", evidence_date: ""}
+      ]
+    },
+    derivatives_anomaly: {
+      available: true,
+      status: "partial",
+      signal: "risk_up",
+      confidence: "low",
+      suggested_constraint: "no_add",
+      window_days: 7,
+      summary: "期权波动率偏高。",
+      categories: [
+        {name: "期权波动率", state: "anomaly", direction: "risk_up", detail: "IV 位于高位。", evidence_date: "2026-07-02"},
+        {name: "期权大单", state: "anomaly", direction: "bullish", detail: "出现看涨大单。", evidence_date: "2026-07-01"}
+      ]
+    }
+  }
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
+const end = html.indexOf("<h4>公司行动</h4>");
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal card boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    for required in [
+        "市场信号 · 富途异动信号",
+        "技术异动",
+        "资金异动",
+        "衍生品异动",
+        "支持",
+        "不加仓",
+        "部分可用",
+        "偏多",
+        "偏空",
+        "风险上升",
+        "无异常",
+    ]:
+        assert required in output
+
+    for forbidden in [
+        "supportive",
+        "no_add",
+        "partial",
+        "risk_up",
+        "bullish",
+        "bearish",
+        "schema",
+    ]:
+        assert forbidden not in output
+
+
+def test_dashboard_futu_anomaly_opposing_signal_affects_overall() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "opposing",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "技术信号反对追高。",
+      categories: [
+        {name: "MACD", state: "anomaly", direction: "bearish", detail: "动能转弱。", evidence_date: "2026-07-02"}
+      ]
+    },
+    capital_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "资金无明显方向。",
+      categories: []
+    },
+    derivatives_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "衍生品无明显方向。",
+      categories: []
+    }
+  }
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf('<div class="futu-signal-overall">');
+const end = html.indexOf('<div class="futu-signal-module-grid">');
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal overall boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    assert "反对" in output
+    assert "市场信号反对当前交易方向" in output
+    assert "中性" not in output
+
+
+def test_dashboard_futu_anomaly_missing_modules_do_not_render_neutral_direction() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: false,
+      status: "missing",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "缺少富途技术异动数据。",
+      categories: []
+    },
+    capital_anomaly: {
+      available: false,
+      status: "error",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "富途资金异动查询失败。",
+      categories: []
+    },
+    derivatives_anomaly: {
+      available: false,
+      status: "stale",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "富途衍生品异动数据已过期。",
+      categories: []
+    }
+  }
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf('<div class="futu-signal-module-grid">');
+const end = html.indexOf('<p class="condition-box">');
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal module boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    for required in ["<strong>缺失</strong>", "<strong>错误</strong>", "<strong>已过期</strong>"]:
+        assert required in output
+    assert "<strong>中性</strong>" not in output
+
+
+def test_dashboard_futu_anomaly_unavailable_modules_do_not_render_neutral_overall() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: false,
+      status: "missing",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "缺少富途技术异动数据。",
+      categories: []
+    },
+    capital_anomaly: {
+      available: false,
+      status: "error",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "富途资金异动查询失败。",
+      categories: []
+    },
+    derivatives_anomaly: {
+      available: false,
+      status: "stale",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "富途衍生品异动数据已过期。",
+      categories: []
+    }
+  }
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf('<div class="futu-signal-overall">');
+const end = html.indexOf('<div class="futu-signal-module-grid">');
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal overall boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    assert "需复核" in output
+    assert "市场信号数据不可用" in output
+    assert "窗口内未发现明显异动" not in output
+    assert "<strong>中性</strong>" not in output
+
+
+def test_dashboard_futu_anomaly_unknown_enums_render_safe_chinese_fallback() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: true,
+      status: "schema",
+      signal: "schema_break",
+      confidence: "very_high",
+      suggested_constraint: "unsafe_add",
+      summary: "异常字段测试。",
+      categories: [
+        {name: "MACD", state: "invalid_state", direction: "strange_direction", detail: "未知枚举测试。", evidence_date: "2026-07-02"}
+      ]
+    },
+    capital_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "正常模块。",
+      categories: []
+    },
+    derivatives_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "medium",
+      suggested_constraint: "",
+      summary: "正常模块。",
+      categories: []
+    }
+  }
+};
+const html = renderTradingDecisionPlugins(holding);
+const start = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
+const end = html.indexOf("<h4>公司行动</h4>");
+if (start < 0 || end < 0 || start >= end) {
+  throw new Error("Futu signal card boundary missing: " + html);
+}
+console.log(html.slice(start, end));
+"""
+    )
+
+    assert "未知" in output
+    assert "MACD" in output
+    for forbidden in [
+        "schema",
+        "schema_break",
+        "very_high",
+        "unsafe_add",
+        "invalid_state",
+        "strange_direction",
+    ]:
+        assert forbidden not in output
+
+
+def test_dashboard_holdings_table_uses_compact_asset_columns() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert holdings_table_header_labels(html) == [
+        "明细",
+        "市场",
+        "标的",
+        "数量",
+        "成本价",
+        "实时价",
+        "美元市值",
+        "港元市值",
+        "持仓占总资产的占比",
+        "盈亏",
+    ]
+    assert "<th>券商</th>" not in html
+    assert "<th>动作</th>" not in html
+    assert "<th>持仓价</th>" not in html
+    assert '<td colspan="10" class="empty-state">加载中</td>' in html
 
 
 def test_dashboard_display_helpers_keep_raw_english_out_of_chinese_ui() -> None:
@@ -702,7 +1097,7 @@ vm.runInContext(`
 function fixedDecisionFactCards(html) {
   const klineStart = html.indexOf("<h4>趋势 / K 线</h4>");
   const newsStart = html.indexOf("<h4>新闻 / 舆论</h4>");
-  const nextStart = html.indexOf("<h4>公司行动</h4>");
+  const nextStart = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
   if (klineStart < 0 || newsStart < 0 || nextStart < 0 || !(klineStart < newsStart && newsStart < nextStart)) {
     throw new Error("fixed decision fact card boundaries missing: " + html);
   }
@@ -857,7 +1252,7 @@ vm.runInContext(`
 function fixedDecisionFactCards(html) {
   const klineStart = html.indexOf("<h4>趋势 / K 线</h4>");
   const newsStart = html.indexOf("<h4>新闻 / 舆论</h4>");
-  const nextStart = html.indexOf("<h4>公司行动</h4>");
+  const nextStart = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
   if (klineStart < 0 || newsStart < 0 || nextStart < 0 || !(klineStart < newsStart && newsStart < nextStart)) {
     throw new Error("fixed decision fact card boundaries missing: " + html);
   }
@@ -1499,7 +1894,7 @@ if (state.researchChat.messageCount !== 4) {
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
-def test_dashboard_header_helpers_filter_assets_and_render_sources() -> None:
+def test_dashboard_header_filters_and_cash_view_helpers() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for dashboard helper runtime checks")
@@ -1515,11 +1910,30 @@ vm.runInContext(`
 state.dashboard = {
   holdings: [
     {
+      market: "HK",
+      symbol: "00700",
+      name: "Tencent",
+      brokers: "phillips",
+      currency: "HKD",
+      total_quantity: "100",
+      avg_cost_price: "150.00",
+      market_value: "15982.00",
+      market_value_hkd: "15982.00",
+      portfolio_weight_hkd: "3.25%",
+      unrealized_pnl_pct: "2.00%",
+    },
+    {
       market: "US",
       symbol: "VIXY",
       name: "ProShares VIX Short-Term Futures ETF",
       brokers: "futu;tiger",
-      market_value_hkd: "37830.00",
+      currency: "USD",
+      total_quantity: "10",
+      avg_cost_price: "12.34",
+      market_value: "6250.00",
+      market_value_hkd: "49062.50",
+      portfolio_weight_hkd: "7.50%",
+      unrealized_pnl_pct: "5.00%",
       broker_details: [
         {
           broker: "futu",
@@ -1538,13 +1952,130 @@ state.dashboard = {
           market_value_hkd: "22698.00",
         },
       ],
+      t_signal: {
+        schema_version: "open_trader.t_signal.v1",
+        run_date: "2026-07-02",
+        market: "US",
+        symbol: "VIXY",
+        futu_symbol: "US.VIXY",
+        name: "ProShares VIX Short-Term Futures ETF",
+        session_phase: "regular",
+        updated_at: "2026-07-02T22:32:00+08:00",
+        action: "BUY_T",
+        suggested_ratio: "15",
+        current_status: "BUY_T 条件满足，等待执行确认。",
+        signal_summary_zh: "低吸做T信号成立，确定比例 15%。",
+        price: {
+          last_price: "48.50",
+          day_change_pct: "-1.20",
+          vwap: "49.10",
+          ma_1m: "48.55",
+          ma_5m: "48.85",
+          day_low: "48.00",
+          day_high: "50.20",
+        },
+        liquidity: {
+          bid: "48.49",
+          ask: "48.50",
+          spread_pct: "0.02",
+          bid_depth: "5000",
+          ask_depth: "4700",
+          depth_status: "pass",
+        },
+        technical: {
+          rsi_5m: "34",
+          volume_ratio_5m: "1.30",
+          price_position: "below_vwap_reclaim",
+          trend_state: "range_rebound",
+        },
+        hard_gates: [
+          {
+            name: "session_phase",
+            status: "pass",
+            message_zh: "当前处于盘中交易时段。",
+          },
+        ],
+        evidence: [
+          {
+            name: "vwap_reclaim",
+            direction: "buy",
+            strength: "medium",
+            message_zh: "价格低于 VWAP 后回收，出现低吸做T信号。",
+          },
+          {
+            name: "rsi_low",
+            direction: "buy",
+            strength: "medium",
+            message_zh: "5分钟 RSI 偏低。",
+          },
+        ],
+        timeline: [
+          {
+            event_at: "2026-07-02T22:32:00+08:00",
+            event_type: "signal_created",
+            action: "BUY_T",
+            suggested_ratio: "15",
+            message_zh: "生成 BUY_T 信号，建议比例 15%。",
+          },
+          {
+            event_at: "2026-07-02T22:32:00+08:00",
+            event_type: "notification_sent",
+            action: "BUY_T",
+            suggested_ratio: "15",
+            message_zh: "已发送 BUY_T 通知。",
+          },
+        ],
+        notification: {
+          should_notify: false,
+          notified: true,
+          dedupe_key: "2026-07-02|US.VIXY|BUY_T|15",
+          last_notified_at: "2026-07-02T22:32:00+08:00",
+          last_notified_dedupe_key: "2026-07-02|US.VIXY|BUY_T|15",
+          last_attempted_dedupe_key: "2026-07-02|US.VIXY|BUY_T|15",
+        },
+        status: "ok",
+        error: "",
+      },
+    },
+    {
+      market: "US",
+      symbol: "BND",
+      name: "Vanguard Total Bond Market ETF",
+      brokers: "tiger",
+      currency: "HKD",
+      total_quantity: "2",
+      avg_cost_price: "50.00",
+      market_value: "100.00",
+      market_value_hkd: "100.00",
+      portfolio_weight_hkd: "2.50%",
+      unrealized_pnl_pct: "-1.00%",
+    },
+    {
+      market: "US",
+      symbol: "VIXY260821C22000",
+      name: "VIXY 260821 22.00C",
+      brokers: "futu",
+      currency: "USD",
+      total_quantity: "1",
+      avg_cost_price: "2.10",
+      market_value: "168.00",
+      market_value_hkd: "300.00",
+      portfolio_weight_hkd: "0.50%",
+      unrealized_pnl_pct: "-20.00%",
     },
     {
       market: "HK",
-      symbol: "00700",
-      name: "Tencent",
-      brokers: "phillips",
-      market_value_hkd: "15982.00",
+      symbol: "HKOPT",
+      name: "腾讯 260730 400.00C",
+      asset_class: "option",
+      brokers: "futu",
+      currency: "HKD",
+      total_quantity: "1",
+      avg_cost_price: "1.00",
+      market_value: "200.00",
+      market_value_hkd: "200.00",
+      portfolio_weight_hkd: "0.40%",
+      unrealized_pnl_pct: "1.00%",
     },
   ],
   cash_rows: [
@@ -1636,10 +2167,10 @@ state.dashboard = {
 state.marketFilter = "US";
 state.brokerFilter = "futu";
 const summary = currentViewSummary();
-if (summary.portfolio_value_hkd !== "15132.00") {
+if (summary.portfolio_value_hkd !== "15432.00") {
   throw new Error("unexpected portfolio value: " + JSON.stringify(summary));
 }
-if (summary.holding_value_hkd !== "15132.00") {
+if (summary.holding_value_hkd !== "15432.00") {
   throw new Error("unexpected holding value: " + JSON.stringify(summary));
 }
 if (summary.cash_like_value_hkd !== "") {
@@ -1648,7 +2179,7 @@ if (summary.cash_like_value_hkd !== "") {
 if (summary.holding_weight_hkd !== "100.00%") {
   throw new Error("unexpected holding weight: " + JSON.stringify(summary));
 }
-if (summary.holding_count !== 1) {
+if (summary.holding_count !== 2) {
   throw new Error("unexpected holding count: " + JSON.stringify(summary));
 }
 state.marketFilter = "ALL";
@@ -1809,7 +2340,7 @@ if (!elements["cash-detail-panel"].classList.contains("hidden")) {
   throw new Error("non-cash view should hide cash detail panel");
 }
 state.brokerFilter = "ALL";
-state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
+state.selectedHoldingKey = holdingKey(state.dashboard.holdings[1], 1);
 renderHoldings();
 if (elements["holdings-table-wrap"].classList.contains("hidden")) {
   throw new Error("trading decision should keep holdings table visible");
@@ -1817,13 +2348,119 @@ if (elements["holdings-table-wrap"].classList.contains("hidden")) {
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
   throw new Error("trading decision should keep bottom symbol detail panel hidden");
 }
-if (!elements["holdings-body"].innerHTML.includes("交易决策") || elements["holdings-body"].innerHTML.includes(">详情<")) {
+if (!elements["holdings-body"].innerHTML.includes("交易决策") || !elements["holdings-body"].innerHTML.includes(">做T<") || elements["holdings-body"].innerHTML.includes(">详情<")) {
   throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
+}
+if (!elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
+  throw new Error("active BUY_T/SELL_T signals should pulse the t signal button: " + elements["holdings-body"].innerHTML);
+}
+state.dashboard.holdings[1].t_signal.session_phase = "closed";
+renderHoldings();
+if (elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
+  throw new Error("non-regular t signals should not pulse the t signal button: " + elements["holdings-body"].innerHTML);
+}
+state.dashboard.holdings[1].t_signal.session_phase = "regular";
+renderHoldings();
+const renderedHoldings = elements["holdings-body"].innerHTML;
+const usStockSectionIndex = renderedHoldings.indexOf("美股正股");
+const usOptionSectionIndex = renderedHoldings.indexOf("美股期权");
+const hkStockSectionIndex = renderedHoldings.indexOf("港股正股");
+const hkOptionSectionIndex = renderedHoldings.indexOf("港股期权");
+if (
+  usStockSectionIndex === -1
+  || usOptionSectionIndex === -1
+  || hkStockSectionIndex === -1
+  || hkOptionSectionIndex === -1
+  || usStockSectionIndex > usOptionSectionIndex
+  || usOptionSectionIndex > hkStockSectionIndex
+  || hkStockSectionIndex > hkOptionSectionIndex
+) {
+  throw new Error("holdings should render stock/option market sections in requested order: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("2 个标的 · 港元市值 HKD 49162.50 · 权重 10.00%")) {
+  throw new Error("US stock section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 15982.00 · 权重 3.25%")) {
+  throw new Error("HK stock section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 300.00 · 权重 0.50%")) {
+  throw new Error("US option section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 200.00 · 权重 0.40%")) {
+  throw new Error("HK option section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+}
+if (renderedHoldings.includes("其他市场持仓")) {
+  throw new Error("OTHER section should not render without an OTHER-market holding: " + renderedHoldings);
+}
+for (const required of ["成本价", "美元市值", "港元市值", "持仓占总资产的占比"]) {
+  if (renderedHoldings.includes("<th>" + required + "</th>")) {
+    throw new Error("body should not render table headers inside market sections: " + renderedHoldings);
+  }
+}
+if (!renderedHoldings.includes("USD 6250.00")) {
+  throw new Error("USD holding should show original USD market value: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("HKD 49062.50")) {
+  throw new Error("HKD converted market value should remain visible: " + renderedHoldings);
+}
+if (!renderedHoldings.includes("<td class=\\"number-cell\\">-</td>")) {
+  throw new Error("non-USD holding should show dash in USD market value column: " + renderedHoldings);
+}
+const holdingRows = Array.from(renderedHoldings.matchAll(/<tr class="[^"]*">\\s*<td><button class="expand-button"[\\s\\S]*?<\\/tr>/g)).map((match) => match[0]);
+if (holdingRows.length !== 5) {
+  throw new Error("main holdings table should render exactly 5 holding rows: " + renderedHoldings);
+}
+for (const row of holdingRows) {
+  const cellCount = (row.match(/<td(?:\\s|>)/g) || []).length;
+  if (cellCount !== 10) {
+    throw new Error("holding row should render exactly 10 cells: " + row);
+  }
+}
+for (const unexpected of ["<td>futu;tiger</td>", "<td>phillips</td>", "<td>futu</td>", "<td>tiger</td>", "<span class=\\"badge\\">"]) {
+  if (renderedHoldings.includes(unexpected)) {
+    throw new Error("main holdings table should not render broker/action cell " + unexpected + ": " + renderedHoldings);
+  }
+}
+if (renderedHoldings.includes("观察 ·") || renderedHoldings.includes("人工复核 ·")) {
+  throw new Error("main holdings table should not render action badges: " + renderedHoldings);
+}
+const sortedSections = groupedHoldingsByMarketSection([
+  { market: "US", symbol: "LOW", portfolio_weight_hkd: "1.00%" },
+  { market: "US", symbol: "HIGH", portfolio_weight_hkd: "9.00%" },
+  { market: "US", symbol: "MISSING", portfolio_weight_hkd: "" },
+]);
+const sortedSymbols = sortedSections[0].rows.map((row) => row.holding.symbol).join(",");
+if (sortedSymbols !== "HIGH,LOW,MISSING") {
+  throw new Error("holdings should sort by portfolio weight descending within market section: " + sortedSymbols);
+}
+const emptyOptionSections = groupedHoldingsByMarketSection([
+  { market: "US", symbol: "US_STOCK", portfolio_weight_hkd: "2.00%" },
+  { market: "HK", symbol: "HK_STOCK", portfolio_weight_hkd: "1.00%" },
+]);
+const emptyOptionKeys = emptyOptionSections.map((section) => section.market).join(",");
+if (emptyOptionKeys !== "US_STOCK,US_OPTION,HK_STOCK,HK_OPTION") {
+  throw new Error("stock/option sections should render in fixed order, including empty option sections: " + emptyOptionKeys);
+}
+const emptyOptionRow = renderMarketSectionRow(emptyOptionSections[3]);
+if (!emptyOptionRow.includes("0 个标的 · 港元市值 HKD 0.00 · 权重 0.00%")) {
+  throw new Error("empty option section should render explicit zero totals: " + emptyOptionRow);
+}
+const malformedSection = renderMarketSectionRow({
+  market: "OTHER",
+  label: "其他市场持仓",
+  className: "market-section-other",
+  rows: [
+    { holding: { market_value_hkd: "bad", portfolio_weight_hkd: "1.00%" }, index: 99 },
+    { holding: { market_value_hkd: "300.00", portfolio_weight_hkd: "" }, index: 100 },
+  ],
+});
+if (!malformedSection.includes("2 个标的 · 港元市值 - · 权重 -") || malformedSection.includes("HKD 0.00")) {
+  throw new Error("malformed section subtotal data should render dash instead of zero: " + malformedSection);
 }
 if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
   throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
 }
-for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "趋势 / K 线与新闻 / 舆论读取固定决策事实，其余插件仍为占位", "占位"]) {
+for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "趋势 / K 线、新闻 / 舆论与富途异动信号读取固定决策事实，其余插件仍为占位", "占位"]) {
   if (!elements["holdings-body"].innerHTML.includes(required)) {
     throw new Error("trading decision detail missing " + required + ": " + elements["holdings-body"].innerHTML);
   }
@@ -1832,6 +2469,38 @@ for (const unexpected of ["插件管理", "策略阈值"]) {
   if (elements["holdings-body"].innerHTML.includes(unexpected)) {
     throw new Error("trading decision detail should not render extra panel " + unexpected);
   }
+}
+state.selectedHoldingDetail = "t_signal";
+renderHoldings();
+for (const required of ["做T信号 ·", "买入做T", "确定比例", "15%", "信号依据", "价格低于 VWAP 后回收", "前置条件", "t-signal-checkmark", "交易时段", "详细信息", "消息 timeline", "已发送 BUY_T 通知。", "已发起提醒 · 2026-07-02T22:32:00+08:00"]) {
+  if (!elements["holdings-body"].innerHTML.includes(required)) {
+    throw new Error("t signal detail missing " + required + ": " + elements["holdings-body"].innerHTML);
+  }
+}
+for (const unexpected of ["小T", "大T", "状态机", ">session_phase<", "已提醒 ·"]) {
+  if (elements["holdings-body"].innerHTML.includes(unexpected)) {
+    throw new Error("t signal detail should not render ambiguous wording " + unexpected);
+  }
+}
+state.selectedHoldingDetail = "decision";
+state.dashboard.holdings.push({
+  market: "JP",
+  symbol: "7203",
+  name: "Toyota",
+  brokers: "phillips",
+  currency: "JPY",
+  total_quantity: "1",
+  avg_cost_price: "3000",
+  market_value: "300.00",
+  market_value_hkd: "300.00",
+  portfolio_weight_hkd: "1.50%",
+  unrealized_pnl_pct: "0.00%",
+});
+state.selectedHoldingKey = "";
+renderHoldings();
+const renderedWithOther = elements["holdings-body"].innerHTML;
+if (!renderedWithOther.includes("其他市场持仓") || !renderedWithOther.includes("1 个标的 · 港元市值 HKD 300.00 · 权重 1.50%")) {
+  throw new Error("OTHER section should render only when an OTHER-market holding exists: " + renderedWithOther);
 }
 `, sandbox);
 """

@@ -21,6 +21,11 @@ from .futu_skill_facts import (
     load_futu_skill_facts_cache,
 )
 from .research_chat import load_research_view_for_holding
+from .t_signal_store import (
+    index_t_signals_by_market_symbol,
+    load_t_signals_cache,
+    t_signals_latest_path,
+)
 from .technical_facts import (
     extract_market_report,
     index_technical_facts_by_market_symbol,
@@ -160,6 +165,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         data_dir=config.data_dir,
         markets=holding_markets,
     )
+    t_signals_by_holding = _latest_t_signals_for_markets(
+        data_dir=config.data_dir,
+        markets=holding_markets,
+    )
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
@@ -181,6 +190,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             decision_facts_file_exists_by_market,
             futu_skill_facts_by_holding,
             tradingagents_summary_by_holding,
+            t_signals_by_holding,
         )
         for row in holding_rows
     ]
@@ -389,6 +399,21 @@ def _latest_tradingagents_summary_for_markets(
     return records_by_key
 
 
+def _latest_t_signals_for_markets(
+    *,
+    data_dir: Path,
+    markets: set[str],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for market in markets:
+        path = t_signals_latest_path(data_dir, market)
+        if path.exists():
+            records_by_key.update(
+                index_t_signals_by_market_symbol(load_t_signals_cache(path))
+            )
+    return records_by_key
+
+
 def _markets_from_rows(rows: list[dict[str, str]]) -> set[str]:
     markets: set[str] = set()
     for row in rows:
@@ -465,6 +490,7 @@ def _merge_holding(
     decision_facts_file_exists_by_market: dict[str, bool],
     futu_skill_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
     tradingagents_summary_by_holding: dict[tuple[str, str], dict[str, Any]],
+    t_signals_by_holding: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -508,6 +534,9 @@ def _merge_holding(
     )
     holding["futu_skill_facts"] = _futu_skill_facts_detail(
         futu_skill_facts_by_holding.get(key) if key is not None else None,
+    )
+    holding["t_signal"] = _t_signal_detail(
+        t_signals_by_holding.get(key) if key is not None else None,
     )
     holding["research_view"] = (
         load_research_view_for_holding(
@@ -553,6 +582,12 @@ def _row_detail(row: dict[str, str] | None) -> dict[str, Any]:
     if row is None:
         return _unavailable_detail()
     return {"available": True, **row}
+
+
+def _t_signal_detail(record: dict[str, Any] | None) -> dict[str, Any]:
+    if record is None:
+        return _unavailable_detail()
+    return {"available": True, **record}
 
 
 def _agent_report_detail(row: dict[str, str] | None) -> dict[str, Any]:
@@ -832,8 +867,61 @@ def _futu_skill_facts_detail(record: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "news_sentiment": _futu_skill_news_sentiment_detail(
             record.get("news_sentiment") if isinstance(record, dict) else None
-        )
+        ),
+        "technical_anomaly": _futu_skill_signal_detail(
+            record.get("technical_anomaly") if isinstance(record, dict) else None
+        ),
+        "capital_anomaly": _futu_skill_signal_detail(
+            record.get("capital_anomaly") if isinstance(record, dict) else None
+        ),
+        "derivatives_anomaly": _futu_skill_signal_detail(
+            record.get("derivatives_anomaly") if isinstance(record, dict) else None
+        ),
     }
+
+
+def _futu_skill_signal_detail(module: object) -> dict[str, Any]:
+    if not isinstance(module, dict):
+        return _missing_futu_skill_signal()
+    status = str(module.get("status") or "").strip()
+    signal = str(module.get("signal") or "").strip()
+    confidence = str(module.get("confidence") or "").strip()
+    return {
+        "available": status in {"ok", "partial"},
+        "status": status or "missing",
+        "signal": signal,
+        "confidence": confidence,
+        "suggested_constraint": str(module.get("suggested_constraint") or ""),
+        "window_days": _safe_int(module.get("window_days")),
+        "summary": str(module.get("summary") or ""),
+        "categories": _futu_skill_signal_categories(module.get("categories")),
+    }
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (OverflowError, TypeError, ValueError):
+        return 0
+
+
+def _futu_skill_signal_categories(categories: object) -> list[dict[str, str]]:
+    if not isinstance(categories, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        normalized.append(
+            {
+                "name": str(category.get("name") or ""),
+                "state": str(category.get("state") or ""),
+                "direction": str(category.get("direction") or ""),
+                "detail": str(category.get("detail") or ""),
+                "evidence_date": str(category.get("evidence_date") or ""),
+            }
+        )
+    return normalized
 
 
 def _futu_skill_news_sentiment_detail(module: object) -> dict[str, Any]:
@@ -851,7 +939,7 @@ def _futu_skill_news_sentiment_detail(module: object) -> dict[str, Any]:
         }
     evidence = module.get("evidence")
     return {
-        "available": True,
+        "available": status in {"ok", "partial"},
         "status": status,
         "signal": signal,
         "confidence": confidence,
@@ -878,6 +966,19 @@ def _missing_futu_skill_news_sentiment() -> dict[str, Any]:
         "domestic_discussion": _missing_futu_domestic_discussion(),
         "blocking_reason": "",
         "suggested_constraint": "",
+    }
+
+
+def _missing_futu_skill_signal() -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": "missing",
+        "signal": "",
+        "confidence": "",
+        "suggested_constraint": "",
+        "window_days": 0,
+        "summary": "",
+        "categories": [],
     }
 
 

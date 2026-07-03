@@ -14,6 +14,7 @@ from open_trader.futu_universe import (
 )
 from open_trader.futu_watch import FutuWatchResult
 from open_trader.futu_watch import QuoteSnapshot
+from open_trader.t_signal_runner import TSignalWatchResult
 
 
 def test_watch_futu_help_includes_expected_options(
@@ -118,6 +119,165 @@ def test_watch_futu_main_reports_runner_error_without_traceback(
     stderr = capsys.readouterr().err
     assert "OpenD connection failed" in stderr
     assert "Traceback" not in stderr
+
+
+def test_watch_t_help_includes_expected_options(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["watch-t", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--portfolio" in output
+    assert "--data-dir" in output
+    assert "--date" in output
+    assert "--market" in output
+    assert "--session-phase" in output
+    assert "--host" in output
+    assert "--port" in output
+    assert "--poll-seconds" in output
+    assert "--once" in output
+
+
+def test_watch_t_main_wires_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeMarketDataClient:
+        def __init__(self, *, host: str, port: int) -> None:
+            captured["host"] = host
+            captured["port"] = port
+
+    class FakeInterpreter:
+        pass
+
+    class FakeNotifier:
+        pass
+
+    def fake_run_t_signal_watch_once(**kwargs: object) -> TSignalWatchResult:
+        captured.update(kwargs)
+        assert isinstance(kwargs["market_data_client"], FakeMarketDataClient)
+        assert isinstance(kwargs["interpreter"], FakeInterpreter)
+        assert isinstance(kwargs["notifier"], FakeNotifier)
+        data_dir = kwargs["data_dir"]
+        assert isinstance(data_dir, Path)
+        return TSignalWatchResult(
+            run_date="2026-07-02",
+            market="US",
+            signal_count=1,
+            notified_count=1,
+            run_path=data_dir / "runs/2026-07-02/US/t_signals.json",
+            latest_path=data_dir / "latest/US/t_signals.json",
+        )
+
+    monkeypatch.setattr(cli, "FutuTSignalMarketDataClient", FakeMarketDataClient)
+    monkeypatch.setattr(cli, "TSignalInterpreter", FakeInterpreter)
+    monkeypatch.setattr(cli, "build_notifier", lambda config: FakeNotifier())
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run=False: object())
+    monkeypatch.setattr(cli, "run_t_signal_watch_once", fake_run_t_signal_watch_once)
+
+    result = cli.main(
+        [
+            "watch-t",
+            "--portfolio",
+            "portfolio.csv",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--date",
+            "2026-07-02",
+            "--market",
+            "US",
+            "--session-phase",
+            "regular",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "11111",
+            "--once",
+        ]
+    )
+
+    assert result == 0
+    assert captured["portfolio_path"] == Path("portfolio.csv")
+    assert captured["data_dir"] == tmp_path / "data"
+    assert captured["run_date"] == "2026-07-02"
+    assert captured["market"] == "US"
+    assert captured["session_phase"] == "regular"
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 11111
+    output = capsys.readouterr().out
+    assert "run_date: 2026-07-02" in output
+    assert "signals: 1" in output
+    assert "notified: 1" in output
+    assert "latest:" in output
+
+
+def test_watch_t_main_repeats_when_once_is_false(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    sleeps: list[float] = []
+
+    class FakeMarketDataClient:
+        def __init__(self, *, host: str, port: int) -> None:
+            pass
+
+    class FakeInterpreter:
+        pass
+
+    class FakeNotifier:
+        pass
+
+    def fake_run_t_signal_watch_once(**kwargs: object) -> TSignalWatchResult:
+        calls.append(kwargs)
+        data_dir = kwargs["data_dir"]
+        assert isinstance(data_dir, Path)
+        return TSignalWatchResult(
+            run_date="2026-07-02",
+            market="US",
+            signal_count=1,
+            notified_count=0,
+            run_path=data_dir / "runs/2026-07-02/US/t_signals.json",
+            latest_path=data_dir / "latest/US/t_signals.json",
+        )
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "FutuTSignalMarketDataClient", FakeMarketDataClient)
+    monkeypatch.setattr(cli, "TSignalInterpreter", FakeInterpreter)
+    monkeypatch.setattr(cli, "build_notifier", lambda config: FakeNotifier())
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run=False: object())
+    monkeypatch.setattr(cli, "run_t_signal_watch_once", fake_run_t_signal_watch_once)
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+
+    result = cli.main(
+        [
+            "watch-t",
+            "--portfolio",
+            "portfolio.csv",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--date",
+            "2026-07-02",
+            "--market",
+            "US",
+            "--poll-seconds",
+            "1.25",
+        ]
+    )
+
+    assert result == 130
+    assert len(calls) == 1
+    assert sleeps == [1.25]
 
 
 def test_check_futu_quotes_help_includes_expected_options(
