@@ -617,9 +617,10 @@ function renderHoldings() {
       const selectedDetail = selected && rowKey === state.selectedHoldingKey
         ? normalizeHoldingDetailMode(state.selectedHoldingDetail)
         : "";
+      const tSignalClass = tSignalButtonClass(holding);
       rows.push(`
         <tr class="${selectedClass}">
-          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="expand-button t-signal-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
+          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
           <td>${escapeHtml(formatPlain(holding.market))}</td>
           <td class="symbol-cell">
             <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
@@ -681,6 +682,16 @@ function showSymbolDetail(detailKey, detailMode = "decision") {
 
 function normalizeHoldingDetailMode(mode) {
   return mode === "t_signal" ? "t_signal" : "decision";
+}
+
+function tSignalButtonClass(holding) {
+  const signal = holding && holding.t_signal && typeof holding.t_signal === "object"
+    ? holding.t_signal
+    : {};
+  const active = signal.status === "ok" && ["BUY_T", "SELL_T"].includes(signal.action);
+  return active
+    ? "expand-button t-signal-button t-signal-button-active"
+    : "expand-button t-signal-button";
 }
 
 function openTradeActionDetail(actionKey) {
@@ -785,6 +796,7 @@ function renderTSignalDetail(holding) {
         ${signal.error ? `<p class="t-signal-error">${escapeHtml(signal.error)}</p>` : ""}
       </section>
       ${renderTSignalEvidence(signal)}
+      ${renderTSignalPrerequisites(signal)}
       ${renderTSignalDetails(signal)}
       ${renderTSignalTimeline(signal)}
     </div>
@@ -802,7 +814,6 @@ function renderTSignalMetric(label, value) {
 
 function renderTSignalEvidence(signal) {
   const evidence = Array.isArray(signal.evidence) ? signal.evidence : [];
-  const gates = Array.isArray(signal.hard_gates) ? signal.hard_gates : [];
   return `
     <section class="detail-section t-signal-section">
       <h3>信号依据</h3>
@@ -814,14 +825,23 @@ function renderTSignalEvidence(signal) {
           </div>
         `).join("") : `<p class="muted-copy">暂无明确买卖依据。</p>`}
       </div>
+    </section>
+  `;
+}
+
+function renderTSignalPrerequisites(signal) {
+  const gates = Array.isArray(signal.hard_gates) ? signal.hard_gates : [];
+  return `
+    <section class="detail-section t-signal-section">
+      <h3>前置条件</h3>
       <div class="t-signal-gate-grid">
-        ${gates.map((gate) => `
+        ${gates.length > 0 ? gates.map((gate) => `
           <div class="t-signal-gate">
-            <span>${escapeHtml(formatPlain(gate.name))}</span>
+            <span>${escapeHtml(tSignalGateNameLabel(gate.name))}</span>
             <strong>${escapeHtml(tSignalGateStatusLabel(gate.status))}</strong>
             <small>${escapeHtml(formatPlain(gate.message_zh))}</small>
           </div>
-        `).join("")}
+        `).join("") : `<p class="muted-copy">暂无前置条件记录。</p>`}
       </div>
     </section>
   `;
@@ -940,11 +960,11 @@ function tSignalNotificationText(notification) {
   }
   if (notification.notified === true) {
     return hasValue(notification.last_notified_at)
-      ? `已提醒 · ${notification.last_notified_at}`
-      : "已提醒";
+      ? `已发起提醒 · ${notification.last_notified_at}`
+      : "已发起提醒";
   }
   if (hasValue(notification.last_attempted_dedupe_key)) {
-    return "已尝试提醒";
+    return "已尝试发起提醒";
   }
   if (notification.should_notify === true) {
     return "待提醒";
@@ -964,6 +984,17 @@ function tSignalStrengthLabel(value) {
 
 function tSignalGateStatusLabel(value) {
   const labels = { pass: "通过", block: "阻断", warn: "提醒", missing: "缺失" };
+  return labels[value] || formatPlain(value);
+}
+
+function tSignalGateNameLabel(value) {
+  const labels = {
+    session_phase: "交易时段",
+    baseline: "底仓数量",
+    technical: "技术完整性",
+    liquidity: "流动性",
+    symbol: "标的匹配",
+  };
   return labels[value] || formatPlain(value);
 }
 
