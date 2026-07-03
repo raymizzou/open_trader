@@ -107,6 +107,17 @@ class HoldMarketDataClient(FakeMarketDataClient):
         return facts.with_field("last_price", Decimal("49.10"))
 
 
+class SellMarketDataClient(FakeMarketDataClient):
+    def get_market_facts(self, **kwargs) -> TMarketFacts:
+        facts = super().get_market_facts(**kwargs)
+        return (
+            facts.with_field("last_price", Decimal("49.00"))
+            .with_field("vwap", Decimal("48.50"))
+            .with_field("ma_1m", Decimal("49.20"))
+            .with_field("rsi_5m", Decimal("68"))
+        )
+
+
 class FailingMarketDataClient(FakeMarketDataClient):
     def get_market_facts(self, **kwargs) -> TMarketFacts:
         raise RuntimeError("OpenD connection failed")
@@ -160,8 +171,15 @@ def test_t_signal_runner_writes_artifact_and_sends_once(tmp_path: Path) -> None:
     assert result.signal_count == 1
     assert result.notified_count == 1
     assert client.closed is True
-    assert notifier.messages[0][0] == "Open Trader｜做T提醒｜US"
-    assert "VIXY BUY_T 15%" in notifier.messages[0][1]
+    assert notifier.messages[0][0] == "Open Trader｜做T提醒｜US.VIXY｜买入做T"
+    assert "动作：买入做T" in notifier.messages[0][1]
+    assert "比例：15%" in notifier.messages[0][1]
+    assert "状态：盘中有效，等待执行确认" in notifier.messages[0][1]
+    assert "结论：" in notifier.messages[0][1]
+    assert "依据：\n1. 价格低于 VWAP 后回收，出现低吸做T信号。" in notifier.messages[0][1]
+    assert "时间：2026-07-02 22:32:00" in notifier.messages[0][1]
+    assert "BUY_T" not in notifier.messages[0][0]
+    assert "BUY_T" not in notifier.messages[0][1]
     cache = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")
     record = cache["records"][0]
     assert record["action"] == "BUY_T"
@@ -169,6 +187,44 @@ def test_t_signal_runner_writes_artifact_and_sends_once(tmp_path: Path) -> None:
     assert record["notification"]["notified"] is True
     assert record["notification"]["should_notify"] is False
     assert record["timeline"][-1]["event_type"] == "notification_sent"
+
+
+def test_t_signal_notification_uses_structured_chinese_template(tmp_path: Path) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path)
+    notifier = CapturingNotifier()
+
+    run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=SellMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=notifier,
+        now_fn=fixed_now,
+    )
+
+    title, message = notifier.messages[0]
+    assert title == "Open Trader｜做T提醒｜US.VIXY｜卖出做T"
+    assert message == (
+        "动作：卖出做T\n"
+        "比例：15%\n"
+        "状态：盘中有效，等待执行确认\n"
+        "\n"
+        "结论：\n"
+        "触发卖出做T，建议比例 15%。\n"
+        "\n"
+        "依据：\n"
+        "1. 价格高于 VWAP 后受压，出现高抛做T信号。\n"
+        "2. 5分钟 RSI 处于偏高区间，回落信号更明确。\n"
+        "3. 5分钟量比放大，价格受压具备成交配合。\n"
+        "\n"
+        "时间：2026-07-02 22:32:00"
+    )
+    assert "SELL_T" not in title
+    assert "SELL_T" not in message
 
 
 def test_t_signal_runner_does_not_mark_null_notifier_as_sent(tmp_path: Path) -> None:

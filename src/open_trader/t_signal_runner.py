@@ -395,15 +395,74 @@ def _build_error_signal(
 
 
 def _notification_title(signal: TSignal) -> str:
-    return f"Open Trader｜做T提醒｜{signal.market}"
+    return f"Open Trader｜做T提醒｜{signal.futu_symbol}｜{_action_label(signal.action)}"
 
 
 def _notification_message(signal: TSignal) -> str:
-    ratio = f" {signal.suggested_ratio}%" if signal.suggested_ratio else ""
+    evidence_lines = _notification_evidence_lines(signal)
     return "\n".join(
         [
-            f"{signal.symbol} {signal.action}{ratio}",
-            signal.signal_summary_zh.strip(),
-            f"依据：{'; '.join(item.message_zh for item in signal.evidence)}",
+            f"动作：{_action_label(signal.action)}",
+            f"比例：{signal.suggested_ratio}%" if signal.suggested_ratio else "比例：-",
+            f"状态：{_notification_status(signal)}",
+            "",
+            "结论：",
+            _localized_action_text(signal.signal_summary_zh.strip(), signal.action),
+            "",
+            "依据：",
+            *evidence_lines,
+            "",
+            f"时间：{_notification_time(signal.updated_at)}",
         ]
     ).strip()
+
+
+def _action_label(action: str) -> str:
+    return {
+        "BUY_T": "买入做T",
+        "SELL_T": "卖出做T",
+    }.get(action, action)
+
+
+def _notification_status(signal: TSignal) -> str:
+    phase = {
+        "pre_market": "盘前",
+        "regular": "盘中",
+        "post_market": "盘后",
+        "closed": "休市",
+        "unknown": "未知时段",
+    }.get(signal.session_phase, "未知时段")
+    if signal.status == "ok":
+        return f"{phase}有效，等待执行确认"
+    status = _localized_action_text(signal.current_status.strip(), signal.action)
+    return status or f"{phase}需要复核"
+
+
+def _notification_evidence_lines(signal: TSignal) -> list[str]:
+    lines = [
+        f"{index}. {item.message_zh.strip()}"
+        for index, item in enumerate(signal.evidence, start=1)
+        if item.message_zh.strip()
+    ]
+    return lines or ["-"]
+
+
+def _notification_time(updated_at: str) -> str:
+    value = updated_at.strip()
+    if not value:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _localized_action_text(text: str, action: str) -> str:
+    label = _action_label(action)
+    return (
+        text.replace(f"触发 {action}", f"触发{label}")
+        .replace(f"生成 {action} 信号", f"生成{label}信号")
+        .replace(f"{action} 条件满足", f"{label}条件满足")
+        .replace(action, label)
+    )
