@@ -33,6 +33,25 @@ UNKNOWN_TIMEFRAME_VALUES = {
     "timeframe unknown",
     "周期缺失",
 }
+BOLLINGER_POSITIONS = {
+    "above_upper",
+    "near_upper",
+    "middle_range",
+    "near_lower",
+    "below_lower",
+    "unknown",
+}
+BOLLINGER_STATUSES = {
+    "upper_risk",
+    "lower_opportunity",
+    "neutral",
+    "unknown",
+}
+BOLLINGER_REFERENCE_BANDS = {"", "upper", "lower"}
+BOLLINGER_VISIBLE_TEXT_FIELDS = ("summary_zh", "detail_zh")
+BOLLINGER_TRADING_INSTRUCTION_PATTERN = re.compile(
+    r"(?:建议买入|建议卖出|买入|卖出|加仓|减仓|下单|建仓|平仓|止盈|止损|仓位|执行)"
+)
 
 
 @dataclass(frozen=True)
@@ -460,6 +479,33 @@ def _validate_facts(facts: dict[str, object]) -> None:
     timeframes = facts.get("timeframes")
     if not isinstance(timeframes, list):
         raise ValueError("technical facts timeframes must be a list")
+    for timeframe in timeframes:
+        if isinstance(timeframe, dict):
+            _validate_bollinger_payload(timeframe.get("bollinger"))
+
+
+def _validate_bollinger_payload(payload: object) -> None:
+    if payload is None or payload == "":
+        return
+    if not isinstance(payload, dict):
+        raise ValueError("bollinger must be an object")
+    position = str(payload.get("position") or "").strip()
+    if position and position not in BOLLINGER_POSITIONS:
+        raise ValueError("bollinger position is invalid")
+    status = str(payload.get("status") or "").strip()
+    if status and status not in BOLLINGER_STATUSES:
+        raise ValueError("bollinger status is invalid")
+    reference_band = str(payload.get("reference_band") or "").strip()
+    if reference_band not in BOLLINGER_REFERENCE_BANDS:
+        raise ValueError("bollinger reference_band is invalid")
+    for field_name in BOLLINGER_VISIBLE_TEXT_FIELDS:
+        value = payload.get(field_name)
+        if value in {None, ""}:
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"bollinger {field_name} must be a string")
+        if BOLLINGER_TRADING_INSTRUCTION_PATTERN.search(value):
+            raise ValueError(f"bollinger {field_name} contains trading instruction")
 
 
 def _has_unknown_timeframe(facts: dict[str, object]) -> bool:
@@ -491,6 +537,13 @@ def _technical_facts_system_prompt() -> str:
         "timeframe。若报告没有明确周期，timeframe 使用 unknown，timeframe_label 使用"
         "\"周期缺失\"。缺失字段使用空字符串或空数组，不要猜测。schema_version 必须是 "
         f"{FACTS_SCHEMA_VERSION}。"
+        "布林带必须放在每个 timeframe 的 bollinger 对象中，字段包含 upper、middle、"
+        "lower、position、status、reference_band、reference_value、distance_pct、"
+        "summary_zh、detail_zh。position 只能使用 above_upper、near_upper、"
+        "middle_range、near_lower、below_lower、unknown；status 只能使用 upper_risk、"
+        "lower_opportunity、neutral、unknown；reference_band 只能使用 upper、lower "
+        "或空字符串。summary_zh 和 detail_zh 必须是中文事实提示，不得包含买入、卖出、"
+        "加仓、减仓、下单、仓位等交易指令。"
     )
 
 

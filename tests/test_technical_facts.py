@@ -12,6 +12,7 @@ from open_trader.technical_facts import (
     LLMTechnicalFactsExtractor,
     OpenAITextClient,
     TechnicalFactsExtractor,
+    _validate_facts,
     build_freshness,
     extract_market_report,
     generate_technical_facts,
@@ -258,6 +259,69 @@ def test_load_technical_facts_cache_returns_empty_for_invalid_json(tmp_path: Pat
     cache_path.write_text("{not-json", encoding="utf-8")
 
     assert load_technical_facts_cache(cache_path) == {}
+
+
+def valid_bollinger_facts() -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.technical_facts.v1",
+        "status": "present",
+        "source_date": "2026-07-04",
+        "market_data_as_of": "2026-07-03",
+        "symbol": "US.MSFT",
+        "timeframes": [
+            {
+                "timeframe": "daily",
+                "timeframe_label": "日线",
+                "current_price": "466.20",
+                "bollinger": {
+                    "upper": "459.13",
+                    "middle": "399.62",
+                    "lower": "340.11",
+                    "position": "above_upper",
+                    "status": "upper_risk",
+                    "reference_band": "upper",
+                    "reference_value": "459.13",
+                    "distance_pct": "1.5%",
+                    "summary_zh": "当前价格已超过日线布林带上轨",
+                    "detail_zh": "价格处在布林带上沿之外，说明短线偏热。这个状态用于提醒可能接近回调区，不直接给出交易动作。",
+                },
+            }
+        ],
+    }
+
+
+def test_validate_facts_accepts_fixed_bollinger_schema() -> None:
+    _validate_facts(valid_bollinger_facts())
+
+
+def test_validate_facts_rejects_invalid_bollinger_status() -> None:
+    facts = valid_bollinger_facts()
+    timeframe = facts["timeframes"][0]  # type: ignore[index]
+    timeframe["bollinger"]["status"] = "buy_signal"  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="bollinger status is invalid"):
+        _validate_facts(facts)
+
+
+def test_validate_facts_rejects_bollinger_trading_instruction_text() -> None:
+    facts = valid_bollinger_facts()
+    timeframe = facts["timeframes"][0]  # type: ignore[index]
+    timeframe["bollinger"]["detail_zh"] = "价格接近下轨，建议加仓。"  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="bollinger detail_zh contains trading instruction"):
+        _validate_facts(facts)
+
+
+def test_validate_facts_allows_missing_or_legacy_bollinger_object() -> None:
+    facts = valid_bollinger_facts()
+    timeframe = facts["timeframes"][0]  # type: ignore[index]
+    timeframe["bollinger"] = {  # type: ignore[index]
+        "upper": "459.13",
+        "middle": "399.62",
+        "lower": "340.11",
+    }
+
+    _validate_facts(facts)
 
 
 def test_generate_technical_facts_writes_run_and_latest_cache(tmp_path: Path) -> None:
