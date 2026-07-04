@@ -434,7 +434,7 @@ def write_all_ineligible_portfolio(path: Path) -> None:
             [
                 {
                     "market": "HK",
-                    "asset_class": "stock",
+                    "asset_class": "money_market_fund",
                     "symbol": "02476",
                     "name": "VGT",
                     "portfolio_weight_hkd": "15.20%",
@@ -444,7 +444,7 @@ def write_all_ineligible_portfolio(path: Path) -> None:
                 },
                 {
                     "market": "US",
-                    "asset_class": "stock",
+                    "asset_class": "cash",
                     "symbol": "AAPL",
                     "name": "Apple",
                     "portfolio_weight_hkd": "8.00%",
@@ -478,10 +478,14 @@ def test_run_premarket_writes_full_advice_classifications_and_actions(
     )
 
     assert isinstance(result, PremarketResult)
-    assert result.eligible_count == 2
-    assert result.advice_count == 2
+    assert result.eligible_count == 3
+    assert result.advice_count == 3
     assert result.action_count == 1
-    assert advice_runner.calls == [("VIXY", "2026-06-16"), ("QQQ", "2026-06-16")]
+    assert advice_runner.calls == [
+        ("VIXY", "2026-06-16"),
+        ("QQQ", "2026-06-16"),
+        ("02476", "2026-06-16"),
+    ]
     assert classifier.previous_by_symbol["VIXY"]["advice_action"] == "hold"
     assert result.report_path.exists()
 
@@ -489,7 +493,7 @@ def test_run_premarket_writes_full_advice_classifications_and_actions(
     assert [row["symbol"] for row in actions] == ["VIXY"]
 
     advice_rows = list(csv.DictReader(result.advice_path.open(encoding="utf-8")))
-    assert [row["symbol"] for row in advice_rows] == ["VIXY", "QQQ"]
+    assert [row["symbol"] for row in advice_rows] == ["VIXY", "QQQ", "02476"]
 
 
 def test_run_premarket_generates_technical_facts_after_advice(
@@ -690,8 +694,12 @@ def test_run_premarket_parallelizes_symbols_but_preserves_output_order(
     classification_rows = list(
         csv.DictReader(result.classifications_path.open(encoding="utf-8"))
     )
-    assert [row["symbol"] for row in advice_rows] == ["VIXY", "QQQ"]
-    assert [row["symbol"] for row in classification_rows] == ["VIXY", "QQQ"]
+    assert [row["symbol"] for row in advice_rows] == ["VIXY", "QQQ", "02476"]
+    assert [row["symbol"] for row in classification_rows] == [
+        "VIXY",
+        "QQQ",
+        "02476",
+    ]
 
 
 def test_run_premarket_uses_advice_runner_factory_per_symbol(
@@ -719,9 +727,13 @@ def test_run_premarket_uses_advice_runner_factory_per_symbol(
         max_workers=2,
     )
 
-    assert result.advice_count == 2
-    assert len(created_runners) == 2
-    assert sorted(runner.calls[0][0] for runner in created_runners) == ["QQQ", "VIXY"]
+    assert result.advice_count == 3
+    assert len(created_runners) == 3
+    assert sorted(runner.calls[0][0] for runner in created_runners) == [
+        "02476",
+        "QQQ",
+        "VIXY",
+    ]
 
 
 def test_run_premarket_dry_run_does_not_update_latest_advice(
@@ -1103,7 +1115,7 @@ def test_run_premarket_converts_advice_runner_failure_and_continues(
     assert advice_rows["VIXY"]["status"] == "ok"
     assert advice_rows["QQQ"]["status"] == "error"
     assert advice_rows["QQQ"]["error"] == "QQQ analysis failed"
-    assert result.advice_count == 2
+    assert result.advice_count == 3
 
 
 def test_run_premarket_falls_back_to_latest_ok_advice_on_symbol_failure(
@@ -1158,7 +1170,7 @@ def test_run_premarket_falls_back_to_latest_ok_advice_on_symbol_failure(
     assert qqq["fallback_reason"] == "QQQ analysis failed"
     assert qqq["fallback_from_date"] == "2026-06-16"
     assert qqq["advice_summary"] == "QQQ prior summary"
-    assert result.advice_count == 2
+    assert result.advice_count == 3
 
 
 def test_run_premarket_falls_back_when_runner_returns_error_advice(

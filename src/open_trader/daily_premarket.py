@@ -30,10 +30,26 @@ from .notifications import (
 )
 from .futu_watch import QuoteSnapshot
 from .market_scope import MarketScope, parse_market_scope
+from .decision_facts import (
+    DECISION_FACTS_SCHEMA_VERSION,
+    DecisionFactsResult,
+    decision_facts_latest_path,
+    decision_facts_run_path,
+)
+from .technical_facts import (
+    TECHNICAL_FACTS_SCHEMA_VERSION,
+    TechnicalFactsResult,
+    technical_facts_latest_path,
+    technical_facts_run_path,
+)
 from .trade_actions import TradeActionsResult, generate_trade_actions
 from .tradingagents_summary import (
     LLMTradingAgentsSummaryExtractor,
+    TRADINGAGENTS_SUMMARY_SCHEMA_VERSION,
+    TradingAgentsSummaryResult,
     generate_tradingagents_summary,
+    tradingagents_summary_latest_path,
+    tradingagents_summary_run_path,
 )
 from .trading_plan import (
     TradingPlanBuildResult,
@@ -59,7 +75,7 @@ class DailyPremarketConfig:
     logs_dir: Path
     portfolio: Path
     dry_run: bool = False
-    max_workers: int = 4
+    max_workers: int = 8
     ta_timeout_seconds: float = 600.0
     ta_max_retries: int = 2
     tradingagents_path: Path = Path("/Users/ray/projects/TradingAgents")
@@ -169,7 +185,7 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
             repo,
         ),
         dry_run=dry_run,
-        max_workers=int(values.get("OPEN_TRADER_MAX_WORKERS", "4")),
+        max_workers=int(values.get("OPEN_TRADER_MAX_WORKERS", "8")),
         ta_timeout_seconds=float(values.get("OPEN_TRADER_TA_TIMEOUT_SECONDS", "600")),
         ta_max_retries=int(values.get("OPEN_TRADER_TA_MAX_RETRIES", "2")),
         tradingagents_path=_config_path(
@@ -288,7 +304,7 @@ class DailyPremarketRunner:
             ...,
             TradeActionsResult,
         ] = generate_trade_actions,
-        summary_generator: Callable[..., object] = generate_tradingagents_summary,
+        summary_generator: Callable[..., object] | None = None,
         summary_extractor_factory: Callable[
             [],
             object,
@@ -300,7 +316,7 @@ class DailyPremarketRunner:
         self.plan_builder = plan_builder
         self.quote_client_factory = quote_client_factory
         self.trade_action_generator = trade_action_generator
-        self.summary_generator = summary_generator
+        self.summary_generator = summary_generator or _write_skipped_tradingagents_summary
         self.summary_extractor_factory = summary_extractor_factory
         self.notifier = notifier or NullNotifier()
 
@@ -346,6 +362,19 @@ class DailyPremarketRunner:
         )
         try:
             with RunLock(lock_path):
+                if self.config.notify_daily_report and not effective_dry_run:
+                    self._notify(
+                        _notification_title("开始通知", market_scope.value),
+                        _start_notification_message(
+                            run_date=run_date,
+                            market=market_scope.value,
+                            config=market_config,
+                            status_path=status_path,
+                            report_path=report_path,
+                        ),
+                        market=market_scope.value,
+                        run_date=run_date,
+                    )
                 try:
                     return self._run_locked(
                         run_date=run_date,
@@ -425,9 +454,104 @@ class DailyPremarketRunner:
             use_fallback=True,
             deadline_reached=_deadline_reached(config, run_date),
             market=market,
+            technical_facts_generator=_write_skipped_technical_facts,
+            decision_facts_generator=_write_skipped_decision_facts,
         )
         advice_path = Path(getattr(premarket_result, "advice_path"))
         actions_path = Path(getattr(premarket_result, "actions_path"))
+        if int(getattr(premarket_result, "eligible_count")) == 0:
+            no_report_error = f"portfolio filters produced no {market} report symbols"
+            futu_status = {
+                "checked": 0,
+                "missing": 0,
+                "triggered": 0,
+                "items": [],
+                "error": "",
+                "diagnostic": _futu_diagnostic(
+                    host=config.futu_host,
+                    port=config.futu_port,
+                    error_type="not_checked",
+                    message="过滤后无报告标的，未执行行情检查。",
+                    next_step=(
+                        "请检查 portfolio.csv 的市场、资产类别和排除清单，"
+                        "然后重新运行每日盘前流程。"
+                    ),
+                    opend_reachable=None,
+                    context_ok=None,
+                    snapshot_ok=None,
+                ),
+            }
+            trade_actions = {"actions": 0, "ready": 0, "review": 0, "watch": 0}
+            artifacts = {
+                "portfolio": str(config.portfolio),
+                "advice": str(advice_path),
+                "classifications": str(getattr(premarket_result, "classifications_path")),
+                "actions": str(actions_path),
+                "premarket_report": str(getattr(premarket_result, "report_path")),
+                "trading_plan": "",
+                "trade_actions": "",
+                "trade_actions_report": "",
+                "technical_facts": "",
+                "decision_facts": "",
+                "latest_advice": "",
+                "latest_actions": "",
+                "latest_trading_plan": "",
+                "latest_trade_actions": "",
+                "latest_technical_facts": "",
+                "latest_decision_facts": "",
+                "status": str(status_path),
+                "report": str(report_path),
+                "log": str(log_path),
+            }
+            result = self._write_status_and_report(
+                run_date=run_date,
+                market=market,
+                config=config,
+                started_at=started_at,
+                status="failed",
+                readiness="blocked",
+                status_reasons=["no_report_symbols"],
+                premarket={
+                    "ok": 0,
+                    "fallback": 0,
+                    "error": 0,
+                    "eligible": 0,
+                    "advice": int(getattr(premarket_result, "advice_count")),
+                    "actions": int(getattr(premarket_result, "action_count")),
+                },
+                plan_counts={"active": 0, "fallback": 0, "error": 0},
+                futu_status=futu_status,
+                trade_actions=trade_actions,
+                artifacts=artifacts,
+                status_path=status_path,
+                report_path=report_path,
+                log_path=log_path,
+                error=no_report_error,
+            )
+            if self.config.notify_daily_report and not dry_run:
+                blocker_message = _blocker_notification_message(
+                    run_date=run_date,
+                    status="failed",
+                    futu_status=futu_status,
+                    trade_actions=trade_actions,
+                    artifacts=artifacts,
+                    error=no_report_error,
+                    readiness="blocked",
+                    status_reasons=["no_report_symbols"],
+                )
+                self._notify(
+                    _notification_title("阻塞通知", market),
+                    blocker_message,
+                    market=market,
+                    run_date=run_date,
+                )
+            self._notify_completion(
+                status_path=status_path,
+                market=market,
+                run_date=run_date,
+                dry_run=dry_run,
+            )
+            return result
         technical_facts_path = Path(
             getattr(
                 premarket_result,
@@ -512,6 +636,7 @@ class DailyPremarketRunner:
         latest_decision_facts_path = latest_dir / "decision_facts.json"
         latest_tradingagents_summary_path = latest_dir / "tradingagents_summary.json"
         artifacts = {
+            "portfolio": str(config.portfolio),
             "advice": str(advice_path),
             "classifications": str(getattr(premarket_result, "classifications_path")),
             "actions": str(actions_path),
@@ -618,6 +743,12 @@ class DailyPremarketRunner:
                     market=market,
                     run_date=run_date,
                 )
+        self._notify_completion(
+            status_path=status_path,
+            market=market,
+            run_date=run_date,
+            dry_run=dry_run,
+        )
         return result
 
     def _advice_runner_factory(
@@ -753,6 +884,7 @@ class DailyPremarketRunner:
         status_path: Path,
         report_path: Path,
         log_path: Path,
+        error: str = "",
     ) -> DailyRunResult:
         finished_at = datetime.now(ZoneInfo(config.timezone))
         payload: dict[str, object] = {
@@ -761,6 +893,7 @@ class DailyPremarketRunner:
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
             "deadline_at": _deadline_at(config, run_date).isoformat(),
+            "max_workers": config.max_workers,
             "status": status,
             "readiness": readiness,
             "status_reasons": status_reasons,
@@ -770,6 +903,8 @@ class DailyPremarketRunner:
             "trade_actions": trade_actions,
             "artifacts": artifacts,
         }
+        if error:
+            payload["error"] = error
         _write_json(status_path, payload)
         _write_text(report_path, _render_daily_report(payload))
         _write_text(log_path, json.dumps(payload, ensure_ascii=False) + "\n")
@@ -815,6 +950,7 @@ class DailyPremarketRunner:
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
             "deadline_at": _failure_deadline_at(config, run_date),
+            "max_workers": config.max_workers,
             "status": "failed",
             "readiness": daily_state["readiness"],
             "status_reasons": daily_state["status_reasons"],
@@ -913,6 +1049,12 @@ class DailyPremarketRunner:
                     market=market,
                     run_date=run_date,
                 )
+        self._notify_completion(
+            status_path=status_path,
+            market=market,
+            run_date=run_date,
+            dry_run=dry_run,
+        )
         return DailyRunResult(
             run_date=run_date,
             status="failed",
@@ -950,6 +1092,7 @@ class DailyPremarketRunner:
             "run_date": run_date,
             "market": market,
             "started_at": started_at.isoformat(),
+            "max_workers": config.max_workers,
             "status": "already_running",
             "readiness": daily_state["readiness"],
             "status_reasons": daily_state["status_reasons"],
@@ -988,6 +1131,30 @@ class DailyPremarketRunner:
                 attempt.error_type,
                 attempt.error,
             )
+
+    def _notify_completion(
+        self,
+        *,
+        status_path: Path,
+        market: str,
+        run_date: str,
+        dry_run: bool,
+    ) -> None:
+        if not self.config.notify_daily_report or dry_run:
+            return
+        try:
+            with status_path.open(encoding="utf-8-sig") as handle:
+                payload = json.load(handle)
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+        self._notify(
+            _notification_title("完成通知", market),
+            _completion_notification_message(payload),
+            market=market,
+            run_date=run_date,
+        )
 
     def _write_notification_log(
         self,
@@ -1103,6 +1270,82 @@ def _market_label(market: str) -> str:
 
 def _notification_title(kind: str, market: str) -> str:
     return f"Open Trader {_market_label(market)}{kind}"
+
+
+def _start_notification_message(
+    *,
+    run_date: str,
+    market: str,
+    config: DailyPremarketConfig,
+    status_path: Path,
+    report_path: Path,
+) -> str:
+    return "\n".join(
+        [
+            "Open Trader｜开始通知",
+            f"日期：{run_date}｜市场：{_market_label(market)}",
+            f"状态：开始运行｜并发：{config.max_workers}",
+            f"组合：{config.portfolio}",
+            f"状态文件：{status_path}",
+            f"报告：{report_path}",
+        ]
+    )
+
+
+def _completion_notification_message(payload: dict[str, object]) -> str:
+    premarket = _mapping(payload.get("premarket"))
+    trading_plan = _mapping(payload.get("trading_plan"))
+    futu = _mapping(payload.get("futu_plan_check"))
+    trade_actions = _mapping(payload.get("trade_actions"))
+    artifacts = _mapping(payload.get("artifacts"))
+    reason_labels = _reason_labels(payload.get("status_reasons"))
+    status = str(payload.get("status", "")).strip()
+    readiness = str(payload.get("readiness", "")).strip()
+    lines = [
+        "Open Trader｜完成通知",
+        (
+            f"日期：{payload.get('run_date', '')}｜市场："
+            f"{_market_label(str(payload.get('market', '')))}"
+        ),
+        f"状态：{_daily_status_label(status)}｜可用性：{_readiness_label(readiness)}",
+        f"原因：{', '.join(reason_labels) if reason_labels else '无'}",
+        f"并发：{payload.get('max_workers', '')}",
+        (
+            "盘前："
+            f"{premarket.get('ok', 0)} 成功，"
+            f"{premarket.get('fallback', 0)} 复用，"
+            f"{premarket.get('error', 0)} 异常"
+        ),
+        (
+            "交易计划："
+            f"{trading_plan.get('active', 0)} active，"
+            f"{trading_plan.get('fallback', 0)} fallback，"
+            f"{trading_plan.get('error', 0)} error"
+        ),
+        (
+            "行情检查："
+            f"{futu.get('checked', 0)} checked，"
+            f"{futu.get('missing', 0)} missing，"
+            f"{futu.get('triggered', 0)} triggered"
+        ),
+        (
+            "交易动作："
+            f"{trade_actions.get('ready', 0)} ready，"
+            f"{trade_actions.get('review', 0)} review，"
+            f"{trade_actions.get('watch', 0)} watch"
+        ),
+    ]
+    error = str(payload.get("error", "")).strip()
+    if error:
+        lines.append(f"错误：{error}")
+    report_path = str(artifacts.get("report", "")).strip()
+    status_path = str(artifacts.get("status", "")).strip()
+    if report_path:
+        lines.append(f"报告：{report_path}")
+    if status_path:
+        lines.append(f"状态文件：{status_path}")
+    lines.append(f"下一步：{_diagnostic_next_step(payload)}")
+    return "\n".join(lines)
 
 
 def _config_for_market(
@@ -1330,6 +1573,8 @@ def _render_daily_report(payload: dict[str, object]) -> str:
     ]
     if payload.get("market"):
         lines.append(f"- Market: {payload['market']}")
+    if payload.get("max_workers"):
+        lines.append(f"- Max workers: {payload.get('max_workers')}")
     if payload.get("error"):
         lines.append(f"- Error: {payload.get('error')}")
     readiness = str(payload.get("readiness", "")).strip()
@@ -1378,6 +1623,7 @@ def _render_daily_report(payload: dict[str, object]) -> str:
 
     lines.extend(["", "## Artifacts", ""])
     for name in [
+        "portfolio",
         "advice",
         "classifications",
         "actions",
@@ -1681,6 +1927,7 @@ def _status_reason_label(reason: str) -> str:
         "tradingagents_summary_failed": "TradingAgents 摘要生成异常",
         "run_failed": "运行失败",
         "already_running": "已有任务运行中",
+        "no_report_symbols": "过滤后无报告标的",
     }.get(reason.strip().lower(), "其他原因")
 
 
@@ -1713,6 +1960,116 @@ def _diagnostic_next_step(payload: dict[str, object]) -> str:
     if int(trade_actions.get("review", 0) or 0) > 0:
         return "请人工复核交易动作，再决定是否执行。"
     return "无需处理。"
+
+
+def _write_skipped_technical_facts(
+    *,
+    data_dir: Path,
+    run_date: str,
+    update_latest: bool,
+    market: MarketScope | str | None = None,
+    **_: object,
+) -> TechnicalFactsResult:
+    market_scope = _optional_market_scope(market)
+    run_path = technical_facts_run_path(data_dir, run_date, market_scope)
+    latest_path = technical_facts_latest_path(data_dir, market_scope)
+    payload: dict[str, object] = {
+        "schema_version": TECHNICAL_FACTS_SCHEMA_VERSION,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "run_date": run_date,
+        "market": market_scope.value if market_scope is not None else "",
+        "status": "skipped",
+        "reason": "daily_premarket_non_blocking",
+        "records": [],
+    }
+    _write_json(run_path, payload)
+    if update_latest:
+        _write_json(latest_path, payload)
+    return TechnicalFactsResult(
+        run_date=run_date,
+        records=0,
+        extracted=0,
+        failed=0,
+        reused=0,
+        run_path=run_path,
+        latest_path=latest_path,
+    )
+
+
+def _write_skipped_decision_facts(
+    *,
+    data_dir: Path,
+    run_date: str,
+    update_latest: bool,
+    market: MarketScope | str | None = None,
+    **_: object,
+) -> DecisionFactsResult:
+    market_scope = _optional_market_scope(market)
+    run_path = decision_facts_run_path(data_dir, run_date, market_scope)
+    latest_path = decision_facts_latest_path(data_dir, market_scope)
+    payload: dict[str, object] = {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "run_date": run_date,
+        "market": market_scope.value if market_scope is not None else "",
+        "status": "skipped",
+        "reason": "daily_premarket_non_blocking",
+        "records": [],
+    }
+    _write_json(run_path, payload)
+    if update_latest:
+        _write_json(latest_path, payload)
+    return DecisionFactsResult(
+        run_date=run_date,
+        records=0,
+        extracted=0,
+        failed=0,
+        reused=0,
+        run_path=run_path,
+        latest_path=latest_path,
+    )
+
+
+def _write_skipped_tradingagents_summary(
+    *,
+    data_dir: Path,
+    run_date: str,
+    update_latest: bool,
+    market: MarketScope | str | None = None,
+    **_: object,
+) -> TradingAgentsSummaryResult:
+    market_scope = _optional_market_scope(market)
+    run_path = tradingagents_summary_run_path(data_dir, run_date, market_scope)
+    latest_path = tradingagents_summary_latest_path(data_dir, market_scope)
+    payload: dict[str, object] = {
+        "schema_version": TRADINGAGENTS_SUMMARY_SCHEMA_VERSION,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "latest_run_date": run_date,
+        "market": market_scope.value if market_scope is not None else "",
+        "status": "skipped",
+        "reason": "daily_premarket_non_blocking",
+        "records": [],
+    }
+    _write_json(run_path, payload)
+    if update_latest:
+        _write_json(latest_path, payload)
+    return TradingAgentsSummaryResult(
+        run_date=run_date,
+        records=0,
+        extracted=0,
+        failed=0,
+        reused=0,
+        run_path=run_path,
+        latest_path=latest_path,
+    )
+
+
+def _optional_market_scope(market: MarketScope | str | None) -> MarketScope | None:
+    if market is None:
+        return None
+    if isinstance(market, MarketScope):
+        return market
+    return parse_market_scope(market)
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:

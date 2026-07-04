@@ -68,6 +68,7 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.deadline == "21:10"
     assert config.futu_host == "127.0.0.1"
     assert config.futu_port == 11111
+    assert config.max_workers == 8
     assert config.classifier_model == "deepseek-v4-flash"
     assert config.notifiers == ("feishu_app", "macos")
     assert config.feishu_app_id == "cli_test"
@@ -238,7 +239,9 @@ def test_build_notifier_requires_feishu_app_config(tmp_path: Path) -> None:
         build_notifier(config)
 
 
-def test_daily_runner_defaults_to_generate_trade_actions(tmp_path: Path) -> None:
+def test_daily_runner_defaults_to_generate_trade_actions_and_skipped_summary(
+    tmp_path: Path,
+) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -255,7 +258,7 @@ def test_daily_runner_defaults_to_generate_trade_actions(tmp_path: Path) -> None
     runner = _DailyPremarketRunner(config=config)
 
     assert runner.trade_action_generator is daily_premarket.generate_trade_actions
-    assert runner.summary_generator is daily_premarket.generate_tradingagents_summary
+    assert runner.summary_generator is daily_premarket._write_skipped_tradingagents_summary
     assert (
         runner.summary_extractor_factory
         is daily_premarket.LLMTradingAgentsSummaryExtractor
@@ -639,6 +642,55 @@ class FakePremarket:
         )()
 
 
+class EmptyPremarket:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, **kwargs: object):
+        self.calls.append(kwargs)
+        data_dir = kwargs["data_dir"]
+        run_date = kwargs["run_date"]
+        market = kwargs["market"]
+        assert isinstance(data_dir, Path)
+        assert isinstance(run_date, str)
+        assert isinstance(market, str)
+        run_dir = data_dir / "runs" / run_date / market
+        advice_path = run_dir / "trading_advice.csv"
+        classifications_path = run_dir / "change_classifications.csv"
+        actions_path = run_dir / "premarket_actions.csv"
+        report_path = Path("reports/premarket") / f"{run_date}-{market}.md"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        advice_path.write_text(
+            "run_date,symbol,market,asset_class,portfolio_weight_hkd,risk_flag,"
+            "source,advice_action,advice_summary,raw_decision,status,error,"
+            "source_status,fallback_reason,fallback_from_date\n",
+            encoding="utf-8",
+        )
+        classifications_path.write_text(
+            "run_date,symbol,include_in_report,change_type,severity,"
+            "suggested_action,summary,rationale,watch_trigger,status,error\n",
+            encoding="utf-8",
+        )
+        actions_path.write_text(
+            "run_date,symbol,market,portfolio_weight_hkd,severity,change_type,"
+            "suggested_action,summary,rationale,watch_trigger\n",
+            encoding="utf-8",
+        )
+        return type(
+            "PremarketResult",
+            (),
+            {
+                "eligible_count": 0,
+                "advice_count": 0,
+                "action_count": 0,
+                "advice_path": advice_path,
+                "classifications_path": classifications_path,
+                "actions_path": actions_path,
+                "report_path": report_path,
+            },
+        )()
+
+
 class FakePlanBuilder:
     def __init__(self, *, market: str = "US", symbol: str = "MSFT") -> None:
         self.market = market
@@ -708,6 +760,10 @@ class FakePlanBuilder:
             plan_path=plan_path,
             latest_path=latest_path,
         )
+
+
+class CapturingPlanBuilder(FakePlanBuilder):
+    pass
 
 
 class FakeQuoteClient:
@@ -987,6 +1043,47 @@ def test_daily_runner_hk_uses_market_scoped_paths_and_calls_market_filter(
     assert "data/latest/trading_plan.csv" not in status["artifacts"].values()
 
 
+def test_daily_runner_skips_blocking_facts_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("portfolio\n", encoding="utf-8")
+    premarket = FakePremarket(market="US", symbol="MSFT")
+
+    _daily_runner(
+        config=config,
+        premarket_runner=premarket,
+        plan_builder=FakePlanBuilder(market="US", symbol="MSFT"),
+        quote_client_factory=lambda **kwargs: FakeQuoteClient(
+            {"US.MSFT": QuoteSnapshot("US.MSFT", Decimal("390"))},
+            **kwargs,
+        ),
+        trade_action_generator=FakeTradeActionGenerator(market="US", symbol="MSFT"),
+    ).run(run_date="2026-06-19", market="US")
+
+    call = premarket.calls[0]
+    technical_result = call["technical_facts_generator"](
+        data_dir=config.data_dir,
+        run_date="2026-06-19",
+        update_latest=False,
+        market="US",
+    )
+    decision_result = call["decision_facts_generator"](
+        data_dir=config.data_dir,
+        run_date="2026-06-19",
+        update_latest=False,
+        market="US",
+    )
+    technical_payload = json.loads(technical_result.run_path.read_text(encoding="utf-8"))
+    decision_payload = json.loads(decision_result.run_path.read_text(encoding="utf-8"))
+
+    assert technical_payload["status"] == "skipped"
+    assert decision_payload["status"] == "skipped"
+
+
 def test_hk_daily_runner_uses_market_notification_titles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1015,13 +1112,22 @@ def test_hk_daily_runner_uses_market_notification_titles(
         notifier=notifier,
     ).run(run_date="2026-06-19", market="HK")
 
-    assert [title for title, _ in notifier.calls] == ["Open Trader 港股行动通知"]
+    assert [title for title, _ in notifier.calls] == [
+        "Open Trader 港股开始通知",
+        "Open Trader 港股行动通知",
+        "Open Trader 港股完成通知",
+    ]
     rows = _notification_rows(tmp_path, "2026-06-19", "HK")
-    assert len(rows) == 1
-    assert rows[0]["market"] == "HK"
-    assert rows[0]["title"] == "Open Trader 港股行动通知"
-    assert rows[0]["channel"] == "CapturingNotifier"
-    assert rows[0]["success"] == "true"
+    assert len(rows) == 3
+    assert [row["title"] for row in rows] == [
+        "Open Trader 港股开始通知",
+        "Open Trader 港股行动通知",
+        "Open Trader 港股完成通知",
+    ]
+    for row in rows:
+        assert row["market"] == "HK"
+        assert row["channel"] == "CapturingNotifier"
+        assert row["success"] == "true"
 
 
 def test_daily_notify_logs_success(
@@ -1226,6 +1332,66 @@ def test_daily_runner_writes_success_status_and_report(
     assert (tmp_path / "reports/daily_runs/2026-06-17-US.md").exists()
 
 
+def test_daily_runner_stops_when_portfolio_filters_to_no_report_symbols(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        dry_run=False,
+    )
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text(
+        "market,asset_class,symbol,ai_eligible,risk_flag\n"
+        "US,cash,USD_CASH,false,normal\n",
+        encoding="utf-8",
+    )
+    premarket = EmptyPremarket()
+    plan_builder = CapturingPlanBuilder()
+
+    runner = _daily_runner(
+        config=config,
+        premarket_runner=premarket,
+        plan_builder=plan_builder,
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        summary_generator=FakeTradingAgentsSummaryGenerator(),
+        notifier=NullNotifier(),
+    )
+
+    result = runner.run("2026-06-17", market="US")
+
+    assert result.status == "failed"
+    assert plan_builder.calls == []
+    status = json.loads(
+        (tmp_path / "data/runs/2026-06-17/US/daily_run_status.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert status["readiness"] == "blocked"
+    assert status["status_reasons"] == ["no_report_symbols"]
+    assert status["error"] == "portfolio filters produced no US report symbols"
+    assert status["premarket"]["eligible"] == 0
+    assert status["artifacts"]["advice"].endswith(
+        "data/runs/2026-06-17/US/trading_advice.csv"
+    )
+    report = (tmp_path / "reports/daily_runs/2026-06-17-US.md").read_text(
+        encoding="utf-8"
+    )
+    assert "- 原因：过滤后无报告标的" in report
+    assert "- portfolio: " in report
+
+
 def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1341,14 +1507,25 @@ def test_daily_runner_sends_feishu_order_review_after_trade_actions(
     ).run("2026-06-17", market="US")
 
     assert result.status == "success"
-    assert len(notifier.calls) == 1
-    title, body = notifier.calls[0]
+    assert [title for title, _ in notifier.calls] == [
+        "Open Trader 美股开始通知",
+        "Open Trader 美股行动通知",
+        "Open Trader 美股完成通知",
+    ]
+    start_body = notifier.calls[0][1]
+    assert "Open Trader｜开始通知" in start_body
+    assert "状态：开始运行｜并发：8" in start_body
+    title, body = notifier.calls[1]
     assert title == "Open Trader 美股行动通知"
     assert "Open Trader｜行动通知" in body
     assert "今日结论：有 1 条可采取行动，需人工确认后执行。" in body
     assert "标的：MSFT｜指示：买入 3 股｜优先级：高" in body
     assert "影响：" in body
     assert "reports/" not in body
+    finish_body = notifier.calls[2][1]
+    assert "Open Trader｜完成通知" in finish_body
+    assert "状态：成功｜可用性：可复核" in finish_body
+    assert "并发：8" in finish_body
 
 
 def test_daily_runner_sends_blocker_notification_when_futu_is_unavailable(
@@ -1522,17 +1699,29 @@ def test_daily_runner_sends_blocker_notification_when_run_fails(
     ).run("2026-06-17", market="US")
 
     assert result.status == "failed"
-    assert len(notifier.calls) == 1
-    title, body = notifier.calls[0]
+    assert [title for title, _ in notifier.calls] == [
+        "Open Trader 美股开始通知",
+        "Open Trader 美股阻塞通知",
+        "Open Trader 美股完成通知",
+    ]
+    title, body = notifier.calls[1]
     assert title == "Open Trader 美股阻塞通知"
     assert "运行失败：每日流程未完成。" in body
     assert "portfolio not found" not in body
     assert "状态文件：" in body
+    finish_body = notifier.calls[2][1]
+    assert "Open Trader｜完成通知" in finish_body
+    assert "状态：失败｜可用性：阻塞" in finish_body
     rows = _notification_rows(tmp_path, "2026-06-17", "US")
-    assert len(rows) == 1
-    assert rows[0]["market"] == "US"
-    assert rows[0]["title"] == "Open Trader 美股阻塞通知"
-    assert rows[0]["success"] == "true"
+    assert len(rows) == 3
+    assert [row["title"] for row in rows] == [
+        "Open Trader 美股开始通知",
+        "Open Trader 美股阻塞通知",
+        "Open Trader 美股完成通知",
+    ]
+    for row in rows:
+        assert row["market"] == "US"
+        assert row["success"] == "true"
 
 
 def test_daily_runner_keeps_partial_status_when_blocker_rendering_fails(
@@ -1580,7 +1769,11 @@ def test_daily_runner_keeps_partial_status_when_blocker_rendering_fails(
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     assert status["status"] == "partial"
     assert "error" not in status
-    assert [title for title, _ in notifier.calls] == ["Open Trader 美股行动通知"]
+    assert [title for title, _ in notifier.calls] == [
+        "Open Trader 美股开始通知",
+        "Open Trader 美股行动通知",
+        "Open Trader 美股完成通知",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1646,10 +1839,17 @@ def test_daily_runner_keeps_success_status_when_order_review_rendering_fails(
     assert "- Status: failed" not in report
     assert (tmp_path / "data/latest/US/trade_actions.csv").exists()
     if expected_status == "success":
-        assert notifier.calls == []
+        assert [title for title, _ in notifier.calls] == [
+            "Open Trader 美股开始通知",
+            "Open Trader 美股完成通知",
+        ]
     else:
-        assert len(notifier.calls) == 1
-        title, body = notifier.calls[0]
+        assert [title for title, _ in notifier.calls] == [
+            "Open Trader 美股开始通知",
+            "Open Trader 美股阻塞通知",
+            "Open Trader 美股完成通知",
+        ]
+        title, body = notifier.calls[1]
         assert title == "Open Trader 美股阻塞通知"
         assert "缺失行情：1" in body
 

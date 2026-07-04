@@ -4,6 +4,7 @@ import argparse
 import re
 import sys
 import time
+from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -307,6 +308,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Write dated outputs but do not update latest artifacts",
+    )
+    daily_parser.add_argument(
+        "--max-workers",
+        type=positive_int,
+        help="Override OPEN_TRADER_MAX_WORKERS for this daily run",
     )
 
     test_notification_parser = subparsers.add_parser(
@@ -831,6 +837,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run-daily-premarket":
         try:
             config = load_env_config(args.config, dry_run=args.dry_run)
+            if args.max_workers is not None:
+                config = replace(config, max_workers=args.max_workers)
             run_date = (
                 datetime.now(ZoneInfo(config.timezone)).date().isoformat()
                 if args.date == "today"

@@ -28,7 +28,9 @@ def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
-def test_load_eligible_portfolio_rows_filters_ai_eligible_rows(tmp_path: Path) -> None:
+def test_load_eligible_portfolio_rows_includes_reportable_rows_without_ai_flag(
+    tmp_path: Path,
+) -> None:
     portfolio_path = tmp_path / "portfolio.csv"
     write_portfolio(
         portfolio_path,
@@ -58,9 +60,85 @@ def test_load_eligible_portfolio_rows_filters_ai_eligible_rows(tmp_path: Path) -
 
     rows = load_eligible_portfolio_rows(portfolio_path)
 
-    assert [row.symbol for row in rows] == ["VIXY"]
+    assert [row.symbol for row in rows] == ["VIXY", "02476"]
     assert rows[0].analysis_symbol == "VIXY"
     assert rows[0].portfolio_weight_hkd == "3.05%"
+    assert rows[1].analysis_symbol == "02476"
+
+
+def test_load_eligible_portfolio_rows_excludes_non_reportable_assets(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [
+            {
+                "market": "US",
+                "asset_class": "stock",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "portfolio_weight_hkd": "1.00%",
+                "ai_eligible": "false",
+                "analysis_symbol": "",
+                "risk_flag": "normal",
+            },
+            {
+                "market": "US",
+                "asset_class": "cash",
+                "symbol": "USD_CASH",
+                "name": "USD Cash",
+                "portfolio_weight_hkd": "2.00%",
+                "ai_eligible": "false",
+                "analysis_symbol": "",
+                "risk_flag": "normal",
+            },
+            {
+                "market": "US",
+                "asset_class": "money_market_fund",
+                "symbol": "UT.123",
+                "name": "Money Fund",
+                "portfolio_weight_hkd": "3.00%",
+                "ai_eligible": "false",
+                "analysis_symbol": "",
+                "risk_flag": "normal",
+            },
+            {
+                "market": "US",
+                "asset_class": "option",
+                "symbol": "MSFT260731C400000",
+                "name": "MSFT Call",
+                "portfolio_weight_hkd": "4.00%",
+                "ai_eligible": "false",
+                "analysis_symbol": "",
+                "risk_flag": "normal",
+            },
+            {
+                "market": "US",
+                "asset_class": "unknown",
+                "symbol": "DRAM260731P55000",
+                "name": "DRAM Put",
+                "portfolio_weight_hkd": "5.00%",
+                "ai_eligible": "false",
+                "analysis_symbol": "",
+                "risk_flag": "normal",
+            },
+            {
+                "market": "US",
+                "asset_class": "unknown",
+                "symbol": "RAM",
+                "name": "2x DRAM ETF",
+                "portfolio_weight_hkd": "6.00%",
+                "ai_eligible": "false",
+                "analysis_symbol": "",
+                "risk_flag": "normal",
+            },
+        ],
+    )
+
+    rows = load_eligible_portfolio_rows(portfolio_path, market="US")
+
+    assert [row.symbol for row in rows] == ["MSFT", "RAM"]
 
 
 def test_load_eligible_portfolio_rows_filters_by_market(tmp_path: Path) -> None:

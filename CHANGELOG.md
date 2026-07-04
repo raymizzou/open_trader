@@ -3,6 +3,13 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-04
+
+- Stabilized the daily HK/US premarket workflow around `portfolio.csv` holdings,
+  report-symbol filtering, non-blocking facts/summary artifacts, configurable
+  worker concurrency, and Feishu start/completion notifications.
+- Verified with the full pytest suite and `git diff --check`.
+
 ## 2026-07-03
 
 - Added holdings-table 做T signal details with fixed ratio sizing, signal

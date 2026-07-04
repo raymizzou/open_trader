@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
 
 from open_trader.market_scope import parse_market_scope
@@ -9,10 +10,22 @@ from .models import PortfolioInputRow
 
 
 REQUIRED_FIELDS = ["symbol", "market", "asset_class", "risk_flag"]
+REPORTABLE_ASSET_CLASSES = {"stock", "etf", "fund", "unknown"}
+OPTION_SYMBOL_PATTERN = re.compile(r"^[A-Z]+[0-9]{6}[CP][0-9]+$")
 
 
 def _csv_value(value: str | None) -> str:
     return (value or "").strip()
+
+
+def _is_reportable_asset(*, symbol: str, asset_class: str) -> bool:
+    normalized_class = asset_class.strip().lower()
+    if normalized_class not in REPORTABLE_ASSET_CLASSES:
+        return False
+    normalized_symbol = symbol.strip().upper()
+    if normalized_class == "unknown" and OPTION_SYMBOL_PATTERN.match(normalized_symbol):
+        return False
+    return True
 
 
 def load_eligible_portfolio_rows(
@@ -39,9 +52,13 @@ def load_eligible_portfolio_rows(
                 )
             }
             normalized_row["market"] = normalized_row["market"].upper()
+            normalized_row["asset_class"] = normalized_row["asset_class"].lower()
             if market_filter is not None and normalized_row["market"] != market_filter:
                 continue
-            if normalized_row["ai_eligible"].lower() != "true":
+            if not _is_reportable_asset(
+                symbol=normalized_row["symbol"],
+                asset_class=normalized_row["asset_class"],
+            ):
                 continue
 
             missing_fields = [

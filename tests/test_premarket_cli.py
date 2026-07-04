@@ -10,6 +10,7 @@ import pytest
 import open_trader.cli as cli
 from open_trader.advice.premarket import PremarketResult
 from open_trader.cli import build_parser
+from open_trader.daily_premarket import DailyPremarketConfig
 from open_trader.notifications import CompositeNotifier
 
 
@@ -273,6 +274,7 @@ def test_run_daily_premarket_help_includes_expected_options(
     assert "--market" in output
     assert "--config" in output
     assert "--dry-run" in output
+    assert "--max-workers" in output
 
 
 def test_run_daily_premarket_requires_market() -> None:
@@ -362,6 +364,65 @@ def test_run_daily_premarket_main_wires_runner(
     assert "status_json:" in output
     assert "report:" in output
     assert "log:" in output
+
+
+def test_run_daily_premarket_main_overrides_max_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        max_workers=4,
+    )
+
+    class FakeRunner:
+        def __init__(self, *, config: object, notifier: object) -> None:
+            captured["config"] = config
+
+        def run(self, *, run_date: str, market: str, dry_run: bool):
+            return type(
+                "DailyRunResult",
+                (),
+                {
+                    "status": "success",
+                    "status_path": tmp_path
+                    / "data/runs/2026-06-17/daily_run_status.json",
+                    "report_path": tmp_path / "reports/daily_runs/2026-06-17.md",
+                    "log_path": tmp_path / "logs/daily_premarket/2026-06-17.log",
+                },
+            )()
+
+    monkeypatch.setattr(cli, "DailyPremarketRunner", FakeRunner)
+    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
+    monkeypatch.setattr(cli, "build_notifier", lambda loaded: object())
+
+    result = cli.main(
+        [
+            "run-daily-premarket",
+            "--date",
+            "2026-06-17",
+            "--market",
+            "US",
+            "--max-workers",
+            "12",
+        ]
+    )
+
+    assert result == 0
+    loaded_config = captured["config"]
+    assert isinstance(loaded_config, DailyPremarketConfig)
+    assert loaded_config.max_workers == 12
+    assert config.max_workers == 4
 
 
 @pytest.mark.parametrize("status", ["failed", "already_running"])
