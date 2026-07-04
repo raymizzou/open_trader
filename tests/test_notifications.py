@@ -12,6 +12,7 @@ from open_trader.notifications import (
     FeishuAppNotifier,
     FeishuWebhookNotifier,
     NotificationError,
+    XiaozhiVoiceNotifier,
     render_feishu_order_review,
 )
 
@@ -266,6 +267,109 @@ def test_feishu_app_notifier_raises_on_token_error() -> None:
 
     with pytest.raises(NotificationError, match="Feishu token error 999"):
         notifier.notify("Open Trader", "hello")
+
+
+def test_xiaozhi_voice_notifier_sends_payload_and_bearer_header() -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        calls.append(
+            {
+                "url": url,
+                "payload": payload,
+                "headers": headers,
+                "timeout": timeout_seconds,
+            }
+        )
+        return {"code": 0, "message": "queued"}
+
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+        post_json=fake_post,
+        timeout_seconds=2.5,
+    )
+
+    notifier.notify("Open Trader 测试通知", "这是一条测试通知。")
+
+    assert calls == [
+        {
+            "url": "http://127.0.0.1:8003/xiaozhi/notify/speak",
+            "payload": {
+                "device_id": "speaker-1",
+                "title": "Open Trader 测试通知",
+                "message": "这是一条测试通知。",
+            },
+            "headers": {"Authorization": "Bearer voice-token"},
+            "timeout": 2.5,
+        }
+    ]
+
+
+def test_xiaozhi_voice_notifier_raises_on_api_error() -> None:
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        return {"code": 404, "message": "device_offline"}
+
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+        post_json=fake_post,
+    )
+
+    with pytest.raises(NotificationError, match="Xiaozhi voice error 404: device_offline"):
+        notifier.notify("title", "message")
+
+
+def test_xiaozhi_voice_notifier_raises_when_response_omits_code() -> None:
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        return {"message": "queued"}
+
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+        post_json=fake_post,
+    )
+
+    with pytest.raises(NotificationError, match="Xiaozhi voice error missing: code"):
+        notifier.notify("title", "message")
+
+
+def test_xiaozhi_voice_notifier_wraps_transport_failure() -> None:
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        raise TimeoutError("timed out")
+
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+        post_json=fake_post,
+    )
+
+    with pytest.raises(NotificationError, match="Xiaozhi voice request failed: timed out"):
+        notifier.notify("title", "message")
 
 
 def test_composite_notifier_continues_after_child_failure() -> None:
