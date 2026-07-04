@@ -1046,18 +1046,7 @@ function tSignalTimelineLabel(value) {
 
 function renderTradingDecisionPlugins(holding) {
   const plugins = [
-    decisionFactsPlugin(holding, {
-      title: "趋势 / K 线",
-      moduleKey: "kline",
-      fieldOrder: [
-        ["trend", "趋势"],
-        ["position", "位置"],
-        ["momentum", "动能"],
-        ["key_levels", "关键位"],
-        ["risk", "风险"],
-      ],
-      score: "K线",
-    }),
+    klineDecisionFactsPlugin(holding),
     newsSentimentPlugin(holding),
     futuAnomalySignalsPlugin(holding),
     {
@@ -1171,6 +1160,31 @@ function decisionFactsPlugin(holding, config) {
     detail: "",
     bodyHtml: renderDecisionFactRows(rows),
     condition: "",
+  };
+}
+
+function klineDecisionFactsPlugin(holding) {
+  const plugin = decisionFactsPlugin(holding, {
+    title: "趋势 / K 线",
+    moduleKey: "kline",
+    fieldOrder: [
+      ["trend", "趋势"],
+      ["position", "位置"],
+      ["momentum", "动能"],
+      ["key_levels", "关键位"],
+      ["risk", "风险"],
+    ],
+    score: "K线",
+  });
+  const detail = holding && typeof holding.technical_facts === "object"
+    ? holding.technical_facts
+    : null;
+  const timeframes = technicalFactsUsable(detail)
+    ? detail.facts.timeframes
+    : [];
+  return {
+    ...plugin,
+    bodyHtml: `${renderBollingerSection(timeframes)}${plugin.bodyHtml}`,
   };
 }
 
@@ -1520,7 +1534,11 @@ function klineTechnicalFactsPlugin(holding) {
     ? holding.technical_facts
     : null;
   if (technicalFactsUsable(detail)) {
-    const rows = technicalFactRows(detail.facts);
+    const timeframes = detail.facts && Array.isArray(detail.facts.timeframes)
+      ? detail.facts.timeframes
+      : [];
+    const rows = timeframes.flatMap((timeframe) => technicalFactRowsForTimeframe(timeframe));
+    const bollingerHtml = renderBollingerSection(timeframes);
     const dateText = technicalFactsDateText(detail);
     return {
       title: "趋势 / K 线",
@@ -1529,7 +1547,7 @@ function klineTechnicalFactsPlugin(holding) {
       score: "K线",
       headline: dateText || "当前可用",
       detail: technicalFactsFreshnessText(detail) || "技术面事实已按最新 TradingAgents 来源校验。",
-      bodyHtml: renderTechnicalFactRows(rows),
+      bodyHtml: `${bollingerHtml}${renderTechnicalFactRows(rows)}`,
       condition: technicalFactsRunText(detail) || "条件：技术面事实与最新报告来源一致。",
     };
   }
@@ -1616,6 +1634,180 @@ function renderTechnicalFactsMeta(detail) {
     return "";
   }
   return `<div class="technical-facts-meta">${escapeHtml(dates)}</div>`;
+}
+
+function renderBollingerSection(timeframes) {
+  const timeframesWithObjects = Array.isArray(timeframes)
+    ? timeframes.filter((timeframe) => timeframe && typeof timeframe === "object")
+    : [];
+  const preferred = timeframesWithObjects.find((timeframe) => {
+    const key = String(timeframe.timeframe || timeframe.period || "").toLowerCase();
+    return key === "daily" || key === "day" || key === "1d";
+  }) || timeframesWithObjects[0];
+  if (!preferred) {
+    return renderBollingerCard({}, "", "");
+  }
+  const bollinger = preferred.bollinger && typeof preferred.bollinger === "object"
+    ? preferred.bollinger
+    : {};
+  return renderBollingerCard(bollinger, preferred.current_price, timeframeLabel(preferred));
+}
+
+function renderBollingerCard(bollinger, currentPrice, timeframe) {
+  const status = bollingerStatus(bollinger);
+  const statusMeta = bollingerStatusMeta(status);
+  const summary = firstPresent(
+    bollinger.summary_zh,
+    defaultBollingerSummary(status, timeframe),
+  );
+  const detail = firstPresent(
+    bollinger.detail_zh,
+    defaultBollingerDetail(status),
+  );
+  return `
+    <section class="technical-bollinger-card ${escapeHtml(statusMeta.className)}">
+      <div class="technical-bollinger-header">
+        <span>${escapeHtml(timeframe ? `${timeframe}布林带` : "布林带")}</span>
+        <strong>${escapeHtml(statusMeta.label)}</strong>
+      </div>
+      <div class="technical-bollinger-copy">
+        <strong>${escapeHtml(summary)}</strong>
+        <p>${escapeHtml(detail)}</p>
+      </div>
+      ${renderBollingerBand(bollinger, currentPrice)}
+      ${renderBollingerMetrics(bollinger, currentPrice, status)}
+    </section>
+  `;
+}
+
+function bollingerStatus(bollinger) {
+  const status = String(bollinger && bollinger.status ? bollinger.status : "").trim();
+  if (["upper_risk", "lower_opportunity", "neutral", "unknown"].includes(status)) {
+    return status;
+  }
+  return "unknown";
+}
+
+function bollingerStatusMeta(status) {
+  const map = {
+    upper_risk: { label: "回调风险升高", className: "upper-risk" },
+    lower_opportunity: { label: "低位机会区域", className: "lower-opportunity" },
+    neutral: { label: "中性区间", className: "middle-range" },
+    unknown: { label: "布林带数据缺失", className: "missing" },
+  };
+  return map[status] || map.unknown;
+}
+
+function defaultBollingerSummary(status, timeframe) {
+  const label = timeframe || "日线";
+  if (status === "upper_risk") {
+    return `当前价格贴近或超过${label}布林带上轨`;
+  }
+  if (status === "lower_opportunity") {
+    return `当前价格接近${label}布林带下轨`;
+  }
+  if (status === "neutral") {
+    return `当前价格位于${label}布林带中性区间`;
+  }
+  return "布林带数据缺失";
+}
+
+function defaultBollingerDetail(status) {
+  if (status === "upper_risk") {
+    return "价格靠近布林带上沿，说明短线偏热。这个状态用于提醒可能接近回调区，不直接给出交易动作。";
+  }
+  if (status === "lower_opportunity") {
+    return "价格靠近布林带下沿，说明进入低位观察区。这个状态用于提醒可能出现低位机会，不直接给出交易动作。";
+  }
+  if (status === "neutral") {
+    return "价格没有贴近上轨或下轨，布林带暂未给出需要特别关注的位置提醒。";
+  }
+  return "当前报告没有提供完整布林带事实。";
+}
+
+function renderBollingerBand(bollinger, currentPrice) {
+  const lower = indicatorValue(bollinger.lower);
+  const middle = indicatorValue(bollinger.middle);
+  const upper = indicatorValue(bollinger.upper);
+  const markerStyle = bollingerMarkerStyle(bollinger, currentPrice);
+  return `
+    <div class="technical-bollinger-band">
+      <div class="technical-bollinger-track">
+        <span class="technical-bollinger-marker" style="${escapeHtml(markerStyle)}"></span>
+      </div>
+      <div class="technical-bollinger-labels">
+        <span>下轨 ${escapeHtml(formatPlain(lower || "缺失"))}</span>
+        <span>中轨 ${escapeHtml(formatPlain(middle || "缺失"))}</span>
+        <span>上轨 ${escapeHtml(formatPlain(upper || "缺失"))}</span>
+      </div>
+    </div>
+  `;
+}
+
+function bollingerMarkerStyle(bollinger, currentPrice) {
+  const lower = numericValue(indicatorValue(bollinger.lower));
+  const upper = numericValue(indicatorValue(bollinger.upper));
+  const current = numericValue(indicatorValue(currentPrice));
+  if (lower === null || upper === null || current === null || upper <= lower) {
+    return "left: 50%";
+  }
+  const raw = ((current - lower) / (upper - lower)) * 100;
+  const clamped = Math.max(2, Math.min(98, raw));
+  return `left: ${clamped.toFixed(1)}%`;
+}
+
+function renderBollingerMetrics(bollinger, currentPrice, status) {
+  const referenceLabel = bollingerReferenceLabel(bollinger, status);
+  const referenceValue = firstPresent(
+    bollinger.reference_value,
+    bollingerReferenceValue(bollinger, status),
+  );
+  const distance = firstPresent(bollinger.distance_pct, bollingerDistanceFallback(status));
+  return renderDecisionFactRows([
+    { label: "当前价", value: currentPrice },
+    { label: referenceLabel, value: referenceValue },
+    { label: "偏离幅度", value: distance },
+  ]);
+}
+
+function bollingerReferenceLabel(bollinger, status) {
+  if (status === "upper_risk") {
+    return "上轨";
+  }
+  if (status === "lower_opportunity") {
+    return "下轨";
+  }
+  if (status === "neutral") {
+    return "中轨";
+  }
+  const referenceBand = String(bollinger.reference_band || "");
+  if (referenceBand === "upper") {
+    return "上轨";
+  }
+  if (referenceBand === "lower") {
+    return "下轨";
+  }
+  return "参考轨道";
+}
+
+function bollingerReferenceValue(bollinger, status) {
+  if (status === "upper_risk") {
+    return bollinger.upper;
+  }
+  if (status === "lower_opportunity") {
+    return bollinger.lower;
+  }
+  if (status === "neutral") {
+    return bollinger.middle;
+  }
+  return firstPresent(bollinger.upper, bollinger.lower, bollinger.middle);
+}
+
+function bollingerDistanceFallback(status) {
+  if (status === "neutral") {
+    return "中性区间";
+  }
+  return "缺失";
 }
 
 function renderTechnicalFactRows(rows) {
