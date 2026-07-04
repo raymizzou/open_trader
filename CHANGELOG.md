@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-04
 
+- Added a fixed Bollinger-band display in the dashboard K-line card, with red
+  upper-band risk, green lower-band opportunity, and neutral middle-range
+  states.
 - Stabilized the daily HK/US premarket workflow around `portfolio.csv` holdings,
   report-symbol filtering, non-blocking facts/summary artifacts, configurable
   worker concurrency, and Feishu start/completion notifications.
