@@ -1764,10 +1764,14 @@ function renderBollingerMetrics(bollinger, currentPrice, status) {
   );
   const distance = firstPresent(bollinger.distance_pct, bollingerDistanceFallback(status));
   return renderDecisionFactRows([
-    { label: "当前价", value: currentPrice },
-    { label: referenceLabel, value: referenceValue },
-    { label: "偏离幅度", value: distance },
+    { label: "当前价", value: bollingerMetricValue(currentPrice) },
+    { label: referenceLabel, value: bollingerMetricValue(referenceValue) },
+    { label: "偏离幅度", value: bollingerMetricValue(distance) },
   ]);
+}
+
+function bollingerMetricValue(value) {
+  return hasValue(value) ? formatPlain(value) : "缺失";
 }
 
 function bollingerReferenceLabel(bollinger, status) {

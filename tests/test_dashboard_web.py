@@ -1758,6 +1758,33 @@ console.log(html);
     assert status not in html
 
 
+def test_dashboard_renders_missing_bollinger_without_undefined() -> None:
+    script = r'''
+const holding = {
+  market: "US",
+  symbol: "MSFT",
+  portfolio_weight_hkd: "10.00%",
+  decision_facts: {
+    kline: {available: true, fields: {trend: "长期看涨，短期动能减弱"}},
+    news_sentiment: {available: false, fields: {}},
+  },
+  technical_facts: {
+    available: false,
+    status: "extraction_error",
+    error: "technical facts status is missing",
+  },
+};
+const html = renderTradingDecisionPlugins(holding);
+console.log(html);
+'''
+    html = run_dashboard_js(script)
+
+    assert "布林带数据缺失" in html
+    assert "undefined" not in html
+    assert "参考轨道" in html
+    assert "缺失" in html
+
+
 def test_dashboard_renders_kline_technical_fact_unavailable_states() -> None:
     node = shutil.which("node")
     if node is None:

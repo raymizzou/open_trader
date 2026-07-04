@@ -8,6 +8,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Added a fixed Bollinger-band display in the dashboard K-line card, with red
   upper-band risk, green lower-band opportunity, and neutral middle-range
   states.
+- Backfilled Bollinger facts from real HK/US latest TradingAgents reports when
+  model extraction fails, and verified the live dashboard renders those facts
+  without `undefined`.
 - Stabilized the daily HK/US premarket workflow around `portfolio.csv` holdings,
   report-symbol filtering, non-blocking facts/summary artifacts, configurable
   worker concurrency, and Feishu start/completion notifications.

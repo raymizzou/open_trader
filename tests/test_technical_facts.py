@@ -827,6 +827,129 @@ def test_generate_technical_facts_does_not_reuse_failed_latest_cache(
     assert row["extraction_status"] == "ok"
 
 
+def test_generate_technical_facts_falls_back_to_bollinger_report_parser(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    report = """
+## 4. Volatility - Bollinger Bands
+
+| Component | Value |
+|-----------|-------|
+| **Upper Band** | $472.80 |
+| **Middle (20 SMA)** | $437.57 |
+| **Lower Band** | $402.34 |
+
+The close of $477.57 is ABOVE the upper Bollinger Band ($472.80).
+"""
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "TSM",
+                "market": "US",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Hold",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report(report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=FailingExtractor(),
+        update_latest=True,
+        market=None,
+    )
+
+    cache = load_technical_facts_cache(result.latest_path)
+    row = cache["records"][0]
+    daily = row["facts"]["timeframes"][0]
+    bollinger = daily["bollinger"]
+    assert result.extracted == 1
+    assert result.failed == 0
+    assert row["extraction_status"] == "ok"
+    assert row["extraction_fallback"] == "bollinger_report_parser"
+    assert daily["current_price"] == "477.57"
+    assert bollinger["upper"] == "472.80"
+    assert bollinger["middle"] == "437.57"
+    assert bollinger["lower"] == "402.34"
+    assert bollinger["status"] == "upper_risk"
+    assert bollinger["position"] == "above_upper"
+    assert bollinger["reference_band"] == "upper"
+    assert bollinger["distance_pct"] == "高于上轨 1.0%"
+
+
+def test_generate_technical_facts_fallback_marks_near_lower_band(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    report = """
+### Bollinger Bands (20,2):
+| Component | Value (Jul 2) |
+|-----------|---------------|
+| Upper Band | **4.084** |
+| Middle (20 SMA) | **3.506** |
+| Lower Band | **2.928** |
+| Current Price | **3.14** |
+
+Price is below the middle band and approaching the lower band.
+"""
+    write_advice(
+        advice_path,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "00200",
+                "market": "HK",
+                "asset_class": "stock",
+                "portfolio_weight_hkd": "8.97%",
+                "risk_flag": "normal",
+                "source": "tradingagents",
+                "advice_action": "Hold",
+                "advice_summary": "",
+                "raw_decision": raw_decision_with_market_report(report),
+                "status": "ok",
+                "error": "",
+                "source_status": "ok",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=FailingExtractor(),
+        update_latest=True,
+        market="HK",
+    )
+
+    cache = load_technical_facts_cache(result.latest_path)
+    bollinger = cache["records"][0]["facts"]["timeframes"][0]["bollinger"]
+    assert result.extracted == 1
+    assert result.failed == 0
+    assert bollinger["status"] == "lower_opportunity"
+    assert bollinger["position"] == "near_lower"
+    assert bollinger["reference_band"] == "lower"
+    assert bollinger["reference_value"] == "2.93"
+    assert bollinger["distance_pct"] == "高于下轨 7.2%"
+
+
 def test_generate_technical_facts_normalizes_reused_record_to_current_run(
     tmp_path: Path,
 ) -> None:

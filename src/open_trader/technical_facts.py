@@ -49,9 +49,11 @@ BOLLINGER_STATUSES = {
 }
 BOLLINGER_REFERENCE_BANDS = {"", "upper", "lower"}
 BOLLINGER_VISIBLE_TEXT_FIELDS = ("summary_zh", "detail_zh")
+BOLLINGER_FALLBACK_VERSION = "bollinger_report_parser.v2"
 BOLLINGER_TRADING_INSTRUCTION_PATTERN = re.compile(
     r"(?:建议买入|建议卖出|买入|卖出|加仓|减仓|下单|建仓|平仓|止盈|止损|仓位|执行)"
 )
+NUMBER_TEXT_PATTERN = re.compile(r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?")
 
 
 @dataclass(frozen=True)
@@ -323,7 +325,7 @@ def generate_technical_facts(
     for source in filtered_sources:
         identity = (source.market, source.symbol, source.source_advice_hash)
         reusable = reusable_records.get(identity)
-        if reusable is not None and reusable.get("extraction_status") == "ok":
+        if reusable is not None and _can_reuse_technical_facts_record(reusable):
             rows.append(
                 _normalize_reused_record(
                     reusable,
@@ -404,6 +406,24 @@ def _extract_record(
         _validate_facts(facts)
     except Exception as exc:
         error = str(exc) or exc.__class__.__name__
+        fallback_facts = _fallback_bollinger_facts(source, run_date, market_report)
+        if fallback_facts is not None:
+            return {
+                **base,
+                "extraction_status": "ok",
+                "error": "",
+                "extractor_error": error,
+                "extraction_fallback": "bollinger_report_parser",
+                "extraction_fallback_version": BOLLINGER_FALLBACK_VERSION,
+                "facts": fallback_facts,
+                "freshness": build_freshness(
+                    market_data_as_of=str(
+                        fallback_facts.get("market_data_as_of") or ""
+                    ).strip(),
+                    run_date=run_date,
+                    has_unknown_timeframe=False,
+                ),
+            }
         facts = _missing_facts(source, run_date, error)
         return {
             **base,
@@ -447,6 +467,14 @@ def _records_by_identity(
         if market and symbol and source_advice_hash:
             indexed[(market, symbol, source_advice_hash)] = record
     return indexed
+
+
+def _can_reuse_technical_facts_record(record: dict[str, Any]) -> bool:
+    if record.get("extraction_status") != "ok":
+        return False
+    if record.get("extraction_fallback") == "bollinger_report_parser":
+        return record.get("extraction_fallback_version") == BOLLINGER_FALLBACK_VERSION
+    return True
 
 
 def _normalize_reused_record(
@@ -557,6 +585,386 @@ def _missing_facts(source: AdviceSource, run_date: str, reason: str) -> dict[str
         "timeframes": [],
         "reason": reason,
     }
+
+
+def _fallback_bollinger_facts(
+    source: AdviceSource,
+    run_date: str,
+    market_report: str,
+) -> dict[str, Any] | None:
+    bollinger = _parse_bollinger_from_report(market_report)
+    if bollinger is None:
+        return None
+    market_data_as_of = bollinger.pop("market_data_as_of", "") or run_date
+    facts: dict[str, Any] = {
+        "schema_version": FACTS_SCHEMA_VERSION,
+        "status": "present",
+        "source_date": run_date,
+        "market_data_as_of": market_data_as_of,
+        "symbol": f"{source.market}.{source.symbol}",
+        "timeframes": [
+            {
+                "timeframe": "daily",
+                "timeframe_label": "日线",
+                "current_price": bollinger.get("current_price", ""),
+                "trend_summary": "",
+                "moving_averages": {},
+                "macd": {},
+                "rsi": {},
+                "bollinger": bollinger,
+                "atr": {},
+                "volume": {},
+                "support_resistance": {
+                    "support_levels": [],
+                    "resistance_levels": [],
+                },
+                "price_action": {"timeline": []},
+                "risks": [],
+                "evidence_quotes": [],
+            }
+        ],
+    }
+    _validate_facts(facts)
+    return facts
+
+
+def _parse_bollinger_from_report(report: str) -> dict[str, str] | None:
+    if not report or ("Bollinger" not in report and "布林" not in report):
+        return None
+    context = _bollinger_context(report)
+    values = _extract_bollinger_table_values(context)
+    upper = values.get("upper") or _extract_labeled_number(
+        context,
+        (
+            "Upper Band",
+            "Upper (boll_ub)",
+            "Bollinger Upper",
+            "boll_ub",
+            "上轨",
+        ),
+    )
+    middle = values.get("middle") or _extract_labeled_number(
+        context,
+        (
+            "Middle (20 SMA)",
+            "Middle Band",
+            "Bollinger Middle",
+            "Middle (boll)",
+            "boll)",
+            "中轨",
+        ),
+    )
+    lower = values.get("lower") or _extract_labeled_number(
+        context,
+        (
+            "Lower Band",
+            "Lower (boll_lb)",
+            "Bollinger Lower",
+            "boll_lb",
+            "下轨",
+        ),
+    )
+    current_price = values.get("current_price") or _extract_current_price(context)
+    if current_price is None or (upper is None and lower is None):
+        return None
+
+    current_value = _to_float(current_price)
+    upper_value = _to_float(upper)
+    lower_value = _to_float(lower)
+    if current_value is None:
+        return None
+
+    state = _classify_bollinger_position(
+        current=current_value,
+        upper=upper_value,
+        lower=lower_value,
+    )
+    reference_value = upper if state["reference_band"] == "upper" else lower
+    distance_pct = _format_bollinger_distance(
+        current=current_value,
+        reference=_to_float(reference_value),
+        reference_band=state["reference_band"],
+    )
+    return {
+        "upper": _format_number_text(upper),
+        "middle": _format_number_text(middle),
+        "lower": _format_number_text(lower),
+        "current_price": _format_number_text(current_price),
+        "position": state["position"],
+        "status": state["status"],
+        "reference_band": state["reference_band"],
+        "reference_value": _format_number_text(reference_value),
+        "distance_pct": distance_pct,
+        "summary_zh": state["summary_zh"],
+        "detail_zh": state["detail_zh"],
+        "market_data_as_of": _extract_bollinger_date(context),
+    }
+
+
+def _bollinger_context(report: str) -> str:
+    lines = report.splitlines()
+    selected: set[int] = set()
+    for index, line in enumerate(lines):
+        if "Bollinger" not in line and "布林" not in line:
+            continue
+        start = max(0, index - 15)
+        end = min(len(lines), index + 26)
+        selected.update(range(start, end))
+    return "\n".join(lines[index] for index in sorted(selected))
+
+
+def _extract_bollinger_table_values(report: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    header_cells: list[str] = []
+    for raw_line in report.splitlines():
+        line = raw_line.strip()
+        if "|" not in line:
+            header_cells = []
+            continue
+        cells = [_plain_cell(cell) for cell in line.strip("|").split("|")]
+        if any(_is_separator_cell(cell) for cell in cells):
+            continue
+        if _looks_like_bollinger_table_header(cells):
+            header_cells = cells
+            continue
+        label_value = _map_bollinger_label_value_row(cells)
+        if label_value:
+            values.update(label_value)
+            continue
+        row_values = [_first_number(cell) for cell in cells]
+        if not header_cells:
+            continue
+        if sum(1 for value in row_values if value is not None) < 2:
+            continue
+        mapped = _map_bollinger_table_row(header_cells, row_values)
+        if mapped:
+            values.update(mapped)
+    return values
+
+
+def _looks_like_bollinger_table_header(cells: list[str]) -> bool:
+    band_columns = 0
+    for cell in cells:
+        cell_text = cell.casefold()
+        if (
+            "upper" in cell_text
+            or "middle" in cell_text
+            or "lower" in cell_text
+            or "boll_ub" in cell_text
+            or "boll_lb" in cell_text
+            or "current price" in cell_text
+            or "上轨" in cell
+            or "中轨" in cell
+            or "下轨" in cell
+        ):
+            band_columns += 1
+    return band_columns >= 2
+
+
+def _map_bollinger_label_value_row(cells: list[str]) -> dict[str, str]:
+    if len(cells) < 2:
+        return {}
+    label = cells[0]
+    value = _first_number(cells[1])
+    if value is None:
+        return {}
+    label_text = label.casefold()
+    if "upper" in label_text or "boll_ub" in label_text or "上轨" in label:
+        return {"upper": value}
+    if (
+        "middle" in label_text
+        or "20 sma" in label_text
+        or label_text == "boll"
+        or "中轨" in label
+    ):
+        return {"middle": value}
+    if "lower" in label_text or "boll_lb" in label_text or "下轨" in label:
+        return {"lower": value}
+    if "current price" in label_text or label_text == "price":
+        return {"current_price": value}
+    return {}
+
+
+def _map_bollinger_table_row(
+    header_cells: list[str],
+    row_values: list[str | None],
+) -> dict[str, str]:
+    mapped: dict[str, str] = {}
+    for index, header in enumerate(header_cells[: len(row_values)]):
+        value = row_values[index]
+        if value is None:
+            continue
+        header_text = header.casefold()
+        if "upper" in header_text or "boll_ub" in header_text or "上轨" in header:
+            mapped["upper"] = value
+        elif (
+            "middle" in header_text
+            or "20 sma" in header_text
+            or "boll)" in header_text
+            or "中轨" in header
+        ):
+            mapped["middle"] = value
+        elif "lower" in header_text or "boll_lb" in header_text or "下轨" in header:
+            mapped["lower"] = value
+        elif "current price" in header_text or header_text == "price":
+            mapped["current_price"] = value
+    return mapped
+
+
+def _extract_labeled_number(report: str, labels: tuple[str, ...]) -> str | None:
+    for raw_line in report.splitlines():
+        line = _plain_cell(raw_line)
+        line_casefold = line.casefold()
+        for label in labels:
+            index = line_casefold.find(label.casefold())
+            if index == -1:
+                continue
+            tail = line[index + len(label) :]
+            if not tail.lstrip().startswith((":","：", "|", "(", "-")):
+                continue
+            value = _first_number(tail)
+            if value is not None:
+                return value
+    return None
+
+
+def _extract_current_price(report: str) -> str | None:
+    plain_report = _plain_cell(report)
+    patterns = (
+        r"On\s+[A-Z][a-z]+\s+\d{1,2}:\s*Price\s+at\s*\$?([0-9][0-9,]*(?:\.\d+)?)",
+        r"Current\s+Price\s*\|?\s*\**\$?([0-9][0-9,]*(?:\.\d+)?)",
+        r"Current\s+price\s*\(\$?([0-9][0-9,]*(?:\.\d+)?)\)",
+        r"Price\s+Position\s*\|?\s*\**\$?([0-9][0-9,]*(?:\.\d+)?)",
+        r"Relationship\s+to\s+Price\s*\(\$?([0-9][0-9,]*(?:\.\d+)?)\)",
+        r"Current\s+close\s*\(\$?([0-9][0-9,]*(?:\.\d+)?)\)",
+        r"close\s+of\s+\$?([0-9][0-9,]*(?:\.\d+)?)",
+        r"Currently,\s+at\s+\$?([0-9][0-9,]*(?:\.\d+)?)",
+        r"price\s*\(\$?([0-9][0-9,]*(?:\.\d+)?)\)",
+        r"The\s+price\s+\(\$?([0-9][0-9,]*(?:\.\d+)?)\)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, plain_report, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).replace(",", "")
+    return None
+
+
+def _classify_bollinger_position(
+    *,
+    current: float,
+    upper: float | None,
+    lower: float | None,
+) -> dict[str, str]:
+    if upper is not None:
+        if current >= upper:
+            return {
+                "position": "above_upper",
+                "status": "upper_risk",
+                "reference_band": "upper",
+                "summary_zh": "当前价格已超过日线布林带上轨",
+                "detail_zh": "价格处在布林带上沿之外，用于提示短线偏热和波动放大。",
+            }
+        if (upper - current) / upper <= 0.05:
+            return {
+                "position": "near_upper",
+                "status": "upper_risk",
+                "reference_band": "upper",
+                "summary_zh": "当前价格贴近日线布林带上轨",
+                "detail_zh": "价格接近布林带上沿，用于提示短线偏热和可能的均值回归压力。",
+            }
+    if lower is not None:
+        if current <= lower:
+            return {
+                "position": "below_lower",
+                "status": "lower_opportunity",
+                "reference_band": "lower",
+                "summary_zh": "当前价格已跌破日线布林带下轨",
+                "detail_zh": "价格处在布林带下沿之外，用于提示短线超跌状态。",
+            }
+        if (current - lower) / lower <= 0.08:
+            return {
+                "position": "near_lower",
+                "status": "lower_opportunity",
+                "reference_band": "lower",
+                "summary_zh": "当前价格接近日线布林带下轨",
+                "detail_zh": "价格靠近布林带下沿，用于提示下轨附近的低位状态。",
+            }
+    return {
+        "position": "middle_range",
+        "status": "neutral",
+        "reference_band": "",
+        "summary_zh": "当前价格位于日线布林带区间内",
+        "detail_zh": "价格未贴近上轨或下轨，布林带事实仅作背景展示。",
+    }
+
+
+def _format_bollinger_distance(
+    *,
+    current: float,
+    reference: float | None,
+    reference_band: str,
+) -> str:
+    if reference is None or not reference_band:
+        return ""
+    distance = (current - reference) / reference * 100
+    band_label = "上轨" if reference_band == "upper" else "下轨"
+    relation = "高于" if distance >= 0 else "低于"
+    return f"{relation}{band_label} {abs(distance):.1f}%"
+
+
+def _extract_bollinger_date(report: str) -> str:
+    match = re.search(
+        r"Bollinger[^\n]*(?:as of|Value)\s*\(?([A-Z][a-z]+\s+\d{1,2})\)?",
+        report,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1)
+    match = re.search(r"Current Band Levels\s*\(([A-Z][a-z]+\s+\d{1,2})\)", report)
+    return match.group(1) if match else ""
+
+
+def _plain_cell(value: str) -> str:
+    return (
+        value.replace("*", "")
+        .replace("`", "")
+        .replace("~", "")
+        .replace("$", "")
+        .replace("—", " ")
+        .strip()
+    )
+
+
+def _cell_mentions(cell: str, needles: tuple[str, ...]) -> bool:
+    cell_text = cell.casefold()
+    return any(needle in cell_text for needle in needles)
+
+
+def _is_separator_cell(cell: str) -> bool:
+    return bool(cell) and set(cell) <= {"-", ":", " "}
+
+
+def _first_number(text: str) -> str | None:
+    match = NUMBER_TEXT_PATTERN.search(text)
+    return match.group(0).replace(",", "") if match else None
+
+
+def _to_float(value: str | None) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _format_number_text(value: str | None) -> str:
+    if value is None:
+        return ""
+    numeric = _to_float(value)
+    if numeric is None:
+        return value
+    return f"{numeric:.2f}"
 
 
 def _latest_run_date(sources: list[AdviceSource]) -> str:
