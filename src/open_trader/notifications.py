@@ -146,6 +146,46 @@ class FeishuAppNotifier:
         return token
 
 
+class XiaozhiVoiceNotifier:
+    def __init__(
+        self,
+        *,
+        speak_url: str,
+        device_id: str,
+        token: str,
+        post_json: PostJsonWithHeaders | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self.speak_url = speak_url
+        self.device_id = device_id
+        self.token = token
+        self._post_json = post_json or _post_json_with_headers
+        self.timeout_seconds = timeout_seconds
+
+    def notify(self, title: str, message: str) -> None:
+        payload: dict[str, object] = {
+            "device_id": self.device_id,
+            "title": title,
+            "message": message,
+        }
+        try:
+            response = self._post_json(
+                self.speak_url,
+                payload,
+                {"Authorization": f"Bearer {self.token}"},
+                self.timeout_seconds,
+            )
+        except Exception as exc:
+            raise NotificationError(f"Xiaozhi voice request failed: {exc}") from exc
+
+        if "code" not in response:
+            raise NotificationError("Xiaozhi voice error missing: code")
+        code = response.get("code")
+        if code not in {0, "0"}:
+            message_text = response.get("message") or response.get("msg") or ""
+            raise NotificationError(f"Xiaozhi voice error {code}: {message_text}")
+
+
 def render_feishu_order_review(
     *,
     run_date: str,
