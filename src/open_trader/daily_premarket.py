@@ -26,6 +26,7 @@ from .notifications import (
     MacOSNotifier,
     Notifier,
     NullNotifier,
+    XiaozhiVoiceNotifier,
     render_feishu_order_review,
 )
 from .futu_watch import QuoteSnapshot
@@ -87,6 +88,9 @@ class DailyPremarketConfig:
     feishu_receive_id_type: str = ""
     feishu_receive_id: str = ""
     feishu_message_format: str = "text"
+    xiaozhi_speak_url: str = ""
+    xiaozhi_device_id: str = ""
+    xiaozhi_token: str = ""
     notify_daily_report: bool = False
     notify_action_triggers: bool = False
 
@@ -202,6 +206,9 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         feishu_message_format=_feishu_message_format_config(
             values.get("OPEN_TRADER_FEISHU_MESSAGE_FORMAT", "text"),
         ),
+        xiaozhi_speak_url=values.get("OPEN_TRADER_XIAOZHI_SPEAK_URL", ""),
+        xiaozhi_device_id=values.get("OPEN_TRADER_XIAOZHI_DEVICE_ID", ""),
+        xiaozhi_token=values.get("OPEN_TRADER_XIAOZHI_TOKEN", ""),
         notify_daily_report=_bool_config(
             values.get("OPEN_TRADER_NOTIFY_DAILY_REPORT", ""),
         ),
@@ -239,6 +246,22 @@ def build_notifier(config: DailyPremarketConfig) -> Notifier:
                     app_secret=config.feishu_app_secret,
                     receive_id_type=config.feishu_receive_id_type,
                     receive_id=config.feishu_receive_id,
+                )
+            )
+            continue
+        if name == "xiaozhi":
+            for field_name, value in [
+                ("OPEN_TRADER_XIAOZHI_SPEAK_URL", config.xiaozhi_speak_url),
+                ("OPEN_TRADER_XIAOZHI_DEVICE_ID", config.xiaozhi_device_id),
+                ("OPEN_TRADER_XIAOZHI_TOKEN", config.xiaozhi_token),
+            ]:
+                if not value:
+                    raise ValueError(f"{field_name} is required")
+            notifiers.append(
+                XiaozhiVoiceNotifier(
+                    speak_url=config.xiaozhi_speak_url,
+                    device_id=config.xiaozhi_device_id,
+                    token=config.xiaozhi_token,
                 )
             )
             continue
@@ -285,6 +308,8 @@ def _notifier_channel(notifier: Notifier) -> str:
         return "feishu_app"
     if isinstance(notifier, FeishuWebhookNotifier):
         return "feishu"
+    if isinstance(notifier, XiaozhiVoiceNotifier):
+        return "xiaozhi"
     if isinstance(notifier, MacOSNotifier):
         return "macos"
     if isinstance(notifier, NullNotifier):
