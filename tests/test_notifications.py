@@ -372,6 +372,42 @@ def test_xiaozhi_voice_notifier_wraps_transport_failure() -> None:
         notifier.notify("title", "message")
 
 
+def test_xiaozhi_voice_notifier_raises_on_invalid_json_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "open_trader.notifications.urllib.request.urlopen",
+        _fake_urlopen_with_body("not-json"),
+    )
+
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+    )
+
+    with pytest.raises(NotificationError, match="Xiaozhi voice returned invalid JSON"):
+        notifier.notify("title", "message")
+
+
+def test_xiaozhi_voice_notifier_raises_on_non_object_json_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "open_trader.notifications.urllib.request.urlopen",
+        _fake_urlopen_with_body("[0]"),
+    )
+
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+    )
+
+    with pytest.raises(NotificationError, match="Xiaozhi voice returned non-object JSON"):
+        notifier.notify("title", "message")
+
+
 def test_composite_notifier_continues_after_child_failure() -> None:
     events: list[str] = []
 
