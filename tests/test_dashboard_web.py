@@ -1607,6 +1607,107 @@ if (card.includes("待接入") || card.includes("占位") || card.includes("rsi:
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
+def test_dashboard_renders_fixed_bollinger_card_without_internal_enums() -> None:
+    script = r'''
+const holding = {
+  technical_facts: {
+    available: true,
+    status: "usable",
+    data_date: "2026-07-03",
+    run_date: "2026-07-04",
+    freshness: {message: "日线数据截至 2026-07-03"},
+    facts: {
+      timeframes: [{
+        timeframe: "daily",
+        timeframe_label: "日线",
+        current_price: "466.20",
+        bollinger: {
+          upper: "459.13",
+          middle: "399.62",
+          lower: "340.11",
+          position: "above_upper",
+          status: "upper_risk",
+          reference_band: "upper",
+          reference_value: "459.13",
+          distance_pct: "1.5%",
+          summary_zh: "当前价格已超过日线布林带上轨",
+          detail_zh: "价格处在布林带上沿之外，说明短线偏热。",
+        },
+        rsi: {value: "56.88"},
+        macd: {crossover: "金叉后延续"},
+        moving_averages: {summary: "价格在主要均线上方"},
+      }],
+    },
+  },
+};
+const html = renderDecisionPluginCard(klineTechnicalFactsPlugin(holding));
+console.log(html);
+'''
+    html = run_dashboard_js(script)
+
+    assert "布林带" in html
+    assert "回调风险升高" in html
+    assert "当前价格已超过日线布林带上轨" in html
+    assert "当前价" in html
+    assert "上轨" in html
+    assert "偏离幅度" in html
+    assert "technical-bollinger-card upper-risk" in html
+    assert "upper_risk" not in html
+    assert "above_upper" not in html
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_label", "expected_class"),
+    [
+        ("lower_opportunity", "低位机会区域", "lower-opportunity"),
+        ("neutral", "中性区间", "middle-range"),
+        ("unknown", "布林带数据缺失", "missing"),
+    ],
+)
+def test_dashboard_renders_bollinger_status_variants(
+    status: str,
+    expected_label: str,
+    expected_class: str,
+) -> None:
+    script = f'''
+const holding = {{
+  technical_facts: {{
+    available: true,
+    status: "usable",
+    data_date: "2026-07-03",
+    run_date: "2026-07-04",
+    freshness: {{message: "日线数据截至 2026-07-03"}},
+    facts: {{
+      timeframes: [{{
+        timeframe: "daily",
+        timeframe_label: "日线",
+        current_price: "388.20",
+        bollinger: {{
+          upper: "459.13",
+          middle: "399.62",
+          lower: "340.11",
+          position: "middle_range",
+          status: "{status}",
+          reference_band: "",
+          reference_value: "",
+          distance_pct: "",
+          summary_zh: "",
+          detail_zh: "",
+        }},
+      }}],
+    }},
+  }},
+}};
+const html = renderDecisionPluginCard(klineTechnicalFactsPlugin(holding));
+console.log(html);
+'''
+    html = run_dashboard_js(script)
+
+    assert expected_label in html
+    assert f"technical-bollinger-card {expected_class}" in html
+    assert status not in html
+
+
 def test_dashboard_renders_kline_technical_fact_unavailable_states() -> None:
     node = shutil.which("node")
     if node is None:

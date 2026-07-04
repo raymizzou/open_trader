@@ -1236,6 +1236,153 @@ tbody tr.active-row {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.technical-bollinger-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  margin-bottom: 10px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.technical-bollinger-card.upper-risk {
+  background: #fff0ee;
+  border-color: #e4b4b0;
+}
+
+.technical-bollinger-card.lower-opportunity {
+  background: #e8f5ee;
+  border-color: #b9ddc9;
+}
+
+.technical-bollinger-card.middle-range,
+.technical-bollinger-card.missing {
+  background: var(--surface-soft);
+}
+
+.technical-bollinger-header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.technical-bollinger-header span,
+.technical-bollinger-header strong {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  min-height: 26px;
+  overflow-wrap: anywhere;
+  padding: 4px 9px;
+}
+
+.technical-bollinger-card.upper-risk .technical-bollinger-header span,
+.technical-bollinger-card.upper-risk .technical-bollinger-header strong {
+  background: #fff7f5;
+  border-color: #e4b4b0;
+  color: var(--danger);
+}
+
+.technical-bollinger-card.lower-opportunity .technical-bollinger-header span,
+.technical-bollinger-card.lower-opportunity .technical-bollinger-header strong {
+  background: #f4fbf7;
+  border-color: #b9ddc9;
+  color: var(--ok);
+}
+
+.technical-bollinger-copy {
+  display: grid;
+  gap: 5px;
+}
+
+.technical-bollinger-copy strong {
+  font-size: 15px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.technical-bollinger-copy p {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.technical-bollinger-card.upper-risk .technical-bollinger-copy p {
+  color: #6b3434;
+}
+
+.technical-bollinger-card.lower-opportunity .technical-bollinger-copy p {
+  color: #2f604a;
+}
+
+.technical-bollinger-band {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.technical-bollinger-track {
+  background: linear-gradient(90deg, #dcece4 0%, #edf1ef 50%, #f3c8c8 100%);
+  border-radius: 999px;
+  height: 10px;
+  position: relative;
+}
+
+.technical-bollinger-marker {
+  background: var(--danger);
+  border: 2px solid var(--surface);
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgba(168, 61, 61, 0.28);
+  height: 18px;
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 18px;
+}
+
+.technical-bollinger-card.lower-opportunity .technical-bollinger-marker {
+  background: var(--ok);
+  box-shadow: 0 0 0 1px rgba(33, 110, 70, 0.28);
+}
+
+.technical-bollinger-card.middle-range .technical-bollinger-marker,
+.technical-bollinger-card.missing .technical-bollinger-marker {
+  background: var(--muted);
+  box-shadow: 0 0 0 1px rgba(111, 118, 109, 0.22);
+}
+
+.technical-bollinger-labels {
+  color: var(--muted);
+  display: grid;
+  font-size: 12px;
+  font-weight: 800;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.technical-bollinger-labels span {
+  overflow-wrap: anywhere;
+}
+
+.technical-bollinger-labels span:nth-child(2) {
+  text-align: center;
+}
+
+.technical-bollinger-labels span:nth-child(3) {
+  text-align: right;
+}
+
 .decision-fact-grid {
   display: grid;
   gap: 8px;
@@ -2242,6 +2389,21 @@ tbody tr.active-row {
   .llm-template-grid,
   .technical-fact-grid {
     grid-template-columns: 1fr;
+  }
+
+  .technical-bollinger-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .technical-bollinger-labels {
+    grid-template-columns: 1fr;
+  }
+
+  .technical-bollinger-labels span,
+  .technical-bollinger-labels span:nth-child(2),
+  .technical-bollinger-labels span:nth-child(3) {
+    text-align: left;
   }
 
   .decision-plugin-grid .futu-signal-card {
