@@ -1046,18 +1046,7 @@ function tSignalTimelineLabel(value) {
 
 function renderTradingDecisionPlugins(holding) {
   const plugins = [
-    decisionFactsPlugin(holding, {
-      title: "趋势 / K 线",
-      moduleKey: "kline",
-      fieldOrder: [
-        ["trend", "趋势"],
-        ["position", "位置"],
-        ["momentum", "动能"],
-        ["key_levels", "关键位"],
-        ["risk", "风险"],
-      ],
-      score: "K线",
-    }),
+    klineDecisionFactsPlugin(holding),
     newsSentimentPlugin(holding),
     futuAnomalySignalsPlugin(holding),
     {
@@ -1171,6 +1160,31 @@ function decisionFactsPlugin(holding, config) {
     detail: "",
     bodyHtml: renderDecisionFactRows(rows),
     condition: "",
+  };
+}
+
+function klineDecisionFactsPlugin(holding) {
+  const plugin = decisionFactsPlugin(holding, {
+    title: "趋势 / K 线",
+    moduleKey: "kline",
+    fieldOrder: [
+      ["trend", "趋势"],
+      ["position", "位置"],
+      ["momentum", "动能"],
+      ["key_levels", "关键位"],
+      ["risk", "风险"],
+    ],
+    score: "K线",
+  });
+  const detail = holding && typeof holding.technical_facts === "object"
+    ? holding.technical_facts
+    : null;
+  const timeframes = technicalFactsUsable(detail)
+    ? detail.facts.timeframes
+    : [];
+  return {
+    ...plugin,
+    bodyHtml: `${renderBollingerSection(timeframes)}${plugin.bodyHtml}`,
   };
 }
 

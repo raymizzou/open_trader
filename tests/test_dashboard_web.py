@@ -1656,6 +1656,56 @@ console.log(html);
     assert "above_upper" not in html
 
 
+def test_dashboard_renders_bollinger_card_in_current_kline_plugin_path() -> None:
+    script = r'''
+const holding = {
+  market: "US",
+  symbol: "MSFT",
+  portfolio_weight_hkd: "10.00%",
+  decision_facts: {
+    kline: {available: false, fields: {}},
+    news_sentiment: {available: false, fields: {}},
+  },
+  technical_facts: {
+    available: true,
+    status: "usable",
+    data_date: "2026-07-03",
+    run_date: "2026-07-04",
+    freshness: {message: "日线数据截至 2026-07-03"},
+    facts: {
+      timeframes: [{
+        timeframe: "daily",
+        timeframe_label: "日线",
+        current_price: "466.20",
+        bollinger: {
+          upper: "459.13",
+          middle: "399.62",
+          lower: "340.11",
+          position: "above_upper",
+          status: "upper_risk",
+          reference_band: "upper",
+          reference_value: "459.13",
+          distance_pct: "1.5%",
+          summary_zh: "当前价格已超过日线布林带上轨",
+          detail_zh: "价格处在布林带上沿之外，说明短线偏热。",
+        },
+      }],
+    },
+  },
+};
+const html = renderTradingDecisionPlugins(holding);
+console.log(html);
+'''
+    html = run_dashboard_js(script)
+
+    assert "<h4>趋势 / K 线</h4>" in html
+    assert "technical-bollinger-card upper-risk" in html
+    assert "回调风险升高" in html
+    assert "当前价格已超过日线布林带上轨" in html
+    assert "upper_risk" not in html
+    assert "above_upper" not in html
+
+
 @pytest.mark.parametrize(
     ("status", "expected_label", "expected_class"),
     [
