@@ -159,7 +159,7 @@ class XiaozhiVoiceNotifier:
         self.speak_url = speak_url
         self.device_id = device_id
         self.token = token
-        self._post_json = post_json or _post_json_with_headers
+        self._post_json = post_json or _post_xiaozhi_json_with_headers
         self.timeout_seconds = timeout_seconds
 
     def notify(self, title: str, message: str) -> None:
@@ -175,6 +175,8 @@ class XiaozhiVoiceNotifier:
                 {"Authorization": f"Bearer {self.token}"},
                 self.timeout_seconds,
             )
+        except NotificationError:
+            raise
         except Exception as exc:
             raise NotificationError(f"Xiaozhi voice request failed: {exc}") from exc
 
@@ -663,6 +665,37 @@ def _post_json_with_headers(
     headers: dict[str, str],
     timeout_seconds: float,
 ) -> dict[str, object]:
+    return _post_json_with_headers_for_channel(
+        "Feishu app",
+        url,
+        payload,
+        headers,
+        timeout_seconds,
+    )
+
+
+def _post_xiaozhi_json_with_headers(
+    url: str,
+    payload: dict[str, object],
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> dict[str, object]:
+    return _post_json_with_headers_for_channel(
+        "Xiaozhi voice",
+        url,
+        payload,
+        headers,
+        timeout_seconds,
+    )
+
+
+def _post_json_with_headers_for_channel(
+    channel: str,
+    url: str,
+    payload: dict[str, object],
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> dict[str, object]:
     merged_headers = {
         "Content-Type": "application/json; charset=utf-8",
         **headers,
@@ -677,13 +710,13 @@ def _post_json_with_headers(
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             body = response.read().decode("utf-8")
     except Exception as exc:
-        raise NotificationError(f"Feishu app request failed: {exc}") from exc
+        raise NotificationError(f"{channel} request failed: {exc}") from exc
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise NotificationError("Feishu app returned invalid JSON") from exc
+        raise NotificationError(f"{channel} returned invalid JSON") from exc
     if not isinstance(parsed, dict):
-        raise NotificationError("Feishu app returned non-object JSON")
+        raise NotificationError(f"{channel} returned non-object JSON")
     return parsed
 
 
