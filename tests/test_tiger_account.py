@@ -1882,6 +1882,84 @@ def test_sync_tiger_portfolio_deduplicates_stock_against_preserved_futu_unknown(
     )
 
 
+def test_sync_tiger_portfolio_infers_preserved_futu_unknown_detail_asset_class(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path, [])
+    run_dir = tmp_path / "data/runs/2026-07-04"
+    futu_ram = {
+        "statement_id": "2026-07-04-futu-live",
+        "broker": "futu",
+        "account_alias": "futu_111",
+        "market": "US",
+        "asset_class": "unknown",
+        "symbol": "RAM",
+        "name": "2倍做多DRAM ETF-T-REX",
+        "currency": "USD",
+        "quantity": "470",
+        "cost_price": "19.69",
+        "last_price": "16.96",
+        "market_value": "7971.2",
+        "cost_value": "9254.3",
+        "unrealized_pnl": "-1283.33",
+        "confidence": "high",
+        "notes": "Futu live account position",
+    }
+    write_csv(
+        run_dir / "extracted_positions.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "market",
+            "asset_class",
+            "symbol",
+            "name",
+            "currency",
+            "quantity",
+            "cost_price",
+            "last_price",
+            "market_value",
+            "cost_value",
+            "unrealized_pnl",
+            "confidence",
+            "notes",
+        ],
+        [futu_ram],
+    )
+    write_csv(
+        run_dir / "extracted_cash.csv",
+        [
+            "statement_id",
+            "broker",
+            "account_alias",
+            "currency",
+            "cash_balance",
+            "available_balance",
+            "confidence",
+            "notes",
+        ],
+        [],
+    )
+    snapshot = tiger_snapshot_from_records(cash_records=[], position_records=[])
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-07-04",
+        update_latest=True,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    ram = next(row for row in rows if row["symbol"] == "RAM")
+    assert ram["asset_class"] == "etf"
+    assert ram["ai_eligible"] == "true"
+    assert ram["analysis_symbol"] == "RAM"
+
+
 def test_sync_tiger_portfolio_detail_path_merges_phillips_tiger_collision(
     tmp_path: Path,
 ) -> None:

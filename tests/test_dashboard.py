@@ -252,6 +252,7 @@ def write_technical_facts(
     report_hash: str,
     market: str = "US",
     extraction_status: str = "ok",
+    source_type: str = "tradingagents_market_report",
     timeframes: list[dict[str, object]] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -269,6 +270,7 @@ def write_technical_facts(
                         "symbol": "VIXY",
                         "source_status": "ok",
                         "source_advice_hash": report_hash,
+                        "source_type": source_type,
                         "extraction_status": extraction_status,
                         "error": "" if extraction_status == "ok" else "llm unavailable",
                         "facts": {
@@ -1118,6 +1120,67 @@ def test_load_dashboard_state_attaches_fresh_technical_facts(
     assert vixy["technical_facts"]["data_date"] == "2026-06-18"
     assert vixy["technical_facts"]["source_hash"] == source_hash(report)
     assert vixy["technical_facts"]["facts"]["timeframes"][0]["timeframe"] == "daily"
+
+
+def test_load_dashboard_state_accepts_kline_sourced_technical_facts_without_advice_hash(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [
+            {
+                "run_date": "2026-06-19",
+                "symbol": "VIXY",
+                "market": "US",
+                "asset_class": "etf",
+                "portfolio_weight_hkd": "97.80%",
+                "risk_flag": "overweight",
+                "source": "tradingagents",
+                "advice_action": "hold",
+                "advice_summary": "Watch volatility.",
+                "raw_decision": raw_decision_with_market_report(""),
+                "status": "error",
+                "error": "daily deadline exceeded",
+                "source_status": "error",
+                "fallback_reason": "",
+                "fallback_from_date": "",
+            }
+        ],
+    )
+    write_technical_facts(
+        config.data_dir / "latest" / "technical_facts.json",
+        report_hash="futu-kline:US.VIXY:2026-06-18",
+        source_type="futu_kline",
+        timeframes=[
+            {
+                "timeframe": "daily",
+                "timeframe_label": "日线",
+                "current_price": "18.82",
+                "bollinger": {
+                    "upper": "20.00",
+                    "middle": "18.00",
+                    "lower": "16.00",
+                    "position": "middle_range",
+                    "status": "neutral",
+                    "reference_band": "",
+                    "distance_pct": "",
+                    "summary_zh": "当前价格位于日线布林带区间内",
+                    "detail_zh": "价格未贴近上轨或下轨，布林带事实仅作背景展示。",
+                },
+            }
+        ],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["technical_facts"]["available"] is True
+    assert vixy["technical_facts"]["status"] == "usable"
+    assert vixy["technical_facts"]["source_hash"] == "futu-kline:US.VIXY:2026-06-18"
+    assert vixy["technical_facts"]["current_source_hash"] == ""
 
 
 def test_load_dashboard_state_marks_missing_technical_facts_file_unavailable(

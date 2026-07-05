@@ -725,6 +725,8 @@ def _technical_facts_detail(
         record.get("source_hash") or record.get("source_advice_hash") or ""
     ).strip()
     current_source_hash = _current_advice_source_hash(advice_row)
+    source_type = str(record.get("source_type") or "").strip()
+    requires_advice_hash = source_type not in {"futu_kline"}
 
     common = {
         "run_date": run_date,
@@ -733,13 +735,13 @@ def _technical_facts_detail(
         "current_source_hash": current_source_hash,
         "freshness": freshness_payload,
     }
-    if not current_source_hash:
+    if requires_advice_hash and not current_source_hash:
         return _technical_facts_unavailable(
             "missing_source_hash",
             error="latest advice market report source hash unavailable",
             **common,
         )
-    if record_source_hash != current_source_hash:
+    if requires_advice_hash and record_source_hash != current_source_hash:
         return _technical_facts_unavailable(
             "stale_source_hash",
             error="technical facts source hash does not match latest advice",
@@ -773,6 +775,7 @@ def _technical_facts_detail(
         "status": "usable",
         "error": "",
         **common,
+        "source_type": source_type,
         "facts": facts_payload,
     }
 

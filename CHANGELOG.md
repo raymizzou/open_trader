@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-04
 
+- Added Futu daily-K Bollinger fact generation for dashboard K-line cards, fixed
+  Futu/Tiger live-sync asset-class inference for type-less positions, and
+  removed the duplicate technical-fact grid from those cards after live
+  dashboard verification across all current HK/US eligible holdings.
 - Added a fixed Bollinger-band display in the dashboard K-line card, with red
   upper-band risk, green lower-band opportunity, and neutral middle-range
   states.

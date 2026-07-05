@@ -860,6 +860,79 @@ def test_sync_futu_portfolio_builds_live_only_portfolio_without_existing_portfol
     assert missing_portfolio_path.exists() is False
 
 
+def test_sync_futu_portfolio_infers_asset_class_when_futu_type_is_missing(
+    tmp_path: Path,
+) -> None:
+    missing_portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    snapshot = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "US.RAM",
+                "stock_name": "2倍做多DRAM ETF-T-REX",
+                "qty": "470",
+                "cost_price": "19.69",
+                "nominal_price": "16.96",
+                "market_val": "7971.20",
+                "currency": "USD",
+            },
+            {
+                "_account_alias": "futu_111",
+                "code": "US.AMAT",
+                "stock_name": "应用材料",
+                "qty": "3",
+                "cost_price": "718.76",
+                "nominal_price": "603.04",
+                "market_val": "1809.12",
+                "currency": "USD",
+            },
+            {
+                "_account_alias": "futu_111",
+                "code": "HK.03661",
+                "stock_name": "圣邦股份",
+                "qty": "300",
+                "cost_price": "85.2",
+                "nominal_price": "120",
+                "market_val": "36000",
+                "currency": "HKD",
+            },
+            {
+                "_account_alias": "futu_111",
+                "code": "US.DRAM260731P55000",
+                "stock_name": "DRAM 260731 55.00P",
+                "qty": "-2",
+                "cost_price": "2.735",
+                "nominal_price": "4.339",
+                "market_val": "-867.78",
+                "currency": "USD",
+            },
+        ],
+    )
+
+    result = sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=missing_portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-07-04",
+        update_latest=False,
+    )
+
+    rows = read_portfolio(result.portfolio_path)
+    by_symbol = {row["symbol"]: row for row in rows}
+    assert by_symbol["RAM"]["asset_class"] == "etf"
+    assert by_symbol["RAM"]["ai_eligible"] == "true"
+    assert by_symbol["RAM"]["analysis_symbol"] == "RAM"
+    assert by_symbol["AMAT"]["asset_class"] == "stock"
+    assert by_symbol["AMAT"]["ai_eligible"] == "true"
+    assert by_symbol["03661"]["asset_class"] == "stock"
+    assert by_symbol["03661"]["analysis_symbol"] == "03661"
+    assert by_symbol["DRAM260731P55000"]["asset_class"] == "option"
+    assert by_symbol["DRAM260731P55000"]["ai_eligible"] == "false"
+    assert by_symbol["DRAM260731P55000"]["analysis_symbol"] == ""
+
+
 def test_sync_futu_portfolio_deduplicates_unknown_zero_position_against_tiger_stock(
     tmp_path: Path,
 ) -> None:

@@ -14,6 +14,7 @@ from .csv_io import write_rows
 from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
 from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
 from .models import AssetClass, CashBalance, Market, Position
+from .parsers.base import detect_asset_class
 
 
 POSITION_DETAIL_FIELDNAMES = [
@@ -1136,7 +1137,7 @@ def _position_from_detail_row(row: dict[str, str]) -> Position:
         broker=row.get("broker", ""),
         account_alias=row.get("account_alias", ""),
         market=_market_from_text(row.get("market", "")),
-        asset_class=_asset_class_from_text(row.get("asset_class", "")),
+        asset_class=_asset_class_from_row(row),
         symbol=row.get("symbol", ""),
         name=row.get("name", ""),
         currency=row.get("currency", "").upper(),
@@ -1460,7 +1461,7 @@ def _position_from_portfolio_row(row: dict[str, str]) -> Position:
         broker=row.get("brokers", ""),
         account_alias=row.get("accounts", ""),
         market=_market_from_text(row.get("market", "")),
-        asset_class=_asset_class_from_text(row.get("asset_class", "")),
+        asset_class=_asset_class_from_row(row),
         symbol=row.get("symbol", ""),
         name=row.get("name", ""),
         currency=row.get("currency", "").upper(),
@@ -1556,6 +1557,17 @@ def _asset_class_from_text(value: str) -> AssetClass:
     for asset_class in AssetClass:
         if asset_class.value == normalized:
             return asset_class
+    return AssetClass.UNKNOWN
+
+
+def _asset_class_from_row(row: dict[str, str]) -> AssetClass:
+    asset_class = _asset_class_from_text(row.get("asset_class", ""))
+    if asset_class != AssetClass.UNKNOWN:
+        return asset_class
+    symbol = row.get("symbol", "")
+    name = row.get("name", "")
+    if symbol or name:
+        return detect_asset_class(symbol, name)
     return AssetClass.UNKNOWN
 
 

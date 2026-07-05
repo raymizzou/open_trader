@@ -12,6 +12,7 @@ from typing import Any, Callable
 from .csv_io import write_rows
 from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
 from .models import AssetClass, CashBalance, Market, Position
+from .parsers.base import detect_asset_class
 from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows
 
 
@@ -553,6 +554,11 @@ def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
         return AssetClass.FUND
     if raw_type in {"OPTION", "WARRANT"}:
         return AssetClass.OPTION
+    code = _first_text(record, ("code", "stock_code", "symbol")).upper()
+    symbol = _symbol_from_code(code)
+    name = _first_text(record, ("stock_name", "name", "security_name"), symbol)
+    if symbol or name:
+        return detect_asset_class(symbol, name)
     return AssetClass.UNKNOWN
 
 

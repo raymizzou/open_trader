@@ -6,6 +6,7 @@ import pytest
 
 from open_trader.futu_quote import FutuQuoteClient, FutuQuoteError
 from open_trader.futu_watch import QuoteSnapshot
+from open_trader.kline_technical_facts import DailyKlineBar
 
 
 class FakeDataFrame:
@@ -34,6 +35,32 @@ class FakeOpenQuoteContext:
                     {"code": "US.QQQ", "last_price": "510.25"},
                 ]
             ),
+        )
+
+    def request_history_kline(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+        ktype: object,
+    ) -> tuple[int, object]:
+        self.requested_history = {
+            "symbol": symbol,
+            "start": start,
+            "end": end,
+            "ktype": ktype,
+        }
+        return (
+            0,
+            FakeDataFrame(
+                [
+                    {"time_key": "2026-06-18 00:00:00", "close": "18.82"},
+                    {"time_key": "2026-06-19", "close": 19.1},
+                    {"time_key": "2026-06-20", "close": None},
+                ]
+            ),
+            None,
         )
 
     def close(self) -> None:
@@ -120,6 +147,25 @@ def test_futu_quote_client_returns_normalized_snapshots() -> None:
         "US.QQQ": QuoteSnapshot("US.QQQ", Decimal("510.25")),
     }
     assert client.context.requested_symbols == ["US.VIXY", "US.QQQ"]
+
+
+def test_futu_quote_client_returns_normalized_daily_kline() -> None:
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    bars = client.get_daily_kline("US.VIXY", start="2026-01-01", end="2026-07-04")
+
+    assert bars == [
+        DailyKlineBar(date="2026-06-18", close=18.82),
+        DailyKlineBar(date="2026-06-19", close=19.1),
+    ]
+    assert client.context.requested_history["symbol"] == "US.VIXY"
+    assert client.context.requested_history["start"] == "2026-01-01"
+    assert client.context.requested_history["end"] == "2026-07-04"
 
 
 def test_futu_quote_client_raises_clear_error_on_sdk_failure() -> None:

@@ -1182,6 +1182,9 @@ function klineDecisionFactsPlugin(holding) {
   const timeframes = technicalFactsUsable(detail)
     ? detail.facts.timeframes
     : [];
+  if (detail && plugin.status === "缺失") {
+    return klineTechnicalFactsPlugin(holding);
+  }
   return {
     ...plugin,
     bodyHtml: `${renderBollingerSection(timeframes)}${plugin.bodyHtml}`,
@@ -1537,7 +1540,6 @@ function klineTechnicalFactsPlugin(holding) {
     const timeframes = detail.facts && Array.isArray(detail.facts.timeframes)
       ? detail.facts.timeframes
       : [];
-    const rows = timeframes.flatMap((timeframe) => technicalFactRowsForTimeframe(timeframe));
     const bollingerHtml = renderBollingerSection(timeframes);
     const dateText = technicalFactsDateText(detail);
     return {
@@ -1546,9 +1548,9 @@ function klineTechnicalFactsPlugin(holding) {
       tone: "ok",
       score: "K线",
       headline: dateText || "当前可用",
-      detail: technicalFactsFreshnessText(detail) || "技术面事实已按最新 TradingAgents 来源校验。",
-      bodyHtml: `${bollingerHtml}${renderTechnicalFactRows(rows)}`,
-      condition: technicalFactsRunText(detail) || "条件：技术面事实与最新报告来源一致。",
+      detail: technicalFactsFreshnessText(detail) || "技术面事实来自日 K 行情。",
+      bodyHtml: bollingerHtml,
+      condition: "",
     };
   }
   const unavailable = technicalFactsUnavailableText(detail);
@@ -1617,6 +1619,9 @@ function technicalFactsRunText(detail) {
   const dates = technicalFactsDateText(detail);
   if (!dates) {
     return "";
+  }
+  if (detail && detail.source_type === "futu_kline") {
+    return `条件：${dates}；来源为日 K 行情。`;
   }
   return `条件：${dates}；来源哈希已与最新报告校验。`;
 }

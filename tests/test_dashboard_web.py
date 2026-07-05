@@ -1496,7 +1496,7 @@ assertOrderedValues(missingCard, [
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
-def test_dashboard_renders_usable_kline_technical_facts_with_timeframe_labels() -> None:
+def test_dashboard_renders_kline_technical_card_without_duplicate_fact_grid() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for dashboard helper runtime checks")
@@ -1533,6 +1533,17 @@ const holding = {
           timeframe_label: "日线",
           current_price: "411.60",
           trend_summary: "价格高于主要均线。",
+          bollinger: {
+            upper: "430.00",
+            middle: "405.00",
+            lower: "380.00",
+            position: "middle_range",
+            status: "neutral",
+            reference_band: "",
+            distance_pct: "",
+            summary_zh: "当前价格位于日线布林带区间内",
+            detail_zh: "价格未贴近上轨或下轨，布林带事实仅作背景展示。",
+          },
           rsi: {value: "56.88"},
           macd: {macd: "0.22", signal: "0.15", histogram: "0.07", crossover: "bullish crossover / 金叉"},
           atr: {value: "33.17", percent_of_price: "8.1%"},
@@ -1567,36 +1578,20 @@ for (const required of [
   "可用",
   "数据日 2026-06-18",
   "运行 2026-06-19",
-  "日线 RSI",
-  "56.88",
-  "日线 MACD",
-  "MACD 0.22",
-  "金叉",
-  "日线 当前价",
-  "411.60",
-  "日线 趋势",
-  "价格高于主要均线。",
-  "日线 ATR",
-  "33.17 · 8.1%",
-  "日线 支撑",
-  "398.15 · 368.24",
-  "日线 阻力",
-  "430.00 · 445.50",
-  "周线 MACD",
-  "形成金叉",
-  "周线 当前价",
-  "409.20",
-  "周线 ATR",
-  "41.10",
-  "周线 支撑",
-  "380.00",
-  "周线 阻力",
-  "455.00",
-  "月线 RSI",
-  "61.20"
+  "日线布林带",
+  "中性区间",
+  "当前价格位于日线布林带区间内",
+  "下轨 380.00",
+  "中轨 405.00",
+  "上轨 430.00"
 ]) {
   if (!card.includes(required)) {
-    throw new Error("missing K-line technical fact " + required + ": " + card);
+    throw new Error("missing K-line bollinger fact " + required + ": " + card);
+  }
+}
+for (const duplicate of ["日线 当前价", "日线 RSI", "日线 MACD", "周线 当前价", "条件："]) {
+  if (card.includes(duplicate)) {
+    throw new Error("duplicate K-line fact grid rendered " + duplicate + ": " + card);
   }
 }
 if (card.includes("待接入") || card.includes("占位") || card.includes("rsi:")) {
@@ -1702,8 +1697,43 @@ console.log(html);
     assert "technical-bollinger-card upper-risk" in html
     assert "回调风险升高" in html
     assert "当前价格已超过日线布林带上轨" in html
+    assert "status-pill status-ok\">可用" in html
+    assert "趋势</span>" not in html
     assert "upper_risk" not in html
     assert "above_upper" not in html
+
+
+def test_dashboard_renders_kline_extraction_error_without_decision_field_noise() -> None:
+    script = r'''
+const holding = {
+  market: "US",
+  symbol: "RAM",
+  portfolio_weight_hkd: "2.95%",
+  decision_facts: {
+    kline: {available: false, fields: {}},
+    news_sentiment: {available: false, fields: {}},
+  },
+  technical_facts: {
+    available: false,
+    status: "extraction_error",
+    data_date: "2026-07-02",
+    run_date: "2026-07-04",
+    error: "日线不足 20 根，无法计算布林带",
+    freshness: {message: "指标周期缺失，需复核"},
+    facts: {},
+  },
+};
+const html = renderDecisionPluginCard(klineDecisionFactsPlugin(holding));
+console.log(html);
+'''
+    html = run_dashboard_js(script)
+
+    assert "<h4>趋势 / K 线</h4>" in html
+    assert "不可用" in html
+    assert "抽取失败" in html
+    assert "日线不足 20 根，无法计算布林带" in html
+    assert "趋势</span>" not in html
+    assert "undefined" not in html
 
 
 @pytest.mark.parametrize(

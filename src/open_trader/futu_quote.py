@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .futu_watch import QuoteSnapshot
+from .kline_technical_facts import DailyKlineBar
 
 
 OPEND_UNREACHABLE_NEXT_STEP = (
@@ -134,6 +135,60 @@ class FutuQuoteClient:
             if price.is_finite():
                 snapshots[code] = QuoteSnapshot(futu_symbol=code, last_price=price)
         return snapshots
+
+    def get_daily_kline(
+        self,
+        futu_symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[DailyKlineBar]:
+        try:
+            from futu import KLType
+
+            ktype = KLType.K_DAY
+        except ImportError:
+            ktype = "K_DAY"
+        response = self.context.request_history_kline(
+            futu_symbol,
+            start=start,
+            end=end,
+            ktype=ktype,
+        )
+        ret_code = response[0]
+        data = response[1]
+        if ret_code != 0:
+            message = str(data)
+            if "网络中断" in message:
+                raise FutuQuoteError(
+                    message,
+                    error_type="quote_server_interrupted",
+                    next_step=QUOTE_INTERRUPTED_NEXT_STEP,
+                    opend_reachable=True,
+                    context_ok=True,
+                    snapshot_ok=False,
+                )
+            raise FutuQuoteError(
+                message,
+                error_type="snapshot_failed",
+                next_step=SNAPSHOT_FAILED_NEXT_STEP,
+                opend_reachable=True,
+                context_ok=True,
+                snapshot_ok=False,
+            )
+        bars: list[DailyKlineBar] = []
+        for record in data.to_dict("records"):
+            date_text = str(record.get("time_key") or record.get("date") or "").strip()
+            close_text = record.get("close")
+            if not date_text or close_text in {None, ""}:
+                continue
+            try:
+                close = float(str(close_text))
+            except ValueError:
+                continue
+            if close == close:
+                bars.append(DailyKlineBar(date=date_text[:10], close=close))
+        return bars
 
     def close(self) -> None:
         self.context.close()
