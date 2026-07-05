@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import subprocess
 import urllib.error
 import urllib.request
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Protocol
@@ -146,6 +148,34 @@ class FeishuAppNotifier:
         return token
 
 
+def render_xiaozhi_voice_notification(title: str, message: str) -> str | None:
+    title = title.strip()
+    message = message.strip()
+    if "测试通知" in title:
+        return message or title
+    if "｜做T提醒｜" in title:
+        return _render_xiaozhi_t_signal_voice(title, message)
+    if title.endswith("开始通知"):
+        market = _voice_market(title, message)
+        return (
+            f"Open Trader 提醒：{market}盘前流程已开始。"
+            "正在生成今日交易复核清单，完成后会继续通知。"
+        )
+    if title.endswith("阻塞通知"):
+        market = _voice_market(title, message)
+        reason = _voice_blocker_reason(message)
+        reason_text = f" {reason}" if reason[:1].isascii() else reason
+        return (
+            f"Open Trader 重要提醒：{market}盘前流程遇到阻塞，原因是{reason_text}。"
+            "请先查看飞书或 UI，处理后再决定是否交易。"
+        )
+    if title.endswith("行动通知"):
+        return None
+    if title.endswith("完成通知"):
+        return _render_xiaozhi_completion_voice(title, message)
+    return "Open Trader 有新通知，请查看飞书或 UI。"
+
+
 class XiaozhiVoiceNotifier:
     def __init__(
         self,
@@ -163,10 +193,13 @@ class XiaozhiVoiceNotifier:
         self.timeout_seconds = timeout_seconds
 
     def notify(self, title: str, message: str) -> None:
+        voice_message = render_xiaozhi_voice_notification(title, message)
+        if voice_message is None:
+            return
         payload: dict[str, object] = {
             "device_id": self.device_id,
             "title": title,
-            "message": message,
+            "message": voice_message,
         }
         try:
             response = self._post_json(
@@ -186,6 +219,208 @@ class XiaozhiVoiceNotifier:
         if code not in {0, "0"}:
             message_text = response.get("message") or response.get("msg") or ""
             raise NotificationError(f"Xiaozhi voice error {code}: {message_text}")
+
+
+def _render_xiaozhi_t_signal_voice(title: str, message: str) -> str:
+    parts = [part.strip() for part in title.split("｜")]
+    symbol = parts[2] if len(parts) >= 3 and parts[2] else "相关标的"
+    action = _voice_t_action(parts[3] if len(parts) >= 4 else _voice_field(message, "动作"))
+    ratio = _voice_field(message, "比例")
+    status = _voice_status_summary(_voice_field(message, "状态"))
+    if ratio and ratio != "-":
+        return (
+            f"Open Trader 做 T 提醒：{symbol} 触发{action} 信号，建议比例{ratio}。"
+            f"当前状态：{status}。请确认后再操作。"
+        )
+    return (
+        f"Open Trader 做 T 提醒：{symbol} 触发{action} 信号。"
+        f"当前状态：{status}。请确认后再操作。"
+    )
+
+
+def _render_xiaozhi_completion_voice(title: str, message: str) -> str:
+    market = _voice_market(title, message)
+    status_line = _voice_field(message, "状态")
+    readiness = _voice_field_from_compound(status_line, "可用性") or _voice_field(
+        message, "可用性"
+    )
+    status = _voice_completion_status(_voice_field_from_compound(status_line, "状态"))
+    ready_count, review_count = _voice_trade_action_counts(message)
+    duration = _voice_completion_duration(message)
+    if ready_count > 0 or review_count > 0:
+        action_summary = f"今日有{ready_count}项可复核，{review_count}项需人工判断。"
+    else:
+        action_summary = "今日没有需要立即处理的交易动作。"
+    next_step = _voice_completion_next_step(readiness)
+    duration_phrase = f"本次用时 {duration}，" if duration else ""
+    return (
+        f"Open Trader 完成提醒：{market}盘前流程已完成，{duration_phrase}"
+        f"状态是{status}。{action_summary}{next_step}"
+    )
+
+
+def _voice_market(title: str, message: str) -> str:
+    if "港股" in title:
+        return "港股"
+    if "美股" in title:
+        return "美股"
+    market = _voice_field(message, "市场")
+    if market:
+        return market
+    return "相关市场"
+
+
+def _voice_field(message: str, name: str) -> str:
+    prefix = f"{name}："
+    for raw_line in message.splitlines():
+        line = raw_line.strip()
+        if line.startswith(prefix):
+            return line.removeprefix(prefix).strip()
+        for part in line.split("｜"):
+            part = part.strip()
+            if part.startswith(prefix):
+                return part.removeprefix(prefix).strip()
+    return ""
+
+
+def _voice_field_from_compound(text: str, name: str) -> str:
+    prefix = f"{name}："
+    first_part = ""
+    for part in text.split("｜"):
+        part = part.strip()
+        if not first_part:
+            first_part = part
+        if part.startswith(prefix):
+            return part.removeprefix(prefix).strip()
+    if name == "状态" and first_part and "：" not in first_part:
+        return first_part
+    if name == "状态" and text and "：" not in text:
+        return text.strip()
+    return ""
+
+
+def _voice_blocker_reason(message: str) -> str:
+    reason_text = _voice_field(message, "原因")
+    if not reason_text:
+        return "流程运行异常"
+    candidates = [
+        item.strip()
+        for item in re.split(r"[,，、]", reason_text)
+        if item.strip()
+    ]
+    if not candidates:
+        return "流程运行异常"
+    priority = [
+        ("run_failed", "流程运行失败"),
+        ("运行失败", "流程运行失败"),
+        ("Futu 行情异常", "Futu 行情异常"),
+        ("缺失行情", "有行情缺失"),
+        ("有行情缺失", "有行情缺失"),
+        ("plan_error", "交易计划异常"),
+        ("交易计划异常", "交易计划异常"),
+        ("advice_error", "建议生成异常"),
+        ("建议生成异常", "建议生成异常"),
+        ("trade_action_review", "有交易动作需要人工复核"),
+        ("交易动作需要人工复核", "有交易动作需要人工复核"),
+        ("already_running", "已有任务在运行"),
+        ("已有任务", "已有任务在运行"),
+    ]
+    for needle, label in priority:
+        if any(needle in candidate for candidate in candidates):
+            return label
+    return candidates[0]
+
+
+def _voice_completion_status(status: str) -> str:
+    return {
+        "成功": "正常",
+        "success": "正常",
+        "部分完成": "部分完成",
+        "partial": "部分完成",
+        "失败": "失败",
+        "failed": "失败",
+        "已有任务运行中": "已有任务在运行",
+        "already_running": "已有任务在运行",
+    }.get(status.strip(), status.strip() or "未知")
+
+
+def _voice_completion_next_step(readiness: str) -> str:
+    value = readiness.strip()
+    return {
+        "可复核": "可以查看飞书复核清单。",
+        "ready": "可以查看飞书复核清单。",
+        "需要人工复核": "请先人工复核标记项。",
+        "review_required": "请先人工复核标记项。",
+        "阻塞": "请先处理阻塞原因。",
+        "blocked": "请先处理阻塞原因。",
+    }.get(value, "请查看飞书或 UI。")
+
+
+def _voice_trade_action_counts(message: str) -> tuple[int, int]:
+    line = _voice_field(message, "交易动作")
+    match = re.search(r"(\d+)\s*ready[，,]\s*(\d+)\s*review", line)
+    if not match:
+        return 0, 0
+    return int(match.group(1)), int(match.group(2))
+
+
+def _voice_completion_duration(message: str) -> str:
+    started_at = _voice_field(message, "开始时间") or _voice_field(message, "Started")
+    finished_at = _voice_field(message, "完成时间") or _voice_field(message, "Finished")
+    if not started_at or not finished_at:
+        status_path = _voice_field(message, "状态文件")
+        if status_path:
+            started_at, finished_at = _voice_status_file_times(status_path)
+    return _voice_duration_between(started_at, finished_at)
+
+
+def _voice_status_file_times(status_path: str) -> tuple[str, str]:
+    try:
+        with Path(status_path).open(encoding="utf-8-sig") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    return str(payload.get("started_at", "")), str(payload.get("finished_at", ""))
+
+
+def _voice_duration_between(started_at: str, finished_at: str) -> str:
+    try:
+        started = datetime.fromisoformat(started_at.strip())
+        finished = datetime.fromisoformat(finished_at.strip())
+    except ValueError:
+        return ""
+    seconds = int(round((finished - started).total_seconds()))
+    if seconds < 0:
+        return ""
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes, remaining_seconds = divmod(seconds, 60)
+    if minutes < 60:
+        if remaining_seconds:
+            return f"{minutes} 分 {remaining_seconds} 秒"
+        return f"{minutes} 分"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if remaining_minutes:
+        return f"{hours} 小时 {remaining_minutes} 分"
+    return f"{hours} 小时"
+
+
+def _voice_t_action(action: str) -> str:
+    value = action.strip().replace(" ", "")
+    if value in {"BUY_T", "买入做T", "买入做Ｔ"}:
+        return "买入做 T"
+    if value in {"SELL_T", "卖出做T", "卖出做Ｔ"}:
+        return "卖出做 T"
+    return action.strip() or "做 T"
+
+
+def _voice_status_summary(status: str) -> str:
+    value = status.strip()
+    if not value:
+        return "需要复核"
+    return re.split(r"[,，]", value, maxsplit=1)[0].strip() or value
 
 
 def render_feishu_order_review(
