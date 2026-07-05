@@ -14,6 +14,7 @@ from open_trader.notifications import (
     NotificationError,
     XiaozhiVoiceNotifier,
     render_feishu_order_review,
+    render_xiaozhi_voice_notification,
 )
 
 
@@ -310,6 +311,244 @@ def test_xiaozhi_voice_notifier_sends_payload_and_bearer_header() -> None:
             "timeout": 2.5,
         }
     ]
+
+
+def test_render_xiaozhi_voice_daily_start_template() -> None:
+    assert (
+        render_xiaozhi_voice_notification(
+            "Open Trader 美股开始通知",
+            "\n".join(
+                [
+                    "Open Trader｜开始通知",
+                    "日期：2026-07-05｜市场：美股",
+                    "状态：开始运行｜并发：8",
+                ]
+            ),
+        )
+        == "Open Trader 提醒：美股盘前流程已开始。正在生成今日交易复核清单，完成后会继续通知。"
+    )
+
+
+def test_render_xiaozhi_voice_daily_blocker_uses_priority_reason() -> None:
+    assert (
+        render_xiaozhi_voice_notification(
+            "Open Trader 港股阻塞通知",
+            "\n".join(
+                [
+                    "Open Trader｜阻塞通知",
+                    "日期：2026-07-05｜状态：部分完成",
+                    "可用性：需要人工复核",
+                    "原因：交易动作需要人工复核, Futu 行情异常",
+                ]
+            ),
+        )
+        == (
+            "Open Trader 重要提醒：港股盘前流程遇到阻塞，原因是 Futu 行情异常。"
+            "请先查看飞书或 UI，处理后再决定是否交易。"
+        )
+    )
+
+
+def test_render_xiaozhi_voice_daily_action_is_skipped() -> None:
+    assert (
+        render_xiaozhi_voice_notification(
+            "Open Trader 美股行动通知",
+            "Open Trader｜行动通知\n今日结论：有 1 条可采取行动。",
+        )
+        is None
+    )
+
+
+def test_render_xiaozhi_voice_daily_completion_includes_duration() -> None:
+    assert (
+        render_xiaozhi_voice_notification(
+            "Open Trader 美股完成通知",
+            "\n".join(
+                [
+                    "Open Trader｜完成通知",
+                    "日期：2026-07-05｜市场：美股",
+                    "开始时间：2026-07-05T21:00:00+08:00",
+                    "完成时间：2026-07-05T21:04:18+08:00",
+                    "状态：部分完成｜可用性：需要人工复核",
+                    "交易动作：4 ready，1 review，4 watch",
+                ]
+            ),
+        )
+        == (
+            "Open Trader 完成提醒：美股盘前流程已完成，本次用时 4 分 18 秒，"
+            "状态是部分完成。今日有4项可复核，1项需人工判断。请先人工复核标记项。"
+        )
+    )
+
+
+def test_render_xiaozhi_voice_daily_completion_reads_status_file_duration(
+    tmp_path: Path,
+) -> None:
+    status_path = tmp_path / "daily_run_status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "started_at": "2026-07-05T21:00:00+08:00",
+                "finished_at": "2026-07-05T21:04:18+08:00",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        render_xiaozhi_voice_notification(
+            "Open Trader 美股完成通知",
+            "\n".join(
+                [
+                    "Open Trader｜完成通知",
+                    "日期：2026-07-05｜市场：美股",
+                    "状态：部分完成｜可用性：需要人工复核",
+                    "交易动作：4 ready，1 review，4 watch",
+                    f"状态文件：{status_path}",
+                ]
+            ),
+        )
+        == (
+            "Open Trader 完成提醒：美股盘前流程已完成，本次用时 4 分 18 秒，"
+            "状态是部分完成。今日有4项可复核，1项需人工判断。请先人工复核标记项。"
+        )
+    )
+
+
+def test_render_xiaozhi_voice_daily_completion_omits_missing_duration() -> None:
+    assert (
+        render_xiaozhi_voice_notification(
+            "Open Trader 港股完成通知",
+            "\n".join(
+                [
+                    "Open Trader｜完成通知",
+                    "日期：2026-07-05｜市场：港股",
+                    "状态：成功｜可用性：可复核",
+                    "交易动作：0 ready，0 review，2 watch",
+                ]
+            ),
+        )
+        == (
+            "Open Trader 完成提醒：港股盘前流程已完成，状态是正常。"
+            "今日没有需要立即处理的交易动作。可以查看飞书复核清单。"
+        )
+    )
+
+
+def test_render_xiaozhi_voice_t_signal_with_ratio() -> None:
+    assert (
+        render_xiaozhi_voice_notification(
+            "Open Trader｜做T提醒｜US ARM｜买入做T",
+            "\n".join(
+                [
+                    "动作：买入做T",
+                    "比例：15%",
+                    "状态：盘中有效，等待执行确认",
+                ]
+            ),
+        )
+        == (
+            "Open Trader 做 T 提醒：US ARM 触发买入做 T 信号，建议比例15%。"
+            "当前状态：盘中有效。请确认后再操作。"
+        )
+    )
+
+
+def test_render_xiaozhi_voice_t_signal_without_ratio() -> None:
+    assert (
+        render_xiaozhi_voice_notification(
+            "Open Trader｜做T提醒｜US ARM｜卖出做T",
+            "\n".join(
+                [
+                    "动作：卖出做T",
+                    "比例：-",
+                    "状态：盘中有效，等待执行确认",
+                ]
+            ),
+        )
+        == "Open Trader 做 T 提醒：US ARM 触发卖出做 T 信号。当前状态：盘中有效。请确认后再操作。"
+    )
+
+
+def test_render_xiaozhi_voice_unknown_fallback() -> None:
+    assert (
+        render_xiaozhi_voice_notification(
+            "Open Trader 其他通知",
+            "长正文",
+        )
+        == "Open Trader 有新通知，请查看飞书或 UI。"
+    )
+
+
+def test_xiaozhi_voice_notifier_sends_short_voice_payload() -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        calls.append(
+            {
+                "url": url,
+                "payload": payload,
+                "headers": headers,
+                "timeout": timeout_seconds,
+            }
+        )
+        return {"code": 0, "message": "queued"}
+
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+        post_json=fake_post,
+        timeout_seconds=2.5,
+    )
+
+    notifier.notify("Open Trader 美股开始通知", "Open Trader｜开始通知")
+
+    assert calls == [
+        {
+            "url": "http://127.0.0.1:8003/xiaozhi/notify/speak",
+            "payload": {
+                "device_id": "speaker-1",
+                "title": "Open Trader 美股开始通知",
+                "message": (
+                    "Open Trader 提醒：美股盘前流程已开始。"
+                    "正在生成今日交易复核清单，完成后会继续通知。"
+                ),
+            },
+            "headers": {"Authorization": "Bearer voice-token"},
+            "timeout": 2.5,
+        }
+    ]
+
+
+def test_xiaozhi_voice_notifier_skips_daily_action_notification() -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        calls.append({"payload": payload})
+        return {"code": 0}
+
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+        post_json=fake_post,
+    )
+
+    notifier.notify("Open Trader 美股行动通知", "Open Trader｜行动通知")
+
+    assert calls == []
 
 
 def test_xiaozhi_voice_notifier_raises_on_api_error() -> None:

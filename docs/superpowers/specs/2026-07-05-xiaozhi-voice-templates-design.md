@@ -132,6 +132,14 @@ If duration cannot be calculated, omit the duration phrase:
 Open Trader 完成提醒：{市场}盘前流程已完成，状态是{状态}。{动作摘要}{下一步}
 ```
 
+Duration source:
+
+```text
+preferred -> parse explicit start/finish fields if present in the message
+normal daily run -> read started_at/finished_at from the status file path in the completion message
+unavailable -> omit duration
+```
+
 Duration format:
 
 ```text
