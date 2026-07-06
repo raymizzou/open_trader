@@ -1164,16 +1164,18 @@ function decisionFactsPlugin(holding, config) {
 }
 
 function klineDecisionFactsPlugin(holding) {
+  const module = decisionFactsModule(holding, "kline");
+  const fieldOrder = [
+    ["trend", "趋势"],
+    ["position", "位置"],
+    ["momentum", "动能"],
+    ["key_levels", "关键位"],
+    ["risk", "风险"],
+  ];
   const plugin = decisionFactsPlugin(holding, {
     title: "趋势 / K 线",
     moduleKey: "kline",
-    fieldOrder: [
-      ["trend", "趋势"],
-      ["position", "位置"],
-      ["momentum", "动能"],
-      ["key_levels", "关键位"],
-      ["risk", "风险"],
-    ],
+    fieldOrder,
     score: "K线",
   });
   const detail = holding && typeof holding.technical_facts === "object"
@@ -1182,12 +1184,16 @@ function klineDecisionFactsPlugin(holding) {
   const timeframes = technicalFactsUsable(detail)
     ? detail.facts.timeframes
     : [];
-  if (detail && plugin.status === "缺失") {
+  const hasFixedFields = module
+    && module.fields
+    && typeof module.fields === "object"
+    && fieldOrder.some(([key]) => Object.prototype.hasOwnProperty.call(module.fields, key));
+  if (detail && plugin.status === "缺失" && !hasFixedFields) {
     return klineTechnicalFactsPlugin(holding);
   }
   return {
     ...plugin,
-    bodyHtml: `${renderBollingerSection(timeframes)}${plugin.bodyHtml}`,
+    bodyHtml: `${plugin.status === "缺失" ? "" : renderBollingerSection(timeframes)}${plugin.bodyHtml}`,
   };
 }
 

@@ -943,9 +943,6 @@ def _apply_asset_class_hints(
 ) -> list[Position]:
     output: list[Position] = []
     for position in positions:
-        if position.asset_class != AssetClass.UNKNOWN:
-            output.append(position)
-            continue
         hint = hints.get(
             (
                 position.market,
@@ -953,7 +950,10 @@ def _apply_asset_class_hints(
                 position.currency.upper(),
             )
         )
-        output.append(replace(position, asset_class=hint) if hint is not None else position)
+        if hint is not None:
+            output.append(replace(position, asset_class=hint))
+            continue
+        output.append(position)
     return output
 
 
