@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from open_trader.kelly_lab import (
     index_kelly_experiments_by_market_symbol,
     load_kelly_lab_state,
@@ -105,6 +107,76 @@ def test_load_kelly_lab_state_missing_files_is_unavailable(tmp_path: Path) -> No
     assert state["experiment_count"] == 0
     assert state["experiments"] == []
     assert "kelly_strategy_templates.json not found" in state["error"]
+
+
+def test_load_kelly_lab_state_rejects_unknown_template_version(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        {
+            "schema_version": "open_trader.kelly_strategy_templates.v1",
+            "templates": [
+                {
+                    "strategy_id": "trend_pullback_20d",
+                    "strategy_name": "趋势回调 20D",
+                    "strategy_version": "v1",
+                    "entry_rule_description": "价格回调到 20 日均线附近。",
+                    "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+                    "max_holding_days": 20,
+                    "order_type": "limit",
+                    "market_session": "regular",
+                }
+            ],
+        },
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        {
+            "schema_version": "open_trader.kelly_experiments.v1",
+            "experiments": [
+                {
+                    "experiment_id": "trend_pullback_20d_exp_20260707",
+                    "experiment_name": "趋势回调 20D 第二版",
+                    "strategy_id": "trend_pullback_20d",
+                    "strategy_version": "v2",
+                    "start_date": "2026-07-07",
+                    "paper_account": "futu_simulate",
+                    "experiment_budget": "100000",
+                    "budget_currency": "USD",
+                    "capital_utilization_pct": "50",
+                    "allocation_mode": "equal_weight",
+                    "max_open_position_per_symbol": 1,
+                    "status": "running",
+                    "locked": True,
+                    "participants": [
+                        {
+                            "market": "US",
+                            "symbol": "AAPL",
+                            "name": "Apple Inc.",
+                            "source": "holding",
+                            "locked": True,
+                            "per_symbol_budget": "25000",
+                            "budget_currency": "USD",
+                        }
+                    ],
+                    "stats": {
+                        "completed_samples": 0,
+                        "open_samples": 0,
+                        "observed_win_rate": "",
+                        "sample_stage": "insufficient",
+                    },
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="unknown strategy template .*trend_pullback_20d.*v2",
+    ):
+        load_kelly_lab_state(data_dir)
 
 
 def test_index_kelly_experiments_by_market_symbol(tmp_path: Path) -> None:

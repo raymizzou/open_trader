@@ -86,11 +86,11 @@ def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
     experiments_payload = _load_json_object(experiments_path)
 
     templates = _validate_templates_payload(templates_payload, templates_path)
-    templates_by_id = _index_templates_by_strategy_id(templates)
+    templates_by_key = _index_templates_by_strategy_key(templates)
     experiments = _validate_experiments_payload(
         experiments_payload,
         experiments_path,
-        templates_by_id,
+        templates_by_key,
     )
 
     return KellyLabState(
@@ -164,7 +164,7 @@ def _validate_templates_payload(
 def _validate_experiments_payload(
     payload: dict[str, Any],
     path: Path,
-    templates_by_id: dict[str, dict[str, Any]],
+    templates_by_key: dict[tuple[str, str], dict[str, Any]],
 ) -> list[dict[str, Any]]:
     _validate_schema_version(
         payload,
@@ -189,8 +189,14 @@ def _validate_experiments_payload(
             raise ValueError(f"{context} must be locked when status is {status!r}")
 
         strategy_id = experiment["strategy_id"]
-        if not isinstance(strategy_id, str) or strategy_id not in templates_by_id:
-            raise ValueError(f"{context} references unknown strategy_id {strategy_id!r}")
+        strategy_version = experiment["strategy_version"]
+        if not isinstance(strategy_id, str) or not isinstance(strategy_version, str):
+            raise ValueError(f"{context} has invalid strategy template reference")
+        strategy_key = (strategy_id, strategy_version)
+        if strategy_key not in templates_by_key:
+            raise ValueError(
+                f"{context} references unknown strategy template {strategy_key!r}",
+            )
 
         participants = experiment["participants"]
         if not isinstance(participants, list):
@@ -201,7 +207,7 @@ def _validate_experiments_payload(
             participants,
             context,
         )
-        normalized_experiment["template"] = copy.deepcopy(templates_by_id[strategy_id])
+        normalized_experiment["template"] = copy.deepcopy(templates_by_key[strategy_key])
         validated.append(normalized_experiment)
     return validated
 
@@ -245,21 +251,28 @@ def _validate_schema_version(
         )
 
 
-def _index_templates_by_strategy_id(
+def _index_templates_by_strategy_key(
     templates: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    indexed: dict[str, dict[str, Any]] = {}
+) -> dict[tuple[str, str], dict[str, Any]]:
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
     for index, template in enumerate(templates):
         strategy_id = template["strategy_id"]
         if not isinstance(strategy_id, str) or not strategy_id:
             raise ValueError(
                 f"kelly_strategy_templates.json template {index} has invalid strategy_id",
             )
-        if strategy_id in indexed:
+        strategy_version = template["strategy_version"]
+        if not isinstance(strategy_version, str) or not strategy_version:
             raise ValueError(
-                f"kelly_strategy_templates.json contains duplicate strategy_id {strategy_id!r}",
+                f"kelly_strategy_templates.json template {index} has invalid strategy_version",
             )
-        indexed[strategy_id] = template
+        strategy_key = (strategy_id, strategy_version)
+        if strategy_key in indexed:
+            raise ValueError(
+                "kelly_strategy_templates.json contains duplicate "
+                f"strategy template {strategy_key!r}",
+            )
+        indexed[strategy_key] = template
     return indexed
 
 
