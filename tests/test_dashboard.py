@@ -2524,3 +2524,47 @@ def test_load_dashboard_state_exposes_kelly_lab_and_holding_detail(
     assert qqq["kelly"]["experiments"] == []
     assert qqq["kelly"]["status"] == "missing_experiment"
     assert qqq["kelly"]["message"] == "该标的未参与任何已锁定的 Kelly 策略实验。"
+
+
+def test_load_dashboard_state_degrades_invalid_kelly_lab_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    latest = tmp_path / "data" / "latest"
+    latest.mkdir(parents=True, exist_ok=True)
+    (latest / "kelly_strategy_templates.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_strategy_templates.v0",
+                "templates": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (latest / "kelly_experiments.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_experiments.v1",
+                "experiments": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    assert len(state["holdings"]) == 1
+    assert state["kelly_lab"]["available"] is False
+    assert state["kelly_lab"]["template_count"] == 0
+    assert state["kelly_lab"]["experiment_count"] == 0
+    assert state["kelly_lab"]["templates"] == []
+    assert state["kelly_lab"]["experiments"] == []
+    assert "Kelly Lab" in state["kelly_lab"]["error"]
+    assert "kelly_strategy_templates.json schema_version" in state["kelly_lab"]["error"]
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["kelly"]["available"] is False
+    assert vixy["kelly"]["experiment_count"] == 0
+    assert vixy["kelly"]["status"] == "missing_experiment"

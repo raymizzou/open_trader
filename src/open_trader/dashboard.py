@@ -175,9 +175,8 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         data_dir=config.data_dir,
         markets=holding_markets,
     )
-    kelly_lab_state = load_kelly_lab_state(config.data_dir)
-    kelly_experiments_by_holding = index_kelly_experiments_by_market_symbol(
-        kelly_lab_state.experiments
+    kelly_lab, kelly_experiments_by_holding = _load_dashboard_kelly_lab(
+        config.data_dir
     )
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
@@ -226,7 +225,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         broker_positions=broker_positions,
         cash_details=cash_details,
         trade_actions=trade_actions,
-        kelly_lab=kelly_lab_state.to_dict(),
+        kelly_lab=kelly_lab,
     )
 
 
@@ -424,6 +423,31 @@ def _latest_t_signals_for_markets(
                 index_t_signals_by_market_symbol(load_t_signals_cache(path))
             )
     return records_by_key
+
+
+def _load_dashboard_kelly_lab(
+    data_dir: Path,
+) -> tuple[dict[str, Any], dict[tuple[str, str], list[dict[str, Any]]]]:
+    try:
+        kelly_lab_state = load_kelly_lab_state(data_dir)
+    except ValueError as exc:
+        return _unavailable_kelly_lab(str(exc)), {}
+
+    return (
+        kelly_lab_state.to_dict(),
+        index_kelly_experiments_by_market_symbol(kelly_lab_state.experiments),
+    )
+
+
+def _unavailable_kelly_lab(error: str) -> dict[str, Any]:
+    return {
+        "available": False,
+        "template_count": 0,
+        "experiment_count": 0,
+        "templates": [],
+        "experiments": [],
+        "error": f"Kelly Lab unavailable: {error}",
+    }
 
 
 def _markets_from_rows(rows: list[dict[str, str]]) -> set[str]:
