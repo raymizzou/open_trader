@@ -264,6 +264,7 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 }
 
 .primary-button,
+.secondary-button,
 .filter-button,
 .expand-button {
   border: 1px solid var(--line);
@@ -283,6 +284,13 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 .primary-button:disabled {
   cursor: wait;
   opacity: 0.72;
+}
+
+.secondary-button {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 700;
+  padding: 0 12px;
 }
 
 .summary-grid {
@@ -380,6 +388,10 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   grid-template-columns: minmax(0, 1fr);
 }
 
+.workspace-grid.kelly-lab-view .holdings-panel {
+  display: none;
+}
+
 .filter-panel,
 .info-panel {
   padding: 14px;
@@ -394,6 +406,39 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 
 .kelly-lab-heading {
   align-items: start;
+}
+
+.kelly-lab-heading-actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.kelly-lab-entry {
+  align-items: center;
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.kelly-lab-entry h2 {
+  font-size: 18px;
+  line-height: 1.25;
+  margin: 0;
+}
+
+.kelly-lab-entry p {
+  color: var(--muted);
+  margin: 6px 0 0;
+}
+
+.kelly-lab-entry-actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
 }
 
 .kelly-lab-empty {
@@ -471,6 +516,62 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   font-weight: 700;
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.kelly-strategy-rules,
+.kelly-derivation {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.kelly-strategy-rules {
+  background: var(--surface);
+}
+
+.kelly-strategy-rules h4,
+.kelly-derivation h4 {
+  font-size: 13px;
+  line-height: 1.3;
+  margin: 0;
+}
+
+.kelly-rule-grid,
+.kelly-derivation-grid {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.kelly-rule-grid div,
+.kelly-derivation-grid div {
+  min-width: 0;
+}
+
+.kelly-rule-grid span,
+.kelly-derivation-grid span {
+  color: var(--muted);
+  display: block;
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.kelly-rule-grid strong,
+.kelly-derivation-grid strong {
+  display: block;
+  font-size: 12px;
+  line-height: 1.35;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.kelly-derivation p {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 0;
 }
 
 .kelly-participant-row {

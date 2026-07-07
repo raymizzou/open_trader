@@ -7,6 +7,7 @@ const state = {
   quotePayload: null,
   marketFilter: "ALL",
   brokerFilter: "ALL",
+  workspaceView: "portfolio",
   selectedHoldingKey: "",
   selectedHoldingDetail: "decision",
   detailLanguage: "zh",
@@ -164,6 +165,15 @@ function bindElements() {
 
 function bindEvents() {
   elements["refresh-quotes"].addEventListener("click", refreshQuotes);
+  if (elements["kelly-lab-panel"]) {
+    elements["kelly-lab-panel"].addEventListener("click", (event) => {
+      const button = event.target.closest("[data-workspace-view]");
+      if (!button) {
+        return;
+      }
+      setWorkspaceView(button.dataset.workspaceView || "portfolio");
+    });
+  }
   elements["header-market-filters"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-market]");
     if (!button) {
@@ -332,10 +342,24 @@ function renderDashboard() {
   renderBrokerFilters();
   renderBrokerCards();
   renderSourceStatusListIntoHeader();
+  renderWorkspaceChrome();
   renderKellyLab();
   renderDashboardViews();
   renderTradeActions();
   renderConnectionPanel();
+}
+
+function setWorkspaceView(view) {
+  state.workspaceView = view === "kelly_lab" ? "kelly_lab" : "portfolio";
+  renderWorkspaceChrome();
+  renderKellyLab();
+}
+
+function renderWorkspaceChrome() {
+  if (!elements["workspace-grid"]) {
+    return;
+  }
+  elements["workspace-grid"].classList.toggle("kelly-lab-view", state.workspaceView === "kelly_lab");
 }
 
 function renderKellyLab() {
@@ -346,6 +370,10 @@ function renderKellyLab() {
 }
 
 function renderKellyLabPanel() {
+  if (state.workspaceView !== "kelly_lab") {
+    return renderKellyLabEntry();
+  }
+
   const dashboard = state.dashboard || {};
   const lab = dashboard.kelly_lab;
   if (state.dashboardError) {
@@ -355,7 +383,10 @@ function renderKellyLabPanel() {
           <h2>模拟盘策略实验室</h2>
           <p>看板数据加载失败。</p>
         </div>
-        <span class="status-pill status-failed">不可用</span>
+        <div class="kelly-lab-heading-actions">
+          <button class="secondary-button" type="button" data-workspace-view="portfolio">返回主页</button>
+          <span class="status-pill status-failed">不可用</span>
+        </div>
       </div>
       <div class="kelly-lab-empty">Kelly Lab 数据暂不可用。</div>
     `;
@@ -367,7 +398,10 @@ function renderKellyLabPanel() {
           <h2>模拟盘策略实验室</h2>
           <p>等待看板数据。</p>
         </div>
-        <span class="status-pill status-muted">加载中</span>
+        <div class="kelly-lab-heading-actions">
+          <button class="secondary-button" type="button" data-workspace-view="portfolio">返回主页</button>
+          <span class="status-pill status-muted">加载中</span>
+        </div>
       </div>
       <div class="kelly-lab-empty">Kelly Lab 数据尚未加载。</div>
     `;
@@ -382,7 +416,10 @@ function renderKellyLabPanel() {
           <h2>模拟盘策略实验室</h2>
           <p>${escapeHtml(formatPlain(message))}</p>
         </div>
-        <span class="status-pill status-muted">不可用</span>
+        <div class="kelly-lab-heading-actions">
+          <button class="secondary-button" type="button" data-workspace-view="portfolio">返回主页</button>
+          <span class="status-pill status-muted">不可用</span>
+        </div>
       </div>
       <div class="kelly-lab-empty">${escapeHtml(formatPlain(message))}</div>
     `;
@@ -399,10 +436,43 @@ function renderKellyLabPanel() {
         <h2>模拟盘策略实验室</h2>
         <p>只读实验结果。</p>
       </div>
-      <span class="count-pill">${escapeHtml(formatPlain(count))} 个实验</span>
+      <div class="kelly-lab-heading-actions">
+        <button class="secondary-button" type="button" data-workspace-view="portfolio">返回主页</button>
+        <span class="count-pill">${escapeHtml(formatPlain(count))} 个实验</span>
+      </div>
     </div>
     <div class="kelly-experiment-grid">
       ${cards}
+    </div>
+  `;
+}
+
+function renderKellyLabEntry() {
+  const dashboard = state.dashboard || {};
+  const lab = dashboard.kelly_lab;
+  const experiments = lab && typeof lab === "object" && Array.isArray(lab.experiments)
+    ? lab.experiments
+    : [];
+  const count = lab && typeof lab === "object" && hasValue(lab.experiment_count)
+    ? lab.experiment_count
+    : experiments.length;
+  const statusText = state.dashboardError
+    ? "不可用"
+    : !state.dashboard
+      ? "加载中"
+      : lab && typeof lab === "object" && lab.available
+        ? `${formatPlain(count)} 个实验`
+        : "未就绪";
+  return `
+    <div class="kelly-lab-entry">
+      <div>
+        <h2>凯利实验室</h2>
+        <p>模拟盘策略实验结果单独查看。</p>
+      </div>
+      <div class="kelly-lab-entry-actions">
+        <span class="count-pill">${escapeHtml(statusText)}</span>
+        <button class="primary-button" type="button" data-workspace-view="kelly_lab">凯利实验室</button>
+      </div>
     </div>
   `;
 }
@@ -418,6 +488,8 @@ function renderKellyExperimentCard(experiment) {
   const strategyId = formatPlain(template.strategy_id);
   const strategyName = formatPlain(template.strategy_name);
   const strategyVersion = hasValue(template.strategy_version) ? ` · ${formatPlain(template.strategy_version)}` : "";
+  const ruleDescriptions = kellyStrategyRuleDescriptions(template);
+  const entrySummary = firstPresent(ruleDescriptions.entry, template.entry_rule_description);
   const budget = hasValue(entry.experiment_budget)
     ? `${formatMoney(entry.experiment_budget, formatPlain(entry.budget_currency || "USD"))}`
     : "-";
@@ -458,7 +530,8 @@ function renderKellyExperimentCard(experiment) {
         </div>
         <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
       </header>
-      <p class="kelly-entry-rule">${escapeHtml(formatPlain(template.entry_rule_description))}</p>
+      <p class="kelly-entry-rule">${escapeHtml(formatPlain(entrySummary))}</p>
+      ${renderKellyStrategyRules(template, ruleDescriptions)}
       <dl class="kelly-stat-grid">
         ${metricRows.map(([label, value]) => `
           <div>
@@ -467,10 +540,176 @@ function renderKellyExperimentCard(experiment) {
           </div>
         `).join("")}
       </dl>
+      ${renderKellyParameterDerivation(stats)}
       <div class="kelly-participant-row" aria-label="实验参与标的">
         ${participantChips}
       </div>
     </article>
+  `;
+}
+
+function renderKellyStrategyRules(template, ruleDescriptions) {
+  const item = template && typeof template === "object" ? template : {};
+  const generated = ruleDescriptions && typeof ruleDescriptions === "object" ? ruleDescriptions : {};
+  const ruleRows = [
+    ["入场", firstPresent(generated.entry, item.entry_rule_description)],
+    ["止损", firstPresent(generated.stopLoss, item.stop_loss_rule_description)],
+    ["止盈", firstPresent(generated.takeProfit, item.take_profit_rule_description)],
+    ["移动止盈", firstPresent(generated.trailingStop, item.trailing_stop_rule_description)],
+    ["时间退出", firstPresent(generated.timeExit, item.time_exit_rule_description)],
+  ];
+  if (
+    !hasValue(generated.stopLoss)
+    && !hasValue(item.stop_loss_rule_description)
+    && !hasValue(generated.takeProfit)
+    && !hasValue(item.take_profit_rule_description)
+  ) {
+    ruleRows.push(["退出", item.exit_rule_description]);
+  }
+  const visibleRows = ruleRows.filter(([, value]) => hasValue(value));
+  if (!visibleRows.length) {
+    return "";
+  }
+
+  return `
+    <section class="kelly-strategy-rules" aria-label="Kelly 策略详情">
+      <h4>策略详情</h4>
+      <div class="kelly-rule-grid">
+        ${visibleRows.map(([label, value]) => `
+          <div>
+            <span>${escapeHtml(label)}</span>
+            <strong>${escapeHtml(formatPlain(value))}</strong>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function kellyStrategyRuleDescriptions(template) {
+  const rules = template && template.rules && typeof template.rules === "object"
+    ? template.rules
+    : {};
+  return {
+    entry: describeKellyRule(rules.entry, "entry"),
+    stopLoss: describeKellyRule(rules.stop_loss, "stop_loss"),
+    takeProfit: describeKellyRule(rules.take_profit, "take_profit"),
+    trailingStop: describeKellyRule(rules.trailing_stop, "trailing_stop"),
+    timeExit: describeKellyRule(rules.time_exit, "time_exit"),
+  };
+}
+
+function describeKellyRule(rule, slot) {
+  const item = rule && typeof rule === "object" ? rule : {};
+  const type = formatPlain(item.type);
+  if (slot === "entry" && type === "pullback_to_moving_average") {
+    const trend = item.trend_filter && typeof item.trend_filter === "object" ? item.trend_filter : {};
+    const direction = trend.direction === "up" ? "向上" : formatPlain(trend.direction);
+    const trendText = hasValue(trend.ma_days)
+      ? `，且 ${formatPlain(trend.ma_days)} 日均线斜率${direction}`
+      : "";
+    const tolerance = hasValue(item.tolerance_pct) ? ` ±${formatPlain(item.tolerance_pct)}% 内` : "附近";
+    return `价格回调到 ${formatPlain(item.ma_days)} 日均线${tolerance}${trendText}。`;
+  }
+  if (slot === "entry" && type === "volume_breakout_high") {
+    const volumeText = hasValue(item.volume_multiple)
+      ? `，成交量不低于 ${formatPlain(item.volume_multiple)} 倍均量`
+      : "";
+    return `价格放量突破近 ${formatPlain(item.lookback_days)} 个交易日高点${volumeText}。`;
+  }
+  if (slot === "stop_loss" && ["any_of", "min_of"].includes(type)) {
+    const children = Array.isArray(item.rules) ? item.rules : [];
+    const parts = children
+      .map((child) => describeKellyRuleFragment(child, "stop_loss"))
+      .filter(hasValue);
+    return parts.length ? `${parts.join(" 或")}。` : "";
+  }
+  if (slot === "take_profit" && type === "risk_multiple") {
+    return `价格达到入场价 + ${formatPlain(item.trigger_r)}R 时卖出 ${formatPlain(item.sell_pct)}%。`;
+  }
+  if (slot === "trailing_stop" && type === "close_below_moving_average") {
+    return `剩余仓位收盘跌破 ${formatPlain(item.ma_days)} 日均线时退出。`;
+  }
+  if (slot === "trailing_stop" && type === "close_below_recent_low") {
+    return `剩余仓位收盘跌破最近 ${formatPlain(item.lookback_days)} 日最低价时退出。`;
+  }
+  if (slot === "time_exit" && type === "max_holding_days") {
+    if (item.exit_if === "no_take_profit_or_stop_loss") {
+      return `持有满 ${formatPlain(item.days)} 个交易日仍未触发止盈或止损则退出。`;
+    }
+    if (item.exit_if === "minimum_unrealized_r_not_reached") {
+      return `持有满 ${formatPlain(item.days)} 个交易日仍未达到 ${formatPlain(item.min_unrealized_r)}R 浮盈则退出。`;
+    }
+    return `持有满 ${formatPlain(item.days)} 个交易日则退出。`;
+  }
+  return "";
+}
+
+function describeKellyRuleFragment(rule, slot) {
+  const item = rule && typeof rule === "object" ? rule : {};
+  const type = formatPlain(item.type);
+  if (slot === "stop_loss" && type === "pct_below_moving_average") {
+    return `跌破 ${formatPlain(item.ma_days)} 日均线 ${formatPlain(item.pct)}%`;
+  }
+  if (slot === "stop_loss" && type === "recent_swing_low_break") {
+    return "跌破最近波段低点";
+  }
+  if (slot === "stop_loss" && type === "pct_below_reference_price") {
+    return `跌回${formatPlain(item.reference || "参考价")}下方 ${formatPlain(item.pct)}%`;
+  }
+  if (slot === "stop_loss" && type === "atr_below_entry") {
+    return `跌破入场价 - ${formatPlain(item.atr_multiple)} ATR`;
+  }
+  return "";
+}
+
+function renderKellyParameterDerivation(stats) {
+  const item = stats && typeof stats === "object" ? stats : {};
+  const hasDerivation = [
+    item.raw_win_rate,
+    item.adjusted_win_rate,
+    item.payoff_ratio,
+    item.full_kelly_pct,
+    item.fractional_kelly_pct,
+    item.suggested_position_pct,
+    item.sample_adjustment,
+    item.last_recomputed_at,
+  ].some(hasValue);
+  if (!hasDerivation) {
+    return "";
+  }
+
+  const winLossCount = hasValue(item.winning_samples) || hasValue(item.losing_samples)
+    ? `${formatPlain(item.winning_samples)} 赢 / ${formatPlain(item.losing_samples)} 亏`
+    : "";
+  const payoffDetail = [item.avg_net_win_pct, item.avg_net_loss_pct]
+    .filter(hasValue)
+    .map(formatPlain)
+    .join(" / ");
+  const rows = [
+    ["原始胜率", [item.raw_win_rate, winLossCount].filter(hasValue).map(formatPlain).join(" · ")],
+    ["修正胜率", [item.adjusted_win_rate, item.sample_adjustment].filter(hasValue).map(formatPlain).join(" · ")],
+    ["盈亏比 b", [item.payoff_ratio, payoffDetail].filter(hasValue).map(formatPlain).join(" · ")],
+    ["Full Kelly", item.full_kelly_pct],
+    ["保守 Kelly", item.fractional_kelly_pct],
+    ["建议仓位", item.suggested_position_pct],
+    ["最近样本", item.last_sample_closed_at],
+    ["最近更新", item.last_recomputed_at],
+  ].filter(([, value]) => hasValue(value));
+
+  return `
+    <section class="kelly-derivation" aria-label="Kelly 参数推导">
+      <h4>参数推导</h4>
+      <div class="kelly-derivation-grid">
+        ${rows.map(([label, value]) => `
+          <div>
+            <span>${escapeHtml(label)}</span>
+            <strong>${escapeHtml(formatPlain(value))}</strong>
+          </div>
+        `).join("")}
+      </div>
+      <p>f* = p - (1 - p) / b</p>
+    </section>
   `;
 }
 

@@ -543,22 +543,103 @@ state.dashboard = {
         strategy_id: "trend_pullback_20d",
         strategy_name: "趋势回调 20D",
         strategy_version: "v1",
-        entry_rule_description: "价格回调到 20 日均线附近。",
-        exit_rule_description: "目标价、止损或 20 个交易日到期。"
+        entry_rule_description: "结构化规则生成入场。",
+        exit_rule_description: "目标价、止损或 20 个交易日到期。",
+        rules: {
+          entry: {
+            type: "pullback_to_moving_average",
+            ma_days: 20,
+            tolerance_pct: 1,
+            trend_filter: {type: "moving_average_slope", ma_days: 50, direction: "up"}
+          },
+          stop_loss: {
+            type: "any_of",
+            rules: [
+              {type: "pct_below_moving_average", ma_days: 20, pct: 3},
+              {type: "recent_swing_low_break", lookback_days: 20}
+            ]
+          },
+          take_profit: {type: "risk_multiple", trigger_r: 2, sell_pct: 50},
+          trailing_stop: {type: "close_below_moving_average", ma_days: 10, apply_to_remaining_position: true},
+          time_exit: {type: "max_holding_days", days: 20, exit_if: "no_take_profit_or_stop_loss"}
+        }
       },
       participants: [
         {market: "US", symbol: "AAPL", name: "Apple Inc.", source: "holding+watchlist", per_symbol_budget: "25000", budget_currency: "USD"}
       ],
-      stats: {completed_samples: 0, open_samples: 0, observed_win_rate: "", sample_stage: "insufficient"}
+      stats: {
+        completed_samples: 18,
+        open_samples: 4,
+        observed_win_rate: "56%",
+        sample_stage: "insufficient",
+        winning_samples: 10,
+        losing_samples: 8,
+        raw_win_rate: "56%",
+        adjusted_win_rate: "52%",
+        avg_net_win_pct: "4.8%",
+        avg_net_loss_pct: "2.9%",
+        payoff_ratio: "1.66",
+        full_kelly_pct: "23.1%",
+        fractional_kelly_pct: "5.8%",
+        suggested_position_pct: "4%",
+        sample_adjustment: "样本少于 200，向 50% 收缩",
+        last_sample_closed_at: "2026-07-07 15:30",
+        last_recomputed_at: "2026-07-07 15:31"
+      }
     }]
   }
 };
+state.workspaceView = "portfolio";
+const entryHtml = renderKellyLabPanel();
+if (!entryHtml.includes("凯利实验室") || !entryHtml.includes("data-workspace-view=\\\"kelly_lab\\\"")) {
+  throw new Error("kelly lab entry missing: " + entryHtml);
+}
+if (entryHtml.includes("趋势回调 20D 第一批") || entryHtml.includes("US.AAPL")) {
+  throw new Error("kelly lab entry leaked experiment details: " + entryHtml);
+}
+state.workspaceView = "kelly_lab";
 const html = renderKellyLabPanel();
 if (!html.includes("模拟盘策略实验室") || !html.includes("趋势回调 20D 第一批")) {
   throw new Error("kelly lab panel missing experiment identity: " + html);
 }
 if (!html.includes("样本不足") || !html.includes("AAPL")) {
   throw new Error("kelly lab panel missing sample stage or participant: " + html);
+}
+for (const required of [
+  "策略详情",
+  "入场",
+  "价格回调到 20 日均线 ±1% 内，且 50 日均线斜率向上。",
+  "止损",
+  "跌破 20 日均线 3% 或跌破最近波段低点。",
+  "止盈",
+  "价格达到入场价 + 2R 时卖出 50%。",
+  "移动止盈",
+  "剩余仓位收盘跌破 10 日均线时退出。",
+  "时间退出",
+  "持有满 20 个交易日仍未触发止盈或止损则退出。",
+  "参数推导",
+  "原始胜率",
+  "10 赢 / 8 亏",
+  "修正胜率",
+  "52%",
+  "盈亏比 b",
+  "1.66",
+  "Full Kelly",
+  "23.1%",
+  "建议仓位",
+  "4%",
+  "样本少于 200，向 50% 收缩",
+  "2026-07-07 15:31"
+]) {
+  if (!html.includes(required)) {
+    throw new Error("kelly derivation missing " + required + ": " + html);
+  }
+}
+if (html.includes("第一目标") || html.includes("延续")) {
+  throw new Error("kelly strategy rules contain vague terms: " + html);
+}
+if (!html.includes("data-workspace-view=\\\"portfolio\\\"")) {
+  throw new Error("kelly lab panel missing return button: " + html);
 }
 """
     )
