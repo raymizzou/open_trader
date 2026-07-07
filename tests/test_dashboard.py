@@ -2422,3 +2422,105 @@ def test_load_dashboard_state_blanks_multi_broker_portfolio_fallback(
     assert summaries["tiger"]["cash_like_value_hkd"] == ""
     assert summaries["tiger"]["portfolio_value_hkd"] == ""
     assert summaries["tiger"]["holding_count"] == 0
+
+
+def test_load_dashboard_state_exposes_kelly_lab_and_holding_detail(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    rows = portfolio_rows()
+    rows.append(
+        {
+            **rows[0],
+            "symbol": "QQQ",
+            "name": "Invesco QQQ Trust",
+            "analysis_symbol": "QQQ",
+        }
+    )
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+    latest = tmp_path / "data" / "latest"
+    latest.mkdir(parents=True, exist_ok=True)
+    (latest / "kelly_strategy_templates.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_strategy_templates.v1",
+                "templates": [
+                    {
+                        "strategy_id": "trend_pullback_20d",
+                        "strategy_name": "趋势回调 20D",
+                        "strategy_version": "v1",
+                        "entry_rule_description": "价格回调到 20 日均线附近。",
+                        "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+                        "max_holding_days": 20,
+                        "order_type": "limit",
+                        "market_session": "regular",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (latest / "kelly_experiments.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_experiments.v1",
+                "experiments": [
+                    {
+                        "experiment_id": "trend_pullback_20d_exp_20260707",
+                        "experiment_name": "趋势回调 20D 第一批",
+                        "strategy_id": "trend_pullback_20d",
+                        "strategy_version": "v1",
+                        "start_date": "2026-07-07",
+                        "paper_account": "futu_simulate",
+                        "experiment_budget": "100000",
+                        "budget_currency": "USD",
+                        "capital_utilization_pct": "50",
+                        "allocation_mode": "equal_weight",
+                        "max_open_position_per_symbol": 1,
+                        "status": "running",
+                        "locked": True,
+                        "participants": [
+                            {
+                                "market": "US",
+                                "symbol": "VIXY",
+                                "name": "ProShares VIX",
+                                "source": "holding+watchlist",
+                                "locked": True,
+                                "per_symbol_budget": "25000",
+                                "budget_currency": "USD",
+                            }
+                        ],
+                        "stats": {
+                            "completed_samples": 0,
+                            "open_samples": 0,
+                            "observed_win_rate": "",
+                            "sample_stage": "insufficient",
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    assert state["kelly_lab"]["available"] is True
+    assert state["kelly_lab"]["experiment_count"] == 1
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["kelly"]["available"] is True
+    assert vixy["kelly"]["experiment_count"] == 1
+    assert vixy["kelly"]["status"] == "available"
+    assert vixy["kelly"]["message"] == "该标的已关联 Kelly 策略实验。"
+    assert (
+        vixy["kelly"]["experiments"][0]["experiment_id"]
+        == "trend_pullback_20d_exp_20260707"
+    )
+    qqq = next(row for row in state["holdings"] if row["symbol"] == "QQQ")
+    assert qqq["kelly"]["available"] is False
+    assert qqq["kelly"]["experiment_count"] == 0
+    assert qqq["kelly"]["experiments"] == []
+    assert qqq["kelly"]["status"] == "missing_experiment"
+    assert qqq["kelly"]["message"] == "该标的未参与任何已锁定的 Kelly 策略实验。"

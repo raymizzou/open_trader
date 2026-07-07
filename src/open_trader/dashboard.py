@@ -20,6 +20,10 @@ from .futu_skill_facts import (
     index_futu_skill_facts_by_market_symbol,
     load_futu_skill_facts_cache,
 )
+from .kelly_lab import (
+    index_kelly_experiments_by_market_symbol,
+    load_kelly_lab_state,
+)
 from .research_chat import load_research_view_for_holding
 from .t_signal_store import (
     index_t_signals_by_market_symbol,
@@ -85,6 +89,7 @@ class DashboardState:
     broker_positions: list[dict[str, str]]
     cash_details: list[dict[str, str]]
     trade_actions: list[dict[str, str]]
+    kelly_lab: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +109,7 @@ class DashboardState:
             "broker_positions": self.broker_positions,
             "cash_details": self.cash_details,
             "trade_actions": self.trade_actions,
+            "kelly_lab": self.kelly_lab,
         }
 
 
@@ -169,6 +175,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         data_dir=config.data_dir,
         markets=holding_markets,
     )
+    kelly_lab_state = load_kelly_lab_state(config.data_dir)
+    kelly_experiments_by_holding = index_kelly_experiments_by_market_symbol(
+        kelly_lab_state.experiments
+    )
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
@@ -191,6 +201,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             futu_skill_facts_by_holding,
             tradingagents_summary_by_holding,
             t_signals_by_holding,
+            kelly_experiments_by_holding,
         )
         for row in holding_rows
     ]
@@ -215,6 +226,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         broker_positions=broker_positions,
         cash_details=cash_details,
         trade_actions=trade_actions,
+        kelly_lab=kelly_lab_state.to_dict(),
     )
 
 
@@ -491,6 +503,7 @@ def _merge_holding(
     futu_skill_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
     tradingagents_summary_by_holding: dict[tuple[str, str], dict[str, Any]],
     t_signals_by_holding: dict[tuple[str, str], dict[str, Any]],
+    kelly_experiments_by_holding: dict[tuple[str, str], list[dict[str, Any]]],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -537,6 +550,9 @@ def _merge_holding(
     )
     holding["t_signal"] = _t_signal_detail(
         t_signals_by_holding.get(key) if key is not None else None,
+    )
+    holding["kelly"] = _kelly_detail(
+        kelly_experiments_by_holding.get(key, []) if key is not None else [],
     )
     holding["research_view"] = (
         load_research_view_for_holding(
@@ -588,6 +604,24 @@ def _t_signal_detail(record: dict[str, Any] | None) -> dict[str, Any]:
     if record is None:
         return _unavailable_detail()
     return {"available": True, **record}
+
+
+def _kelly_detail(experiments: list[dict[str, Any]]) -> dict[str, Any]:
+    if experiments:
+        return {
+            "available": True,
+            "experiment_count": len(experiments),
+            "experiments": experiments,
+            "status": "available",
+            "message": "该标的已关联 Kelly 策略实验。",
+        }
+    return {
+        "available": False,
+        "experiment_count": 0,
+        "experiments": [],
+        "status": "missing_experiment",
+        "message": "该标的未参与任何已锁定的 Kelly 策略实验。",
+    }
 
 
 def _agent_report_detail(row: dict[str, str] | None) -> dict[str, Any]:
