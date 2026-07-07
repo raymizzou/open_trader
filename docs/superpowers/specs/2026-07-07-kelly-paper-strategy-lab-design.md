@@ -340,7 +340,11 @@ page.
 
 ## Testing
 
-Unit tests should cover:
+Every implementation phase must ship with automated tests and a Playwright
+verification path. A phase is not complete if only backend tests pass and the
+dashboard path is unverified.
+
+Unit tests must cover the backend behavior introduced in that phase:
 
 - experiment lock validation
 - capital allocation calculation
@@ -350,7 +354,7 @@ Unit tests should cover:
 - Kelly stats thresholds
 - dashboard detail mode routing for `kelly`
 
-Integration-style tests should use fake Futu clients for:
+Integration-style tests must use fake Futu clients for:
 
 - simulated account connection
 - order placement
@@ -358,7 +362,29 @@ Integration-style tests should use fake Futu clients for:
 - fill query
 - rejected order handling
 
-No test should require a live Futu OpenD connection.
+No automated test should require a live Futu OpenD connection.
+
+Playwright validation is required for each UI-affecting phase:
+
+- Phase 1: experiment page renders strategy templates, locked experiments, and
+  participant lists from local fixtures; holdings table shows the `凯利` button;
+  clicking it opens the inline Kelly detail row.
+- Phase 2: experiment page shows simulated order sync status, including success
+  and failure fixture states.
+- Phase 3: manual simulated-order action path shows intent creation, pending
+  order state, and synced order id using fake server data.
+- Phase 4: runner output fixtures show active/open/completed samples in the
+  experiment page and Kelly holding detail.
+- Phase 5: Kelly stats render sample stages, observed win rate, average win,
+  average loss, conservative win rate, full Kelly, and fractional Kelly only
+  when thresholds allow them.
+
+Each phase plan must list exact verification commands, including:
+
+- focused `pytest` commands for the new backend tests
+- the dashboard fixture/server command used for UI validation
+- the focused Playwright command or script
+- expected pass/fail evidence
 
 ## Non-Goals
 
