@@ -1,0 +1,279 @@
+from __future__ import annotations
+
+import copy
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+TEMPLATES_SCHEMA_VERSION = "open_trader.kelly_strategy_templates.v1"
+EXPERIMENTS_SCHEMA_VERSION = "open_trader.kelly_experiments.v1"
+
+ALLOWED_EXPERIMENT_STATUSES = {"draft", "running", "paused", "completed", "failed"}
+
+REQUIRED_TEMPLATE_FIELDS = {
+    "strategy_id",
+    "strategy_name",
+    "strategy_version",
+    "entry_rule_description",
+    "exit_rule_description",
+    "max_holding_days",
+    "order_type",
+    "market_session",
+}
+
+REQUIRED_EXPERIMENT_FIELDS = {
+    "experiment_id",
+    "experiment_name",
+    "strategy_id",
+    "strategy_version",
+    "start_date",
+    "paper_account",
+    "experiment_budget",
+    "budget_currency",
+    "capital_utilization_pct",
+    "allocation_mode",
+    "max_open_position_per_symbol",
+    "status",
+    "locked",
+    "participants",
+    "stats",
+}
+
+REQUIRED_PARTICIPANT_FIELDS = {
+    "market",
+    "symbol",
+    "name",
+    "source",
+    "locked",
+    "per_symbol_budget",
+    "budget_currency",
+}
+
+
+@dataclass(frozen=True)
+class KellyLabState:
+    available: bool
+    templates: list[dict[str, Any]] = field(default_factory=list)
+    experiments: list[dict[str, Any]] = field(default_factory=list)
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "template_count": len(self.templates),
+            "experiment_count": len(self.experiments),
+            "templates": self.templates,
+            "experiments": self.experiments,
+            "error": self.error,
+        }
+
+
+def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
+    latest_dir = data_dir / "latest"
+    templates_path = latest_dir / "kelly_strategy_templates.json"
+    experiments_path = latest_dir / "kelly_experiments.json"
+
+    missing_path = _first_missing_path(templates_path, experiments_path)
+    if missing_path is not None:
+        return KellyLabState(
+            available=False,
+            error=f"{missing_path.name} not found at {missing_path}",
+        )
+
+    templates_payload = _load_json_object(templates_path)
+    experiments_payload = _load_json_object(experiments_path)
+
+    templates = _validate_templates_payload(templates_payload, templates_path)
+    templates_by_id = _index_templates_by_strategy_id(templates)
+    experiments = _validate_experiments_payload(
+        experiments_payload,
+        experiments_path,
+        templates_by_id,
+    )
+
+    return KellyLabState(
+        available=True,
+        templates=templates,
+        experiments=experiments,
+    )
+
+
+def index_kelly_experiments_by_market_symbol(
+    experiments: list[dict[str, Any]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    indexed: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for experiment in experiments:
+        participants = experiment.get("participants")
+        if not isinstance(participants, list):
+            continue
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            market = participant.get("market")
+            symbol = participant.get("symbol")
+            if not isinstance(market, str) or not isinstance(symbol, str):
+                continue
+            key = (market.upper(), symbol.upper())
+            indexed.setdefault(key, []).append(experiment)
+    return indexed
+
+
+def _first_missing_path(*paths: Path) -> Path | None:
+    for path in paths:
+        if not path.exists():
+            return path
+    return None
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+    return payload
+
+
+def _validate_templates_payload(
+    payload: dict[str, Any],
+    path: Path,
+) -> list[dict[str, Any]]:
+    _validate_schema_version(
+        payload,
+        path,
+        expected_schema_version=TEMPLATES_SCHEMA_VERSION,
+    )
+    templates = payload.get("templates")
+    if not isinstance(templates, list):
+        raise ValueError(f"{path.name} must contain a templates list")
+
+    validated: list[dict[str, Any]] = []
+    for index, template in enumerate(templates):
+        if not isinstance(template, dict):
+            raise ValueError(f"{path.name} template {index} must be an object")
+        _require_fields(
+            template,
+            REQUIRED_TEMPLATE_FIELDS,
+            f"{path.name} template {index}",
+        )
+        validated.append(copy.deepcopy(template))
+    return validated
+
+
+def _validate_experiments_payload(
+    payload: dict[str, Any],
+    path: Path,
+    templates_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    _validate_schema_version(
+        payload,
+        path,
+        expected_schema_version=EXPERIMENTS_SCHEMA_VERSION,
+    )
+    experiments = payload.get("experiments")
+    if not isinstance(experiments, list):
+        raise ValueError(f"{path.name} must contain an experiments list")
+
+    validated: list[dict[str, Any]] = []
+    for index, experiment in enumerate(experiments):
+        context = f"{path.name} experiment {index}"
+        if not isinstance(experiment, dict):
+            raise ValueError(f"{context} must be an object")
+        _require_fields(experiment, REQUIRED_EXPERIMENT_FIELDS, context)
+
+        status = experiment["status"]
+        if not isinstance(status, str) or status not in ALLOWED_EXPERIMENT_STATUSES:
+            raise ValueError(f"{context} has invalid status {status!r}")
+        if status != "draft" and experiment["locked"] is not True:
+            raise ValueError(f"{context} must be locked when status is {status!r}")
+
+        strategy_id = experiment["strategy_id"]
+        if not isinstance(strategy_id, str) or strategy_id not in templates_by_id:
+            raise ValueError(f"{context} references unknown strategy_id {strategy_id!r}")
+
+        participants = experiment["participants"]
+        if not isinstance(participants, list):
+            raise ValueError(f"{context} participants must be a list")
+
+        normalized_experiment = copy.deepcopy(experiment)
+        normalized_experiment["participants"] = _validate_participants(
+            participants,
+            context,
+        )
+        normalized_experiment["template"] = copy.deepcopy(templates_by_id[strategy_id])
+        validated.append(normalized_experiment)
+    return validated
+
+
+def _validate_participants(
+    participants: list[Any],
+    context: str,
+) -> list[dict[str, Any]]:
+    validated: list[dict[str, Any]] = []
+    for index, participant in enumerate(participants):
+        participant_context = f"{context} participant {index}"
+        if not isinstance(participant, dict):
+            raise ValueError(f"{participant_context} must be an object")
+        _require_fields(participant, REQUIRED_PARTICIPANT_FIELDS, participant_context)
+        if participant["locked"] is not True:
+            raise ValueError(f"{participant_context} must be locked")
+
+        normalized = copy.deepcopy(participant)
+        normalized["market"] = _uppercase_required_string(
+            normalized["market"],
+            f"{participant_context} market",
+        )
+        normalized["symbol"] = _uppercase_required_string(
+            normalized["symbol"],
+            f"{participant_context} symbol",
+        )
+        validated.append(normalized)
+    return validated
+
+
+def _validate_schema_version(
+    payload: dict[str, Any],
+    path: Path,
+    *,
+    expected_schema_version: str,
+) -> None:
+    schema_version = payload.get("schema_version")
+    if schema_version != expected_schema_version:
+        raise ValueError(
+            f"{path.name} schema_version must be {expected_schema_version!r}",
+        )
+
+
+def _index_templates_by_strategy_id(
+    templates: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for index, template in enumerate(templates):
+        strategy_id = template["strategy_id"]
+        if not isinstance(strategy_id, str) or not strategy_id:
+            raise ValueError(
+                f"kelly_strategy_templates.json template {index} has invalid strategy_id",
+            )
+        if strategy_id in indexed:
+            raise ValueError(
+                f"kelly_strategy_templates.json contains duplicate strategy_id {strategy_id!r}",
+            )
+        indexed[strategy_id] = template
+    return indexed
+
+
+def _require_fields(
+    payload: dict[str, Any],
+    required_fields: set[str],
+    context: str,
+) -> None:
+    missing = sorted(required_fields - payload.keys())
+    if missing:
+        raise ValueError(f"{context} missing required fields: {', '.join(missing)}")
+
+
+def _uppercase_required_string(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{context} must be a non-empty string")
+    return value.upper()
