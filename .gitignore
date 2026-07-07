@@ -10,3 +10,4 @@ logs/
 __pycache__/
 *.py[cod]
 config/daily_premarket.env
+.superpowers/
