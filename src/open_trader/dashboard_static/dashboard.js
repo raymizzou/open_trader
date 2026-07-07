@@ -1193,7 +1193,7 @@ function klineDecisionFactsPlugin(holding) {
   }
   return {
     ...plugin,
-    bodyHtml: `${plugin.status === "缺失" ? "" : renderBollingerSection(timeframes)}${plugin.bodyHtml}`,
+    bodyHtml: `${timeframes.length ? renderBollingerSection(timeframes) : ""}${plugin.bodyHtml}`,
   };
 }
 

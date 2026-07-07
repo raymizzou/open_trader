@@ -2255,6 +2255,82 @@ def test_daily_runner_promotes_decision_facts(tmp_path: Path) -> None:
     assert status["artifacts"]["latest_decision_facts"] == str(latest_decision_facts)
 
 
+def test_promote_latest_set_skips_non_blocking_fact_placeholders(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    run_dir = data_dir / "runs/2026-07-06/US"
+    latest_dir = data_dir / "latest/US"
+    run_dir.mkdir(parents=True)
+    latest_dir.mkdir(parents=True)
+    advice_path = run_dir / "trading_advice.csv"
+    actions_path = run_dir / "premarket_actions.csv"
+    plan_path = run_dir / "trading_plan.csv"
+    trade_actions_path = run_dir / "trade_actions.csv"
+    technical_facts_path = run_dir / "technical_facts.json"
+    decision_facts_path = run_dir / "decision_facts.json"
+    for path, text in (
+        (advice_path, "new advice\n"),
+        (actions_path, "new actions\n"),
+        (plan_path, "new plan\n"),
+        (trade_actions_path, "new trade actions\n"),
+    ):
+        path.write_text(text, encoding="utf-8")
+    technical_facts_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.technical_facts_cache.v1",
+                "status": "skipped",
+                "reason": "daily_premarket_non_blocking",
+                "records": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    decision_facts_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.decision_facts.v1",
+                "status": "skipped",
+                "reason": "daily_premarket_non_blocking",
+                "records": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    latest_technical_facts = latest_dir / "technical_facts.json"
+    latest_decision_facts = latest_dir / "decision_facts.json"
+    latest_technical_facts.write_text(
+        '{"run_date":"2026-07-05","records":[{"symbol":"MSFT"}]}\n',
+        encoding="utf-8",
+    )
+    latest_decision_facts.write_text(
+        '{"run_date":"2026-07-05","records":[{"symbol":"MSFT"}]}\n',
+        encoding="utf-8",
+    )
+
+    daily_premarket._promote_latest_set(
+        advice_path=advice_path,
+        actions_path=actions_path,
+        plan_path=plan_path,
+        trade_actions_path=trade_actions_path,
+        technical_facts_path=technical_facts_path,
+        decision_facts_path=decision_facts_path,
+        data_dir=data_dir,
+        market="US",
+    )
+
+    assert (latest_dir / "trading_advice.csv").read_text(encoding="utf-8") == (
+        "new advice\n"
+    )
+    assert latest_technical_facts.read_text(encoding="utf-8") == (
+        '{"run_date":"2026-07-05","records":[{"symbol":"MSFT"}]}\n'
+    )
+    assert latest_decision_facts.read_text(encoding="utf-8") == (
+        '{"run_date":"2026-07-05","records":[{"symbol":"MSFT"}]}\n'
+    )
+
+
 def test_daily_runner_does_not_promote_latest_when_plan_build_fails(
     tmp_path: Path,
 ) -> None:

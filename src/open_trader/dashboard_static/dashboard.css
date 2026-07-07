@@ -1009,12 +1009,14 @@ tbody tr.active-row {
 }
 
 .decision-plugin-grid {
+  align-items: start;
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .decision-plugin-card {
+  align-content: start;
   border: 1px solid var(--line);
   border-radius: 8px;
   display: grid;

@@ -364,6 +364,10 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".decision-dashboard" in css
     assert ".decision-card.primary" in css
     assert ".decision-metric-strip" in css
+    decision_plugin_grid_css = css.split(".decision-plugin-grid {", 1)[1].split("}", 1)[0]
+    assert "align-items: start;" in decision_plugin_grid_css
+    decision_plugin_card_css = css.split(".decision-plugin-card {", 1)[1].split("}", 1)[0]
+    assert "align-content: start;" in decision_plugin_card_css
     assert ".decision-fact-grid" in css
     assert ".technical-fact-grid" in css
     assert ".analyst-dialogue" in css
@@ -1788,7 +1792,7 @@ console.log(html);
     assert status not in html
 
 
-def test_dashboard_renders_missing_bollinger_without_undefined() -> None:
+def test_dashboard_omits_bollinger_when_technical_facts_unusable() -> None:
     script = r'''
 const holding = {
   market: "US",
@@ -1809,9 +1813,11 @@ console.log(html);
 '''
     html = run_dashboard_js(script)
 
-    assert "布林带数据缺失" in html
+    assert "长期看涨，短期动能减弱" in html
+    assert "technical-bollinger-card" not in html
+    assert "布林带数据缺失" not in html
     assert "undefined" not in html
-    assert "参考轨道" in html
+    assert "参考轨道" not in html
     assert "缺失" in html
 
 

@@ -1415,14 +1415,18 @@ def _promote_latest_set(
             latest_path=latest_dir / "trade_actions.csv",
         ),
     ]
-    if technical_facts_path is not None:
+    if technical_facts_path is not None and _should_promote_latest_fact(
+        technical_facts_path
+    ):
         promotions.append(
             _LatestPromotion(
                 source_path=technical_facts_path,
                 latest_path=latest_dir / "technical_facts.json",
             )
         )
-    if decision_facts_path is not None:
+    if decision_facts_path is not None and _should_promote_latest_fact(
+        decision_facts_path
+    ):
         promotions.append(
             _LatestPromotion(
                 source_path=decision_facts_path,
@@ -1466,6 +1470,19 @@ def _promote_latest_set(
         for promotion in promotions:
             if promotion.temp_path is not None and promotion.temp_path.exists():
                 _best_effort_unlink(promotion.temp_path)
+
+
+def _should_promote_latest_fact(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    return not (
+        payload.get("status") == "skipped"
+        and payload.get("reason") == "daily_premarket_non_blocking"
+    )
 
 
 def _copy_latest_temp(*, source_path: Path, latest_path: Path) -> Path:
