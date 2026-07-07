@@ -969,7 +969,7 @@ git commit -m "feat: render kelly lab experiment panel"
 
 - [ ] **Step 1: Write failing JS detail-mode test**
 
-Add this assertion block to the existing `test_dashboard_runtime_helpers_render_expected_content()` script in `tests/test_dashboard_web.py`, near the current `做T` detail assertions:
+Add this assertion block to the existing `test_dashboard_header_filters_and_cash_view_helpers()` script in `tests/test_dashboard_web.py`, near the current `做T` detail assertions:
 
 ```javascript
 state.selectedHoldingDetail = "kelly";
@@ -1011,7 +1011,7 @@ if (!elements["holdings-body"].innerHTML.includes("交易决策") || !elements["
 Run:
 
 ```bash
-.venv/bin/python -m pytest tests/test_dashboard_web.py::test_dashboard_runtime_helpers_render_expected_content -q
+.venv/bin/python -m pytest tests/test_dashboard_web.py::test_dashboard_header_filters_and_cash_view_helpers -q
 ```
 
 Expected: FAIL because `normalizeHoldingDetailMode()` rejects `kelly` and no Kelly button/detail exists.
@@ -1131,7 +1131,7 @@ Append to `src/open_trader/dashboard_static/dashboard.css`:
 Run:
 
 ```bash
-.venv/bin/python -m pytest tests/test_dashboard_web.py::test_dashboard_runtime_helpers_render_expected_content -q
+.venv/bin/python -m pytest tests/test_dashboard_web.py::test_dashboard_header_filters_and_cash_view_helpers -q
 ```
 
 Expected: PASS.
@@ -1503,7 +1503,7 @@ git commit -m "test: add kelly lab playwright coverage"
 Run:
 
 ```bash
-.venv/bin/python -m pytest tests/test_kelly_lab.py tests/test_dashboard.py::test_load_dashboard_state_exposes_kelly_lab_and_holding_detail tests/test_dashboard_web.py::test_dashboard_static_contains_kelly_lab_panel_mount tests/test_dashboard_web.py::test_dashboard_js_renders_kelly_lab_panel tests/test_dashboard_web.py::test_dashboard_runtime_helpers_render_expected_content -q
+.venv/bin/python -m pytest tests/test_kelly_lab.py tests/test_dashboard.py::test_load_dashboard_state_exposes_kelly_lab_and_holding_detail tests/test_dashboard.py::test_load_dashboard_state_degrades_invalid_kelly_lab_artifacts tests/test_dashboard_web.py::test_dashboard_static_contains_kelly_lab_panel_mount tests/test_dashboard_web.py::test_dashboard_js_renders_kelly_lab_panel tests/test_dashboard_web.py::test_dashboard_header_filters_and_cash_view_helpers -q
 ```
 
 Expected: all selected tests PASS.
