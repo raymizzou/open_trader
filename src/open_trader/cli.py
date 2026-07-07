@@ -32,6 +32,7 @@ from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
 from .market_scope import parse_market_scope
+from .notifications import NullNotifier
 from .parsers.phillips import PhillipsStatementParser
 from .pipeline import run_import, validate_month
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
@@ -1021,7 +1022,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "watch-t":
         try:
-            config = load_env_config(args.config, dry_run=False)
             while True:
                 result = run_t_signal_watch_once(
                     portfolio_path=args.portfolio,
@@ -1034,7 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
                         port=args.port,
                     ),
                     interpreter=TSignalInterpreter(),
-                    notifier=build_notifier(config),
+                    notifier=NullNotifier(),
                 )
                 print(f"run_date: {result.run_date}")
                 print(f"market: {result.market}")

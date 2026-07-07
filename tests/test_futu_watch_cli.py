@@ -14,6 +14,7 @@ from open_trader.futu_universe import (
 )
 from open_trader.futu_watch import FutuWatchResult
 from open_trader.futu_watch import QuoteSnapshot
+from open_trader.notifications import NullNotifier
 from open_trader.t_signal_runner import TSignalWatchResult
 
 
@@ -157,14 +158,11 @@ def test_watch_t_main_wires_runner(
     class FakeInterpreter:
         pass
 
-    class FakeNotifier:
-        pass
-
     def fake_run_t_signal_watch_once(**kwargs: object) -> TSignalWatchResult:
         captured.update(kwargs)
         assert isinstance(kwargs["market_data_client"], FakeMarketDataClient)
         assert isinstance(kwargs["interpreter"], FakeInterpreter)
-        assert isinstance(kwargs["notifier"], FakeNotifier)
+        assert isinstance(kwargs["notifier"], NullNotifier)
         data_dir = kwargs["data_dir"]
         assert isinstance(data_dir, Path)
         return TSignalWatchResult(
@@ -178,8 +176,18 @@ def test_watch_t_main_wires_runner(
 
     monkeypatch.setattr(cli, "FutuTSignalMarketDataClient", FakeMarketDataClient)
     monkeypatch.setattr(cli, "TSignalInterpreter", FakeInterpreter)
-    monkeypatch.setattr(cli, "build_notifier", lambda config: FakeNotifier())
-    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run=False: object())
+    monkeypatch.setattr(
+        cli,
+        "build_notifier",
+        lambda config: pytest.fail("watch-t should not build notification channels"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_env_config",
+        lambda path, dry_run=False: pytest.fail(
+            "watch-t should not load notification config"
+        ),
+    )
     monkeypatch.setattr(cli, "run_t_signal_watch_once", fake_run_t_signal_watch_once)
 
     result = cli.main(
@@ -216,6 +224,66 @@ def test_watch_t_main_wires_runner(
     assert "signals: 1" in output
     assert "notified: 1" in output
     assert "latest:" in output
+
+
+def test_watch_t_main_uses_null_notifier_without_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakeMarketDataClient:
+        def __init__(self, *, host: str, port: int) -> None:
+            pass
+
+    class FakeInterpreter:
+        pass
+
+    def fake_run_t_signal_watch_once(**kwargs: object) -> TSignalWatchResult:
+        assert isinstance(kwargs["notifier"], NullNotifier)
+        data_dir = kwargs["data_dir"]
+        assert isinstance(data_dir, Path)
+        return TSignalWatchResult(
+            run_date="2026-07-02",
+            market="US",
+            signal_count=1,
+            notified_count=0,
+            run_path=data_dir / "runs/2026-07-02/US/t_signals.json",
+            latest_path=data_dir / "latest/US/t_signals.json",
+        )
+
+    monkeypatch.setattr(cli, "FutuTSignalMarketDataClient", FakeMarketDataClient)
+    monkeypatch.setattr(cli, "TSignalInterpreter", FakeInterpreter)
+    monkeypatch.setattr(
+        cli,
+        "build_notifier",
+        lambda config: pytest.fail("watch-t should not build notification channels"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_env_config",
+        lambda path, dry_run=False: pytest.fail(
+            "watch-t should not load notification config"
+        ),
+    )
+    monkeypatch.setattr(cli, "run_t_signal_watch_once", fake_run_t_signal_watch_once)
+
+    result = cli.main(
+        [
+            "watch-t",
+            "--portfolio",
+            "portfolio.csv",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--date",
+            "2026-07-02",
+            "--market",
+            "US",
+            "--once",
+        ]
+    )
+
+    assert result == 0
+    assert "notified: 0" in capsys.readouterr().out
 
 
 def test_watch_t_main_repeats_when_once_is_false(
