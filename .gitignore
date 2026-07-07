@@ -11,3 +11,6 @@ __pycache__/
 *.py[cod]
 config/daily_premarket.env
 .superpowers/
+node_modules/
+test-results/
+playwright-report/
