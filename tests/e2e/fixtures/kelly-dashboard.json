@@ -17,7 +17,18 @@
     "template_count": 1,
     "experiment_count": 1,
     "error": "",
-    "templates": [],
+    "templates": [
+      {
+        "strategy_id": "trend_pullback_20d",
+        "strategy_name": "趋势回调 20D",
+        "strategy_version": "v1",
+        "entry_rule_description": "价格回调到 20 日均线附近。",
+        "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+        "max_holding_days": 20,
+        "order_type": "limit",
+        "market_session": "regular"
+      }
+    ],
     "experiments": [
       {
         "experiment_id": "trend_pullback_20d_exp_20260707",
