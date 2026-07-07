@@ -121,6 +121,7 @@ function bindElements() {
     "current-view-cash-note",
     "broker-summary-cards",
     "source-status-list",
+    "kelly-lab-panel",
     "cash-detail-panel",
     "summary-value",
     "summary-holding-bar",
@@ -331,9 +332,171 @@ function renderDashboard() {
   renderBrokerFilters();
   renderBrokerCards();
   renderSourceStatusListIntoHeader();
+  renderKellyLab();
   renderDashboardViews();
   renderTradeActions();
   renderConnectionPanel();
+}
+
+function renderKellyLab() {
+  if (!elements["kelly-lab-panel"]) {
+    return;
+  }
+  elements["kelly-lab-panel"].innerHTML = renderKellyLabPanel();
+}
+
+function renderKellyLabPanel() {
+  const dashboard = state.dashboard || {};
+  const lab = dashboard.kelly_lab;
+  if (state.dashboardError) {
+    return `
+      <div class="section-heading compact kelly-lab-heading">
+        <div>
+          <h2>模拟盘策略实验室</h2>
+          <p>看板数据加载失败。</p>
+        </div>
+        <span class="status-pill status-failed">不可用</span>
+      </div>
+      <div class="kelly-lab-empty">Kelly Lab 数据暂不可用。</div>
+    `;
+  }
+  if (!state.dashboard) {
+    return `
+      <div class="section-heading compact kelly-lab-heading">
+        <div>
+          <h2>模拟盘策略实验室</h2>
+          <p>等待看板数据。</p>
+        </div>
+        <span class="status-pill status-muted">加载中</span>
+      </div>
+      <div class="kelly-lab-empty">Kelly Lab 数据尚未加载。</div>
+    `;
+  }
+  if (!lab || typeof lab !== "object" || !lab.available) {
+    const message = lab && typeof lab === "object"
+      ? firstPresent(lab.error, lab.message, lab.reason, "Kelly Lab 数据不可用。")
+      : "缺少 Kelly Lab 数据。";
+    return `
+      <div class="section-heading compact kelly-lab-heading">
+        <div>
+          <h2>模拟盘策略实验室</h2>
+          <p>${escapeHtml(formatPlain(message))}</p>
+        </div>
+        <span class="status-pill status-muted">不可用</span>
+      </div>
+      <div class="kelly-lab-empty">${escapeHtml(formatPlain(message))}</div>
+    `;
+  }
+
+  const experiments = Array.isArray(lab.experiments) ? lab.experiments : [];
+  const count = hasValue(lab.experiment_count) ? lab.experiment_count : experiments.length;
+  const cards = experiments.length
+    ? experiments.map(renderKellyExperimentCard).join("")
+    : `<div class="kelly-lab-empty">暂无实验。</div>`;
+  return `
+    <div class="section-heading compact kelly-lab-heading">
+      <div>
+        <h2>模拟盘策略实验室</h2>
+        <p>只读实验结果。</p>
+      </div>
+      <span class="count-pill">${escapeHtml(formatPlain(count))} 个实验</span>
+    </div>
+    <div class="kelly-experiment-grid">
+      ${cards}
+    </div>
+  `;
+}
+
+function renderKellyExperimentCard(experiment) {
+  const entry = experiment && typeof experiment === "object" ? experiment : {};
+  const template = entry.template && typeof entry.template === "object" ? entry.template : {};
+  const stats = entry.stats && typeof entry.stats === "object" ? entry.stats : {};
+  const participants = Array.isArray(entry.participants) ? entry.participants : [];
+  const name = firstPresent(entry.experiment_name, entry.experiment_id, "未命名实验");
+  const status = kellyExperimentStatusLabel(entry.status);
+  const stage = kellySampleStageLabel(stats.sample_stage);
+  const strategyId = formatPlain(template.strategy_id);
+  const strategyName = formatPlain(template.strategy_name);
+  const strategyVersion = hasValue(template.strategy_version) ? ` · ${formatPlain(template.strategy_version)}` : "";
+  const budget = hasValue(entry.experiment_budget)
+    ? `${formatMoney(entry.experiment_budget, formatPlain(entry.budget_currency || "USD"))}`
+    : "-";
+  const participantChips = participants.length
+    ? participants.map((participant) => {
+      const item = participant && typeof participant === "object" ? participant : {};
+      const symbol = [item.market, item.symbol]
+        .filter(hasValue)
+        .map(formatPlain)
+        .join(".");
+      const label = firstPresent(symbol, item.name, item.source, "未命名标的");
+      const detail = [item.name, item.source]
+        .filter(hasValue)
+        .map(formatPlain)
+        .join(" · ");
+      return `
+        <span class="kelly-participant-chip">
+          <strong>${escapeHtml(formatPlain(label))}</strong>
+          ${detail ? `<small>${escapeHtml(detail)}</small>` : ""}
+        </span>
+      `;
+    }).join("")
+    : `<span class="kelly-participant-chip muted"><strong>暂无参与标的</strong></span>`;
+  const metricRows = [
+    ["阶段", stage],
+    ["已完成", stats.completed_samples],
+    ["进行中", stats.open_samples],
+    ["胜率", stats.observed_win_rate],
+    ["预算", budget],
+    ["资金使用", hasValue(entry.capital_utilization_pct) ? `${formatPlain(entry.capital_utilization_pct)}%` : ""],
+  ];
+  return `
+    <article class="kelly-experiment-card">
+      <header class="kelly-experiment-card-header">
+        <div>
+          <h3>${escapeHtml(formatPlain(name))}</h3>
+          <span>${escapeHtml(strategyId)} · ${escapeHtml(strategyName)}${escapeHtml(strategyVersion)}</span>
+        </div>
+        <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
+      </header>
+      <p class="kelly-entry-rule">${escapeHtml(formatPlain(template.entry_rule_description))}</p>
+      <dl class="kelly-stat-grid">
+        ${metricRows.map(([label, value]) => `
+          <div>
+            <dt>${escapeHtml(label)}</dt>
+            <dd>${escapeHtml(formatPlain(value))}</dd>
+          </div>
+        `).join("")}
+      </dl>
+      <div class="kelly-participant-row" aria-label="实验参与标的">
+        ${participantChips}
+      </div>
+    </article>
+  `;
+}
+
+function kellyExperimentStatusLabel(status) {
+  const labels = {
+    active: { label: "运行中", className: "status-ok" },
+    completed: { label: "已完成", className: "status-ok" },
+    draft: { label: "草稿", className: "status-muted" },
+    paused: { label: "已暂停", className: "status-warn" },
+    running: { label: "运行中", className: "status-ok" },
+    stopped: { label: "已停止", className: "status-muted" },
+  };
+  const key = formatPlain(status).toLowerCase();
+  return labels[key] || { label: formatPlain(status), className: "status-muted" };
+}
+
+function kellySampleStageLabel(stage) {
+  const labels = {
+    complete: "样本完成",
+    enough: "样本足够",
+    insufficient: "样本不足",
+    open: "采样中",
+    ready: "待采样",
+  };
+  const key = formatPlain(stage).toLowerCase();
+  return labels[key] || formatPlain(stage);
 }
 
 function renderDashboardViews() {
@@ -3707,6 +3870,7 @@ function renderLoadError(error) {
   setElementText("connection-poll", "-");
   renderHeaderSummary();
   renderSourceStatusListIntoHeader();
+  renderKellyLab();
   renderDashboardErrorState();
 }
 

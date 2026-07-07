@@ -518,6 +518,52 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
 
 
+def test_dashboard_static_contains_kelly_lab_panel_mount() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="kelly-lab-panel"' in html
+
+
+def test_dashboard_js_renders_kelly_lab_panel() -> None:
+    run_dashboard_js(
+        """
+state.dashboard = {
+  kelly_lab: {
+    available: true,
+    experiment_count: 1,
+    experiments: [{
+      experiment_id: "trend_pullback_20d_exp_20260707",
+      experiment_name: "趋势回调 20D 第一批",
+      status: "running",
+      locked: true,
+      experiment_budget: "100000",
+      budget_currency: "USD",
+      capital_utilization_pct: "50",
+      template: {
+        strategy_id: "trend_pullback_20d",
+        strategy_name: "趋势回调 20D",
+        strategy_version: "v1",
+        entry_rule_description: "价格回调到 20 日均线附近。",
+        exit_rule_description: "目标价、止损或 20 个交易日到期。"
+      },
+      participants: [
+        {market: "US", symbol: "AAPL", name: "Apple Inc.", source: "holding+watchlist", per_symbol_budget: "25000", budget_currency: "USD"}
+      ],
+      stats: {completed_samples: 0, open_samples: 0, observed_win_rate: "", sample_stage: "insufficient"}
+    }]
+  }
+};
+const html = renderKellyLabPanel();
+if (!html.includes("模拟盘策略实验室") || !html.includes("趋势回调 20D 第一批")) {
+  throw new Error("kelly lab panel missing experiment identity: " + html);
+}
+if (!html.includes("样本不足") || !html.includes("AAPL")) {
+  throw new Error("kelly lab panel missing sample stage or participant: " + html);
+}
+"""
+    )
+
+
 def test_dashboard_renders_futu_anomaly_signal_card_in_chinese() -> None:
     output = run_dashboard_js(
         """

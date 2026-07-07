@@ -294,6 +294,7 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 
 .summary-card,
 .filter-panel,
+.kelly-lab-panel,
 .holdings-panel,
 .info-panel {
   background: var(--surface);
@@ -382,6 +383,123 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 .filter-panel,
 .info-panel {
   padding: 14px;
+}
+
+.kelly-lab-panel {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.kelly-lab-heading {
+  align-items: start;
+}
+
+.kelly-lab-empty {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  padding: 12px;
+}
+
+.kelly-experiment-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+}
+
+.kelly-experiment-card {
+  background: #fbfcf8;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.kelly-experiment-card-header {
+  align-items: start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.kelly-experiment-card h3 {
+  font-size: 14px;
+  margin: 0 0 4px;
+  overflow-wrap: anywhere;
+}
+
+.kelly-experiment-card-header span:not(.status-pill),
+.kelly-entry-rule,
+.kelly-participant-chip small {
+  color: var(--muted);
+}
+
+.kelly-entry-rule {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.kelly-stat-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+}
+
+.kelly-stat-grid div {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 8px;
+}
+
+.kelly-stat-grid dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.kelly-stat-grid dd {
+  font-weight: 700;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.kelly-participant-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.kelly-participant-chip {
+  background: #eef5f1;
+  border: 1px solid #c9ded4;
+  border-radius: 8px;
+  display: inline-grid;
+  gap: 2px;
+  max-width: 100%;
+  min-height: 30px;
+  min-width: 0;
+  padding: 5px 8px;
+}
+
+.kelly-participant-chip strong,
+.kelly-participant-chip small {
+  overflow-wrap: anywhere;
+}
+
+.kelly-participant-chip.muted {
+  background: var(--surface-soft);
+  border-color: var(--line);
+  color: var(--muted);
 }
 
 .panel-section + .panel-section {
