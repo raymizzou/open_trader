@@ -2608,7 +2608,7 @@ if (elements["holdings-table-wrap"].classList.contains("hidden")) {
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
   throw new Error("trading decision should keep bottom symbol detail panel hidden");
 }
-if (!elements["holdings-body"].innerHTML.includes("交易决策") || !elements["holdings-body"].innerHTML.includes(">做T<") || elements["holdings-body"].innerHTML.includes(">详情<")) {
+if (!elements["holdings-body"].innerHTML.includes("交易决策") || !elements["holdings-body"].innerHTML.includes(">做T<") || !elements["holdings-body"].innerHTML.includes(">凯利<") || elements["holdings-body"].innerHTML.includes(">详情<")) {
   throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
 }
 if (!elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
@@ -2741,6 +2741,32 @@ for (const unexpected of ["小T", "大T", "状态机", ">session_phase<", "已�
   if (elements["holdings-body"].innerHTML.includes(unexpected)) {
     throw new Error("t signal detail should not render ambiguous wording " + unexpected);
   }
+}
+state.selectedHoldingDetail = "kelly";
+state.dashboard.holdings[1].kelly = {
+  available: true,
+  experiment_count: 1,
+  status: "available",
+  message: "该标的已关联 Kelly 策略实验。",
+  experiments: [{
+    experiment_id: "trend_pullback_20d_exp_20260707",
+    experiment_name: "趋势回调 20D 第一批",
+    status: "running",
+    template: {strategy_id: "trend_pullback_20d", strategy_name: "趋势回调 20D"},
+    stats: {completed_samples: 0, open_samples: 0, observed_win_rate: "", sample_stage: "insufficient"}
+  }]
+};
+renderHoldings();
+for (const required of ["凯利仓位 ·", "趋势回调 20D 第一批", "样本不足", "阶段 1 不计算 Kelly 仓位"]) {
+  if (!elements["holdings-body"].innerHTML.includes(required)) {
+    throw new Error("kelly detail missing " + required + ": " + elements["holdings-body"].innerHTML);
+  }
+}
+state.dashboard.holdings[1].kelly.experiments = [];
+state.dashboard.holdings[1].kelly.experiment_count = 0;
+renderHoldings();
+if (!elements["holdings-body"].innerHTML.includes("暂无关联 Kelly 策略实验")) {
+  throw new Error("kelly detail should show missing experiment message: " + elements["holdings-body"].innerHTML);
 }
 state.selectedHoldingDetail = "decision";
 state.dashboard.holdings.push({

@@ -769,6 +769,12 @@ tbody tr.active-row {
   min-width: 48px;
 }
 
+.kelly-button {
+  border-color: #c8d7e3;
+  color: #305f7d;
+  min-width: 48px;
+}
+
 .t-signal-button-active {
   animation: t-signal-pulse 1.15s ease-in-out infinite;
   background: #e7f4ec;
@@ -967,11 +973,28 @@ tbody tr.active-row {
   margin-top: 14px;
 }
 
+.kelly-detail-layout {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
 .t-signal-section {
   background: var(--surface);
 }
 
+.kelly-detail-section {
+  background: var(--surface);
+}
+
 .t-signal-status-row {
+  align-items: start;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.kelly-detail-status-row {
   align-items: start;
   display: flex;
   gap: 12px;
@@ -983,7 +1006,13 @@ tbody tr.active-row {
   margin: 0 0 6px;
 }
 
+.kelly-detail-status-row h3 {
+  font-size: 17px;
+  margin: 0 0 6px;
+}
+
 .t-signal-status-row p,
+.kelly-detail-status-row p,
 .muted-copy {
   color: var(--muted);
   line-height: 1.5;
@@ -992,11 +1021,16 @@ tbody tr.active-row {
 
 .t-signal-metric-grid,
 .t-signal-detail-grid,
-.t-signal-gate-grid {
+.t-signal-gate-grid,
+.kelly-detail-stat-grid {
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-top: 12px;
+}
+
+.kelly-detail-stat-grid {
+  margin-bottom: 0;
 }
 
 .t-signal-detail-grid {
@@ -1028,6 +1062,46 @@ tbody tr.active-row {
 .t-signal-evidence-item strong,
 .t-signal-timeline-event strong {
   overflow-wrap: anywhere;
+}
+
+.kelly-detail-experiment-list {
+  display: grid;
+  gap: 10px;
+}
+
+.kelly-detail-experiment {
+  display: grid;
+  gap: 10px;
+}
+
+.kelly-detail-stat-grid div {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.kelly-detail-stat-grid dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.kelly-detail-stat-grid dd {
+  font-weight: 700;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.kelly-stage-note {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-weight: 700;
+  margin: 0;
+  padding: 10px;
 }
 
 .t-signal-gate-status {
@@ -2392,7 +2466,8 @@ tbody tr.active-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .detail-metric-grid {
+  .detail-metric-grid,
+  .kelly-detail-stat-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -2570,7 +2645,8 @@ tbody tr.active-row {
   .detail-grid,
   .t-signal-metric-grid,
   .t-signal-detail-grid,
-  .t-signal-gate-grid {
+  .t-signal-gate-grid,
+  .kelly-detail-stat-grid {
     grid-template-columns: 1fr;
   }
 }
