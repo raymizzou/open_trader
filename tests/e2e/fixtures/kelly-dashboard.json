@@ -1,0 +1,144 @@
+{
+  "portfolio_path": "tests/e2e/fixtures/portfolio.csv",
+  "broker_detail_month": "",
+  "detail_available": false,
+  "broker_source_statuses": [],
+  "summary": {
+    "portfolio_value_hkd": "1000000.00",
+    "holding_value_hkd": "1000000.00",
+    "cash_like_value_hkd": "0.00",
+    "cash_like_weight_hkd": "0.00%",
+    "holding_count": 2
+  },
+  "broker_summaries": [],
+  "cash_details": [],
+  "kelly_lab": {
+    "available": true,
+    "template_count": 1,
+    "experiment_count": 1,
+    "error": "",
+    "templates": [],
+    "experiments": [
+      {
+        "experiment_id": "trend_pullback_20d_exp_20260707",
+        "experiment_name": "趋势回调 20D 第一批",
+        "strategy_id": "trend_pullback_20d",
+        "strategy_version": "v1",
+        "start_date": "2026-07-07",
+        "paper_account": "futu_simulate",
+        "experiment_budget": "100000",
+        "budget_currency": "USD",
+        "capital_utilization_pct": "50",
+        "allocation_mode": "equal_weight",
+        "max_open_position_per_symbol": 1,
+        "status": "running",
+        "locked": true,
+        "template": {
+          "strategy_id": "trend_pullback_20d",
+          "strategy_name": "趋势回调 20D",
+          "strategy_version": "v1",
+          "entry_rule_description": "价格回调到 20 日均线附近。",
+          "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+          "max_holding_days": 20,
+          "order_type": "limit",
+          "market_session": "regular"
+        },
+        "participants": [
+          {
+            "market": "US",
+            "symbol": "AAPL",
+            "name": "Apple Inc.",
+            "source": "holding+watchlist",
+            "locked": true,
+            "per_symbol_budget": "25000",
+            "budget_currency": "USD"
+          }
+        ],
+        "stats": {
+          "completed_samples": 0,
+          "open_samples": 0,
+          "observed_win_rate": "",
+          "sample_stage": "insufficient"
+        }
+      }
+    ]
+  },
+  "holdings": [
+    {
+      "market": "US",
+      "asset_class": "stock",
+      "symbol": "AAPL",
+      "name": "Apple Inc.",
+      "currency": "USD",
+      "total_quantity": "10",
+      "avg_cost_price": "180",
+      "last_price": "210",
+      "market_value": "2100",
+      "market_value_hkd": "16380.00",
+      "portfolio_weight_hkd": "1.64%",
+      "unrealized_pnl_pct": "16.67%",
+      "brokers": "futu",
+      "broker_detail_count": 0,
+      "broker_details": [],
+      "agent_report": {"available": false},
+      "tradingagents_summary": {"available": false},
+      "strategy": {"available": false},
+      "premarket_action": {"available": false},
+      "trade_action": {"available": false},
+      "technical_facts": {"available": false},
+      "decision_facts": {"kline": {"available": false}, "news_sentiment": {"available": false}},
+      "futu_skill_facts": {},
+      "t_signal": {"available": false},
+      "research_view": {},
+      "kelly": {
+        "available": true,
+        "experiment_count": 1,
+        "status": "available",
+        "message": "该标的已关联 Kelly 策略实验。",
+        "experiments": [
+          {
+            "experiment_id": "trend_pullback_20d_exp_20260707",
+            "experiment_name": "趋势回调 20D 第一批",
+            "status": "running",
+            "template": {"strategy_id": "trend_pullback_20d", "strategy_name": "趋势回调 20D"},
+            "stats": {"completed_samples": 0, "open_samples": 0, "observed_win_rate": "", "sample_stage": "insufficient"}
+          }
+        ]
+      }
+    },
+    {
+      "market": "US",
+      "asset_class": "stock",
+      "symbol": "MSFT",
+      "name": "Microsoft",
+      "currency": "USD",
+      "total_quantity": "5",
+      "avg_cost_price": "420",
+      "last_price": "500",
+      "market_value": "2500",
+      "market_value_hkd": "19500.00",
+      "portfolio_weight_hkd": "1.95%",
+      "unrealized_pnl_pct": "19.05%",
+      "brokers": "futu",
+      "broker_detail_count": 0,
+      "broker_details": [],
+      "agent_report": {"available": false},
+      "tradingagents_summary": {"available": false},
+      "strategy": {"available": false},
+      "premarket_action": {"available": false},
+      "trade_action": {"available": false},
+      "technical_facts": {"available": false},
+      "decision_facts": {"kline": {"available": false}, "news_sentiment": {"available": false}},
+      "futu_skill_facts": {},
+      "t_signal": {"available": false},
+      "research_view": {},
+      "kelly": {
+        "available": false,
+        "experiment_count": 0,
+        "status": "missing_experiment",
+        "message": "该标的未参与任何已锁定的 Kelly 策略实验。",
+        "experiments": []
+      }
+    }
+  ]
+}

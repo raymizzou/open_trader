@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:kelly": "playwright test tests/e2e/kelly-lab.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.45.0"
+  }
+}
