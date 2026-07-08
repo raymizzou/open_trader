@@ -645,6 +645,61 @@ state.dashboard = {
         last_sample_closed_at: "2026-07-07 15:30",
         last_recomputed_at: "2026-07-07 15:31"
       }
+    },
+    {
+      experiment_id: "breakout_10d_mock_20260707",
+      experiment_name: "突破 10D Mock 第一批",
+      status: "running",
+      locked: true,
+      experiment_budget: "60000",
+      budget_currency: "USD",
+      capital_utilization_pct: "40",
+      template: {
+        strategy_id: "breakout_10d",
+        strategy_name: "突破 10D",
+        strategy_version: "v1",
+        entry_rule_description: "结构化规则生成入场。",
+        exit_rule_description: "目标价、止损或 10 个交易日到期。",
+        rules: {
+          entry: {
+            type: "volume_breakout_high",
+            lookback_days: 10,
+            volume_multiple: 1.5
+          },
+          stop_loss: {
+            type: "any_of",
+            rules: [
+              {type: "pct_below_reference_price", reference: "breakout_price", pct: 2},
+              {type: "atr_below_entry", atr_multiple: 1.5}
+            ]
+          },
+          take_profit: {type: "risk_multiple", trigger_r: 2, sell_pct: 50},
+          trailing_stop: {type: "close_below_recent_low", lookback_days: 5, apply_to_remaining_position: true},
+          time_exit: {type: "max_holding_days", days: 10, exit_if: "minimum_unrealized_r_not_reached", min_unrealized_r: 1}
+        }
+      },
+      participants: [
+        {market: "US", symbol: "MSFT", name: "微软", source: "watchlist", per_symbol_budget: "20000", budget_currency: "USD"}
+      ],
+      stats: {
+        completed_samples: 42,
+        open_samples: 3,
+        observed_win_rate: "52%",
+        sample_stage: "open",
+        winning_samples: 22,
+        losing_samples: 20,
+        raw_win_rate: "52%",
+        adjusted_win_rate: "51%",
+        avg_net_win_pct: "6.1%",
+        avg_net_loss_pct: "3.4%",
+        payoff_ratio: "1.79",
+        full_kelly_pct: "24.2%",
+        fractional_kelly_pct: "6.1%",
+        suggested_position_pct: "4%",
+        sample_adjustment: "样本少于 200，向 50% 收缩",
+        last_sample_closed_at: "2026-07-07 15:45",
+        last_recomputed_at: "2026-07-07 15:46"
+      }
     }]
   }
 };
@@ -660,6 +715,13 @@ state.workspaceView = "kelly_lab";
 const html = renderKellyLabPanel();
 if (!html.includes("模拟盘策略实验室") || !html.includes("趋势回调 20D 第一批")) {
   throw new Error("kelly lab panel missing experiment identity: " + html);
+}
+if (!html.includes("role=\\\"tablist\\\"") || !html.includes("data-kelly-experiment=\\\"trend_pullback_20d_exp_20260707\\\"") || !html.includes("data-kelly-experiment=\\\"breakout_10d_mock_20260707\\\"")) {
+  throw new Error("kelly lab strategy tabs missing: " + html);
+}
+const breakoutNameCount = html.split("突破 10D Mock 第一批").length - 1;
+if (breakoutNameCount !== 1) {
+  throw new Error("kelly lab should only render active strategy detail: " + html);
 }
 if (!html.includes("样本不足") || !html.includes("AAPL")) {
   throw new Error("kelly lab panel missing sample stage or participant: " + html);
@@ -735,6 +797,15 @@ const fallbackHtml = renderKellyExperimentCard({
 });
 if (!fallbackHtml.includes("标的状态") || !fallbackHtml.includes("US.IBM") || !fallbackHtml.includes("等待该策略下一次入场信号。")) {
   throw new Error("kelly participant fallback lifecycle missing: " + fallbackHtml);
+}
+state.selectedKellyExperimentId = "breakout_10d_mock_20260707";
+const secondHtml = renderKellyLabPanel();
+const trendNameCount = secondHtml.split("趋势回调 20D 第一批").length - 1;
+if (!secondHtml.includes("突破 10D Mock 第一批") || trendNameCount !== 1) {
+  throw new Error("kelly lab tab selection did not isolate active strategy: " + secondHtml);
+}
+if (!secondHtml.includes("价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。") || !secondHtml.includes("US.MSFT")) {
+  throw new Error("kelly lab second tab content missing: " + secondHtml);
 }
 """
     )

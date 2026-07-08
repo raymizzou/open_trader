@@ -9,12 +9,14 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await page.getByRole('button', { name: '凯利实验室' }).click();
 
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toBeVisible();
+  await expect(page.getByRole('tab', { name: /趋势回调 20D 第一批/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByText('Mock 状态样本')).toHaveCount(0);
   await expect(page.getByText('状态说明')).toHaveCount(0);
   for (const symbol of ['US.AAPL', 'US.MSFT', 'US.TSM', 'US.SOXX', 'HK.02840', 'US.RAM', 'US.DRAM']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
   }
-  await expect(page.getByText('趋势回调 20D 第一批')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '趋势回调 20D 第一批' })).toBeVisible();
   const symbolStates = page.getByLabel('Kelly 标的状态');
   await expect(symbolStates.getByText('观察中 → 待下单 → 持仓中 → 待退出 → 已完成')).toBeVisible();
   await expect(symbolStates.getByText('该标的在策略监控范围内，但当前没有入场信号，也没有持仓。')).toBeVisible();
@@ -41,6 +43,14 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByText('23.1%')).toBeVisible();
   await expect(page.getByText('建议仓位')).toBeVisible();
   await expect(page.getByText('4%', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '突破 10D Mock 第一批' })).toHaveCount(0);
+  await page.getByRole('tab', { name: /突破 10D Mock 第一批/ }).click();
+  await expect(page.getByRole('tab', { name: /趋势回调 20D 第一批/ })).toHaveAttribute('aria-selected', 'false');
+  await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('heading', { name: '趋势回调 20D 第一批' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '突破 10D Mock 第一批' })).toBeVisible();
+  await expect(page.getByLabel('Kelly 标的状态').getByText('US.MSFT')).toBeVisible();
+  await expect(page.getByLabel('Kelly 策略详情').getByText('价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。')).toBeVisible();
   await page.getByRole('button', { name: '返回主页' }).click();
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toHaveCount(0);
 

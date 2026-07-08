@@ -15,7 +15,7 @@
   "kelly_lab": {
     "available": true,
     "template_count": 1,
-    "experiment_count": 1,
+    "experiment_count": 2,
     "error": "",
     "templates": [
       {
@@ -158,6 +158,96 @@
           "sample_adjustment": "样本少于 200，向 50% 收缩",
           "last_sample_closed_at": "2026-07-07 15:30",
           "last_recomputed_at": "2026-07-07 15:31"
+        }
+      },
+      {
+        "experiment_id": "breakout_10d_mock_20260707",
+        "experiment_name": "突破 10D Mock 第一批",
+        "strategy_id": "breakout_10d",
+        "strategy_version": "v1",
+        "start_date": "2026-07-07",
+        "paper_account": "futu_simulate",
+        "experiment_budget": "60000",
+        "budget_currency": "USD",
+        "capital_utilization_pct": "40",
+        "allocation_mode": "equal_weight",
+        "max_open_position_per_symbol": 1,
+        "status": "running",
+        "locked": true,
+        "template": {
+          "strategy_id": "breakout_10d",
+          "strategy_name": "突破 10D",
+          "strategy_version": "v1",
+          "entry_rule_description": "结构化规则生成入场。",
+          "exit_rule_description": "目标价、止损或 10 个交易日到期。",
+          "rules": {
+            "entry": {
+              "type": "volume_breakout_high",
+              "lookback_days": 10,
+              "volume_multiple": 1.5
+            },
+            "stop_loss": {
+              "type": "any_of",
+              "rules": [
+                {"type": "pct_below_reference_price", "reference": "breakout_price", "pct": 2},
+                {"type": "atr_below_entry", "atr_multiple": 1.5}
+              ]
+            },
+            "take_profit": {"type": "risk_multiple", "trigger_r": 2, "sell_pct": 50},
+            "trailing_stop": {"type": "close_below_recent_low", "lookback_days": 5, "apply_to_remaining_position": true},
+            "time_exit": {"type": "max_holding_days", "days": 10, "exit_if": "minimum_unrealized_r_not_reached", "min_unrealized_r": 1}
+          },
+          "max_holding_days": 10,
+          "order_type": "limit",
+          "market_session": "regular"
+        },
+        "participants": [
+          {
+            "market": "US",
+            "symbol": "MSFT",
+            "name": "微软",
+            "source": "watchlist",
+            "locked": true,
+            "per_symbol_budget": "20000",
+            "budget_currency": "USD"
+          },
+          {
+            "market": "US",
+            "symbol": "TSM",
+            "name": "台积电",
+            "source": "holding",
+            "locked": true,
+            "per_symbol_budget": "20000",
+            "budget_currency": "USD"
+          },
+          {
+            "market": "HK",
+            "symbol": "06951",
+            "name": "三环集团",
+            "source": "holding",
+            "locked": true,
+            "per_symbol_budget": "20000",
+            "budget_currency": "USD"
+          }
+        ],
+        "stats": {
+          "completed_samples": 42,
+          "open_samples": 3,
+          "observed_win_rate": "52%",
+          "sample_stage": "open",
+          "winning_samples": 22,
+          "losing_samples": 20,
+          "raw_win_rate": "52%",
+          "adjusted_win_rate": "51%",
+          "avg_net_win_pct": "6.1%",
+          "avg_net_loss_pct": "3.4%",
+          "payoff_ratio": "1.79",
+          "full_kelly_pct": "24.2%",
+          "fractional_kelly_pct": "6.1%",
+          "suggested_position_pct": "4%",
+          "sample_adjustment": "样本少于 200，向 50% 收缩",
+          "last_sample_closed_at": "2026-07-07 15:45",
+          "last_recomputed_at": "2026-07-07 15:46"
         }
       }
     ]

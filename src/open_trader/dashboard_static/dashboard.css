@@ -449,10 +449,52 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   padding: 12px;
 }
 
+.kelly-strategy-tabs {
+  align-items: stretch;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.kelly-strategy-tab {
+  align-items: start;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  display: grid;
+  gap: 2px;
+  min-height: 44px;
+  min-width: min(220px, 100%);
+  padding: 7px 10px;
+  text-align: left;
+}
+
+.kelly-strategy-tab.active {
+  background: #e4efe9;
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.kelly-strategy-tab span {
+  color: var(--text);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.kelly-strategy-tab small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .kelly-experiment-grid {
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+}
+
+.kelly-experiment-grid.single {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .kelly-experiment-card {

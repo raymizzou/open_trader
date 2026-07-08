@@ -8,6 +8,7 @@ const state = {
   marketFilter: "ALL",
   brokerFilter: "ALL",
   workspaceView: "portfolio",
+  selectedKellyExperimentId: "",
   selectedHoldingKey: "",
   selectedHoldingDetail: "decision",
   detailLanguage: "zh",
@@ -167,11 +168,16 @@ function bindEvents() {
   elements["refresh-quotes"].addEventListener("click", refreshQuotes);
   if (elements["kelly-lab-panel"]) {
     elements["kelly-lab-panel"].addEventListener("click", (event) => {
-      const button = event.target.closest("[data-workspace-view]");
-      if (!button) {
+      const strategyTab = event.target.closest("[data-kelly-experiment]");
+      if (strategyTab) {
+        state.selectedKellyExperimentId = strategyTab.dataset.kellyExperiment || "";
+        renderKellyLab();
         return;
       }
-      setWorkspaceView(button.dataset.workspaceView || "portfolio");
+      const viewButton = event.target.closest("[data-workspace-view]");
+      if (viewButton) {
+        setWorkspaceView(viewButton.dataset.workspaceView || "portfolio");
+      }
     });
   }
   elements["header-market-filters"].addEventListener("click", (event) => {
@@ -427,8 +433,10 @@ function renderKellyLabPanel() {
 
   const experiments = Array.isArray(lab.experiments) ? lab.experiments : [];
   const count = hasValue(lab.experiment_count) ? lab.experiment_count : experiments.length;
-  const cards = experiments.length
-    ? experiments.map(renderKellyExperimentCard).join("")
+  const activeExperiment = activeKellyExperiment(experiments);
+  const activeExperimentId = activeExperiment ? kellyExperimentKey(activeExperiment, experiments.indexOf(activeExperiment)) : "";
+  const cards = activeExperiment
+    ? renderKellyExperimentCard(activeExperiment)
     : `<div class="kelly-lab-empty">暂无实验。</div>`;
   return `
     <div class="section-heading compact kelly-lab-heading">
@@ -441,7 +449,8 @@ function renderKellyLabPanel() {
         <span class="count-pill">${escapeHtml(formatPlain(count))} 个实验</span>
       </div>
     </div>
-    <div class="kelly-experiment-grid">
+    ${renderKellyStrategyTabs(experiments, activeExperimentId)}
+    <div class="kelly-experiment-grid single">
       ${cards}
     </div>
   `;
@@ -535,6 +544,55 @@ const KELLY_LIFECYCLE_STATUSES = [
     className: "status-failed",
   },
 ];
+
+function activeKellyExperiment(experiments) {
+  const items = Array.isArray(experiments) ? experiments : [];
+  if (!items.length) {
+    return null;
+  }
+  const selected = formatPlain(state.selectedKellyExperimentId);
+  return items.find((experiment, index) => kellyExperimentKey(experiment, index) === selected) || items[0];
+}
+
+function kellyExperimentKey(experiment, index) {
+  const entry = experiment && typeof experiment === "object" ? experiment : {};
+  const strategyVersion = [entry.strategy_id, entry.strategy_version].filter(hasValue).map(formatPlain).join(":");
+  return firstPresent(entry.experiment_id, strategyVersion, entry.experiment_name, `experiment-${index}`);
+}
+
+function renderKellyStrategyTabs(experiments, activeExperimentId) {
+  const items = Array.isArray(experiments) ? experiments : [];
+  if (!items.length) {
+    return "";
+  }
+  return `
+    <div class="kelly-strategy-tabs" role="tablist" aria-label="Kelly 策略">
+      ${items.map((experiment, index) => {
+        const entry = experiment && typeof experiment === "object" ? experiment : {};
+        const template = entry.template && typeof entry.template === "object" ? entry.template : {};
+        const experimentId = kellyExperimentKey(entry, index);
+        const active = experimentId === activeExperimentId;
+        const label = firstPresent(entry.experiment_name, template.strategy_name, entry.strategy_id, "未命名策略");
+        const detail = [entry.strategy_id, template.strategy_name, entry.strategy_version]
+          .filter(hasValue)
+          .map(formatPlain)
+          .join(" · ");
+        return `
+          <button
+            class="kelly-strategy-tab ${active ? "active" : ""}"
+            type="button"
+            role="tab"
+            aria-selected="${active ? "true" : "false"}"
+            data-kelly-experiment="${escapeHtml(formatPlain(experimentId))}"
+          >
+            <span>${escapeHtml(formatPlain(label))}</span>
+            ${detail ? `<small>${escapeHtml(detail)}</small>` : ""}
+          </button>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
 
 function renderKellySymbolStates(experiment) {
   const entry = experiment && typeof experiment === "object" ? experiment : {};
