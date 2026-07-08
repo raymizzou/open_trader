@@ -202,6 +202,107 @@ def test_load_kelly_lab_state_generates_lifecycle_states_from_symbol_facts(
     ]
 
 
+def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        {
+            "schema_version": "open_trader.kelly_strategy_templates.v1",
+            "templates": [
+                {
+                    "strategy_id": "trend_pullback_20d",
+                    "strategy_name": "趋势回调 20D",
+                    "strategy_version": "v1",
+                    "entry_rule_description": "价格回调到 20 日均线附近。",
+                    "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+                    "max_holding_days": 20,
+                    "order_type": "limit",
+                    "market_session": "regular",
+                }
+            ],
+        },
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        {
+            "schema_version": "open_trader.kelly_experiments.v1",
+            "experiments": [
+                {
+                    "experiment_id": "trend_pullback_20d_exp_20260707",
+                    "experiment_name": "趋势回调 20D 第一批",
+                    "strategy_id": "trend_pullback_20d",
+                    "strategy_version": "v1",
+                    "start_date": "2026-07-07",
+                    "paper_account": "futu_simulate",
+                    "experiment_budget": "100000",
+                    "budget_currency": "USD",
+                    "capital_utilization_pct": "50",
+                    "allocation_mode": "equal_weight",
+                    "max_open_position_per_symbol": 1,
+                    "status": "running",
+                    "locked": True,
+                    "participants": [
+                        {
+                            "market": "US",
+                            "symbol": "DRAM",
+                            "name": "DRAM ETF",
+                            "source": "holding",
+                            "locked": True,
+                            "per_symbol_budget": "25000",
+                            "budget_currency": "USD",
+                        },
+                        {
+                            "market": "HK",
+                            "symbol": "02840",
+                            "name": "SPDR Gold",
+                            "source": "holding",
+                            "locked": True,
+                            "per_symbol_budget": "25000",
+                            "budget_currency": "USD",
+                        },
+                    ],
+                    "lifecycle_states": [
+                        {
+                            "market": "US",
+                            "symbol": "DRAM",
+                            "status": "watching",
+                            "reason": "属于该策略。",
+                        },
+                        {
+                            "market": "HK",
+                            "symbol": "02840",
+                            "status": "holding",
+                            "reason": "属于该策略。",
+                        },
+                        {
+                            "market": "US",
+                            "symbol": "MSFT",
+                            "status": "completed",
+                            "reason": "混入其他策略。",
+                        },
+                    ],
+                    "stats": {
+                        "completed_samples": 0,
+                        "open_samples": 0,
+                        "observed_win_rate": "",
+                        "sample_stage": "insufficient",
+                    },
+                }
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    lifecycle_states = state["experiments"][0]["lifecycle_states"]
+    assert [(item["market"], item["symbol"]) for item in lifecycle_states] == [
+        ("US", "DRAM"),
+        ("HK", "02840"),
+    ]
+
+
 def test_load_kelly_lab_state_missing_files_is_unavailable(tmp_path: Path) -> None:
     state = load_kelly_lab_state(tmp_path / "data").to_dict()
 

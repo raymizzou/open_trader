@@ -44,14 +44,14 @@
           {
             "status": "watching",
             "market": "US",
-            "symbol": "AAPL",
+            "symbol": "DRAM",
             "reason": "价格距离 MA20 仍有 2.4%，入场规则未满足。",
             "updated_at": "2026-07-08 10:00"
           },
           {
             "status": "pending_entry_order",
             "market": "US",
-            "symbol": "MSFT",
+            "symbol": "RAM",
             "reason": "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
             "action": "准备提交模拟盘买入订单",
             "updated_at": "2026-07-08 10:01"
@@ -59,42 +59,18 @@
           {
             "status": "holding",
             "market": "US",
-            "symbol": "TSM",
+            "symbol": "SOXX",
             "reason": "模拟盘买入已成交，当前监控退出规则。",
             "action": "继续检查止盈、止损、移动止盈、时间退出",
             "updated_at": "2026-07-08 10:02"
           },
           {
             "status": "pending_exit_order",
-            "market": "US",
-            "symbol": "SOXX",
+            "market": "HK",
+            "symbol": "02840",
             "reason": "止盈触发，价格达到入场价 + 2R。",
             "action": "准备卖出 50%",
             "updated_at": "2026-07-08 10:03"
-          },
-          {
-            "status": "completed",
-            "market": "HK",
-            "symbol": "02840",
-            "reason": "卖出成交，样本闭环完成。",
-            "action": "计入胜率和盈亏比统计",
-            "updated_at": "2026-07-08 10:04"
-          },
-          {
-            "status": "risk_blocked",
-            "market": "US",
-            "symbol": "RAM",
-            "reason": "策略总仓位上限已满。",
-            "action": "不下单，只记录拦截事件",
-            "updated_at": "2026-07-08 10:05"
-          },
-          {
-            "status": "execution_failed",
-            "market": "US",
-            "symbol": "DRAM",
-            "reason": "模拟盘订单同步失败。",
-            "action": "停止自动推进，等待人工检查",
-            "updated_at": "2026-07-08 10:06"
           }
         ],
         "allocation_mode": "equal_weight",
@@ -132,9 +108,36 @@
         "participants": [
           {
             "market": "US",
-            "symbol": "AAPL",
-            "name": "Apple Inc.",
-            "source": "holding+watchlist",
+            "symbol": "DRAM",
+            "name": "Roundhill Memory ETF",
+            "source": "holding",
+            "locked": true,
+            "per_symbol_budget": "25000",
+            "budget_currency": "USD"
+          },
+          {
+            "market": "US",
+            "symbol": "RAM",
+            "name": "2倍做多DRAM ETF-T-REX",
+            "source": "holding",
+            "locked": true,
+            "per_symbol_budget": "25000",
+            "budget_currency": "USD"
+          },
+          {
+            "market": "US",
+            "symbol": "SOXX",
+            "name": "iShares费城交易所半导体ETF",
+            "source": "holding",
+            "locked": true,
+            "per_symbol_budget": "25000",
+            "budget_currency": "USD"
+          },
+          {
+            "market": "HK",
+            "symbol": "02840",
+            "name": "SPDR金",
+            "source": "holding",
             "locked": true,
             "per_symbol_budget": "25000",
             "budget_currency": "USD"

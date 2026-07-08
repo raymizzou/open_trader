@@ -210,12 +210,42 @@ def _validate_experiments_payload(
             context,
         )
         normalized_experiment["template"] = copy.deepcopy(templates_by_key[strategy_key])
-        if "lifecycle_states" not in normalized_experiment:
+        if "lifecycle_states" in normalized_experiment:
+            normalized_experiment["lifecycle_states"] = _filter_lifecycle_states_to_participants(
+                normalized_experiment["lifecycle_states"],
+                normalized_experiment["participants"],
+            )
+        else:
             normalized_experiment["lifecycle_states"] = build_kelly_lifecycle_states(
                 normalized_experiment,
             )
         validated.append(normalized_experiment)
     return validated
+
+
+def _filter_lifecycle_states_to_participants(
+    lifecycle_states: Any,
+    participants: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not isinstance(lifecycle_states, list):
+        return []
+    allowed = {
+        (participant["market"].upper(), participant["symbol"].upper())
+        for participant in participants
+        if isinstance(participant.get("market"), str)
+        and isinstance(participant.get("symbol"), str)
+    }
+    filtered: list[dict[str, Any]] = []
+    for lifecycle_state in lifecycle_states:
+        if not isinstance(lifecycle_state, dict):
+            continue
+        market = lifecycle_state.get("market")
+        symbol = lifecycle_state.get("symbol")
+        if not isinstance(market, str) or not isinstance(symbol, str):
+            continue
+        if (market.upper(), symbol.upper()) in allowed:
+            filtered.append(copy.deepcopy(lifecycle_state))
+    return filtered
 
 
 def _validate_participants(

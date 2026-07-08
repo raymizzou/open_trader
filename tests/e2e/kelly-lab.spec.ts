@@ -13,8 +13,11 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByText('Mock 状态样本')).toHaveCount(0);
   await expect(page.getByText('状态说明')).toHaveCount(0);
-  for (const symbol of ['US.AAPL', 'US.MSFT', 'US.TSM', 'US.SOXX', 'HK.02840', 'US.RAM', 'US.DRAM']) {
+  for (const symbol of ['US.DRAM', 'US.RAM', 'US.SOXX', 'HK.02840']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
+  }
+  for (const symbol of ['US.MSFT', 'US.TSM', 'HK.06951']) {
+    await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toHaveCount(0);
   }
   await expect(page.getByRole('heading', { name: '趋势回调 20D 第一批' })).toBeVisible();
   const symbolStates = page.getByLabel('Kelly 标的状态');
@@ -23,9 +26,6 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(symbolStates.getByText('入场规则已触发，Kelly 仓位已计算，风控检查已通过。')).toBeVisible();
   await expect(symbolStates.getByText('模拟盘买入已成交，这笔策略样本正在进行中。')).toBeVisible();
   await expect(symbolStates.getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toBeVisible();
-  await expect(symbolStates.getByText('买入和卖出都已成交，交易样本已经闭环。')).toBeVisible();
-  await expect(symbolStates.getByText('入场规则触发了，但账户或组合风控不允许下单。')).toBeVisible();
-  await expect(symbolStates.getByText('系统本来应该下单或退出，但模拟盘接口、订单同步、撤单或成交确认失败。')).toBeVisible();
   await expect(page.getByText('样本不足')).toBeVisible();
   await expect(page.getByLabel('实验参与标的')).toHaveCount(0);
   await expect(page.getByText('策略详情')).toBeVisible();
@@ -49,7 +49,12 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByRole('heading', { name: '趋势回调 20D 第一批' })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: '突破 10D Mock 第一批' })).toBeVisible();
-  await expect(page.getByLabel('Kelly 标的状态').getByText('US.MSFT')).toBeVisible();
+  for (const symbol of ['US.MSFT', 'US.TSM', 'HK.06951']) {
+    await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
+  }
+  for (const symbol of ['US.DRAM', 'US.RAM', 'US.SOXX', 'HK.02840']) {
+    await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toHaveCount(0);
+  }
   await expect(page.getByLabel('Kelly 策略详情').getByText('价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。')).toBeVisible();
   await page.getByRole('button', { name: '返回主页' }).click();
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toHaveCount(0);

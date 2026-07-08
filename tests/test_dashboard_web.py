@@ -545,14 +545,14 @@ state.dashboard = {
         {
           status: "watching",
           market: "US",
-          symbol: "AAPL",
+          symbol: "DRAM",
           reason: "价格距离 MA20 仍有 2.4%，入场规则未满足。",
           updated_at: "2026-07-08 10:00"
         },
         {
           status: "pending_entry_order",
           market: "US",
-          symbol: "MSFT",
+          symbol: "RAM",
           reason: "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
           action: "准备提交模拟盘买入订单",
           updated_at: "2026-07-08 10:01"
@@ -560,42 +560,18 @@ state.dashboard = {
         {
           status: "holding",
           market: "US",
-          symbol: "TSM",
+          symbol: "SOXX",
           reason: "模拟盘买入已成交，当前监控退出规则。",
           action: "继续检查止盈、止损、移动止盈、时间退出",
           updated_at: "2026-07-08 10:02"
         },
         {
           status: "pending_exit_order",
-          market: "US",
-          symbol: "SOXX",
+          market: "HK",
+          symbol: "02840",
           reason: "止盈触发，价格达到入场价 + 2R。",
           action: "准备卖出 50%",
           updated_at: "2026-07-08 10:03"
-        },
-        {
-          status: "completed",
-          market: "HK",
-          symbol: "02840",
-          reason: "卖出成交，样本闭环完成。",
-          action: "计入胜率和盈亏比统计",
-          updated_at: "2026-07-08 10:04"
-        },
-        {
-          status: "risk_blocked",
-          market: "US",
-          symbol: "RAM",
-          reason: "策略总仓位上限已满。",
-          action: "不下单，只记录拦截事件",
-          updated_at: "2026-07-08 10:05"
-        },
-        {
-          status: "execution_failed",
-          market: "US",
-          symbol: "DRAM",
-          reason: "模拟盘订单同步失败。",
-          action: "停止自动推进，等待人工检查",
-          updated_at: "2026-07-08 10:06"
         }
       ],
       template: {
@@ -624,7 +600,10 @@ state.dashboard = {
         }
       },
       participants: [
-        {market: "US", symbol: "AAPL", name: "Apple Inc.", source: "holding+watchlist", per_symbol_budget: "25000", budget_currency: "USD"}
+        {market: "US", symbol: "DRAM", name: "Roundhill Memory ETF", source: "holding", per_symbol_budget: "25000", budget_currency: "USD"},
+        {market: "US", symbol: "RAM", name: "2倍做多DRAM ETF-T-REX", source: "holding", per_symbol_budget: "25000", budget_currency: "USD"},
+        {market: "US", symbol: "SOXX", name: "iShares费城交易所半导体ETF", source: "holding", per_symbol_budget: "25000", budget_currency: "USD"},
+        {market: "HK", symbol: "02840", name: "SPDR金", source: "holding", per_symbol_budget: "25000", budget_currency: "USD"}
       ],
       stats: {
         completed_samples: 18,
@@ -679,7 +658,9 @@ state.dashboard = {
         }
       },
       participants: [
-        {market: "US", symbol: "MSFT", name: "微软", source: "watchlist", per_symbol_budget: "20000", budget_currency: "USD"}
+        {market: "US", symbol: "MSFT", name: "微软", source: "watchlist", per_symbol_budget: "20000", budget_currency: "USD"},
+        {market: "US", symbol: "TSM", name: "台积电", source: "holding", per_symbol_budget: "20000", budget_currency: "USD"},
+        {market: "HK", symbol: "06951", name: "三环集团", source: "holding", per_symbol_budget: "20000", budget_currency: "USD"}
       ],
       stats: {
         completed_samples: 42,
@@ -723,8 +704,13 @@ const breakoutNameCount = html.split("突破 10D Mock 第一批").length - 1;
 if (breakoutNameCount !== 1) {
   throw new Error("kelly lab should only render active strategy detail: " + html);
 }
-if (!html.includes("样本不足") || !html.includes("AAPL")) {
+if (!html.includes("样本不足") || !html.includes("US.DRAM")) {
   throw new Error("kelly lab panel missing sample stage or participant: " + html);
+}
+for (const forbidden of ["US.MSFT", "US.TSM", "HK.06951"]) {
+  if (html.includes(forbidden)) {
+    throw new Error("kelly first tab leaked another strategy symbol " + forbidden + ": " + html);
+  }
 }
 if (html.includes("实验参与标的") || html.includes("kelly-participant-row")) {
   throw new Error("kelly lab should use symbol states as the only symbol list: " + html);
@@ -740,15 +726,6 @@ for (const required of [
   "模拟盘买入已成交，这笔策略样本正在进行中。",
   "待退出",
   "这笔持仓已经触发退出规则，但卖出还没有完成。",
-  "已完成",
-  "买入和卖出都已成交，交易样本已经闭环。",
-  "风控拦截",
-  "入场规则触发了，但账户或组合风控不允许下单。",
-  "执行失败",
-  "系统本来应该下单或退出，但模拟盘接口、订单同步、撤单或成交确认失败。",
-  "US.AAPL",
-  "US.MSFT",
-  "US.TSM",
   "US.SOXX",
   "HK.02840",
   "US.RAM",
@@ -810,8 +787,13 @@ const trendNameCount = secondHtml.split("趋势回调 20D 第一批").length - 1
 if (!secondHtml.includes("突破 10D Mock 第一批") || trendNameCount !== 1) {
   throw new Error("kelly lab tab selection did not isolate active strategy: " + secondHtml);
 }
-if (!secondHtml.includes("价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。") || !secondHtml.includes("US.MSFT")) {
+if (!secondHtml.includes("价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。") || !secondHtml.includes("US.MSFT") || !secondHtml.includes("US.TSM") || !secondHtml.includes("HK.06951")) {
   throw new Error("kelly lab second tab content missing: " + secondHtml);
+}
+for (const forbidden of ["US.DRAM", "US.RAM", "US.SOXX", "HK.02840"]) {
+  if (secondHtml.includes(forbidden)) {
+    throw new Error("kelly second tab leaked another strategy symbol " + forbidden + ": " + secondHtml);
+  }
 }
 """
     )
