@@ -107,3 +107,80 @@ def test_evaluate_kelly_rules_triggers_exit_rules_from_trade_facts() -> None:
     assert result["time_exit"]["reasons"] == [
         "holding days 20 reached max 20 without take-profit or stop-loss",
     ]
+
+
+def breakout_rules() -> dict[str, object]:
+    return {
+        "entry": {
+            "type": "volume_breakout_high",
+            "lookback_days": 10,
+            "volume_multiple": 1.5,
+        },
+        "stop_loss": {
+            "type": "any_of",
+            "rules": [
+                {"type": "pct_below_reference_price", "reference": "breakout_price", "pct": 2},
+                {"type": "atr_below_entry", "atr_multiple": 1.5},
+            ],
+        },
+        "trailing_stop": {
+            "type": "close_below_recent_low",
+            "lookback_days": 5,
+            "apply_to_remaining_position": True,
+        },
+        "time_exit": {
+            "type": "max_holding_days",
+            "days": 10,
+            "exit_if": "minimum_unrealized_r_not_reached",
+            "min_unrealized_r": 1,
+        },
+    }
+
+
+def test_evaluate_kelly_rules_triggers_breakout_entry_rule() -> None:
+    result = evaluate_kelly_rules(
+        breakout_rules(),
+        {
+            "price": 111,
+            "recent_highs": {"10": 110},
+            "volume_multiple": 1.6,
+        },
+    )
+
+    assert result["entry"]["triggered"] is True
+    assert result["entry"]["action"] == {"enter": True}
+    assert result["entry"]["reasons"] == [
+        "price 111 broke above recent 10-day high 110 with volume multiple 1.6",
+    ]
+
+
+def test_evaluate_kelly_rules_triggers_breakout_exit_rules() -> None:
+    result = evaluate_kelly_rules(
+        breakout_rules(),
+        {
+            "price": 103,
+            "close_price": 97,
+            "entry_price": 100,
+            "breakout_price": 100,
+            "atr": 2,
+            "recent_lows": {"5": 98},
+            "holding_days": 10,
+            "unrealized_r": 0.5,
+        },
+    )
+
+    assert result["stop_loss"]["triggered"] is True
+    assert result["stop_loss"]["reasons"] == [
+        "close 97 is below breakout_price 100 by at least 2%",
+        "close 97 is below entry 100 - 1.5 ATR",
+    ]
+
+    assert result["trailing_stop"]["triggered"] is True
+    assert result["trailing_stop"]["reasons"] == [
+        "close 97 is below recent 5-day low 98",
+    ]
+
+    assert result["time_exit"]["triggered"] is True
+    assert result["time_exit"]["reasons"] == [
+        "holding days 10 reached max 10 without reaching 1R unrealized profit",
+    ]

@@ -99,6 +99,109 @@ def test_load_kelly_lab_state_returns_locked_experiments(tmp_path: Path) -> None
     assert experiment["stats"]["sample_stage"] == "insufficient"
 
 
+def test_load_kelly_lab_state_generates_lifecycle_states_from_symbol_facts(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        {
+            "schema_version": "open_trader.kelly_strategy_templates.v1",
+            "templates": [
+                {
+                    "strategy_id": "trend_pullback_20d",
+                    "strategy_name": "趋势回调 20D",
+                    "strategy_version": "v1",
+                    "entry_rule_description": "价格回调到 20 日均线附近。",
+                    "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+                    "max_holding_days": 20,
+                    "order_type": "limit",
+                    "market_session": "regular",
+                    "rules": {
+                        "entry": {
+                            "type": "pullback_to_moving_average",
+                            "ma_days": 20,
+                            "tolerance_pct": 1,
+                            "trend_filter": {
+                                "type": "moving_average_slope",
+                                "ma_days": 50,
+                                "direction": "up",
+                            },
+                        },
+                        "take_profit": {
+                            "type": "risk_multiple",
+                            "trigger_r": 2,
+                            "sell_pct": 50,
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        {
+            "schema_version": "open_trader.kelly_experiments.v1",
+            "experiments": [
+                {
+                    "experiment_id": "trend_pullback_20d_exp_20260707",
+                    "experiment_name": "趋势回调 20D 第一批",
+                    "strategy_id": "trend_pullback_20d",
+                    "strategy_version": "v1",
+                    "start_date": "2026-07-07",
+                    "paper_account": "futu_simulate",
+                    "experiment_budget": "100000",
+                    "budget_currency": "USD",
+                    "capital_utilization_pct": "50",
+                    "allocation_mode": "equal_weight",
+                    "max_open_position_per_symbol": 1,
+                    "status": "running",
+                    "locked": True,
+                    "participants": [
+                        {
+                            "market": "us",
+                            "symbol": "aapl",
+                            "name": "Apple Inc.",
+                            "source": "watchlist",
+                            "locked": True,
+                            "per_symbol_budget": "25000",
+                            "budget_currency": "USD",
+                        }
+                    ],
+                    "symbol_facts": {
+                        "US.AAPL": {
+                            "price": 99.4,
+                            "moving_averages": {"20": 100},
+                            "moving_average_slopes": {"50": "up"},
+                            "updated_at": "2026-07-08 13:00",
+                        }
+                    },
+                    "stats": {
+                        "completed_samples": 0,
+                        "open_samples": 0,
+                        "observed_win_rate": "",
+                        "sample_stage": "insufficient",
+                    },
+                }
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    lifecycle_states = state["experiments"][0]["lifecycle_states"]
+    assert lifecycle_states == [
+        {
+            "market": "US",
+            "symbol": "AAPL",
+            "status": "pending_entry_order",
+            "reason": "入场规则触发，Kelly 仓位已计算，风控通过。",
+            "action": "准备提交模拟盘买入订单",
+            "updated_at": "2026-07-08 13:00",
+        }
+    ]
+
+
 def test_load_kelly_lab_state_missing_files_is_unavailable(tmp_path: Path) -> None:
     state = load_kelly_lab_state(tmp_path / "data").to_dict()
 

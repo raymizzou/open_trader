@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .kelly_lifecycle import build_kelly_lifecycle_states
+
 
 TEMPLATES_SCHEMA_VERSION = "open_trader.kelly_strategy_templates.v1"
 EXPERIMENTS_SCHEMA_VERSION = "open_trader.kelly_experiments.v1"
@@ -208,6 +210,10 @@ def _validate_experiments_payload(
             context,
         )
         normalized_experiment["template"] = copy.deepcopy(templates_by_key[strategy_key])
+        if "lifecycle_states" not in normalized_experiment:
+            normalized_experiment["lifecycle_states"] = build_kelly_lifecycle_states(
+                normalized_experiment,
+            )
         validated.append(normalized_experiment)
     return validated
 

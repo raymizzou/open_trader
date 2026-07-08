@@ -38,6 +38,8 @@ def _triggered_result(reasons: list[str], action: dict[str, Any]) -> RuleResult:
 
 def _evaluate_entry(rule: Any, facts: dict[str, Any]) -> RuleResult:
     item = rule if isinstance(rule, dict) else {}
+    if item.get("type") == "volume_breakout_high":
+        return _evaluate_volume_breakout_entry(item, facts)
     if item.get("type") != "pullback_to_moving_average":
         return _empty_result()
 
@@ -68,6 +70,25 @@ def _evaluate_entry(rule: Any, facts: dict[str, Any]) -> RuleResult:
 
     return _triggered_result(
         [f"price {_fmt(price)} is within {_fmt(tolerance_pct)}% of MA{ma_days} {_fmt(ma)}"],
+        {"enter": True},
+    )
+
+
+def _evaluate_volume_breakout_entry(rule: dict[str, Any], facts: dict[str, Any]) -> RuleResult:
+    price = _number(facts.get("price"))
+    lookback_days = rule.get("lookback_days")
+    recent_high = _fact_by_days(facts.get("recent_highs"), lookback_days)
+    required_volume = _number(rule.get("volume_multiple"))
+    actual_volume = _number(facts.get("volume_multiple"))
+    if None in {price, recent_high, required_volume, actual_volume}:
+        return _empty_result()
+    if price <= recent_high or actual_volume < required_volume:
+        return _empty_result()
+    return _triggered_result(
+        [
+            f"price {_fmt(price)} broke above recent {lookback_days}-day high "
+            f"{_fmt(recent_high)} with volume multiple {_fmt(actual_volume)}",
+        ],
         {"enter": True},
     )
 
@@ -110,6 +131,31 @@ def _evaluate_stop_loss_child(rule: dict[str, Any], facts: dict[str, Any]) -> st
             return f"close {_fmt(close_price)} is below recent {lookback_days}-day swing low {_fmt(swing_low)}"
         return ""
 
+    if rule.get("type") == "pct_below_reference_price":
+        reference = rule.get("reference")
+        reference_price = _number(facts.get(str(reference)))
+        pct = _number(rule.get("pct"), default=0)
+        if reference_price is None:
+            return ""
+        threshold = reference_price * (1 - pct / 100)
+        if close_price <= threshold:
+            return (
+                f"close {_fmt(close_price)} is below {reference} "
+                f"{_fmt(reference_price)} by at least {_fmt(pct)}%"
+            )
+        return ""
+
+    if rule.get("type") == "atr_below_entry":
+        entry_price = _number(facts.get("entry_price"))
+        atr = _number(facts.get("atr"))
+        atr_multiple = _number(rule.get("atr_multiple"))
+        if None in {entry_price, atr, atr_multiple}:
+            return ""
+        threshold = entry_price - atr_multiple * atr
+        if close_price <= threshold:
+            return f"close {_fmt(close_price)} is below entry {_fmt(entry_price)} - {_fmt(atr_multiple)} ATR"
+        return ""
+
     return ""
 
 
@@ -135,6 +181,16 @@ def _evaluate_take_profit(rule: Any, facts: dict[str, Any]) -> RuleResult:
 
 def _evaluate_trailing_stop(rule: Any, facts: dict[str, Any]) -> RuleResult:
     item = rule if isinstance(rule, dict) else {}
+    if item.get("type") == "close_below_recent_low":
+        close_price = _number(facts.get("close_price"))
+        lookback_days = item.get("lookback_days")
+        recent_low = _fact_by_days(facts.get("recent_lows"), lookback_days)
+        if close_price is None or recent_low is None or close_price >= recent_low:
+            return _empty_result()
+        return _triggered_result(
+            [f"close {_fmt(close_price)} is below recent {lookback_days}-day low {_fmt(recent_low)}"],
+            {"exit_remaining": bool(item.get("apply_to_remaining_position"))},
+        )
     if item.get("type") != "close_below_moving_average":
         return _empty_result()
 
@@ -166,6 +222,19 @@ def _evaluate_time_exit(rule: Any, facts: dict[str, Any]) -> RuleResult:
             [
                 f"holding days {_fmt(holding_days)} reached max {_fmt(max_days)} "
                 "without take-profit or stop-loss",
+            ],
+            {"exit_pct": 100},
+        )
+
+    if item.get("exit_if") == "minimum_unrealized_r_not_reached":
+        min_unrealized_r = _number(item.get("min_unrealized_r"))
+        unrealized_r = _number(facts.get("unrealized_r"))
+        if min_unrealized_r is None or unrealized_r is None or unrealized_r >= min_unrealized_r:
+            return _empty_result()
+        return _triggered_result(
+            [
+                f"holding days {_fmt(holding_days)} reached max {_fmt(max_days)} "
+                f"without reaching {_fmt(min_unrealized_r)}R unrealized profit",
             ],
             {"exit_pct": 100},
         )
