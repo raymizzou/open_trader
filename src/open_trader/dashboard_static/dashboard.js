@@ -669,7 +669,6 @@ function renderKellyExperimentCard(experiment) {
   const entry = experiment && typeof experiment === "object" ? experiment : {};
   const template = entry.template && typeof entry.template === "object" ? entry.template : {};
   const stats = entry.stats && typeof entry.stats === "object" ? entry.stats : {};
-  const participants = Array.isArray(entry.participants) ? entry.participants : [];
   const name = firstPresent(entry.experiment_name, entry.experiment_id, "未命名实验");
   const status = kellyExperimentStatusLabel(entry.status);
   const stage = kellySampleStageLabel(stats.sample_stage);
@@ -681,26 +680,6 @@ function renderKellyExperimentCard(experiment) {
   const budget = hasValue(entry.experiment_budget)
     ? `${formatMoney(entry.experiment_budget, formatPlain(entry.budget_currency || "USD"))}`
     : "-";
-  const participantChips = participants.length
-    ? participants.map((participant) => {
-      const item = participant && typeof participant === "object" ? participant : {};
-      const symbol = [item.market, item.symbol]
-        .filter(hasValue)
-        .map(formatPlain)
-        .join(".");
-      const label = firstPresent(symbol, item.name, item.source, "未命名标的");
-      const detail = [item.name, item.source]
-        .filter(hasValue)
-        .map(formatPlain)
-        .join(" · ");
-      return `
-        <span class="kelly-participant-chip">
-          <strong>${escapeHtml(formatPlain(label))}</strong>
-          ${detail ? `<small>${escapeHtml(detail)}</small>` : ""}
-        </span>
-      `;
-    }).join("")
-    : `<span class="kelly-participant-chip muted"><strong>暂无参与标的</strong></span>`;
   const metricRows = [
     ["阶段", stage],
     ["已完成", stats.completed_samples],
@@ -730,9 +709,6 @@ function renderKellyExperimentCard(experiment) {
       </dl>
       ${renderKellyParameterDerivation(stats)}
       ${renderKellySymbolStates(entry)}
-      <div class="kelly-participant-row" aria-label="实验参与标的">
-        ${participantChips}
-      </div>
     </article>
   `;
 }

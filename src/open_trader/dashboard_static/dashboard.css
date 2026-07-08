@@ -523,8 +523,7 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 }
 
 .kelly-experiment-card-header span:not(.status-pill),
-.kelly-entry-rule,
-.kelly-participant-chip small {
+.kelly-entry-rule {
   color: var(--muted);
 }
 
@@ -703,35 +702,6 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   font-size: 12px;
   margin: 2px 0 0;
   overflow-wrap: anywhere;
-}
-
-.kelly-participant-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.kelly-participant-chip {
-  background: #eef5f1;
-  border: 1px solid #c9ded4;
-  border-radius: 8px;
-  display: inline-grid;
-  gap: 2px;
-  max-width: 100%;
-  min-height: 30px;
-  min-width: 0;
-  padding: 5px 8px;
-}
-
-.kelly-participant-chip strong,
-.kelly-participant-chip small {
-  overflow-wrap: anywhere;
-}
-
-.kelly-participant-chip.muted {
-  background: var(--surface-soft);
-  border-color: var(--line);
-  color: var(--muted);
 }
 
 .panel-section + .panel-section {

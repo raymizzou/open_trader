@@ -726,6 +726,9 @@ if (breakoutNameCount !== 1) {
 if (!html.includes("样本不足") || !html.includes("AAPL")) {
   throw new Error("kelly lab panel missing sample stage or participant: " + html);
 }
+if (html.includes("实验参与标的") || html.includes("kelly-participant-row")) {
+  throw new Error("kelly lab should use symbol states as the only symbol list: " + html);
+}
 for (const required of [
   "标的状态",
   "观察中 → 待下单 → 持仓中 → 待退出 → 已完成",
@@ -797,6 +800,9 @@ const fallbackHtml = renderKellyExperimentCard({
 });
 if (!fallbackHtml.includes("标的状态") || !fallbackHtml.includes("US.IBM") || !fallbackHtml.includes("等待该策略下一次入场信号。")) {
   throw new Error("kelly participant fallback lifecycle missing: " + fallbackHtml);
+}
+if (fallbackHtml.includes("实验参与标的") || fallbackHtml.includes("kelly-participant-row")) {
+  throw new Error("kelly fallback should not render duplicate participant chips: " + fallbackHtml);
 }
 state.selectedKellyExperimentId = "breakout_10d_mock_20260707";
 const secondHtml = renderKellyLabPanel();

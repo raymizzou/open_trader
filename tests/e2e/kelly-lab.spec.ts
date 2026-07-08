@@ -27,7 +27,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(symbolStates.getByText('入场规则触发了，但账户或组合风控不允许下单。')).toBeVisible();
   await expect(symbolStates.getByText('系统本来应该下单或退出，但模拟盘接口、订单同步、撤单或成交确认失败。')).toBeVisible();
   await expect(page.getByText('样本不足')).toBeVisible();
-  await expect(page.getByLabel('实验参与标的').getByText('US.AAPL')).toBeVisible();
+  await expect(page.getByLabel('实验参与标的')).toHaveCount(0);
   await expect(page.getByText('策略详情')).toBeVisible();
   const strategyRules = page.getByLabel('Kelly 策略详情');
   await expect(strategyRules.getByText('价格回调到 20 日均线 ±1% 内，且 50 日均线斜率向上。')).toBeVisible();
