@@ -9,9 +9,23 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await page.getByRole('button', { name: '凯利实验室' }).click();
 
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toBeVisible();
+  await expect(page.getByText('Mock 状态样本')).toHaveCount(0);
+  await expect(page.getByText('状态说明')).toHaveCount(0);
+  for (const symbol of ['US.AAPL', 'US.MSFT', 'US.TSM', 'US.SOXX', 'HK.02840', 'US.RAM', 'US.DRAM']) {
+    await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
+  }
   await expect(page.getByText('趋势回调 20D 第一批')).toBeVisible();
+  const symbolStates = page.getByLabel('Kelly 标的状态');
+  await expect(symbolStates.getByText('观察中 → 待下单 → 持仓中 → 待退出 → 已完成')).toBeVisible();
+  await expect(symbolStates.getByText('该标的在策略监控范围内，但当前没有入场信号，也没有持仓。')).toBeVisible();
+  await expect(symbolStates.getByText('入场规则已触发，Kelly 仓位已计算，风控检查已通过。')).toBeVisible();
+  await expect(symbolStates.getByText('模拟盘买入已成交，这笔策略样本正在进行中。')).toBeVisible();
+  await expect(symbolStates.getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toBeVisible();
+  await expect(symbolStates.getByText('买入和卖出都已成交，交易样本已经闭环。')).toBeVisible();
+  await expect(symbolStates.getByText('入场规则触发了，但账户或组合风控不允许下单。')).toBeVisible();
+  await expect(symbolStates.getByText('系统本来应该下单或退出，但模拟盘接口、订单同步、撤单或成交确认失败。')).toBeVisible();
   await expect(page.getByText('样本不足')).toBeVisible();
-  await expect(page.getByText('US.AAPL')).toBeVisible();
+  await expect(page.getByLabel('实验参与标的').getByText('US.AAPL')).toBeVisible();
   await expect(page.getByText('策略详情')).toBeVisible();
   const strategyRules = page.getByLabel('Kelly 策略详情');
   await expect(strategyRules.getByText('价格回调到 20 日均线 ±1% 内，且 50 日均线斜率向上。')).toBeVisible();

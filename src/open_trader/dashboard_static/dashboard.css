@@ -456,6 +456,7 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 }
 
 .kelly-experiment-card {
+  align-content: start;
   background: #fbfcf8;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -572,6 +573,94 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   color: var(--muted);
   font-size: 11px;
   margin: 0;
+}
+
+.kelly-symbol-states {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.kelly-symbol-states-header {
+  align-items: start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.kelly-symbol-states-header h4 {
+  font-size: 13px;
+  line-height: 1.3;
+  margin: 0;
+}
+
+.kelly-symbol-states-header p {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.kelly-symbol-state-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+}
+
+.kelly-symbol-state-card {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 9px;
+}
+
+.kelly-symbol-state-heading {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.kelly-symbol-state-heading strong {
+  overflow-wrap: anywhere;
+}
+
+.kelly-symbol-state-card p,
+.kelly-symbol-state-card dd,
+.kelly-symbol-state-card small {
+  color: var(--muted);
+}
+
+.kelly-symbol-state-card p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.kelly-symbol-state-card dl {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+}
+
+.kelly-symbol-state-card dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.kelly-symbol-state-card dd {
+  font-size: 12px;
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
 }
 
 .kelly-participant-row {

@@ -368,6 +368,8 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "align-items: start;" in decision_plugin_grid_css
     decision_plugin_card_css = css.split(".decision-plugin-card {", 1)[1].split("}", 1)[0]
     assert "align-content: start;" in decision_plugin_card_css
+    kelly_experiment_card_css = css.split(".kelly-experiment-card {", 1)[1].split("}", 1)[0]
+    assert "align-content: start;" in kelly_experiment_card_css
     assert ".decision-fact-grid" in css
     assert ".technical-fact-grid" in css
     assert ".analyst-dialogue" in css
@@ -539,6 +541,63 @@ state.dashboard = {
       experiment_budget: "100000",
       budget_currency: "USD",
       capital_utilization_pct: "50",
+      lifecycle_states: [
+        {
+          status: "watching",
+          market: "US",
+          symbol: "AAPL",
+          reason: "价格距离 MA20 仍有 2.4%，入场规则未满足。",
+          updated_at: "2026-07-08 10:00"
+        },
+        {
+          status: "pending_entry_order",
+          market: "US",
+          symbol: "MSFT",
+          reason: "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
+          action: "准备提交模拟盘买入订单",
+          updated_at: "2026-07-08 10:01"
+        },
+        {
+          status: "holding",
+          market: "US",
+          symbol: "TSM",
+          reason: "模拟盘买入已成交，当前监控退出规则。",
+          action: "继续检查止盈、止损、移动止盈、时间退出",
+          updated_at: "2026-07-08 10:02"
+        },
+        {
+          status: "pending_exit_order",
+          market: "US",
+          symbol: "SOXX",
+          reason: "止盈触发，价格达到入场价 + 2R。",
+          action: "准备卖出 50%",
+          updated_at: "2026-07-08 10:03"
+        },
+        {
+          status: "completed",
+          market: "HK",
+          symbol: "02840",
+          reason: "卖出成交，样本闭环完成。",
+          action: "计入胜率和盈亏比统计",
+          updated_at: "2026-07-08 10:04"
+        },
+        {
+          status: "risk_blocked",
+          market: "US",
+          symbol: "RAM",
+          reason: "策略总仓位上限已满。",
+          action: "不下单，只记录拦截事件",
+          updated_at: "2026-07-08 10:05"
+        },
+        {
+          status: "execution_failed",
+          market: "US",
+          symbol: "DRAM",
+          reason: "模拟盘订单同步失败。",
+          action: "停止自动推进，等待人工检查",
+          updated_at: "2026-07-08 10:06"
+        }
+      ],
       template: {
         strategy_id: "trend_pullback_20d",
         strategy_name: "趋势回调 20D",
@@ -606,6 +665,29 @@ if (!html.includes("样本不足") || !html.includes("AAPL")) {
   throw new Error("kelly lab panel missing sample stage or participant: " + html);
 }
 for (const required of [
+  "标的状态",
+  "观察中 → 待下单 → 持仓中 → 待退出 → 已完成",
+  "观察中",
+  "该标的在策略监控范围内，但当前没有入场信号，也没有持仓。",
+  "待下单",
+  "入场规则已触发，Kelly 仓位已计算，风控检查已通过。",
+  "持仓中",
+  "模拟盘买入已成交，这笔策略样本正在进行中。",
+  "待退出",
+  "这笔持仓已经触发退出规则，但卖出还没有完成。",
+  "已完成",
+  "买入和卖出都已成交，交易样本已经闭环。",
+  "风控拦截",
+  "入场规则触发了，但账户或组合风控不允许下单。",
+  "执行失败",
+  "系统本来应该下单或退出，但模拟盘接口、订单同步、撤单或成交确认失败。",
+  "US.AAPL",
+  "US.MSFT",
+  "US.TSM",
+  "US.SOXX",
+  "HK.02840",
+  "US.RAM",
+  "US.DRAM",
   "策略详情",
   "入场",
   "价格回调到 20 日均线 ±1% 内，且 50 日均线斜率向上。",
@@ -635,11 +717,24 @@ for (const required of [
     throw new Error("kelly derivation missing " + required + ": " + html);
   }
 }
+if (html.includes("Mock 状态样本") || html.includes("状态说明")) {
+  throw new Error("kelly lifecycle should be scoped inside strategy card, not global: " + html);
+}
 if (html.includes("第一目标") || html.includes("延续")) {
   throw new Error("kelly strategy rules contain vague terms: " + html);
 }
 if (!html.includes("data-workspace-view=\\\"portfolio\\\"")) {
   throw new Error("kelly lab panel missing return button: " + html);
+}
+const fallbackHtml = renderKellyExperimentCard({
+  experiment_name: "无状态样本策略",
+  status: "running",
+  participants: [{market: "US", symbol: "IBM", name: "IBM", source: "watchlist"}],
+  template: {strategy_id: "fallback_strategy", strategy_name: "Fallback"},
+  stats: {}
+});
+if (!fallbackHtml.includes("标的状态") || !fallbackHtml.includes("US.IBM") || !fallbackHtml.includes("等待该策略下一次入场信号。")) {
+  throw new Error("kelly participant fallback lifecycle missing: " + fallbackHtml);
 }
 """
     )

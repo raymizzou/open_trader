@@ -477,6 +477,136 @@ function renderKellyLabEntry() {
   `;
 }
 
+const KELLY_LIFECYCLE_STATUSES = [
+  {
+    key: "watching",
+    label: "观察中",
+    meaning: "该标的在策略监控范围内，但当前没有入场信号，也没有持仓。",
+    systemAction: "持续检查入场规则。",
+    nextStep: "入场规则触发后进入「待下单」。",
+    className: "status-muted",
+  },
+  {
+    key: "pending_entry_order",
+    label: "待下单",
+    meaning: "入场规则已触发，Kelly 仓位已计算，风控检查已通过。",
+    systemAction: "准备向模拟盘提交买入订单。",
+    nextStep: "买入成交后进入「持仓中」；下单失败进入「执行失败」。",
+    className: "status-ok",
+  },
+  {
+    key: "holding",
+    label: "持仓中",
+    meaning: "模拟盘买入已成交，这笔策略样本正在进行中。",
+    systemAction: "持续检查止盈、止损、移动止盈、时间退出。",
+    nextStep: "任一退出规则触发后进入「待退出」。",
+    className: "status-ok",
+  },
+  {
+    key: "pending_exit_order",
+    label: "待退出",
+    meaning: "这笔持仓已经触发退出规则，但卖出还没有完成。",
+    systemAction: "准备向模拟盘提交卖出订单。",
+    nextStep: "卖出成交后进入「已完成」；卖出失败进入「执行失败」。",
+    className: "status-warn",
+  },
+  {
+    key: "completed",
+    label: "已完成",
+    meaning: "买入和卖出都已成交，交易样本已经闭环。",
+    systemAction: "把净盈亏、持有天数、退出原因计入样本统计。",
+    nextStep: "更新胜率 p、盈亏比 b、Kelly 仓位参数。",
+    className: "status-muted",
+  },
+  {
+    key: "risk_blocked",
+    label: "风控拦截",
+    meaning: "入场规则触发了，但账户或组合风控不允许下单。",
+    systemAction: "不下单，不计入完成样本，只记录拦截事件。",
+    nextStep: "风控条件解除后重新评估。",
+    className: "status-warn",
+  },
+  {
+    key: "execution_failed",
+    label: "执行失败",
+    meaning: "系统本来应该下单或退出，但模拟盘接口、订单同步、撤单或成交确认失败。",
+    systemAction: "停止自动推进，标记需要人工检查。",
+    nextStep: "人工处理后可以重试、取消，或手动标记结果。",
+    className: "status-failed",
+  },
+];
+
+function renderKellySymbolStates(experiment) {
+  const entry = experiment && typeof experiment === "object" ? experiment : {};
+  const lifecycleSamples = Array.isArray(entry.lifecycle_states)
+    ? entry.lifecycle_states.filter((sample) => sample && typeof sample === "object")
+    : [];
+  const participants = Array.isArray(entry.participants)
+    ? entry.participants.filter((participant) => participant && typeof participant === "object")
+    : [];
+  const samples = lifecycleSamples.length
+    ? lifecycleSamples
+    : participants.map((participant) => ({
+      ...participant,
+      status: "watching",
+      reason: "等待该策略下一次入场信号。",
+    }));
+  if (!samples.length) {
+    return "";
+  }
+
+  return `
+    <section class="kelly-symbol-states" aria-label="Kelly 标的状态">
+      <div class="kelly-symbol-states-header">
+        <h4>标的状态</h4>
+        <p>观察中 → 待下单 → 持仓中 → 待退出 → 已完成</p>
+      </div>
+      <div class="kelly-symbol-state-grid">
+        ${samples.map(renderKellySymbolState).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderKellySymbolState(sample) {
+  const item = sample && typeof sample === "object" ? sample : {};
+  const status = kellyLifecycleStatus(item.status);
+  const symbol = [item.market, item.symbol]
+    .filter(hasValue)
+    .map(formatPlain)
+    .join(".");
+  return `
+    <article class="kelly-symbol-state-card">
+      <div class="kelly-symbol-state-heading">
+        <strong>${escapeHtml(firstPresent(symbol, item.symbol, "未命名标的"))}</strong>
+        <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
+      </div>
+      <p>${escapeHtml(formatPlain(item.reason))}</p>
+      <dl>
+        <div>
+          <dt>状态含义</dt>
+          <dd>${escapeHtml(formatPlain(status.meaning))}</dd>
+        </div>
+        <div>
+          <dt>系统动作</dt>
+          <dd>${escapeHtml(firstPresent(item.action, status.systemAction))}</dd>
+        </div>
+        <div>
+          <dt>下一步</dt>
+          <dd>${escapeHtml(formatPlain(status.nextStep))}</dd>
+        </div>
+      </dl>
+      ${hasValue(item.updated_at) ? `<small>${escapeHtml(formatPlain(item.updated_at))}</small>` : ""}
+    </article>
+  `;
+}
+
+function kellyLifecycleStatus(status) {
+  const key = formatPlain(status);
+  return KELLY_LIFECYCLE_STATUSES.find((item) => item.key === key)
+    || { label: key, className: "status-muted" };
+}
+
 function renderKellyExperimentCard(experiment) {
   const entry = experiment && typeof experiment === "object" ? experiment : {};
   const template = entry.template && typeof entry.template === "object" ? entry.template : {};
@@ -541,6 +671,7 @@ function renderKellyExperimentCard(experiment) {
         `).join("")}
       </dl>
       ${renderKellyParameterDerivation(stats)}
+      ${renderKellySymbolStates(entry)}
       <div class="kelly-participant-row" aria-label="实验参与标的">
         ${participantChips}
       </div>
