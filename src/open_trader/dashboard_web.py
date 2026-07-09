@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .backtest import run_backtest
 from .dashboard import DashboardConfig, load_dashboard_state
 from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
 from .research_chat import ResearchChatError, ResearchChatService
+from .trading_plan import load_trading_plan_rows
 
 
 STATIC_DIR = Path(__file__).with_name("dashboard_static")
@@ -33,6 +36,87 @@ def build_quotes_payload(
     if account_sync_payload:
         payload["account_sync"] = account_sync_payload
     return payload
+
+
+def build_backtest_run_payload(
+    config: DashboardConfig,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    market = str(request.get("market") or "").strip().upper()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    if not market or not symbol:
+        raise ValueError("market and symbol are required")
+
+    plan_path = _dashboard_backtest_plan_path(config.data_dir, market)
+    plan = _latest_active_plan(plan_path, market=market, symbol=symbol)
+    prices_path = config.data_dir / "prices" / market / f"{symbol}.csv"
+    run_backtest(
+        plan_path=plan_path,
+        prices_path=prices_path,
+        data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
+        run_date=plan.run_date,
+        symbol=symbol,
+        market=market,
+        initial_cash=_decimal_request_value(request, "initial_cash", "100000"),
+        commission_bps=_decimal_request_value(request, "commission_bps", "10"),
+        slippage_bps=_decimal_request_value(request, "slippage_bps", "5"),
+    )
+    backtest = _dashboard_backtest_for_holding(config, market=market, symbol=symbol)
+    return {
+        "status": "ok",
+        "market": market,
+        "symbol": symbol,
+        "backtest": backtest,
+    }
+
+
+def _dashboard_backtest_plan_path(data_dir: Path, market: str) -> Path:
+    scoped_path = data_dir / "latest" / market / "trading_plan.csv"
+    if scoped_path.exists():
+        return scoped_path
+    return data_dir / "latest" / "trading_plan.csv"
+
+
+def _latest_active_plan(plan_path: Path, *, market: str, symbol: str) -> Any:
+    plans = [
+        plan
+        for plan in load_trading_plan_rows(plan_path)
+        if plan.status == "active"
+        and plan.market.upper() == market
+        and plan.symbol.upper() == symbol
+    ]
+    if not plans:
+        raise ValueError(f"no active trading plan found for {market}.{symbol}")
+    plans.sort(key=lambda plan: (plan.run_date, plan.symbol))
+    return plans[-1]
+
+
+def _decimal_request_value(
+    request: dict[str, Any],
+    key: str,
+    default: str,
+) -> Decimal:
+    value = request.get(key, default)
+    return Decimal(str(value))
+
+
+def _dashboard_backtest_for_holding(
+    config: DashboardConfig,
+    *,
+    market: str,
+    symbol: str,
+) -> dict[str, Any]:
+    payload = build_dashboard_payload(config)
+    for holding in payload.get("holdings", []):
+        if (
+            str(holding.get("market", "")).strip().upper() == market
+            and str(holding.get("symbol", "")).strip().upper() == symbol
+        ):
+            backtest = holding.get("backtest")
+            if isinstance(backtest, dict):
+                return backtest
+    return {"available": False, "error": "holding is not visible in dashboard"}
 
 
 def create_dashboard_server(
@@ -101,6 +185,11 @@ def create_dashboard_server(
                             market=market,
                             symbol=symbol,
                         )
+                    )
+                    return
+                if path == "/api/backtests/run":
+                    self._send_json(
+                        build_backtest_run_payload(config, self._read_json_body())
                     )
                     return
                 if path.startswith("/api/research-chat/sessions/"):

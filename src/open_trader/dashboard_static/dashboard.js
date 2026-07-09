@@ -12,6 +12,11 @@ const state = {
   detailLanguage: "zh",
   refreshActive: false,
   quoteIntervalId: null,
+  backtestRun: {
+    detailKey: "",
+    busy: false,
+    error: "",
+  },
   researchChat: {
     holdingKey: "",
     sessionId: "",
@@ -231,6 +236,11 @@ function handleSymbolDetailClick(event) {
   const chatButton = event.target.closest("[data-research-chat]");
   if (chatButton) {
     openResearchChat(chatButton.dataset.researchChat || "");
+    return;
+  }
+  const backtestButton = event.target.closest("[data-run-backtest]");
+  if (backtestButton) {
+    runBacktestForHolding(backtestButton.dataset.runBacktest || "");
     return;
   }
   const rawButton = event.target.closest("[data-toggle-raw-report]");
@@ -814,6 +824,7 @@ function renderTSignalDetail(holding) {
 
 function renderBacktestDetail(holding) {
   const title = `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
+  const runControls = renderBacktestRunControls(holding);
   const backtest = holding && holding.backtest && typeof holding.backtest === "object"
     ? holding.backtest
     : null;
@@ -825,6 +836,7 @@ function renderBacktestDetail(holding) {
           <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
           <h2>回测详情 · ${escapeHtml(title)}</h2>
           <p>${escapeHtml(message)}</p>
+          ${runControls}
         </div>
         <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
       </div>
@@ -841,6 +853,7 @@ function renderBacktestDetail(holding) {
         <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
         <h2>回测详情 · ${escapeHtml(title)}</h2>
         <p>${escapeHtml(backtestSummaryText(backtest))}</p>
+        ${runControls}
       </div>
       <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
     </div>
@@ -865,6 +878,56 @@ function renderBacktestDetail(holding) {
       </section>
     </div>
   `;
+}
+
+function renderBacktestRunControls(holding) {
+  const detailKey = state.selectedHoldingKey || holdingKey(holding, 0);
+  const runState = state.backtestRun || {};
+  const busy = runState.busy === true && runState.detailKey === detailKey;
+  const error = runState.detailKey === detailKey ? runState.error : "";
+  return `
+    <div class="backtest-run-controls">
+      <button class="raw-toggle" type="button" data-run-backtest="${escapeHtml(detailKey)}"${busy ? " disabled" : ""}>${busy ? "运行中" : "运行回测"}</button>
+      ${error ? `<span class="detail-warning">${escapeHtml(error)}</span>` : ""}
+    </div>
+  `;
+}
+
+async function runBacktestForHolding(detailKey) {
+  const holding = holdingByKey(detailKey);
+  if (!holding) {
+    return;
+  }
+  state.backtestRun = { detailKey, busy: true, error: "" };
+  state.selectedHoldingKey = detailKey;
+  state.selectedHoldingDetail = "backtest";
+  renderHoldings();
+  try {
+    const response = await fetch("/api/backtests/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        market: holding.market || "",
+        symbol: holding.symbol || "",
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok || payload.status === "error") {
+      throw new Error(payload.message || `backtest ${response.status}`);
+    }
+    await loadDashboard();
+    state.backtestRun = { detailKey, busy: false, error: "" };
+    state.selectedHoldingKey = detailKey;
+    state.selectedHoldingDetail = "backtest";
+    renderHoldings();
+  } catch (error) {
+    state.backtestRun = {
+      detailKey,
+      busy: false,
+      error: error.message || "回测运行失败",
+    };
+    renderHoldings();
+  }
 }
 
 function backtestSummaryText(backtest) {
@@ -2664,10 +2727,22 @@ async function postDashboardJson(url, payload) {
 }
 
 function holdingByKey(detailKey) {
-  return filteredHoldings().find((holding) => holdingKey(holding) === detailKey)
+  return holdingByKeyFromRows(filteredHoldings(), detailKey)
     || (state.dashboard && Array.isArray(state.dashboard.holdings)
-      ? state.dashboard.holdings.find((holding) => holdingKey(holding) === detailKey)
+      ? holdingByKeyFromRows(state.dashboard.holdings, detailKey)
       : null);
+}
+
+function holdingByKeyFromRows(rows, detailKey) {
+  for (let index = 0; index < rows.length; index += 1) {
+    if (
+      holdingKey(rows[index], index) === detailKey
+      || holdingKey(rows[index]) === detailKey
+    ) {
+      return rows[index];
+    }
+  }
+  return null;
 }
 
 function renderTradeDecisionBand(action, holding) {

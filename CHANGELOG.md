@@ -10,6 +10,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   `data/latest` or placing orders.
 - Added dashboard backtest entry buttons that open a per-holding回测详情 view
   without showing backtest metrics on the main holdings table.
+- Added a dashboard-only backtest run action that uses the local latest trading
+  plan and `data/prices/<market>/<symbol>.csv`, then refreshes the detail view.
 - Documented the first backtest workflow in both READMEs.
 - Verified with focused backtest/dashboard pytest coverage, the full pytest
   suite, and a local dashboard click check on `127.0.0.1:8766`.

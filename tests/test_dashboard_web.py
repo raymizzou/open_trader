@@ -13,6 +13,7 @@ import pytest
 from open_trader.dashboard_quotes import QuoteRefreshResult
 from open_trader.dashboard_web import STATIC_DIR
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
+from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 
 from tests.test_dashboard import dashboard_config, portfolio_rows, write_csv
 
@@ -2817,6 +2818,127 @@ console.log(html);
     assert "回测详情 · US.VIXY" in html
 
 
+def test_dashboard_backtest_detail_runs_from_button_and_refreshes() -> None:
+    html = run_dashboard_js(
+        r"""
+function makeElement() {
+  const classes = new Set();
+  return {
+    innerHTML: "",
+    textContent: "",
+    disabled: false,
+    classList: {
+      add(...names) { names.forEach((name) => classes.add(name)); },
+      remove(...names) { names.forEach((name) => classes.delete(name)); },
+      contains(name) { return classes.has(name); },
+      toggle(name, force) {
+        if (force === undefined) {
+          classes.has(name) ? classes.delete(name) : classes.add(name);
+        } else if (force) {
+          classes.add(name);
+        } else {
+          classes.delete(name);
+        }
+        return classes.has(name);
+      },
+    },
+    querySelectorAll() { return []; },
+    addEventListener() {},
+  };
+}
+(async () => {
+elements["visible-count"] = makeElement();
+elements["workspace-grid"] = makeElement();
+elements["holdings-table-wrap"] = makeElement();
+elements["symbol-detail-panel"] = makeElement();
+elements["cash-detail-panel"] = makeElement();
+elements["holdings-body"] = makeElement();
+state.dashboardError = null;
+state.quotes = {};
+state.marketFilter = "ALL";
+state.brokerFilter = "ALL";
+state.selectedHoldingDetail = "backtest";
+state.dashboard = {
+  holdings: [{
+    market: "US",
+    symbol: "VIXY",
+    name: "ProShares VIX Short-Term Futures ETF",
+    brokers: "futu",
+    currency: "USD",
+    total_quantity: "10",
+    avg_cost_price: "12.34",
+    market_value: "6250.00",
+    market_value_hkd: "49062.50",
+    portfolio_weight_hkd: "7.50%",
+    unrealized_pnl_pct: "5.00%",
+    backtest: { available: false, error: "" },
+  }],
+};
+state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
+renderHoldings();
+let html = elements["holdings-body"].innerHTML;
+if (!html.includes(">运行回测<") || !html.includes('data-run-backtest="US:VIXY:ProShares VIX Short-Term Futures ETF:0"')) {
+  throw new Error("backtest detail should expose run button: " + html);
+}
+let posted = null;
+let loadCount = 0;
+globalThis.fetch = async (url, options) => {
+  posted = { url, body: JSON.parse(options.body) };
+  return {
+    ok: true,
+    json: async () => ({
+      status: "ok",
+      backtest: {
+        available: true,
+        run_id: "2026-06-18-US-VIXY-trading-plan",
+        metrics: { total_return_pct: "1.17" },
+      },
+    }),
+  };
+};
+loadDashboard = async () => {
+  loadCount += 1;
+  state.dashboard.holdings[0].backtest = {
+    available: true,
+    run_id: "2026-06-18-US-VIXY-trading-plan",
+    run_date: "2026-06-18",
+    market: "US",
+    symbol: "VIXY",
+    strategy: "trading_plan",
+    metrics: {
+      total_return_pct: "1.17",
+      win_rate_pct: "50.00",
+      max_drawdown_pct: "-3.40",
+      trade_count: "2",
+    },
+    report_path: "reports/backtests/2026-06-18-US-VIXY-trading-plan.md",
+    trades_path: "data/backtests/2026-06-18-US-VIXY-trading-plan/trades.csv",
+    equity_curve_path: "data/backtests/2026-06-18-US-VIXY-trading-plan/equity_curve.csv",
+    metrics_path: "data/backtests/2026-06-18-US-VIXY-trading-plan/metrics.json",
+  };
+};
+await runBacktestForHolding(state.selectedHoldingKey);
+if (!posted || posted.url !== "/api/backtests/run") {
+  throw new Error("backtest run should post to API: " + JSON.stringify(posted));
+}
+if (posted.body.market !== "US" || posted.body.symbol !== "VIXY") {
+  throw new Error("backtest run body should identify holding: " + JSON.stringify(posted.body));
+}
+if (loadCount !== 1) {
+  throw new Error("backtest run should reload dashboard once: " + loadCount);
+}
+html = elements["holdings-body"].innerHTML;
+if (!html.includes("回测详情 · US.VIXY") || !html.includes("1.17%")) {
+  throw new Error("backtest detail should refresh after run: " + html);
+}
+console.log(html);
+})();
+"""
+    )
+
+    assert "回测详情 · US.VIXY" in html
+
+
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
     from open_trader.dashboard_web import build_dashboard_payload
 
@@ -2847,6 +2969,70 @@ def test_build_quotes_payload_returns_service_refresh() -> None:
     assert payload["account_sync"]["interval_seconds"] == 60
     assert list(payload["quotes"]) == ["US.MSFT"]
     assert payload["quotes"]["US.MSFT"]["last_price"] == "500"
+
+
+def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
+    plan_row.update(
+        {
+            "run_date": "2026-06-18",
+            "symbol": "VIXY",
+            "market": "US",
+            "rating": "Overweight",
+            "entry_zone_low": "40",
+            "entry_zone_high": "42",
+            "target_1": "48",
+            "stop_loss": "36",
+            "max_weight": "25%",
+            "status": "active",
+        }
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+    write_csv(
+        config.data_dir / "prices" / "US" / "VIXY.csv",
+        ["date", "open", "high", "low", "close"],
+        [
+            {"date": "2026-06-18", "open": "45", "high": "46", "low": "44", "close": "45"},
+            {"date": "2026-06-19", "open": "41", "high": "43", "low": "40", "close": "42"},
+            {"date": "2026-06-20", "open": "47", "high": "49", "low": "46", "close": "48"},
+        ],
+    )
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        payload = post_json(
+            f"http://{host}:{port}/api/backtests/run",
+            {"market": "US", "symbol": "VIXY"},
+        )
+        dashboard_payload = read_json(f"http://{host}:{port}/api/dashboard")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert payload["status"] == "ok"
+    assert payload["backtest"]["run_id"] == "2026-06-18-US-VIXY-trading-plan"
+    assert payload["backtest"]["metrics"]["trade_count"] == "2"
+    vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest"]["available"] is True
+    assert vixy["backtest"]["run_id"] == "2026-06-18-US-VIXY-trading-plan"
 
 
 def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
