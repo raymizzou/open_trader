@@ -626,6 +626,52 @@ function renderKellySymbolStates(experiment) {
   `;
 }
 
+function renderKellyOrderSync(experiment) {
+  const entry = experiment && typeof experiment === "object" ? experiment : {};
+  const sync = entry.order_sync && typeof entry.order_sync === "object" ? entry.order_sync : null;
+  if (!sync) {
+    return "";
+  }
+  const status = kellyOrderSyncStatus(sync.status);
+  const rows = [
+    ["环境", sync.environment],
+    ["最近同步", sync.last_synced_at],
+    ["订单", sync.order_count],
+    ["成交", sync.fill_count],
+  ];
+  return `
+    <section class="kelly-order-sync" aria-label="Kelly 订单同步">
+      <div class="kelly-order-sync-header">
+        <h4>订单同步</h4>
+        <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
+      </div>
+      <dl class="kelly-order-sync-grid">
+        ${rows.map(([label, value]) => `
+          <div>
+            <dt>${escapeHtml(label)}</dt>
+            <dd>${escapeHtml(formatPlain(value))}</dd>
+          </div>
+        `).join("")}
+      </dl>
+      ${hasValue(sync.message) ? `<p>${escapeHtml(formatPlain(sync.message))}</p>` : ""}
+      ${hasValue(sync.next_action) ? `<small>${escapeHtml(formatPlain(sync.next_action))}</small>` : ""}
+    </section>
+  `;
+}
+
+function kellyOrderSyncStatus(status) {
+  const labels = {
+    failed: { label: "同步失败", className: "status-failed" },
+    ok: { label: "同步成功", className: "status-ok" },
+    partial: { label: "部分同步", className: "status-partial" },
+    running: { label: "同步中", className: "status-partial" },
+    stale: { label: "同步过期", className: "status-stale" },
+    success: { label: "同步成功", className: "status-ok" },
+  };
+  const key = formatPlain(status).toLowerCase();
+  return labels[key] || { label: firstPresent(status, "未同步"), className: "status-muted" };
+}
+
 function renderKellySymbolState(sample) {
   const item = sample && typeof sample === "object" ? sample : {};
   const status = kellyLifecycleStatus(item.status);
@@ -698,6 +744,7 @@ function renderKellyExperimentCard(experiment) {
         <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
       </header>
       <p class="kelly-entry-rule">${escapeHtml(formatPlain(entrySummary))}</p>
+      ${renderKellyOrderSync(entry)}
       ${renderKellyStrategyRules(template, ruleDescriptions)}
       <dl class="kelly-stat-grid">
         ${metricRows.map(([label, value]) => `

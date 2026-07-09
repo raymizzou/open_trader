@@ -560,6 +560,7 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   overflow-wrap: anywhere;
 }
 
+.kelly-order-sync,
 .kelly-strategy-rules,
 .kelly-derivation {
   background: var(--surface-soft);
@@ -572,6 +573,56 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 
 .kelly-strategy-rules {
   background: var(--surface);
+}
+
+.kelly-order-sync-header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.kelly-order-sync h4 {
+  font-size: 13px;
+  line-height: 1.3;
+  margin: 0;
+}
+
+.kelly-order-sync-grid {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+}
+
+.kelly-order-sync-grid div {
+  min-width: 0;
+}
+
+.kelly-order-sync-grid dt {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.kelly-order-sync-grid dd {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.kelly-order-sync p,
+.kelly-order-sync small {
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.kelly-order-sync small {
+  font-size: 11px;
 }
 
 .kelly-strategy-rules h4,

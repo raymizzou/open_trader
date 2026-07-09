@@ -541,6 +541,15 @@ state.dashboard = {
       experiment_budget: "100000",
       budget_currency: "USD",
       capital_utilization_pct: "50",
+      order_sync: {
+        status: "success",
+        environment: "SIMULATE",
+        last_synced_at: "2026-07-08 10:08",
+        order_count: 7,
+        fill_count: 5,
+        message: "富途模拟盘订单已同步。",
+        next_action: "可以继续扫描入场与退出信号。"
+      },
       lifecycle_states: [
         {
           status: "watching",
@@ -633,6 +642,15 @@ state.dashboard = {
       experiment_budget: "60000",
       budget_currency: "USD",
       capital_utilization_pct: "40",
+      order_sync: {
+        status: "failed",
+        environment: "SIMULATE",
+        last_synced_at: "2026-07-08 10:09",
+        order_count: 3,
+        fill_count: 2,
+        message: "模拟盘订单同步失败：OpenD 不可用。",
+        next_action: "本轮不下单，保留现有订单状态。"
+      },
       template: {
         strategy_id: "breakout_10d",
         strategy_name: "突破 10D",
@@ -717,6 +735,16 @@ if (html.includes("实验参与标的") || html.includes("kelly-participant-row"
 }
 for (const required of [
   "标的状态",
+  "订单同步",
+  "同步成功",
+  "富途模拟盘订单已同步。",
+  "SIMULATE",
+  "2026-07-08 10:08",
+  "订单",
+  "7",
+  "成交",
+  "5",
+  "可以继续扫描入场与退出信号。",
   "观察中 → 待下单 → 持仓中 → 待退出 → 已完成",
   "观察中",
   "该标的在策略监控范围内，但当前没有入场信号，也没有持仓。",
@@ -789,6 +817,11 @@ if (!secondHtml.includes("突破 10D Mock 第一批") || trendNameCount !== 1) {
 }
 if (!secondHtml.includes("价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。") || !secondHtml.includes("US.MSFT") || !secondHtml.includes("US.TSM") || !secondHtml.includes("HK.06951")) {
   throw new Error("kelly lab second tab content missing: " + secondHtml);
+}
+for (const required of ["订单同步", "同步失败", "模拟盘订单同步失败：OpenD 不可用。", "本轮不下单，保留现有订单状态。"]) {
+  if (!secondHtml.includes(required)) {
+    throw new Error("kelly second tab order sync missing " + required + ": " + secondHtml);
+  }
 }
 for (const forbidden of ["US.DRAM", "US.RAM", "US.SOXX", "HK.02840"]) {
   if (secondHtml.includes(forbidden)) {
