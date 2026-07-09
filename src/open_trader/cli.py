@@ -27,7 +27,10 @@ from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_skill_facts import FutuSkillFactsExtractor, generate_futu_skill_facts
 from .kelly_paper_order_sync import (
     FakeFutuPaperOrderClient,
+    FutuPaperOrderSyncError,
+    FutuSimulatePaperOrderClient,
     default_fake_kelly_paper_orders,
+    load_kelly_experiment_symbol_index,
     sync_kelly_paper_orders,
 )
 from .t_signal import TSignalInterpreter
@@ -648,11 +651,18 @@ def build_parser() -> argparse.ArgumentParser:
         "sync-paper-orders",
         help="Refresh Kelly Lab paper-order artifact",
     )
-    kelly_sync_paper_orders_parser.add_argument(
+    kelly_order_source_group = kelly_sync_paper_orders_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    kelly_order_source_group.add_argument(
         "--fake",
         action="store_true",
-        required=True,
-        help="Use built-in fake simulate orders. Required until real Futu sync is added.",
+        help="Use built-in fake simulate orders.",
+    )
+    kelly_order_source_group.add_argument(
+        "--futu-simulate",
+        action="store_true",
+        help="Read orders from Futu simulate account through OpenD.",
     )
     kelly_sync_paper_orders_parser.add_argument(
         "--data-dir",
@@ -662,6 +672,12 @@ def build_parser() -> argparse.ArgumentParser:
     kelly_sync_paper_orders_parser.add_argument(
         "--synced-at",
         help="Override sync timestamp for deterministic local demos",
+    )
+    kelly_sync_paper_orders_parser.add_argument("--host", default="127.0.0.1")
+    kelly_sync_paper_orders_parser.add_argument(
+        "--port",
+        type=positive_int,
+        default=11111,
     )
 
     trading_plan_parser = subparsers.add_parser(
@@ -1246,14 +1262,30 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "kelly" and args.kelly_command == "sync-paper-orders":
-        client = FakeFutuPaperOrderClient(
-            orders=default_fake_kelly_paper_orders(),
-        )
-        payload = sync_kelly_paper_orders(
-            data_dir=args.data_dir,
-            client=client,
-            synced_at=args.synced_at,
-        )
+        client = None
+        try:
+            if args.fake:
+                client = FakeFutuPaperOrderClient(
+                    orders=default_fake_kelly_paper_orders(),
+                )
+            else:
+                client = FutuSimulatePaperOrderClient(
+                    host=args.host,
+                    port=args.port,
+                    experiment_symbol_index=load_kelly_experiment_symbol_index(
+                        args.data_dir
+                    ),
+                )
+            payload = sync_kelly_paper_orders(
+                data_dir=args.data_dir,
+                client=client,
+                synced_at=args.synced_at,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuPaperOrderSyncError) as exc:
+            parser.error(str(exc))
+        finally:
+            if client is not None and hasattr(client, "close"):
+                client.close()
         print(f"environment: {payload['environment']}")
         print(f"orders: {len(payload['orders'])}")
         print(f"synced_at: {payload['synced_at']}")

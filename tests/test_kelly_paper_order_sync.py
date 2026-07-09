@@ -7,8 +7,15 @@ import pytest
 
 from open_trader.kelly_paper_order_sync import (
     FakeFutuPaperOrderClient,
+    FutuSimulatePaperOrderClient,
+    load_kelly_experiment_symbol_index,
     sync_kelly_paper_orders,
 )
+
+
+def write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def test_sync_kelly_paper_orders_writes_latest_artifact_from_fake_client(
@@ -94,3 +101,179 @@ def test_sync_kelly_paper_orders_rejects_order_without_experiment_id(
         sync_kelly_paper_orders(tmp_path / "data", client)
 
     assert not (tmp_path / "data" / "latest" / "kelly_paper_orders.json").exists()
+
+
+class FakeDataFrame:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
+
+    def to_dict(self, orient: str) -> list[dict[str, object]]:
+        assert orient == "records"
+        return self._rows
+
+
+class FakeFutuOrderContext:
+    def __init__(self, *, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.closed = False
+        self.order_calls: list[dict[str, object]] = []
+
+    def get_acc_list(self) -> tuple[int, FakeDataFrame]:
+        return (
+            0,
+            FakeDataFrame(
+                [
+                    {
+                        "acc_id": 111,
+                        "acc_index": 0,
+                        "trd_env": "REAL",
+                        "acc_type": "CASH",
+                        "acc_status": "ACTIVE",
+                    },
+                    {
+                        "acc_id": 222,
+                        "acc_index": 1,
+                        "trd_env": "SIMULATE",
+                        "acc_type": "SECURITY",
+                        "acc_status": "ACTIVE",
+                    },
+                ]
+            ),
+        )
+
+    def order_list_query(
+        self,
+        *,
+        trd_env: str,
+        acc_id: int,
+        acc_index: int,
+        refresh_cache: bool,
+        order_market: str,
+    ) -> tuple[int, FakeDataFrame]:
+        self.order_calls.append(
+            {
+                "trd_env": trd_env,
+                "acc_id": acc_id,
+                "acc_index": acc_index,
+                "refresh_cache": refresh_cache,
+                "order_market": order_market,
+            }
+        )
+        return (
+            0,
+            FakeDataFrame(
+                [
+                    {
+                        "code": "US.RAM",
+                        "trd_side": "BUY",
+                        "create_time": "2026-07-09 10:01:00",
+                        "price": "12.34",
+                        "qty": "800",
+                        "dealt_qty": "800",
+                        "dealt_avg_price": "12.35",
+                        "order_status": "FILLED_ALL",
+                        "order_id": "SIM-10001",
+                    },
+                    {
+                        "code": "US.SOXX",
+                        "trd_side": "SELL",
+                        "create_time": "2026-07-09 10:02:00",
+                        "price": "246.80",
+                        "qty": "20",
+                        "dealt_qty": "0",
+                        "dealt_avg_price": "",
+                        "order_status": "SUBMITTED",
+                        "order_id": "SIM-10002",
+                    },
+                ]
+            ),
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_load_kelly_experiment_symbol_index_maps_unique_participants(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        {
+            "schema_version": "open_trader.kelly_experiments.v1",
+            "experiments": [
+                {
+                    "experiment_id": "trend_exp",
+                    "participants": [
+                        {"market": "US", "symbol": "RAM"},
+                        {"market": "US", "symbol": "SOXX"},
+                    ],
+                },
+                {
+                    "experiment_id": "breakout_exp",
+                    "participants": [
+                        {"market": "US", "symbol": "MSFT"},
+                        {"market": "US", "symbol": "SOXX"},
+                    ],
+                },
+            ],
+        },
+    )
+
+    index = load_kelly_experiment_symbol_index(data_dir)
+
+    assert index[("US", "RAM")] == "trend_exp"
+    assert index[("US", "MSFT")] == "breakout_exp"
+    assert ("US", "SOXX") not in index
+
+
+def test_futu_simulate_paper_order_client_reads_simulate_orders() -> None:
+    client = FutuSimulatePaperOrderClient(
+        host="127.0.0.1",
+        port=11111,
+        experiment_symbol_index={("US", "RAM"): "trend_exp"},
+        context_factory=FakeFutuOrderContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    orders = client.list_orders()
+
+    assert orders == [
+        {
+            "experiment_id": "trend_exp",
+            "market": "US",
+            "symbol": "RAM",
+            "side": "buy",
+            "submitted_at": "2026-07-09 10:01:00",
+            "order_price": "12.34",
+            "order_qty": "800",
+            "filled_qty": "800",
+            "avg_fill_price": "12.35",
+            "status": "filled",
+            "order_id": "SIM-10001",
+        }
+    ]
+    assert client.context.order_calls == [
+        {
+            "trd_env": "SIMULATE",
+            "acc_id": 222,
+            "acc_index": 1,
+            "refresh_cache": True,
+            "order_market": "N/A",
+        }
+    ]
+
+
+def test_futu_simulate_paper_order_client_closes_context() -> None:
+    client = FutuSimulatePaperOrderClient(
+        host="127.0.0.1",
+        port=11111,
+        experiment_symbol_index={},
+        context_factory=FakeFutuOrderContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    client.close()
+
+    assert client.context.closed is True

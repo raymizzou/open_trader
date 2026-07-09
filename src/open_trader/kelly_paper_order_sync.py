@@ -3,13 +3,22 @@ from __future__ import annotations
 import copy
 import json
 import os
+import socket
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .kelly_lab import PAPER_ORDERS_SCHEMA_VERSION
+
+TRD_ENV_SIMULATE = "SIMULATE"
+
+
+class FutuPaperOrderSyncError(RuntimeError):
+    def __init__(self, message: str, *, error_type: str) -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class PaperOrderClient(Protocol):
@@ -28,6 +37,94 @@ class FakeFutuPaperOrderClient:
 
     def list_orders(self) -> list[dict[str, Any]]:
         return [copy.deepcopy(order) for order in self.orders]
+
+
+class FutuSimulatePaperOrderClient:
+    environment = TRD_ENV_SIMULATE
+    source = "futu_simulate_paper_order_client"
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        experiment_symbol_index: dict[tuple[str, str], str],
+        context_factory: Callable[..., Any] = None,
+        connectivity_checker: Callable[[str, int], bool] = None,
+    ) -> None:
+        connectivity_checker = connectivity_checker or _can_connect_to_opend
+        context_factory = context_factory or _default_trade_context_factory
+        if not connectivity_checker(host, port):
+            raise FutuPaperOrderSyncError(
+                f"Futu OpenD is not reachable at {host}:{port}. Start OpenD, log in, and check host/port.",
+                error_type="opend_unreachable",
+            )
+        try:
+            self.context = context_factory(host=host, port=port)
+        except FutuPaperOrderSyncError:
+            raise
+        except Exception as exc:
+            raise FutuPaperOrderSyncError(
+                f"failed to create Futu trade context at {host}:{port}: {exc}",
+                error_type="trade_context_failed",
+            ) from exc
+        self.host = host
+        self.port = port
+        self.experiment_symbol_index = experiment_symbol_index
+
+    def list_orders(self) -> list[dict[str, Any]]:
+        accounts = self._simulate_accounts()
+        orders: list[dict[str, Any]] = []
+        for account in accounts:
+            ret_code, data = self.context.order_list_query(
+                trd_env=TRD_ENV_SIMULATE,
+                acc_id=account["acc_id"],
+                acc_index=account["acc_index"],
+                refresh_cache=True,
+                order_market="N/A",
+            )
+            if ret_code != 0:
+                raise FutuPaperOrderSyncError(
+                    str(data),
+                    error_type="order_query_failed",
+                )
+            for record in _records(data):
+                order = _order_from_futu_record(record, self.experiment_symbol_index)
+                if order is not None:
+                    orders.append(order)
+        return orders
+
+    def close(self) -> None:
+        self.context.close()
+
+    def _simulate_accounts(self) -> list[dict[str, int]]:
+        ret_code, data = self.context.get_acc_list()
+        if ret_code != 0:
+            raise FutuPaperOrderSyncError(
+                str(data),
+                error_type="account_query_failed",
+            )
+        accounts: list[dict[str, int]] = []
+        for record in _records(data):
+            trd_env = str(record.get("trd_env", "")).strip().upper()
+            acc_status = str(record.get("acc_status", "ACTIVE")).strip().upper()
+            if trd_env != TRD_ENV_SIMULATE or acc_status not in {"", "ACTIVE"}:
+                continue
+            accounts.append(
+                {
+                    "acc_id": _as_int(record.get("acc_id"), field_name="acc_id"),
+                    "acc_index": _as_int(
+                        record.get("acc_index", 0),
+                        field_name="acc_index",
+                    ),
+                }
+            )
+        if not accounts:
+            raise FutuPaperOrderSyncError(
+                "no SIMULATE Futu securities accounts found",
+                error_type="no_simulate_accounts",
+            )
+        return accounts
 
 
 def default_fake_kelly_paper_orders() -> tuple[dict[str, Any], ...]:
@@ -96,6 +193,42 @@ def sync_kelly_paper_orders(
     return payload
 
 
+def load_kelly_experiment_symbol_index(data_dir: Path) -> dict[tuple[str, str], str]:
+    path = data_dir / "latest" / "kelly_experiments.json"
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    experiments = payload.get("experiments")
+    if not isinstance(experiments, list):
+        raise ValueError(f"{path.name} must contain an experiments list")
+
+    experiment_ids_by_symbol: dict[tuple[str, str], set[str]] = {}
+    for experiment in experiments:
+        if not isinstance(experiment, dict):
+            continue
+        experiment_id = experiment.get("experiment_id")
+        if not isinstance(experiment_id, str) or not experiment_id.strip():
+            continue
+        participants = experiment.get("participants")
+        if not isinstance(participants, list):
+            continue
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            market = participant.get("market")
+            symbol = participant.get("symbol")
+            if not isinstance(market, str) or not isinstance(symbol, str):
+                continue
+            key = (market.strip().upper(), symbol.strip().upper())
+            if key[0] and key[1]:
+                experiment_ids_by_symbol.setdefault(key, set()).add(experiment_id)
+
+    return {
+        key: next(iter(experiment_ids))
+        for key, experiment_ids in experiment_ids_by_symbol.items()
+        if len(experiment_ids) == 1
+    }
+
+
 def _validated_orders(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not isinstance(orders, list):
         raise ValueError("paper order client must return an orders list")
@@ -136,3 +269,127 @@ def _atomic_temp_path(path: Path) -> Path:
 
 def _current_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _can_connect_to_opend(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def _default_trade_context_factory(*, host: str, port: int) -> Any:
+    try:
+        from futu import OpenSecTradeContext
+    except ImportError as exc:
+        raise FutuPaperOrderSyncError(
+            "futu-api is not installed. Install it with: .venv/bin/python -m pip install futu-api",
+            error_type="trade_context_failed",
+        ) from exc
+    return OpenSecTradeContext(host=host, port=port)
+
+
+def _records(data: object) -> list[dict[str, object]]:
+    if hasattr(data, "to_dict"):
+        rows = data.to_dict("records")
+        return [dict(row) for row in rows]
+    raise FutuPaperOrderSyncError(
+        f"Futu returned an unsupported table payload: {type(data).__name__}",
+        error_type="trade_context_failed",
+    )
+
+
+def _as_int(value: object, *, field_name: str) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise FutuPaperOrderSyncError(
+            f"Futu account field {field_name} is not an integer: {value!r}",
+            error_type="account_query_failed",
+        ) from exc
+
+
+def _order_from_futu_record(
+    record: dict[str, object],
+    experiment_symbol_index: dict[tuple[str, str], str],
+) -> dict[str, Any] | None:
+    market_symbol = _market_symbol_from_futu_code(record.get("code"))
+    if market_symbol is None:
+        return None
+    experiment_id = experiment_symbol_index.get(market_symbol)
+    if experiment_id is None:
+        return None
+    market, symbol = market_symbol
+    filled_qty = _first_text(record, ("dealt_qty", "filled_qty", "fill_qty"))
+    avg_fill_price = _first_text(
+        record,
+        ("dealt_avg_price", "avg_fill_price", "avg_price"),
+        "-",
+    )
+    if not avg_fill_price:
+        avg_fill_price = "-"
+    return {
+        "experiment_id": experiment_id,
+        "market": market,
+        "symbol": symbol,
+        "side": _normalize_side(_first_text(record, ("trd_side", "side"))),
+        "submitted_at": _first_text(
+            record,
+            ("create_time", "submitted_at", "create_time_str"),
+        ),
+        "order_price": _first_text(record, ("price", "order_price")),
+        "order_qty": _first_text(record, ("qty", "order_qty")),
+        "filled_qty": filled_qty,
+        "avg_fill_price": avg_fill_price,
+        "status": _normalize_order_status(
+            _first_text(record, ("order_status", "status")),
+        ),
+        "order_id": _first_text(record, ("order_id", "orderid")),
+    }
+
+
+def _market_symbol_from_futu_code(value: object) -> tuple[str, str] | None:
+    text = str(value or "").strip().upper()
+    if "." not in text:
+        return None
+    market, symbol = text.split(".", 1)
+    if not market or not symbol:
+        return None
+    return market, symbol
+
+
+def _first_text(
+    record: dict[str, object],
+    keys: tuple[str, ...],
+    default: str = "",
+) -> str:
+    for key in keys:
+        value = record.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def _normalize_side(value: str) -> str:
+    normalized = value.strip().upper()
+    if normalized in {"BUY", "BUY_BACK"}:
+        return "buy"
+    if normalized in {"SELL", "SELL_SHORT"}:
+        return "sell"
+    return normalized.lower()
+
+
+def _normalize_order_status(value: str) -> str:
+    normalized = value.strip().upper()
+    if normalized == "FILLED_ALL":
+        return "filled"
+    if normalized in {"FILLED_PART", "FILL_CANCELLED", "CANCELLED_PART"}:
+        return "partial_filled"
+    if normalized in {"SUBMITTED", "SUBMITTING", "WAITING_SUBMIT", "UNSUBMITTED"}:
+        return "submitted"
+    if normalized in {"CANCELLED_ALL", "CANCELLING_ALL", "CANCELLING_PART"}:
+        return "cancelled"
+    if normalized in {"FAILED", "SUBMIT_FAILED", "TIMEOUT", "DISABLED", "DELETED"}:
+        return "rejected"
+    return normalized.lower()
