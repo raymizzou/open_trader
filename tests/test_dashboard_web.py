@@ -548,7 +548,33 @@ state.dashboard = {
         order_count: 7,
         fill_count: 5,
         message: "富途模拟盘订单已同步。",
-        next_action: "可以继续扫描入场与退出信号。"
+        next_action: "可以继续扫描入场与退出信号。",
+        orders: [
+          {
+            market: "US",
+            symbol: "RAM",
+            side: "buy",
+            submitted_at: "2026-07-08 10:01",
+            order_price: "12.34",
+            order_qty: "800",
+            filled_qty: "800",
+            avg_fill_price: "12.34",
+            status: "filled",
+            order_id: "SIM-10001"
+          },
+          {
+            market: "HK",
+            symbol: "02840",
+            side: "sell",
+            submitted_at: "2026-07-08 10:03",
+            order_price: "218.80",
+            order_qty: "100",
+            filled_qty: "0",
+            avg_fill_price: "-",
+            status: "submitted",
+            order_id: "SIM-10002"
+          }
+        ]
       },
       lifecycle_states: [
         {
@@ -649,7 +675,21 @@ state.dashboard = {
         order_count: 3,
         fill_count: 2,
         message: "模拟盘订单同步失败：OpenD 不可用。",
-        next_action: "本轮不下单，保留现有订单状态。"
+        next_action: "本轮不下单，保留现有订单状态。",
+        orders: [
+          {
+            market: "US",
+            symbol: "MSFT",
+            side: "buy",
+            submitted_at: "2026-07-08 10:05",
+            order_price: "505.10",
+            order_qty: "20",
+            filled_qty: "0",
+            avg_fill_price: "-",
+            status: "rejected",
+            order_id: "SIM-20001"
+          }
+        ]
       },
       template: {
         strategy_id: "breakout_10d",
@@ -745,6 +785,28 @@ for (const required of [
   "成交",
   "5",
   "可以继续扫描入场与退出信号。",
+  "标的",
+  "方向",
+  "下单时间",
+  "订单价",
+  "订单数量",
+  "成交数量",
+  "成交均价",
+  "状态",
+  "US.RAM",
+  "SIM-10001",
+  "买入",
+  "2026-07-08 10:01",
+  "12.34",
+  "800",
+  "已成交",
+  "HK.02840",
+  "SIM-10002",
+  "卖出",
+  "218.80",
+  "100",
+  "0",
+  "待成交",
   "观察中 → 待下单 → 持仓中 → 待退出 → 已完成",
   "观察中",
   "该标的在策略监控范围内，但当前没有入场信号，也没有持仓。",
@@ -799,6 +861,15 @@ if (!html.includes("data-workspace-view=\\\"portfolio\\\"")) {
 const fallbackHtml = renderKellyExperimentCard({
   experiment_name: "无状态样本策略",
   status: "running",
+  order_sync: {
+    status: "success",
+    environment: "SIMULATE",
+    last_synced_at: "2026-07-08 10:10",
+    order_count: 0,
+    fill_count: 0,
+    message: "富途模拟盘订单已同步。",
+    next_action: "等待下一次信号。"
+  },
   participants: [{market: "US", symbol: "IBM", name: "IBM", source: "watchlist"}],
   template: {strategy_id: "fallback_strategy", strategy_name: "Fallback"},
   stats: {}
@@ -809,6 +880,9 @@ if (!fallbackHtml.includes("标的状态") || !fallbackHtml.includes("US.IBM") |
 if (fallbackHtml.includes("实验参与标的") || fallbackHtml.includes("kelly-participant-row")) {
   throw new Error("kelly fallback should not render duplicate participant chips: " + fallbackHtml);
 }
+if (!fallbackHtml.includes("暂无同步订单明细。")) {
+  throw new Error("kelly order sync empty detail missing: " + fallbackHtml);
+}
 state.selectedKellyExperimentId = "breakout_10d_mock_20260707";
 const secondHtml = renderKellyLabPanel();
 const trendNameCount = secondHtml.split("趋势回调 20D 第一批").length - 1;
@@ -818,7 +892,7 @@ if (!secondHtml.includes("突破 10D Mock 第一批") || trendNameCount !== 1) {
 if (!secondHtml.includes("价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。") || !secondHtml.includes("US.MSFT") || !secondHtml.includes("US.TSM") || !secondHtml.includes("HK.06951")) {
   throw new Error("kelly lab second tab content missing: " + secondHtml);
 }
-for (const required of ["订单同步", "同步失败", "模拟盘订单同步失败：OpenD 不可用。", "本轮不下单，保留现有订单状态。"]) {
+for (const required of ["订单同步", "同步失败", "模拟盘订单同步失败：OpenD 不可用。", "本轮不下单，保留现有订单状态。", "US.MSFT", "SIM-20001", "买入", "505.10", "20", "拒单"]) {
   if (!secondHtml.includes(required)) {
     throw new Error("kelly second tab order sync missing " + required + ": " + secondHtml);
   }

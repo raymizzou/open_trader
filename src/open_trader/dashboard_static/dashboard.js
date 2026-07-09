@@ -655,8 +655,77 @@ function renderKellyOrderSync(experiment) {
       </dl>
       ${hasValue(sync.message) ? `<p>${escapeHtml(formatPlain(sync.message))}</p>` : ""}
       ${hasValue(sync.next_action) ? `<small>${escapeHtml(formatPlain(sync.next_action))}</small>` : ""}
+      ${renderKellyOrderSyncOrders(sync)}
     </section>
   `;
+}
+
+function renderKellyOrderSyncOrders(sync) {
+  const orders = sync && Array.isArray(sync.orders)
+    ? sync.orders.filter((order) => order && typeof order === "object")
+    : [];
+  if (!orders.length) {
+    return `<p class="kelly-order-empty">暂无同步订单明细。</p>`;
+  }
+  const headers = ["标的", "方向", "下单时间", "订单价", "订单数量", "成交数量", "成交均价", "状态"];
+  return `
+    <div class="kelly-order-table" role="table" aria-label="Kelly 同步订单明细">
+      <div class="kelly-order-row header" role="row">
+        ${headers.map((header) => `<span role="columnheader">${escapeHtml(header)}</span>`).join("")}
+      </div>
+      ${orders.map(renderKellyOrderSyncOrder).join("")}
+    </div>
+  `;
+}
+
+function renderKellyOrderSyncOrder(order) {
+  const item = order && typeof order === "object" ? order : {};
+  const symbol = [item.market, item.symbol]
+    .filter(hasValue)
+    .map(formatPlain)
+    .join(".");
+  const symbolCell = `
+    <strong>${escapeHtml(firstPresent(symbol, item.symbol, "-"))}</strong>
+    ${hasValue(item.order_id) ? `<small>${escapeHtml(formatPlain(item.order_id))}</small>` : ""}
+  `;
+  const cells = [
+    symbolCell,
+    escapeHtml(kellyOrderSideLabel(item.side)),
+    escapeHtml(formatPlain(item.submitted_at || "-")),
+    escapeHtml(formatPlain(item.order_price || "-")),
+    escapeHtml(formatPlain(item.order_qty || "-")),
+    escapeHtml(formatPlain(item.filled_qty || "-")),
+    escapeHtml(formatPlain(item.avg_fill_price || "-")),
+    escapeHtml(kellyOrderStatusLabel(item.status)),
+  ];
+  return `
+    <div class="kelly-order-row" role="row">
+      ${cells.map((cell) => `<span role="cell">${cell}</span>`).join("")}
+    </div>
+  `;
+}
+
+function kellyOrderSideLabel(side) {
+  const labels = {
+    buy: "买入",
+    sell: "卖出",
+  };
+  const key = formatPlain(side).toLowerCase();
+  return labels[key] || firstPresent(side, "-");
+}
+
+function kellyOrderStatusLabel(status) {
+  const labels = {
+    cancelled: "已撤单",
+    failed: "失败",
+    filled: "已成交",
+    partial_filled: "部分成交",
+    pending: "待成交",
+    rejected: "拒单",
+    submitted: "待成交",
+  };
+  const key = formatPlain(status).toLowerCase();
+  return labels[key] || firstPresent(status, "-");
 }
 
 function kellyOrderSyncStatus(status) {

@@ -26,6 +26,13 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(orderSync.getByText('SIMULATE')).toBeVisible();
   await expect(orderSync.getByText('2026-07-08 10:08')).toBeVisible();
   await expect(orderSync.getByText('可以继续扫描入场与退出信号。')).toBeVisible();
+  await expect(orderSync.getByText('US.RAM')).toBeVisible();
+  await expect(orderSync.getByText('SIM-10001')).toBeVisible();
+  await expect(orderSync.getByText('买入')).toBeVisible();
+  await expect(orderSync.getByText('12.34')).toHaveCount(2);
+  await expect(orderSync.getByText('800')).toHaveCount(2);
+  await expect(orderSync.getByText('已成交')).toBeVisible();
+  await expect(orderSync.getByText('US.MSFT')).toHaveCount(0);
   const symbolStates = page.getByLabel('Kelly 标的状态');
   await expect(symbolStates.getByText('观察中 → 待下单 → 持仓中 → 待退出 → 已完成')).toBeVisible();
   await expect(symbolStates.getByText('该标的在策略监控范围内，但当前没有入场信号，也没有持仓。')).toBeVisible();
@@ -65,6 +72,11 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(failedOrderSync.getByText('同步失败', { exact: true })).toBeVisible();
   await expect(failedOrderSync.getByText('模拟盘订单同步失败：OpenD 不可用。')).toBeVisible();
   await expect(failedOrderSync.getByText('本轮不下单，保留现有订单状态。')).toBeVisible();
+  await expect(failedOrderSync.getByText('US.MSFT')).toBeVisible();
+  await expect(failedOrderSync.getByText('SIM-20001')).toBeVisible();
+  await expect(failedOrderSync.getByText('拒单')).toBeVisible();
+  await expect(failedOrderSync.getByText('505.10')).toBeVisible();
+  await expect(failedOrderSync.getByText('US.RAM')).toHaveCount(0);
   await expect(page.getByLabel('Kelly 策略详情').getByText('价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。')).toBeVisible();
   await page.getByRole('button', { name: '返回主页' }).click();
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toHaveCount(0);
