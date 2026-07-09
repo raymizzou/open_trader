@@ -11,6 +11,7 @@ from .kelly_lifecycle import build_kelly_lifecycle_states
 
 TEMPLATES_SCHEMA_VERSION = "open_trader.kelly_strategy_templates.v1"
 EXPERIMENTS_SCHEMA_VERSION = "open_trader.kelly_experiments.v1"
+PAPER_ORDERS_SCHEMA_VERSION = "open_trader.kelly_paper_orders.v1"
 
 ALLOWED_EXPERIMENT_STATUSES = {"draft", "running", "paused", "completed", "failed"}
 
@@ -76,6 +77,7 @@ def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
     latest_dir = data_dir / "latest"
     templates_path = latest_dir / "kelly_strategy_templates.json"
     experiments_path = latest_dir / "kelly_experiments.json"
+    paper_orders_path = latest_dir / "kelly_paper_orders.json"
 
     missing_path = _first_missing_path(templates_path, experiments_path)
     if missing_path is not None:
@@ -94,6 +96,8 @@ def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
         experiments_path,
         templates_by_key,
     )
+    paper_orders = _load_optional_paper_orders(paper_orders_path)
+    experiments = _attach_paper_orders_to_experiments(experiments, paper_orders)
 
     return KellyLabState(
         available=True,
@@ -135,6 +139,63 @@ def _load_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"{path.name} must contain a JSON object")
     return payload
+
+
+def _load_optional_paper_orders(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    payload = _load_json_object(path)
+    _validate_schema_version(
+        payload,
+        path,
+        expected_schema_version=PAPER_ORDERS_SCHEMA_VERSION,
+    )
+    orders = payload.get("orders")
+    if not isinstance(orders, list):
+        raise ValueError(f"{path.name} must contain an orders list")
+
+    validated: list[dict[str, Any]] = []
+    for index, order in enumerate(orders):
+        if not isinstance(order, dict):
+            raise ValueError(f"{path.name} order {index} must be an object")
+        experiment_id = order.get("experiment_id")
+        if not isinstance(experiment_id, str) or not experiment_id:
+            raise ValueError(f"{path.name} order {index} has invalid experiment_id")
+        normalized = copy.deepcopy(order)
+        for key in ("market", "symbol", "side", "status"):
+            if isinstance(normalized.get(key), str):
+                normalized[key] = normalized[key].strip()
+        validated.append(normalized)
+    return validated
+
+
+def _attach_paper_orders_to_experiments(
+    experiments: list[dict[str, Any]],
+    paper_orders: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not paper_orders:
+        return experiments
+    orders_by_experiment: dict[str, list[dict[str, Any]]] = {}
+    for order in paper_orders:
+        experiment_id = order.get("experiment_id")
+        if not isinstance(experiment_id, str):
+            continue
+        orders_by_experiment.setdefault(experiment_id, []).append(copy.deepcopy(order))
+
+    attached: list[dict[str, Any]] = []
+    for experiment in experiments:
+        normalized = copy.deepcopy(experiment)
+        experiment_id = normalized.get("experiment_id")
+        if isinstance(experiment_id, str) and experiment_id in orders_by_experiment:
+            order_sync = normalized.get("order_sync")
+            if isinstance(order_sync, dict):
+                order_sync = copy.deepcopy(order_sync)
+            else:
+                order_sync = {}
+            order_sync["orders"] = orders_by_experiment[experiment_id]
+            normalized["order_sync"] = order_sync
+        attached.append(normalized)
+    return attached
 
 
 def _validate_templates_payload(
