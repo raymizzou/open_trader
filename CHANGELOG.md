@@ -3,6 +3,14 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-09
+
+- Added a read-only `run-backtest` MVP for active trading-plan rows, producing
+  trades, equity curve, metrics, and Markdown report artifacts without updating
+  `data/latest` or placing orders.
+- Documented the first backtest workflow in both READMEs.
+- Verified with focused backtest and CLI pytest coverage.
+
 ## 2026-07-04
 
 - Added Futu daily-K Bollinger fact generation for dashboard K-line cards, fixed

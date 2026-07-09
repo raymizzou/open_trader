@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
+from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
     build_notifier,
@@ -75,6 +76,21 @@ def positive_decimal(value: str) -> Decimal:
             f"invalid positive decimal value: {value}"
         )
     return rate
+
+
+def non_negative_decimal(value: str) -> Decimal:
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid non-negative decimal value: {value}"
+        ) from exc
+
+    if not parsed.is_finite() or parsed < Decimal("0"):
+        raise argparse.ArgumentTypeError(
+            f"invalid non-negative decimal value: {value}"
+        )
+    return parsed
 
 
 def positive_int(value: str) -> int:
@@ -714,6 +730,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write dated output and report but do not update latest trade actions",
     )
 
+    backtest_parser = subparsers.add_parser(
+        "run-backtest",
+        help="Backtest one active trading-plan rule against historical daily prices",
+    )
+    backtest_parser.add_argument(
+        "--plan",
+        type=Path,
+        default=Path("data/latest/trading_plan.csv"),
+    )
+    backtest_parser.add_argument(
+        "--prices",
+        type=Path,
+        required=True,
+        help="Historical OHLC CSV with date, open, high, low, close columns",
+    )
+    backtest_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    backtest_parser.add_argument("--reports-dir", type=Path, default=Path("reports"))
+    backtest_parser.add_argument("--symbol", required=True)
+    backtest_parser.add_argument(
+        "--market",
+        type=canonical_market,
+        required=True,
+        choices=["HK", "US"],
+    )
+    backtest_parser.add_argument(
+        "--date",
+        type=canonical_date,
+        required=True,
+        help="Trading plan run date, YYYY-MM-DD",
+    )
+    backtest_parser.add_argument(
+        "--initial-cash",
+        type=positive_decimal,
+        default=Decimal("100000"),
+    )
+    backtest_parser.add_argument(
+        "--commission-bps",
+        type=non_negative_decimal,
+        default=Decimal("10"),
+    )
+    backtest_parser.add_argument(
+        "--slippage-bps",
+        type=non_negative_decimal,
+        default=Decimal("5"),
+    )
+
     dashboard_parser = subparsers.add_parser(
         "dashboard",
         help="Serve the realtime portfolio dashboard",
@@ -1316,6 +1378,36 @@ def main(argv: list[str] | None = None) -> int:
         print(f"trade_actions_csv: {result.actions_path}")
         print(f"report: {result.report_path}")
         print(f"latest: {result.latest_path}")
+        return 0
+
+    if args.command == "run-backtest":
+        try:
+            result = run_backtest(
+                plan_path=args.plan,
+                prices_path=args.prices,
+                data_dir=args.data_dir,
+                reports_dir=args.reports_dir,
+                run_date=args.date,
+                symbol=args.symbol,
+                market=args.market,
+                initial_cash=args.initial_cash,
+                commission_bps=args.commission_bps,
+                slippage_bps=args.slippage_bps,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            parser.error(str(exc))
+        print(f"run_id: {result.run_id}")
+        print(f"run_date: {result.run_date}")
+        print(f"market: {result.market}")
+        print(f"symbol: {result.symbol}")
+        print(f"trades: {result.trade_count}")
+        print(f"final_equity: {result.final_equity}")
+        print(f"total_return_pct: {result.total_return_pct}")
+        print(f"max_drawdown_pct: {result.max_drawdown_pct}")
+        print(f"metrics: {result.metrics_path}")
+        print(f"trades_csv: {result.trades_path}")
+        print(f"equity_curve_csv: {result.equity_curve_path}")
+        print(f"report: {result.report_path}")
         return 0
 
     if args.command == "dashboard":

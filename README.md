@@ -305,6 +305,27 @@ report, then blocks latest promotion.
   --date 2026-06-16
 ```
 
+### Backtest a Trading Plan
+
+Run a single-symbol, read-only backtest for an active trading-plan row against
+historical daily OHLC prices:
+
+```bash
+.venv/bin/python -m open_trader run-backtest \
+  --plan data/latest/trading_plan.csv \
+  --prices data/prices/US/MSFT.csv \
+  --symbol MSFT \
+  --market US \
+  --date 2026-06-16
+```
+
+The first backtest strategy is intentionally narrow: it uses the selected
+`trading_plan.csv` entry zone, stop loss, targets, and max weight; starts
+evaluating candles after the plan date; applies commission and slippage; and
+writes standalone artifacts under `data/backtests/<run_id>/` plus a Markdown
+report under `reports/backtests/`. It does not place orders or update
+`data/latest`.
+
 ### Deploy Local Frontend Dashboard
 
 ```bash
