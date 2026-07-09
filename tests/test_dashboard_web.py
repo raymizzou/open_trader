@@ -2721,6 +2721,102 @@ if (!renderedWithOther.includes("其他市场持仓") || !renderedWithOther.incl
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
+def test_dashboard_renders_backtest_entry_and_detail_only_after_selection() -> None:
+    html = run_dashboard_js(
+        r"""
+function makeElement() {
+  const classes = new Set();
+  return {
+    innerHTML: "",
+    textContent: "",
+    classList: {
+      add(...names) { names.forEach((name) => classes.add(name)); },
+      remove(...names) { names.forEach((name) => classes.delete(name)); },
+      contains(name) { return classes.has(name); },
+      toggle(name, force) {
+        if (force === undefined) {
+          classes.has(name) ? classes.delete(name) : classes.add(name);
+        } else if (force) {
+          classes.add(name);
+        } else {
+          classes.delete(name);
+        }
+        return classes.has(name);
+      },
+    },
+    querySelectorAll() { return []; },
+  };
+}
+elements["visible-count"] = makeElement();
+elements["workspace-grid"] = makeElement();
+elements["holdings-table-wrap"] = makeElement();
+elements["symbol-detail-panel"] = makeElement();
+elements["cash-detail-panel"] = makeElement();
+elements["holdings-body"] = makeElement();
+state.dashboardError = null;
+state.quotes = {};
+state.marketFilter = "ALL";
+state.brokerFilter = "ALL";
+state.selectedHoldingKey = "";
+state.selectedHoldingDetail = "decision";
+state.dashboard = {
+  holdings: [{
+    market: "US",
+    symbol: "VIXY",
+    name: "ProShares VIX Short-Term Futures ETF",
+    brokers: "futu",
+    currency: "USD",
+    total_quantity: "10",
+    avg_cost_price: "12.34",
+    market_value: "6250.00",
+    market_value_hkd: "49062.50",
+    portfolio_weight_hkd: "7.50%",
+    unrealized_pnl_pct: "5.00%",
+    backtest: {
+      available: true,
+      run_id: "2026-06-18-US-VIXY-trading-plan",
+      run_date: "2026-06-18",
+      market: "US",
+      symbol: "VIXY",
+      strategy: "trading_plan",
+      metrics: {
+        total_return_pct: "1.17",
+        win_rate_pct: "50.00",
+        max_drawdown_pct: "-3.40",
+        trade_count: "2",
+      },
+      report_path: "reports/backtests/2026-06-18-US-VIXY-trading-plan.md",
+      trades_path: "data/backtests/2026-06-18-US-VIXY-trading-plan/trades.csv",
+      equity_curve_path: "data/backtests/2026-06-18-US-VIXY-trading-plan/equity_curve.csv",
+      status: "ok",
+      error: "",
+    },
+  }],
+};
+renderHoldings();
+let html = elements["holdings-body"].innerHTML;
+if (!html.includes(">查看回测<") || !html.includes('data-detail-mode="backtest"')) {
+  throw new Error("holding row should expose backtest entry: " + html);
+}
+if (html.includes("总收益") || html.includes("1.17%") || html.includes("回测详情 ·")) {
+  throw new Error("main holdings table should not show backtest metrics before selection: " + html);
+}
+state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
+state.selectedHoldingDetail = "backtest";
+renderHoldings();
+html = elements["holdings-body"].innerHTML;
+for (const required of ["回测详情 · US.VIXY", "总收益", "1.17%", "胜率", "50.00%", "最大回撤", "-3.40%", "交易次数", "2", "reports/backtests/2026-06-18-US-VIXY-trading-plan.md"]) {
+  if (!html.includes(required)) {
+    throw new Error("backtest detail missing " + required + ": " + html);
+  }
+}
+console.log(html);
+"""
+    )
+
+    assert "回测详情 · US.VIXY" in html
+
+
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
     from open_trader.dashboard_web import build_dashboard_payload
 

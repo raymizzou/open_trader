@@ -620,7 +620,7 @@ function renderHoldings() {
       const tSignalClass = tSignalButtonClass(holding);
       rows.push(`
         <tr class="${selectedClass}">
-          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
+          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button><button class="expand-button backtest-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="backtest">查看回测</button></td>
           <td>${escapeHtml(formatPlain(holding.market))}</td>
           <td class="symbol-cell">
             <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
@@ -642,7 +642,9 @@ function renderHoldings() {
               <div class="symbol-detail-panel inline-symbol-detail">
                 ${selectedDetail === "t_signal"
                   ? renderTSignalDetail(selected.holding)
-                  : renderSymbolDetail(selected.holding, selected.index)}
+                  : selectedDetail === "backtest"
+                    ? renderBacktestDetail(selected.holding)
+                    : renderSymbolDetail(selected.holding, selected.index)}
               </div>
             </td>
           </tr>
@@ -681,7 +683,10 @@ function showSymbolDetail(detailKey, detailMode = "decision") {
 }
 
 function normalizeHoldingDetailMode(mode) {
-  return mode === "t_signal" ? "t_signal" : "decision";
+  if (mode === "t_signal" || mode === "backtest") {
+    return mode;
+  }
+  return "decision";
 }
 
 function tSignalButtonClass(holding) {
@@ -805,6 +810,90 @@ function renderTSignalDetail(holding) {
       ${renderTSignalTimeline(signal)}
     </div>
   `;
+}
+
+function renderBacktestDetail(holding) {
+  const title = `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
+  const backtest = holding && holding.backtest && typeof holding.backtest === "object"
+    ? holding.backtest
+    : null;
+  if (!backtest || backtest.available === false) {
+    const message = backtest && backtest.error ? backtest.error : "暂无回测结果。";
+    return `
+      <div class="detail-header trading-decision-header">
+        <div>
+          <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
+          <h2>回测详情 · ${escapeHtml(title)}</h2>
+          <p>${escapeHtml(message)}</p>
+        </div>
+        <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
+      </div>
+      <section class="detail-section backtest-section">
+        <h3>当前状态</h3>
+        <p class="muted-copy">该标的尚未生成交易计划回测结果。</p>
+      </section>
+    `;
+  }
+  const metrics = backtest.metrics && typeof backtest.metrics === "object" ? backtest.metrics : {};
+  return `
+    <div class="detail-header trading-decision-header">
+      <div>
+        <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
+        <h2>回测详情 · ${escapeHtml(title)}</h2>
+        <p>${escapeHtml(backtestSummaryText(backtest))}</p>
+      </div>
+      <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
+    </div>
+    <div class="backtest-layout">
+      <section class="detail-section backtest-section">
+        <h3>结果概览</h3>
+        <div class="detail-metric-grid backtest-metric-grid">
+          ${renderBacktestMetric("总收益", percentMetricText(metrics.total_return_pct))}
+          ${renderBacktestMetric("胜率", percentMetricText(metrics.win_rate_pct))}
+          ${renderBacktestMetric("最大回撤", percentMetricText(metrics.max_drawdown_pct))}
+          ${renderBacktestMetric("交易次数", metrics.trade_count)}
+        </div>
+      </section>
+      <section class="detail-section backtest-section">
+        <h3>输出文件</h3>
+        <dl class="detail-dl backtest-output-list">
+          ${renderRequiredTerm("报告", backtest.report_path)}
+          ${renderRequiredTerm("交易明细", backtest.trades_path)}
+          ${renderRequiredTerm("权益曲线", backtest.equity_curve_path)}
+          ${renderRequiredTerm("指标 JSON", backtest.metrics_path)}
+        </dl>
+      </section>
+    </div>
+  `;
+}
+
+function backtestSummaryText(backtest) {
+  const runDate = formatPlain(backtest.run_date);
+  const strategy = backtestStrategyLabel(backtest.strategy);
+  return [runDate, strategy, formatPlain(backtest.run_id)]
+    .filter((part) => hasValue(part) && part !== "-")
+    .join(" · ") || "交易计划回测结果";
+}
+
+function backtestStrategyLabel(strategy) {
+  return strategy === "trading_plan" ? "交易计划回测" : formatPlain(strategy);
+}
+
+function renderBacktestMetric(label, value) {
+  return `
+    <div class="detail-metric backtest-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(formatPlain(value))}</strong>
+    </div>
+  `;
+}
+
+function percentMetricText(value) {
+  if (!hasValue(value)) {
+    return "-";
+  }
+  const text = formatPlain(value);
+  return text.endsWith("%") ? text : `${text}%`;
 }
 
 function renderTSignalMetric(label, value) {

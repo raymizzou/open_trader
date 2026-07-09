@@ -660,6 +660,10 @@ tbody tr.active-row {
   font-weight: 700;
 }
 
+.backtest-button {
+  min-width: 72px;
+}
+
 @keyframes t-signal-pulse {
   0% {
     box-shadow: 0 0 0 0 rgba(31, 111, 91, 0.34);
@@ -847,6 +851,20 @@ tbody tr.active-row {
   display: grid;
   gap: 12px;
   margin-top: 14px;
+}
+
+.backtest-layout {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.backtest-section {
+  background: var(--surface);
+}
+
+.backtest-output-list dd {
+  overflow-wrap: anywhere;
 }
 
 .t-signal-section {

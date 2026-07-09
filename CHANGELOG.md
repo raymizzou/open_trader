@@ -8,8 +8,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Added a read-only `run-backtest` MVP for active trading-plan rows, producing
   trades, equity curve, metrics, and Markdown report artifacts without updating
   `data/latest` or placing orders.
+- Added dashboard backtest entry buttons that open a per-holding回测详情 view
+  without showing backtest metrics on the main holdings table.
 - Documented the first backtest workflow in both READMEs.
-- Verified with focused backtest and CLI pytest coverage.
+- Verified with focused backtest/dashboard pytest coverage, the full pytest
+  suite, and a local dashboard click check on `127.0.0.1:8766`.
 
 ## 2026-07-04
 

@@ -637,6 +637,83 @@ def test_load_dashboard_state_uses_portfolio_when_monthly_details_are_absent(
     assert holdings_by_symbol["VIXY"]["broker_detail_count"] == 0
     assert holdings_by_symbol["VIXY"]["broker_details"] == []
     assert holdings_by_symbol["VIXY"]["trade_action"] == {"available": False, "error": ""}
+    assert holdings_by_symbol["VIXY"]["backtest"] == {"available": False, "error": ""}
+
+
+def test_load_dashboard_state_attaches_latest_backtest_result(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    older_dir = config.data_dir / "backtests" / "2026-06-16-US-VIXY-trading-plan"
+    older_dir.mkdir(parents=True)
+    (older_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.backtest_metrics.v1",
+                "run_id": "2026-06-16-US-VIXY-trading-plan",
+                "run_date": "2026-06-16",
+                "market": "US",
+                "symbol": "VIXY",
+                "strategy": "trading_plan",
+                "metrics": {
+                    "total_return_pct": "-2.00",
+                    "win_rate_pct": "33.33",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    latest_dir = config.data_dir / "backtests" / "2026-06-18-US-VIXY-trading-plan"
+    latest_dir.mkdir(parents=True)
+    (latest_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.backtest_metrics.v1",
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "run_date": "2026-06-18",
+                "market": "US",
+                "symbol": "VIXY",
+                "strategy": "trading_plan",
+                "metrics": {
+                    "total_return_pct": "1.17",
+                    "win_rate_pct": "50.00",
+                    "max_drawdown_pct": "-3.40",
+                    "trade_count": "2",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (latest_dir / "trades.csv").write_text("symbol,side\nVIXY,BUY\n", encoding="utf-8")
+    (latest_dir / "equity_curve.csv").write_text("date,equity\n2026-06-18,10000\n", encoding="utf-8")
+    report_path = config.reports_dir / "backtests" / "2026-06-18-US-VIXY-trading-plan.md"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("# VIXY 回测\n", encoding="utf-8")
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest"] == {
+        "available": True,
+        "run_id": "2026-06-18-US-VIXY-trading-plan",
+        "run_date": "2026-06-18",
+        "market": "US",
+        "symbol": "VIXY",
+        "strategy": "trading_plan",
+        "metrics": {
+            "total_return_pct": "1.17",
+            "win_rate_pct": "50.00",
+            "max_drawdown_pct": "-3.40",
+            "trade_count": "2",
+        },
+        "metrics_path": str(latest_dir / "metrics.json"),
+        "trades_path": str(latest_dir / "trades.csv"),
+        "equity_curve_path": str(latest_dir / "equity_curve.csv"),
+        "report_path": str(report_path),
+        "status": "ok",
+        "error": "",
+    }
 
 
 def test_load_dashboard_state_excludes_cash_like_rows_from_holdings(

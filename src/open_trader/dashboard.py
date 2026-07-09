@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -169,6 +170,11 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         data_dir=config.data_dir,
         markets=holding_markets,
     )
+    backtests_by_holding = _latest_backtests_by_holding(
+        data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
+        markets=holding_markets,
+    )
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
@@ -191,6 +197,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             futu_skill_facts_by_holding,
             tradingagents_summary_by_holding,
             t_signals_by_holding,
+            backtests_by_holding,
         )
         for row in holding_rows
     ]
@@ -414,6 +421,78 @@ def _latest_t_signals_for_markets(
     return records_by_key
 
 
+def _latest_backtests_by_holding(
+    *,
+    data_dir: Path,
+    reports_dir: Path,
+    markets: set[str],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    backtests_dir = data_dir / "backtests"
+    if not backtests_dir.exists():
+        return {}
+
+    records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for metrics_path in backtests_dir.glob("*/metrics.json"):
+        detail = _backtest_detail(metrics_path, reports_dir)
+        if not detail:
+            continue
+        key = (detail["market"], detail["symbol"])
+        if key[0] not in markets:
+            continue
+        current = records_by_key.get(key)
+        if current is None or _backtest_sort_key(detail) > _backtest_sort_key(current):
+            records_by_key[key] = detail
+    return records_by_key
+
+
+def _backtest_detail(metrics_path: Path, reports_dir: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    market = str(payload.get("market", "")).strip().upper()
+    symbol = str(payload.get("symbol", "")).strip().upper()
+    if not market or not symbol:
+        return None
+    run_id = str(payload.get("run_id", "") or metrics_path.parent.name).strip()
+    report_path = reports_dir / "backtests" / f"{run_id}.md"
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else payload
+    metric_keys = (
+        "total_return_pct",
+        "win_rate_pct",
+        "max_drawdown_pct",
+        "trade_count",
+        "round_trips",
+        "initial_cash",
+        "final_equity",
+    )
+    return {
+        "available": True,
+        "run_id": run_id,
+        "run_date": str(payload.get("run_date", "")).strip(),
+        "market": market,
+        "symbol": symbol,
+        "strategy": str(payload.get("strategy", "trading_plan")).strip() or "trading_plan",
+        "metrics": {
+            key: str(metrics.get(key, ""))
+            for key in metric_keys
+            if isinstance(metrics, dict) and metrics.get(key, "") != ""
+        },
+        "metrics_path": str(metrics_path),
+        "trades_path": str(metrics_path.parent / "trades.csv"),
+        "equity_curve_path": str(metrics_path.parent / "equity_curve.csv"),
+        "report_path": str(report_path),
+        "status": "ok",
+        "error": "",
+    }
+
+
+def _backtest_sort_key(detail: dict[str, Any]) -> tuple[str, str]:
+    return (str(detail.get("run_date", "")), str(detail.get("run_id", "")))
+
+
 def _markets_from_rows(rows: list[dict[str, str]]) -> set[str]:
     markets: set[str] = set()
     for row in rows:
@@ -491,6 +570,7 @@ def _merge_holding(
     futu_skill_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
     tradingagents_summary_by_holding: dict[tuple[str, str], dict[str, Any]],
     t_signals_by_holding: dict[tuple[str, str], dict[str, Any]],
+    backtests_by_holding: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -538,6 +618,9 @@ def _merge_holding(
     holding["t_signal"] = _t_signal_detail(
         t_signals_by_holding.get(key) if key is not None else None,
     )
+    holding["backtest"] = _backtest_holding_detail(
+        backtests_by_holding.get(key) if key is not None else None,
+    )
     holding["research_view"] = (
         load_research_view_for_holding(
             data_dir=data_dir,
@@ -552,6 +635,12 @@ def _merge_holding(
         )
     )
     return holding
+
+
+def _backtest_holding_detail(record: dict[str, Any] | None) -> dict[str, Any]:
+    if record is None:
+        return _unavailable_detail()
+    return record
 
 
 def _broker_detail_row(row: dict[str, str]) -> dict[str, str]:
