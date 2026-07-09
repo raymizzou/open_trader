@@ -30,6 +30,50 @@ class FakeFutuPaperOrderClient:
         return [copy.deepcopy(order) for order in self.orders]
 
 
+def default_fake_kelly_paper_orders() -> tuple[dict[str, Any], ...]:
+    return (
+        {
+            "experiment_id": "trend_pullback_20d_exp_20260707",
+            "market": "US",
+            "symbol": "RAM",
+            "side": "buy",
+            "submitted_at": "2026-07-08 10:01",
+            "order_price": "12.34",
+            "order_qty": "800",
+            "filled_qty": "800",
+            "avg_fill_price": "12.34",
+            "status": "filled",
+            "order_id": "SIM-10001",
+        },
+        {
+            "experiment_id": "trend_pullback_20d_exp_20260707",
+            "market": "US",
+            "symbol": "SOXX",
+            "side": "sell",
+            "submitted_at": "2026-07-08 10:03",
+            "order_price": "246.80",
+            "order_qty": "20",
+            "filled_qty": "0",
+            "avg_fill_price": "-",
+            "status": "submitted",
+            "order_id": "SIM-10002",
+        },
+        {
+            "experiment_id": "breakout_10d_exp_20260707",
+            "market": "US",
+            "symbol": "MSFT",
+            "side": "buy",
+            "submitted_at": "2026-07-08 10:04",
+            "order_price": "498.20",
+            "order_qty": "40",
+            "filled_qty": "40",
+            "avg_fill_price": "498.10",
+            "status": "partial_filled",
+            "order_id": "SIM-20001",
+        },
+    )
+
+
 def sync_kelly_paper_orders(
     data_dir: Path,
     client: PaperOrderClient,

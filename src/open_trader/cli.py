@@ -25,6 +25,11 @@ from .decision_facts import LLMDecisionFactsExtractor, generate_decision_facts
 from .futu_account import FutuAccountClient, FutuAccountError, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_skill_facts import FutuSkillFactsExtractor, generate_futu_skill_facts
+from .kelly_paper_order_sync import (
+    FakeFutuPaperOrderClient,
+    default_fake_kelly_paper_orders,
+    sync_kelly_paper_orders,
+)
 from .t_signal import TSignalInterpreter
 from .t_signal_futu import FutuTSignalMarketDataClient
 from .t_signal_runner import run_t_signal_watch_once
@@ -631,6 +636,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Update data/latest/portfolio.csv after writing dated artifacts",
     )
 
+    kelly_parser = subparsers.add_parser(
+        "kelly",
+        help="Run Kelly Lab workflows",
+    )
+    kelly_subparsers = kelly_parser.add_subparsers(
+        dest="kelly_command",
+        required=True,
+    )
+    kelly_sync_paper_orders_parser = kelly_subparsers.add_parser(
+        "sync-paper-orders",
+        help="Refresh Kelly Lab paper-order artifact",
+    )
+    kelly_sync_paper_orders_parser.add_argument(
+        "--fake",
+        action="store_true",
+        required=True,
+        help="Use built-in fake simulate orders. Required until real Futu sync is added.",
+    )
+    kelly_sync_paper_orders_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_sync_paper_orders_parser.add_argument(
+        "--synced-at",
+        help="Override sync timestamp for deterministic local demos",
+    )
+
     trading_plan_parser = subparsers.add_parser(
         "build-trading-plan",
         help="Convert trading_advice.csv into structured trading_plan.csv",
@@ -1210,6 +1243,21 @@ def main(argv: list[str] | None = None) -> int:
             if account_client is not None:
                 account_client.close()
         _print_tiger_sync_result(result)
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "sync-paper-orders":
+        client = FakeFutuPaperOrderClient(
+            orders=default_fake_kelly_paper_orders(),
+        )
+        payload = sync_kelly_paper_orders(
+            data_dir=args.data_dir,
+            client=client,
+            synced_at=args.synced_at,
+        )
+        print(f"environment: {payload['environment']}")
+        print(f"orders: {len(payload['orders'])}")
+        print(f"synced_at: {payload['synced_at']}")
+        print(f"latest: {args.data_dir / 'latest' / 'kelly_paper_orders.json'}")
         return 0
 
     if args.command == "build-trading-plan":
