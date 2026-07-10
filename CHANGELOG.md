@@ -13,6 +13,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   parameter updates.
 - Added explicit Futu trading-market selection for HK, US, and CN simulate
   accounts so paper-order sync and execution target the intended market account.
+- Enforced single-market Kelly paper experiments with fixed US/HK/CN simulated
+  capital pools, split mixed-market mock data, and blocked cross-market order
+  intents before execution.
 - Verified with focused Kelly/dashboard pytest coverage, compile checks,
   `git diff --check`, live Futu SIMULATE HK order execution/sync, and live
   US/CN simulate-account order probes.
