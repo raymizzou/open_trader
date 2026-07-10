@@ -1,4 +1,11 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Locator } from '@playwright/test';
+
+async function expectNoEditableControls(scope: Locator) {
+  await expect(scope.locator('input, textarea, select, [contenteditable="true"]')).toHaveCount(0);
+  for (const role of ['textbox', 'combobox', 'spinbutton', 'switch'] as const) {
+    await expect(scope.getByRole(role)).toHaveCount(0);
+  }
+}
 
 test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await page.goto('/');
@@ -9,9 +16,11 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await page.getByRole('button', { name: '凯利实验室' }).click();
 
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toBeVisible();
+  const kellyLabPanel = page.getByLabel('Kelly 模拟盘策略实验室');
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'false');
+  await expectNoEditableControls(kellyLabPanel);
   await expect(page.getByText('Mock 状态样本')).toHaveCount(0);
   await expect(page.getByText('状态说明')).toHaveCount(0);
   const usTrendCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '趋势回调 20D Mock US 第一批' }) });
@@ -80,6 +89,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ }).click();
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ })).toHaveAttribute('aria-selected', 'true');
+  await expectNoEditableControls(kellyLabPanel);
   await expect(page.getByRole('heading', { name: '趋势回调 20D Mock US 第一批' })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' })).toBeVisible();
   const hkTrendCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' }) });
@@ -92,6 +102,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'true');
+  await expectNoEditableControls(kellyLabPanel);
   await expect(page.getByRole('heading', { name: '趋势回调 20D Mock US 第一批' })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: '突破 10D Mock 第一批' })).toBeVisible();
   const breakoutCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '突破 10D Mock 第一批' }) });
