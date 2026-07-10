@@ -16,6 +16,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   that are ready to run, missing prices, missing plan fields, or unsupported.
 - Added live counts to the dashboard backtest-status filter, scoped by the
   current market and broker filters.
+- Made dashboard loads automatically fetch missing backtest daily K-line price
+  CSVs through Futu so operators do not need to manually fill price data first.
 
 ## 2026-07-09
 

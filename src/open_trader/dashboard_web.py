@@ -22,7 +22,17 @@ from .trading_plan import load_trading_plan_rows
 STATIC_DIR = Path(__file__).with_name("dashboard_static")
 
 
-def build_dashboard_payload(config: DashboardConfig) -> dict[str, Any]:
+def build_dashboard_payload(
+    config: DashboardConfig,
+    *,
+    auto_fetch_backtest_prices: bool = False,
+    backtest_price_provider: DailyKlineProvider | None = None,
+) -> dict[str, Any]:
+    if auto_fetch_backtest_prices:
+        auto_fetch_missing_backtest_prices(
+            config,
+            provider=backtest_price_provider,
+        )
     return load_dashboard_state(config).to_dict()
 
 
@@ -124,6 +134,67 @@ def build_backtest_prices_payload(
     }
 
 
+def auto_fetch_missing_backtest_prices(
+    config: DashboardConfig,
+    *,
+    provider: DailyKlineProvider | None = None,
+    end: str | None = None,
+) -> None:
+    payload = load_dashboard_state(config).to_dict()
+    requests = _missing_backtest_price_requests(payload)
+    if not requests:
+        return
+
+    owned_provider = provider is None
+    price_provider = provider or FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+    fetch_end = end or date.today().isoformat()
+    try:
+        for request in requests:
+            try:
+                fetch_backtest_prices(
+                    data_dir=config.data_dir,
+                    market=request["market"],
+                    symbol=request["symbol"],
+                    start=request["start"] or fetch_end,
+                    end=fetch_end,
+                    provider=price_provider,
+                )
+            except Exception:
+                continue
+    finally:
+        if owned_provider and hasattr(price_provider, "close"):
+            price_provider.close()
+
+
+def _missing_backtest_price_requests(payload: dict[str, Any]) -> list[dict[str, str]]:
+    requests: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for holding in payload.get("holdings", []):
+        if not isinstance(holding, dict):
+            continue
+        readiness = holding.get("backtest_readiness")
+        if not isinstance(readiness, dict) or readiness.get("prices_missing") is not True:
+            continue
+        if readiness.get("status") in {"unsupported_strategy", "missing_plan"}:
+            continue
+        market = str(holding.get("market") or "").strip().upper()
+        symbol = str(holding.get("symbol") or "").strip().upper()
+        if not market or not symbol:
+            continue
+        key = (market, symbol)
+        if key in seen:
+            continue
+        seen.add(key)
+        requests.append(
+            {
+                "market": market,
+                "symbol": symbol,
+                "start": str(readiness.get("run_date") or "").strip(),
+            }
+        )
+    return requests
+
+
 def _dashboard_backtest_plan_path(data_dir: Path, market: str) -> Path:
     scoped_path = data_dir / "latest" / market / "trading_plan.csv"
     if scoped_path.exists():
@@ -223,7 +294,13 @@ def create_dashboard_server(
                 return
             if path == "/api/dashboard":
                 try:
-                    self._send_json(build_dashboard_payload(config))
+                    self._send_json(
+                        build_dashboard_payload(
+                            config,
+                            auto_fetch_backtest_prices=True,
+                            backtest_price_provider=backtest_price_provider,
+                        )
+                    )
                 except Exception as exc:
                     self._send_error_json(exc)
                 return

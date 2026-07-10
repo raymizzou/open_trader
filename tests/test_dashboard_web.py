@@ -6,6 +6,7 @@ import subprocess
 import threading
 import urllib.error
 import urllib.request
+from datetime import date
 from typing import Any
 
 import pytest
@@ -71,6 +72,21 @@ class FakeBacktestPriceProvider:
                 close=42.0,
             )
         ]
+
+
+class RaisingBacktestPriceProvider:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, str]] = []
+
+    def get_daily_kline(
+        self,
+        futu_symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[object]:
+        self.requests.append({"futu_symbol": futu_symbol, "start": start, "end": end})
+        raise RuntimeError("kline unavailable")
 
 
 def quote_result() -> QuoteRefreshResult:
@@ -3658,6 +3674,120 @@ def test_dashboard_server_fetches_backtest_prices_api(tmp_path) -> None:
     assert vixy["backtest_readiness"]["status"] == "ready"
 
 
+def test_dashboard_server_auto_fetches_missing_backtest_prices_on_dashboard_load(
+    tmp_path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
+    plan_row.update(
+        {
+            "run_date": "2026-06-18",
+            "symbol": "VIXY",
+            "market": "US",
+            "rating": "Overweight",
+            "entry_zone_low": "40",
+            "entry_zone_high": "42",
+            "max_weight": "25%",
+            "status": "active",
+        }
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+    provider = FakeBacktestPriceProvider()
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        backtest_price_provider=provider,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        dashboard_payload = read_json(f"http://{host}:{port}/api/dashboard")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert provider.requests == [
+        {
+            "futu_symbol": "US.VIXY",
+            "start": "2026-06-18",
+            "end": date.today().isoformat(),
+        }
+    ]
+    assert (config.data_dir / "prices" / "US" / "VIXY.csv").is_file()
+    vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest_readiness"]["status"] == "ready"
+
+
+def test_dashboard_server_keeps_payload_when_auto_backtest_price_fetch_fails(
+    tmp_path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
+    plan_row.update(
+        {
+            "run_date": "2026-06-18",
+            "symbol": "VIXY",
+            "market": "US",
+            "rating": "Overweight",
+            "entry_zone_low": "40",
+            "entry_zone_high": "42",
+            "max_weight": "25%",
+            "status": "active",
+        }
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+    provider = RaisingBacktestPriceProvider()
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        backtest_price_provider=provider,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        dashboard_payload = read_json(f"http://{host}:{port}/api/dashboard")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert provider.requests == [
+        {
+            "futu_symbol": "US.VIXY",
+            "start": "2026-06-18",
+            "end": date.today().isoformat(),
+        }
+    ]
+    assert not (config.data_dir / "prices" / "US" / "VIXY.csv").exists()
+    vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest_readiness"]["status"] == "missing_prices"
+
+
 def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
@@ -3946,7 +4076,7 @@ def test_dashboard_server_returns_json_500_when_dashboard_payload_raises(
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
 
-    def raise_runtime_error(config) -> dict[str, Any]:
+    def raise_runtime_error(config, **kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("dashboard boom")
 
     monkeypatch.setattr(
