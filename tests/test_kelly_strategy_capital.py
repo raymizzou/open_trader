@@ -100,6 +100,80 @@ def test_build_kelly_strategy_capital_payload_counts_reserved_orders_and_positio
     ]
 
 
+def test_build_kelly_strategy_capital_payload_counts_synced_paper_order_fields() -> None:
+    payload = build_kelly_strategy_capital_payload(
+        [
+            {
+                "experiment_id": "trend_us",
+                "experiment_name": "趋势回调 US",
+                "market": "US",
+                "experiment_budget": "30000",
+                "budget_currency": "USD",
+            }
+        ],
+        paper_orders_payload={
+            "orders": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "us",
+                    "symbol": "ram",
+                    "side": "buy",
+                    "status": "submitted",
+                    "order_price": "150",
+                    "order_qty": "8",
+                    "filled_qty": "0",
+                    "avg_fill_price": "-",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "us",
+                    "symbol": "soxx",
+                    "side": "buy",
+                    "status": "partial_filled",
+                    "order_price": "200",
+                    "order_qty": "3",
+                    "filled_qty": "1",
+                    "avg_fill_price": "190",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "us",
+                    "symbol": "tsm",
+                    "side": "buy",
+                    "status": "filled",
+                    "order_price": "625",
+                    "order_qty": "10",
+                    "filled_qty": "10",
+                    "avg_fill_price": "620",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "us",
+                    "symbol": "nvda",
+                    "side": "sell",
+                    "status": "submitted",
+                    "order_price": "100",
+                    "order_qty": "5",
+                },
+            ]
+        },
+        calculated_at="2026-07-10 21:06",
+    )
+
+    capital = payload["strategies"][0]
+    assert capital["reserved_order_notional"] == "1800"
+    assert capital["position_notional"] == "6200"
+    assert capital["occupied_notional"] == "8000"
+    assert capital["available_notional"] == "22000"
+    assert capital["utilization_pct"] == "26.67"
+    assert capital["open_buy_order_count"] == 2
+    assert capital["symbol_occupancy"] == [
+        {"market": "US", "symbol": "RAM", "notional": "1200"},
+        {"market": "US", "symbol": "SOXX", "notional": "600"},
+        {"market": "US", "symbol": "TSM", "notional": "6200"},
+    ]
+
+
 def test_write_and_load_kelly_strategy_capital_roundtrips_payload(tmp_path) -> None:
     payload = build_kelly_strategy_capital_payload(
         [

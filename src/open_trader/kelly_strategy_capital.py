@@ -11,7 +11,13 @@ from typing import Any
 
 STRATEGY_CAPITAL_SCHEMA_VERSION = "open_trader.kelly_strategy_capital.v1"
 
-_OPEN_BUY_STATUSES = {"pending", "submitted", "submitting", "partially_filled"}
+_OPEN_BUY_STATUSES = {
+    "pending",
+    "submitted",
+    "submitting",
+    "partially_filled",
+    "partial_filled",
+}
 
 
 def build_kelly_strategy_capital_payload(
@@ -110,8 +116,8 @@ def _capital_usage_by_experiment(
         experiment_id = _field_text(order.get("experiment_id"))
         usage = usage_by_experiment.setdefault(experiment_id, _empty_usage())
         market_symbol = (
-            _field_text(order.get("market")),
-            _field_text(order.get("symbol")),
+            _field_text(order.get("market")).upper(),
+            _field_text(order.get("symbol")).upper(),
         )
 
         if status in _OPEN_BUY_STATUSES:
@@ -142,13 +148,23 @@ def _empty_usage() -> dict[str, Any]:
 
 
 def _open_buy_order_notional(order: dict[str, Any]) -> Decimal:
-    price = _parse_decimal(order.get("limit_price"))
+    price = _first_decimal(order, ("limit_price", "order_price", "price"))
     quantity = _first_decimal(order, ("quantity", "order_qty"))
     return price * quantity
 
 
 def _filled_buy_order_notional(order: dict[str, Any]) -> Decimal:
-    price = _first_decimal(order, ("filled_avg_price", "limit_price", "price"))
+    price = _first_decimal(
+        order,
+        (
+            "filled_avg_price",
+            "avg_fill_price",
+            "avg_price",
+            "limit_price",
+            "order_price",
+            "price",
+        ),
+    )
     quantity = _first_decimal(order, ("filled_qty", "quantity", "order_qty"))
     return price * quantity
 
