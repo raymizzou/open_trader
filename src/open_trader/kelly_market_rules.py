@@ -22,19 +22,19 @@ class KellyMarketCapitalPool:
 KELLY_MARKET_CAPITAL_POOLS: dict[str, KellyMarketCapitalPool] = {
     "US": KellyMarketCapitalPool(
         market="US",
-        amount="100000",
+        amount="30000",
         currency="USD",
         enabled=True,
     ),
     "HK": KellyMarketCapitalPool(
         market="HK",
-        amount="500000",
+        amount="200000",
         currency="HKD",
         enabled=True,
     ),
     "CN": KellyMarketCapitalPool(
         market="CN",
-        amount="500000",
+        amount="150000",
         currency="CNY",
         enabled=False,
     ),

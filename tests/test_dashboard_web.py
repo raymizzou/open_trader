@@ -539,9 +539,9 @@ state.dashboard = {
       market: "US",
       status: "running",
       locked: true,
-      experiment_budget: "100000",
+      experiment_budget: "30000",
       budget_currency: "USD",
-      market_capital_pool: {currency: "USD", amount: "100000"},
+      market_capital_pool: {currency: "USD", amount: "30000"},
       capital_utilization_pct: "50",
       order_sync: {
         status: "success",
@@ -599,7 +599,7 @@ state.dashboard = {
             order_type: "NORMAL",
             price: "12.50",
             qty: "80",
-            planned_notional: "1000",
+            planned_notional: "400",
             budget_currency: "USD",
             execution_status: "dry_run",
             futu_order_id: "",
@@ -714,9 +714,9 @@ state.dashboard = {
       market: "US",
       status: "running",
       locked: true,
-      experiment_budget: "60000",
+      experiment_budget: "30000",
       budget_currency: "USD",
-      market_capital_pool: {currency: "USD", amount: "100000"},
+      market_capital_pool: {currency: "USD", amount: "30000"},
       capital_utilization_pct: "40",
       order_sync: {
         status: "failed",
@@ -796,9 +796,9 @@ state.dashboard = {
         }
       },
       participants: [
-        {market: "US", symbol: "MSFT", name: "微软", source: "watchlist", per_symbol_budget: "20000", budget_currency: "USD"},
-        {market: "US", symbol: "TSM", name: "台积电", source: "holding", per_symbol_budget: "20000", budget_currency: "USD"},
-        {market: "HK", symbol: "06951", name: "三环集团", source: "holding", per_symbol_budget: "20000", budget_currency: "USD"}
+        {market: "US", symbol: "MSFT", name: "微软", source: "watchlist", per_symbol_budget: "15000", budget_currency: "USD"},
+        {market: "US", symbol: "TSM", name: "台积电", source: "holding", per_symbol_budget: "15000", budget_currency: "USD"},
+        {market: "HK", symbol: "06951", name: "三环集团", source: "holding", per_symbol_budget: "15000", budget_currency: "USD"}
       ],
       stats: {
         completed_samples: 42,
@@ -852,7 +852,7 @@ function expectMetric(html, label, value, description) {
   }
 }
 expectMetric(html, "市场", "US", "kelly lab panel missing market metric");
-expectMetric(html, "模拟资金池", "USD 100000", "kelly lab panel missing capital pool metric");
+expectMetric(html, "模拟资金池", "USD 30000", "kelly lab panel missing capital pool metric");
 for (const forbidden of ["US.MSFT", "US.TSM", "HK.06951"]) {
   if (html.includes(forbidden)) {
     throw new Error("kelly first tab leaked another strategy symbol " + forbidden + ": " + html);
@@ -879,7 +879,7 @@ for (const required of [
   "计划金额",
   "富途订单",
   "错误",
-  "1000",
+  "400",
   "预演",
   "已跳过",
   "missing order quantity",
@@ -994,16 +994,16 @@ const disabledPoolHtml = renderKellyExperimentCard({
   experiment_name: "禁用市场资金池策略",
   market: "CN",
   status: "running",
-  experiment_budget: "500000",
+  experiment_budget: "150000",
   budget_currency: "CNY",
-  market_capital_pool: {market: "CN", currency: "CNY", amount: "500000", enabled: false},
+  market_capital_pool: {market: "CN", currency: "CNY", amount: "150000", enabled: false},
   participants: [{market: "CN", symbol: "600000", name: "浦发银行", source: "watchlist"}],
   template: {strategy_id: "disabled_pool_strategy", strategy_name: "Disabled Pool"},
   stats: {}
 });
 expectMetric(disabledPoolHtml, "市场", "CN", "kelly disabled pool market metric missing");
 expectMetric(disabledPoolHtml, "模拟资金池", "未启用", "kelly disabled pool should show unavailable metric");
-if (/<div>\\s*<dt>模拟资金池<\\/dt>\\s*<dd>CNY 500000<\\/dd>\\s*<\\/div>/.test(disabledPoolHtml)) {
+if (/<div>\\s*<dt>模拟资金池<\\/dt>\\s*<dd>CNY 150000<\\/dd>\\s*<\\/div>/.test(disabledPoolHtml)) {
   throw new Error("kelly disabled pool rendered active capital amount: " + disabledPoolHtml);
 }
 if (fallbackHtml.includes("实验参与标的") || fallbackHtml.includes("kelly-participant-row")) {

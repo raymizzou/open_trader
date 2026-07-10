@@ -12,7 +12,7 @@
       "experiment_market": "US",
       "market_capital_pool": {
         "market": "US",
-        "amount": "100000",
+        "amount": "30000",
         "currency": "USD",
         "enabled": true
       },
@@ -28,7 +28,7 @@
       "reason": "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
       "action": "准备提交模拟盘买入订单",
       "suggested_position_pct": "4%",
-      "per_symbol_budget": "33333.33",
+      "per_symbol_budget": "10000",
       "budget_currency": "USD"
     },
     {
@@ -40,7 +40,7 @@
       "experiment_market": "HK",
       "market_capital_pool": {
         "market": "HK",
-        "amount": "500000",
+        "amount": "200000",
         "currency": "HKD",
         "enabled": true
       },
@@ -56,7 +56,7 @@
       "reason": "止盈触发，价格达到入场价 + 2R。",
       "action": "准备卖出 50%",
       "suggested_position_pct": "4%",
-      "per_symbol_budget": "500000",
+      "per_symbol_budget": "200000",
       "budget_currency": "HKD"
     }
   ]

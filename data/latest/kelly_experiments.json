@@ -9,7 +9,7 @@
       "market": "US",
       "start_date": "2026-07-07",
       "paper_account": "futu_simulate_us",
-      "experiment_budget": "100000",
+      "experiment_budget": "30000",
       "budget_currency": "USD",
       "capital_utilization_pct": "50",
       "order_sync": {
@@ -71,7 +71,7 @@
           "name": "Roundhill Memory ETF",
           "source": "holding",
           "locked": true,
-          "per_symbol_budget": "33333.33",
+          "per_symbol_budget": "10000",
           "budget_currency": "USD"
         },
         {
@@ -80,7 +80,7 @@
           "name": "2倍做多DRAM ETF-T-REX",
           "source": "holding",
           "locked": true,
-          "per_symbol_budget": "33333.33",
+          "per_symbol_budget": "10000",
           "budget_currency": "USD"
         },
         {
@@ -89,7 +89,7 @@
           "name": "iShares费城交易所半导体ETF",
           "source": "holding",
           "locked": true,
-          "per_symbol_budget": "33333.33",
+          "per_symbol_budget": "10000",
           "budget_currency": "USD"
         }
       ],
@@ -121,7 +121,7 @@
       "market": "HK",
       "start_date": "2026-07-07",
       "paper_account": "futu_simulate_hk",
-      "experiment_budget": "500000",
+      "experiment_budget": "200000",
       "budget_currency": "HKD",
       "capital_utilization_pct": "50",
       "order_sync": {
@@ -168,7 +168,7 @@
           "name": "SPDR金",
           "source": "holding",
           "locked": true,
-          "per_symbol_budget": "500000",
+          "per_symbol_budget": "200000",
           "budget_currency": "HKD"
         }
       ],
@@ -200,7 +200,7 @@
       "market": "US",
       "start_date": "2026-07-07",
       "paper_account": "futu_simulate_mock",
-      "experiment_budget": "60000",
+      "experiment_budget": "30000",
       "budget_currency": "USD",
       "capital_utilization_pct": "40",
       "order_sync": {
@@ -237,7 +237,7 @@
           "name": "微软",
           "source": "watchlist",
           "locked": true,
-          "per_symbol_budget": "20000",
+          "per_symbol_budget": "15000",
           "budget_currency": "USD"
         },
         {
@@ -246,7 +246,7 @@
           "name": "台积电",
           "source": "holding",
           "locked": true,
-          "per_symbol_budget": "20000",
+          "per_symbol_budget": "15000",
           "budget_currency": "USD"
         }
       ],

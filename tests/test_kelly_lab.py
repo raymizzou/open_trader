@@ -127,7 +127,7 @@ def test_load_kelly_lab_state_attaches_market_capital_pool(
     assert experiment["budget_currency"] == "USD"
     assert experiment["market_capital_pool"] == {
         "market": "US",
-        "amount": "100000",
+        "amount": "30000",
         "currency": "USD",
         "enabled": True,
     }
@@ -941,11 +941,11 @@ def test_latest_kelly_experiments_split_trend_pullback_mock_by_market() -> None:
     trend_us = experiments["trend_pullback_20d_us_mock_20260707"]
     assert trend_us["experiment_name"] == "趋势回调 20D Mock US 第一批"
     assert trend_us["market"] == "US"
-    assert trend_us["experiment_budget"] == "100000"
+    assert trend_us["experiment_budget"] == "30000"
     assert trend_us["budget_currency"] == "USD"
     assert trend_us["market_capital_pool"] == {
         "market": "US",
-        "amount": "100000",
+        "amount": "30000",
         "currency": "USD",
         "enabled": True,
     }
@@ -953,9 +953,9 @@ def test_latest_kelly_experiments_split_trend_pullback_mock_by_market() -> None:
         (participant["market"], participant["symbol"], participant["per_symbol_budget"])
         for participant in trend_us["participants"]
     ] == [
-        ("US", "DRAM", "33333.33"),
-        ("US", "RAM", "33333.33"),
-        ("US", "SOXX", "33333.33"),
+        ("US", "DRAM", "10000"),
+        ("US", "RAM", "10000"),
+        ("US", "SOXX", "10000"),
     ]
     assert {
         (state["market"], state["symbol"]) for state in trend_us["lifecycle_states"]
@@ -978,18 +978,18 @@ def test_latest_kelly_experiments_split_trend_pullback_mock_by_market() -> None:
     trend_hk = experiments["trend_pullback_20d_hk_mock_20260707"]
     assert trend_hk["experiment_name"] == "趋势回调 20D Mock HK 第一批"
     assert trend_hk["market"] == "HK"
-    assert trend_hk["experiment_budget"] == "500000"
+    assert trend_hk["experiment_budget"] == "200000"
     assert trend_hk["budget_currency"] == "HKD"
     assert trend_hk["market_capital_pool"] == {
         "market": "HK",
-        "amount": "500000",
+        "amount": "200000",
         "currency": "HKD",
         "enabled": True,
     }
     assert [
         (participant["market"], participant["symbol"], participant["per_symbol_budget"])
         for participant in trend_hk["participants"]
-    ] == [("HK", "02840", "500000")]
+    ] == [("HK", "02840", "200000")]
     assert [
         (state["market"], state["symbol"], state["status"])
         for state in trend_hk["lifecycle_states"]

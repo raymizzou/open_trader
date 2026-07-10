@@ -42,7 +42,7 @@ Each experiment must declare a top-level `market`:
   "strategy_id": "trend_pullback_20d",
   "strategy_version": "v1",
   "market": "US",
-  "experiment_budget": "100000",
+  "experiment_budget": "30000",
   "budget_currency": "USD"
 }
 ```
@@ -63,12 +63,12 @@ preferred shape is:
 trend_pullback_20d_us_mock_20260707:
   market: US
   participants: US.DRAM, US.RAM, US.SOXX
-  budget: 100000 USD
+  budget: 30000 USD
 
 trend_pullback_20d_hk_mock_20260707:
   market: HK
   participants: HK.02840
-  budget: 500000 HKD
+  budget: 200000 HKD
 ```
 
 The same symbol may appear in multiple experiments if the user intentionally
@@ -76,28 +76,28 @@ assigns it to multiple strategies. Attribution remains by `experiment_id`.
 
 ### Market Capital Pools
 
-The first version uses fixed market-level paper capital constants:
+The first version uses fixed per-strategy paper capital constants:
 
 ```text
-US: 100000 USD
-HK: 500000 HKD
-CN: 500000 CNY
+US: 30000 USD
+HK: 200000 HKD
+CN: 150000 CNY
 ```
 
 CN is represented in config and validation but not enabled in the UI workflow
 yet. CN orders may be read for diagnostics, but no CN strategy experiment is
 required in this phase.
 
-The experiment budget should default from the market pool:
+The experiment budget should default from the per-strategy market budget:
 
 ```text
-US experiment -> 100000 USD
-HK experiment -> 500000 HKD
-CN experiment -> 500000 CNY
+US experiment -> 30000 USD
+HK experiment -> 200000 HKD
+CN experiment -> 150000 CNY
 ```
 
 In this phase, the experiment budget is not user-editable in the UI. If a later
-phase needs multiple experiments sharing one market pool, that phase must add an
+phase needs multiple experiments sharing one account-level pool, that phase must add an
 explicit reserved/consumed allocation ledger. The current phase only records the
 declared budget per experiment and does not attempt cross-experiment cash
 reservation.
@@ -130,7 +130,7 @@ metadata:
 
 ```text
 市场: US
-模拟资金池: USD 100000
+模拟资金池: USD 30000
 ```
 
 The participant list should be read-only. It should not include controls that

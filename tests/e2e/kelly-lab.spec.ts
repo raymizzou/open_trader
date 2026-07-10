@@ -27,7 +27,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(usTrendCard.getByText('市场')).toBeVisible();
   await expect(usTrendCard.getByText('US', { exact: true })).toBeVisible();
   await expect(usTrendCard.getByText('模拟资金池')).toBeVisible();
-  await expect(usTrendCard.getByText('USD 100000').first()).toBeVisible();
+  await expect(usTrendCard.getByText('USD 30000').first()).toBeVisible();
   for (const symbol of ['US.DRAM', 'US.RAM', 'US.SOXX']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
   }
@@ -94,7 +94,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' })).toBeVisible();
   const hkTrendCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' }) });
   await expect(hkTrendCard.getByText('HK', { exact: true })).toBeVisible();
-  await expect(hkTrendCard.getByText('HKD 500000').first()).toBeVisible();
+  await expect(hkTrendCard.getByText('HKD 200000').first()).toBeVisible();
   await expect(page.getByLabel('Kelly 标的状态').getByText('HK.02840')).toBeVisible();
   await expect(page.getByLabel('Kelly 标的状态').getByText('US.DRAM')).toHaveCount(0);
   await expect(page.getByLabel('Kelly 标的状态').getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toBeVisible();
@@ -107,7 +107,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByRole('heading', { name: '突破 10D Mock 第一批' })).toBeVisible();
   const breakoutCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '突破 10D Mock 第一批' }) });
   await expect(breakoutCard.getByText('US', { exact: true })).toBeVisible();
-  await expect(breakoutCard.getByText('USD 100000')).toBeVisible();
+  await expect(breakoutCard.getByText('USD 30000').first()).toBeVisible();
   for (const symbol of ['US.MSFT', 'US.TSM']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
   }

@@ -29,18 +29,41 @@
             "type": "pullback_to_moving_average",
             "ma_days": 20,
             "tolerance_pct": 1,
-            "trend_filter": {"type": "moving_average_slope", "ma_days": 50, "direction": "up"}
+            "trend_filter": {
+              "type": "moving_average_slope",
+              "ma_days": 50,
+              "direction": "up"
+            }
           },
           "stop_loss": {
             "type": "any_of",
             "rules": [
-              {"type": "pct_below_moving_average", "ma_days": 20, "pct": 3},
-              {"type": "recent_swing_low_break", "lookback_days": 20}
+              {
+                "type": "pct_below_moving_average",
+                "ma_days": 20,
+                "pct": 3
+              },
+              {
+                "type": "recent_swing_low_break",
+                "lookback_days": 20
+              }
             ]
           },
-          "take_profit": {"type": "risk_multiple", "trigger_r": 2, "sell_pct": 50},
-          "trailing_stop": {"type": "close_below_moving_average", "ma_days": 10, "apply_to_remaining_position": true},
-          "time_exit": {"type": "max_holding_days", "days": 20, "exit_if": "no_take_profit_or_stop_loss"}
+          "take_profit": {
+            "type": "risk_multiple",
+            "trigger_r": 2,
+            "sell_pct": 50
+          },
+          "trailing_stop": {
+            "type": "close_below_moving_average",
+            "ma_days": 10,
+            "apply_to_remaining_position": true
+          },
+          "time_exit": {
+            "type": "max_holding_days",
+            "days": 20,
+            "exit_if": "no_take_profit_or_stop_loss"
+          }
         },
         "max_holding_days": 20,
         "order_type": "limit",
@@ -61,13 +84,33 @@
           "stop_loss": {
             "type": "any_of",
             "rules": [
-              {"type": "pct_below_reference_price", "reference": "突破价", "pct": 2},
-              {"type": "atr_below_entry", "atr_multiple": 1.5}
+              {
+                "type": "pct_below_reference_price",
+                "reference": "突破价",
+                "pct": 2
+              },
+              {
+                "type": "atr_below_entry",
+                "atr_multiple": 1.5
+              }
             ]
           },
-          "take_profit": {"type": "risk_multiple", "trigger_r": 2, "sell_pct": 50},
-          "trailing_stop": {"type": "close_below_recent_low", "lookback_days": 5, "apply_to_remaining_position": true},
-          "time_exit": {"type": "max_holding_days", "days": 10, "exit_if": "minimum_unrealized_r_not_reached", "min_unrealized_r": 1}
+          "take_profit": {
+            "type": "risk_multiple",
+            "trigger_r": 2,
+            "sell_pct": 50
+          },
+          "trailing_stop": {
+            "type": "close_below_recent_low",
+            "lookback_days": 5,
+            "apply_to_remaining_position": true
+          },
+          "time_exit": {
+            "type": "max_holding_days",
+            "days": 10,
+            "exit_if": "minimum_unrealized_r_not_reached",
+            "min_unrealized_r": 1
+          }
         },
         "max_holding_days": 10,
         "order_type": "limit",
@@ -83,9 +126,14 @@
         "strategy_version": "v1",
         "start_date": "2026-07-07",
         "paper_account": "futu_simulate",
-        "experiment_budget": "100000",
+        "experiment_budget": "30000",
         "budget_currency": "USD",
-        "market_capital_pool": {"market": "US", "currency": "USD", "amount": "100000", "enabled": true},
+        "market_capital_pool": {
+          "market": "US",
+          "amount": "30000",
+          "currency": "USD",
+          "enabled": true
+        },
         "capital_utilization_pct": "50",
         "order_sync": {
           "status": "success",
@@ -131,7 +179,7 @@
               "order_type": "NORMAL",
               "price": "12.50",
               "qty": "80",
-              "planned_notional": "1000",
+              "planned_notional": "400",
               "budget_currency": "USD",
               "execution_status": "dry_run",
               "submitted": false,
@@ -198,18 +246,41 @@
               "type": "pullback_to_moving_average",
               "ma_days": 20,
               "tolerance_pct": 1,
-              "trend_filter": {"type": "moving_average_slope", "ma_days": 50, "direction": "up"}
+              "trend_filter": {
+                "type": "moving_average_slope",
+                "ma_days": 50,
+                "direction": "up"
+              }
             },
             "stop_loss": {
               "type": "any_of",
               "rules": [
-                {"type": "pct_below_moving_average", "ma_days": 20, "pct": 3},
-                {"type": "recent_swing_low_break", "lookback_days": 20}
+                {
+                  "type": "pct_below_moving_average",
+                  "ma_days": 20,
+                  "pct": 3
+                },
+                {
+                  "type": "recent_swing_low_break",
+                  "lookback_days": 20
+                }
               ]
             },
-            "take_profit": {"type": "risk_multiple", "trigger_r": 2, "sell_pct": 50},
-            "trailing_stop": {"type": "close_below_moving_average", "ma_days": 10, "apply_to_remaining_position": true},
-            "time_exit": {"type": "max_holding_days", "days": 20, "exit_if": "no_take_profit_or_stop_loss"}
+            "take_profit": {
+              "type": "risk_multiple",
+              "trigger_r": 2,
+              "sell_pct": 50
+            },
+            "trailing_stop": {
+              "type": "close_below_moving_average",
+              "ma_days": 10,
+              "apply_to_remaining_position": true
+            },
+            "time_exit": {
+              "type": "max_holding_days",
+              "days": 20,
+              "exit_if": "no_take_profit_or_stop_loss"
+            }
           },
           "max_holding_days": 20,
           "order_type": "limit",
@@ -222,7 +293,7 @@
             "name": "Roundhill Memory ETF",
             "source": "holding",
             "locked": true,
-            "per_symbol_budget": "25000",
+            "per_symbol_budget": "10000",
             "budget_currency": "USD"
           },
           {
@@ -231,7 +302,7 @@
             "name": "2倍做多DRAM ETF-T-REX",
             "source": "holding",
             "locked": true,
-            "per_symbol_budget": "25000",
+            "per_symbol_budget": "10000",
             "budget_currency": "USD"
           },
           {
@@ -240,7 +311,7 @@
             "name": "iShares费城交易所半导体ETF",
             "source": "holding",
             "locked": true,
-            "per_symbol_budget": "25000",
+            "per_symbol_budget": "10000",
             "budget_currency": "USD"
           }
         ],
@@ -272,9 +343,14 @@
         "strategy_version": "v1",
         "start_date": "2026-07-07",
         "paper_account": "futu_simulate",
-        "experiment_budget": "500000",
+        "experiment_budget": "200000",
         "budget_currency": "HKD",
-        "market_capital_pool": {"market": "HK", "currency": "HKD", "amount": "500000", "enabled": true},
+        "market_capital_pool": {
+          "market": "HK",
+          "amount": "200000",
+          "currency": "HKD",
+          "enabled": true
+        },
         "capital_utilization_pct": "50",
         "order_sync": {
           "status": "success",
@@ -355,18 +431,41 @@
               "type": "pullback_to_moving_average",
               "ma_days": 20,
               "tolerance_pct": 1,
-              "trend_filter": {"type": "moving_average_slope", "ma_days": 50, "direction": "up"}
+              "trend_filter": {
+                "type": "moving_average_slope",
+                "ma_days": 50,
+                "direction": "up"
+              }
             },
             "stop_loss": {
               "type": "any_of",
               "rules": [
-                {"type": "pct_below_moving_average", "ma_days": 20, "pct": 3},
-                {"type": "recent_swing_low_break", "lookback_days": 20}
+                {
+                  "type": "pct_below_moving_average",
+                  "ma_days": 20,
+                  "pct": 3
+                },
+                {
+                  "type": "recent_swing_low_break",
+                  "lookback_days": 20
+                }
               ]
             },
-            "take_profit": {"type": "risk_multiple", "trigger_r": 2, "sell_pct": 50},
-            "trailing_stop": {"type": "close_below_moving_average", "ma_days": 10, "apply_to_remaining_position": true},
-            "time_exit": {"type": "max_holding_days", "days": 20, "exit_if": "no_take_profit_or_stop_loss"}
+            "take_profit": {
+              "type": "risk_multiple",
+              "trigger_r": 2,
+              "sell_pct": 50
+            },
+            "trailing_stop": {
+              "type": "close_below_moving_average",
+              "ma_days": 10,
+              "apply_to_remaining_position": true
+            },
+            "time_exit": {
+              "type": "max_holding_days",
+              "days": 20,
+              "exit_if": "no_take_profit_or_stop_loss"
+            }
           },
           "max_holding_days": 20,
           "order_type": "limit",
@@ -379,7 +478,7 @@
             "name": "SPDR金",
             "source": "holding",
             "locked": true,
-            "per_symbol_budget": "500000",
+            "per_symbol_budget": "200000",
             "budget_currency": "HKD"
           }
         ],
@@ -411,9 +510,14 @@
         "strategy_version": "v1",
         "start_date": "2026-07-07",
         "paper_account": "futu_simulate",
-        "experiment_budget": "60000",
+        "experiment_budget": "30000",
         "budget_currency": "USD",
-        "market_capital_pool": {"market": "US", "currency": "USD", "amount": "100000", "enabled": true},
+        "market_capital_pool": {
+          "market": "US",
+          "amount": "30000",
+          "currency": "USD",
+          "enabled": true
+        },
         "capital_utilization_pct": "40",
         "order_sync": {
           "status": "failed",
@@ -488,13 +592,33 @@
             "stop_loss": {
               "type": "any_of",
               "rules": [
-                {"type": "pct_below_reference_price", "reference": "breakout_price", "pct": 2},
-                {"type": "atr_below_entry", "atr_multiple": 1.5}
+                {
+                  "type": "pct_below_reference_price",
+                  "reference": "breakout_price",
+                  "pct": 2
+                },
+                {
+                  "type": "atr_below_entry",
+                  "atr_multiple": 1.5
+                }
               ]
             },
-            "take_profit": {"type": "risk_multiple", "trigger_r": 2, "sell_pct": 50},
-            "trailing_stop": {"type": "close_below_recent_low", "lookback_days": 5, "apply_to_remaining_position": true},
-            "time_exit": {"type": "max_holding_days", "days": 10, "exit_if": "minimum_unrealized_r_not_reached", "min_unrealized_r": 1}
+            "take_profit": {
+              "type": "risk_multiple",
+              "trigger_r": 2,
+              "sell_pct": 50
+            },
+            "trailing_stop": {
+              "type": "close_below_recent_low",
+              "lookback_days": 5,
+              "apply_to_remaining_position": true
+            },
+            "time_exit": {
+              "type": "max_holding_days",
+              "days": 10,
+              "exit_if": "minimum_unrealized_r_not_reached",
+              "min_unrealized_r": 1
+            }
           },
           "max_holding_days": 10,
           "order_type": "limit",
@@ -507,7 +631,7 @@
             "name": "微软",
             "source": "watchlist",
             "locked": true,
-            "per_symbol_budget": "20000",
+            "per_symbol_budget": "15000",
             "budget_currency": "USD"
           },
           {
@@ -516,7 +640,7 @@
             "name": "台积电",
             "source": "holding",
             "locked": true,
-            "per_symbol_budget": "20000",
+            "per_symbol_budget": "15000",
             "budget_currency": "USD"
           }
         ],
@@ -559,15 +683,36 @@
       "brokers": "futu",
       "broker_detail_count": 0,
       "broker_details": [],
-      "agent_report": {"available": false},
-      "tradingagents_summary": {"available": false},
-      "strategy": {"available": false},
-      "premarket_action": {"available": false},
-      "trade_action": {"available": false},
-      "technical_facts": {"available": false},
-      "decision_facts": {"kline": {"available": false}, "news_sentiment": {"available": false}},
+      "agent_report": {
+        "available": false
+      },
+      "tradingagents_summary": {
+        "available": false
+      },
+      "strategy": {
+        "available": false
+      },
+      "premarket_action": {
+        "available": false
+      },
+      "trade_action": {
+        "available": false
+      },
+      "technical_facts": {
+        "available": false
+      },
+      "decision_facts": {
+        "kline": {
+          "available": false
+        },
+        "news_sentiment": {
+          "available": false
+        }
+      },
       "futu_skill_facts": {},
-      "t_signal": {"available": false},
+      "t_signal": {
+        "available": false
+      },
       "research_view": {},
       "kelly": {
         "available": true,
@@ -579,8 +724,16 @@
             "experiment_id": "trend_pullback_20d_us_mock_20260707",
             "experiment_name": "趋势回调 20D Mock US 第一批",
             "status": "running",
-            "template": {"strategy_id": "trend_pullback_20d", "strategy_name": "趋势回调 20D"},
-            "stats": {"completed_samples": 0, "open_samples": 0, "observed_win_rate": "", "sample_stage": "insufficient"}
+            "template": {
+              "strategy_id": "trend_pullback_20d",
+              "strategy_name": "趋势回调 20D"
+            },
+            "stats": {
+              "completed_samples": 0,
+              "open_samples": 0,
+              "observed_win_rate": "",
+              "sample_stage": "insufficient"
+            }
           }
         ]
       }
@@ -601,15 +754,36 @@
       "brokers": "futu",
       "broker_detail_count": 0,
       "broker_details": [],
-      "agent_report": {"available": false},
-      "tradingagents_summary": {"available": false},
-      "strategy": {"available": false},
-      "premarket_action": {"available": false},
-      "trade_action": {"available": false},
-      "technical_facts": {"available": false},
-      "decision_facts": {"kline": {"available": false}, "news_sentiment": {"available": false}},
+      "agent_report": {
+        "available": false
+      },
+      "tradingagents_summary": {
+        "available": false
+      },
+      "strategy": {
+        "available": false
+      },
+      "premarket_action": {
+        "available": false
+      },
+      "trade_action": {
+        "available": false
+      },
+      "technical_facts": {
+        "available": false
+      },
+      "decision_facts": {
+        "kline": {
+          "available": false
+        },
+        "news_sentiment": {
+          "available": false
+        }
+      },
       "futu_skill_facts": {},
-      "t_signal": {"available": false},
+      "t_signal": {
+        "available": false
+      },
       "research_view": {},
       "kelly": {
         "available": false,

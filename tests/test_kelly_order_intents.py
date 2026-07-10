@@ -20,7 +20,7 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
             "market": "US",
             "market_capital_pool": {
                 "market": "US",
-                "amount": 100000,
+                "amount": 30000,
                 "currency": "USD",
                 "enabled": True,
             },
@@ -100,7 +100,7 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                 "experiment_market": "US",
                 "market_capital_pool": {
                     "market": "US",
-                    "amount": 100000,
+                    "amount": 30000,
                     "currency": "USD",
                     "enabled": True,
                 },
@@ -128,7 +128,7 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                 "experiment_market": "US",
                 "market_capital_pool": {
                     "market": "US",
-                    "amount": 100000,
+                    "amount": 30000,
                     "currency": "USD",
                     "enabled": True,
                 },
