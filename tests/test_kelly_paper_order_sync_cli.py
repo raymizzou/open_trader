@@ -45,6 +45,8 @@ def test_kelly_sync_paper_orders_parser_accepts_futu_simulate_mode() -> None:
             "127.0.0.1",
             "--port",
             "11111",
+            "--trd-market",
+            "US",
         ]
     )
 
@@ -53,6 +55,7 @@ def test_kelly_sync_paper_orders_parser_accepts_futu_simulate_mode() -> None:
     assert args.futu_simulate is True
     assert args.host == "127.0.0.1"
     assert args.port == 11111
+    assert args.trd_market == "US"
 
 
 def test_kelly_sync_paper_orders_parser_accepts_diagnose_mode() -> None:
@@ -275,6 +278,8 @@ def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
             "127.0.0.1",
             "--port",
             "11111",
+            "--trd-market",
+            "US",
             "--synced-at",
             "2026-07-09 11:30",
         ]
@@ -294,6 +299,7 @@ def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
                 "experiment_id": "trend_exp",
             }
         },
+        "trd_market": "US",
     }
     assert captured["data_dir"] == tmp_path / "data"
     assert captured["synced_at"] == "2026-07-09 11:30"

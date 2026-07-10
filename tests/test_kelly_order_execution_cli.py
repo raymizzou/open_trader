@@ -16,6 +16,8 @@ def test_kelly_execute_orders_parser_accepts_dry_run_options() -> None:
             "--data-dir",
             "data",
             "--dry-run",
+            "--trd-market",
+            "CN",
             "--executed-at",
             "2026-07-10 13:32",
             "--limit-price",
@@ -30,6 +32,7 @@ def test_kelly_execute_orders_parser_accepts_dry_run_options() -> None:
     assert args.data_dir == Path("data")
     assert args.dry_run is True
     assert args.futu_simulate is False
+    assert args.trd_market == "CN"
     assert args.executed_at == "2026-07-10 13:32"
     assert args.limit_price == ["US.RAM=12.50"]
     assert args.order_qty == ["HK.02840=1"]
@@ -159,6 +162,8 @@ def test_kelly_execute_orders_main_writes_links_for_futu_simulate(
             "--futu-simulate",
             "--simulate-acc-id",
             "12958917",
+            "--trd-market",
+            "US",
             "--executed-at",
             "2026-07-10 13:32",
             "--limit-price",
@@ -173,6 +178,7 @@ def test_kelly_execute_orders_main_writes_links_for_futu_simulate(
         "host": "127.0.0.1",
         "port": 11111,
         "simulate_acc_id": 12958917,
+        "trd_market": "US",
     }
     assert captured["execute_kwargs"]["dry_run"] is False
     assert captured["execute_kwargs"]["client"].__class__ is FakeClient

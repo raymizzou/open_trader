@@ -117,9 +117,10 @@ class FakeDataFrame:
 
 
 class FakeFutuOrderContext:
-    def __init__(self, *, host: str, port: int) -> None:
+    def __init__(self, *, host: str, port: int, trd_market: str = "HK") -> None:
         self.host = host
         self.port = port
+        self.trd_market = trd_market
         self.closed = False
         self.order_calls: list[dict[str, object]] = []
 
@@ -370,9 +371,12 @@ def test_futu_simulate_paper_order_client_reads_simulate_orders() -> None:
         host="127.0.0.1",
         port=11111,
         experiment_symbol_index={("US", "RAM"): "trend_exp"},
+        trd_market="US",
         context_factory=FakeFutuOrderContext,
         connectivity_checker=lambda host, port: True,
     )
+
+    assert client.context.trd_market == "US"
 
     orders = client.list_orders()
 

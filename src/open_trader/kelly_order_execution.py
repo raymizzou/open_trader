@@ -41,6 +41,7 @@ class FutuSimulateOrderExecutionClient:
         host: str,
         port: int,
         simulate_acc_id: int | None = None,
+        trd_market: str = "HK",
         context_factory: Any = None,
         connectivity_checker: Any = None,
     ) -> None:
@@ -52,7 +53,11 @@ class FutuSimulateOrderExecutionClient:
                 error_type="opend_unreachable",
             )
         try:
-            self.context = context_factory(host=host, port=port)
+            self.context = context_factory(
+                host=host,
+                port=port,
+                trd_market=trd_market,
+            )
         except FutuOrderExecutionError:
             raise
         except Exception as exc:
@@ -62,6 +67,7 @@ class FutuSimulateOrderExecutionClient:
             ) from exc
         self.host = host
         self.port = port
+        self.trd_market = trd_market
         self.account = self._select_simulate_account(simulate_acc_id)
 
     def place_order(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -481,7 +487,7 @@ def _can_connect_to_opend(host: str, port: int) -> bool:
         return False
 
 
-def _default_trade_context_factory(*, host: str, port: int) -> Any:
+def _default_trade_context_factory(*, host: str, port: int, trd_market: str = "HK") -> Any:
     try:
         from futu import OpenSecTradeContext
     except ImportError as exc:
@@ -489,7 +495,11 @@ def _default_trade_context_factory(*, host: str, port: int) -> Any:
             "futu-api is not installed. Install it with: .venv/bin/python -m pip install futu-api",
             error_type="trade_context_failed",
         ) from exc
-    return OpenSecTradeContext(host=host, port=port)
+    return OpenSecTradeContext(
+        host=host,
+        port=port,
+        filter_trdmarket=_futu_trd_market(trd_market),
+    )
 
 
 def _futu_trade_side(side: str) -> str:
@@ -507,6 +517,27 @@ def _futu_trade_side(side: str) -> str:
     raise FutuOrderExecutionError(
         f"unsupported order side: {side!r}",
         error_type="unsupported_side",
+    )
+
+
+def _futu_trd_market(trd_market: str) -> str:
+    try:
+        from futu import TrdMarket
+    except ImportError as exc:
+        raise FutuOrderExecutionError(
+            "futu-api is not installed. Install it with: .venv/bin/python -m pip install futu-api",
+            error_type="trade_context_failed",
+        ) from exc
+    key = str(trd_market).strip().upper()
+    if key == "HK":
+        return TrdMarket.HK
+    if key == "US":
+        return TrdMarket.US
+    if key in {"CN", "A", "A_SHARE"}:
+        return TrdMarket.CN
+    raise FutuOrderExecutionError(
+        f"unsupported trading market: {trd_market!r}",
+        error_type="unsupported_trd_market",
     )
 
 

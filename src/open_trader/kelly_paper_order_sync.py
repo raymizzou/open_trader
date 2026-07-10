@@ -61,6 +61,7 @@ class FutuSimulatePaperOrderClient:
         experiment_symbol_index: dict[tuple[str, str], str],
         ambiguous_symbol_index: dict[tuple[str, str], list[str]] | None = None,
         order_link_index: dict[str, dict[str, Any]] | None = None,
+        trd_market: str = "HK",
         context_factory: Callable[..., Any] = None,
         connectivity_checker: Callable[[str, int], bool] = None,
     ) -> None:
@@ -72,7 +73,11 @@ class FutuSimulatePaperOrderClient:
                 error_type="opend_unreachable",
             )
         try:
-            self.context = context_factory(host=host, port=port)
+            self.context = context_factory(
+                host=host,
+                port=port,
+                trd_market=trd_market,
+            )
         except FutuPaperOrderSyncError:
             raise
         except Exception as exc:
@@ -82,6 +87,7 @@ class FutuSimulatePaperOrderClient:
             ) from exc
         self.host = host
         self.port = port
+        self.trd_market = trd_market
         self.experiment_symbol_index = experiment_symbol_index
         self.ambiguous_symbol_index = ambiguous_symbol_index or {}
         self.order_link_index = order_link_index or {}
@@ -414,7 +420,7 @@ def _can_connect_to_opend(host: str, port: int) -> bool:
         return False
 
 
-def _default_trade_context_factory(*, host: str, port: int) -> Any:
+def _default_trade_context_factory(*, host: str, port: int, trd_market: str = "HK") -> Any:
     try:
         from futu import OpenSecTradeContext
     except ImportError as exc:
@@ -422,7 +428,32 @@ def _default_trade_context_factory(*, host: str, port: int) -> Any:
             "futu-api is not installed. Install it with: .venv/bin/python -m pip install futu-api",
             error_type="trade_context_failed",
         ) from exc
-    return OpenSecTradeContext(host=host, port=port)
+    return OpenSecTradeContext(
+        host=host,
+        port=port,
+        filter_trdmarket=_futu_trd_market(trd_market),
+    )
+
+
+def _futu_trd_market(trd_market: str) -> str:
+    try:
+        from futu import TrdMarket
+    except ImportError as exc:
+        raise FutuPaperOrderSyncError(
+            "futu-api is not installed. Install it with: .venv/bin/python -m pip install futu-api",
+            error_type="trade_context_failed",
+        ) from exc
+    key = str(trd_market).strip().upper()
+    if key == "HK":
+        return TrdMarket.HK
+    if key == "US":
+        return TrdMarket.US
+    if key in {"CN", "A", "A_SHARE"}:
+        return TrdMarket.CN
+    raise FutuPaperOrderSyncError(
+        f"unsupported trading market: {trd_market!r}",
+        error_type="unsupported_trd_market",
+    )
 
 
 def _records(data: object) -> list[dict[str, object]]:

@@ -718,6 +718,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=11111,
     )
+    kelly_sync_paper_orders_parser.add_argument(
+        "--trd-market",
+        choices=("HK", "US", "CN"),
+        default="HK",
+        help="Futu trading market used to select the simulate account.",
+    )
 
     kelly_build_order_intents_parser = kelly_subparsers.add_parser(
         "build-order-intents",
@@ -798,6 +804,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--simulate-acc-id",
         type=int,
         help="Futu SIMULATE securities account id to use when multiple exist.",
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--trd-market",
+        choices=("HK", "US", "CN"),
+        default="HK",
+        help="Futu trading market used to select the simulate account.",
     )
 
     trading_plan_parser = subparsers.add_parser(
@@ -1398,6 +1410,7 @@ def main(argv: list[str] | None = None) -> int:
                     experiment_symbol_index=symbol_index_details.unique,
                     ambiguous_symbol_index=symbol_index_details.ambiguous,
                     order_link_index=load_kelly_order_links(args.data_dir),
+                    trd_market=args.trd_market,
                 )
             payload = sync_kelly_paper_orders(
                 data_dir=args.data_dir,
@@ -1474,6 +1487,7 @@ def main(argv: list[str] | None = None) -> int:
                     host=args.host,
                     port=args.port,
                     simulate_acc_id=args.simulate_acc_id,
+                    trd_market=args.trd_market,
                 )
             payload = execute_kelly_orders(
                 data_dir=args.data_dir,

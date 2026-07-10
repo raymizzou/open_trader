@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from open_trader.kelly_order_execution import (
+    FutuSimulateOrderExecutionClient,
     execute_kelly_orders_from_risk_checks,
     write_kelly_order_links_from_executions,
     write_kelly_order_executions,
@@ -25,6 +26,40 @@ class FakeOrderExecutionClient:
             "status": "submitted",
             "raw": {"order_id": f"SIM-{len(self.requests)}"},
         }
+
+
+class FakeFutuExecutionContext:
+    def __init__(self, *, host: str, port: int, trd_market: str = "HK") -> None:
+        self.host = host
+        self.port = port
+        self.trd_market = trd_market
+
+    def get_acc_list(self) -> object:
+        return (
+            0,
+            FakeDataFrame(
+                [
+                    {
+                        "acc_id": 12958916,
+                        "acc_index": 0,
+                        "trd_env": "SIMULATE",
+                        "acc_status": "ACTIVE",
+                    }
+                ]
+            ),
+        )
+
+    def close(self) -> None:
+        pass
+
+
+class FakeDataFrame:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
+
+    def to_dict(self, orient: str) -> list[dict[str, object]]:
+        assert orient == "records"
+        return self._rows
 
 
 def risk_payload() -> dict[str, Any]:
@@ -248,6 +283,20 @@ def test_execute_kelly_orders_submits_ready_orders_with_client() -> None:
     assert payload["executions"][0]["futu_order_id"] == "SIM-1"
     assert payload["executions"][1]["execution_status"] == "submitted"
     assert payload["executions"][1]["futu_order_id"] == "SIM-2"
+
+
+def test_futu_simulate_order_execution_client_uses_requested_trd_market() -> None:
+    client = FutuSimulateOrderExecutionClient(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=12958916,
+        trd_market="US",
+        context_factory=FakeFutuExecutionContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    assert client.context.trd_market == "US"
+    assert client.account == {"acc_id": 12958916, "acc_index": 0}
 
 
 def test_write_kelly_order_executions_writes_latest_artifact(tmp_path: Path) -> None:
