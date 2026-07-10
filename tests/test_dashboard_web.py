@@ -1040,6 +1040,73 @@ for (const forbidden of ["US.DRAM", "US.RAM", "US.SOXX", "HK.02840"]) {
     )
 
 
+def test_dashboard_renders_kelly_strategy_capital_panel() -> None:
+    output = run_dashboard_js(
+        """
+state.dashboard = {
+  kelly_lab: {
+    available: true,
+    experiments: [{
+      experiment_id: "trend_pullback_20d_us_mock_20260707",
+      experiment_name: "趋势回调 20D Mock US 第一批",
+      market: "US",
+      experiment_budget: "30000",
+      budget_currency: "USD",
+      status: "running",
+      template: {
+        strategy_id: "trend_pullback_20d",
+        strategy_name: "趋势回调 20D",
+        entry_rule_description: "价格回调到 20 日均线附近。"
+      },
+      stats: {},
+      capital: {
+        currency: "USD",
+        budget: 30000,
+        occupied_notional: 8460,
+        position_notional: 6200,
+        reserved_order_notional: 2260,
+        available_notional: 21540,
+        utilization_pct: 28.2,
+        open_buy_order_count: 2,
+        realized_pnl: 420,
+        updated_at: "2026-07-10 13:45",
+        symbol_occupancy: [
+          {symbol: "US.RAM", occupied_notional: 8460}
+        ],
+        next_order_impact: {
+          symbol: "US.RAM",
+          estimated_notional: 1500,
+          available_after_order: 20040,
+          risk_status: "approved",
+          reason: "订单提交后仍保留充足可用资金。"
+        }
+      }
+    }]
+  }
+};
+state.workspaceView = "kelly_lab";
+const html = renderKellyLabPanel();
+for (const required of [
+  "策略资金",
+  "总资金",
+  "USD 30,000",
+  "可用资金",
+  "USD 21,540",
+  "已占用",
+  "USD 8,460",
+  "下一笔下单影响",
+  "US.RAM",
+  "资金足够"
+]) {
+  if (!html.includes(required)) {
+    throw new Error("kelly capital panel missing " + required + ": " + html);
+  }
+}
+"""
+    )
+    assert output == ""
+
+
 def test_dashboard_renders_futu_anomaly_signal_card_in_chinese() -> None:
     output = run_dashboard_js(
         """

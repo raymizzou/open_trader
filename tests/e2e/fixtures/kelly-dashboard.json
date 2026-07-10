@@ -135,6 +135,31 @@
           "enabled": true
         },
         "capital_utilization_pct": "50",
+        "capital": {
+          "currency": "USD",
+          "budget": 30000,
+          "occupied_notional": 8460,
+          "position_notional": 6200,
+          "reserved_order_notional": 2260,
+          "available_notional": 21540,
+          "utilization_pct": 28.2,
+          "open_buy_order_count": 2,
+          "realized_pnl": 420,
+          "updated_at": "2026-07-10 13:45",
+          "symbol_occupancy": [
+            {
+              "symbol": "US.RAM",
+              "occupied_notional": 8460
+            }
+          ],
+          "next_order_impact": {
+            "symbol": "US.RAM",
+            "estimated_notional": 1500,
+            "available_after_order": 20040,
+            "risk_status": "approved",
+            "reason": "订单提交后仍保留充足可用资金。"
+          }
+        },
         "order_sync": {
           "status": "success",
           "environment": "SIMULATE",
@@ -352,6 +377,31 @@
           "enabled": true
         },
         "capital_utilization_pct": "50",
+        "capital": {
+          "currency": "HKD",
+          "budget": 200000,
+          "occupied_notional": 45000,
+          "position_notional": 45000,
+          "reserved_order_notional": 0,
+          "available_notional": 155000,
+          "utilization_pct": 22.5,
+          "open_buy_order_count": 0,
+          "realized_pnl": 0,
+          "updated_at": "2026-07-10 13:45",
+          "symbol_occupancy": [
+            {
+              "symbol": "HK.02840",
+              "occupied_notional": 45000
+            }
+          ],
+          "next_order_impact": {
+            "symbol": "HK.02840",
+            "estimated_notional": 0,
+            "available_after_order": 155000,
+            "risk_status": "approved",
+            "reason": "退出订单不新增买单占用。"
+          }
+        },
         "order_sync": {
           "status": "success",
           "environment": "SIMULATE",
