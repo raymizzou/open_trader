@@ -263,6 +263,58 @@ def test_build_kelly_strategy_capital_payload_counts_submitted_real_executions_o
     ]
 
 
+def test_build_kelly_strategy_capital_payload_dedupes_synced_paper_order_and_execution() -> None:
+    payload = build_kelly_strategy_capital_payload(
+        [
+            {
+                "experiment_id": "trend_us",
+                "experiment_name": "趋势回调 US",
+                "market": "US",
+                "experiment_budget": "30000",
+                "budget_currency": "USD",
+            }
+        ],
+        paper_orders_payload={
+            "orders": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "RAM",
+                    "side": "buy",
+                    "status": "submitted",
+                    "order_id": "SIM-1",
+                    "price": "150",
+                    "quantity": "8",
+                }
+            ]
+        },
+        order_executions_payload={
+            "executions": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "RAM",
+                    "side": "buy",
+                    "execution_status": "submitted",
+                    "submitted": True,
+                    "futu_order_id": "SIM-1",
+                    "price": "150",
+                    "qty": "8",
+                }
+            ]
+        },
+        calculated_at="2026-07-10 21:09",
+    )
+
+    capital = payload["strategies"][0]
+    assert capital["reserved_order_notional"] == "1200"
+    assert capital["occupied_notional"] == "1200"
+    assert capital["open_buy_order_count"] == 1
+    assert capital["symbol_occupancy"] == [
+        {"market": "US", "symbol": "RAM", "notional": "1200"},
+    ]
+
+
 def test_build_kelly_strategy_capital_payload_falls_back_after_invalid_decimal() -> None:
     payload = build_kelly_strategy_capital_payload(
         [

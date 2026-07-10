@@ -133,6 +133,9 @@ def _capital_usage_by_experiment(
         else:
             continue
 
+        order_key = _stable_order_id(order)
+        if order_key:
+            usage["paper_order_ids"].add(order_key)
         if notional:
             usage["symbol_occupancy"][market_symbol] = (
                 usage["symbol_occupancy"].get(market_symbol, Decimal("0")) + notional
@@ -161,6 +164,9 @@ def _merge_execution_usage_by_experiment(
 
         experiment_id = _field_text(execution.get("experiment_id"))
         usage = usage_by_experiment.setdefault(experiment_id, _empty_usage())
+        order_key = _stable_order_id(execution)
+        if order_key and order_key in usage["paper_order_ids"]:
+            continue
         market_symbol = (
             _field_text(execution.get("market")).upper(),
             _field_text(execution.get("symbol")).upper(),
@@ -180,7 +186,12 @@ def _empty_usage() -> dict[str, Any]:
         "position_notional": Decimal("0"),
         "open_buy_order_count": 0,
         "symbol_occupancy": {},
+        "paper_order_ids": set(),
     }
+
+
+def _stable_order_id(order: dict[str, Any]) -> str:
+    return _first_text(order, ("order_id", "futu_order_id", "execution_order_id"))
 
 
 def _open_buy_order_notional(order: dict[str, Any]) -> Decimal:
@@ -219,6 +230,14 @@ def _first_decimal(order: dict[str, Any], keys: tuple[str, ...]) -> Decimal:
             if parsed is not None:
                 return parsed
     return Decimal("0")
+
+
+def _first_text(order: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        text = _field_text(order.get(key))
+        if text:
+            return text
+    return ""
 
 
 def _parse_decimal(value: object) -> Decimal:
