@@ -12,6 +12,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Added sell-side trading-plan backtests for underweight/reduce/trim/sell
   ratings, seeded from current dashboard holding quantity and verified through
   pytest plus a local dashboard click check.
+- Added a dashboard backtest-status filter so operators can isolate holdings
+  that are ready to run, missing prices, missing plan fields, or unsupported.
 
 ## 2026-07-09
 

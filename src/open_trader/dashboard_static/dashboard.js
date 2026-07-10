@@ -7,6 +7,7 @@ const state = {
   quotePayload: null,
   marketFilter: "ALL",
   brokerFilter: "ALL",
+  backtestFilter: "ALL",
   selectedHoldingKey: "",
   selectedHoldingDetail: "decision",
   detailLanguage: "zh",
@@ -124,6 +125,7 @@ function bindElements() {
     "refresh-quotes",
     "header-market-filters",
     "header-broker-filters",
+    "header-backtest-filters",
     "current-view-label",
     "current-view-value",
     "current-view-holding-value",
@@ -193,6 +195,17 @@ function bindEvents() {
     state.selectedHoldingKey = "";
     state.selectedHoldingDetail = "decision";
     setActiveFilter(elements["header-broker-filters"], button);
+    renderDashboardViews();
+  });
+  elements["header-backtest-filters"].addEventListener("click", (event) => {
+    const button = event.target.closest("[data-backtest]");
+    if (!button) {
+      return;
+    }
+    state.backtestFilter = button.dataset.backtest || "ALL";
+    state.selectedHoldingKey = "";
+    state.selectedHoldingDetail = "decision";
+    setActiveFilter(elements["header-backtest-filters"], button);
     renderDashboardViews();
   });
   elements["holdings-body"].addEventListener("click", (event) => {
@@ -383,7 +396,11 @@ function currentViewSummary() {
       holding_count: cashRows.length,
     };
   }
-  if (state.marketFilter === "ALL" && state.brokerFilter !== "ALL") {
+  if (
+    state.marketFilter === "ALL"
+    && state.brokerFilter !== "ALL"
+    && state.backtestFilter === "ALL"
+  ) {
     const summary = currentBrokerSummary();
     if (summary) {
       return {
@@ -521,7 +538,10 @@ function emptyMoneySummary(complete) {
 function currentViewLabel(count) {
   const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CASH" ? "现金" : state.marketFilter;
   const brokerLabel = state.brokerFilter === "ALL" ? "全部券商" : brokerDisplayName(state.brokerFilter);
-  return `当前视图：${marketLabel} · ${brokerLabel} · ${formatPlain(count)} 条`;
+  const backtestLabel = state.backtestFilter === "ALL" || state.marketFilter === "CASH"
+    ? ""
+    : ` · ${backtestFilterLabel(state.backtestFilter)}`;
+  return `当前视图：${marketLabel} · ${brokerLabel}${backtestLabel} · ${formatPlain(count)} 条`;
 }
 
 function renderSummary() {
@@ -744,8 +764,10 @@ function openTradeActionDetail(actionKey) {
 function resetHoldingFilters() {
   state.marketFilter = "ALL";
   state.brokerFilter = "ALL";
+  state.backtestFilter = "ALL";
   setFilterActiveByDataset(elements["header-market-filters"], "market", "ALL");
   setFilterActiveByDataset(elements["header-broker-filters"], "broker", "ALL");
+  setFilterActiveByDataset(elements["header-backtest-filters"], "backtest", "ALL");
 }
 
 function setFilterActiveByDataset(container, datasetKey, value) {
@@ -4272,8 +4294,42 @@ function filteredHoldings() {
     const brokers = rowBrokers(holding);
     const marketMatches = state.marketFilter === "ALL" || market === state.marketFilter;
     const brokerMatches = state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
-    return marketMatches && brokerMatches;
+    const backtestMatches = backtestFilterMatches(holding);
+    return marketMatches && brokerMatches && backtestMatches;
   });
+}
+
+function backtestFilterMatches(holding) {
+  if (state.marketFilter === "CASH" || state.backtestFilter === "ALL") {
+    return true;
+  }
+  const readiness = holding && holding.backtest_readiness && typeof holding.backtest_readiness === "object"
+    ? holding.backtest_readiness
+    : {};
+  const status = String(readiness.status || "").trim();
+  if (state.backtestFilter === "READY") {
+    return status === "ready";
+  }
+  if (state.backtestFilter === "MISSING_PRICES") {
+    return status === "missing_prices" || readiness.prices_missing === true;
+  }
+  if (state.backtestFilter === "MISSING_FIELDS") {
+    return status === "missing_fields";
+  }
+  if (state.backtestFilter === "UNSUPPORTED") {
+    return status === "unsupported_strategy";
+  }
+  return true;
+}
+
+function backtestFilterLabel(value) {
+  const labels = {
+    READY: "回测可运行",
+    MISSING_PRICES: "回测缺价格",
+    MISSING_FIELDS: "回测缺字段",
+    UNSUPPORTED: "回测暂不支持",
+  };
+  return labels[value] || "全部回测";
 }
 
 function holdingsEmptyRow(message) {

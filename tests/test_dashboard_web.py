@@ -303,6 +303,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "dashboard-header" in html
     assert "header-market-filters" in html
     assert "header-broker-filters" in html
+    assert "header-backtest-filters" in html
+    assert "data-backtest=\"READY\"" in html
+    assert "可运行" in html
     assert "current-view-value" in html
     assert "broker-summary-cards" in html
     assert "source-status-list" in html
@@ -542,6 +545,97 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".workspace-grid.detail-mode {" in mobile_css
     assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
+
+
+def test_dashboard_backtest_filter_limits_holdings_and_ignores_cash_view() -> None:
+    output = run_dashboard_js(
+        r"""
+state.dashboard = {
+  holdings: [
+    {
+      market: "US",
+      symbol: "READY",
+      name: "Ready",
+      brokers: "futu",
+      backtest_readiness: { status: "ready", prices_missing: false, missing_fields: [] },
+    },
+    {
+      market: "US",
+      symbol: "NOPRICE",
+      name: "No Price",
+      brokers: "futu",
+      backtest_readiness: { status: "missing_prices", prices_missing: true, missing_fields: [] },
+    },
+    {
+      market: "HK",
+      symbol: "NOFIELD",
+      name: "No Field",
+      brokers: "phillips",
+      backtest_readiness: { status: "missing_fields", prices_missing: false, missing_fields: ["target_1"] },
+    },
+    {
+      market: "US",
+      symbol: "UNSUPPORTED",
+      name: "Unsupported",
+      brokers: "tiger",
+      backtest_readiness: { status: "unsupported_strategy", prices_missing: false, missing_fields: [] },
+    },
+    {
+      market: "US",
+      symbol: "NOREADINESS",
+      name: "No Readiness",
+      brokers: "futu",
+    },
+  ],
+  cash_rows: [
+    { market: "CASH", symbol: "HKD_CASH", brokers: "futu", market_value_hkd: "100" },
+  ],
+};
+state.marketFilter = "ALL";
+state.brokerFilter = "ALL";
+state.backtestFilter = "READY";
+let symbols = filteredHoldings().map((holding) => holding.symbol).join(",");
+if (symbols !== "READY") {
+  throw new Error("READY filter mismatch: " + symbols);
+}
+state.backtestFilter = "MISSING_PRICES";
+symbols = filteredHoldings().map((holding) => holding.symbol).join(",");
+if (symbols !== "NOPRICE") {
+  throw new Error("MISSING_PRICES filter mismatch: " + symbols);
+}
+state.backtestFilter = "MISSING_FIELDS";
+symbols = filteredHoldings().map((holding) => holding.symbol).join(",");
+if (symbols !== "NOFIELD") {
+  throw new Error("MISSING_FIELDS filter mismatch: " + symbols);
+}
+state.backtestFilter = "UNSUPPORTED";
+symbols = filteredHoldings().map((holding) => holding.symbol).join(",");
+if (symbols !== "UNSUPPORTED") {
+  throw new Error("UNSUPPORTED filter mismatch: " + symbols);
+}
+state.backtestFilter = "ALL";
+symbols = filteredHoldings().map((holding) => holding.symbol).join(",");
+if (symbols !== "READY,NOPRICE,NOFIELD,UNSUPPORTED,NOREADINESS") {
+  throw new Error("ALL filter mismatch: " + symbols);
+}
+state.marketFilter = "US";
+state.backtestFilter = "READY";
+symbols = filteredHoldings().map((holding) => holding.symbol).join(",");
+if (symbols !== "READY") {
+  throw new Error("combined market/backtest filter mismatch: " + symbols);
+}
+state.marketFilter = "CASH";
+state.brokerFilter = "futu";
+state.backtestFilter = "READY";
+const cashRows = filteredCashRows();
+if (cashRows.length !== 1 || cashRows[0].symbol !== "HKD_CASH") {
+  throw new Error("backtest filter should not affect cash view: " + JSON.stringify(cashRows));
+}
+console.log("ok");
+"""
+    )
+
+    assert "ok" in output
 
 
 def test_dashboard_renders_futu_anomaly_signal_card_in_chinese() -> None:
