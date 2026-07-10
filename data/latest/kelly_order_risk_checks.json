@@ -19,7 +19,7 @@
       "checked_at": "2026-07-10 13:31",
       "risk_status": "approved",
       "execution_status": "ready",
-      "planned_notional": "1000",
+      "planned_notional": "1333.3332",
       "budget_currency": "USD",
       "reason": "entry risk checks passed",
       "check_results": [

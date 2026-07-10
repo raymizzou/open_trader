@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import json
 from pathlib import Path
 
@@ -1040,6 +1041,35 @@ def test_latest_kelly_order_artifacts_reference_visible_experiments() -> None:
                 assert row["budget_currency"] == experiment["budget_currency"]
             if "intent_id" in row:
                 assert row["intent_id"].startswith(f"{experiment_id}:")
+
+
+def test_latest_entry_planned_notionals_match_order_intents() -> None:
+    latest_dir = Path("data") / "latest"
+    intents_payload = json.loads(
+        (latest_dir / "kelly_order_intents.json").read_text()
+    )
+    intent_by_id = {
+        intent["intent_id"]: intent
+        for intent in intents_payload["intents"]
+        if intent.get("intent_type") == "entry"
+    }
+    artifact_specs = [
+        ("kelly_order_risk_checks.json", "checks"),
+        ("kelly_order_executions.json", "executions"),
+    ]
+
+    for file_name, rows_key in artifact_specs:
+        payload = json.loads((latest_dir / file_name).read_text())
+        for row in payload[rows_key]:
+            intent = intent_by_id.get(row.get("intent_id"))
+            if intent is None or not row.get("planned_notional"):
+                continue
+            expected_notional = (
+                Decimal(intent["per_symbol_budget"])
+                * Decimal(intent["suggested_position_pct"].rstrip("%"))
+                / Decimal("100")
+            )
+            assert Decimal(row["planned_notional"]) == expected_notional
 
 
 def test_load_checked_in_kelly_data_has_scoped_order_and_lifecycle_metadata() -> None:
