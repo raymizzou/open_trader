@@ -3,6 +3,19 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-10
+
+- Fixed the daily US/HK premarket workflow so non-dry-run automation refreshes
+  the live Futu and Tiger portfolio before generating premarket advice and trade
+  actions, preventing stale holdings from producing false manual-review
+  blockers.
+- Changed single-share trim sizing so a triggered `TRIM` action on a 1-share
+  holding produces a 1-share ready action instead of rounding to zero and
+  requiring manual review.
+- Verified on local `main` with the full pytest suite, replayed the 2026-07-09
+  US blocker scenario as `ready=2 review=0`, and confirmed the US launchd
+  premarket job was not running stale code.
+
 ## 2026-07-04
 
 - Added Futu daily-K Bollinger fact generation for dashboard K-line cards, fixed
