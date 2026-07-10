@@ -148,8 +148,9 @@
           "updated_at": "2026-07-10 13:45",
           "symbol_occupancy": [
             {
-              "symbol": "US.RAM",
-              "occupied_notional": 8460
+              "market": "US",
+              "symbol": "RAM",
+              "notional": "3720"
             }
           ],
           "next_order_impact": {

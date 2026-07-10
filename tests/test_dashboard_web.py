@@ -1107,6 +1107,146 @@ for (const required of [
     assert output == ""
 
 
+def test_dashboard_renders_kelly_strategy_capital_unavailable_fallback() -> None:
+    output = run_dashboard_js(
+        """
+const baseExperiment = {
+  experiment_name: "资金缺失策略",
+  market: "US",
+  experiment_budget: "30000",
+  budget_currency: "USD",
+  status: "running",
+  template: {
+    strategy_id: "trend_pullback_20d",
+    strategy_name: "趋势回调 20D",
+    entry_rule_description: "价格回调到 20 日均线附近。"
+  },
+  stats: {}
+};
+const missingHtml = renderKellyExperimentCard(baseExperiment);
+const disabledHtml = renderKellyExperimentCard({
+  ...baseExperiment,
+  capital: {available: false}
+});
+for (const html of [missingHtml, disabledHtml]) {
+  for (const required of ["策略资金", "策略资金数据暂不可用。"]) {
+    if (!html.includes(required)) {
+      throw new Error("kelly capital fallback missing " + required + ": " + html);
+    }
+  }
+}
+"""
+    )
+    assert output == ""
+
+
+def test_dashboard_bounds_kelly_strategy_capital_utilization_widths() -> None:
+    output = run_dashboard_js(
+        """
+const overflowingHtml = renderKellyExperimentCard({
+  experiment_name: "资金超限策略",
+  market: "US",
+  budget_currency: "USD",
+  status: "running",
+  template: {strategy_id: "overflow", strategy_name: "Overflow"},
+  stats: {},
+  capital: {
+    currency: "USD",
+    budget: 100,
+    occupied_notional: 250,
+    position_notional: 140,
+    reserved_order_notional: 90,
+    available_notional: 0,
+    utilization_pct: 250,
+    open_buy_order_count: 1,
+    realized_pnl: 0
+  }
+});
+const invalidHtml = renderKellyExperimentCard({
+  experiment_name: "资金异常策略",
+  market: "US",
+  budget_currency: "USD",
+  status: "running",
+  template: {strategy_id: "invalid", strategy_name: "Invalid"},
+  stats: {},
+  capital: {
+    currency: "USD",
+    budget: "not-a-number",
+    occupied_notional: "",
+    position_notional: "bad",
+    reserved_order_notional: -25,
+    available_notional: 0,
+    utilization_pct: "bad",
+    open_buy_order_count: 0,
+    realized_pnl: 0
+  }
+});
+for (const html of [overflowingHtml, invalidHtml]) {
+  if (html.includes("NaN%") || /width:\\s*-/.test(html)) {
+    throw new Error("kelly capital utilization emitted invalid width: " + html);
+  }
+  const widths = [...html.matchAll(/width:\\s*([0-9.]+)%/g)].map((match) => Number.parseFloat(match[1]));
+  if (widths.length !== 2) {
+    throw new Error("kelly capital utilization width count mismatch: " + html);
+  }
+  for (const width of widths) {
+    if (!Number.isFinite(width) || width < 0 || width > 100) {
+      throw new Error("kelly capital utilization width out of bounds " + width + ": " + html);
+    }
+  }
+}
+if (!overflowingHtml.includes('style="width: 100%"></span>') || !overflowingHtml.includes('style="width: 0%"></span>')) {
+  throw new Error("kelly capital overflowing widths should clamp to 100 and 0: " + overflowingHtml);
+}
+"""
+    )
+    assert output == ""
+
+
+def test_dashboard_renders_kelly_capital_producer_symbol_shape() -> None:
+    output = run_dashboard_js(
+        """
+const html = renderKellyExperimentCard({
+  experiment_name: "真实资金形状策略",
+  market: "US",
+  budget_currency: "USD",
+  status: "running",
+  template: {strategy_id: "producer", strategy_name: "Producer"},
+  stats: {},
+  capital: {
+    currency: "USD",
+    budget: 10000,
+    occupied_notional: 3720,
+    position_notional: 3720,
+    reserved_order_notional: 0,
+    available_notional: 6280,
+    utilization_pct: 37.2,
+    open_buy_order_count: 0,
+    realized_pnl: 0,
+    symbol_occupancy: [
+      {market: "US", symbol: "RAM", notional: "3720"},
+      {market: "US", symbol: "US.DRAM", notional: "500"}
+    ],
+    next_order_impact: {
+      market: "US",
+      symbol: "US.RAM",
+      estimated_notional: 500,
+      available_after_order: 5780,
+      risk_status: "approved"
+    }
+  }
+});
+if (!html.includes("US.RAM") || !html.includes("USD 3,720")) {
+  throw new Error("kelly producer symbol shape missing rendered symbol: " + html);
+}
+if (html.includes("US.US.RAM") || html.includes("US.US.DRAM")) {
+  throw new Error("kelly producer symbol duplicated market prefix: " + html);
+}
+"""
+    )
+    assert output == ""
+
+
 def test_dashboard_renders_futu_anomaly_signal_card_in_chinese() -> None:
     output = run_dashboard_js(
         """

@@ -1024,11 +1024,15 @@ function kellyCapitalSymbolOccupancy(value) {
 
 function kellyCapitalSymbol(value) {
   const item = value && typeof value === "object" ? value : {};
-  const marketSymbol = [item.market, firstPresent(item.symbol, item.code)]
+  const rawSymbol = firstPresent(item.symbol, item.code);
+  const formattedSymbol = hasValue(rawSymbol) ? formatPlain(rawSymbol) : "";
+  const marketSymbol = formattedSymbol.includes(".")
+    ? formattedSymbol
+    : [item.market, formattedSymbol]
     .filter(hasValue)
     .map(formatPlain)
     .join(".");
-  return firstPresent(item.futu_code, marketSymbol, item.symbol, item.code, "-");
+  return firstPresent(item.futu_code, marketSymbol, formattedSymbol, "-");
 }
 
 function renderKellyCapitalLine(label, value) {

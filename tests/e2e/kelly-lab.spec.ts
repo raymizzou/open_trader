@@ -28,11 +28,12 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(usTrendCard.getByText('US', { exact: true })).toBeVisible();
   await expect(usTrendCard.getByText('模拟资金池')).toBeVisible();
   await expect(usTrendCard.getByText('USD 30000').first()).toBeVisible();
-  const usCapital = page.getByLabel('Kelly 策略资金');
+  const usCapital = usTrendCard.getByLabel('Kelly 策略资金');
   await expect(usCapital).toBeVisible();
   await expect(usCapital.getByText('可用资金', { exact: true })).toBeVisible();
   await expect(usCapital.getByText('USD 21,540')).toBeVisible();
   await expect(usCapital.getByText('下一笔下单影响')).toBeVisible();
+  await expect(usCapital.locator('.kelly-capital-pane', { hasText: '标的占用' }).getByText('US.RAM', { exact: true })).toBeVisible();
   for (const symbol of ['US.DRAM', 'US.RAM', 'US.SOXX']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
   }
@@ -100,7 +101,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   const hkTrendCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' }) });
   await expect(hkTrendCard.getByText('HK', { exact: true })).toBeVisible();
   await expect(hkTrendCard.getByText('HKD 200000').first()).toBeVisible();
-  const hkCapital = page.getByLabel('Kelly 策略资金');
+  const hkCapital = hkTrendCard.getByLabel('Kelly 策略资金');
   await expect(hkCapital.locator('dd', { hasText: 'HKD 155,000' })).toBeVisible();
   await expect(page.getByLabel('Kelly 标的状态').getByText('HK.02840')).toBeVisible();
   await expect(page.getByLabel('Kelly 标的状态').getByText('US.DRAM')).toHaveCount(0);
