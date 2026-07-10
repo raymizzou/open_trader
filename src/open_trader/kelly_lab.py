@@ -228,13 +228,19 @@ def _attach_paper_orders_to_experiments(
     for experiment in experiments:
         normalized = copy.deepcopy(experiment)
         experiment_id = normalized.get("experiment_id")
+        experiment_market = _normalized_market_or_empty(normalized.get("market"))
         if isinstance(experiment_id, str) and experiment_id in orders_by_experiment:
+            orders = [
+                order
+                for order in orders_by_experiment[experiment_id]
+                if _normalized_market_or_empty(order.get("market")) == experiment_market
+            ]
             order_sync = normalized.get("order_sync")
             if isinstance(order_sync, dict):
                 order_sync = copy.deepcopy(order_sync)
             else:
                 order_sync = {}
-            order_sync["orders"] = orders_by_experiment[experiment_id]
+            order_sync["orders"] = orders
             normalized["order_sync"] = order_sync
         attached.append(normalized)
     return attached
@@ -262,8 +268,14 @@ def _attach_order_execution_to_experiments(
     for experiment in experiments:
         normalized = copy.deepcopy(experiment)
         experiment_id = normalized.get("experiment_id")
+        experiment_market = _normalized_market_or_empty(normalized.get("market"))
         if isinstance(experiment_id, str):
-            executions = executions_by_experiment.get(experiment_id, [])
+            executions = [
+                execution
+                for execution in executions_by_experiment.get(experiment_id, [])
+                if _normalized_market_or_empty(execution.get("market"))
+                == experiment_market
+            ]
             if executions:
                 normalized["order_execution"] = _order_execution_summary(
                     order_execution,
@@ -307,6 +319,10 @@ def _count_executions(executions: list[dict[str, Any]], status: str) -> int:
         for execution in executions
         if str(execution.get("execution_status", "")).strip() == status
     )
+
+
+def _normalized_market_or_empty(value: Any) -> str:
+    return value.strip().upper() if isinstance(value, str) else ""
 
 
 def _validate_templates_payload(

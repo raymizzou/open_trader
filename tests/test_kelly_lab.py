@@ -586,6 +586,99 @@ def test_load_kelly_lab_state_attaches_paper_orders_by_experiment_id(
     ]
 
 
+def test_load_kelly_lab_state_filters_attached_paper_orders_to_experiment_market(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_paper_orders.json",
+        {
+            "schema_version": "open_trader.kelly_paper_orders.v1",
+            "orders": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "RAM",
+                    "side": "buy",
+                    "status": "filled",
+                    "order_id": "SIM-US",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "HK",
+                    "symbol": "02840",
+                    "side": "sell",
+                    "status": "submitted",
+                    "order_id": "SIM-HK",
+                },
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    orders = state["experiments"][0]["order_sync"]["orders"]
+    assert [(order["market"], order["symbol"]) for order in orders] == [("US", "RAM")]
+
+
+def test_load_kelly_lab_state_filters_attached_order_executions_to_experiment_market(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_order_executions.json",
+        {
+            "schema_version": "open_trader.kelly_order_executions.v1",
+            "environment": "SIMULATE",
+            "source": "test",
+            "executed_at": "2026-07-10 15:28",
+            "executions": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "RAM",
+                    "side": "buy",
+                    "execution_status": "skipped",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "HK",
+                    "symbol": "02840",
+                    "side": "sell",
+                    "execution_status": "submitted",
+                },
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    order_execution = state["experiments"][0]["order_execution"]
+    assert order_execution["execution_count"] == 1
+    assert order_execution["submitted_count"] == 0
+    assert order_execution["skipped_count"] == 1
+    assert [
+        (execution["market"], execution["symbol"])
+        for execution in order_execution["executions"]
+    ] == [("US", "RAM")]
+
+
 def test_load_kelly_lab_state_keeps_existing_order_sync_when_paper_orders_missing(
     tmp_path: Path,
 ) -> None:
@@ -815,3 +908,10 @@ def test_index_kelly_experiments_by_market_symbol(tmp_path: Path) -> None:
 
     assert list(indexed) == [("US", "MSFT")]
     assert indexed[("US", "MSFT")][0]["experiment_id"] == "breakout_10d_exp_20260707"
+
+
+def test_load_checked_in_kelly_data_is_available() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+
+    assert state["available"] is True
+    assert state["experiment_count"] >= 1
