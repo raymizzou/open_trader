@@ -33,6 +33,16 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(orderSync.getByText('800')).toHaveCount(2);
   await expect(orderSync.getByText('已成交')).toBeVisible();
   await expect(orderSync.getByText('US.MSFT')).toHaveCount(0);
+  const orderExecution = page.getByLabel('Kelly 订单执行');
+  await expect(orderExecution.getByText('部分执行')).toBeVisible();
+  await expect(orderExecution.getByText('Kelly 订单执行存在失败或跳过项。')).toBeVisible();
+  await expect(orderExecution.getByText('DRY_RUN')).toBeVisible();
+  await expect(orderExecution.getByText('2026-07-10 13:32').first()).toBeVisible();
+  await expect(orderExecution.getByText('US.RAM')).toBeVisible();
+  await expect(orderExecution.getByText('预演').first()).toBeVisible();
+  await expect(orderExecution.getByText('已跳过')).toBeVisible();
+  await expect(orderExecution.getByText('missing order quantity')).toBeVisible();
+  await expect(orderExecution.getByText('US.MSFT')).toHaveCount(0);
   const symbolStates = page.getByLabel('Kelly 标的状态');
   await expect(symbolStates.getByText('观察中 → 待下单 → 持仓中 → 待退出 → 已完成')).toBeVisible();
   await expect(symbolStates.getByText('该标的在策略监控范围内，但当前没有入场信号，也没有持仓。')).toBeVisible();
@@ -77,6 +87,11 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(failedOrderSync.getByText('拒单')).toBeVisible();
   await expect(failedOrderSync.getByText('505.10')).toBeVisible();
   await expect(failedOrderSync.getByText('US.RAM')).toHaveCount(0);
+  const failedOrderExecution = page.getByLabel('Kelly 订单执行');
+  await expect(failedOrderExecution.getByText('执行失败', { exact: true }).first()).toBeVisible();
+  await expect(failedOrderExecution.getByText('Kelly 订单执行存在失败或跳过项。')).toBeVisible();
+  await expect(failedOrderExecution.getByText('OpenD disconnected')).toBeVisible();
+  await expect(failedOrderExecution.getByText('US.RAM')).toHaveCount(0);
   await expect(page.getByLabel('Kelly 策略详情').getByText('价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。')).toBeVisible();
   await page.getByRole('button', { name: '返回主页' }).click();
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toHaveCount(0);

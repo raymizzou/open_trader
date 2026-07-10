@@ -576,6 +576,52 @@ state.dashboard = {
           }
         ]
       },
+      order_execution: {
+        status: "partial",
+        environment: "DRY_RUN",
+        source: "dry_run",
+        last_executed_at: "2026-07-10 13:32",
+        execution_count: 2,
+        submitted_count: 0,
+        dry_run_count: 1,
+        skipped_count: 1,
+        failed_count: 0,
+        message: "Kelly 订单执行存在失败或跳过项。",
+        executions: [
+          {
+            intent_id: "trend_pullback_20d_exp_20260707:US:RAM:entry",
+            market: "US",
+            symbol: "RAM",
+            futu_code: "US.RAM",
+            side: "buy",
+            order_type: "NORMAL",
+            price: "12.50",
+            qty: "80",
+            planned_notional: "1000",
+            budget_currency: "USD",
+            execution_status: "dry_run",
+            futu_order_id: "",
+            executed_at: "2026-07-10 13:32",
+            error: ""
+          },
+          {
+            intent_id: "trend_pullback_20d_exp_20260707:HK:02840:exit",
+            market: "HK",
+            symbol: "02840",
+            futu_code: "HK.02840",
+            side: "sell",
+            order_type: "NORMAL",
+            price: "3000",
+            qty: "",
+            planned_notional: "",
+            budget_currency: "USD",
+            execution_status: "skipped",
+            futu_order_id: "",
+            executed_at: "2026-07-10 13:32",
+            error: "missing order quantity"
+          }
+        ]
+      },
       lifecycle_states: [
         {
           status: "watching",
@@ -691,6 +737,36 @@ state.dashboard = {
           }
         ]
       },
+      order_execution: {
+        status: "failed",
+        environment: "SIMULATE",
+        source: "futu_simulate_order_execution_client",
+        last_executed_at: "2026-07-10 13:35",
+        execution_count: 1,
+        submitted_count: 0,
+        dry_run_count: 0,
+        skipped_count: 0,
+        failed_count: 1,
+        message: "Kelly 订单执行存在失败或跳过项。",
+        executions: [
+          {
+            intent_id: "breakout_10d_mock_20260707:US:MSFT:entry",
+            market: "US",
+            symbol: "MSFT",
+            futu_code: "US.MSFT",
+            side: "buy",
+            order_type: "NORMAL",
+            price: "505.10",
+            qty: "1",
+            planned_notional: "505.10",
+            budget_currency: "USD",
+            execution_status: "failed",
+            futu_order_id: "",
+            executed_at: "2026-07-10 13:35",
+            error: "OpenD disconnected"
+          }
+        ]
+      },
       template: {
         strategy_id: "breakout_10d",
         strategy_name: "突破 10D",
@@ -775,6 +851,26 @@ if (html.includes("实验参与标的") || html.includes("kelly-participant-row"
 }
 for (const required of [
   "标的状态",
+  "订单执行",
+  "部分执行",
+  "Kelly 订单执行存在失败或跳过项。",
+  "DRY_RUN",
+  "2026-07-10 13:32",
+  "执行",
+  "2",
+  "预演",
+  "1",
+  "提交",
+  "0",
+  "跳过",
+  "1",
+  "计划金额",
+  "富途订单",
+  "错误",
+  "1000",
+  "预演",
+  "已跳过",
+  "missing order quantity",
   "订单同步",
   "同步成功",
   "富途模拟盘订单已同步。",
@@ -895,6 +991,11 @@ if (!secondHtml.includes("价格放量突破近 10 个交易日高点，成交�
 for (const required of ["订单同步", "同步失败", "模拟盘订单同步失败：OpenD 不可用。", "本轮不下单，保留现有订单状态。", "US.MSFT", "SIM-20001", "买入", "505.10", "20", "拒单"]) {
   if (!secondHtml.includes(required)) {
     throw new Error("kelly second tab order sync missing " + required + ": " + secondHtml);
+  }
+}
+for (const required of ["订单执行", "执行失败", "Kelly 订单执行存在失败或跳过项。", "SIMULATE", "2026-07-10 13:35", "OpenD disconnected", "执行失败"]) {
+  if (!secondHtml.includes(required)) {
+    throw new Error("kelly second tab order execution missing " + required + ": " + secondHtml);
   }
 }
 for (const forbidden of ["US.DRAM", "US.RAM", "US.SOXX", "HK.02840"]) {

@@ -705,6 +705,91 @@ function renderKellyOrderSyncOrder(order) {
   `;
 }
 
+function renderKellyOrderExecution(experiment) {
+  const entry = experiment && typeof experiment === "object" ? experiment : {};
+  const execution = entry.order_execution && typeof entry.order_execution === "object"
+    ? entry.order_execution
+    : null;
+  if (!execution) {
+    return "";
+  }
+  const status = kellyOrderExecutionStatus(execution.status);
+  const rows = [
+    ["环境", execution.environment],
+    ["最近执行", execution.last_executed_at],
+    ["执行", execution.execution_count],
+    ["预演", execution.dry_run_count],
+    ["提交", execution.submitted_count],
+    ["跳过", execution.skipped_count],
+    ["失败", execution.failed_count],
+  ];
+  return `
+    <section class="kelly-order-sync" aria-label="Kelly 订单执行">
+      <div class="kelly-order-sync-header">
+        <h4>订单执行</h4>
+        <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
+      </div>
+      <dl class="kelly-order-sync-grid">
+        ${rows.map(([label, value]) => `
+          <div>
+            <dt>${escapeHtml(label)}</dt>
+            <dd>${escapeHtml(formatPlain(value))}</dd>
+          </div>
+        `).join("")}
+      </dl>
+      ${hasValue(execution.message) ? `<p>${escapeHtml(formatPlain(execution.message))}</p>` : ""}
+      ${renderKellyOrderExecutionRows(execution)}
+    </section>
+  `;
+}
+
+function renderKellyOrderExecutionRows(execution) {
+  const executions = execution && Array.isArray(execution.executions)
+    ? execution.executions.filter((item) => item && typeof item === "object")
+    : [];
+  if (!executions.length) {
+    return `<p class="kelly-order-empty">暂无订单执行明细。</p>`;
+  }
+  const headers = ["标的", "方向", "价格", "数量", "计划金额", "富途订单", "状态", "错误"];
+  return `
+    <div class="kelly-order-table" role="table" aria-label="Kelly 订单执行明细">
+      <div class="kelly-order-row header" role="row">
+        ${headers.map((header) => `<span role="columnheader">${escapeHtml(header)}</span>`).join("")}
+      </div>
+      ${executions.map(renderKellyOrderExecutionRow).join("")}
+    </div>
+  `;
+}
+
+function renderKellyOrderExecutionRow(execution) {
+  const item = execution && typeof execution === "object" ? execution : {};
+  const symbol = firstPresent(
+    item.futu_code,
+    [item.market, item.symbol].filter(hasValue).map(formatPlain).join("."),
+    item.symbol,
+    "-",
+  );
+  const symbolCell = `
+    <strong>${escapeHtml(formatPlain(symbol))}</strong>
+    ${hasValue(item.executed_at) ? `<small>${escapeHtml(formatPlain(item.executed_at))}</small>` : ""}
+  `;
+  const cells = [
+    symbolCell,
+    escapeHtml(kellyOrderSideLabel(item.side)),
+    escapeHtml(formatPlain(item.price || "-")),
+    escapeHtml(formatPlain(item.qty || "-")),
+    escapeHtml(formatPlain(item.planned_notional || "-")),
+    escapeHtml(formatPlain(item.futu_order_id || "-")),
+    escapeHtml(kellyExecutionStatusLabel(item.execution_status)),
+    escapeHtml(formatPlain(item.error || "-")),
+  ];
+  return `
+    <div class="kelly-order-row" role="row">
+      ${cells.map((cell) => `<span role="cell">${cell}</span>`).join("")}
+    </div>
+  `;
+}
+
 function kellyOrderSideLabel(side) {
   const labels = {
     buy: "买入",
@@ -712,6 +797,17 @@ function kellyOrderSideLabel(side) {
   };
   const key = formatPlain(side).toLowerCase();
   return labels[key] || firstPresent(side, "-");
+}
+
+function kellyExecutionStatusLabel(status) {
+  const labels = {
+    dry_run: "预演",
+    failed: "执行失败",
+    skipped: "已跳过",
+    submitted: "已提交",
+  };
+  const key = formatPlain(status).toLowerCase();
+  return labels[key] || firstPresent(status, "-");
 }
 
 function kellyOrderStatusLabel(status) {
@@ -726,6 +822,17 @@ function kellyOrderStatusLabel(status) {
   };
   const key = formatPlain(status).toLowerCase();
   return labels[key] || firstPresent(status, "-");
+}
+
+function kellyOrderExecutionStatus(status) {
+  const labels = {
+    failed: { label: "执行失败", className: "status-failed" },
+    partial: { label: "部分执行", className: "status-partial" },
+    running: { label: "执行中", className: "status-partial" },
+    success: { label: "执行成功", className: "status-ok" },
+  };
+  const key = formatPlain(status).toLowerCase();
+  return labels[key] || { label: firstPresent(status, "未执行"), className: "status-muted" };
 }
 
 function kellyOrderSyncStatus(status) {
@@ -814,6 +921,7 @@ function renderKellyExperimentCard(experiment) {
       </header>
       <p class="kelly-entry-rule">${escapeHtml(formatPlain(entrySummary))}</p>
       ${renderKellyOrderSync(entry)}
+      ${renderKellyOrderExecution(entry)}
       ${renderKellyStrategyRules(template, ruleDescriptions)}
       <dl class="kelly-stat-grid">
         ${metricRows.map(([label, value]) => `

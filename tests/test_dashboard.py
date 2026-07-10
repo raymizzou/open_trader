@@ -2504,11 +2504,81 @@ def test_load_dashboard_state_exposes_kelly_lab_and_holding_detail(
         ),
         encoding="utf-8",
     )
+    (latest / "kelly_order_executions.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_order_executions.v1",
+                "environment": "DRY_RUN",
+                "source": "dry_run",
+                "executed_at": "2026-07-10 13:32",
+                "execution_count": 1,
+                "submitted_count": 0,
+                "dry_run_count": 1,
+                "skipped_count": 0,
+                "failed_count": 0,
+                "executions": [
+                    {
+                        "intent_id": "trend_pullback_20d_exp_20260707:US:VIXY:entry",
+                        "experiment_id": "trend_pullback_20d_exp_20260707",
+                        "market": "US",
+                        "symbol": "VIXY",
+                        "futu_code": "US.VIXY",
+                        "side": "buy",
+                        "order_type": "NORMAL",
+                        "price": "12.5",
+                        "qty": "80",
+                        "planned_notional": "1000",
+                        "budget_currency": "USD",
+                        "execution_status": "dry_run",
+                        "submitted": False,
+                        "futu_order_id": "",
+                        "executed_at": "2026-07-10 13:32",
+                        "error": "",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     state = load_dashboard_state(config).to_dict()
 
     assert state["kelly_lab"]["available"] is True
     assert state["kelly_lab"]["experiment_count"] == 1
+    experiment = state["kelly_lab"]["experiments"][0]
+    assert experiment["order_execution"] == {
+        "status": "success",
+        "environment": "DRY_RUN",
+        "source": "dry_run",
+        "last_executed_at": "2026-07-10 13:32",
+        "execution_count": 1,
+        "submitted_count": 0,
+        "dry_run_count": 1,
+        "skipped_count": 0,
+        "failed_count": 0,
+        "message": "Kelly 订单执行结果已生成。",
+        "executions": [
+            {
+                "intent_id": "trend_pullback_20d_exp_20260707:US:VIXY:entry",
+                "experiment_id": "trend_pullback_20d_exp_20260707",
+                "market": "US",
+                "symbol": "VIXY",
+                "futu_code": "US.VIXY",
+                "side": "buy",
+                "order_type": "NORMAL",
+                "price": "12.5",
+                "qty": "80",
+                "planned_notional": "1000",
+                "budget_currency": "USD",
+                "execution_status": "dry_run",
+                "submitted": False,
+                "futu_order_id": "",
+                "executed_at": "2026-07-10 13:32",
+                "error": "",
+            }
+        ],
+    }
     vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
     assert vixy["kelly"]["available"] is True
     assert vixy["kelly"]["experiment_count"] == 1
