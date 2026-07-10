@@ -536,10 +536,12 @@ state.dashboard = {
     experiments: [{
       experiment_id: "trend_pullback_20d_exp_20260707",
       experiment_name: "趋势回调 20D 第一批",
+      market: "US",
       status: "running",
       locked: true,
       experiment_budget: "100000",
       budget_currency: "USD",
+      market_capital_pool: {currency: "USD", amount: "100000"},
       capital_utilization_pct: "50",
       order_sync: {
         status: "success",
@@ -709,10 +711,12 @@ state.dashboard = {
     {
       experiment_id: "breakout_10d_mock_20260707",
       experiment_name: "突破 10D Mock 第一批",
+      market: "US",
       status: "running",
       locked: true,
       experiment_budget: "60000",
       budget_currency: "USD",
+      market_capital_pool: {currency: "USD", amount: "60000"},
       capital_utilization_pct: "40",
       order_sync: {
         status: "failed",
@@ -841,6 +845,11 @@ if (breakoutNameCount !== 1) {
 if (!html.includes("样本不足") || !html.includes("US.DRAM")) {
   throw new Error("kelly lab panel missing sample stage or participant: " + html);
 }
+for (const required of ["市场", "US", "模拟资金池", "USD 100000"]) {
+  if (!html.includes(required)) {
+    throw new Error("kelly lab panel missing market or capital pool " + required + ": " + html);
+  }
+}
 for (const forbidden of ["US.MSFT", "US.TSM", "HK.06951"]) {
   if (html.includes(forbidden)) {
     throw new Error("kelly first tab leaked another strategy symbol " + forbidden + ": " + html);
@@ -956,7 +965,10 @@ if (!html.includes("data-workspace-view=\\\"portfolio\\\"")) {
 }
 const fallbackHtml = renderKellyExperimentCard({
   experiment_name: "无状态样本策略",
+  market: "US",
   status: "running",
+  experiment_budget: "25000",
+  budget_currency: "USD",
   order_sync: {
     status: "success",
     environment: "SIMULATE",
@@ -972,6 +984,9 @@ const fallbackHtml = renderKellyExperimentCard({
 });
 if (!fallbackHtml.includes("标的状态") || !fallbackHtml.includes("US.IBM") || !fallbackHtml.includes("等待该策略下一次入场信号。")) {
   throw new Error("kelly participant fallback lifecycle missing: " + fallbackHtml);
+}
+if (!fallbackHtml.includes("市场") || !fallbackHtml.includes("模拟资金池") || !fallbackHtml.includes("USD 25000")) {
+  throw new Error("kelly participant fallback market capital pool missing: " + fallbackHtml);
 }
 if (fallbackHtml.includes("实验参与标的") || fallbackHtml.includes("kelly-participant-row")) {
   throw new Error("kelly fallback should not render duplicate participant chips: " + fallbackHtml);

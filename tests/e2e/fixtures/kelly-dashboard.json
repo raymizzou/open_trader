@@ -15,7 +15,7 @@
   "kelly_lab": {
     "available": true,
     "template_count": 1,
-    "experiment_count": 2,
+    "experiment_count": 3,
     "error": "",
     "templates": [
       {
@@ -31,14 +31,16 @@
     ],
     "experiments": [
       {
-        "experiment_id": "trend_pullback_20d_exp_20260707",
-        "experiment_name": "趋势回调 20D 第一批",
+        "experiment_id": "trend_pullback_20d_mock_us_20260707",
+        "experiment_name": "趋势回调 20D Mock US 第一批",
+        "market": "US",
         "strategy_id": "trend_pullback_20d",
         "strategy_version": "v1",
         "start_date": "2026-07-07",
         "paper_account": "futu_simulate",
         "experiment_budget": "100000",
         "budget_currency": "USD",
+        "market_capital_pool": {"currency": "USD", "amount": "100000"},
         "capital_utilization_pct": "50",
         "order_sync": {
           "status": "success",
@@ -60,18 +62,6 @@
               "avg_fill_price": "12.34",
               "status": "filled",
               "order_id": "SIM-10001"
-            },
-            {
-              "market": "HK",
-              "symbol": "02840",
-              "side": "sell",
-              "submitted_at": "2026-07-08 10:03",
-              "order_price": "218.80",
-              "order_qty": "100",
-              "filled_qty": "0",
-              "avg_fill_price": "-",
-              "status": "submitted",
-              "order_id": "SIM-10002"
             }
           ]
         },
@@ -88,7 +78,7 @@
           "message": "Kelly 订单执行存在失败或跳过项。",
           "executions": [
             {
-              "intent_id": "trend_pullback_20d_exp_20260707:US:RAM:entry",
+              "intent_id": "trend_pullback_20d_mock_us_20260707:US:RAM:entry",
               "market": "US",
               "symbol": "RAM",
               "futu_code": "US.RAM",
@@ -105,10 +95,10 @@
               "error": ""
             },
             {
-              "intent_id": "trend_pullback_20d_exp_20260707:HK:02840:exit",
-              "market": "HK",
-              "symbol": "02840",
-              "futu_code": "HK.02840",
+              "intent_id": "trend_pullback_20d_mock_us_20260707:US:SOXX:exit",
+              "market": "US",
+              "symbol": "SOXX",
+              "futu_code": "US.SOXX",
               "side": "sell",
               "order_type": "NORMAL",
               "price": "3000",
@@ -146,14 +136,6 @@
             "reason": "模拟盘买入已成交，当前监控退出规则。",
             "action": "继续检查止盈、止损、移动止盈、时间退出",
             "updated_at": "2026-07-08 10:02"
-          },
-          {
-            "status": "pending_exit_order",
-            "market": "HK",
-            "symbol": "02840",
-            "reason": "止盈触发，价格达到入场价 + 2R。",
-            "action": "准备卖出 50%",
-            "updated_at": "2026-07-08 10:03"
           }
         ],
         "allocation_mode": "equal_weight",
@@ -215,15 +197,6 @@
             "locked": true,
             "per_symbol_budget": "25000",
             "budget_currency": "USD"
-          },
-          {
-            "market": "HK",
-            "symbol": "02840",
-            "name": "SPDR金",
-            "source": "holding",
-            "locked": true,
-            "per_symbol_budget": "25000",
-            "budget_currency": "USD"
           }
         ],
         "stats": {
@@ -247,14 +220,155 @@
         }
       },
       {
-        "experiment_id": "breakout_10d_mock_20260707",
-        "experiment_name": "突破 10D Mock 第一批",
+        "experiment_id": "trend_pullback_20d_mock_hk_20260707",
+        "experiment_name": "趋势回调 20D Mock HK 第一批",
+        "market": "HK",
+        "strategy_id": "trend_pullback_20d",
+        "strategy_version": "v1",
+        "start_date": "2026-07-07",
+        "paper_account": "futu_simulate",
+        "experiment_budget": "500000",
+        "budget_currency": "HKD",
+        "market_capital_pool": {"currency": "HKD", "amount": "500000"},
+        "capital_utilization_pct": "50",
+        "order_sync": {
+          "status": "success",
+          "environment": "SIMULATE",
+          "last_synced_at": "2026-07-08 10:03",
+          "order_count": 1,
+          "fill_count": 0,
+          "message": "富途模拟盘订单已同步。",
+          "next_action": "可以继续扫描入场与退出信号。",
+          "orders": [
+            {
+              "market": "HK",
+              "symbol": "02840",
+              "side": "sell",
+              "submitted_at": "2026-07-08 10:03",
+              "order_price": "218.80",
+              "order_qty": "100",
+              "filled_qty": "0",
+              "avg_fill_price": "-",
+              "status": "submitted",
+              "order_id": "SIM-10002"
+            }
+          ]
+        },
+        "order_execution": {
+          "status": "partial",
+          "environment": "DRY_RUN",
+          "source": "dry_run",
+          "last_executed_at": "2026-07-10 13:32",
+          "execution_count": 1,
+          "submitted_count": 0,
+          "dry_run_count": 0,
+          "skipped_count": 1,
+          "failed_count": 0,
+          "message": "Kelly 订单执行存在失败或跳过项。",
+          "executions": [
+            {
+              "intent_id": "trend_pullback_20d_mock_hk_20260707:HK:02840:exit",
+              "market": "HK",
+              "symbol": "02840",
+              "futu_code": "HK.02840",
+              "side": "sell",
+              "order_type": "NORMAL",
+              "price": "3000",
+              "qty": "",
+              "planned_notional": "",
+              "budget_currency": "HKD",
+              "execution_status": "skipped",
+              "submitted": false,
+              "futu_order_id": "",
+              "executed_at": "2026-07-10 13:32",
+              "error": "missing order quantity"
+            }
+          ]
+        },
+        "lifecycle_states": [
+          {
+            "status": "pending_exit_order",
+            "market": "HK",
+            "symbol": "02840",
+            "reason": "止盈触发，价格达到入场价 + 2R。",
+            "action": "准备卖出 50%",
+            "updated_at": "2026-07-08 10:03"
+          }
+        ],
+        "allocation_mode": "equal_weight",
+        "max_open_position_per_symbol": 1,
+        "status": "running",
+        "locked": true,
+        "template": {
+          "strategy_id": "trend_pullback_20d",
+          "strategy_name": "趋势回调 20D",
+          "strategy_version": "v1",
+          "entry_rule_description": "结构化规则生成入场。",
+          "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+          "rules": {
+            "entry": {
+              "type": "pullback_to_moving_average",
+              "ma_days": 20,
+              "tolerance_pct": 1,
+              "trend_filter": {"type": "moving_average_slope", "ma_days": 50, "direction": "up"}
+            },
+            "stop_loss": {
+              "type": "any_of",
+              "rules": [
+                {"type": "pct_below_moving_average", "ma_days": 20, "pct": 3},
+                {"type": "recent_swing_low_break", "lookback_days": 20}
+              ]
+            },
+            "take_profit": {"type": "risk_multiple", "trigger_r": 2, "sell_pct": 50},
+            "trailing_stop": {"type": "close_below_moving_average", "ma_days": 10, "apply_to_remaining_position": true},
+            "time_exit": {"type": "max_holding_days", "days": 20, "exit_if": "no_take_profit_or_stop_loss"}
+          },
+          "max_holding_days": 20,
+          "order_type": "limit",
+          "market_session": "regular"
+        },
+        "participants": [
+          {
+            "market": "HK",
+            "symbol": "02840",
+            "name": "SPDR金",
+            "source": "holding",
+            "locked": true,
+            "per_symbol_budget": "500000",
+            "budget_currency": "HKD"
+          }
+        ],
+        "stats": {
+          "completed_samples": 18,
+          "open_samples": 1,
+          "observed_win_rate": "56%",
+          "sample_stage": "insufficient",
+          "winning_samples": 10,
+          "losing_samples": 8,
+          "raw_win_rate": "56%",
+          "adjusted_win_rate": "52%",
+          "avg_net_win_pct": "4.8%",
+          "avg_net_loss_pct": "2.9%",
+          "payoff_ratio": "1.66",
+          "full_kelly_pct": "23.1%",
+          "fractional_kelly_pct": "5.8%",
+          "suggested_position_pct": "4%",
+          "sample_adjustment": "样本少于 200，向 50% 收缩",
+          "last_sample_closed_at": "2026-07-07 15:30",
+          "last_recomputed_at": "2026-07-07 15:31"
+        }
+      },
+      {
+        "experiment_id": "breakout_10d_mock_us_20260707",
+        "experiment_name": "突破 10D Mock US 第一批",
+        "market": "US",
         "strategy_id": "breakout_10d",
         "strategy_version": "v1",
         "start_date": "2026-07-07",
         "paper_account": "futu_simulate",
         "experiment_budget": "60000",
         "budget_currency": "USD",
+        "market_capital_pool": {"currency": "USD", "amount": "60000"},
         "capital_utilization_pct": "40",
         "order_sync": {
           "status": "failed",
@@ -292,7 +406,7 @@
           "message": "Kelly 订单执行存在失败或跳过项。",
           "executions": [
             {
-              "intent_id": "breakout_10d_mock_20260707:US:MSFT:entry",
+              "intent_id": "breakout_10d_mock_us_20260707:US:MSFT:entry",
               "market": "US",
               "symbol": "MSFT",
               "futu_code": "US.MSFT",
@@ -359,15 +473,6 @@
             "locked": true,
             "per_symbol_budget": "20000",
             "budget_currency": "USD"
-          },
-          {
-            "market": "HK",
-            "symbol": "06951",
-            "name": "三环集团",
-            "source": "holding",
-            "locked": true,
-            "per_symbol_budget": "20000",
-            "budget_currency": "USD"
           }
         ],
         "stats": {
@@ -426,8 +531,8 @@
         "message": "该标的已关联 Kelly 策略实验。",
         "experiments": [
           {
-            "experiment_id": "trend_pullback_20d_exp_20260707",
-            "experiment_name": "趋势回调 20D 第一批",
+            "experiment_id": "trend_pullback_20d_mock_us_20260707",
+            "experiment_name": "趋势回调 20D Mock US 第一批",
             "status": "running",
             "template": {"strategy_id": "trend_pullback_20d", "strategy_name": "趋势回调 20D"},
             "stats": {"completed_samples": 0, "open_samples": 0, "observed_win_rate": "", "sample_stage": "insufficient"}

@@ -5,21 +5,32 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
 
   await expect(page.getByRole('heading', { name: '持仓列表' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toHaveCount(0);
-  await expect(page.getByText('趋势回调 20D 第一批')).toHaveCount(0);
+  await expect(page.getByText('趋势回调 20D Mock US 第一批')).toHaveCount(0);
   await page.getByRole('button', { name: '凯利实验室' }).click();
 
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toBeVisible();
-  await expect(page.getByRole('tab', { name: /趋势回调 20D 第一批/ })).toHaveAttribute('aria-selected', 'true');
-  await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'false');
+  await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ })).toHaveAttribute('aria-selected', 'false');
+  await expect(page.getByRole('tab', { name: /突破 10D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByText('Mock 状态样本')).toHaveCount(0);
   await expect(page.getByText('状态说明')).toHaveCount(0);
-  for (const symbol of ['US.DRAM', 'US.RAM', 'US.SOXX', 'HK.02840']) {
+  const usTrendCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '趋势回调 20D Mock US 第一批' }) });
+  await expect(usTrendCard.getByText('市场')).toBeVisible();
+  await expect(usTrendCard.getByText('US', { exact: true })).toBeVisible();
+  await expect(usTrendCard.getByText('模拟资金池')).toBeVisible();
+  await expect(usTrendCard.getByText('USD 100000').first()).toBeVisible();
+  for (const symbol of ['US.DRAM', 'US.RAM', 'US.SOXX']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
   }
-  for (const symbol of ['US.MSFT', 'US.TSM', 'HK.06951']) {
+  for (const symbol of ['HK.02840', 'US.MSFT', 'US.TSM']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toHaveCount(0);
   }
-  await expect(page.getByRole('heading', { name: '趋势回调 20D 第一批' })).toBeVisible();
+  const symbolStates = page.getByLabel('Kelly 标的状态');
+  await expect(symbolStates.getByRole('checkbox')).toHaveCount(0);
+  for (const buttonName of ['新策略', '保存配置', '添加标的']) {
+    await expect(page.getByRole('button', { name: buttonName })).toHaveCount(0);
+  }
+  await expect(page.getByRole('heading', { name: '趋势回调 20D Mock US 第一批' })).toBeVisible();
   const orderSync = page.getByLabel('Kelly 订单同步');
   await expect(orderSync.getByText('同步成功')).toBeVisible();
   await expect(orderSync.getByText('富途模拟盘订单已同步。')).toBeVisible();
@@ -43,12 +54,11 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(orderExecution.getByText('已跳过')).toBeVisible();
   await expect(orderExecution.getByText('missing order quantity')).toBeVisible();
   await expect(orderExecution.getByText('US.MSFT')).toHaveCount(0);
-  const symbolStates = page.getByLabel('Kelly 标的状态');
   await expect(symbolStates.getByText('观察中 → 待下单 → 持仓中 → 待退出 → 已完成')).toBeVisible();
   await expect(symbolStates.getByText('该标的在策略监控范围内，但当前没有入场信号，也没有持仓。')).toBeVisible();
   await expect(symbolStates.getByText('入场规则已触发，Kelly 仓位已计算，风控检查已通过。')).toBeVisible();
   await expect(symbolStates.getByText('模拟盘买入已成交，这笔策略样本正在进行中。')).toBeVisible();
-  await expect(symbolStates.getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toBeVisible();
+  await expect(symbolStates.getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toHaveCount(0);
   await expect(page.getByText('样本不足')).toBeVisible();
   await expect(page.getByLabel('实验参与标的')).toHaveCount(0);
   await expect(page.getByText('策略详情')).toBeVisible();
@@ -66,13 +76,25 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByText('23.1%')).toBeVisible();
   await expect(page.getByText('建议仓位')).toBeVisible();
   await expect(page.getByText('4%', { exact: true })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '突破 10D Mock 第一批' })).toHaveCount(0);
-  await page.getByRole('tab', { name: /突破 10D Mock 第一批/ }).click();
-  await expect(page.getByRole('tab', { name: /趋势回调 20D 第一批/ })).toHaveAttribute('aria-selected', 'false');
-  await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'true');
-  await expect(page.getByRole('heading', { name: '趋势回调 20D 第一批' })).toHaveCount(0);
-  await expect(page.getByRole('heading', { name: '突破 10D Mock 第一批' })).toBeVisible();
-  for (const symbol of ['US.MSFT', 'US.TSM', 'HK.06951']) {
+  await expect(page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' })).toHaveCount(0);
+  await page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ }).click();
+  await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
+  await expect(page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('heading', { name: '趋势回调 20D Mock US 第一批' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' })).toBeVisible();
+  const hkTrendCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' }) });
+  await expect(hkTrendCard.getByText('HK', { exact: true })).toBeVisible();
+  await expect(hkTrendCard.getByText('HKD 500000').first()).toBeVisible();
+  await expect(page.getByLabel('Kelly 标的状态').getByText('HK.02840')).toBeVisible();
+  await expect(page.getByLabel('Kelly 标的状态').getByText('US.DRAM')).toHaveCount(0);
+  await expect(page.getByLabel('Kelly 标的状态').getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toBeVisible();
+  await page.getByRole('tab', { name: /突破 10D Mock US 第一批/ }).click();
+  await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
+  await expect(page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ })).toHaveAttribute('aria-selected', 'false');
+  await expect(page.getByRole('tab', { name: /突破 10D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('heading', { name: '趋势回调 20D Mock US 第一批' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '突破 10D Mock US 第一批' })).toBeVisible();
+  for (const symbol of ['US.MSFT', 'US.TSM']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
   }
   for (const symbol of ['US.DRAM', 'US.RAM', 'US.SOXX', 'HK.02840']) {
@@ -102,5 +124,5 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
 
   await expect(page.getByRole('heading', { name: /凯利仓位 · US\.AAPL/ })).toBeVisible();
   await expect(page.getByText('阶段 1 不计算 Kelly 仓位', { exact: true })).toBeVisible();
-  await expect(page.getByText('趋势回调 20D 第一批').last()).toBeVisible();
+  await expect(page.getByText('趋势回调 20D Mock US 第一批').last()).toBeVisible();
 });

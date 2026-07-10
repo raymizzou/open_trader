@@ -902,7 +902,10 @@ function renderKellyExperimentCard(experiment) {
   const budget = hasValue(entry.experiment_budget)
     ? `${formatMoney(entry.experiment_budget, formatPlain(entry.budget_currency || "USD"))}`
     : "-";
+  const pool = kellyMarketCapitalPool(entry);
   const metricRows = [
+    ["市场", entry.market],
+    ["模拟资金池", pool],
     ["阶段", stage],
     ["已完成", stats.completed_samples],
     ["进行中", stats.open_samples],
@@ -935,6 +938,16 @@ function renderKellyExperimentCard(experiment) {
       ${renderKellySymbolStates(entry)}
     </article>
   `;
+}
+
+function kellyMarketCapitalPool(experiment) {
+  const entry = experiment && typeof experiment === "object" ? experiment : {};
+  const pool = entry.market_capital_pool && typeof entry.market_capital_pool === "object"
+    ? entry.market_capital_pool
+    : {};
+  const currency = firstPresent(pool.currency, entry.budget_currency);
+  const amount = firstPresent(pool.amount, entry.experiment_budget);
+  return hasValue(currency) && hasValue(amount) ? `${formatPlain(currency)} ${formatPlain(amount)}` : "";
 }
 
 function renderKellyStrategyRules(template, ruleDescriptions) {
