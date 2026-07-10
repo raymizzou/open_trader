@@ -968,6 +968,11 @@ def test_latest_kelly_experiments_split_trend_pullback_mock_by_market() -> None:
     assert [
         (order["market"], order["symbol"]) for order in trend_us["order_sync"]["orders"]
     ] == [("US", "RAM")]
+    assert trend_us["order_execution"]["execution_count"] == 1
+    assert [
+        (execution["market"], execution["symbol"])
+        for execution in trend_us["order_execution"]["executions"]
+    ] == [("US", "RAM")]
 
     trend_hk = experiments["trend_pullback_20d_hk_mock_20260707"]
     assert trend_hk["experiment_name"] == "趋势回调 20D Mock HK 第一批"
@@ -996,6 +1001,45 @@ def test_latest_kelly_experiments_split_trend_pullback_mock_by_market() -> None:
         for order in trend_hk["order_sync"]["orders"]
         if str(order.get("filled_qty", "")).strip() not in {"", "0", "-"}
     )
+    assert trend_hk["order_execution"]["execution_count"] == 1
+    assert [
+        (execution["market"], execution["symbol"])
+        for execution in trend_hk["order_execution"]["executions"]
+    ] == [("HK", "02840")]
+
+
+def test_latest_kelly_order_artifacts_reference_visible_experiments() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+    experiments = {
+        experiment["experiment_id"]: experiment for experiment in state["experiments"]
+    }
+    artifact_specs = [
+        ("kelly_order_intents.json", "intents", "intent_count"),
+        ("kelly_order_risk_checks.json", "checks", "intent_count"),
+        ("kelly_order_executions.json", "executions", "execution_count"),
+        ("kelly_order_links.json", "links", None),
+    ]
+
+    for file_name, rows_key, count_key in artifact_specs:
+        payload = json.loads((Path("data") / "latest" / file_name).read_text())
+        rows = payload[rows_key]
+        if count_key is not None:
+            assert payload[count_key] == len(rows)
+
+        for row in rows:
+            experiment_id = row["experiment_id"]
+            assert experiment_id in experiments, (
+                f"{file_name} references stale experiment_id {experiment_id}"
+            )
+            experiment = experiments[experiment_id]
+            if "experiment_name" in row:
+                assert row["experiment_name"] == experiment["experiment_name"]
+            if "market" in row:
+                assert row["market"] == experiment["market"]
+            if "budget_currency" in row:
+                assert row["budget_currency"] == experiment["budget_currency"]
+            if "intent_id" in row:
+                assert row["intent_id"].startswith(f"{experiment_id}:")
 
 
 def test_load_checked_in_kelly_data_has_scoped_order_and_lifecycle_metadata() -> None:
