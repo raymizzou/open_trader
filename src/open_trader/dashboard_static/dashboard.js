@@ -83,6 +83,14 @@ const DETAIL_LANGUAGE_LABELS = {
   en: "English",
 };
 
+const BACKTEST_FILTER_OPTIONS = [
+  { value: "ALL", label: "全部回测" },
+  { value: "READY", label: "可运行" },
+  { value: "MISSING_PRICES", label: "缺价格" },
+  { value: "MISSING_FIELDS", label: "缺字段" },
+  { value: "UNSUPPORTED", label: "暂不支持" },
+];
+
 const PRIORITY_LABELS = {
   critical: "紧急",
   high: "高",
@@ -362,6 +370,7 @@ function accountSyncReloadNeeded(accountSync) {
 
 function renderDashboard() {
   renderBrokerFilters();
+  renderBacktestFilters();
   renderBrokerCards();
   renderSourceStatusListIntoHeader();
   renderDashboardViews();
@@ -370,6 +379,7 @@ function renderDashboard() {
 }
 
 function renderDashboardViews() {
+  renderBacktestFilters();
   renderHeaderSummary();
   renderHoldings();
 }
@@ -609,6 +619,50 @@ function renderBrokerFilters() {
   }
   elements["header-broker-filters"].innerHTML = buttons.join("");
   setFilterActiveByDataset(elements["header-broker-filters"], "broker", state.brokerFilter);
+}
+
+function renderBacktestFilters() {
+  if (!elements["header-backtest-filters"]) {
+    return;
+  }
+  elements["header-backtest-filters"].innerHTML = renderBacktestFilterButtons();
+}
+
+function renderBacktestFilterButtons() {
+  const counts = backtestFilterCounts();
+  return BACKTEST_FILTER_OPTIONS.map((option) => {
+    const activeClass = state.backtestFilter === option.value ? " active" : "";
+    const count = counts[option.value] || 0;
+    return `<button class="filter-button${activeClass}" type="button" data-backtest="${escapeHtml(option.value)}">${escapeHtml(option.label)} ${formatPlain(count)}</button>`;
+  }).join("");
+}
+
+function backtestFilterCounts() {
+  const counts = {
+    ALL: 0,
+    READY: 0,
+    MISSING_PRICES: 0,
+    MISSING_FIELDS: 0,
+    UNSUPPORTED: 0,
+  };
+  for (const holding of backtestFilterScopeHoldings()) {
+    counts.ALL += 1;
+    const bucket = backtestFilterBucket(holding);
+    if (bucket && Object.prototype.hasOwnProperty.call(counts, bucket)) {
+      counts[bucket] += 1;
+    }
+  }
+  return counts;
+}
+
+function backtestFilterScopeHoldings() {
+  return getHoldings().filter((holding) => {
+    const market = String(holding.market || "").toUpperCase();
+    const brokers = rowBrokers(holding);
+    const marketMatches = state.marketFilter === "ALL" || state.marketFilter === "CASH" || market === state.marketFilter;
+    const brokerMatches = state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
+    return marketMatches && brokerMatches;
+  });
 }
 
 function renderHoldings() {
@@ -4303,23 +4357,27 @@ function backtestFilterMatches(holding) {
   if (state.marketFilter === "CASH" || state.backtestFilter === "ALL") {
     return true;
   }
+  return backtestFilterBucket(holding) === state.backtestFilter;
+}
+
+function backtestFilterBucket(holding) {
   const readiness = holding && holding.backtest_readiness && typeof holding.backtest_readiness === "object"
     ? holding.backtest_readiness
     : {};
   const status = String(readiness.status || "").trim();
-  if (state.backtestFilter === "READY") {
-    return status === "ready";
+  if (status === "ready") {
+    return "READY";
   }
-  if (state.backtestFilter === "MISSING_PRICES") {
-    return status === "missing_prices" || readiness.prices_missing === true;
+  if (status === "missing_prices" || readiness.prices_missing === true) {
+    return "MISSING_PRICES";
   }
-  if (state.backtestFilter === "MISSING_FIELDS") {
-    return status === "missing_fields";
+  if (status === "missing_fields") {
+    return "MISSING_FIELDS";
   }
-  if (state.backtestFilter === "UNSUPPORTED") {
-    return status === "unsupported_strategy";
+  if (status === "unsupported_strategy") {
+    return "UNSUPPORTED";
   }
-  return true;
+  return "";
 }
 
 function backtestFilterLabel(value) {

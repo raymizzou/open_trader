@@ -638,6 +638,70 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_backtest_filter_buttons_show_current_scope_counts() -> None:
+    output = run_dashboard_js(
+        r"""
+state.dashboard = {
+  holdings: [
+    {
+      market: "US",
+      symbol: "READY",
+      brokers: "futu",
+      backtest_readiness: { status: "ready", prices_missing: false, missing_fields: [] },
+    },
+    {
+      market: "US",
+      symbol: "NOPRICE",
+      brokers: "futu",
+      backtest_readiness: { status: "missing_prices", prices_missing: true, missing_fields: [] },
+    },
+    {
+      market: "HK",
+      symbol: "NOFIELD",
+      brokers: "phillips",
+      backtest_readiness: { status: "missing_fields", prices_missing: false, missing_fields: ["target_1"] },
+    },
+    {
+      market: "US",
+      symbol: "UNSUPPORTED",
+      brokers: "tiger",
+      backtest_readiness: { status: "unsupported_strategy", prices_missing: false, missing_fields: [] },
+    },
+    {
+      market: "US",
+      symbol: "NOREADINESS",
+      brokers: "futu",
+    },
+  ],
+};
+state.marketFilter = "ALL";
+state.brokerFilter = "ALL";
+state.backtestFilter = "READY";
+let html = renderBacktestFilterButtons();
+for (const expected of ["全部回测 5", "可运行 1", "缺价格 1", "缺字段 1", "暂不支持 1"]) {
+  if (!html.includes(expected)) {
+    throw new Error("missing global count " + expected + ": " + html);
+  }
+}
+if (!html.includes('data-backtest="READY"') || !html.includes("active")) {
+  throw new Error("active backtest filter should remain selected: " + html);
+}
+state.marketFilter = "US";
+state.brokerFilter = "futu";
+state.backtestFilter = "ALL";
+html = renderBacktestFilterButtons();
+for (const expected of ["全部回测 3", "可运行 1", "缺价格 1", "缺字段 0", "暂不支持 0"]) {
+  if (!html.includes(expected)) {
+    throw new Error("missing scoped count " + expected + ": " + html);
+  }
+}
+console.log("ok");
+"""
+    )
+
+    assert "ok" in output
+
+
 def test_dashboard_renders_futu_anomaly_signal_card_in_chinese() -> None:
     output = run_dashboard_js(
         """

@@ -14,6 +14,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   pytest plus a local dashboard click check.
 - Added a dashboard backtest-status filter so operators can isolate holdings
   that are ready to run, missing prices, missing plan fields, or unsupported.
+- Added live counts to the dashboard backtest-status filter, scoped by the
+  current market and broker filters.
 
 ## 2026-07-09
 
