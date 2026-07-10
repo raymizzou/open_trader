@@ -238,6 +238,103 @@ def test_build_notifier_rejects_unknown_notifier(tmp_path: Path) -> None:
         build_notifier(config)
 
 
+def test_refresh_live_portfolio_syncs_futu_then_tiger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+    )
+    futu_path = tmp_path / "data/runs/2026-07-09/futu-portfolio.csv"
+    tiger_path = tmp_path / "data/runs/2026-07-09/portfolio.csv"
+    calls: list[str] = []
+    closed: list[str] = []
+
+    class FakeFutuClient:
+        def __init__(self, *, host: str, port: int) -> None:
+            calls.append(f"futu_client:{host}:{port}")
+
+        def fetch_snapshot(self) -> object:
+            calls.append("futu_snapshot")
+            return object()
+
+        def close(self) -> None:
+            closed.append("futu")
+
+    class FakeTigerClient:
+        def __init__(self, *, config: object) -> None:
+            calls.append(f"tiger_client:{config}")
+
+        def fetch_snapshot(self) -> object:
+            calls.append("tiger_snapshot")
+            return object()
+
+        def close(self) -> None:
+            closed.append("tiger")
+
+    def fake_sync_futu_portfolio(**kwargs: object) -> object:
+        calls.append("sync_futu")
+        assert kwargs["portfolio_path"] == config.portfolio
+        assert kwargs["data_dir"] == config.data_dir
+        assert kwargs["reports_dir"] == config.reports_dir
+        assert kwargs["run_date"] == "2026-07-09"
+        assert kwargs["update_latest"] is True
+        return type("Result", (), {"portfolio_path": futu_path})()
+
+    def fake_sync_tiger_portfolio(**kwargs: object) -> object:
+        calls.append("sync_tiger")
+        assert kwargs["portfolio_path"] == config.portfolio
+        assert kwargs["data_dir"] == config.data_dir
+        assert kwargs["reports_dir"] == config.reports_dir
+        assert kwargs["run_date"] == "2026-07-09"
+        assert kwargs["update_latest"] is True
+        return type("Result", (), {"portfolio_path": tiger_path})()
+
+    monkeypatch.setattr(daily_premarket, "FutuAccountClient", FakeFutuClient)
+    monkeypatch.setattr(
+        daily_premarket,
+        "sync_futu_portfolio",
+        fake_sync_futu_portfolio,
+    )
+    monkeypatch.setattr(
+        daily_premarket,
+        "load_tiger_account_config",
+        lambda **kwargs: "tiger-config",
+    )
+    monkeypatch.setattr(daily_premarket, "TigerAccountClient", FakeTigerClient)
+    monkeypatch.setattr(
+        daily_premarket,
+        "sync_tiger_portfolio",
+        fake_sync_tiger_portfolio,
+    )
+
+    result = daily_premarket.refresh_live_portfolio(
+        run_date="2026-07-09",
+        market="US",
+        config=config,
+    )
+
+    assert result == tiger_path
+    assert calls == [
+        "futu_client:127.0.0.1:11111",
+        "futu_snapshot",
+        "sync_futu",
+        "tiger_client:tiger-config",
+        "tiger_snapshot",
+        "sync_tiger",
+    ]
+    assert closed == ["futu", "tiger"]
+
+
 def test_build_notifier_requires_feishu_webhook(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,
@@ -1103,6 +1200,49 @@ def test_daily_runner_hk_uses_market_scoped_paths_and_calls_market_filter(
         tmp_path / "data/latest/HK/trading_plan.csv"
     )
     assert "data/latest/trading_plan.csv" not in status["artifacts"].values()
+
+
+def test_daily_runner_refreshes_portfolio_before_premarket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    stale_portfolio = config.portfolio
+    stale_portfolio.parent.mkdir(parents=True, exist_ok=True)
+    stale_portfolio.write_text("stale\n", encoding="utf-8")
+    refreshed_portfolio = tmp_path / "data/runs/2026-06-19/portfolio.csv"
+    refreshed_portfolio.parent.mkdir(parents=True, exist_ok=True)
+    refreshed_portfolio.write_text("fresh\n", encoding="utf-8")
+    refresh_calls: list[dict[str, object]] = []
+    premarket = FakePremarket(market="US", symbol="MSFT")
+    trade_actions = FakeTradeActionGenerator(market="US", symbol="MSFT")
+
+    def refresh_portfolio(**kwargs: object) -> Path:
+        refresh_calls.append(kwargs)
+        return refreshed_portfolio
+
+    _daily_runner(
+        config=config,
+        portfolio_refresher=refresh_portfolio,
+        premarket_runner=premarket,
+        plan_builder=FakePlanBuilder(market="US", symbol="MSFT"),
+        quote_client_factory=lambda **kwargs: FakeQuoteClient(
+            {"US.MSFT": QuoteSnapshot("US.MSFT", Decimal("390"))},
+            **kwargs,
+        ),
+        trade_action_generator=trade_actions,
+    ).run(run_date="2026-06-19", market="US")
+
+    assert refresh_calls == [
+        {
+            "run_date": "2026-06-19",
+            "market": "US",
+            "config": config,
+        }
+    ]
+    assert premarket.calls[0]["portfolio_path"] == refreshed_portfolio
+    assert trade_actions.calls[0]["portfolio_path"] == refreshed_portfolio
 
 
 def test_daily_runner_skips_blocking_facts_generation(

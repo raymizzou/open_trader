@@ -1578,7 +1578,7 @@ def test_stop_loss_missing_position_is_review() -> None:
     assert row["reason"] == row["error"]
 
 
-def test_trim_with_quantity_below_one_share_is_review() -> None:
+def test_trim_with_single_share_sells_one_share() -> None:
     row = build_trade_action_row(
         plan=active_plan(),
         quote_status=quote_status("target_1_hit", price="451"),
@@ -1586,10 +1586,13 @@ def test_trim_with_quantity_below_one_share_is_review() -> None:
         source_plan="data/latest/trading_plan.csv",
     )
 
-    assert row["action"] == "REVIEW"
-    assert row["status"] == "review"
-    assert "below one share" in row["error"]
-    assert row["reason"] == row["error"]
+    assert row["action"] == "TRIM"
+    assert row["status"] == "ready"
+    assert row["suggested_quantity"] == "1"
+    assert row["suggested_notional"] == "451"
+    assert row["post_trade_quantity"] == "0"
+    assert row["post_trade_weight"] == "0%"
+    assert row["error"] == ""
 
 
 def test_target_one_trims_half_position() -> None:

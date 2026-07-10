@@ -17,6 +17,7 @@ from .daily_premarket import (
     DailyPremarketRunner,
     build_notifier,
     load_env_config,
+    refresh_live_portfolio,
     send_notification_with_results,
 )
 from .dashboard import DashboardConfig
@@ -848,6 +849,9 @@ def main(argv: list[str] | None = None) -> int:
             result = DailyPremarketRunner(
                 config=config,
                 notifier=build_notifier(config),
+                portfolio_refresher=(
+                    None if args.dry_run else refresh_live_portfolio
+                ),
             ).run(
                 run_date=run_date,
                 market=args.market,

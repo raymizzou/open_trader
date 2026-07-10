@@ -494,6 +494,8 @@ def _size_sell_action_row(
         quantity = (position.quantity * Decimal("0.5")).to_integral_value(
             rounding=ROUND_DOWN
         )
+        if quantity < 1 and position.quantity >= 1:
+            quantity = Decimal("1")
     else:
         quantity = position.quantity
 

@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
+from .futu_account import FutuAccountClient, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .notifications import (
     CompositeNotifier,
@@ -31,6 +32,11 @@ from .notifications import (
 )
 from .futu_watch import QuoteSnapshot
 from .market_scope import MarketScope, parse_market_scope
+from .tiger_account import (
+    TigerAccountClient,
+    load_tiger_account_config,
+    sync_tiger_portfolio,
+)
 from .decision_facts import (
     DECISION_FACTS_SCHEMA_VERSION,
     DecisionFactsResult,
@@ -61,6 +67,8 @@ from .trading_plan import (
 
 
 LOGGER = logging.getLogger(__name__)
+
+PortfolioRefresher = Callable[..., Path]
 
 
 @dataclass(frozen=True)
@@ -274,6 +282,61 @@ def build_notifier(config: DailyPremarketConfig) -> Notifier:
     return CompositeNotifier(notifiers)
 
 
+def _no_op_portfolio_refresher(
+    *,
+    run_date: str,
+    market: str,
+    config: DailyPremarketConfig,
+) -> Path:
+    return config.portfolio
+
+
+def refresh_live_portfolio(
+    *,
+    run_date: str,
+    market: str,
+    config: DailyPremarketConfig,
+) -> Path:
+    futu_client = None
+    tiger_client = None
+    try:
+        futu_client = FutuAccountClient(
+            host=config.futu_host,
+            port=config.futu_port,
+        )
+        sync_futu_portfolio(
+            snapshot=futu_client.fetch_snapshot(),
+            portfolio_path=config.portfolio,
+            data_dir=config.data_dir,
+            reports_dir=config.reports_dir,
+            run_date=run_date,
+            update_latest=True,
+        )
+    finally:
+        if futu_client is not None:
+            futu_client.close()
+
+    try:
+        tiger_config = load_tiger_account_config(
+            config_dir=Path("~/.tigeropen/"),
+            account=None,
+            sandbox=False,
+        )
+        tiger_client = TigerAccountClient(config=tiger_config)
+        tiger_result = sync_tiger_portfolio(
+            snapshot=tiger_client.fetch_snapshot(),
+            portfolio_path=config.portfolio,
+            data_dir=config.data_dir,
+            reports_dir=config.reports_dir,
+            run_date=run_date,
+            update_latest=True,
+        )
+        return tiger_result.portfolio_path
+    finally:
+        if tiger_client is not None:
+            tiger_client.close()
+
+
 def send_notification_with_results(
     notifier: Notifier,
     title: str,
@@ -329,6 +392,7 @@ class DailyPremarketRunner:
             ...,
             TradeActionsResult,
         ] = generate_trade_actions,
+        portfolio_refresher: PortfolioRefresher | None = None,
         summary_generator: Callable[..., object] | None = None,
         summary_extractor_factory: Callable[
             [],
@@ -341,6 +405,7 @@ class DailyPremarketRunner:
         self.plan_builder = plan_builder
         self.quote_client_factory = quote_client_factory
         self.trade_action_generator = trade_action_generator
+        self.portfolio_refresher = portfolio_refresher or _no_op_portfolio_refresher
         self.summary_generator = summary_generator or _write_skipped_tradingagents_summary
         self.summary_extractor_factory = summary_extractor_factory
         self.notifier = notifier or NullNotifier()
@@ -459,12 +524,17 @@ class DailyPremarketRunner:
         log_path: Path,
         dry_run: bool,
     ) -> DailyRunResult:
-        if not config.portfolio.exists():
-            raise FileNotFoundError(f"portfolio not found: {config.portfolio}")
+        portfolio_path = self.portfolio_refresher(
+            run_date=run_date,
+            market=market,
+            config=config,
+        )
+        if not portfolio_path.exists():
+            raise FileNotFoundError(f"portfolio not found: {portfolio_path}")
 
         premarket_result = self.premarket_runner(
             run_date=run_date,
-            portfolio_path=config.portfolio,
+            portfolio_path=portfolio_path,
             data_dir=config.data_dir,
             reports_dir=config.reports_dir,
             advice_runner=None,
@@ -604,7 +674,7 @@ class DailyPremarketRunner:
         futu_status = self._check_futu_plan(plan_result.plan_path)
         trade_actions_result = self.trade_action_generator(
             plan_path=plan_result.plan_path,
-            portfolio_path=config.portfolio,
+            portfolio_path=portfolio_path,
             data_dir=config.data_dir,
             reports_dir=config.reports_dir,
             snapshots=_snapshots_from_futu_status(futu_status),
@@ -661,7 +731,7 @@ class DailyPremarketRunner:
         latest_decision_facts_path = latest_dir / "decision_facts.json"
         latest_tradingagents_summary_path = latest_dir / "tradingagents_summary.json"
         artifacts = {
-            "portfolio": str(config.portfolio),
+            "portfolio": str(portfolio_path),
             "advice": str(advice_path),
             "classifications": str(getattr(premarket_result, "classifications_path")),
             "actions": str(actions_path),

@@ -305,9 +305,16 @@ def test_run_daily_premarket_main_wires_runner(
     captured: dict[str, object] = {}
 
     class FakeRunner:
-        def __init__(self, *, config: object, notifier: object) -> None:
+        def __init__(
+            self,
+            *,
+            config: object,
+            notifier: object,
+            portfolio_refresher: object,
+        ) -> None:
             captured["config"] = config
             captured["notifier"] = notifier
+            captured["portfolio_refresher"] = portfolio_refresher
 
         def run(self, *, run_date: str, market: str, dry_run: bool):
             captured["run_date"] = run_date
@@ -356,6 +363,7 @@ def test_run_daily_premarket_main_wires_runner(
     assert captured["dry_run"] is True
     assert captured["notifier_config"] is captured["config"]
     assert captured["notifier"] is not None
+    assert captured["portfolio_refresher"] is None
     assert captured["run_date"] == "2026-06-17"
     assert captured["market"] == "US"
     assert captured["runner_dry_run"] is True
@@ -386,8 +394,15 @@ def test_run_daily_premarket_main_overrides_max_workers(
     )
 
     class FakeRunner:
-        def __init__(self, *, config: object, notifier: object) -> None:
+        def __init__(
+            self,
+            *,
+            config: object,
+            notifier: object,
+            portfolio_refresher: object,
+        ) -> None:
             captured["config"] = config
+            captured["portfolio_refresher"] = portfolio_refresher
 
         def run(self, *, run_date: str, market: str, dry_run: bool):
             return type(
@@ -422,8 +437,8 @@ def test_run_daily_premarket_main_overrides_max_workers(
     loaded_config = captured["config"]
     assert isinstance(loaded_config, DailyPremarketConfig)
     assert loaded_config.max_workers == 12
+    assert captured["portfolio_refresher"] is cli.refresh_live_portfolio
     assert config.max_workers == 4
-
 
 @pytest.mark.parametrize("status", ["failed", "already_running"])
 def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status(
@@ -433,7 +448,13 @@ def test_run_daily_premarket_main_returns_nonzero_for_unsuccessful_runner_status
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     class FakeRunner:
-        def __init__(self, *, config: object, notifier: object) -> None:
+        def __init__(
+            self,
+            *,
+            config: object,
+            notifier: object,
+            portfolio_refresher: object,
+        ) -> None:
             pass
 
         def run(self, *, run_date: str, market: str, dry_run: bool):
