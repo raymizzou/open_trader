@@ -235,6 +235,8 @@ def test_build_kelly_order_risk_checks_blocks_entry_when_strategy_capital_insuff
         },
     )
 
+    assert payload["approved_count"] == 0
+    assert payload["blocked_count"] == 1
     check = payload["checks"][0]
     assert check["risk_status"] == "blocked"
     assert check["execution_status"] == "risk_blocked"
@@ -286,6 +288,8 @@ def test_build_kelly_order_risk_checks_approves_entry_when_strategy_capital_suff
         },
     )
 
+    assert payload["approved_count"] == 1
+    assert payload["blocked_count"] == 0
     check = payload["checks"][0]
     assert check["risk_status"] == "approved"
     assert check["execution_status"] == "ready"
@@ -348,6 +352,127 @@ def test_build_kelly_order_risk_checks_preserves_exit_allow_with_strategy_capita
         "check": "exit_default_allow",
         "status": "passed",
         "detail": "sell/exit intents are not blocked in v1",
+    }
+
+
+@pytest.mark.parametrize(
+    "strategy_capital_payload",
+    [
+        {"strategies": "bad"},
+        {
+            "strategies": [
+                {
+                    "experiment_id": "different",
+                    "currency": "USD",
+                    "available_notional": "0",
+                },
+                "bad",
+                {},
+            ]
+        },
+    ],
+)
+def test_build_kelly_order_risk_checks_ignores_malformed_or_irrelevant_strategy_capital(
+    strategy_capital_payload: dict[str, object],
+) -> None:
+    intent_payload = {
+        "schema_version": "open_trader.kelly_order_intents.v1",
+        "created_at": "2026-07-10 13:30",
+        "intent_count": 1,
+        "intents": [
+            {
+                "intent_id": "trend:US:RAM:entry",
+                "experiment_id": "trend",
+                "experiment_name": "趋势回调第一批",
+                "strategy_id": "trend_pullback_20d",
+                "strategy_version": "v1",
+                "experiment_market": "US",
+                "market": "US",
+                "symbol": "RAM",
+                "intent_type": "entry",
+                "side": "buy",
+                "suggested_position_pct": "4%",
+                "per_symbol_budget": "25000",
+                "budget_currency": "USD",
+            }
+        ],
+    }
+
+    payload = build_kelly_order_risk_checks_payload(
+        intent_payload,
+        checked_at="2026-07-10 13:31",
+        max_entry_position_pct="4",
+        strategy_capital_payload=strategy_capital_payload,
+    )
+
+    check = payload["checks"][0]
+    assert payload["approved_count"] == 1
+    assert payload["blocked_count"] == 0
+    assert check["risk_status"] == "approved"
+    assert check["execution_status"] == "ready"
+    assert check["planned_notional"] == "1000"
+    assert "strategy_available_capital" not in [
+        result["check"] for result in check["check_results"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        {
+            "experiment_id": "trend",
+            "currency": "USD",
+        },
+        {
+            "experiment_id": "trend",
+            "currency": "USD",
+            "available_notional": "not-a-number",
+        },
+    ],
+)
+def test_build_kelly_order_risk_checks_blocks_entry_when_strategy_capital_available_invalid(
+    strategy: dict[str, str],
+) -> None:
+    intent_payload = {
+        "schema_version": "open_trader.kelly_order_intents.v1",
+        "created_at": "2026-07-10 13:30",
+        "intent_count": 1,
+        "intents": [
+            {
+                "intent_id": "trend:US:RAM:entry",
+                "experiment_id": "trend",
+                "experiment_name": "趋势回调第一批",
+                "strategy_id": "trend_pullback_20d",
+                "strategy_version": "v1",
+                "experiment_market": "US",
+                "market": "US",
+                "symbol": "RAM",
+                "intent_type": "entry",
+                "side": "buy",
+                "suggested_position_pct": "4%",
+                "per_symbol_budget": "25000",
+                "budget_currency": "USD",
+            }
+        ],
+    }
+
+    payload = build_kelly_order_risk_checks_payload(
+        intent_payload,
+        checked_at="2026-07-10 13:31",
+        max_entry_position_pct="4",
+        strategy_capital_payload={"strategies": [strategy]},
+    )
+
+    check = payload["checks"][0]
+    assert payload["approved_count"] == 0
+    assert payload["blocked_count"] == 1
+    assert check["risk_status"] == "blocked"
+    assert check["execution_status"] == "risk_blocked"
+    assert check["planned_notional"] == "1000"
+    assert check["check_results"][-1] == {
+        "check": "strategy_available_capital",
+        "status": "failed",
+        "detail": "1000 <= 0 USD",
     }
 
 
