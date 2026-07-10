@@ -3327,10 +3327,9 @@ console.log(html);
     assert "暂不支持该策略" in html
 
 
-def test_dashboard_backtest_detail_fetches_missing_prices() -> None:
+def test_dashboard_backtest_detail_hides_manual_missing_price_fetch_button() -> None:
     html = run_dashboard_js(
         r"""
-(async () => {
 function makeElement() {
   const classes = new Set();
   return {
@@ -3393,57 +3392,18 @@ state.dashboard = {
 };
 state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
 renderHoldings();
-let html = elements["holdings-body"].innerHTML;
-if (!html.includes(">拉取价格数据<") || !html.includes('data-fetch-backtest-prices="US:VIXY:ProShares VIX Short-Term Futures ETF:0"')) {
-  throw new Error("missing price state should expose fetch button: " + html);
+const html = elements["holdings-body"].innerHTML;
+if (!html.includes("缺少计划字段") || !html.includes("missing backtest field(s): max_weight")) {
+  throw new Error("missing price readiness should still show diagnostic state: " + html);
 }
-let posted = null;
-let loadCount = 0;
-globalThis.fetch = async (url, options) => {
-  posted = { url, body: JSON.parse(options.body) };
-  return {
-    ok: true,
-    json: async () => ({
-      status: "ok",
-      records: 1,
-      prices_path: "data/prices/US/VIXY.csv",
-      backtest_readiness: { status: "missing_fields", prices_missing: false },
-    }),
-  };
-};
-loadDashboard = async () => {
-  loadCount += 1;
-  state.dashboard.holdings[0].backtest_readiness = {
-    available: true,
-    status: "ready",
-    run_date: "2026-06-18",
-    plan_path: "data/latest/US/trading_plan.csv",
-    prices_path: "data/prices/US/VIXY.csv",
-    prices_missing: false,
-    missing_fields: [],
-    error: "",
-  };
-};
-await fetchBacktestPricesForHolding(state.selectedHoldingKey);
-if (!posted || posted.url !== "/api/backtests/prices") {
-  throw new Error("price fetch should post to API: " + JSON.stringify(posted));
-}
-if (posted.body.market !== "US" || posted.body.symbol !== "VIXY") {
-  throw new Error("price fetch body should identify holding: " + JSON.stringify(posted.body));
-}
-if (loadCount !== 1) {
-  throw new Error("price fetch should reload dashboard once: " + loadCount);
-}
-html = elements["holdings-body"].innerHTML;
-if (!html.includes("已就绪") || html.includes(">拉取价格数据<")) {
-  throw new Error("price fetch should refresh readiness: " + html);
+if (html.includes(">拉取价格数据<") || html.includes("data-fetch-backtest-prices")) {
+  throw new Error("missing price readiness should not expose manual fetch button: " + html);
 }
 console.log(html);
-})();
 """
     )
 
-    assert "已就绪" in html
+    assert "缺少计划字段" in html
 
 
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
