@@ -163,6 +163,44 @@ class FutuSimulatePaperOrderClient:
         return accounts
 
 
+class MultiMarketPaperOrderClient:
+    environment = TRD_ENV_SIMULATE
+    source = "multi_market_futu_simulate_paper_order_client"
+
+    def __init__(self, clients: list[PaperOrderClient]) -> None:
+        if not clients:
+            raise ValueError("at least one paper order client is required")
+        self.clients = clients
+        self.last_sync_diagnostics: dict[str, list[dict[str, Any]]] = {
+            "matched_orders": [],
+            "skipped_orders": [],
+        }
+
+    def list_orders(self) -> list[dict[str, Any]]:
+        orders: list[dict[str, Any]] = []
+        self.last_sync_diagnostics = {
+            "matched_orders": [],
+            "skipped_orders": [],
+        }
+        for client in self.clients:
+            orders.extend(client.list_orders())
+            diagnostics = getattr(client, "last_sync_diagnostics", None)
+            if isinstance(diagnostics, dict):
+                self.last_sync_diagnostics["matched_orders"].extend(
+                    diagnostics.get("matched_orders", []),
+                )
+                self.last_sync_diagnostics["skipped_orders"].extend(
+                    diagnostics.get("skipped_orders", []),
+                )
+        return orders
+
+    def close(self) -> None:
+        for client in self.clients:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
+
 def default_fake_kelly_paper_orders() -> tuple[dict[str, Any], ...]:
     return (
         {

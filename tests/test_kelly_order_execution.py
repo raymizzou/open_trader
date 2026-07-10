@@ -6,6 +6,7 @@ from typing import Any
 
 from open_trader.kelly_order_execution import (
     FutuSimulateOrderExecutionClient,
+    MarketRoutingOrderExecutionClient,
     execute_kelly_orders_from_risk_checks,
     write_kelly_order_links_from_executions,
     write_kelly_order_executions,
@@ -258,6 +259,7 @@ def test_execute_kelly_orders_submits_ready_orders_with_client() -> None:
     assert client.requests == [
         {
             "intent_id": "trend:US:RAM:entry",
+            "market": "US",
             "futu_code": "US.RAM",
             "side": "buy",
             "order_type": "NORMAL",
@@ -267,6 +269,7 @@ def test_execute_kelly_orders_submits_ready_orders_with_client() -> None:
         },
         {
             "intent_id": "trend:HK:02840:exit",
+            "market": "HK",
             "futu_code": "HK.02840",
             "side": "sell",
             "order_type": "NORMAL",
@@ -297,6 +300,47 @@ def test_futu_simulate_order_execution_client_uses_requested_trd_market() -> Non
 
     assert client.context.trd_market == "US"
     assert client.account == {"acc_id": 12958916, "acc_index": 0}
+
+
+def test_market_routing_order_execution_client_routes_by_request_market() -> None:
+    created_markets: list[str] = []
+
+    class FakeMarketClient:
+        environment = "SIMULATE"
+        source = "fake_market_client"
+
+        def __init__(self, **kwargs: object) -> None:
+            self.trd_market = str(kwargs["trd_market"])
+            self.requests: list[dict[str, object]] = []
+            created_markets.append(self.trd_market)
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            return {
+                "futu_order_id": f"{self.trd_market}-1",
+                "status": "submitted",
+            }
+
+        def close(self) -> None:
+            pass
+
+    client = MarketRoutingOrderExecutionClient(
+        host="127.0.0.1",
+        port=11111,
+        client_factory=FakeMarketClient,
+    )
+
+    assert client.place_order({"market": "US", "futu_code": "US.RAM"})[
+        "futu_order_id"
+    ] == "US-1"
+    assert client.place_order({"market": "HK", "futu_code": "HK.02840"})[
+        "futu_order_id"
+    ] == "HK-1"
+    assert client.place_order({"market": "US", "futu_code": "US.SOXX"})[
+        "futu_order_id"
+    ] == "US-1"
+
+    assert created_markets == ["US", "HK"]
 
 
 def test_write_kelly_order_executions_writes_latest_artifact(tmp_path: Path) -> None:

@@ -29,6 +29,7 @@ from .kelly_paper_order_sync import (
     FakeFutuPaperOrderClient,
     FutuPaperOrderSyncError,
     FutuSimulatePaperOrderClient,
+    MultiMarketPaperOrderClient,
     build_kelly_paper_order_sync_report,
     default_fake_kelly_paper_orders,
     load_kelly_experiment_symbol_index_details,
@@ -47,6 +48,7 @@ from .kelly_order_risk import (
 from .kelly_order_execution import (
     FutuOrderExecutionError,
     FutuSimulateOrderExecutionClient,
+    MarketRoutingOrderExecutionClient,
     execute_kelly_orders,
     write_kelly_order_links_from_executions,
     write_kelly_order_executions,
@@ -174,6 +176,30 @@ def _parse_key_value_options(values: list[str], *, option_name: str) -> dict[str
             raise ValueError(f"{option_name} contains duplicate key: {key}")
         parsed[key] = item_value
     return parsed
+
+
+def _kelly_sync_trd_markets(
+    trd_market: str,
+    symbol_index_details: object,
+) -> list[str]:
+    requested = str(trd_market).strip()
+    if requested != "auto":
+        return [requested]
+
+    markets: set[str] = set()
+    for attr in ("unique", "ambiguous"):
+        index = getattr(symbol_index_details, attr, {})
+        if not isinstance(index, dict):
+            continue
+        for key in index:
+            if not isinstance(key, tuple) or not key:
+                continue
+            market = str(key[0]).strip().upper()
+            if market in {"HK", "US", "CN"}:
+                markets.add(market)
+    if not markets:
+        raise ValueError("no Kelly experiment markets found for auto Futu sync")
+    return sorted(markets)
 
 
 def _print_tiger_sync_result(result: TigerPortfolioSyncResult) -> None:
@@ -720,9 +746,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     kelly_sync_paper_orders_parser.add_argument(
         "--trd-market",
-        choices=("HK", "US", "CN"),
-        default="HK",
-        help="Futu trading market used to select the simulate account.",
+        choices=("auto", "HK", "US", "CN"),
+        default="auto",
+        help="Futu trading market used to select the simulate account. Use auto to follow Kelly experiment markets.",
     )
 
     kelly_build_order_intents_parser = kelly_subparsers.add_parser(
@@ -807,9 +833,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     kelly_execute_orders_parser.add_argument(
         "--trd-market",
-        choices=("HK", "US", "CN"),
-        default="HK",
-        help="Futu trading market used to select the simulate account.",
+        choices=("auto", "HK", "US", "CN"),
+        default="auto",
+        help="Futu trading market used to select the simulate account. Use auto to follow Kelly order markets.",
     )
 
     trading_plan_parser = subparsers.add_parser(
@@ -1404,13 +1430,26 @@ def main(argv: list[str] | None = None) -> int:
                 symbol_index_details = load_kelly_experiment_symbol_index_details(
                     args.data_dir
                 )
-                client = FutuSimulatePaperOrderClient(
-                    host=args.host,
-                    port=args.port,
-                    experiment_symbol_index=symbol_index_details.unique,
-                    ambiguous_symbol_index=symbol_index_details.ambiguous,
-                    order_link_index=load_kelly_order_links(args.data_dir),
-                    trd_market=args.trd_market,
+                order_link_index = load_kelly_order_links(args.data_dir)
+                sync_markets = _kelly_sync_trd_markets(
+                    args.trd_market,
+                    symbol_index_details,
+                )
+                clients = [
+                    FutuSimulatePaperOrderClient(
+                        host=args.host,
+                        port=args.port,
+                        experiment_symbol_index=symbol_index_details.unique,
+                        ambiguous_symbol_index=symbol_index_details.ambiguous,
+                        order_link_index=order_link_index,
+                        trd_market=trd_market,
+                    )
+                    for trd_market in sync_markets
+                ]
+                client = (
+                    clients[0]
+                    if len(clients) == 1
+                    else MultiMarketPaperOrderClient(clients)
                 )
             payload = sync_kelly_paper_orders(
                 data_dir=args.data_dir,
@@ -1483,12 +1522,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             dry_run = not args.futu_simulate
             if not dry_run:
-                client = FutuSimulateOrderExecutionClient(
-                    host=args.host,
-                    port=args.port,
-                    simulate_acc_id=args.simulate_acc_id,
-                    trd_market=args.trd_market,
-                )
+                if args.trd_market == "auto":
+                    client = MarketRoutingOrderExecutionClient(
+                        host=args.host,
+                        port=args.port,
+                        simulate_acc_id=args.simulate_acc_id,
+                    )
+                else:
+                    client = FutuSimulateOrderExecutionClient(
+                        host=args.host,
+                        port=args.port,
+                        simulate_acc_id=args.simulate_acc_id,
+                        trd_market=args.trd_market,
+                    )
             payload = execute_kelly_orders(
                 data_dir=args.data_dir,
                 dry_run=dry_run,

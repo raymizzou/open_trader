@@ -143,6 +143,44 @@ class FutuSimulateOrderExecutionClient:
         return accounts[0]
 
 
+class MarketRoutingOrderExecutionClient:
+    environment = TRD_ENV_SIMULATE
+    source = "market_routing_futu_simulate_order_execution_client"
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        simulate_acc_id: int | None = None,
+        client_factory: Any = None,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.simulate_acc_id = simulate_acc_id
+        self.client_factory = client_factory or FutuSimulateOrderExecutionClient
+        self.clients_by_market: dict[str, OrderExecutionClient] = {}
+
+    def place_order(self, request: dict[str, Any]) -> dict[str, Any]:
+        market = _request_market(request)
+        client = self.clients_by_market.get(market)
+        if client is None:
+            client = self.client_factory(
+                host=self.host,
+                port=self.port,
+                simulate_acc_id=self.simulate_acc_id,
+                trd_market=market,
+            )
+            self.clients_by_market[market] = client
+        return client.place_order(request)
+
+    def close(self) -> None:
+        for client in self.clients_by_market.values():
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
+
 def load_kelly_order_risk_checks(data_dir: Path) -> dict[str, Any]:
     path = data_dir / "latest" / "kelly_order_risk_checks.json"
     with path.open(encoding="utf-8") as handle:
@@ -403,6 +441,7 @@ def _build_order_request(
     intent_id = str(check.get("intent_id", "")).strip()
     return {
         "intent_id": intent_id,
+        "market": market,
         "futu_code": futu_code,
         "side": side,
         "order_type": "NORMAL",
@@ -410,6 +449,21 @@ def _build_order_request(
         "qty": _decimal_text(qty),
         "remark": f"open_trader:{intent_id}",
     }
+
+
+def _request_market(request: dict[str, Any]) -> str:
+    market = str(request.get("market", "")).strip().upper()
+    if market:
+        return market
+    futu_code = str(request.get("futu_code", "")).strip().upper()
+    if "." in futu_code:
+        market = futu_code.split(".", 1)[0].strip()
+    if market:
+        return market
+    raise FutuOrderExecutionError(
+        "order request is missing market",
+        error_type="missing_order_market",
+    )
 
 
 def _is_ready_check(check: dict[str, Any]) -> bool:

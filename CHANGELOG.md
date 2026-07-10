@@ -17,6 +17,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   simulated budgets of `30000 USD`, `200000 HKD`, and disabled `150000 CNY`,
   split mixed-market mock data, and blocked cross-market order intents before
   execution.
+- Added automatic Futu SIMULATE market routing for Kelly paper-order sync and
+  execution so commands follow experiment/order markets by default while still
+  allowing manual `--trd-market` overrides.
 - Verified with focused Kelly/dashboard pytest coverage, compile checks,
   `git diff --check`, live Futu SIMULATE HK order execution/sync, and live
   US/CN simulate-account order probes.

@@ -187,3 +187,74 @@ def test_kelly_execute_orders_main_writes_links_for_futu_simulate(
     assert captured["links_data_dir"] == tmp_path / "data"
     assert captured["links_payload"]["submitted_count"] == 1
     assert captured["client_closed"] is True
+
+
+def test_kelly_execute_orders_parser_defaults_to_auto_trd_market() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(["kelly", "execute-orders", "--futu-simulate"])
+
+    assert args.trd_market == "auto"
+
+
+def test_kelly_execute_orders_main_uses_market_router_for_auto_futu_simulate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRoutingClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured["client_kwargs"] = kwargs
+
+        def close(self) -> None:
+            captured["client_closed"] = True
+
+    def fake_execute(**kwargs: object) -> dict[str, object]:
+        captured["execute_kwargs"] = kwargs
+        return {
+            "schema_version": "open_trader.kelly_order_executions.v1",
+            "environment": "SIMULATE",
+            "source": "fake",
+            "executed_at": kwargs["executed_at"],
+            "execution_count": 0,
+            "submitted_count": 0,
+            "dry_run_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+            "executions": [],
+        }
+
+    monkeypatch.setattr(cli, "MarketRoutingOrderExecutionClient", FakeRoutingClient)
+    monkeypatch.setattr(cli, "execute_kelly_orders", fake_execute)
+    monkeypatch.setattr(
+        cli,
+        "write_kelly_order_executions",
+        lambda data_dir, payload: tmp_path
+        / "data/latest/kelly_order_executions.json",
+    )
+    monkeypatch.setattr(
+        cli,
+        "write_kelly_order_links_from_executions",
+        lambda data_dir, payload: tmp_path / "data/latest/kelly_order_links.json",
+    )
+
+    result = cli.main(
+        [
+            "kelly",
+            "execute-orders",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--futu-simulate",
+            "--executed-at",
+            "2026-07-10 13:32",
+        ]
+    )
+
+    assert result == 0
+    assert captured["client_kwargs"] == {
+        "host": "127.0.0.1",
+        "port": 11111,
+        "simulate_acc_id": None,
+    }
+    assert captured["execute_kwargs"]["client"].__class__ is FakeRoutingClient
+    assert captured["client_closed"] is True
