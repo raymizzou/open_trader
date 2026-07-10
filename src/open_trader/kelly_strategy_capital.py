@@ -44,8 +44,8 @@ def build_kelly_strategy_capital_payload(
             {
                 "experiment_id": experiment_id,
                 "experiment_name": _field_text(experiment.get("experiment_name")),
-                "market": _field_text(experiment.get("market")),
-                "currency": _field_text(experiment.get("budget_currency")),
+                "market": _field_text(experiment.get("market")).upper(),
+                "currency": _field_text(experiment.get("budget_currency")).upper(),
                 "budget": _decimal_text(budget),
                 "occupied_notional": _decimal_text(occupied),
                 "position_notional": _decimal_text(usage["position_notional"]),

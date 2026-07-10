@@ -13,9 +13,9 @@ def test_build_kelly_strategy_capital_payload_initializes_empty_experiment() -> 
             {
                 "experiment_id": "trend_us",
                 "experiment_name": "趋势回调 US",
-                "market": "US",
+                "market": "us",
                 "experiment_budget": "30000",
-                "budget_currency": "USD",
+                "budget_currency": "uSd",
                 "participants": [
                     {"market": "US", "symbol": "RAM"},
                     {"market": "US", "symbol": "SOXX"},
