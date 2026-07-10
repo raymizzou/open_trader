@@ -9,6 +9,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   K-line data and refresh the per-holding backtest readiness state.
 - Marked sell-side, hold, and underweight trading plans as unsupported by the
   first buy-side backtest engine instead of showing misleading missing fields.
+- Added sell-side trading-plan backtests for underweight/reduce/trim/sell
+  ratings, seeded from current dashboard holding quantity and verified through
+  pytest plus a local dashboard click check.
 
 ## 2026-07-09
 
