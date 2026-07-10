@@ -42,6 +42,7 @@ from .tradingagents_summary import (
     normalize_ta_view,
     tradingagents_summary_latest_path,
 )
+from .trading_plan import load_trading_plan_rows
 
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
@@ -175,6 +176,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         reports_dir=config.reports_dir,
         markets=holding_markets,
     )
+    backtest_readiness_by_holding = _backtest_readiness_for_markets(
+        data_dir=config.data_dir,
+        markets=holding_markets,
+    )
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
@@ -198,6 +203,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             tradingagents_summary_by_holding,
             t_signals_by_holding,
             backtests_by_holding,
+            backtest_readiness_by_holding,
         )
         for row in holding_rows
     ]
@@ -493,6 +499,85 @@ def _backtest_sort_key(detail: dict[str, Any]) -> tuple[str, str]:
     return (str(detail.get("run_date", "")), str(detail.get("run_id", "")))
 
 
+def _backtest_readiness_for_markets(
+    *,
+    data_dir: Path,
+    markets: set[str],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    readiness: dict[tuple[str, str], dict[str, Any]] = {}
+    for market in markets:
+        plan_path = _backtest_plan_path(data_dir, market)
+        if not plan_path.exists():
+            continue
+        try:
+            plans = load_trading_plan_rows(plan_path)
+        except (OSError, ValueError):
+            continue
+        for plan in plans:
+            if plan.status != "active" or plan.market.upper() != market:
+                continue
+            symbol = plan.symbol.upper()
+            detail = _backtest_readiness_detail(
+                data_dir=data_dir,
+                plan_path=plan_path,
+                market=market,
+                symbol=symbol,
+                run_date=plan.run_date,
+                fields={
+                    "entry_zone_low": plan.entry_zone_low,
+                    "entry_zone_high": plan.entry_zone_high,
+                    "max_weight": plan.max_weight,
+                },
+            )
+            key = (market, symbol)
+            current = readiness.get(key)
+            if current is None or _backtest_sort_key(detail) > _backtest_sort_key(current):
+                readiness[key] = detail
+    return readiness
+
+
+def _backtest_plan_path(data_dir: Path, market: str) -> Path:
+    scoped_path = data_dir / "latest" / market / "trading_plan.csv"
+    if scoped_path.exists():
+        return scoped_path
+    return data_dir / "latest" / "trading_plan.csv"
+
+
+def _backtest_readiness_detail(
+    *,
+    data_dir: Path,
+    plan_path: Path,
+    market: str,
+    symbol: str,
+    run_date: str,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    prices_path = data_dir / "prices" / market / f"{symbol}.csv"
+    missing_fields = [
+        field
+        for field, value in fields.items()
+        if value is None or str(value).strip() == ""
+    ]
+    if missing_fields:
+        status = "missing_fields"
+        error = f"missing backtest field(s): {', '.join(missing_fields)}"
+    elif not prices_path.exists():
+        status = "missing_prices"
+        error = f"missing price CSV: {prices_path}"
+    else:
+        status = "ready"
+        error = ""
+    return {
+        "available": status == "ready",
+        "status": status,
+        "run_date": run_date,
+        "plan_path": str(plan_path),
+        "prices_path": str(prices_path),
+        "missing_fields": missing_fields,
+        "error": error,
+    }
+
+
 def _markets_from_rows(rows: list[dict[str, str]]) -> set[str]:
     markets: set[str] = set()
     for row in rows:
@@ -571,6 +656,7 @@ def _merge_holding(
     tradingagents_summary_by_holding: dict[tuple[str, str], dict[str, Any]],
     t_signals_by_holding: dict[tuple[str, str], dict[str, Any]],
     backtests_by_holding: dict[tuple[str, str], dict[str, Any]],
+    backtest_readiness_by_holding: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -621,6 +707,11 @@ def _merge_holding(
     holding["backtest"] = _backtest_holding_detail(
         backtests_by_holding.get(key) if key is not None else None,
     )
+    holding["backtest_readiness"] = _backtest_readiness_holding_detail(
+        backtest_readiness_by_holding.get(key) if key is not None else None,
+        data_dir=data_dir,
+        key=key,
+    )
     holding["research_view"] = (
         load_research_view_for_holding(
             data_dir=data_dir,
@@ -641,6 +732,27 @@ def _backtest_holding_detail(record: dict[str, Any] | None) -> dict[str, Any]:
     if record is None:
         return _unavailable_detail()
     return record
+
+
+def _backtest_readiness_holding_detail(
+    record: dict[str, Any] | None,
+    *,
+    data_dir: Path,
+    key: tuple[str, str] | None,
+) -> dict[str, Any]:
+    if record is not None:
+        return record
+    market = key[0] if key is not None else ""
+    symbol = key[1] if key is not None else ""
+    return {
+        "available": False,
+        "status": "missing_plan",
+        "run_date": "",
+        "plan_path": str(_backtest_plan_path(data_dir, market)) if market else "",
+        "prices_path": str(data_dir / "prices" / market / f"{symbol}.csv") if market and symbol else "",
+        "missing_fields": [],
+        "error": "no active trading plan found",
+    }
 
 
 def _broker_detail_row(row: dict[str, str]) -> dict[str, str]:

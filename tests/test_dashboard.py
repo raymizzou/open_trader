@@ -716,6 +716,70 @@ def test_load_dashboard_state_attaches_latest_backtest_result(
     }
 
 
+def test_load_dashboard_state_exposes_backtest_readiness(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
+    plan_row.update(
+        {
+            "run_date": "2026-06-18",
+            "symbol": "VIXY",
+            "market": "US",
+            "rating": "Overweight",
+            "entry_zone_low": "40",
+            "entry_zone_high": "",
+            "max_weight": "",
+            "status": "active",
+        }
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest_readiness"] == {
+        "available": False,
+        "status": "missing_fields",
+        "run_date": "2026-06-18",
+        "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
+        "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
+        "missing_fields": ["entry_zone_high", "max_weight"],
+        "error": "missing backtest field(s): entry_zone_high, max_weight",
+    }
+
+    plan_row["entry_zone_high"] = "42"
+    plan_row["max_weight"] = "25%"
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+    write_csv(
+        config.data_dir / "prices" / "US" / "VIXY.csv",
+        ["date", "open", "high", "low", "close"],
+        [{"date": "2026-06-19", "open": "41", "high": "43", "low": "40", "close": "42"}],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest_readiness"] == {
+        "available": True,
+        "status": "ready",
+        "run_date": "2026-06-18",
+        "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
+        "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
+        "missing_fields": [],
+        "error": "",
+    }
+
+
 def test_load_dashboard_state_excludes_cash_like_rows_from_holdings(
     tmp_path: Path,
 ) -> None:

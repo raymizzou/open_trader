@@ -2939,6 +2939,83 @@ console.log(html);
     assert "回测详情 · US.VIXY" in html
 
 
+def test_dashboard_backtest_detail_renders_readiness_gaps() -> None:
+    html = run_dashboard_js(
+        r"""
+function makeElement() {
+  const classes = new Set();
+  return {
+    innerHTML: "",
+    textContent: "",
+    classList: {
+      add(...names) { names.forEach((name) => classes.add(name)); },
+      remove(...names) { names.forEach((name) => classes.delete(name)); },
+      contains(name) { return classes.has(name); },
+      toggle(name, force) {
+        if (force === undefined) {
+          classes.has(name) ? classes.delete(name) : classes.add(name);
+        } else if (force) {
+          classes.add(name);
+        } else {
+          classes.delete(name);
+        }
+        return classes.has(name);
+      },
+    },
+    querySelectorAll() { return []; },
+  };
+}
+elements["visible-count"] = makeElement();
+elements["workspace-grid"] = makeElement();
+elements["holdings-table-wrap"] = makeElement();
+elements["symbol-detail-panel"] = makeElement();
+elements["cash-detail-panel"] = makeElement();
+elements["holdings-body"] = makeElement();
+state.dashboardError = null;
+state.quotes = {};
+state.marketFilter = "ALL";
+state.brokerFilter = "ALL";
+state.selectedHoldingDetail = "backtest";
+state.dashboard = {
+  holdings: [{
+    market: "US",
+    symbol: "VIXY",
+    name: "ProShares VIX Short-Term Futures ETF",
+    brokers: "futu",
+    currency: "USD",
+    total_quantity: "10",
+    avg_cost_price: "12.34",
+    market_value: "6250.00",
+    market_value_hkd: "49062.50",
+    portfolio_weight_hkd: "7.50%",
+    unrealized_pnl_pct: "5.00%",
+    backtest: { available: false, error: "" },
+    backtest_readiness: {
+      available: false,
+      status: "missing_fields",
+      run_date: "2026-06-18",
+      plan_path: "data/latest/US/trading_plan.csv",
+      prices_path: "data/prices/US/VIXY.csv",
+      missing_fields: ["entry_zone_high", "max_weight"],
+      error: "missing backtest field(s): entry_zone_high, max_weight",
+    },
+  }],
+};
+state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
+renderHoldings();
+const html = elements["holdings-body"].innerHTML;
+for (const required of ["回测准备", "缺少计划字段", "entry_zone_high", "max_weight", "data/latest/US/trading_plan.csv", "data/prices/US/VIXY.csv"]) {
+  if (!html.includes(required)) {
+    throw new Error("backtest readiness missing " + required + ": " + html);
+  }
+}
+console.log(html);
+"""
+    )
+
+    assert "缺少计划字段" in html
+
+
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
     from open_trader.dashboard_web import build_dashboard_payload
 

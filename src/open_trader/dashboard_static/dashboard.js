@@ -844,6 +844,7 @@ function renderBacktestDetail(holding) {
         <h3>当前状态</h3>
         <p class="muted-copy">该标的尚未生成交易计划回测结果。</p>
       </section>
+      ${renderBacktestReadiness(holding)}
     `;
   }
   const metrics = backtest.metrics && typeof backtest.metrics === "object" ? backtest.metrics : {};
@@ -876,8 +877,61 @@ function renderBacktestDetail(holding) {
           ${renderRequiredTerm("指标 JSON", backtest.metrics_path)}
         </dl>
       </section>
+      ${renderBacktestReadiness(holding)}
     </div>
   `;
+}
+
+function renderBacktestReadiness(holding) {
+  const readiness = holding && holding.backtest_readiness && typeof holding.backtest_readiness === "object"
+    ? holding.backtest_readiness
+    : {};
+  return `
+    <section class="detail-section backtest-section">
+      <h3>回测准备</h3>
+      <div class="t-signal-status-row">
+        <p class="muted-copy">${escapeHtml(backtestReadinessMessage(readiness))}</p>
+        <span class="status-pill ${escapeHtml(backtestReadinessTone(readiness.status))}">${escapeHtml(backtestReadinessLabel(readiness.status))}</span>
+      </div>
+      <dl class="detail-dl backtest-output-list">
+        ${renderRequiredTerm("计划日期", readiness.run_date)}
+        ${renderRequiredTerm("计划文件", readiness.plan_path)}
+        ${renderRequiredTerm("价格文件", readiness.prices_path)}
+        ${renderRequiredTerm("缺少字段", backtestMissingFieldsText(readiness.missing_fields))}
+      </dl>
+    </section>
+  `;
+}
+
+function backtestReadinessLabel(status) {
+  const labels = {
+    ready: "已就绪",
+    missing_fields: "缺少计划字段",
+    missing_prices: "缺少价格文件",
+    missing_plan: "缺少交易计划",
+  };
+  return labels[status] || "未就绪";
+}
+
+function backtestReadinessTone(status) {
+  return status === "ready" ? "status-ok" : "status-partial";
+}
+
+function backtestReadinessMessage(readiness) {
+  if (!readiness || typeof readiness !== "object") {
+    return "暂无回测准备信息。";
+  }
+  if (readiness.status === "ready") {
+    return "交易计划字段和价格 CSV 已就绪，可以运行只读回测。";
+  }
+  if (readiness.error) {
+    return readiness.error;
+  }
+  return "回测运行前需要补齐交易计划字段和价格 CSV。";
+}
+
+function backtestMissingFieldsText(fields) {
+  return Array.isArray(fields) && fields.length ? fields.join(", ") : "-";
 }
 
 function renderBacktestRunControls(holding) {

@@ -12,6 +12,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   without showing backtest metrics on the main holdings table.
 - Added a dashboard-only backtest run action that uses the local latest trading
   plan and `data/prices/<market>/<symbol>.csv`, then refreshes the detail view.
+- Added dashboard backtest readiness details so operators can see missing plan
+  fields and price CSV paths before running a backtest.
 - Documented the first backtest workflow in both READMEs.
 - Verified with focused backtest/dashboard pytest coverage, the full pytest
   suite, and a local dashboard click check on `127.0.0.1:8766`.
