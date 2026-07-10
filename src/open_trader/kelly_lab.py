@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from .kelly_lifecycle import build_kelly_lifecycle_states
+from .kelly_market_rules import (
+    kelly_market_capital_pool,
+    kelly_market_currency,
+    normalize_kelly_market,
+)
 
 
 TEMPLATES_SCHEMA_VERSION = "open_trader.kelly_strategy_templates.v1"
@@ -32,6 +37,7 @@ REQUIRED_EXPERIMENT_FIELDS = {
     "experiment_name",
     "strategy_id",
     "strategy_version",
+    "market",
     "start_date",
     "paper_account",
     "experiment_budget",
@@ -371,9 +377,31 @@ def _validate_experiments_payload(
             raise ValueError(f"{context} participants must be a list")
 
         normalized_experiment = copy.deepcopy(experiment)
+        experiment_id = _required_string(
+            normalized_experiment["experiment_id"],
+            f"{context} experiment_id",
+        )
+        experiment_market = normalize_kelly_market(normalized_experiment["market"])
+        expected_currency = kelly_market_currency(experiment_market)
+        normalized_experiment["market"] = experiment_market
+        normalized_experiment["budget_currency"] = _validate_budget_currency(
+            normalized_experiment["budget_currency"],
+            expected_currency,
+            (
+                f"{experiment_id} budget_currency "
+                f"{normalized_experiment['budget_currency']} must match "
+                f"market {experiment_market} currency {expected_currency}"
+            ),
+        )
         normalized_experiment["participants"] = _validate_participants(
             participants,
             context,
+            experiment_id,
+            experiment_market,
+            expected_currency,
+        )
+        normalized_experiment["market_capital_pool"] = kelly_market_capital_pool(
+            experiment_market,
         )
         normalized_experiment["template"] = copy.deepcopy(templates_by_key[strategy_key])
         if "lifecycle_states" in normalized_experiment:
@@ -417,6 +445,9 @@ def _filter_lifecycle_states_to_participants(
 def _validate_participants(
     participants: list[Any],
     context: str,
+    experiment_id: str,
+    experiment_market: str,
+    expected_currency: str,
 ) -> list[dict[str, Any]]:
     validated: list[dict[str, Any]] = []
     for index, participant in enumerate(participants):
@@ -435,6 +466,21 @@ def _validate_participants(
         normalized["symbol"] = _uppercase_required_string(
             normalized["symbol"],
             f"{participant_context} symbol",
+        )
+        participant_label = f"{normalized['market']}.{normalized['symbol']}"
+        if normalized["market"] != experiment_market:
+            raise ValueError(
+                f"{experiment_id} participant {participant_label} "
+                f"must match experiment market {experiment_market}",
+            )
+        normalized["budget_currency"] = _validate_budget_currency(
+            normalized["budget_currency"],
+            expected_currency,
+            (
+                f"{experiment_id} participant {participant_label} "
+                f"budget_currency {normalized['budget_currency']} must match "
+                f"market {experiment_market} currency {expected_currency}"
+            ),
         )
         validated.append(normalized)
     return validated
@@ -489,6 +535,23 @@ def _require_fields(
 
 
 def _uppercase_required_string(value: Any, context: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{context} must be a non-empty string")
-    return value.upper()
+    return value.strip().upper()
+
+
+def _required_string(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{context} must be a non-empty string")
+    return value.strip()
+
+
+def _validate_budget_currency(
+    value: Any,
+    expected_currency: str,
+    message: str,
+) -> str:
+    currency = _uppercase_required_string(value, "budget_currency")
+    if currency != expected_currency:
+        raise ValueError(message)
+    return currency

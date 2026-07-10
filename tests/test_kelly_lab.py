@@ -16,6 +16,167 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
+def minimal_template_payload() -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.kelly_strategy_templates.v1",
+        "templates": [
+            {
+                "strategy_id": "trend_pullback_20d",
+                "strategy_name": "趋势回调 20D",
+                "strategy_version": "v1",
+                "entry_rule_description": "价格回调到 20 日均线附近。",
+                "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+                "max_holding_days": 20,
+                "order_type": "limit",
+                "market_session": "regular",
+            }
+        ],
+    }
+
+
+def minimal_experiment_payload(
+    *,
+    experiment_market: str = "US",
+    experiment_budget_currency: str = "USD",
+    participant_market: str = "US",
+    participant_symbol: str = "RAM",
+    participant_budget_currency: str = "USD",
+) -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.kelly_experiments.v1",
+        "experiments": [
+            {
+                "experiment_id": "trend_us",
+                "experiment_name": "趋势回调 US",
+                "strategy_id": "trend_pullback_20d",
+                "strategy_version": "v1",
+                "market": experiment_market,
+                "start_date": "2026-07-07",
+                "paper_account": "futu_simulate",
+                "experiment_budget": "100000",
+                "budget_currency": experiment_budget_currency,
+                "capital_utilization_pct": "50",
+                "allocation_mode": "equal_weight",
+                "max_open_position_per_symbol": 1,
+                "status": "running",
+                "locked": True,
+                "participants": [
+                    {
+                        "market": participant_market,
+                        "symbol": participant_symbol,
+                        "name": "RAM",
+                        "source": "holding",
+                        "locked": True,
+                        "per_symbol_budget": "25000",
+                        "budget_currency": participant_budget_currency,
+                    }
+                ],
+                "stats": {
+                    "completed_samples": 0,
+                    "open_samples": 0,
+                    "observed_win_rate": "",
+                    "sample_stage": "insufficient",
+                },
+            }
+        ],
+    }
+
+
+def test_load_kelly_lab_state_rejects_mixed_market_experiment(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(participant_market="HK", participant_symbol="02840"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="trend_us participant HK.02840 must match experiment market US",
+    ):
+        load_kelly_lab_state(data_dir)
+
+
+def test_load_kelly_lab_state_attaches_market_capital_pool(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(
+            experiment_market="us",
+            participant_market="us",
+            participant_symbol="ram",
+        ),
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    experiment = state["experiments"][0]
+    assert experiment["market"] == "US"
+    assert experiment["budget_currency"] == "USD"
+    assert experiment["market_capital_pool"] == {
+        "market": "US",
+        "amount": "100000",
+        "currency": "USD",
+        "enabled": True,
+    }
+    assert experiment["participants"][0]["market"] == "US"
+    assert experiment["participants"][0]["symbol"] == "RAM"
+
+
+def test_load_kelly_lab_state_rejects_experiment_budget_currency_mismatch(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(experiment_budget_currency="HKD"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="trend_us budget_currency HKD must match market US currency USD",
+    ):
+        load_kelly_lab_state(data_dir)
+
+
+def test_load_kelly_lab_state_rejects_participant_budget_currency_mismatch(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(participant_budget_currency="HKD"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "trend_us participant US.RAM budget_currency HKD "
+            "must match market US currency USD"
+        ),
+    ):
+        load_kelly_lab_state(data_dir)
+
+
 def test_load_kelly_lab_state_returns_locked_experiments(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     write_json(
@@ -46,6 +207,7 @@ def test_load_kelly_lab_state_returns_locked_experiments(tmp_path: Path) -> None
                     "experiment_name": "趋势回调 20D 第一批",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -66,9 +228,9 @@ def test_load_kelly_lab_state_returns_locked_experiments(tmp_path: Path) -> None
                             "budget_currency": "USD",
                         },
                         {
-                            "market": "HK",
-                            "symbol": "00700",
-                            "name": "腾讯控股",
+                            "market": "US",
+                            "symbol": "MSFT",
+                            "name": "Microsoft",
                             "source": "watchlist",
                             "locked": True,
                             "per_symbol_budget": "25000",
@@ -148,6 +310,7 @@ def test_load_kelly_lab_state_generates_lifecycle_states_from_symbol_facts(
                     "experiment_name": "趋势回调 20D 第一批",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -234,6 +397,7 @@ def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
                     "experiment_name": "趋势回调 20D 第一批",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -254,9 +418,9 @@ def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
                             "budget_currency": "USD",
                         },
                         {
-                            "market": "HK",
-                            "symbol": "02840",
-                            "name": "SPDR Gold",
+                            "market": "US",
+                            "symbol": "RAM",
+                            "name": "RAM ETF",
                             "source": "holding",
                             "locked": True,
                             "per_symbol_budget": "25000",
@@ -271,8 +435,8 @@ def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
                             "reason": "属于该策略。",
                         },
                         {
-                            "market": "HK",
-                            "symbol": "02840",
+                            "market": "US",
+                            "symbol": "RAM",
                             "status": "holding",
                             "reason": "属于该策略。",
                         },
@@ -299,7 +463,7 @@ def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
     lifecycle_states = state["experiments"][0]["lifecycle_states"]
     assert [(item["market"], item["symbol"]) for item in lifecycle_states] == [
         ("US", "DRAM"),
-        ("HK", "02840"),
+        ("US", "RAM"),
     ]
 
 
@@ -335,6 +499,7 @@ def test_load_kelly_lab_state_attaches_paper_orders_by_experiment_id(
                     "experiment_name": "趋势回调 20D 第一批",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -453,6 +618,7 @@ def test_load_kelly_lab_state_keeps_existing_order_sync_when_paper_orders_missin
                     "experiment_name": "突破 10D 第一批",
                     "strategy_id": "breakout_10d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "50000",
@@ -543,6 +709,7 @@ def test_load_kelly_lab_state_rejects_unknown_template_version(
                     "experiment_name": "趋势回调 20D 第二版",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v2",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -611,6 +778,7 @@ def test_index_kelly_experiments_by_market_symbol(tmp_path: Path) -> None:
                     "experiment_name": "突破 10D 第一批",
                     "strategy_id": "breakout_10d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "50000",
