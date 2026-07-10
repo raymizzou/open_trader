@@ -7,6 +7,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - Added a dashboard action to fetch missing backtest price CSVs from Futu daily
   K-line data and refresh the per-holding backtest readiness state.
+- Marked sell-side, hold, and underweight trading plans as unsupported by the
+  first buy-side backtest engine instead of showing misleading missing fields.
 
 ## 2026-07-09
 

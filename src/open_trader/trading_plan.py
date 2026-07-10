@@ -189,6 +189,16 @@ def evaluate_plan_quote(plan: TradingPlanRow, last_price: Decimal) -> PlanQuoteS
     return _status(plan, last_price, "watch", "No plan trigger is active.")
 
 
+def is_buy_side_backtest_rating(rating: str) -> bool:
+    normalized = rating.strip().lower()
+    if not normalized:
+        return False
+    return any(
+        keyword in normalized
+        for keyword in ("overweight", "buy", "accumulate", "add", "加仓", "买入", "超配")
+    )
+
+
 def _status(
     plan: TradingPlanRow,
     last_price: Decimal,

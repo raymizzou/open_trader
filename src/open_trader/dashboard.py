@@ -42,7 +42,7 @@ from .tradingagents_summary import (
     normalize_ta_view,
     tradingagents_summary_latest_path,
 )
-from .trading_plan import load_trading_plan_rows
+from .trading_plan import is_buy_side_backtest_rating, load_trading_plan_rows
 
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
@@ -523,6 +523,7 @@ def _backtest_readiness_for_markets(
                 market=market,
                 symbol=symbol,
                 run_date=plan.run_date,
+                rating=plan.rating,
                 fields={
                     "entry_zone_low": plan.entry_zone_low,
                     "entry_zone_high": plan.entry_zone_high,
@@ -550,10 +551,22 @@ def _backtest_readiness_detail(
     market: str,
     symbol: str,
     run_date: str,
+    rating: str,
     fields: dict[str, Any],
 ) -> dict[str, Any]:
     prices_path = data_dir / "prices" / market / f"{symbol}.csv"
     prices_missing = not prices_path.exists()
+    if not is_buy_side_backtest_rating(rating):
+        return {
+            "available": False,
+            "status": "unsupported_strategy",
+            "run_date": run_date,
+            "plan_path": str(plan_path),
+            "prices_path": str(prices_path),
+            "prices_missing": prices_missing,
+            "missing_fields": [],
+            "error": "backtest supports buy-side trading plans only",
+        }
     missing_fields = [
         field
         for field, value in fields.items()

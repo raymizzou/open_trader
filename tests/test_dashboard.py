@@ -782,6 +782,45 @@ def test_load_dashboard_state_exposes_backtest_readiness(
     }
 
 
+def test_load_dashboard_state_marks_sell_side_backtest_unsupported(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
+    plan_row.update(
+        {
+            "run_date": "2026-06-18",
+            "symbol": "VIXY",
+            "market": "US",
+            "rating": "Underweight",
+            "entry_zone_low": "30",
+            "entry_zone_high": "50",
+            "max_weight": "",
+            "status": "active",
+        }
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest_readiness"] == {
+        "available": False,
+        "status": "unsupported_strategy",
+        "run_date": "2026-06-18",
+        "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
+        "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
+        "prices_missing": True,
+        "missing_fields": [],
+        "error": "backtest supports buy-side trading plans only",
+    }
+
+
 def test_load_dashboard_state_excludes_cash_like_rows_from_holdings(
     tmp_path: Path,
 ) -> None:

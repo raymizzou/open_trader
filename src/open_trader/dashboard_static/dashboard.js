@@ -920,6 +920,7 @@ function backtestReadinessLabel(status) {
     missing_fields: "缺少计划字段",
     missing_prices: "缺少价格文件",
     missing_plan: "缺少交易计划",
+    unsupported_strategy: "暂不支持该策略",
   };
   return labels[status] || "未就绪";
 }
@@ -934,6 +935,9 @@ function backtestReadinessMessage(readiness) {
   }
   if (readiness.status === "ready") {
     return "交易计划字段和价格 CSV 已就绪，可以运行只读回测。";
+  }
+  if (readiness.status === "unsupported_strategy") {
+    return "第一版回测仅支持买入或加仓类交易计划。";
   }
   if (readiness.error) {
     return readiness.error;
@@ -962,6 +966,12 @@ function renderBacktestPriceControls(holding, readiness) {
 }
 
 function renderBacktestRunControls(holding) {
+  const readiness = holding && holding.backtest_readiness && typeof holding.backtest_readiness === "object"
+    ? holding.backtest_readiness
+    : {};
+  if (readiness.status === "unsupported_strategy") {
+    return "";
+  }
   const detailKey = state.selectedHoldingKey || holdingKey(holding, 0);
   const runState = state.backtestRun || {};
   const busy = runState.busy === true && runState.detailKey === detailKey;
