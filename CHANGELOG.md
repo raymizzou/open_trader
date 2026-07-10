@@ -3,6 +3,20 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-10
+
+- Added the Kelly strategy lab workflow for paper-trading experiments, including
+  strategy details, symbol-level lifecycle states, Kelly parameter derivation,
+  risk-checked order intents, execution records, and Futu order linkage.
+- Connected Futu SIMULATE order execution and order sync so submitted paper
+  orders can be attributed back to strategy samples and used for future Kelly
+  parameter updates.
+- Added explicit Futu trading-market selection for HK, US, and CN simulate
+  accounts so paper-order sync and execution target the intended market account.
+- Verified with focused Kelly/dashboard pytest coverage, compile checks,
+  `git diff --check`, live Futu SIMULATE HK order execution/sync, and live
+  US/CN simulate-account order probes.
+
 ## 2026-07-04
 
 - Added Futu daily-K Bollinger fact generation for dashboard K-line cards, fixed
