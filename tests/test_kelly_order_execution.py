@@ -6,6 +6,7 @@ from typing import Any
 
 from open_trader.kelly_order_execution import (
     execute_kelly_orders_from_risk_checks,
+    write_kelly_order_links_from_executions,
     write_kelly_order_executions,
 )
 
@@ -267,3 +268,86 @@ def test_write_kelly_order_executions_writes_latest_artifact(tmp_path: Path) -> 
 
     assert path == tmp_path / "data/latest/kelly_order_executions.json"
     assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_write_kelly_order_links_from_executions_indexes_submitted_orders(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    (data_dir / "latest").mkdir(parents=True)
+    (data_dir / "latest" / "kelly_order_links.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_order_links.v1",
+                "links": [
+                    {
+                        "futu_order_id": "OLD-1",
+                        "experiment_id": "old_exp",
+                        "intent_id": "old_exp:US:OLD:entry",
+                        "market": "US",
+                        "symbol": "OLD",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    execution_payload = {
+        "schema_version": "open_trader.kelly_order_executions.v1",
+        "environment": "SIMULATE",
+        "source": "fake_order_execution_client",
+        "executed_at": "2026-07-10 13:32",
+        "executions": [
+            {
+                "intent_id": "trend:US:RAM:entry",
+                "experiment_id": "trend",
+                "market": "US",
+                "symbol": "RAM",
+                "side": "buy",
+                "price": "12.5",
+                "qty": "80",
+                "execution_status": "submitted",
+                "submitted": True,
+                "futu_order_id": "SIM-1",
+            },
+            {
+                "intent_id": "trend:HK:02840:exit",
+                "experiment_id": "trend",
+                "market": "HK",
+                "symbol": "02840",
+                "side": "sell",
+                "price": "3000",
+                "qty": "1",
+                "execution_status": "skipped",
+                "submitted": False,
+                "futu_order_id": "",
+            },
+        ],
+    }
+
+    path = write_kelly_order_links_from_executions(data_dir, execution_payload)
+
+    assert path == data_dir / "latest/kelly_order_links.json"
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "schema_version": "open_trader.kelly_order_links.v1",
+        "updated_at": "2026-07-10 13:32",
+        "links": [
+            {
+                "futu_order_id": "OLD-1",
+                "experiment_id": "old_exp",
+                "intent_id": "old_exp:US:OLD:entry",
+                "market": "US",
+                "symbol": "OLD",
+            },
+            {
+                "futu_order_id": "SIM-1",
+                "experiment_id": "trend",
+                "intent_id": "trend:US:RAM:entry",
+                "market": "US",
+                "symbol": "RAM",
+                "side": "buy",
+                "price": "12.5",
+                "qty": "80",
+            },
+        ],
+    }

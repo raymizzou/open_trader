@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 ORDER_EXECUTIONS_SCHEMA_VERSION = "open_trader.kelly_order_executions.v1"
 ORDER_RISK_CHECKS_SCHEMA_VERSION = "open_trader.kelly_order_risk_checks.v1"
+ORDER_LINKS_SCHEMA_VERSION = "open_trader.kelly_order_links.v1"
 TRD_ENV_SIMULATE = "SIMULATE"
 
 
@@ -224,6 +225,64 @@ def write_kelly_order_executions(data_dir: Path, payload: dict[str, Any]) -> Pat
     }
     _write_json_atomic(path, writable_payload)
     return path
+
+
+def write_kelly_order_links_from_executions(
+    data_dir: Path,
+    execution_payload: dict[str, Any],
+) -> Path:
+    path = data_dir / "latest" / "kelly_order_links.json"
+    existing_links = _load_existing_order_links(path)
+    links_by_order_id = {
+        str(link.get("futu_order_id", "")).strip(): dict(link)
+        for link in existing_links
+        if str(link.get("futu_order_id", "")).strip()
+    }
+
+    for execution in execution_payload.get("executions", []):
+        if not isinstance(execution, dict):
+            continue
+        if execution.get("submitted") is not True:
+            continue
+        futu_order_id = str(execution.get("futu_order_id", "")).strip()
+        experiment_id = str(execution.get("experiment_id", "")).strip()
+        if not futu_order_id or not experiment_id:
+            continue
+        links_by_order_id[futu_order_id] = {
+            "futu_order_id": futu_order_id,
+            "experiment_id": experiment_id,
+            "intent_id": str(execution.get("intent_id", "")).strip(),
+            "market": str(execution.get("market", "")).strip().upper(),
+            "symbol": str(execution.get("symbol", "")).strip().upper(),
+            "side": str(execution.get("side", "")).strip().lower(),
+            "price": str(execution.get("price", "")).strip(),
+            "qty": str(execution.get("qty", "")).strip(),
+        }
+
+    payload = {
+        "schema_version": ORDER_LINKS_SCHEMA_VERSION,
+        "updated_at": str(execution_payload.get("executed_at", "")).strip(),
+        "links": list(links_by_order_id.values()),
+    }
+    _write_json_atomic(path, payload)
+    return path
+
+
+def _load_existing_order_links(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+    if payload.get("schema_version") != ORDER_LINKS_SCHEMA_VERSION:
+        raise ValueError(
+            f"{path.name} schema_version must be {ORDER_LINKS_SCHEMA_VERSION!r}",
+        )
+    links = payload.get("links")
+    if not isinstance(links, list):
+        raise ValueError(f"{path.name} must contain a links list")
+    return [dict(link) for link in links if isinstance(link, dict)]
 
 
 def _build_execution_record(

@@ -48,6 +48,7 @@ from .kelly_order_execution import (
     FutuOrderExecutionError,
     FutuSimulateOrderExecutionClient,
     execute_kelly_orders,
+    write_kelly_order_links_from_executions,
     write_kelly_order_executions,
 )
 from .t_signal import TSignalInterpreter
@@ -1483,6 +1484,8 @@ def main(argv: list[str] | None = None) -> int:
                 client=client,
             )
             latest_path = write_kelly_order_executions(args.data_dir, payload)
+            if not dry_run:
+                write_kelly_order_links_from_executions(args.data_dir, payload)
         except (
             FileNotFoundError,
             ValueError,
