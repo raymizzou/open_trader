@@ -915,3 +915,31 @@ def test_load_checked_in_kelly_data_is_available() -> None:
 
     assert state["available"] is True
     assert state["experiment_count"] >= 1
+
+
+def test_load_checked_in_kelly_data_has_scoped_order_and_lifecycle_metadata() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+    experiments = {
+        experiment["experiment_id"]: experiment for experiment in state["experiments"]
+    }
+
+    for experiment in experiments.values():
+        order_sync = experiment.get("order_sync")
+        if isinstance(order_sync, dict) and "orders" in order_sync:
+            orders = order_sync["orders"]
+            assert order_sync["order_count"] == len(orders)
+            assert order_sync["fill_count"] == sum(
+                1
+                for order in orders
+                if str(order.get("filled_qty", "")).strip() not in {"", "0", "-"}
+            )
+
+    trend = experiments["trend_pullback_20d_mock_20260707"]
+    participants = {
+        (participant["market"], participant["symbol"])
+        for participant in trend["participants"]
+    }
+    lifecycle_states = {
+        (state["market"], state["symbol"]) for state in trend["lifecycle_states"]
+    }
+    assert lifecycle_states <= participants
