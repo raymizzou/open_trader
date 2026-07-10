@@ -199,6 +199,24 @@ def is_buy_side_backtest_rating(rating: str) -> bool:
     )
 
 
+def is_sell_side_backtest_rating(rating: str) -> bool:
+    normalized = rating.strip().lower()
+    if not normalized:
+        return False
+    return any(
+        keyword in normalized
+        for keyword in ("underweight", "reduce", "trim", "sell", "减仓", "卖出", "低配")
+    )
+
+
+def backtest_plan_side(rating: str) -> str | None:
+    if is_buy_side_backtest_rating(rating):
+        return "buy"
+    if is_sell_side_backtest_rating(rating):
+        return "sell"
+    return None
+
+
 def _status(
     plan: TradingPlanRow,
     last_price: Decimal,

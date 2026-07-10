@@ -766,6 +766,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Decimal("100000"),
     )
     backtest_parser.add_argument(
+        "--initial-position-quantity",
+        type=non_negative_decimal,
+        default=Decimal("0"),
+        help="Existing position quantity to seed sell-side backtests",
+    )
+    backtest_parser.add_argument(
         "--commission-bps",
         type=non_negative_decimal,
         default=Decimal("10"),
@@ -1397,6 +1403,7 @@ def main(argv: list[str] | None = None) -> int:
                 symbol=args.symbol,
                 market=args.market,
                 initial_cash=args.initial_cash,
+                initial_position_quantity=args.initial_position_quantity,
                 commission_bps=args.commission_bps,
                 slippage_bps=args.slippage_bps,
                 adapter=args.adapter,

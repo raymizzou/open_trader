@@ -42,7 +42,7 @@ from .tradingagents_summary import (
     normalize_ta_view,
     tradingagents_summary_latest_path,
 )
-from .trading_plan import is_buy_side_backtest_rating, load_trading_plan_rows
+from .trading_plan import backtest_plan_side, load_trading_plan_rows
 
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
@@ -543,6 +543,8 @@ def _backtest_readiness_for_markets(
                     "entry_zone_low": plan.entry_zone_low,
                     "entry_zone_high": plan.entry_zone_high,
                     "max_weight": plan.max_weight,
+                    "stop_loss": plan.stop_loss,
+                    "target_1": plan.target_1,
                 },
             )
             key = (market, symbol)
@@ -571,7 +573,8 @@ def _backtest_readiness_detail(
 ) -> dict[str, Any]:
     prices_path = data_dir / "prices" / market / f"{symbol}.csv"
     prices_missing = not prices_path.exists()
-    if not is_buy_side_backtest_rating(rating):
+    side = backtest_plan_side(rating)
+    if side is None:
         return {
             "available": False,
             "status": "unsupported_strategy",
@@ -580,12 +583,25 @@ def _backtest_readiness_detail(
             "prices_path": str(prices_path),
             "prices_missing": prices_missing,
             "missing_fields": [],
-            "error": "backtest supports buy-side trading plans only",
+            "error": "unsupported backtest strategy rating",
         }
+    required_fields = (
+        ("entry_zone_high", "max_weight")
+        if side == "buy"
+        else ("stop_loss_or_target_1",)
+    )
     missing_fields = [
         field
-        for field, value in fields.items()
-        if value is None or str(value).strip() == ""
+        for field in required_fields
+        if (
+            field == "stop_loss_or_target_1"
+            and fields.get("stop_loss") is None
+            and fields.get("target_1") is None
+        )
+        or (
+            field != "stop_loss_or_target_1"
+            and (fields.get(field) is None or str(fields.get(field)).strip() == "")
+        )
     ]
     if missing_fields:
         status = "missing_fields"

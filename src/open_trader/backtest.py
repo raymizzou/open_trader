@@ -10,7 +10,7 @@ from tempfile import NamedTemporaryFile
 from typing import Protocol
 
 from .market_scope import parse_market_scope
-from .trading_plan import TradingPlanRow, load_trading_plan_rows
+from .trading_plan import TradingPlanRow, backtest_plan_side, load_trading_plan_rows
 
 
 BACKTEST_METRICS_SCHEMA_VERSION = "open_trader.backtest.metrics.v1"
@@ -94,6 +94,7 @@ class TradingPlanBacktestAdapter(Protocol):
         effective_run_date: str,
         prices_path: Path,
         initial_cash: Decimal,
+        initial_position_quantity: Decimal,
         commission_bps: Decimal,
         slippage_bps: Decimal,
     ) -> tuple[list[BacktestExecution], list[dict[str, str]]]:
@@ -111,6 +112,7 @@ class SimpleTradingPlanAdapter:
         effective_run_date: str,
         prices_path: Path,
         initial_cash: Decimal,
+        initial_position_quantity: Decimal,
         commission_bps: Decimal,
         slippage_bps: Decimal,
     ) -> tuple[list[BacktestExecution], list[dict[str, str]]]:
@@ -123,6 +125,7 @@ class SimpleTradingPlanAdapter:
             effective_run_date=effective_run_date,
             bars=bars,
             initial_cash=initial_cash,
+            initial_position_quantity=initial_position_quantity,
             commission_bps=commission_bps,
             slippage_bps=slippage_bps,
         )
@@ -139,6 +142,7 @@ class BacktraderTradingPlanAdapter:
         effective_run_date: str,
         prices_path: Path,
         initial_cash: Decimal,
+        initial_position_quantity: Decimal,
         commission_bps: Decimal,
         slippage_bps: Decimal,
     ) -> tuple[list[BacktestExecution], list[dict[str, str]]]:
@@ -153,6 +157,7 @@ class BacktraderTradingPlanAdapter:
                 ("plan", plan),
                 ("effective_run_date", effective_run_date),
                 ("initial_cash", initial_cash),
+                ("initial_position_quantity", initial_position_quantity),
                 ("commission_bps", commission_bps),
                 ("slippage_bps", slippage_bps),
             )
@@ -180,6 +185,7 @@ class BacktraderTradingPlanAdapter:
                     effective_run_date=self.p.effective_run_date,
                     bars=self.bars,
                     initial_cash=self.p.initial_cash,
+                    initial_position_quantity=self.p.initial_position_quantity,
                     commission_bps=self.p.commission_bps,
                     slippage_bps=self.p.slippage_bps,
                 )
@@ -217,6 +223,7 @@ def run_backtest(
     symbol: str,
     market: str,
     initial_cash: Decimal,
+    initial_position_quantity: Decimal = Decimal("0"),
     commission_bps: Decimal,
     slippage_bps: Decimal,
     adapter: str = "backtrader",
@@ -225,7 +232,10 @@ def run_backtest(
     normalized_symbol = symbol.strip().upper()
     if not normalized_symbol:
         raise ValueError("symbol is required")
-    _validate_positive_decimal("initial_cash", initial_cash)
+    _validate_non_negative_decimal("initial_cash", initial_cash)
+    _validate_non_negative_decimal("initial_position_quantity", initial_position_quantity)
+    if initial_cash == 0 and initial_position_quantity == 0:
+        raise ValueError("initial_cash or initial_position_quantity must be positive")
     _validate_non_negative_decimal("commission_bps", commission_bps)
     _validate_non_negative_decimal("slippage_bps", slippage_bps)
 
@@ -245,6 +255,7 @@ def run_backtest(
         effective_run_date=run_date,
         prices_path=prices_path,
         initial_cash=initial_cash,
+        initial_position_quantity=initial_position_quantity,
         commission_bps=commission_bps,
         slippage_bps=slippage_bps,
     )
@@ -255,6 +266,7 @@ def run_backtest(
         symbol=normalized_symbol,
         adapter=adapter_name,
         initial_cash=initial_cash,
+        initial_position_quantity=initial_position_quantity,
         trades=trades,
         equity_rows=equity_rows,
     )
@@ -319,6 +331,13 @@ def _select_plan(
             f"multiple active trading plans match run_date {run_date} for {market}.{symbol}"
         )
     plan = matches[0]
+    side = backtest_plan_side(plan.rating)
+    if side is None:
+        raise ValueError(f"unsupported backtest rating: {plan.rating}")
+    if side == "sell":
+        if plan.stop_loss is None and plan.target_1 is None:
+            raise ValueError("trading plan stop_loss or target_1 is required for sell-side backtest")
+        return plan
     if plan.entry_zone_high is None:
         raise ValueError("trading plan entry_zone_high is required for backtest")
     if not plan.max_weight.strip():
@@ -354,19 +373,25 @@ def _simulate_trading_plan(
     effective_run_date: str,
     bars: list[PriceBar],
     initial_cash: Decimal,
+    initial_position_quantity: Decimal,
     commission_bps: Decimal,
     slippage_bps: Decimal,
 ) -> tuple[list[BacktestExecution], list[dict[str, str]]]:
+    side = backtest_plan_side(plan.rating)
+    if side == "sell" and initial_position_quantity <= 0:
+        raise ValueError("sell-side backtest requires a positive initial position quantity")
+    if side == "buy" and initial_cash <= 0:
+        raise ValueError("buy-side backtest requires positive initial cash")
     cash = initial_cash
-    quantity = Decimal("0")
+    quantity = initial_position_quantity if side == "sell" else Decimal("0")
     trades: list[BacktestExecution] = []
     equity_rows: list[dict[str, str]] = []
     peak_equity = initial_cash
-    max_weight = _parse_percent(plan.max_weight)
+    max_weight = _parse_percent(plan.max_weight) if side == "buy" else Decimal("0")
 
     for bar in bars:
         if bar.date > effective_run_date:
-            if quantity == 0 and _entry_touched(plan, bar):
+            if side == "buy" and quantity == 0 and _entry_touched(plan, bar):
                 entry_price = _buy_price(plan.entry_zone_high or bar.close, slippage_bps)
                 quantity = _buy_quantity(
                     initial_cash=initial_cash,
@@ -392,8 +417,31 @@ def _simulate_trading_plan(
                             reason="entry_zone",
                         )
                     )
-            elif quantity > 0:
+            elif side == "buy" and quantity > 0:
                 exit_reason, raw_exit_price = _exit_signal(plan, bar)
+                if raw_exit_price is not None:
+                    exit_price = _sell_price(raw_exit_price, slippage_bps)
+                    notional = exit_price * quantity
+                    fees = _fee(notional, commission_bps)
+                    cash += notional - fees
+                    trades.append(
+                        _execution(
+                            run_id=run_id,
+                            plan=plan,
+                            run_date=effective_run_date,
+                            date=bar.date,
+                            side="SELL",
+                            price=exit_price,
+                            quantity=quantity,
+                            notional=notional,
+                            fees=fees,
+                            cash_after=cash,
+                            reason=exit_reason,
+                        )
+                    )
+                    quantity = Decimal("0")
+            elif side == "sell" and quantity > 0:
+                exit_reason, raw_exit_price = _sell_side_exit_signal(plan, bar)
                 if raw_exit_price is not None:
                     exit_price = _sell_price(raw_exit_price, slippage_bps)
                     notional = exit_price * quantity
@@ -493,6 +541,14 @@ def _exit_signal(plan: TradingPlanRow, bar: PriceBar) -> tuple[str, Decimal | No
     return "", None
 
 
+def _sell_side_exit_signal(plan: TradingPlanRow, bar: PriceBar) -> tuple[str, Decimal | None]:
+    if plan.stop_loss is not None and bar.low <= plan.stop_loss:
+        return "stop_loss", plan.stop_loss
+    if plan.target_1 is not None and bar.low <= plan.target_1:
+        return "target_1", plan.target_1
+    return "", None
+
+
 def _buy_quantity(
     *,
     initial_cash: Decimal,
@@ -555,16 +611,22 @@ def _build_metrics(
     symbol: str,
     adapter: str,
     initial_cash: Decimal,
+    initial_position_quantity: Decimal,
     trades: list[BacktestExecution],
     equity_rows: list[dict[str, str]],
 ) -> dict[str, object]:
     final_equity = (
         Decimal(equity_rows[-1]["equity"]) if equity_rows else initial_cash
     )
+    initial_equity = (
+        Decimal(equity_rows[0]["equity"])
+        if initial_position_quantity > 0 and equity_rows
+        else initial_cash
+    )
     total_return_pct = (
         Decimal("0")
-        if initial_cash == 0
-        else ((final_equity - initial_cash) / initial_cash * Decimal("100"))
+        if initial_equity == 0
+        else ((final_equity - initial_equity) / initial_equity * Decimal("100"))
     )
     max_drawdown_pct = max(
         [Decimal(row["drawdown_pct"]) for row in equity_rows] or [Decimal("0")]
@@ -585,6 +647,8 @@ def _build_metrics(
         "strategy": "trading_plan",
         "adapter": adapter,
         "initial_cash": _money(initial_cash),
+        "initial_position_quantity": _quantity(initial_position_quantity),
+        "initial_equity": _money(initial_equity),
         "final_equity": _money(final_equity),
         "total_return_pct": _percent(total_return_pct),
         "max_drawdown_pct": _percent(max_drawdown_pct),

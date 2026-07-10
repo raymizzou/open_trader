@@ -16,7 +16,7 @@ from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
 from .futu_quote import FutuQuoteClient
 from .research_chat import ResearchChatError, ResearchChatService
-from .trading_plan import is_buy_side_backtest_rating, load_trading_plan_rows
+from .trading_plan import load_trading_plan_rows
 
 
 STATIC_DIR = Path(__file__).with_name("dashboard_static")
@@ -52,8 +52,6 @@ def build_backtest_run_payload(
 
     plan_path = _dashboard_backtest_plan_path(config.data_dir, market)
     plan = _latest_active_plan(plan_path, market=market, symbol=symbol)
-    if not is_buy_side_backtest_rating(plan.rating):
-        raise ValueError("backtest supports buy-side trading plans only")
     prices_path = config.data_dir / "prices" / market / f"{symbol}.csv"
     run_backtest(
         plan_path=plan_path,
@@ -64,6 +62,9 @@ def build_backtest_run_payload(
         symbol=symbol,
         market=market,
         initial_cash=_decimal_request_value(request, "initial_cash", "100000"),
+        initial_position_quantity=_decimal_request_value(
+            request, "initial_position_quantity", "0"
+        ),
         commission_bps=_decimal_request_value(request, "commission_bps", "10"),
         slippage_bps=_decimal_request_value(request, "slippage_bps", "5"),
         adapter=str(request.get("adapter") or "backtrader"),

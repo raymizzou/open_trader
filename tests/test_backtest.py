@@ -247,6 +247,82 @@ def test_run_backtest_marks_open_position_to_market_at_end(tmp_path: Path) -> No
     assert trades[1]["price"] == "425.0000"
 
 
+def test_run_backtest_sell_side_starts_from_current_position_and_exits_on_target(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "trading_plan.csv"
+    prices_path = tmp_path / "prices.csv"
+    plan = active_plan_row(symbol="DRAM")
+    plan.update(
+        {
+            "rating": "Underweight",
+            "entry_zone_low": "",
+            "entry_zone_high": "",
+            "max_weight": "",
+            "target_1": "90",
+            "target_2": "",
+            "stop_loss": "",
+        }
+    )
+    write_trading_plan(plan_path, [plan])
+    write_prices(
+        prices_path,
+        [
+            {
+                "date": "2026-06-16",
+                "open": "100",
+                "high": "101",
+                "low": "99",
+                "close": "100",
+                "volume": "1000",
+            },
+            {
+                "date": "2026-06-17",
+                "open": "96",
+                "high": "97",
+                "low": "89",
+                "close": "91",
+                "volume": "1000",
+            },
+        ],
+    )
+
+    result = run_backtest(
+        plan_path=plan_path,
+        prices_path=prices_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-06-16",
+        symbol="DRAM",
+        market="US",
+        initial_cash=Decimal("0"),
+        initial_position_quantity=Decimal("10"),
+        commission_bps=Decimal("10"),
+        slippage_bps=Decimal("5"),
+    )
+
+    trades = read_csv(result.trades_path)
+    assert [row["side"] for row in trades] == ["SELL"]
+    assert trades[0]["date"] == "2026-06-17"
+    assert trades[0]["reason"] == "target_1"
+    assert trades[0]["price"] == "89.9550"
+    assert trades[0]["quantity"] == "10"
+    assert trades[0]["cash_after"] == "898.65"
+
+    equity = read_csv(result.equity_curve_path)
+    assert equity[0]["position_quantity"] == "10"
+    assert equity[0]["equity"] == "1000.00"
+    assert equity[1]["position_quantity"] == "0"
+    assert equity[1]["equity"] == "898.65"
+
+    metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    assert metrics["initial_cash"] == "0.00"
+    assert metrics["initial_position_quantity"] == "10"
+    assert metrics["initial_equity"] == "1000.00"
+    assert metrics["final_equity"] == "898.65"
+    assert metrics["total_return_pct"] == "-10.14"
+
+
 def test_run_backtest_treats_blank_plan_run_date_as_selected_date(
     tmp_path: Path,
 ) -> None:

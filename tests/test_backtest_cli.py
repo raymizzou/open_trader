@@ -35,6 +35,7 @@ def test_run_backtest_parse_defaults_and_invalid_values() -> None:
     assert args.market == "US"
     assert args.date == "2026-06-16"
     assert args.initial_cash == Decimal("100000")
+    assert args.initial_position_quantity == Decimal("0")
     assert args.commission_bps == Decimal("10")
     assert args.slippage_bps == Decimal("5")
 
@@ -73,6 +74,7 @@ def test_run_backtest_help_includes_expected_options(
     assert "--market" in output
     assert "--date" in output
     assert "--initial-cash" in output
+    assert "--initial-position-quantity" in output
     assert "--commission-bps" in output
     assert "--slippage-bps" in output
 
@@ -123,6 +125,8 @@ def test_run_backtest_main_wires_pipeline_and_prints_summary(
             "2026-06-16",
             "--initial-cash",
             "50000",
+            "--initial-position-quantity",
+            "10",
             "--commission-bps",
             "8",
             "--slippage-bps",
@@ -140,6 +144,7 @@ def test_run_backtest_main_wires_pipeline_and_prints_summary(
         "symbol": "MSFT",
         "market": "US",
         "initial_cash": Decimal("50000"),
+        "initial_position_quantity": Decimal("10"),
         "commission_bps": Decimal("8"),
         "slippage_bps": Decimal("3"),
         "adapter": "backtrader",

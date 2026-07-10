@@ -2976,7 +2976,7 @@ await runBacktestForHolding(state.selectedHoldingKey);
 if (!posted || posted.url !== "/api/backtests/run") {
   throw new Error("backtest run should post to API: " + JSON.stringify(posted));
 }
-if (posted.body.market !== "US" || posted.body.symbol !== "VIXY") {
+if (posted.body.market !== "US" || posted.body.symbol !== "VIXY" || posted.body.initial_position_quantity !== "10") {
   throw new Error("backtest run body should identify holding: " + JSON.stringify(posted.body));
 }
 if (loadCount !== 1) {
@@ -3131,14 +3131,14 @@ state.dashboard = {
       prices_path: "data/prices/US/VIXY.csv",
       prices_missing: false,
       missing_fields: [],
-      error: "backtest supports buy-side trading plans only",
+      error: "unsupported backtest strategy rating",
     },
   }],
 };
 state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
 renderHoldings();
 const html = elements["holdings-body"].innerHTML;
-for (const required of ["回测准备", "暂不支持该策略", "第一版回测仅支持买入或加仓类交易计划。"]) {
+for (const required of ["回测准备", "暂不支持该策略", "第一版回测支持买入、加仓和减仓类交易计划；其他策略暂不支持。"]) {
   if (!html.includes(required)) {
     throw new Error("unsupported strategy readiness missing " + required + ": " + html);
   }
@@ -3369,7 +3369,7 @@ def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> N
     assert vixy["backtest"]["run_id"] == "2026-06-18-US-VIXY-trading-plan"
 
 
-def test_dashboard_server_rejects_sell_side_backtest_run(tmp_path) -> None:
+def test_dashboard_server_runs_sell_side_backtest_from_current_position(tmp_path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
     config = dashboard_config(tmp_path)
@@ -3381,11 +3381,11 @@ def test_dashboard_server_rejects_sell_side_backtest_run(tmp_path) -> None:
             "symbol": "VIXY",
             "market": "US",
             "rating": "Underweight",
-            "entry_zone_low": "40",
-            "entry_zone_high": "42",
-            "target_1": "48",
-            "stop_loss": "36",
-            "max_weight": "25%",
+            "entry_zone_low": "",
+            "entry_zone_high": "",
+            "target_1": "40",
+            "stop_loss": "",
+            "max_weight": "",
             "status": "active",
         }
     )
@@ -3397,7 +3397,10 @@ def test_dashboard_server_rejects_sell_side_backtest_run(tmp_path) -> None:
     write_csv(
         config.data_dir / "prices" / "US" / "VIXY.csv",
         ["date", "open", "high", "low", "close"],
-        [{"date": "2026-06-19", "open": "41", "high": "43", "low": "40", "close": "42"}],
+        [
+            {"date": "2026-06-18", "open": "45", "high": "46", "low": "44", "close": "45"},
+            {"date": "2026-06-19", "open": "41", "high": "43", "low": "39", "close": "40"},
+        ],
     )
     server = create_dashboard_server(
         config=config,
@@ -3410,20 +3413,23 @@ def test_dashboard_server_rejects_sell_side_backtest_run(tmp_path) -> None:
 
     try:
         host, port = server.server_address
-        status, content_type, payload = post_error_json(
+        payload = post_json(
             f"http://{host}:{port}/api/backtests/run",
-            json.dumps({"market": "US", "symbol": "VIXY"}).encode("utf-8"),
+            {"market": "US", "symbol": "VIXY", "initial_position_quantity": "10"},
         )
+        dashboard_payload = read_json(f"http://{host}:{port}/api/dashboard")
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
 
-    assert status == 500
-    assert content_type == "application/json; charset=utf-8"
-    assert payload["error_type"] == "ValueError"
-    assert payload["message"] == "backtest supports buy-side trading plans only"
+    assert payload["status"] == "ok"
+    assert payload["backtest"]["metrics"]["trade_count"] == "1"
+    assert payload["backtest"]["trades"][0]["side"] == "SELL"
+    assert payload["backtest"]["trades"][0]["reason"] == "target_1"
+    vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest"]["available"] is True
 
 
 def test_dashboard_server_fetches_backtest_prices_api(tmp_path) -> None:

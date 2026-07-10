@@ -1176,7 +1176,7 @@ function backtestReadinessMessage(readiness) {
     return "交易计划字段和价格 CSV 已就绪，可以运行只读回测。";
   }
   if (readiness.status === "unsupported_strategy") {
-    return "第一版回测仅支持买入或加仓类交易计划。";
+    return "第一版回测支持买入、加仓和减仓类交易计划；其他策略暂不支持。";
   }
   if (readiness.error) {
     return readiness.error;
@@ -1239,6 +1239,7 @@ async function runBacktestForHolding(detailKey) {
       body: JSON.stringify({
         market: holding.market || "",
         symbol: holding.symbol || "",
+        initial_position_quantity: formatPlain(holding.total_quantity || "0"),
       }),
     });
     const payload = await response.json();
