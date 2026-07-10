@@ -36,11 +36,13 @@ def build_kelly_order_risk_checks(
     *,
     checked_at: str | None = None,
     max_entry_position_pct: str = "4",
+    strategy_capital_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return build_kelly_order_risk_checks_payload(
         load_kelly_order_intents(data_dir),
         checked_at=checked_at,
         max_entry_position_pct=max_entry_position_pct,
+        strategy_capital_payload=strategy_capital_payload,
     )
 
 
@@ -49,6 +51,7 @@ def build_kelly_order_risk_checks_payload(
     *,
     checked_at: str | None = None,
     max_entry_position_pct: str = "4",
+    strategy_capital_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     timestamp = checked_at or _current_timestamp()
     max_entry_pct = _parse_positive_decimal(max_entry_position_pct)
@@ -59,6 +62,7 @@ def build_kelly_order_risk_checks_payload(
     if not isinstance(raw_intents, list):
         raise ValueError("intent payload must contain an intents list")
 
+    capital_by_experiment = _strategy_capital_by_experiment(strategy_capital_payload)
     checks: list[dict[str, Any]] = []
     for item in raw_intents:
         if not isinstance(item, dict):
@@ -68,6 +72,7 @@ def build_kelly_order_risk_checks_payload(
                 item,
                 checked_at=timestamp,
                 max_entry_position_pct=max_entry_pct,
+                capital_by_experiment=capital_by_experiment,
             )
         )
 
@@ -95,6 +100,7 @@ def _build_single_check(
     *,
     checked_at: str,
     max_entry_position_pct: Decimal,
+    capital_by_experiment: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     base = _base_check(intent, checked_at=checked_at)
     side = str(intent.get("side", "")).strip().lower()
@@ -167,6 +173,26 @@ def _build_single_check(
                 ),
             }
         )
+        experiment_id = str(intent.get("experiment_id", "")).strip()
+        capital_snapshot = capital_by_experiment.get(experiment_id)
+        if capital_snapshot is not None:
+            available = _parse_positive_decimal(
+                capital_snapshot.get("available_notional")
+            ) or Decimal("0")
+            currency = str(
+                capital_snapshot.get("currency") or budget_currency
+            ).strip().upper()
+            capital_check_passed = planned <= available
+            check_results.append(
+                {
+                    "check": "strategy_available_capital",
+                    "status": "passed" if capital_check_passed else "failed",
+                    "detail": (
+                        f"{planned_notional} <= "
+                        f"{_decimal_text(available)} {currency}"
+                    ),
+                }
+            )
 
     risk_status = (
         "approved"
@@ -186,6 +212,21 @@ def _build_single_check(
             else "entry risk checks failed"
         ),
         "check_results": check_results,
+    }
+
+
+def _strategy_capital_by_experiment(
+    payload: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return {}
+    strategies = payload.get("strategies")
+    if not isinstance(strategies, list):
+        return {}
+    return {
+        str(item.get("experiment_id", "")).strip(): item
+        for item in strategies
+        if isinstance(item, dict) and str(item.get("experiment_id", "")).strip()
     }
 
 
