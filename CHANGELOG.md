@@ -20,6 +20,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Added automatic Futu SIMULATE market routing for Kelly paper-order sync and
   execution so commands follow experiment/order markets by default while still
   allowing manual `--trd-market` overrides.
+- Added strategy-level Kelly capital snapshots, capital-aware order risk checks,
+  and a Kelly Lab capital panel showing occupied, available, and next-order
+  impact per strategy.
 - Verified with focused Kelly/dashboard pytest coverage, compile checks,
   `git diff --check`, live Futu SIMULATE HK order execution/sync, and live
   US/CN simulate-account order probes.
