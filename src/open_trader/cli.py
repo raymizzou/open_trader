@@ -36,6 +36,10 @@ from .kelly_paper_order_sync import (
     sync_kelly_paper_orders,
     write_kelly_paper_order_sync_report,
 )
+from .kelly_order_intents import (
+    build_kelly_order_intents,
+    write_kelly_order_intents,
+)
 from .t_signal import TSignalInterpreter
 from .t_signal_futu import FutuTSignalMarketDataClient
 from .t_signal_runner import run_t_signal_watch_once
@@ -688,6 +692,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=11111,
     )
 
+    kelly_build_order_intents_parser = kelly_subparsers.add_parser(
+        "build-order-intents",
+        help="Build Kelly order intents from pending lifecycle states",
+    )
+    kelly_build_order_intents_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_build_order_intents_parser.add_argument(
+        "--created-at",
+        help="Override intent creation timestamp for deterministic local demos",
+    )
+
     trading_plan_parser = subparsers.add_parser(
         "build-trading-plan",
         help="Convert trading_advice.csv into structured trading_plan.csv",
@@ -1314,6 +1332,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"skipped_ambiguous_symbol: {counts['skipped_ambiguous_symbol']}")
             print(f"skipped_invalid_code: {counts['skipped_invalid_code']}")
             print(f"sync_report: {sync_report_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "build-order-intents":
+        try:
+            payload = build_kelly_order_intents(
+                data_dir=args.data_dir,
+                created_at=args.created_at,
+            )
+            latest_path = write_kelly_order_intents(args.data_dir, payload)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"intents: {payload['intent_count']}")
+        print(f"latest: {latest_path}")
         return 0
 
     if args.command == "build-trading-plan":
