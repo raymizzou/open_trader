@@ -44,6 +44,12 @@ from .kelly_order_risk import (
     build_kelly_order_risk_checks,
     write_kelly_order_risk_checks,
 )
+from .kelly_order_execution import (
+    FutuOrderExecutionError,
+    FutuSimulateOrderExecutionClient,
+    execute_kelly_orders,
+    write_kelly_order_executions,
+)
 from .t_signal import TSignalInterpreter
 from .t_signal_futu import FutuTSignalMarketDataClient
 from .t_signal_runner import run_t_signal_watch_once
@@ -151,6 +157,22 @@ def _parse_symbol_subset(value: str | None) -> set[str] | None:
 
 def _parse_symbol_set(value: str | None) -> set[str]:
     return _parse_symbol_subset(value) or set()
+
+
+def _parse_key_value_options(values: list[str], *, option_name: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for raw_value in values:
+        if "=" not in raw_value:
+            raise ValueError(f"{option_name} must use MARKET.SYMBOL=value: {raw_value}")
+        raw_key, raw_item_value = raw_value.split("=", 1)
+        key = raw_key.strip().upper()
+        item_value = raw_item_value.strip()
+        if not key or not item_value:
+            raise ValueError(f"{option_name} must use MARKET.SYMBOL=value: {raw_value}")
+        if key in parsed:
+            raise ValueError(f"{option_name} contains duplicate key: {key}")
+        parsed[key] = item_value
+    return parsed
 
 
 def _print_tiger_sync_result(result: TigerPortfolioSyncResult) -> None:
@@ -727,6 +749,54 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-entry-position-pct",
         default="4",
         help="Maximum allowed Kelly entry position percentage per symbol",
+    )
+
+    kelly_execute_orders_parser = kelly_subparsers.add_parser(
+        "execute-orders",
+        help="Execute approved Kelly order risk checks",
+    )
+    execution_mode_group = kelly_execute_orders_parser.add_mutually_exclusive_group()
+    execution_mode_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build execution records without submitting to Futu. This is the default.",
+    )
+    execution_mode_group.add_argument(
+        "--futu-simulate",
+        action="store_true",
+        help="Submit approved orders to the Futu SIMULATE trading environment.",
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--executed-at",
+        help="Override execution timestamp for deterministic local demos",
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--limit-price",
+        action="append",
+        default=[],
+        help="Limit price as MARKET.SYMBOL=PRICE. Repeat for multiple symbols.",
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--order-qty",
+        action="append",
+        default=[],
+        help="Explicit order quantity as MARKET.SYMBOL=QTY. Required for sell orders.",
+    )
+    kelly_execute_orders_parser.add_argument("--host", default="127.0.0.1")
+    kelly_execute_orders_parser.add_argument(
+        "--port",
+        type=positive_int,
+        default=11111,
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--simulate-acc-id",
+        type=int,
+        help="Futu SIMULATE securities account id to use when multiple exist.",
     )
 
     trading_plan_parser = subparsers.add_parser(
@@ -1383,6 +1453,52 @@ def main(argv: list[str] | None = None) -> int:
         print(f"intents: {payload['intent_count']}")
         print(f"approved: {payload['approved_count']}")
         print(f"blocked: {payload['blocked_count']}")
+        print(f"latest: {latest_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "execute-orders":
+        client = None
+        try:
+            limit_prices = _parse_key_value_options(
+                args.limit_price,
+                option_name="--limit-price",
+            )
+            order_quantities = _parse_key_value_options(
+                args.order_qty,
+                option_name="--order-qty",
+            )
+            dry_run = not args.futu_simulate
+            if not dry_run:
+                client = FutuSimulateOrderExecutionClient(
+                    host=args.host,
+                    port=args.port,
+                    simulate_acc_id=args.simulate_acc_id,
+                )
+            payload = execute_kelly_orders(
+                data_dir=args.data_dir,
+                dry_run=dry_run,
+                executed_at=args.executed_at,
+                limit_prices=limit_prices,
+                order_quantities=order_quantities,
+                client=client,
+            )
+            latest_path = write_kelly_order_executions(args.data_dir, payload)
+        except (
+            FileNotFoundError,
+            ValueError,
+            RuntimeError,
+            FutuOrderExecutionError,
+        ) as exc:
+            parser.error(str(exc))
+        finally:
+            if client is not None and hasattr(client, "close"):
+                client.close()
+        print(f"environment: {payload['environment']}")
+        print(f"executions: {payload['execution_count']}")
+        print(f"dry_run: {payload['dry_run_count']}")
+        print(f"submitted: {payload['submitted_count']}")
+        print(f"skipped: {payload['skipped_count']}")
+        print(f"failed: {payload['failed_count']}")
         print(f"latest: {latest_path}")
         return 0
 
