@@ -917,6 +917,87 @@ def test_load_checked_in_kelly_data_is_available() -> None:
     assert state["experiment_count"] >= 1
 
 
+def test_latest_kelly_experiments_are_single_market() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+
+    allowed_markets = {"US", "HK", "CN"}
+    for experiment in state["experiments"]:
+        experiment_market = experiment["market"]
+        assert experiment_market in allowed_markets
+        assert experiment["market_capital_pool"]["market"] == experiment_market
+        for participant in experiment["participants"]:
+            assert participant["market"] == experiment_market
+
+
+def test_latest_kelly_experiments_split_trend_pullback_mock_by_market() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+    experiments = {
+        experiment["experiment_id"]: experiment for experiment in state["experiments"]
+    }
+
+    assert "trend_pullback_20d_mock_20260707" not in experiments
+
+    trend_us = experiments["trend_pullback_20d_us_mock_20260707"]
+    assert trend_us["experiment_name"] == "趋势回调 20D Mock US 第一批"
+    assert trend_us["market"] == "US"
+    assert trend_us["experiment_budget"] == "100000"
+    assert trend_us["budget_currency"] == "USD"
+    assert trend_us["market_capital_pool"] == {
+        "market": "US",
+        "amount": "100000",
+        "currency": "USD",
+        "enabled": True,
+    }
+    assert [
+        (participant["market"], participant["symbol"], participant["per_symbol_budget"])
+        for participant in trend_us["participants"]
+    ] == [
+        ("US", "DRAM", "33333.33"),
+        ("US", "RAM", "33333.33"),
+        ("US", "SOXX", "33333.33"),
+    ]
+    assert {
+        (state["market"], state["symbol"]) for state in trend_us["lifecycle_states"]
+    } == {
+        ("US", "DRAM"),
+        ("US", "RAM"),
+        ("US", "SOXX"),
+    }
+    assert trend_us["order_sync"]["order_count"] == 1
+    assert trend_us["order_sync"]["fill_count"] == 1
+    assert [
+        (order["market"], order["symbol"]) for order in trend_us["order_sync"]["orders"]
+    ] == [("US", "RAM")]
+
+    trend_hk = experiments["trend_pullback_20d_hk_mock_20260707"]
+    assert trend_hk["experiment_name"] == "趋势回调 20D Mock HK 第一批"
+    assert trend_hk["market"] == "HK"
+    assert trend_hk["experiment_budget"] == "500000"
+    assert trend_hk["budget_currency"] == "HKD"
+    assert trend_hk["market_capital_pool"] == {
+        "market": "HK",
+        "amount": "500000",
+        "currency": "HKD",
+        "enabled": True,
+    }
+    assert [
+        (participant["market"], participant["symbol"], participant["per_symbol_budget"])
+        for participant in trend_hk["participants"]
+    ] == [("HK", "02840", "500000")]
+    assert [
+        (state["market"], state["symbol"], state["status"])
+        for state in trend_hk["lifecycle_states"]
+    ] == [("HK", "02840", "pending_exit_order")]
+    assert trend_hk["order_sync"]["order_count"] == len(
+        trend_hk["order_sync"]["orders"]
+    )
+    assert trend_hk["order_sync"]["fill_count"] == sum(
+        1
+        for order in trend_hk["order_sync"]["orders"]
+        if str(order.get("filled_qty", "")).strip() not in {"", "0", "-"}
+    )
+
+
 def test_load_checked_in_kelly_data_has_scoped_order_and_lifecycle_metadata() -> None:
     state = load_kelly_lab_state(Path("data")).to_dict()
     experiments = {
@@ -934,12 +1015,13 @@ def test_load_checked_in_kelly_data_has_scoped_order_and_lifecycle_metadata() ->
                 if str(order.get("filled_qty", "")).strip() not in {"", "0", "-"}
             )
 
-    trend = experiments["trend_pullback_20d_mock_20260707"]
-    participants = {
-        (participant["market"], participant["symbol"])
-        for participant in trend["participants"]
-    }
-    lifecycle_states = {
-        (state["market"], state["symbol"]) for state in trend["lifecycle_states"]
-    }
-    assert lifecycle_states <= participants
+    for experiment in experiments.values():
+        participants = {
+            (participant["market"], participant["symbol"])
+            for participant in experiment["participants"]
+        }
+        lifecycle_states = {
+            (state["market"], state["symbol"])
+            for state in experiment["lifecycle_states"]
+        }
+        assert lifecycle_states <= participants

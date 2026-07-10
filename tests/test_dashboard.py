@@ -2471,6 +2471,7 @@ def test_load_dashboard_state_exposes_kelly_lab_and_holding_detail(
                         "experiment_name": "趋势回调 20D 第一批",
                         "strategy_id": "trend_pullback_20d",
                         "strategy_version": "v1",
+                        "market": "US",
                         "start_date": "2026-07-07",
                         "paper_account": "futu_simulate",
                         "experiment_budget": "100000",
