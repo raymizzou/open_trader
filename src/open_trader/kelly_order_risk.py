@@ -100,7 +100,11 @@ def _build_single_check(
     side = str(intent.get("side", "")).strip().lower()
     intent_type = str(intent.get("intent_type", "")).strip().lower()
     budget_currency = str(intent.get("budget_currency", "")).strip()
-    market_scope_results = _market_scope_check_results(intent)
+    is_exit = side == "sell" or intent_type == "exit"
+    market_scope_results = _market_scope_check_results(
+        intent,
+        include_budget_currency=not is_exit,
+    )
 
     if any(result["status"] == "failed" for result in market_scope_results):
         return {
@@ -113,7 +117,7 @@ def _build_single_check(
             "check_results": market_scope_results,
         }
 
-    if side == "sell" or intent_type == "exit":
+    if is_exit:
         return {
             **base,
             "risk_status": "approved",
@@ -185,7 +189,11 @@ def _build_single_check(
     }
 
 
-def _market_scope_check_results(intent: dict[str, Any]) -> list[dict[str, str]]:
+def _market_scope_check_results(
+    intent: dict[str, Any],
+    *,
+    include_budget_currency: bool,
+) -> list[dict[str, str]]:
     try:
         experiment_market = normalize_kelly_market(intent.get("experiment_market"))
     except ValueError:
@@ -202,17 +210,14 @@ def _market_scope_check_results(intent: dict[str, Any]) -> list[dict[str, str]]:
     except ValueError:
         return [
             {
-                "check": "experiment_market_present",
+                "check": "symbol_market_present",
                 "status": "failed",
                 "detail": _field_text(intent.get("market")),
             }
         ]
 
-    budget_currency = str(intent.get("budget_currency", "")).strip().upper()
-    market_currency = kelly_market_currency(symbol_market)
     market_matches = symbol_market == experiment_market
-    currency_matches = budget_currency == market_currency
-    return [
+    results = [
         {
             "check": "experiment_market_matches_symbol",
             "status": "passed" if market_matches else "failed",
@@ -221,7 +226,15 @@ def _market_scope_check_results(intent: dict[str, Any]) -> list[dict[str, str]]:
                 if market_matches
                 else f"{symbol_market} != {experiment_market}"
             ),
-        },
+        }
+    ]
+    if not include_budget_currency:
+        return results
+
+    budget_currency = str(intent.get("budget_currency", "")).strip().upper()
+    market_currency = kelly_market_currency(symbol_market)
+    currency_matches = budget_currency == market_currency
+    results.append(
         {
             "check": "budget_currency_matches_market",
             "status": "passed" if currency_matches else "failed",
@@ -230,8 +243,9 @@ def _market_scope_check_results(intent: dict[str, Any]) -> list[dict[str, str]]:
                 if currency_matches
                 else f"{budget_currency} != {market_currency}"
             ),
-        },
-    ]
+        }
+    )
+    return results
 
 
 def _base_check(intent: dict[str, Any], *, checked_at: str) -> dict[str, str]:

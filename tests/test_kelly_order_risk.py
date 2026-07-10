@@ -43,7 +43,7 @@ def test_build_kelly_order_risk_checks_approves_valid_entry_and_exit() -> None:
                 "side": "sell",
                 "suggested_position_pct": "4%",
                 "per_symbol_budget": "25000",
-                "budget_currency": "HKD",
+                "budget_currency": "USD",
             },
         ],
     }
@@ -120,18 +120,13 @@ def test_build_kelly_order_risk_checks_approves_valid_entry_and_exit() -> None:
                 "execution_status": "ready",
                 "checked_at": "2026-07-10 13:31",
                 "planned_notional": "",
-                "budget_currency": "HKD",
+                "budget_currency": "USD",
                 "reason": "exit intent reduces exposure",
                 "check_results": [
                     {
                         "check": "experiment_market_matches_symbol",
                         "status": "passed",
                         "detail": "HK == HK",
-                    },
-                    {
-                        "check": "budget_currency_matches_market",
-                        "status": "passed",
-                        "detail": "HKD == HKD",
                     },
                     {
                         "check": "exit_default_allow",
@@ -333,6 +328,68 @@ def test_build_kelly_order_risk_checks_blocks_market_currency_mismatch() -> None
         "status": "failed",
         "detail": "USD != HKD",
     }
+
+
+def test_build_kelly_order_risk_checks_blocks_malformed_market_scope() -> None:
+    intent_payload = {
+        "schema_version": "open_trader.kelly_order_intents.v1",
+        "created_at": "2026-07-10 13:30",
+        "intent_count": 2,
+        "intents": [
+            {
+                "intent_id": "trend:XX:RAM:entry",
+                "experiment_id": "trend",
+                "experiment_name": "趋势回调第一批",
+                "strategy_id": "trend_pullback_20d",
+                "strategy_version": "v1",
+                "experiment_market": "US",
+                "market": "XX",
+                "symbol": "RAM",
+                "intent_type": "entry",
+                "side": "buy",
+                "suggested_position_pct": "4%",
+                "per_symbol_budget": "25000",
+                "budget_currency": "USD",
+            },
+            {
+                "intent_id": "trend:US:RAM:entry",
+                "experiment_id": "trend",
+                "experiment_name": "趋势回调第一批",
+                "strategy_id": "trend_pullback_20d",
+                "strategy_version": "v1",
+                "experiment_market": "moon",
+                "market": "US",
+                "symbol": "RAM",
+                "intent_type": "entry",
+                "side": "buy",
+                "suggested_position_pct": "4%",
+                "per_symbol_budget": "25000",
+                "budget_currency": "USD",
+            },
+        ],
+    }
+
+    payload = build_kelly_order_risk_checks_payload(
+        intent_payload,
+        checked_at="2026-07-10 13:31",
+        max_entry_position_pct="4",
+    )
+
+    assert payload["blocked_count"] == 2
+    assert payload["checks"][0]["check_results"] == [
+        {
+            "check": "symbol_market_present",
+            "status": "failed",
+            "detail": "XX",
+        }
+    ]
+    assert payload["checks"][1]["check_results"] == [
+        {
+            "check": "experiment_market_present",
+            "status": "failed",
+            "detail": "moon",
+        }
+    ]
 
 
 def test_write_kelly_order_risk_checks_writes_latest_artifact(tmp_path: Path) -> None:

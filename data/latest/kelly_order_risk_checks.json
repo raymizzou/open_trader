@@ -73,11 +73,6 @@
           "detail": "HK == HK"
         },
         {
-          "check": "budget_currency_matches_market",
-          "status": "passed",
-          "detail": "HKD == HKD"
-        },
-        {
           "check": "exit_default_allow",
           "status": "passed",
           "detail": "sell/exit intents are not blocked in v1"
