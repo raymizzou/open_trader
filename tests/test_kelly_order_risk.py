@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from open_trader.kelly_order_risk import (
     build_kelly_order_risk_checks_payload,
     write_kelly_order_risk_checks,
@@ -287,6 +289,51 @@ def test_build_kelly_order_risk_checks_blocks_cross_market_entry() -> None:
     }
 
 
+def test_build_kelly_order_risk_checks_blocks_cross_market_exit() -> None:
+    intent_payload = {
+        "schema_version": "open_trader.kelly_order_intents.v1",
+        "created_at": "2026-07-10 13:30",
+        "intent_count": 1,
+        "intents": [
+            {
+                "intent_id": "trend:HK:02840:exit",
+                "experiment_id": "trend",
+                "experiment_name": "趋势回调第一批",
+                "strategy_id": "trend_pullback_20d",
+                "strategy_version": "v1",
+                "experiment_market": "US",
+                "market": "HK",
+                "symbol": "02840",
+                "intent_type": "exit",
+                "side": "sell",
+                "suggested_position_pct": "4%",
+                "per_symbol_budget": "25000",
+                "budget_currency": "USD",
+            }
+        ],
+    }
+
+    payload = build_kelly_order_risk_checks_payload(
+        intent_payload,
+        checked_at="2026-07-10 13:31",
+        max_entry_position_pct="4",
+    )
+
+    assert payload["blocked_count"] == 1
+    check = payload["checks"][0]
+    assert check["risk_status"] == "blocked"
+    assert check["execution_status"] == "risk_blocked"
+    assert check["reason"] == "market scope checks failed"
+    assert "exit_default_allow" not in [
+        result["check"] for result in check["check_results"]
+    ]
+    assert check["check_results"][0] == {
+        "check": "experiment_market_matches_symbol",
+        "status": "failed",
+        "detail": "HK != US",
+    }
+
+
 def test_build_kelly_order_risk_checks_blocks_market_currency_mismatch() -> None:
     intent_payload = {
         "schema_version": "open_trader.kelly_order_intents.v1",
@@ -388,6 +435,60 @@ def test_build_kelly_order_risk_checks_blocks_malformed_market_scope() -> None:
             "check": "experiment_market_present",
             "status": "failed",
             "detail": "moon",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_check"),
+    [
+        ("market", "symbol_market_present"),
+        ("experiment_market", "experiment_market_present"),
+    ],
+)
+def test_build_kelly_order_risk_checks_blocks_blank_market_scope(
+    field: str,
+    expected_check: str,
+) -> None:
+    intent = {
+        "intent_id": "trend:US:RAM:entry",
+        "experiment_id": "trend",
+        "experiment_name": "趋势回调第一批",
+        "strategy_id": "trend_pullback_20d",
+        "strategy_version": "v1",
+        "experiment_market": "US",
+        "market": "US",
+        "symbol": "RAM",
+        "intent_type": "entry",
+        "side": "buy",
+        "suggested_position_pct": "4%",
+        "per_symbol_budget": "25000",
+        "budget_currency": "USD",
+    }
+    intent[field] = ""
+    intent_payload = {
+        "schema_version": "open_trader.kelly_order_intents.v1",
+        "created_at": "2026-07-10 13:30",
+        "intent_count": 1,
+        "intents": [intent],
+    }
+
+    payload = build_kelly_order_risk_checks_payload(
+        intent_payload,
+        checked_at="2026-07-10 13:31",
+        max_entry_position_pct="4",
+    )
+
+    assert payload["blocked_count"] == 1
+    check = payload["checks"][0]
+    assert check["risk_status"] == "blocked"
+    assert check["execution_status"] == "risk_blocked"
+    assert check["reason"] == "market scope checks failed"
+    assert check["check_results"] == [
+        {
+            "check": expected_check,
+            "status": "failed",
+            "detail": "",
         }
     ]
 
