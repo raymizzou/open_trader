@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -83,3 +84,48 @@ def test_kelly_check_order_risk_main_writes_payload_and_prints_summary(
     assert "approved: 2" in output
     assert "blocked: 1" in output
     assert f"latest: {latest_path}" in output
+
+
+def test_kelly_check_order_risk_main_passes_latest_strategy_capital(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    strategy_capital_payload = {"strategies": []}
+    (latest_dir / "kelly_strategy_capital.json").write_text(
+        json.dumps(strategy_capital_payload),
+        encoding="utf-8",
+    )
+
+    def fake_build(**kwargs: object) -> dict[str, object]:
+        captured["build_kwargs"] = kwargs
+        return {
+            "schema_version": "open_trader.kelly_order_risk_checks.v1",
+            "intent_count": 0,
+            "approved_count": 0,
+            "blocked_count": 0,
+            "checks": [],
+        }
+
+    def fake_write(data_dir_arg: Path, payload: dict[str, object]) -> Path:
+        return data_dir_arg / "latest/kelly_order_risk_checks.json"
+
+    monkeypatch.setattr(cli, "build_kelly_order_risk_checks", fake_build)
+    monkeypatch.setattr(cli, "write_kelly_order_risk_checks", fake_write)
+
+    result = cli.main(
+        [
+            "kelly",
+            "check-order-risk",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+
+    assert result == 0
+    assert captured["build_kwargs"]["strategy_capital_payload"] == {
+        "strategies": [],
+    }

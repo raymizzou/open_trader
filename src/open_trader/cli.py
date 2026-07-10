@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -8,6 +9,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
@@ -45,6 +47,11 @@ from .kelly_order_risk import (
     build_kelly_order_risk_checks,
     write_kelly_order_risk_checks,
 )
+from .kelly_strategy_capital import (
+    build_kelly_strategy_capital_payload,
+    write_kelly_strategy_capital,
+)
+from .kelly_lab import load_kelly_lab_state
 from .kelly_order_execution import (
     FutuOrderExecutionError,
     FutuSimulateOrderExecutionClient,
@@ -160,6 +167,14 @@ def _parse_symbol_subset(value: str | None) -> set[str] | None:
 
 def _parse_symbol_set(value: str | None) -> set[str]:
     return _parse_symbol_subset(value) or set()
+
+
+def _load_optional_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return payload if isinstance(payload, dict) else None
 
 
 def _parse_key_value_options(values: list[str], *, option_name: str) -> dict[str, str]:
@@ -763,6 +778,20 @@ def build_parser() -> argparse.ArgumentParser:
     kelly_build_order_intents_parser.add_argument(
         "--created-at",
         help="Override intent creation timestamp for deterministic local demos",
+    )
+
+    kelly_build_strategy_capital_parser = kelly_subparsers.add_parser(
+        "build-strategy-capital",
+        help="Build Kelly strategy capital from lab state and latest order artifacts",
+    )
+    kelly_build_strategy_capital_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_build_strategy_capital_parser.add_argument(
+        "--calculated-at",
+        help="Override capital calculation timestamp for deterministic local demos",
     )
 
     kelly_check_order_risk_parser = kelly_subparsers.add_parser(
@@ -1493,12 +1522,45 @@ def main(argv: list[str] | None = None) -> int:
         print(f"latest: {latest_path}")
         return 0
 
+    if args.command == "kelly" and args.kelly_command == "build-strategy-capital":
+        try:
+            lab_state = load_kelly_lab_state(args.data_dir)
+            if not lab_state.available:
+                raise ValueError(lab_state.error)
+            latest_dir = args.data_dir / "latest"
+            paper_orders_payload = _load_optional_json(
+                latest_dir / "kelly_paper_orders.json",
+            )
+            order_executions_payload = _load_optional_json(
+                latest_dir / "kelly_order_executions.json",
+            )
+            payload = build_kelly_strategy_capital_payload(
+                lab_state.experiments,
+                paper_orders_payload=paper_orders_payload,
+                order_executions_payload=order_executions_payload,
+                calculated_at=args.calculated_at,
+            )
+            latest_path = write_kelly_strategy_capital(args.data_dir, payload)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"strategies: {payload['strategy_count']}")
+        print(f"latest: {latest_path}")
+        return 0
+
     if args.command == "kelly" and args.kelly_command == "check-order-risk":
         try:
+            strategy_capital_payload = _load_optional_json(
+                args.data_dir / "latest" / "kelly_strategy_capital.json",
+            )
+            risk_kwargs = {
+                "data_dir": args.data_dir,
+                "checked_at": args.checked_at,
+                "max_entry_position_pct": args.max_entry_position_pct,
+            }
+            if strategy_capital_payload is not None:
+                risk_kwargs["strategy_capital_payload"] = strategy_capital_payload
             payload = build_kelly_order_risk_checks(
-                data_dir=args.data_dir,
-                checked_at=args.checked_at,
-                max_entry_position_pct=args.max_entry_position_pct,
+                **risk_kwargs,
             )
             latest_path = write_kelly_order_risk_checks(args.data_dir, payload)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
