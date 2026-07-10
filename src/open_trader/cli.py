@@ -40,6 +40,10 @@ from .kelly_order_intents import (
     build_kelly_order_intents,
     write_kelly_order_intents,
 )
+from .kelly_order_risk import (
+    build_kelly_order_risk_checks,
+    write_kelly_order_risk_checks,
+)
 from .t_signal import TSignalInterpreter
 from .t_signal_futu import FutuTSignalMarketDataClient
 from .t_signal_runner import run_t_signal_watch_once
@@ -706,6 +710,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override intent creation timestamp for deterministic local demos",
     )
 
+    kelly_check_order_risk_parser = kelly_subparsers.add_parser(
+        "check-order-risk",
+        help="Check Kelly order intents against first-pass risk limits",
+    )
+    kelly_check_order_risk_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_check_order_risk_parser.add_argument(
+        "--checked-at",
+        help="Override risk-check timestamp for deterministic local demos",
+    )
+    kelly_check_order_risk_parser.add_argument(
+        "--max-entry-position-pct",
+        default="4",
+        help="Maximum allowed Kelly entry position percentage per symbol",
+    )
+
     trading_plan_parser = subparsers.add_parser(
         "build-trading-plan",
         help="Convert trading_advice.csv into structured trading_plan.csv",
@@ -1344,6 +1367,22 @@ def main(argv: list[str] | None = None) -> int:
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             parser.error(str(exc))
         print(f"intents: {payload['intent_count']}")
+        print(f"latest: {latest_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "check-order-risk":
+        try:
+            payload = build_kelly_order_risk_checks(
+                data_dir=args.data_dir,
+                checked_at=args.checked_at,
+                max_entry_position_pct=args.max_entry_position_pct,
+            )
+            latest_path = write_kelly_order_risk_checks(args.data_dir, payload)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"intents: {payload['intent_count']}")
+        print(f"approved: {payload['approved_count']}")
+        print(f"blocked: {payload['blocked_count']}")
         print(f"latest: {latest_path}")
         return 0
 
