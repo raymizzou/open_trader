@@ -173,20 +173,27 @@ def _first_decimal(order: dict[str, Any], keys: tuple[str, ...]) -> Decimal:
     for key in keys:
         value = order.get(key)
         if _field_text(value):
-            return _parse_decimal(value)
+            parsed = _parse_optional_decimal(value)
+            if parsed is not None:
+                return parsed
     return Decimal("0")
 
 
 def _parse_decimal(value: object) -> Decimal:
+    parsed = _parse_optional_decimal(value)
+    return parsed if parsed is not None else Decimal("0")
+
+
+def _parse_optional_decimal(value: object) -> Decimal | None:
     text = _field_text(value)
     if not text:
-        return Decimal("0")
+        return None
     try:
         parsed = Decimal(text)
     except (InvalidOperation, ValueError):
-        return Decimal("0")
+        return None
     if not parsed.is_finite():
-        return Decimal("0")
+        return None
     return parsed
 
 

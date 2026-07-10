@@ -174,6 +174,42 @@ def test_build_kelly_strategy_capital_payload_counts_synced_paper_order_fields()
     ]
 
 
+def test_build_kelly_strategy_capital_payload_falls_back_after_invalid_decimal() -> None:
+    payload = build_kelly_strategy_capital_payload(
+        [
+            {
+                "experiment_id": "trend_us",
+                "experiment_name": "趋势回调 US",
+                "market": "US",
+                "experiment_budget": "30000",
+                "budget_currency": "USD",
+            }
+        ],
+        paper_orders_payload={
+            "orders": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "RAM",
+                    "side": "buy",
+                    "status": "filled",
+                    "avg_fill_price": "-",
+                    "order_price": "150",
+                    "filled_qty": "8",
+                }
+            ]
+        },
+        calculated_at="2026-07-10 21:07",
+    )
+
+    capital = payload["strategies"][0]
+    assert capital["position_notional"] == "1200"
+    assert capital["occupied_notional"] == "1200"
+    assert capital["symbol_occupancy"] == [
+        {"market": "US", "symbol": "RAM", "notional": "1200"},
+    ]
+
+
 def test_write_and_load_kelly_strategy_capital_roundtrips_payload(tmp_path) -> None:
     payload = build_kelly_strategy_capital_payload(
         [
