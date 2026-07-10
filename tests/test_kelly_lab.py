@@ -680,6 +680,98 @@ def test_load_kelly_lab_state_filters_attached_order_executions_to_experiment_ma
     ] == [("US", "RAM")]
 
 
+def test_load_kelly_lab_state_attaches_strategy_capital_snapshot(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_strategy_capital.json",
+        {
+            "schema_version": "open_trader.kelly_strategy_capital.v1",
+            "calculated_at": "2026-07-10 21:10",
+            "strategy_count": 1,
+            "strategies": [
+                {
+                    "experiment_id": "trend_us",
+                    "currency": "USD",
+                    "budget": "30000",
+                    "occupied_notional": "7400",
+                    "position_notional": "6200",
+                    "reserved_order_notional": "1200",
+                    "available_notional": "22600",
+                    "utilization_pct": "24.67",
+                    "open_buy_order_count": 1,
+                    "realized_pnl": "0",
+                    "updated_at": "2026-07-10 21:10",
+                    "symbol_occupancy": [
+                        {"market": "US", "symbol": "RAM", "notional": "1200"}
+                    ],
+                    "next_order_impact": {},
+                }
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    assert state["experiments"][0]["capital"]["available_notional"] == "22600"
+    assert state["experiments"][0]["capital"]["open_buy_order_count"] == 1
+
+
+def test_load_kelly_lab_state_marks_strategy_capital_unavailable_when_missing(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    assert state["experiments"][0]["capital"] == {"available": False}
+
+
+def test_load_kelly_lab_state_rejects_strategy_capital_without_strategies(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_strategy_capital.json",
+        {
+            "schema_version": "open_trader.kelly_strategy_capital.v1",
+            "calculated_at": "2026-07-10 21:10",
+            "strategy_count": 0,
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="kelly_strategy_capital.json must contain a strategies list",
+    ):
+        load_kelly_lab_state(data_dir)
+
+
 def test_load_kelly_lab_state_keeps_existing_order_sync_when_paper_orders_missing(
     tmp_path: Path,
 ) -> None:

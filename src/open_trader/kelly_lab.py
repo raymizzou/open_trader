@@ -18,6 +18,7 @@ TEMPLATES_SCHEMA_VERSION = "open_trader.kelly_strategy_templates.v1"
 EXPERIMENTS_SCHEMA_VERSION = "open_trader.kelly_experiments.v1"
 PAPER_ORDERS_SCHEMA_VERSION = "open_trader.kelly_paper_orders.v1"
 ORDER_EXECUTIONS_SCHEMA_VERSION = "open_trader.kelly_order_executions.v1"
+STRATEGY_CAPITAL_SCHEMA_VERSION = "open_trader.kelly_strategy_capital.v1"
 
 ALLOWED_EXPERIMENT_STATUSES = {"draft", "running", "paused", "completed", "failed"}
 
@@ -86,6 +87,7 @@ def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
     experiments_path = latest_dir / "kelly_experiments.json"
     paper_orders_path = latest_dir / "kelly_paper_orders.json"
     order_executions_path = latest_dir / "kelly_order_executions.json"
+    strategy_capital_path = latest_dir / "kelly_strategy_capital.json"
 
     missing_path = _first_missing_path(templates_path, experiments_path)
     if missing_path is not None:
@@ -108,6 +110,11 @@ def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
     experiments = _attach_paper_orders_to_experiments(experiments, paper_orders)
     order_execution = _load_optional_order_execution(order_executions_path)
     experiments = _attach_order_execution_to_experiments(experiments, order_execution)
+    strategy_capital = _load_optional_strategy_capital(strategy_capital_path)
+    experiments = _attach_strategy_capital_to_experiments(
+        experiments,
+        strategy_capital,
+    )
 
     return KellyLabState(
         available=True,
@@ -211,6 +218,27 @@ def _load_optional_order_execution(path: Path) -> dict[str, Any] | None:
     return normalized_payload
 
 
+def _load_optional_strategy_capital(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    payload = _load_json_object(path)
+    _validate_schema_version(
+        payload,
+        path,
+        expected_schema_version=STRATEGY_CAPITAL_SCHEMA_VERSION,
+    )
+    strategies = payload.get("strategies")
+    if not isinstance(strategies, list):
+        raise ValueError(f"{path.name} must contain a strategies list")
+
+    validated: list[dict[str, Any]] = []
+    for index, strategy in enumerate(strategies):
+        if not isinstance(strategy, dict):
+            raise ValueError(f"{path.name} strategy {index} must be an object")
+        validated.append(copy.deepcopy(strategy))
+    return validated
+
+
 def _attach_paper_orders_to_experiments(
     experiments: list[dict[str, Any]],
     paper_orders: list[dict[str, Any]],
@@ -281,6 +309,28 @@ def _attach_order_execution_to_experiments(
                     order_execution,
                     executions,
                 )
+        attached.append(normalized)
+    return attached
+
+
+def _attach_strategy_capital_to_experiments(
+    experiments: list[dict[str, Any]],
+    strategies: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    capital_by_experiment: dict[str, dict[str, Any]] = {}
+    for strategy in strategies:
+        experiment_id = strategy.get("experiment_id")
+        if isinstance(experiment_id, str) and experiment_id.strip():
+            capital_by_experiment[experiment_id] = copy.deepcopy(strategy)
+
+    attached: list[dict[str, Any]] = []
+    for experiment in experiments:
+        normalized = copy.deepcopy(experiment)
+        experiment_id = normalized.get("experiment_id")
+        if isinstance(experiment_id, str) and experiment_id in capital_by_experiment:
+            normalized["capital"] = copy.deepcopy(capital_by_experiment[experiment_id])
+        else:
+            normalized["capital"] = {"available": False}
         attached.append(normalized)
     return attached
 
