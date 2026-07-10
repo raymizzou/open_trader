@@ -1,7 +1,7 @@
 import { expect, test, type Locator } from '@playwright/test';
 
 async function expectNoEditableControls(scope: Locator) {
-  await expect(scope.locator('input, textarea, select, [contenteditable="true"]')).toHaveCount(0);
+  await expect(scope.locator('input, textarea, select, [contenteditable]:not([contenteditable="false"])')).toHaveCount(0);
   for (const role of ['textbox', 'combobox', 'spinbutton', 'switch'] as const) {
     await expect(scope.getByRole(role)).toHaveCount(0);
   }
