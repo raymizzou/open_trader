@@ -716,7 +716,7 @@ state.dashboard = {
       locked: true,
       experiment_budget: "60000",
       budget_currency: "USD",
-      market_capital_pool: {currency: "USD", amount: "60000"},
+      market_capital_pool: {currency: "USD", amount: "100000"},
       capital_utilization_pct: "40",
       order_sync: {
         status: "failed",
@@ -845,11 +845,14 @@ if (breakoutNameCount !== 1) {
 if (!html.includes("样本不足") || !html.includes("US.DRAM")) {
   throw new Error("kelly lab panel missing sample stage or participant: " + html);
 }
-for (const required of ["市场", "US", "模拟资金池", "USD 100000"]) {
-  if (!html.includes(required)) {
-    throw new Error("kelly lab panel missing market or capital pool " + required + ": " + html);
+function expectMetric(html, label, value, description) {
+  const pattern = new RegExp("<div>\\\\s*<dt>" + label + "</dt>\\\\s*<dd>" + value + "</dd>\\\\s*</div>");
+  if (!pattern.test(html)) {
+    throw new Error(description + ": " + html);
   }
 }
+expectMetric(html, "市场", "US", "kelly lab panel missing market metric");
+expectMetric(html, "模拟资金池", "USD 100000", "kelly lab panel missing capital pool metric");
 for (const forbidden of ["US.MSFT", "US.TSM", "HK.06951"]) {
   if (html.includes(forbidden)) {
     throw new Error("kelly first tab leaked another strategy symbol " + forbidden + ": " + html);
@@ -985,8 +988,23 @@ const fallbackHtml = renderKellyExperimentCard({
 if (!fallbackHtml.includes("标的状态") || !fallbackHtml.includes("US.IBM") || !fallbackHtml.includes("等待该策略下一次入场信号。")) {
   throw new Error("kelly participant fallback lifecycle missing: " + fallbackHtml);
 }
-if (!fallbackHtml.includes("市场") || !fallbackHtml.includes("模拟资金池") || !fallbackHtml.includes("USD 25000")) {
-  throw new Error("kelly participant fallback market capital pool missing: " + fallbackHtml);
+expectMetric(fallbackHtml, "市场", "US", "kelly fallback market metric missing");
+expectMetric(fallbackHtml, "模拟资金池", "USD 25000", "kelly fallback capital pool missing");
+const disabledPoolHtml = renderKellyExperimentCard({
+  experiment_name: "禁用市场资金池策略",
+  market: "CN",
+  status: "running",
+  experiment_budget: "500000",
+  budget_currency: "CNY",
+  market_capital_pool: {market: "CN", currency: "CNY", amount: "500000", enabled: false},
+  participants: [{market: "CN", symbol: "600000", name: "浦发银行", source: "watchlist"}],
+  template: {strategy_id: "disabled_pool_strategy", strategy_name: "Disabled Pool"},
+  stats: {}
+});
+expectMetric(disabledPoolHtml, "市场", "CN", "kelly disabled pool market metric missing");
+expectMetric(disabledPoolHtml, "模拟资金池", "未启用", "kelly disabled pool should show unavailable metric");
+if (/<div>\\s*<dt>模拟资金池<\\/dt>\\s*<dd>CNY 500000<\\/dd>\\s*<\\/div>/.test(disabledPoolHtml)) {
+  throw new Error("kelly disabled pool rendered active capital amount: " + disabledPoolHtml);
 }
 if (fallbackHtml.includes("实验参与标的") || fallbackHtml.includes("kelly-participant-row")) {
   throw new Error("kelly fallback should not render duplicate participant chips: " + fallbackHtml);

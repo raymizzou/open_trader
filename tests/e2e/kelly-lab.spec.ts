@@ -11,7 +11,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toBeVisible();
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ })).toHaveAttribute('aria-selected', 'false');
-  await expect(page.getByRole('tab', { name: /突破 10D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
+  await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByText('Mock 状态样本')).toHaveCount(0);
   await expect(page.getByText('状态说明')).toHaveCount(0);
   const usTrendCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '趋势回调 20D Mock US 第一批' }) });
@@ -88,12 +88,15 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByLabel('Kelly 标的状态').getByText('HK.02840')).toBeVisible();
   await expect(page.getByLabel('Kelly 标的状态').getByText('US.DRAM')).toHaveCount(0);
   await expect(page.getByLabel('Kelly 标的状态').getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toBeVisible();
-  await page.getByRole('tab', { name: /突破 10D Mock US 第一批/ }).click();
+  await page.getByRole('tab', { name: /突破 10D Mock 第一批/ }).click();
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ })).toHaveAttribute('aria-selected', 'false');
-  await expect(page.getByRole('tab', { name: /突破 10D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tab', { name: /突破 10D Mock 第一批/ })).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByRole('heading', { name: '趋势回调 20D Mock US 第一批' })).toHaveCount(0);
-  await expect(page.getByRole('heading', { name: '突破 10D Mock US 第一批' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '突破 10D Mock 第一批' })).toBeVisible();
+  const breakoutCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '突破 10D Mock 第一批' }) });
+  await expect(breakoutCard.getByText('US', { exact: true })).toBeVisible();
+  await expect(breakoutCard.getByText('USD 100000')).toBeVisible();
   for (const symbol of ['US.MSFT', 'US.TSM']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
   }

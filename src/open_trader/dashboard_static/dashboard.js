@@ -945,6 +945,9 @@ function kellyMarketCapitalPool(experiment) {
   const pool = entry.market_capital_pool && typeof entry.market_capital_pool === "object"
     ? entry.market_capital_pool
     : {};
+  if (pool.enabled === false) {
+    return "未启用";
+  }
   const currency = firstPresent(pool.currency, entry.budget_currency);
   const amount = firstPresent(pool.amount, entry.experiment_budget);
   return hasValue(currency) && hasValue(amount) ? `${formatPlain(currency)} ${formatPlain(amount)}` : "";
