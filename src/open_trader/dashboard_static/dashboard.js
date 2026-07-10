@@ -17,6 +17,11 @@ const state = {
     busy: false,
     error: "",
   },
+  backtestPrices: {
+    detailKey: "",
+    busy: false,
+    error: "",
+  },
   researchChat: {
     holdingKey: "",
     sessionId: "",
@@ -241,6 +246,11 @@ function handleSymbolDetailClick(event) {
   const backtestButton = event.target.closest("[data-run-backtest]");
   if (backtestButton) {
     runBacktestForHolding(backtestButton.dataset.runBacktest || "");
+    return;
+  }
+  const backtestPricesButton = event.target.closest("[data-fetch-backtest-prices]");
+  if (backtestPricesButton) {
+    fetchBacktestPricesForHolding(backtestPricesButton.dataset.fetchBacktestPrices || "");
     return;
   }
   const rawButton = event.target.closest("[data-toggle-raw-report]");
@@ -899,6 +909,7 @@ function renderBacktestReadiness(holding) {
         ${renderRequiredTerm("价格文件", readiness.prices_path)}
         ${renderRequiredTerm("缺少字段", backtestMissingFieldsText(readiness.missing_fields))}
       </dl>
+      ${renderBacktestPriceControls(holding, readiness)}
     </section>
   `;
 }
@@ -932,6 +943,22 @@ function backtestReadinessMessage(readiness) {
 
 function backtestMissingFieldsText(fields) {
   return Array.isArray(fields) && fields.length ? fields.join(", ") : "-";
+}
+
+function renderBacktestPriceControls(holding, readiness) {
+  if (!readiness || (readiness.status !== "missing_prices" && readiness.prices_missing !== true)) {
+    return "";
+  }
+  const detailKey = state.selectedHoldingKey || holdingKey(holding, 0);
+  const fetchState = state.backtestPrices || {};
+  const busy = fetchState.busy === true && fetchState.detailKey === detailKey;
+  const error = fetchState.detailKey === detailKey ? fetchState.error : "";
+  return `
+    <div class="backtest-run-controls">
+      <button class="raw-toggle" type="button" data-fetch-backtest-prices="${escapeHtml(detailKey)}"${busy ? " disabled" : ""}>${busy ? "拉取中" : "拉取价格数据"}</button>
+      ${error ? `<span class="detail-warning">${escapeHtml(error)}</span>` : ""}
+    </div>
+  `;
 }
 
 function renderBacktestRunControls(holding) {
@@ -979,6 +1006,43 @@ async function runBacktestForHolding(detailKey) {
       detailKey,
       busy: false,
       error: error.message || "回测运行失败",
+    };
+    renderHoldings();
+  }
+}
+
+async function fetchBacktestPricesForHolding(detailKey) {
+  const holding = holdingByKey(detailKey);
+  if (!holding) {
+    return;
+  }
+  state.backtestPrices = { detailKey, busy: true, error: "" };
+  state.selectedHoldingKey = detailKey;
+  state.selectedHoldingDetail = "backtest";
+  renderHoldings();
+  try {
+    const response = await fetch("/api/backtests/prices", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        market: holding.market || "",
+        symbol: holding.symbol || "",
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok || payload.status === "error") {
+      throw new Error(payload.message || `backtest prices ${response.status}`);
+    }
+    await loadDashboard();
+    state.backtestPrices = { detailKey, busy: false, error: "" };
+    state.selectedHoldingKey = detailKey;
+    state.selectedHoldingDetail = "backtest";
+    renderHoldings();
+  } catch (error) {
+    state.backtestPrices = {
+      detailKey,
+      busy: false,
+      error: error.message || "价格数据拉取失败",
     };
     renderHoldings();
   }

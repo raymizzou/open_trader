@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,9 +10,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .backtest import run_backtest
+from .backtest_prices import DailyKlineProvider, fetch_backtest_prices
 from .dashboard import DashboardConfig, load_dashboard_state
 from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
+from .futu_quote import FutuQuoteClient
 from .research_chat import ResearchChatError, ResearchChatService
 from .trading_plan import load_trading_plan_rows
 
@@ -71,6 +74,52 @@ def build_backtest_run_payload(
     }
 
 
+def build_backtest_prices_payload(
+    config: DashboardConfig,
+    request: dict[str, Any],
+    *,
+    provider: DailyKlineProvider | None = None,
+) -> dict[str, Any]:
+    market = str(request.get("market") or "").strip().upper()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    if not market or not symbol:
+        raise ValueError("market and symbol are required")
+
+    plan_path = _dashboard_backtest_plan_path(config.data_dir, market)
+    plan = _latest_active_plan(plan_path, market=market, symbol=symbol)
+    end = str(request.get("end") or date.today().isoformat()).strip()
+    start = str(request.get("start") or plan.run_date or end).strip()
+    owned_provider = provider is None
+    price_provider = provider or FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+    try:
+        result = fetch_backtest_prices(
+            data_dir=config.data_dir,
+            market=market,
+            symbol=symbol,
+            start=start,
+            end=end,
+            provider=price_provider,
+        )
+    finally:
+        if owned_provider and hasattr(price_provider, "close"):
+            price_provider.close()
+
+    return {
+        "status": "ok",
+        "market": result.market,
+        "symbol": result.symbol,
+        "start": result.start,
+        "end": result.end,
+        "records": result.records,
+        "prices_path": str(result.prices_path),
+        "backtest_readiness": _dashboard_backtest_readiness_for_holding(
+            config,
+            market=result.market,
+            symbol=result.symbol,
+        ),
+    }
+
+
 def _dashboard_backtest_plan_path(data_dir: Path, market: str) -> Path:
     scoped_path = data_dir / "latest" / market / "trading_plan.csv"
     if scoped_path.exists():
@@ -119,6 +168,28 @@ def _dashboard_backtest_for_holding(
     return {"available": False, "error": "holding is not visible in dashboard"}
 
 
+def _dashboard_backtest_readiness_for_holding(
+    config: DashboardConfig,
+    *,
+    market: str,
+    symbol: str,
+) -> dict[str, Any]:
+    payload = build_dashboard_payload(config)
+    for holding in payload.get("holdings", []):
+        if (
+            str(holding.get("market", "")).strip().upper() == market
+            and str(holding.get("symbol", "")).strip().upper() == symbol
+        ):
+            readiness = holding.get("backtest_readiness")
+            if isinstance(readiness, dict):
+                return readiness
+    return {
+        "available": False,
+        "status": "missing_plan",
+        "error": "holding is not visible in dashboard",
+    }
+
+
 def create_dashboard_server(
     config: DashboardConfig,
     host: str,
@@ -126,6 +197,7 @@ def create_dashboard_server(
     quote_service: DashboardQuoteService | None = None,
     account_sync_service: DashboardAccountSyncService | None = None,
     research_chat_service: ResearchChatService | None = None,
+    backtest_price_provider: DailyKlineProvider | None = None,
 ) -> ThreadingHTTPServer:
     service = quote_service or DashboardQuoteService(config=config)
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
@@ -190,6 +262,15 @@ def create_dashboard_server(
                 if path == "/api/backtests/run":
                     self._send_json(
                         build_backtest_run_payload(config, self._read_json_body())
+                    )
+                    return
+                if path == "/api/backtests/prices":
+                    self._send_json(
+                        build_backtest_prices_payload(
+                            config,
+                            self._read_json_body(),
+                            provider=backtest_price_provider,
+                        )
                     )
                     return
                 if path.startswith("/api/research-chat/sessions/"):

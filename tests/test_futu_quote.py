@@ -55,7 +55,13 @@ class FakeOpenQuoteContext:
             0,
             FakeDataFrame(
                 [
-                    {"time_key": "2026-06-18 00:00:00", "close": "18.82"},
+                    {
+                        "time_key": "2026-06-18 00:00:00",
+                        "open": "18.4",
+                        "high": "19.0",
+                        "low": "18.2",
+                        "close": "18.82",
+                    },
                     {"time_key": "2026-06-19", "close": 19.1},
                     {"time_key": "2026-06-20", "close": None},
                 ]
@@ -160,7 +166,13 @@ def test_futu_quote_client_returns_normalized_daily_kline() -> None:
     bars = client.get_daily_kline("US.VIXY", start="2026-01-01", end="2026-07-04")
 
     assert bars == [
-        DailyKlineBar(date="2026-06-18", close=18.82),
+        DailyKlineBar(
+            date="2026-06-18",
+            close=18.82,
+            open=18.4,
+            high=19.0,
+            low=18.2,
+        ),
         DailyKlineBar(date="2026-06-19", close=19.1),
     ]
     assert client.context.requested_history["symbol"] == "US.VIXY"

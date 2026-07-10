@@ -749,6 +749,7 @@ def test_load_dashboard_state_exposes_backtest_readiness(
         "run_date": "2026-06-18",
         "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
         "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
+        "prices_missing": True,
         "missing_fields": ["entry_zone_high", "max_weight"],
         "error": "missing backtest field(s): entry_zone_high, max_weight",
     }
@@ -775,6 +776,7 @@ def test_load_dashboard_state_exposes_backtest_readiness(
         "run_date": "2026-06-18",
         "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
         "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
+        "prices_missing": False,
         "missing_fields": [],
         "error": "",
     }

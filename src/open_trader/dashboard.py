@@ -553,6 +553,7 @@ def _backtest_readiness_detail(
     fields: dict[str, Any],
 ) -> dict[str, Any]:
     prices_path = data_dir / "prices" / market / f"{symbol}.csv"
+    prices_missing = not prices_path.exists()
     missing_fields = [
         field
         for field, value in fields.items()
@@ -561,7 +562,7 @@ def _backtest_readiness_detail(
     if missing_fields:
         status = "missing_fields"
         error = f"missing backtest field(s): {', '.join(missing_fields)}"
-    elif not prices_path.exists():
+    elif prices_missing:
         status = "missing_prices"
         error = f"missing price CSV: {prices_path}"
     else:
@@ -573,6 +574,7 @@ def _backtest_readiness_detail(
         "run_date": run_date,
         "plan_path": str(plan_path),
         "prices_path": str(prices_path),
+        "prices_missing": prices_missing,
         "missing_fields": missing_fields,
         "error": error,
     }
@@ -750,6 +752,11 @@ def _backtest_readiness_holding_detail(
         "run_date": "",
         "plan_path": str(_backtest_plan_path(data_dir, market)) if market else "",
         "prices_path": str(data_dir / "prices" / market / f"{symbol}.csv") if market and symbol else "",
+        "prices_missing": (
+            not (data_dir / "prices" / market / f"{symbol}.csv").exists()
+            if market and symbol
+            else False
+        ),
         "missing_fields": [],
         "error": "no active trading plan found",
     }

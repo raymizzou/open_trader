@@ -187,8 +187,26 @@ class FutuQuoteClient:
             except ValueError:
                 continue
             if close == close:
-                bars.append(DailyKlineBar(date=date_text[:10], close=close))
+                bars.append(
+                    DailyKlineBar(
+                        date=date_text[:10],
+                        open=_optional_float(record.get("open")),
+                        high=_optional_float(record.get("high")),
+                        low=_optional_float(record.get("low")),
+                        close=close,
+                    )
+                )
         return bars
 
     def close(self) -> None:
         self.context.close()
+
+
+def _optional_float(value: object) -> float | None:
+    if value in {None, ""}:
+        return None
+    try:
+        parsed = float(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed == parsed else None

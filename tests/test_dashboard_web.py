@@ -48,6 +48,31 @@ class FakeAccountSyncService:
         return Result()
 
 
+class FakeBacktestPriceProvider:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, str]] = []
+
+    def get_daily_kline(
+        self,
+        futu_symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[object]:
+        from open_trader.kline_technical_facts import DailyKlineBar
+
+        self.requests.append({"futu_symbol": futu_symbol, "start": start, "end": end})
+        return [
+            DailyKlineBar(
+                date="2026-06-19",
+                open=41.0,
+                high=43.0,
+                low=40.0,
+                close=42.0,
+            )
+        ]
+
+
 def quote_result() -> QuoteRefreshResult:
     return QuoteRefreshResult(
         status="ok",
@@ -2996,6 +3021,7 @@ state.dashboard = {
       run_date: "2026-06-18",
       plan_path: "data/latest/US/trading_plan.csv",
       prices_path: "data/prices/US/VIXY.csv",
+      prices_missing: true,
       missing_fields: ["entry_zone_high", "max_weight"],
       error: "missing backtest field(s): entry_zone_high, max_weight",
     },
@@ -3014,6 +3040,125 @@ console.log(html);
     )
 
     assert "缺少计划字段" in html
+
+
+def test_dashboard_backtest_detail_fetches_missing_prices() -> None:
+    html = run_dashboard_js(
+        r"""
+(async () => {
+function makeElement() {
+  const classes = new Set();
+  return {
+    innerHTML: "",
+    textContent: "",
+    classList: {
+      add(...names) { names.forEach((name) => classes.add(name)); },
+      remove(...names) { names.forEach((name) => classes.delete(name)); },
+      contains(name) { return classes.has(name); },
+      toggle(name, force) {
+        if (force === undefined) {
+          classes.has(name) ? classes.delete(name) : classes.add(name);
+        } else if (force) {
+          classes.add(name);
+        } else {
+          classes.delete(name);
+        }
+        return classes.has(name);
+      },
+    },
+    querySelectorAll() { return []; },
+  };
+}
+elements["visible-count"] = makeElement();
+elements["workspace-grid"] = makeElement();
+elements["holdings-table-wrap"] = makeElement();
+elements["symbol-detail-panel"] = makeElement();
+elements["cash-detail-panel"] = makeElement();
+elements["holdings-body"] = makeElement();
+state.dashboardError = null;
+state.quotes = {};
+state.marketFilter = "ALL";
+state.brokerFilter = "ALL";
+state.selectedHoldingDetail = "backtest";
+state.dashboard = {
+  holdings: [{
+    market: "US",
+    symbol: "VIXY",
+    name: "ProShares VIX Short-Term Futures ETF",
+    brokers: "futu",
+    currency: "USD",
+    total_quantity: "10",
+    avg_cost_price: "12.34",
+    market_value: "6250.00",
+    market_value_hkd: "49062.50",
+    portfolio_weight_hkd: "7.50%",
+    unrealized_pnl_pct: "5.00%",
+    backtest: { available: false, error: "" },
+    backtest_readiness: {
+      available: false,
+      status: "missing_fields",
+      run_date: "2026-06-18",
+      plan_path: "data/latest/US/trading_plan.csv",
+      prices_path: "data/prices/US/VIXY.csv",
+      prices_missing: true,
+      missing_fields: ["max_weight"],
+      error: "missing backtest field(s): max_weight",
+    },
+  }],
+};
+state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
+renderHoldings();
+let html = elements["holdings-body"].innerHTML;
+if (!html.includes(">拉取价格数据<") || !html.includes('data-fetch-backtest-prices="US:VIXY:ProShares VIX Short-Term Futures ETF:0"')) {
+  throw new Error("missing price state should expose fetch button: " + html);
+}
+let posted = null;
+let loadCount = 0;
+globalThis.fetch = async (url, options) => {
+  posted = { url, body: JSON.parse(options.body) };
+  return {
+    ok: true,
+    json: async () => ({
+      status: "ok",
+      records: 1,
+      prices_path: "data/prices/US/VIXY.csv",
+      backtest_readiness: { status: "missing_fields", prices_missing: false },
+    }),
+  };
+};
+loadDashboard = async () => {
+  loadCount += 1;
+  state.dashboard.holdings[0].backtest_readiness = {
+    available: true,
+    status: "ready",
+    run_date: "2026-06-18",
+    plan_path: "data/latest/US/trading_plan.csv",
+    prices_path: "data/prices/US/VIXY.csv",
+    prices_missing: false,
+    missing_fields: [],
+    error: "",
+  };
+};
+await fetchBacktestPricesForHolding(state.selectedHoldingKey);
+if (!posted || posted.url !== "/api/backtests/prices") {
+  throw new Error("price fetch should post to API: " + JSON.stringify(posted));
+}
+if (posted.body.market !== "US" || posted.body.symbol !== "VIXY") {
+  throw new Error("price fetch body should identify holding: " + JSON.stringify(posted.body));
+}
+if (loadCount !== 1) {
+  throw new Error("price fetch should reload dashboard once: " + loadCount);
+}
+html = elements["holdings-body"].innerHTML;
+if (!html.includes("已就绪") || html.includes(">拉取价格数据<")) {
+  throw new Error("price fetch should refresh readiness: " + html);
+}
+console.log(html);
+})();
+"""
+    )
+
+    assert "已就绪" in html
 
 
 def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
@@ -3110,6 +3255,74 @@ def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> N
     vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
     assert vixy["backtest"]["available"] is True
     assert vixy["backtest"]["run_id"] == "2026-06-18-US-VIXY-trading-plan"
+
+
+def test_dashboard_server_fetches_backtest_prices_api(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
+    plan_row.update(
+        {
+            "run_date": "2026-06-18",
+            "symbol": "VIXY",
+            "market": "US",
+            "rating": "Overweight",
+            "entry_zone_low": "40",
+            "entry_zone_high": "42",
+            "max_weight": "25%",
+            "status": "active",
+        }
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+    provider = FakeBacktestPriceProvider()
+    server = create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        backtest_price_provider=provider,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        payload = post_json(
+            f"http://{host}:{port}/api/backtests/prices",
+            {"market": "US", "symbol": "VIXY", "end": "2026-07-10"},
+        )
+        dashboard_payload = read_json(f"http://{host}:{port}/api/dashboard")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert payload["status"] == "ok"
+    assert payload["records"] == 1
+    assert payload["prices_path"] == str(config.data_dir / "prices" / "US" / "VIXY.csv")
+    assert payload["backtest_readiness"]["status"] == "ready"
+    assert provider.requests == [
+        {
+            "futu_symbol": "US.VIXY",
+            "start": "2026-06-18",
+            "end": "2026-07-10",
+        }
+    ]
+    assert (config.data_dir / "prices" / "US" / "VIXY.csv").read_text(
+        encoding="utf-8"
+    ).splitlines() == [
+        "date,open,high,low,close",
+        "2026-06-19,41.0,43.0,40.0,42.0",
+    ]
+    vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest_readiness"]["status"] == "ready"
 
 
 def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:

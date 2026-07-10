@@ -3,6 +3,11 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-10
+
+- Added a dashboard action to fetch missing backtest price CSVs from Futu daily
+  K-line data and refresh the per-holding backtest readiness state.
+
 ## 2026-07-09
 
 - Added a read-only `run-backtest` MVP for active trading-plan rows, producing
