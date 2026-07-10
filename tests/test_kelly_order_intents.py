@@ -17,6 +17,13 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
             "strategy_id": "trend_pullback_20d",
             "strategy_version": "v1",
             "status": "running",
+            "market": "US",
+            "market_capital_pool": {
+                "market": "US",
+                "amount": 100000,
+                "currency": "USD",
+                "enabled": True,
+            },
             "budget_currency": "USD",
             "participants": [
                 {
@@ -90,6 +97,13 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                 "experiment_name": "趋势回调第一批",
                 "strategy_id": "trend_pullback_20d",
                 "strategy_version": "v1",
+                "experiment_market": "US",
+                "market_capital_pool": {
+                    "market": "US",
+                    "amount": 100000,
+                    "currency": "USD",
+                    "enabled": True,
+                },
                 "market": "US",
                 "symbol": "RAM",
                 "intent_type": "entry",
@@ -111,6 +125,13 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                 "experiment_name": "趋势回调第一批",
                 "strategy_id": "trend_pullback_20d",
                 "strategy_version": "v1",
+                "experiment_market": "US",
+                "market_capital_pool": {
+                    "market": "US",
+                    "amount": 100000,
+                    "currency": "USD",
+                    "enabled": True,
+                },
                 "market": "US",
                 "symbol": "SOXX",
                 "intent_type": "exit",
@@ -127,6 +148,46 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                 "budget_currency": "USD",
             },
         ],
+    }
+
+
+def test_build_kelly_order_intents_skips_cross_market_lifecycle_state() -> None:
+    experiments = [
+        {
+            "experiment_id": "trend_exp",
+            "experiment_name": "趋势回调第一批",
+            "strategy_id": "trend_pullback_20d",
+            "strategy_version": "v1",
+            "status": "running",
+            "market": "US",
+            "participants": [
+                {
+                    "market": "US",
+                    "symbol": "RAM",
+                    "per_symbol_budget": "25000",
+                    "budget_currency": "USD",
+                },
+            ],
+            "lifecycle_states": [
+                {
+                    "status": "pending_entry_order",
+                    "market": "HK",
+                    "symbol": "02840",
+                },
+            ],
+        },
+    ]
+
+    payload = build_kelly_order_intents_payload(
+        experiments,
+        created_at="2026-07-10 13:30",
+    )
+
+    assert payload == {
+        "schema_version": "open_trader.kelly_order_intents.v1",
+        "created_at": "2026-07-10 13:30",
+        "intent_count": 0,
+        "intents": [],
     }
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import uuid
@@ -47,6 +48,10 @@ def build_kelly_order_intents_payload(
             continue
 
         participants_by_key = _participants_by_key(experiment.get("participants"))
+        experiment_market = str(experiment.get("market", "")).strip().upper()
+        market_capital_pool = experiment.get("market_capital_pool")
+        if not isinstance(market_capital_pool, dict):
+            market_capital_pool = {}
         stats = experiment.get("stats")
         if not isinstance(stats, dict):
             stats = {}
@@ -66,6 +71,8 @@ def build_kelly_order_intents_payload(
             symbol = str(lifecycle_state.get("symbol", "")).strip().upper()
             if not market or not symbol:
                 continue
+            if experiment_market and market != experiment_market:
+                continue
 
             participant = participants_by_key.get((market, symbol), {})
             experiment_id = str(experiment.get("experiment_id", "")).strip()
@@ -80,6 +87,8 @@ def build_kelly_order_intents_payload(
                     "strategy_version": str(
                         experiment.get("strategy_version", "")
                     ).strip(),
+                    "experiment_market": experiment_market,
+                    "market_capital_pool": copy.deepcopy(market_capital_pool),
                     "market": market,
                     "symbol": symbol,
                     "intent_type": intent_type,

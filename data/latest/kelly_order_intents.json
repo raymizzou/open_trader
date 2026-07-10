@@ -9,6 +9,13 @@
       "experiment_name": "趋势回调 20D Mock US 第一批",
       "strategy_id": "trend_pullback_20d",
       "strategy_version": "v1",
+      "experiment_market": "US",
+      "market_capital_pool": {
+        "market": "US",
+        "amount": "100000",
+        "currency": "USD",
+        "enabled": true
+      },
       "market": "US",
       "symbol": "RAM",
       "intent_type": "entry",
@@ -30,6 +37,13 @@
       "experiment_name": "趋势回调 20D Mock HK 第一批",
       "strategy_id": "trend_pullback_20d",
       "strategy_version": "v1",
+      "experiment_market": "HK",
+      "market_capital_pool": {
+        "market": "HK",
+        "amount": "500000",
+        "currency": "HKD",
+        "enabled": true
+      },
       "market": "HK",
       "symbol": "02840",
       "intent_type": "exit",
