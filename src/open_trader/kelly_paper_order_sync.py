@@ -13,6 +13,9 @@ from typing import Any, Callable, Protocol
 from .kelly_lab import PAPER_ORDERS_SCHEMA_VERSION
 
 TRD_ENV_SIMULATE = "SIMULATE"
+PAPER_ORDER_SYNC_REPORT_SCHEMA_VERSION = (
+    "open_trader.kelly_paper_order_sync_report.v1"
+)
 
 
 class FutuPaperOrderSyncError(RuntimeError):
@@ -39,6 +42,12 @@ class FakeFutuPaperOrderClient:
         return [copy.deepcopy(order) for order in self.orders]
 
 
+@dataclass(frozen=True)
+class KellyExperimentSymbolIndexDetails:
+    unique: dict[tuple[str, str], str]
+    ambiguous: dict[tuple[str, str], list[str]]
+
+
 class FutuSimulatePaperOrderClient:
     environment = TRD_ENV_SIMULATE
     source = "futu_simulate_paper_order_client"
@@ -49,6 +58,7 @@ class FutuSimulatePaperOrderClient:
         host: str,
         port: int,
         experiment_symbol_index: dict[tuple[str, str], str],
+        ambiguous_symbol_index: dict[tuple[str, str], list[str]] | None = None,
         context_factory: Callable[..., Any] = None,
         connectivity_checker: Callable[[str, int], bool] = None,
     ) -> None:
@@ -71,10 +81,19 @@ class FutuSimulatePaperOrderClient:
         self.host = host
         self.port = port
         self.experiment_symbol_index = experiment_symbol_index
+        self.ambiguous_symbol_index = ambiguous_symbol_index or {}
+        self.last_sync_diagnostics: dict[str, list[dict[str, Any]]] = {
+            "matched_orders": [],
+            "skipped_orders": [],
+        }
 
     def list_orders(self) -> list[dict[str, Any]]:
         accounts = self._simulate_accounts()
         orders: list[dict[str, Any]] = []
+        self.last_sync_diagnostics = {
+            "matched_orders": [],
+            "skipped_orders": [],
+        }
         for account in accounts:
             ret_code, data = self.context.order_list_query(
                 trd_env=TRD_ENV_SIMULATE,
@@ -89,9 +108,16 @@ class FutuSimulatePaperOrderClient:
                     error_type="order_query_failed",
                 )
             for record in _records(data):
-                order = _order_from_futu_record(record, self.experiment_symbol_index)
+                order, diagnostic = _classify_futu_order_record(
+                    record,
+                    self.experiment_symbol_index,
+                    self.ambiguous_symbol_index,
+                )
                 if order is not None:
                     orders.append(order)
+                    self.last_sync_diagnostics["matched_orders"].append(diagnostic)
+                else:
+                    self.last_sync_diagnostics["skipped_orders"].append(diagnostic)
         return orders
 
     def close(self) -> None:
@@ -194,6 +220,12 @@ def sync_kelly_paper_orders(
 
 
 def load_kelly_experiment_symbol_index(data_dir: Path) -> dict[tuple[str, str], str]:
+    return load_kelly_experiment_symbol_index_details(data_dir).unique
+
+
+def load_kelly_experiment_symbol_index_details(
+    data_dir: Path,
+) -> KellyExperimentSymbolIndexDetails:
     path = data_dir / "latest" / "kelly_experiments.json"
     with path.open(encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -222,11 +254,76 @@ def load_kelly_experiment_symbol_index(data_dir: Path) -> dict[tuple[str, str], 
             if key[0] and key[1]:
                 experiment_ids_by_symbol.setdefault(key, set()).add(experiment_id)
 
-    return {
+    unique = {
         key: next(iter(experiment_ids))
         for key, experiment_ids in experiment_ids_by_symbol.items()
         if len(experiment_ids) == 1
     }
+    ambiguous = {
+        key: sorted(experiment_ids)
+        for key, experiment_ids in experiment_ids_by_symbol.items()
+        if len(experiment_ids) > 1
+    }
+    return KellyExperimentSymbolIndexDetails(unique=unique, ambiguous=ambiguous)
+
+
+def build_kelly_paper_order_sync_report(
+    payload: dict[str, Any],
+    client: PaperOrderClient,
+) -> dict[str, Any]:
+    diagnostics = getattr(client, "last_sync_diagnostics", None)
+    if isinstance(diagnostics, dict):
+        matched_orders = [
+            copy.deepcopy(order)
+            for order in diagnostics.get("matched_orders", [])
+            if isinstance(order, dict)
+        ]
+        skipped_orders = [
+            copy.deepcopy(order)
+            for order in diagnostics.get("skipped_orders", [])
+            if isinstance(order, dict)
+        ]
+    else:
+        matched_orders = [
+            _matched_diagnostic_from_order(order)
+            for order in payload.get("orders", [])
+            if isinstance(order, dict)
+        ]
+        skipped_orders = []
+
+    counts = {
+        "matched": len(matched_orders),
+        "skipped_untracked_symbol": _count_skipped_reason(
+            skipped_orders,
+            "untracked_symbol",
+        ),
+        "skipped_ambiguous_symbol": _count_skipped_reason(
+            skipped_orders,
+            "ambiguous_symbol",
+        ),
+        "skipped_invalid_code": _count_skipped_reason(skipped_orders, "invalid_code"),
+        "orders_written": len(
+            [order for order in payload.get("orders", []) if isinstance(order, dict)]
+        ),
+    }
+    return {
+        "schema_version": PAPER_ORDER_SYNC_REPORT_SCHEMA_VERSION,
+        "environment": payload.get("environment", ""),
+        "source": payload.get("source", getattr(client, "source", "")),
+        "synced_at": payload.get("synced_at", ""),
+        "counts": counts,
+        "matched_orders": matched_orders,
+        "skipped_orders": skipped_orders,
+    }
+
+
+def write_kelly_paper_order_sync_report(
+    data_dir: Path,
+    report: dict[str, Any],
+) -> Path:
+    path = data_dir / "latest" / "kelly_paper_order_sync_report.json"
+    _write_json_atomic(path, report)
+    return path
 
 
 def _validated_orders(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -310,17 +407,36 @@ def _as_int(value: object, *, field_name: str) -> int:
         ) from exc
 
 
-def _order_from_futu_record(
+def _classify_futu_order_record(
     record: dict[str, object],
     experiment_symbol_index: dict[tuple[str, str], str],
-) -> dict[str, Any] | None:
+    ambiguous_symbol_index: dict[tuple[str, str], list[str]],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     market_symbol = _market_symbol_from_futu_code(record.get("code"))
+    order_id = _first_text(record, ("order_id", "orderid"))
     if market_symbol is None:
-        return None
+        return None, {
+            "code": str(record.get("code", "")).strip(),
+            "order_id": order_id,
+            "reason": "invalid_code",
+        }
+    market, symbol = market_symbol
+    if market_symbol in ambiguous_symbol_index:
+        return None, {
+            "market": market,
+            "symbol": symbol,
+            "order_id": order_id,
+            "reason": "ambiguous_symbol",
+            "experiment_ids": list(ambiguous_symbol_index[market_symbol]),
+        }
     experiment_id = experiment_symbol_index.get(market_symbol)
     if experiment_id is None:
-        return None
-    market, symbol = market_symbol
+        return None, {
+            "market": market,
+            "symbol": symbol,
+            "order_id": order_id,
+            "reason": "untracked_symbol",
+        }
     filled_qty = _first_text(record, ("dealt_qty", "filled_qty", "fill_qty"))
     avg_fill_price = _first_text(
         record,
@@ -329,7 +445,7 @@ def _order_from_futu_record(
     )
     if not avg_fill_price:
         avg_fill_price = "-"
-    return {
+    order = {
         "experiment_id": experiment_id,
         "market": market,
         "symbol": symbol,
@@ -345,7 +461,18 @@ def _order_from_futu_record(
         "status": _normalize_order_status(
             _first_text(record, ("order_status", "status")),
         ),
-        "order_id": _first_text(record, ("order_id", "orderid")),
+        "order_id": order_id,
+    }
+    return order, _matched_diagnostic_from_order(order)
+
+
+def _matched_diagnostic_from_order(order: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "market": str(order.get("market", "")).strip(),
+        "symbol": str(order.get("symbol", "")).strip(),
+        "order_id": str(order.get("order_id", "")).strip(),
+        "experiment_id": str(order.get("experiment_id", "")).strip(),
+        "reason": "matched",
     }
 
 
@@ -369,6 +496,10 @@ def _first_text(
         if value is not None and str(value).strip():
             return str(value).strip()
     return default
+
+
+def _count_skipped_reason(orders: list[dict[str, Any]], reason: str) -> int:
+    return sum(1 for order in orders if order.get("reason") == reason)
 
 
 def _normalize_side(value: str) -> str:

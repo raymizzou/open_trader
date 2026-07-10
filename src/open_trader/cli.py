@@ -29,9 +29,11 @@ from .kelly_paper_order_sync import (
     FakeFutuPaperOrderClient,
     FutuPaperOrderSyncError,
     FutuSimulatePaperOrderClient,
+    build_kelly_paper_order_sync_report,
     default_fake_kelly_paper_orders,
-    load_kelly_experiment_symbol_index,
+    load_kelly_experiment_symbol_index_details,
     sync_kelly_paper_orders,
+    write_kelly_paper_order_sync_report,
 )
 from .t_signal import TSignalInterpreter
 from .t_signal_futu import FutuTSignalMarketDataClient
@@ -673,6 +675,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--synced-at",
         help="Override sync timestamp for deterministic local demos",
     )
+    kelly_sync_paper_orders_parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Write a paper-order sync diagnostic report.",
+    )
     kelly_sync_paper_orders_parser.add_argument("--host", default="127.0.0.1")
     kelly_sync_paper_orders_parser.add_argument(
         "--port",
@@ -1269,18 +1276,26 @@ def main(argv: list[str] | None = None) -> int:
                     orders=default_fake_kelly_paper_orders(),
                 )
             else:
+                symbol_index_details = load_kelly_experiment_symbol_index_details(
+                    args.data_dir
+                )
                 client = FutuSimulatePaperOrderClient(
                     host=args.host,
                     port=args.port,
-                    experiment_symbol_index=load_kelly_experiment_symbol_index(
-                        args.data_dir
-                    ),
+                    experiment_symbol_index=symbol_index_details.unique,
+                    ambiguous_symbol_index=symbol_index_details.ambiguous,
                 )
             payload = sync_kelly_paper_orders(
                 data_dir=args.data_dir,
                 client=client,
                 synced_at=args.synced_at,
             )
+            if args.diagnose:
+                sync_report = build_kelly_paper_order_sync_report(payload, client)
+                sync_report_path = write_kelly_paper_order_sync_report(
+                    args.data_dir,
+                    sync_report,
+                )
         except (FileNotFoundError, ValueError, RuntimeError, FutuPaperOrderSyncError) as exc:
             parser.error(str(exc))
         finally:
@@ -1290,6 +1305,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"orders: {len(payload['orders'])}")
         print(f"synced_at: {payload['synced_at']}")
         print(f"latest: {args.data_dir / 'latest' / 'kelly_paper_orders.json'}")
+        if args.diagnose:
+            counts = sync_report["counts"]
+            print(f"matched: {counts['matched']}")
+            print(f"skipped_untracked_symbol: {counts['skipped_untracked_symbol']}")
+            print(f"skipped_ambiguous_symbol: {counts['skipped_ambiguous_symbol']}")
+            print(f"skipped_invalid_code: {counts['skipped_invalid_code']}")
+            print(f"sync_report: {sync_report_path}")
         return 0
 
     if args.command == "build-trading-plan":

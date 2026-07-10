@@ -55,6 +55,14 @@ def test_kelly_sync_paper_orders_parser_accepts_futu_simulate_mode() -> None:
     assert args.port == 11111
 
 
+def test_kelly_sync_paper_orders_parser_accepts_diagnose_mode() -> None:
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["kelly", "sync-paper-orders", "--fake", "--diagnose"])
+
+    assert args.diagnose is True
+
+
 def test_kelly_sync_paper_orders_fake_wires_sync_and_prints_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -107,6 +115,90 @@ def test_kelly_sync_paper_orders_fake_wires_sync_and_prints_summary(
     assert f"latest: {tmp_path / 'data/latest/kelly_paper_orders.json'}" in output
 
 
+def test_kelly_sync_paper_orders_diagnose_writes_report_and_prints_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    report_path = tmp_path / "data/latest/kelly_paper_order_sync_report.json"
+
+    def fake_default_orders() -> tuple[dict[str, object], ...]:
+        return (
+            {
+                "experiment_id": "trend_exp",
+                "market": "US",
+                "symbol": "RAM",
+                "side": "buy",
+                "order_id": "SIM-10001",
+            },
+        )
+
+    def fake_sync_kelly_paper_orders(**kwargs: object) -> dict[str, object]:
+        captured["sync_kwargs"] = kwargs
+        client = kwargs["client"]
+        return {
+            "environment": "SIMULATE",
+            "source": client.source,
+            "synced_at": kwargs["synced_at"],
+            "orders": client.list_orders(),
+        }
+
+    def fake_build_report(payload: object, client: object) -> dict[str, object]:
+        captured["report_payload"] = payload
+        captured["report_client"] = client
+        return {
+            "counts": {
+                "matched": 1,
+                "skipped_untracked_symbol": 2,
+                "skipped_ambiguous_symbol": 1,
+                "skipped_invalid_code": 0,
+                "orders_written": 1,
+            }
+        }
+
+    def fake_write_report(data_dir: Path, report: object) -> Path:
+        captured["report_data_dir"] = data_dir
+        captured["report"] = report
+        return report_path
+
+    monkeypatch.setattr(cli, "default_fake_kelly_paper_orders", fake_default_orders)
+    monkeypatch.setattr(cli, "sync_kelly_paper_orders", fake_sync_kelly_paper_orders)
+    monkeypatch.setattr(cli, "build_kelly_paper_order_sync_report", fake_build_report)
+    monkeypatch.setattr(cli, "write_kelly_paper_order_sync_report", fake_write_report)
+
+    result = cli.main(
+        [
+            "kelly",
+            "sync-paper-orders",
+            "--fake",
+            "--diagnose",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--synced-at",
+            "2026-07-10 09:30",
+        ]
+    )
+
+    assert result == 0
+    assert captured["report_data_dir"] == tmp_path / "data"
+    assert captured["report"] == {
+        "counts": {
+            "matched": 1,
+            "skipped_untracked_symbol": 2,
+            "skipped_ambiguous_symbol": 1,
+            "skipped_invalid_code": 0,
+            "orders_written": 1,
+        }
+    }
+    output = capsys.readouterr().out
+    assert "matched: 1" in output
+    assert "skipped_untracked_symbol: 2" in output
+    assert "skipped_ambiguous_symbol: 1" in output
+    assert "skipped_invalid_code: 0" in output
+    assert f"sync_report: {report_path}" in output
+
+
 def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -136,9 +228,13 @@ def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
         def close(self) -> None:
             closed.append(True)
 
-    def fake_load_index(data_dir: Path) -> dict[tuple[str, str], str]:
+    class FakeSymbolIndexDetails:
+        unique = {("US", "RAM"): "trend_exp"}
+        ambiguous: dict[tuple[str, str], list[str]] = {}
+
+    def fake_load_index(data_dir: Path) -> FakeSymbolIndexDetails:
         captured["index_data_dir"] = data_dir
-        return {("US", "RAM"): "trend_exp"}
+        return FakeSymbolIndexDetails()
 
     def fake_sync_kelly_paper_orders(**kwargs: object) -> dict[str, object]:
         captured.update(kwargs)
@@ -151,7 +247,11 @@ def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
         }
 
     monkeypatch.setattr(cli, "FutuSimulatePaperOrderClient", FakeFutuSimulateClient)
-    monkeypatch.setattr(cli, "load_kelly_experiment_symbol_index", fake_load_index)
+    monkeypatch.setattr(
+        cli,
+        "load_kelly_experiment_symbol_index_details",
+        fake_load_index,
+    )
     monkeypatch.setattr(cli, "sync_kelly_paper_orders", fake_sync_kelly_paper_orders)
 
     result = cli.main(
@@ -176,6 +276,7 @@ def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
         "host": "127.0.0.1",
         "port": 11111,
         "experiment_symbol_index": {("US", "RAM"): "trend_exp"},
+        "ambiguous_symbol_index": {},
     }
     assert captured["data_dir"] == tmp_path / "data"
     assert captured["synced_at"] == "2026-07-09 11:30"
