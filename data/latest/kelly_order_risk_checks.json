@@ -24,6 +24,16 @@
       "reason": "entry risk checks passed",
       "check_results": [
         {
+          "check": "experiment_market_matches_symbol",
+          "status": "passed",
+          "detail": "US == US"
+        },
+        {
+          "check": "budget_currency_matches_market",
+          "status": "passed",
+          "detail": "USD == USD"
+        },
+        {
           "check": "per_symbol_budget_positive",
           "status": "passed",
           "detail": "33333.33"
@@ -57,6 +67,16 @@
       "budget_currency": "HKD",
       "reason": "exit intent reduces exposure",
       "check_results": [
+        {
+          "check": "experiment_market_matches_symbol",
+          "status": "passed",
+          "detail": "HK == HK"
+        },
+        {
+          "check": "budget_currency_matches_market",
+          "status": "passed",
+          "detail": "HKD == HKD"
+        },
         {
           "check": "exit_default_allow",
           "status": "passed",

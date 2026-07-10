@@ -8,6 +8,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from .kelly_market_rules import kelly_market_currency, normalize_kelly_market
+
 
 ORDER_RISK_CHECKS_SCHEMA_VERSION = "open_trader.kelly_order_risk_checks.v1"
 ORDER_INTENTS_SCHEMA_VERSION = "open_trader.kelly_order_intents.v1"
@@ -98,6 +100,18 @@ def _build_single_check(
     side = str(intent.get("side", "")).strip().lower()
     intent_type = str(intent.get("intent_type", "")).strip().lower()
     budget_currency = str(intent.get("budget_currency", "")).strip()
+    market_scope_results = _market_scope_check_results(intent)
+
+    if any(result["status"] == "failed" for result in market_scope_results):
+        return {
+            **base,
+            "risk_status": "blocked",
+            "execution_status": "risk_blocked",
+            "planned_notional": "",
+            "budget_currency": budget_currency,
+            "reason": "market scope checks failed",
+            "check_results": market_scope_results,
+        }
 
     if side == "sell" or intent_type == "exit":
         return {
@@ -108,6 +122,7 @@ def _build_single_check(
             "budget_currency": budget_currency,
             "reason": "exit intent reduces exposure",
             "check_results": [
+                *market_scope_results,
                 {
                     "check": "exit_default_allow",
                     "status": "passed",
@@ -119,6 +134,7 @@ def _build_single_check(
     budget = _parse_positive_decimal(intent.get("per_symbol_budget"))
     position_pct = _parse_positive_decimal(intent.get("suggested_position_pct"))
     check_results = [
+        *market_scope_results,
         {
             "check": "per_symbol_budget_positive",
             "status": "passed" if budget is not None else "failed",
@@ -167,6 +183,55 @@ def _build_single_check(
         ),
         "check_results": check_results,
     }
+
+
+def _market_scope_check_results(intent: dict[str, Any]) -> list[dict[str, str]]:
+    try:
+        experiment_market = normalize_kelly_market(intent.get("experiment_market"))
+    except ValueError:
+        return [
+            {
+                "check": "experiment_market_present",
+                "status": "failed",
+                "detail": _field_text(intent.get("experiment_market")),
+            }
+        ]
+
+    try:
+        symbol_market = normalize_kelly_market(intent.get("market"))
+    except ValueError:
+        return [
+            {
+                "check": "experiment_market_present",
+                "status": "failed",
+                "detail": _field_text(intent.get("market")),
+            }
+        ]
+
+    budget_currency = str(intent.get("budget_currency", "")).strip().upper()
+    market_currency = kelly_market_currency(symbol_market)
+    market_matches = symbol_market == experiment_market
+    currency_matches = budget_currency == market_currency
+    return [
+        {
+            "check": "experiment_market_matches_symbol",
+            "status": "passed" if market_matches else "failed",
+            "detail": (
+                f"{symbol_market} == {experiment_market}"
+                if market_matches
+                else f"{symbol_market} != {experiment_market}"
+            ),
+        },
+        {
+            "check": "budget_currency_matches_market",
+            "status": "passed" if currency_matches else "failed",
+            "detail": (
+                f"{budget_currency} == {market_currency}"
+                if currency_matches
+                else f"{budget_currency} != {market_currency}"
+            ),
+        },
+    ]
 
 
 def _base_check(intent: dict[str, Any], *, checked_at: str) -> dict[str, str]:
