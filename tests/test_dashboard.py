@@ -656,6 +656,7 @@ def test_load_dashboard_state_attaches_latest_backtest_result(
                 "market": "US",
                 "symbol": "VIXY",
                 "strategy": "trading_plan",
+                "adapter": "backtrader",
                 "metrics": {
                     "total_return_pct": "-2.00",
                     "win_rate_pct": "33.33",
@@ -675,6 +676,7 @@ def test_load_dashboard_state_attaches_latest_backtest_result(
                 "market": "US",
                 "symbol": "VIXY",
                 "strategy": "trading_plan",
+                "adapter": "backtrader",
                 "metrics": {
                     "total_return_pct": "1.17",
                     "win_rate_pct": "50.00",
@@ -685,8 +687,29 @@ def test_load_dashboard_state_attaches_latest_backtest_result(
         ),
         encoding="utf-8",
     )
-    (latest_dir / "trades.csv").write_text("symbol,side\nVIXY,BUY\n", encoding="utf-8")
-    (latest_dir / "equity_curve.csv").write_text("date,equity\n2026-06-18,10000\n", encoding="utf-8")
+    (latest_dir / "trades.csv").write_text(
+        "\n".join(
+            [
+                "run_id,run_date,date,market,symbol,side,price,quantity,notional,fees,cash_after,reason",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-18,2026-06-19,US,VIXY,BUY,40.2000,621,24964.20,24.96,75010.84,entry_zone",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-18,2026-06-20,US,VIXY,SELL,47.9760,621,29793.10,29.79,104774.15,target_1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "equity_curve.csv").write_text(
+        "\n".join(
+            [
+                "run_id,date,cash,position_quantity,close,equity,drawdown_pct",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-18,100000.00,0,45.0000,100000.00,0.00",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-19,75010.84,621,42.0000,101092.84,0.00",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-20,104774.15,0,48.0000,104774.15,0.00",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     report_path = config.reports_dir / "backtests" / "2026-06-18-US-VIXY-trading-plan.md"
     report_path.parent.mkdir(parents=True)
     report_path.write_text("# VIXY 回测\n", encoding="utf-8")
@@ -701,6 +724,7 @@ def test_load_dashboard_state_attaches_latest_backtest_result(
         "market": "US",
         "symbol": "VIXY",
         "strategy": "trading_plan",
+        "adapter": "backtrader",
         "metrics": {
             "total_return_pct": "1.17",
             "win_rate_pct": "50.00",
@@ -710,6 +734,65 @@ def test_load_dashboard_state_attaches_latest_backtest_result(
         "metrics_path": str(latest_dir / "metrics.json"),
         "trades_path": str(latest_dir / "trades.csv"),
         "equity_curve_path": str(latest_dir / "equity_curve.csv"),
+        "trades": [
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "run_date": "2026-06-18",
+                "date": "2026-06-19",
+                "market": "US",
+                "symbol": "VIXY",
+                "side": "BUY",
+                "price": "40.2000",
+                "quantity": "621",
+                "notional": "24964.20",
+                "fees": "24.96",
+                "cash_after": "75010.84",
+                "reason": "entry_zone",
+            },
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "run_date": "2026-06-18",
+                "date": "2026-06-20",
+                "market": "US",
+                "symbol": "VIXY",
+                "side": "SELL",
+                "price": "47.9760",
+                "quantity": "621",
+                "notional": "29793.10",
+                "fees": "29.79",
+                "cash_after": "104774.15",
+                "reason": "target_1",
+            },
+        ],
+        "equity_curve": [
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "date": "2026-06-18",
+                "cash": "100000.00",
+                "position_quantity": "0",
+                "close": "45.0000",
+                "equity": "100000.00",
+                "drawdown_pct": "0.00",
+            },
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "date": "2026-06-19",
+                "cash": "75010.84",
+                "position_quantity": "621",
+                "close": "42.0000",
+                "equity": "101092.84",
+                "drawdown_pct": "0.00",
+            },
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "date": "2026-06-20",
+                "cash": "104774.15",
+                "position_quantity": "0",
+                "close": "48.0000",
+                "equity": "104774.15",
+                "drawdown_pct": "0.00",
+            },
+        ],
         "report_path": str(report_path),
         "status": "ok",
         "error": "",

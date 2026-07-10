@@ -116,6 +116,7 @@ def test_run_backtest_uses_trading_plan_after_run_date_and_writes_artifacts(
     )
 
     assert result.run_id == "2026-06-16-US-MSFT-trading-plan"
+    assert result.adapter == "backtrader"
     assert result.trade_count == 2
     assert result.metrics_path == (
         data_dir / "backtests/2026-06-16-US-MSFT-trading-plan/metrics.json"
@@ -137,6 +138,7 @@ def test_run_backtest_uses_trading_plan_after_run_date_and_writes_artifacts(
     metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
     assert metrics["schema_version"] == BACKTEST_METRICS_SCHEMA_VERSION
     assert metrics["run_id"] == result.run_id
+    assert metrics["adapter"] == "backtrader"
     assert metrics["initial_cash"] == "100000.00"
     assert metrics["trade_count"] == 2
     assert metrics["round_trips"] == 1
@@ -158,6 +160,7 @@ def test_run_backtest_uses_trading_plan_after_run_date_and_writes_artifacts(
     report = result.report_path.read_text(encoding="utf-8")
     assert "# Backtest - 2026-06-16-US-MSFT-trading-plan" in report
     assert "标的：US.MSFT" in report
+    assert "执行后端：backtrader" in report
     assert "交易次数：2" in report
 
 

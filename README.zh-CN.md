@@ -290,13 +290,15 @@ promotion。
   --prices data/prices/US/MSFT.csv \
   --symbol MSFT \
   --market US \
-  --date 2026-06-16
+  --date 2026-06-16 \
+  --adapter backtrader
 ```
 
 第一版回测策略刻意保持窄边界：只使用选中 `trading_plan.csv` 行里的 entry zone、
 stop loss、targets 和 max weight；从 plan 日期之后的日线开始评估；计入手续费和
 滑点；输出独立产物到 `data/backtests/<run_id>/`，并在 `reports/backtests/`
-写 Markdown 报告。该命令不会下单，也不会更新 `data/latest`。
+写 Markdown 报告。默认执行后端是 `backtrader`，也保留 `simple` 作为本地回退。
+该命令不会下单，也不会更新 `data/latest`。
 
 ### 部署本机前端仪表盘
 

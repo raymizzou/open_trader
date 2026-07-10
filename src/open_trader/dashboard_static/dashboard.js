@@ -878,6 +878,7 @@ function renderBacktestDetail(holding) {
           ${renderBacktestMetric("交易次数", metrics.trade_count)}
         </div>
       </section>
+      ${renderBacktestVisualReport(backtest)}
       <section class="detail-section backtest-section">
         <h3>输出文件</h3>
         <dl class="detail-dl backtest-output-list">
@@ -890,6 +891,244 @@ function renderBacktestDetail(holding) {
       ${renderBacktestReadiness(holding)}
     </div>
   `;
+}
+
+function renderBacktestVisualReport(backtest) {
+  const equityRows = Array.isArray(backtest.equity_curve) ? backtest.equity_curve : [];
+  const trades = Array.isArray(backtest.trades) ? backtest.trades : [];
+  if (!equityRows.length && !trades.length) {
+    return `
+      <section class="detail-section backtest-section">
+        <h3>可视化报告</h3>
+        <p class="muted-copy">暂无可视化数据。生成 trades.csv 和 equity_curve.csv 后会显示权益曲线、价格走势和交易明细。</p>
+      </section>
+    `;
+  }
+  return `
+    <div class="backtest-visual-grid">
+      <section class="detail-section backtest-section backtest-chart-section">
+        <div class="backtest-chart-header">
+          <div>
+            <h3>权益曲线</h3>
+            <p class="muted-copy">从初始资金到最终权益，叠加 BUY/SELL 标记。</p>
+          </div>
+        </div>
+        ${renderBacktestEquityChart(equityRows, trades)}
+      </section>
+      <section class="detail-section backtest-section backtest-chart-section">
+        <div class="backtest-chart-header">
+          <div>
+            <h3>价格走势与买卖点</h3>
+            <p class="muted-copy">使用回测权益曲线里的 close 字段定位价格走势。</p>
+          </div>
+        </div>
+        ${renderBacktestPriceChart(equityRows, trades)}
+      </section>
+    </div>
+    ${renderBacktestTradesTable(trades)}
+  `;
+}
+
+function renderBacktestEquityChart(rows, trades) {
+  const points = backtestChartPoints(rows, "equity", 720, 260);
+  if (!points.length) {
+    return `<p class="muted-copy">暂无权益曲线数据。</p>`;
+  }
+  return `
+    <div class="backtest-chart-wrap">
+      <svg viewBox="0 0 720 260" role="img" aria-label="权益曲线">
+        ${renderBacktestGrid()}
+        <path class="backtest-area-line" d="${escapeHtml(backtestAreaPath(points, 224))}"></path>
+        <path class="backtest-equity-line" d="${escapeHtml(backtestLinePath(points))}"></path>
+        ${backtestTradeMarkers(points, trades, "equity")}
+        ${renderBacktestAxisLabels(points, "equity")}
+      </svg>
+    </div>
+  `;
+}
+
+function renderBacktestPriceChart(rows, trades) {
+  const points = backtestChartPoints(rows, "close", 720, 260);
+  if (!points.length) {
+    return `<p class="muted-copy">暂无价格走势数据。</p>`;
+  }
+  return `
+    <div class="backtest-chart-wrap">
+      <svg viewBox="0 0 720 260" role="img" aria-label="价格走势与买卖点">
+        ${renderBacktestGrid()}
+        <path class="backtest-price-line" d="${escapeHtml(backtestLinePath(points))}"></path>
+        ${backtestTradeMarkers(points, trades, "price")}
+        ${renderBacktestAxisLabels(points, "close")}
+      </svg>
+    </div>
+  `;
+}
+
+function renderBacktestGrid() {
+  return `
+    <line class="backtest-grid-line" x1="58" y1="34" x2="684" y2="34"></line>
+    <line class="backtest-grid-line" x1="58" y1="98" x2="684" y2="98"></line>
+    <line class="backtest-grid-line" x1="58" y1="162" x2="684" y2="162"></line>
+    <line class="backtest-axis-line" x1="58" y1="224" x2="684" y2="224"></line>
+    <line class="backtest-axis-line" x1="58" y1="24" x2="58" y2="224"></line>
+  `;
+}
+
+function backtestChartPoints(rows, field, width, height) {
+  const values = rows
+    .map((row) => ({
+      date: formatPlain(row.date),
+      value: numericMetric(row[field]),
+    }))
+    .filter((row) => hasValue(row.date) && Number.isFinite(row.value));
+  if (!values.length) {
+    return [];
+  }
+  const left = 58;
+  const right = width - 36;
+  const top = 24;
+  const bottom = height - 36;
+  const minValue = Math.min(...values.map((row) => row.value));
+  const maxValue = Math.max(...values.map((row) => row.value));
+  const spread = maxValue - minValue || Math.max(Math.abs(maxValue), 1);
+  return values.map((row, index) => {
+    const ratioX = values.length === 1 ? 0.5 : index / (values.length - 1);
+    const ratioY = (row.value - minValue) / spread;
+    return {
+      ...row,
+      x: left + ratioX * (right - left),
+      y: bottom - ratioY * (bottom - top),
+      label: row.date.slice(5) || row.date,
+    };
+  });
+}
+
+function numericMetric(value) {
+  if (value === null || value === undefined) {
+    return NaN;
+  }
+  const parsed = Number(String(value).replace(/[%,$]/g, "").trim());
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function backtestLinePath(points) {
+  return points
+    .map((point, index) => `${index === 0 ? "M" : "L"}${numberForSvg(point.x)} ${numberForSvg(point.y)}`)
+    .join(" ");
+}
+
+function backtestAreaPath(points, baseline) {
+  if (!points.length) {
+    return "";
+  }
+  return `${backtestLinePath(points)} L${numberForSvg(points[points.length - 1].x)} ${baseline} L${numberForSvg(points[0].x)} ${baseline} Z`;
+}
+
+function backtestTradeMarkers(points, trades, mode) {
+  if (!points.length || !Array.isArray(trades)) {
+    return "";
+  }
+  const pointsByDate = new Map(points.map((point) => [point.date, point]));
+  return trades
+    .map((trade) => {
+      const point = pointsByDate.get(formatPlain(trade.date));
+      if (!point) {
+        return "";
+      }
+      const side = String(trade.side || "").toUpperCase();
+      const klass = side === "SELL" ? "backtest-marker-sell" : "backtest-marker-buy";
+      const label = mode === "price" ? formatPlain(trade.price) : side;
+      return `
+        <circle class="${klass}" cx="${numberForSvg(point.x)}" cy="${numberForSvg(point.y)}" r="7"></circle>
+        <text class="backtest-chart-label" x="${numberForSvg(Math.min(point.x + 10, 610))}" y="${numberForSvg(Math.max(point.y - 10, 20))}">${escapeHtml(side)} ${escapeHtml(label)}</text>
+      `;
+    })
+    .join("");
+}
+
+function renderBacktestAxisLabels(points, field) {
+  if (!points.length) {
+    return "";
+  }
+  const first = points[0];
+  const last = points[points.length - 1];
+  const high = points.reduce((current, point) => (point.value > current.value ? point : current), first);
+  return `
+    <text class="backtest-axis-label" x="62" y="246">${escapeHtml(first.label)}</text>
+    <text class="backtest-axis-label" x="${numberForSvg(Math.max(last.x - 34, 62))}" y="246">${escapeHtml(last.label)}</text>
+    <text class="backtest-axis-label" x="64" y="42">${escapeHtml(backtestCompactNumber(high.value, field))}</text>
+  `;
+}
+
+function renderBacktestTradesTable(trades) {
+  if (!Array.isArray(trades) || !trades.length) {
+    return `
+      <section class="detail-section backtest-section">
+        <h3>交易明细</h3>
+        <p class="muted-copy">暂无交易明细。</p>
+      </section>
+    `;
+  }
+  return `
+    <section class="detail-section backtest-section">
+      <div class="backtest-chart-header">
+        <div>
+          <h3>交易明细</h3>
+          <p class="muted-copy">trades.csv 内容直接展示，便于审计成交假设。</p>
+        </div>
+        <span class="status-pill status-ok">${escapeHtml(String(trades.length))} rows</span>
+      </div>
+      <div class="backtest-table-scroll">
+        <table class="backtest-trades-table">
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>方向</th>
+              <th>价格</th>
+              <th>数量</th>
+              <th>手续费</th>
+              <th>现金</th>
+              <th>原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${trades.map(renderBacktestTradeRow).join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderBacktestTradeRow(trade) {
+  const side = String(trade.side || "").toUpperCase();
+  const tone = side === "SELL" ? "status-partial" : "status-ok";
+  return `
+    <tr>
+      <td>${escapeHtml(formatPlain(trade.date))}</td>
+      <td><span class="status-pill ${tone}">${escapeHtml(side || "-")}</span></td>
+      <td>${escapeHtml(formatPlain(trade.price))}</td>
+      <td>${escapeHtml(formatPlain(trade.quantity))}</td>
+      <td>${escapeHtml(formatPlain(trade.fees))}</td>
+      <td>${escapeHtml(formatPlain(trade.cash_after))}</td>
+      <td>${escapeHtml(formatPlain(trade.reason))}</td>
+    </tr>
+  `;
+}
+
+function numberForSvg(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed.toFixed(2) : "0";
+}
+
+function backtestCompactNumber(value, field) {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+  if (field === "equity" && Math.abs(value) >= 1000) {
+    return `${(value / 1000).toFixed(1)}k`;
+  }
+  return value.toFixed(2);
 }
 
 function renderBacktestReadiness(holding) {
@@ -1061,13 +1300,27 @@ async function fetchBacktestPricesForHolding(detailKey) {
 function backtestSummaryText(backtest) {
   const runDate = formatPlain(backtest.run_date);
   const strategy = backtestStrategyLabel(backtest.strategy);
-  return [runDate, strategy, formatPlain(backtest.run_id)]
+  const adapter = backtestAdapterLabel(backtest.adapter);
+  return [runDate, strategy, adapter, formatPlain(backtest.run_id)]
     .filter((part) => hasValue(part) && part !== "-")
     .join(" · ") || "交易计划回测结果";
 }
 
 function backtestStrategyLabel(strategy) {
   return strategy === "trading_plan" ? "交易计划回测" : formatPlain(strategy);
+}
+
+function backtestAdapterLabel(adapter) {
+  if (adapter === "backtrader") {
+    return "Backtrader";
+  }
+  if (adapter === "simple") {
+    return "Simple";
+  }
+  if (adapter === "legacy") {
+    return "Legacy";
+  }
+  return formatPlain(adapter);
 }
 
 function renderBacktestMetric(label, value) {

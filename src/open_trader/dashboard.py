@@ -481,6 +481,7 @@ def _backtest_detail(metrics_path: Path, reports_dir: Path) -> dict[str, Any] | 
         "market": market,
         "symbol": symbol,
         "strategy": str(payload.get("strategy", "trading_plan")).strip() or "trading_plan",
+        "adapter": str(payload.get("adapter", "legacy")).strip() or "legacy",
         "metrics": {
             key: str(metrics.get(key, ""))
             for key in metric_keys
@@ -489,10 +490,24 @@ def _backtest_detail(metrics_path: Path, reports_dir: Path) -> dict[str, Any] | 
         "metrics_path": str(metrics_path),
         "trades_path": str(metrics_path.parent / "trades.csv"),
         "equity_curve_path": str(metrics_path.parent / "equity_curve.csv"),
+        "trades": _backtest_csv_rows(metrics_path.parent / "trades.csv"),
+        "equity_curve": _backtest_csv_rows(metrics_path.parent / "equity_curve.csv"),
         "report_path": str(report_path),
         "status": "ok",
         "error": "",
     }
+
+
+def _backtest_csv_rows(path: Path) -> list[dict[str, str]]:
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            return [
+                {str(key): str(value or "") for key, value in row.items()}
+                for row in csv.DictReader(handle)
+                if row
+            ]
+    except OSError:
+        return []
 
 
 def _backtest_sort_key(detail: dict[str, Any]) -> tuple[str, str]:

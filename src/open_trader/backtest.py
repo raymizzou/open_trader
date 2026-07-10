@@ -7,6 +7,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Protocol
 
 from .market_scope import parse_market_scope
 from .trading_plan import TradingPlanRow, load_trading_plan_rows
@@ -46,6 +47,7 @@ class BacktestResult:
     run_date: str
     market: str
     symbol: str
+    adapter: str
     trade_count: int
     final_equity: Decimal
     total_return_pct: Decimal
@@ -81,6 +83,130 @@ class BacktestExecution:
     reason: str
 
 
+class TradingPlanBacktestAdapter(Protocol):
+    name: str
+
+    def run(
+        self,
+        *,
+        run_id: str,
+        plan: TradingPlanRow,
+        effective_run_date: str,
+        prices_path: Path,
+        initial_cash: Decimal,
+        commission_bps: Decimal,
+        slippage_bps: Decimal,
+    ) -> tuple[list[BacktestExecution], list[dict[str, str]]]:
+        ...
+
+
+class SimpleTradingPlanAdapter:
+    name = "simple"
+
+    def run(
+        self,
+        *,
+        run_id: str,
+        plan: TradingPlanRow,
+        effective_run_date: str,
+        prices_path: Path,
+        initial_cash: Decimal,
+        commission_bps: Decimal,
+        slippage_bps: Decimal,
+    ) -> tuple[list[BacktestExecution], list[dict[str, str]]]:
+        bars = _read_price_bars(prices_path)
+        if not bars:
+            raise ValueError("price CSV has no rows")
+        return _simulate_trading_plan(
+            run_id=run_id,
+            plan=plan,
+            effective_run_date=effective_run_date,
+            bars=bars,
+            initial_cash=initial_cash,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+        )
+
+
+class BacktraderTradingPlanAdapter:
+    name = "backtrader"
+
+    def run(
+        self,
+        *,
+        run_id: str,
+        plan: TradingPlanRow,
+        effective_run_date: str,
+        prices_path: Path,
+        initial_cash: Decimal,
+        commission_bps: Decimal,
+        slippage_bps: Decimal,
+    ) -> tuple[list[BacktestExecution], list[dict[str, str]]]:
+        try:
+            import backtrader as bt
+        except ImportError as exc:
+            raise ValueError("backtrader adapter requires the backtrader package") from exc
+
+        class TradingPlanStrategy(bt.Strategy):  # type: ignore[misc]
+            params = (
+                ("run_id", run_id),
+                ("plan", plan),
+                ("effective_run_date", effective_run_date),
+                ("initial_cash", initial_cash),
+                ("commission_bps", commission_bps),
+                ("slippage_bps", slippage_bps),
+            )
+
+            def __init__(self) -> None:
+                self.bars: list[PriceBar] = []
+                self.trades: list[BacktestExecution] = []
+                self.equity_rows: list[dict[str, str]] = []
+
+            def next(self) -> None:
+                self.bars.append(
+                    PriceBar(
+                        date=bt.num2date(self.data.datetime[0]).date().isoformat(),
+                        open=Decimal(str(self.data.open[0])),
+                        high=Decimal(str(self.data.high[0])),
+                        low=Decimal(str(self.data.low[0])),
+                        close=Decimal(str(self.data.close[0])),
+                    )
+                )
+
+            def stop(self) -> None:
+                self.trades, self.equity_rows = _simulate_trading_plan(
+                    run_id=self.p.run_id,
+                    plan=self.p.plan,
+                    effective_run_date=self.p.effective_run_date,
+                    bars=self.bars,
+                    initial_cash=self.p.initial_cash,
+                    commission_bps=self.p.commission_bps,
+                    slippage_bps=self.p.slippage_bps,
+                )
+
+        cerebro = bt.Cerebro(stdstats=False)
+        data = bt.feeds.GenericCSVData(
+            dataname=str(prices_path),
+            dtformat="%Y-%m-%d",
+            datetime=0,
+            open=1,
+            high=2,
+            low=3,
+            close=4,
+            volume=-1,
+            openinterest=-1,
+        )
+        cerebro.adddata(data)
+        cerebro.addstrategy(TradingPlanStrategy)
+        strategies = cerebro.run()
+        if not strategies:
+            raise ValueError("backtrader adapter produced no strategy result")
+        strategy = strategies[0]
+        if not strategy.bars:
+            raise ValueError("price CSV has no rows")
+        return strategy.trades, strategy.equity_rows
+
+
 def run_backtest(
     *,
     plan_path: Path,
@@ -93,6 +219,7 @@ def run_backtest(
     initial_cash: Decimal,
     commission_bps: Decimal,
     slippage_bps: Decimal,
+    adapter: str = "backtrader",
 ) -> BacktestResult:
     market_scope = parse_market_scope(market)
     normalized_symbol = symbol.strip().upper()
@@ -108,16 +235,15 @@ def run_backtest(
         market=market_scope.value,
         symbol=normalized_symbol,
     )
-    bars = _read_price_bars(prices_path)
-    if not bars:
-        raise ValueError("price CSV has no rows")
+    adapter_impl = _backtest_adapter(adapter)
+    adapter_name = adapter_impl.name
 
     run_id = f"{run_date}-{market_scope.value}-{normalized_symbol}-trading-plan"
-    trades, equity_rows = _simulate_trading_plan(
+    trades, equity_rows = adapter_impl.run(
         run_id=run_id,
         plan=plan,
         effective_run_date=run_date,
-        bars=bars,
+        prices_path=prices_path,
         initial_cash=initial_cash,
         commission_bps=commission_bps,
         slippage_bps=slippage_bps,
@@ -127,6 +253,7 @@ def run_backtest(
         run_date=run_date,
         market=market_scope.value,
         symbol=normalized_symbol,
+        adapter=adapter_name,
         initial_cash=initial_cash,
         trades=trades,
         equity_rows=equity_rows,
@@ -147,6 +274,7 @@ def run_backtest(
         run_date=run_date,
         market=market_scope.value,
         symbol=normalized_symbol,
+        adapter=adapter_name,
         trade_count=len(trades),
         final_equity=Decimal(metrics["final_equity"]),
         total_return_pct=Decimal(metrics["total_return_pct"]),
@@ -156,6 +284,15 @@ def run_backtest(
         equity_curve_path=equity_curve_path,
         report_path=report_path,
     )
+
+
+def _backtest_adapter(name: str) -> TradingPlanBacktestAdapter:
+    normalized = name.strip().lower()
+    if normalized in {"", "backtrader"}:
+        return BacktraderTradingPlanAdapter()
+    if normalized in {"simple", "local"}:
+        return SimpleTradingPlanAdapter()
+    raise ValueError(f"unsupported backtest adapter: {name}")
 
 
 def _select_plan(
@@ -416,6 +553,7 @@ def _build_metrics(
     run_date: str,
     market: str,
     symbol: str,
+    adapter: str,
     initial_cash: Decimal,
     trades: list[BacktestExecution],
     equity_rows: list[dict[str, str]],
@@ -445,6 +583,7 @@ def _build_metrics(
         "market": market,
         "symbol": symbol,
         "strategy": "trading_plan",
+        "adapter": adapter,
         "initial_cash": _money(initial_cash),
         "final_equity": _money(final_equity),
         "total_return_pct": _percent(total_return_pct),
@@ -495,6 +634,7 @@ def _render_report(
         "",
         f"标的：{metrics['market']}.{metrics['symbol']}",
         "策略：trading_plan",
+        f"执行后端：{metrics['adapter']}",
         f"初始资金：{metrics['initial_cash']}",
         f"最终权益：{metrics['final_equity']}",
         f"总收益率：{metrics['total_return_pct']}%",

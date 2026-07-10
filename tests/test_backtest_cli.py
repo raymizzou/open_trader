@@ -91,6 +91,7 @@ def test_run_backtest_main_wires_pipeline_and_prints_summary(
             run_date="2026-06-16",
             market="US",
             symbol="MSFT",
+            adapter="backtrader",
             trade_count=2,
             final_equity=Decimal("101184.58"),
             total_return_pct=Decimal("1.18"),
@@ -141,11 +142,13 @@ def test_run_backtest_main_wires_pipeline_and_prints_summary(
         "initial_cash": Decimal("50000"),
         "commission_bps": Decimal("8"),
         "slippage_bps": Decimal("3"),
+        "adapter": "backtrader",
     }
 
     output = capsys.readouterr().out
     assert "run_id: 2026-06-16-US-MSFT-trading-plan" in output
     assert "run_date: 2026-06-16" in output
+    assert "adapter: backtrader" in output
     assert "trades: 2" in output
     assert "final_equity: 101184.58" in output
     assert "total_return_pct: 1.18" in output

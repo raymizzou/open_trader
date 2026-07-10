@@ -2805,12 +2805,38 @@ state.dashboard = {
       market: "US",
       symbol: "VIXY",
       strategy: "trading_plan",
+      adapter: "backtrader",
       metrics: {
         total_return_pct: "1.17",
         win_rate_pct: "50.00",
         max_drawdown_pct: "-3.40",
         trade_count: "2",
       },
+      trades: [
+        {
+          date: "2026-06-19",
+          side: "BUY",
+          price: "40.2000",
+          quantity: "621",
+          fees: "24.96",
+          cash_after: "75010.84",
+          reason: "entry_zone",
+        },
+        {
+          date: "2026-06-20",
+          side: "SELL",
+          price: "47.9760",
+          quantity: "621",
+          fees: "29.79",
+          cash_after: "104774.15",
+          reason: "target_1",
+        },
+      ],
+      equity_curve: [
+        { date: "2026-06-18", close: "45.0000", equity: "100000.00", drawdown_pct: "0.00" },
+        { date: "2026-06-19", close: "42.0000", equity: "101092.84", drawdown_pct: "0.00" },
+        { date: "2026-06-20", close: "48.0000", equity: "104774.15", drawdown_pct: "0.00" },
+      ],
       report_path: "reports/backtests/2026-06-18-US-VIXY-trading-plan.md",
       trades_path: "data/backtests/2026-06-18-US-VIXY-trading-plan/trades.csv",
       equity_curve_path: "data/backtests/2026-06-18-US-VIXY-trading-plan/equity_curve.csv",
@@ -2831,10 +2857,13 @@ state.selectedHoldingKey = holdingKey(state.dashboard.holdings[0], 0);
 state.selectedHoldingDetail = "backtest";
 renderHoldings();
 html = elements["holdings-body"].innerHTML;
-for (const required of ["回测详情 · US.VIXY", "总收益", "1.17%", "胜率", "50.00%", "最大回撤", "-3.40%", "交易次数", "2", "reports/backtests/2026-06-18-US-VIXY-trading-plan.md"]) {
+for (const required of ["回测详情 · US.VIXY", "Backtrader", "总收益", "1.17%", "胜率", "50.00%", "最大回撤", "-3.40%", "交易次数", "2", "权益曲线", "价格走势与买卖点", "交易明细", "<svg", "BUY", "SELL", "entry_zone", "target_1", "reports/backtests/2026-06-18-US-VIXY-trading-plan.md"]) {
   if (!html.includes(required)) {
     throw new Error("backtest detail missing " + required + ": " + html);
   }
+}
+if ((html.match(/回测准备/g) || []).length !== 1) {
+  throw new Error("backtest readiness should render once: " + html);
 }
 console.log(html);
 """
@@ -2930,6 +2959,7 @@ loadDashboard = async () => {
     market: "US",
     symbol: "VIXY",
     strategy: "trading_plan",
+    adapter: "backtrader",
     metrics: {
       total_return_pct: "1.17",
       win_rate_pct: "50.00",
@@ -3332,6 +3362,7 @@ def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> N
 
     assert payload["status"] == "ok"
     assert payload["backtest"]["run_id"] == "2026-06-18-US-VIXY-trading-plan"
+    assert payload["backtest"]["adapter"] == "backtrader"
     assert payload["backtest"]["metrics"]["trade_count"] == "2"
     vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
     assert vixy["backtest"]["available"] is True

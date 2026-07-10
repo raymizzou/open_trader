@@ -775,6 +775,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=non_negative_decimal,
         default=Decimal("5"),
     )
+    backtest_parser.add_argument(
+        "--adapter",
+        choices=["backtrader", "simple"],
+        default="backtrader",
+        help="Backtest execution adapter",
+    )
 
     dashboard_parser = subparsers.add_parser(
         "dashboard",
@@ -1393,6 +1399,7 @@ def main(argv: list[str] | None = None) -> int:
                 initial_cash=args.initial_cash,
                 commission_bps=args.commission_bps,
                 slippage_bps=args.slippage_bps,
+                adapter=args.adapter,
             )
         except (FileNotFoundError, ValueError) as exc:
             parser.error(str(exc))
@@ -1400,6 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"run_date: {result.run_date}")
         print(f"market: {result.market}")
         print(f"symbol: {result.symbol}")
+        print(f"adapter: {result.adapter}")
         print(f"trades: {result.trade_count}")
         print(f"final_equity: {result.final_equity}")
         print(f"total_return_pct: {result.total_return_pct}")

@@ -66,6 +66,7 @@ def build_backtest_run_payload(
         initial_cash=_decimal_request_value(request, "initial_cash", "100000"),
         commission_bps=_decimal_request_value(request, "commission_bps", "10"),
         slippage_bps=_decimal_request_value(request, "slippage_bps", "5"),
+        adapter=str(request.get("adapter") or "backtrader"),
     )
     backtest = _dashboard_backtest_for_holding(config, market=market, symbol=symbol)
     return {
