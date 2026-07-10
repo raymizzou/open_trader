@@ -236,6 +236,15 @@ def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
         captured["index_data_dir"] = data_dir
         return FakeSymbolIndexDetails()
 
+    def fake_load_links(data_dir: Path) -> dict[str, dict[str, object]]:
+        captured["links_data_dir"] = data_dir
+        return {
+            "SIM-10001": {
+                "futu_order_id": "SIM-10001",
+                "experiment_id": "trend_exp",
+            }
+        }
+
     def fake_sync_kelly_paper_orders(**kwargs: object) -> dict[str, object]:
         captured.update(kwargs)
         client = kwargs["client"]
@@ -252,6 +261,7 @@ def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
         "load_kelly_experiment_symbol_index_details",
         fake_load_index,
     )
+    monkeypatch.setattr(cli, "load_kelly_order_links", fake_load_links)
     monkeypatch.setattr(cli, "sync_kelly_paper_orders", fake_sync_kelly_paper_orders)
 
     result = cli.main(
@@ -272,11 +282,18 @@ def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
 
     assert result == 0
     assert captured["index_data_dir"] == tmp_path / "data"
+    assert captured["links_data_dir"] == tmp_path / "data"
     assert captured["client_kwargs"] == {
         "host": "127.0.0.1",
         "port": 11111,
         "experiment_symbol_index": {("US", "RAM"): "trend_exp"},
         "ambiguous_symbol_index": {},
+        "order_link_index": {
+            "SIM-10001": {
+                "futu_order_id": "SIM-10001",
+                "experiment_id": "trend_exp",
+            }
+        },
     }
     assert captured["data_dir"] == tmp_path / "data"
     assert captured["synced_at"] == "2026-07-09 11:30"

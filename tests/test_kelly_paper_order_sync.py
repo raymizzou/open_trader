@@ -9,6 +9,7 @@ from open_trader.kelly_paper_order_sync import (
     FakeFutuPaperOrderClient,
     FutuSimulatePaperOrderClient,
     build_kelly_paper_order_sync_report,
+    load_kelly_order_links,
     load_kelly_experiment_symbol_index_details,
     load_kelly_experiment_symbol_index,
     sync_kelly_paper_orders,
@@ -325,6 +326,45 @@ def test_load_kelly_experiment_symbol_index_details_preserves_ambiguous_symbols(
     assert details.ambiguous == {("US", "SOXX"): ["breakout_exp", "trend_exp"]}
 
 
+def test_load_kelly_order_links_returns_empty_when_missing(tmp_path: Path) -> None:
+    assert load_kelly_order_links(tmp_path / "data") == {}
+
+
+def test_load_kelly_order_links_indexes_by_futu_order_id(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_order_links.json",
+        {
+            "schema_version": "open_trader.kelly_order_links.v1",
+            "links": [
+                {
+                    "futu_order_id": "SIM-10002",
+                    "experiment_id": "breakout_exp",
+                    "strategy_id": "breakout_10d",
+                    "market": "US",
+                    "symbol": "SOXX",
+                    "side": "buy",
+                    "created_at": "2026-07-10 12:30",
+                    "source": "kelly_auto_order",
+                }
+            ],
+        },
+    )
+
+    assert load_kelly_order_links(data_dir) == {
+        "SIM-10002": {
+            "futu_order_id": "SIM-10002",
+            "experiment_id": "breakout_exp",
+            "strategy_id": "breakout_10d",
+            "market": "US",
+            "symbol": "SOXX",
+            "side": "buy",
+            "created_at": "2026-07-10 12:30",
+            "source": "kelly_auto_order",
+        }
+    }
+
+
 def test_futu_simulate_paper_order_client_reads_simulate_orders() -> None:
     client = FutuSimulatePaperOrderClient(
         host="127.0.0.1",
@@ -360,6 +400,49 @@ def test_futu_simulate_paper_order_client_reads_simulate_orders() -> None:
             "order_market": "N/A",
         }
     ]
+
+
+def test_futu_simulate_paper_order_client_prefers_order_link_for_ambiguous_symbol(
+    tmp_path: Path,
+) -> None:
+    client = FutuSimulatePaperOrderClient(
+        host="127.0.0.1",
+        port=11111,
+        experiment_symbol_index={("US", "RAM"): "trend_exp"},
+        ambiguous_symbol_index={("US", "SOXX"): ["breakout_exp", "trend_exp"]},
+        order_link_index={
+            "SIM-10002": {
+                "futu_order_id": "SIM-10002",
+                "experiment_id": "breakout_exp",
+                "strategy_id": "breakout_10d",
+                "market": "US",
+                "symbol": "SOXX",
+                "side": "sell",
+                "created_at": "2026-07-10 12:30",
+                "source": "kelly_auto_order",
+            }
+        },
+        context_factory=FakeFutuOrderContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    payload = sync_kelly_paper_orders(
+        tmp_path / "data",
+        client,
+        synced_at="2026-07-10 12:35",
+    )
+    report = build_kelly_paper_order_sync_report(payload, client)
+
+    assert payload["orders"][1]["experiment_id"] == "breakout_exp"
+    assert payload["orders"][1]["symbol"] == "SOXX"
+    assert report["matched_orders"][1] == {
+        "market": "US",
+        "symbol": "SOXX",
+        "order_id": "SIM-10002",
+        "experiment_id": "breakout_exp",
+        "reason": "matched_by_order_link",
+    }
+    assert report["skipped_orders"] == []
 
 
 def test_futu_simulate_paper_order_client_records_diagnostics(

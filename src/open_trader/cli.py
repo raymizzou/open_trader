@@ -32,6 +32,7 @@ from .kelly_paper_order_sync import (
     build_kelly_paper_order_sync_report,
     default_fake_kelly_paper_orders,
     load_kelly_experiment_symbol_index_details,
+    load_kelly_order_links,
     sync_kelly_paper_orders,
     write_kelly_paper_order_sync_report,
 )
@@ -1284,6 +1285,7 @@ def main(argv: list[str] | None = None) -> int:
                     port=args.port,
                     experiment_symbol_index=symbol_index_details.unique,
                     ambiguous_symbol_index=symbol_index_details.ambiguous,
+                    order_link_index=load_kelly_order_links(args.data_dir),
                 )
             payload = sync_kelly_paper_orders(
                 data_dir=args.data_dir,

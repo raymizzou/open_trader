@@ -16,6 +16,7 @@ TRD_ENV_SIMULATE = "SIMULATE"
 PAPER_ORDER_SYNC_REPORT_SCHEMA_VERSION = (
     "open_trader.kelly_paper_order_sync_report.v1"
 )
+ORDER_LINKS_SCHEMA_VERSION = "open_trader.kelly_order_links.v1"
 
 
 class FutuPaperOrderSyncError(RuntimeError):
@@ -59,6 +60,7 @@ class FutuSimulatePaperOrderClient:
         port: int,
         experiment_symbol_index: dict[tuple[str, str], str],
         ambiguous_symbol_index: dict[tuple[str, str], list[str]] | None = None,
+        order_link_index: dict[str, dict[str, Any]] | None = None,
         context_factory: Callable[..., Any] = None,
         connectivity_checker: Callable[[str, int], bool] = None,
     ) -> None:
@@ -82,6 +84,7 @@ class FutuSimulatePaperOrderClient:
         self.port = port
         self.experiment_symbol_index = experiment_symbol_index
         self.ambiguous_symbol_index = ambiguous_symbol_index or {}
+        self.order_link_index = order_link_index or {}
         self.last_sync_diagnostics: dict[str, list[dict[str, Any]]] = {
             "matched_orders": [],
             "skipped_orders": [],
@@ -112,6 +115,7 @@ class FutuSimulatePaperOrderClient:
                     record,
                     self.experiment_symbol_index,
                     self.ambiguous_symbol_index,
+                    self.order_link_index,
                 )
                 if order is not None:
                     orders.append(order)
@@ -267,6 +271,40 @@ def load_kelly_experiment_symbol_index_details(
     return KellyExperimentSymbolIndexDetails(unique=unique, ambiguous=ambiguous)
 
 
+def load_kelly_order_links(data_dir: Path) -> dict[str, dict[str, Any]]:
+    path = data_dir / "latest" / "kelly_order_links.json"
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+    schema_version = payload.get("schema_version")
+    if schema_version != ORDER_LINKS_SCHEMA_VERSION:
+        raise ValueError(
+            f"{path.name} schema_version must be {ORDER_LINKS_SCHEMA_VERSION}"
+        )
+    links = payload.get("links")
+    if not isinstance(links, list):
+        raise ValueError(f"{path.name} must contain a links list")
+
+    indexed: dict[str, dict[str, Any]] = {}
+    for index, link in enumerate(links):
+        if not isinstance(link, dict):
+            raise ValueError(f"{path.name} link {index} must be an object")
+        futu_order_id = link.get("futu_order_id")
+        experiment_id = link.get("experiment_id")
+        if not isinstance(futu_order_id, str) or not futu_order_id.strip():
+            raise ValueError(f"{path.name} link {index} has invalid futu_order_id")
+        if not isinstance(experiment_id, str) or not experiment_id.strip():
+            raise ValueError(f"{path.name} link {index} has invalid experiment_id")
+        normalized = copy.deepcopy(link)
+        normalized["futu_order_id"] = futu_order_id.strip()
+        normalized["experiment_id"] = experiment_id.strip()
+        indexed[normalized["futu_order_id"]] = normalized
+    return indexed
+
+
 def build_kelly_paper_order_sync_report(
     payload: dict[str, Any],
     client: PaperOrderClient,
@@ -411,6 +449,7 @@ def _classify_futu_order_record(
     record: dict[str, object],
     experiment_symbol_index: dict[tuple[str, str], str],
     ambiguous_symbol_index: dict[tuple[str, str], list[str]],
+    order_link_index: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     market_symbol = _market_symbol_from_futu_code(record.get("code"))
     order_id = _first_text(record, ("order_id", "orderid"))
@@ -421,6 +460,18 @@ def _classify_futu_order_record(
             "reason": "invalid_code",
         }
     market, symbol = market_symbol
+    linked_experiment_id = _linked_experiment_id(order_id, order_link_index)
+    if linked_experiment_id is not None:
+        order = _order_from_futu_record(
+            record,
+            experiment_id=linked_experiment_id,
+            market=market,
+            symbol=symbol,
+            order_id=order_id,
+        )
+        diagnostic = _matched_diagnostic_from_order(order)
+        diagnostic["reason"] = "matched_by_order_link"
+        return order, diagnostic
     if market_symbol in ambiguous_symbol_index:
         return None, {
             "market": market,
@@ -437,6 +488,24 @@ def _classify_futu_order_record(
             "order_id": order_id,
             "reason": "untracked_symbol",
         }
+    order = _order_from_futu_record(
+        record,
+        experiment_id=experiment_id,
+        market=market,
+        symbol=symbol,
+        order_id=order_id,
+    )
+    return order, _matched_diagnostic_from_order(order)
+
+
+def _order_from_futu_record(
+    record: dict[str, object],
+    *,
+    experiment_id: str,
+    market: str,
+    symbol: str,
+    order_id: str,
+) -> dict[str, Any]:
     filled_qty = _first_text(record, ("dealt_qty", "filled_qty", "fill_qty"))
     avg_fill_price = _first_text(
         record,
@@ -463,7 +532,20 @@ def _classify_futu_order_record(
         ),
         "order_id": order_id,
     }
-    return order, _matched_diagnostic_from_order(order)
+    return order
+
+
+def _linked_experiment_id(
+    order_id: str,
+    order_link_index: dict[str, dict[str, Any]],
+) -> str | None:
+    link = order_link_index.get(order_id)
+    if not isinstance(link, dict):
+        return None
+    experiment_id = link.get("experiment_id")
+    if not isinstance(experiment_id, str) or not experiment_id.strip():
+        return None
+    return experiment_id.strip()
 
 
 def _matched_diagnostic_from_order(order: dict[str, Any]) -> dict[str, Any]:
