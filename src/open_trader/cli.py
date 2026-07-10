@@ -49,6 +49,7 @@ from .kelly_order_risk import (
 )
 from .kelly_strategy_capital import (
     build_kelly_strategy_capital_payload,
+    load_kelly_strategy_capital,
     write_kelly_strategy_capital,
 )
 from .kelly_lab import load_kelly_lab_state
@@ -1524,7 +1525,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "kelly" and args.kelly_command == "build-strategy-capital":
         try:
-            lab_state = load_kelly_lab_state(args.data_dir)
+            lab_state = load_kelly_lab_state(
+                args.data_dir,
+                include_strategy_capital=False,
+            )
             if not lab_state.available:
                 raise ValueError(lab_state.error)
             latest_dir = args.data_dir / "latest"
@@ -1549,9 +1553,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "kelly" and args.kelly_command == "check-order-risk":
         try:
-            strategy_capital_payload = _load_optional_json(
-                args.data_dir / "latest" / "kelly_strategy_capital.json",
-            )
+            try:
+                strategy_capital_payload = load_kelly_strategy_capital(args.data_dir)
+            except FileNotFoundError:
+                strategy_capital_payload = None
             risk_kwargs = {
                 "data_dir": args.data_dir,
                 "checked_at": args.checked_at,

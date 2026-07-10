@@ -94,7 +94,10 @@ def test_kelly_check_order_risk_main_passes_latest_strategy_capital(
     data_dir = tmp_path / "data"
     latest_dir = data_dir / "latest"
     latest_dir.mkdir(parents=True)
-    strategy_capital_payload = {"strategies": []}
+    strategy_capital_payload = {
+        "schema_version": "open_trader.kelly_strategy_capital.v1",
+        "strategies": [],
+    }
     (latest_dir / "kelly_strategy_capital.json").write_text(
         json.dumps(strategy_capital_payload),
         encoding="utf-8",
@@ -126,6 +129,60 @@ def test_kelly_check_order_risk_main_passes_latest_strategy_capital(
     )
 
     assert result == 0
-    assert captured["build_kwargs"]["strategy_capital_payload"] == {
-        "strategies": [],
-    }
+    assert (
+        captured["build_kwargs"]["strategy_capital_payload"]
+        == strategy_capital_payload
+    )
+
+
+@pytest.mark.parametrize(
+    ("strategy_capital_payload", "expected_error"),
+    [
+        (
+            {
+                "schema_version": "wrong",
+                "strategies": [],
+            },
+            "kelly_strategy_capital.json schema_version",
+        ),
+        (
+            {
+                "schema_version": "open_trader.kelly_strategy_capital.v1",
+                "strategies": {},
+            },
+            "kelly_strategy_capital.json must contain a strategies list",
+        ),
+    ],
+)
+def test_kelly_check_order_risk_rejects_invalid_present_strategy_capital(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    strategy_capital_payload: dict[str, object],
+    expected_error: str,
+) -> None:
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    (latest_dir / "kelly_strategy_capital.json").write_text(
+        json.dumps(strategy_capital_payload),
+        encoding="utf-8",
+    )
+
+    def fail_build(**kwargs: object) -> dict[str, object]:
+        raise AssertionError("risk checks should not build with invalid capital")
+
+    monkeypatch.setattr(cli, "build_kelly_order_risk_checks", fail_build)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "kelly",
+                "check-order-risk",
+                "--data-dir",
+                str(data_dir),
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert expected_error in capsys.readouterr().err

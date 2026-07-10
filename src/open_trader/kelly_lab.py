@@ -81,7 +81,11 @@ class KellyLabState:
         }
 
 
-def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
+def load_kelly_lab_state(
+    data_dir: Path,
+    *,
+    include_strategy_capital: bool = True,
+) -> KellyLabState:
     latest_dir = data_dir / "latest"
     templates_path = latest_dir / "kelly_strategy_templates.json"
     experiments_path = latest_dir / "kelly_experiments.json"
@@ -110,11 +114,12 @@ def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
     experiments = _attach_paper_orders_to_experiments(experiments, paper_orders)
     order_execution = _load_optional_order_execution(order_executions_path)
     experiments = _attach_order_execution_to_experiments(experiments, order_execution)
-    strategy_capital = _load_optional_strategy_capital(strategy_capital_path)
-    experiments = _attach_strategy_capital_to_experiments(
-        experiments,
-        strategy_capital,
-    )
+    if include_strategy_capital:
+        strategy_capital = _load_optional_strategy_capital(strategy_capital_path)
+        experiments = _attach_strategy_capital_to_experiments(
+            experiments,
+            strategy_capital,
+        )
 
     return KellyLabState(
         available=True,

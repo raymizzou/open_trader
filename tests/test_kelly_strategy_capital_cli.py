@@ -73,7 +73,16 @@ def test_kelly_build_strategy_capital_main_loads_inputs_and_writes_payload(
         captured["payload"] = payload
         return latest_path
 
-    monkeypatch.setattr(cli, "load_kelly_lab_state", lambda data_dir_arg: FakeKellyLabState())
+    def fake_load_kelly_lab_state(
+        data_dir_arg: Path,
+        *,
+        include_strategy_capital: bool = True,
+    ) -> FakeKellyLabState:
+        captured["load_data_dir"] = data_dir_arg
+        captured["include_strategy_capital"] = include_strategy_capital
+        return FakeKellyLabState()
+
+    monkeypatch.setattr(cli, "load_kelly_lab_state", fake_load_kelly_lab_state)
     monkeypatch.setattr(cli, "build_kelly_strategy_capital_payload", fake_build)
     monkeypatch.setattr(cli, "write_kelly_strategy_capital", fake_write)
 
@@ -89,6 +98,8 @@ def test_kelly_build_strategy_capital_main_loads_inputs_and_writes_payload(
     )
 
     assert result == 0
+    assert captured["load_data_dir"] == data_dir
+    assert captured["include_strategy_capital"] is False
     assert captured["experiments"] == [{"experiment_id": "trend"}]
     assert captured["paper_orders_payload"] == paper_orders_payload
     assert captured["order_executions_payload"] == order_executions_payload
@@ -103,3 +114,73 @@ def test_kelly_build_strategy_capital_main_loads_inputs_and_writes_payload(
     output = capsys.readouterr().out
     assert "strategies: 1" in output
     assert f"latest: {latest_path}" in output
+
+
+def test_kelly_build_strategy_capital_ignores_invalid_existing_capital(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    (latest_dir / "kelly_strategy_capital.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_strategy_capital.v1",
+                "strategies": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKellyLabState:
+        available = True
+        experiments = [{"experiment_id": "trend"}]
+        error = ""
+
+    def fake_load_kelly_lab_state(
+        data_dir_arg: Path,
+        *,
+        include_strategy_capital: bool = True,
+    ) -> FakeKellyLabState:
+        captured["load_data_dir"] = data_dir_arg
+        captured["include_strategy_capital"] = include_strategy_capital
+        return FakeKellyLabState()
+
+    def fake_build(
+        experiments: list[dict[str, object]],
+        *,
+        paper_orders_payload: dict[str, object] | None,
+        order_executions_payload: dict[str, object] | None,
+        calculated_at: str | None,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": "open_trader.kelly_strategy_capital.v1",
+            "calculated_at": calculated_at,
+            "strategy_count": len(experiments),
+            "strategies": [],
+        }
+
+    monkeypatch.setattr(cli, "load_kelly_lab_state", fake_load_kelly_lab_state)
+    monkeypatch.setattr(cli, "build_kelly_strategy_capital_payload", fake_build)
+    monkeypatch.setattr(
+        cli,
+        "write_kelly_strategy_capital",
+        lambda data_dir_arg, payload: data_dir_arg
+        / "latest"
+        / "kelly_strategy_capital.json",
+    )
+
+    result = cli.main(
+        [
+            "kelly",
+            "build-strategy-capital",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+
+    assert result == 0
+    assert captured["load_data_dir"] == data_dir
+    assert captured["include_strategy_capital"] is False
