@@ -27,9 +27,12 @@ def build_kelly_strategy_capital_payload(
     order_executions_payload: dict[str, Any] | None = None,
     calculated_at: str | None = None,
 ) -> dict[str, Any]:
-    del order_executions_payload
     timestamp = calculated_at or _current_timestamp()
     orders_by_experiment = _capital_usage_by_experiment(paper_orders_payload or {})
+    _merge_execution_usage_by_experiment(
+        orders_by_experiment,
+        order_executions_payload or {},
+    )
 
     strategies: list[dict[str, Any]] = []
     for experiment in experiments:
@@ -138,6 +141,39 @@ def _capital_usage_by_experiment(
     return usage_by_experiment
 
 
+def _merge_execution_usage_by_experiment(
+    usage_by_experiment: dict[str, dict[str, Any]],
+    order_executions_payload: dict[str, Any],
+) -> None:
+    raw_executions = order_executions_payload.get("executions", [])
+    if not isinstance(raw_executions, list):
+        return
+
+    for execution in raw_executions:
+        if not isinstance(execution, dict):
+            continue
+        if _field_text(execution.get("side")).lower() != "buy":
+            continue
+        if _field_text(execution.get("execution_status")).lower() != "submitted":
+            continue
+        if execution.get("submitted") is not True:
+            continue
+
+        experiment_id = _field_text(execution.get("experiment_id"))
+        usage = usage_by_experiment.setdefault(experiment_id, _empty_usage())
+        market_symbol = (
+            _field_text(execution.get("market")).upper(),
+            _field_text(execution.get("symbol")).upper(),
+        )
+        notional = _execution_buy_notional(execution)
+        usage["reserved_order_notional"] += notional
+        usage["open_buy_order_count"] += 1
+        if notional:
+            usage["symbol_occupancy"][market_symbol] = (
+                usage["symbol_occupancy"].get(market_symbol, Decimal("0")) + notional
+            )
+
+
 def _empty_usage() -> dict[str, Any]:
     return {
         "reserved_order_notional": Decimal("0"),
@@ -166,6 +202,12 @@ def _filled_buy_order_notional(order: dict[str, Any]) -> Decimal:
         ),
     )
     quantity = _first_decimal(order, ("filled_qty", "quantity", "order_qty"))
+    return price * quantity
+
+
+def _execution_buy_notional(execution: dict[str, Any]) -> Decimal:
+    price = _first_decimal(execution, ("limit_price", "order_price", "price"))
+    quantity = _first_decimal(execution, ("quantity", "order_qty", "qty"))
     return price * quantity
 
 

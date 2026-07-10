@@ -100,7 +100,7 @@ def _build_single_check(
     *,
     checked_at: str,
     max_entry_position_pct: Decimal,
-    capital_by_experiment: dict[str, dict[str, Any]],
+    capital_by_experiment: dict[str, dict[str, Any]] | None,
 ) -> dict[str, Any]:
     base = _base_check(intent, checked_at=checked_at)
     side = str(intent.get("side", "")).strip().lower()
@@ -174,24 +174,15 @@ def _build_single_check(
             }
         )
         experiment_id = str(intent.get("experiment_id", "")).strip()
-        capital_snapshot = capital_by_experiment.get(experiment_id)
-        if capital_snapshot is not None:
-            available = _parse_positive_decimal(
-                capital_snapshot.get("available_notional")
-            ) or Decimal("0")
-            currency = str(
-                capital_snapshot.get("currency") or budget_currency
-            ).strip().upper()
-            capital_check_passed = planned <= available
+        if capital_by_experiment is not None:
             check_results.append(
-                {
-                    "check": "strategy_available_capital",
-                    "status": "passed" if capital_check_passed else "failed",
-                    "detail": (
-                        f"{planned_notional} <= "
-                        f"{_decimal_text(available)} {currency}"
-                    ),
-                }
+                _strategy_available_capital_result(
+                    intent,
+                    capital_by_experiment.get(experiment_id),
+                    planned=planned,
+                    planned_notional=planned_notional,
+                    budget_currency=budget_currency,
+                )
             )
 
     risk_status = (
@@ -217,9 +208,9 @@ def _build_single_check(
 
 def _strategy_capital_by_experiment(
     payload: dict[str, Any] | None,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, dict[str, Any]] | None:
     if not isinstance(payload, dict):
-        return {}
+        return None
     strategies = payload.get("strategies")
     if not isinstance(strategies, list):
         return {}
@@ -227,6 +218,56 @@ def _strategy_capital_by_experiment(
         str(item.get("experiment_id", "")).strip(): item
         for item in strategies
         if isinstance(item, dict) and str(item.get("experiment_id", "")).strip()
+    }
+
+
+def _strategy_available_capital_result(
+    intent: dict[str, Any],
+    capital_snapshot: dict[str, Any] | None,
+    *,
+    planned: Decimal,
+    planned_notional: str,
+    budget_currency: str,
+) -> dict[str, str]:
+    experiment_id = str(intent.get("experiment_id", "")).strip()
+    if capital_snapshot is None:
+        return {
+            "check": "strategy_available_capital",
+            "status": "failed",
+            "detail": f"missing capital snapshot for {experiment_id}",
+        }
+
+    intent_market = str(
+        intent.get("market") or intent.get("experiment_market") or ""
+    ).strip().upper()
+    capital_market = str(capital_snapshot.get("market") or "").strip().upper()
+    if capital_market and capital_market != intent_market:
+        return {
+            "check": "strategy_available_capital",
+            "status": "failed",
+            "detail": f"capital market {capital_market} != {intent_market}",
+        }
+
+    expected_currency = str(budget_currency or "").strip().upper()
+    currency = str(capital_snapshot.get("currency") or expected_currency).strip().upper()
+    if currency and expected_currency and currency != expected_currency:
+        return {
+            "check": "strategy_available_capital",
+            "status": "failed",
+            "detail": f"capital currency {currency} != {expected_currency}",
+        }
+
+    available = _parse_positive_decimal(capital_snapshot.get("available_notional")) or Decimal(
+        "0"
+    )
+    capital_check_passed = planned <= available
+    return {
+        "check": "strategy_available_capital",
+        "status": "passed" if capital_check_passed else "failed",
+        "detail": (
+            f"{planned_notional} <= "
+            f"{_decimal_text(available)} {currency or expected_currency}"
+        ),
     }
 
 

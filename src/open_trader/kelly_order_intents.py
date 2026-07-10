@@ -24,7 +24,7 @@ def build_kelly_order_intents(
     *,
     created_at: str | None = None,
 ) -> dict[str, Any]:
-    state = load_kelly_lab_state(data_dir)
+    state = load_kelly_lab_state(data_dir, include_strategy_capital=False)
     if not state.available:
         raise ValueError(state.error or "Kelly Lab data is not available")
     return build_kelly_order_intents_payload(

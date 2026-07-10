@@ -356,24 +356,28 @@ def test_build_kelly_order_risk_checks_preserves_exit_allow_with_strategy_capita
 
 
 @pytest.mark.parametrize(
-    "strategy_capital_payload",
+    ("strategy_capital_payload", "expected_detail"),
     [
-        {"strategies": "bad"},
-        {
-            "strategies": [
-                {
-                    "experiment_id": "different",
-                    "currency": "USD",
-                    "available_notional": "0",
-                },
-                "bad",
-                {},
-            ]
-        },
+        ({"strategies": "bad"}, "missing capital snapshot for trend"),
+        (
+            {
+                "strategies": [
+                    {
+                        "experiment_id": "different",
+                        "currency": "USD",
+                        "available_notional": "0",
+                    },
+                    "bad",
+                    {},
+                ]
+            },
+            "missing capital snapshot for trend",
+        ),
     ],
 )
-def test_build_kelly_order_risk_checks_ignores_malformed_or_irrelevant_strategy_capital(
+def test_build_kelly_order_risk_checks_fails_closed_without_valid_matching_strategy_capital(
     strategy_capital_payload: dict[str, object],
+    expected_detail: str,
 ) -> None:
     intent_payload = {
         "schema_version": "open_trader.kelly_order_intents.v1",
@@ -406,14 +410,86 @@ def test_build_kelly_order_risk_checks_ignores_malformed_or_irrelevant_strategy_
     )
 
     check = payload["checks"][0]
-    assert payload["approved_count"] == 1
-    assert payload["blocked_count"] == 0
-    assert check["risk_status"] == "approved"
-    assert check["execution_status"] == "ready"
+    assert payload["approved_count"] == 0
+    assert payload["blocked_count"] == 1
+    assert check["risk_status"] == "blocked"
+    assert check["execution_status"] == "risk_blocked"
     assert check["planned_notional"] == "1000"
-    assert "strategy_available_capital" not in [
-        result["check"] for result in check["check_results"]
-    ]
+    assert check["check_results"][-1] == {
+        "check": "strategy_available_capital",
+        "status": "failed",
+        "detail": expected_detail,
+    }
+
+
+@pytest.mark.parametrize(
+    ("capital_snapshot", "expected_detail"),
+    [
+        (
+            {
+                "experiment_id": "trend",
+                "market": "HK",
+                "currency": "USD",
+                "available_notional": "1500",
+            },
+            "capital market HK != US",
+        ),
+        (
+            {
+                "experiment_id": "trend",
+                "market": "US",
+                "currency": "HKD",
+                "available_notional": "1500",
+            },
+            "capital currency HKD != USD",
+        ),
+    ],
+)
+def test_build_kelly_order_risk_checks_blocks_strategy_capital_market_currency_mismatch(
+    capital_snapshot: dict[str, str],
+    expected_detail: str,
+) -> None:
+    intent_payload = {
+        "schema_version": "open_trader.kelly_order_intents.v1",
+        "created_at": "2026-07-10 13:30",
+        "intent_count": 1,
+        "intents": [
+            {
+                "intent_id": "trend:US:RAM:entry",
+                "experiment_id": "trend",
+                "experiment_name": "趋势回调第一批",
+                "strategy_id": "trend_pullback_20d",
+                "strategy_version": "v1",
+                "experiment_market": "US",
+                "market": "US",
+                "symbol": "RAM",
+                "intent_type": "entry",
+                "side": "buy",
+                "suggested_position_pct": "4%",
+                "per_symbol_budget": "25000",
+                "budget_currency": "USD",
+            }
+        ],
+    }
+
+    payload = build_kelly_order_risk_checks_payload(
+        intent_payload,
+        checked_at="2026-07-10 13:31",
+        max_entry_position_pct="4",
+        strategy_capital_payload={"strategies": [capital_snapshot]},
+    )
+
+    check = payload["checks"][0]
+    assert payload["approved_count"] == 0
+    assert payload["blocked_count"] == 1
+    assert check["risk_status"] == "blocked"
+    assert check["execution_status"] == "risk_blocked"
+    assert check["planned_notional"] == "1000"
+    assert check["check_results"][-1] == {
+        "check": "strategy_available_capital",
+        "status": "failed",
+        "detail": expected_detail,
+    }
 
 
 @pytest.mark.parametrize(

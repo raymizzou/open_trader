@@ -333,11 +333,32 @@ def _attach_strategy_capital_to_experiments(
         normalized = copy.deepcopy(experiment)
         experiment_id = normalized.get("experiment_id")
         if isinstance(experiment_id, str) and experiment_id in capital_by_experiment:
-            normalized["capital"] = copy.deepcopy(capital_by_experiment[experiment_id])
+            capital = copy.deepcopy(capital_by_experiment[experiment_id])
+            if _strategy_capital_matches_experiment(capital, normalized):
+                normalized["capital"] = capital
+            else:
+                normalized["capital"] = {
+                    "available": False,
+                    "reason": "capital market/currency mismatch",
+                }
         else:
             normalized["capital"] = {"available": False}
         attached.append(normalized)
     return attached
+
+
+def _strategy_capital_matches_experiment(
+    capital: dict[str, Any],
+    experiment: dict[str, Any],
+) -> bool:
+    capital_market = _normalized_market_or_empty(capital.get("market"))
+    experiment_market = _normalized_market_or_empty(experiment.get("market"))
+    if capital_market and capital_market != experiment_market:
+        return False
+
+    capital_currency = _normalized_market_or_empty(capital.get("currency"))
+    experiment_currency = _normalized_market_or_empty(experiment.get("budget_currency"))
+    return not capital_currency or capital_currency == experiment_currency
 
 
 def _order_execution_summary(

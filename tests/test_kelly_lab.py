@@ -726,6 +726,43 @@ def test_load_kelly_lab_state_attaches_strategy_capital_snapshot(
     assert state["experiments"][0]["capital"]["open_buy_order_count"] == 1
 
 
+def test_load_kelly_lab_state_marks_strategy_capital_unavailable_on_market_currency_mismatch(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_strategy_capital.json",
+        {
+            "schema_version": "open_trader.kelly_strategy_capital.v1",
+            "calculated_at": "2026-07-10 21:10",
+            "strategy_count": 1,
+            "strategies": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "HK",
+                    "currency": "HKD",
+                    "available_notional": "22600",
+                }
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    assert state["experiments"][0]["capital"] == {
+        "available": False,
+        "reason": "capital market/currency mismatch",
+    }
+
+
 def test_load_kelly_lab_state_marks_strategy_capital_unavailable_when_missing(
     tmp_path: Path,
 ) -> None:

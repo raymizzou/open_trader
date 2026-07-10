@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from open_trader.kelly_order_intents import (
+    build_kelly_order_intents,
     build_kelly_order_intents_payload,
     write_kelly_order_intents,
 )
@@ -203,3 +204,95 @@ def test_write_kelly_order_intents_writes_latest_artifact(tmp_path: Path) -> Non
 
     assert path == tmp_path / "data/latest/kelly_order_intents.json"
     assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_build_kelly_order_intents_ignores_malformed_optional_strategy_capital(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    (latest_dir / "kelly_strategy_templates.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_strategy_templates.v1",
+                "templates": [
+                    {
+                        "strategy_id": "trend_pullback_20d",
+                        "strategy_name": "趋势回调 20D",
+                        "strategy_version": "v1",
+                        "entry_rule_description": "价格回调到 20 日均线附近。",
+                        "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+                        "max_holding_days": 20,
+                        "order_type": "limit",
+                        "market_session": "regular",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (latest_dir / "kelly_experiments.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_experiments.v1",
+                "experiments": [
+                    {
+                        "experiment_id": "trend_us",
+                        "experiment_name": "趋势回调 US",
+                        "strategy_id": "trend_pullback_20d",
+                        "strategy_version": "v1",
+                        "market": "US",
+                        "start_date": "2026-07-07",
+                        "paper_account": "futu_simulate",
+                        "experiment_budget": "30000",
+                        "budget_currency": "USD",
+                        "capital_utilization_pct": "50",
+                        "allocation_mode": "equal_weight",
+                        "max_open_position_per_symbol": 1,
+                        "status": "running",
+                        "locked": True,
+                        "participants": [
+                            {
+                                "market": "US",
+                                "symbol": "RAM",
+                                "name": "RAM ETF",
+                                "source": "holding",
+                                "locked": True,
+                                "per_symbol_budget": "10000",
+                                "budget_currency": "USD",
+                            }
+                        ],
+                        "lifecycle_states": [
+                            {
+                                "status": "pending_entry_order",
+                                "market": "US",
+                                "symbol": "RAM",
+                            }
+                        ],
+                        "stats": {"suggested_position_pct": "4%"},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (latest_dir / "kelly_strategy_capital.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_strategy_capital.v1",
+                "strategies": "bad",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = build_kelly_order_intents(
+        data_dir,
+        created_at="2026-07-10 13:30",
+    )
+
+    assert payload["intent_count"] == 1
+    assert payload["intents"][0]["intent_id"] == "trend_us:US:RAM:entry"
