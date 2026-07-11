@@ -68,6 +68,7 @@ def build_kelly_trade_samples_payload(
 
 def write_kelly_trade_samples(data_dir: Path, payload: dict[str, Any]) -> Path:
     path = data_dir / "latest" / "kelly_trade_samples.json"
+    _validate_kelly_trade_samples_payload(payload, path.name)
     _write_json_atomic(path, payload)
     return path
 
@@ -76,15 +77,22 @@ def load_kelly_trade_samples(data_dir: Path) -> dict[str, Any]:
     path = data_dir / "latest" / "kelly_trade_samples.json"
     with path.open(encoding="utf-8") as handle:
         payload = json.load(handle)
+    _validate_kelly_trade_samples_payload(payload, path.name)
+    return payload
+
+
+def _validate_kelly_trade_samples_payload(
+    payload: object,
+    artifact_name: str,
+) -> None:
     if not isinstance(payload, dict):
-        raise ValueError(f"{path.name} must contain a JSON object")
+        raise ValueError(f"{artifact_name} must contain a JSON object")
     if payload.get("schema_version") != TRADE_SAMPLES_SCHEMA_VERSION:
         raise ValueError(
-            f"{path.name} schema_version must be {TRADE_SAMPLES_SCHEMA_VERSION!r}",
+            f"{artifact_name} schema_version must be {TRADE_SAMPLES_SCHEMA_VERSION!r}",
         )
     if not isinstance(payload.get("stats_by_experiment"), dict):
-        raise ValueError(f"{path.name} must contain stats_by_experiment")
-    return payload
+        raise ValueError(f"{artifact_name} must contain stats_by_experiment")
 
 
 def _pair_group(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from open_trader.kelly_trade_samples import (
     build_kelly_trade_samples_payload,
     load_kelly_trade_samples,
@@ -295,3 +297,42 @@ def test_write_and_load_kelly_trade_samples(tmp_path) -> None:
 
     assert path == tmp_path / "data" / "latest" / "kelly_trade_samples.json"
     assert loaded == payload
+
+
+def test_write_kelly_trade_samples_rejects_bad_schema_without_artifact(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    artifact_path = data_dir / "latest" / "kelly_trade_samples.json"
+
+    with pytest.raises(ValueError):
+        write_kelly_trade_samples(
+            data_dir,
+            {
+                "schema_version": "open_trader.kelly_trade_samples.v0",
+                "stats_by_experiment": {},
+            },
+        )
+
+    assert not artifact_path.exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": "open_trader.kelly_trade_samples.v1"},
+        {
+            "schema_version": "open_trader.kelly_trade_samples.v1",
+            "stats_by_experiment": [],
+        },
+    ],
+)
+def test_write_kelly_trade_samples_rejects_invalid_stats_without_artifact(
+    tmp_path,
+    payload: dict[str, object],
+) -> None:
+    data_dir = tmp_path / "data"
+    artifact_path = data_dir / "latest" / "kelly_trade_samples.json"
+
+    with pytest.raises(ValueError):
+        write_kelly_trade_samples(data_dir, payload)
+
+    assert not artifact_path.exists()
