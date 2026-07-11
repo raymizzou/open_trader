@@ -2328,6 +2328,66 @@ tbody tr.active-row {
   overflow-wrap: anywhere;
 }
 
+.backtest-result-section {
+  margin-top: 18px;
+}
+
+.backtest-comparison-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.backtest-metric-card {
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.backtest-metric-card span,
+.backtest-chart-legend,
+.backtest-run-details dt,
+.backtest-artifacts span { color: var(--muted); }
+.backtest-metric-card strong { overflow-wrap: anywhere; }
+.benchmark-unavailable strong { font-size: 0.88rem; }
+
+.backtest-chart {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  padding: 10px;
+}
+
+.backtest-chart svg { display: block; width: 100%; }
+.backtest-chart-legend { display: flex; flex-wrap: wrap; gap: 16px; }
+.backtest-chart-legend span::before { content: ""; display: inline-block; height: 3px; margin-right: 6px; vertical-align: middle; width: 18px; }
+.backtest-line-strategy { stroke: #38bdf8; }
+.backtest-line-buy-hold { stroke: #f59e0b; }
+.backtest-line-market { stroke: #a78bfa; }
+.backtest-chart-legend .backtest-line-strategy::before { background: #38bdf8; }
+.backtest-chart-legend .backtest-line-buy-hold::before { background: #f59e0b; }
+.backtest-chart-legend .backtest-line-market::before { background: #a78bfa; }
+.backtest-price-line { stroke: #94a3b8; }
+.backtest-action-marker circle { fill: #22c55e; }
+.backtest-action-marker.action-reduce circle,
+.backtest-action-marker.action-exit circle { fill: #ef4444; }
+.backtest-action-marker text { fill: currentColor; font-size: 10px; text-anchor: middle; }
+
+.backtest-table-wrap { overflow-x: auto; }
+.backtest-trades-table { border-collapse: collapse; min-width: 680px; width: 100%; }
+.backtest-trades-table th,
+.backtest-trades-table td { border-bottom: 1px solid var(--border); padding: 9px; text-align: left; }
+.backtest-empty-state { color: var(--muted); }
+.backtest-run-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; }
+.backtest-run-details dd { margin: 0; overflow-wrap: anywhere; }
+.backtest-artifacts { list-style: none; margin: 0; padding: 0; }
+.backtest-artifacts li { display: grid; gap: 4px; grid-template-columns: minmax(150px, 220px) minmax(0, 1fr); padding: 5px 0; }
+.backtest-artifacts code { overflow-wrap: anywhere; }
+
 .empty-state {
   color: var(--muted);
   padding: 24px;
@@ -2372,6 +2432,7 @@ tbody tr.active-row {
 }
 
 @media (max-width: 850px) {
+  .backtest-comparison-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .backtest-form,
   .backtest-strategy-cards,
   .backtest-input-grid,
@@ -2385,6 +2446,9 @@ tbody tr.active-row {
 }
 
 @media (max-width: 760px) {
+  .backtest-comparison-grid,
+  .backtest-artifacts li,
+  .backtest-run-details { grid-template-columns: 1fr; }
   .dashboard-shell {
     padding: 10px;
   }

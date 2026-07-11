@@ -332,7 +332,7 @@ const range=new E();range.dataset.rangePreset="3Y";elements["backtest-range-cont
 elements["backtest-initial-cash"].value="250000";elements["backtest-max-weight"].value="12%";elements["backtest-commission"].value="8";elements["backtest-slippage"].value="3";
 await elements["standard-backtest-form"].submit();
 if(posts.length!==1||posts[0].url!=="/api/backtests/standard/run"||posts[0].body.adapter!==undefined||posts[0].body.initial_cash!=="250000")throw new Error(JSON.stringify(posts));
-if(!elements["standard-backtest-results"].hidden||elements["standard-backtest-results"].innerHTML)throw new Error("results exposed");
+if(elements["standard-backtest-results"].hidden||!elements["standard-backtest-results"].innerHTML.includes("回测对比"))throw new Error("results missing");
 await elements["standard-backtest-form"].submit();if(elements["standard-backtest-status"].textContent!=="回测请求失败，请稍后重试。")throw new Error("unsafe fallback");
 const custom=new E();custom.dataset.rangePreset="CUSTOM";elements["backtest-range-controls"].click(custom);if(!elements["backtest-custom-start"].required||elements["backtest-custom-end"].required)throw new Error("required mismatch");
 elements["backtest-custom-start"].value="";await elements["standard-backtest-form"].submit();if(posts.length!==2||elements["standard-backtest-status"].textContent!=="自定义区间必须填写开始日期。")throw new Error("missing start fetched");
@@ -340,6 +340,37 @@ elements["backtest-custom-start"].value="2026-01-02";elements["backtest-custom-e
 elements["close-standard-backtest"].click();await elements["open-standard-backtest"].click();if(state.standardBacktest.initialCash!=="250000"||state.standardBacktest.source!=="watchlist")throw new Error("state lost");
 console.log("ok");
 """)
+    assert "ok" in output
+
+
+def test_standard_backtest_result_renders_normalized_comparisons_and_details() -> None:
+    output = run_dashboard_js(r'''
+const target={innerHTML:"",hidden:true}; document.getElementById=(id)=>id==="standard-backtest-results"?target:null;
+const execution=(trades=[])=>({trades,equity_curve:[{date:"2026-01-02",equity:"100000",mark_price:"10"},{date:"2026-01-03",equity:"101000",mark_price:"11"}],final_equity:"101000",total_return_pct:"1",annualized_return_pct:"8",max_drawdown_pct:"-2",win_rate_pct:"50",actual_start:"2026-01-02",actual_end:"2026-01-03",initial_cash:"100000",initial_allocated_notional:"10000"});
+const fixtureResult={run_id:"run-1",status:"ok",message_zh:"标准策略回测完成",strategy_id:"trend_pullback/v1",benchmark_symbol:"SPY",requested_start:"2025-01-01",requested_end:"2026-01-03",actual_start:"2026-01-02",actual_end:"2026-01-03",strategy:execution([{decision_date:"2026-01-02",execution_date:"2026-01-03",action:"BUY",quantity:"10",raw_price:"10",execution_price:"10.1",fees:"1",reason:"规则触发"},{decision_date:"2026-01-03",execution_date:"2026-01-03",action:"ADD",quantity:"2",raw_price:"11",execution_price:"11.1",fees:"1",reason:"加仓"},{decision_date:"2026-01-03",execution_date:"2026-01-03",action:"REDUCE",quantity:"-2",raw_price:"11",execution_price:"10.9",fees:"1",reason:"减仓"},{decision_date:"2026-01-03",execution_date:"2026-01-03",action:"EXIT",quantity:"-10",raw_price:"11",execution_price:"10.9",fees:"1",reason:"退出"}]),buy_hold:execution(),market_benchmark:execution(),strategy_excess_return_pct:"0.5",market_excess_return_pct:"0.2",adapter_version:"1.9",manifest_path:"data/<manifest>.json",signals_path:"data/signals.csv",trades_path:"data/trades.csv",equity_curve_path:"data/equity.csv",buy_hold_equity_path:"data/buy.csv",market_benchmark_equity_path:"data/market.csv",metrics_path:"data/metrics.json",report_path:"reports/report.md"};
+renderStandardBacktestResult(fixtureResult);
+for(const expected of ["策略收益","买入持有","SPY","相对买入持有","相对市场指数","最大回撤","交易次数","胜率","BUY","ADD","REDUCE","EXIT","请求范围","实际数据","trend_pullback/v1","交易成本","结果文件"]){if(!target.innerHTML.includes(expected))throw new Error(`missing ${expected}`)}
+if(!target.innerHTML.includes("&lt;manifest&gt;")||target.innerHTML.includes("data/<manifest>"))throw new Error("dynamic path not escaped");
+if(target.hidden)throw new Error("result remains hidden"); console.log("ok");
+''')
+    assert "ok" in output
+
+
+def test_standard_backtest_result_treats_zero_trades_as_success() -> None:
+    output = run_dashboard_js(r'''
+const target={innerHTML:"",hidden:true}; document.getElementById=()=>target;
+const result={strategy:{trades:[],equity_curve:[],total_return_pct:"0",max_drawdown_pct:"0",win_rate_pct:"0",initial_cash:"100",initial_allocated_notional:"10"},buy_hold:{equity_curve:[],total_return_pct:"0"},market_benchmark:{equity_curve:[],total_return_pct:"0"},benchmark_symbol:"SPY"};
+renderStandardBacktestResult(result); if(!target.innerHTML.includes("所选区间内没有触发交易")||target.innerHTML.includes("error"))throw new Error(target.innerHTML); console.log("ok");
+''')
+    assert "ok" in output
+
+
+def test_standard_backtest_result_isolates_missing_market_benchmark() -> None:
+    output = run_dashboard_js(r'''
+const target={innerHTML:"",hidden:true}; document.getElementById=()=>target;
+const result={strategy:{trades:[],equity_curve:[{date:"2026-01-02",equity:"100",mark_price:"10"}],total_return_pct:"1",max_drawdown_pct:"-1",win_rate_pct:"0",initial_cash:"100",initial_allocated_notional:"10"},buy_hold:{equity_curve:[],total_return_pct:"0"},market_benchmark:null,benchmark_symbol:"SPY"};
+renderStandardBacktestResult(result); if(!target.innerHTML.includes("策略收益")||!target.innerHTML.includes("基准行情缺失，无法比较"))throw new Error(target.innerHTML); console.log("ok");
+''')
     assert "ok" in output
 
 

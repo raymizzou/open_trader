@@ -398,6 +398,7 @@ async function submitStandardBacktest(event) {
       return;
     }
     backtest.result = payload;
+    renderStandardBacktestResult(payload);
     elements["standard-backtest-status"].textContent = "回测运行成功。";
   } catch (_) {
     elements["standard-backtest-status"].textContent = "回测请求失败，请稍后重试。";
@@ -405,6 +406,124 @@ async function submitStandardBacktest(event) {
     backtest.busy = false;
     elements["run-standard-backtest"].disabled = false;
   }
+}
+
+function renderStandardBacktestResult(result) {
+  const target = document.getElementById("standard-backtest-results");
+  if (!target || !result || typeof result !== "object") return;
+  target.innerHTML = [
+    renderBacktestComparisonMetrics(result),
+    renderBacktestEquityComparison(result),
+    renderBacktestPriceActions(result),
+    renderBacktestTradeTable(result),
+    renderBacktestRunAssumptions(result),
+  ].join("");
+  target.hidden = false;
+}
+
+function renderBacktestComparisonMetrics(result) {
+  const strategy = result.strategy || {};
+  const buyHold = result.buy_hold || {};
+  const benchmark = result.market_benchmark;
+  const benchmarkLabel = result.benchmark_symbol || "市场指数";
+  const rows = [
+    ["策略收益", strategy.total_return_pct],
+    ["买入持有", buyHold.total_return_pct],
+    [benchmarkLabel, benchmark && benchmark.total_return_pct],
+    ["相对买入持有", result.strategy_excess_return_pct],
+    ["相对市场指数", benchmark && result.market_excess_return_pct],
+    ["最大回撤", strategy.max_drawdown_pct],
+    ["交易次数", Array.isArray(strategy.trades) ? strategy.trades.filter((trade) => Number(trade.quantity) !== 0).length : 0, "count"],
+    ["胜率", strategy.win_rate_pct],
+  ];
+  return `<section class="backtest-result-section" aria-labelledby="backtest-comparison-title"><h3 id="backtest-comparison-title">回测对比</h3><div class="backtest-comparison-grid">${rows.map(([label, value, kind]) => {
+    const unavailable = (label === benchmarkLabel || label === "相对市场指数") && !benchmark;
+    const display = unavailable ? "基准行情缺失，无法比较" : kind === "count" ? String(value) : backtestPercent(value);
+    return `<article class="backtest-metric-card${unavailable ? " benchmark-unavailable" : ""}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display)}</strong></article>`;
+  }).join("")}</div></section>`;
+}
+
+function renderBacktestEquityComparison(result) {
+  return `<section class="backtest-result-section"><h3>净值曲线</h3>${renderThreeSeriesBacktestChart(
+    result.strategy && result.strategy.equity_curve,
+    result.buy_hold && result.buy_hold.equity_curve,
+    result.market_benchmark && result.market_benchmark.equity_curve,
+    result.benchmark_symbol,
+  )}</section>`;
+}
+
+function renderThreeSeriesBacktestChart(strategyRows, buyHoldRows, marketRows, benchmarkSymbol) {
+  const series = [
+    ["策略", strategyRows, "backtest-line-strategy"],
+    ["买入持有", buyHoldRows, "backtest-line-buy-hold"],
+    [benchmarkSymbol || "市场指数", marketRows, "backtest-line-market"],
+  ];
+  const points = series.flatMap(([, rows]) => Array.isArray(rows) ? rows : []).map((row) => Number(row.equity)).filter(Number.isFinite);
+  const dates = [...new Set(series.flatMap(([, rows]) => Array.isArray(rows) ? rows.map((row) => String(row.date || "")) : []).filter(Boolean))].sort();
+  const min = points.length ? Math.min(...points) : 0;
+  const max = points.length ? Math.max(...points) : 1;
+  const path = (rows) => {
+    const byDate = new Map((Array.isArray(rows) ? rows : []).map((row) => [String(row.date || ""), Number(row.equity)]));
+    let started = false;
+    return dates.map((date, index) => {
+      const value = byDate.get(date);
+      if (!Number.isFinite(value)) return "";
+      const x = dates.length > 1 ? 20 + index * 560 / (dates.length - 1) : 300;
+      const y = 180 - (value - min) * 150 / (max - min || 1);
+      const command = started ? "L" : "M";
+      started = true;
+      return `${command}${x.toFixed(1)},${y.toFixed(1)}`;
+    }).filter(Boolean).join(" ");
+  };
+  const legend = series.map(([label, , className]) => `<span class="${className}">${escapeHtml(label)}</span>`).join("");
+  const paths = series.map(([, rows, className]) => `<path class="${className}" d="${path(rows)}" fill="none" vector-effect="non-scaling-stroke"></path>`).join("");
+  return `<div class="backtest-chart" role="img" aria-label="策略、买入持有与市场指数净值曲线"><div class="backtest-chart-legend">${legend}</div><svg viewBox="0 0 600 200" aria-hidden="true">${paths}</svg></div>`;
+}
+
+function renderBacktestPriceActions(result) {
+  const strategy = result.strategy || {};
+  const rows = Array.isArray(strategy.equity_curve) ? strategy.equity_curve : [];
+  const trades = Array.isArray(strategy.trades) ? strategy.trades : [];
+  return `<section class="backtest-result-section"><h3>价格与动作</h3>${renderPriceActionChart(rows, trades)}</section>`;
+}
+
+function renderPriceActionChart(rows, trades) {
+  const prices = rows.map((row) => Number(row.mark_price)).filter(Number.isFinite);
+  const min = prices.length ? Math.min(...prices) : 0;
+  const max = prices.length ? Math.max(...prices) : 1;
+  const dateIndex = new Map(rows.map((row, index) => [String(row.date || ""), index]));
+  const xy = (date, price) => {
+    const index = dateIndex.get(String(date || "")) || 0;
+    return [rows.length > 1 ? 20 + index * 560 / (rows.length - 1) : 300, 180 - (Number(price) - min) * 150 / (max - min || 1)];
+  };
+  const pricePath = rows.map((row, index) => { const [x, y] = xy(row.date, row.mark_price); return `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`; }).join(" ");
+  const allowed = new Set(["BUY", "ADD", "REDUCE", "EXIT"]);
+  const explanations = { BUY: "买入", ADD: "加仓", REDUCE: "减仓", EXIT: "退出" };
+  const markers = trades.filter((trade) => allowed.has(String(trade.action || ""))).map((trade) => {
+    const action = String(trade.action); const [x, y] = xy(trade.execution_date, trade.raw_price);
+    return `<g class="backtest-action-marker action-${action.toLowerCase()}"><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5"></circle><text x="${x.toFixed(1)}" y="${(y - 9).toFixed(1)}">${action}</text></g>`;
+  }).join("");
+  const summary = trades.filter((trade) => allowed.has(String(trade.action || ""))).map((trade) => `${trade.execution_date} ${trade.action}（${explanations[trade.action]}）`).join("；");
+  return `<div class="backtest-chart" role="img" aria-label="价格曲线与交易动作。${escapeHtml(summary || "没有执行动作")}。HOLD（观察）不绘制标记。"><svg viewBox="0 0 600 200" aria-hidden="true"><path class="backtest-price-line" d="${pricePath}" fill="none" vector-effect="non-scaling-stroke"></path>${markers}</svg></div>`;
+}
+
+function renderBacktestTradeTable(result) {
+  const trades = result.strategy && Array.isArray(result.strategy.trades) ? result.strategy.trades : [];
+  if (!trades.length) return '<section class="backtest-result-section"><h3>交易记录</h3><p class="backtest-empty-state">所选区间内没有触发交易</p></section>';
+  return `<section class="backtest-result-section"><h3>交易记录</h3><div class="backtest-table-wrap"><table class="backtest-trades-table"><thead><tr><th>执行日期</th><th>动作</th><th>数量</th><th>成交价</th><th>费用</th><th>原因</th></tr></thead><tbody>${trades.map((trade) => `<tr><td>${escapeHtml(trade.execution_date)}</td><td>${escapeHtml(trade.action)}</td><td>${escapeHtml(trade.quantity)}</td><td>${escapeHtml(trade.execution_price)}</td><td>${escapeHtml(trade.fees)}</td><td>${escapeHtml(trade.reason)}</td></tr>`).join("")}</tbody></table></div></section>`;
+}
+
+function renderBacktestRunAssumptions(result) {
+  const strategy = result.strategy || {};
+  const trades = Array.isArray(strategy.trades) ? strategy.trades : [];
+  const totalFees = trades.reduce((sum, trade) => sum + (Number(trade.fees) || 0), 0);
+  const artifacts = [["manifest_path", "运行清单"], ["signals_path", "策略信号"], ["trades_path", "交易记录"], ["equity_curve_path", "策略净值"], ["buy_hold_equity_path", "买入持有净值"], ["market_benchmark_equity_path", "市场指数净值"], ["metrics_path", "指标数据"], ["report_path", "回测报告"]];
+  return `<section class="backtest-result-section"><h3>运行详情</h3><dl class="backtest-run-details"><dt>请求范围</dt><dd>${escapeHtml(result.requested_start || "-")} 至 ${escapeHtml(result.requested_end || "-")}</dd><dt>实际数据</dt><dd>${escapeHtml(result.actual_start || "-")} 至 ${escapeHtml(result.actual_end || "-")}</dd><dt>策略版本</dt><dd>${escapeHtml(result.strategy_id || "-")}</dd><dt>执行器版本</dt><dd>${escapeHtml(result.adapter_version || "-")}</dd><dt>初始资金 / 策略额度</dt><dd>${escapeHtml(strategy.initial_cash || "-")} / ${escapeHtml(strategy.initial_allocated_notional || "-")}</dd><dt>交易成本</dt><dd>成交费用合计 ${escapeHtml(totalFees.toFixed(2))}</dd><dt>运行编号</dt><dd>${escapeHtml(result.run_id || "-")}</dd></dl><h4>结果文件</h4><ul class="backtest-artifacts">${artifacts.filter(([key]) => result[key]).map(([key, label]) => `<li><span>${label}</span><code>${escapeHtml(result[key])}</code></li>`).join("")}</ul></section>`;
+}
+
+function backtestPercent(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(2)}%` : "-";
 }
 
 function validateStandardBacktestDates() {
