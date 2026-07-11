@@ -7,22 +7,33 @@ async function expectNoEditableControls(scope: Locator) {
   }
 }
 
-async function expectKellyDerivationFits(scope: Locator) {
+async function expectKellyDerivationFits(scope: Locator, expectedRowCount: number) {
   await expect(scope).toBeVisible();
-  await expect(scope.locator('.kelly-derivation-grid > div')).toHaveCount(14);
-  const layout = await scope.locator('.kelly-derivation-grid > div').evaluateAll((rows) => rows.map((row) => {
+  const rows = scope.locator('.kelly-derivation-grid > div');
+  await expect(rows).toHaveCount(expectedRowCount);
+  const layout = await rows.evaluateAll((rows) => rows.map((row) => {
     const rect = row.getBoundingClientRect();
-    const value = row.querySelector('strong');
     return {
       bottom: rect.bottom,
+      content: Array.from(row.querySelectorAll('span, strong')).map((element) => {
+        const contentRect = element.getBoundingClientRect();
+        return {
+          bottom: contentRect.bottom,
+          fits: element.scrollWidth <= element.clientWidth,
+          left: contentRect.left,
+          right: contentRect.right,
+          top: contentRect.top,
+        };
+      }),
       left: rect.left,
       right: rect.right,
       top: rect.top,
-      valueFits: value ? value.scrollWidth <= value.clientWidth : false,
     };
   }));
   for (const row of layout) {
-    expect(row.valueFits).toBe(true);
+    for (const content of row.content) {
+      expect(content.fits).toBe(true);
+    }
   }
   for (let index = 0; index < layout.length; index += 1) {
     for (let otherIndex = index + 1; otherIndex < layout.length; otherIndex += 1) {
@@ -35,6 +46,27 @@ async function expectKellyDerivationFits(scope: Locator) {
       expect(overlaps).toBe(false);
     }
   }
+  const content = layout.flatMap((row) => row.content);
+  for (let index = 0; index < content.length; index += 1) {
+    for (let otherIndex = index + 1; otherIndex < content.length; otherIndex += 1) {
+      const first = content[index];
+      const second = content[otherIndex];
+      const overlaps = first.left < second.right
+        && first.right > second.left
+        && first.top < second.bottom
+        && first.bottom > second.top;
+      expect(overlaps).toBe(false);
+    }
+  }
+}
+
+async function expectKellyDerivationRow(scope: Locator, label: string, value: string) {
+  const row = scope.locator('.kelly-derivation-grid > div').filter({ hasText: label });
+  await expect(row).toHaveCount(1);
+  await expect(row.locator('span')).toHaveText(label);
+  await expect(row.locator('strong')).toHaveText(value);
+  await expect(row.locator('span')).toBeVisible();
+  await expect(row.locator('strong')).toBeVisible();
 }
 
 test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
@@ -136,7 +168,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(parameterDerivation.getByText('2026-07-11 11:58')).toBeVisible();
   await expect(parameterDerivation.getByText('最近计算')).toBeVisible();
   await expect(parameterDerivation.getByText('2026-07-11 12:00')).toBeVisible();
-  await expectKellyDerivationFits(parameterDerivation);
+  await expectKellyDerivationFits(parameterDerivation, 14);
   await expect(page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' })).toHaveCount(0);
   await page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ }).click();
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
@@ -197,6 +229,38 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByRole('heading', { name: /凯利仓位 · US\.AAPL/ })).toBeVisible();
   await expect(page.getByText('阶段 1 不计算 Kelly 仓位', { exact: true })).toBeVisible();
   await expect(page.getByText('趋势回调 20D Mock US 第一批').last()).toBeVisible();
+});
+
+test('renders sufficient and insufficient Kelly derivations without mobile overflow', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await page.getByRole('button', { name: '凯利实验室' }).click();
+
+  const sufficientDerivation = page.getByLabel('Kelly 参数推导');
+  for (const [label, value] of [
+    ['样本状态', '样本充足'],
+    ['已完成样本', '208'],
+    ['进行中样本', '3'],
+    ['来源样本时间', '2026-07-11 11:59'],
+    ['最近完成样本', '2026-07-11 11:58'],
+    ['最近计算', '2026-07-11 12:00'],
+  ]) {
+    await expectKellyDerivationRow(sufficientDerivation, label, value);
+  }
+  await expectKellyDerivationFits(sufficientDerivation, 14);
+
+  await page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ }).click();
+  const insufficientDerivation = page.getByLabel('Kelly 参数推导');
+  for (const [label, value] of [
+    ['样本状态', '样本不足'],
+    ['已完成样本', '0'],
+    ['进行中样本', '0'],
+    ['来源样本时间', '2026-07-11 11:59'],
+    ['最近计算', '2026-07-11 12:00'],
+  ]) {
+    await expectKellyDerivationRow(insufficientDerivation, label, value);
+  }
+  await expectKellyDerivationFits(insufficientDerivation, 13);
 });
 
 test('renders stale Kelly strategy stats as unavailable without controls at mobile viewport', async ({ page }) => {
