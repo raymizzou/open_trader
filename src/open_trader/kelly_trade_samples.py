@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import uuid
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -82,8 +80,8 @@ def load_kelly_trade_samples(data_dir: Path) -> dict[str, Any]:
         raise ValueError(
             f"{path.name} schema_version must be {TRADE_SAMPLES_SCHEMA_VERSION!r}",
         )
-    if not isinstance(payload.get("samples"), list):
-        raise ValueError(f"{path.name} must contain a samples list")
+    if not isinstance(payload.get("stats_by_experiment"), dict):
+        raise ValueError(f"{path.name} must contain stats_by_experiment")
     return payload
 
 
@@ -185,62 +183,127 @@ def _stats_by_experiment(
     samples: list[dict[str, Any]],
     open_positions: list[dict[str, Any]],
     skipped_orders: list[dict[str, Any]],
-    timestamp: str,
+    generated_at: str,
 ) -> dict[str, dict[str, Any]]:
     stats: dict[str, dict[str, Any]] = {}
     for experiment in experiments:
         experiment_id = _text(experiment.get("experiment_id"))
-        stats[experiment_id] = {
-            "experiment_id": experiment_id,
-            "experiment_name": _text(experiment.get("experiment_name")),
-            "market": _text(experiment.get("market")).upper(),
-            "completed_samples": 0,
-            "winning_samples": 0,
-            "losing_samples": 0,
-            "flat_samples": 0,
-            "open_samples": 0,
-            "skipped_orders": 0,
-            "win_rate": "0%",
-            "suggested_position_pct": "0%",
-            "parameter_source": "futu_paper_order_samples",
-            "updated_at": timestamp,
-        }
-
-    for sample in samples:
-        experiment_id = _text(sample.get("experiment_id"))
-        stat = stats.get(experiment_id)
-        if stat is None:
-            continue
-        stat["completed_samples"] += 1
-        result = _text(sample.get("result"))
-        if result == "win":
-            stat["winning_samples"] += 1
-        elif result == "loss":
-            stat["losing_samples"] += 1
-        elif result == "flat":
-            stat["flat_samples"] += 1
-
-    for position in open_positions:
-        experiment_id = _text(position.get("experiment_id"))
-        stat = stats.get(experiment_id)
-        if stat is None:
-            continue
-        stat["open_samples"] += 1
-
-    for skipped in skipped_orders:
-        experiment_id = _text(skipped.get("experiment_id"))
-        stat = stats.get(experiment_id)
-        if stat is None:
-            continue
-        stat["skipped_orders"] += 1
-
-    for stat in stats.values():
-        completed = stat["completed_samples"]
-        if completed:
-            stat["win_rate"] = _pct_text(
-                Decimal(stat["winning_samples"]) / Decimal(completed)
-            )
+        exp_samples = [
+            sample for sample in samples if sample["experiment_id"] == experiment_id
+        ]
+        exp_open = [
+            item for item in open_positions if item["experiment_id"] == experiment_id
+        ]
+        exp_skipped = [
+            item for item in skipped_orders if item.get("experiment_id") == experiment_id
+        ]
+        stats[experiment_id] = _experiment_stats(
+            exp_samples,
+            exp_open,
+            exp_skipped,
+            generated_at,
+        )
+        stats[experiment_id].update(
+            {
+                "experiment_id": experiment_id,
+                "experiment_name": _text(experiment.get("experiment_name")),
+                "market": _text(experiment.get("market")).upper(),
+            }
+        )
     return stats
+
+
+def _experiment_stats(
+    samples: list[dict[str, Any]],
+    open_positions: list[dict[str, Any]],
+    skipped_orders: list[dict[str, Any]],
+    generated_at: str,
+) -> dict[str, Any]:
+    completed = len(samples)
+    wins = [sample for sample in samples if _text(sample.get("result")) == "win"]
+    losses = [sample for sample in samples if _text(sample.get("result")) == "loss"]
+    flats = [sample for sample in samples if _text(sample.get("result")) == "flat"]
+    raw_win_rate = (
+        Decimal(len(wins)) / Decimal(completed) if completed else Decimal("0")
+    )
+    adjusted_win_rate = _adjusted_win_rate(len(wins), completed)
+    avg_net_win = _average_pct(wins)
+    avg_net_loss = abs(_average_pct(losses))
+    payoff_ratio = (
+        Decimal("0") if avg_net_loss <= 0 else avg_net_win / avg_net_loss
+    )
+    full_kelly = _kelly_fraction(adjusted_win_rate, payoff_ratio)
+    fractional_kelly = full_kelly / Decimal("4") if full_kelly > 0 else Decimal("0")
+    suggested_position = (
+        min(fractional_kelly, Decimal("0.04"))
+        if fractional_kelly > 0
+        else Decimal("0")
+    )
+    last_closed_at = max(
+        (_text(sample.get("exit_submitted_at")) for sample in samples),
+        default="",
+    )
+    return {
+        "completed_samples": completed,
+        "winning_samples": len(wins),
+        "losing_samples": len(losses),
+        "flat_samples": len(flats),
+        "open_samples": len(open_positions),
+        "skipped_orders": len(skipped_orders),
+        "raw_win_rate": _pct_text(raw_win_rate),
+        "adjusted_win_rate": _pct_text(adjusted_win_rate),
+        "avg_net_win_pct": _pct_text(avg_net_win),
+        "avg_net_loss_pct": _pct_text(avg_net_loss),
+        "payoff_ratio": _decimal_text(payoff_ratio),
+        "full_kelly_pct": _pct_text(full_kelly),
+        "fractional_kelly_pct": _pct_text(fractional_kelly),
+        "suggested_position_pct": _pct_text(suggested_position),
+        "sample_stage": "sufficient" if completed >= 200 else "insufficient",
+        "sample_adjustment": (
+            "未收缩" if completed >= 200 else "样本少于 200，向 50% 收缩"
+        ),
+        "last_sample_closed_at": last_closed_at,
+        "last_recomputed_at": generated_at,
+        "win_rate": _pct_text(raw_win_rate),
+        "parameter_source": "futu_paper_order_samples",
+        "updated_at": generated_at,
+    }
+
+
+def _adjusted_win_rate(winning_samples: int, completed_samples: int) -> Decimal:
+    if completed_samples >= 200:
+        return Decimal(winning_samples) / Decimal(completed_samples)
+    return (Decimal(winning_samples) + Decimal("100")) / (
+        Decimal(completed_samples) + Decimal("200")
+    )
+
+
+def _average_pct(samples: list[dict[str, Any]]) -> Decimal:
+    values = [
+        value
+        for value in (_pct_decimal(sample.get("net_pnl_pct")) for sample in samples)
+        if value is not None
+    ]
+    if not values:
+        return Decimal("0")
+    return sum(values, Decimal("0")) / Decimal(len(values))
+
+
+def _pct_decimal(value: object) -> Decimal | None:
+    text = _text(value).rstrip("%")
+    if not text:
+        return None
+    parsed = _decimal(text)
+    if parsed is None:
+        return None
+    return parsed / Decimal("100")
+
+
+def _kelly_fraction(win_rate: Decimal, payoff_ratio: Decimal) -> Decimal:
+    if payoff_ratio <= 0:
+        return Decimal("0")
+    kelly = win_rate - ((Decimal("1") - win_rate) / payoff_ratio)
+    return kelly if kelly > 0 else Decimal("0")
 
 
 def _order_skip_reason(
@@ -366,16 +429,11 @@ def _diagnostic(order: dict[str, Any], reason: str) -> dict[str, Any]:
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        temp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        temp_path.replace(path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    tmp_path.replace(path)
 
 
 def _current_timestamp() -> str:
