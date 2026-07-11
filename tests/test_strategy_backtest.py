@@ -14,7 +14,8 @@ import backtrader as bt
 
 from open_trader.standard_strategies import StrategyBar, StrategySignal
 from open_trader.strategy_backtest import (
-    BacktraderTargetWeightAdapter, StandardBacktestRequest, run_standard_backtest,
+    BacktraderTargetWeightAdapter, NormalizedTrade, StandardBacktestRequest,
+    _execution_result, _run_buy_hold, run_standard_backtest,
 )
 
 
@@ -159,7 +160,7 @@ def test_adapter_runs_real_cerebro_and_notify_order_lifecycle(monkeypatch: pytes
     )
     assert calls == 1
     assert any(trade.quantity > 0 for trade in result.trades)
-    assert any(trade.reason == "end_of_backtest" for trade in result.trades)
+    assert any(trade.reason == "回测期末平仓" for trade in result.trades)
 
 
 def test_unequal_calendars_are_intersected_by_exact_date_set(tmp_path: Path) -> None:
@@ -180,7 +181,7 @@ def test_terminal_strategy_position_is_liquidated_with_cost_reconciliation() -> 
     buy, sell = [trade for trade in result.trades if trade.quantity]
     assert buy.execution_price == Decimal("100.1")
     assert sell.execution_price == Decimal("119.88")
-    assert sell.action == "EXIT" and sell.reason == "end_of_backtest"
+    assert sell.action == "EXIT" and sell.reason == "回测期末平仓"
     expected = Decimal("100000") - buy.quantity * buy.execution_price - buy.fees
     expected += abs(sell.quantity) * sell.execution_price - sell.fees
     assert result.final_equity == expected
@@ -249,3 +250,76 @@ def test_run_collision_refuses_to_overwrite_in_chinese(tmp_path: Path, monkeypat
     run_standard_backtest(request, price_provider=fixture_provider("basic"))
     with pytest.raises(ValueError, match="回测运行编号已存在，拒绝覆盖"):
         run_standard_backtest(request, price_provider=fixture_provider("basic"))
+
+
+def test_reduce_uses_sell_slippage_for_target_quantity() -> None:
+    days = [date(2025, 1, day) for day in range(2, 7)]
+    result = BacktraderTargetWeightAdapter().run(
+        bars=[_bar(day, "100") for day in days],
+        signals=[_signal(days[0], days[1], "BUY", "0.1"), _signal(days[2], days[3], "REDUCE", "0.05")],
+        initial_cash=Decimal("100000"), commission_bps=Decimal("0"), slippage_bps=Decimal("10"),
+    )
+    reduce = next(trade for trade in result.trades if trade.action == "REDUCE")
+    assert reduce.execution_price == Decimal("99.9")
+    assert abs(reduce.quantity) == Decimal("49")  # 99 shares -> target floor(5000 / 99.9) = 50
+
+
+def test_strategy_entry_sizing_includes_commission_and_matches_benchmark() -> None:
+    days = [date(2025, 1, day) for day in range(2, 6)]
+    bars = [_bar(day, "10") for day in days]
+    strategy = BacktraderTargetWeightAdapter().run(
+        bars=bars, signals=[_signal(days[0], days[1], "BUY", "0.1")],
+        initial_cash=Decimal("1000"), commission_bps=Decimal("100"), slippage_bps=Decimal("0"),
+    )
+    benchmark = _run_buy_hold(
+        bars, Decimal("1000"), Decimal("100"), Decimal("100"), Decimal("0"),
+    )
+    strategy_buy = next(trade for trade in strategy.trades if trade.action == "BUY")
+    benchmark_buy = next(trade for trade in benchmark.trades if trade.action == "BUY")
+    assert strategy_buy.quantity == benchmark_buy.quantity == Decimal("9")
+    assert strategy_buy.quantity * strategy_buy.execution_price + strategy_buy.fees <= Decimal("100")
+
+
+def test_terminal_reason_is_chinese_in_trade_csv_and_report_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.strategy_backtest as module
+    monkeypatch.setattr(
+        module, "generate_strategy_signals",
+        lambda *args, **kwargs: [_signal(date(2025, 1, 1), date(2025, 1, 2), "BUY", "0.1")],
+    )
+    result = run_standard_backtest(
+        standard_request(tmp_path, strategy_id="breakout_momentum/v1"),
+        price_provider=fixture_provider("breakout_next_open"),
+    )
+    assert any(trade.reason == "回测期末平仓" for trade in result.trades)
+    assert "end_of_backtest" not in result.trades_path.read_text(encoding="utf-8")
+    assert "end_of_backtest" not in result.report_path.read_text(encoding="utf-8")
+    assert "回测期末平仓" in result.trades_path.read_text(encoding="utf-8")
+
+
+def test_annualized_return_and_drawdown_match_hand_calculation() -> None:
+    rows = [
+        {"date": "2025-01-01", "cash": "100", "position_quantity": "0", "close": "1", "equity": "100", "drawdown_pct": "0"},
+        {"date": "2025-07-01", "cash": "80", "position_quantity": "0", "close": "1", "equity": "80", "drawdown_pct": "-20"},
+        {"date": "2026-01-01", "cash": "121", "position_quantity": "0", "close": "1", "equity": "121", "drawdown_pct": "0"},
+    ]
+    result = _execution_result([], rows, Decimal("100"), Decimal("10"), date(2025, 1, 1), date(2026, 1, 1), Decimal("-20"))
+    assert result.total_return_pct == Decimal("21.00")
+    assert result.annualized_return_pct == Decimal("21.00")
+    assert result.max_drawdown_pct == Decimal("20")
+
+
+def test_existing_publication_lock_refuses_run_without_touching_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.strategy_backtest as module
+    monkeypatch.setattr(module, "_build_run_id", lambda *args, **kwargs: "fixed-run")
+    parent = tmp_path / "data" / "backtests"
+    parent.mkdir(parents=True)
+    lock = parent / ".fixed-run.lock"
+    lock.write_text("first publisher", encoding="utf-8")
+    with pytest.raises(ValueError, match="回测运行编号已存在，拒绝覆盖"):
+        run_standard_backtest(standard_request(tmp_path), price_provider=fixture_provider("basic"))
+    assert lock.read_text(encoding="utf-8") == "first publisher"
+    assert not (parent / "fixed-run").exists()

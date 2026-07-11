@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import shutil
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import date, datetime, timedelta, timezone
@@ -176,8 +177,13 @@ class BacktraderTargetWeightAdapter:
                 next_open = next_open_by_decision.get(signal.decision_date)
                 if next_open is None or signal.target_weight is None:
                     return
-                slipped = next_open * (Decimal("1") + slippage_bps / Decimal("10000"))
-                target = (initial_cash * signal.target_weight / slipped).quantize(Decimal("1"), rounding=ROUND_DOWN)
+                target_notional = initial_cash * signal.target_weight
+                current_notional = Decimal(str(self.position.size)) * next_open
+                is_buy = target_notional > current_notional
+                slip_direction = Decimal("1") if is_buy else Decimal("-1")
+                slipped = next_open * (Decimal("1") + slip_direction * slippage_bps / Decimal("10000"))
+                entry_cost_factor = Decimal("1") + commission_bps / Decimal("10000") if is_buy else Decimal("1")
+                target = (target_notional / (slipped * entry_cost_factor)).quantize(Decimal("1"), rounding=ROUND_DOWN)
                 delta = target - Decimal(str(self.position.size))
                 if delta == 0:
                     self.trades_out.append(NormalizedTrade(
@@ -221,7 +227,7 @@ class BacktraderTargetWeightAdapter:
                     if order is not None:
                         self.order_meta[order.ref] = {
                             "decision": last_bar.date, "execution": last_bar.date,
-                            "action": "EXIT", "raw": last_bar.close, "reason": "end_of_backtest",
+                            "action": "EXIT", "raw": last_bar.close, "reason": "回测期末平仓",
                         }
 
             def notify_order(self, order: object) -> None:
@@ -401,7 +407,7 @@ def _run_buy_hold(bars: Sequence[StrategyBar], initial_cash: Decimal, allocated:
     exit_fee = quantity * exit_price * commission_bps / Decimal("10000")
     trades = [
         NormalizedTrade(bars[0].date.isoformat(), entry_bar.date.isoformat(), "BUY", quantity, entry_bar.open, entry, entry_fee, "基准首个可执行开盘买入"),
-        NormalizedTrade(exit_bar.date.isoformat(), exit_bar.date.isoformat(), "EXIT", -quantity, exit_bar.close, exit_price, exit_fee, "end_of_backtest"),
+        NormalizedTrade(exit_bar.date.isoformat(), exit_bar.date.isoformat(), "EXIT", -quantity, exit_bar.close, exit_price, exit_fee, "回测期末平仓"),
     ]
     curve: list[dict[str, str]] = []
     for bar in bars:
@@ -482,10 +488,16 @@ def _publish_run(request: StandardBacktestRequest, run_id: str, manifest_base: d
         raise ValueError("回测运行编号已存在，拒绝覆盖")
     parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = parent / f".{run_id}.lock"
     staging = parent / f".{run_id}.tmp-{uuid4().hex}"
     report_temp: Path | None = None
     published = False
+    lock_fd: int | None = None
     try:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            raise ValueError("回测运行编号已存在，拒绝覆盖") from exc
         staging.mkdir()
         artifacts: dict[str, tuple[str, object, Sequence[str] | None]] = {
             "signals.csv": ("csv", _signal_rows(signals), ("decision_date", "earliest_execution_date", "action", "target_weight", "rule", "explanation", "data_cutoff")),
@@ -521,6 +533,9 @@ def _publish_run(request: StandardBacktestRequest, run_id: str, manifest_base: d
             report_temp.unlink()
         if published and not report_path.exists() and final_dir.exists():
             shutil.rmtree(final_dir)
+        if lock_fd is not None:
+            os.close(lock_fd)
+            lock_path.unlink(missing_ok=True)
 
 
 def _write_run_artifact(path: Path, kind: str, payload: object, fieldnames: Sequence[str] | None) -> None:
