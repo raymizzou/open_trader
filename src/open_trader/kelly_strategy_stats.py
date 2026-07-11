@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -12,6 +14,18 @@ from typing import Any
 
 STRATEGY_STATS_SCHEMA_VERSION = "open_trader.kelly_strategy_stats.v1"
 TRADE_SAMPLES_SCHEMA_VERSION = "open_trader.kelly_trade_samples.v1"
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_TRADE_EVIDENCE_FIELDS = (
+    "schema_version",
+    "generated_at",
+    "source_orders_synced_at",
+    "sample_count",
+    "open_position_count",
+    "skipped_order_count",
+    "samples",
+    "open_positions",
+    "diagnostics",
+)
 
 
 def build_kelly_strategy_stats_payload(
@@ -34,6 +48,7 @@ def build_kelly_strategy_stats_payload(
     )
     timestamp = generated_at or _current_timestamp()
     source_generated_at = evidence["generated_at"]
+    source_digest = kelly_trade_samples_digest(evidence)
     stats_by_experiment = {
         experiment_id: _experiment_stats(
             samples=_for_experiment(evidence["samples"], experiment_id),
@@ -49,6 +64,7 @@ def build_kelly_strategy_stats_payload(
             experiment_id=experiment_id,
             experiment_name=experiment_name,
             source_trade_samples_generated_at=source_generated_at,
+            source_trade_samples_digest=source_digest,
         )
         for experiment_id, experiment_name, market in configured_experiments
     }
@@ -56,6 +72,7 @@ def build_kelly_strategy_stats_payload(
         "schema_version": STRATEGY_STATS_SCHEMA_VERSION,
         "generated_at": timestamp,
         "source_trade_samples_generated_at": source_generated_at,
+        "source_trade_samples_digest": source_digest,
         "experiment_count": len(stats_by_experiment),
         "stats_by_experiment": stats_by_experiment,
     }
@@ -67,6 +84,7 @@ def validate_kelly_strategy_stats_payload(
     artifact_name: str = "kelly_strategy_stats.json",
     expected_experiment_ids: set[str] | None = None,
     expected_trade_samples_generated_at: str | None = None,
+    expected_trade_samples_digest: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not isinstance(payload, dict):
         raise ValueError(f"{artifact_name} must contain a JSON object")
@@ -77,6 +95,7 @@ def validate_kelly_strategy_stats_payload(
         )
     generated_at = payload.get("generated_at")
     source_generated_at = payload.get("source_trade_samples_generated_at")
+    source_digest = payload.get("source_trade_samples_digest")
     stats = payload.get("stats_by_experiment")
     if not isinstance(generated_at, str) or not generated_at.strip():
         raise ValueError(f"{artifact_name} must contain generated_at")
@@ -84,6 +103,10 @@ def validate_kelly_strategy_stats_payload(
         raise ValueError(
             f"{artifact_name} must contain source_trade_samples_generated_at"
         )
+    if not isinstance(source_digest, str) or not _SHA256_PATTERN.fullmatch(
+        source_digest
+    ):
+        raise ValueError(f"{artifact_name} contains invalid source trade samples digest")
     if not isinstance(stats, dict):
         raise ValueError(f"{artifact_name} must contain stats_by_experiment")
     experiment_count = payload.get("experiment_count")
@@ -92,6 +115,11 @@ def validate_kelly_strategy_stats_payload(
     if (
         expected_trade_samples_generated_at is not None
         and source_generated_at != expected_trade_samples_generated_at
+    ):
+        raise ValueError(f"{artifact_name} is stale")
+    if (
+        expected_trade_samples_digest is not None
+        and source_digest != expected_trade_samples_digest
     ):
         raise ValueError(f"{artifact_name} is stale")
     if expected_experiment_ids is not None and set(stats) != expected_experiment_ids:
@@ -120,6 +148,7 @@ def validate_kelly_strategy_stats_payload(
         "last_sample_closed_at",
         "last_recomputed_at",
         "source_trade_samples_generated_at",
+        "source_trade_samples_digest",
         "updated_at",
         "calculation_inputs",
     }
@@ -139,6 +168,8 @@ def validate_kelly_strategy_stats_payload(
             item,
             experiment_id=experiment_id,
             source_trade_samples_generated_at=source_generated_at,
+            source_trade_samples_digest=source_digest,
+            generated_at=generated_at,
             artifact_name=artifact_name,
         )
     return copy.deepcopy(stats)
@@ -169,6 +200,22 @@ def validate_kelly_trade_samples_payload(
         artifact_name=artifact_name,
         require_artifact_fields=True,
     )
+
+
+def kelly_trade_samples_digest(payload: dict[str, Any]) -> str:
+    evidence = {
+        field: payload[field]
+        for field in _TRADE_EVIDENCE_FIELDS
+        if field in payload
+    }
+    canonical = json.dumps(
+        evidence,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _validate_trade_samples_evidence(
@@ -288,7 +335,7 @@ def _validate_completed_samples(
             raise ValueError(f"{label} contains invalid exit_notional")
         if gross_pnl != exit_notional - entry_notional:
             raise ValueError(f"{label} contains invalid gross_pnl")
-        if sample["net_pnl_pct"] != _sample_pct_text(gross_pnl / entry_notional):
+        if sample["net_pnl_pct"] != _pct_text(gross_pnl / entry_notional):
             raise ValueError(f"{label} contains invalid net_pnl_pct")
         if (result == "win" and gross_pnl <= 0) or (
             result == "loss" and gross_pnl >= 0
@@ -373,13 +420,6 @@ def _sample_pct_decimal(value: object) -> Decimal | None:
     return _decimal(value.strip()[:-1])
 
 
-def _sample_pct_text(value: Decimal) -> str:
-    rounded = _pct_text(value)
-    if rounded == "0%" and value != 0:
-        return f"{_decimal_text(value * Decimal('100'))}%"
-    return rounded
-
-
 def _validate_evidence_experiment_coverage(
     evidence: dict[str, Any],
     configured_experiment_markets: dict[str, str],
@@ -404,6 +444,8 @@ def _validate_stats_record(
     *,
     experiment_id: str,
     source_trade_samples_generated_at: str,
+    source_trade_samples_digest: str,
+    generated_at: str,
     artifact_name: str,
 ) -> None:
     label = f"{artifact_name} stats for {experiment_id}"
@@ -437,7 +479,7 @@ def _validate_stats_record(
     for field in ("winning_samples", "losing_samples", "flat_samples"):
         if counts[field] > completed:
             raise ValueError(f"{label} contains invalid {field}")
-    if classified > completed:
+    if classified != completed:
         raise ValueError(f"{label} contains invalid completed_samples")
 
     expected_stage = "sufficient" if completed >= 200 else "insufficient"
@@ -526,8 +568,10 @@ def _validate_stats_record(
         raise ValueError(
             f"{label} contains invalid source_trade_samples_generated_at"
         )
+    if item["source_trade_samples_digest"] != source_trade_samples_digest:
+        raise ValueError(f"{label} contains invalid source_trade_samples_digest")
     for field in ("last_recomputed_at", "updated_at"):
-        if not isinstance(item[field], str) or not item[field].strip():
+        if item[field] != generated_at:
             raise ValueError(f"{label} contains invalid {field}")
     if not isinstance(item["last_sample_closed_at"], str):
         raise ValueError(f"{label} contains invalid last_sample_closed_at")
@@ -586,15 +630,23 @@ def _validated_pct(value: object, *, field: str, label: str) -> Decimal:
 def _configured_experiments(
     experiments: list[dict[str, Any]],
 ) -> list[tuple[str, str, str]]:
-    return [
-        (
-            experiment_id,
-            _text(experiment.get("experiment_name")),
-            _text(experiment.get("market")).upper(),
+    configured: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for index, experiment in enumerate(experiments):
+        experiment_id = _text(experiment.get("experiment_id"))
+        if not experiment_id:
+            raise ValueError(f"configured experiment {index} has blank experiment_id")
+        if experiment_id in seen:
+            raise ValueError(f"duplicate experiment_id {experiment_id}")
+        seen.add(experiment_id)
+        configured.append(
+            (
+                experiment_id,
+                _text(experiment.get("experiment_name")),
+                _text(experiment.get("market")).upper(),
+            )
         )
-        for experiment in experiments
-        if (experiment_id := _text(experiment.get("experiment_id")))
-    ]
+    return configured
 
 
 def _for_experiment(
@@ -617,6 +669,7 @@ def _experiment_stats(
     experiment_id: str,
     experiment_name: str,
     source_trade_samples_generated_at: str,
+    source_trade_samples_digest: str,
 ) -> dict[str, Any]:
     completed = len(samples)
     wins = [sample for sample in samples if _text(sample.get("result")) == "win"]
@@ -676,6 +729,7 @@ def _experiment_stats(
         "win_rate": _pct_text(raw_win_rate),
         "parameter_source": "futu_paper_order_samples",
         "source_trade_samples_generated_at": source_trade_samples_generated_at,
+        "source_trade_samples_digest": source_trade_samples_digest,
         "updated_at": generated_at,
         "calculation_inputs": calculation_inputs,
     }

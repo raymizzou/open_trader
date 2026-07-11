@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -10,7 +11,10 @@ from open_trader.kelly_lab import (
     index_kelly_experiments_by_market_symbol,
     load_kelly_lab_state,
 )
-from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
+from open_trader.kelly_strategy_stats import (
+    build_kelly_strategy_stats_payload,
+    kelly_trade_samples_digest,
+)
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
@@ -82,6 +86,32 @@ def minimal_experiment_payload(
             }
         ],
     }
+
+
+@pytest.mark.parametrize("experiment_id", ["", "   "])
+def test_load_kelly_lab_state_rejects_blank_experiment_id(
+    tmp_path: Path,
+    experiment_id: str,
+) -> None:
+    data_dir = tmp_path / "data"
+    experiments = minimal_experiment_payload()
+    experiments["experiments"][0]["experiment_id"] = experiment_id
+    write_json(data_dir / "latest/kelly_strategy_templates.json", minimal_template_payload())
+    write_json(data_dir / "latest/kelly_experiments.json", experiments)
+
+    with pytest.raises(ValueError, match="experiment_id"):
+        load_kelly_lab_state(data_dir, include_strategy_stats=False)
+
+
+def test_load_kelly_lab_state_rejects_duplicate_experiment_id(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    experiments = minimal_experiment_payload()
+    experiments["experiments"].append(copy.deepcopy(experiments["experiments"][0]))
+    write_json(data_dir / "latest/kelly_strategy_templates.json", minimal_template_payload())
+    write_json(data_dir / "latest/kelly_experiments.json", experiments)
+
+    with pytest.raises(ValueError, match="duplicate experiment_id.*trend_us"):
+        load_kelly_lab_state(data_dir, include_strategy_stats=False)
 
 
 def _write_minimal_kelly_templates(latest_dir: Path) -> None:
@@ -269,6 +299,39 @@ def test_lab_fails_closed_for_missing_or_invalid_strategy_stats(
     assert state.available is False
     assert "kelly_strategy_stats.json" in state.error
     assert error in state.error
+
+
+def test_lab_rejects_changed_trade_evidence_with_same_generated_minute(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    trade_samples = _write_lab_fixtures(data_dir)
+    _write_strategy_stats_fixture(
+        data_dir / "latest",
+        trade_samples_payload=trade_samples,
+    )
+    changed = copy.deepcopy(trade_samples)
+    changed["diagnostics"] = {
+        "skipped_orders": [
+            {
+                "reason": "unsupported_status",
+                "experiment_id": "trend_us",
+                "market": "US",
+                "symbol": "RAM",
+                "side": "buy",
+                "status": "cancelled",
+                "order_id": "ORDER-1",
+                "submitted_at": "2026-07-11 10:00",
+            }
+        ]
+    }
+    changed["skipped_order_count"] = 1
+    write_json(data_dir / "latest/kelly_trade_samples.json", changed)
+
+    state = load_kelly_lab_state(data_dir)
+
+    assert state.available is False
+    assert "kelly_strategy_stats.json is stale" in state.error
 
 
 def test_load_kelly_lab_state_rejects_mixed_market_experiment(
@@ -1236,11 +1299,22 @@ def test_load_checked_in_kelly_data_uses_unified_strategy_stats() -> None:
     experiments_payload = json.loads(
         (latest_dir / "kelly_experiments.json").read_text(encoding="utf-8")
     )
+    trade_samples_payload = json.loads(
+        (latest_dir / "kelly_trade_samples.json").read_text(encoding="utf-8")
+    )
+    intents_payload = json.loads(
+        (latest_dir / "kelly_order_intents.json").read_text(encoding="utf-8")
+    )
+    risk_payload = json.loads(
+        (latest_dir / "kelly_order_risk_checks.json").read_text(encoding="utf-8")
+    )
     state = load_kelly_lab_state(Path("data")).to_dict()
 
     assert state["available"] is True
     assert state["error"] == ""
     expected_stats = stats_payload["stats_by_experiment"]
+    expected_digest = kelly_trade_samples_digest(trade_samples_payload)
+    assert stats_payload["source_trade_samples_digest"] == expected_digest
     embedded_stats = {
         experiment["experiment_id"]: experiment["stats"]
         for experiment in experiments_payload["experiments"]
@@ -1259,6 +1333,45 @@ def test_load_checked_in_kelly_data_uses_unified_strategy_stats() -> None:
             == stats_payload["source_trade_samples_generated_at"]
         )
         assert stats["last_recomputed_at"] == stats_payload["generated_at"]
+        assert stats["updated_at"] == stats_payload["generated_at"]
+        assert stats["source_trade_samples_digest"] == expected_digest
+
+    intents_by_type = {
+        intent["intent_type"]: intent for intent in intents_payload["intents"]
+    }
+    entry = intents_by_type["entry"]
+    entry_stats = expected_stats[entry["experiment_id"]]
+    assert entry["suggested_position_pct"] == "0%"
+    assert entry["suggested_position_pct"] == entry_stats["suggested_position_pct"]
+    assert entry["parameter_source"] == entry_stats["parameter_source"]
+    assert entry["strategy_stats_generated_at"] == entry_stats["last_recomputed_at"]
+    assert (
+        entry["strategy_stats_source_samples_generated_at"]
+        == entry_stats["source_trade_samples_generated_at"]
+    )
+    assert entry["source_trade_samples_digest"] == expected_digest
+
+    exit_intent = intents_by_type["exit"]
+    for field in (
+        "suggested_position_pct",
+        "parameter_source",
+        "strategy_stats_generated_at",
+        "strategy_stats_source_samples_generated_at",
+        "source_trade_samples_digest",
+        "per_symbol_budget",
+    ):
+        assert field not in exit_intent
+
+    checks_by_intent = {
+        check["intent_id"]: check for check in risk_payload["checks"]
+    }
+    assert checks_by_intent[entry["intent_id"]]["risk_status"] == "blocked"
+    assert checks_by_intent[entry["intent_id"]]["suggested_position_pct"] == "0%"
+    assert (
+        checks_by_intent[entry["intent_id"]]["source_trade_samples_digest"]
+        == expected_digest
+    )
+    assert checks_by_intent[exit_intent["intent_id"]]["risk_status"] == "approved"
 
 
 def test_latest_kelly_experiments_are_single_market() -> None:

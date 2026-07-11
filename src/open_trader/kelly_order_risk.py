@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from .kelly_market_rules import kelly_market_currency, normalize_kelly_market
+from .kelly_strategy_stats import (
+    kelly_trade_samples_digest,
+    load_kelly_strategy_stats,
+    validate_kelly_strategy_stats_payload,
+)
+from .kelly_trade_samples import load_kelly_trade_samples
 
 
 ORDER_RISK_CHECKS_SCHEMA_VERSION = "open_trader.kelly_order_risk_checks.v1"
@@ -38,11 +44,38 @@ def build_kelly_order_risk_checks(
     max_entry_position_pct: str = "4",
     strategy_capital_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    intent_payload = load_kelly_order_intents(data_dir)
+    strategy_stats_by_experiment = None
+    if _contains_entry_intent(intent_payload):
+        try:
+            trade_samples_payload = load_kelly_trade_samples(data_dir)
+            strategy_stats_payload = load_kelly_strategy_stats(data_dir)
+            strategy_stats_by_experiment = validate_kelly_strategy_stats_payload(
+                strategy_stats_payload,
+                expected_trade_samples_generated_at=trade_samples_payload[
+                    "generated_at"
+                ],
+                expected_trade_samples_digest=kelly_trade_samples_digest(
+                    trade_samples_payload
+                ),
+            )
+        except (FileNotFoundError, ValueError):
+            strategy_stats_by_experiment = None
     return build_kelly_order_risk_checks_payload(
-        load_kelly_order_intents(data_dir),
+        intent_payload,
         checked_at=checked_at,
         max_entry_position_pct=max_entry_position_pct,
         strategy_capital_payload=strategy_capital_payload,
+        strategy_stats_by_experiment=strategy_stats_by_experiment,
+    )
+
+
+def _contains_entry_intent(payload: dict[str, Any]) -> bool:
+    return any(
+        isinstance(intent, dict)
+        and str(intent.get("intent_type", "")).strip().lower() == "entry"
+        and str(intent.get("side", "")).strip().lower() != "sell"
+        for intent in payload.get("intents", [])
     )
 
 
@@ -52,6 +85,7 @@ def build_kelly_order_risk_checks_payload(
     checked_at: str | None = None,
     max_entry_position_pct: str = "4",
     strategy_capital_payload: dict[str, Any] | None = None,
+    strategy_stats_by_experiment: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     timestamp = checked_at or _current_timestamp()
     max_entry_pct = _parse_positive_decimal(max_entry_position_pct)
@@ -73,6 +107,7 @@ def build_kelly_order_risk_checks_payload(
                 checked_at=timestamp,
                 max_entry_position_pct=max_entry_pct,
                 capital_by_experiment=capital_by_experiment,
+                strategy_stats_by_experiment=strategy_stats_by_experiment,
             )
         )
 
@@ -101,6 +136,7 @@ def _build_single_check(
     checked_at: str,
     max_entry_position_pct: Decimal,
     capital_by_experiment: dict[str, dict[str, Any]] | None,
+    strategy_stats_by_experiment: dict[str, dict[str, Any]] | None,
 ) -> dict[str, Any]:
     base = _base_check(intent, checked_at=checked_at)
     side = str(intent.get("side", "")).strip().lower()
@@ -155,6 +191,10 @@ def _build_single_check(
             "status": "passed" if position_pct is not None else "failed",
             "detail": _field_text(intent.get("suggested_position_pct")).rstrip("%"),
         },
+        _strategy_stats_provenance_result(
+            intent,
+            strategy_stats_by_experiment,
+        ),
     ]
 
     planned_notional = ""
@@ -218,6 +258,49 @@ def _strategy_capital_by_experiment(
         str(item.get("experiment_id", "")).strip(): item
         for item in strategies
         if isinstance(item, dict) and str(item.get("experiment_id", "")).strip()
+    }
+
+
+def _strategy_stats_provenance_result(
+    intent: dict[str, Any],
+    stats_by_experiment: dict[str, dict[str, Any]] | None,
+) -> dict[str, str]:
+    experiment_id = _field_text(intent.get("experiment_id"))
+    stats = (
+        stats_by_experiment.get(experiment_id)
+        if stats_by_experiment is not None
+        else None
+    )
+    expected = {
+        "suggested_position_pct": _field_text(
+            stats.get("suggested_position_pct") if stats else None
+        ),
+        "parameter_source": _field_text(
+            stats.get("parameter_source") if stats else None
+        ),
+        "strategy_stats_generated_at": _field_text(
+            stats.get("last_recomputed_at") if stats else None
+        ),
+        "strategy_stats_source_samples_generated_at": _field_text(
+            stats.get("source_trade_samples_generated_at") if stats else None
+        ),
+        "source_trade_samples_digest": _field_text(
+            stats.get("source_trade_samples_digest") if stats else None
+        ),
+    }
+    mismatched = [
+        field
+        for field, expected_value in expected.items()
+        if not expected_value or _field_text(intent.get(field)) != expected_value
+    ]
+    return {
+        "check": "strategy_stats_provenance",
+        "status": "failed" if mismatched else "passed",
+        "detail": (
+            ", ".join(mismatched)
+            if mismatched
+            else f"matches current stats for {experiment_id}"
+        ),
     }
 
 
@@ -350,6 +433,9 @@ def _base_check(intent: dict[str, Any], *, checked_at: str) -> dict[str, str]:
         ).strip(),
         "strategy_stats_source_samples_generated_at": str(
             intent.get("strategy_stats_source_samples_generated_at", "")
+        ).strip(),
+        "source_trade_samples_digest": str(
+            intent.get("source_trade_samples_digest", "")
         ).strip(),
         "checked_at": checked_at,
     }

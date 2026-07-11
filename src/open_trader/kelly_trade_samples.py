@@ -71,7 +71,11 @@ def build_kelly_trade_samples_payload(
             key: value
             for key, value in stats.items()
             if key
-            not in {"calculation_inputs", "source_trade_samples_generated_at"}
+            not in {
+                "calculation_inputs",
+                "source_trade_samples_generated_at",
+                "source_trade_samples_digest",
+            }
         }
         for experiment_id, stats in strategy_stats["stats_by_experiment"].items()
     }
@@ -167,7 +171,7 @@ def _completed_sample(
         "entry_notional": _decimal_text(entry_notional),
         "exit_notional": _decimal_text(exit_notional),
         "gross_pnl": _decimal_text(gross_pnl),
-        "net_pnl_pct": _sample_pct_text(net_pnl_pct),
+        "net_pnl_pct": _pct_text(net_pnl_pct),
         "result": "win" if gross_pnl > 0 else "loss" if gross_pnl < 0 else "flat",
     }
 
@@ -283,13 +287,6 @@ def _pct_text(value: Decimal) -> str:
         rounding=ROUND_HALF_UP,
     )
     return f"{_decimal_text(pct)}%"
-
-
-def _sample_pct_text(value: Decimal) -> str:
-    rounded = _pct_text(value)
-    if rounded == "0%" and value != 0:
-        return f"{_decimal_text(value * Decimal('100'))}%"
-    return rounded
 
 
 def _text(value: object) -> str:

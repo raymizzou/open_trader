@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 from decimal import Decimal
+import hashlib
+import json
 
 import pytest
 
@@ -85,6 +87,28 @@ def _valid_stats_payload() -> dict[str, object]:
     )
 
 
+def _expected_trade_samples_digest(payload: dict[str, object]) -> str:
+    evidence_fields = (
+        "schema_version",
+        "generated_at",
+        "source_orders_synced_at",
+        "sample_count",
+        "open_position_count",
+        "skipped_order_count",
+        "samples",
+        "open_positions",
+        "diagnostics",
+    )
+    canonical = {field: payload[field] for field in evidence_fields if field in payload}
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def test_builds_stats_for_every_configured_experiment() -> None:
     payload = build_kelly_strategy_stats_payload(
         [
@@ -97,6 +121,12 @@ def test_builds_stats_for_every_configured_experiment() -> None:
 
     assert payload["schema_version"] == "open_trader.kelly_strategy_stats.v1"
     assert payload["source_trade_samples_generated_at"] == "2026-07-11 12:00"
+    expected_digest = _expected_trade_samples_digest(_trade_samples_payload())
+    assert payload["source_trade_samples_digest"] == expected_digest
+    assert (
+        payload["stats_by_experiment"]["trend_us"]["source_trade_samples_digest"]
+        == expected_digest
+    )
     assert payload["stats_by_experiment"]["trend_us"]["completed_samples"] == 1
     assert payload["stats_by_experiment"]["breakout_hk"]["completed_samples"] == 0
     assert (
@@ -123,6 +153,25 @@ def test_validate_rejects_stale_or_incomplete_experiment_coverage() -> None:
         validate_kelly_strategy_stats_payload(
             payload,
             expected_trade_samples_generated_at="2026-07-11 12:02",
+        )
+
+
+def test_validate_rejects_changed_evidence_with_same_generated_minute() -> None:
+    source = _trade_samples_payload()
+    payload = build_kelly_strategy_stats_payload(
+        [{"experiment_id": "trend_us", "market": "US"}],
+        source,
+        generated_at="2026-07-11 12:01",
+    )
+    changed = copy.deepcopy(source)
+    changed["samples"] = [_sample("win", "11%")]
+
+    assert changed["generated_at"] == source["generated_at"]
+    with pytest.raises(ValueError, match="stale"):
+        validate_kelly_strategy_stats_payload(
+            payload,
+            expected_trade_samples_generated_at=changed["generated_at"],
+            expected_trade_samples_digest=_expected_trade_samples_digest(changed),
         )
 
 
@@ -193,7 +242,7 @@ def test_write_and_load_kelly_strategy_stats(tmp_path) -> None:
     assert loaded == payload
 
 
-def test_low_magnitude_samples_round_trip_with_raw_calculation_inputs(tmp_path) -> None:
+def test_calculation_inputs_use_serialized_trade_sample_precision(tmp_path) -> None:
     trade_samples = {
         "schema_version": "open_trader.kelly_trade_samples.v1",
         "generated_at": "2026-07-11 12:00",
@@ -224,12 +273,12 @@ def test_low_magnitude_samples_round_trip_with_raw_calculation_inputs(tmp_path) 
                 "entry_submitted_at": "2026-07-11 11:00",
                 "exit_submitted_at": "2026-07-11 12:00",
                 "entry_price": "100000",
-                "exit_price": "99996",
+                "exit_price": "99995",
                 "quantity": "1",
                 "entry_notional": "100000",
-                "exit_notional": "99996",
-                "gross_pnl": "-4",
-                "net_pnl_pct": "-0.004%",
+                "exit_notional": "99995",
+                "gross_pnl": "-5",
+                "net_pnl_pct": "-0.01%",
                 "result": "loss",
             },
         ],
@@ -243,8 +292,8 @@ def test_low_magnitude_samples_round_trip_with_raw_calculation_inputs(tmp_path) 
     )
 
     stats = payload["stats_by_experiment"]["trend_us"]
-    assert stats["payoff_ratio"] == "2.5"
-    assert stats["calculation_inputs"]["payoff_ratio"] == "2.5"
+    assert stats["payoff_ratio"] == "1"
+    assert stats["calculation_inputs"]["payoff_ratio"] == "1"
 
     write_kelly_strategy_stats(tmp_path / "data", payload)
     assert load_kelly_strategy_stats(tmp_path / "data") == payload
@@ -316,6 +365,75 @@ def test_preserves_legacy_precision_for_uneven_sample_values() -> None:
     assert stats["full_kelly_pct"] == "33.35%"
     assert stats["fractional_kelly_pct"] == "8.34%"
     assert stats["suggested_position_pct"] == "4%"
+
+
+@pytest.mark.parametrize("experiment_id", ["", "   "])
+def test_build_rejects_blank_configured_experiment_id(experiment_id: str) -> None:
+    with pytest.raises(ValueError, match="blank experiment_id"):
+        build_kelly_strategy_stats_payload(
+            [{"experiment_id": experiment_id, "market": "US"}],
+            {**_trade_samples_payload(), "samples": []},
+            generated_at="2026-07-11 12:01",
+        )
+
+
+def test_build_rejects_duplicate_configured_experiment_id() -> None:
+    with pytest.raises(ValueError, match="duplicate experiment_id.*trend_us"):
+        build_kelly_strategy_stats_payload(
+            [
+                {"experiment_id": "trend_us", "market": "US"},
+                {"experiment_id": "trend_us", "market": "US"},
+            ],
+            _trade_samples_payload(),
+            generated_at="2026-07-11 12:01",
+        )
+
+
+def test_validate_requires_classified_samples_to_equal_completed_samples() -> None:
+    payload = _valid_stats_payload()
+    stats = payload["stats_by_experiment"]["trend_us"]
+    stats.update(
+        completed_samples=2,
+        raw_win_rate="50%",
+        adjusted_win_rate="50%",
+        win_rate="50%",
+    )
+    stats["calculation_inputs"].update(
+        raw_win_rate_fraction="0.5",
+        adjusted_win_rate_fraction="0.5",
+    )
+
+    with pytest.raises(ValueError, match="completed_samples"):
+        validate_kelly_strategy_stats_payload(payload)
+
+
+@pytest.mark.parametrize("field", ["last_recomputed_at", "updated_at"])
+def test_validate_requires_record_timestamps_to_equal_generated_at(field: str) -> None:
+    payload = _valid_stats_payload()
+    payload["stats_by_experiment"]["trend_us"][field] = "2026-07-11 12:02"
+
+    with pytest.raises(ValueError, match=field):
+        validate_kelly_strategy_stats_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda payload: payload.update(source_trade_samples_digest="bad"), "digest"),
+        (
+            lambda payload: payload["stats_by_experiment"]["trend_us"].update(
+                source_trade_samples_digest="0" * 64
+            ),
+            "source_trade_samples_digest",
+        ),
+    ],
+)
+def test_validate_rejects_invalid_trade_sample_digest(mutate, message: str) -> None:
+    payload = _valid_stats_payload()
+    mutate(payload)
+
+    with pytest.raises(ValueError, match=message):
+        validate_kelly_strategy_stats_payload(payload)
 
 
 @pytest.mark.parametrize(

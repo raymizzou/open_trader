@@ -3,6 +3,14 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-12
+
+- Kept pending Kelly exits available when unified strategy stats are missing,
+  malformed, stale, or incomplete, while suppressing entries until stats recover.
+- Bound entry risk approval to the current validated trade evidence and strategy
+  stats through exact timestamps, parameter provenance, and a canonical SHA-256
+  evidence digest; restored the original two-decimal trade-sample rounding rules.
+
 ## 2026-07-11
 
 - 将 Kelly 交易证据与运行时 `kelly_strategy_stats.json` 分离，让仪表盘与订单

@@ -421,6 +421,61 @@ def test_build_trade_samples_computes_loss_and_shrunk_kelly_stats() -> None:
     assert stats["last_recomputed_at"] == "2026-07-12 10:01"
 
 
+@pytest.mark.parametrize(
+    ("exit_price", "expected_net_pnl_pct", "expected_avg_field", "expected_avg"),
+    [
+        ("100004", "0%", "avg_net_win_pct", "0%"),
+        ("100005", "0.01%", "avg_net_win_pct", "0.01%"),
+        ("99996", "0%", "avg_net_loss_pct", "0%"),
+        ("99995", "-0.01%", "avg_net_loss_pct", "0.01%"),
+    ],
+)
+def test_trade_sample_precision_matches_base_rounding_golden(
+    exit_price: str,
+    expected_net_pnl_pct: str,
+    expected_avg_field: str,
+    expected_avg: str,
+) -> None:
+    payload = build_kelly_trade_samples_payload(
+        [_experiment()],
+        {
+            "schema_version": "open_trader.kelly_paper_orders.v1",
+            "synced_at": "2026-07-11 09:30",
+            "orders": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "submitted_at": "2026-07-11 09:31",
+                    "filled_qty": "1",
+                    "avg_fill_price": "100000",
+                    "status": "filled",
+                    "order_id": "BUY-1",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "submitted_at": "2026-07-11 10:00",
+                    "filled_qty": "1",
+                    "avg_fill_price": exit_price,
+                    "status": "filled",
+                    "order_id": "SELL-1",
+                },
+            ],
+        },
+        generated_at="2026-07-11 10:01",
+    )
+
+    assert payload["samples"][0]["net_pnl_pct"] == expected_net_pnl_pct
+    assert (
+        payload["stats_by_experiment"]["trend_us"][expected_avg_field]
+        == expected_avg
+    )
+
+
 def test_write_and_load_kelly_trade_samples(tmp_path) -> None:
     payload = build_kelly_trade_samples_payload(
         [_experiment()],

@@ -1,10 +1,10 @@
 {
   "schema_version": "open_trader.kelly_order_risk_checks.v1",
-  "checked_at": "2026-07-10 13:31",
+  "checked_at": "2026-07-12 00:18",
   "max_entry_position_pct": "4",
   "intent_count": 2,
-  "approved_count": 2,
-  "blocked_count": 0,
+  "approved_count": 1,
+  "blocked_count": 1,
   "checks": [
     {
       "intent_id": "trend_pullback_20d_us_mock_20260707:US:RAM:entry",
@@ -16,12 +16,17 @@
       "symbol": "RAM",
       "intent_type": "entry",
       "side": "buy",
-      "checked_at": "2026-07-10 13:31",
-      "risk_status": "approved",
-      "execution_status": "ready",
-      "planned_notional": "400",
+      "suggested_position_pct": "0%",
+      "parameter_source": "futu_paper_order_samples",
+      "strategy_stats_generated_at": "2026-07-12 00:18",
+      "strategy_stats_source_samples_generated_at": "2026-07-12 00:18",
+      "source_trade_samples_digest": "7ebe55511417264974b7c525948d82d87b6700ec2847e000f1501dd095127111",
+      "checked_at": "2026-07-12 00:18",
+      "risk_status": "blocked",
+      "execution_status": "risk_blocked",
+      "planned_notional": "",
       "budget_currency": "USD",
-      "reason": "entry risk checks passed",
+      "reason": "entry risk checks failed",
       "check_results": [
         {
           "check": "experiment_market_matches_symbol",
@@ -40,13 +45,13 @@
         },
         {
           "check": "suggested_position_pct_positive",
-          "status": "passed",
-          "detail": "4"
+          "status": "failed",
+          "detail": "0"
         },
         {
-          "check": "max_entry_position_pct",
+          "check": "strategy_stats_provenance",
           "status": "passed",
-          "detail": "4 <= 4"
+          "detail": "matches current stats for trend_pullback_20d_us_mock_20260707"
         }
       ]
     },
@@ -60,7 +65,12 @@
       "symbol": "02840",
       "intent_type": "exit",
       "side": "sell",
-      "checked_at": "2026-07-10 13:31",
+      "suggested_position_pct": "",
+      "parameter_source": "",
+      "strategy_stats_generated_at": "",
+      "strategy_stats_source_samples_generated_at": "",
+      "source_trade_samples_digest": "",
+      "checked_at": "2026-07-12 00:18",
       "risk_status": "approved",
       "execution_status": "ready",
       "planned_notional": "",

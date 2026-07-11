@@ -13,6 +13,7 @@ from .kelly_market_rules import (
     normalize_kelly_market,
 )
 from .kelly_strategy_stats import (
+    kelly_trade_samples_digest,
     validate_kelly_strategy_stats_payload,
     validate_kelly_trade_samples_payload,
 )
@@ -73,6 +74,7 @@ class KellyLabState:
     templates: list[dict[str, Any]] = field(default_factory=list)
     experiments: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
+    error_kind: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -129,19 +131,26 @@ def load_kelly_lab_state(
         )
     if include_strategy_stats:
         try:
-            missing_path = _first_missing_path(
-                trade_samples_path,
-                strategy_stats_path,
-            )
-            if missing_path is not None:
+            if not trade_samples_path.exists():
                 raise FileNotFoundError(
-                    f"{missing_path.name} not found at {missing_path}"
+                    f"{trade_samples_path.name} not found at {trade_samples_path}"
                 )
             trade_samples_payload = _load_json_object(trade_samples_path)
             validate_kelly_trade_samples_payload(
                 trade_samples_payload,
                 artifact_name=trade_samples_path.name,
             )
+        except (ValueError, FileNotFoundError) as exc:
+            return KellyLabState(
+                available=False,
+                error=str(exc),
+                error_kind="trade_samples",
+            )
+        try:
+            if not strategy_stats_path.exists():
+                raise FileNotFoundError(
+                    f"{strategy_stats_path.name} not found at {strategy_stats_path}"
+                )
             strategy_stats_payload = _load_json_object(strategy_stats_path)
             strategy_stats = validate_kelly_strategy_stats_payload(
                 strategy_stats_payload,
@@ -152,13 +161,20 @@ def load_kelly_lab_state(
                 expected_trade_samples_generated_at=trade_samples_payload[
                     "generated_at"
                 ],
+                expected_trade_samples_digest=kelly_trade_samples_digest(
+                    trade_samples_payload
+                ),
             )
             experiments = _attach_strategy_stats_to_experiments(
                 experiments,
                 strategy_stats,
             )
         except (ValueError, FileNotFoundError) as exc:
-            return KellyLabState(available=False, error=str(exc))
+            return KellyLabState(
+                available=False,
+                error=str(exc),
+                error_kind="strategy_stats",
+            )
 
     return KellyLabState(
         available=True,
@@ -495,6 +511,7 @@ def _validate_experiments_payload(
         raise ValueError(f"{path.name} must contain an experiments list")
 
     validated: list[dict[str, Any]] = []
+    seen_experiment_ids: set[str] = set()
     for index, experiment in enumerate(experiments):
         context = f"{path.name} experiment {index}"
         if not isinstance(experiment, dict):
@@ -526,6 +543,9 @@ def _validate_experiments_payload(
             normalized_experiment["experiment_id"],
             f"{context} experiment_id",
         )
+        if experiment_id in seen_experiment_ids:
+            raise ValueError(f"{path.name} contains duplicate experiment_id {experiment_id}")
+        seen_experiment_ids.add(experiment_id)
         experiment_market = normalize_kelly_market(normalized_experiment["market"])
         expected_currency = kelly_market_currency(experiment_market)
         normalized_experiment["market"] = experiment_market
