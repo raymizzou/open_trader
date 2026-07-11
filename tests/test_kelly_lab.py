@@ -208,6 +208,30 @@ def test_load_kelly_lab_state_rejects_invalid_trade_sample_schema(
     assert "kelly_trade_samples.json schema_version" in state.error
 
 
+def test_load_kelly_lab_state_can_skip_trade_sample_overlay(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    _write_minimal_kelly_templates(latest_dir)
+    _write_minimal_kelly_experiments(latest_dir)
+    (latest_dir / "kelly_trade_samples.json").write_text(
+        json.dumps({"schema_version": "wrong", "stats_by_experiment": {}}),
+        encoding="utf-8",
+    )
+
+    state = load_kelly_lab_state(data_dir, include_trade_samples=False)
+
+    assert state.available is True
+    assert state.experiments[0]["stats"] == {
+        "completed_samples": 0,
+        "open_samples": 0,
+        "observed_win_rate": "",
+        "sample_stage": "insufficient",
+    }
+
+
 def test_load_kelly_lab_state_rejects_mixed_market_experiment(
     tmp_path: Path,
 ) -> None:

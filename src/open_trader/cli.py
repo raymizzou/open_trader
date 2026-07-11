@@ -1546,6 +1546,7 @@ def main(argv: list[str] | None = None) -> int:
             lab_state = load_kelly_lab_state(
                 args.data_dir,
                 include_strategy_capital=False,
+                include_trade_samples=False,
             )
             if not lab_state.available:
                 raise ValueError(lab_state.error)
@@ -1574,6 +1575,7 @@ def main(argv: list[str] | None = None) -> int:
             lab_state = load_kelly_lab_state(
                 args.data_dir,
                 include_strategy_capital=False,
+                include_trade_samples=False,
             )
             if not lab_state.available:
                 raise ValueError(lab_state.error)

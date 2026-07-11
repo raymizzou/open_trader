@@ -77,9 +77,11 @@ def test_kelly_build_strategy_capital_main_loads_inputs_and_writes_payload(
         data_dir_arg: Path,
         *,
         include_strategy_capital: bool = True,
+        include_trade_samples: bool = True,
     ) -> FakeKellyLabState:
         captured["load_data_dir"] = data_dir_arg
         captured["include_strategy_capital"] = include_strategy_capital
+        captured["include_trade_samples"] = include_trade_samples
         return FakeKellyLabState()
 
     monkeypatch.setattr(cli, "load_kelly_lab_state", fake_load_kelly_lab_state)
@@ -100,6 +102,7 @@ def test_kelly_build_strategy_capital_main_loads_inputs_and_writes_payload(
     assert result == 0
     assert captured["load_data_dir"] == data_dir
     assert captured["include_strategy_capital"] is False
+    assert captured["include_trade_samples"] is False
     assert captured["experiments"] == [{"experiment_id": "trend"}]
     assert captured["paper_orders_payload"] == paper_orders_payload
     assert captured["order_executions_payload"] == order_executions_payload
@@ -143,9 +146,11 @@ def test_kelly_build_strategy_capital_ignores_invalid_existing_capital(
         data_dir_arg: Path,
         *,
         include_strategy_capital: bool = True,
+        include_trade_samples: bool = True,
     ) -> FakeKellyLabState:
         captured["load_data_dir"] = data_dir_arg
         captured["include_strategy_capital"] = include_strategy_capital
+        captured["include_trade_samples"] = include_trade_samples
         return FakeKellyLabState()
 
     def fake_build(
@@ -184,3 +189,4 @@ def test_kelly_build_strategy_capital_ignores_invalid_existing_capital(
     assert result == 0
     assert captured["load_data_dir"] == data_dir
     assert captured["include_strategy_capital"] is False
+    assert captured["include_trade_samples"] is False

@@ -86,6 +86,7 @@ def load_kelly_lab_state(
     data_dir: Path,
     *,
     include_strategy_capital: bool = True,
+    include_trade_samples: bool = True,
 ) -> KellyLabState:
     latest_dir = data_dir / "latest"
     templates_path = latest_dir / "kelly_strategy_templates.json"
@@ -122,14 +123,15 @@ def load_kelly_lab_state(
             experiments,
             strategy_capital,
         )
-    try:
-        trade_sample_stats = _load_optional_trade_sample_stats(trade_samples_path)
-        experiments = _attach_trade_sample_stats_to_experiments(
-            experiments,
-            trade_sample_stats,
-        )
-    except (ValueError, FileNotFoundError) as exc:
-        return KellyLabState(available=False, error=str(exc))
+    if include_trade_samples:
+        try:
+            trade_sample_stats = _load_optional_trade_sample_stats(trade_samples_path)
+            experiments = _attach_trade_sample_stats_to_experiments(
+                experiments,
+                trade_sample_stats,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            return KellyLabState(available=False, error=str(exc))
 
     return KellyLabState(
         available=True,
