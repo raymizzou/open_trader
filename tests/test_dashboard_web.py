@@ -104,6 +104,32 @@ def test_standard_backtest_http_routes_expose_options_and_map_validation_to_400(
         thread.join(timeout=2)
 
 
+@pytest.mark.parametrize("body", [b"{bad json", b"[]"])
+def test_standard_backtest_http_rejects_invalid_json_objects_with_chinese_400(
+    tmp_path, body
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    server = create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        status, _, payload = post_error_json(
+            f"http://{host}:{port}/api/backtests/standard/run", body
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert status == 400
+    assert payload["message"] == "请求正文必须是有效的 JSON 对象"
+
+
 def test_owned_backtest_provider_close_failure_is_execution_error(tmp_path, monkeypatch) -> None:
     import open_trader.dashboard_web as dashboard_web
 
@@ -4098,18 +4124,20 @@ def test_dashboard_server_serves_research_chat_apis(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("body", "error_type"),
+    ("body", "error_type", "expected_status", "expected_message"),
     [
-        (b"", "ResearchChatError"),
-        (b"{bad json", "JSONDecodeError"),
-        (b'["not", "object"]', "ResearchChatError"),
-        (b'"not object"', "ResearchChatError"),
+        (b"", "ResearchChatError", 500, "market and symbol are required"),
+        (b"{bad json", "ValueError", 400, "请求正文必须是有效的 JSON 对象"),
+        (b'["not", "object"]', "ValueError", 400, "请求正文必须是有效的 JSON 对象"),
+        (b'"not object"', "ValueError", 400, "请求正文必须是有效的 JSON 对象"),
     ],
 )
 def test_dashboard_server_returns_json_error_for_bad_research_chat_create_body(
     tmp_path,
     body: bytes,
     error_type: str,
+    expected_status: int,
+    expected_message: str,
 ) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
@@ -4139,10 +4167,11 @@ def test_dashboard_server_returns_json_error_for_bad_research_chat_create_body(
         thread.join(timeout=5)
         assert not thread.is_alive()
 
-    assert status == 500
+    assert status == expected_status
     assert content_type == "application/json; charset=utf-8"
     assert payload["status"] == "error"
     assert payload["error_type"] == error_type
+    assert payload["message"] == expected_message
     assert dashboard_payload["summary"]["holding_count"] == 1
 
 

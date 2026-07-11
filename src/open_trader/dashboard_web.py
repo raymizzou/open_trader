@@ -384,9 +384,12 @@ def create_dashboard_server(
         def _read_json_body(self) -> dict[str, Any]:
             content_length = int(self.headers.get("Content-Length") or "0")
             body = self.rfile.read(content_length) if content_length else b"{}"
-            payload = json.loads(body.decode("utf-8") or "{}")
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ValueError("请求正文必须是有效的 JSON 对象") from exc
             if not isinstance(payload, dict):
-                raise ResearchChatError("request body must be a JSON object")
+                raise ValueError("请求正文必须是有效的 JSON 对象")
             return payload
 
         def _research_chat_session_id(self, path: str) -> str | None:
@@ -420,7 +423,7 @@ def create_dashboard_server(
 
         def _send_error_json(self, error: Exception) -> None:
             status = HTTPStatus.INTERNAL_SERVER_ERROR
-            if type(error) is ValueError:
+            if isinstance(error, ValueError):
                 status = HTTPStatus.BAD_REQUEST
             elif isinstance(error, StandardBacktestExecutionError):
                 status = HTTPStatus.BAD_GATEWAY

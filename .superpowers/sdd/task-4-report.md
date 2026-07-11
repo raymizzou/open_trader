@@ -153,3 +153,35 @@ git diff --check
 ```
 
 Both commands exited 0 with no output. A source scan also found no remaining holding-row `查看回测`, `data-detail-mode="backtest"`, legacy fetch call, backtest filter element, or price-sync status element.
+
+## Final review cleanup
+
+- `_read_json_body` now converts malformed JSON, invalid UTF-8, arrays, scalars, and `null` into `ValueError("请求正文必须是有效的 JSON 对象")`. All `ValueError` subclasses map to HTTP 400; standard execution failures remain HTTP 502.
+- Removed the unreachable legacy per-row backtest rendering, readiness, run-control, chart/table helpers, and their disconnected CSS.
+
+### RED
+
+```text
+../../.venv/bin/python -m pytest tests/test_dashboard_web.py::test_standard_backtest_http_rejects_invalid_json_objects_with_chinese_400 -q
+FF                                                                       [100%]
+2 failed in 1.46s
+Expected status 400, received 500.
+```
+
+### GREEN and final verification
+
+```text
+../../.venv/bin/python -m pytest tests/test_dashboard.py tests/test_dashboard_web.py tests/test_standard_strategies.py tests/test_backtest_prices.py tests/test_strategy_backtest.py -q
+........................................................................ [ 46%]
+........................................................................ [ 92%]
+...........                                                              [100%]
+155 passed in 12.20s
+```
+
+The following also exited 0:
+
+```text
+../../.venv/bin/python -m py_compile src/open_trader/dashboard.py src/open_trader/dashboard_web.py src/open_trader/backtest_prices.py
+git diff --check
+test -z "$(rg -l 'backtest_readiness|data-run-backtest|renderBacktestDetail|fetch\\(\"/api/backtests/run\"' src/open_trader/dashboard_static/dashboard.js src/open_trader/dashboard_static/index.html || true)"
+```

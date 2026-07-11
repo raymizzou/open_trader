@@ -140,21 +140,6 @@ button {
   overflow-wrap: anywhere;
 }
 
-.backtest-price-sync-status {
-  align-self: start;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  display: inline-flex;
-  font-size: 12px;
-  font-weight: 700;
-  min-height: 26px;
-  padding: 5px 8px;
-  width: fit-content;
-}
-
-.backtest-price-sync-status:empty {
-  display: none;
-}
 
 .current-view-card {
   background: var(--surface-soft);
@@ -682,9 +667,6 @@ tbody tr.active-row {
   font-weight: 700;
 }
 
-.backtest-button {
-  min-width: 72px;
-}
 
 @keyframes t-signal-pulse {
   0% {
@@ -873,132 +855,6 @@ tbody tr.active-row {
   display: grid;
   gap: 12px;
   margin-top: 14px;
-}
-
-.backtest-layout {
-  display: grid;
-  gap: 12px;
-  margin-top: 14px;
-}
-
-.backtest-section {
-  background: var(--surface);
-}
-
-.backtest-output-list dd {
-  overflow-wrap: anywhere;
-}
-
-.backtest-visual-grid {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.backtest-chart-section {
-  display: grid;
-  gap: 10px;
-}
-
-.backtest-chart-header {
-  align-items: start;
-  display: flex;
-  gap: 12px;
-  justify-content: space-between;
-}
-
-.backtest-chart-header h3 {
-  margin-bottom: 4px;
-}
-
-.backtest-chart-wrap {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  min-height: 240px;
-  overflow: hidden;
-}
-
-.backtest-chart-wrap svg {
-  display: block;
-  height: auto;
-  width: 100%;
-}
-
-.backtest-grid-line {
-  stroke: #e6ebf1;
-  stroke-width: 1;
-}
-
-.backtest-axis-line {
-  stroke: #cfd7e3;
-  stroke-width: 1;
-}
-
-.backtest-area-line {
-  fill: rgba(47, 95, 152, 0.12);
-  stroke: none;
-}
-
-.backtest-equity-line,
-.backtest-price-line {
-  fill: none;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.backtest-equity-line {
-  stroke: #2f5f98;
-  stroke-width: 3;
-}
-
-.backtest-price-line {
-  stroke: #333d4f;
-  stroke-width: 2.5;
-}
-
-.backtest-marker-buy,
-.backtest-marker-sell {
-  stroke: #fff;
-  stroke-width: 3;
-}
-
-.backtest-marker-buy {
-  fill: #216e46;
-}
-
-.backtest-marker-sell {
-  fill: #a83d3d;
-}
-
-.backtest-chart-label,
-.backtest-axis-label {
-  fill: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.backtest-table-scroll {
-  max-width: 100%;
-  overflow-x: auto;
-}
-
-.backtest-trades-table {
-  border-collapse: collapse;
-  min-width: 760px;
-  width: 100%;
-}
-
-.backtest-trades-table th,
-.backtest-trades-table td {
-  border-bottom: 1px solid var(--border);
-  padding: 10px 12px;
-  text-align: left;
-  vertical-align: top;
-}
-
-.backtest-trades-table th {
-  color: var(--muted);
-  font-size: 12px;
 }
 
 .t-signal-section {
@@ -2450,9 +2306,6 @@ tbody tr.active-row {
     grid-template-columns: 1fr;
   }
 
-  .backtest-visual-grid {
-    grid-template-columns: 1fr;
-  }
 
 }
 
