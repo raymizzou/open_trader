@@ -7,6 +7,36 @@ async function expectNoEditableControls(scope: Locator) {
   }
 }
 
+async function expectKellyDerivationFits(scope: Locator) {
+  await expect(scope).toBeVisible();
+  await expect(scope.locator('.kelly-derivation-grid > div')).toHaveCount(14);
+  const layout = await scope.locator('.kelly-derivation-grid > div').evaluateAll((rows) => rows.map((row) => {
+    const rect = row.getBoundingClientRect();
+    const value = row.querySelector('strong');
+    return {
+      bottom: rect.bottom,
+      left: rect.left,
+      right: rect.right,
+      top: rect.top,
+      valueFits: value ? value.scrollWidth <= value.clientWidth : false,
+    };
+  }));
+  for (const row of layout) {
+    expect(row.valueFits).toBe(true);
+  }
+  for (let index = 0; index < layout.length; index += 1) {
+    for (let otherIndex = index + 1; otherIndex < layout.length; otherIndex += 1) {
+      const first = layout[index];
+      const second = layout[otherIndex];
+      const overlaps = first.left < second.right
+        && first.right > second.left
+        && first.top < second.bottom
+        && first.bottom > second.top;
+      expect(overlaps).toBe(false);
+    }
+  }
+}
+
 test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await page.goto('/');
 
@@ -74,7 +104,7 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(symbolStates.getByText('入场规则已触发，Kelly 仓位已计算，风控检查已通过。')).toBeVisible();
   await expect(symbolStates.getByText('模拟盘买入已成交，这笔策略样本正在进行中。')).toBeVisible();
   await expect(symbolStates.getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toHaveCount(0);
-  await expect(page.getByText('样本不足')).toBeVisible();
+  await expect(page.getByText('样本充足')).toBeVisible();
   await expect(page.getByLabel('实验参与标的')).toHaveCount(0);
   await expect(page.getByText('策略详情')).toBeVisible();
   const strategyRules = page.getByLabel('Kelly 策略详情');
@@ -87,13 +117,26 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByText('延续')).toHaveCount(0);
   const parameterDerivation = page.getByLabel('Kelly 参数推导');
   await expect(parameterDerivation.getByText('参数推导')).toBeVisible();
+  await expect(parameterDerivation.getByText('样本状态')).toBeVisible();
+  await expect(parameterDerivation.getByText('样本充足')).toBeVisible();
+  await expect(parameterDerivation.getByText('已完成样本')).toBeVisible();
+  await expect(parameterDerivation.getByText('208', { exact: true })).toBeVisible();
+  await expect(parameterDerivation.getByText('进行中样本')).toBeVisible();
+  await expect(parameterDerivation.getByText('3', { exact: true })).toBeVisible();
   await expect(parameterDerivation.getByText('参数来源')).toBeVisible();
   await expect(parameterDerivation.getByText('富途模拟盘订单样本')).toBeVisible();
   await expect(parameterDerivation.getByText('跳过订单')).toBeVisible();
-  await expect(parameterDerivation.getByText('0 赢 / 0 亏')).toBeVisible();
+  await expect(parameterDerivation.getByText('116 赢 / 92 亏')).toBeVisible();
   await expect(parameterDerivation.getByText('Full Kelly')).toBeVisible();
   await expect(parameterDerivation.getByText('建议仓位')).toBeVisible();
-  await expect(parameterDerivation.getByText('0%', { exact: true })).toHaveCount(3);
+  await expect(parameterDerivation.getByText('4%', { exact: true })).toBeVisible();
+  await expect(parameterDerivation.getByText('来源样本时间')).toBeVisible();
+  await expect(parameterDerivation.getByText('2026-07-11 11:59')).toBeVisible();
+  await expect(parameterDerivation.getByText('最近完成样本')).toBeVisible();
+  await expect(parameterDerivation.getByText('2026-07-11 11:58')).toBeVisible();
+  await expect(parameterDerivation.getByText('最近计算')).toBeVisible();
+  await expect(parameterDerivation.getByText('2026-07-11 12:00')).toBeVisible();
+  await expectKellyDerivationFits(parameterDerivation);
   await expect(page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' })).toHaveCount(0);
   await page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ }).click();
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
@@ -109,6 +152,10 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByLabel('Kelly 标的状态').getByText('HK.02840')).toBeVisible();
   await expect(page.getByLabel('Kelly 标的状态').getByText('US.DRAM')).toHaveCount(0);
   await expect(page.getByLabel('Kelly 标的状态').getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toBeVisible();
+  const insufficientDerivation = page.getByLabel('Kelly 参数推导');
+  await expect(insufficientDerivation.getByText('样本状态')).toBeVisible();
+  await expect(insufficientDerivation.getByText('样本不足')).toBeVisible();
+  await expect(insufficientDerivation.getByText('0%', { exact: true })).toHaveCount(3);
   await page.getByRole('tab', { name: /突破 10D Mock 第一批/ }).click();
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock US 第一批/ })).toHaveAttribute('aria-selected', 'false');
   await expect(page.getByRole('tab', { name: /趋势回调 20D Mock HK 第一批/ })).toHaveAttribute('aria-selected', 'false');
@@ -150,4 +197,22 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByRole('heading', { name: /凯利仓位 · US\.AAPL/ })).toBeVisible();
   await expect(page.getByText('阶段 1 不计算 Kelly 仓位', { exact: true })).toBeVisible();
   await expect(page.getByText('趋势回调 20D Mock US 第一批').last()).toBeVisible();
+});
+
+test('renders stale Kelly strategy stats as unavailable without controls at mobile viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route('**/api/dashboard', async (route) => {
+    const response = await route.fetch();
+    const fixture = await response.json();
+    fixture.kelly_lab = fixture.kelly_lab_unavailable;
+    await route.fulfill({ response, json: fixture });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: '凯利实验室' }).click();
+
+  const kellyLabPanel = page.getByLabel('Kelly 模拟盘策略实验室');
+  await expect(kellyLabPanel.getByText('不可用', { exact: true })).toBeVisible();
+  await expect(kellyLabPanel.locator('.kelly-lab-empty')).toHaveText('kelly_strategy_stats.json stale: source trade sample timestamp does not match');
+  await expectNoEditableControls(kellyLabPanel);
 });

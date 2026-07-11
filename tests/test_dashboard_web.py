@@ -1057,6 +1057,7 @@ const html = renderKellyParameterDerivation({
   fractional_kelly_pct: "6.25%",
   suggested_position_pct: "4%",
   sample_adjustment: "样本少于 200，向 50% 收缩",
+  source_trade_samples_generated_at: "2026-07-12 09:59",
   last_sample_closed_at: "2026-07-12 10:00",
   last_recomputed_at: "2026-07-12 10:01",
   parameter_source: "futu_paper_order_samples",
@@ -1066,10 +1067,40 @@ console.log(html);
 """
     )
 
+    assert "样本状态" in html
+    assert "样本不足" in html
+    assert "已完成样本" in html
+    assert "2" in html
+    assert "进行中样本" in html
+    assert "1" in html
     assert "参数来源" in html
     assert "富途模拟盘订单样本" in html
     assert "跳过订单" in html
     assert "3" in html
+    assert "来源样本时间" in html
+    assert "2026-07-12 09:59" in html
+    assert "最近完成样本" in html
+    assert "2026-07-12 10:00" in html
+    assert "最近计算" in html
+    assert "2026-07-12 10:01" in html
+
+
+def test_dashboard_js_renders_kelly_unavailable_strategy_stats_error() -> None:
+    html = run_dashboard_js(
+        """
+state.workspaceView = "kelly_lab";
+state.dashboard = {
+  kelly_lab: {
+    available: false,
+    error: "kelly_strategy_stats.json stale: source trade sample timestamp does not match"
+  }
+};
+console.log(renderKellyLabPanel());
+"""
+    )
+
+    assert "不可用" in html
+    assert "kelly_strategy_stats.json" in html
 
 
 def test_dashboard_renders_kelly_strategy_capital_panel() -> None:

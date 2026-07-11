@@ -1261,7 +1261,15 @@ function describeKellyRuleFragment(rule, slot) {
 
 function renderKellyParameterDerivation(stats) {
   const item = stats && typeof stats === "object" ? stats : {};
+  const sampleStageLabel = item.sample_stage === "sufficient"
+    ? "样本充足"
+    : item.sample_stage === "insufficient"
+      ? "样本不足"
+      : item.sample_stage;
   const hasDerivation = [
+    item.sample_stage,
+    item.completed_samples,
+    item.open_samples,
     item.raw_win_rate,
     item.adjusted_win_rate,
     item.payoff_ratio,
@@ -1271,6 +1279,8 @@ function renderKellyParameterDerivation(stats) {
     item.sample_adjustment,
     item.parameter_source,
     item.skipped_order_count,
+    item.source_trade_samples_generated_at,
+    item.last_sample_closed_at,
     item.last_recomputed_at,
   ].some(hasValue);
   if (!hasDerivation) {
@@ -1288,6 +1298,9 @@ function renderKellyParameterDerivation(stats) {
     ? "富途模拟盘订单样本"
     : item.parameter_source;
   const rows = [
+    ["样本状态", sampleStageLabel],
+    ["已完成样本", item.completed_samples],
+    ["进行中样本", item.open_samples],
     ["原始胜率", [item.raw_win_rate, winLossCount].filter(hasValue).map(formatPlain).join(" · ")],
     ["修正胜率", [item.adjusted_win_rate, item.sample_adjustment].filter(hasValue).map(formatPlain).join(" · ")],
     ["盈亏比 b", [item.payoff_ratio, payoffDetail].filter(hasValue).map(formatPlain).join(" · ")],
@@ -1296,8 +1309,9 @@ function renderKellyParameterDerivation(stats) {
     ["建议仓位", item.suggested_position_pct],
     ["参数来源", sourceLabel],
     ["跳过订单", item.skipped_order_count],
-    ["最近样本", item.last_sample_closed_at],
-    ["最近更新", item.last_recomputed_at],
+    ["来源样本时间", item.source_trade_samples_generated_at],
+    ["最近完成样本", item.last_sample_closed_at],
+    ["最近计算", item.last_recomputed_at],
   ].filter(([, value]) => hasValue(value));
 
   return `
