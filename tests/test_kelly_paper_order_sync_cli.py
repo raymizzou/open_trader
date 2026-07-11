@@ -1,0 +1,409 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import open_trader.cli as cli
+from open_trader.kelly_paper_order_sync import (
+    FakeFutuPaperOrderClient,
+    FutuSimulatePaperOrderClient,
+)
+
+
+def test_kelly_sync_paper_orders_parser_accepts_fake_mode() -> None:
+    parser = cli.build_parser()
+
+    args = parser.parse_args(
+        [
+            "kelly",
+            "sync-paper-orders",
+            "--fake",
+            "--data-dir",
+            "data",
+            "--synced-at",
+            "2026-07-09 11:00",
+        ]
+    )
+
+    assert args.command == "kelly"
+    assert args.kelly_command == "sync-paper-orders"
+    assert args.fake is True
+    assert args.data_dir == Path("data")
+    assert args.synced_at == "2026-07-09 11:00"
+
+
+def test_kelly_sync_paper_orders_parser_accepts_futu_simulate_mode() -> None:
+    parser = cli.build_parser()
+
+    args = parser.parse_args(
+        [
+            "kelly",
+            "sync-paper-orders",
+            "--futu-simulate",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "11111",
+            "--trd-market",
+            "US",
+        ]
+    )
+
+    assert args.command == "kelly"
+    assert args.kelly_command == "sync-paper-orders"
+    assert args.futu_simulate is True
+    assert args.host == "127.0.0.1"
+    assert args.port == 11111
+    assert args.trd_market == "US"
+
+
+def test_kelly_sync_paper_orders_parser_defaults_to_auto_trd_market() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(["kelly", "sync-paper-orders", "--futu-simulate"])
+
+    assert args.trd_market == "auto"
+
+
+def test_kelly_sync_paper_orders_parser_accepts_diagnose_mode() -> None:
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["kelly", "sync-paper-orders", "--fake", "--diagnose"])
+
+    assert args.diagnose is True
+
+
+def test_kelly_sync_paper_orders_fake_wires_sync_and_prints_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_default_orders() -> tuple[dict[str, object], ...]:
+        return (
+            {
+                "experiment_id": "trend_pullback_20d_exp_20260707",
+                "market": "US",
+                "symbol": "RAM",
+                "side": "buy",
+                "order_id": "SIM-10001",
+            },
+        )
+
+    def fake_sync_kelly_paper_orders(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        client = kwargs["client"]
+        assert isinstance(client, FakeFutuPaperOrderClient)
+        return {
+            "environment": "SIMULATE",
+            "orders": client.list_orders(),
+            "synced_at": kwargs["synced_at"],
+        }
+
+    monkeypatch.setattr(cli, "default_fake_kelly_paper_orders", fake_default_orders)
+    monkeypatch.setattr(cli, "sync_kelly_paper_orders", fake_sync_kelly_paper_orders)
+
+    result = cli.main(
+        [
+            "kelly",
+            "sync-paper-orders",
+            "--fake",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--synced-at",
+            "2026-07-09 11:00",
+        ]
+    )
+
+    assert result == 0
+    assert captured["data_dir"] == tmp_path / "data"
+    assert captured["synced_at"] == "2026-07-09 11:00"
+    output = capsys.readouterr().out
+    assert "environment: SIMULATE" in output
+    assert "orders: 1" in output
+    assert f"latest: {tmp_path / 'data/latest/kelly_paper_orders.json'}" in output
+
+
+def test_kelly_sync_paper_orders_diagnose_writes_report_and_prints_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    report_path = tmp_path / "data/latest/kelly_paper_order_sync_report.json"
+
+    def fake_default_orders() -> tuple[dict[str, object], ...]:
+        return (
+            {
+                "experiment_id": "trend_exp",
+                "market": "US",
+                "symbol": "RAM",
+                "side": "buy",
+                "order_id": "SIM-10001",
+            },
+        )
+
+    def fake_sync_kelly_paper_orders(**kwargs: object) -> dict[str, object]:
+        captured["sync_kwargs"] = kwargs
+        client = kwargs["client"]
+        return {
+            "environment": "SIMULATE",
+            "source": client.source,
+            "synced_at": kwargs["synced_at"],
+            "orders": client.list_orders(),
+        }
+
+    def fake_build_report(payload: object, client: object) -> dict[str, object]:
+        captured["report_payload"] = payload
+        captured["report_client"] = client
+        return {
+            "counts": {
+                "matched": 1,
+                "skipped_untracked_symbol": 2,
+                "skipped_ambiguous_symbol": 1,
+                "skipped_invalid_code": 0,
+                "orders_written": 1,
+            }
+        }
+
+    def fake_write_report(data_dir: Path, report: object) -> Path:
+        captured["report_data_dir"] = data_dir
+        captured["report"] = report
+        return report_path
+
+    monkeypatch.setattr(cli, "default_fake_kelly_paper_orders", fake_default_orders)
+    monkeypatch.setattr(cli, "sync_kelly_paper_orders", fake_sync_kelly_paper_orders)
+    monkeypatch.setattr(cli, "build_kelly_paper_order_sync_report", fake_build_report)
+    monkeypatch.setattr(cli, "write_kelly_paper_order_sync_report", fake_write_report)
+
+    result = cli.main(
+        [
+            "kelly",
+            "sync-paper-orders",
+            "--fake",
+            "--diagnose",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--synced-at",
+            "2026-07-10 09:30",
+        ]
+    )
+
+    assert result == 0
+    assert captured["report_data_dir"] == tmp_path / "data"
+    assert captured["report"] == {
+        "counts": {
+            "matched": 1,
+            "skipped_untracked_symbol": 2,
+            "skipped_ambiguous_symbol": 1,
+            "skipped_invalid_code": 0,
+            "orders_written": 1,
+        }
+    }
+    output = capsys.readouterr().out
+    assert "matched: 1" in output
+    assert "skipped_untracked_symbol: 2" in output
+    assert "skipped_ambiguous_symbol: 1" in output
+    assert "skipped_invalid_code: 0" in output
+    assert f"sync_report: {report_path}" in output
+
+
+def test_kelly_sync_paper_orders_futu_simulate_wires_sync_and_closes_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    closed: list[bool] = []
+
+    class FakeFutuSimulateClient:
+        environment = "SIMULATE"
+        source = "futu_simulate_paper_order_client"
+
+        def __init__(self, **kwargs: object) -> None:
+            captured["client_kwargs"] = kwargs
+
+        def list_orders(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "experiment_id": "trend_exp",
+                    "market": "US",
+                    "symbol": "RAM",
+                    "side": "buy",
+                    "order_id": "SIM-10001",
+                }
+            ]
+
+        def close(self) -> None:
+            closed.append(True)
+
+    class FakeSymbolIndexDetails:
+        unique = {("US", "RAM"): "trend_exp"}
+        ambiguous: dict[tuple[str, str], list[str]] = {}
+
+    def fake_load_index(data_dir: Path) -> FakeSymbolIndexDetails:
+        captured["index_data_dir"] = data_dir
+        return FakeSymbolIndexDetails()
+
+    def fake_load_links(data_dir: Path) -> dict[str, dict[str, object]]:
+        captured["links_data_dir"] = data_dir
+        return {
+            "SIM-10001": {
+                "futu_order_id": "SIM-10001",
+                "experiment_id": "trend_exp",
+            }
+        }
+
+    def fake_sync_kelly_paper_orders(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        client = kwargs["client"]
+        assert isinstance(client, FakeFutuSimulateClient)
+        return {
+            "environment": "SIMULATE",
+            "orders": client.list_orders(),
+            "synced_at": kwargs["synced_at"],
+        }
+
+    monkeypatch.setattr(cli, "FutuSimulatePaperOrderClient", FakeFutuSimulateClient)
+    monkeypatch.setattr(
+        cli,
+        "load_kelly_experiment_symbol_index_details",
+        fake_load_index,
+    )
+    monkeypatch.setattr(cli, "load_kelly_order_links", fake_load_links)
+    monkeypatch.setattr(cli, "sync_kelly_paper_orders", fake_sync_kelly_paper_orders)
+
+    result = cli.main(
+        [
+            "kelly",
+            "sync-paper-orders",
+            "--futu-simulate",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "11111",
+            "--trd-market",
+            "US",
+            "--synced-at",
+            "2026-07-09 11:30",
+        ]
+    )
+
+    assert result == 0
+    assert captured["index_data_dir"] == tmp_path / "data"
+    assert captured["links_data_dir"] == tmp_path / "data"
+    assert captured["client_kwargs"] == {
+        "host": "127.0.0.1",
+        "port": 11111,
+        "experiment_symbol_index": {("US", "RAM"): "trend_exp"},
+        "ambiguous_symbol_index": {},
+        "order_link_index": {
+            "SIM-10001": {
+                "futu_order_id": "SIM-10001",
+                "experiment_id": "trend_exp",
+            }
+        },
+        "trd_market": "US",
+    }
+    assert captured["data_dir"] == tmp_path / "data"
+    assert captured["synced_at"] == "2026-07-09 11:30"
+    assert closed == [True]
+    output = capsys.readouterr().out
+    assert "environment: SIMULATE" in output
+    assert "orders: 1" in output
+    assert f"latest: {tmp_path / 'data/latest/kelly_paper_orders.json'}" in output
+
+
+def test_kelly_sync_paper_orders_futu_simulate_auto_syncs_all_markets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {"client_kwargs": []}
+    closed: list[str] = []
+
+    class FakeFutuSimulateClient:
+        environment = "SIMULATE"
+        source = "futu_simulate_paper_order_client"
+
+        def __init__(self, **kwargs: object) -> None:
+            self.trd_market = str(kwargs["trd_market"])
+            captured["client_kwargs"].append(kwargs)  # type: ignore[union-attr]
+
+        def list_orders(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "experiment_id": f"{self.trd_market.lower()}_exp",
+                    "market": self.trd_market,
+                    "symbol": "RAM" if self.trd_market == "US" else "02840",
+                    "side": "buy",
+                    "order_id": f"SIM-{self.trd_market}",
+                }
+            ]
+
+        def close(self) -> None:
+            closed.append(self.trd_market)
+
+    class FakeSymbolIndexDetails:
+        unique = {
+            ("US", "RAM"): "us_exp",
+            ("HK", "02840"): "hk_exp",
+        }
+        ambiguous: dict[tuple[str, str], list[str]] = {}
+
+    monkeypatch.setattr(cli, "FutuSimulatePaperOrderClient", FakeFutuSimulateClient)
+    monkeypatch.setattr(
+        cli,
+        "load_kelly_experiment_symbol_index_details",
+        lambda data_dir: FakeSymbolIndexDetails(),
+    )
+    monkeypatch.setattr(cli, "load_kelly_order_links", lambda data_dir: {})
+
+    def fake_sync_kelly_paper_orders(**kwargs: object) -> dict[str, object]:
+        client = kwargs["client"]
+        captured["client_source"] = client.source
+        orders = client.list_orders()
+        return {
+            "environment": "SIMULATE",
+            "orders": orders,
+            "synced_at": kwargs["synced_at"],
+        }
+
+    monkeypatch.setattr(cli, "sync_kelly_paper_orders", fake_sync_kelly_paper_orders)
+
+    result = cli.main(
+        [
+            "kelly",
+            "sync-paper-orders",
+            "--futu-simulate",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--synced-at",
+            "2026-07-09 11:30",
+        ]
+    )
+
+    assert result == 0
+    assert [item["trd_market"] for item in captured["client_kwargs"]] == ["HK", "US"]  # type: ignore[index]
+    assert captured["client_source"] == "multi_market_futu_simulate_paper_order_client"
+    assert closed == ["HK", "US"]
+
+
+def test_kelly_sync_paper_orders_requires_fake_mode() -> None:
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["kelly", "sync-paper-orders"])
+
+    assert exc_info.value.code == 2
+
+
+def test_kelly_sync_paper_orders_rejects_multiple_sources() -> None:
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["kelly", "sync-paper-orders", "--fake", "--futu-simulate"])
+
+    assert exc_info.value.code == 2

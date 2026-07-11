@@ -1,0 +1,63 @@
+{
+  "schema_version": "open_trader.kelly_order_intents.v1",
+  "created_at": "2026-07-10 13:30",
+  "intent_count": 2,
+  "intents": [
+    {
+      "intent_id": "trend_pullback_20d_us_mock_20260707:US:RAM:entry",
+      "experiment_id": "trend_pullback_20d_us_mock_20260707",
+      "experiment_name": "趋势回调 20D Mock US 第一批",
+      "strategy_id": "trend_pullback_20d",
+      "strategy_version": "v1",
+      "experiment_market": "US",
+      "market_capital_pool": {
+        "market": "US",
+        "amount": "30000",
+        "currency": "USD",
+        "enabled": true
+      },
+      "market": "US",
+      "symbol": "RAM",
+      "intent_type": "entry",
+      "side": "buy",
+      "execution_status": "pending",
+      "risk_status": "not_checked",
+      "created_at": "2026-07-10 13:30",
+      "source": "kelly_lifecycle",
+      "source_status": "pending_entry_order",
+      "reason": "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
+      "action": "准备提交模拟盘买入订单",
+      "suggested_position_pct": "4%",
+      "per_symbol_budget": "10000",
+      "budget_currency": "USD"
+    },
+    {
+      "intent_id": "trend_pullback_20d_hk_mock_20260707:HK:02840:exit",
+      "experiment_id": "trend_pullback_20d_hk_mock_20260707",
+      "experiment_name": "趋势回调 20D Mock HK 第一批",
+      "strategy_id": "trend_pullback_20d",
+      "strategy_version": "v1",
+      "experiment_market": "HK",
+      "market_capital_pool": {
+        "market": "HK",
+        "amount": "200000",
+        "currency": "HKD",
+        "enabled": true
+      },
+      "market": "HK",
+      "symbol": "02840",
+      "intent_type": "exit",
+      "side": "sell",
+      "execution_status": "pending",
+      "risk_status": "not_checked",
+      "created_at": "2026-07-10 13:30",
+      "source": "kelly_lifecycle",
+      "source_status": "pending_exit_order",
+      "reason": "止盈触发，价格达到入场价 + 2R。",
+      "action": "准备卖出 50%",
+      "suggested_position_pct": "4%",
+      "per_symbol_budget": "200000",
+      "budget_currency": "HKD"
+    }
+  ]
+}

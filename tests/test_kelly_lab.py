@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import json
 from pathlib import Path
 
@@ -14,6 +15,316 @@ from open_trader.kelly_lab import (
 def write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def minimal_template_payload() -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.kelly_strategy_templates.v1",
+        "templates": [
+            {
+                "strategy_id": "trend_pullback_20d",
+                "strategy_name": "趋势回调 20D",
+                "strategy_version": "v1",
+                "entry_rule_description": "价格回调到 20 日均线附近。",
+                "exit_rule_description": "目标价、止损或 20 个交易日到期。",
+                "max_holding_days": 20,
+                "order_type": "limit",
+                "market_session": "regular",
+            }
+        ],
+    }
+
+
+def minimal_experiment_payload(
+    *,
+    experiment_market: str = "US",
+    experiment_budget_currency: str = "USD",
+    participant_market: str = "US",
+    participant_symbol: str = "RAM",
+    participant_budget_currency: str = "USD",
+) -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.kelly_experiments.v1",
+        "experiments": [
+            {
+                "experiment_id": "trend_us",
+                "experiment_name": "趋势回调 US",
+                "strategy_id": "trend_pullback_20d",
+                "strategy_version": "v1",
+                "market": experiment_market,
+                "start_date": "2026-07-07",
+                "paper_account": "futu_simulate",
+                "experiment_budget": "100000",
+                "budget_currency": experiment_budget_currency,
+                "capital_utilization_pct": "50",
+                "allocation_mode": "equal_weight",
+                "max_open_position_per_symbol": 1,
+                "status": "running",
+                "locked": True,
+                "participants": [
+                    {
+                        "market": participant_market,
+                        "symbol": participant_symbol,
+                        "name": "RAM",
+                        "source": "holding",
+                        "locked": True,
+                        "per_symbol_budget": "25000",
+                        "budget_currency": participant_budget_currency,
+                    }
+                ],
+                "stats": {
+                    "completed_samples": 0,
+                    "open_samples": 0,
+                    "observed_win_rate": "",
+                    "sample_stage": "insufficient",
+                },
+            }
+        ],
+    }
+
+
+def _write_minimal_kelly_templates(latest_dir: Path) -> None:
+    latest_dir.joinpath("kelly_strategy_templates.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_strategy_templates.v1",
+                "templates": [
+                    {
+                        "strategy_id": "trend_pullback_20d",
+                        "strategy_name": "Trend Pullback",
+                        "strategy_version": "v1",
+                        "entry_rule_description": "Entry",
+                        "exit_rule_description": "Exit",
+                        "max_holding_days": 20,
+                        "order_type": "limit",
+                        "market_session": "regular",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_minimal_kelly_experiments(latest_dir: Path) -> None:
+    latest_dir.joinpath("kelly_experiments.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_experiments.v1",
+                "experiments": [
+                    {
+                        "experiment_id": "trend_us",
+                        "experiment_name": "Trend US",
+                        "strategy_id": "trend_pullback_20d",
+                        "strategy_version": "v1",
+                        "market": "US",
+                        "start_date": "2026-07-07",
+                        "paper_account": "futu_simulate_us",
+                        "experiment_budget": "30000",
+                        "budget_currency": "USD",
+                        "capital_utilization_pct": "50",
+                        "allocation_mode": "equal_weight",
+                        "max_open_position_per_symbol": 1,
+                        "status": "running",
+                        "locked": True,
+                        "participants": [
+                            {
+                                "market": "US",
+                                "symbol": "AAPL",
+                                "name": "Apple",
+                                "source": "watchlist",
+                                "locked": True,
+                                "per_symbol_budget": "30000",
+                                "budget_currency": "USD",
+                            }
+                        ],
+                        "stats": {
+                            "completed_samples": 0,
+                            "open_samples": 0,
+                            "observed_win_rate": "",
+                            "sample_stage": "insufficient",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_load_kelly_lab_state_overlays_trade_sample_stats(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    _write_minimal_kelly_templates(latest_dir)
+    _write_minimal_kelly_experiments(latest_dir)
+    (latest_dir / "kelly_trade_samples.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_trade_samples.v1",
+                "generated_at": "2026-07-11 11:00",
+                "stats_by_experiment": {
+                    "trend_us": {
+                        "completed_samples": 2,
+                        "open_samples": 1,
+                        "observed_win_rate": "50%",
+                        "sample_stage": "insufficient",
+                        "parameter_source": "futu_paper_order_samples",
+                        "skipped_order_count": 3,
+                        "last_recomputed_at": "2026-07-11 11:00",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_kelly_lab_state(data_dir)
+
+    assert state.available is True
+    stats = state.experiments[0]["stats"]
+    assert stats["completed_samples"] == 2
+    assert stats["open_samples"] == 1
+    assert stats["parameter_source"] == "futu_paper_order_samples"
+    assert stats["skipped_order_count"] == 3
+
+
+def test_load_kelly_lab_state_rejects_invalid_trade_sample_schema(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    _write_minimal_kelly_templates(latest_dir)
+    _write_minimal_kelly_experiments(latest_dir)
+    (latest_dir / "kelly_trade_samples.json").write_text(
+        json.dumps({"schema_version": "wrong", "stats_by_experiment": {}}),
+        encoding="utf-8",
+    )
+
+    state = load_kelly_lab_state(data_dir)
+
+    assert state.available is False
+    assert "kelly_trade_samples.json schema_version" in state.error
+
+
+def test_load_kelly_lab_state_can_skip_trade_sample_overlay(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    _write_minimal_kelly_templates(latest_dir)
+    _write_minimal_kelly_experiments(latest_dir)
+    (latest_dir / "kelly_trade_samples.json").write_text(
+        json.dumps({"schema_version": "wrong", "stats_by_experiment": {}}),
+        encoding="utf-8",
+    )
+
+    state = load_kelly_lab_state(data_dir, include_trade_samples=False)
+
+    assert state.available is True
+    assert state.experiments[0]["stats"] == {
+        "completed_samples": 0,
+        "open_samples": 0,
+        "observed_win_rate": "",
+        "sample_stage": "insufficient",
+    }
+
+
+def test_load_kelly_lab_state_rejects_mixed_market_experiment(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(participant_market="HK", participant_symbol="02840"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="trend_us participant HK.02840 must match experiment market US",
+    ):
+        load_kelly_lab_state(data_dir)
+
+
+def test_load_kelly_lab_state_attaches_market_capital_pool(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(
+            experiment_market="us",
+            participant_market="us",
+            participant_symbol="ram",
+        ),
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    experiment = state["experiments"][0]
+    assert experiment["market"] == "US"
+    assert experiment["budget_currency"] == "USD"
+    assert experiment["market_capital_pool"] == {
+        "market": "US",
+        "amount": "30000",
+        "currency": "USD",
+        "enabled": True,
+    }
+    assert experiment["participants"][0]["market"] == "US"
+    assert experiment["participants"][0]["symbol"] == "RAM"
+
+
+def test_load_kelly_lab_state_rejects_experiment_budget_currency_mismatch(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(experiment_budget_currency="HKD"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="trend_us budget_currency HKD must match market US currency USD",
+    ):
+        load_kelly_lab_state(data_dir)
+
+
+def test_load_kelly_lab_state_rejects_participant_budget_currency_mismatch(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(participant_budget_currency="HKD"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "trend_us participant US.RAM budget_currency HKD "
+            "must match market US currency USD"
+        ),
+    ):
+        load_kelly_lab_state(data_dir)
 
 
 def test_load_kelly_lab_state_returns_locked_experiments(tmp_path: Path) -> None:
@@ -46,6 +357,7 @@ def test_load_kelly_lab_state_returns_locked_experiments(tmp_path: Path) -> None
                     "experiment_name": "趋势回调 20D 第一批",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -66,9 +378,9 @@ def test_load_kelly_lab_state_returns_locked_experiments(tmp_path: Path) -> None
                             "budget_currency": "USD",
                         },
                         {
-                            "market": "HK",
-                            "symbol": "00700",
-                            "name": "腾讯控股",
+                            "market": "US",
+                            "symbol": "MSFT",
+                            "name": "Microsoft",
                             "source": "watchlist",
                             "locked": True,
                             "per_symbol_budget": "25000",
@@ -148,6 +460,7 @@ def test_load_kelly_lab_state_generates_lifecycle_states_from_symbol_facts(
                     "experiment_name": "趋势回调 20D 第一批",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -234,6 +547,7 @@ def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
                     "experiment_name": "趋势回调 20D 第一批",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -254,9 +568,9 @@ def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
                             "budget_currency": "USD",
                         },
                         {
-                            "market": "HK",
-                            "symbol": "02840",
-                            "name": "SPDR Gold",
+                            "market": "US",
+                            "symbol": "RAM",
+                            "name": "RAM ETF",
                             "source": "holding",
                             "locked": True,
                             "per_symbol_budget": "25000",
@@ -271,8 +585,8 @@ def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
                             "reason": "属于该策略。",
                         },
                         {
-                            "market": "HK",
-                            "symbol": "02840",
+                            "market": "US",
+                            "symbol": "RAM",
                             "status": "holding",
                             "reason": "属于该策略。",
                         },
@@ -299,7 +613,7 @@ def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
     lifecycle_states = state["experiments"][0]["lifecycle_states"]
     assert [(item["market"], item["symbol"]) for item in lifecycle_states] == [
         ("US", "DRAM"),
-        ("HK", "02840"),
+        ("US", "RAM"),
     ]
 
 
@@ -335,6 +649,7 @@ def test_load_kelly_lab_state_attaches_paper_orders_by_experiment_id(
                     "experiment_name": "趋势回调 20D 第一批",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -421,6 +736,228 @@ def test_load_kelly_lab_state_attaches_paper_orders_by_experiment_id(
     ]
 
 
+def test_load_kelly_lab_state_filters_attached_paper_orders_to_experiment_market(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_paper_orders.json",
+        {
+            "schema_version": "open_trader.kelly_paper_orders.v1",
+            "orders": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "RAM",
+                    "side": "buy",
+                    "status": "filled",
+                    "order_id": "SIM-US",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "HK",
+                    "symbol": "02840",
+                    "side": "sell",
+                    "status": "submitted",
+                    "order_id": "SIM-HK",
+                },
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    orders = state["experiments"][0]["order_sync"]["orders"]
+    assert [(order["market"], order["symbol"]) for order in orders] == [("US", "RAM")]
+
+
+def test_load_kelly_lab_state_filters_attached_order_executions_to_experiment_market(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_order_executions.json",
+        {
+            "schema_version": "open_trader.kelly_order_executions.v1",
+            "environment": "SIMULATE",
+            "source": "test",
+            "executed_at": "2026-07-10 15:28",
+            "executions": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "RAM",
+                    "side": "buy",
+                    "execution_status": "skipped",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "HK",
+                    "symbol": "02840",
+                    "side": "sell",
+                    "execution_status": "submitted",
+                },
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    order_execution = state["experiments"][0]["order_execution"]
+    assert order_execution["execution_count"] == 1
+    assert order_execution["submitted_count"] == 0
+    assert order_execution["skipped_count"] == 1
+    assert [
+        (execution["market"], execution["symbol"])
+        for execution in order_execution["executions"]
+    ] == [("US", "RAM")]
+
+
+def test_load_kelly_lab_state_attaches_strategy_capital_snapshot(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_strategy_capital.json",
+        {
+            "schema_version": "open_trader.kelly_strategy_capital.v1",
+            "calculated_at": "2026-07-10 21:10",
+            "strategy_count": 1,
+            "strategies": [
+                {
+                    "experiment_id": "trend_us",
+                    "currency": "USD",
+                    "budget": "30000",
+                    "occupied_notional": "7400",
+                    "position_notional": "6200",
+                    "reserved_order_notional": "1200",
+                    "available_notional": "22600",
+                    "utilization_pct": "24.67",
+                    "open_buy_order_count": 1,
+                    "realized_pnl": "0",
+                    "updated_at": "2026-07-10 21:10",
+                    "symbol_occupancy": [
+                        {"market": "US", "symbol": "RAM", "notional": "1200"}
+                    ],
+                    "next_order_impact": {},
+                }
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    assert state["experiments"][0]["capital"]["available_notional"] == "22600"
+    assert state["experiments"][0]["capital"]["open_buy_order_count"] == 1
+
+
+def test_load_kelly_lab_state_marks_strategy_capital_unavailable_on_market_currency_mismatch(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_strategy_capital.json",
+        {
+            "schema_version": "open_trader.kelly_strategy_capital.v1",
+            "calculated_at": "2026-07-10 21:10",
+            "strategy_count": 1,
+            "strategies": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "HK",
+                    "currency": "HKD",
+                    "available_notional": "22600",
+                }
+            ],
+        },
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    assert state["experiments"][0]["capital"] == {
+        "available": False,
+        "reason": "capital market/currency mismatch",
+    }
+
+
+def test_load_kelly_lab_state_marks_strategy_capital_unavailable_when_missing(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+
+    state = load_kelly_lab_state(data_dir).to_dict()
+
+    assert state["experiments"][0]["capital"] == {"available": False}
+
+
+def test_load_kelly_lab_state_rejects_strategy_capital_without_strategies(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_json(
+        data_dir / "latest" / "kelly_strategy_templates.json",
+        minimal_template_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_experiments.json",
+        minimal_experiment_payload(),
+    )
+    write_json(
+        data_dir / "latest" / "kelly_strategy_capital.json",
+        {
+            "schema_version": "open_trader.kelly_strategy_capital.v1",
+            "calculated_at": "2026-07-10 21:10",
+            "strategy_count": 0,
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="kelly_strategy_capital.json must contain a strategies list",
+    ):
+        load_kelly_lab_state(data_dir)
+
+
 def test_load_kelly_lab_state_keeps_existing_order_sync_when_paper_orders_missing(
     tmp_path: Path,
 ) -> None:
@@ -453,6 +990,7 @@ def test_load_kelly_lab_state_keeps_existing_order_sync_when_paper_orders_missin
                     "experiment_name": "突破 10D 第一批",
                     "strategy_id": "breakout_10d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "50000",
@@ -543,6 +1081,7 @@ def test_load_kelly_lab_state_rejects_unknown_template_version(
                     "experiment_name": "趋势回调 20D 第二版",
                     "strategy_id": "trend_pullback_20d",
                     "strategy_version": "v2",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "100000",
@@ -611,6 +1150,7 @@ def test_index_kelly_experiments_by_market_symbol(tmp_path: Path) -> None:
                     "experiment_name": "突破 10D 第一批",
                     "strategy_id": "breakout_10d",
                     "strategy_version": "v1",
+                    "market": "US",
                     "start_date": "2026-07-07",
                     "paper_account": "futu_simulate",
                     "experiment_budget": "50000",
@@ -647,3 +1187,193 @@ def test_index_kelly_experiments_by_market_symbol(tmp_path: Path) -> None:
 
     assert list(indexed) == [("US", "MSFT")]
     assert indexed[("US", "MSFT")][0]["experiment_id"] == "breakout_10d_exp_20260707"
+
+
+def test_load_checked_in_kelly_data_is_available() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+
+    assert state["available"] is True
+    assert state["experiment_count"] >= 1
+
+
+def test_latest_kelly_experiments_are_single_market() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+
+    allowed_markets = {"US", "HK", "CN"}
+    for experiment in state["experiments"]:
+        experiment_market = experiment["market"]
+        assert experiment_market in allowed_markets
+        assert experiment["market_capital_pool"]["market"] == experiment_market
+        for participant in experiment["participants"]:
+            assert participant["market"] == experiment_market
+
+
+def test_latest_kelly_experiments_split_trend_pullback_mock_by_market() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+    experiments = {
+        experiment["experiment_id"]: experiment for experiment in state["experiments"]
+    }
+
+    assert "trend_pullback_20d_mock_20260707" not in experiments
+
+    trend_us = experiments["trend_pullback_20d_us_mock_20260707"]
+    assert trend_us["experiment_name"] == "趋势回调 20D Mock US 第一批"
+    assert trend_us["market"] == "US"
+    assert trend_us["experiment_budget"] == "30000"
+    assert trend_us["budget_currency"] == "USD"
+    assert trend_us["market_capital_pool"] == {
+        "market": "US",
+        "amount": "30000",
+        "currency": "USD",
+        "enabled": True,
+    }
+    assert [
+        (participant["market"], participant["symbol"], participant["per_symbol_budget"])
+        for participant in trend_us["participants"]
+    ] == [
+        ("US", "DRAM", "10000"),
+        ("US", "RAM", "10000"),
+        ("US", "SOXX", "10000"),
+    ]
+    assert {
+        (state["market"], state["symbol"]) for state in trend_us["lifecycle_states"]
+    } == {
+        ("US", "DRAM"),
+        ("US", "RAM"),
+        ("US", "SOXX"),
+    }
+    assert trend_us["order_sync"]["order_count"] == 1
+    assert trend_us["order_sync"]["fill_count"] == 1
+    assert [
+        (order["market"], order["symbol"]) for order in trend_us["order_sync"]["orders"]
+    ] == [("US", "RAM")]
+    assert trend_us["order_execution"]["execution_count"] == 1
+    assert [
+        (execution["market"], execution["symbol"])
+        for execution in trend_us["order_execution"]["executions"]
+    ] == [("US", "RAM")]
+
+    trend_hk = experiments["trend_pullback_20d_hk_mock_20260707"]
+    assert trend_hk["experiment_name"] == "趋势回调 20D Mock HK 第一批"
+    assert trend_hk["market"] == "HK"
+    assert trend_hk["experiment_budget"] == "200000"
+    assert trend_hk["budget_currency"] == "HKD"
+    assert trend_hk["market_capital_pool"] == {
+        "market": "HK",
+        "amount": "200000",
+        "currency": "HKD",
+        "enabled": True,
+    }
+    assert [
+        (participant["market"], participant["symbol"], participant["per_symbol_budget"])
+        for participant in trend_hk["participants"]
+    ] == [("HK", "02840", "200000")]
+    assert [
+        (state["market"], state["symbol"], state["status"])
+        for state in trend_hk["lifecycle_states"]
+    ] == [("HK", "02840", "pending_exit_order")]
+    assert trend_hk["order_sync"]["order_count"] == len(
+        trend_hk["order_sync"]["orders"]
+    )
+    assert trend_hk["order_sync"]["fill_count"] == sum(
+        1
+        for order in trend_hk["order_sync"]["orders"]
+        if str(order.get("filled_qty", "")).strip() not in {"", "0", "-"}
+    )
+    assert trend_hk["order_execution"]["execution_count"] == 1
+    assert [
+        (execution["market"], execution["symbol"])
+        for execution in trend_hk["order_execution"]["executions"]
+    ] == [("HK", "02840")]
+
+
+def test_latest_kelly_order_artifacts_reference_visible_experiments() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+    experiments = {
+        experiment["experiment_id"]: experiment for experiment in state["experiments"]
+    }
+    artifact_specs = [
+        ("kelly_order_intents.json", "intents", "intent_count"),
+        ("kelly_order_risk_checks.json", "checks", "intent_count"),
+        ("kelly_order_executions.json", "executions", "execution_count"),
+        ("kelly_order_links.json", "links", None),
+    ]
+
+    for file_name, rows_key, count_key in artifact_specs:
+        payload = json.loads((Path("data") / "latest" / file_name).read_text())
+        rows = payload[rows_key]
+        if count_key is not None:
+            assert payload[count_key] == len(rows)
+
+        for row in rows:
+            experiment_id = row["experiment_id"]
+            assert experiment_id in experiments, (
+                f"{file_name} references stale experiment_id {experiment_id}"
+            )
+            experiment = experiments[experiment_id]
+            if "experiment_name" in row:
+                assert row["experiment_name"] == experiment["experiment_name"]
+            if "market" in row:
+                assert row["market"] == experiment["market"]
+            if "budget_currency" in row:
+                assert row["budget_currency"] == experiment["budget_currency"]
+            if "intent_id" in row:
+                assert row["intent_id"].startswith(f"{experiment_id}:")
+
+
+def test_latest_entry_planned_notionals_match_order_intents() -> None:
+    latest_dir = Path("data") / "latest"
+    intents_payload = json.loads(
+        (latest_dir / "kelly_order_intents.json").read_text()
+    )
+    intent_by_id = {
+        intent["intent_id"]: intent
+        for intent in intents_payload["intents"]
+        if intent.get("intent_type") == "entry"
+    }
+    artifact_specs = [
+        ("kelly_order_risk_checks.json", "checks"),
+        ("kelly_order_executions.json", "executions"),
+    ]
+
+    for file_name, rows_key in artifact_specs:
+        payload = json.loads((latest_dir / file_name).read_text())
+        for row in payload[rows_key]:
+            intent = intent_by_id.get(row.get("intent_id"))
+            if intent is None or not row.get("planned_notional"):
+                continue
+            expected_notional = (
+                Decimal(intent["per_symbol_budget"])
+                * Decimal(intent["suggested_position_pct"].rstrip("%"))
+                / Decimal("100")
+            )
+            assert Decimal(row["planned_notional"]) == expected_notional
+
+
+def test_load_checked_in_kelly_data_has_scoped_order_and_lifecycle_metadata() -> None:
+    state = load_kelly_lab_state(Path("data")).to_dict()
+    experiments = {
+        experiment["experiment_id"]: experiment for experiment in state["experiments"]
+    }
+
+    for experiment in experiments.values():
+        order_sync = experiment.get("order_sync")
+        if isinstance(order_sync, dict) and "orders" in order_sync:
+            orders = order_sync["orders"]
+            assert order_sync["order_count"] == len(orders)
+            assert order_sync["fill_count"] == sum(
+                1
+                for order in orders
+                if str(order.get("filled_qty", "")).strip() not in {"", "0", "-"}
+            )
+
+    for experiment in experiments.values():
+        participants = {
+            (participant["market"], participant["symbol"])
+            for participant in experiment["participants"]
+        }
+        lifecycle_states = {
+            (state["market"], state["symbol"])
+            for state in experiment["lifecycle_states"]
+        }
+        assert lifecycle_states <= participants

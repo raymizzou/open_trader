@@ -7,11 +7,19 @@ from pathlib import Path
 from typing import Any
 
 from .kelly_lifecycle import build_kelly_lifecycle_states
+from .kelly_market_rules import (
+    kelly_market_capital_pool,
+    kelly_market_currency,
+    normalize_kelly_market,
+)
 
 
 TEMPLATES_SCHEMA_VERSION = "open_trader.kelly_strategy_templates.v1"
 EXPERIMENTS_SCHEMA_VERSION = "open_trader.kelly_experiments.v1"
 PAPER_ORDERS_SCHEMA_VERSION = "open_trader.kelly_paper_orders.v1"
+ORDER_EXECUTIONS_SCHEMA_VERSION = "open_trader.kelly_order_executions.v1"
+STRATEGY_CAPITAL_SCHEMA_VERSION = "open_trader.kelly_strategy_capital.v1"
+TRADE_SAMPLES_SCHEMA_VERSION = "open_trader.kelly_trade_samples.v1"
 
 ALLOWED_EXPERIMENT_STATUSES = {"draft", "running", "paused", "completed", "failed"}
 
@@ -31,6 +39,7 @@ REQUIRED_EXPERIMENT_FIELDS = {
     "experiment_name",
     "strategy_id",
     "strategy_version",
+    "market",
     "start_date",
     "paper_account",
     "experiment_budget",
@@ -73,11 +82,19 @@ class KellyLabState:
         }
 
 
-def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
+def load_kelly_lab_state(
+    data_dir: Path,
+    *,
+    include_strategy_capital: bool = True,
+    include_trade_samples: bool = True,
+) -> KellyLabState:
     latest_dir = data_dir / "latest"
     templates_path = latest_dir / "kelly_strategy_templates.json"
     experiments_path = latest_dir / "kelly_experiments.json"
     paper_orders_path = latest_dir / "kelly_paper_orders.json"
+    order_executions_path = latest_dir / "kelly_order_executions.json"
+    strategy_capital_path = latest_dir / "kelly_strategy_capital.json"
+    trade_samples_path = latest_dir / "kelly_trade_samples.json"
 
     missing_path = _first_missing_path(templates_path, experiments_path)
     if missing_path is not None:
@@ -98,6 +115,23 @@ def load_kelly_lab_state(data_dir: Path) -> KellyLabState:
     )
     paper_orders = _load_optional_paper_orders(paper_orders_path)
     experiments = _attach_paper_orders_to_experiments(experiments, paper_orders)
+    order_execution = _load_optional_order_execution(order_executions_path)
+    experiments = _attach_order_execution_to_experiments(experiments, order_execution)
+    if include_strategy_capital:
+        strategy_capital = _load_optional_strategy_capital(strategy_capital_path)
+        experiments = _attach_strategy_capital_to_experiments(
+            experiments,
+            strategy_capital,
+        )
+    if include_trade_samples:
+        try:
+            trade_sample_stats = _load_optional_trade_sample_stats(trade_samples_path)
+            experiments = _attach_trade_sample_stats_to_experiments(
+                experiments,
+                trade_sample_stats,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            return KellyLabState(available=False, error=str(exc))
 
     return KellyLabState(
         available=True,
@@ -169,6 +203,81 @@ def _load_optional_paper_orders(path: Path) -> list[dict[str, Any]]:
     return validated
 
 
+def _load_optional_order_execution(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    payload = _load_json_object(path)
+    _validate_schema_version(
+        payload,
+        path,
+        expected_schema_version=ORDER_EXECUTIONS_SCHEMA_VERSION,
+    )
+    executions = payload.get("executions")
+    if not isinstance(executions, list):
+        raise ValueError(f"{path.name} must contain an executions list")
+
+    validated: list[dict[str, Any]] = []
+    for index, execution in enumerate(executions):
+        if not isinstance(execution, dict):
+            raise ValueError(f"{path.name} execution {index} must be an object")
+        experiment_id = execution.get("experiment_id")
+        if not isinstance(experiment_id, str) or not experiment_id.strip():
+            raise ValueError(f"{path.name} execution {index} has invalid experiment_id")
+        normalized = copy.deepcopy(execution)
+        normalized["experiment_id"] = experiment_id.strip()
+        for key in ("market", "symbol", "side", "execution_status"):
+            if isinstance(normalized.get(key), str):
+                normalized[key] = normalized[key].strip()
+        validated.append(normalized)
+
+    normalized_payload = copy.deepcopy(payload)
+    normalized_payload["executions"] = validated
+    return normalized_payload
+
+
+def _load_optional_strategy_capital(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    payload = _load_json_object(path)
+    _validate_schema_version(
+        payload,
+        path,
+        expected_schema_version=STRATEGY_CAPITAL_SCHEMA_VERSION,
+    )
+    strategies = payload.get("strategies")
+    if not isinstance(strategies, list):
+        raise ValueError(f"{path.name} must contain a strategies list")
+
+    validated: list[dict[str, Any]] = []
+    for index, strategy in enumerate(strategies):
+        if not isinstance(strategy, dict):
+            raise ValueError(f"{path.name} strategy {index} must be an object")
+        validated.append(copy.deepcopy(strategy))
+    return validated
+
+
+def _load_optional_trade_sample_stats(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    payload = _load_json_object(path)
+    _validate_schema_version(
+        payload,
+        path,
+        expected_schema_version=TRADE_SAMPLES_SCHEMA_VERSION,
+    )
+    stats_by_experiment = payload.get("stats_by_experiment")
+    if not isinstance(stats_by_experiment, dict):
+        raise ValueError(f"{path.name} must contain stats_by_experiment")
+    validated: dict[str, dict[str, Any]] = {}
+    for experiment_id, stats in stats_by_experiment.items():
+        if not isinstance(experiment_id, str) or not experiment_id.strip():
+            raise ValueError(f"{path.name} contains invalid experiment id")
+        if not isinstance(stats, dict):
+            raise ValueError(f"{path.name} stats for {experiment_id} must be an object")
+        validated[experiment_id] = copy.deepcopy(stats)
+    return validated
+
+
 def _attach_paper_orders_to_experiments(
     experiments: list[dict[str, Any]],
     paper_orders: list[dict[str, Any]],
@@ -186,16 +295,165 @@ def _attach_paper_orders_to_experiments(
     for experiment in experiments:
         normalized = copy.deepcopy(experiment)
         experiment_id = normalized.get("experiment_id")
+        experiment_market = _normalized_market_or_empty(normalized.get("market"))
         if isinstance(experiment_id, str) and experiment_id in orders_by_experiment:
+            orders = [
+                order
+                for order in orders_by_experiment[experiment_id]
+                if _normalized_market_or_empty(order.get("market")) == experiment_market
+            ]
             order_sync = normalized.get("order_sync")
             if isinstance(order_sync, dict):
                 order_sync = copy.deepcopy(order_sync)
             else:
                 order_sync = {}
-            order_sync["orders"] = orders_by_experiment[experiment_id]
+            order_sync["orders"] = orders
             normalized["order_sync"] = order_sync
         attached.append(normalized)
     return attached
+
+
+def _attach_order_execution_to_experiments(
+    experiments: list[dict[str, Any]],
+    order_execution: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if order_execution is None:
+        return experiments
+
+    executions_by_experiment: dict[str, list[dict[str, Any]]] = {}
+    for execution in order_execution.get("executions", []):
+        if not isinstance(execution, dict):
+            continue
+        experiment_id = execution.get("experiment_id")
+        if not isinstance(experiment_id, str):
+            continue
+        executions_by_experiment.setdefault(experiment_id, []).append(
+            copy.deepcopy(execution)
+        )
+
+    attached: list[dict[str, Any]] = []
+    for experiment in experiments:
+        normalized = copy.deepcopy(experiment)
+        experiment_id = normalized.get("experiment_id")
+        experiment_market = _normalized_market_or_empty(normalized.get("market"))
+        if isinstance(experiment_id, str):
+            executions = [
+                execution
+                for execution in executions_by_experiment.get(experiment_id, [])
+                if _normalized_market_or_empty(execution.get("market"))
+                == experiment_market
+            ]
+            if executions:
+                normalized["order_execution"] = _order_execution_summary(
+                    order_execution,
+                    executions,
+                )
+        attached.append(normalized)
+    return attached
+
+
+def _attach_strategy_capital_to_experiments(
+    experiments: list[dict[str, Any]],
+    strategies: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    capital_by_experiment: dict[str, dict[str, Any]] = {}
+    for strategy in strategies:
+        experiment_id = strategy.get("experiment_id")
+        if isinstance(experiment_id, str) and experiment_id.strip():
+            capital_by_experiment[experiment_id] = copy.deepcopy(strategy)
+
+    attached: list[dict[str, Any]] = []
+    for experiment in experiments:
+        normalized = copy.deepcopy(experiment)
+        experiment_id = normalized.get("experiment_id")
+        if isinstance(experiment_id, str) and experiment_id in capital_by_experiment:
+            capital = copy.deepcopy(capital_by_experiment[experiment_id])
+            if _strategy_capital_matches_experiment(capital, normalized):
+                normalized["capital"] = capital
+            else:
+                normalized["capital"] = {
+                    "available": False,
+                    "reason": "capital market/currency mismatch",
+                }
+        else:
+            normalized["capital"] = {"available": False}
+        attached.append(normalized)
+    return attached
+
+
+def _attach_trade_sample_stats_to_experiments(
+    experiments: list[dict[str, Any]],
+    stats_by_experiment: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not stats_by_experiment:
+        return experiments
+    attached: list[dict[str, Any]] = []
+    for experiment in experiments:
+        normalized = copy.deepcopy(experiment)
+        experiment_id = normalized.get("experiment_id")
+        if isinstance(experiment_id, str) and experiment_id in stats_by_experiment:
+            current_stats = normalized.get("stats")
+            if not isinstance(current_stats, dict):
+                current_stats = {}
+            merged = copy.deepcopy(current_stats)
+            merged.update(copy.deepcopy(stats_by_experiment[experiment_id]))
+            normalized["stats"] = merged
+        attached.append(normalized)
+    return attached
+
+
+def _strategy_capital_matches_experiment(
+    capital: dict[str, Any],
+    experiment: dict[str, Any],
+) -> bool:
+    capital_market = _normalized_market_or_empty(capital.get("market"))
+    experiment_market = _normalized_market_or_empty(experiment.get("market"))
+    if capital_market and capital_market != experiment_market:
+        return False
+
+    capital_currency = _normalized_market_or_empty(capital.get("currency"))
+    experiment_currency = _normalized_market_or_empty(experiment.get("budget_currency"))
+    return not capital_currency or capital_currency == experiment_currency
+
+
+def _order_execution_summary(
+    payload: dict[str, Any],
+    executions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    dry_run_count = _count_executions(executions, "dry_run")
+    submitted_count = _count_executions(executions, "submitted")
+    skipped_count = _count_executions(executions, "skipped")
+    failed_count = _count_executions(executions, "failed")
+    status = "failed" if failed_count else "partial" if skipped_count else "success"
+    return {
+        "status": status,
+        "environment": str(payload.get("environment", "")).strip(),
+        "source": str(payload.get("source", "")).strip(),
+        "last_executed_at": str(payload.get("executed_at", "")).strip(),
+        "execution_count": len(executions),
+        "submitted_count": submitted_count,
+        "dry_run_count": dry_run_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "message": (
+            "Kelly 订单执行存在失败或跳过项。"
+            if failed_count or skipped_count
+            else "Kelly 订单执行结果已生成。"
+        ),
+        "executions": executions,
+    }
+
+
+def _count_executions(executions: list[dict[str, Any]], status: str) -> int:
+    return sum(
+        1
+        for execution in executions
+        if str(execution.get("execution_status", "")).strip() == status
+    )
+
+
+def _normalized_market_or_empty(value: Any) -> str:
+    return value.strip().upper() if isinstance(value, str) else ""
 
 
 def _validate_templates_payload(
@@ -266,9 +524,31 @@ def _validate_experiments_payload(
             raise ValueError(f"{context} participants must be a list")
 
         normalized_experiment = copy.deepcopy(experiment)
+        experiment_id = _required_string(
+            normalized_experiment["experiment_id"],
+            f"{context} experiment_id",
+        )
+        experiment_market = normalize_kelly_market(normalized_experiment["market"])
+        expected_currency = kelly_market_currency(experiment_market)
+        normalized_experiment["market"] = experiment_market
+        normalized_experiment["budget_currency"] = _validate_budget_currency(
+            normalized_experiment["budget_currency"],
+            expected_currency,
+            (
+                f"{experiment_id} budget_currency "
+                f"{normalized_experiment['budget_currency']} must match "
+                f"market {experiment_market} currency {expected_currency}"
+            ),
+        )
         normalized_experiment["participants"] = _validate_participants(
             participants,
             context,
+            experiment_id,
+            experiment_market,
+            expected_currency,
+        )
+        normalized_experiment["market_capital_pool"] = kelly_market_capital_pool(
+            experiment_market,
         )
         normalized_experiment["template"] = copy.deepcopy(templates_by_key[strategy_key])
         if "lifecycle_states" in normalized_experiment:
@@ -312,6 +592,9 @@ def _filter_lifecycle_states_to_participants(
 def _validate_participants(
     participants: list[Any],
     context: str,
+    experiment_id: str,
+    experiment_market: str,
+    expected_currency: str,
 ) -> list[dict[str, Any]]:
     validated: list[dict[str, Any]] = []
     for index, participant in enumerate(participants):
@@ -330,6 +613,21 @@ def _validate_participants(
         normalized["symbol"] = _uppercase_required_string(
             normalized["symbol"],
             f"{participant_context} symbol",
+        )
+        participant_label = f"{normalized['market']}.{normalized['symbol']}"
+        if normalized["market"] != experiment_market:
+            raise ValueError(
+                f"{experiment_id} participant {participant_label} "
+                f"must match experiment market {experiment_market}",
+            )
+        normalized["budget_currency"] = _validate_budget_currency(
+            normalized["budget_currency"],
+            expected_currency,
+            (
+                f"{experiment_id} participant {participant_label} "
+                f"budget_currency {normalized['budget_currency']} must match "
+                f"market {experiment_market} currency {expected_currency}"
+            ),
         )
         validated.append(normalized)
     return validated
@@ -384,6 +682,23 @@ def _require_fields(
 
 
 def _uppercase_required_string(value: Any, context: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{context} must be a non-empty string")
-    return value.upper()
+    return value.strip().upper()
+
+
+def _required_string(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{context} must be a non-empty string")
+    return value.strip()
+
+
+def _validate_budget_currency(
+    value: Any,
+    expected_currency: str,
+    message: str,
+) -> str:
+    currency = _uppercase_required_string(value, "budget_currency")
+    if currency != expected_currency:
+        raise ValueError(message)
+    return currency

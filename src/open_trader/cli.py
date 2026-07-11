@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -8,6 +9,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
@@ -26,6 +28,44 @@ from .decision_facts import LLMDecisionFactsExtractor, generate_decision_facts
 from .futu_account import FutuAccountClient, FutuAccountError, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_skill_facts import FutuSkillFactsExtractor, generate_futu_skill_facts
+from .kelly_paper_order_sync import (
+    FakeFutuPaperOrderClient,
+    FutuPaperOrderSyncError,
+    FutuSimulatePaperOrderClient,
+    MultiMarketPaperOrderClient,
+    build_kelly_paper_order_sync_report,
+    default_fake_kelly_paper_orders,
+    load_kelly_experiment_symbol_index_details,
+    load_kelly_order_links,
+    sync_kelly_paper_orders,
+    write_kelly_paper_order_sync_report,
+)
+from .kelly_order_intents import (
+    build_kelly_order_intents,
+    write_kelly_order_intents,
+)
+from .kelly_order_risk import (
+    build_kelly_order_risk_checks,
+    write_kelly_order_risk_checks,
+)
+from .kelly_strategy_capital import (
+    build_kelly_strategy_capital_payload,
+    load_kelly_strategy_capital,
+    write_kelly_strategy_capital,
+)
+from .kelly_trade_samples import (
+    build_kelly_trade_samples_payload,
+    write_kelly_trade_samples,
+)
+from .kelly_lab import load_kelly_lab_state
+from .kelly_order_execution import (
+    FutuOrderExecutionError,
+    FutuSimulateOrderExecutionClient,
+    MarketRoutingOrderExecutionClient,
+    execute_kelly_orders,
+    write_kelly_order_links_from_executions,
+    write_kelly_order_executions,
+)
 from .t_signal import TSignalInterpreter
 from .t_signal_futu import FutuTSignalMarketDataClient
 from .t_signal_runner import run_t_signal_watch_once
@@ -133,6 +173,54 @@ def _parse_symbol_subset(value: str | None) -> set[str] | None:
 
 def _parse_symbol_set(value: str | None) -> set[str]:
     return _parse_symbol_subset(value) or set()
+
+
+def _load_optional_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return payload if isinstance(payload, dict) else None
+
+
+def _parse_key_value_options(values: list[str], *, option_name: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for raw_value in values:
+        if "=" not in raw_value:
+            raise ValueError(f"{option_name} must use MARKET.SYMBOL=value: {raw_value}")
+        raw_key, raw_item_value = raw_value.split("=", 1)
+        key = raw_key.strip().upper()
+        item_value = raw_item_value.strip()
+        if not key or not item_value:
+            raise ValueError(f"{option_name} must use MARKET.SYMBOL=value: {raw_value}")
+        if key in parsed:
+            raise ValueError(f"{option_name} contains duplicate key: {key}")
+        parsed[key] = item_value
+    return parsed
+
+
+def _kelly_sync_trd_markets(
+    trd_market: str,
+    symbol_index_details: object,
+) -> list[str]:
+    requested = str(trd_market).strip()
+    if requested != "auto":
+        return [requested]
+
+    markets: set[str] = set()
+    for attr in ("unique", "ambiguous"):
+        index = getattr(symbol_index_details, attr, {})
+        if not isinstance(index, dict):
+            continue
+        for key in index:
+            if not isinstance(key, tuple) or not key:
+                continue
+            market = str(key[0]).strip().upper()
+            if market in {"HK", "US", "CN"}:
+                markets.add(market)
+    if not markets:
+        raise ValueError("no Kelly experiment markets found for auto Futu sync")
+    return sorted(markets)
 
 
 def _print_tiger_sync_result(result: TigerPortfolioSyncResult) -> None:
@@ -630,6 +718,173 @@ def build_parser() -> argparse.ArgumentParser:
         "--update-latest",
         action="store_true",
         help="Update data/latest/portfolio.csv after writing dated artifacts",
+    )
+
+    kelly_parser = subparsers.add_parser(
+        "kelly",
+        help="Run Kelly Lab workflows",
+    )
+    kelly_subparsers = kelly_parser.add_subparsers(
+        dest="kelly_command",
+        required=True,
+    )
+    kelly_sync_paper_orders_parser = kelly_subparsers.add_parser(
+        "sync-paper-orders",
+        help="Refresh Kelly Lab paper-order artifact",
+    )
+    kelly_order_source_group = kelly_sync_paper_orders_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    kelly_order_source_group.add_argument(
+        "--fake",
+        action="store_true",
+        help="Use built-in fake simulate orders.",
+    )
+    kelly_order_source_group.add_argument(
+        "--futu-simulate",
+        action="store_true",
+        help="Read orders from Futu simulate account through OpenD.",
+    )
+    kelly_sync_paper_orders_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_sync_paper_orders_parser.add_argument(
+        "--synced-at",
+        help="Override sync timestamp for deterministic local demos",
+    )
+    kelly_sync_paper_orders_parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Write a paper-order sync diagnostic report.",
+    )
+    kelly_sync_paper_orders_parser.add_argument("--host", default="127.0.0.1")
+    kelly_sync_paper_orders_parser.add_argument(
+        "--port",
+        type=positive_int,
+        default=11111,
+    )
+    kelly_sync_paper_orders_parser.add_argument(
+        "--trd-market",
+        choices=("auto", "HK", "US", "CN"),
+        default="auto",
+        help="Futu trading market used to select the simulate account. Use auto to follow Kelly experiment markets.",
+    )
+
+    kelly_build_order_intents_parser = kelly_subparsers.add_parser(
+        "build-order-intents",
+        help="Build Kelly order intents from pending lifecycle states",
+    )
+    kelly_build_order_intents_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_build_order_intents_parser.add_argument(
+        "--created-at",
+        help="Override intent creation timestamp for deterministic local demos",
+    )
+
+    kelly_build_strategy_capital_parser = kelly_subparsers.add_parser(
+        "build-strategy-capital",
+        help="Build Kelly strategy capital from lab state and latest order artifacts",
+    )
+    kelly_build_strategy_capital_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_build_strategy_capital_parser.add_argument(
+        "--calculated-at",
+        help="Override capital calculation timestamp for deterministic local demos",
+    )
+
+    kelly_build_trade_samples_parser = kelly_subparsers.add_parser(
+        "build-trade-samples",
+        help="Build Kelly trade samples and stats from synced paper orders",
+    )
+    kelly_build_trade_samples_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_build_trade_samples_parser.add_argument(
+        "--generated-at",
+        help="Override sample generation timestamp for deterministic local demos",
+    )
+
+    kelly_check_order_risk_parser = kelly_subparsers.add_parser(
+        "check-order-risk",
+        help="Check Kelly order intents against first-pass risk limits",
+    )
+    kelly_check_order_risk_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_check_order_risk_parser.add_argument(
+        "--checked-at",
+        help="Override risk-check timestamp for deterministic local demos",
+    )
+    kelly_check_order_risk_parser.add_argument(
+        "--max-entry-position-pct",
+        default="4",
+        help="Maximum allowed Kelly entry position percentage per symbol",
+    )
+
+    kelly_execute_orders_parser = kelly_subparsers.add_parser(
+        "execute-orders",
+        help="Execute approved Kelly order risk checks",
+    )
+    execution_mode_group = kelly_execute_orders_parser.add_mutually_exclusive_group()
+    execution_mode_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build execution records without submitting to Futu. This is the default.",
+    )
+    execution_mode_group.add_argument(
+        "--futu-simulate",
+        action="store_true",
+        help="Submit approved orders to the Futu SIMULATE trading environment.",
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--executed-at",
+        help="Override execution timestamp for deterministic local demos",
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--limit-price",
+        action="append",
+        default=[],
+        help="Limit price as MARKET.SYMBOL=PRICE. Repeat for multiple symbols.",
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--order-qty",
+        action="append",
+        default=[],
+        help="Explicit order quantity as MARKET.SYMBOL=QTY. Required for sell orders.",
+    )
+    kelly_execute_orders_parser.add_argument("--host", default="127.0.0.1")
+    kelly_execute_orders_parser.add_argument(
+        "--port",
+        type=positive_int,
+        default=11111,
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--simulate-acc-id",
+        type=int,
+        help="Futu SIMULATE securities account id to use when multiple exist.",
+    )
+    kelly_execute_orders_parser.add_argument(
+        "--trd-market",
+        choices=("auto", "HK", "US", "CN"),
+        default="auto",
+        help="Futu trading market used to select the simulate account. Use auto to follow Kelly order markets.",
     )
 
     trading_plan_parser = subparsers.add_parser(
@@ -1214,6 +1469,219 @@ def main(argv: list[str] | None = None) -> int:
             if account_client is not None:
                 account_client.close()
         _print_tiger_sync_result(result)
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "sync-paper-orders":
+        client = None
+        try:
+            if args.fake:
+                client = FakeFutuPaperOrderClient(
+                    orders=default_fake_kelly_paper_orders(),
+                )
+            else:
+                symbol_index_details = load_kelly_experiment_symbol_index_details(
+                    args.data_dir
+                )
+                order_link_index = load_kelly_order_links(args.data_dir)
+                sync_markets = _kelly_sync_trd_markets(
+                    args.trd_market,
+                    symbol_index_details,
+                )
+                clients = [
+                    FutuSimulatePaperOrderClient(
+                        host=args.host,
+                        port=args.port,
+                        experiment_symbol_index=symbol_index_details.unique,
+                        ambiguous_symbol_index=symbol_index_details.ambiguous,
+                        order_link_index=order_link_index,
+                        trd_market=trd_market,
+                    )
+                    for trd_market in sync_markets
+                ]
+                client = (
+                    clients[0]
+                    if len(clients) == 1
+                    else MultiMarketPaperOrderClient(clients)
+                )
+            payload = sync_kelly_paper_orders(
+                data_dir=args.data_dir,
+                client=client,
+                synced_at=args.synced_at,
+            )
+            if args.diagnose:
+                sync_report = build_kelly_paper_order_sync_report(payload, client)
+                sync_report_path = write_kelly_paper_order_sync_report(
+                    args.data_dir,
+                    sync_report,
+                )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuPaperOrderSyncError) as exc:
+            parser.error(str(exc))
+        finally:
+            if client is not None and hasattr(client, "close"):
+                client.close()
+        print(f"environment: {payload['environment']}")
+        print(f"orders: {len(payload['orders'])}")
+        print(f"synced_at: {payload['synced_at']}")
+        print(f"latest: {args.data_dir / 'latest' / 'kelly_paper_orders.json'}")
+        if args.diagnose:
+            counts = sync_report["counts"]
+            print(f"matched: {counts['matched']}")
+            print(f"skipped_untracked_symbol: {counts['skipped_untracked_symbol']}")
+            print(f"skipped_ambiguous_symbol: {counts['skipped_ambiguous_symbol']}")
+            print(f"skipped_invalid_code: {counts['skipped_invalid_code']}")
+            print(f"sync_report: {sync_report_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "build-order-intents":
+        try:
+            payload = build_kelly_order_intents(
+                data_dir=args.data_dir,
+                created_at=args.created_at,
+            )
+            latest_path = write_kelly_order_intents(args.data_dir, payload)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"intents: {payload['intent_count']}")
+        print(f"latest: {latest_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "build-strategy-capital":
+        try:
+            lab_state = load_kelly_lab_state(
+                args.data_dir,
+                include_strategy_capital=False,
+                include_trade_samples=False,
+            )
+            if not lab_state.available:
+                raise ValueError(lab_state.error)
+            latest_dir = args.data_dir / "latest"
+            paper_orders_payload = _load_optional_json(
+                latest_dir / "kelly_paper_orders.json",
+            )
+            order_executions_payload = _load_optional_json(
+                latest_dir / "kelly_order_executions.json",
+            )
+            payload = build_kelly_strategy_capital_payload(
+                lab_state.experiments,
+                paper_orders_payload=paper_orders_payload,
+                order_executions_payload=order_executions_payload,
+                calculated_at=args.calculated_at,
+            )
+            latest_path = write_kelly_strategy_capital(args.data_dir, payload)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"strategies: {payload['strategy_count']}")
+        print(f"latest: {latest_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "build-trade-samples":
+        try:
+            lab_state = load_kelly_lab_state(
+                args.data_dir,
+                include_strategy_capital=False,
+                include_trade_samples=False,
+            )
+            if not lab_state.available:
+                raise ValueError(lab_state.error)
+            latest_dir = args.data_dir / "latest"
+            paper_orders_payload = _load_optional_json(
+                latest_dir / "kelly_paper_orders.json",
+            )
+            if paper_orders_payload is None:
+                raise FileNotFoundError(latest_dir / "kelly_paper_orders.json")
+            payload = build_kelly_trade_samples_payload(
+                lab_state.experiments,
+                paper_orders_payload,
+                generated_at=args.generated_at,
+            )
+            latest_path = write_kelly_trade_samples(args.data_dir, payload)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"samples: {payload['sample_count']}")
+        print(f"open_positions: {payload['open_position_count']}")
+        print(f"skipped_orders: {payload['skipped_order_count']}")
+        print(f"latest: {latest_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "check-order-risk":
+        try:
+            try:
+                strategy_capital_payload = load_kelly_strategy_capital(args.data_dir)
+            except FileNotFoundError:
+                strategy_capital_payload = None
+            risk_kwargs = {
+                "data_dir": args.data_dir,
+                "checked_at": args.checked_at,
+                "max_entry_position_pct": args.max_entry_position_pct,
+            }
+            if strategy_capital_payload is not None:
+                risk_kwargs["strategy_capital_payload"] = strategy_capital_payload
+            payload = build_kelly_order_risk_checks(
+                **risk_kwargs,
+            )
+            latest_path = write_kelly_order_risk_checks(args.data_dir, payload)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"intents: {payload['intent_count']}")
+        print(f"approved: {payload['approved_count']}")
+        print(f"blocked: {payload['blocked_count']}")
+        print(f"latest: {latest_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "execute-orders":
+        client = None
+        try:
+            limit_prices = _parse_key_value_options(
+                args.limit_price,
+                option_name="--limit-price",
+            )
+            order_quantities = _parse_key_value_options(
+                args.order_qty,
+                option_name="--order-qty",
+            )
+            dry_run = not args.futu_simulate
+            if not dry_run:
+                if args.trd_market == "auto":
+                    client = MarketRoutingOrderExecutionClient(
+                        host=args.host,
+                        port=args.port,
+                        simulate_acc_id=args.simulate_acc_id,
+                    )
+                else:
+                    client = FutuSimulateOrderExecutionClient(
+                        host=args.host,
+                        port=args.port,
+                        simulate_acc_id=args.simulate_acc_id,
+                        trd_market=args.trd_market,
+                    )
+            payload = execute_kelly_orders(
+                data_dir=args.data_dir,
+                dry_run=dry_run,
+                executed_at=args.executed_at,
+                limit_prices=limit_prices,
+                order_quantities=order_quantities,
+                client=client,
+            )
+            latest_path = write_kelly_order_executions(args.data_dir, payload)
+            if not dry_run:
+                write_kelly_order_links_from_executions(args.data_dir, payload)
+        except (
+            FileNotFoundError,
+            ValueError,
+            RuntimeError,
+            FutuOrderExecutionError,
+        ) as exc:
+            parser.error(str(exc))
+        finally:
+            if client is not None and hasattr(client, "close"):
+                client.close()
+        print(f"environment: {payload['environment']}")
+        print(f"executions: {payload['execution_count']}")
+        print(f"dry_run: {payload['dry_run_count']}")
+        print(f"submitted: {payload['submitted_count']}")
+        print(f"skipped: {payload['skipped_count']}")
+        print(f"failed: {payload['failed_count']}")
+        print(f"latest: {latest_path}")
         return 0
 
     if args.command == "build-trading-plan":

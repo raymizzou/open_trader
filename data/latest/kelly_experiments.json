@@ -1,0 +1,274 @@
+{
+  "schema_version": "open_trader.kelly_experiments.v1",
+  "experiments": [
+    {
+      "experiment_id": "trend_pullback_20d_us_mock_20260707",
+      "experiment_name": "趋势回调 20D Mock US 第一批",
+      "strategy_id": "trend_pullback_20d",
+      "strategy_version": "v1",
+      "market": "US",
+      "start_date": "2026-07-07",
+      "paper_account": "futu_simulate_us",
+      "experiment_budget": "30000",
+      "budget_currency": "USD",
+      "capital_utilization_pct": "50",
+      "order_sync": {
+        "status": "success",
+        "environment": "SIMULATE",
+        "last_synced_at": "2026-07-08 10:08",
+        "order_count": 1,
+        "fill_count": 1,
+        "message": "富途模拟盘订单已同步。",
+        "next_action": "可以继续扫描入场与退出信号。",
+        "orders": [
+          {
+            "market": "US",
+            "symbol": "RAM",
+            "side": "buy",
+            "submitted_at": "2026-07-08 10:01",
+            "order_price": "12.34",
+            "order_qty": "800",
+            "filled_qty": "800",
+            "avg_fill_price": "12.34",
+            "status": "filled",
+            "order_id": "SIM-10001"
+          }
+        ]
+      },
+      "lifecycle_states": [
+        {
+          "status": "watching",
+          "market": "US",
+          "symbol": "DRAM",
+          "reason": "价格距离 MA20 仍有 2.4%，入场规则未满足。",
+          "updated_at": "2026-07-08 10:00"
+        },
+        {
+          "status": "pending_entry_order",
+          "market": "US",
+          "symbol": "RAM",
+          "reason": "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
+          "action": "准备提交模拟盘买入订单",
+          "updated_at": "2026-07-08 10:01"
+        },
+        {
+          "status": "holding",
+          "market": "US",
+          "symbol": "SOXX",
+          "reason": "模拟盘买入已成交，当前监控退出规则。",
+          "action": "继续检查止盈、止损、移动止盈、时间退出",
+          "updated_at": "2026-07-08 10:02"
+        }
+      ],
+      "allocation_mode": "equal_weight",
+      "max_open_position_per_symbol": 1,
+      "status": "running",
+      "locked": true,
+      "participants": [
+        {
+          "market": "US",
+          "symbol": "DRAM",
+          "name": "Roundhill Memory ETF",
+          "source": "holding",
+          "locked": true,
+          "per_symbol_budget": "10000",
+          "budget_currency": "USD"
+        },
+        {
+          "market": "US",
+          "symbol": "RAM",
+          "name": "2倍做多DRAM ETF-T-REX",
+          "source": "holding",
+          "locked": true,
+          "per_symbol_budget": "10000",
+          "budget_currency": "USD"
+        },
+        {
+          "market": "US",
+          "symbol": "SOXX",
+          "name": "iShares费城交易所半导体ETF",
+          "source": "holding",
+          "locked": true,
+          "per_symbol_budget": "10000",
+          "budget_currency": "USD"
+        }
+      ],
+      "stats": {
+        "completed_samples": 18,
+        "open_samples": 4,
+        "observed_win_rate": "56%",
+        "sample_stage": "insufficient",
+        "winning_samples": 10,
+        "losing_samples": 8,
+        "raw_win_rate": "56%",
+        "adjusted_win_rate": "52%",
+        "avg_net_win_pct": "4.8%",
+        "avg_net_loss_pct": "2.9%",
+        "payoff_ratio": "1.66",
+        "full_kelly_pct": "23.1%",
+        "fractional_kelly_pct": "5.8%",
+        "suggested_position_pct": "4%",
+        "sample_adjustment": "样本少于 200，向 50% 收缩",
+        "last_sample_closed_at": "2026-07-07 15:30",
+        "last_recomputed_at": "2026-07-07 15:31"
+      }
+    },
+    {
+      "experiment_id": "trend_pullback_20d_hk_mock_20260707",
+      "experiment_name": "趋势回调 20D Mock HK 第一批",
+      "strategy_id": "trend_pullback_20d",
+      "strategy_version": "v1",
+      "market": "HK",
+      "start_date": "2026-07-07",
+      "paper_account": "futu_simulate_hk",
+      "experiment_budget": "200000",
+      "budget_currency": "HKD",
+      "capital_utilization_pct": "50",
+      "order_sync": {
+        "status": "success",
+        "environment": "SIMULATE",
+        "last_synced_at": "2026-07-08 10:08",
+        "order_count": 1,
+        "fill_count": 0,
+        "message": "富途模拟盘订单已同步。",
+        "next_action": "可以继续扫描入场与退出信号。",
+        "orders": [
+          {
+            "market": "HK",
+            "symbol": "02840",
+            "side": "sell",
+            "submitted_at": "2026-07-08 10:03",
+            "order_price": "218.80",
+            "order_qty": "100",
+            "filled_qty": "0",
+            "avg_fill_price": "-",
+            "status": "submitted",
+            "order_id": "SIM-10002"
+          }
+        ]
+      },
+      "lifecycle_states": [
+        {
+          "status": "pending_exit_order",
+          "market": "HK",
+          "symbol": "02840",
+          "reason": "止盈触发，价格达到入场价 + 2R。",
+          "action": "准备卖出 50%",
+          "updated_at": "2026-07-08 10:03"
+        }
+      ],
+      "allocation_mode": "equal_weight",
+      "max_open_position_per_symbol": 1,
+      "status": "running",
+      "locked": true,
+      "participants": [
+        {
+          "market": "HK",
+          "symbol": "02840",
+          "name": "SPDR金",
+          "source": "holding",
+          "locked": true,
+          "per_symbol_budget": "200000",
+          "budget_currency": "HKD"
+        }
+      ],
+      "stats": {
+        "completed_samples": 18,
+        "open_samples": 4,
+        "observed_win_rate": "56%",
+        "sample_stage": "insufficient",
+        "winning_samples": 10,
+        "losing_samples": 8,
+        "raw_win_rate": "56%",
+        "adjusted_win_rate": "52%",
+        "avg_net_win_pct": "4.8%",
+        "avg_net_loss_pct": "2.9%",
+        "payoff_ratio": "1.66",
+        "full_kelly_pct": "23.1%",
+        "fractional_kelly_pct": "5.8%",
+        "suggested_position_pct": "4%",
+        "sample_adjustment": "样本少于 200，向 50% 收缩",
+        "last_sample_closed_at": "2026-07-07 15:30",
+        "last_recomputed_at": "2026-07-07 15:31"
+      }
+    },
+    {
+      "experiment_id": "breakout_10d_mock_20260707",
+      "experiment_name": "突破 10D Mock 第一批",
+      "strategy_id": "breakout_10d",
+      "strategy_version": "v1",
+      "market": "US",
+      "start_date": "2026-07-07",
+      "paper_account": "futu_simulate_mock",
+      "experiment_budget": "30000",
+      "budget_currency": "USD",
+      "capital_utilization_pct": "40",
+      "order_sync": {
+        "status": "failed",
+        "environment": "SIMULATE",
+        "last_synced_at": "2026-07-08 10:09",
+        "order_count": 1,
+        "fill_count": 0,
+        "message": "模拟盘订单同步失败：OpenD 不可用。",
+        "next_action": "本轮不下单，保留现有订单状态。",
+        "orders": [
+          {
+            "market": "US",
+            "symbol": "MSFT",
+            "side": "buy",
+            "submitted_at": "2026-07-08 10:05",
+            "order_price": "505.10",
+            "order_qty": "20",
+            "filled_qty": "0",
+            "avg_fill_price": "-",
+            "status": "rejected",
+            "order_id": "SIM-20001"
+          }
+        ]
+      },
+      "allocation_mode": "equal_weight",
+      "max_open_position_per_symbol": 1,
+      "status": "running",
+      "locked": true,
+      "participants": [
+        {
+          "market": "US",
+          "symbol": "MSFT",
+          "name": "微软",
+          "source": "watchlist",
+          "locked": true,
+          "per_symbol_budget": "15000",
+          "budget_currency": "USD"
+        },
+        {
+          "market": "US",
+          "symbol": "TSM",
+          "name": "台积电",
+          "source": "holding",
+          "locked": true,
+          "per_symbol_budget": "15000",
+          "budget_currency": "USD"
+        }
+      ],
+      "stats": {
+        "completed_samples": 42,
+        "open_samples": 3,
+        "observed_win_rate": "52%",
+        "sample_stage": "open",
+        "winning_samples": 22,
+        "losing_samples": 20,
+        "raw_win_rate": "52%",
+        "adjusted_win_rate": "51%",
+        "avg_net_win_pct": "6.1%",
+        "avg_net_loss_pct": "3.4%",
+        "payoff_ratio": "1.79",
+        "full_kelly_pct": "24.2%",
+        "fractional_kelly_pct": "6.1%",
+        "suggested_position_pct": "4%",
+        "sample_adjustment": "样本少于 200，向 50% 收缩",
+        "last_sample_closed_at": "2026-07-07 15:45",
+        "last_recomputed_at": "2026-07-07 15:46"
+      }
+    }
+  ]
+}

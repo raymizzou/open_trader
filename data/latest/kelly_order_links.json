@@ -1,0 +1,16 @@
+{
+  "schema_version": "open_trader.kelly_order_links.v1",
+  "updated_at": "2026-07-10 15:28",
+  "links": [
+    {
+      "futu_order_id": "7567462",
+      "experiment_id": "trend_pullback_20d_hk_mock_20260707",
+      "intent_id": "trend_pullback_20d_hk_mock_20260707:HK:02840:exit",
+      "market": "HK",
+      "symbol": "02840",
+      "side": "sell",
+      "price": "2950",
+      "qty": "1"
+    }
+  ]
+}

@@ -705,6 +705,91 @@ function renderKellyOrderSyncOrder(order) {
   `;
 }
 
+function renderKellyOrderExecution(experiment) {
+  const entry = experiment && typeof experiment === "object" ? experiment : {};
+  const execution = entry.order_execution && typeof entry.order_execution === "object"
+    ? entry.order_execution
+    : null;
+  if (!execution) {
+    return "";
+  }
+  const status = kellyOrderExecutionStatus(execution.status);
+  const rows = [
+    ["环境", execution.environment],
+    ["最近执行", execution.last_executed_at],
+    ["执行", execution.execution_count],
+    ["预演", execution.dry_run_count],
+    ["提交", execution.submitted_count],
+    ["跳过", execution.skipped_count],
+    ["失败", execution.failed_count],
+  ];
+  return `
+    <section class="kelly-order-sync" aria-label="Kelly 订单执行">
+      <div class="kelly-order-sync-header">
+        <h4>订单执行</h4>
+        <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
+      </div>
+      <dl class="kelly-order-sync-grid">
+        ${rows.map(([label, value]) => `
+          <div>
+            <dt>${escapeHtml(label)}</dt>
+            <dd>${escapeHtml(formatPlain(value))}</dd>
+          </div>
+        `).join("")}
+      </dl>
+      ${hasValue(execution.message) ? `<p>${escapeHtml(formatPlain(execution.message))}</p>` : ""}
+      ${renderKellyOrderExecutionRows(execution)}
+    </section>
+  `;
+}
+
+function renderKellyOrderExecutionRows(execution) {
+  const executions = execution && Array.isArray(execution.executions)
+    ? execution.executions.filter((item) => item && typeof item === "object")
+    : [];
+  if (!executions.length) {
+    return `<p class="kelly-order-empty">暂无订单执行明细。</p>`;
+  }
+  const headers = ["标的", "方向", "价格", "数量", "计划金额", "富途订单", "状态", "错误"];
+  return `
+    <div class="kelly-order-table" role="table" aria-label="Kelly 订单执行明细">
+      <div class="kelly-order-row header" role="row">
+        ${headers.map((header) => `<span role="columnheader">${escapeHtml(header)}</span>`).join("")}
+      </div>
+      ${executions.map(renderKellyOrderExecutionRow).join("")}
+    </div>
+  `;
+}
+
+function renderKellyOrderExecutionRow(execution) {
+  const item = execution && typeof execution === "object" ? execution : {};
+  const symbol = firstPresent(
+    item.futu_code,
+    [item.market, item.symbol].filter(hasValue).map(formatPlain).join("."),
+    item.symbol,
+    "-",
+  );
+  const symbolCell = `
+    <strong>${escapeHtml(formatPlain(symbol))}</strong>
+    ${hasValue(item.executed_at) ? `<small>${escapeHtml(formatPlain(item.executed_at))}</small>` : ""}
+  `;
+  const cells = [
+    symbolCell,
+    escapeHtml(kellyOrderSideLabel(item.side)),
+    escapeHtml(formatPlain(item.price || "-")),
+    escapeHtml(formatPlain(item.qty || "-")),
+    escapeHtml(formatPlain(item.planned_notional || "-")),
+    escapeHtml(formatPlain(item.futu_order_id || "-")),
+    escapeHtml(kellyExecutionStatusLabel(item.execution_status)),
+    escapeHtml(formatPlain(item.error || "-")),
+  ];
+  return `
+    <div class="kelly-order-row" role="row">
+      ${cells.map((cell) => `<span role="cell">${cell}</span>`).join("")}
+    </div>
+  `;
+}
+
 function kellyOrderSideLabel(side) {
   const labels = {
     buy: "买入",
@@ -712,6 +797,17 @@ function kellyOrderSideLabel(side) {
   };
   const key = formatPlain(side).toLowerCase();
   return labels[key] || firstPresent(side, "-");
+}
+
+function kellyExecutionStatusLabel(status) {
+  const labels = {
+    dry_run: "预演",
+    failed: "执行失败",
+    skipped: "已跳过",
+    submitted: "已提交",
+  };
+  const key = formatPlain(status).toLowerCase();
+  return labels[key] || firstPresent(status, "-");
 }
 
 function kellyOrderStatusLabel(status) {
@@ -726,6 +822,17 @@ function kellyOrderStatusLabel(status) {
   };
   const key = formatPlain(status).toLowerCase();
   return labels[key] || firstPresent(status, "-");
+}
+
+function kellyOrderExecutionStatus(status) {
+  const labels = {
+    failed: { label: "执行失败", className: "status-failed" },
+    partial: { label: "部分执行", className: "status-partial" },
+    running: { label: "执行中", className: "status-partial" },
+    success: { label: "执行成功", className: "status-ok" },
+  };
+  const key = formatPlain(status).toLowerCase();
+  return labels[key] || { label: firstPresent(status, "未执行"), className: "status-muted" };
 }
 
 function kellyOrderSyncStatus(status) {
@@ -780,6 +887,196 @@ function kellyLifecycleStatus(status) {
     || { label: key, className: "status-muted" };
 }
 
+function renderKellyStrategyCapital(experiment) {
+  const entry = experiment && typeof experiment === "object" ? experiment : {};
+  const capital = entry.capital && typeof entry.capital === "object" ? entry.capital : null;
+  if (!capital || capital.available === false) {
+    return `
+      <section class="kelly-strategy-capital unavailable" aria-label="Kelly 策略资金">
+        <div class="kelly-strategy-capital-header">
+          <div>
+            <h4>策略资金</h4>
+            <p>策略资金数据暂不可用。</p>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  const currency = formatPlain(firstPresent(capital.currency, entry.budget_currency, "USD"));
+  const positionWidth = capitalSegmentWidth(capital.position_notional, capital.budget);
+  const reservedWidth = capitalSegmentWidth(capital.reserved_order_notional, capital.budget, positionWidth);
+  const utilization = hasValue(capital.utilization_pct)
+    ? `${formatPlain(capital.utilization_pct)}%`
+    : "";
+  const metrics = [
+    ["总资金", formatCapitalMoney(capital.budget, currency), ""],
+    ["已占用", formatCapitalMoney(capital.occupied_notional, currency), ""],
+    ["可用资金", formatCapitalMoney(capital.available_notional, currency), "primary"],
+    ["占用率", firstPresent(utilization, "-"), ""],
+    ["未完成买单", capital.open_buy_order_count, ""],
+    ["已实现盈亏", formatCapitalMoney(capital.realized_pnl, currency), ""],
+  ];
+  return `
+    <section class="kelly-strategy-capital" aria-label="Kelly 策略资金">
+      <div class="kelly-strategy-capital-header">
+        <div>
+          <h4>策略资金</h4>
+          ${hasValue(capital.updated_at) ? `<p>更新于 ${escapeHtml(formatPlain(capital.updated_at))}</p>` : ""}
+        </div>
+      </div>
+      <dl class="kelly-capital-metric-grid">
+        ${metrics.map(([label, value, className]) => `
+          <div class="${escapeHtml(className)}">
+            <dt>${escapeHtml(label)}</dt>
+            <dd>${escapeHtml(formatPlain(value))}</dd>
+          </div>
+        `).join("")}
+      </dl>
+      <div class="kelly-capital-utilization-bar" aria-label="Kelly 资金占用率">
+        <span class="position" style="width: ${escapeHtml(formatPlain(positionWidth))}%"></span>
+        <span class="reserved" style="width: ${escapeHtml(formatPlain(reservedWidth))}%"></span>
+      </div>
+      <div class="kelly-capital-breakdown-grid">
+        ${renderKellyCapitalBreakdownPane(capital, currency)}
+        ${renderKellyCapitalSymbolPane(capital, currency)}
+        ${renderKellyCapitalNextOrderPane(capital, currency)}
+      </div>
+    </section>
+  `;
+}
+
+function renderKellyCapitalBreakdownPane(capital, currency) {
+  const rows = [
+    ["持仓占用", formatCapitalMoney(capital.position_notional, currency)],
+    ["待成交买单", formatCapitalMoney(capital.reserved_order_notional, currency)],
+    ["保守口径 / 买单提交即占用", "已启用"],
+  ];
+  return `
+    <div class="kelly-capital-pane">
+      <h5>占用拆分</h5>
+      ${rows.map(([label, value]) => renderKellyCapitalLine(label, value)).join("")}
+    </div>
+  `;
+}
+
+function renderKellyCapitalSymbolPane(capital, currency) {
+  const occupancy = kellyCapitalSymbolOccupancy(capital.symbol_occupancy);
+  const lines = occupancy.length
+    ? occupancy.map((item) => {
+      const symbol = kellyCapitalSymbol(item);
+      const value = firstPresent(item.occupied_notional, item.notional, item.value);
+      return renderKellyCapitalLine(symbol, formatCapitalMoney(value, currency));
+    }).join("")
+    : renderKellyCapitalLine("标的", "暂无占用");
+  return `
+    <div class="kelly-capital-pane">
+      <h5>标的占用</h5>
+      ${lines}
+    </div>
+  `;
+}
+
+function renderKellyCapitalNextOrderPane(capital, currency) {
+  const impact = capital.next_order_impact && typeof capital.next_order_impact === "object"
+    ? capital.next_order_impact
+    : null;
+  if (!impact) {
+    return `
+      <div class="kelly-capital-pane">
+        <h5>下一笔下单影响</h5>
+        ${renderKellyCapitalLine("状态", "暂无待评估订单")}
+      </div>
+    `;
+  }
+  const status = kellyCapitalRiskStatus(impact.risk_status);
+  const rows = [
+    ["标的", kellyCapitalSymbol(impact)],
+    ["预计金额", formatCapitalMoney(impact.estimated_notional, currency)],
+    ["下单后可用", formatCapitalMoney(impact.available_after_order, currency)],
+    ["风控", status],
+  ];
+  if (hasValue(impact.reason)) {
+    rows.push(["原因", impact.reason]);
+  }
+  return `
+    <div class="kelly-capital-pane">
+      <h5>下一笔下单影响</h5>
+      ${rows.map(([label, value]) => renderKellyCapitalLine(label, value)).join("")}
+    </div>
+  `;
+}
+
+function kellyCapitalSymbolOccupancy(value) {
+  if (Array.isArray(value)) {
+    return value.filter((item) => item && typeof item === "object");
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value).map(([symbol, notional]) => {
+      if (notional && typeof notional === "object") {
+        return { symbol, ...notional };
+      }
+      return { symbol, occupied_notional: notional };
+    });
+  }
+  return [];
+}
+
+function kellyCapitalSymbol(value) {
+  const item = value && typeof value === "object" ? value : {};
+  const rawSymbol = firstPresent(item.symbol, item.code);
+  const formattedSymbol = hasValue(rawSymbol) ? formatPlain(rawSymbol) : "";
+  const marketSymbol = formattedSymbol.includes(".")
+    ? formattedSymbol
+    : [item.market, formattedSymbol]
+    .filter(hasValue)
+    .map(formatPlain)
+    .join(".");
+  return firstPresent(item.futu_code, marketSymbol, formattedSymbol, "-");
+}
+
+function renderKellyCapitalLine(label, value) {
+  return `
+    <div class="kelly-capital-line">
+      <span>${escapeHtml(formatPlain(label))}</span>
+      <strong>${escapeHtml(formatPlain(value))}</strong>
+    </div>
+  `;
+}
+
+function kellyCapitalRiskStatus(status) {
+  const key = formatPlain(status).toLowerCase();
+  if (key === "approved" || key === "ok" || key === "pass") {
+    return "资金足够";
+  }
+  if (key === "blocked" || key === "failed" || key === "rejected") {
+    return "资金不足";
+  }
+  return firstPresent(status, "-");
+}
+
+function formatCapitalMoney(value, currency) {
+  if (!hasValue(value)) {
+    return "-";
+  }
+  const parsed = Number.parseFloat(String(value).replace(/,/g, ""));
+  const amount = Number.isFinite(parsed)
+    ? parsed.toLocaleString("en-US", { maximumFractionDigits: 2 })
+    : formatPlain(value);
+  return formatMoney(amount, currency);
+}
+
+function capitalSegmentWidth(value, budget, offset = 0) {
+  const amount = Number.parseFloat(String(value || "").replace(/,/g, ""));
+  const total = Number.parseFloat(String(budget || "").replace(/,/g, ""));
+  const used = Number.parseFloat(String(offset || ""));
+  if (!Number.isFinite(amount) || !Number.isFinite(total) || total <= 0) {
+    return 0;
+  }
+  const raw = Math.min(100, Math.max(0, (amount / total) * 100));
+  return Math.min(raw, Math.max(0, 100 - (Number.isFinite(used) ? used : 0)));
+}
+
 function renderKellyExperimentCard(experiment) {
   const entry = experiment && typeof experiment === "object" ? experiment : {};
   const template = entry.template && typeof entry.template === "object" ? entry.template : {};
@@ -795,7 +1092,10 @@ function renderKellyExperimentCard(experiment) {
   const budget = hasValue(entry.experiment_budget)
     ? `${formatMoney(entry.experiment_budget, formatPlain(entry.budget_currency || "USD"))}`
     : "-";
+  const pool = kellyMarketCapitalPool(entry);
   const metricRows = [
+    ["市场", entry.market],
+    ["模拟资金池", pool],
     ["阶段", stage],
     ["已完成", stats.completed_samples],
     ["进行中", stats.open_samples],
@@ -813,7 +1113,9 @@ function renderKellyExperimentCard(experiment) {
         <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
       </header>
       <p class="kelly-entry-rule">${escapeHtml(formatPlain(entrySummary))}</p>
+      ${renderKellyStrategyCapital(entry)}
       ${renderKellyOrderSync(entry)}
+      ${renderKellyOrderExecution(entry)}
       ${renderKellyStrategyRules(template, ruleDescriptions)}
       <dl class="kelly-stat-grid">
         ${metricRows.map(([label, value]) => `
@@ -827,6 +1129,19 @@ function renderKellyExperimentCard(experiment) {
       ${renderKellySymbolStates(entry)}
     </article>
   `;
+}
+
+function kellyMarketCapitalPool(experiment) {
+  const entry = experiment && typeof experiment === "object" ? experiment : {};
+  const pool = entry.market_capital_pool && typeof entry.market_capital_pool === "object"
+    ? entry.market_capital_pool
+    : {};
+  if (pool.enabled === false) {
+    return "未启用";
+  }
+  const currency = firstPresent(pool.currency, entry.budget_currency);
+  const amount = firstPresent(pool.amount, entry.experiment_budget);
+  return hasValue(currency) && hasValue(amount) ? `${formatPlain(currency)} ${formatPlain(amount)}` : "";
 }
 
 function renderKellyStrategyRules(template, ruleDescriptions) {
@@ -954,6 +1269,8 @@ function renderKellyParameterDerivation(stats) {
     item.fractional_kelly_pct,
     item.suggested_position_pct,
     item.sample_adjustment,
+    item.parameter_source,
+    item.skipped_order_count,
     item.last_recomputed_at,
   ].some(hasValue);
   if (!hasDerivation) {
@@ -967,6 +1284,9 @@ function renderKellyParameterDerivation(stats) {
     .filter(hasValue)
     .map(formatPlain)
     .join(" / ");
+  const sourceLabel = item.parameter_source === "futu_paper_order_samples"
+    ? "富途模拟盘订单样本"
+    : item.parameter_source;
   const rows = [
     ["原始胜率", [item.raw_win_rate, winLossCount].filter(hasValue).map(formatPlain).join(" · ")],
     ["修正胜率", [item.adjusted_win_rate, item.sample_adjustment].filter(hasValue).map(formatPlain).join(" · ")],
@@ -974,6 +1294,8 @@ function renderKellyParameterDerivation(stats) {
     ["Full Kelly", item.full_kelly_pct],
     ["保守 Kelly", item.fractional_kelly_pct],
     ["建议仓位", item.suggested_position_pct],
+    ["参数来源", sourceLabel],
+    ["跳过订单", item.skipped_order_count],
     ["最近样本", item.last_sample_closed_at],
     ["最近更新", item.last_recomputed_at],
   ].filter(([, value]) => hasValue(value));

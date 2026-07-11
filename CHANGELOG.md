@@ -15,6 +15,30 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Verified on local `main` with the full pytest suite, replayed the 2026-07-09
   US blocker scenario as `ready=2 review=0`, and confirmed the US launchd
   premarket job was not running stale code.
+- Added the Kelly strategy lab workflow for paper-trading experiments, including
+  strategy details, symbol-level lifecycle states, Kelly parameter derivation,
+  risk-checked order intents, execution records, and Futu order linkage.
+- Connected Futu SIMULATE order execution and order sync so submitted paper
+  orders can be attributed back to strategy samples and used for future Kelly
+  parameter updates.
+- Added explicit Futu trading-market selection for HK, US, and CN simulate
+  accounts so paper-order sync and execution target the intended market account.
+- Enforced single-market Kelly paper experiments with fixed per-strategy
+  simulated budgets of `30000 USD`, `200000 HKD`, and disabled `150000 CNY`,
+  split mixed-market mock data, and blocked cross-market order intents before
+  execution.
+- Added automatic Futu SIMULATE market routing for Kelly paper-order sync and
+  execution so commands follow experiment/order markets by default while still
+  allowing manual `--trd-market` overrides.
+- Added strategy-level Kelly capital snapshots, capital-aware order risk checks,
+  and a Kelly Lab capital panel showing occupied, available, and next-order
+  impact per strategy.
+- Added Kelly trade sample generation from synced Futu paper orders, including
+  derived win rate, payoff ratio, Kelly sizing stats, and dashboard source
+  visibility.
+- Verified with focused Kelly/dashboard pytest coverage, compile checks,
+  `git diff --check`, live Futu SIMULATE HK order execution/sync, and live
+  US/CN simulate-account order probes.
 
 ## 2026-07-04
 
