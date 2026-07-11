@@ -51,6 +51,7 @@ class FakeDailyKlineProvider:
                 high=505.0,
                 low=498.0,
                 close=503.25,
+                volume=123456.0,
             ),
             DailyKlineBar(
                 date="2026-07-10",
@@ -58,6 +59,7 @@ class FakeDailyKlineProvider:
                 high=506.0,
                 low=501.0,
                 close=502.5,
+                volume=654321.0,
             ),
         ]
 
@@ -87,9 +89,22 @@ def test_fetch_backtest_prices_writes_market_symbol_price_csv(tmp_path: Path) ->
     ]
     assert result.prices_path.read_text(encoding="utf-8").splitlines() == [
         "date,open,high,low,close,volume",
-        "2026-07-09,500.0,505.0,498.0,503.25,0",
-        "2026-07-10,504.0,506.0,501.0,502.5,0",
+        "2026-07-09,500.0,505.0,498.0,503.25,123456.0",
+        "2026-07-10,504.0,506.0,501.0,502.5,654321.0",
     ]
+
+
+@pytest.mark.parametrize("volume", [float("nan"), float("inf"), -1.0])
+def test_fetch_backtest_prices_rejects_invalid_volume(tmp_path: Path, volume: float) -> None:
+    class InvalidVolumeProvider:
+        def get_daily_kline(self, futu_symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
+            return [DailyKlineBar(date=start, close=100, volume=volume)]
+
+    with pytest.raises(ValueError, match="成交量必须是有限的非负数"):
+        fetch_backtest_prices(
+            data_dir=tmp_path, market="US", symbol="MSFT",
+            start="2026-07-09", end="2026-07-10", provider=InvalidVolumeProvider(),
+        )
 
 
 @pytest.mark.parametrize("start,end", [("", "2026-07-10"), ("2026-07-09", "  ")])
@@ -172,7 +187,7 @@ class CoverageProvider:
 
     def get_daily_kline(self, futu_symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
         self.requests.append((futu_symbol, start, end))
-        return [DailyKlineBar(date=start, close=100), DailyKlineBar(date=end, close=101)]
+        return [DailyKlineBar(date=start, close=100, volume=1000), DailyKlineBar(date=end, close=101, volume=1000)]
 
 
 def test_ensure_price_range_fetches_when_file_does_not_cover_warmup(tmp_path: Path) -> None:
@@ -245,7 +260,7 @@ class LatestDiscoveryProvider:
 
     def get_daily_kline(self, futu_symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
         self.requests.append((futu_symbol, start, end))
-        return [DailyKlineBar(date=start, close=100), DailyKlineBar(date=self.latest.isoformat(), close=101)]
+        return [DailyKlineBar(date=start, close=100, volume=1000), DailyKlineBar(date=self.latest.isoformat(), close=101, volume=1000)]
 
 
 def test_resolved_range_uses_last_trading_bar_for_default_end(tmp_path: Path) -> None:

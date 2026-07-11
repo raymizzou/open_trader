@@ -367,6 +367,26 @@ if(target.hidden)throw new Error("result remains hidden"); console.log("ok");
     assert "ok" in output
 
 
+def test_generated_standard_backtest_payload_renders_finite_price_path_and_marker(tmp_path) -> None:
+    from tests.test_strategy_backtest import fixture_provider, standard_request
+    from open_trader.strategy_backtest import run_standard_backtest
+
+    fixture_result = run_standard_backtest(
+        standard_request(tmp_path, strategy_id="breakout_momentum/v1"),
+        price_provider=fixture_provider("breakout_next_open"),
+    ).to_dict()
+    output = run_dashboard_js('''
+const result=''' + json.dumps(fixture_result, ensure_ascii=False) + r''';
+const chart=renderPriceActionChart(result.strategy.equity_curve,result.strategy.trades);
+const path=(chart.match(/class="backtest-price-line" d="([^"]+)"/)||[])[1]||"";
+if(!path.includes("M")||!path.includes("L")||/NaN|Infinity/.test(path))throw new Error(`invalid price path: ${path}`);
+const marker=(chart.match(/<circle cx="([^"]+)" cy="([^"]+)" r="5"><\/circle>/)||[]);
+if(!marker.length||!Number.isFinite(Number(marker[1]))||!Number.isFinite(Number(marker[2])))throw new Error(`invalid marker: ${chart}`);
+console.log("ok");
+''')
+    assert "ok" in output
+
+
 def test_standard_backtest_result_treats_zero_trades_as_success() -> None:
     output = run_dashboard_js(r'''
 const target={innerHTML:"",hidden:true}; document.getElementById=()=>target;
@@ -394,9 +414,9 @@ renderStandardBacktestResult(result); if(!target.innerHTML.includes("策略收�
 def test_standard_backtest_result_bounds_large_and_invalid_chart_data() -> None:
     output = run_dashboard_js(r'''
 const target={innerHTML:"",hidden:true}; document.getElementById=()=>target;
-const rows=Array.from({length:50000},(_,i)=>({date:`2025-${String(1+(i%12)).padStart(2,"0")}-${String(1+(i%28)).padStart(2,"0")}-${i}`,equity:String(100000+i),mark_price:String(100+i/100)}));
-rows[10].equity="NaN"; rows[11].equity="Infinity"; rows[12].mark_price="bad";
-const trades=Array.from({length:700},(_,i)=>({execution_date:rows[i*50].date,action:i%2?"BUY":"HOLD",quantity:"1",raw_price:i===2?"Infinity":rows[i*50].mark_price,execution_price:"100",fees:"1",reason:"记录"}));
+const rows=Array.from({length:50000},(_,i)=>({date:`2025-${String(1+(i%12)).padStart(2,"0")}-${String(1+(i%28)).padStart(2,"0")}-${i}`,equity:String(100000+i),close:String(100+i/100)}));
+rows[10].equity="NaN"; rows[11].equity="Infinity"; rows[12].close="bad";
+const trades=Array.from({length:700},(_,i)=>({execution_date:rows[i*50].date,action:i%2?"BUY":"HOLD",quantity:"1",raw_price:i===2?"Infinity":rows[i*50].close,execution_price:"100",fees:"1",reason:"记录"}));
 const result={strategy:{trades,equity_curve:rows,total_return_pct:"1",max_drawdown_pct:"-1",win_rate_pct:"1"},buy_hold:{equity_curve:rows,total_return_pct:"1"},market_benchmark:{equity_curve:rows,total_return_pct:"1"},benchmark_symbol:"SPY",signals:[],assumptions:{},strategy_definition:{parameters:{}}};
 renderStandardBacktestResult(result);
 if(/NaN|Infinity/.test(target.innerHTML))throw new Error("non-finite SVG output");
@@ -411,9 +431,9 @@ console.log("ok");
 def test_standard_backtest_result_aggregates_and_bounds_action_markers() -> None:
     output = run_dashboard_js(r'''
 const target={innerHTML:"",hidden:true}; document.getElementById=()=>target;
-const rows=Array.from({length:1000},(_,i)=>({date:`d${i}`,equity:String(100000+i),mark_price:String(100+i/100)}));
+const rows=Array.from({length:1000},(_,i)=>({date:`d${i}`,equity:String(100000+i),close:String(100+i/100)}));
 const actions=["BUY","ADD","REDUCE","EXIT"];
-const trades=Array.from({length:50000},(_,i)=>({execution_date:rows[i%rows.length].date,action:actions[i%4],quantity:"1",raw_price:i===49999?"Infinity":rows[i%rows.length].mark_price,execution_price:"100",fees:"1",reason:"大量记录"}));
+const trades=Array.from({length:50000},(_,i)=>({execution_date:rows[i%rows.length].date,action:actions[i%4],quantity:"1",raw_price:i===49999?"Infinity":rows[i%rows.length].close,execution_price:"100",fees:"1",reason:"大量记录"}));
 const result={strategy:{trades,equity_curve:rows,total_return_pct:"1",max_drawdown_pct:"-1",win_rate_pct:"1"},buy_hold:{equity_curve:rows,total_return_pct:"1"},market_benchmark:{equity_curve:rows,total_return_pct:"1"},benchmark_symbol:"SPY",signals:[],assumptions:{},strategy_definition:{parameters:{}}};
 const chart=renderPriceActionChart(rows,trades);
 const markerCount=(chart.match(/<g class="backtest-action-marker/g)||[]).length;
@@ -479,6 +499,7 @@ class FakeBacktestPriceProvider:
                 high=43.0,
                 low=40.0,
                 close=42.0,
+                volume=1000.0,
             )
         ]
 

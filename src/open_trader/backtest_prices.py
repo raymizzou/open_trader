@@ -269,13 +269,19 @@ def fetch_backtest_prices(
 
 def _price_row(bar: DailyKlineBar) -> dict[str, str]:
     close = bar.close
+    try:
+        volume = Decimal(str(bar.volume))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("成交量必须是有限的非负数") from exc
+    if not volume.is_finite() or volume < 0:
+        raise ValueError("成交量必须是有限的非负数")
     return {
         "date": bar.date,
         "open": str(bar.open if bar.open is not None else close),
         "high": str(bar.high if bar.high is not None else close),
         "low": str(bar.low if bar.low is not None else close),
         "close": str(close),
-        "volume": str(getattr(bar, "volume", 0)),
+        "volume": str(bar.volume),
     }
 
 

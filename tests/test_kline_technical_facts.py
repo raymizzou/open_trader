@@ -99,11 +99,11 @@ def test_generate_kline_technical_facts_writes_bollinger_records(
     provider = FakeDailyKlineProvider(
         {
             "US.RAM": [
-                DailyKlineBar(date=f"2026-06-{day:02d}", close=float(100 + day))
+                DailyKlineBar(date=f"2026-06-{day:02d}", close=float(100 + day), volume=1000)
                 for day in range(1, 21)
             ],
             "US.AMAT": [
-                DailyKlineBar(date=f"2026-06-{day:02d}", close=200.0)
+                DailyKlineBar(date=f"2026-06-{day:02d}", close=200.0, volume=1000)
                 for day in range(1, 11)
             ],
         }

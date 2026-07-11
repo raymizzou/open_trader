@@ -61,8 +61,10 @@ class FakeOpenQuoteContext:
                         "high": "19.0",
                         "low": "18.2",
                         "close": "18.82",
+                        "volume": "123456",
                     },
-                    {"time_key": "2026-06-19", "close": 19.1},
+                    {"time_key": "2026-06-19", "close": 19.1, "volume": 654321},
+                    {"time_key": "2026-06-19", "close": 19.1, "volume": "NaN"},
                     {"time_key": "2026-06-20", "close": None},
                 ]
             ),
@@ -172,8 +174,9 @@ def test_futu_quote_client_returns_normalized_daily_kline() -> None:
             open=18.4,
             high=19.0,
             low=18.2,
+            volume=123456.0,
         ),
-        DailyKlineBar(date="2026-06-19", close=19.1),
+        DailyKlineBar(date="2026-06-19", close=19.1, volume=654321.0),
     ]
     assert client.context.requested_history["symbol"] == "US.VIXY"
     assert client.context.requested_history["start"] == "2026-01-01"

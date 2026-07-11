@@ -490,7 +490,7 @@ function renderBacktestPriceActions(result) {
 
 function renderPriceActionChart(rows, trades) {
   const allowed = new Set(["BUY", "ADD", "REDUCE", "EXIT"]);
-  const validDates = new Set((Array.isArray(rows) ? rows : []).filter((row) => row && Number.isFinite(Number(row.mark_price))).map((row) => String(row.date || "")));
+  const validDates = new Set((Array.isArray(rows) ? rows : []).filter((row) => row && Number.isFinite(Number(row.close))).map((row) => String(row.date || "")));
   const grouped = new Map();
   for (const trade of Array.isArray(trades) ? trades : []) {
     const action = String(trade.action || "");
@@ -504,8 +504,8 @@ function renderPriceActionChart(rows, trades) {
   }
   const allGroups = [...grouped.values()];
   const actionGroups = sampleBacktestActionGroups(allGroups, 600);
-  rows = downsampleBacktestRows(rows, "mark_price", new Set(actionGroups.map((group) => group.execution_date)));
-  const prices = rows.map((row) => Number(row.mark_price));
+  rows = downsampleBacktestRows(rows, "close", new Set(actionGroups.map((group) => group.execution_date)));
+  const prices = rows.map((row) => Number(row.close));
   const [min, max] = finiteBacktestExtent(prices);
   const dateIndex = new Map(rows.map((row, index) => [String(row.date || ""), index]));
   const xy = (date, price) => {
@@ -514,7 +514,7 @@ function renderPriceActionChart(rows, trades) {
   };
   const displayedGroups = actionGroups.filter((group) => dateIndex.has(group.execution_date));
   const omittedGroups = allGroups.length - displayedGroups.length;
-  const pricePath = rows.map((row, index) => { const [x, y] = xy(row.date, row.mark_price); return `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`; }).join(" ");
+  const pricePath = rows.map((row, index) => { const [x, y] = xy(row.date, row.close); return `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`; }).join(" ");
   const explanations = { BUY: "买入", ADD: "加仓", REDUCE: "减仓", EXIT: "退出" };
   const markers = displayedGroups.map((group) => {
     const [x, y] = xy(group.execution_date, group.raw_price);

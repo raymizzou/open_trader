@@ -48,6 +48,7 @@ class FixtureProvider:
             rows.append(DailyKlineBar(
                 date=day.isoformat(), open=float(open_price), high=float(max(open_price, close) + 1),
                 low=float(min(open_price, close) - 1), close=float(close),
+                volume=float(volume),
             ))
         return rows
 
@@ -83,6 +84,18 @@ def test_standard_backtest_executes_signal_at_next_session_open(tmp_path: Path) 
     assert buy.execution_date == "2025-02-11"
     assert buy.raw_price == Decimal("105")
     assert buy.execution_price == Decimal("105.0525")
+
+
+def test_breakout_rejects_zero_only_volume_in_chinese(tmp_path: Path) -> None:
+    class ZeroVolumeProvider(FixtureProvider):
+        def get_daily_kline(self, futu_symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
+            return [replace(bar, volume=0.0) for bar in super().get_daily_kline(futu_symbol, start=start, end=end)]
+
+    with pytest.raises(ValueError, match="突破动量策略需要有效的非零成交量数据"):
+        run_standard_backtest(
+            standard_request(tmp_path, strategy_id="breakout_momentum/v1"),
+            price_provider=ZeroVolumeProvider("breakout_next_open"),
+        )
 
 
 def test_invalid_max_weight_is_rejected_in_chinese(tmp_path: Path) -> None:

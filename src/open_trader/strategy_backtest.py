@@ -319,6 +319,10 @@ class StandardBacktestService:
         symbol_bars = tuple(symbol_map[day] for day in common_dates)
         benchmark_bars = tuple(benchmark_map[day] for day in common_dates) if benchmark_map else ()
         all_symbol_bars = tuple(bar for bar in symbol_prices.price_range.bars if bar.date <= actual_end)
+        if request.strategy_id == "breakout_momentum/v1" and not any(
+            bar.volume > 0 for bar in all_symbol_bars
+        ):
+            raise ValueError("突破动量策略需要有效的非零成交量数据")
         generated = generate_strategy_signals(
             request.strategy_id, all_symbol_bars, start_date=actual_start,
             max_strategy_weight=request.max_strategy_weight,
