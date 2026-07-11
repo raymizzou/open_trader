@@ -356,9 +356,11 @@
           "full_kelly_pct": "23.1%",
           "fractional_kelly_pct": "5.8%",
           "suggested_position_pct": "4%",
+          "parameter_source": "futu_paper_order_samples",
+          "skipped_order_count": 0,
           "sample_adjustment": "样本少于 200，向 50% 收缩",
           "last_sample_closed_at": "2026-07-07 15:30",
-          "last_recomputed_at": "2026-07-07 15:31"
+          "last_recomputed_at": "2026-07-11 12:00"
         }
       },
       {

@@ -86,6 +86,9 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByText('第一目标')).toHaveCount(0);
   await expect(page.getByText('延续')).toHaveCount(0);
   await expect(page.getByText('参数推导')).toBeVisible();
+  await expect(page.getByText('参数来源')).toBeVisible();
+  await expect(page.getByText('富途模拟盘订单样本')).toBeVisible();
+  await expect(page.getByText('跳过订单')).toBeVisible();
   await expect(page.getByText('10 赢 / 8 亏')).toBeVisible();
   await expect(page.getByText('Full Kelly')).toBeVisible();
   await expect(page.getByText('23.1%')).toBeVisible();
