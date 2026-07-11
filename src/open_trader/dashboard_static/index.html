@@ -14,6 +14,7 @@
           <div class="brand-block">
             <span class="brand">Open Trader</span>
             <span class="page-title">持仓实时看板</span>
+            <button id="open-standard-backtest" class="primary-button" type="button">策略回测</button>
           </div>
           <div class="header-filter-block">
             <div id="header-market-filters" class="segmented-control" aria-label="市场筛选">
@@ -120,6 +121,43 @@
           <div id="symbol-detail-panel" class="symbol-detail-panel hidden" aria-live="polite"></div>
         </section>
       </main>
+      <section id="standard-backtest-workspace" class="backtest-workspace hidden" hidden>
+        <header class="backtest-workspace-header">
+          <div><h1>策略回测</h1><p>一次选择一个标的和一套策略。</p></div>
+          <button id="close-standard-backtest" class="raw-toggle" type="button">返回持仓看板</button>
+        </header>
+        <form id="standard-backtest-form" class="backtest-form">
+          <section class="backtest-form-section">
+            <h2>选择标的</h2>
+            <div id="backtest-symbol-source" class="segmented-control" aria-label="标的来源"></div>
+            <label>回测标的<select id="backtest-symbol" required></select></label>
+          </section>
+          <section class="backtest-form-section backtest-strategy-section">
+            <h2>选择策略</h2>
+            <div id="backtest-strategy-cards" class="backtest-strategy-cards"></div>
+          </section>
+          <section class="backtest-form-section">
+            <h2>回测区间</h2>
+            <div id="backtest-range-controls" class="segmented-control"></div>
+            <div id="backtest-custom-range" class="backtest-custom-range hidden" hidden>
+              <label>开始日期<input id="backtest-custom-start" type="date"></label>
+              <label>结束日期<input id="backtest-custom-end" type="date"></label>
+            </div>
+          </section>
+          <section class="backtest-form-section">
+            <h2>资金与成本</h2>
+            <div class="backtest-input-grid">
+              <label>最大仓位<input id="backtest-max-weight" inputmode="decimal" value="10%"></label>
+              <label>佣金（基点）<input id="backtest-commission" inputmode="decimal" value="10"></label>
+              <label>滑点（基点）<input id="backtest-slippage" inputmode="decimal" value="5"></label>
+            </div>
+            <p class="backtest-engine-note">回测执行细节由系统统一管理。</p>
+          </section>
+          <button id="run-standard-backtest" class="primary-button backtest-run-button" type="submit">运行回测</button>
+        </form>
+        <div id="standard-backtest-status" aria-live="polite"></div>
+        <section id="standard-backtest-results" class="backtest-results" hidden></section>
+      </section>
     </div>
     <div id="research-chat-layer" class="research-chat-layer hidden" hidden role="dialog" aria-modal="true" aria-label="LLM 深度讨论">
       <section class="research-chat-modal">

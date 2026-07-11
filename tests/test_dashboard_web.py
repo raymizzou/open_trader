@@ -234,6 +234,36 @@ def test_dashboard_static_removes_legacy_holding_backtest_ui() -> None:
     assert "backtest-price-sync-status" not in html
 
 
+def test_dashboard_has_one_global_backtest_entry_and_no_row_entry() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+
+    assert html.count('id="open-standard-backtest"') == 1
+    assert 'id="standard-backtest-workspace"' in html
+    assert 'id="header-backtest-filters"' not in html
+    assert 'data-detail-mode="backtest"' not in js
+    assert "查看回测" not in js
+
+
+def test_standard_backtest_workspace_builds_request_without_adapter() -> None:
+    output = run_dashboard_js(
+        r"""
+state.standardBacktest.symbolKey = "US:MSFT";
+state.standardBacktest.strategyId = "trend_pullback/v1";
+state.standardBacktest.rangePreset = "3Y";
+state.standardBacktest.maxWeight = "10%";
+state.standardBacktest.costRate = "0.10%";
+const request = buildStandardBacktestRequest();
+if (request.market !== "US" || request.symbol !== "MSFT") throw new Error(JSON.stringify(request));
+if (request.strategy_id !== "trend_pullback/v1" || request.range_preset !== "3Y") throw new Error(JSON.stringify(request));
+if (request.adapter !== undefined) throw new Error("adapter leaked to UI");
+if (request.max_strategy_weight !== "10%" || request.commission_bps !== "10") throw new Error(JSON.stringify(request));
+console.log("ok");
+"""
+    )
+    assert "ok" in output
+
+
 class FakeQuoteService:
     def __init__(self, result: QuoteRefreshResult) -> None:
         self.result = result

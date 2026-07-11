@@ -19,6 +19,21 @@ const state = {
     messageCount: 0,
     messages: [],
   },
+  standardBacktest: {
+    options: null,
+    source: "holdings",
+    symbolKey: "",
+    strategyId: "trend_pullback/v1",
+    rangePreset: "1Y",
+    customStart: "",
+    customEnd: "",
+    maxWeight: "10%",
+    commissionBps: "10",
+    slippageBps: "5",
+    busy: false,
+    error: "",
+    result: null,
+  },
 };
 
 const elements = {};
@@ -154,6 +169,23 @@ function bindElements() {
     "research-chat-close",
     "research-chat-finalize",
     "research-chat-status",
+    "open-standard-backtest",
+    "close-standard-backtest",
+    "standard-backtest-workspace",
+    "standard-backtest-form",
+    "backtest-symbol-source",
+    "backtest-symbol",
+    "backtest-strategy-cards",
+    "backtest-range-controls",
+    "backtest-custom-range",
+    "backtest-custom-start",
+    "backtest-custom-end",
+    "backtest-max-weight",
+    "backtest-commission",
+    "backtest-slippage",
+    "run-standard-backtest",
+    "standard-backtest-status",
+    "standard-backtest-results",
   ].forEach((id) => {
     elements[id] = document.getElementById(id);
   });
@@ -212,6 +244,154 @@ function bindEvents() {
     }
   });
   elements["symbol-detail-panel"].addEventListener("click", handleSymbolDetailClick);
+  elements["open-standard-backtest"].addEventListener("click", openStandardBacktest);
+  elements["close-standard-backtest"].addEventListener("click", closeStandardBacktest);
+  elements["backtest-symbol-source"].addEventListener("click", handleBacktestChoice);
+  elements["backtest-strategy-cards"].addEventListener("click", handleBacktestChoice);
+  elements["backtest-range-controls"].addEventListener("click", handleBacktestChoice);
+  elements["backtest-symbol"].addEventListener("change", (event) => {
+    state.standardBacktest.symbolKey = event.target.value;
+  });
+  elements["standard-backtest-form"].addEventListener("submit", submitStandardBacktest);
+}
+
+async function openStandardBacktest() {
+  elements["workspace-grid"].classList.add("hidden");
+  elements["standard-backtest-workspace"].hidden = false;
+  elements["standard-backtest-workspace"].classList.remove("hidden");
+  if (!state.standardBacktest.options) {
+    elements["standard-backtest-status"].textContent = "正在加载回测选项…";
+    try {
+      const response = await fetch("/api/backtests/options", { cache: "no-store" });
+      if (!response.ok) throw new Error(`options ${response.status}`);
+      state.standardBacktest.options = await response.json();
+      const defaults = state.standardBacktest.options.defaults || {};
+      state.standardBacktest.rangePreset = defaults.range || state.standardBacktest.rangePreset;
+      state.standardBacktest.maxWeight = decimalAsPercent(defaults.max_strategy_weight, "10%");
+      state.standardBacktest.commissionBps = String(defaults.commission_bps || "10");
+      state.standardBacktest.slippageBps = String(defaults.slippage_bps || "5");
+      elements["standard-backtest-status"].textContent = "";
+    } catch (error) {
+      state.standardBacktest.error = "回测选项加载失败，请稍后重试。";
+      elements["standard-backtest-status"].textContent = state.standardBacktest.error;
+    }
+  }
+  renderStandardBacktest();
+}
+
+function closeStandardBacktest() {
+  syncStandardBacktestInputs();
+  elements["standard-backtest-workspace"].hidden = true;
+  elements["standard-backtest-workspace"].classList.add("hidden");
+  elements["workspace-grid"].classList.remove("hidden");
+}
+
+function handleBacktestChoice(event) {
+  const source = event.target.closest("[data-backtest-source]");
+  const strategy = event.target.closest("[data-strategy-id]");
+  const range = event.target.closest("[data-range-preset]");
+  if (source) {
+    syncStandardBacktestInputs();
+    state.standardBacktest.source = source.dataset.backtestSource;
+    state.standardBacktest.symbolKey = "";
+  } else if (strategy && !strategy.disabled) {
+    state.standardBacktest.strategyId = strategy.dataset.strategyId;
+  } else if (range) {
+    syncStandardBacktestInputs();
+    state.standardBacktest.rangePreset = range.dataset.rangePreset;
+  } else {
+    return;
+  }
+  renderStandardBacktest();
+}
+
+function renderStandardBacktest() {
+  const options = state.standardBacktest.options;
+  if (!options) return;
+  const backtest = state.standardBacktest;
+  elements["backtest-symbol-source"].innerHTML = [
+    ["holdings", "当前持仓"], ["watchlist", "关注列表"],
+  ].map(([key, label]) => `<button class="filter-button ${backtest.source === key ? "active" : ""}" type="button" data-backtest-source="${key}">${label}</button>`).join("");
+  const universe = (options.universe && options.universe[backtest.source]) || [];
+  if (!universe.some((row) => `${row.market}:${row.symbol}` === backtest.symbolKey)) {
+    backtest.symbolKey = universe.length ? `${universe[0].market}:${universe[0].symbol}` : "";
+  }
+  elements["backtest-symbol"].innerHTML = universe.length
+    ? universe.map((row) => `<option value="${escapeHtml(`${row.market}:${row.symbol}`)}" ${`${row.market}:${row.symbol}` === backtest.symbolKey ? "selected" : ""}>${escapeHtml(`${row.market} · ${row.symbol}${row.name ? ` · ${row.name}` : ""}`)}</option>`).join("")
+    : '<option value="">暂无可回测标的</option>';
+  elements["backtest-strategy-cards"].innerHTML = options.strategies.map((strategy) => `
+    <button class="backtest-strategy-card ${strategy.id === backtest.strategyId ? "active" : ""}" type="button" data-strategy-id="${escapeHtml(strategy.id)}">
+      <strong>${escapeHtml(strategy.name_zh)}</strong><span>${escapeHtml(strategy.description_zh)}</span>
+    </button>`).join("") + '<button class="backtest-strategy-card" type="button" disabled><strong>自定义策略</strong><span>后续版本</span></button>';
+  elements["backtest-range-controls"].innerHTML = options.ranges.map((range) => `<button class="filter-button ${range === backtest.rangePreset ? "active" : ""}" type="button" data-range-preset="${range}">${range === "CUSTOM" ? "自定义" : range}</button>`).join("");
+  const custom = backtest.rangePreset === "CUSTOM";
+  elements["backtest-custom-range"].hidden = !custom;
+  elements["backtest-custom-range"].classList.toggle("hidden", !custom);
+  elements["backtest-custom-start"].value = backtest.customStart;
+  elements["backtest-custom-end"].value = backtest.customEnd;
+  elements["backtest-max-weight"].value = backtest.maxWeight;
+  elements["backtest-commission"].value = backtest.commissionBps;
+  elements["backtest-slippage"].value = backtest.slippageBps;
+}
+
+function syncStandardBacktestInputs() {
+  if (!elements["backtest-max-weight"]) return;
+  state.standardBacktest.customStart = elements["backtest-custom-start"].value;
+  state.standardBacktest.customEnd = elements["backtest-custom-end"].value;
+  state.standardBacktest.maxWeight = elements["backtest-max-weight"].value;
+  state.standardBacktest.commissionBps = elements["backtest-commission"].value;
+  state.standardBacktest.slippageBps = elements["backtest-slippage"].value;
+}
+
+function buildStandardBacktestRequest() {
+  const backtest = state.standardBacktest;
+  const separator = backtest.symbolKey.indexOf(":");
+  const request = {
+    market: backtest.symbolKey.slice(0, separator),
+    symbol: backtest.symbolKey.slice(separator + 1),
+    strategy_id: backtest.strategyId,
+    range_preset: backtest.rangePreset,
+    max_strategy_weight: backtest.maxWeight,
+    commission_bps: backtest.commissionBps,
+    slippage_bps: backtest.slippageBps,
+  };
+  if (backtest.rangePreset === "CUSTOM") {
+    request.custom_start = backtest.customStart;
+    request.custom_end = backtest.customEnd;
+  }
+  return request;
+}
+
+async function submitStandardBacktest(event) {
+  event.preventDefault();
+  syncStandardBacktestInputs();
+  const backtest = state.standardBacktest;
+  if (!backtest.symbolKey || backtest.busy) return;
+  backtest.busy = true;
+  elements["run-standard-backtest"].disabled = true;
+  elements["standard-backtest-status"].textContent = "正在运行回测…";
+  try {
+    const response = await fetch("/api/backtests/standard/run", {
+      method: "POST", headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify(buildStandardBacktestRequest()),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.message || `run ${response.status}`);
+    backtest.result = payload;
+    elements["standard-backtest-results"].hidden = false;
+    elements["standard-backtest-results"].innerHTML = '<h2>回测完成</h2><p>结果已生成，可在回测报告中查看完整指标。</p>';
+    elements["standard-backtest-status"].textContent = "回测运行成功。";
+  } catch (error) {
+    elements["standard-backtest-status"].textContent = `回测运行失败：${error.message}`;
+  } finally {
+    backtest.busy = false;
+    elements["run-standard-backtest"].disabled = false;
+  }
+}
+
+function decimalAsPercent(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number * 100}%` : fallback;
 }
 
 function handleSymbolDetailClick(event) {
