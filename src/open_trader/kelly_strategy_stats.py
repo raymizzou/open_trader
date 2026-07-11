@@ -27,7 +27,10 @@ def build_kelly_strategy_stats_payload(
     configured_experiments = _configured_experiments(experiments)
     _validate_evidence_experiment_coverage(
         evidence,
-        {experiment_id for experiment_id, _, _ in configured_experiments},
+        {
+            experiment_id: market
+            for experiment_id, _, market in configured_experiments
+        },
     )
     timestamp = generated_at or _current_timestamp()
     source_generated_at = evidence["generated_at"]
@@ -285,10 +288,12 @@ def _validate_completed_samples(
             raise ValueError(f"{label} contains invalid exit_notional")
         if gross_pnl != exit_notional - entry_notional:
             raise ValueError(f"{label} contains invalid gross_pnl")
-        if (result == "win" and net_pnl_pct <= 0) or (
-            result == "loss" and net_pnl_pct >= 0
-        ) or (result == "flat" and net_pnl_pct != 0):
-            raise ValueError(f"{label} contains inconsistent result")
+        if sample["net_pnl_pct"] != _sample_pct_text(gross_pnl / entry_notional):
+            raise ValueError(f"{label} contains invalid net_pnl_pct")
+        if (result == "win" and gross_pnl <= 0) or (
+            result == "loss" and gross_pnl >= 0
+        ) or (result == "flat" and gross_pnl != 0):
+            raise ValueError(f"{label} contains invalid gross_pnl direction")
 
 
 def _validate_open_positions(
@@ -368,17 +373,29 @@ def _sample_pct_decimal(value: object) -> Decimal | None:
     return _decimal(value.strip()[:-1])
 
 
+def _sample_pct_text(value: Decimal) -> str:
+    rounded = _pct_text(value)
+    if rounded == "0%" and value != 0:
+        return f"{_decimal_text(value * Decimal('100'))}%"
+    return rounded
+
+
 def _validate_evidence_experiment_coverage(
     evidence: dict[str, Any],
-    configured_experiment_ids: set[str],
+    configured_experiment_markets: dict[str, str],
 ) -> None:
     for field in ("samples", "open_positions"):
         for index, record in enumerate(evidence[field]):
             experiment_id = record["experiment_id"]
-            if experiment_id not in configured_experiment_ids:
+            configured_market = configured_experiment_markets.get(experiment_id)
+            if configured_market is None:
                 raise ValueError(
                     f"trade samples {field}[{index}] has unknown experiment "
                     f"{experiment_id}"
+                )
+            if _text(record["market"]).upper() != configured_market:
+                raise ValueError(
+                    f"trade samples {field}[{index}] has market mismatch"
                 )
 
 

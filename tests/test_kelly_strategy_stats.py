@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from decimal import Decimal
 
 import pytest
 
@@ -28,8 +29,10 @@ def _sample(
     *,
     exit_submitted_at: str = "2026-07-11 11:59",
 ) -> dict[str, str]:
-    exit_price = {"win": "110", "loss": "95", "flat": "100"}[result]
-    gross_pnl = {"win": "10", "loss": "-5", "flat": "0"}[result]
+    entry_price = Decimal("100")
+    net_pnl = Decimal(net_pnl_pct.removesuffix("%")) / Decimal("100")
+    exit_price = entry_price * (Decimal("1") + net_pnl)
+    gross_pnl = exit_price - entry_price
     return {
         "experiment_id": "trend_us",
         "market": "US",
@@ -38,15 +41,32 @@ def _sample(
         "exit_order_id": "SELL-1",
         "entry_submitted_at": "2026-07-11 09:00",
         "exit_submitted_at": exit_submitted_at,
-        "entry_price": "100",
-        "exit_price": exit_price,
+        "entry_price": _decimal_text(entry_price),
+        "exit_price": _decimal_text(exit_price),
         "quantity": "1",
         "entry_notional": "100",
-        "exit_notional": exit_price,
-        "gross_pnl": gross_pnl,
+        "exit_notional": _decimal_text(exit_price),
+        "gross_pnl": _decimal_text(gross_pnl),
         "net_pnl_pct": net_pnl_pct,
         "result": result,
     }
+
+
+def _open_position(*, market: str = "US") -> dict[str, str]:
+    return {
+        "experiment_id": "trend_us",
+        "market": market,
+        "symbol": "AAPL",
+        "entry_order_id": "BUY-1",
+        "entry_submitted_at": "2026-07-11 09:00",
+        "entry_price": "100",
+        "quantity": "1",
+        "entry_notional": "100",
+    }
+
+
+def _decimal_text(value: Decimal) -> str:
+    return format(value.normalize(), "f") if value else "0"
 
 
 def _samples(*, wins: int, losses: int, flats: int = 0) -> list[dict[str, str]]:
@@ -111,6 +131,47 @@ def test_build_rejects_unknown_trade_sample_experiment() -> None:
     trade_samples["samples"][0]["experiment_id"] = "missing_experiment"
 
     with pytest.raises(ValueError, match="unknown experiment"):
+        build_kelly_strategy_stats_payload(
+            [{"experiment_id": "trend_us", "market": "US"}],
+            trade_samples,
+            generated_at="2026-07-11 12:01",
+        )
+
+
+def test_build_rejects_completed_sample_pnl_mismatch() -> None:
+    trade_samples = _trade_samples_payload()
+    trade_samples["samples"][0]["net_pnl_pct"] = "99%"
+
+    with pytest.raises(ValueError, match="net_pnl_pct"):
+        build_kelly_strategy_stats_payload(
+            [{"experiment_id": "trend_us", "market": "US"}],
+            trade_samples,
+            generated_at="2026-07-11 12:01",
+        )
+
+
+def test_build_rejects_completed_sample_result_mismatch() -> None:
+    trade_samples = _trade_samples_payload()
+    trade_samples["samples"][0]["result"] = "loss"
+
+    with pytest.raises(ValueError, match="gross_pnl direction"):
+        build_kelly_strategy_stats_payload(
+            [{"experiment_id": "trend_us", "market": "US"}],
+            trade_samples,
+            generated_at="2026-07-11 12:01",
+        )
+
+
+@pytest.mark.parametrize("field", ["samples", "open_positions"])
+def test_build_rejects_evidence_market_mismatch(field: str) -> None:
+    trade_samples = _trade_samples_payload()
+    if field == "samples":
+        trade_samples["samples"][0]["market"] = "HK"
+    else:
+        trade_samples["samples"] = []
+        trade_samples["open_positions"] = [_open_position(market="HK")]
+
+    with pytest.raises(ValueError, match="market mismatch"):
         build_kelly_strategy_stats_payload(
             [{"experiment_id": "trend_us", "market": "US"}],
             trade_samples,
