@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -9,7 +10,12 @@ from pathlib import Path
 import pytest
 
 from open_trader.kline_technical_facts import DailyKlineBar
-from open_trader.strategy_backtest import StandardBacktestRequest, run_standard_backtest
+import backtrader as bt
+
+from open_trader.standard_strategies import StrategyBar, StrategySignal
+from open_trader.strategy_backtest import (
+    BacktraderTargetWeightAdapter, StandardBacktestRequest, run_standard_backtest,
+)
 
 
 class FixtureProvider:
@@ -22,6 +28,8 @@ class FixtureProvider:
         rows: list[DailyKlineBar] = []
         for offset in range(170):
             day = first + timedelta(days=offset)
+            if self.scenario == "unequal_calendar" and benchmark and day == date(2025, 2, 3):
+                continue
             close = Decimal("100") + Decimal(offset) / Decimal("10")
             volume = Decimal("100")
             if self.scenario == "never_triggers":
@@ -111,3 +119,133 @@ def test_zero_trade_run_is_successful(tmp_path: Path) -> None:
     assert result.status == "ok"
     assert result.trade_count == 0
     assert result.message_zh == "所选区间内没有触发交易"
+
+
+def test_zero_quantity_attempt_uses_zero_trade_success_message(tmp_path: Path) -> None:
+    result = run_standard_backtest(
+        standard_request(tmp_path, strategy_id="breakout_momentum/v1", initial_cash=Decimal("1")),
+        price_provider=fixture_provider("breakout_next_open"),
+    )
+    assert result.trades
+    assert all(trade.quantity == 0 for trade in result.trades)
+    assert result.trade_count == 0
+    assert result.message_zh == "所选区间内没有触发交易"
+
+
+def _bar(day: date, price: str) -> StrategyBar:
+    value = Decimal(price)
+    return StrategyBar(day, value, value, value, value, Decimal("100"))
+
+
+def _signal(decision: date, execution: date, action: str, weight: str) -> StrategySignal:
+    return StrategySignal(decision, execution, action, Decimal(weight), "test", "测试信号", decision)  # type: ignore[arg-type]
+
+
+def test_adapter_runs_real_cerebro_and_notify_order_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    original = bt.Cerebro.run
+
+    def tracked(self: bt.Cerebro, *args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(bt.Cerebro, "run", tracked)
+    days = [date(2025, 1, day) for day in range(2, 6)]
+    result = BacktraderTargetWeightAdapter().run(
+        bars=[_bar(day, price) for day, price in zip(days, ("100", "101", "102", "103"))],
+        signals=[_signal(days[0], days[1], "BUY", "0.1")], initial_cash=Decimal("100000"),
+        commission_bps=Decimal("2"), slippage_bps=Decimal("5"),
+    )
+    assert calls == 1
+    assert any(trade.quantity > 0 for trade in result.trades)
+    assert any(trade.reason == "end_of_backtest" for trade in result.trades)
+
+
+def test_unequal_calendars_are_intersected_by_exact_date_set(tmp_path: Path) -> None:
+    result = run_standard_backtest(standard_request(tmp_path), price_provider=fixture_provider("unequal_calendar"))
+    curves = (result.strategy.equity_curve, result.buy_hold.equity_curve, result.market_benchmark.equity_curve)
+    date_sets = [[row["date"] for row in curve] for curve in curves]
+    assert date_sets[0] == date_sets[1] == date_sets[2]
+    assert "2025-02-03" not in date_sets[0]
+
+
+def test_terminal_strategy_position_is_liquidated_with_cost_reconciliation() -> None:
+    days = [date(2025, 1, day) for day in range(2, 6)]
+    result = BacktraderTargetWeightAdapter().run(
+        bars=[_bar(day, price) for day, price in zip(days, ("100", "100", "110", "120"))],
+        signals=[_signal(days[0], days[1], "BUY", "0.1")], initial_cash=Decimal("100000"),
+        commission_bps=Decimal("10"), slippage_bps=Decimal("10"),
+    )
+    buy, sell = [trade for trade in result.trades if trade.quantity]
+    assert buy.execution_price == Decimal("100.1")
+    assert sell.execution_price == Decimal("119.88")
+    assert sell.action == "EXIT" and sell.reason == "end_of_backtest"
+    expected = Decimal("100000") - buy.quantity * buy.execution_price - buy.fees
+    expected += abs(sell.quantity) * sell.execution_price - sell.fees
+    assert result.final_equity == expected
+    assert Decimal(result.equity_curve[-1]["position_quantity"]) == 0
+
+
+def test_win_rate_uses_completed_round_trip_realized_pnl() -> None:
+    days = [date(2025, 1, day) for day in range(2, 9)]
+    bars = [_bar(day, price) for day, price in zip(days, ("100", "100", "120", "120", "100", "100", "80"))]
+    signals = [
+        _signal(days[0], days[1], "BUY", "0.1"), _signal(days[1], days[2], "EXIT", "0"),
+        _signal(days[3], days[4], "BUY", "0.1"), _signal(days[4], days[5], "EXIT", "0"),
+    ]
+    result = BacktraderTargetWeightAdapter().run(
+        bars=bars, signals=signals, initial_cash=Decimal("100000"),
+        commission_bps=Decimal("0"), slippage_bps=Decimal("0"),
+    )
+    assert result.win_rate_pct == Decimal("50")
+
+
+def test_conflicting_same_execution_date_signals_are_rejected_in_chinese() -> None:
+    days = [date(2025, 1, day) for day in range(2, 6)]
+    with pytest.raises(ValueError, match="同一执行日存在冲突策略信号"):
+        BacktraderTargetWeightAdapter().run(
+            bars=[_bar(day, "100") for day in days],
+            signals=[_signal(days[0], days[1], "BUY", "0.1"), _signal(days[0] - timedelta(days=1), days[1], "EXIT", "0")],
+            initial_cash=Decimal("100000"), commission_bps=Decimal("0"), slippage_bps=Decimal("0"),
+        )
+
+
+def test_manifest_has_schema_and_verified_artifact_hashes(tmp_path: Path) -> None:
+    result = run_standard_backtest(standard_request(tmp_path), price_provider=fixture_provider("basic"))
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["schema_version"] == "open_trader.standard_backtest.manifest.v1"
+    for filename, digest in manifest["artifacts"].items():
+        assert hashlib.sha256((result.manifest_path.parent / filename).read_bytes()).hexdigest() == digest["sha256"]
+    payload = result.to_dict()
+    assert payload["strategy"]["initial_allocated_notional"] == "10000.00"
+    assert payload["actual_start"] == result.actual_start.isoformat()
+    assert result.strategy.annualized_return_pct.is_finite()
+    assert result.strategy.max_drawdown_pct >= 0
+
+
+def test_artifact_failure_leaves_no_partial_final_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import open_trader.strategy_backtest as module
+    original = module._write_run_artifact
+    calls = 0
+
+    def fail_second(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected")
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_write_run_artifact", fail_second)
+    with pytest.raises(ValueError, match="回测产物写入失败"):
+        run_standard_backtest(standard_request(tmp_path), price_provider=fixture_provider("basic"))
+    assert not list((tmp_path / "data" / "backtests").iterdir())
+
+
+def test_run_collision_refuses_to_overwrite_in_chinese(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import open_trader.strategy_backtest as module
+    monkeypatch.setattr(module, "_build_run_id", lambda *args, **kwargs: "fixed-run")
+    request = standard_request(tmp_path)
+    run_standard_backtest(request, price_provider=fixture_provider("basic"))
+    with pytest.raises(ValueError, match="回测运行编号已存在，拒绝覆盖"):
+        run_standard_backtest(request, price_provider=fixture_provider("basic"))
