@@ -1032,11 +1032,17 @@ PYTHONPATH=src .venv/bin/python -m open_trader dashboard \
 Record the new PID and startup timestamp. Do not call the deployment verified
 from `curl` alone.
 
-- [ ] **Step 6: Verify real API data and run one real read-only backtest**
+- [ ] **Step 6: Verify real API data and run all three real read-only strategies**
 
 Use `GET /api/backtests/options` to confirm current holdings and watchlist symbols.
-Choose one current holding with adequate Futu data, run the 1Y
-`trend_pullback/v1` request through `POST /api/backtests/standard/run`, and inspect:
+Choose one current holding with adequate Futu data and run three separate 1Y
+requests through `POST /api/backtests/standard/run`:
+
+- `trend_pullback/v1`
+- `breakout_momentum/v1`
+- `range_mean_reversion/v1`
+
+For every strategy, inspect:
 
 - requested and actual date ranges;
 - strategy and benchmark symbols;
@@ -1045,7 +1051,7 @@ Choose one current holding with adequate Futu data, run the 1Y
 - zero-trade handling or normalized trades;
 - no modification to portfolio, trading plan, or order state.
 
-- [ ] **Step 7: Verify the live UI in a browser**
+- [ ] **Step 7: Verify every strategy in the live UI with Playwright**
 
 Against `http://127.0.0.1:8766`, prove:
 
@@ -1054,13 +1060,17 @@ Against `http://127.0.0.1:8766`, prove:
 - no `查看回测` button in any current holding row;
 - the global entry opens the dedicated workspace;
 - holdings and watchlist source tabs use real local symbols;
-- a strategy and range can be selected and submitted;
-- the result shows both benchmarks, actual dates, assumptions, charts, trades or
-  the valid zero-trade message;
+- each of `趋势回调`, `突破动量`, and `区间均值回归` can be selected and submitted
+  as a separate run against real local data;
+- each strategy run renders its own strategy ID/version, both benchmarks, actual
+  dates, assumptions, charts, and trades or the valid zero-trade message;
 - desktop and mobile widths remain usable.
 
-Capture screenshots and console/network errors. Any old process or stale static
-asset invalidates the check until restarted and reverified.
+Use Playwright for all three strategy runs. Save one screenshot per completed
+strategy result plus desktop/mobile workspace screenshots, and record console and
+network errors. A successful run of one strategy is not evidence for either of
+the other two. Any old process or stale static asset invalidates the check until
+restarted and all three strategies are reverified.
 
 - [ ] **Step 8: Finalize changelog, rerun checks, and commit**
 
