@@ -260,10 +260,35 @@ def _validate_stats_record(
     )
     if payoff_ratio < 0:
         raise ValueError(f"{label} contains invalid payoff_ratio")
-    if abs(fractional_kelly - (full_kelly / Decimal("4"))) > Decimal("0.0001"):
+    if counts["winning_samples"] == 0 and avg_net_win != 0:
+        raise ValueError(f"{label} contains invalid avg_net_win_pct")
+    if counts["losing_samples"] == 0 and avg_net_loss != 0:
+        raise ValueError(f"{label} contains invalid avg_net_loss_pct")
+    expected_payoff_ratio = (
+        Decimal("0") if avg_net_loss <= 0 else avg_net_win / avg_net_loss
+    )
+    if payoff_ratio != expected_payoff_ratio:
+        raise ValueError(f"{label} contains invalid payoff_ratio")
+    expected_full_kelly = _pct_value(
+        _kelly_fraction(adjusted_win_rate, payoff_ratio)
+    )
+    if full_kelly != expected_full_kelly:
+        raise ValueError(f"{label} contains invalid full_kelly_pct")
+    expected_fractional_kelly = _pct_value(
+        expected_full_kelly / Decimal("4")
+        if expected_full_kelly > 0
+        else Decimal("0")
+    )
+    if fractional_kelly != expected_fractional_kelly:
         raise ValueError(f"{label} contains invalid fractional_kelly_pct")
-    if suggested_position > Decimal("0.04") or suggested_position != min(
-        fractional_kelly, Decimal("0.04")
+    expected_suggested_position = _pct_value(
+        min(expected_fractional_kelly, Decimal("0.04"))
+        if expected_fractional_kelly > 0
+        else Decimal("0")
+    )
+    if (
+        suggested_position > Decimal("0.04")
+        or suggested_position != expected_suggested_position
     ):
         raise ValueError(f"{label} contains invalid suggested_position_pct")
     if completed == 0 and suggested_position != 0:
@@ -338,18 +363,20 @@ def _experiment_stats(
     wins = [sample for sample in samples if _text(sample.get("result")) == "win"]
     losses = [sample for sample in samples if _text(sample.get("result")) == "loss"]
     flats = [sample for sample in samples if _text(sample.get("result")) == "flat"]
-    raw_win_rate = (
+    raw_win_rate = _pct_value(
         Decimal(len(wins)) / Decimal(completed) if completed else Decimal("0")
     )
-    adjusted_win_rate = _adjusted_win_rate(len(wins), completed)
-    avg_net_win = _average_pct(wins)
-    avg_net_loss = abs(_average_pct(losses))
+    adjusted_win_rate = _pct_value(_adjusted_win_rate(len(wins), completed))
+    avg_net_win = _pct_value(_average_pct(wins))
+    avg_net_loss = _pct_value(abs(_average_pct(losses)))
     payoff_ratio = (
         Decimal("0") if avg_net_loss <= 0 else avg_net_win / avg_net_loss
     )
-    full_kelly = _kelly_fraction(adjusted_win_rate, payoff_ratio)
-    fractional_kelly = full_kelly / Decimal("4") if full_kelly > 0 else Decimal("0")
-    suggested_position = (
+    full_kelly = _pct_value(_kelly_fraction(adjusted_win_rate, payoff_ratio))
+    fractional_kelly = _pct_value(
+        full_kelly / Decimal("4") if full_kelly > 0 else Decimal("0")
+    )
+    suggested_position = _pct_value(
         min(fractional_kelly, Decimal("0.04"))
         if fractional_kelly > 0
         else Decimal("0")
@@ -445,11 +472,15 @@ def _decimal_text(value: Decimal) -> str:
 
 
 def _pct_text(value: Decimal) -> str:
-    pct = (value * Decimal("100")).quantize(
+    pct = _pct_value(value) * Decimal("100")
+    return f"{_decimal_text(pct)}%"
+
+
+def _pct_value(value: Decimal) -> Decimal:
+    return (value * Decimal("100")).quantize(
         Decimal("0.01"),
         rounding=ROUND_HALF_UP,
-    )
-    return f"{_decimal_text(pct)}%"
+    ) / Decimal("100")
 
 
 def _text(value: object) -> str:

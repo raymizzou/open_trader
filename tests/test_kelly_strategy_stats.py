@@ -264,3 +264,48 @@ def test_validate_requires_zero_sample_position_to_be_zero() -> None:
 
     with pytest.raises(ValueError, match="suggested_position_pct"):
         validate_kelly_strategy_stats_payload(payload)
+
+
+def test_validate_rejects_false_kelly_calculation_chain() -> None:
+    payload = _valid_stats_payload()
+    stats = payload["stats_by_experiment"]["trend_us"]
+    stats.update(
+        payoff_ratio="2",
+        full_kelly_pct="25%",
+        fractional_kelly_pct="6.25%",
+        suggested_position_pct="4%",
+    )
+
+    with pytest.raises(ValueError, match="payoff_ratio"):
+        validate_kelly_strategy_stats_payload(payload)
+
+
+def test_validate_accepts_kelly_values_at_serialized_precision() -> None:
+    trade_samples = _trade_samples_payload()
+    trade_samples["samples"] = [
+        *[
+            {
+                "experiment_id": "trend_us",
+                "result": "win",
+                "net_pnl_pct": "11%",
+                "exit_submitted_at": "2026-07-11 11:59",
+            }
+            for _ in range(3)
+        ],
+        *[
+            {
+                "experiment_id": "trend_us",
+                "result": "loss",
+                "net_pnl_pct": "-4%",
+                "exit_submitted_at": "2026-07-11 11:59",
+            }
+            for _ in range(3)
+        ],
+    ]
+    payload = build_kelly_strategy_stats_payload(
+        [{"experiment_id": "trend_us", "market": "US"}],
+        trade_samples,
+        generated_at="2026-07-11 12:01",
+    )
+
+    validate_kelly_strategy_stats_payload(payload)
