@@ -3,6 +3,18 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-12
+
+- Added one global dashboard workspace for read-only standard-strategy research
+  across current holdings and watchlist symbols, with trend-pullback,
+  breakout-momentum, and range-mean-reversion strategies.
+- Added buy-and-hold and market-index comparisons, explicit actual data dates,
+  fixed cost and sizing assumptions, and standalone auditable artifacts.
+- Verified with `178` focused and `1129` full pytest tests, three real 1Y
+  MSFT/Futu API runs with SPY comparison and hashed artifacts, and separate
+  Playwright submissions for all three strategies on `127.0.0.1:8766` with
+  desktop/mobile screenshots and no console or network errors.
+
 ## 2026-07-11
 
 - Added a dashboard backtest price-sync status line so operators can see when

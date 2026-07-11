@@ -328,6 +328,27 @@ report under `reports/backtests/`. The default execution adapter is
 `backtrader`; `simple` remains available as a local fallback. It does not place
 orders or update `data/latest`.
 
+### Run Standard Strategy Research in the Dashboard
+
+Open the single global workspace through `Realtime Portfolio Dashboard` →
+`Strategy Backtest`, then choose `Current Holdings` or `Watchlist`, one symbol,
+one of `Trend Pullback`, `Breakout Momentum`, or `Range Mean Reversion`, a time
+range, and `Run Backtest`. The workspace intentionally hides Backtrader and
+compares the selected strategy with both buy-and-hold and a market benchmark:
+US equities default to `SPY`, while HK equities default to `HK.02800`.
+
+The requested range can be `6M`, `1Y`, `3Y`, `5Y`, or custom. Available Futu
+history may cover less than the requested range, so every result shows the
+actual data start and end dates. Results also show the fixed research
+assumptions: initial cash, maximum strategy weight, commission, and slippage.
+The run writes a manifest, signals, trades, equity curves, metrics, and report
+under `data/backtests/<run_id>/` and `reports/backtests/` without changing the
+portfolio, trading plan, or order state.
+
+These standard-strategy results are research-only. Custom strategy editing and
+automatic execution are explicitly out of scope; the dashboard does not place
+orders.
+
 ### Deploy Local Frontend Dashboard
 
 ```bash
