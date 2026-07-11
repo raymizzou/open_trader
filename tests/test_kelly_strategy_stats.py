@@ -158,6 +158,56 @@ def test_applies_quarter_kelly_and_four_percent_cap() -> None:
     assert stats["suggested_position_pct"] == "4%"
 
 
+def test_preserves_legacy_precision_for_uneven_sample_values() -> None:
+    trade_samples = _trade_samples_payload()
+    trade_samples["samples"] = [
+        {
+            "experiment_id": "trend_us",
+            "result": "win",
+            "net_pnl_pct": "10.01%",
+            "exit_submitted_at": "2026-07-11 09:00",
+        },
+        {
+            "experiment_id": "trend_us",
+            "result": "win",
+            "net_pnl_pct": "10.02%",
+            "exit_submitted_at": "2026-07-11 10:00",
+        },
+        {
+            "experiment_id": "trend_us",
+            "result": "loss",
+            "net_pnl_pct": "-3.33%",
+            "exit_submitted_at": "2026-07-12 09:00",
+        },
+        {
+            "experiment_id": "trend_us",
+            "result": "loss",
+            "net_pnl_pct": "-3.34%",
+            "exit_submitted_at": "2026-07-12 10:00",
+        },
+    ]
+
+    stats = build_kelly_strategy_stats_payload(
+        [
+            {
+                "experiment_id": "trend_us",
+                "experiment_name": "Trend US",
+                "market": "US",
+            }
+        ],
+        trade_samples,
+        generated_at="2026-07-11 12:01",
+    )["stats_by_experiment"]["trend_us"]
+
+    assert stats["experiment_name"] == "Trend US"
+    assert stats["avg_net_win_pct"] == "10.02%"
+    assert stats["avg_net_loss_pct"] == "3.34%"
+    assert stats["payoff_ratio"] == "3.002998500749625187406296852"
+    assert stats["full_kelly_pct"] == "33.35%"
+    assert stats["fractional_kelly_pct"] == "8.34%"
+    assert stats["suggested_position_pct"] == "4%"
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

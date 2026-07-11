@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from open_trader.cli import main
 
 
@@ -77,6 +79,10 @@ def _write_kelly_lab_artifacts(data_dir: Path) -> None:
         {
             "schema_version": "open_trader.kelly_trade_samples.v1",
             "generated_at": "2026-07-11 12:00",
+            "source_orders_synced_at": "2026-07-11 11:59",
+            "sample_count": 0,
+            "open_position_count": 0,
+            "skipped_order_count": 0,
             "stats_by_experiment": {},
             "samples": [],
             "open_positions": [],
@@ -105,3 +111,36 @@ def test_build_strategy_stats_cli_writes_latest_artifact(tmp_path: Path) -> None
     )
     assert result == 0
     assert payload["generated_at"] == "2026-07-11 12:01"
+
+
+def test_build_strategy_stats_cli_rejects_incomplete_trade_sample_evidence(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_kelly_lab_artifacts(data_dir)
+    _write_json(
+        data_dir / "latest" / "kelly_trade_samples.json",
+        {
+            "schema_version": "open_trader.kelly_trade_samples.v1",
+            "generated_at": "2026-07-11 12:00",
+            "source_orders_synced_at": "2026-07-11 11:59",
+            "stats_by_experiment": {},
+            "samples": [],
+            "open_positions": [],
+            "diagnostics": {"skipped_orders": []},
+        },
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        main(
+            [
+                "kelly",
+                "build-strategy-stats",
+                "--data-dir",
+                str(data_dir),
+            ]
+        )
+
+    assert "sample_count" in capsys.readouterr().err
+    assert not (data_dir / "latest" / "kelly_strategy_stats.json").exists()

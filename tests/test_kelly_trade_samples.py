@@ -7,9 +7,6 @@ from open_trader.kelly_trade_samples import (
     load_kelly_trade_samples,
     write_kelly_trade_samples,
 )
-from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
-
-
 def _experiment(experiment_id: str = "trend_us") -> dict[str, object]:
     return {
         "experiment_id": experiment_id,
@@ -96,27 +93,134 @@ def test_build_trade_samples_pairs_filled_buy_and_sell_as_win() -> None:
     )
 
 
-def test_build_trade_samples_delegates_legacy_stats_to_strategy_stats_builder() -> None:
+def test_build_trade_samples_preserves_legacy_stats_for_uneven_samples() -> None:
     payload = build_kelly_trade_samples_payload(
         [_experiment()],
         {
             "schema_version": "open_trader.kelly_paper_orders.v1",
             "synced_at": "2026-07-11 09:30",
-            "orders": [],
+            "orders": [
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "submitted_at": "2026-07-11 08:00",
+                    "filled_qty": "1",
+                    "avg_fill_price": "10000",
+                    "status": "filled",
+                    "order_id": "BUY-1",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "submitted_at": "2026-07-11 09:00",
+                    "filled_qty": "1",
+                    "avg_fill_price": "11001",
+                    "status": "filled",
+                    "order_id": "SELL-1",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "submitted_at": "2026-07-11 09:30",
+                    "filled_qty": "1",
+                    "avg_fill_price": "10000",
+                    "status": "filled",
+                    "order_id": "BUY-2",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "submitted_at": "2026-07-11 10:00",
+                    "filled_qty": "1",
+                    "avg_fill_price": "11002",
+                    "status": "filled",
+                    "order_id": "SELL-2",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "submitted_at": "2026-07-12 08:00",
+                    "filled_qty": "1",
+                    "avg_fill_price": "10000",
+                    "status": "filled",
+                    "order_id": "BUY-3",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "submitted_at": "2026-07-12 09:00",
+                    "filled_qty": "1",
+                    "avg_fill_price": "9667",
+                    "status": "filled",
+                    "order_id": "SELL-3",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "submitted_at": "2026-07-12 09:30",
+                    "filled_qty": "1",
+                    "avg_fill_price": "10000",
+                    "status": "filled",
+                    "order_id": "BUY-4",
+                },
+                {
+                    "experiment_id": "trend_us",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "submitted_at": "2026-07-12 10:00",
+                    "filled_qty": "1",
+                    "avg_fill_price": "9666",
+                    "status": "filled",
+                    "order_id": "SELL-4",
+                },
+            ],
         },
         generated_at="2026-07-12 10:01",
     )
-    evidence = {
-        key: value for key, value in payload.items() if key != "stats_by_experiment"
+
+    assert payload["stats_by_experiment"] == {
+        "trend_us": {
+            "experiment_id": "trend_us",
+            "experiment_name": "Trend US",
+            "market": "US",
+            "completed_samples": 4,
+            "winning_samples": 2,
+            "losing_samples": 2,
+            "flat_samples": 0,
+            "open_samples": 0,
+            "skipped_order_count": 0,
+            "raw_win_rate": "50%",
+            "adjusted_win_rate": "50%",
+            "avg_net_win_pct": "10.02%",
+            "avg_net_loss_pct": "3.34%",
+            "payoff_ratio": "3.002998500749625187406296852",
+            "full_kelly_pct": "33.35%",
+            "fractional_kelly_pct": "8.34%",
+            "suggested_position_pct": "4%",
+            "sample_stage": "insufficient",
+            "sample_adjustment": "样本少于 200，向 50% 收缩",
+            "last_sample_closed_at": "2026-07-12 10:00",
+            "last_recomputed_at": "2026-07-12 10:01",
+            "win_rate": "50%",
+            "parameter_source": "futu_paper_order_samples",
+            "updated_at": "2026-07-12 10:01",
+        }
     }
-
-    expected = build_kelly_strategy_stats_payload(
-        [_experiment()],
-        evidence,
-        generated_at="2026-07-12 10:01",
-    )
-
-    assert payload["stats_by_experiment"] == expected["stats_by_experiment"]
 
 
 def test_build_trade_samples_keeps_unmatched_buy_as_open_position() -> None:
@@ -335,6 +439,24 @@ def test_write_kelly_trade_samples_rejects_bad_schema_without_artifact(tmp_path)
             data_dir,
             {
                 "schema_version": "open_trader.kelly_trade_samples.v0",
+                "stats_by_experiment": {},
+            },
+        )
+
+    assert not artifact_path.exists()
+
+
+def test_write_kelly_trade_samples_rejects_incomplete_evidence_without_artifact(
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    artifact_path = data_dir / "latest" / "kelly_trade_samples.json"
+
+    with pytest.raises(ValueError, match="generated_at"):
+        write_kelly_trade_samples(
+            data_dir,
+            {
+                "schema_version": "open_trader.kelly_trade_samples.v1",
                 "stats_by_experiment": {},
             },
         )

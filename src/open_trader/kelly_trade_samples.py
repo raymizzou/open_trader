@@ -63,7 +63,15 @@ def build_kelly_trade_samples_payload(
         evidence,
         generated_at=timestamp,
     )
-    return {**evidence, "stats_by_experiment": strategy_stats["stats_by_experiment"]}
+    compatibility_stats = {
+        experiment_id: {
+            key: value
+            for key, value in stats.items()
+            if key != "source_trade_samples_generated_at"
+        }
+        for experiment_id, stats in strategy_stats["stats_by_experiment"].items()
+    }
+    return {**evidence, "stats_by_experiment": compatibility_stats}
 
 
 def write_kelly_trade_samples(data_dir: Path, payload: dict[str, Any]) -> Path:
@@ -91,8 +99,48 @@ def _validate_kelly_trade_samples_payload(
         raise ValueError(
             f"{artifact_name} schema_version must be {TRADE_SAMPLES_SCHEMA_VERSION!r}",
         )
+    generated_at = payload.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at.strip():
+        raise ValueError(f"{artifact_name} must contain generated_at")
+    if not isinstance(payload.get("source_orders_synced_at"), str):
+        raise ValueError(f"{artifact_name} must contain source_orders_synced_at")
+    samples = payload.get("samples")
+    if not isinstance(samples, list):
+        raise ValueError(f"{artifact_name} must contain samples")
+    open_positions = payload.get("open_positions")
+    if not isinstance(open_positions, list):
+        raise ValueError(f"{artifact_name} must contain open_positions")
+    diagnostics = payload.get("diagnostics")
+    if not isinstance(diagnostics, dict) or not isinstance(
+        diagnostics.get("skipped_orders"), list
+    ):
+        raise ValueError(f"{artifact_name} must contain diagnostics.skipped_orders")
+    _validate_count(payload, "sample_count", len(samples), artifact_name)
+    _validate_count(
+        payload,
+        "open_position_count",
+        len(open_positions),
+        artifact_name,
+    )
+    _validate_count(
+        payload,
+        "skipped_order_count",
+        len(diagnostics["skipped_orders"]),
+        artifact_name,
+    )
     if not isinstance(payload.get("stats_by_experiment"), dict):
         raise ValueError(f"{artifact_name} must contain stats_by_experiment")
+
+
+def _validate_count(
+    payload: dict[str, Any],
+    field: str,
+    expected: int,
+    artifact_name: str,
+) -> None:
+    value = payload.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or value != expected:
+        raise ValueError(f"{artifact_name} contains invalid {field}")
 
 
 def _pair_group(

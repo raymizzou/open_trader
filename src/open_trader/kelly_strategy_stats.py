@@ -36,9 +36,10 @@ def build_kelly_strategy_stats_payload(
             generated_at=timestamp,
             market=market,
             experiment_id=experiment_id,
+            experiment_name=experiment_name,
             source_trade_samples_generated_at=source_generated_at,
         )
-        for experiment_id, market in _configured_experiments(experiments)
+        for experiment_id, experiment_name, market in _configured_experiments(experiments)
     }
     return {
         "schema_version": STRATEGY_STATS_SCHEMA_VERSION,
@@ -86,6 +87,7 @@ def validate_kelly_strategy_stats_payload(
         raise ValueError(f"{artifact_name} experiment coverage mismatch")
     required = {
         "experiment_id",
+        "experiment_name",
         "market",
         "completed_samples",
         "winning_samples",
@@ -175,6 +177,8 @@ def _validate_stats_record(
     label = f"{artifact_name} stats for {experiment_id}"
     if item["experiment_id"] != experiment_id:
         raise ValueError(f"{label} contains invalid experiment_id")
+    if not isinstance(item["experiment_name"], str):
+        raise ValueError(f"{label} contains invalid experiment_name")
     if not isinstance(item["market"], str) or not item["market"].strip():
         raise ValueError(f"{label} contains invalid market")
 
@@ -267,28 +271,24 @@ def _validate_stats_record(
     expected_payoff_ratio = (
         Decimal("0") if avg_net_loss <= 0 else avg_net_win / avg_net_loss
     )
-    if payoff_ratio != expected_payoff_ratio:
+    if abs(payoff_ratio - expected_payoff_ratio) > Decimal("0.01"):
         raise ValueError(f"{label} contains invalid payoff_ratio")
-    expected_full_kelly = _pct_value(
-        _kelly_fraction(adjusted_win_rate, payoff_ratio)
-    )
-    if full_kelly != expected_full_kelly:
+    expected_full_kelly = _kelly_fraction(adjusted_win_rate, payoff_ratio)
+    if abs(full_kelly - expected_full_kelly) > Decimal("0.0001"):
         raise ValueError(f"{label} contains invalid full_kelly_pct")
-    expected_fractional_kelly = _pct_value(
-        expected_full_kelly / Decimal("4")
-        if expected_full_kelly > 0
-        else Decimal("0")
+    expected_fractional_kelly = (
+        full_kelly / Decimal("4") if full_kelly > 0 else Decimal("0")
     )
-    if fractional_kelly != expected_fractional_kelly:
+    if abs(fractional_kelly - expected_fractional_kelly) > Decimal("0.0001"):
         raise ValueError(f"{label} contains invalid fractional_kelly_pct")
-    expected_suggested_position = _pct_value(
+    expected_suggested_position = (
         min(expected_fractional_kelly, Decimal("0.04"))
         if expected_fractional_kelly > 0
         else Decimal("0")
     )
     if (
         suggested_position > Decimal("0.04")
-        or suggested_position != expected_suggested_position
+        or abs(suggested_position - expected_suggested_position) > Decimal("0.0001")
     ):
         raise ValueError(f"{label} contains invalid suggested_position_pct")
     if completed == 0 and suggested_position != 0:
@@ -331,9 +331,13 @@ def _validated_pct(value: object, *, field: str, label: str) -> Decimal:
 
 def _configured_experiments(
     experiments: list[dict[str, Any]],
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, str]]:
     return [
-        (experiment_id, _text(experiment.get("market")).upper())
+        (
+            experiment_id,
+            _text(experiment.get("experiment_name")),
+            _text(experiment.get("market")).upper(),
+        )
         for experiment in experiments
         if (experiment_id := _text(experiment.get("experiment_id")))
     ]
@@ -357,26 +361,25 @@ def _experiment_stats(
     generated_at: str,
     market: str,
     experiment_id: str,
+    experiment_name: str,
     source_trade_samples_generated_at: str,
 ) -> dict[str, Any]:
     completed = len(samples)
     wins = [sample for sample in samples if _text(sample.get("result")) == "win"]
     losses = [sample for sample in samples if _text(sample.get("result")) == "loss"]
     flats = [sample for sample in samples if _text(sample.get("result")) == "flat"]
-    raw_win_rate = _pct_value(
+    raw_win_rate = (
         Decimal(len(wins)) / Decimal(completed) if completed else Decimal("0")
     )
-    adjusted_win_rate = _pct_value(_adjusted_win_rate(len(wins), completed))
-    avg_net_win = _pct_value(_average_pct(wins))
-    avg_net_loss = _pct_value(abs(_average_pct(losses)))
+    adjusted_win_rate = _adjusted_win_rate(len(wins), completed)
+    avg_net_win = _average_pct(wins)
+    avg_net_loss = abs(_average_pct(losses))
     payoff_ratio = (
         Decimal("0") if avg_net_loss <= 0 else avg_net_win / avg_net_loss
     )
-    full_kelly = _pct_value(_kelly_fraction(adjusted_win_rate, payoff_ratio))
-    fractional_kelly = _pct_value(
-        full_kelly / Decimal("4") if full_kelly > 0 else Decimal("0")
-    )
-    suggested_position = _pct_value(
+    full_kelly = _kelly_fraction(adjusted_win_rate, payoff_ratio)
+    fractional_kelly = full_kelly / Decimal("4") if full_kelly > 0 else Decimal("0")
+    suggested_position = (
         min(fractional_kelly, Decimal("0.04"))
         if fractional_kelly > 0
         else Decimal("0")
@@ -387,6 +390,7 @@ def _experiment_stats(
     )
     return {
         "experiment_id": experiment_id,
+        "experiment_name": experiment_name,
         "market": market,
         "completed_samples": completed,
         "winning_samples": len(wins),
