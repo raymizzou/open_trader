@@ -1228,11 +1228,37 @@ def test_index_kelly_experiments_by_market_symbol(tmp_path: Path) -> None:
     assert indexed[("US", "MSFT")][0]["experiment_id"] == "breakout_10d_exp_20260707"
 
 
-def test_load_checked_in_kelly_data_requires_strategy_stats() -> None:
+def test_load_checked_in_kelly_data_uses_unified_strategy_stats() -> None:
+    latest_dir = Path("data/latest")
+    stats_payload = json.loads(
+        (latest_dir / "kelly_strategy_stats.json").read_text(encoding="utf-8")
+    )
+    experiments_payload = json.loads(
+        (latest_dir / "kelly_experiments.json").read_text(encoding="utf-8")
+    )
     state = load_kelly_lab_state(Path("data")).to_dict()
 
-    assert state["available"] is False
-    assert "kelly_strategy_stats.json" in state["error"]
+    assert state["available"] is True
+    assert state["error"] == ""
+    expected_stats = stats_payload["stats_by_experiment"]
+    embedded_stats = {
+        experiment["experiment_id"]: experiment["stats"]
+        for experiment in experiments_payload["experiments"]
+    }
+    loaded_stats = {
+        experiment["experiment_id"]: experiment["stats"]
+        for experiment in state["experiments"]
+    }
+    assert loaded_stats == expected_stats
+    for experiment_id, stats in loaded_stats.items():
+        assert stats != embedded_stats[experiment_id]
+        assert stats["suggested_position_pct"] == "0%"
+        assert stats["parameter_source"] == "futu_paper_order_samples"
+        assert (
+            stats["source_trade_samples_generated_at"]
+            == stats_payload["source_trade_samples_generated_at"]
+        )
+        assert stats["last_recomputed_at"] == stats_payload["generated_at"]
 
 
 def test_latest_kelly_experiments_are_single_market() -> None:
