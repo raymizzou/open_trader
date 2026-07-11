@@ -36,6 +36,11 @@ STANDARD_BACKTEST_REQUEST_KEYS = {
     "market", "symbol", "strategy_id", "range_preset", "custom_start", "custom_end",
     "initial_cash", "max_strategy_weight", "commission_bps", "slippage_bps",
 }
+MAX_JSON_BODY_BYTES = 1024 * 1024
+
+
+class RequestBodyTooLargeError(Exception):
+    pass
 
 
 class StandardBacktestExecutionError(RuntimeError):
@@ -382,7 +387,15 @@ def create_dashboard_server(
             return
 
         def _read_json_body(self) -> dict[str, Any]:
-            content_length = int(self.headers.get("Content-Length") or "0")
+            raw_content_length = self.headers.get("Content-Length") or "0"
+            try:
+                content_length = int(raw_content_length)
+            except ValueError as exc:
+                raise ValueError("Content-Length 必须是非负整数") from exc
+            if content_length < 0:
+                raise ValueError("Content-Length 必须是非负整数")
+            if content_length > MAX_JSON_BODY_BYTES:
+                raise RequestBodyTooLargeError("请求正文不能超过 1 MiB")
             body = self.rfile.read(content_length) if content_length else b"{}"
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")
@@ -423,7 +436,9 @@ def create_dashboard_server(
 
         def _send_error_json(self, error: Exception) -> None:
             status = HTTPStatus.INTERNAL_SERVER_ERROR
-            if isinstance(error, ValueError):
+            if isinstance(error, RequestBodyTooLargeError):
+                status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            elif isinstance(error, ValueError):
                 status = HTTPStatus.BAD_REQUEST
             elif isinstance(error, StandardBacktestExecutionError):
                 status = HTTPStatus.BAD_GATEWAY

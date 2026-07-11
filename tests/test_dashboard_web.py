@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import shutil
 import subprocess
@@ -143,6 +144,44 @@ def test_standard_backtest_http_rejects_invalid_json_objects_with_chinese_400(
         thread.join(timeout=2)
     assert status == 400
     assert payload["message"] == "请求正文必须是有效的 JSON 对象"
+
+
+@pytest.mark.parametrize(
+    ("content_length", "expected_status", "expected_message"),
+    [
+        ("invalid", 400, "Content-Length 必须是非负整数"),
+        ("-1", 400, "Content-Length 必须是非负整数"),
+        (str(1024 * 1024 + 1), 413, "请求正文不能超过 1 MiB"),
+    ],
+)
+def test_dashboard_http_rejects_invalid_or_oversized_content_length_before_read(
+    tmp_path, content_length, expected_status, expected_message
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    server = create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    connection = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        connection.putrequest("POST", "/api/backtests/standard/run")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", content_length)
+        connection.endheaders()
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert response.status == expected_status
+    assert payload["message"] == expected_message
 
 
 def test_owned_backtest_provider_close_failure_is_execution_error(tmp_path, monkeypatch) -> None:

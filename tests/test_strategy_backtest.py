@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import csv
 import json
 import hashlib
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -130,7 +131,12 @@ def test_result_payload_exposes_manifest_backed_assumptions_definition_and_signa
     assert payload["strategy_definition"]["name_zh"] == "趋势回调"
     assert payload["strategy_definition"]["parameters"]["sma_short"] == "20"
     assert payload["signals"]
-    assert {"decision_date", "earliest_execution_date", "action", "target_weight", "rule", "explanation", "data_cutoff"} <= payload["signals"][0].keys()
+    assert {"market", "symbol", "strategy_id", "strategy_version", "parameters", "decision_date", "earliest_execution_date", "action", "target_weight", "rule", "explanation", "data_cutoff"} <= payload["signals"][0].keys()
+    assert payload["signals"][0]["market"] == "US"
+    assert payload["signals"][0]["symbol"] == "MSFT"
+    assert payload["signals"][0]["strategy_id"] == "trend_pullback/v1"
+    assert payload["signals"][0]["strategy_version"] == "v1"
+    assert payload["signals"][0]["parameters"]["sma_short"] == "20"
     assert any(signal["action"] == "HOLD" for signal in payload["signals"])
 
 
@@ -159,10 +165,41 @@ def test_run_writes_reproducible_manifest_and_normalized_artifacts(tmp_path: Pat
     assert manifest["strategy"]["id"] == "trend_pullback/v1"
     assert manifest["adapter"] == {"name": "backtrader", "version": result.adapter_version}
     assert manifest["sources"]["symbol"]["sha256"]
+    created_at = datetime.fromisoformat(manifest["created_at"])
+    assert created_at.tzinfo is not None
+    assert created_at.utcoffset().total_seconds() == 0
     assert manifest["requested_range"] == {"start": "2025-01-01", "end": "2026-01-01"}
+    expected_data_paths = {
+        "signals.csv": f"backtests/{result.run_id}/signals.csv",
+        "trades.csv": f"backtests/{result.run_id}/trades.csv",
+        "equity_curve.csv": f"backtests/{result.run_id}/equity_curve.csv",
+        "buy_hold_equity.csv": f"backtests/{result.run_id}/buy_hold_equity.csv",
+        "market_benchmark_equity.csv": f"backtests/{result.run_id}/market_benchmark_equity.csv",
+        "metrics.json": f"backtests/{result.run_id}/metrics.json",
+        "report.md": f"backtests/{result.run_id}/report.md",
+    }
+    assert {name: item["path"] for name, item in manifest["artifacts"].items()} == expected_data_paths
+    assert manifest["report"] == {
+        "path": f"backtests/{result.run_id}.md",
+        "sha256": hashlib.sha256(result.report_path.read_bytes()).hexdigest(),
+    }
+    assert "manifest.json" not in manifest["artifacts"]
     assert result.signals_path.exists()
     assert result.trades_path.exists()
     assert result.equity_curve_path.exists()
+
+
+def test_detached_signals_csv_self_describes_strategy_and_parameters(tmp_path: Path) -> None:
+    result = run_standard_backtest(standard_request(tmp_path), price_provider=fixture_provider("never_triggers"))
+    with result.signals_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows
+    assert {row["market"] for row in rows} == {"US"}
+    assert {row["symbol"] for row in rows} == {"MSFT"}
+    assert {row["strategy_id"] for row in rows} == {"trend_pullback/v1"}
+    assert {row["strategy_version"] for row in rows} == {"v1"}
+    expected = json.dumps(result.strategy_definition["parameters"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    assert {row["parameters"] for row in rows} == {expected}
 
 
 def test_zero_trade_run_is_successful(tmp_path: Path) -> None:

@@ -86,7 +86,7 @@ class StandardBacktestResult:
     market_benchmark_error: str | None
     assumptions: dict[str, str]
     strategy_definition: dict[str, object]
-    signals: Sequence[dict[str, str]]
+    signals: Sequence[dict[str, object]]
     adapter_version: str
     manifest_path: Path
     signals_path: Path
@@ -355,9 +355,11 @@ class StandardBacktestService:
             "market_excess_return_pct": str(market_excess) if market_excess is not None else None,
             "market_benchmark_error": benchmark_error,
         }
+        definition = next(item.to_dict() for item in strategy_catalog() if item.strategy_id == request.strategy_id)
         manifest_base = {
             "schema_version": MANIFEST_SCHEMA_VERSION, "run_id": run_id, "request_hash": request_hash,
-            "strategy": next(item.to_dict() for item in strategy_catalog() if item.strategy_id == request.strategy_id),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "strategy": definition,
             "adapter": {"name": adapter.name, "version": adapter.version},
             "requested_range": {"start": requested_start.isoformat(), "end": requested_end.isoformat()},
             "actual_range": {"start": actual_start.isoformat(), "end": actual_end.isoformat()},
@@ -372,10 +374,9 @@ class StandardBacktestService:
             },
         }
         final_dir, report_path = _publish_run(
-            request, run_id, manifest_base, signals, strategy, buy_hold, market_benchmark,
+            request, run_id, manifest_base, signals, definition, strategy, buy_hold, market_benchmark,
             _render_report(run_id, request.strategy_id, benchmark_symbol, message, metrics), metrics,
         )
-        definition = next(item.to_dict() for item in strategy_catalog() if item.strategy_id == request.strategy_id)
         return StandardBacktestResult(
             run_id=run_id, status="ok", message_zh=message, strategy_id=request.strategy_id,
             benchmark_symbol=benchmark_symbol, requested_start=requested_start, requested_end=requested_end,
@@ -385,7 +386,9 @@ class StandardBacktestService:
             market_excess_return_pct=market_excess, market_benchmark_error=benchmark_error,
             assumptions={"initial_cash": str(request.initial_cash), "max_strategy_weight": str(request.max_strategy_weight),
                          "commission_bps": str(request.commission_bps), "slippage_bps": str(request.slippage_bps)},
-            strategy_definition=definition, signals=_signal_rows(signals), adapter_version=adapter.version,
+            strategy_definition=definition,
+            signals=_signal_rows(signals, market=market, symbol=symbol, strategy_definition=definition),
+            adapter_version=adapter.version,
             manifest_path=final_dir / "manifest.json", signals_path=final_dir / "signals.csv",
             trades_path=final_dir / "trades.csv", equity_curve_path=final_dir / "equity_curve.csv",
             buy_hold_equity_path=final_dir / "buy_hold_equity.csv",
@@ -516,7 +519,8 @@ def _build_run_id(market: str, symbol: str, strategy_id: str, request_hash: str)
 
 
 def _publish_run(request: StandardBacktestRequest, run_id: str, manifest_base: dict[str, object],
-                 signals: Sequence[StrategySignal], strategy: ExecutionResult,
+                 signals: Sequence[StrategySignal], strategy_definition: dict[str, object],
+                 strategy: ExecutionResult,
                  buy_hold: ExecutionResult, market_benchmark: ExecutionResult | None,
                  report: str, metrics: dict[str, object]) -> tuple[Path, Path]:
     parent = request.data_dir / "backtests"
@@ -537,8 +541,16 @@ def _publish_run(request: StandardBacktestRequest, run_id: str, manifest_base: d
         except FileExistsError as exc:
             raise ValueError("回测运行编号已存在，拒绝覆盖") from exc
         staging.mkdir()
+        market = str(manifest_base["sources"]["symbol"]["market"])  # type: ignore[index]
+        symbol = str(manifest_base["sources"]["symbol"]["symbol"])  # type: ignore[index]
+        signal_fields = ("market", "symbol", "strategy_id", "strategy_version", "parameters",
+                         "decision_date", "earliest_execution_date", "action", "target_weight",
+                         "rule", "explanation", "data_cutoff")
         artifacts: dict[str, tuple[str, object, Sequence[str] | None]] = {
-            "signals.csv": ("csv", _signal_rows(signals), ("decision_date", "earliest_execution_date", "action", "target_weight", "rule", "explanation", "data_cutoff")),
+            "signals.csv": ("csv", _signal_rows(
+                signals, market=market, symbol=symbol, strategy_definition=strategy_definition,
+                serialize_parameters=True,
+            ), signal_fields),
             "trades.csv": ("csv", [_json_safe(trade) for trade in strategy.trades], tuple(field.name for field in fields(NormalizedTrade))),
             "equity_curve.csv": ("csv", list(strategy.equity_curve), EQUITY_FIELDS),
             "buy_hold_equity.csv": ("csv", list(buy_hold.equity_curve), EQUITY_FIELDS),
@@ -549,12 +561,22 @@ def _publish_run(request: StandardBacktestRequest, run_id: str, manifest_base: d
             artifacts["market_benchmark_equity.csv"] = ("csv", list(market_benchmark.equity_curve), EQUITY_FIELDS)
         for filename, (kind, payload, fieldnames) in artifacts.items():
             _write_run_artifact(staging / filename, kind, payload, fieldnames)
-        hashes = {filename: {"sha256": hashlib.sha256((staging / filename).read_bytes()).hexdigest()}
+        hashes = {filename: {
+                    "path": _normalized_location(final_dir / filename, request.data_dir),
+                    "sha256": hashlib.sha256((staging / filename).read_bytes()).hexdigest(),
+                  }
                   for filename in artifacts}
-        _write_run_artifact(staging / "manifest.json", "json", {**manifest_base, "artifacts": hashes}, None)
         with NamedTemporaryFile("w", encoding="utf-8", dir=report_path.parent, delete=False) as handle:
             report_temp = Path(handle.name)
             handle.write(report)
+        _write_run_artifact(staging / "manifest.json", "json", {
+            **manifest_base,
+            "artifacts": hashes,
+            "report": {
+                "path": _normalized_location(report_path, request.reports_dir),
+                "sha256": hashlib.sha256(report_temp.read_bytes()).hexdigest(),
+            },
+        }, None)
         if final_dir.exists() or report_path.exists():
             raise ValueError("回测运行编号已存在，拒绝覆盖")
         staging.replace(final_dir)
@@ -590,12 +612,29 @@ def _write_run_artifact(path: Path, kind: str, payload: object, fieldnames: Sequ
         writer.writerows(payload)  # type: ignore[arg-type]
 
 
-def _signal_rows(signals: Sequence[StrategySignal]) -> list[dict[str, str]]:
-    return [{"decision_date": item.decision_date.isoformat(),
+def _signal_rows(signals: Sequence[StrategySignal], *, market: str, symbol: str,
+                 strategy_definition: dict[str, object],
+                 serialize_parameters: bool = False) -> list[dict[str, object]]:
+    strategy_id = str(strategy_definition["id"])
+    parameters = strategy_definition["parameters"]
+    parameter_value = (json.dumps(parameters, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                       if serialize_parameters else parameters)
+    return [{"market": market, "symbol": symbol, "strategy_id": strategy_id,
+             "strategy_version": strategy_id.rsplit("/", 1)[-1], "parameters": parameter_value,
+             "decision_date": item.decision_date.isoformat(),
              "earliest_execution_date": item.earliest_execution_date.isoformat() if item.earliest_execution_date else "",
              "action": item.action, "target_weight": str(item.target_weight) if item.target_weight is not None else "",
              "rule": item.rule, "explanation": item.explanation, "data_cutoff": item.data_cutoff.isoformat()}
             for item in signals]
+
+
+def _normalized_location(path: Path, root: Path) -> str:
+    normalized_path = path.expanduser().resolve(strict=False)
+    normalized_root = root.expanduser().resolve(strict=False)
+    try:
+        return normalized_path.relative_to(normalized_root).as_posix()
+    except ValueError:
+        return normalized_path.as_posix()
 
 
 def _json_safe(value: object) -> object:
