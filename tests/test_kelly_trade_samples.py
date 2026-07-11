@@ -7,6 +7,7 @@ from open_trader.kelly_trade_samples import (
     load_kelly_trade_samples,
     write_kelly_trade_samples,
 )
+from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
 
 
 def _experiment(experiment_id: str = "trend_us") -> dict[str, object]:
@@ -93,6 +94,29 @@ def test_build_trade_samples_pairs_filled_buy_and_sell_as_win() -> None:
         payload["stats_by_experiment"]["trend_us"]["parameter_source"]
         == "futu_paper_order_samples"
     )
+
+
+def test_build_trade_samples_delegates_legacy_stats_to_strategy_stats_builder() -> None:
+    payload = build_kelly_trade_samples_payload(
+        [_experiment()],
+        {
+            "schema_version": "open_trader.kelly_paper_orders.v1",
+            "synced_at": "2026-07-11 09:30",
+            "orders": [],
+        },
+        generated_at="2026-07-12 10:01",
+    )
+    evidence = {
+        key: value for key, value in payload.items() if key != "stats_by_experiment"
+    }
+
+    expected = build_kelly_strategy_stats_payload(
+        [_experiment()],
+        evidence,
+        generated_at="2026-07-12 10:01",
+    )
+
+    assert payload["stats_by_experiment"] == expected["stats_by_experiment"]
 
 
 def test_build_trade_samples_keeps_unmatched_buy_as_open_position() -> None:

@@ -8,6 +8,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from .kelly_strategy_stats import build_kelly_strategy_stats_payload
+
 
 TRADE_SAMPLES_SCHEMA_VERSION = "open_trader.kelly_trade_samples.v1"
 
@@ -45,14 +47,7 @@ def build_kelly_trade_samples_payload(
         group_skips.extend(paired["skipped_orders"])
 
     diagnostics = {"skipped_orders": skipped + group_skips}
-    stats = _stats_by_experiment(
-        experiments,
-        samples,
-        open_positions,
-        diagnostics["skipped_orders"],
-        timestamp,
-    )
-    return {
+    evidence = {
         "schema_version": TRADE_SAMPLES_SCHEMA_VERSION,
         "generated_at": timestamp,
         "source_orders_synced_at": _text(paper_orders_payload.get("synced_at")),
@@ -61,9 +56,14 @@ def build_kelly_trade_samples_payload(
         "skipped_order_count": len(diagnostics["skipped_orders"]),
         "samples": samples,
         "open_positions": open_positions,
-        "stats_by_experiment": stats,
         "diagnostics": diagnostics,
     }
+    strategy_stats = build_kelly_strategy_stats_payload(
+        experiments,
+        evidence,
+        generated_at=timestamp,
+    )
+    return {**evidence, "stats_by_experiment": strategy_stats["stats_by_experiment"]}
 
 
 def write_kelly_trade_samples(data_dir: Path, payload: dict[str, Any]) -> Path:
@@ -186,134 +186,6 @@ def _open_position(
         "quantity": _decimal_text(quantity),
         "entry_notional": _decimal_text(entry_notional),
     }
-
-
-def _stats_by_experiment(
-    experiments: list[dict[str, Any]],
-    samples: list[dict[str, Any]],
-    open_positions: list[dict[str, Any]],
-    skipped_orders: list[dict[str, Any]],
-    generated_at: str,
-) -> dict[str, dict[str, Any]]:
-    stats: dict[str, dict[str, Any]] = {}
-    for experiment in experiments:
-        experiment_id = _text(experiment.get("experiment_id"))
-        exp_samples = [
-            sample for sample in samples if sample["experiment_id"] == experiment_id
-        ]
-        exp_open = [
-            item for item in open_positions if item["experiment_id"] == experiment_id
-        ]
-        exp_skipped = [
-            item for item in skipped_orders if item.get("experiment_id") == experiment_id
-        ]
-        stats[experiment_id] = _experiment_stats(
-            exp_samples,
-            exp_open,
-            exp_skipped,
-            generated_at,
-        )
-        stats[experiment_id].update(
-            {
-                "experiment_id": experiment_id,
-                "experiment_name": _text(experiment.get("experiment_name")),
-                "market": _text(experiment.get("market")).upper(),
-            }
-        )
-    return stats
-
-
-def _experiment_stats(
-    samples: list[dict[str, Any]],
-    open_positions: list[dict[str, Any]],
-    skipped_orders: list[dict[str, Any]],
-    generated_at: str,
-) -> dict[str, Any]:
-    completed = len(samples)
-    wins = [sample for sample in samples if _text(sample.get("result")) == "win"]
-    losses = [sample for sample in samples if _text(sample.get("result")) == "loss"]
-    flats = [sample for sample in samples if _text(sample.get("result")) == "flat"]
-    raw_win_rate = (
-        Decimal(len(wins)) / Decimal(completed) if completed else Decimal("0")
-    )
-    adjusted_win_rate = _adjusted_win_rate(len(wins), completed)
-    avg_net_win = _average_pct(wins)
-    avg_net_loss = abs(_average_pct(losses))
-    payoff_ratio = (
-        Decimal("0") if avg_net_loss <= 0 else avg_net_win / avg_net_loss
-    )
-    full_kelly = _kelly_fraction(adjusted_win_rate, payoff_ratio)
-    fractional_kelly = full_kelly / Decimal("4") if full_kelly > 0 else Decimal("0")
-    suggested_position = (
-        min(fractional_kelly, Decimal("0.04"))
-        if fractional_kelly > 0
-        else Decimal("0")
-    )
-    last_closed_at = max(
-        (_text(sample.get("exit_submitted_at")) for sample in samples),
-        default="",
-    )
-    return {
-        "completed_samples": completed,
-        "winning_samples": len(wins),
-        "losing_samples": len(losses),
-        "flat_samples": len(flats),
-        "open_samples": len(open_positions),
-        "skipped_order_count": len(skipped_orders),
-        "raw_win_rate": _pct_text(raw_win_rate),
-        "adjusted_win_rate": _pct_text(adjusted_win_rate),
-        "avg_net_win_pct": _pct_text(avg_net_win),
-        "avg_net_loss_pct": _pct_text(avg_net_loss),
-        "payoff_ratio": _decimal_text(payoff_ratio),
-        "full_kelly_pct": _pct_text(full_kelly),
-        "fractional_kelly_pct": _pct_text(fractional_kelly),
-        "suggested_position_pct": _pct_text(suggested_position),
-        "sample_stage": "sufficient" if completed >= 200 else "insufficient",
-        "sample_adjustment": (
-            "未收缩" if completed >= 200 else "样本少于 200，向 50% 收缩"
-        ),
-        "last_sample_closed_at": last_closed_at,
-        "last_recomputed_at": generated_at,
-        "win_rate": _pct_text(raw_win_rate),
-        "parameter_source": "futu_paper_order_samples",
-        "updated_at": generated_at,
-    }
-
-
-def _adjusted_win_rate(winning_samples: int, completed_samples: int) -> Decimal:
-    if completed_samples >= 200:
-        return Decimal(winning_samples) / Decimal(completed_samples)
-    return (Decimal(winning_samples) + Decimal("100")) / (
-        Decimal(completed_samples) + Decimal("200")
-    )
-
-
-def _average_pct(samples: list[dict[str, Any]]) -> Decimal:
-    values = [
-        value
-        for value in (_pct_decimal(sample.get("net_pnl_pct")) for sample in samples)
-        if value is not None
-    ]
-    if not values:
-        return Decimal("0")
-    return sum(values, Decimal("0")) / Decimal(len(values))
-
-
-def _pct_decimal(value: object) -> Decimal | None:
-    text = _text(value).rstrip("%")
-    if not text:
-        return None
-    parsed = _decimal(text)
-    if parsed is None:
-        return None
-    return parsed / Decimal("100")
-
-
-def _kelly_fraction(win_rate: Decimal, payoff_ratio: Decimal) -> Decimal:
-    if payoff_ratio <= 0:
-        return Decimal("0")
-    kelly = win_rate - ((Decimal("1") - win_rate) / payoff_ratio)
-    return kelly if kelly > 0 else Decimal("0")
 
 
 def _order_skip_reason(
