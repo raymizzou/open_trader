@@ -1040,6 +1040,38 @@ for (const forbidden of ["US.DRAM", "US.RAM", "US.SOXX", "HK.02840"]) {
     )
 
 
+def test_dashboard_js_renders_kelly_parameter_source() -> None:
+    html = run_dashboard_js(
+        """
+const html = renderKellyParameterDerivation({
+  completed_samples: 2,
+  open_samples: 1,
+  observed_win_rate: "50%",
+  sample_stage: "insufficient",
+  raw_win_rate: "50%",
+  adjusted_win_rate: "50%",
+  avg_net_win_pct: "10%",
+  avg_net_loss_pct: "5%",
+  payoff_ratio: "2",
+  full_kelly_pct: "25%",
+  fractional_kelly_pct: "6.25%",
+  suggested_position_pct: "4%",
+  sample_adjustment: "样本少于 200，向 50% 收缩",
+  last_sample_closed_at: "2026-07-12 10:00",
+  last_recomputed_at: "2026-07-12 10:01",
+  parameter_source: "futu_paper_order_samples",
+  skipped_order_count: 3
+});
+console.log(html);
+"""
+    )
+
+    assert "参数来源" in html
+    assert "富途模拟盘订单样本" in html
+    assert "跳过订单" in html
+    assert "3" in html
+
+
 def test_dashboard_renders_kelly_strategy_capital_panel() -> None:
     output = run_dashboard_js(
         """

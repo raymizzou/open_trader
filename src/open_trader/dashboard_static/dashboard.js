@@ -1269,6 +1269,8 @@ function renderKellyParameterDerivation(stats) {
     item.fractional_kelly_pct,
     item.suggested_position_pct,
     item.sample_adjustment,
+    item.parameter_source,
+    item.skipped_order_count,
     item.last_recomputed_at,
   ].some(hasValue);
   if (!hasDerivation) {
@@ -1282,6 +1284,9 @@ function renderKellyParameterDerivation(stats) {
     .filter(hasValue)
     .map(formatPlain)
     .join(" / ");
+  const sourceLabel = item.parameter_source === "futu_paper_order_samples"
+    ? "富途模拟盘订单样本"
+    : item.parameter_source;
   const rows = [
     ["原始胜率", [item.raw_win_rate, winLossCount].filter(hasValue).map(formatPlain).join(" · ")],
     ["修正胜率", [item.adjusted_win_rate, item.sample_adjustment].filter(hasValue).map(formatPlain).join(" · ")],
@@ -1289,6 +1294,8 @@ function renderKellyParameterDerivation(stats) {
     ["Full Kelly", item.full_kelly_pct],
     ["保守 Kelly", item.fractional_kelly_pct],
     ["建议仓位", item.suggested_position_pct],
+    ["参数来源", sourceLabel],
+    ["跳过订单", item.skipped_order_count],
     ["最近样本", item.last_sample_closed_at],
     ["最近更新", item.last_recomputed_at],
   ].filter(([, value]) => hasValue(value));
