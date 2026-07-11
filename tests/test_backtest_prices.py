@@ -76,6 +76,33 @@ def test_fetch_backtest_prices_writes_market_symbol_price_csv(tmp_path: Path) ->
     ]
 
 
+@pytest.mark.parametrize("start,end", [("", "2026-07-10"), ("2026-07-09", "  ")])
+def test_fetch_backtest_prices_rejects_empty_dates_in_chinese(
+    tmp_path: Path, start: str, end: str
+) -> None:
+    with pytest.raises(ValueError, match="^开始日期和结束日期不能为空$"):
+        fetch_backtest_prices(
+            data_dir=tmp_path, market="US", symbol="MSFT",
+            start=start, end=end, provider=FakeDailyKlineProvider(),
+        )
+
+
+class EmptyDailyKlineProvider:
+    def get_daily_kline(self, futu_symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
+        return []
+
+
+def test_fetch_backtest_prices_reports_empty_provider_range_in_chinese(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match="^US\\.MSFT 在请求日期区间 2026-07-09 至 2026-07-10 没有返回日线数据$",
+    ):
+        fetch_backtest_prices(
+            data_dir=tmp_path, market="US", symbol="MSFT",
+            start="2026-07-09", end="2026-07-10", provider=EmptyDailyKlineProvider(),
+        )
+
+
 def _write_prices(path: Path, rows: list[str]) -> Path:
     path.write_text("date,open,high,low,close,volume\n" + "\n".join(rows) + "\n", encoding="utf-8")
     return path
@@ -239,3 +266,18 @@ def test_resolved_custom_end_preserves_request_and_clamps_effective_end(tmp_path
     assert result.date_range.requested_end == latest
     assert result.price_range.requested_end == requested_end
     assert result.price_range.actual_end == latest
+
+
+def test_resolved_range_propagates_chinese_empty_provider_error(tmp_path: Path) -> None:
+    provisional = resolve_backtest_range(
+        preset="1Y", custom_start=None, custom_end=None, latest_available=date.today()
+    )
+    message = (
+        f"US\\.MSFT 在请求日期区间 {provisional.warmup_start.isoformat()} "
+        f"至 {date.today().isoformat()} 没有返回日线数据"
+    )
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        ensure_resolved_backtest_price_range(
+            data_dir=tmp_path, market="US", symbol="MSFT", preset="1Y",
+            custom_start=None, custom_end=None, provider=EmptyDailyKlineProvider(),
+        )

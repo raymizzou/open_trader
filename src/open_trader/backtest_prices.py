@@ -223,13 +223,13 @@ def fetch_backtest_prices(
     if not normalized_symbol:
         raise ValueError("标的代码不能为空")
     if not start.strip() or not end.strip():
-        raise ValueError("start and end are required")
+        raise ValueError("开始日期和结束日期不能为空")
 
     futu_symbol = f"{market_scope.value}.{normalized_symbol}"
     bars = provider.get_daily_kline(futu_symbol, start=start, end=end)
     rows = [_price_row(bar) for bar in bars]
     if not rows:
-        raise ValueError(f"no daily kline rows returned for {futu_symbol}")
+        raise ValueError(f"{futu_symbol} 在请求日期区间 {start} 至 {end} 没有返回日线数据")
 
     prices_path = data_dir / "prices" / market_scope.value / f"{normalized_symbol}.csv"
     _atomic_write_csv(prices_path, rows)
