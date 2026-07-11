@@ -19,6 +19,7 @@ EXPERIMENTS_SCHEMA_VERSION = "open_trader.kelly_experiments.v1"
 PAPER_ORDERS_SCHEMA_VERSION = "open_trader.kelly_paper_orders.v1"
 ORDER_EXECUTIONS_SCHEMA_VERSION = "open_trader.kelly_order_executions.v1"
 STRATEGY_CAPITAL_SCHEMA_VERSION = "open_trader.kelly_strategy_capital.v1"
+TRADE_SAMPLES_SCHEMA_VERSION = "open_trader.kelly_trade_samples.v1"
 
 ALLOWED_EXPERIMENT_STATUSES = {"draft", "running", "paused", "completed", "failed"}
 
@@ -92,6 +93,7 @@ def load_kelly_lab_state(
     paper_orders_path = latest_dir / "kelly_paper_orders.json"
     order_executions_path = latest_dir / "kelly_order_executions.json"
     strategy_capital_path = latest_dir / "kelly_strategy_capital.json"
+    trade_samples_path = latest_dir / "kelly_trade_samples.json"
 
     missing_path = _first_missing_path(templates_path, experiments_path)
     if missing_path is not None:
@@ -120,6 +122,14 @@ def load_kelly_lab_state(
             experiments,
             strategy_capital,
         )
+    try:
+        trade_sample_stats = _load_optional_trade_sample_stats(trade_samples_path)
+        experiments = _attach_trade_sample_stats_to_experiments(
+            experiments,
+            trade_sample_stats,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        return KellyLabState(available=False, error=str(exc))
 
     return KellyLabState(
         available=True,
@@ -244,6 +254,28 @@ def _load_optional_strategy_capital(path: Path) -> list[dict[str, Any]]:
     return validated
 
 
+def _load_optional_trade_sample_stats(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    payload = _load_json_object(path)
+    _validate_schema_version(
+        payload,
+        path,
+        expected_schema_version=TRADE_SAMPLES_SCHEMA_VERSION,
+    )
+    stats_by_experiment = payload.get("stats_by_experiment")
+    if not isinstance(stats_by_experiment, dict):
+        raise ValueError(f"{path.name} must contain stats_by_experiment")
+    validated: dict[str, dict[str, Any]] = {}
+    for experiment_id, stats in stats_by_experiment.items():
+        if not isinstance(experiment_id, str) or not experiment_id.strip():
+            raise ValueError(f"{path.name} contains invalid experiment id")
+        if not isinstance(stats, dict):
+            raise ValueError(f"{path.name} stats for {experiment_id} must be an object")
+        validated[experiment_id] = copy.deepcopy(stats)
+    return validated
+
+
 def _attach_paper_orders_to_experiments(
     experiments: list[dict[str, Any]],
     paper_orders: list[dict[str, Any]],
@@ -343,6 +375,27 @@ def _attach_strategy_capital_to_experiments(
                 }
         else:
             normalized["capital"] = {"available": False}
+        attached.append(normalized)
+    return attached
+
+
+def _attach_trade_sample_stats_to_experiments(
+    experiments: list[dict[str, Any]],
+    stats_by_experiment: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not stats_by_experiment:
+        return experiments
+    attached: list[dict[str, Any]] = []
+    for experiment in experiments:
+        normalized = copy.deepcopy(experiment)
+        experiment_id = normalized.get("experiment_id")
+        if isinstance(experiment_id, str) and experiment_id in stats_by_experiment:
+            current_stats = normalized.get("stats")
+            if not isinstance(current_stats, dict):
+                current_stats = {}
+            merged = copy.deepcopy(current_stats)
+            merged.update(copy.deepcopy(stats_by_experiment[experiment_id]))
+            normalized["stats"] = merged
         attached.append(normalized)
     return attached
 

@@ -83,6 +83,131 @@ def minimal_experiment_payload(
     }
 
 
+def _write_minimal_kelly_templates(latest_dir: Path) -> None:
+    latest_dir.joinpath("kelly_strategy_templates.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_strategy_templates.v1",
+                "templates": [
+                    {
+                        "strategy_id": "trend_pullback_20d",
+                        "strategy_name": "Trend Pullback",
+                        "strategy_version": "v1",
+                        "entry_rule_description": "Entry",
+                        "exit_rule_description": "Exit",
+                        "max_holding_days": 20,
+                        "order_type": "limit",
+                        "market_session": "regular",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_minimal_kelly_experiments(latest_dir: Path) -> None:
+    latest_dir.joinpath("kelly_experiments.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_experiments.v1",
+                "experiments": [
+                    {
+                        "experiment_id": "trend_us",
+                        "experiment_name": "Trend US",
+                        "strategy_id": "trend_pullback_20d",
+                        "strategy_version": "v1",
+                        "market": "US",
+                        "start_date": "2026-07-07",
+                        "paper_account": "futu_simulate_us",
+                        "experiment_budget": "30000",
+                        "budget_currency": "USD",
+                        "capital_utilization_pct": "50",
+                        "allocation_mode": "equal_weight",
+                        "max_open_position_per_symbol": 1,
+                        "status": "running",
+                        "locked": True,
+                        "participants": [
+                            {
+                                "market": "US",
+                                "symbol": "AAPL",
+                                "name": "Apple",
+                                "source": "watchlist",
+                                "locked": True,
+                                "per_symbol_budget": "30000",
+                                "budget_currency": "USD",
+                            }
+                        ],
+                        "stats": {
+                            "completed_samples": 0,
+                            "open_samples": 0,
+                            "observed_win_rate": "",
+                            "sample_stage": "insufficient",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_load_kelly_lab_state_overlays_trade_sample_stats(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    _write_minimal_kelly_templates(latest_dir)
+    _write_minimal_kelly_experiments(latest_dir)
+    (latest_dir / "kelly_trade_samples.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.kelly_trade_samples.v1",
+                "generated_at": "2026-07-11 11:00",
+                "stats_by_experiment": {
+                    "trend_us": {
+                        "completed_samples": 2,
+                        "open_samples": 1,
+                        "observed_win_rate": "50%",
+                        "sample_stage": "insufficient",
+                        "parameter_source": "futu_paper_order_samples",
+                        "skipped_order_count": 3,
+                        "last_recomputed_at": "2026-07-11 11:00",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_kelly_lab_state(data_dir)
+
+    assert state.available is True
+    stats = state.experiments[0]["stats"]
+    assert stats["completed_samples"] == 2
+    assert stats["open_samples"] == 1
+    assert stats["parameter_source"] == "futu_paper_order_samples"
+    assert stats["skipped_order_count"] == 3
+
+
+def test_load_kelly_lab_state_rejects_invalid_trade_sample_schema(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    latest_dir = data_dir / "latest"
+    latest_dir.mkdir(parents=True)
+    _write_minimal_kelly_templates(latest_dir)
+    _write_minimal_kelly_experiments(latest_dir)
+    (latest_dir / "kelly_trade_samples.json").write_text(
+        json.dumps({"schema_version": "wrong", "stats_by_experiment": {}}),
+        encoding="utf-8",
+    )
+
+    state = load_kelly_lab_state(data_dir)
+
+    assert state.available is False
+    assert "kelly_trade_samples.json schema_version" in state.error
+
+
 def test_load_kelly_lab_state_rejects_mixed_market_experiment(
     tmp_path: Path,
 ) -> None:
