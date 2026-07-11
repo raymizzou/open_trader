@@ -129,16 +129,16 @@
         <form id="standard-backtest-form" class="backtest-form">
           <section class="backtest-form-section">
             <h2>选择标的</h2>
-            <div id="backtest-symbol-source" class="segmented-control" aria-label="标的来源"></div>
+            <div id="backtest-symbol-source" class="segmented-control" role="group" aria-label="标的来源"></div>
             <label>回测标的<select id="backtest-symbol" required></select></label>
           </section>
           <section class="backtest-form-section backtest-strategy-section">
             <h2>选择策略</h2>
-            <div id="backtest-strategy-cards" class="backtest-strategy-cards"></div>
+            <div id="backtest-strategy-cards" class="backtest-strategy-cards" role="group" aria-label="标准策略"></div>
           </section>
           <section class="backtest-form-section">
             <h2>回测区间</h2>
-            <div id="backtest-range-controls" class="segmented-control"></div>
+            <div id="backtest-range-controls" class="segmented-control" role="group" aria-label="回测区间"></div>
             <div id="backtest-custom-range" class="backtest-custom-range hidden" hidden>
               <label>开始日期<input id="backtest-custom-start" type="date"></label>
               <label>结束日期<input id="backtest-custom-end" type="date"></label>
@@ -147,6 +147,7 @@
           <section class="backtest-form-section">
             <h2>资金与成本</h2>
             <div class="backtest-input-grid">
+              <label>初始资金<input id="backtest-initial-cash" inputmode="decimal" value="100000"></label>
               <label>最大仓位<input id="backtest-max-weight" inputmode="decimal" value="10%"></label>
               <label>佣金（基点）<input id="backtest-commission" inputmode="decimal" value="10"></label>
               <label>滑点（基点）<input id="backtest-slippage" inputmode="decimal" value="5"></label>

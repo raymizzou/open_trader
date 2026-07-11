@@ -65,6 +65,21 @@ def test_standard_backtest_request_parses_percent_and_normalizes_hk_symbol(tmp_p
     assert parsed.custom_start == date(2025, 1, 1)
 
 
+def test_standard_backtest_request_allows_custom_range_without_end_date(tmp_path) -> None:
+    from open_trader.dashboard_web import parse_standard_backtest_request
+
+    config = dashboard_config(tmp_path)
+    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    row.update({"market": "US", "symbol": "MSFT", "asset_class": "stock"})
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
+    parsed = parse_standard_backtest_request(config, {
+        "market": "US", "symbol": "MSFT", "strategy_id": "trend_pullback/v1",
+        "range_preset": "CUSTOM", "custom_start": "2025-01-01",
+    })
+    assert parsed.custom_start == date(2025, 1, 1)
+    assert parsed.custom_end is None
+
+
 @pytest.mark.parametrize("symbol", ["../../outside", "..", "BAD/S", "BAD\\S", "BAD:S", "BAD S"])
 def test_standard_backtest_request_rejects_unsafe_symbol_grammar(tmp_path, symbol) -> None:
     from open_trader.dashboard_web import parse_standard_backtest_request
@@ -251,16 +266,77 @@ def test_standard_backtest_workspace_builds_request_without_adapter() -> None:
 state.standardBacktest.symbolKey = "US:MSFT";
 state.standardBacktest.strategyId = "trend_pullback/v1";
 state.standardBacktest.rangePreset = "3Y";
+state.standardBacktest.initialCash = "250000";
 state.standardBacktest.maxWeight = "10%";
-state.standardBacktest.costRate = "0.10%";
 const request = buildStandardBacktestRequest();
 if (request.market !== "US" || request.symbol !== "MSFT") throw new Error(JSON.stringify(request));
 if (request.strategy_id !== "trend_pullback/v1" || request.range_preset !== "3Y") throw new Error(JSON.stringify(request));
 if (request.adapter !== undefined) throw new Error("adapter leaked to UI");
+if (request.initial_cash !== "250000") throw new Error(JSON.stringify(request));
 if (request.max_strategy_weight !== "10%" || request.commission_bps !== "10") throw new Error(JSON.stringify(request));
 console.log("ok");
 """
     )
+    assert "ok" in output
+
+
+def test_standard_backtest_custom_dates_and_safe_error_contract() -> None:
+    output = run_dashboard_js(
+        r"""
+state.standardBacktest.rangePreset = "CUSTOM";
+state.standardBacktest.customStart = "";
+state.standardBacktest.customEnd = "";
+if (validateStandardBacktestDates() !== "自定义区间必须填写开始日期。") throw new Error("missing start");
+state.standardBacktest.customStart = "2026-01-02";
+state.standardBacktest.customEnd = "2026-01-02";
+if (validateStandardBacktestDates() !== "开始日期必须早于结束日期。") throw new Error("equal dates");
+state.standardBacktest.customEnd = "";
+if (validateStandardBacktestDates() !== "") throw new Error("optional end rejected");
+if (safeBacktestErrorMessage({message: "参数有误"}) !== "参数有误") throw new Error("Chinese message lost");
+if (safeBacktestErrorMessage({message: "Internal Server Error"}) !== "回测请求失败，请稍后重试。") throw new Error("English leaked");
+if (safeBacktestErrorMessage(null) !== "回测请求失败，请稍后重试。") throw new Error("fallback missing");
+console.log("ok");
+"""
+    )
+    assert "ok" in output
+
+
+def test_standard_backtest_workspace_accessibility_and_hidden_results_contract() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    assert 'id="backtest-initial-cash"' in html
+    assert 'role="group"' in html
+    assert "aria-pressed" in js
+    assert 'elements["standard-backtest-results"].hidden = false' not in js
+    assert 'elements["standard-backtest-results"].innerHTML' not in js
+
+
+def test_standard_backtest_dom_click_and_submit_flow() -> None:
+    output = run_dashboard_js(r"""
+class E {
+  constructor(){this.dataset={};this.value="";this.hidden=false;this.disabled=false;this.required=false;this.innerHTML="";this.textContent="";this.listeners={};this.classList={add(){},remove(){},toggle(){}};}
+  addEventListener(n,f){this.listeners[n]=f;} click(target=this){return this.listeners.click&&this.listeners.click({target,preventDefault(){}});} submit(){return this.listeners.submit({preventDefault(){}});}
+  closest(s){if(s==="[data-backtest-source]"&&this.dataset.backtestSource)return this;if(s==="[data-strategy-id]"&&this.dataset.strategyId)return this;if(s==="[data-range-preset]"&&this.dataset.rangePreset)return this;return null;} querySelector(){return null;}
+}
+const nodes={}; document.getElementById=(id)=>nodes[id]||(nodes[id]=new E()); document.querySelector=()=>new E(); document.getElementById("standard-backtest-results").hidden=true;
+const posts=[]; fetch=async(url,init={})=>{
+ if(url==="/api/backtests/options")return{ok:true,json:async()=>({strategies:[{id:"trend_pullback/v1",name_zh:"趋势回调",description_zh:"说明"},{id:"breakout_momentum/v1",name_zh:"突破动量",description_zh:"说明"},{id:"range_mean_reversion/v1",name_zh:"区间均值回归",description_zh:"说明"}],ranges:["1Y","3Y","CUSTOM"],defaults:{range:"1Y",initial_cash:"100000",max_strategy_weight:"0.10",commission_bps:"10",slippage_bps:"5"},universe:{holdings:[{market:"US",symbol:"MSFT",name:"微软"}],watchlist:[{market:"HK",symbol:"00700",name:"腾讯"}]}})};
+ posts.push({url,body:JSON.parse(init.body)});if(posts.length===2)return{ok:false,json:async()=>{throw new Error("html")}};return{ok:true,json:async()=>({status:"ok"})};};
+bindElements();bindEvents();await elements["open-standard-backtest"].click();
+if(elements["standard-backtest-workspace"].hidden||state.standardBacktest.symbolKey!=="US:MSFT")throw new Error("open failed");
+const watch=new E();watch.dataset.backtestSource="watchlist";elements["backtest-symbol-source"].click(watch);
+const range=new E();range.dataset.rangePreset="3Y";elements["backtest-range-controls"].click(range);
+elements["backtest-initial-cash"].value="250000";elements["backtest-max-weight"].value="12%";elements["backtest-commission"].value="8";elements["backtest-slippage"].value="3";
+await elements["standard-backtest-form"].submit();
+if(posts.length!==1||posts[0].url!=="/api/backtests/standard/run"||posts[0].body.adapter!==undefined||posts[0].body.initial_cash!=="250000")throw new Error(JSON.stringify(posts));
+if(!elements["standard-backtest-results"].hidden||elements["standard-backtest-results"].innerHTML)throw new Error("results exposed");
+await elements["standard-backtest-form"].submit();if(elements["standard-backtest-status"].textContent!=="回测请求失败，请稍后重试。")throw new Error("unsafe fallback");
+const custom=new E();custom.dataset.rangePreset="CUSTOM";elements["backtest-range-controls"].click(custom);if(!elements["backtest-custom-start"].required||elements["backtest-custom-end"].required)throw new Error("required mismatch");
+elements["backtest-custom-start"].value="";await elements["standard-backtest-form"].submit();if(posts.length!==2||elements["standard-backtest-status"].textContent!=="自定义区间必须填写开始日期。")throw new Error("missing start fetched");
+elements["backtest-custom-start"].value="2026-01-02";elements["backtest-custom-end"].value="2026-01-02";await elements["standard-backtest-form"].submit();if(posts.length!==2||elements["standard-backtest-status"].textContent!=="开始日期必须早于结束日期。")throw new Error("date order fetched");
+elements["close-standard-backtest"].click();await elements["open-standard-backtest"].click();if(state.standardBacktest.initialCash!=="250000"||state.standardBacktest.source!=="watchlist")throw new Error("state lost");
+console.log("ok");
+""")
     assert "ok" in output
 
 
@@ -470,9 +546,11 @@ const fs = require("fs");
 const vm = require("vm");
 const code = fs.readFileSync(process.argv[1], "utf8");
 const sandbox = { document: { addEventListener() {} }, console };
-vm.createContext(sandbox);
-vm.runInContext(code, sandbox);
-vm.runInContext(process.argv[2], sandbox);
+(async () => {
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  await vm.runInContext(`(async () => {${process.argv[2]}})()`, sandbox);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 """
     result = subprocess.run(
         [node, "-e", runner, str(js_path), script],

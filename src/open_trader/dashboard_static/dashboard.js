@@ -27,6 +27,7 @@ const state = {
     rangePreset: "1Y",
     customStart: "",
     customEnd: "",
+    initialCash: "100000",
     maxWeight: "10%",
     commissionBps: "10",
     slippageBps: "5",
@@ -180,6 +181,7 @@ function bindElements() {
     "backtest-custom-range",
     "backtest-custom-start",
     "backtest-custom-end",
+    "backtest-initial-cash",
     "backtest-max-weight",
     "backtest-commission",
     "backtest-slippage",
@@ -268,6 +270,7 @@ async function openStandardBacktest() {
       const defaults = state.standardBacktest.options.defaults || {};
       state.standardBacktest.rangePreset = defaults.range || state.standardBacktest.rangePreset;
       state.standardBacktest.maxWeight = decimalAsPercent(defaults.max_strategy_weight, "10%");
+      state.standardBacktest.initialCash = String(defaults.initial_cash || "100000");
       state.standardBacktest.commissionBps = String(defaults.commission_bps || "10");
       state.standardBacktest.slippageBps = String(defaults.slippage_bps || "5");
       elements["standard-backtest-status"].textContent = "";
@@ -311,7 +314,7 @@ function renderStandardBacktest() {
   const backtest = state.standardBacktest;
   elements["backtest-symbol-source"].innerHTML = [
     ["holdings", "当前持仓"], ["watchlist", "关注列表"],
-  ].map(([key, label]) => `<button class="filter-button ${backtest.source === key ? "active" : ""}" type="button" data-backtest-source="${key}">${label}</button>`).join("");
+  ].map(([key, label]) => `<button class="filter-button ${backtest.source === key ? "active" : ""}" type="button" data-backtest-source="${key}" aria-pressed="${backtest.source === key}">${label}</button>`).join("");
   const universe = (options.universe && options.universe[backtest.source]) || [];
   if (!universe.some((row) => `${row.market}:${row.symbol}` === backtest.symbolKey)) {
     backtest.symbolKey = universe.length ? `${universe[0].market}:${universe[0].symbol}` : "";
@@ -320,15 +323,17 @@ function renderStandardBacktest() {
     ? universe.map((row) => `<option value="${escapeHtml(`${row.market}:${row.symbol}`)}" ${`${row.market}:${row.symbol}` === backtest.symbolKey ? "selected" : ""}>${escapeHtml(`${row.market} · ${row.symbol}${row.name ? ` · ${row.name}` : ""}`)}</option>`).join("")
     : '<option value="">暂无可回测标的</option>';
   elements["backtest-strategy-cards"].innerHTML = options.strategies.map((strategy) => `
-    <button class="backtest-strategy-card ${strategy.id === backtest.strategyId ? "active" : ""}" type="button" data-strategy-id="${escapeHtml(strategy.id)}">
+    <button class="backtest-strategy-card ${strategy.id === backtest.strategyId ? "active" : ""}" type="button" data-strategy-id="${escapeHtml(strategy.id)}" aria-pressed="${strategy.id === backtest.strategyId}">
       <strong>${escapeHtml(strategy.name_zh)}</strong><span>${escapeHtml(strategy.description_zh)}</span>
-    </button>`).join("") + '<button class="backtest-strategy-card" type="button" disabled><strong>自定义策略</strong><span>后续版本</span></button>';
-  elements["backtest-range-controls"].innerHTML = options.ranges.map((range) => `<button class="filter-button ${range === backtest.rangePreset ? "active" : ""}" type="button" data-range-preset="${range}">${range === "CUSTOM" ? "自定义" : range}</button>`).join("");
+    </button>`).join("") + '<button class="backtest-strategy-card" type="button" disabled aria-disabled="true" aria-pressed="false"><strong>自定义策略</strong><span>后续版本</span></button>';
+  elements["backtest-range-controls"].innerHTML = options.ranges.map((range) => `<button class="filter-button ${range === backtest.rangePreset ? "active" : ""}" type="button" data-range-preset="${range}" aria-pressed="${range === backtest.rangePreset}">${range === "CUSTOM" ? "自定义" : range}</button>`).join("");
   const custom = backtest.rangePreset === "CUSTOM";
   elements["backtest-custom-range"].hidden = !custom;
   elements["backtest-custom-range"].classList.toggle("hidden", !custom);
+  elements["backtest-custom-start"].required = custom;
   elements["backtest-custom-start"].value = backtest.customStart;
   elements["backtest-custom-end"].value = backtest.customEnd;
+  elements["backtest-initial-cash"].value = backtest.initialCash;
   elements["backtest-max-weight"].value = backtest.maxWeight;
   elements["backtest-commission"].value = backtest.commissionBps;
   elements["backtest-slippage"].value = backtest.slippageBps;
@@ -338,6 +343,7 @@ function syncStandardBacktestInputs() {
   if (!elements["backtest-max-weight"]) return;
   state.standardBacktest.customStart = elements["backtest-custom-start"].value;
   state.standardBacktest.customEnd = elements["backtest-custom-end"].value;
+  state.standardBacktest.initialCash = elements["backtest-initial-cash"].value;
   state.standardBacktest.maxWeight = elements["backtest-max-weight"].value;
   state.standardBacktest.commissionBps = elements["backtest-commission"].value;
   state.standardBacktest.slippageBps = elements["backtest-slippage"].value;
@@ -351,6 +357,7 @@ function buildStandardBacktestRequest() {
     symbol: backtest.symbolKey.slice(separator + 1),
     strategy_id: backtest.strategyId,
     range_preset: backtest.rangePreset,
+    initial_cash: backtest.initialCash,
     max_strategy_weight: backtest.maxWeight,
     commission_bps: backtest.commissionBps,
     slippage_bps: backtest.slippageBps,
@@ -367,6 +374,11 @@ async function submitStandardBacktest(event) {
   syncStandardBacktestInputs();
   const backtest = state.standardBacktest;
   if (!backtest.symbolKey || backtest.busy) return;
+  const validationError = validateStandardBacktestDates();
+  if (validationError) {
+    elements["standard-backtest-status"].textContent = validationError;
+    return;
+  }
   backtest.busy = true;
   elements["run-standard-backtest"].disabled = true;
   elements["standard-backtest-status"].textContent = "正在运行回测…";
@@ -375,18 +387,37 @@ async function submitStandardBacktest(event) {
       method: "POST", headers: { "Content-Type": "application/json; charset=utf-8" },
       body: JSON.stringify(buildStandardBacktestRequest()),
     });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.message || `run ${response.status}`);
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { payload = null; }
+    if (!response.ok) {
+      elements["standard-backtest-status"].textContent = safeBacktestErrorMessage(payload);
+      return;
+    }
+    if (!payload || typeof payload !== "object") {
+      elements["standard-backtest-status"].textContent = "回测请求失败，请稍后重试。";
+      return;
+    }
     backtest.result = payload;
-    elements["standard-backtest-results"].hidden = false;
-    elements["standard-backtest-results"].innerHTML = '<h2>回测完成</h2><p>结果已生成，可在回测报告中查看完整指标。</p>';
     elements["standard-backtest-status"].textContent = "回测运行成功。";
-  } catch (error) {
-    elements["standard-backtest-status"].textContent = `回测运行失败：${error.message}`;
+  } catch (_) {
+    elements["standard-backtest-status"].textContent = "回测请求失败，请稍后重试。";
   } finally {
     backtest.busy = false;
     elements["run-standard-backtest"].disabled = false;
   }
+}
+
+function validateStandardBacktestDates() {
+  const backtest = state.standardBacktest;
+  if (backtest.rangePreset !== "CUSTOM") return "";
+  if (!backtest.customStart) return "自定义区间必须填写开始日期。";
+  if (backtest.customEnd && backtest.customStart >= backtest.customEnd) return "开始日期必须早于结束日期。";
+  return "";
+}
+
+function safeBacktestErrorMessage(payload) {
+  const message = payload && typeof payload.message === "string" ? payload.message.trim() : "";
+  return message && /[\u3400-\u9fff]/.test(message) ? message : "回测请求失败，请稍后重试。";
 }
 
 function decimalAsPercent(value, fallback) {

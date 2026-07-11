@@ -98,10 +98,10 @@ def parse_standard_backtest_request(
     custom_start = _parse_iso_date(request, "custom_start")
     custom_end = _parse_iso_date(request, "custom_end")
     if preset == "CUSTOM":
-        if custom_start is None or custom_end is None:
-            raise ValueError("自定义区间必须提供开始和结束日期")
-        if custom_start > custom_end:
-            raise ValueError("开始日期不能晚于结束日期")
+        if custom_start is None:
+            raise ValueError("自定义区间必须提供开始日期")
+        if custom_end is not None and custom_start >= custom_end:
+            raise ValueError("开始日期必须早于结束日期")
     elif custom_start is not None or custom_end is not None:
         raise ValueError("预设区间不能同时提供自定义日期")
     options = build_standard_backtest_options_payload(config)
