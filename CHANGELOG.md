@@ -3,6 +3,19 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-11
+
+- Completed the Kelly trade-sample closed loop on `main`: synced paper orders can
+  now generate `kelly_trade_samples.json`, overlay per-strategy sample stats in
+  Kelly Lab, and show the parameter source plus skipped-order count in the
+  dashboard.
+- Kept sample artifacts out of producer command dependencies so rebuilding order
+  intents, strategy capital, or trade samples is not blocked by stale/corrupt
+  sample stats.
+- Verified on merged `main` with focused Kelly/dashboard pytest coverage
+  (`134 passed`), Kelly Playwright (`1 passed`), `compileall`, `git diff --check`,
+  and a restarted live dashboard on port `8766`.
+
 ## 2026-07-10
 
 - Fixed the daily US/HK premarket workflow so non-dry-run automation refreshes
