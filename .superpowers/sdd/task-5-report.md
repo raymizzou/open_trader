@@ -52,3 +52,19 @@ The Node DOM harness now exercises the lazy options click, holdings/watchlist sw
 ### Review commit
 
 Commit subject: `fix: harden standard backtest workspace`
+
+## Safe Error Message Follow-up
+
+### RED
+
+Command: `../../.venv/bin/python -m pytest tests/test_dashboard_web.py::test_standard_backtest_custom_dates_and_safe_error_contract -q`
+
+Exact result: `1 failed in 0.35s`; the mixed message `参数 invalid: Internal Server Error` was incorrectly passed through.
+
+### GREEN
+
+Command: `../../.venv/bin/python -m pytest tests/test_dashboard_web.py -q`
+
+Exact result: `65 passed in 11.86s`. `node --check src/open_trader/dashboard_static/dashboard.js` and `git diff --check` also exited 0.
+
+Commit subject: `fix: filter mixed-language backtest errors`
