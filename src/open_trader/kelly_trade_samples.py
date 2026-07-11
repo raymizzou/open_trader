@@ -259,7 +259,7 @@ def _experiment_stats(
         "losing_samples": len(losses),
         "flat_samples": len(flats),
         "open_samples": len(open_positions),
-        "skipped_orders": len(skipped_orders),
+        "skipped_order_count": len(skipped_orders),
         "raw_win_rate": _pct_text(raw_win_rate),
         "adjusted_win_rate": _pct_text(adjusted_win_rate),
         "avg_net_win_pct": _pct_text(avg_net_win),

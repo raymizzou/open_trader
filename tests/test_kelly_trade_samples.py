@@ -209,6 +209,9 @@ def test_build_trade_samples_skips_unsupported_order_patterns() -> None:
         "unknown_experiment",
     ]
     assert payload["skipped_order_count"] == 3
+    stats = payload["stats_by_experiment"]["trend_us"]
+    assert stats["skipped_order_count"] == 2
+    assert "skipped_orders" not in stats
 
 
 def test_build_trade_samples_computes_loss_and_shrunk_kelly_stats() -> None:
