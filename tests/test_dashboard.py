@@ -99,6 +99,34 @@ def test_dashboard_backtest_universe_combines_holdings_and_watchlist(tmp_path: P
     ]
 
 
+def test_dashboard_backtest_universe_rejects_unsafe_and_option_symbols(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    rows = []
+    for market, symbol, asset_class, name in [
+        ("US", "BRK.B", "stock", "Berkshire"),
+        ("US", "SPY", "etf", "SPDR ETF"),
+        ("HK", "00700", "stock", "腾讯"),
+        ("US", "AAPL260116C00150000", "", ""),
+        ("HK", "12345", "", "腾讯期权"),
+        ("US", "../../outside", "stock", "unsafe"),
+        ("US", "BAD/SYMBOL", "stock", "unsafe"),
+        ("US", "BAD\\SYMBOL", "stock", "unsafe"),
+        ("US", "BAD:SYMBOL", "stock", "unsafe"),
+        ("US", "BAD SYMBOL", "stock", "unsafe"),
+        ("HK", "123456", "stock", "unsafe"),
+    ]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update({"market": market, "symbol": symbol, "asset_class": asset_class, "name": name})
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+
+    universe = load_dashboard_state(config).to_dict()["backtest_universe"]["holdings"]
+
+    assert [(row["market"], row["symbol"]) for row in universe] == [
+        ("US", "BRK.B"), ("US", "SPY"), ("HK", "00700"),
+    ]
+
+
 def raw_decision_with_market_report(report: str) -> str:
     return json.dumps({"state": {"market_report": report}}, ensure_ascii=False)
 

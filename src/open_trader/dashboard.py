@@ -9,6 +9,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from .backtest_prices import normalize_backtest_symbol
+
 from .decision_facts import (
     KLINE_FIELDS,
     NEWS_SENTIMENT_FIELDS,
@@ -21,6 +23,8 @@ from .futu_skill_facts import (
     index_futu_skill_facts_by_market_symbol,
     load_futu_skill_facts_cache,
 )
+from .models import AssetClass
+from .parsers.base import detect_asset_class
 from .research_chat import load_research_view_for_holding
 from .t_signal_store import (
     index_t_signals_by_market_symbol,
@@ -238,12 +242,19 @@ def _build_backtest_universe(
     def append_valid(target: list[dict[str, str]], row: dict[str, str]) -> None:
         market = str(row.get("market") or "").strip().upper()
         symbol = str(row.get("symbol") or "").strip().upper()
-        if market not in {"HK", "US"} or not symbol:
+        if market not in {"HK", "US"}:
             return
         asset_class = str(row.get("asset_class") or "").strip().lower()
-        if asset_class and asset_class not in {"stock", "etf"}:
+        if asset_class in {"", "unknown"}:
+            asset_class = detect_asset_class(
+                symbol, str(row.get("name") or "")
+            ).value
+        if asset_class not in {AssetClass.STOCK.value, AssetClass.ETF.value}:
             return
-        normalized_symbol = symbol.zfill(5) if market == "HK" and symbol.isdigit() else symbol
+        try:
+            normalized_symbol = normalize_backtest_symbol(market, symbol)
+        except ValueError:
+            return
         key = (market, normalized_symbol)
         if key in seen:
             return

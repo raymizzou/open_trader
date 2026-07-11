@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .backtest import run_backtest
-from .backtest_prices import DailyKlineProvider
+from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
 from .dashboard import (
     DashboardConfig,
     _backtest_holding_detail,
@@ -106,7 +106,7 @@ def parse_standard_backtest_request(
         raise ValueError("预设区间不能同时提供自定义日期")
     options = build_standard_backtest_options_payload(config)
     universe = options["universe"]["holdings"] + options["universe"]["watchlist"]
-    normalized = symbol.zfill(5) if market == "HK" and symbol.isdigit() else symbol
+    normalized = normalize_backtest_symbol(market, symbol)
     allowed = {
         (row["market"], row["symbol"].zfill(5) if row["market"] == "HK" and row["symbol"].isdigit() else row["symbol"])
         for row in universe
@@ -141,14 +141,26 @@ def build_standard_backtest_run_payload(
         )
     except Exception as exc:
         raise StandardBacktestExecutionError(f"行情服务连接失败：{exc}") from exc
+    result: dict[str, Any] | None = None
+    primary_error: StandardBacktestExecutionError | None = None
     try:
+        result = run_standard_backtest(parsed, price_provider=price_provider).to_dict()
+    except Exception as exc:
+        primary_error = StandardBacktestExecutionError(f"标准策略回测执行失败：{exc}")
+        primary_error.__cause__ = exc
+    if owned_provider and hasattr(price_provider, "close"):
         try:
-            return run_standard_backtest(parsed, price_provider=price_provider).to_dict()
-        except Exception as exc:
-            raise StandardBacktestExecutionError(f"标准策略回测执行失败：{exc}") from exc
-    finally:
-        if owned_provider and hasattr(price_provider, "close"):
             price_provider.close()
+        except Exception as exc:
+            if primary_error is None:
+                raise StandardBacktestExecutionError(
+                    f"行情服务关闭失败：{exc}"
+                ) from exc
+    if primary_error is not None:
+        raise primary_error
+    if result is None:  # pragma: no cover - defensive invariant
+        raise StandardBacktestExecutionError("标准策略回测未返回结果")
+    return result
 
 
 def build_dashboard_payload(

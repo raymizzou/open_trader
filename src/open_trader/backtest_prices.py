@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 import hashlib
 from pathlib import Path
+import re
 from tempfile import NamedTemporaryFile
 from typing import Protocol, Sequence
 
@@ -17,6 +18,33 @@ from .standard_strategies import StrategyBar
 
 BACKTEST_PRICE_FIELDNAMES = ("date", "open", "high", "low", "close", "volume")
 PRESET_MONTHS = {"6M": 6, "1Y": 12, "3Y": 36, "5Y": 60}
+US_EQUITY_SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:[.-][A-Z0-9]+)*")
+HK_EQUITY_SYMBOL_PATTERN = re.compile(r"\d{1,5}")
+
+
+def normalize_backtest_symbol(market: str, symbol: str) -> str:
+    normalized_market = market.strip().upper()
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        raise ValueError("标的代码不能为空")
+    valid = (
+        normalized_market == "HK"
+        and HK_EQUITY_SYMBOL_PATTERN.fullmatch(normalized_symbol) is not None
+    ) or (
+        normalized_market == "US"
+        and US_EQUITY_SYMBOL_PATTERN.fullmatch(normalized_symbol) is not None
+    )
+    if not valid:
+        raise ValueError("标的代码格式无效，仅支持港股或美股正股及 ETF")
+    return normalized_symbol.zfill(5) if normalized_market == "HK" else normalized_symbol
+
+
+def _backtest_prices_path(data_dir: Path, market: str, symbol: str) -> Path:
+    base = (data_dir / "prices" / market).resolve()
+    target = (base / f"{symbol}.csv").resolve()
+    if not target.is_relative_to(base):
+        raise ValueError("价格文件路径无效")
+    return target
 
 
 class DailyKlineProvider(Protocol):
@@ -134,10 +162,8 @@ def ensure_backtest_price_range(
     date_range: BacktestDateRange, provider: DailyKlineProvider,
 ) -> BacktestPriceRangeResult:
     market_scope = _parse_market_scope_zh(market)
-    normalized_symbol = symbol.strip().upper()
-    if not normalized_symbol:
-        raise ValueError("标的代码不能为空")
-    prices_path = data_dir / "prices" / market_scope.value / f"{normalized_symbol}.csv"
+    normalized_symbol = normalize_backtest_symbol(market_scope.value, symbol)
+    prices_path = _backtest_prices_path(data_dir, market_scope.value, normalized_symbol)
     bars: list[StrategyBar] | None = None
     if prices_path.exists():
         bars = load_price_rows(prices_path)
@@ -219,9 +245,7 @@ def fetch_backtest_prices(
     provider: DailyKlineProvider,
 ) -> BacktestPriceFetchResult:
     market_scope = _parse_market_scope_zh(market)
-    normalized_symbol = symbol.strip().upper()
-    if not normalized_symbol:
-        raise ValueError("标的代码不能为空")
+    normalized_symbol = normalize_backtest_symbol(market_scope.value, symbol)
     if not start.strip() or not end.strip():
         raise ValueError("开始日期和结束日期不能为空")
 
@@ -231,7 +255,7 @@ def fetch_backtest_prices(
     if not rows:
         raise ValueError(f"{futu_symbol} 在请求日期区间 {start} 至 {end} 没有返回日线数据")
 
-    prices_path = data_dir / "prices" / market_scope.value / f"{normalized_symbol}.csv"
+    prices_path = _backtest_prices_path(data_dir, market_scope.value, normalized_symbol)
     _atomic_write_csv(prices_path, rows)
     return BacktestPriceFetchResult(
         market=market_scope.value,

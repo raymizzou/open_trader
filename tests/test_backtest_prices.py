@@ -13,6 +13,22 @@ from open_trader.backtest_prices import (
     load_price_rows,
     resolve_backtest_range,
 )
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    ["../../outside", "..", "BAD/SYMBOL", "BAD\\SYMBOL", "BAD:SYMBOL", "BAD SYMBOL"],
+)
+def test_fetch_backtest_prices_rejects_unsafe_symbols(tmp_path: Path, symbol: str) -> None:
+    provider = FakeDailyKlineProvider()
+
+    with pytest.raises(ValueError, match="标的代码格式无效"):
+        fetch_backtest_prices(
+            data_dir=tmp_path, market="US", symbol=symbol,
+            start="2025-01-01", end="2026-01-01", provider=provider,
+        )
+
+    assert provider.requests == []
 from open_trader.kline_technical_facts import DailyKlineBar
 
 

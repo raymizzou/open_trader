@@ -65,6 +65,19 @@ def test_standard_backtest_request_parses_percent_and_normalizes_hk_symbol(tmp_p
     assert parsed.custom_start == date(2025, 1, 1)
 
 
+@pytest.mark.parametrize("symbol", ["../../outside", "..", "BAD/S", "BAD\\S", "BAD:S", "BAD S"])
+def test_standard_backtest_request_rejects_unsafe_symbol_grammar(tmp_path, symbol) -> None:
+    from open_trader.dashboard_web import parse_standard_backtest_request
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+    with pytest.raises(ValueError, match="标的代码格式无效"):
+        parse_standard_backtest_request(config, {
+            "market": "US", "symbol": symbol,
+            "strategy_id": "trend_pullback/v1", "range_preset": "1Y",
+        })
+
+
 def test_standard_backtest_http_routes_expose_options_and_map_validation_to_400(tmp_path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
@@ -89,6 +102,110 @@ def test_standard_backtest_http_routes_expose_options_and_map_validation_to_400(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_owned_backtest_provider_close_failure_is_execution_error(tmp_path, monkeypatch) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+
+    class Provider:
+        def close(self) -> None:
+            raise RuntimeError("close boom")
+
+    class Result:
+        def to_dict(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+    monkeypatch.setattr(dashboard_web, "FutuQuoteClient", lambda **_: Provider())
+    monkeypatch.setattr(dashboard_web, "run_standard_backtest", lambda *_, **__: Result())
+    request = {"market": "US", "symbol": "VIXY", "strategy_id": "trend_pullback/v1"}
+
+    with pytest.raises(dashboard_web.StandardBacktestExecutionError, match="关闭.*close boom"):
+        dashboard_web.build_standard_backtest_run_payload(config, request)
+
+
+def test_owned_backtest_provider_close_failure_does_not_mask_run_failure(tmp_path, monkeypatch) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+
+    class Provider:
+        def close(self) -> None:
+            raise RuntimeError("close boom")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("run boom")
+
+    monkeypatch.setattr(dashboard_web, "FutuQuoteClient", lambda **_: Provider())
+    monkeypatch.setattr(dashboard_web, "run_standard_backtest", fail)
+    request = {"market": "US", "symbol": "VIXY", "strategy_id": "trend_pullback/v1"}
+
+    with pytest.raises(dashboard_web.StandardBacktestExecutionError, match="run boom") as error:
+        dashboard_web.build_standard_backtest_run_payload(config, request)
+    assert "close boom" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("run_error", "expected"),
+    [(None, "行情服务关闭失败：close boom"), ("run boom", "标准策略回测执行失败：run boom")],
+)
+def test_standard_backtest_http_maps_owned_provider_lifecycle_errors_to_502(
+    tmp_path, monkeypatch, run_error, expected
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+
+    class Provider:
+        def close(self) -> None:
+            raise RuntimeError("close boom")
+
+    class Result:
+        def to_dict(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+    def run(*args, **kwargs):
+        if run_error:
+            raise RuntimeError(run_error)
+        return Result()
+
+    monkeypatch.setattr(dashboard_web, "FutuQuoteClient", lambda **_: Provider())
+    monkeypatch.setattr(dashboard_web, "run_standard_backtest", run)
+    server = dashboard_web.create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        status, _, payload = post_error_json(
+            f"http://{host}:{port}/api/backtests/standard/run",
+            json.dumps({
+                "market": "US", "symbol": "VIXY",
+                "strategy_id": "trend_pullback/v1",
+            }).encode(),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert status == 502
+    assert payload["message"] == expected
+
+
+def test_dashboard_static_removes_legacy_holding_backtest_ui() -> None:
+    source = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert "查看回测" not in source
+    assert 'data-detail-mode="backtest"' not in source
+    assert 'fetch("/api/backtests/run"' not in source
+    assert "header-backtest-filters" not in html
+    assert "backtest-price-sync-status" not in html
 
 
 class FakeQuoteService:
@@ -386,16 +503,15 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "持仓实时看板" in html
     assert "刷新账户与行情" in html
     assert "accountSyncReloadNeeded" in js
-    assert "renderBacktestPriceSyncStatus" in js
+    assert "renderBacktestPriceSyncStatus" not in js
     assert "全部市场" in html
     assert "symbol-detail-panel" in html
     assert "dashboard-header" in html
     assert "header-market-filters" in html
     assert "header-broker-filters" in html
-    assert "header-backtest-filters" in html
-    assert "backtest-price-sync-status" in html
-    assert "data-backtest=\"READY\"" in html
-    assert "可运行" in html
+    assert "header-backtest-filters" not in html
+    assert "backtest-price-sync-status" not in html
+    assert "data-backtest=\"READY\"" not in html
     assert "current-view-value" in html
     assert "broker-summary-cards" in html
     assert "source-status-list" in html
@@ -637,7 +753,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
 
 
-def test_dashboard_backtest_filter_limits_holdings_and_ignores_cash_view() -> None:
+def obsolete_dashboard_backtest_filter_limits_holdings_and_ignores_cash_view() -> None:
     output = run_dashboard_js(
         r"""
 state.dashboard = {
@@ -728,7 +844,7 @@ console.log("ok");
     assert "ok" in output
 
 
-def test_dashboard_backtest_filter_buttons_show_current_scope_counts() -> None:
+def obsolete_dashboard_backtest_filter_buttons_show_current_scope_counts() -> None:
     output = run_dashboard_js(
         r"""
 state.dashboard = {
@@ -792,7 +908,7 @@ console.log("ok");
     assert "ok" in output
 
 
-def test_dashboard_renders_backtest_price_auto_sync_status() -> None:
+def obsolete_dashboard_renders_backtest_price_auto_sync_status() -> None:
     output = run_dashboard_js(
         r"""
 let rendered = "";
@@ -3049,7 +3165,7 @@ if (!renderedWithOther.includes("其他市场持仓") || !renderedWithOther.incl
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
-def test_dashboard_renders_backtest_entry_and_detail_only_after_selection() -> None:
+def obsolete_dashboard_renders_backtest_entry_and_detail_only_after_selection() -> None:
     html = run_dashboard_js(
         r"""
 function makeElement() {
@@ -3174,7 +3290,7 @@ console.log(html);
     assert "回测详情 · US.VIXY" in html
 
 
-def test_dashboard_backtest_detail_runs_from_button_and_refreshes() -> None:
+def obsolete_dashboard_backtest_detail_runs_from_button_and_refreshes() -> None:
     html = run_dashboard_js(
         r"""
 function makeElement() {
@@ -3296,7 +3412,7 @@ console.log(html);
     assert "回测详情 · US.VIXY" in html
 
 
-def test_dashboard_backtest_detail_renders_readiness_gaps() -> None:
+def obsolete_dashboard_backtest_detail_renders_readiness_gaps() -> None:
     html = run_dashboard_js(
         r"""
 function makeElement() {
@@ -3374,7 +3490,7 @@ console.log(html);
     assert "缺少计划字段" in html
 
 
-def test_dashboard_backtest_detail_renders_unsupported_strategy() -> None:
+def obsolete_dashboard_backtest_detail_renders_unsupported_strategy() -> None:
     html = run_dashboard_js(
         r"""
 function makeElement() {
@@ -3455,7 +3571,7 @@ console.log(html);
     assert "暂不支持该策略" in html
 
 
-def test_dashboard_backtest_detail_hides_manual_missing_price_fetch_button() -> None:
+def obsolete_dashboard_backtest_detail_hides_manual_missing_price_fetch_button() -> None:
     html = run_dashboard_js(
         r"""
 function makeElement() {

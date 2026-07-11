@@ -7,22 +7,11 @@ const state = {
   quotePayload: null,
   marketFilter: "ALL",
   brokerFilter: "ALL",
-  backtestFilter: "ALL",
   selectedHoldingKey: "",
   selectedHoldingDetail: "decision",
   detailLanguage: "zh",
   refreshActive: false,
   quoteIntervalId: null,
-  backtestRun: {
-    detailKey: "",
-    busy: false,
-    error: "",
-  },
-  backtestPrices: {
-    detailKey: "",
-    busy: false,
-    error: "",
-  },
   researchChat: {
     holdingKey: "",
     sessionId: "",
@@ -83,14 +72,6 @@ const DETAIL_LANGUAGE_LABELS = {
   en: "English",
 };
 
-const BACKTEST_FILTER_OPTIONS = [
-  { value: "ALL", label: "全部回测" },
-  { value: "READY", label: "可运行" },
-  { value: "MISSING_PRICES", label: "缺价格" },
-  { value: "MISSING_FIELDS", label: "缺字段" },
-  { value: "UNSUPPORTED", label: "暂不支持" },
-];
-
 const PRIORITY_LABELS = {
   critical: "紧急",
   high: "高",
@@ -133,8 +114,6 @@ function bindElements() {
     "refresh-quotes",
     "header-market-filters",
     "header-broker-filters",
-    "header-backtest-filters",
-    "backtest-price-sync-status",
     "current-view-label",
     "current-view-value",
     "current-view-holding-value",
@@ -206,17 +185,6 @@ function bindEvents() {
     setActiveFilter(elements["header-broker-filters"], button);
     renderDashboardViews();
   });
-  elements["header-backtest-filters"].addEventListener("click", (event) => {
-    const button = event.target.closest("[data-backtest]");
-    if (!button) {
-      return;
-    }
-    state.backtestFilter = button.dataset.backtest || "ALL";
-    state.selectedHoldingKey = "";
-    state.selectedHoldingDetail = "decision";
-    setActiveFilter(elements["header-backtest-filters"], button);
-    renderDashboardViews();
-  });
   elements["holdings-body"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-detail-key]");
     if (button) {
@@ -263,11 +231,6 @@ function handleSymbolDetailClick(event) {
   const chatButton = event.target.closest("[data-research-chat]");
   if (chatButton) {
     openResearchChat(chatButton.dataset.researchChat || "");
-    return;
-  }
-  const backtestButton = event.target.closest("[data-run-backtest]");
-  if (backtestButton) {
-    runBacktestForHolding(backtestButton.dataset.runBacktest || "");
     return;
   }
   const rawButton = event.target.closest("[data-toggle-raw-report]");
@@ -366,7 +329,6 @@ function accountSyncReloadNeeded(accountSync) {
 
 function renderDashboard() {
   renderBrokerFilters();
-  renderBacktestFilters();
   renderBrokerCards();
   renderSourceStatusListIntoHeader();
   renderDashboardViews();
@@ -375,7 +337,6 @@ function renderDashboard() {
 }
 
 function renderDashboardViews() {
-  renderBacktestFilters();
   renderHeaderSummary();
   renderHoldings();
 }
@@ -405,7 +366,6 @@ function currentViewSummary() {
   if (
     state.marketFilter === "ALL"
     && state.brokerFilter !== "ALL"
-    && state.backtestFilter === "ALL"
   ) {
     const summary = currentBrokerSummary();
     if (summary) {
@@ -544,10 +504,7 @@ function emptyMoneySummary(complete) {
 function currentViewLabel(count) {
   const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CASH" ? "现金" : state.marketFilter;
   const brokerLabel = state.brokerFilter === "ALL" ? "全部券商" : brokerDisplayName(state.brokerFilter);
-  const backtestLabel = state.backtestFilter === "ALL" || state.marketFilter === "CASH"
-    ? ""
-    : ` · ${backtestFilterLabel(state.backtestFilter)}`;
-  return `当前视图：${marketLabel} · ${brokerLabel}${backtestLabel} · ${formatPlain(count)} 条`;
+  return `当前视图：${marketLabel} · ${brokerLabel} · ${formatPlain(count)} 条`;
 }
 
 function renderSummary() {
@@ -617,111 +574,6 @@ function renderBrokerFilters() {
   setFilterActiveByDataset(elements["header-broker-filters"], "broker", state.brokerFilter);
 }
 
-function renderBacktestFilters() {
-  if (!elements["header-backtest-filters"]) {
-    return;
-  }
-  elements["header-backtest-filters"].innerHTML = renderBacktestFilterButtons();
-  renderBacktestPriceSyncStatus();
-}
-
-function renderBacktestFilterButtons() {
-  const counts = backtestFilterCounts();
-  return BACKTEST_FILTER_OPTIONS.map((option) => {
-    const activeClass = state.backtestFilter === option.value ? " active" : "";
-    const count = counts[option.value] || 0;
-    return `<button class="filter-button${activeClass}" type="button" data-backtest="${escapeHtml(option.value)}">${escapeHtml(option.label)} ${formatPlain(count)}</button>`;
-  }).join("");
-}
-
-function renderBacktestPriceSyncStatus() {
-  const element = elements["backtest-price-sync-status"];
-  if (!element) {
-    return;
-  }
-  const status = backtestPriceSyncStatus(state.dashboard && state.dashboard.backtest_price_sync);
-  element.textContent = status.text;
-  element.className = `backtest-price-sync-status ${status.className}`;
-}
-
-function backtestPriceSyncStatus(sync) {
-  if (!sync || typeof sync !== "object") {
-    return { text: "", className: "status-muted" };
-  }
-  const attempted = integerValue(sync.attempted);
-  const succeeded = integerValue(sync.succeeded);
-  const failed = integerValue(sync.failed);
-  if (attempted <= 0) {
-    return { text: "", className: "status-muted" };
-  }
-  const failedSymbols = backtestPriceSyncFailedSymbols(sync.errors);
-  if (failed > 0 && succeeded > 0) {
-    const suffix = failedSymbols ? `：${failedSymbols}` : "";
-    return {
-      text: `已自动补齐 ${formatPlain(succeeded)} 个回测价格文件，失败 ${formatPlain(failed)} 个${suffix}`,
-      className: "status-warning",
-    };
-  }
-  if (failed > 0) {
-    const suffix = failedSymbols ? `：${failedSymbols}` : "";
-    return {
-      text: `自动补齐失败 ${formatPlain(failed)} 个${suffix}`,
-      className: "status-warning",
-    };
-  }
-  return {
-    text: `已自动补齐 ${formatPlain(succeeded)} 个回测价格文件`,
-    className: "status-ok",
-  };
-}
-
-function backtestPriceSyncFailedSymbols(errors) {
-  if (!Array.isArray(errors) || errors.length === 0) {
-    return "";
-  }
-  return errors.map((error) => {
-    if (!error || typeof error !== "object") {
-      return "";
-    }
-    const market = String(error.market || "").trim().toUpperCase();
-    const symbol = String(error.symbol || "").trim().toUpperCase();
-    return [market, symbol].filter(Boolean).join(".");
-  }).filter(Boolean).join(", ");
-}
-
-function integerValue(value) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function backtestFilterCounts() {
-  const counts = {
-    ALL: 0,
-    READY: 0,
-    MISSING_PRICES: 0,
-    MISSING_FIELDS: 0,
-    UNSUPPORTED: 0,
-  };
-  for (const holding of backtestFilterScopeHoldings()) {
-    counts.ALL += 1;
-    const bucket = backtestFilterBucket(holding);
-    if (bucket && Object.prototype.hasOwnProperty.call(counts, bucket)) {
-      counts[bucket] += 1;
-    }
-  }
-  return counts;
-}
-
-function backtestFilterScopeHoldings() {
-  return getHoldings().filter((holding) => {
-    const market = String(holding.market || "").toUpperCase();
-    const brokers = rowBrokers(holding);
-    const marketMatches = state.marketFilter === "ALL" || state.marketFilter === "CASH" || market === state.marketFilter;
-    const brokerMatches = state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
-    return marketMatches && brokerMatches;
-  });
-}
-
 function renderHoldings() {
   if (state.marketFilter === "CASH") {
     const cashRows = filteredCashRows();
@@ -771,7 +623,7 @@ function renderHoldings() {
       const tSignalClass = tSignalButtonClass(holding);
       rows.push(`
         <tr class="${selectedClass}">
-          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button><button class="expand-button backtest-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="backtest">查看回测</button></td>
+          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
           <td>${escapeHtml(formatPlain(holding.market))}</td>
           <td class="symbol-cell">
             <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
@@ -793,9 +645,7 @@ function renderHoldings() {
               <div class="symbol-detail-panel inline-symbol-detail">
                 ${selectedDetail === "t_signal"
                   ? renderTSignalDetail(selected.holding)
-                  : selectedDetail === "backtest"
-                    ? renderBacktestDetail(selected.holding)
-                    : renderSymbolDetail(selected.holding, selected.index)}
+                  : renderSymbolDetail(selected.holding, selected.index)}
               </div>
             </td>
           </tr>
@@ -834,7 +684,7 @@ function showSymbolDetail(detailKey, detailMode = "decision") {
 }
 
 function normalizeHoldingDetailMode(mode) {
-  if (mode === "t_signal" || mode === "backtest") {
+  if (mode === "t_signal") {
     return mode;
   }
   return "decision";
@@ -875,10 +725,8 @@ function openTradeActionDetail(actionKey) {
 function resetHoldingFilters() {
   state.marketFilter = "ALL";
   state.brokerFilter = "ALL";
-  state.backtestFilter = "ALL";
   setFilterActiveByDataset(elements["header-market-filters"], "market", "ALL");
   setFilterActiveByDataset(elements["header-broker-filters"], "broker", "ALL");
-  setFilterActiveByDataset(elements["header-backtest-filters"], "backtest", "ALL");
 }
 
 function setFilterActiveByDataset(container, datasetKey, value) {
@@ -1337,44 +1185,6 @@ function renderBacktestRunControls(holding) {
       ${error ? `<span class="detail-warning">${escapeHtml(error)}</span>` : ""}
     </div>
   `;
-}
-
-async function runBacktestForHolding(detailKey) {
-  const holding = holdingByKey(detailKey);
-  if (!holding) {
-    return;
-  }
-  state.backtestRun = { detailKey, busy: true, error: "" };
-  state.selectedHoldingKey = detailKey;
-  state.selectedHoldingDetail = "backtest";
-  renderHoldings();
-  try {
-    const response = await fetch("/api/backtests/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({
-        market: holding.market || "",
-        symbol: holding.symbol || "",
-        initial_position_quantity: formatPlain(holding.total_quantity || "0"),
-      }),
-    });
-    const payload = await response.json();
-    if (!response.ok || payload.status === "error") {
-      throw new Error(payload.message || `backtest ${response.status}`);
-    }
-    await loadDashboard();
-    state.backtestRun = { detailKey, busy: false, error: "" };
-    state.selectedHoldingKey = detailKey;
-    state.selectedHoldingDetail = "backtest";
-    renderHoldings();
-  } catch (error) {
-    state.backtestRun = {
-      detailKey,
-      busy: false,
-      error: error.message || "回测运行失败",
-    };
-    renderHoldings();
-  }
 }
 
 function backtestSummaryText(backtest) {
@@ -4351,46 +4161,8 @@ function filteredHoldings() {
     const brokers = rowBrokers(holding);
     const marketMatches = state.marketFilter === "ALL" || market === state.marketFilter;
     const brokerMatches = state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
-    const backtestMatches = backtestFilterMatches(holding);
-    return marketMatches && brokerMatches && backtestMatches;
+    return marketMatches && brokerMatches;
   });
-}
-
-function backtestFilterMatches(holding) {
-  if (state.marketFilter === "CASH" || state.backtestFilter === "ALL") {
-    return true;
-  }
-  return backtestFilterBucket(holding) === state.backtestFilter;
-}
-
-function backtestFilterBucket(holding) {
-  const readiness = holding && holding.backtest_readiness && typeof holding.backtest_readiness === "object"
-    ? holding.backtest_readiness
-    : {};
-  const status = String(readiness.status || "").trim();
-  if (status === "ready") {
-    return "READY";
-  }
-  if (status === "missing_prices" || readiness.prices_missing === true) {
-    return "MISSING_PRICES";
-  }
-  if (status === "missing_fields") {
-    return "MISSING_FIELDS";
-  }
-  if (status === "unsupported_strategy") {
-    return "UNSUPPORTED";
-  }
-  return "";
-}
-
-function backtestFilterLabel(value) {
-  const labels = {
-    READY: "回测可运行",
-    MISSING_PRICES: "回测缺价格",
-    MISSING_FIELDS: "回测缺字段",
-    UNSUPPORTED: "回测暂不支持",
-  };
-  return labels[value] || "全部回测";
 }
 
 function holdingsEmptyRow(message) {
