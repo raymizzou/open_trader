@@ -16,44 +16,44 @@ def _trade_samples_payload() -> dict[str, object]:
     return {
         "schema_version": "open_trader.kelly_trade_samples.v1",
         "generated_at": "2026-07-11 12:00",
-        "samples": [
-            {
-                "experiment_id": "trend_us",
-                "result": "win",
-                "net_pnl_pct": "10%",
-                "exit_submitted_at": "2026-07-11 11:59",
-            }
-        ],
+        "samples": [_sample("win", "10%")],
         "open_positions": [],
         "diagnostics": {"skipped_orders": []},
     }
 
 
+def _sample(
+    result: str,
+    net_pnl_pct: str,
+    *,
+    exit_submitted_at: str = "2026-07-11 11:59",
+) -> dict[str, str]:
+    exit_price = {"win": "110", "loss": "95", "flat": "100"}[result]
+    gross_pnl = {"win": "10", "loss": "-5", "flat": "0"}[result]
+    return {
+        "experiment_id": "trend_us",
+        "market": "US",
+        "symbol": "AAPL",
+        "entry_order_id": "BUY-1",
+        "exit_order_id": "SELL-1",
+        "entry_submitted_at": "2026-07-11 09:00",
+        "exit_submitted_at": exit_submitted_at,
+        "entry_price": "100",
+        "exit_price": exit_price,
+        "quantity": "1",
+        "entry_notional": "100",
+        "exit_notional": exit_price,
+        "gross_pnl": gross_pnl,
+        "net_pnl_pct": net_pnl_pct,
+        "result": result,
+    }
+
+
 def _samples(*, wins: int, losses: int, flats: int = 0) -> list[dict[str, str]]:
     return [
-        {
-            "experiment_id": "trend_us",
-            "result": "win",
-            "net_pnl_pct": "10%",
-            "exit_submitted_at": "2026-07-11 11:59",
-        }
-        for _ in range(wins)
-    ] + [
-        {
-            "experiment_id": "trend_us",
-            "result": "loss",
-            "net_pnl_pct": "-5%",
-            "exit_submitted_at": "2026-07-11 11:59",
-        }
-        for _ in range(losses)
-    ] + [
-        {
-            "experiment_id": "trend_us",
-            "result": "flat",
-            "net_pnl_pct": "0%",
-            "exit_submitted_at": "2026-07-11 11:59",
-        }
-        for _ in range(flats)
+        *[_sample("win", "10%") for _ in range(wins)],
+        *[_sample("loss", "-5%") for _ in range(losses)],
+        *[_sample("flat", "0%") for _ in range(flats)],
     ]
 
 
@@ -106,6 +106,18 @@ def test_validate_rejects_stale_or_incomplete_experiment_coverage() -> None:
         )
 
 
+def test_build_rejects_unknown_trade_sample_experiment() -> None:
+    trade_samples = _trade_samples_payload()
+    trade_samples["samples"][0]["experiment_id"] = "missing_experiment"
+
+    with pytest.raises(ValueError, match="unknown experiment"):
+        build_kelly_strategy_stats_payload(
+            [{"experiment_id": "trend_us", "market": "US"}],
+            trade_samples,
+            generated_at="2026-07-11 12:01",
+        )
+
+
 def test_write_and_load_kelly_strategy_stats(tmp_path) -> None:
     payload = build_kelly_strategy_stats_payload(
         [{"experiment_id": "trend_us", "market": "US"}],
@@ -118,6 +130,63 @@ def test_write_and_load_kelly_strategy_stats(tmp_path) -> None:
 
     assert path == tmp_path / "data" / "latest" / "kelly_strategy_stats.json"
     assert loaded == payload
+
+
+def test_low_magnitude_samples_round_trip_with_raw_calculation_inputs(tmp_path) -> None:
+    trade_samples = {
+        "schema_version": "open_trader.kelly_trade_samples.v1",
+        "generated_at": "2026-07-11 12:00",
+        "samples": [
+            {
+                "experiment_id": "trend_us",
+                "market": "US",
+                "symbol": "AAPL",
+                "entry_order_id": "BUY-1",
+                "exit_order_id": "SELL-1",
+                "entry_submitted_at": "2026-07-11 09:00",
+                "exit_submitted_at": "2026-07-11 10:00",
+                "entry_price": "100000",
+                "exit_price": "100010",
+                "quantity": "1",
+                "entry_notional": "100000",
+                "exit_notional": "100010",
+                "gross_pnl": "10",
+                "net_pnl_pct": "0.01%",
+                "result": "win",
+            },
+            {
+                "experiment_id": "trend_us",
+                "market": "US",
+                "symbol": "AAPL",
+                "entry_order_id": "BUY-2",
+                "exit_order_id": "SELL-2",
+                "entry_submitted_at": "2026-07-11 11:00",
+                "exit_submitted_at": "2026-07-11 12:00",
+                "entry_price": "100000",
+                "exit_price": "99996",
+                "quantity": "1",
+                "entry_notional": "100000",
+                "exit_notional": "99996",
+                "gross_pnl": "-4",
+                "net_pnl_pct": "-0.004%",
+                "result": "loss",
+            },
+        ],
+        "open_positions": [],
+        "diagnostics": {"skipped_orders": []},
+    }
+    payload = build_kelly_strategy_stats_payload(
+        [{"experiment_id": "trend_us", "market": "US"}],
+        trade_samples,
+        generated_at="2026-07-11 12:01",
+    )
+
+    stats = payload["stats_by_experiment"]["trend_us"]
+    assert stats["payoff_ratio"] == "2.5"
+    assert stats["calculation_inputs"]["payoff_ratio"] == "2.5"
+
+    write_kelly_strategy_stats(tmp_path / "data", payload)
+    assert load_kelly_strategy_stats(tmp_path / "data") == payload
 
 
 def test_builds_unshrunk_stats_at_200_samples() -> None:
@@ -161,30 +230,10 @@ def test_applies_quarter_kelly_and_four_percent_cap() -> None:
 def test_preserves_legacy_precision_for_uneven_sample_values() -> None:
     trade_samples = _trade_samples_payload()
     trade_samples["samples"] = [
-        {
-            "experiment_id": "trend_us",
-            "result": "win",
-            "net_pnl_pct": "10.01%",
-            "exit_submitted_at": "2026-07-11 09:00",
-        },
-        {
-            "experiment_id": "trend_us",
-            "result": "win",
-            "net_pnl_pct": "10.02%",
-            "exit_submitted_at": "2026-07-11 10:00",
-        },
-        {
-            "experiment_id": "trend_us",
-            "result": "loss",
-            "net_pnl_pct": "-3.33%",
-            "exit_submitted_at": "2026-07-12 09:00",
-        },
-        {
-            "experiment_id": "trend_us",
-            "result": "loss",
-            "net_pnl_pct": "-3.34%",
-            "exit_submitted_at": "2026-07-12 10:00",
-        },
+        _sample("win", "10.01%", exit_submitted_at="2026-07-11 09:00"),
+        _sample("win", "10.02%", exit_submitted_at="2026-07-11 10:00"),
+        _sample("loss", "-3.33%", exit_submitted_at="2026-07-12 09:00"),
+        _sample("loss", "-3.34%", exit_submitted_at="2026-07-12 10:00"),
     ]
 
     stats = build_kelly_strategy_stats_payload(
@@ -330,27 +379,19 @@ def test_validate_rejects_false_kelly_calculation_chain() -> None:
         validate_kelly_strategy_stats_payload(payload)
 
 
+def test_validate_requires_raw_calculation_inputs() -> None:
+    payload = _valid_stats_payload()
+    del payload["stats_by_experiment"]["trend_us"]["calculation_inputs"]
+
+    with pytest.raises(ValueError, match="calculation_inputs"):
+        validate_kelly_strategy_stats_payload(payload)
+
+
 def test_validate_accepts_kelly_values_at_serialized_precision() -> None:
     trade_samples = _trade_samples_payload()
     trade_samples["samples"] = [
-        *[
-            {
-                "experiment_id": "trend_us",
-                "result": "win",
-                "net_pnl_pct": "11%",
-                "exit_submitted_at": "2026-07-11 11:59",
-            }
-            for _ in range(3)
-        ],
-        *[
-            {
-                "experiment_id": "trend_us",
-                "result": "loss",
-                "net_pnl_pct": "-4%",
-                "exit_submitted_at": "2026-07-11 11:59",
-            }
-            for _ in range(3)
-        ],
+        *[_sample("win", "11%") for _ in range(3)],
+        *[_sample("loss", "-4%") for _ in range(3)],
     ]
     payload = build_kelly_strategy_stats_payload(
         [{"experiment_id": "trend_us", "market": "US"}],

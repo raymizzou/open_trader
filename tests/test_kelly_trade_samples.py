@@ -91,6 +91,11 @@ def test_build_trade_samples_pairs_filled_buy_and_sell_as_win() -> None:
         payload["stats_by_experiment"]["trend_us"]["parameter_source"]
         == "futu_paper_order_samples"
     )
+    assert "calculation_inputs" not in payload["stats_by_experiment"]["trend_us"]
+    assert (
+        "source_trade_samples_generated_at"
+        not in payload["stats_by_experiment"]["trend_us"]
+    )
 
 
 def test_build_trade_samples_preserves_legacy_stats_for_uneven_samples() -> None:
@@ -460,6 +465,24 @@ def test_write_kelly_trade_samples_rejects_incomplete_evidence_without_artifact(
                 "stats_by_experiment": {},
             },
         )
+
+    assert not artifact_path.exists()
+
+
+def test_write_kelly_trade_samples_rejects_malformed_sample_without_artifact(
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+    artifact_path = data_dir / "latest" / "kelly_trade_samples.json"
+    payload = build_kelly_trade_samples_payload(
+        [_experiment()],
+        {"schema_version": "open_trader.kelly_paper_orders.v1", "orders": []},
+        generated_at="2026-07-12 10:01",
+    )
+    payload.update(sample_count=1, samples=[{}])
+
+    with pytest.raises(ValueError, match=r"samples\[0\]"):
+        write_kelly_trade_samples(data_dir, payload)
 
     assert not artifact_path.exists()
 
