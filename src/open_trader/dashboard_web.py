@@ -10,34 +10,151 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .backtest import run_backtest
-from .backtest_prices import DailyKlineProvider, fetch_backtest_prices
-from .dashboard import DashboardConfig, load_dashboard_state
+from .backtest_prices import DailyKlineProvider
+from .dashboard import (
+    DashboardConfig,
+    _backtest_holding_detail,
+    _latest_backtests_by_holding,
+    load_dashboard_state,
+)
 from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
 from .futu_quote import FutuQuoteClient
 from .research_chat import ResearchChatError, ResearchChatService
+from .standard_strategies import strategy_catalog
+from .strategy_backtest import (
+    StandardBacktestRequest,
+    run_standard_backtest,
+    validate_standard_backtest_request,
+)
 from .trading_plan import load_trading_plan_rows
 
 
 STATIC_DIR = Path(__file__).with_name("dashboard_static")
+STANDARD_BACKTEST_RANGES = ("6M", "1Y", "3Y", "5Y", "CUSTOM")
+STANDARD_BACKTEST_REQUEST_KEYS = {
+    "market", "symbol", "strategy_id", "range_preset", "custom_start", "custom_end",
+    "initial_cash", "max_strategy_weight", "commission_bps", "slippage_bps",
+}
+
+
+class StandardBacktestExecutionError(RuntimeError):
+    pass
+
+
+def build_standard_backtest_options_payload(config: DashboardConfig) -> dict[str, Any]:
+    state = load_dashboard_state(config).to_dict()
+    return {
+        "strategies": [definition.to_dict() for definition in strategy_catalog()],
+        "ranges": list(STANDARD_BACKTEST_RANGES),
+        "defaults": {
+            "range": "1Y", "initial_cash": "100000", "max_strategy_weight": "0.10",
+            "commission_bps": "10", "slippage_bps": "5",
+        },
+        "universe": state["backtest_universe"],
+        "benchmarks": {"US": "SPY", "HK": "HK.02800"},
+    }
+
+
+def _parse_decimal(request: dict[str, Any], key: str, default: str) -> Decimal:
+    raw = str(request.get(key, default)).strip()
+    percent = raw.endswith("%")
+    if percent:
+        raw = raw[:-1].strip()
+    try:
+        value = Decimal(raw)
+    except Exception as exc:
+        raise ValueError(f"{key} 必须是有效数字") from exc
+    return value / Decimal("100") if percent else value
+
+
+def _parse_iso_date(request: dict[str, Any], key: str) -> date | None:
+    raw = str(request.get(key) or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} 必须使用 YYYY-MM-DD 格式") from exc
+    if parsed.isoformat() != raw:
+        raise ValueError(f"{key} 必须使用 YYYY-MM-DD 格式")
+    return parsed
+
+
+def parse_standard_backtest_request(
+    config: DashboardConfig, request: dict[str, Any]
+) -> StandardBacktestRequest:
+    unknown = set(request) - STANDARD_BACKTEST_REQUEST_KEYS
+    if unknown:
+        raise ValueError(f"不支持的请求字段：{', '.join(sorted(unknown))}")
+    market = str(request.get("market") or "").strip().upper()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    strategy_id = str(request.get("strategy_id") or "").strip()
+    preset = str(request.get("range_preset") or "1Y").strip().upper()
+    if preset not in STANDARD_BACKTEST_RANGES:
+        raise ValueError(f"不支持的回测区间：{preset}")
+    if strategy_id not in {item.strategy_id for item in strategy_catalog()}:
+        raise ValueError(f"未知策略：{strategy_id}")
+    custom_start = _parse_iso_date(request, "custom_start")
+    custom_end = _parse_iso_date(request, "custom_end")
+    if preset == "CUSTOM":
+        if custom_start is None or custom_end is None:
+            raise ValueError("自定义区间必须提供开始和结束日期")
+        if custom_start > custom_end:
+            raise ValueError("开始日期不能晚于结束日期")
+    elif custom_start is not None or custom_end is not None:
+        raise ValueError("预设区间不能同时提供自定义日期")
+    options = build_standard_backtest_options_payload(config)
+    universe = options["universe"]["holdings"] + options["universe"]["watchlist"]
+    normalized = symbol.zfill(5) if market == "HK" and symbol.isdigit() else symbol
+    allowed = {
+        (row["market"], row["symbol"].zfill(5) if row["market"] == "HK" and row["symbol"].isdigit() else row["symbol"])
+        for row in universe
+    }
+    if (market, normalized) not in allowed:
+        raise ValueError("所选标的不在可回测范围内")
+    parsed = StandardBacktestRequest(
+        data_dir=config.data_dir, reports_dir=config.reports_dir, market=market,
+        symbol=normalized, strategy_id=strategy_id,
+        range_preset=None if preset == "CUSTOM" else preset,
+        custom_start=custom_start, custom_end=custom_end,
+        initial_cash=_parse_decimal(request, "initial_cash", "100000"),
+        max_strategy_weight=_parse_decimal(request, "max_strategy_weight", "0.10"),
+        commission_bps=_parse_decimal(request, "commission_bps", "10"),
+        slippage_bps=_parse_decimal(request, "slippage_bps", "5"),
+    )
+    validate_standard_backtest_request(parsed)
+    return parsed
+
+
+def build_standard_backtest_run_payload(
+    config: DashboardConfig, request: dict[str, Any], *,
+    provider: DailyKlineProvider | None = None,
+) -> dict[str, Any]:
+    if "adapter" in request:
+        raise ValueError("不支持从界面选择回测执行工具")
+    parsed = parse_standard_backtest_request(config, request)
+    owned_provider = provider is None
+    try:
+        price_provider = provider or FutuQuoteClient(
+            host=config.futu_host, port=config.futu_port
+        )
+    except Exception as exc:
+        raise StandardBacktestExecutionError(f"行情服务连接失败：{exc}") from exc
+    try:
+        try:
+            return run_standard_backtest(parsed, price_provider=price_provider).to_dict()
+        except Exception as exc:
+            raise StandardBacktestExecutionError(f"标准策略回测执行失败：{exc}") from exc
+    finally:
+        if owned_provider and hasattr(price_provider, "close"):
+            price_provider.close()
 
 
 def build_dashboard_payload(
     config: DashboardConfig,
-    *,
-    auto_fetch_backtest_prices: bool = False,
-    backtest_price_provider: DailyKlineProvider | None = None,
 ) -> dict[str, Any]:
-    backtest_price_sync: dict[str, Any] | None = None
-    if auto_fetch_backtest_prices:
-        backtest_price_sync = auto_fetch_missing_backtest_prices(
-            config,
-            provider=backtest_price_provider,
-        )
-    payload = load_dashboard_state(config).to_dict()
-    if backtest_price_sync is not None:
-        payload["backtest_price_sync"] = backtest_price_sync
-    return payload
+    return load_dashboard_state(config).to_dict()
 
 
 def build_quotes_payload(
@@ -92,142 +209,6 @@ def build_backtest_run_payload(
     }
 
 
-def build_backtest_prices_payload(
-    config: DashboardConfig,
-    request: dict[str, Any],
-    *,
-    provider: DailyKlineProvider | None = None,
-) -> dict[str, Any]:
-    market = str(request.get("market") or "").strip().upper()
-    symbol = str(request.get("symbol") or "").strip().upper()
-    if not market or not symbol:
-        raise ValueError("market and symbol are required")
-
-    plan_path = _dashboard_backtest_plan_path(config.data_dir, market)
-    plan = _latest_active_plan(plan_path, market=market, symbol=symbol)
-    end = str(request.get("end") or date.today().isoformat()).strip()
-    start = str(request.get("start") or plan.run_date or end).strip()
-    owned_provider = provider is None
-    price_provider = provider or FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-    try:
-        result = fetch_backtest_prices(
-            data_dir=config.data_dir,
-            market=market,
-            symbol=symbol,
-            start=start,
-            end=end,
-            provider=price_provider,
-        )
-    finally:
-        if owned_provider and hasattr(price_provider, "close"):
-            price_provider.close()
-
-    return {
-        "status": "ok",
-        "market": result.market,
-        "symbol": result.symbol,
-        "start": result.start,
-        "end": result.end,
-        "records": result.records,
-        "prices_path": str(result.prices_path),
-        "backtest_readiness": _dashboard_backtest_readiness_for_holding(
-            config,
-            market=result.market,
-            symbol=result.symbol,
-        ),
-    }
-
-
-def auto_fetch_missing_backtest_prices(
-    config: DashboardConfig,
-    *,
-    provider: DailyKlineProvider | None = None,
-    end: str | None = None,
-) -> dict[str, Any]:
-    payload = load_dashboard_state(config).to_dict()
-    requests = _missing_backtest_price_requests(payload)
-    if not requests:
-        return {
-            "status": "skipped",
-            "attempted": 0,
-            "succeeded": 0,
-            "failed": 0,
-            "errors": [],
-        }
-
-    owned_provider = provider is None
-    price_provider = provider or FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-    fetch_end = end or date.today().isoformat()
-    succeeded = 0
-    errors: list[dict[str, str]] = []
-    try:
-        for request in requests:
-            try:
-                fetch_backtest_prices(
-                    data_dir=config.data_dir,
-                    market=request["market"],
-                    symbol=request["symbol"],
-                    start=request["start"] or fetch_end,
-                    end=fetch_end,
-                    provider=price_provider,
-                )
-                succeeded += 1
-            except Exception as exc:
-                errors.append(
-                    {
-                        "market": request["market"],
-                        "symbol": request["symbol"],
-                        "message": str(exc) or "auto backtest price fetch failed",
-                    }
-                )
-                continue
-    finally:
-        if owned_provider and hasattr(price_provider, "close"):
-            price_provider.close()
-    failed = len(errors)
-    status = "ok"
-    if failed and succeeded:
-        status = "partial"
-    elif failed:
-        status = "failed"
-    return {
-        "status": status,
-        "attempted": len(requests),
-        "succeeded": succeeded,
-        "failed": failed,
-        "errors": errors,
-    }
-
-
-def _missing_backtest_price_requests(payload: dict[str, Any]) -> list[dict[str, str]]:
-    requests: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for holding in payload.get("holdings", []):
-        if not isinstance(holding, dict):
-            continue
-        readiness = holding.get("backtest_readiness")
-        if not isinstance(readiness, dict) or readiness.get("prices_missing") is not True:
-            continue
-        if readiness.get("status") in {"unsupported_strategy", "missing_plan"}:
-            continue
-        market = str(holding.get("market") or "").strip().upper()
-        symbol = str(holding.get("symbol") or "").strip().upper()
-        if not market or not symbol:
-            continue
-        key = (market, symbol)
-        if key in seen:
-            continue
-        seen.add(key)
-        requests.append(
-            {
-                "market": market,
-                "symbol": symbol,
-                "start": str(readiness.get("run_date") or "").strip(),
-            }
-        )
-    return requests
-
-
 def _dashboard_backtest_plan_path(data_dir: Path, market: str) -> Path:
     scoped_path = data_dir / "latest" / market / "trading_plan.csv"
     if scoped_path.exists():
@@ -264,38 +245,10 @@ def _dashboard_backtest_for_holding(
     market: str,
     symbol: str,
 ) -> dict[str, Any]:
-    payload = build_dashboard_payload(config)
-    for holding in payload.get("holdings", []):
-        if (
-            str(holding.get("market", "")).strip().upper() == market
-            and str(holding.get("symbol", "")).strip().upper() == symbol
-        ):
-            backtest = holding.get("backtest")
-            if isinstance(backtest, dict):
-                return backtest
-    return {"available": False, "error": "holding is not visible in dashboard"}
-
-
-def _dashboard_backtest_readiness_for_holding(
-    config: DashboardConfig,
-    *,
-    market: str,
-    symbol: str,
-) -> dict[str, Any]:
-    payload = build_dashboard_payload(config)
-    for holding in payload.get("holdings", []):
-        if (
-            str(holding.get("market", "")).strip().upper() == market
-            and str(holding.get("symbol", "")).strip().upper() == symbol
-        ):
-            readiness = holding.get("backtest_readiness")
-            if isinstance(readiness, dict):
-                return readiness
-    return {
-        "available": False,
-        "status": "missing_plan",
-        "error": "holding is not visible in dashboard",
-    }
+    rows = _latest_backtests_by_holding(
+        data_dir=config.data_dir, reports_dir=config.reports_dir, markets={market},
+    )
+    return _backtest_holding_detail(rows.get((market, symbol)))
 
 
 def create_dashboard_server(
@@ -328,12 +281,14 @@ def create_dashboard_server(
             if path == "/api/dashboard":
                 try:
                     self._send_json(
-                        build_dashboard_payload(
-                            config,
-                            auto_fetch_backtest_prices=True,
-                            backtest_price_provider=backtest_price_provider,
-                        )
+                        build_dashboard_payload(config)
                     )
+                except Exception as exc:
+                    self._send_error_json(exc)
+                return
+            if path == "/api/backtests/options":
+                try:
+                    self._send_json(build_standard_backtest_options_payload(config))
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
@@ -378,12 +333,10 @@ def create_dashboard_server(
                         build_backtest_run_payload(config, self._read_json_body())
                     )
                     return
-                if path == "/api/backtests/prices":
+                if path == "/api/backtests/standard/run":
                     self._send_json(
-                        build_backtest_prices_payload(
-                            config,
-                            self._read_json_body(),
-                            provider=backtest_price_provider,
+                        build_standard_backtest_run_payload(
+                            config, self._read_json_body(), provider=backtest_price_provider,
                         )
                     )
                     return
@@ -454,13 +407,18 @@ def create_dashboard_server(
             self.wfile.write(body)
 
         def _send_error_json(self, error: Exception) -> None:
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
+            if type(error) is ValueError:
+                status = HTTPStatus.BAD_REQUEST
+            elif isinstance(error, StandardBacktestExecutionError):
+                status = HTTPStatus.BAD_GATEWAY
             self._send_json(
                 {
                     "status": "error",
                     "error_type": type(error).__name__,
                     "message": str(error),
                 },
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                status=status,
             )
 
         def _send_file(self, path: Path, content_type: str) -> None:

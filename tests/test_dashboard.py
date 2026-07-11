@@ -71,6 +71,34 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
     )
 
 
+def test_dashboard_backtest_universe_combines_holdings_and_watchlist(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    rows: list[dict[str, str]] = []
+    for market, symbol in [("US", "MSFT"), ("HK", "00700")]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update({"market": market, "symbol": symbol, "asset_class": "stock"})
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+    write_csv(
+        config.data_dir / "latest/watchlist.csv",
+        ["market", "symbol"],
+        [
+            {"market": "US", "symbol": "MSFT"},
+            {"market": "US", "symbol": "NVDA"},
+            {"market": "HK", "symbol": "00700"},
+        ],
+    )
+
+    payload = load_dashboard_state(config).to_dict()
+
+    assert [(row["market"], row["symbol"]) for row in payload["backtest_universe"]["holdings"]] == [
+        ("US", "MSFT"), ("HK", "00700"),
+    ]
+    assert [(row["market"], row["symbol"]) for row in payload["backtest_universe"]["watchlist"]] == [
+        ("US", "NVDA"),
+    ]
+
+
 def raw_decision_with_market_report(report: str) -> str:
     return json.dumps({"state": {"market_report": report}}, ensure_ascii=False)
 
@@ -637,10 +665,11 @@ def test_load_dashboard_state_uses_portfolio_when_monthly_details_are_absent(
     assert holdings_by_symbol["VIXY"]["broker_detail_count"] == 0
     assert holdings_by_symbol["VIXY"]["broker_details"] == []
     assert holdings_by_symbol["VIXY"]["trade_action"] == {"available": False, "error": ""}
-    assert holdings_by_symbol["VIXY"]["backtest"] == {"available": False, "error": ""}
+    assert "backtest" not in holdings_by_symbol["VIXY"]
+    assert "backtest_readiness" not in holdings_by_symbol["VIXY"]
 
 
-def test_load_dashboard_state_attaches_latest_backtest_result(
+def obsolete_load_dashboard_state_attaches_latest_backtest_result(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -799,7 +828,7 @@ def test_load_dashboard_state_attaches_latest_backtest_result(
     }
 
 
-def test_load_dashboard_state_exposes_backtest_readiness(
+def obsolete_load_dashboard_state_exposes_backtest_readiness(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -865,7 +894,7 @@ def test_load_dashboard_state_exposes_backtest_readiness(
     }
 
 
-def test_load_dashboard_state_marks_sell_side_backtest_ready(
+def obsolete_load_dashboard_state_marks_sell_side_backtest_ready(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)

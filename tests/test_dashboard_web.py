@@ -19,6 +19,78 @@ from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 from tests.test_dashboard import dashboard_config, portfolio_rows, write_csv
 
 
+def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path) -> None:
+    from open_trader.dashboard_web import build_standard_backtest_options_payload
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    payload = build_standard_backtest_options_payload(config)
+
+    assert [item["id"] for item in payload["strategies"]] == [
+        "trend_pullback/v1", "breakout_momentum/v1", "range_mean_reversion/v1",
+    ]
+    assert payload["ranges"] == ["6M", "1Y", "3Y", "5Y", "CUSTOM"]
+    assert payload["defaults"] == {
+        "range": "1Y", "initial_cash": "100000", "max_strategy_weight": "0.10",
+        "commission_bps": "10", "slippage_bps": "5",
+    }
+
+
+def test_standard_backtest_run_rejects_adapter_choice(tmp_path) -> None:
+    from open_trader.dashboard_web import build_standard_backtest_run_payload
+
+    config = dashboard_config(tmp_path)
+    with pytest.raises(ValueError, match="不支持从界面选择回测执行工具"):
+        build_standard_backtest_run_payload(config, {"adapter": "simple"})
+
+
+def test_standard_backtest_request_parses_percent_and_normalizes_hk_symbol(tmp_path) -> None:
+    from decimal import Decimal
+    from open_trader.dashboard_web import parse_standard_backtest_request
+
+    config = dashboard_config(tmp_path)
+    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    row.update({"market": "HK", "symbol": "700", "asset_class": "stock"})
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
+
+    parsed = parse_standard_backtest_request(config, {
+        "market": "hk", "symbol": "00700", "strategy_id": "trend_pullback/v1",
+        "range_preset": "CUSTOM", "custom_start": "2025-01-01",
+        "custom_end": "2026-01-01", "max_strategy_weight": "10%",
+    })
+
+    assert parsed.market == "HK"
+    assert parsed.symbol == "00700"
+    assert parsed.max_strategy_weight == Decimal("0.10")
+    assert parsed.custom_start == date(2025, 1, 1)
+
+
+def test_standard_backtest_http_routes_expose_options_and_map_validation_to_400(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    server = create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        options = read_json(f"http://{host}:{port}/api/backtests/options")
+        assert options["defaults"]["range"] == "1Y"
+        status, _, payload = post_error_json(
+            f"http://{host}:{port}/api/backtests/standard/run",
+            json.dumps({"adapter": "simple"}).encode(),
+        )
+        assert status == 400
+        assert payload["message"] == "不支持从界面选择回测执行工具"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 class FakeQuoteService:
     def __init__(self, result: QuoteRefreshResult) -> None:
         self.result = result
@@ -3555,8 +3627,8 @@ def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> N
     assert payload["backtest"]["adapter"] == "backtrader"
     assert payload["backtest"]["metrics"]["trade_count"] == "2"
     vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
-    assert vixy["backtest"]["available"] is True
-    assert vixy["backtest"]["run_id"] == "2026-06-18-US-VIXY-trading-plan"
+    assert "backtest" not in vixy
+    assert "backtest_readiness" not in vixy
 
 
 def test_dashboard_server_runs_sell_side_backtest_from_current_position(tmp_path) -> None:
@@ -3619,10 +3691,11 @@ def test_dashboard_server_runs_sell_side_backtest_from_current_position(tmp_path
     assert payload["backtest"]["trades"][0]["side"] == "SELL"
     assert payload["backtest"]["trades"][0]["reason"] == "target_1"
     vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
-    assert vixy["backtest"]["available"] is True
+    assert "backtest" not in vixy
+    assert "backtest_readiness" not in vixy
 
 
-def test_dashboard_server_fetches_backtest_prices_api(tmp_path) -> None:
+def obsolete_dashboard_server_fetches_backtest_prices_api(tmp_path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
     config = dashboard_config(tmp_path)
@@ -3690,7 +3763,7 @@ def test_dashboard_server_fetches_backtest_prices_api(tmp_path) -> None:
     assert vixy["backtest_readiness"]["status"] == "ready"
 
 
-def test_dashboard_server_auto_fetches_missing_backtest_prices_on_dashboard_load(
+def obsolete_dashboard_server_auto_fetches_missing_backtest_prices_on_dashboard_load(
     tmp_path,
 ) -> None:
     from open_trader.dashboard_web import create_dashboard_server
@@ -3754,7 +3827,7 @@ def test_dashboard_server_auto_fetches_missing_backtest_prices_on_dashboard_load
     assert vixy["backtest_readiness"]["status"] == "ready"
 
 
-def test_dashboard_server_keeps_payload_when_auto_backtest_price_fetch_fails(
+def obsolete_dashboard_server_keeps_payload_when_auto_backtest_price_fetch_fails(
     tmp_path,
 ) -> None:
     from open_trader.dashboard_web import create_dashboard_server

@@ -87,6 +87,7 @@ class DashboardState:
     broker_positions: list[dict[str, str]]
     cash_details: list[dict[str, str]]
     trade_actions: list[dict[str, str]]
+    backtest_universe: dict[str, list[dict[str, str]]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +107,7 @@ class DashboardState:
             "broker_positions": self.broker_positions,
             "cash_details": self.cash_details,
             "trade_actions": self.trade_actions,
+            "backtest_universe": self.backtest_universe,
         }
 
 
@@ -171,15 +173,6 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         data_dir=config.data_dir,
         markets=holding_markets,
     )
-    backtests_by_holding = _latest_backtests_by_holding(
-        data_dir=config.data_dir,
-        reports_dir=config.reports_dir,
-        markets=holding_markets,
-    )
-    backtest_readiness_by_holding = _backtest_readiness_for_markets(
-        data_dir=config.data_dir,
-        markets=holding_markets,
-    )
     positions_by_holding = _group_by_market_symbol(broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
@@ -202,11 +195,13 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             futu_skill_facts_by_holding,
             tradingagents_summary_by_holding,
             t_signals_by_holding,
-            backtests_by_holding,
-            backtest_readiness_by_holding,
         )
         for row in holding_rows
     ]
+    backtest_universe = _build_backtest_universe(
+        holding_rows,
+        _read_csv_rows(config.data_dir / "latest" / "watchlist.csv"),
+    )
 
     return DashboardState(
         config=config,
@@ -228,7 +223,44 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         broker_positions=broker_positions,
         cash_details=cash_details,
         trade_actions=trade_actions,
+        backtest_universe=backtest_universe,
     )
+
+
+def _build_backtest_universe(
+    holding_rows: list[dict[str, str]],
+    watchlist_rows: list[dict[str, str]],
+) -> dict[str, list[dict[str, str]]]:
+    holdings: list[dict[str, str]] = []
+    watchlist: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def append_valid(target: list[dict[str, str]], row: dict[str, str]) -> None:
+        market = str(row.get("market") or "").strip().upper()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if market not in {"HK", "US"} or not symbol:
+            return
+        asset_class = str(row.get("asset_class") or "").strip().lower()
+        if asset_class and asset_class not in {"stock", "etf"}:
+            return
+        normalized_symbol = symbol.zfill(5) if market == "HK" and symbol.isdigit() else symbol
+        key = (market, normalized_symbol)
+        if key in seen:
+            return
+        seen.add(key)
+        target.append(
+            {
+                "market": market,
+                "symbol": symbol,
+                "futu_symbol": f"{market}.{normalized_symbol}",
+            }
+        )
+
+    for row in holding_rows:
+        append_valid(holdings, row)
+    for row in watchlist_rows:
+        append_valid(watchlist, row)
+    return {"holdings": holdings, "watchlist": watchlist}
 
 
 def latest_broker_detail_month(data_dir: Path) -> str:
@@ -701,8 +733,6 @@ def _merge_holding(
     futu_skill_facts_by_holding: dict[tuple[str, str], dict[str, Any]],
     tradingagents_summary_by_holding: dict[tuple[str, str], dict[str, Any]],
     t_signals_by_holding: dict[tuple[str, str], dict[str, Any]],
-    backtests_by_holding: dict[tuple[str, str], dict[str, Any]],
-    backtest_readiness_by_holding: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -749,14 +779,6 @@ def _merge_holding(
     )
     holding["t_signal"] = _t_signal_detail(
         t_signals_by_holding.get(key) if key is not None else None,
-    )
-    holding["backtest"] = _backtest_holding_detail(
-        backtests_by_holding.get(key) if key is not None else None,
-    )
-    holding["backtest_readiness"] = _backtest_readiness_holding_detail(
-        backtest_readiness_by_holding.get(key) if key is not None else None,
-        data_dir=data_dir,
-        key=key,
     )
     holding["research_view"] = (
         load_research_view_for_holding(
