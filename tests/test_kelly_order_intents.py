@@ -288,6 +288,15 @@ def test_build_kelly_order_intents_ignores_malformed_optional_strategy_capital(
         ),
         encoding="utf-8",
     )
+    (latest_dir / "kelly_trade_samples.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "wrong",
+                "stats_by_experiment": {},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     payload = build_kelly_order_intents(
         data_dir,
