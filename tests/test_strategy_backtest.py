@@ -25,6 +25,10 @@ class FixtureProvider:
 
     def get_daily_kline(self, futu_symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
         benchmark = futu_symbol.endswith(".SPY") or futu_symbol.endswith(".02800")
+        if self.scenario == "missing_benchmark" and benchmark:
+            return []
+        if self.scenario == "broken_benchmark" and benchmark:
+            raise ValueError("基准服务认证失败")
         first = date(2024, 9, 23)
         rows: list[DailyKlineBar] = []
         for offset in range(170):
@@ -101,6 +105,39 @@ def test_strategy_and_benchmarks_share_capital_range_and_notional(tmp_path: Path
     assert result.buy_hold.initial_allocated_notional == Decimal("10000")
     assert result.market_benchmark.initial_allocated_notional == Decimal("10000")
     assert result.strategy_excess_return_pct == result.strategy.total_return_pct - result.buy_hold.total_return_pct
+
+
+def test_result_payload_exposes_manifest_backed_assumptions_definition_and_signals(tmp_path: Path) -> None:
+    payload = run_standard_backtest(standard_request(tmp_path), price_provider=fixture_provider("never_triggers")).to_dict()
+    assert payload["assumptions"] == {
+        "initial_cash": "100000", "max_strategy_weight": "0.10",
+        "commission_bps": "2", "slippage_bps": "5",
+    }
+    assert payload["strategy_definition"]["id"] == "trend_pullback/v1"
+    assert payload["strategy_definition"]["name_zh"] == "趋势回调"
+    assert payload["strategy_definition"]["parameters"]["sma_short"] == "20"
+    assert payload["signals"]
+    assert {"decision_date", "earliest_execution_date", "action", "target_weight", "rule", "explanation", "data_cutoff"} <= payload["signals"][0].keys()
+    assert any(signal["action"] == "HOLD" for signal in payload["signals"])
+
+
+def test_missing_market_benchmark_degrades_only_market_comparison(tmp_path: Path) -> None:
+    result = run_standard_backtest(
+        standard_request(tmp_path), price_provider=fixture_provider("missing_benchmark"),
+    )
+    payload = result.to_dict()
+    assert result.strategy.equity_curve and result.buy_hold.equity_curve
+    assert payload["market_benchmark"] is None
+    assert payload["market_excess_return_pct"] is None
+    assert payload["market_benchmark_error"] == "基准行情缺失，无法比较"
+    assert payload["market_benchmark_equity_path"] is None
+
+
+def test_market_benchmark_degradation_does_not_swallow_unrelated_failures(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="基准服务认证失败"):
+        run_standard_backtest(
+            standard_request(tmp_path), price_provider=fixture_provider("broken_benchmark"),
+        )
 
 
 def test_run_writes_reproducible_manifest_and_normalized_artifacts(tmp_path: Path) -> None:

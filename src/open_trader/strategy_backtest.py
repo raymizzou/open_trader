@@ -80,16 +80,20 @@ class StandardBacktestResult:
     actual_end: date
     strategy: ExecutionResult
     buy_hold: ExecutionResult
-    market_benchmark: ExecutionResult
+    market_benchmark: ExecutionResult | None
     strategy_excess_return_pct: Decimal
-    market_excess_return_pct: Decimal
+    market_excess_return_pct: Decimal | None
+    market_benchmark_error: str | None
+    assumptions: dict[str, str]
+    strategy_definition: dict[str, object]
+    signals: Sequence[dict[str, str]]
     adapter_version: str
     manifest_path: Path
     signals_path: Path
     trades_path: Path
     equity_curve_path: Path
     buy_hold_equity_path: Path
-    market_benchmark_equity_path: Path
+    market_benchmark_equity_path: Path | None
     metrics_path: Path
     report_path: Path
 
@@ -285,31 +289,48 @@ class StandardBacktestService:
             preset=request.range_preset, custom_start=request.custom_start,
             custom_end=request.custom_end, provider=self.price_provider,
         )
-        benchmark_prices = ensure_resolved_backtest_price_range(
-            data_dir=request.data_dir, market=market, symbol=benchmark_symbol,
-            preset=request.range_preset, custom_start=request.custom_start,
-            custom_end=request.custom_end, provider=self.price_provider,
-        )
+        benchmark_prices = None
+        benchmark_error = None
+        try:
+            benchmark_prices = ensure_resolved_backtest_price_range(
+                data_dir=request.data_dir, market=market, symbol=benchmark_symbol,
+                preset=request.range_preset, custom_start=request.custom_start,
+                custom_end=request.custom_end, provider=self.price_provider,
+            )
+        except ValueError as exc:
+            if not any(fragment in str(exc) for fragment in (
+                "没有返回日线数据", "请求区间内没有可用价格数据", "价格文件没有数据行",
+            )):
+                raise
+            benchmark_error = "基准行情缺失，无法比较"
         requested_start = symbol_prices.price_range.requested_start
         requested_end = symbol_prices.price_range.requested_end
         symbol_map = {bar.date: bar for bar in symbol_prices.price_range.bars if requested_start <= bar.date <= requested_end}
-        benchmark_map = {bar.date: bar for bar in benchmark_prices.price_range.bars if requested_start <= bar.date <= requested_end}
-        common_dates = sorted(symbol_map.keys() & benchmark_map.keys())
+        benchmark_map = ({bar.date: bar for bar in benchmark_prices.price_range.bars if requested_start <= bar.date <= requested_end}
+                         if benchmark_prices is not None else {})
+        common_dates = sorted(symbol_map.keys() & benchmark_map.keys()) if benchmark_map else sorted(symbol_map)
+        if benchmark_map and len(common_dates) < 2:
+            benchmark_error = "基准行情缺失，无法比较"
+            benchmark_map = {}
+            common_dates = sorted(symbol_map)
         if len(common_dates) < 2:
-            raise ValueError("策略标的与市场基准没有足够的共同交易日")
+            raise ValueError("策略标的没有足够的交易日")
         actual_start, actual_end = common_dates[0], common_dates[-1]
         symbol_bars = tuple(symbol_map[day] for day in common_dates)
-        benchmark_bars = tuple(benchmark_map[day] for day in common_dates)
+        benchmark_bars = tuple(benchmark_map[day] for day in common_dates) if benchmark_map else ()
         all_symbol_bars = tuple(bar for bar in symbol_prices.price_range.bars if bar.date <= actual_end)
         generated = generate_strategy_signals(
             request.strategy_id, all_symbol_bars, start_date=actual_start,
             max_strategy_weight=request.max_strategy_weight,
         )
-        signals = [signal for signal in generated if signal.decision_date in symbol_map and signal.earliest_execution_date in symbol_map]
+        signals = [signal for signal in generated if signal.decision_date in common_dates and (
+            signal.action == "HOLD" or signal.earliest_execution_date in symbol_map
+        )]
         # Rebind execution to the next common trading date so all comparisons use the same calendar.
         next_common = {day: common_dates[index + 1] for index, day in enumerate(common_dates[:-1])}
-        signals = [replace(signal, earliest_execution_date=next_common.get(signal.decision_date))
-                   for signal in signals if signal.decision_date in next_common]
+        signals = [signal if signal.action == "HOLD" else replace(
+            signal, earliest_execution_date=next_common.get(signal.decision_date)
+        ) for signal in signals if signal.action == "HOLD" or signal.decision_date in next_common]
         adapter = BacktraderTargetWeightAdapter()
         allocated = request.initial_cash * request.max_strategy_weight
         strategy = replace(adapter.run(
@@ -317,7 +338,9 @@ class StandardBacktestService:
             commission_bps=request.commission_bps, slippage_bps=request.slippage_bps,
         ), initial_allocated_notional=allocated)
         buy_hold = _run_buy_hold(symbol_bars, request.initial_cash, allocated, request.commission_bps, request.slippage_bps)
-        market_benchmark = _run_buy_hold(benchmark_bars, request.initial_cash, allocated, request.commission_bps, request.slippage_bps)
+        market_benchmark = (_run_buy_hold(benchmark_bars, request.initial_cash, allocated, request.commission_bps, request.slippage_bps)
+                            if benchmark_bars else None)
+        market_excess = strategy.total_return_pct - market_benchmark.total_return_pct if market_benchmark else None
         request_hash = hashlib.sha256(json.dumps(_json_safe(request), sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
         run_id = _build_run_id(market, symbol, request.strategy_id, request_hash)
         message = "所选区间内没有触发交易" if not any(trade.quantity for trade in strategy.trades) else "标准策略回测完成"
@@ -325,7 +348,8 @@ class StandardBacktestService:
             "strategy": _json_safe(strategy), "buy_hold": _json_safe(buy_hold),
             "market_benchmark": _json_safe(market_benchmark),
             "strategy_excess_return_pct": str(strategy.total_return_pct - buy_hold.total_return_pct),
-            "market_excess_return_pct": str(strategy.total_return_pct - market_benchmark.total_return_pct),
+            "market_excess_return_pct": str(market_excess) if market_excess is not None else None,
+            "market_benchmark_error": benchmark_error,
         }
         manifest_base = {
             "schema_version": MANIFEST_SCHEMA_VERSION, "run_id": run_id, "request_hash": request_hash,
@@ -338,21 +362,31 @@ class StandardBacktestService:
             "costs_bps": {"commission": str(request.commission_bps), "slippage": str(request.slippage_bps)},
             "sources": {
                 "symbol": {"market": market, "symbol": symbol, "sha256": symbol_prices.price_range.source_hash},
-                "benchmark": {"market": market, "symbol": benchmark_symbol, "sha256": benchmark_prices.price_range.source_hash},
+                "benchmark": ({"market": market, "symbol": benchmark_symbol, "sha256": benchmark_prices.price_range.source_hash}
+                              if benchmark_prices is not None and benchmark_map else
+                              {"market": market, "symbol": benchmark_symbol, "error": benchmark_error}),
             },
         }
         final_dir, report_path = _publish_run(
             request, run_id, manifest_base, signals, strategy, buy_hold, market_benchmark,
             _render_report(run_id, request.strategy_id, benchmark_symbol, message, metrics), metrics,
         )
+        definition = next(item.to_dict() for item in strategy_catalog() if item.strategy_id == request.strategy_id)
         return StandardBacktestResult(
-            run_id, "ok", message, request.strategy_id, benchmark_symbol, requested_start,
-            requested_end, actual_start, actual_end, strategy, buy_hold, market_benchmark,
-            strategy.total_return_pct - buy_hold.total_return_pct,
-            strategy.total_return_pct - market_benchmark.total_return_pct, adapter.version,
-            final_dir / "manifest.json", final_dir / "signals.csv", final_dir / "trades.csv",
-            final_dir / "equity_curve.csv", final_dir / "buy_hold_equity.csv",
-            final_dir / "market_benchmark_equity.csv", final_dir / "metrics.json", report_path,
+            run_id=run_id, status="ok", message_zh=message, strategy_id=request.strategy_id,
+            benchmark_symbol=benchmark_symbol, requested_start=requested_start, requested_end=requested_end,
+            actual_start=actual_start, actual_end=actual_end, strategy=strategy, buy_hold=buy_hold,
+            market_benchmark=market_benchmark,
+            strategy_excess_return_pct=strategy.total_return_pct - buy_hold.total_return_pct,
+            market_excess_return_pct=market_excess, market_benchmark_error=benchmark_error,
+            assumptions={"initial_cash": str(request.initial_cash), "max_strategy_weight": str(request.max_strategy_weight),
+                         "commission_bps": str(request.commission_bps), "slippage_bps": str(request.slippage_bps)},
+            strategy_definition=definition, signals=_signal_rows(signals), adapter_version=adapter.version,
+            manifest_path=final_dir / "manifest.json", signals_path=final_dir / "signals.csv",
+            trades_path=final_dir / "trades.csv", equity_curve_path=final_dir / "equity_curve.csv",
+            buy_hold_equity_path=final_dir / "buy_hold_equity.csv",
+            market_benchmark_equity_path=final_dir / "market_benchmark_equity.csv" if market_benchmark else None,
+            metrics_path=final_dir / "metrics.json", report_path=report_path,
         )
 
 
@@ -479,7 +513,7 @@ def _build_run_id(market: str, symbol: str, strategy_id: str, request_hash: str)
 
 def _publish_run(request: StandardBacktestRequest, run_id: str, manifest_base: dict[str, object],
                  signals: Sequence[StrategySignal], strategy: ExecutionResult,
-                 buy_hold: ExecutionResult, market_benchmark: ExecutionResult,
+                 buy_hold: ExecutionResult, market_benchmark: ExecutionResult | None,
                  report: str, metrics: dict[str, object]) -> tuple[Path, Path]:
     parent = request.data_dir / "backtests"
     final_dir = parent / run_id
@@ -504,10 +538,11 @@ def _publish_run(request: StandardBacktestRequest, run_id: str, manifest_base: d
             "trades.csv": ("csv", [_json_safe(trade) for trade in strategy.trades], tuple(field.name for field in fields(NormalizedTrade))),
             "equity_curve.csv": ("csv", list(strategy.equity_curve), EQUITY_FIELDS),
             "buy_hold_equity.csv": ("csv", list(buy_hold.equity_curve), EQUITY_FIELDS),
-            "market_benchmark_equity.csv": ("csv", list(market_benchmark.equity_curve), EQUITY_FIELDS),
             "metrics.json": ("json", metrics, None),
             "report.md": ("text", report, None),
         }
+        if market_benchmark is not None:
+            artifacts["market_benchmark_equity.csv"] = ("csv", list(market_benchmark.equity_curve), EQUITY_FIELDS)
         for filename, (kind, payload, fieldnames) in artifacts.items():
             _write_run_artifact(staging / filename, kind, payload, fieldnames)
         hashes = {filename: {"sha256": hashlib.sha256((staging / filename).read_bytes()).hexdigest()}

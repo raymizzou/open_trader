@@ -449,19 +449,20 @@ function renderBacktestEquityComparison(result) {
     result.buy_hold && result.buy_hold.equity_curve,
     result.market_benchmark && result.market_benchmark.equity_curve,
     result.benchmark_symbol,
+    (result.strategy && result.strategy.trades || []).map((trade) => trade.execution_date),
   )}</section>`;
 }
 
-function renderThreeSeriesBacktestChart(strategyRows, buyHoldRows, marketRows, benchmarkSymbol) {
+function renderThreeSeriesBacktestChart(strategyRows, buyHoldRows, marketRows, benchmarkSymbol, actionDates) {
+  const preserved = new Set(Array.isArray(actionDates) ? actionDates.map(String) : []);
   const series = [
-    ["策略", strategyRows, "backtest-line-strategy"],
-    ["买入持有", buyHoldRows, "backtest-line-buy-hold"],
-    [benchmarkSymbol || "市场指数", marketRows, "backtest-line-market"],
+    ["策略", downsampleBacktestRows(strategyRows, "equity", preserved), "backtest-line-strategy"],
+    ["买入持有", downsampleBacktestRows(buyHoldRows, "equity", preserved), "backtest-line-buy-hold"],
+    [benchmarkSymbol || "市场指数", downsampleBacktestRows(marketRows, "equity", preserved), "backtest-line-market"],
   ];
-  const points = series.flatMap(([, rows]) => Array.isArray(rows) ? rows : []).map((row) => Number(row.equity)).filter(Number.isFinite);
+  const points = series.flatMap(([, rows]) => rows).map((row) => Number(row.equity));
   const dates = [...new Set(series.flatMap(([, rows]) => Array.isArray(rows) ? rows.map((row) => String(row.date || "")) : []).filter(Boolean))].sort();
-  const min = points.length ? Math.min(...points) : 0;
-  const max = points.length ? Math.max(...points) : 1;
+  const [min, max] = finiteBacktestExtent(points);
   const path = (rows) => {
     const byDate = new Map((Array.isArray(rows) ? rows : []).map((row) => [String(row.date || ""), Number(row.equity)]));
     let started = false;
@@ -488,37 +489,73 @@ function renderBacktestPriceActions(result) {
 }
 
 function renderPriceActionChart(rows, trades) {
-  const prices = rows.map((row) => Number(row.mark_price)).filter(Number.isFinite);
-  const min = prices.length ? Math.min(...prices) : 0;
-  const max = prices.length ? Math.max(...prices) : 1;
+  const allowed = new Set(["BUY", "ADD", "REDUCE", "EXIT"]);
+  const actionTrades = trades.filter((trade) => allowed.has(String(trade.action || "")));
+  rows = downsampleBacktestRows(rows, "mark_price", new Set(actionTrades.map((trade) => String(trade.execution_date || ""))));
+  const prices = rows.map((row) => Number(row.mark_price));
+  const [min, max] = finiteBacktestExtent(prices);
   const dateIndex = new Map(rows.map((row, index) => [String(row.date || ""), index]));
   const xy = (date, price) => {
     const index = dateIndex.get(String(date || "")) || 0;
     return [rows.length > 1 ? 20 + index * 560 / (rows.length - 1) : 300, 180 - (Number(price) - min) * 150 / (max - min || 1)];
   };
   const pricePath = rows.map((row, index) => { const [x, y] = xy(row.date, row.mark_price); return `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`; }).join(" ");
-  const allowed = new Set(["BUY", "ADD", "REDUCE", "EXIT"]);
   const explanations = { BUY: "买入", ADD: "加仓", REDUCE: "减仓", EXIT: "退出" };
-  const markers = trades.filter((trade) => allowed.has(String(trade.action || ""))).map((trade) => {
+  const markers = actionTrades.filter((trade) => dateIndex.has(String(trade.execution_date || "")) && Number.isFinite(Number(trade.raw_price))).map((trade) => {
     const action = String(trade.action); const [x, y] = xy(trade.execution_date, trade.raw_price);
     return `<g class="backtest-action-marker action-${action.toLowerCase()}"><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5"></circle><text x="${x.toFixed(1)}" y="${(y - 9).toFixed(1)}">${action}</text></g>`;
   }).join("");
-  const summary = trades.filter((trade) => allowed.has(String(trade.action || ""))).map((trade) => `${trade.execution_date} ${trade.action}（${explanations[trade.action]}）`).join("；");
+  const summary = actionTrades.map((trade) => `${trade.execution_date} ${trade.action}（${explanations[trade.action]}）`).join("；");
   return `<div class="backtest-chart" role="img" aria-label="价格曲线与交易动作。${escapeHtml(summary || "没有执行动作")}。HOLD（观察）不绘制标记。"><svg viewBox="0 0 600 200" aria-hidden="true"><path class="backtest-price-line" d="${pricePath}" fill="none" vector-effect="non-scaling-stroke"></path>${markers}</svg></div>`;
 }
 
 function renderBacktestTradeTable(result) {
   const trades = result.strategy && Array.isArray(result.strategy.trades) ? result.strategy.trades : [];
   if (!trades.length) return '<section class="backtest-result-section"><h3>交易记录</h3><p class="backtest-empty-state">所选区间内没有触发交易</p></section>';
-  return `<section class="backtest-result-section"><h3>交易记录</h3><div class="backtest-table-wrap"><table class="backtest-trades-table"><thead><tr><th>执行日期</th><th>动作</th><th>数量</th><th>成交价</th><th>费用</th><th>原因</th></tr></thead><tbody>${trades.map((trade) => `<tr><td>${escapeHtml(trade.execution_date)}</td><td>${escapeHtml(trade.action)}</td><td>${escapeHtml(trade.quantity)}</td><td>${escapeHtml(trade.execution_price)}</td><td>${escapeHtml(trade.fees)}</td><td>${escapeHtml(trade.reason)}</td></tr>`).join("")}</tbody></table></div></section>`;
+  const visible = trades.slice(0, 500);
+  const notice = trades.length > visible.length ? `<p>仅显示前 500 笔，共 ${trades.length} 笔</p>` : "";
+  return `<section class="backtest-result-section"><h3>交易记录</h3>${notice}<div class="backtest-table-wrap"><table class="backtest-trades-table"><thead><tr><th>执行日期</th><th>动作</th><th>数量</th><th>成交价</th><th>费用</th><th>原因</th></tr></thead><tbody>${visible.map((trade) => `<tr><td>${escapeHtml(trade.execution_date)}</td><td>${escapeHtml(trade.action)}</td><td>${escapeHtml(trade.quantity)}</td><td>${escapeHtml(trade.execution_price)}</td><td>${escapeHtml(trade.fees)}</td><td>${escapeHtml(trade.reason)}</td></tr>`).join("")}</tbody></table></div></section>`;
 }
 
 function renderBacktestRunAssumptions(result) {
   const strategy = result.strategy || {};
   const trades = Array.isArray(strategy.trades) ? strategy.trades : [];
   const totalFees = trades.reduce((sum, trade) => sum + (Number(trade.fees) || 0), 0);
+  const assumptions = result.assumptions || {};
+  const definition = result.strategy_definition || {};
+  const parameterLabels = { sma_short: "短期均线周期", sma_long: "长期均线周期", atr_period: "真实波幅周期", rsi_period: "强弱指标周期", stop_multiplier: "止损倍数", high_period: "突破周期", volume_period: "成交量周期", volume_multiplier: "成交量倍数", sma_exit: "退出均线周期", bollinger_period: "布林带周期", stddev_multiplier: "标准差倍数" };
+  const parameters = definition.parameters && typeof definition.parameters === "object" ? Object.entries(definition.parameters) : [];
+  const signals = Array.isArray(result.signals) ? result.signals : [];
+  const holdSignals = signals.filter((signal) => signal.action === "HOLD");
   const artifacts = [["manifest_path", "运行清单"], ["signals_path", "策略信号"], ["trades_path", "交易记录"], ["equity_curve_path", "策略净值"], ["buy_hold_equity_path", "买入持有净值"], ["market_benchmark_equity_path", "市场指数净值"], ["metrics_path", "指标数据"], ["report_path", "回测报告"]];
-  return `<section class="backtest-result-section"><h3>运行详情</h3><dl class="backtest-run-details"><dt>请求范围</dt><dd>${escapeHtml(result.requested_start || "-")} 至 ${escapeHtml(result.requested_end || "-")}</dd><dt>实际数据</dt><dd>${escapeHtml(result.actual_start || "-")} 至 ${escapeHtml(result.actual_end || "-")}</dd><dt>策略版本</dt><dd>${escapeHtml(result.strategy_id || "-")}</dd><dt>执行器版本</dt><dd>${escapeHtml(result.adapter_version || "-")}</dd><dt>初始资金 / 策略额度</dt><dd>${escapeHtml(strategy.initial_cash || "-")} / ${escapeHtml(strategy.initial_allocated_notional || "-")}</dd><dt>交易成本</dt><dd>成交费用合计 ${escapeHtml(totalFees.toFixed(2))}</dd><dt>运行编号</dt><dd>${escapeHtml(result.run_id || "-")}</dd></dl><h4>结果文件</h4><ul class="backtest-artifacts">${artifacts.filter(([key]) => result[key]).map(([key, label]) => `<li><span>${label}</span><code>${escapeHtml(result[key])}</code></li>`).join("")}</ul></section>`;
+  return `<section class="backtest-result-section"><h3>运行详情</h3><dl class="backtest-run-details"><dt>请求范围</dt><dd>${escapeHtml(result.requested_start || "-")} 至 ${escapeHtml(result.requested_end || "-")}</dd><dt>实际数据</dt><dd>${escapeHtml(result.actual_start || "-")} 至 ${escapeHtml(result.actual_end || "-")}</dd><dt>策略版本</dt><dd>${escapeHtml(result.strategy_id || "-")}</dd><dt>策略名称</dt><dd>${escapeHtml(definition.name_zh || "-")} · ${escapeHtml(definition.description_zh || "-")}</dd><dt>执行器版本</dt><dd>${escapeHtml(result.adapter_version || "-")}</dd><dt>运行编号</dt><dd>${escapeHtml(result.run_id || "-")}</dd></dl><h4>交易假设</h4><dl class="backtest-run-details"><dt>初始资金</dt><dd>${escapeHtml(assumptions.initial_cash || "-")}</dd><dt>最大策略仓位</dt><dd>${backtestPercent(Number(assumptions.max_strategy_weight) * 100)}</dd><dt>佣金</dt><dd>${escapeHtml(assumptions.commission_bps || "-")} 基点</dd><dt>滑点</dt><dd>${escapeHtml(assumptions.slippage_bps || "-")} 基点</dd><dt>已实现交易费用</dt><dd>${escapeHtml(totalFees.toFixed(2))}</dd></dl><h4>固定参数</h4><dl class="backtest-run-details">${parameters.map(([key, value]) => `<dt>${escapeHtml(parameterLabels[key] || key)}</dt><dd>${escapeHtml(value)}</dd>`).join("")}</dl><p class="backtest-signal-summary">HOLD（观察）信号 ${holdSignals.length} 次${holdSignals.length ? `；${escapeHtml(holdSignals.slice(0, 10).map((signal) => signal.decision_date).join("、"))}` : ""}</p><h4>结果文件</h4><ul class="backtest-artifacts">${artifacts.filter(([key]) => result[key]).map(([key, label]) => `<li><span>${label}</span><code>${escapeHtml(result[key])}</code></li>`).join("")}</ul></section>`;
+}
+
+function finiteBacktestExtent(values) {
+  let min = Infinity; let max = -Infinity;
+  for (const value of values) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) continue;
+    if (number < min) min = number;
+    if (number > max) max = number;
+  }
+  return min === Infinity ? [0, 1] : [min, max];
+}
+
+function downsampleBacktestRows(rows, valueKey, preservedDates, limit = 600) {
+  const valid = (Array.isArray(rows) ? rows : []).filter((row) => row && String(row.date || "") && Number.isFinite(Number(row[valueKey])));
+  if (valid.length <= limit) return valid;
+  const selected = new Set([0, valid.length - 1]);
+  const preserveIndexes = [];
+  valid.forEach((row, index) => { if (preservedDates && preservedDates.has(String(row.date))) preserveIndexes.push(index); });
+  const preserveStep = Math.max(1, Math.ceil(preserveIndexes.length / Math.max(1, limit - 2)));
+  for (let index = 0; index < preserveIndexes.length && selected.size < limit; index += preserveStep) selected.add(preserveIndexes[index]);
+  const remaining = limit - selected.size;
+  if (remaining > 0) {
+    const step = (valid.length - 1) / (remaining + 1);
+    for (let index = 1; index <= remaining; index += 1) selected.add(Math.round(index * step));
+  }
+  return [...selected].sort((left, right) => left - right).slice(0, limit).map((index) => valid[index]);
 }
 
 function backtestPercent(value) {
