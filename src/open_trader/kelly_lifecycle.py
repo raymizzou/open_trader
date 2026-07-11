@@ -6,6 +6,8 @@ from .kelly_rules import evaluate_kelly_rules
 
 
 LifecycleState = dict[str, Any]
+PENDING_ENTRY_REASON = "入场规则触发，仓位计算与风控检查待执行。"
+PENDING_ENTRY_ACTION = "等待仓位计算与风控检查"
 
 
 def build_kelly_lifecycle_states(
@@ -99,8 +101,8 @@ def decide_kelly_lifecycle_state(
         return {
             **base,
             "status": "pending_entry_order",
-            "reason": "入场规则触发，Kelly 仓位已计算，风控通过。",
-            "action": "准备提交模拟盘买入订单",
+            "reason": PENDING_ENTRY_REASON,
+            "action": PENDING_ENTRY_ACTION,
         }
 
     return {

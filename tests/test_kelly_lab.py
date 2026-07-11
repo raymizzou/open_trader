@@ -610,8 +610,8 @@ def test_load_kelly_lab_state_generates_lifecycle_states_from_symbol_facts(
             "market": "US",
             "symbol": "AAPL",
             "status": "pending_entry_order",
-            "reason": "入场规则触发，Kelly 仓位已计算，风控通过。",
-            "action": "准备提交模拟盘买入订单",
+            "reason": "入场规则触发，仓位计算与风控检查待执行。",
+            "action": "等待仓位计算与风控检查",
             "updated_at": "2026-07-08 13:00",
         }
     ]
@@ -1372,6 +1372,20 @@ def test_load_checked_in_kelly_data_uses_unified_strategy_stats() -> None:
         == expected_digest
     )
     assert checks_by_intent[exit_intent["intent_id"]]["risk_status"] == "approved"
+    entry_experiment = next(
+        experiment
+        for experiment in state["experiments"]
+        if experiment["experiment_id"] == entry["experiment_id"]
+    )
+    pending_entry = next(
+        item
+        for item in entry_experiment["lifecycle_states"]
+        if item["status"] == "pending_entry_order"
+    )
+    for item in (pending_entry, entry):
+        narrative = f"{item.get('reason', '')} {item.get('action', '')}"
+        assert "4%" not in narrative
+        assert "风控通过" not in narrative
 
 
 def test_latest_kelly_experiments_are_single_market() -> None:

@@ -636,8 +636,8 @@ state.dashboard = {
           status: "pending_entry_order",
           market: "US",
           symbol: "RAM",
-          reason: "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
-          action: "准备提交模拟盘买入订单",
+          reason: "入场规则触发，仓位计算与风控检查待执行。",
+          action: "等待仓位计算与风控检查",
           updated_at: "2026-07-08 10:01"
         },
         {
@@ -919,7 +919,7 @@ for (const required of [
   "观察中",
   "该标的在策略监控范围内，但当前没有入场信号，也没有持仓。",
   "待下单",
-  "入场规则已触发，Kelly 仓位已计算，风控检查已通过。",
+  "入场规则触发，仓位计算与风控检查待执行。",
   "持仓中",
   "模拟盘买入已成交，这笔策略样本正在进行中。",
   "待退出",
@@ -959,6 +959,9 @@ for (const required of [
 }
 if (html.includes("Mock 状态样本") || html.includes("状态说明")) {
   throw new Error("kelly lifecycle should be scoped inside strategy card, not global: " + html);
+}
+if (html.includes("风控通过") || html.includes("Kelly 建议单标的仓位 4%")) {
+  throw new Error("pending entry narrative claims pre-risk approval: " + html);
 }
 if (html.includes("第一目标") || html.includes("延续")) {
   throw new Error("kelly strategy rules contain vague terms: " + html);

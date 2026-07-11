@@ -56,7 +56,7 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                     "status": "pending_entry_order",
                     "market": "US",
                     "symbol": "RAM",
-                    "reason": "入场规则触发。",
+                    "reason": "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
                     "action": "准备提交模拟盘买入订单",
                     "updated_at": "2026-07-10 10:01",
                 },
@@ -122,8 +122,8 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                 "created_at": "2026-07-10 13:30",
                 "source": "kelly_lifecycle",
                 "source_status": "pending_entry_order",
-                "reason": "入场规则触发。",
-                "action": "准备提交模拟盘买入订单",
+                "reason": "入场规则触发，仓位计算与风控检查待执行。",
+                "action": "等待仓位计算与风控检查",
                 "suggested_position_pct": "3%",
                 "parameter_source": "futu_paper_order_samples",
                 "strategy_stats_generated_at": "2026-07-11 12:01",
@@ -160,6 +160,10 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
             },
         ],
     }
+
+    entry = payload["intents"][0]
+    assert "4%" not in f"{entry['reason']} {entry['action']}"
+    assert "风控通过" not in f"{entry['reason']} {entry['action']}"
 
 
 def test_build_kelly_order_intents_blocks_zero_sample_entry_in_risk_checks() -> None:

@@ -10,6 +10,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Bound entry risk approval to the current validated trade evidence and strategy
   stats through exact timestamps, parameter provenance, and a canonical SHA-256
   evidence digest; restored the original two-decimal trade-sample rounding rules.
+- Required unified strategy stats to cover every currently configured experiment
+  before any entry can pass risk, while preserving exit approval on config/stats
+  failures and isolating provenance validation from optional order artifacts.
+- Changed pending-entry lifecycle and intent text to state that sizing and risk are
+  still pending, removing pre-risk percentage and approval claims from artifacts
+  and the dashboard.
 
 ## 2026-07-11
 

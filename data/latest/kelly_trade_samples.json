@@ -1,6 +1,6 @@
 {
   "schema_version": "open_trader.kelly_trade_samples.v1",
-  "generated_at": "2026-07-12 00:18",
+  "generated_at": "2026-07-12 00:35",
   "source_orders_synced_at": "2026-07-10 15:38",
   "sample_count": 0,
   "open_position_count": 0,
@@ -32,10 +32,10 @@
       "sample_stage": "insufficient",
       "sample_adjustment": "样本少于 200，向 50% 收缩",
       "last_sample_closed_at": "",
-      "last_recomputed_at": "2026-07-12 00:18",
+      "last_recomputed_at": "2026-07-12 00:35",
       "win_rate": "0%",
       "parameter_source": "futu_paper_order_samples",
-      "updated_at": "2026-07-12 00:18"
+      "updated_at": "2026-07-12 00:35"
     },
     "trend_pullback_20d_hk_mock_20260707": {
       "experiment_id": "trend_pullback_20d_hk_mock_20260707",
@@ -58,10 +58,10 @@
       "sample_stage": "insufficient",
       "sample_adjustment": "样本少于 200，向 50% 收缩",
       "last_sample_closed_at": "",
-      "last_recomputed_at": "2026-07-12 00:18",
+      "last_recomputed_at": "2026-07-12 00:35",
       "win_rate": "0%",
       "parameter_source": "futu_paper_order_samples",
-      "updated_at": "2026-07-12 00:18"
+      "updated_at": "2026-07-12 00:35"
     },
     "breakout_10d_mock_20260707": {
       "experiment_id": "breakout_10d_mock_20260707",
@@ -84,10 +84,10 @@
       "sample_stage": "insufficient",
       "sample_adjustment": "样本少于 200，向 50% 收缩",
       "last_sample_closed_at": "",
-      "last_recomputed_at": "2026-07-12 00:18",
+      "last_recomputed_at": "2026-07-12 00:35",
       "win_rate": "0%",
       "parameter_source": "futu_paper_order_samples",
-      "updated_at": "2026-07-12 00:18"
+      "updated_at": "2026-07-12 00:35"
     }
   }
 }

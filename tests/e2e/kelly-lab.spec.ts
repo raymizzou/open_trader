@@ -133,7 +133,11 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(orderExecution.getByText('US.MSFT')).toHaveCount(0);
   await expect(symbolStates.getByText('观察中 → 待下单 → 持仓中 → 待退出 → 已完成')).toBeVisible();
   await expect(symbolStates.getByText('该标的在策略监控范围内，但当前没有入场信号，也没有持仓。')).toBeVisible();
-  await expect(symbolStates.getByText('入场规则已触发，Kelly 仓位已计算，风控检查已通过。')).toBeVisible();
+  const pendingEntryNarrative = symbolStates.getByText('入场规则触发，仓位计算与风控检查待执行。');
+  await expect(pendingEntryNarrative).toHaveCount(2);
+  await expect(pendingEntryNarrative.first()).toBeVisible();
+  await expect(symbolStates.getByText(/风控通过/)).toHaveCount(0);
+  await expect(symbolStates.getByText(/Kelly 建议单标的仓位 4%/)).toHaveCount(0);
   await expect(symbolStates.getByText('模拟盘买入已成交，这笔策略样本正在进行中。')).toBeVisible();
   await expect(symbolStates.getByText('这笔持仓已经触发退出规则，但卖出还没有完成。')).toHaveCount(0);
   await expect(page.getByText('样本充足')).toBeVisible();

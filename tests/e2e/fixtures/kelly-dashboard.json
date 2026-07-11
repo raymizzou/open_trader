@@ -244,8 +244,8 @@
             "status": "pending_entry_order",
             "market": "US",
             "symbol": "RAM",
-            "reason": "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
-            "action": "准备提交模拟盘买入订单",
+            "reason": "入场规则触发，仓位计算与风控检查待执行。",
+            "action": "等待仓位计算与风控检查",
             "updated_at": "2026-07-08 10:01"
           },
           {

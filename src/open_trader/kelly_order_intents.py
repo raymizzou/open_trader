@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .kelly_lab import load_kelly_lab_state
+from .kelly_lifecycle import PENDING_ENTRY_ACTION, PENDING_ENTRY_REASON
 
 
 ORDER_INTENTS_SCHEMA_VERSION = "open_trader.kelly_order_intents.v1"
@@ -98,6 +99,11 @@ def build_kelly_order_intents_payload(
 
             participant = participants_by_key.get((market, symbol), {})
             experiment_id = str(experiment.get("experiment_id", "")).strip()
+            reason = str(lifecycle_state.get("reason", "")).strip()
+            action = str(lifecycle_state.get("action", "")).strip()
+            if intent_type == "entry":
+                reason = PENDING_ENTRY_REASON
+                action = PENDING_ENTRY_ACTION
             intent = {
                     "intent_id": f"{experiment_id}:{market}:{symbol}:{intent_type}",
                     "experiment_id": experiment_id,
@@ -119,8 +125,8 @@ def build_kelly_order_intents_payload(
                     "created_at": timestamp,
                     "source": "kelly_lifecycle",
                     "source_status": source_status,
-                    "reason": str(lifecycle_state.get("reason", "")).strip(),
-                    "action": str(lifecycle_state.get("action", "")).strip(),
+                    "reason": reason,
+                    "action": action,
                     "budget_currency": str(
                         participant.get("budget_currency")
                         or experiment.get("budget_currency", "")

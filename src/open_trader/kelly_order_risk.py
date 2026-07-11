@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from .kelly_lab import load_kelly_lab_state
 from .kelly_market_rules import kelly_market_currency, normalize_kelly_market
 from .kelly_strategy_stats import (
     kelly_trade_samples_digest,
@@ -46,12 +47,26 @@ def build_kelly_order_risk_checks(
 ) -> dict[str, Any]:
     intent_payload = load_kelly_order_intents(data_dir)
     strategy_stats_by_experiment = None
+    strategy_stats_config_error = ""
     if _contains_entry_intent(intent_payload):
         try:
+            lab_state = load_kelly_lab_state(
+                data_dir,
+                include_operational_artifacts=False,
+                include_strategy_capital=False,
+                include_strategy_stats=False,
+            )
+            if not lab_state.available:
+                raise ValueError(lab_state.error or "Kelly Lab config is unavailable")
+            expected_experiment_ids = {
+                str(experiment["experiment_id"]).strip()
+                for experiment in lab_state.experiments
+            }
             trade_samples_payload = load_kelly_trade_samples(data_dir)
             strategy_stats_payload = load_kelly_strategy_stats(data_dir)
             strategy_stats_by_experiment = validate_kelly_strategy_stats_payload(
                 strategy_stats_payload,
+                expected_experiment_ids=expected_experiment_ids,
                 expected_trade_samples_generated_at=trade_samples_payload[
                     "generated_at"
                 ],
@@ -59,14 +74,18 @@ def build_kelly_order_risk_checks(
                     trade_samples_payload
                 ),
             )
-        except (FileNotFoundError, ValueError):
+        except (FileNotFoundError, ValueError) as exc:
             strategy_stats_by_experiment = None
+            strategy_stats_config_error = (
+                f"strategy stats/config validation failed: {exc}"
+            )
     return build_kelly_order_risk_checks_payload(
         intent_payload,
         checked_at=checked_at,
         max_entry_position_pct=max_entry_position_pct,
         strategy_capital_payload=strategy_capital_payload,
         strategy_stats_by_experiment=strategy_stats_by_experiment,
+        strategy_stats_config_error=strategy_stats_config_error,
     )
 
 
@@ -86,6 +105,7 @@ def build_kelly_order_risk_checks_payload(
     max_entry_position_pct: str = "4",
     strategy_capital_payload: dict[str, Any] | None = None,
     strategy_stats_by_experiment: dict[str, dict[str, Any]] | None = None,
+    strategy_stats_config_error: str = "",
 ) -> dict[str, Any]:
     timestamp = checked_at or _current_timestamp()
     max_entry_pct = _parse_positive_decimal(max_entry_position_pct)
@@ -108,6 +128,7 @@ def build_kelly_order_risk_checks_payload(
                 max_entry_position_pct=max_entry_pct,
                 capital_by_experiment=capital_by_experiment,
                 strategy_stats_by_experiment=strategy_stats_by_experiment,
+                strategy_stats_config_error=strategy_stats_config_error,
             )
         )
 
@@ -137,6 +158,7 @@ def _build_single_check(
     max_entry_position_pct: Decimal,
     capital_by_experiment: dict[str, dict[str, Any]] | None,
     strategy_stats_by_experiment: dict[str, dict[str, Any]] | None,
+    strategy_stats_config_error: str,
 ) -> dict[str, Any]:
     base = _base_check(intent, checked_at=checked_at)
     side = str(intent.get("side", "")).strip().lower()
@@ -194,6 +216,7 @@ def _build_single_check(
         _strategy_stats_provenance_result(
             intent,
             strategy_stats_by_experiment,
+            strategy_stats_config_error=strategy_stats_config_error,
         ),
     ]
 
@@ -264,7 +287,15 @@ def _strategy_capital_by_experiment(
 def _strategy_stats_provenance_result(
     intent: dict[str, Any],
     stats_by_experiment: dict[str, dict[str, Any]] | None,
+    *,
+    strategy_stats_config_error: str = "",
 ) -> dict[str, str]:
+    if strategy_stats_config_error:
+        return {
+            "check": "strategy_stats_provenance",
+            "status": "failed",
+            "detail": strategy_stats_config_error,
+        }
     experiment_id = _field_text(intent.get("experiment_id"))
     stats = (
         stats_by_experiment.get(experiment_id)

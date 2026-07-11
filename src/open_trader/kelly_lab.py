@@ -90,6 +90,7 @@ class KellyLabState:
 def load_kelly_lab_state(
     data_dir: Path,
     *,
+    include_operational_artifacts: bool = True,
     include_strategy_capital: bool = True,
     include_strategy_stats: bool = True,
 ) -> KellyLabState:
@@ -119,10 +120,14 @@ def load_kelly_lab_state(
         experiments_path,
         templates_by_key,
     )
-    paper_orders = _load_optional_paper_orders(paper_orders_path)
-    experiments = _attach_paper_orders_to_experiments(experiments, paper_orders)
-    order_execution = _load_optional_order_execution(order_executions_path)
-    experiments = _attach_order_execution_to_experiments(experiments, order_execution)
+    if include_operational_artifacts:
+        paper_orders = _load_optional_paper_orders(paper_orders_path)
+        experiments = _attach_paper_orders_to_experiments(experiments, paper_orders)
+        order_execution = _load_optional_order_execution(order_executions_path)
+        experiments = _attach_order_execution_to_experiments(
+            experiments,
+            order_execution,
+        )
     if include_strategy_capital:
         strategy_capital = _load_optional_strategy_capital(strategy_capital_path)
         experiments = _attach_strategy_capital_to_experiments(

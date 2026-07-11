@@ -498,9 +498,9 @@ const KELLY_LIFECYCLE_STATUSES = [
   {
     key: "pending_entry_order",
     label: "待下单",
-    meaning: "入场规则已触发，Kelly 仓位已计算，风控检查已通过。",
-    systemAction: "准备向模拟盘提交买入订单。",
-    nextStep: "买入成交后进入「持仓中」；下单失败进入「执行失败」。",
+    meaning: "入场规则触发，仓位计算与风控检查待执行。",
+    systemAction: "等待仓位计算与风控检查。",
+    nextStep: "风控检查允许入场后提交买入；未允许则记录拦截。",
     className: "status-ok",
   },
   {
