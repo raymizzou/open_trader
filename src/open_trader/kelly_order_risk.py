@@ -341,6 +341,16 @@ def _base_check(intent: dict[str, Any], *, checked_at: str) -> dict[str, str]:
         "symbol": str(intent.get("symbol", "")).strip().upper(),
         "intent_type": str(intent.get("intent_type", "")).strip(),
         "side": str(intent.get("side", "")).strip(),
+        "suggested_position_pct": str(
+            intent.get("suggested_position_pct", "")
+        ).strip(),
+        "parameter_source": str(intent.get("parameter_source", "")).strip(),
+        "strategy_stats_generated_at": str(
+            intent.get("strategy_stats_generated_at", "")
+        ).strip(),
+        "strategy_stats_source_samples_generated_at": str(
+            intent.get("strategy_stats_source_samples_generated_at", "")
+        ).strip(),
         "checked_at": checked_at,
     }
 

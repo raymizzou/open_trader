@@ -8,6 +8,7 @@ from open_trader.kelly_order_intents import (
     build_kelly_order_intents_payload,
     write_kelly_order_intents,
 )
+from open_trader.kelly_order_risk import build_kelly_order_risk_checks_payload
 from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
 
 
@@ -42,7 +43,10 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                 },
             ],
             "stats": {
-                "suggested_position_pct": "4%",
+                "suggested_position_pct": "3%",
+                "parameter_source": "futu_paper_order_samples",
+                "last_recomputed_at": "2026-07-11 12:01",
+                "source_trade_samples_generated_at": "2026-07-11 12:00",
             },
             "lifecycle_states": [
                 {
@@ -117,7 +121,10 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                 "source_status": "pending_entry_order",
                 "reason": "入场规则触发。",
                 "action": "准备提交模拟盘买入订单",
-                "suggested_position_pct": "4%",
+                "suggested_position_pct": "3%",
+                "parameter_source": "futu_paper_order_samples",
+                "strategy_stats_generated_at": "2026-07-11 12:01",
+                "strategy_stats_source_samples_generated_at": "2026-07-11 12:00",
                 "per_symbol_budget": "25000",
                 "budget_currency": "USD",
             },
@@ -145,12 +152,63 @@ def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> No
                 "source_status": "pending_exit_order",
                 "reason": "止盈触发。",
                 "action": "准备卖出 50%",
-                "suggested_position_pct": "4%",
+                "suggested_position_pct": "3%",
+                "parameter_source": "futu_paper_order_samples",
+                "strategy_stats_generated_at": "2026-07-11 12:01",
+                "strategy_stats_source_samples_generated_at": "2026-07-11 12:00",
                 "per_symbol_budget": "25000",
                 "budget_currency": "USD",
             },
         ],
     }
+
+
+def test_build_kelly_order_intents_blocks_zero_sample_entry_in_risk_checks() -> None:
+    payload = build_kelly_order_intents_payload(
+        [
+            {
+                "experiment_id": "trend_exp",
+                "experiment_name": "趋势回调第一批",
+                "strategy_id": "trend_pullback_20d",
+                "strategy_version": "v1",
+                "status": "running",
+                "market": "US",
+                "budget_currency": "USD",
+                "participants": [
+                    {
+                        "market": "US",
+                        "symbol": "RAM",
+                        "per_symbol_budget": "25000",
+                        "budget_currency": "USD",
+                    }
+                ],
+                "stats": {
+                    "suggested_position_pct": "0%",
+                    "parameter_source": "futu_paper_order_samples",
+                    "last_recomputed_at": "2026-07-11 12:01",
+                    "source_trade_samples_generated_at": "2026-07-11 12:00",
+                },
+                "lifecycle_states": [
+                    {
+                        "status": "pending_entry_order",
+                        "market": "US",
+                        "symbol": "RAM",
+                    }
+                ],
+            }
+        ],
+        created_at="2026-07-11 12:02",
+    )
+
+    intent = payload["intents"][0]
+    assert intent["suggested_position_pct"] == "0%"
+
+    risk_payload = build_kelly_order_risk_checks_payload(
+        payload,
+        checked_at="2026-07-11 12:03",
+    )
+
+    assert risk_payload["checks"][0]["risk_status"] == "blocked"
 
 
 def test_build_kelly_order_intents_skips_cross_market_lifecycle_state() -> None:

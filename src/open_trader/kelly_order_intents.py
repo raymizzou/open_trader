@@ -106,6 +106,15 @@ def build_kelly_order_intents_payload(
                     "suggested_position_pct": str(
                         stats.get("suggested_position_pct", "")
                     ).strip(),
+                    "parameter_source": str(
+                        stats.get("parameter_source", "")
+                    ).strip(),
+                    "strategy_stats_generated_at": str(
+                        stats.get("last_recomputed_at", "")
+                    ).strip(),
+                    "strategy_stats_source_samples_generated_at": str(
+                        stats.get("source_trade_samples_generated_at", "")
+                    ).strip(),
                     "per_symbol_budget": str(
                         participant.get("per_symbol_budget", "")
                     ).strip(),

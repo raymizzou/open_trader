@@ -40,7 +40,16 @@ def test_kelly_build_order_intents_main_writes_payload_and_prints_summary(
             "schema_version": "open_trader.kelly_order_intents.v1",
             "created_at": kwargs["created_at"],
             "intent_count": 2,
-            "intents": [{"intent_id": "a"}, {"intent_id": "b"}],
+            "intents": [
+                {
+                    "intent_id": "a",
+                    "suggested_position_pct": "3%",
+                    "parameter_source": "futu_paper_order_samples",
+                    "strategy_stats_generated_at": "2026-07-11 12:01",
+                    "strategy_stats_source_samples_generated_at": "2026-07-11 12:00",
+                },
+                {"intent_id": "b"},
+            ],
         }
 
     def fake_write(data_dir: Path, payload: dict[str, object]) -> Path:
@@ -69,6 +78,13 @@ def test_kelly_build_order_intents_main_writes_payload_and_prints_summary(
     }
     assert captured["write_data_dir"] == tmp_path / "data"
     assert captured["payload"]["intent_count"] == 2
+    assert captured["payload"]["intents"][0] == {
+        "intent_id": "a",
+        "suggested_position_pct": "3%",
+        "parameter_source": "futu_paper_order_samples",
+        "strategy_stats_generated_at": "2026-07-11 12:01",
+        "strategy_stats_source_samples_generated_at": "2026-07-11 12:00",
+    }
     output = capsys.readouterr().out
     assert "intents: 2" in output
     assert f"latest: {latest_path}" in output
