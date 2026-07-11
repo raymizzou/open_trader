@@ -52,6 +52,10 @@ from .kelly_strategy_capital import (
     load_kelly_strategy_capital,
     write_kelly_strategy_capital,
 )
+from .kelly_trade_samples import (
+    build_kelly_trade_samples_payload,
+    write_kelly_trade_samples,
+)
 from .kelly_lab import load_kelly_lab_state
 from .kelly_order_execution import (
     FutuOrderExecutionError,
@@ -793,6 +797,20 @@ def build_parser() -> argparse.ArgumentParser:
     kelly_build_strategy_capital_parser.add_argument(
         "--calculated-at",
         help="Override capital calculation timestamp for deterministic local demos",
+    )
+
+    kelly_build_trade_samples_parser = kelly_subparsers.add_parser(
+        "build-trade-samples",
+        help="Build Kelly trade samples and stats from synced paper orders",
+    )
+    kelly_build_trade_samples_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_build_trade_samples_parser.add_argument(
+        "--generated-at",
+        help="Override sample generation timestamp for deterministic local demos",
     )
 
     kelly_check_order_risk_parser = kelly_subparsers.add_parser(
@@ -1548,6 +1566,34 @@ def main(argv: list[str] | None = None) -> int:
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             parser.error(str(exc))
         print(f"strategies: {payload['strategy_count']}")
+        print(f"latest: {latest_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "build-trade-samples":
+        try:
+            lab_state = load_kelly_lab_state(
+                args.data_dir,
+                include_strategy_capital=False,
+            )
+            if not lab_state.available:
+                raise ValueError(lab_state.error)
+            latest_dir = args.data_dir / "latest"
+            paper_orders_payload = _load_optional_json(
+                latest_dir / "kelly_paper_orders.json",
+            )
+            if paper_orders_payload is None:
+                raise FileNotFoundError(latest_dir / "kelly_paper_orders.json")
+            payload = build_kelly_trade_samples_payload(
+                lab_state.experiments,
+                paper_orders_payload,
+                generated_at=args.generated_at,
+            )
+            latest_path = write_kelly_trade_samples(args.data_dir, payload)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"samples: {payload['sample_count']}")
+        print(f"open_positions: {payload['open_position_count']}")
+        print(f"skipped_orders: {payload['skipped_order_count']}")
         print(f"latest: {latest_path}")
         return 0
 
