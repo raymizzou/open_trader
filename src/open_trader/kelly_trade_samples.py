@@ -208,7 +208,9 @@ def _stats_by_experiment(
 
     for sample in samples:
         experiment_id = _text(sample.get("experiment_id"))
-        stat = stats.setdefault(experiment_id, _default_stats(experiment_id, timestamp))
+        stat = stats.get(experiment_id)
+        if stat is None:
+            continue
         stat["completed_samples"] += 1
         result = _text(sample.get("result"))
         if result == "win":
@@ -220,12 +222,16 @@ def _stats_by_experiment(
 
     for position in open_positions:
         experiment_id = _text(position.get("experiment_id"))
-        stat = stats.setdefault(experiment_id, _default_stats(experiment_id, timestamp))
+        stat = stats.get(experiment_id)
+        if stat is None:
+            continue
         stat["open_samples"] += 1
 
     for skipped in skipped_orders:
         experiment_id = _text(skipped.get("experiment_id"))
-        stat = stats.setdefault(experiment_id, _default_stats(experiment_id, timestamp))
+        stat = stats.get(experiment_id)
+        if stat is None:
+            continue
         stat["skipped_orders"] += 1
 
     for stat in stats.values():
@@ -235,24 +241,6 @@ def _stats_by_experiment(
                 Decimal(stat["winning_samples"]) / Decimal(completed)
             )
     return stats
-
-
-def _default_stats(experiment_id: str, timestamp: str) -> dict[str, Any]:
-    return {
-        "experiment_id": experiment_id,
-        "experiment_name": "",
-        "market": "",
-        "completed_samples": 0,
-        "winning_samples": 0,
-        "losing_samples": 0,
-        "flat_samples": 0,
-        "open_samples": 0,
-        "skipped_orders": 0,
-        "win_rate": "0%",
-        "suggested_position_pct": "0%",
-        "parameter_source": "futu_paper_order_samples",
-        "updated_at": timestamp,
-    }
 
 
 def _order_skip_reason(

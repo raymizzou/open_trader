@@ -118,3 +118,32 @@ def test_build_trade_samples_keeps_unmatched_buy_as_open_position() -> None:
     assert payload["stats_by_experiment"]["trend_us"]["completed_samples"] == 0
     assert payload["stats_by_experiment"]["trend_us"]["open_samples"] == 1
     assert payload["stats_by_experiment"]["trend_us"]["suggested_position_pct"] == "0%"
+
+
+def test_build_trade_samples_keeps_unknown_experiment_out_of_stats() -> None:
+    payload = build_kelly_trade_samples_payload(
+        [_experiment()],
+        {
+            "schema_version": "open_trader.kelly_paper_orders.v1",
+            "synced_at": "2026-07-11 09:30",
+            "orders": [
+                {
+                    "experiment_id": "missing_exp",
+                    "market": "US",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "submitted_at": "2026-07-11 09:31",
+                    "filled_qty": "10",
+                    "avg_fill_price": "100",
+                    "status": "filled",
+                    "order_id": "BUY-1",
+                }
+            ],
+        },
+        generated_at="2026-07-12 10:01",
+    )
+
+    assert payload["skipped_order_count"] == 1
+    assert payload["diagnostics"]["skipped_orders"][0]["reason"] == "unknown_experiment"
+    assert payload["diagnostics"]["skipped_orders"][0]["experiment_id"] == "missing_exp"
+    assert "missing_exp" not in payload["stats_by_experiment"]
