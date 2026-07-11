@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-11
 
+- Separated Kelly trade evidence from runtime `kelly_strategy_stats.json`, made
+  the dashboard and order sizing consume the same strategy-stat source, and
+  made entries fail closed when those stats are missing or stale.
 - Completed the Kelly trade-sample closed loop on `main`: synced paper orders can
   now generate `kelly_trade_samples.json`, overlay per-strategy sample stats in
   Kelly Lab, and show the parameter source plus skipped-order count in the
