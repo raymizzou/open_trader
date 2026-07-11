@@ -74,6 +74,9 @@ def validate_kelly_strategy_stats_payload(
         )
     if not isinstance(stats, dict):
         raise ValueError(f"{artifact_name} must contain stats_by_experiment")
+    experiment_count = payload.get("experiment_count")
+    if not _is_nonnegative_int(experiment_count) or experiment_count != len(stats):
+        raise ValueError(f"{artifact_name} contains invalid experiment_count")
     if (
         expected_trade_samples_generated_at is not None
         and source_generated_at != expected_trade_samples_generated_at
@@ -82,12 +85,29 @@ def validate_kelly_strategy_stats_payload(
     if expected_experiment_ids is not None and set(stats) != expected_experiment_ids:
         raise ValueError(f"{artifact_name} experiment coverage mismatch")
     required = {
+        "experiment_id",
+        "market",
         "completed_samples",
+        "winning_samples",
+        "losing_samples",
+        "flat_samples",
+        "open_samples",
+        "skipped_order_count",
+        "raw_win_rate",
+        "adjusted_win_rate",
+        "avg_net_win_pct",
+        "avg_net_loss_pct",
+        "payoff_ratio",
+        "full_kelly_pct",
+        "fractional_kelly_pct",
         "sample_stage",
         "suggested_position_pct",
+        "sample_adjustment",
         "parameter_source",
+        "last_sample_closed_at",
         "last_recomputed_at",
         "source_trade_samples_generated_at",
+        "updated_at",
     }
     for experiment_id, item in stats.items():
         if not isinstance(experiment_id, str) or not experiment_id.strip():
@@ -101,6 +121,12 @@ def validate_kelly_strategy_stats_payload(
             raise ValueError(
                 f"{artifact_name} stats for {experiment_id} missing {sorted(missing)}"
             )
+        _validate_stats_record(
+            item,
+            experiment_id=experiment_id,
+            source_trade_samples_generated_at=source_generated_at,
+            artifact_name=artifact_name,
+        )
     return copy.deepcopy(stats)
 
 
@@ -137,6 +163,145 @@ def _validate_trade_samples_payload(payload: dict[str, Any]) -> None:
         diagnostics.get("skipped_orders"), list
     ):
         raise ValueError("trade samples must contain diagnostics.skipped_orders")
+
+
+def _validate_stats_record(
+    item: dict[str, Any],
+    *,
+    experiment_id: str,
+    source_trade_samples_generated_at: str,
+    artifact_name: str,
+) -> None:
+    label = f"{artifact_name} stats for {experiment_id}"
+    if item["experiment_id"] != experiment_id:
+        raise ValueError(f"{label} contains invalid experiment_id")
+    if not isinstance(item["market"], str) or not item["market"].strip():
+        raise ValueError(f"{label} contains invalid market")
+
+    counts = {
+        field: item[field]
+        for field in (
+            "completed_samples",
+            "winning_samples",
+            "losing_samples",
+            "flat_samples",
+            "open_samples",
+            "skipped_order_count",
+        )
+    }
+    for field, value in counts.items():
+        if not _is_nonnegative_int(value):
+            raise ValueError(f"{label} contains invalid {field}")
+    completed = counts["completed_samples"]
+    classified = (
+        counts["winning_samples"]
+        + counts["losing_samples"]
+        + counts["flat_samples"]
+    )
+    for field in ("winning_samples", "losing_samples", "flat_samples"):
+        if counts[field] > completed:
+            raise ValueError(f"{label} contains invalid {field}")
+    if classified > completed:
+        raise ValueError(f"{label} contains invalid completed_samples")
+
+    expected_stage = "sufficient" if completed >= 200 else "insufficient"
+    if item["sample_stage"] != expected_stage:
+        raise ValueError(f"{label} contains invalid sample_stage")
+    expected_adjustment = (
+        "未收缩" if completed >= 200 else "样本少于 200，向 50% 收缩"
+    )
+    if item["sample_adjustment"] != expected_adjustment:
+        raise ValueError(f"{label} contains invalid sample_adjustment")
+
+    raw_win_rate = _validated_pct(item["raw_win_rate"], field="raw_win_rate", label=label)
+    adjusted_win_rate = _validated_pct(
+        item["adjusted_win_rate"], field="adjusted_win_rate", label=label
+    )
+    if raw_win_rate > Decimal("1") or adjusted_win_rate > Decimal("1"):
+        raise ValueError(f"{label} contains invalid win rate")
+    expected_raw_win_rate = (
+        Decimal(counts["winning_samples"]) / Decimal(completed)
+        if completed
+        else Decimal("0")
+    )
+    expected_adjusted_win_rate = _adjusted_win_rate(
+        counts["winning_samples"], completed
+    )
+    if _pct_text(raw_win_rate) != _pct_text(expected_raw_win_rate):
+        raise ValueError(f"{label} contains invalid raw_win_rate")
+    if _pct_text(adjusted_win_rate) != _pct_text(expected_adjusted_win_rate):
+        raise ValueError(f"{label} contains invalid adjusted_win_rate")
+    if _validated_pct(item["win_rate"], field="win_rate", label=label) != raw_win_rate:
+        raise ValueError(f"{label} contains invalid win_rate")
+
+    avg_net_win = _validated_pct(
+        item["avg_net_win_pct"], field="avg_net_win_pct", label=label
+    )
+    avg_net_loss = _validated_pct(
+        item["avg_net_loss_pct"], field="avg_net_loss_pct", label=label
+    )
+    full_kelly = _validated_pct(
+        item["full_kelly_pct"], field="full_kelly_pct", label=label
+    )
+    fractional_kelly = _validated_pct(
+        item["fractional_kelly_pct"], field="fractional_kelly_pct", label=label
+    )
+    suggested_position = _validated_pct(
+        item["suggested_position_pct"],
+        field="suggested_position_pct",
+        label=label,
+    )
+    if any(value > Decimal("1") for value in (full_kelly, fractional_kelly)):
+        raise ValueError(f"{label} contains invalid kelly percentage")
+    if avg_net_win < 0 or avg_net_loss < 0:
+        raise ValueError(f"{label} contains invalid net pnl percentage")
+    payoff_ratio = _validated_decimal(
+        item["payoff_ratio"], field="payoff_ratio", label=label
+    )
+    if payoff_ratio < 0:
+        raise ValueError(f"{label} contains invalid payoff_ratio")
+    if abs(fractional_kelly - (full_kelly / Decimal("4"))) > Decimal("0.0001"):
+        raise ValueError(f"{label} contains invalid fractional_kelly_pct")
+    if suggested_position > Decimal("0.04") or suggested_position != min(
+        fractional_kelly, Decimal("0.04")
+    ):
+        raise ValueError(f"{label} contains invalid suggested_position_pct")
+    if completed == 0 and suggested_position != 0:
+        raise ValueError(f"{label} contains invalid suggested_position_pct")
+
+    if item["parameter_source"] != "futu_paper_order_samples":
+        raise ValueError(f"{label} contains invalid parameter_source")
+    if item["source_trade_samples_generated_at"] != source_trade_samples_generated_at:
+        raise ValueError(
+            f"{label} contains invalid source_trade_samples_generated_at"
+        )
+    for field in ("last_recomputed_at", "updated_at"):
+        if not isinstance(item[field], str) or not item[field].strip():
+            raise ValueError(f"{label} contains invalid {field}")
+    if not isinstance(item["last_sample_closed_at"], str):
+        raise ValueError(f"{label} contains invalid last_sample_closed_at")
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _validated_decimal(value: object, *, field: str, label: str) -> Decimal:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} contains invalid {field}")
+    parsed = _decimal(value)
+    if parsed is None:
+        raise ValueError(f"{label} contains invalid {field}")
+    return parsed
+
+
+def _validated_pct(value: object, *, field: str, label: str) -> Decimal:
+    if not isinstance(value, str) or not value.strip().endswith("%"):
+        raise ValueError(f"{label} contains invalid {field}")
+    parsed = _decimal(value.strip()[:-1])
+    if parsed is None or parsed < 0 or parsed != parsed.quantize(Decimal("0.01")):
+        raise ValueError(f"{label} contains invalid {field}")
+    return parsed / Decimal("100")
 
 
 def _configured_experiments(
