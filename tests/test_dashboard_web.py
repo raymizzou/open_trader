@@ -314,12 +314,14 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "持仓实时看板" in html
     assert "刷新账户与行情" in html
     assert "accountSyncReloadNeeded" in js
+    assert "renderBacktestPriceSyncStatus" in js
     assert "全部市场" in html
     assert "symbol-detail-panel" in html
     assert "dashboard-header" in html
     assert "header-market-filters" in html
     assert "header-broker-filters" in html
     assert "header-backtest-filters" in html
+    assert "backtest-price-sync-status" in html
     assert "data-backtest=\"READY\"" in html
     assert "可运行" in html
     assert "current-view-value" in html
@@ -710,6 +712,60 @@ for (const expected of ["全部回测 3", "可运行 1", "缺价格 1", "缺字�
   if (!html.includes(expected)) {
     throw new Error("missing scoped count " + expected + ": " + html);
   }
+}
+console.log("ok");
+"""
+    )
+
+    assert "ok" in output
+
+
+def test_dashboard_renders_backtest_price_auto_sync_status() -> None:
+    output = run_dashboard_js(
+        r"""
+let rendered = "";
+elements["backtest-price-sync-status"] = {
+  textContent: "",
+  className: "",
+};
+state.dashboard = {
+  backtest_price_sync: {
+    status: "ok",
+    attempted: 2,
+    succeeded: 2,
+    failed: 0,
+    errors: [],
+  },
+};
+renderBacktestPriceSyncStatus();
+rendered = elements["backtest-price-sync-status"].textContent;
+if (rendered !== "已自动补齐 2 个回测价格文件") {
+  throw new Error("success sync status mismatch: " + rendered);
+}
+if (!elements["backtest-price-sync-status"].className.includes("status-ok")) {
+  throw new Error("success sync status should use ok tone: " + elements["backtest-price-sync-status"].className);
+}
+state.dashboard = {
+  backtest_price_sync: {
+    status: "failed",
+    attempted: 1,
+    succeeded: 0,
+    failed: 1,
+    errors: [{ market: "US", symbol: "VIXY", message: "kline unavailable" }],
+  },
+};
+renderBacktestPriceSyncStatus();
+rendered = elements["backtest-price-sync-status"].textContent;
+if (rendered !== "自动补齐失败 1 个：US.VIXY") {
+  throw new Error("failed sync status mismatch: " + rendered);
+}
+if (!elements["backtest-price-sync-status"].className.includes("status-warning")) {
+  throw new Error("failed sync status should use warning tone: " + elements["backtest-price-sync-status"].className);
+}
+state.dashboard = { backtest_price_sync: { status: "skipped", attempted: 0, succeeded: 0, failed: 0, errors: [] } };
+renderBacktestPriceSyncStatus();
+if (elements["backtest-price-sync-status"].textContent !== "") {
+  throw new Error("skipped sync status should stay empty: " + elements["backtest-price-sync-status"].textContent);
 }
 console.log("ok");
 """
@@ -3687,6 +3743,13 @@ def test_dashboard_server_auto_fetches_missing_backtest_prices_on_dashboard_load
         }
     ]
     assert (config.data_dir / "prices" / "US" / "VIXY.csv").is_file()
+    assert dashboard_payload["backtest_price_sync"] == {
+        "status": "ok",
+        "attempted": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "errors": [],
+    }
     vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
     assert vixy["backtest_readiness"]["status"] == "ready"
 
@@ -3744,6 +3807,19 @@ def test_dashboard_server_keeps_payload_when_auto_backtest_price_fetch_fails(
         }
     ]
     assert not (config.data_dir / "prices" / "US" / "VIXY.csv").exists()
+    assert dashboard_payload["backtest_price_sync"] == {
+        "status": "failed",
+        "attempted": 1,
+        "succeeded": 0,
+        "failed": 1,
+        "errors": [
+            {
+                "market": "US",
+                "symbol": "VIXY",
+                "message": "kline unavailable",
+            }
+        ],
+    }
     vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
     assert vixy["backtest_readiness"]["status"] == "missing_prices"
 

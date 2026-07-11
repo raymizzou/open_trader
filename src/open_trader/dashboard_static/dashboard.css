@@ -140,6 +140,22 @@ button {
   overflow-wrap: anywhere;
 }
 
+.backtest-price-sync-status {
+  align-self: start;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 700;
+  min-height: 26px;
+  padding: 5px 8px;
+  width: fit-content;
+}
+
+.backtest-price-sync-status:empty {
+  display: none;
+}
+
 .current-view-card {
   background: var(--surface-soft);
   border: 1px solid var(--line);
@@ -478,6 +494,12 @@ h2 {
 }
 
 .status-warn {
+  background: #fff1dc;
+  border-color: #efc47e;
+  color: var(--warning);
+}
+
+.status-warning {
   background: #fff1dc;
   border-color: #efc47e;
   color: var(--warning);

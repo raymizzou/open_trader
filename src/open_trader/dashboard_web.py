@@ -28,12 +28,16 @@ def build_dashboard_payload(
     auto_fetch_backtest_prices: bool = False,
     backtest_price_provider: DailyKlineProvider | None = None,
 ) -> dict[str, Any]:
+    backtest_price_sync: dict[str, Any] | None = None
     if auto_fetch_backtest_prices:
-        auto_fetch_missing_backtest_prices(
+        backtest_price_sync = auto_fetch_missing_backtest_prices(
             config,
             provider=backtest_price_provider,
         )
-    return load_dashboard_state(config).to_dict()
+    payload = load_dashboard_state(config).to_dict()
+    if backtest_price_sync is not None:
+        payload["backtest_price_sync"] = backtest_price_sync
+    return payload
 
 
 def build_quotes_payload(
@@ -139,15 +143,23 @@ def auto_fetch_missing_backtest_prices(
     *,
     provider: DailyKlineProvider | None = None,
     end: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     payload = load_dashboard_state(config).to_dict()
     requests = _missing_backtest_price_requests(payload)
     if not requests:
-        return
+        return {
+            "status": "skipped",
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "errors": [],
+        }
 
     owned_provider = provider is None
     price_provider = provider or FutuQuoteClient(host=config.futu_host, port=config.futu_port)
     fetch_end = end or date.today().isoformat()
+    succeeded = 0
+    errors: list[dict[str, str]] = []
     try:
         for request in requests:
             try:
@@ -159,11 +171,32 @@ def auto_fetch_missing_backtest_prices(
                     end=fetch_end,
                     provider=price_provider,
                 )
-            except Exception:
+                succeeded += 1
+            except Exception as exc:
+                errors.append(
+                    {
+                        "market": request["market"],
+                        "symbol": request["symbol"],
+                        "message": str(exc) or "auto backtest price fetch failed",
+                    }
+                )
                 continue
     finally:
         if owned_provider and hasattr(price_provider, "close"):
             price_provider.close()
+    failed = len(errors)
+    status = "ok"
+    if failed and succeeded:
+        status = "partial"
+    elif failed:
+        status = "failed"
+    return {
+        "status": status,
+        "attempted": len(requests),
+        "succeeded": succeeded,
+        "failed": failed,
+        "errors": errors,
+    }
 
 
 def _missing_backtest_price_requests(payload: dict[str, Any]) -> list[dict[str, str]]:

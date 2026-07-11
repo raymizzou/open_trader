@@ -3,6 +3,11 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-11
+
+- Added a dashboard backtest price-sync status line so operators can see when
+  automatic price backfill succeeds or fails during page load.
+
 ## 2026-07-10
 
 - Added a dashboard action to fetch missing backtest price CSVs from Futu daily

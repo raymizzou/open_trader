@@ -134,6 +134,7 @@ function bindElements() {
     "header-market-filters",
     "header-broker-filters",
     "header-backtest-filters",
+    "backtest-price-sync-status",
     "current-view-label",
     "current-view-value",
     "current-view-holding-value",
@@ -621,6 +622,7 @@ function renderBacktestFilters() {
     return;
   }
   elements["header-backtest-filters"].innerHTML = renderBacktestFilterButtons();
+  renderBacktestPriceSyncStatus();
 }
 
 function renderBacktestFilterButtons() {
@@ -630,6 +632,66 @@ function renderBacktestFilterButtons() {
     const count = counts[option.value] || 0;
     return `<button class="filter-button${activeClass}" type="button" data-backtest="${escapeHtml(option.value)}">${escapeHtml(option.label)} ${formatPlain(count)}</button>`;
   }).join("");
+}
+
+function renderBacktestPriceSyncStatus() {
+  const element = elements["backtest-price-sync-status"];
+  if (!element) {
+    return;
+  }
+  const status = backtestPriceSyncStatus(state.dashboard && state.dashboard.backtest_price_sync);
+  element.textContent = status.text;
+  element.className = `backtest-price-sync-status ${status.className}`;
+}
+
+function backtestPriceSyncStatus(sync) {
+  if (!sync || typeof sync !== "object") {
+    return { text: "", className: "status-muted" };
+  }
+  const attempted = integerValue(sync.attempted);
+  const succeeded = integerValue(sync.succeeded);
+  const failed = integerValue(sync.failed);
+  if (attempted <= 0) {
+    return { text: "", className: "status-muted" };
+  }
+  const failedSymbols = backtestPriceSyncFailedSymbols(sync.errors);
+  if (failed > 0 && succeeded > 0) {
+    const suffix = failedSymbols ? `：${failedSymbols}` : "";
+    return {
+      text: `已自动补齐 ${formatPlain(succeeded)} 个回测价格文件，失败 ${formatPlain(failed)} 个${suffix}`,
+      className: "status-warning",
+    };
+  }
+  if (failed > 0) {
+    const suffix = failedSymbols ? `：${failedSymbols}` : "";
+    return {
+      text: `自动补齐失败 ${formatPlain(failed)} 个${suffix}`,
+      className: "status-warning",
+    };
+  }
+  return {
+    text: `已自动补齐 ${formatPlain(succeeded)} 个回测价格文件`,
+    className: "status-ok",
+  };
+}
+
+function backtestPriceSyncFailedSymbols(errors) {
+  if (!Array.isArray(errors) || errors.length === 0) {
+    return "";
+  }
+  return errors.map((error) => {
+    if (!error || typeof error !== "object") {
+      return "";
+    }
+    const market = String(error.market || "").trim().toUpperCase();
+    const symbol = String(error.symbol || "").trim().toUpperCase();
+    return [market, symbol].filter(Boolean).join(".");
+  }).filter(Boolean).join(", ");
+}
+
+function integerValue(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function backtestFilterCounts() {
