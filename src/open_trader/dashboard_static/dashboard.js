@@ -490,8 +490,21 @@ function renderBacktestPriceActions(result) {
 
 function renderPriceActionChart(rows, trades) {
   const allowed = new Set(["BUY", "ADD", "REDUCE", "EXIT"]);
-  const actionTrades = trades.filter((trade) => allowed.has(String(trade.action || "")));
-  rows = downsampleBacktestRows(rows, "mark_price", new Set(actionTrades.map((trade) => String(trade.execution_date || ""))));
+  const validDates = new Set((Array.isArray(rows) ? rows : []).filter((row) => row && Number.isFinite(Number(row.mark_price))).map((row) => String(row.date || "")));
+  const grouped = new Map();
+  for (const trade of Array.isArray(trades) ? trades : []) {
+    const action = String(trade.action || "");
+    const executionDate = String(trade.execution_date || "");
+    const price = Number(trade.raw_price);
+    if (!allowed.has(action) || !validDates.has(executionDate) || !Number.isFinite(price)) continue;
+    const key = `${executionDate}\u0000${action}`;
+    const current = grouped.get(key);
+    if (current) current.count += 1;
+    else grouped.set(key, { execution_date: executionDate, action, raw_price: price, count: 1 });
+  }
+  const allGroups = [...grouped.values()];
+  const actionGroups = sampleBacktestActionGroups(allGroups, 600);
+  rows = downsampleBacktestRows(rows, "mark_price", new Set(actionGroups.map((group) => group.execution_date)));
   const prices = rows.map((row) => Number(row.mark_price));
   const [min, max] = finiteBacktestExtent(prices);
   const dateIndex = new Map(rows.map((row, index) => [String(row.date || ""), index]));
@@ -499,14 +512,38 @@ function renderPriceActionChart(rows, trades) {
     const index = dateIndex.get(String(date || "")) || 0;
     return [rows.length > 1 ? 20 + index * 560 / (rows.length - 1) : 300, 180 - (Number(price) - min) * 150 / (max - min || 1)];
   };
+  const displayedGroups = actionGroups.filter((group) => dateIndex.has(group.execution_date));
+  const omittedGroups = allGroups.length - displayedGroups.length;
   const pricePath = rows.map((row, index) => { const [x, y] = xy(row.date, row.mark_price); return `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`; }).join(" ");
   const explanations = { BUY: "买入", ADD: "加仓", REDUCE: "减仓", EXIT: "退出" };
-  const markers = actionTrades.filter((trade) => dateIndex.has(String(trade.execution_date || "")) && Number.isFinite(Number(trade.raw_price))).map((trade) => {
-    const action = String(trade.action); const [x, y] = xy(trade.execution_date, trade.raw_price);
-    return `<g class="backtest-action-marker action-${action.toLowerCase()}"><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5"></circle><text x="${x.toFixed(1)}" y="${(y - 9).toFixed(1)}">${action}</text></g>`;
+  const markers = displayedGroups.map((group) => {
+    const [x, y] = xy(group.execution_date, group.raw_price);
+    const count = group.count > 1 ? ` ×${group.count}` : "";
+    return `<g class="backtest-action-marker action-${group.action.toLowerCase()}"><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5"></circle><text x="${x.toFixed(1)}" y="${(y - 9).toFixed(1)}">${group.action}${count}</text></g>`;
   }).join("");
-  const summary = actionTrades.map((trade) => `${trade.execution_date} ${trade.action}（${explanations[trade.action]}）`).join("；");
-  return `<div class="backtest-chart" role="img" aria-label="价格曲线与交易动作。${escapeHtml(summary || "没有执行动作")}。HOLD（观察）不绘制标记。"><svg viewBox="0 0 600 200" aria-hidden="true"><path class="backtest-price-line" d="${pricePath}" fill="none" vector-effect="non-scaling-stroke"></path>${markers}</svg></div>`;
+  const summary = displayedGroups.map((group) => `${group.execution_date} ${group.action}（${explanations[group.action]}）${group.count > 1 ? `共 ${group.count} 笔` : ""}`).join("；");
+  const omittedNotice = omittedGroups ? `另有 ${omittedGroups} 组交易标记未显示` : "";
+  return `<div class="backtest-chart" role="img" aria-label="价格曲线与交易动作。${escapeHtml(summary || "没有执行动作")}。${omittedNotice}。HOLD（观察）不绘制标记。"><svg viewBox="0 0 600 200" aria-hidden="true"><path class="backtest-price-line" d="${pricePath}" fill="none" vector-effect="non-scaling-stroke"></path>${markers}</svg></div>`;
+}
+
+function sampleBacktestActionGroups(groups, limit) {
+  if (groups.length <= limit) return groups;
+  const selected = new Set([0, groups.length - 1]);
+  const actions = ["BUY", "ADD", "REDUCE", "EXIT"];
+  for (const action of actions) {
+    const first = groups.findIndex((group) => group.action === action);
+    if (first >= 0) selected.add(first);
+    for (let index = groups.length - 1; index >= 0; index -= 1) {
+      if (groups[index].action === action) { selected.add(index); break; }
+    }
+  }
+  const remaining = limit - selected.size;
+  const step = (groups.length - 1) / (remaining + 1);
+  for (let index = 1; index <= remaining; index += 1) selected.add(Math.round(index * step));
+  if (selected.size < limit) {
+    for (let index = 0; index < groups.length && selected.size < limit; index += 1) selected.add(index);
+  }
+  return [...selected].sort((left, right) => left - right).slice(0, limit).map((index) => groups[index]);
 }
 
 function renderBacktestTradeTable(result) {

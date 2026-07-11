@@ -408,6 +408,26 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_standard_backtest_result_aggregates_and_bounds_action_markers() -> None:
+    output = run_dashboard_js(r'''
+const target={innerHTML:"",hidden:true}; document.getElementById=()=>target;
+const rows=Array.from({length:1000},(_,i)=>({date:`d${i}`,equity:String(100000+i),mark_price:String(100+i/100)}));
+const actions=["BUY","ADD","REDUCE","EXIT"];
+const trades=Array.from({length:50000},(_,i)=>({execution_date:rows[i%rows.length].date,action:actions[i%4],quantity:"1",raw_price:i===49999?"Infinity":rows[i%rows.length].mark_price,execution_price:"100",fees:"1",reason:"大量记录"}));
+const result={strategy:{trades,equity_curve:rows,total_return_pct:"1",max_drawdown_pct:"-1",win_rate_pct:"1"},buy_hold:{equity_curve:rows,total_return_pct:"1"},market_benchmark:{equity_curve:rows,total_return_pct:"1"},benchmark_symbol:"SPY",signals:[],assumptions:{},strategy_definition:{parameters:{}}};
+const chart=renderPriceActionChart(rows,trades);
+const markerCount=(chart.match(/<g class="backtest-action-marker/g)||[]).length;
+if(markerCount>600)throw new Error(`unbounded markers ${markerCount}`);
+if(!chart.includes("×"))throw new Error("aggregated count missing");
+if(!chart.includes("另有 ")||!chart.includes("组交易标记未显示"))throw new Error("omitted notice missing");
+const aria=(chart.match(/aria-label="([^"]*)"/)||[])[1]||"";
+if(aria.length>50000)throw new Error(`unbounded aria ${aria.length}`);
+if(/NaN|Infinity/.test(chart))throw new Error("invalid numeric output");
+console.log("ok");
+''')
+    assert "ok" in output
+
+
 class FakeQuoteService:
     def __init__(self, result: QuoteRefreshResult) -> None:
         self.result = result
