@@ -10,10 +10,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
   breakout-momentum, and range-mean-reversion strategies.
 - Added buy-and-hold and market-index comparisons, explicit actual data dates,
   fixed cost and sizing assumptions, and standalone auditable artifacts.
-- Verified with `178` focused and `1129` full pytest tests, three real 1Y
-  MSFT/Futu API runs with SPY comparison and hashed artifacts, and separate
-  Playwright submissions for all three strategies on `127.0.0.1:8766` with
-  desktop/mobile screenshots and no console or network errors.
+- Preserved real nonzero Futu daily volume for breakout research and fixed the
+  price/action chart to render the serialized close-price series.
+- Verified with `192` focused and `1134` full pytest tests, three fresh real 1Y
+  MSFT/Futu API runs with 320 positive-volume MSFT and SPY rows, and separate
+  Playwright submissions for all three strategies proving visible equity,
+  price-path, and action-marker geometry with no console or network errors.
 
 ## 2026-07-11
 
