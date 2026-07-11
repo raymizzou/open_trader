@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -8,6 +8,7 @@ import pytest
 from open_trader.backtest_prices import (
     BacktestDateRange,
     ensure_backtest_price_range,
+    ensure_resolved_backtest_price_range,
     fetch_backtest_prices,
     load_price_rows,
     resolve_backtest_range,
@@ -139,7 +140,7 @@ def test_ensure_price_range_fetches_when_file_does_not_cover_warmup(tmp_path: Pa
         provider=provider,
     )
     assert provider.requests == [("US.MSFT", "2024-09-23", "2026-01-01")]
-    assert result.actual_start <= date(2025, 1, 1)
+    assert result.actual_start == date(2026, 1, 1)
     assert result.actual_end == date(2026, 1, 1)
     assert len(result.source_hash) == 64
 
@@ -147,7 +148,11 @@ def test_ensure_price_range_fetches_when_file_does_not_cover_warmup(tmp_path: Pa
 def test_ensure_price_range_reuses_complete_csv(tmp_path: Path) -> None:
     path = tmp_path / "prices" / "US" / "MSFT.csv"
     path.parent.mkdir(parents=True)
-    _write_prices(path, ["2024-09-23,1,1,1,1,1", "2026-01-01,2,2,2,2,2"])
+    _write_prices(path, [
+        "2024-01-01,1,1,1,1,1", "2024-09-23,1,1,1,1,1",
+        "2025-01-01,1,1,1,1,1", "2026-01-01,2,2,2,2,2",
+        "2026-02-01,2,2,2,2,2",
+    ])
     provider = CoverageProvider()
     result = ensure_backtest_price_range(
         data_dir=tmp_path, market="us", symbol="msft",
@@ -156,3 +161,81 @@ def test_ensure_price_range_reuses_complete_csv(tmp_path: Path) -> None:
     )
     assert provider.requests == []
     assert result.prices_path == path
+    assert [bar.date for bar in result.bars] == [
+        date(2024, 9, 23), date(2025, 1, 1), date(2026, 1, 1)
+    ]
+    assert result.actual_start == date(2025, 1, 1)
+    assert result.actual_end == date(2026, 1, 1)
+
+
+def test_ensure_price_range_rejects_no_requested_period_bar_in_chinese(tmp_path: Path) -> None:
+    path = tmp_path / "prices" / "US" / "MSFT.csv"
+    path.parent.mkdir(parents=True)
+    _write_prices(path, ["2024-09-23,1,1,1,1,1", "2024-12-31,1,1,1,1,1"])
+    with pytest.raises(ValueError, match="请求区间内没有可用价格数据"):
+        ensure_backtest_price_range(
+            data_dir=tmp_path, market="US", symbol="MSFT",
+            date_range=BacktestDateRange(date(2025, 1, 1), date(2024, 12, 31), date(2024, 9, 23)),
+            provider=CoverageProvider(),
+        )
+
+
+@pytest.mark.parametrize(
+    "market,symbol,message",
+    [("EU", "MSFT", "不支持的市场：EU"), ("US", "  ", "标的代码不能为空")],
+)
+def test_ensure_price_range_uses_chinese_input_errors(
+    tmp_path: Path, market: str, symbol: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ensure_backtest_price_range(
+            data_dir=tmp_path, market=market, symbol=symbol,
+            date_range=BacktestDateRange(date(2025, 1, 1), date(2026, 1, 1), date(2024, 9, 23)),
+            provider=CoverageProvider(),
+        )
+
+
+class LatestDiscoveryProvider:
+    def __init__(self, latest: date) -> None:
+        self.latest = latest
+        self.requests: list[tuple[str, str, str]] = []
+
+    def get_daily_kline(self, futu_symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
+        self.requests.append((futu_symbol, start, end))
+        return [DailyKlineBar(date=start, close=100), DailyKlineBar(date=self.latest.isoformat(), close=101)]
+
+
+def test_resolved_range_uses_last_trading_bar_for_default_end(tmp_path: Path) -> None:
+    latest = date.today() - timedelta(days=2)
+    provider = LatestDiscoveryProvider(latest)
+    result = ensure_resolved_backtest_price_range(
+        data_dir=tmp_path, market="US", symbol="MSFT", preset="1Y",
+        custom_start=None, custom_end=None, provider=provider,
+    )
+    assert result.date_range.requested_end == latest
+    assert result.price_range.actual_end == latest
+    assert provider.requests[0][2] == date.today().isoformat()
+
+
+def test_resolved_range_refetches_when_recomputed_warmup_is_earlier(tmp_path: Path) -> None:
+    latest = date.today() - timedelta(days=2)
+    provider = LatestDiscoveryProvider(latest)
+    result = ensure_resolved_backtest_price_range(
+        data_dir=tmp_path, market="US", symbol="MSFT", preset="3Y",
+        custom_start=None, custom_end=None, provider=provider,
+    )
+    assert len(provider.requests) == 2
+    assert provider.requests[1][1] == result.date_range.warmup_start.isoformat()
+
+
+def test_resolved_custom_end_preserves_request_and_clamps_effective_end(tmp_path: Path) -> None:
+    latest = date(2026, 7, 10)
+    provider = LatestDiscoveryProvider(latest)
+    requested_end = date(2026, 7, 12)
+    result = ensure_resolved_backtest_price_range(
+        data_dir=tmp_path, market="US", symbol="MSFT", preset=None,
+        custom_start=date(2025, 7, 12), custom_end=requested_end, provider=provider,
+    )
+    assert result.date_range.requested_end == latest
+    assert result.price_range.requested_end == requested_end
+    assert result.price_range.actual_end == latest

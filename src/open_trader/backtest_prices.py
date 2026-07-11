@@ -11,7 +11,7 @@ from tempfile import NamedTemporaryFile
 from typing import Protocol, Sequence
 
 from .kline_technical_facts import DailyKlineBar
-from .market_scope import parse_market_scope
+from .market_scope import MarketScope, parse_market_scope
 from .standard_strategies import StrategyBar
 
 
@@ -59,6 +59,12 @@ class BacktestPriceRangeResult:
     prices_path: Path
     source_hash: str
     bars: Sequence[StrategyBar]
+
+
+@dataclass(frozen=True)
+class ResolvedBacktestPriceRangeResult:
+    date_range: BacktestDateRange
+    price_range: BacktestPriceRangeResult
 
 
 def _subtract_months(value: date, months: int) -> date:
@@ -127,10 +133,10 @@ def ensure_backtest_price_range(
     *, data_dir: Path, market: str, symbol: str,
     date_range: BacktestDateRange, provider: DailyKlineProvider,
 ) -> BacktestPriceRangeResult:
-    market_scope = parse_market_scope(market)
+    market_scope = _parse_market_scope_zh(market)
     normalized_symbol = symbol.strip().upper()
     if not normalized_symbol:
-        raise ValueError("symbol is required")
+        raise ValueError("标的代码不能为空")
     prices_path = data_dir / "prices" / market_scope.value / f"{normalized_symbol}.csv"
     bars: list[StrategyBar] | None = None
     if prices_path.exists():
@@ -145,13 +151,62 @@ def ensure_backtest_price_range(
         )
         prices_path = fetched.prices_path
         bars = load_price_rows(prices_path)
+    bars = [
+        bar for bar in bars
+        if date_range.warmup_start <= bar.date <= date_range.requested_end
+    ]
+    if not bars:
+        raise ValueError("请求区间内没有可用价格数据")
+    requested_bars = [bar for bar in bars if bar.date >= date_range.requested_start]
+    if not requested_bars:
+        raise ValueError("请求区间内没有可用价格数据")
     return BacktestPriceRangeResult(
         market=market_scope.value, symbol=normalized_symbol,
         requested_start=date_range.requested_start, requested_end=date_range.requested_end,
-        actual_start=bars[0].date, actual_end=bars[-1].date,
+        actual_start=requested_bars[0].date, actual_end=requested_bars[-1].date,
         warmup_start=date_range.warmup_start, prices_path=prices_path,
         source_hash=hashlib.sha256(prices_path.read_bytes()).hexdigest(), bars=tuple(bars),
     )
+
+
+def ensure_resolved_backtest_price_range(
+    *,
+    data_dir: Path,
+    market: str,
+    symbol: str,
+    preset: str | None,
+    custom_start: date | None,
+    custom_end: date | None,
+    provider: DailyKlineProvider,
+) -> ResolvedBacktestPriceRangeResult:
+    provisional_end = custom_end or date.today()
+    provisional_range = resolve_backtest_range(
+        preset=preset, custom_start=custom_start, custom_end=custom_end,
+        latest_available=provisional_end,
+    )
+    initial = ensure_backtest_price_range(
+        data_dir=data_dir, market=market, symbol=symbol,
+        date_range=provisional_range, provider=provider,
+    )
+    effective_range = resolve_backtest_range(
+        preset=preset, custom_start=custom_start, custom_end=custom_end,
+        latest_available=initial.actual_end,
+    )
+    if custom_end is not None:
+        preserved = BacktestPriceRangeResult(
+            market=initial.market, symbol=initial.symbol,
+            requested_start=initial.requested_start, requested_end=custom_end,
+            actual_start=initial.actual_start, actual_end=initial.actual_end,
+            warmup_start=initial.warmup_start, prices_path=initial.prices_path,
+            source_hash=initial.source_hash, bars=initial.bars,
+        )
+        return ResolvedBacktestPriceRangeResult(effective_range, preserved)
+    if effective_range.warmup_start < initial.bars[0].date:
+        initial = ensure_backtest_price_range(
+            data_dir=data_dir, market=market, symbol=symbol,
+            date_range=effective_range, provider=provider,
+        )
+    return ResolvedBacktestPriceRangeResult(effective_range, initial)
 
 
 def fetch_backtest_prices(
@@ -163,10 +218,10 @@ def fetch_backtest_prices(
     end: str,
     provider: DailyKlineProvider,
 ) -> BacktestPriceFetchResult:
-    market_scope = parse_market_scope(market)
+    market_scope = _parse_market_scope_zh(market)
     normalized_symbol = symbol.strip().upper()
     if not normalized_symbol:
-        raise ValueError("symbol is required")
+        raise ValueError("标的代码不能为空")
     if not start.strip() or not end.strip():
         raise ValueError("start and end are required")
 
@@ -214,3 +269,10 @@ def _atomic_write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
     temp_path.replace(path)
+
+
+def _parse_market_scope_zh(market: str) -> MarketScope:
+    try:
+        return parse_market_scope(market)
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"不支持的市场：{market}") from exc
