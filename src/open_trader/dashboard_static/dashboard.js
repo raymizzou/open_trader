@@ -417,7 +417,7 @@ function validateStandardBacktestDates() {
 
 function safeBacktestErrorMessage(payload) {
   const message = payload && typeof payload.message === "string" ? payload.message.trim() : "";
-  const isSafeChinese = message && /[\u3400-\u9fff]/.test(message) && !/[A-Za-z]{2,}/.test(message);
+  const isSafeChinese = message && /[\u3400-\u9fff]/.test(message) && !/[A-Za-z]/.test(message);
   return isSafeChinese ? message : "回测请求失败，请稍后重试。";
 }
 

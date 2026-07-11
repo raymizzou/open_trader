@@ -68,3 +68,15 @@ Command: `../../.venv/bin/python -m pytest tests/test_dashboard_web.py -q`
 Exact result: `65 passed in 11.86s`. `node --check src/open_trader/dashboard_static/dashboard.js` and `git diff --check` also exited 0.
 
 Commit subject: `fix: filter mixed-language backtest errors`
+
+## Any-Latin Error Filter Follow-up
+
+### RED
+
+Focused safe-error test returned `1 failed in 0.36s`; `参数 X 无效` exposed that a single Latin character still passed through.
+
+### GREEN
+
+`../../.venv/bin/python -m pytest tests/test_dashboard_web.py -q` returned `65 passed in 11.93s`. Node syntax and diff checks exited 0.
+
+Commit subject: `fix: reject Latin characters in backtest errors`
