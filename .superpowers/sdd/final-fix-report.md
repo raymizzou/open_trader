@@ -118,3 +118,119 @@ The zero-sample entry is `0%` and blocked; the pending exit is approved.
 - No unresolved correctness concerns.
 - Pre-existing untracked `.venv` and `node_modules` symlinks were not modified or
   committed.
+
+---
+
+# Second Final-Review Fix
+
+Date: 2026-07-12 (Asia/Shanghai)
+
+## Commit
+
+- Implementation and regenerated artifacts: `41c693ccc024e73379839e44cf81c287a830c855`
+- Report update: recorded by the commit containing this section.
+
+## Fixes
+
+- Production entry risk now validates current templates/experiments without
+  strategy stats or optional order artifacts, derives the exact configured
+  experiment IDs, and requires unified stats to cover that set exactly.
+- Invalid config or stats blocks every entry with a
+  `strategy_stats_provenance` failure while valid exits continue to approval.
+- Malformed optional paper-order/execution artifacts cannot affect entry
+  provenance authorization; malformed experiment configuration still fails
+  closed.
+- Pending-entry lifecycle and intent narratives now say only that the entry rule
+  triggered and sizing/risk checks are pending. Intent generation overwrites
+  stale persisted pending-entry narratives.
+- Checked-in lifecycle, intent, risk, execution, sample, and strategy-stat
+  artifacts were regenerated as one chain. The entry remains `0%` and blocked;
+  the exit remains approved.
+
+## TDD Evidence
+
+- Exact-coverage production RED:
+  `PYTHONPATH=src .venv/bin/python -m pytest tests/test_kelly_order_risk.py::test_production_risk_blocks_entry_when_stats_omit_configured_experiment tests/test_kelly_order_risk.py::test_production_risk_blocks_entry_when_experiment_config_is_malformed -q`
+  - `2 failed in 0.29s`
+- Exact-coverage production GREEN:
+  `PYTHONPATH=src .venv/bin/python -m pytest tests/test_kelly_order_risk.py -q`
+  - `34 passed in 0.22s`
+- Narrative RED: focused lifecycle, intent, and dashboard tests
+  - `3 failed in 0.30s`
+- Narrative lifecycle/intent GREEN
+  - `2 passed in 0.01s`
+- Combined focused GREEN:
+  `PYTHONPATH=src .venv/bin/python -m pytest tests/test_kelly_lifecycle.py tests/test_kelly_order_intents.py tests/test_kelly_order_risk.py tests/test_dashboard_web.py::test_dashboard_js_renders_kelly_lab_panel -q`
+  - `52 passed in 0.47s`
+- Checked-in consistency RED before regeneration
+  - `1 failed` because the old intent still claimed `4%` and `风控通过`
+- Checked-in consistency GREEN after regeneration
+  - `1 passed in 0.01s`
+- Optional operational-artifact isolation RED:
+  `PYTHONPATH=src .venv/bin/python -m pytest tests/test_kelly_order_risk.py::test_production_risk_ignores_malformed_operational_artifacts -q`
+  - `2 failed in 0.06s`
+- Optional operational-artifact isolation GREEN:
+  `PYTHONPATH=src .venv/bin/python -m pytest tests/test_kelly_order_risk.py tests/test_kelly_lab.py -q`
+  - `69 passed in 0.27s`
+
+## Real CLI Chain
+
+All commands exited `0`:
+
+```text
+PYTHONPATH=src .venv/bin/python -m open_trader kelly build-trade-samples --data-dir data --generated-at '2026-07-12 00:35'
+samples: 0; open_positions: 0; skipped_orders: 0
+
+PYTHONPATH=src .venv/bin/python -m open_trader kelly build-strategy-stats --data-dir data --generated-at '2026-07-12 00:35'
+experiments: 3
+
+PYTHONPATH=src .venv/bin/python -m open_trader kelly build-order-intents --data-dir data --created-at '2026-07-12 00:35'
+intents: 2
+
+PYTHONPATH=src .venv/bin/python -m open_trader kelly check-order-risk --data-dir data --checked-at '2026-07-12 00:35'
+intents: 2; approved: 1; blocked: 1
+
+PYTHONPATH=src .venv/bin/python -m open_trader kelly execute-orders --data-dir data --dry-run --executed-at '2026-07-12 00:35' --limit-price HK.02840=2950 --order-qty HK.02840=1
+executions: 2; dry_run: 1; submitted: 0; skipped: 1; failed: 0
+```
+
+Generated evidence digest:
+`703cd9842e55547f5b68f4e4d710baecdc23906221a73dfc610c0a4da055d815`.
+
+## Final Verification
+
+- `PYTHONPATH=src .venv/bin/python -m pytest -q`
+  - `1247 passed in 16.68s`
+- `npm run test:e2e:kelly`
+  - `3 passed (1.3s)`
+- `PYTHONPATH=src .venv/bin/python -m compileall -q src tests`
+  - exit `0`
+- `git diff --check`
+  - exit `0`
+- First `codex review --uncommitted`
+  - identified optional order-artifact coupling; fixed with a RED/GREEN
+    production regression.
+- Second `codex review --uncommitted`
+  - `No actionable correctness issues were identified.`
+
+## Live Verification
+
+- Stopped only the prior `open_trader_dashboard_8766` screen/PID `42841` and
+  preserved the unrelated watch and Xiaozhi screens.
+- Restarted `open_trader_dashboard_8766` from this feature worktree.
+- Dashboard Python PID: `49008`; start: `Sun Jul 12 00:38:20 2026`.
+- Fresh log `/tmp/open_trader_dashboard_8766.log` contains
+  `dashboard_url: http://127.0.0.1:8766`.
+- Live `/api/dashboard`: Kelly available, 3 experiments, canonical pending-entry
+  reason/action, with no pre-risk percentage or approval claim.
+- Live Playwright: canonical pending narrative rendered twice; legacy `4%` claim
+  absent; `风控通过` absent.
+- Checked-in risk API source artifact: 2 checks, entry blocked, exit approved.
+
+## Concerns
+
+- No unresolved correctness concerns.
+- The E2E narrative update initially exposed a strict-locator duplicate because
+  the same canonical text intentionally appears in reason and meaning; the test
+  now asserts an exact count of 2 and both rendered values.
+- Pre-existing untracked `.venv` and `node_modules` symlinks were preserved.
