@@ -10,6 +10,7 @@ from open_trader.kelly_lab import (
     index_kelly_experiments_by_market_symbol,
     load_kelly_lab_state,
 )
+from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
@@ -152,84 +153,122 @@ def _write_minimal_kelly_experiments(latest_dir: Path) -> None:
     )
 
 
-def test_load_kelly_lab_state_overlays_trade_sample_stats(tmp_path: Path) -> None:
-    data_dir = tmp_path / "data"
+def _trade_samples_payload(*, legacy_position: str | None = None) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "open_trader.kelly_trade_samples.v1",
+        "generated_at": "2026-07-11 11:00",
+        "source_orders_synced_at": "2026-07-11 10:59",
+        "sample_count": 0,
+        "open_position_count": 0,
+        "skipped_order_count": 0,
+        "stats_by_experiment": {},
+        "samples": [],
+        "open_positions": [],
+        "diagnostics": {"skipped_orders": []},
+    }
+    if legacy_position is not None:
+        payload["stats_by_experiment"] = {
+            "trend_us": {"suggested_position_pct": legacy_position}
+        }
+    return payload
+
+
+def _write_strategy_stats_fixture(
+    latest_dir: Path,
+    *,
+    trade_samples_payload: dict[str, object],
+) -> None:
+    payload = build_kelly_strategy_stats_payload(
+        [
+            {
+                "experiment_id": "trend_us",
+                "experiment_name": "Trend US",
+                "market": "US",
+            }
+        ],
+        trade_samples_payload,
+        generated_at="2026-07-11 11:01",
+    )
+    write_json(latest_dir / "kelly_strategy_stats.json", payload)
+
+
+def _write_lab_fixtures(
+    data_dir: Path,
+    *,
+    embedded_position: str = "9%",
+    sample_position: str | None = None,
+) -> dict[str, object]:
     latest_dir = data_dir / "latest"
     latest_dir.mkdir(parents=True)
     _write_minimal_kelly_templates(latest_dir)
-    _write_minimal_kelly_experiments(latest_dir)
-    (latest_dir / "kelly_trade_samples.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "open_trader.kelly_trade_samples.v1",
-                "generated_at": "2026-07-11 11:00",
-                "stats_by_experiment": {
-                    "trend_us": {
-                        "completed_samples": 2,
-                        "open_samples": 1,
-                        "observed_win_rate": "50%",
-                        "sample_stage": "insufficient",
-                        "parameter_source": "futu_paper_order_samples",
-                        "skipped_order_count": 3,
-                        "last_recomputed_at": "2026-07-11 11:00",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
+    experiments = minimal_experiment_payload()
+    experiments["experiments"][0]["stats"]["suggested_position_pct"] = embedded_position
+    write_json(latest_dir / "kelly_experiments.json", experiments)
+    trade_samples = _trade_samples_payload(legacy_position=sample_position)
+    write_json(latest_dir / "kelly_trade_samples.json", trade_samples)
+    return trade_samples
+
+
+def test_lab_uses_strategy_stats_instead_of_embedded_or_sample_stats(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    trade_samples = _write_lab_fixtures(
+        data_dir,
+        embedded_position="9%",
+        sample_position="8%",
+    )
+    _write_strategy_stats_fixture(
+        data_dir / "latest",
+        trade_samples_payload=trade_samples,
     )
 
     state = load_kelly_lab_state(data_dir)
 
     assert state.available is True
-    stats = state.experiments[0]["stats"]
-    assert stats["completed_samples"] == 2
-    assert stats["open_samples"] == 1
-    assert stats["parameter_source"] == "futu_paper_order_samples"
-    assert stats["skipped_order_count"] == 3
+    assert state.experiments[0]["stats"]["suggested_position_pct"] == "0%"
+    assert "observed_win_rate" not in state.experiments[0]["stats"]
 
 
-def test_load_kelly_lab_state_rejects_invalid_trade_sample_schema(
+@pytest.mark.parametrize(
+    ("artifact_payload", "error"),
+    [
+        (None, "not found"),
+        ({"schema_version": "wrong"}, "schema_version"),
+        ("stale", "stale"),
+        ("incomplete", "experiment coverage mismatch"),
+    ],
+)
+def test_lab_fails_closed_for_missing_or_invalid_strategy_stats(
     tmp_path: Path,
+    artifact_payload: dict[str, object] | str | None,
+    error: str,
 ) -> None:
     data_dir = tmp_path / "data"
+    trade_samples = _write_lab_fixtures(data_dir)
     latest_dir = data_dir / "latest"
-    latest_dir.mkdir(parents=True)
-    _write_minimal_kelly_templates(latest_dir)
-    _write_minimal_kelly_experiments(latest_dir)
-    (latest_dir / "kelly_trade_samples.json").write_text(
-        json.dumps({"schema_version": "wrong", "stats_by_experiment": {}}),
-        encoding="utf-8",
-    )
+    if artifact_payload == "stale":
+        payload = build_kelly_strategy_stats_payload(
+            [],
+            {**trade_samples, "generated_at": "2026-07-11 10:59"},
+            generated_at="2026-07-11 11:01",
+        )
+    elif artifact_payload == "incomplete":
+        payload = build_kelly_strategy_stats_payload(
+            [],
+            trade_samples,
+            generated_at="2026-07-11 11:01",
+        )
+    else:
+        payload = artifact_payload
+    if payload is not None:
+        write_json(latest_dir / "kelly_strategy_stats.json", payload)
 
     state = load_kelly_lab_state(data_dir)
 
     assert state.available is False
-    assert "kelly_trade_samples.json schema_version" in state.error
-
-
-def test_load_kelly_lab_state_can_skip_trade_sample_overlay(
-    tmp_path: Path,
-) -> None:
-    data_dir = tmp_path / "data"
-    latest_dir = data_dir / "latest"
-    latest_dir.mkdir(parents=True)
-    _write_minimal_kelly_templates(latest_dir)
-    _write_minimal_kelly_experiments(latest_dir)
-    (latest_dir / "kelly_trade_samples.json").write_text(
-        json.dumps({"schema_version": "wrong", "stats_by_experiment": {}}),
-        encoding="utf-8",
-    )
-
-    state = load_kelly_lab_state(data_dir, include_trade_samples=False)
-
-    assert state.available is True
-    assert state.experiments[0]["stats"] == {
-        "completed_samples": 0,
-        "open_samples": 0,
-        "observed_win_rate": "",
-        "sample_stage": "insufficient",
-    }
+    assert "kelly_strategy_stats.json" in state.error
+    assert error in state.error
 
 
 def test_load_kelly_lab_state_rejects_mixed_market_experiment(
@@ -269,7 +308,7 @@ def test_load_kelly_lab_state_attaches_market_capital_pool(
         ),
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     experiment = state["experiments"][0]
     assert experiment["market"] == "US"
@@ -398,7 +437,7 @@ def test_load_kelly_lab_state_returns_locked_experiments(tmp_path: Path) -> None
         },
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     assert state["available"] is True
     assert state["template_count"] == 1
@@ -500,7 +539,7 @@ def test_load_kelly_lab_state_generates_lifecycle_states_from_symbol_facts(
         },
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     lifecycle_states = state["experiments"][0]["lifecycle_states"]
     assert lifecycle_states == [
@@ -608,7 +647,7 @@ def test_load_kelly_lab_state_filters_manual_lifecycle_states_to_participants(
         },
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     lifecycle_states = state["experiments"][0]["lifecycle_states"]
     assert [(item["market"], item["symbol"]) for item in lifecycle_states] == [
@@ -716,7 +755,7 @@ def test_load_kelly_lab_state_attaches_paper_orders_by_experiment_id(
         },
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     orders = state["experiments"][0]["order_sync"]["orders"]
     assert orders == [
@@ -773,7 +812,7 @@ def test_load_kelly_lab_state_filters_attached_paper_orders_to_experiment_market
         },
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     orders = state["experiments"][0]["order_sync"]["orders"]
     assert [(order["market"], order["symbol"]) for order in orders] == [("US", "RAM")]
@@ -817,7 +856,7 @@ def test_load_kelly_lab_state_filters_attached_order_executions_to_experiment_ma
         },
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     order_execution = state["experiments"][0]["order_execution"]
     assert order_execution["execution_count"] == 1
@@ -869,7 +908,7 @@ def test_load_kelly_lab_state_attaches_strategy_capital_snapshot(
         },
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     assert state["experiments"][0]["capital"]["available_notional"] == "22600"
     assert state["experiments"][0]["capital"]["open_buy_order_count"] == 1
@@ -904,7 +943,7 @@ def test_load_kelly_lab_state_marks_strategy_capital_unavailable_on_market_curre
         },
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     assert state["experiments"][0]["capital"] == {
         "available": False,
@@ -925,7 +964,7 @@ def test_load_kelly_lab_state_marks_strategy_capital_unavailable_when_missing(
         minimal_experiment_payload(),
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     assert state["experiments"][0]["capital"] == {"available": False}
 
@@ -1028,7 +1067,7 @@ def test_load_kelly_lab_state_keeps_existing_order_sync_when_paper_orders_missin
         },
     )
 
-    state = load_kelly_lab_state(data_dir).to_dict()
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False).to_dict()
 
     assert state["available"] is True
     assert state["experiments"][0]["order_sync"] == {
@@ -1181,7 +1220,7 @@ def test_index_kelly_experiments_by_market_symbol(tmp_path: Path) -> None:
             ],
         },
     )
-    state = load_kelly_lab_state(data_dir)
+    state = load_kelly_lab_state(data_dir, include_strategy_stats=False)
 
     indexed = index_kelly_experiments_by_market_symbol(state.experiments)
 
@@ -1189,15 +1228,15 @@ def test_index_kelly_experiments_by_market_symbol(tmp_path: Path) -> None:
     assert indexed[("US", "MSFT")][0]["experiment_id"] == "breakout_10d_exp_20260707"
 
 
-def test_load_checked_in_kelly_data_is_available() -> None:
+def test_load_checked_in_kelly_data_requires_strategy_stats() -> None:
     state = load_kelly_lab_state(Path("data")).to_dict()
 
-    assert state["available"] is True
-    assert state["experiment_count"] >= 1
+    assert state["available"] is False
+    assert "kelly_strategy_stats.json" in state["error"]
 
 
 def test_latest_kelly_experiments_are_single_market() -> None:
-    state = load_kelly_lab_state(Path("data")).to_dict()
+    state = load_kelly_lab_state(Path("data"), include_strategy_stats=False).to_dict()
 
     allowed_markets = {"US", "HK", "CN"}
     for experiment in state["experiments"]:
@@ -1209,7 +1248,7 @@ def test_latest_kelly_experiments_are_single_market() -> None:
 
 
 def test_latest_kelly_experiments_split_trend_pullback_mock_by_market() -> None:
-    state = load_kelly_lab_state(Path("data")).to_dict()
+    state = load_kelly_lab_state(Path("data"), include_strategy_stats=False).to_dict()
     experiments = {
         experiment["experiment_id"]: experiment for experiment in state["experiments"]
     }
@@ -1288,7 +1327,7 @@ def test_latest_kelly_experiments_split_trend_pullback_mock_by_market() -> None:
 
 
 def test_latest_kelly_order_artifacts_reference_visible_experiments() -> None:
-    state = load_kelly_lab_state(Path("data")).to_dict()
+    state = load_kelly_lab_state(Path("data"), include_strategy_stats=False).to_dict()
     experiments = {
         experiment["experiment_id"]: experiment for experiment in state["experiments"]
     }
@@ -1351,7 +1390,7 @@ def test_latest_entry_planned_notionals_match_order_intents() -> None:
 
 
 def test_load_checked_in_kelly_data_has_scoped_order_and_lifecycle_metadata() -> None:
-    state = load_kelly_lab_state(Path("data")).to_dict()
+    state = load_kelly_lab_state(Path("data"), include_strategy_stats=False).to_dict()
     experiments = {
         experiment["experiment_id"]: experiment for experiment in state["experiments"]
     }

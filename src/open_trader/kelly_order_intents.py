@@ -27,7 +27,6 @@ def build_kelly_order_intents(
     state = load_kelly_lab_state(
         data_dir,
         include_strategy_capital=False,
-        include_trade_samples=False,
     )
     if not state.available:
         raise ValueError(state.error or "Kelly Lab data is not available")

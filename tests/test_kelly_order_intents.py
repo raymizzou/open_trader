@@ -8,6 +8,7 @@ from open_trader.kelly_order_intents import (
     build_kelly_order_intents_payload,
     write_kelly_order_intents,
 )
+from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
 
 
 def test_build_kelly_order_intents_payload_from_pending_lifecycle_states() -> None:
@@ -288,12 +289,36 @@ def test_build_kelly_order_intents_ignores_malformed_optional_strategy_capital(
         ),
         encoding="utf-8",
     )
+    trade_samples_payload = {
+        "schema_version": "open_trader.kelly_trade_samples.v1",
+        "generated_at": "2026-07-10 13:29",
+        "source_orders_synced_at": "2026-07-10 13:28",
+        "sample_count": 0,
+        "open_position_count": 0,
+        "skipped_order_count": 0,
+        "stats_by_experiment": {},
+        "samples": [],
+        "open_positions": [],
+        "diagnostics": {"skipped_orders": []},
+    }
     (latest_dir / "kelly_trade_samples.json").write_text(
+        json.dumps(trade_samples_payload),
+        encoding="utf-8",
+    )
+    (latest_dir / "kelly_strategy_stats.json").write_text(
         json.dumps(
-            {
-                "schema_version": "wrong",
-                "stats_by_experiment": {},
-            }
+            build_kelly_strategy_stats_payload(
+                [
+                    {
+                        "experiment_id": "trend_us",
+                        "experiment_name": "趋势回调 US",
+                        "market": "US",
+                    }
+                ],
+                trade_samples_payload,
+                generated_at="2026-07-10 13:30",
+            ),
+            ensure_ascii=False,
         ),
         encoding="utf-8",
     )
