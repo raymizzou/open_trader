@@ -130,17 +130,37 @@ def generate_strategy_signals(
     max_strategy_weight: Decimal,
 ) -> list[StrategySignal]:
     if strategy_id not in {item.strategy_id for item in _CATALOG}:
-        raise ValueError(f"unknown strategy_id: {strategy_id}")
+        raise ValueError(f"未知策略：{strategy_id}")
     if max_strategy_weight < 0:
-        raise ValueError("max_strategy_weight must not be negative")
+        raise ValueError("最大策略权重不能为负数")
 
     signals: list[StrategySignal] = []
     current_weight = Decimal("0")
     entry_price: Decimal | None = None
     active_stop: Decimal | None = None
     breakout_level: Decimal | None = None
+    pending: tuple[Action, Decimal | None, Decimal | None] | None = None
 
     for index, bar in enumerate(bars):
+        if pending is not None:
+            pending_action, decision_atr, pending_breakout = pending
+            if pending_action == "BUY":
+                current_weight = max_strategy_weight * Decimal("0.5")
+                entry_price = bar.open
+                breakout_level = pending_breakout
+                if decision_atr is not None:
+                    active_stop = bar.open - Decimal("2") * decision_atr
+            elif pending_action == "ADD":
+                current_weight = max_strategy_weight
+                if decision_atr is not None and strategy_id != "range_mean_reversion/v1":
+                    active_stop = bar.open - Decimal("2") * decision_atr
+            elif pending_action == "REDUCE":
+                current_weight = max_strategy_weight * Decimal("0.5")
+            elif pending_action == "EXIT":
+                current_weight = Decimal("0")
+                entry_price = active_stop = breakout_level = None
+            pending = None
+
         history = bars[: index + 1]
         closes = [item.close for item in history]
         candidates: list[tuple[Action, str, str]] = [("HOLD", "hold", "未触发交易条件")]
@@ -191,19 +211,13 @@ def generate_strategy_signals(
 
         action, rule, explanation = min(candidates, key=lambda item: ACTION_PRECEDENCE[item[0]])
         target = _target(action, max_strategy_weight)
-        if action in ("BUY", "ADD"):
-            if action == "BUY":
-                entry_price = bar.close
-                if strategy_id == "breakout_momentum/v1":
-                    breakout_level = _prior_high([item.high for item in history], 20)
-            if atr14 is not None and not (strategy_id == "range_mean_reversion/v1" and action == "ADD"):
-                active_stop = bar.close - Decimal("2") * atr14
-            current_weight = target or Decimal("0")
-        elif action == "REDUCE":
-            current_weight = target or Decimal("0")
-        elif action == "EXIT":
-            current_weight = Decimal("0")
-            entry_price = active_stop = breakout_level = None
+        if action != "HOLD":
+            captured_breakout = (
+                _prior_high([item.high for item in history], 20)
+                if strategy_id == "breakout_momentum/v1" and action == "BUY"
+                else None
+            )
+            pending = (action, atr14, captured_breakout)
 
         signals.append(StrategySignal(
             decision_date=bar.date,
