@@ -703,9 +703,15 @@ def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[s
     assert "--tiger" not in output
 
 
-def test_import_statements_requires_a_statement(capsys: pytest.CaptureFixture[str]) -> None:
+def test_import_statements_requires_a_statement(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
     with pytest.raises(SystemExit) as exc_info:
-        cli.main(["import-statements", "--month", "2026-07"])
+        cli.main([
+            "import-statements", "--month", "2026-07",
+            "--config", str(tmp_path / "missing.env"),
+        ])
     assert exc_info.value.code == 2
     assert "OPEN_TRADER_EASTMONEY_STATEMENT" in capsys.readouterr().err
 
