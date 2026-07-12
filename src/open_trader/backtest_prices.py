@@ -20,6 +20,7 @@ BACKTEST_PRICE_FIELDNAMES = ("date", "open", "high", "low", "close", "volume")
 PRESET_MONTHS = {"6M": 6, "1Y": 12, "3Y": 36, "5Y": 60}
 US_EQUITY_SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:[.-][A-Z0-9]+)*")
 HK_EQUITY_SYMBOL_PATTERN = re.compile(r"\d{1,5}")
+CN_EQUITY_SYMBOL_PATTERN = re.compile(r"\d{6}")
 
 
 def normalize_backtest_symbol(market: str, symbol: str) -> str:
@@ -33,9 +34,12 @@ def normalize_backtest_symbol(market: str, symbol: str) -> str:
     ) or (
         normalized_market == "US"
         and US_EQUITY_SYMBOL_PATTERN.fullmatch(normalized_symbol) is not None
+    ) or (
+        normalized_market == "CN"
+        and CN_EQUITY_SYMBOL_PATTERN.fullmatch(normalized_symbol) is not None
     )
     if not valid:
-        raise ValueError("标的代码格式无效，仅支持港股或美股正股及 ETF")
+        raise ValueError("标的代码格式无效，仅支持港股、美股或 A 股正股及 ETF")
     return normalized_symbol.zfill(5) if normalized_market == "HK" else normalized_symbol
 
 
@@ -282,19 +286,27 @@ def fetch_backtest_prices(
 
 
 def _price_row(bar: DailyKlineBar) -> dict[str, str]:
-    close = bar.close
     try:
+        date.fromisoformat(bar.date)
+        close = Decimal(str(bar.close))
+        open_ = Decimal(str(bar.open if bar.open is not None else bar.close))
+        high = Decimal(str(bar.high if bar.high is not None else bar.close))
+        low = Decimal(str(bar.low if bar.low is not None else bar.close))
         volume = Decimal(str(bar.volume))
     except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError("成交量必须是有限的非负数") from exc
+        raise ValueError("价格必须是有限的非负数") from exc
     if not volume.is_finite() or volume < 0:
         raise ValueError("成交量必须是有限的非负数")
+    if not all(value.is_finite() and value >= 0 for value in (open_, high, low, close)):
+        raise ValueError("价格必须是有限的非负数")
+    if low > min(open_, close) or high < max(open_, close) or low > high:
+        raise ValueError("价格高低关系无效")
     return {
         "date": bar.date,
-        "open": str(bar.open if bar.open is not None else close),
-        "high": str(bar.high if bar.high is not None else close),
-        "low": str(bar.low if bar.low is not None else close),
-        "close": str(close),
+        "open": str(bar.open if bar.open is not None else bar.close),
+        "high": str(bar.high if bar.high is not None else bar.close),
+        "low": str(bar.low if bar.low is not None else bar.close),
+        "close": str(bar.close),
         "volume": str(bar.volume),
     }
 

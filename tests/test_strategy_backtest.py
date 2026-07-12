@@ -121,6 +121,12 @@ def test_strategy_and_benchmarks_share_capital_range_and_notional(tmp_path: Path
     assert result.strategy_excess_return_pct == result.strategy.total_return_pct - result.buy_hold.total_return_pct
 
 
+def test_cn_standard_backtest_uses_csi_300_benchmark(tmp_path: Path) -> None:
+    request = standard_request(tmp_path, market="CN", symbol="600025")
+    result = run_standard_backtest(request, price_provider=fixture_provider("basic"))
+    assert result.benchmark_symbol == "000300"
+
+
 def test_result_payload_exposes_manifest_backed_assumptions_definition_and_signals(tmp_path: Path) -> None:
     payload = run_standard_backtest(standard_request(tmp_path), price_provider=fixture_provider("never_triggers")).to_dict()
     assert payload["assumptions"] == {

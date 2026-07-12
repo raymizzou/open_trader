@@ -35,6 +35,25 @@ def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path) -
         "range": "1Y", "initial_cash": "100000", "max_strategy_weight": "0.10",
         "commission_bps": "10", "slippage_bps": "5",
     }
+    assert payload["benchmarks"]["CN"] == "000300"
+
+
+def test_cn_standard_backtest_owns_akshare_provider(tmp_path, monkeypatch) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    config = dashboard_config(tmp_path)
+    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    row.update({"market": "CN", "symbol": "600025", "asset_class": "stock"})
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
+    provider = object()
+    monkeypatch.setattr(dashboard_web, "AkShareDailyKlineProvider", lambda: provider)
+    monkeypatch.setattr(dashboard_web, "FutuQuoteClient", lambda **_: pytest.fail("Futu must not serve CN"))
+    monkeypatch.setattr(dashboard_web, "run_standard_backtest", lambda request, *, price_provider: type("Result", (), {"to_dict": lambda self: {"provider": price_provider}})())
+
+    result = dashboard_web.build_standard_backtest_run_payload(config, {
+        "market": "CN", "symbol": "600025", "strategy_id": "trend_pullback/v1",
+    })
+    assert result["provider"] is provider
 
 
 def test_standard_backtest_run_rejects_adapter_choice(tmp_path) -> None:

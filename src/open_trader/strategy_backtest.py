@@ -19,7 +19,7 @@ from .backtest_prices import DailyKlineProvider, ensure_resolved_backtest_price_
 from .standard_strategies import StrategyBar, StrategySignal, generate_strategy_signals, strategy_catalog
 
 
-BENCHMARK_SYMBOLS = {"US": "SPY", "HK": "02800"}
+BENCHMARK_SYMBOLS = {"US": "SPY", "HK": "02800", "CN": "000300"}
 MANIFEST_SCHEMA_VERSION = "open_trader.standard_backtest.manifest.v1"
 EQUITY_FIELDS = ("date", "cash", "position_quantity", "close", "equity", "drawdown_pct")
 

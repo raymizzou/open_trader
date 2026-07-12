@@ -242,7 +242,7 @@ def _build_backtest_universe(
     def append_valid(target: list[dict[str, str]], row: dict[str, str]) -> None:
         market = str(row.get("market") or "").strip().upper()
         symbol = str(row.get("symbol") or "").strip().upper()
-        if market not in {"HK", "US"}:
+        if market not in {"HK", "US", "CN"}:
             return
         asset_class = str(row.get("asset_class") or "").strip().lower()
         if asset_class in {"", "unknown"}:

@@ -94,6 +94,33 @@ def test_fetch_backtest_prices_writes_market_symbol_price_csv(tmp_path: Path) ->
     ]
 
 
+def test_failed_fetch_does_not_replace_existing_cache(tmp_path: Path) -> None:
+    class FailingProvider:
+        def get_daily_kline(self, symbol: str, *, start: str, end: str):
+            raise RuntimeError("upstream failed")
+
+    path = tmp_path / "prices" / "CN" / "600025.csv"
+    path.parent.mkdir(parents=True)
+    path.write_text("date,open,high,low,close,volume\n2026-07-09,1,1,1,1,1\n")
+    with pytest.raises(RuntimeError, match="upstream failed"):
+        fetch_backtest_prices(data_dir=tmp_path, market="CN", symbol="600025", start="2026-07-01", end="2026-07-10", provider=FailingProvider())
+    assert "2026-07-09" in path.read_text()
+
+
+def test_invalid_fetch_does_not_replace_existing_cache(tmp_path: Path) -> None:
+    class InvalidProvider:
+        def get_daily_kline(self, symbol: str, *, start: str, end: str):
+            return [DailyKlineBar(date=end, open=float("nan"), high=2, low=1, close=2, volume=3)]
+
+    path = tmp_path / "prices" / "CN" / "600025.csv"
+    path.parent.mkdir(parents=True)
+    original = "date,open,high,low,close,volume\n2026-07-09,1,1,1,1,1\n"
+    path.write_text(original)
+    with pytest.raises(ValueError, match="价格必须是有限的非负数"):
+        fetch_backtest_prices(data_dir=tmp_path, market="CN", symbol="600025", start="2026-07-01", end="2026-07-10", provider=InvalidProvider())
+    assert path.read_text() == original
+
+
 @pytest.mark.parametrize("volume", [float("nan"), float("inf"), -1.0])
 def test_fetch_backtest_prices_rejects_invalid_volume(tmp_path: Path, volume: float) -> None:
     class InvalidVolumeProvider:
