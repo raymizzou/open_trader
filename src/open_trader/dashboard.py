@@ -243,7 +243,15 @@ def _overlay_cn_cached_close(row: dict[str, str], data_dir: Path) -> dict[str, s
     quantity = _optional_decimal(row.get("total_quantity", ""))
     cost = _optional_decimal(row.get("cost_value", ""))
     fx = _optional_decimal(row.get("fx_to_hkd", ""))
-    if close is None or close <= 0 or quantity is None or cost is None or fx is None:
+    if (
+        close is None
+        or close <= 0
+        or quantity is None
+        or quantity <= 0
+        or cost is None
+        or fx is None
+        or fx <= 0
+    ):
         return row
     market_value = close * quantity
     pnl = market_value - cost

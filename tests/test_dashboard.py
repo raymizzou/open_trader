@@ -4,6 +4,8 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
+
 from open_trader.advice.models import (
     PREMARKET_ACTION_FIELDNAMES,
     TRADING_ADVICE_FIELDNAMES,
@@ -118,6 +120,65 @@ def test_dashboard_refreshes_cn_derived_values_from_cached_close(tmp_path: Path)
     assert holding["unrealized_pnl"] == "6654.00"
     assert holding["unrealized_pnl_pct"] == "12.47%"
     assert state.summary["portfolio_value_hkd"] == "64800.00"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("close", "bad"),
+        ("close", "0"),
+        ("close", "-1"),
+        ("total_quantity", "bad"),
+        ("total_quantity", "0"),
+        ("total_quantity", "-1"),
+        ("cost_value", ""),
+        ("cost_value", "NaN"),
+        ("fx_to_hkd", ""),
+        ("fx_to_hkd", "NaN"),
+        ("fx_to_hkd", "0"),
+        ("fx_to_hkd", "-1"),
+    ],
+)
+def test_dashboard_invalid_cn_cached_inputs_preserve_statement_row_and_summary(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    row = {fieldname: "" for fieldname in PORTFOLIO_FIELDNAMES}
+    row.update(
+        {
+            "market": "CN",
+            "asset_class": "stock",
+            "symbol": "600025",
+            "currency": "CNY",
+            "total_quantity": "6000",
+            "last_price": "9.62",
+            "market_value": "57720",
+            "market_value_hkd": "62337.60",
+            "cost_value": "53346",
+            "unrealized_pnl": "4374",
+            "unrealized_pnl_pct": "8.20%",
+            "fx_to_hkd": "1.08",
+            "brokers": "eastmoney",
+        }
+    )
+    close = "10.00"
+    if field == "close":
+        close = value
+    else:
+        row[field] = value
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
+    write_csv(
+        config.data_dir / "prices/CN/600025.csv",
+        ["date", "close"],
+        [{"date": "2026-07-10", "close": close}],
+    )
+
+    state = load_dashboard_state(config)
+
+    assert {key: state.holdings[0][key] for key in row} == row
+    assert state.summary["portfolio_value_hkd"] == "62337.60"
 
 
 def test_dashboard_exposes_eastmoney_statement_metadata() -> None:
