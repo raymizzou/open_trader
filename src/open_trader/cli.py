@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from getpass import getpass
 import re
 import sys
 import time
@@ -35,6 +36,7 @@ from .fx import StaticMonthEndFxProvider
 from .market_scope import parse_market_scope
 from .notifications import NullNotifier
 from .parsers.phillips import PhillipsStatementParser
+from .parsers.eastmoney import EastmoneyStatementParser
 from .pipeline import run_import, validate_month
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
 from .tiger_account import (
@@ -205,14 +207,17 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Statement month, YYYY-MM",
     )
-    import_parser.add_argument("--phillips", type=Path, required=True)
+    statement_group = import_parser.add_mutually_exclusive_group(required=True)
+    statement_group.add_argument("--phillips", type=Path)
+    statement_group.add_argument("--eastmoney", type=Path)
     import_parser.add_argument("--data-dir", type=Path, default=Path("data"))
     import_parser.add_argument(
         "--usd-hkd",
         type=positive_decimal,
-        required=True,
         help="Month-end USD/HKD exchange rate",
     )
+    import_parser.add_argument("--cny-hkd", type=positive_decimal)
+    import_parser.add_argument("--update-latest", action="store_true")
 
     premarket_parser = subparsers.add_parser(
         "run-premarket",
@@ -817,16 +822,25 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "import-statements":
+        if args.phillips is not None and args.usd_hkd is None:
+            parser.error("--phillips requires --usd-hkd")
+        if args.eastmoney is not None and args.cny_hkd is None:
+            parser.error("--eastmoney requires --cny-hkd")
+        if args.eastmoney is not None:
+            statement_paths = {"eastmoney": args.eastmoney}
+            parsers = [EastmoneyStatementParser(getpass("东方财富对账单密码: "))]
+            rates = {"CNY": args.cny_hkd}
+        else:
+            statement_paths = {"phillips": args.phillips}
+            parsers = [PhillipsStatementParser()]
+            rates = {"USD": args.usd_hkd}
         result = run_import(
             month=args.month,
-            statement_paths={
-                "phillips": args.phillips,
-            },
-            parsers=[
-                PhillipsStatementParser(),
-            ],
+            statement_paths=statement_paths,
+            parsers=parsers,
             data_dir=args.data_dir,
-            fx_provider=StaticMonthEndFxProvider(args.month, {"USD": args.usd_hkd}),
+            fx_provider=StaticMonthEndFxProvider(args.month, rates),
+            update_latest=args.update_latest,
         )
         print(f"portfolio: {result.portfolio_path}")
         print(f"latest: {result.latest_path}")

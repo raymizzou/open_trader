@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import csv
 from datetime import UTC, datetime
 from decimal import Decimal
 from os import close
@@ -15,7 +16,7 @@ from .csv_io import write_rows
 from .fx import StaticMonthEndFxProvider
 from .models import CashBalance, ManifestRecord, Position, WarningRecord
 from .parsers.base import ParseResult, StatementParser, sha256_file
-from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows
+from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, merge_eastmoney_portfolio_rows
 
 
 MANIFEST_FIELDNAMES = [
@@ -87,6 +88,7 @@ def run_import(
     parsers: Iterable[StatementParser],
     data_dir: Path,
     fx_provider: StaticMonthEndFxProvider,
+    update_latest: bool = True,
 ) -> ImportResult:
     validate_month(month)
     parser_list = list(parsers)
@@ -124,16 +126,22 @@ def run_import(
 
     portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
 
-    temp_run_dir = _make_temp_run_dir(run_dir)
     latest_path = latest_dir / "portfolio.csv"
+    if {parser.broker for parser in parser_list} == {"eastmoney"} and latest_path.exists():
+        with latest_path.open(newline="", encoding="utf-8") as handle:
+            portfolio_rows = merge_eastmoney_portfolio_rows(
+                list(csv.DictReader(handle)), portfolio_rows
+            )
+    temp_run_dir = _make_temp_run_dir(run_dir)
     temp_latest_path: Path | None = None
     backup_latest_path: Path | None = None
     backup_run_dir: Path | None = None
     temp_run_promoted = False
     latest_replaced = False
     try:
-        latest_dir.mkdir(parents=True, exist_ok=True)
-        temp_latest_path = _make_temp_latest_path(latest_path)
+        if update_latest:
+            latest_dir.mkdir(parents=True, exist_ok=True)
+            temp_latest_path = _make_temp_latest_path(latest_path)
         write_rows(
             temp_run_dir / "manifest.csv",
             MANIFEST_FIELDNAMES,
@@ -156,12 +164,14 @@ def run_import(
         )
         write_rows(temp_run_dir / "portfolio.csv", PORTFOLIO_FIELDNAMES, portfolio_rows)
 
-        copyfile(temp_run_dir / "portfolio.csv", temp_latest_path)
-        if latest_path.exists():
-            backup_latest_path = _make_backup_latest_path(latest_path)
-            latest_path.rename(backup_latest_path)
-        temp_latest_path.replace(latest_path)
-        latest_replaced = True
+        if update_latest:
+            assert temp_latest_path is not None
+            copyfile(temp_run_dir / "portfolio.csv", temp_latest_path)
+            if latest_path.exists():
+                backup_latest_path = _make_backup_latest_path(latest_path)
+                latest_path.rename(backup_latest_path)
+            temp_latest_path.replace(latest_path)
+            latest_replaced = True
 
         if run_dir.exists():
             backup_run_dir = _make_backup_run_dir(run_dir)

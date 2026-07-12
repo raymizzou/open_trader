@@ -4,7 +4,76 @@ import pytest
 
 from open_trader.fx import StaticMonthEndFxProvider
 from open_trader.models import AssetClass, CashBalance, Market, Position
-from open_trader.portfolio import build_portfolio_rows
+import open_trader.portfolio as portfolio
+from open_trader.portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows
+
+
+def portfolio_row(**overrides: str) -> dict[str, str]:
+    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    row.update({
+        "sort_group": "2", "market": "US", "asset_class": "stock", "symbol": "AAPL",
+        "currency": "USD", "fx_to_hkd": "7.8", "market_value_hkd": "100.00", "portfolio_weight_hkd": "99.99%",
+        "brokers": "futu", "risk_flag": "normal",
+    })
+    row.update(overrides)
+    return row
+
+
+def test_merge_eastmoney_rows_preserves_other_brokers_and_recalculates_weights() -> None:
+    preserved = [
+        portfolio_row(symbol="AAPL", brokers="futu", market_value_hkd="100.00"),
+        portfolio_row(symbol="TSLA", brokers="tiger", market_value_hkd="200.00"),
+        portfolio_row(symbol="NVDA", brokers="phillips", market_value_hkd="300.00"),
+        portfolio_row(market="CASH", asset_class="cash", symbol="HKD_CASH", currency="HKD", brokers="futu", market_value_hkd="400.00"),
+        portfolio_row(market="CN", symbol="600519", currency="CNY", brokers="eastmoney", market_value_hkd="1.00"),
+    ]
+    new = [portfolio_row(market="CN", symbol="000001", currency="CNY", brokers="eastmoney", market_value_hkd="1000.00")]
+
+    rows = portfolio.merge_eastmoney_portfolio_rows(preserved, new)
+
+    assert list(rows[0]) == PORTFOLIO_FIELDNAMES
+    assert {row["symbol"] for row in rows} == {"AAPL", "TSLA", "NVDA", "HKD_CASH", "000001"}
+    for original in preserved[:-1]:
+        merged = next(row for row in rows if row["symbol"] == original["symbol"])
+        assert {key: value for key, value in merged.items() if key != "portfolio_weight_hkd"} == {
+            key: value for key, value in original.items() if key != "portfolio_weight_hkd"
+        }
+    assert sum(Decimal(row["market_value_hkd"]) for row in rows) == Decimal("2000.00")
+    assert sum(Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in rows) == Decimal("100.00")
+
+
+def test_merge_eastmoney_rows_rejects_mixed_broker_row() -> None:
+    with pytest.raises(ValueError, match="mixes Eastmoney"):
+        portfolio.merge_eastmoney_portfolio_rows([portfolio_row(brokers="futu;eastmoney")], [])
+
+
+def test_merge_eastmoney_weights_keep_two_decimal_total_at_one_hundred_percent() -> None:
+    rows = portfolio.merge_eastmoney_portfolio_rows(
+        [portfolio_row(symbol="A", market_value_hkd="1"), portfolio_row(symbol="B", market_value_hkd="1")],
+        [portfolio_row(symbol="C", brokers="eastmoney", market_value_hkd="1")],
+    )
+    assert sum(Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in rows) == Decimal("100.00")
+
+
+def test_merge_eastmoney_rows_rejects_preserved_new_identity_collision() -> None:
+    with pytest.raises(ValueError, match="identity collision"):
+        portfolio.merge_eastmoney_portfolio_rows(
+            [portfolio_row(symbol="600519", market="CN", currency="CNY", brokers="futu")],
+            [portfolio_row(symbol="600519", market="CN", currency="CNY", brokers="eastmoney")],
+        )
+
+
+@pytest.mark.parametrize("value", ["", "NaN", "Infinity"])
+def test_merge_eastmoney_rows_rejects_invalid_hkd_values(value: str) -> None:
+    with pytest.raises(ValueError, match="market_value_hkd"):
+        portfolio.merge_eastmoney_portfolio_rows([portfolio_row(market_value_hkd=value)], [])
+
+
+def test_merge_eastmoney_rows_rejects_missing_non_hkd_fx() -> None:
+    with pytest.raises(ValueError, match="fx_to_hkd"):
+        portfolio.merge_eastmoney_portfolio_rows(
+            [portfolio_row(market="CN", currency="CNY", fx_to_hkd="")], []
+        )
 
 
 def position(
