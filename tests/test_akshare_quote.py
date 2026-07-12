@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import requests
 
 from open_trader.akshare_quote import AkShareDailyKlineProvider
 from open_trader.kline_technical_facts import DailyKlineBar
@@ -44,6 +45,80 @@ def test_akshare_provider_uses_index_endpoint_for_cn_benchmark() -> None:
     )
     assert calls == [{"symbol": "sh000300"}]
     assert bars[0].close == 2
+
+
+@pytest.mark.parametrize(
+    ("code", "fallback_symbol"),
+    [("600900", "sh600900"), ("001234", "sz001234")],
+)
+def test_akshare_provider_falls_back_to_sina_stock_on_connection_error(
+    code: str, fallback_symbol: str,
+) -> None:
+    calls = []
+
+    def primary(**kwargs):
+        raise requests.ConnectionError("offline")
+
+    def fallback(**kwargs):
+        calls.append(kwargs)
+        return FakeFrame([{
+            "date": "2026-07-10", "open": 1, "high": 2, "low": 1,
+            "close": 2, "volume": 3,
+        }])
+
+    bars = AkShareDailyKlineProvider(
+        stock_history=primary, index_history=lambda **_: None,
+        stock_history_fallback=fallback, index_history_fallback=lambda **_: None,
+    ).get_daily_kline(f"CN.{code}", start="2026-07-01", end="2026-07-10")
+
+    assert calls == [{
+        "symbol": fallback_symbol, "start_date": "20260701",
+        "end_date": "20260710", "adjust": "qfq",
+    }]
+    assert bars[0].close == 2
+
+
+def test_akshare_provider_falls_back_to_sina_index_on_connection_error() -> None:
+    calls = []
+
+    def primary(**kwargs):
+        raise requests.ConnectionError("offline")
+
+    def fallback(**kwargs):
+        calls.append(kwargs)
+        return FakeFrame([{
+            "date": "2026-07-10", "open": 1, "high": 2, "low": 1,
+            "close": 2, "volume": 3,
+        }])
+
+    bars = AkShareDailyKlineProvider(
+        stock_history=lambda **_: None, index_history=primary,
+        stock_history_fallback=lambda **_: None, index_history_fallback=fallback,
+    ).get_daily_kline("CN.000300", start="2026-07-01", end="2026-07-10")
+
+    assert calls == [{"symbol": "sh000300"}]
+    assert bars[0].close == 2
+
+
+def test_akshare_provider_does_not_fallback_for_invalid_primary_frame() -> None:
+    fallback_called = False
+
+    def fallback(**kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+
+    invalid = FakeFrame([{
+        "日期": "2026-07-10", "开盘": 1, "最高": 2, "最低": 1,
+        "收盘": float("nan"), "成交量": 3,
+    }])
+    provider = AkShareDailyKlineProvider(
+        stock_history=lambda **_: invalid, index_history=lambda **_: None,
+        stock_history_fallback=fallback, index_history_fallback=lambda **_: None,
+    )
+
+    with pytest.raises(ValueError, match="AKShare 日线数据无效"):
+        provider.get_daily_kline("CN.600900", start="2026-07-01", end="2026-07-10")
+    assert fallback_called is False
 
 
 @pytest.mark.parametrize("symbol", ["US.600025", "CN.60025", "CN.6000250", "CN.ABCDEF"])

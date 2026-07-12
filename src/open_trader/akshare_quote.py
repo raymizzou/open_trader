@@ -5,31 +5,53 @@ from decimal import Decimal, InvalidOperation
 import re
 from typing import Any, Callable
 
+import requests
+
 from .kline_technical_facts import DailyKlineBar
 
 
 class AkShareDailyKlineProvider:
-    def __init__(self, stock_history: Callable[..., Any] | None = None, index_history: Callable[..., Any] | None = None) -> None:
-        if stock_history is None or index_history is None:
+    def __init__(
+        self, stock_history: Callable[..., Any] | None = None,
+        index_history: Callable[..., Any] | None = None,
+        stock_history_fallback: Callable[..., Any] | None = None,
+        index_history_fallback: Callable[..., Any] | None = None,
+    ) -> None:
+        if None in (stock_history, index_history, stock_history_fallback, index_history_fallback):
             import akshare as ak
             stock_history = stock_history or ak.stock_zh_a_hist
             index_history = index_history or ak.stock_zh_index_daily_em
+            stock_history_fallback = stock_history_fallback or ak.stock_zh_a_daily
+            index_history_fallback = index_history_fallback or ak.stock_zh_index_daily
         self.stock_history = stock_history
         self.index_history = index_history
+        self.stock_history_fallback = stock_history_fallback
+        self.index_history_fallback = index_history_fallback
 
     def get_daily_kline(self, symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
         match = re.fullmatch(r"CN\.(\d{6})", symbol)
         if match is None:
             raise ValueError("AKShare 行情仅支持 CN.六位代码")
         code = match.group(1)
-        frame = (
-            self.index_history(symbol="sh000300")
-            if code == "000300"
-            else self.stock_history(
-                symbol=code, period="daily", start_date=start.replace("-", ""),
-                end_date=end.replace("-", ""), adjust="qfq",
+        try:
+            frame = (
+                self.index_history(symbol="sh000300")
+                if code == "000300"
+                else self.stock_history(
+                    symbol=code, period="daily", start_date=start.replace("-", ""),
+                    end_date=end.replace("-", ""), adjust="qfq",
+                )
             )
-        )
+        except requests.exceptions.RequestException:
+            frame = (
+                self.index_history_fallback(symbol="sh000300")
+                if code == "000300"
+                else self.stock_history_fallback(
+                    symbol=f"{'sh' if code[0] in '569' else 'sz'}{code}",
+                    start_date=start.replace("-", ""), end_date=end.replace("-", ""),
+                    adjust="qfq",
+                )
+            )
         return _validated_bars_between(frame, start, end)
 
 
