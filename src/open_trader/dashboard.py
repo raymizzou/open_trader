@@ -50,16 +50,18 @@ from .trading_plan import backtest_plan_side, load_trading_plan_rows
 
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
-BROKERS = ("futu", "tiger", "phillips")
+BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 BROKER_LABELS = {
     "futu": "富途",
     "tiger": "老虎",
     "phillips": "辉立",
+    "eastmoney": "东方财富",
 }
 BROKER_SOURCE_KINDS = {
     "futu": "live_account",
     "tiger": "live_account",
     "phillips": "statement",
+    "eastmoney": "statement",
 }
 DETAIL_FX_TO_HKD = {
     "HKD": Decimal("1"),
@@ -116,7 +118,9 @@ class DashboardState:
 
 
 def load_dashboard_state(config: DashboardConfig) -> DashboardState:
-    portfolio_rows = _read_csv_rows(config.portfolio_path)
+    portfolio_rows = [
+        _overlay_cn_cached_close(row, config.data_dir) for row in _read_csv_rows(config.portfolio_path)
+    ]
     detail_month = latest_broker_detail_month(config.data_dir)
     detail_dir = config.data_dir / "runs" / detail_month if detail_month else None
     broker_positions = (
@@ -229,6 +233,31 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         trade_actions=trade_actions,
         backtest_universe=backtest_universe,
     )
+
+
+def _overlay_cn_cached_close(row: dict[str, str], data_dir: Path) -> dict[str, str]:
+    if str(row.get("market") or "").strip().upper() != "CN":
+        return row
+    prices = _read_csv_rows(data_dir / "prices" / "CN" / f"{row.get('symbol', '').strip()}.csv")
+    close = _optional_decimal(prices[-1].get("close", "")) if prices else None
+    quantity = _optional_decimal(row.get("total_quantity", ""))
+    cost = _optional_decimal(row.get("cost_value", ""))
+    fx = _optional_decimal(row.get("fx_to_hkd", ""))
+    if close is None or close <= 0 or quantity is None or cost is None or fx is None:
+        return row
+    market_value = close * quantity
+    pnl = market_value - cost
+    updated = dict(row)
+    updated.update(
+        {
+            "last_price": format(close, "f").rstrip("0").rstrip("."),
+            "market_value": _money_text(market_value),
+            "market_value_hkd": _money_text(market_value * fx),
+            "unrealized_pnl": _money_text(pnl),
+            "unrealized_pnl_pct": _pct_text(_ratio(pnl, cost)),
+        }
+    )
+    return updated
 
 
 def _build_backtest_universe(

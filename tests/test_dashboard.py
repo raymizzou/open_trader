@@ -8,7 +8,12 @@ from open_trader.advice.models import (
     PREMARKET_ACTION_FIELDNAMES,
     TRADING_ADVICE_FIELDNAMES,
 )
-from open_trader.dashboard import DashboardConfig, load_dashboard_state
+from open_trader.dashboard import (
+    BROKER_LABELS,
+    BROKER_SOURCE_KINDS,
+    DashboardConfig,
+    load_dashboard_state,
+)
 from open_trader.decision_facts import (
     KLINE_FIELDS,
     MISSING_VALUE,
@@ -69,6 +74,55 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
         futu_host="127.0.0.1",
         futu_port=11111,
     )
+
+
+def test_dashboard_refreshes_cn_derived_values_from_cached_close(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    row.update(
+        {
+            "market": "CN",
+            "asset_class": "stock",
+            "symbol": "600025",
+            "name": "华能水电",
+            "currency": "CNY",
+            "total_quantity": "6000",
+            "last_price": "9.62",
+            "market_value": "57720",
+            "cost_value": "53346",
+            "fx_to_hkd": "1.08",
+            "brokers": "eastmoney",
+        }
+    )
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
+    write_csv(
+        config.data_dir / "prices/CN/600025.csv",
+        ["date", "open", "high", "low", "close", "volume"],
+        [
+            {
+                "date": "2026-07-10",
+                "open": "9.8",
+                "high": "10.1",
+                "low": "9.7",
+                "close": "10.00",
+                "volume": "123456",
+            }
+        ],
+    )
+
+    state = load_dashboard_state(config)
+    holding = state.holdings[0]
+    assert holding["last_price"] == "10"
+    assert holding["market_value"] == "60000.00"
+    assert holding["market_value_hkd"] == "64800.00"
+    assert holding["unrealized_pnl"] == "6654.00"
+    assert holding["unrealized_pnl_pct"] == "12.47%"
+    assert state.summary["portfolio_value_hkd"] == "64800.00"
+
+
+def test_dashboard_exposes_eastmoney_statement_metadata() -> None:
+    assert BROKER_LABELS["eastmoney"] == "东方财富"
+    assert BROKER_SOURCE_KINDS["eastmoney"] == "statement"
 
 
 def test_dashboard_backtest_universe_combines_holdings_and_watchlist(tmp_path: Path) -> None:

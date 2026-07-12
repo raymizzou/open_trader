@@ -20,6 +20,21 @@ from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 from tests.test_dashboard import dashboard_config, portfolio_rows, write_csv
 
 
+def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+
+    assert holdings_table_header_labels(html) == [
+        "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值",
+        "港元市值", "持仓占总资产的占比", "盈亏",
+    ]
+    assert 'data-market="CN">A 股</button>' in html
+    assert 'label: "A 股正股"' in js
+    assert 'market === "CN"' in js
+    for forbidden_id in ("a-share-panel", "a-share-card", "cn-panel", "cn-card"):
+        assert f'id="{forbidden_id}"' not in html
+
+
 def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path) -> None:
     from open_trader.dashboard_web import build_standard_backtest_options_payload
 

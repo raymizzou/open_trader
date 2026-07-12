@@ -46,6 +46,7 @@ const MARKET_SECTION_CONFIGS = [
   { market: "US_OPTION", marketGroup: "US", label: "美股期权", className: "market-section-us-option" },
   { market: "HK_STOCK", marketGroup: "HK", label: "港股正股", className: "market-section-hk-stock" },
   { market: "HK_OPTION", marketGroup: "HK", label: "港股期权", className: "market-section-hk-option" },
+  { market: "CN_STOCK", marketGroup: "CN", label: "A 股正股", className: "market-section-cn-stock" },
   { market: "OTHER", marketGroup: "OTHER", label: "其他市场持仓", className: "market-section-other" },
 ];
 
@@ -907,7 +908,7 @@ function emptyMoneySummary(complete) {
 }
 
 function currentViewLabel(count) {
-  const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CASH" ? "现金" : state.marketFilter;
+  const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CASH" ? "现金" : state.marketFilter === "CN" ? "A 股" : state.marketFilter;
   const brokerLabel = state.brokerFilter === "ALL" ? "全部券商" : brokerDisplayName(state.brokerFilter);
   return `当前视图：${marketLabel} · ${brokerLabel} · ${formatPlain(count)} 条`;
 }
@@ -4164,6 +4165,9 @@ function marketSectionKey(holding) {
   }
   if (market === "HK") {
     return isOptionHolding(holding) ? "HK_OPTION" : "HK_STOCK";
+  }
+  if (market === "CN") {
+    return "CN_STOCK";
   }
   return "OTHER";
 }
