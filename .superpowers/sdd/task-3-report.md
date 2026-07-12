@@ -62,3 +62,11 @@ Output: `1166 passed in 20.16s`.
 - Eastmoney `positions_count` and CLI `positions:` output now represent every combined non-cash portfolio row; Phillips-only counting remains unchanged.
 - Self-review RED: the missing-cost regression with `avg_cost_price="stale"` failed (`1 failed in 0.08s`); the shared clear helper now also blanks this cost-derived field.
 - Self-review GREEN: covering tests `96 passed in 0.47s`; full suite `1166 passed in 23.75s`.
+
+## Risk-flag rereview fix
+
+- RED command: `PYTHONPATH=.:src /Users/ray/projects/open_trader/.venv/bin/pytest tests/test_portfolio.py::test_merge_eastmoney_preserves_valid_non_eastmoney_risk_flag -q`.
+- RED output: `1 failed in 0.06s`; a preserved non-Eastmoney row with `risk_flag=overweight` and recalculated `1.00%` weight was incorrectly changed to `normal`.
+- GREEN command: `PYTHONPATH=.:src /Users/ray/projects/open_trader/.venv/bin/pytest tests/test_portfolio.py tests/test_pipeline.py tests/test_parsers_text.py -q`.
+- GREEN output: `97 passed in 0.40s`.
+- Invariant: valid existing risk flags survive combined numeric/weight recomputation; only newly detected missing cost overrides the row to `data_check`.

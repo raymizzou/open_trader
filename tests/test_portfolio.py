@@ -61,6 +61,18 @@ def test_merge_eastmoney_weights_keep_two_decimal_total_at_one_hundred_percent()
     assert sum(Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in rows) == Decimal("100.00")
 
 
+def test_merge_eastmoney_preserves_valid_non_eastmoney_risk_flag() -> None:
+    rows = portfolio.merge_eastmoney_portfolio_rows(
+        [portfolio_row(symbol="A", market_value="1", cost_value="0.5", fx_to_hkd="1", risk_flag="overweight")],
+        [portfolio_row(symbol="B", brokers="eastmoney", market_value="99", cost_value="50", fx_to_hkd="1")],
+    )
+    preserved = next(row for row in rows if row["symbol"] == "A")
+    assert preserved["portfolio_weight_hkd"] == "1.00%"
+    assert preserved["market_value_hkd"] == "1.00"
+    assert preserved["unrealized_pnl"] == "0.50"
+    assert preserved["risk_flag"] == "overweight"
+
+
 def test_merge_eastmoney_clears_missing_cost_derived_values_and_marks_data_check() -> None:
     row = portfolio_row(
         cost_value="",

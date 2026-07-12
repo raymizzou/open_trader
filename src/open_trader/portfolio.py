@@ -174,15 +174,6 @@ def merge_eastmoney_portfolio_rows(
         )
     for row, percentage in zip(combined, percentages):
         row["portfolio_weight_hkd"] = f"{percentage:.2f}%"
-        if row["risk_flag"] == "data_check":
-            continue
-        if row["asset_class"] not in {
-            AssetClass.CASH.value,
-            AssetClass.MONEY_MARKET_FUND.value,
-        } and percentage > Decimal("10"):
-            row["risk_flag"] = "overweight"
-        else:
-            row["risk_flag"] = "normal"
     return sorted(
         combined,
         key=lambda row: (int(row["sort_group"]), -Decimal(row["market_value_hkd"])),
