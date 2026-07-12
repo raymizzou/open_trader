@@ -78,3 +78,59 @@ $ /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q
 .........................................................                [100%]
 1209 passed in 23.28s
 ```
+
+## Final review failure-path follow-up
+
+When any sibling row prevents a complete weight recalculation, the dashboard now restores `original_portfolio_rows` wholesale. This prevents refreshed CN value/P&L fields from being paired with stale portfolio weights.
+
+### TDD RED
+
+```text
+$ /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q tests/test_dashboard.py -k discards_cn_overlay_when_complete_weights_are_invalid
+F                                                                        [100%]
+E       AssertionError: refreshed CN row differed from the original row
+1 failed, 56 deselected in 0.79s
+```
+
+### TDD GREEN
+
+```text
+$ /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q tests/test_dashboard.py -k discards_cn_overlay_when_complete_weights_are_invalid
+.                                                                        [100%]
+1 passed, 56 deselected in 0.33s
+```
+
+The regression asserts every original field/value/weight, the original `100.00` HKD summary, and byte-for-byte unchanged `portfolio.csv`.
+
+### Focused and portfolio tests
+
+```text
+$ /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q tests/test_dashboard.py tests/test_portfolio.py
+........................................................................ [ 80%]
+..................                                                       [100%]
+90 passed in 0.45s
+```
+
+### Full suite
+
+```text
+$ /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q
+........................................................................ [  5%]
+........................................................................ [ 11%]
+........................................................................ [ 17%]
+........................................................................ [ 23%]
+........................................................................ [ 29%]
+........................................................................ [ 35%]
+........................................................................ [ 41%]
+........................................................................ [ 47%]
+........................................................................ [ 53%]
+........................................................................ [ 59%]
+........................................................................ [ 65%]
+........................................................................ [ 71%]
+........................................................................ [ 77%]
+........................................................................ [ 83%]
+........................................................................ [ 89%]
+........................................................................ [ 95%]
+..........................................................               [100%]
+1210 passed in 25.21s
+```

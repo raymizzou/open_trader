@@ -181,6 +181,46 @@ def test_dashboard_refreshes_all_weights_after_cn_cached_closes(tmp_path: Path) 
     assert config.portfolio_path.read_bytes() == original
 
 
+def test_dashboard_discards_cn_overlay_when_complete_weights_are_invalid(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    rows = []
+    for values in [
+        {
+            "market": "CN", "asset_class": "stock", "symbol": "600001",
+            "currency": "CNY", "total_quantity": "1", "last_price": "100",
+            "market_value": "100", "cost_value": "80", "fx_to_hkd": "1",
+            "market_value_hkd": "100", "unrealized_pnl": "20",
+            "unrealized_pnl_pct": "25.00%", "portfolio_weight_hkd": "10.00%",
+        },
+        {
+            "market": "US", "asset_class": "stock", "symbol": "AAPL",
+            "currency": "USD", "market_value_hkd": "bad",
+            "portfolio_weight_hkd": "90.00%",
+        },
+    ]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update(values)
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+    original_file = config.portfolio_path.read_bytes()
+    write_csv(
+        config.data_dir / "prices/CN/600001.csv",
+        ["date", "close"],
+        [{"date": "2026-07-10", "close": "200"}],
+    )
+
+    state = load_dashboard_state(config)
+
+    assert [
+        {key: holding[key] for key in original}
+        for holding, original in zip(state.holdings, rows)
+    ] == rows
+    assert state.summary["portfolio_value_hkd"] == "100.00"
+    assert config.portfolio_path.read_bytes() == original_file
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

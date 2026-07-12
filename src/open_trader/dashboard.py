@@ -131,7 +131,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         try:
             recalculate_portfolio_weights(portfolio_rows)
         except PortfolioBuildError:
-            pass
+            portfolio_rows = original_portfolio_rows
     detail_month = latest_broker_detail_month(config.data_dir)
     detail_dir = config.data_dir / "runs" / detail_month if detail_month else None
     broker_positions = (
