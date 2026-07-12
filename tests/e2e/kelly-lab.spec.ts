@@ -69,7 +69,7 @@ async function expectKellyDerivationRow(scope: Locator, label: string, value: st
   await expect(row.locator('strong')).toBeVisible();
 }
 
-test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
+test('renders Kelly lab without a holding-level Kelly entry', async ({ page }) => {
   await page.goto('/');
 
   await expect(page.getByRole('heading', { name: '持仓列表' })).toBeVisible();
@@ -227,12 +227,8 @@ test('renders Kelly lab and opens holding Kelly detail', async ({ page }) => {
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toHaveCount(0);
 
   const aaplRow = page.getByRole('row').filter({ hasText: 'AAPL' }).first();
-  await expect(aaplRow.getByRole('button', { name: '凯利' })).toBeVisible();
-  await aaplRow.getByRole('button', { name: '凯利' }).click();
-
-  await expect(page.getByRole('heading', { name: /凯利仓位 · US\.AAPL/ })).toBeVisible();
-  await expect(page.getByText('阶段 1 不计算 Kelly 仓位', { exact: true })).toBeVisible();
-  await expect(page.getByText('趋势回调 20D Mock US 第一批').last()).toBeVisible();
+  await expect(aaplRow.getByRole('button', { name: '凯利' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: /凯利仓位 · US\.AAPL/ })).toHaveCount(0);
 });
 
 test('renders sufficient and insufficient Kelly derivations without mobile overflow', async ({ page }) => {

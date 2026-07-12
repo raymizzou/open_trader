@@ -1639,7 +1639,7 @@ function renderHoldings() {
       const tSignalClass = tSignalButtonClass(holding);
       rows.push(`
         <tr class="${selectedClass}">
-          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button><button class="expand-button kelly-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="kelly">凯利</button></td>
+          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
           <td>${escapeHtml(formatPlain(holding.market))}</td>
           <td class="symbol-cell">
             <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
@@ -1661,9 +1661,7 @@ function renderHoldings() {
               <div class="symbol-detail-panel inline-symbol-detail">
                 ${selectedDetail === "t_signal"
                   ? renderTSignalDetail(selected.holding)
-                  : selectedDetail === "kelly"
-                    ? renderKellyDetail(selected.holding)
-                    : renderSymbolDetail(selected.holding, selected.index)}
+                  : renderSymbolDetail(selected.holding, selected.index)}
               </div>
             </td>
           </tr>
@@ -1702,7 +1700,7 @@ function showSymbolDetail(detailKey, detailMode = "decision") {
 }
 
 function normalizeHoldingDetailMode(mode) {
-  return ["t_signal", "kelly"].includes(mode) ? mode : "decision";
+  return mode === "t_signal" ? mode : "decision";
 }
 
 function tSignalButtonClass(holding) {
@@ -1826,91 +1824,6 @@ function renderTSignalDetail(holding) {
       ${renderTSignalTimeline(signal)}
     </div>
   `;
-}
-
-function renderKellyDetail(holding) {
-  const title = `${formatPlain(holding.market)}.${formatPlain(holding.symbol)}`;
-  const kelly = holding && holding.kelly && typeof holding.kelly === "object"
-    ? holding.kelly
-    : null;
-  const experiments = kelly && Array.isArray(kelly.experiments) ? kelly.experiments : [];
-  const message = kelly
-    ? firstPresent(kelly.message, kelly.error, kelly.reason, "暂无 Kelly 策略实验数据。")
-    : "暂无 Kelly 策略实验数据。";
-  const count = kelly && hasValue(kelly.experiment_count) ? kelly.experiment_count : experiments.length;
-  const status = kellyDetailStatus(kelly);
-
-  return `
-    <div class="detail-header trading-decision-header">
-      <div>
-        <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
-        <h2>凯利仓位 · ${escapeHtml(title)}</h2>
-        <p>${escapeHtml(formatPlain(message))}</p>
-      </div>
-      <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
-    </div>
-    <div class="kelly-detail-layout">
-      <section class="detail-section kelly-detail-section">
-        <div class="kelly-detail-status-row">
-          <div>
-            <h3>关联实验</h3>
-            <p>${escapeHtml(formatPlain(count))} 个实验 · 阶段 1 不计算 Kelly 仓位</p>
-          </div>
-          <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
-        </div>
-      </section>
-      ${experiments.length
-        ? `<div class="kelly-detail-experiment-list">${experiments.map(renderKellyDetailExperiment).join("")}</div>`
-        : `<section class="detail-section kelly-detail-section"><h3>实验明细</h3><p class="muted-copy">暂无关联 Kelly 策略实验。阶段 1 不计算 Kelly 仓位。</p></section>`}
-    </div>
-  `;
-}
-
-function renderKellyDetailExperiment(experiment) {
-  const entry = experiment && typeof experiment === "object" ? experiment : {};
-  const template = entry.template && typeof entry.template === "object" ? entry.template : {};
-  const stats = entry.stats && typeof entry.stats === "object" ? entry.stats : {};
-  const name = firstPresent(entry.experiment_name, entry.experiment_id, "未命名实验");
-  const status = kellyExperimentStatusLabel(entry.status);
-  const strategy = [template.strategy_id, template.strategy_name]
-    .filter(hasValue)
-    .map(formatPlain)
-    .join(" · ");
-  const rows = [
-    ["阶段", kellySampleStageLabel(stats.sample_stage)],
-    ["已完成样本", stats.completed_samples],
-    ["进行中样本", stats.open_samples],
-    ["观测胜率", stats.observed_win_rate],
-  ];
-  return `
-    <article class="detail-section kelly-detail-section kelly-detail-experiment">
-      <div class="kelly-detail-status-row">
-        <div>
-          <h3>${escapeHtml(formatPlain(name))}</h3>
-          <p>${escapeHtml(formatPlain(strategy))}</p>
-        </div>
-        <span class="status-pill ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
-      </div>
-      <dl class="kelly-detail-stat-grid">
-        ${rows.map(([label, value]) => renderCompactKv(label, value)).join("")}
-      </dl>
-      <p class="kelly-stage-note">阶段 1 不计算 Kelly 仓位</p>
-    </article>
-  `;
-}
-
-function kellyDetailStatus(kelly) {
-  if (!kelly || kelly.available === false) {
-    return { label: "不可用", className: "status-muted" };
-  }
-  const key = formatPlain(kelly.status).toLowerCase();
-  if (["available", "ok", "ready"].includes(key)) {
-    return { label: "可用", className: "status-ok" };
-  }
-  if (["missing", "empty"].includes(key)) {
-    return { label: "未关联", className: "status-muted" };
-  }
-  return { label: formatPlain(kelly.status || "待确认"), className: "status-muted" };
 }
 
 function renderTSignalMetric(label, value) {
