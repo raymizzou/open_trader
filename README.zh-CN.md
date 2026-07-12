@@ -139,6 +139,22 @@ data/latest/portfolio.csv
 
 Futu 和 Tiger 的当前持仓通过 live account sync 更新，不再依赖月结单导入。
 
+东方财富 A 股对账单使用月末 CNY/HKD 汇率导入；例如 2026-06-30 香港金管局月末汇率为
+`1.1549`：
+
+```bash
+.venv/bin/python -m open_trader import-statements \
+  --month 2026-07 \
+  --eastmoney /Users/ray/Downloads/电子对账单.pdf \
+  --cny-hkd 1.1549 \
+  --data-dir data \
+  --update-latest
+```
+
+命令会在终端提示输入 PDF 密码，不应把密码写进命令、配置或日志。导入器只读取对账单
+首页的当前汇总表，不导入成交明细；`--update-latest` 会保留其他券商行，并替换已有的
+东方财富行。标准策略研究会按需使用 AKShare 获取 A 股日线，AKShare 不需要密钥。
+
 ### 手动运行盘前建议
 
 ```bash

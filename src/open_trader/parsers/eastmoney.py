@@ -113,9 +113,8 @@ def _parse_position(row: list[str | None], statement_id: str) -> Position:
 
 def _extract_money(text: str, label: str) -> Decimal | None:
     match = re.search(
-        rf"^\s*{re.escape(label)}\s*\(RMB\)\s*[:：]\s*({MONEY})\s*$",
+        rf"{re.escape(label)}\s*\(RMB\)\s*[:：]\s*({MONEY})",
         text,
-        flags=re.MULTILINE,
     )
     return parse_decimal(match.group(1)) if match else None
 

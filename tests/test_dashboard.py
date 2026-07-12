@@ -133,6 +133,7 @@ def test_dashboard_refreshes_cn_derived_values_from_cached_close(tmp_path: Path)
         ("total_quantity", "-1"),
         ("cost_value", ""),
         ("cost_value", "NaN"),
+        ("cost_value", "-1"),
         ("fx_to_hkd", ""),
         ("fx_to_hkd", "NaN"),
         ("fx_to_hkd", "0"),

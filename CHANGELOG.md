@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-12
 
+- Added password-prompted Eastmoney A-share statement imports using an explicit
+  month-end CNY/HKD rate, plus AKShare daily prices for standard-strategy research.
+- Kept the Dashboard holdings layout unchanged while adding the existing A-share
+  market and Eastmoney broker filters.
 - Added one global dashboard workspace for read-only standard-strategy research
   across current holdings and watchlist symbols, with trend-pullback,
   breakout-momentum, and range-mean-reversion strategies.

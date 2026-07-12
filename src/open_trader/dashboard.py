@@ -249,6 +249,7 @@ def _overlay_cn_cached_close(row: dict[str, str], data_dir: Path) -> dict[str, s
         or quantity is None
         or quantity <= 0
         or cost is None
+        or cost < 0
         or fx is None
         or fx <= 0
     ):

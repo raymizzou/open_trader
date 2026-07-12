@@ -37,6 +37,18 @@ def test_parse_eastmoney_first_page_only() -> None:
     assert result.cash_balances[0].available_balance == Decimal("405219.55")
 
 
+def test_parse_eastmoney_cash_when_currency_balances_share_lines() -> None:
+    result = parse_eastmoney_page(
+        "资金余额(RMB)： 10000.00 资金余额(HKD)： 2.00 资金余额(USD)： 3.00\n"
+        "资金可用(RMB)： 405219.55 资金可用(HKD)： 5.00 资金可用(USD)： 6.00",
+        [POSITIONS],
+        "2026-07",
+    )
+
+    assert result.cash_balances[0].cash_balance == Decimal("10000.00")
+    assert result.cash_balances[0].available_balance == Decimal("405219.55")
+
+
 def test_parser_rejects_missing_summary_table() -> None:
     with pytest.raises(ValueError, match="汇总股票资料"):
         parse_eastmoney_page("资金余额", [], "2026-07")
