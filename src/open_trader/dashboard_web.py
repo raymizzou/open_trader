@@ -1,22 +1,178 @@
 from __future__ import annotations
 
 import json
+from datetime import date
+from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .dashboard import DashboardConfig, load_dashboard_state
+from .backtest import run_backtest
+from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
+from .akshare_quote import AkShareDailyKlineProvider
+from .dashboard import (
+    DashboardConfig,
+    _backtest_holding_detail,
+    _latest_backtests_by_holding,
+    load_dashboard_state,
+)
 from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
+from .futu_quote import FutuQuoteClient
 from .research_chat import ResearchChatError, ResearchChatService
+from .standard_strategies import strategy_catalog
+from .strategy_backtest import (
+    StandardBacktestRequest,
+    run_standard_backtest,
+    validate_standard_backtest_request,
+)
+from .trading_plan import load_trading_plan_rows
 
 
 STATIC_DIR = Path(__file__).with_name("dashboard_static")
+STANDARD_BACKTEST_RANGES = ("6M", "1Y", "3Y", "5Y", "CUSTOM")
+STANDARD_BACKTEST_REQUEST_KEYS = {
+    "market", "symbol", "strategy_id", "range_preset", "custom_start", "custom_end",
+    "initial_cash", "max_strategy_weight", "commission_bps", "slippage_bps",
+}
+MAX_JSON_BODY_BYTES = 1024 * 1024
 
 
-def build_dashboard_payload(config: DashboardConfig) -> dict[str, Any]:
+class RequestBodyTooLargeError(Exception):
+    pass
+
+
+class StandardBacktestExecutionError(RuntimeError):
+    pass
+
+
+def build_standard_backtest_options_payload(config: DashboardConfig) -> dict[str, Any]:
+    state = load_dashboard_state(config).to_dict()
+    return {
+        "strategies": [definition.to_dict() for definition in strategy_catalog()],
+        "ranges": list(STANDARD_BACKTEST_RANGES),
+        "defaults": {
+            "range": "1Y", "initial_cash": "100000", "max_strategy_weight": "0.10",
+            "commission_bps": "10", "slippage_bps": "5",
+        },
+        "universe": state["backtest_universe"],
+        "benchmarks": {"US": "SPY", "HK": "HK.02800", "CN": "000300"},
+    }
+
+
+def _parse_decimal(request: dict[str, Any], key: str, default: str) -> Decimal:
+    raw = str(request.get(key, default)).strip()
+    percent = raw.endswith("%")
+    if percent:
+        raw = raw[:-1].strip()
+    try:
+        value = Decimal(raw)
+    except Exception as exc:
+        raise ValueError(f"{key} 必须是有效数字") from exc
+    return value / Decimal("100") if percent else value
+
+
+def _parse_iso_date(request: dict[str, Any], key: str) -> date | None:
+    raw = str(request.get(key) or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} 必须使用 YYYY-MM-DD 格式") from exc
+    if parsed.isoformat() != raw:
+        raise ValueError(f"{key} 必须使用 YYYY-MM-DD 格式")
+    return parsed
+
+
+def parse_standard_backtest_request(
+    config: DashboardConfig, request: dict[str, Any]
+) -> StandardBacktestRequest:
+    unknown = set(request) - STANDARD_BACKTEST_REQUEST_KEYS
+    if unknown:
+        raise ValueError(f"不支持的请求字段：{', '.join(sorted(unknown))}")
+    market = str(request.get("market") or "").strip().upper()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    strategy_id = str(request.get("strategy_id") or "").strip()
+    preset = str(request.get("range_preset") or "1Y").strip().upper()
+    if preset not in STANDARD_BACKTEST_RANGES:
+        raise ValueError(f"不支持的回测区间：{preset}")
+    if strategy_id not in {item.strategy_id for item in strategy_catalog()}:
+        raise ValueError(f"未知策略：{strategy_id}")
+    custom_start = _parse_iso_date(request, "custom_start")
+    custom_end = _parse_iso_date(request, "custom_end")
+    if preset == "CUSTOM":
+        if custom_start is None:
+            raise ValueError("自定义区间必须提供开始日期")
+        if custom_end is not None and custom_start >= custom_end:
+            raise ValueError("开始日期必须早于结束日期")
+    elif custom_start is not None or custom_end is not None:
+        raise ValueError("预设区间不能同时提供自定义日期")
+    options = build_standard_backtest_options_payload(config)
+    universe = options["universe"]["holdings"] + options["universe"]["watchlist"]
+    normalized = normalize_backtest_symbol(market, symbol)
+    allowed = {
+        (row["market"], row["symbol"].zfill(5) if row["market"] == "HK" and row["symbol"].isdigit() else row["symbol"])
+        for row in universe
+    }
+    if (market, normalized) not in allowed:
+        raise ValueError("所选标的不在可回测范围内")
+    parsed = StandardBacktestRequest(
+        data_dir=config.data_dir, reports_dir=config.reports_dir, market=market,
+        symbol=normalized, strategy_id=strategy_id,
+        range_preset=None if preset == "CUSTOM" else preset,
+        custom_start=custom_start, custom_end=custom_end,
+        initial_cash=_parse_decimal(request, "initial_cash", "100000"),
+        max_strategy_weight=_parse_decimal(request, "max_strategy_weight", "0.10"),
+        commission_bps=_parse_decimal(request, "commission_bps", "10"),
+        slippage_bps=_parse_decimal(request, "slippage_bps", "5"),
+    )
+    validate_standard_backtest_request(parsed)
+    return parsed
+
+
+def build_standard_backtest_run_payload(
+    config: DashboardConfig, request: dict[str, Any], *,
+    provider: DailyKlineProvider | None = None,
+) -> dict[str, Any]:
+    if "adapter" in request:
+        raise ValueError("不支持从界面选择回测执行工具")
+    parsed = parse_standard_backtest_request(config, request)
+    owned_provider = provider is None
+    try:
+        price_provider = provider or (
+            AkShareDailyKlineProvider() if parsed.market == "CN" else
+            FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+        )
+    except Exception as exc:
+        raise StandardBacktestExecutionError(f"行情服务连接失败：{exc}") from exc
+    result: dict[str, Any] | None = None
+    primary_error: StandardBacktestExecutionError | None = None
+    try:
+        result = run_standard_backtest(parsed, price_provider=price_provider).to_dict()
+    except Exception as exc:
+        primary_error = StandardBacktestExecutionError(f"标准策略回测执行失败：{exc}")
+        primary_error.__cause__ = exc
+    if owned_provider and hasattr(price_provider, "close"):
+        try:
+            price_provider.close()
+        except Exception as exc:
+            if primary_error is None:
+                raise StandardBacktestExecutionError(
+                    f"行情服务关闭失败：{exc}"
+                ) from exc
+    if primary_error is not None:
+        raise primary_error
+    if result is None:  # pragma: no cover - defensive invariant
+        raise StandardBacktestExecutionError("标准策略回测未返回结果")
+    return result
+
+
+def build_dashboard_payload(
+    config: DashboardConfig,
+) -> dict[str, Any]:
     return load_dashboard_state(config).to_dict()
 
 
@@ -35,6 +191,85 @@ def build_quotes_payload(
     return payload
 
 
+def build_backtest_run_payload(
+    config: DashboardConfig,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    market = str(request.get("market") or "").strip().upper()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    if not market or not symbol:
+        raise ValueError("market and symbol are required")
+
+    plan_path = _dashboard_backtest_plan_path(config.data_dir, market)
+    plan = _latest_active_plan(plan_path, market=market, symbol=symbol)
+    prices_path = config.data_dir / "prices" / market / f"{symbol}.csv"
+    run_backtest(
+        plan_path=plan_path,
+        prices_path=prices_path,
+        data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
+        run_date=plan.run_date,
+        symbol=symbol,
+        market=market,
+        initial_cash=_decimal_request_value(request, "initial_cash", "100000"),
+        initial_position_quantity=_decimal_request_value(
+            request, "initial_position_quantity", "0"
+        ),
+        commission_bps=_decimal_request_value(request, "commission_bps", "10"),
+        slippage_bps=_decimal_request_value(request, "slippage_bps", "5"),
+        adapter=str(request.get("adapter") or "backtrader"),
+    )
+    backtest = _dashboard_backtest_for_holding(config, market=market, symbol=symbol)
+    return {
+        "status": "ok",
+        "market": market,
+        "symbol": symbol,
+        "backtest": backtest,
+    }
+
+
+def _dashboard_backtest_plan_path(data_dir: Path, market: str) -> Path:
+    scoped_path = data_dir / "latest" / market / "trading_plan.csv"
+    if scoped_path.exists():
+        return scoped_path
+    return data_dir / "latest" / "trading_plan.csv"
+
+
+def _latest_active_plan(plan_path: Path, *, market: str, symbol: str) -> Any:
+    plans = [
+        plan
+        for plan in load_trading_plan_rows(plan_path)
+        if plan.status == "active"
+        and plan.market.upper() == market
+        and plan.symbol.upper() == symbol
+    ]
+    if not plans:
+        raise ValueError(f"no active trading plan found for {market}.{symbol}")
+    plans.sort(key=lambda plan: (plan.run_date, plan.symbol))
+    return plans[-1]
+
+
+def _decimal_request_value(
+    request: dict[str, Any],
+    key: str,
+    default: str,
+) -> Decimal:
+    value = request.get(key, default)
+    return Decimal(str(value))
+
+
+def _dashboard_backtest_for_holding(
+    config: DashboardConfig,
+    *,
+    market: str,
+    symbol: str,
+) -> dict[str, Any]:
+    rows = _latest_backtests_by_holding(
+        data_dir=config.data_dir, reports_dir=config.reports_dir, markets={market},
+    )
+    return _backtest_holding_detail(rows.get((market, symbol)))
+
+
 def create_dashboard_server(
     config: DashboardConfig,
     host: str,
@@ -42,6 +277,7 @@ def create_dashboard_server(
     quote_service: DashboardQuoteService | None = None,
     account_sync_service: DashboardAccountSyncService | None = None,
     research_chat_service: ResearchChatService | None = None,
+    backtest_price_provider: DailyKlineProvider | None = None,
 ) -> ThreadingHTTPServer:
     service = quote_service or DashboardQuoteService(config=config)
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
@@ -63,7 +299,15 @@ def create_dashboard_server(
                 return
             if path == "/api/dashboard":
                 try:
-                    self._send_json(build_dashboard_payload(config))
+                    self._send_json(
+                        build_dashboard_payload(config)
+                    )
+                except Exception as exc:
+                    self._send_error_json(exc)
+                return
+            if path == "/api/backtests/options":
+                try:
+                    self._send_json(build_standard_backtest_options_payload(config))
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
@@ -103,6 +347,18 @@ def create_dashboard_server(
                         )
                     )
                     return
+                if path == "/api/backtests/run":
+                    self._send_json(
+                        build_backtest_run_payload(config, self._read_json_body())
+                    )
+                    return
+                if path == "/api/backtests/standard/run":
+                    self._send_json(
+                        build_standard_backtest_run_payload(
+                            config, self._read_json_body(), provider=backtest_price_provider,
+                        )
+                    )
+                    return
                 if path.startswith("/api/research-chat/sessions/"):
                     route = self._research_chat_session_action(path)
                     if route is None:
@@ -133,11 +389,22 @@ def create_dashboard_server(
             return
 
         def _read_json_body(self) -> dict[str, Any]:
-            content_length = int(self.headers.get("Content-Length") or "0")
+            raw_content_length = self.headers.get("Content-Length") or "0"
+            try:
+                content_length = int(raw_content_length)
+            except ValueError as exc:
+                raise ValueError("Content-Length 必须是非负整数") from exc
+            if content_length < 0:
+                raise ValueError("Content-Length 必须是非负整数")
+            if content_length > MAX_JSON_BODY_BYTES:
+                raise RequestBodyTooLargeError("请求正文不能超过 1 MiB")
             body = self.rfile.read(content_length) if content_length else b"{}"
-            payload = json.loads(body.decode("utf-8") or "{}")
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ValueError("请求正文必须是有效的 JSON 对象") from exc
             if not isinstance(payload, dict):
-                raise ResearchChatError("request body must be a JSON object")
+                raise ValueError("请求正文必须是有效的 JSON 对象")
             return payload
 
         def _research_chat_session_id(self, path: str) -> str | None:
@@ -170,13 +437,20 @@ def create_dashboard_server(
             self.wfile.write(body)
 
         def _send_error_json(self, error: Exception) -> None:
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
+            if isinstance(error, RequestBodyTooLargeError):
+                status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            elif isinstance(error, ValueError):
+                status = HTTPStatus.BAD_REQUEST
+            elif isinstance(error, StandardBacktestExecutionError):
+                status = HTTPStatus.BAD_GATEWAY
             self._send_json(
                 {
                     "status": "error",
                     "error_type": type(error).__name__,
                     "message": str(error),
                 },
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                status=status,
             )
 
         def _send_file(self, path: Path, content_type: str) -> None:

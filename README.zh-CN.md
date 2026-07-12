@@ -139,6 +139,24 @@ data/latest/portfolio.csv
 
 Futu 和 Tiger 的当前持仓通过 live account sync 更新，不再依赖月结单导入。
 
+东方财富 A 股对账单使用月末 CNY/HKD 汇率导入；例如 2026-06-30 香港金管局月末汇率为
+`1.1549`：
+
+```bash
+.venv/bin/python -m open_trader import-statements \
+  --month 2026-07 \
+  --eastmoney /Users/ray/Downloads/电子对账单.pdf \
+  --cny-hkd 1.1549 \
+  --fx-date 2026-06-30 \
+  --data-dir data \
+  --update-latest
+```
+
+`--fx-date` 记录该官方汇率的实际日期，避免把导入月份的月末误记为汇率日期。命令会
+在终端提示输入 PDF 密码，不应把密码写进命令、配置或日志。导入器只读取对账单
+首页的当前汇总表，不导入成交明细；`--update-latest` 会保留其他券商行，并替换已有的
+东方财富行。标准策略研究会按需使用 AKShare 获取 A 股日线，AKShare 不需要密钥。
+
 ### 手动运行盘前建议
 
 ```bash
@@ -280,6 +298,41 @@ promotion。
   --date 2026-06-16
 ```
 
+### 回测 Trading Plan
+
+用历史日线 OHLC 行情，对一个 active trading-plan 行做单标的只读回测：
+
+```bash
+.venv/bin/python -m open_trader run-backtest \
+  --plan data/latest/trading_plan.csv \
+  --prices data/prices/US/MSFT.csv \
+  --symbol MSFT \
+  --market US \
+  --date 2026-06-16 \
+  --adapter backtrader
+```
+
+第一版回测策略刻意保持窄边界：只使用选中 `trading_plan.csv` 行里的 entry zone、
+stop loss、targets 和 max weight；从 plan 日期之后的日线开始评估；计入手续费和
+滑点；输出独立产物到 `data/backtests/<run_id>/`，并在 `reports/backtests/`
+写 Markdown 报告。默认执行后端是 `backtrader`，也保留 `simple` 作为本地回退。
+该命令不会下单，也不会更新 `data/latest`。
+
+### 在看板运行标准策略研究
+
+从唯一的全局入口依次进入：`持仓实时看板` → `策略回测` → `当前持仓/自选股` →
+`单一标的` → `趋势回调/突破动量/区间均值回归` → `时间范围` → `运行回测`。
+工作区刻意隐藏 Backtrader，并把所选策略同时与“买入持有”和市场指数比较：美股默认
+使用 `SPY`，港股默认使用 `HK.02800`。
+
+时间范围支持 `6M`、`1Y`、`3Y`、`5Y` 和自定义。Futu 实际可用历史行情可能短于
+请求范围，因此每次结果都会明确显示实际数据起止日期，并展示初始资金、策略最大
+仓位、手续费和滑点等固定研究假设。每次运行会把清单、信号、交易、净值曲线、指标
+和报告写到 `data/backtests/<run_id>/` 与 `reports/backtests/`，不会修改持仓、
+trading plan 或订单状态。
+
+标准策略结果仅供研究。自定义策略编辑和自动执行明确不在范围内；看板不会下单。
+
 ### 部署本机前端仪表盘
 
 ```bash
@@ -360,6 +413,17 @@ curl -sS http://127.0.0.1:8766/ | head
 curl -sS http://127.0.0.1:8766/api/dashboard | head -c 500
 ps aux | rg 'open_trader dashboard'
 ```
+
+Dashboard 行为改动部署后必须运行统一验收门：
+
+```bash
+make acceptance
+```
+
+它会运行全量测试，并检查真实 API 数据、两个后台刷新周期、运行目录与
+Git SHA、错误日志，以及系统 Chrome 中的桌面和移动端 `A 股` / `东方财富`
+筛选流程。只有 `PASS` 可以标记为完成；`FAIL` 必须修复，浏览器不可用则
+返回 `BLOCKED`，不能用 curl 或单元测试替代。
 
 也可以用结构化检查确认 API 和 SOXX 决策事实是否存在：
 

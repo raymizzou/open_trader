@@ -21,6 +21,22 @@ const state = {
     messageCount: 0,
     messages: [],
   },
+  standardBacktest: {
+    options: null,
+    source: "holdings",
+    symbolKey: "",
+    strategyId: "trend_pullback/v1",
+    rangePreset: "1Y",
+    customStart: "",
+    customEnd: "",
+    initialCash: "100000",
+    maxWeight: "10%",
+    commissionBps: "10",
+    slippageBps: "5",
+    busy: false,
+    error: "",
+    result: null,
+  },
 };
 
 const elements = {};
@@ -32,6 +48,7 @@ const MARKET_SECTION_CONFIGS = [
   { market: "US_OPTION", marketGroup: "US", label: "美股期权", className: "market-section-us-option" },
   { market: "HK_STOCK", marketGroup: "HK", label: "港股正股", className: "market-section-hk-stock" },
   { market: "HK_OPTION", marketGroup: "HK", label: "港股期权", className: "market-section-hk-option" },
+  { market: "CN_STOCK", marketGroup: "CN", label: "A 股正股", className: "market-section-cn-stock" },
   { market: "OTHER", marketGroup: "OTHER", label: "其他市场持仓", className: "market-section-other" },
 ];
 
@@ -157,6 +174,24 @@ function bindElements() {
     "research-chat-close",
     "research-chat-finalize",
     "research-chat-status",
+    "open-standard-backtest",
+    "close-standard-backtest",
+    "standard-backtest-workspace",
+    "standard-backtest-form",
+    "backtest-symbol-source",
+    "backtest-symbol",
+    "backtest-strategy-cards",
+    "backtest-range-controls",
+    "backtest-custom-range",
+    "backtest-custom-start",
+    "backtest-custom-end",
+    "backtest-initial-cash",
+    "backtest-max-weight",
+    "backtest-commission",
+    "backtest-slippage",
+    "run-standard-backtest",
+    "standard-backtest-status",
+    "standard-backtest-results",
   ].forEach((id) => {
     elements[id] = document.getElementById(id);
   });
@@ -229,6 +264,377 @@ function bindEvents() {
     }
   });
   elements["symbol-detail-panel"].addEventListener("click", handleSymbolDetailClick);
+  elements["open-standard-backtest"].addEventListener("click", openStandardBacktest);
+  elements["close-standard-backtest"].addEventListener("click", closeStandardBacktest);
+  elements["backtest-symbol-source"].addEventListener("click", handleBacktestChoice);
+  elements["backtest-strategy-cards"].addEventListener("click", handleBacktestChoice);
+  elements["backtest-range-controls"].addEventListener("click", handleBacktestChoice);
+  elements["backtest-symbol"].addEventListener("change", (event) => {
+    state.standardBacktest.symbolKey = event.target.value;
+  });
+  elements["standard-backtest-form"].addEventListener("submit", submitStandardBacktest);
+}
+
+async function openStandardBacktest() {
+  elements["workspace-grid"].classList.add("hidden");
+  elements["standard-backtest-workspace"].hidden = false;
+  elements["standard-backtest-workspace"].classList.remove("hidden");
+  if (!state.standardBacktest.options) {
+    elements["standard-backtest-status"].textContent = "正在加载回测选项…";
+    try {
+      const response = await fetch("/api/backtests/options", { cache: "no-store" });
+      if (!response.ok) throw new Error(`options ${response.status}`);
+      state.standardBacktest.options = await response.json();
+      const defaults = state.standardBacktest.options.defaults || {};
+      state.standardBacktest.rangePreset = defaults.range || state.standardBacktest.rangePreset;
+      state.standardBacktest.maxWeight = decimalAsPercent(defaults.max_strategy_weight, "10%");
+      state.standardBacktest.initialCash = String(defaults.initial_cash || "100000");
+      state.standardBacktest.commissionBps = String(defaults.commission_bps || "10");
+      state.standardBacktest.slippageBps = String(defaults.slippage_bps || "5");
+      elements["standard-backtest-status"].textContent = "";
+    } catch (error) {
+      state.standardBacktest.error = "回测选项加载失败，请稍后重试。";
+      elements["standard-backtest-status"].textContent = state.standardBacktest.error;
+    }
+  }
+  renderStandardBacktest();
+}
+
+function closeStandardBacktest() {
+  syncStandardBacktestInputs();
+  elements["standard-backtest-workspace"].hidden = true;
+  elements["standard-backtest-workspace"].classList.add("hidden");
+  elements["workspace-grid"].classList.remove("hidden");
+}
+
+function handleBacktestChoice(event) {
+  const source = event.target.closest("[data-backtest-source]");
+  const strategy = event.target.closest("[data-strategy-id]");
+  const range = event.target.closest("[data-range-preset]");
+  if (source) {
+    syncStandardBacktestInputs();
+    state.standardBacktest.source = source.dataset.backtestSource;
+    state.standardBacktest.symbolKey = "";
+  } else if (strategy && !strategy.disabled) {
+    state.standardBacktest.strategyId = strategy.dataset.strategyId;
+  } else if (range) {
+    syncStandardBacktestInputs();
+    state.standardBacktest.rangePreset = range.dataset.rangePreset;
+  } else {
+    return;
+  }
+  renderStandardBacktest();
+}
+
+function renderStandardBacktest() {
+  const options = state.standardBacktest.options;
+  if (!options) return;
+  const backtest = state.standardBacktest;
+  elements["backtest-symbol-source"].innerHTML = [
+    ["holdings", "当前持仓"], ["watchlist", "关注列表"],
+  ].map(([key, label]) => `<button class="filter-button ${backtest.source === key ? "active" : ""}" type="button" data-backtest-source="${key}" aria-pressed="${backtest.source === key}">${label}</button>`).join("");
+  const universe = (options.universe && options.universe[backtest.source]) || [];
+  if (!universe.some((row) => `${row.market}:${row.symbol}` === backtest.symbolKey)) {
+    backtest.symbolKey = universe.length ? `${universe[0].market}:${universe[0].symbol}` : "";
+  }
+  elements["backtest-symbol"].innerHTML = universe.length
+    ? universe.map((row) => `<option value="${escapeHtml(`${row.market}:${row.symbol}`)}" ${`${row.market}:${row.symbol}` === backtest.symbolKey ? "selected" : ""}>${escapeHtml(`${row.market} · ${row.symbol}${row.name ? ` · ${row.name}` : ""}`)}</option>`).join("")
+    : '<option value="">暂无可回测标的</option>';
+  elements["backtest-strategy-cards"].innerHTML = options.strategies.map((strategy) => `
+    <button class="backtest-strategy-card ${strategy.id === backtest.strategyId ? "active" : ""}" type="button" data-strategy-id="${escapeHtml(strategy.id)}" aria-pressed="${strategy.id === backtest.strategyId}">
+      <strong>${escapeHtml(strategy.name_zh)}</strong><span>${escapeHtml(strategy.description_zh)}</span>
+    </button>`).join("") + '<button class="backtest-strategy-card" type="button" disabled aria-disabled="true" aria-pressed="false"><strong>自定义策略</strong><span>后续版本</span></button>';
+  elements["backtest-range-controls"].innerHTML = options.ranges.map((range) => `<button class="filter-button ${range === backtest.rangePreset ? "active" : ""}" type="button" data-range-preset="${range}" aria-pressed="${range === backtest.rangePreset}">${range === "CUSTOM" ? "自定义" : range}</button>`).join("");
+  const custom = backtest.rangePreset === "CUSTOM";
+  elements["backtest-custom-range"].hidden = !custom;
+  elements["backtest-custom-range"].classList.toggle("hidden", !custom);
+  elements["backtest-custom-start"].required = custom;
+  elements["backtest-custom-start"].value = backtest.customStart;
+  elements["backtest-custom-end"].value = backtest.customEnd;
+  elements["backtest-initial-cash"].value = backtest.initialCash;
+  elements["backtest-max-weight"].value = backtest.maxWeight;
+  elements["backtest-commission"].value = backtest.commissionBps;
+  elements["backtest-slippage"].value = backtest.slippageBps;
+}
+
+function syncStandardBacktestInputs() {
+  if (!elements["backtest-max-weight"]) return;
+  state.standardBacktest.customStart = elements["backtest-custom-start"].value;
+  state.standardBacktest.customEnd = elements["backtest-custom-end"].value;
+  state.standardBacktest.initialCash = elements["backtest-initial-cash"].value;
+  state.standardBacktest.maxWeight = elements["backtest-max-weight"].value;
+  state.standardBacktest.commissionBps = elements["backtest-commission"].value;
+  state.standardBacktest.slippageBps = elements["backtest-slippage"].value;
+}
+
+function buildStandardBacktestRequest() {
+  const backtest = state.standardBacktest;
+  const separator = backtest.symbolKey.indexOf(":");
+  const request = {
+    market: backtest.symbolKey.slice(0, separator),
+    symbol: backtest.symbolKey.slice(separator + 1),
+    strategy_id: backtest.strategyId,
+    range_preset: backtest.rangePreset,
+    initial_cash: backtest.initialCash,
+    max_strategy_weight: backtest.maxWeight,
+    commission_bps: backtest.commissionBps,
+    slippage_bps: backtest.slippageBps,
+  };
+  if (backtest.rangePreset === "CUSTOM") {
+    request.custom_start = backtest.customStart;
+    request.custom_end = backtest.customEnd;
+  }
+  return request;
+}
+
+async function submitStandardBacktest(event) {
+  event.preventDefault();
+  syncStandardBacktestInputs();
+  const backtest = state.standardBacktest;
+  if (!backtest.symbolKey || backtest.busy) return;
+  const validationError = validateStandardBacktestDates();
+  if (validationError) {
+    elements["standard-backtest-status"].textContent = validationError;
+    return;
+  }
+  backtest.busy = true;
+  elements["run-standard-backtest"].disabled = true;
+  elements["standard-backtest-status"].textContent = "正在运行回测…";
+  try {
+    const response = await fetch("/api/backtests/standard/run", {
+      method: "POST", headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify(buildStandardBacktestRequest()),
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { payload = null; }
+    if (!response.ok) {
+      elements["standard-backtest-status"].textContent = safeBacktestErrorMessage(payload);
+      return;
+    }
+    if (!payload || typeof payload !== "object") {
+      elements["standard-backtest-status"].textContent = "回测请求失败，请稍后重试。";
+      return;
+    }
+    backtest.result = payload;
+    renderStandardBacktestResult(payload);
+    elements["standard-backtest-status"].textContent = "回测运行成功。";
+  } catch (_) {
+    elements["standard-backtest-status"].textContent = "回测请求失败，请稍后重试。";
+  } finally {
+    backtest.busy = false;
+    elements["run-standard-backtest"].disabled = false;
+  }
+}
+
+function renderStandardBacktestResult(result) {
+  const target = document.getElementById("standard-backtest-results");
+  if (!target || !result || typeof result !== "object") return;
+  target.innerHTML = [
+    renderBacktestComparisonMetrics(result),
+    renderBacktestEquityComparison(result),
+    renderBacktestPriceActions(result),
+    renderBacktestTradeTable(result),
+    renderBacktestRunAssumptions(result),
+  ].join("");
+  target.hidden = false;
+}
+
+function renderBacktestComparisonMetrics(result) {
+  const strategy = result.strategy || {};
+  const buyHold = result.buy_hold || {};
+  const benchmark = result.market_benchmark;
+  const benchmarkLabel = result.benchmark_symbol || "市场指数";
+  const rows = [
+    ["策略收益", strategy.total_return_pct],
+    ["买入持有", buyHold.total_return_pct],
+    [benchmarkLabel, benchmark && benchmark.total_return_pct],
+    ["相对买入持有", result.strategy_excess_return_pct],
+    ["相对市场指数", benchmark && result.market_excess_return_pct],
+    ["最大回撤", strategy.max_drawdown_pct],
+    ["交易次数", Array.isArray(strategy.trades) ? strategy.trades.filter((trade) => Number(trade.quantity) !== 0).length : 0, "count"],
+    ["胜率", strategy.win_rate_pct],
+  ];
+  return `<section class="backtest-result-section" aria-labelledby="backtest-comparison-title"><h3 id="backtest-comparison-title">回测对比</h3><div class="backtest-comparison-grid">${rows.map(([label, value, kind]) => {
+    const unavailable = (label === benchmarkLabel || label === "相对市场指数") && !benchmark;
+    const display = unavailable ? "基准行情缺失，无法比较" : kind === "count" ? String(value) : backtestPercent(value);
+    return `<article class="backtest-metric-card${unavailable ? " benchmark-unavailable" : ""}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display)}</strong></article>`;
+  }).join("")}</div></section>`;
+}
+
+function renderBacktestEquityComparison(result) {
+  return `<section class="backtest-result-section"><h3>净值曲线</h3>${renderThreeSeriesBacktestChart(
+    result.strategy && result.strategy.equity_curve,
+    result.buy_hold && result.buy_hold.equity_curve,
+    result.market_benchmark && result.market_benchmark.equity_curve,
+    result.benchmark_symbol,
+    (result.strategy && result.strategy.trades || []).map((trade) => trade.execution_date),
+  )}</section>`;
+}
+
+function renderThreeSeriesBacktestChart(strategyRows, buyHoldRows, marketRows, benchmarkSymbol, actionDates) {
+  const preserved = new Set(Array.isArray(actionDates) ? actionDates.map(String) : []);
+  const series = [
+    ["策略", downsampleBacktestRows(strategyRows, "equity", preserved), "backtest-line-strategy"],
+    ["买入持有", downsampleBacktestRows(buyHoldRows, "equity", preserved), "backtest-line-buy-hold"],
+    [benchmarkSymbol || "市场指数", downsampleBacktestRows(marketRows, "equity", preserved), "backtest-line-market"],
+  ];
+  const points = series.flatMap(([, rows]) => rows).map((row) => Number(row.equity));
+  const dates = [...new Set(series.flatMap(([, rows]) => Array.isArray(rows) ? rows.map((row) => String(row.date || "")) : []).filter(Boolean))].sort();
+  const [min, max] = finiteBacktestExtent(points);
+  const path = (rows) => {
+    const byDate = new Map((Array.isArray(rows) ? rows : []).map((row) => [String(row.date || ""), Number(row.equity)]));
+    let started = false;
+    return dates.map((date, index) => {
+      const value = byDate.get(date);
+      if (!Number.isFinite(value)) return "";
+      const x = dates.length > 1 ? 20 + index * 560 / (dates.length - 1) : 300;
+      const y = 180 - (value - min) * 150 / (max - min || 1);
+      const command = started ? "L" : "M";
+      started = true;
+      return `${command}${x.toFixed(1)},${y.toFixed(1)}`;
+    }).filter(Boolean).join(" ");
+  };
+  const legend = series.map(([label, , className]) => `<span class="${className}">${escapeHtml(label)}</span>`).join("");
+  const paths = series.map(([, rows, className]) => `<path class="${className}" d="${path(rows)}" fill="none" vector-effect="non-scaling-stroke"></path>`).join("");
+  return `<div class="backtest-chart" role="img" aria-label="策略、买入持有与市场指数净值曲线"><div class="backtest-chart-legend">${legend}</div><svg viewBox="0 0 600 200" aria-hidden="true">${paths}</svg></div>`;
+}
+
+function renderBacktestPriceActions(result) {
+  const strategy = result.strategy || {};
+  const rows = Array.isArray(strategy.equity_curve) ? strategy.equity_curve : [];
+  const trades = Array.isArray(strategy.trades) ? strategy.trades : [];
+  return `<section class="backtest-result-section"><h3>价格与动作</h3>${renderPriceActionChart(rows, trades)}</section>`;
+}
+
+function renderPriceActionChart(rows, trades) {
+  const allowed = new Set(["BUY", "ADD", "REDUCE", "EXIT"]);
+  const validDates = new Set((Array.isArray(rows) ? rows : []).filter((row) => row && Number.isFinite(Number(row.close))).map((row) => String(row.date || "")));
+  const grouped = new Map();
+  for (const trade of Array.isArray(trades) ? trades : []) {
+    const action = String(trade.action || "");
+    const executionDate = String(trade.execution_date || "");
+    const price = Number(trade.raw_price);
+    if (!allowed.has(action) || !validDates.has(executionDate) || !Number.isFinite(price)) continue;
+    const key = `${executionDate}\u0000${action}`;
+    const current = grouped.get(key);
+    if (current) current.count += 1;
+    else grouped.set(key, { execution_date: executionDate, action, raw_price: price, count: 1 });
+  }
+  const allGroups = [...grouped.values()];
+  const actionGroups = sampleBacktestActionGroups(allGroups, 600);
+  rows = downsampleBacktestRows(rows, "close", new Set(actionGroups.map((group) => group.execution_date)));
+  const prices = rows.map((row) => Number(row.close));
+  const [min, max] = finiteBacktestExtent(prices);
+  const dateIndex = new Map(rows.map((row, index) => [String(row.date || ""), index]));
+  const xy = (date, price) => {
+    const index = dateIndex.get(String(date || "")) || 0;
+    return [rows.length > 1 ? 20 + index * 560 / (rows.length - 1) : 300, 180 - (Number(price) - min) * 150 / (max - min || 1)];
+  };
+  const displayedGroups = actionGroups.filter((group) => dateIndex.has(group.execution_date));
+  const omittedGroups = allGroups.length - displayedGroups.length;
+  const pricePath = rows.map((row, index) => { const [x, y] = xy(row.date, row.close); return `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`; }).join(" ");
+  const explanations = { BUY: "买入", ADD: "加仓", REDUCE: "减仓", EXIT: "退出" };
+  const markers = displayedGroups.map((group) => {
+    const [x, y] = xy(group.execution_date, group.raw_price);
+    const count = group.count > 1 ? ` ×${group.count}` : "";
+    return `<g class="backtest-action-marker action-${group.action.toLowerCase()}"><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5"></circle><text x="${x.toFixed(1)}" y="${(y - 9).toFixed(1)}">${group.action}${count}</text></g>`;
+  }).join("");
+  const summary = displayedGroups.map((group) => `${group.execution_date} ${group.action}（${explanations[group.action]}）${group.count > 1 ? `共 ${group.count} 笔` : ""}`).join("；");
+  const omittedNotice = omittedGroups ? `另有 ${omittedGroups} 组交易标记未显示` : "";
+  return `<div class="backtest-chart" role="img" aria-label="价格曲线与交易动作。${escapeHtml(summary || "没有执行动作")}。${omittedNotice}。HOLD（观察）不绘制标记。"><svg viewBox="0 0 600 200" aria-hidden="true"><path class="backtest-price-line" d="${pricePath}" fill="none" vector-effect="non-scaling-stroke"></path>${markers}</svg></div>`;
+}
+
+function sampleBacktestActionGroups(groups, limit) {
+  if (groups.length <= limit) return groups;
+  const selected = new Set([0, groups.length - 1]);
+  const actions = ["BUY", "ADD", "REDUCE", "EXIT"];
+  for (const action of actions) {
+    const first = groups.findIndex((group) => group.action === action);
+    if (first >= 0) selected.add(first);
+    for (let index = groups.length - 1; index >= 0; index -= 1) {
+      if (groups[index].action === action) { selected.add(index); break; }
+    }
+  }
+  const remaining = limit - selected.size;
+  const step = (groups.length - 1) / (remaining + 1);
+  for (let index = 1; index <= remaining; index += 1) selected.add(Math.round(index * step));
+  if (selected.size < limit) {
+    for (let index = 0; index < groups.length && selected.size < limit; index += 1) selected.add(index);
+  }
+  return [...selected].sort((left, right) => left - right).slice(0, limit).map((index) => groups[index]);
+}
+
+function renderBacktestTradeTable(result) {
+  const trades = result.strategy && Array.isArray(result.strategy.trades) ? result.strategy.trades : [];
+  if (!trades.length) return '<section class="backtest-result-section"><h3>交易记录</h3><p class="backtest-empty-state">所选区间内没有触发交易</p></section>';
+  const visible = trades.slice(0, 500);
+  const notice = trades.length > visible.length ? `<p>仅显示前 500 笔，共 ${trades.length} 笔</p>` : "";
+  return `<section class="backtest-result-section"><h3>交易记录</h3>${notice}<div class="backtest-table-wrap"><table class="backtest-trades-table"><thead><tr><th>执行日期</th><th>动作</th><th>数量</th><th>成交价</th><th>费用</th><th>原因</th></tr></thead><tbody>${visible.map((trade) => `<tr><td>${escapeHtml(trade.execution_date)}</td><td>${escapeHtml(trade.action)}</td><td>${escapeHtml(trade.quantity)}</td><td>${escapeHtml(trade.execution_price)}</td><td>${escapeHtml(trade.fees)}</td><td>${escapeHtml(trade.reason)}</td></tr>`).join("")}</tbody></table></div></section>`;
+}
+
+function renderBacktestRunAssumptions(result) {
+  const strategy = result.strategy || {};
+  const trades = Array.isArray(strategy.trades) ? strategy.trades : [];
+  const totalFees = trades.reduce((sum, trade) => sum + (Number(trade.fees) || 0), 0);
+  const assumptions = result.assumptions || {};
+  const definition = result.strategy_definition || {};
+  const parameterLabels = { sma_short: "短期均线周期", sma_long: "长期均线周期", atr_period: "真实波幅周期", rsi_period: "强弱指标周期", stop_multiplier: "止损倍数", high_period: "突破周期", volume_period: "成交量周期", volume_multiplier: "成交量倍数", sma_exit: "退出均线周期", bollinger_period: "布林带周期", stddev_multiplier: "标准差倍数" };
+  const parameters = definition.parameters && typeof definition.parameters === "object" ? Object.entries(definition.parameters) : [];
+  const signals = Array.isArray(result.signals) ? result.signals : [];
+  const holdSignals = signals.filter((signal) => signal.action === "HOLD");
+  const artifacts = [["manifest_path", "运行清单"], ["signals_path", "策略信号"], ["trades_path", "交易记录"], ["equity_curve_path", "策略净值"], ["buy_hold_equity_path", "买入持有净值"], ["market_benchmark_equity_path", "市场指数净值"], ["metrics_path", "指标数据"], ["report_path", "回测报告"]];
+  return `<section class="backtest-result-section"><h3>运行详情</h3><dl class="backtest-run-details"><dt>请求范围</dt><dd>${escapeHtml(result.requested_start || "-")} 至 ${escapeHtml(result.requested_end || "-")}</dd><dt>实际数据</dt><dd>${escapeHtml(result.actual_start || "-")} 至 ${escapeHtml(result.actual_end || "-")}</dd><dt>策略版本</dt><dd>${escapeHtml(result.strategy_id || "-")}</dd><dt>策略名称</dt><dd>${escapeHtml(definition.name_zh || "-")} · ${escapeHtml(definition.description_zh || "-")}</dd><dt>执行器版本</dt><dd>${escapeHtml(result.adapter_version || "-")}</dd><dt>运行编号</dt><dd>${escapeHtml(result.run_id || "-")}</dd></dl><h4>交易假设</h4><dl class="backtest-run-details"><dt>初始资金</dt><dd>${escapeHtml(assumptions.initial_cash || "-")}</dd><dt>最大策略仓位</dt><dd>${backtestPercent(Number(assumptions.max_strategy_weight) * 100)}</dd><dt>佣金</dt><dd>${escapeHtml(assumptions.commission_bps || "-")} 基点</dd><dt>滑点</dt><dd>${escapeHtml(assumptions.slippage_bps || "-")} 基点</dd><dt>已实现交易费用</dt><dd>${escapeHtml(totalFees.toFixed(2))}</dd></dl><h4>固定参数</h4><dl class="backtest-run-details">${parameters.map(([key, value]) => `<dt>${escapeHtml(parameterLabels[key] || key)}</dt><dd>${escapeHtml(value)}</dd>`).join("")}</dl><p class="backtest-signal-summary">HOLD（观察）信号 ${holdSignals.length} 次${holdSignals.length ? `；${escapeHtml(holdSignals.slice(0, 10).map((signal) => signal.decision_date).join("、"))}` : ""}</p><h4>结果文件</h4><ul class="backtest-artifacts">${artifacts.filter(([key]) => result[key]).map(([key, label]) => `<li><span>${label}</span><code>${escapeHtml(result[key])}</code></li>`).join("")}</ul></section>`;
+}
+
+function finiteBacktestExtent(values) {
+  let min = Infinity; let max = -Infinity;
+  for (const value of values) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) continue;
+    if (number < min) min = number;
+    if (number > max) max = number;
+  }
+  return min === Infinity ? [0, 1] : [min, max];
+}
+
+function downsampleBacktestRows(rows, valueKey, preservedDates, limit = 600) {
+  const valid = (Array.isArray(rows) ? rows : []).filter((row) => row && String(row.date || "") && Number.isFinite(Number(row[valueKey])));
+  if (valid.length <= limit) return valid;
+  const selected = new Set([0, valid.length - 1]);
+  const preserveIndexes = [];
+  valid.forEach((row, index) => { if (preservedDates && preservedDates.has(String(row.date))) preserveIndexes.push(index); });
+  const preserveStep = Math.max(1, Math.ceil(preserveIndexes.length / Math.max(1, limit - 2)));
+  for (let index = 0; index < preserveIndexes.length && selected.size < limit; index += preserveStep) selected.add(preserveIndexes[index]);
+  const remaining = limit - selected.size;
+  if (remaining > 0) {
+    const step = (valid.length - 1) / (remaining + 1);
+    for (let index = 1; index <= remaining; index += 1) selected.add(Math.round(index * step));
+  }
+  return [...selected].sort((left, right) => left - right).slice(0, limit).map((index) => valid[index]);
+}
+
+function backtestPercent(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(2)}%` : "-";
+}
+
+function validateStandardBacktestDates() {
+  const backtest = state.standardBacktest;
+  if (backtest.rangePreset !== "CUSTOM") return "";
+  if (!backtest.customStart) return "自定义区间必须填写开始日期。";
+  if (backtest.customEnd && backtest.customStart >= backtest.customEnd) return "开始日期必须早于结束日期。";
+  return "";
+}
+
+function safeBacktestErrorMessage(payload) {
+  const message = payload && typeof payload.message === "string" ? payload.message.trim() : "";
+  const isSafeChinese = message && /[\u3400-\u9fff]/.test(message) && !/[A-Za-z]/.test(message);
+  return isSafeChinese ? message : "回测请求失败，请稍后重试。";
+}
+
+function decimalAsPercent(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number * 100}%` : fallback;
 }
 
 function handleSymbolDetailClick(event) {
@@ -1382,7 +1788,10 @@ function currentViewSummary() {
       holding_count: cashRows.length,
     };
   }
-  if (state.marketFilter === "ALL" && state.brokerFilter !== "ALL") {
+  if (
+    state.marketFilter === "ALL"
+    && state.brokerFilter !== "ALL"
+  ) {
     const summary = currentBrokerSummary();
     if (summary) {
       return {
@@ -1518,7 +1927,7 @@ function emptyMoneySummary(complete) {
 }
 
 function currentViewLabel(count) {
-  const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CASH" ? "现金" : state.marketFilter;
+  const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CASH" ? "现金" : state.marketFilter === "CN" ? "A 股" : state.marketFilter;
   const brokerLabel = state.brokerFilter === "ALL" ? "全部券商" : brokerDisplayName(state.brokerFilter);
   return `当前视图：${marketLabel} · ${brokerLabel} · ${formatPlain(count)} 条`;
 }
@@ -3594,10 +4003,22 @@ async function postDashboardJson(url, payload) {
 }
 
 function holdingByKey(detailKey) {
-  return filteredHoldings().find((holding) => holdingKey(holding) === detailKey)
+  return holdingByKeyFromRows(filteredHoldings(), detailKey)
     || (state.dashboard && Array.isArray(state.dashboard.holdings)
-      ? state.dashboard.holdings.find((holding) => holdingKey(holding) === detailKey)
+      ? holdingByKeyFromRows(state.dashboard.holdings, detailKey)
       : null);
+}
+
+function holdingByKeyFromRows(rows, detailKey) {
+  for (let index = 0; index < rows.length; index += 1) {
+    if (
+      holdingKey(rows[index], index) === detailKey
+      || holdingKey(rows[index]) === detailKey
+    ) {
+      return rows[index];
+    }
+  }
+  return null;
 }
 
 function renderTradeDecisionBand(action, holding) {
@@ -4761,6 +5182,9 @@ function marketSectionKey(holding) {
   }
   if (market === "HK") {
     return isOptionHolding(holding) ? "HK_OPTION" : "HK_STOCK";
+  }
+  if (market === "CN") {
+    return "CN_STOCK";
   }
   return "OTHER";
 }

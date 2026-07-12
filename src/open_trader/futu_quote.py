@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 from collections.abc import Callable, Sequence
 from decimal import Decimal, InvalidOperation
+import math
 from typing import Any
 
 from .futu_watch import QuoteSnapshot
@@ -180,15 +181,36 @@ class FutuQuoteClient:
         for record in data.to_dict("records"):
             date_text = str(record.get("time_key") or record.get("date") or "").strip()
             close_text = record.get("close")
-            if not date_text or close_text in {None, ""}:
+            volume_text = record.get("volume")
+            if not date_text or close_text in {None, ""} or volume_text in {None, ""}:
                 continue
             try:
                 close = float(str(close_text))
-            except ValueError:
+                volume = float(str(volume_text))
+            except (TypeError, ValueError):
                 continue
-            if close == close:
-                bars.append(DailyKlineBar(date=date_text[:10], close=close))
+            if math.isfinite(close) and math.isfinite(volume) and volume >= 0:
+                bars.append(
+                    DailyKlineBar(
+                        date=date_text[:10],
+                        open=_optional_float(record.get("open")),
+                        high=_optional_float(record.get("high")),
+                        low=_optional_float(record.get("low")),
+                        close=close,
+                        volume=volume,
+                    )
+                )
         return bars
 
     def close(self) -> None:
         self.context.close()
+
+
+def _optional_float(value: object) -> float | None:
+    if value in {None, ""}:
+        return None
+    try:
+        parsed = float(str(value))
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None

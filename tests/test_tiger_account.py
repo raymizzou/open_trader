@@ -25,6 +25,10 @@ from open_trader.tiger_account import (
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 
 
+def test_preserved_cn_market_stays_cn_during_tiger_sync() -> None:
+    assert tiger_account_module._market_from_text("CN") is Market.CN
+
+
 def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:

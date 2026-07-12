@@ -31,6 +31,10 @@ MIN_BOLLINGER_POINTS = 20
 class DailyKlineBar:
     date: str
     close: float
+    volume: float
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
 
 
 class DailyKlineProvider(Protocol):

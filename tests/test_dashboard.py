@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import csv
 import json
+from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 from open_trader.advice.models import (
     PREMARKET_ACTION_FIELDNAMES,
     TRADING_ADVICE_FIELDNAMES,
 )
-from open_trader.dashboard import DashboardConfig, load_dashboard_state
+from open_trader.dashboard import (
+    BROKER_LABELS,
+    BROKER_SOURCE_KINDS,
+    DashboardConfig,
+    load_dashboard_state,
+)
 from open_trader.decision_facts import (
     KLINE_FIELDS,
     MISSING_VALUE,
@@ -70,6 +78,294 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
         futu_host="127.0.0.1",
         futu_port=11111,
     )
+
+
+def test_dashboard_refreshes_cn_derived_values_from_cached_close(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    row.update(
+        {
+            "market": "CN",
+            "asset_class": "stock",
+            "symbol": "600025",
+            "name": "华能水电",
+            "currency": "CNY",
+            "total_quantity": "6000",
+            "last_price": "9.62",
+            "market_value": "57720",
+            "cost_value": "53346",
+            "fx_to_hkd": "1.08",
+            "brokers": "eastmoney",
+        }
+    )
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
+    write_csv(
+        config.data_dir / "prices/CN/600025.csv",
+        ["date", "open", "high", "low", "close", "volume"],
+        [
+            {
+                "date": "2026-07-10",
+                "open": "9.8",
+                "high": "10.1",
+                "low": "9.7",
+                "close": "10.00",
+                "volume": "123456",
+            }
+        ],
+    )
+
+    state = load_dashboard_state(config)
+    holding = state.holdings[0]
+    assert holding["last_price"] == "10"
+    assert holding["market_value"] == "60000.00"
+    assert holding["market_value_hkd"] == "64800.00"
+    assert holding["unrealized_pnl"] == "6654.00"
+    assert holding["unrealized_pnl_pct"] == "12.47%"
+    assert state.summary["portfolio_value_hkd"] == "64800.00"
+
+
+def test_dashboard_refreshes_all_weights_after_cn_cached_closes(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    rows = []
+    for values in [
+        {
+            "market": "CN", "asset_class": "stock", "symbol": "600001",
+            "currency": "CNY", "total_quantity": "1", "cost_value": "100",
+            "fx_to_hkd": "1", "market_value_hkd": "100",
+            "portfolio_weight_hkd": "10.00%",
+        },
+        {
+            "market": "CN", "asset_class": "stock", "symbol": "600002",
+            "currency": "CNY", "total_quantity": "1", "cost_value": "200",
+            "fx_to_hkd": "1", "market_value_hkd": "200",
+            "portfolio_weight_hkd": "20.00%",
+        },
+        {
+            "market": "US", "asset_class": "stock", "symbol": "AAPL",
+            "currency": "HKD", "market_value_hkd": "400",
+            "portfolio_weight_hkd": "40.00%",
+        },
+        {
+            "market": "CASH", "asset_class": "cash", "symbol": "HKD_CASH",
+            "currency": "HKD", "market_value_hkd": "100",
+            "portfolio_weight_hkd": "30.00%",
+        },
+    ]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update(values)
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+    original = config.portfolio_path.read_bytes()
+    for symbol, close in [("600001", "201"), ("600002", "302")]:
+        write_csv(
+            config.data_dir / f"prices/CN/{symbol}.csv",
+            ["date", "close"],
+            [{"date": "2026-07-10", "close": close}],
+        )
+
+    payload = load_dashboard_state(config).to_dict()
+    displayed_rows = payload["holdings"] + payload["cash_rows"]
+
+    assert payload["summary"]["portfolio_value_hkd"] == "1003.00"
+    assert sum(Decimal(row["market_value_hkd"]) for row in displayed_rows) == Decimal(
+        "1003.00"
+    )
+    assert {row["symbol"]: row["portfolio_weight_hkd"] for row in displayed_rows} == {
+        "600001": "20.04%",
+        "600002": "30.11%",
+        "AAPL": "39.88%",
+        "HKD_CASH": "9.97%",
+    }
+    assert sum(
+        Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in displayed_rows
+    ) == Decimal("100.00")
+    assert config.portfolio_path.read_bytes() == original
+
+
+def test_dashboard_discards_cn_overlay_when_complete_weights_are_invalid(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    rows = []
+    for values in [
+        {
+            "market": "CN", "asset_class": "stock", "symbol": "600001",
+            "currency": "CNY", "total_quantity": "1", "last_price": "100",
+            "market_value": "100", "cost_value": "80", "fx_to_hkd": "1",
+            "market_value_hkd": "100", "unrealized_pnl": "20",
+            "unrealized_pnl_pct": "25.00%", "portfolio_weight_hkd": "10.00%",
+        },
+        {
+            "market": "US", "asset_class": "stock", "symbol": "AAPL",
+            "currency": "USD", "market_value_hkd": "bad",
+            "portfolio_weight_hkd": "90.00%",
+        },
+    ]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update(values)
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+    original_file = config.portfolio_path.read_bytes()
+    write_csv(
+        config.data_dir / "prices/CN/600001.csv",
+        ["date", "close"],
+        [{"date": "2026-07-10", "close": "200"}],
+    )
+
+    state = load_dashboard_state(config)
+
+    assert [
+        {key: holding[key] for key in original}
+        for holding, original in zip(state.holdings, rows)
+    ] == rows
+    assert state.summary["portfolio_value_hkd"] == "100.00"
+    assert config.portfolio_path.read_bytes() == original_file
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("close", "bad"),
+        ("close", "0"),
+        ("close", "-1"),
+        ("total_quantity", "bad"),
+        ("total_quantity", "0"),
+        ("total_quantity", "-1"),
+        ("cost_value", ""),
+        ("cost_value", "NaN"),
+        ("cost_value", "-1"),
+        ("fx_to_hkd", ""),
+        ("fx_to_hkd", "NaN"),
+        ("fx_to_hkd", "0"),
+        ("fx_to_hkd", "-1"),
+    ],
+)
+def test_dashboard_invalid_cn_cached_inputs_preserve_statement_row_and_summary(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    row = {fieldname: "" for fieldname in PORTFOLIO_FIELDNAMES}
+    row.update(
+        {
+            "market": "CN",
+            "asset_class": "stock",
+            "symbol": "600025",
+            "currency": "CNY",
+            "total_quantity": "6000",
+            "last_price": "9.62",
+            "market_value": "57720",
+            "market_value_hkd": "62337.60",
+            "cost_value": "53346",
+            "unrealized_pnl": "4374",
+            "unrealized_pnl_pct": "8.20%",
+            "fx_to_hkd": "1.08",
+            "brokers": "eastmoney",
+        }
+    )
+    close = "10.00"
+    if field == "close":
+        close = value
+    else:
+        row[field] = value
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
+    write_csv(
+        config.data_dir / "prices/CN/600025.csv",
+        ["date", "close"],
+        [{"date": "2026-07-10", "close": close}],
+    )
+
+    state = load_dashboard_state(config)
+
+    assert {key: state.holdings[0][key] for key in row} == row
+    assert state.summary["portfolio_value_hkd"] == "62337.60"
+
+
+def test_dashboard_exposes_eastmoney_statement_metadata() -> None:
+    assert BROKER_LABELS["eastmoney"] == "东方财富"
+    assert BROKER_SOURCE_KINDS["eastmoney"] == "statement"
+
+
+def test_dashboard_backtest_universe_combines_holdings_and_watchlist(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    rows: list[dict[str, str]] = []
+    for market, symbol in [("US", "MSFT"), ("HK", "00700")]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update({"market": market, "symbol": symbol, "asset_class": "stock"})
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+    write_csv(
+        config.data_dir / "latest/watchlist.csv",
+        ["market", "symbol"],
+        [
+            {"market": "US", "symbol": "MSFT"},
+            {"market": "US", "symbol": "NVDA"},
+            {"market": "HK", "symbol": "00700"},
+        ],
+    )
+
+    payload = load_dashboard_state(config).to_dict()
+
+    assert [(row["market"], row["symbol"]) for row in payload["backtest_universe"]["holdings"]] == [
+        ("US", "MSFT"), ("HK", "00700"),
+    ]
+    assert [(row["market"], row["symbol"]) for row in payload["backtest_universe"]["watchlist"]] == [
+        ("US", "NVDA"),
+    ]
+
+
+def test_dashboard_keeps_other_holdings_out_of_scoped_market_loaders(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    rows: list[dict[str, str]] = []
+    for market, symbol in [("US", "MSFT"), ("OTHER", "PRIVATE")]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update({
+            "market": market,
+            "symbol": symbol,
+            "asset_class": "stock",
+            "currency": "HKD",
+            "market_value": "100",
+            "market_value_hkd": "100",
+            "portfolio_weight_hkd": "50.00%",
+        })
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+
+    payload = load_dashboard_state(config).to_dict()
+
+    assert {(row["market"], row["symbol"]) for row in payload["holdings"]} == {
+        ("US", "MSFT"),
+        ("OTHER", "PRIVATE"),
+    }
+
+
+def test_dashboard_backtest_universe_rejects_unsafe_and_option_symbols(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    rows = []
+    for market, symbol, asset_class, name in [
+        ("US", "BRK.B", "stock", "Berkshire"),
+        ("US", "SPY", "etf", "SPDR ETF"),
+        ("HK", "00700", "stock", "腾讯"),
+        ("US", "AAPL260116C00150000", "", ""),
+        ("HK", "12345", "", "腾讯期权"),
+        ("US", "../../outside", "stock", "unsafe"),
+        ("US", "BAD/SYMBOL", "stock", "unsafe"),
+        ("US", "BAD\\SYMBOL", "stock", "unsafe"),
+        ("US", "BAD:SYMBOL", "stock", "unsafe"),
+        ("US", "BAD SYMBOL", "stock", "unsafe"),
+        ("HK", "123456", "stock", "unsafe"),
+    ]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update({"market": market, "symbol": symbol, "asset_class": asset_class, "name": name})
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+
+    universe = load_dashboard_state(config).to_dict()["backtest_universe"]["holdings"]
+
+    assert [(row["market"], row["symbol"]) for row in universe] == [
+        ("US", "BRK.B"), ("US", "SPY"), ("HK", "00700"),
+    ]
 
 
 def raw_decision_with_market_report(report: str) -> str:
@@ -638,6 +934,278 @@ def test_load_dashboard_state_uses_portfolio_when_monthly_details_are_absent(
     assert holdings_by_symbol["VIXY"]["broker_detail_count"] == 0
     assert holdings_by_symbol["VIXY"]["broker_details"] == []
     assert holdings_by_symbol["VIXY"]["trade_action"] == {"available": False, "error": ""}
+    assert "backtest" not in holdings_by_symbol["VIXY"]
+    assert "backtest_readiness" not in holdings_by_symbol["VIXY"]
+
+
+def obsolete_load_dashboard_state_attaches_latest_backtest_result(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    older_dir = config.data_dir / "backtests" / "2026-06-16-US-VIXY-trading-plan"
+    older_dir.mkdir(parents=True)
+    (older_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.backtest_metrics.v1",
+                "run_id": "2026-06-16-US-VIXY-trading-plan",
+                "run_date": "2026-06-16",
+                "market": "US",
+                "symbol": "VIXY",
+                "strategy": "trading_plan",
+                "adapter": "backtrader",
+                "metrics": {
+                    "total_return_pct": "-2.00",
+                    "win_rate_pct": "33.33",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    latest_dir = config.data_dir / "backtests" / "2026-06-18-US-VIXY-trading-plan"
+    latest_dir.mkdir(parents=True)
+    (latest_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.backtest_metrics.v1",
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "run_date": "2026-06-18",
+                "market": "US",
+                "symbol": "VIXY",
+                "strategy": "trading_plan",
+                "adapter": "backtrader",
+                "metrics": {
+                    "total_return_pct": "1.17",
+                    "win_rate_pct": "50.00",
+                    "max_drawdown_pct": "-3.40",
+                    "trade_count": "2",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (latest_dir / "trades.csv").write_text(
+        "\n".join(
+            [
+                "run_id,run_date,date,market,symbol,side,price,quantity,notional,fees,cash_after,reason",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-18,2026-06-19,US,VIXY,BUY,40.2000,621,24964.20,24.96,75010.84,entry_zone",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-18,2026-06-20,US,VIXY,SELL,47.9760,621,29793.10,29.79,104774.15,target_1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (latest_dir / "equity_curve.csv").write_text(
+        "\n".join(
+            [
+                "run_id,date,cash,position_quantity,close,equity,drawdown_pct",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-18,100000.00,0,45.0000,100000.00,0.00",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-19,75010.84,621,42.0000,101092.84,0.00",
+                "2026-06-18-US-VIXY-trading-plan,2026-06-20,104774.15,0,48.0000,104774.15,0.00",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report_path = config.reports_dir / "backtests" / "2026-06-18-US-VIXY-trading-plan.md"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("# VIXY 回测\n", encoding="utf-8")
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest"] == {
+        "available": True,
+        "run_id": "2026-06-18-US-VIXY-trading-plan",
+        "run_date": "2026-06-18",
+        "market": "US",
+        "symbol": "VIXY",
+        "strategy": "trading_plan",
+        "adapter": "backtrader",
+        "metrics": {
+            "total_return_pct": "1.17",
+            "win_rate_pct": "50.00",
+            "max_drawdown_pct": "-3.40",
+            "trade_count": "2",
+        },
+        "metrics_path": str(latest_dir / "metrics.json"),
+        "trades_path": str(latest_dir / "trades.csv"),
+        "equity_curve_path": str(latest_dir / "equity_curve.csv"),
+        "trades": [
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "run_date": "2026-06-18",
+                "date": "2026-06-19",
+                "market": "US",
+                "symbol": "VIXY",
+                "side": "BUY",
+                "price": "40.2000",
+                "quantity": "621",
+                "notional": "24964.20",
+                "fees": "24.96",
+                "cash_after": "75010.84",
+                "reason": "entry_zone",
+            },
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "run_date": "2026-06-18",
+                "date": "2026-06-20",
+                "market": "US",
+                "symbol": "VIXY",
+                "side": "SELL",
+                "price": "47.9760",
+                "quantity": "621",
+                "notional": "29793.10",
+                "fees": "29.79",
+                "cash_after": "104774.15",
+                "reason": "target_1",
+            },
+        ],
+        "equity_curve": [
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "date": "2026-06-18",
+                "cash": "100000.00",
+                "position_quantity": "0",
+                "close": "45.0000",
+                "equity": "100000.00",
+                "drawdown_pct": "0.00",
+            },
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "date": "2026-06-19",
+                "cash": "75010.84",
+                "position_quantity": "621",
+                "close": "42.0000",
+                "equity": "101092.84",
+                "drawdown_pct": "0.00",
+            },
+            {
+                "run_id": "2026-06-18-US-VIXY-trading-plan",
+                "date": "2026-06-20",
+                "cash": "104774.15",
+                "position_quantity": "0",
+                "close": "48.0000",
+                "equity": "104774.15",
+                "drawdown_pct": "0.00",
+            },
+        ],
+        "report_path": str(report_path),
+        "status": "ok",
+        "error": "",
+    }
+
+
+def obsolete_load_dashboard_state_exposes_backtest_readiness(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
+    plan_row.update(
+        {
+            "run_date": "2026-06-18",
+            "symbol": "VIXY",
+            "market": "US",
+            "rating": "Overweight",
+            "entry_zone_low": "40",
+            "entry_zone_high": "",
+            "max_weight": "",
+            "status": "active",
+        }
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest_readiness"] == {
+        "available": False,
+        "status": "missing_fields",
+        "run_date": "2026-06-18",
+        "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
+        "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
+        "prices_missing": True,
+        "missing_fields": ["entry_zone_high", "max_weight"],
+        "error": "missing backtest field(s): entry_zone_high, max_weight",
+    }
+
+    plan_row["entry_zone_high"] = "42"
+    plan_row["max_weight"] = "25%"
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+    write_csv(
+        config.data_dir / "prices" / "US" / "VIXY.csv",
+        ["date", "open", "high", "low", "close"],
+        [{"date": "2026-06-19", "open": "41", "high": "43", "low": "40", "close": "42"}],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest_readiness"] == {
+        "available": True,
+        "status": "ready",
+        "run_date": "2026-06-18",
+        "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
+        "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
+        "prices_missing": False,
+        "missing_fields": [],
+        "error": "",
+    }
+
+
+def obsolete_load_dashboard_state_marks_sell_side_backtest_ready(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
+    plan_row.update(
+        {
+            "run_date": "2026-06-18",
+            "symbol": "VIXY",
+            "market": "US",
+            "rating": "Underweight",
+            "entry_zone_low": "30",
+            "entry_zone_high": "50",
+            "target_1": "35",
+            "max_weight": "",
+            "status": "active",
+        }
+    )
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_plan.csv",
+        TRADING_PLAN_FIELDNAMES,
+        [plan_row],
+    )
+    write_csv(
+        config.data_dir / "prices" / "US" / "VIXY.csv",
+        ["date", "open", "high", "low", "close"],
+        [{"date": "2026-06-19", "open": "41", "high": "43", "low": "34", "close": "35"}],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    assert vixy["backtest_readiness"] == {
+        "available": True,
+        "status": "ready",
+        "run_date": "2026-06-18",
+        "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
+        "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
+        "prices_missing": False,
+        "missing_fields": [],
+        "error": "",
+    }
 
 
 def test_load_dashboard_state_excludes_cash_like_rows_from_holdings(
@@ -1996,6 +2564,45 @@ def test_load_dashboard_state_prefers_latest_daily_sync_details(
     vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
     assert vixy["broker_details"][0]["account_alias"] == "live"
     assert vixy["broker_details"][0]["quantity"] == "100"
+
+
+def test_load_dashboard_state_keeps_latest_details_for_each_broker(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    base = {
+        "account_alias": "main",
+        "market": "HK",
+        "asset_class": "stock",
+        "symbol": "00001",
+        "name": "Holding",
+        "currency": "HKD",
+        "quantity": "1",
+        "cost_price": "",
+        "last_price": "100",
+        "market_value": "100",
+        "cost_value": "",
+        "unrealized_pnl": "",
+        "confidence": "high",
+        "notes": "",
+    }
+    write_csv(
+        config.data_dir / "runs" / "2026-06" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [{**base, "statement_id": "2026-06-phillips", "broker": "phillips"}],
+    )
+    write_csv(
+        config.data_dir / "runs" / "2026-07" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [{**base, "statement_id": "2026-07-eastmoney", "broker": "eastmoney"}],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+    summaries = {row["broker"]: row for row in state["broker_summaries"]}
+
+    assert summaries["phillips"]["portfolio_value_hkd"] == "100.00"
+    assert summaries["eastmoney"]["portfolio_value_hkd"] == "100.00"
 
 
 def test_load_dashboard_state_builds_broker_summaries_from_detail_rows(

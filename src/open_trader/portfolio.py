@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Iterable
 
 from .fx import StaticMonthEndFxProvider
@@ -68,16 +68,19 @@ def _sort_group(market: Market, asset_class: AssetClass, ai_eligible: bool) -> i
         return 3
     if market == Market.US:
         return 4
+    if market == Market.CN:
+        return 5
     if market == Market.CASH:
-        return 6
-    return 5
+        return 7
+    return 6
 
 
 def _ai_eligible(position: Position) -> bool:
-    return position.market in {Market.US, Market.HK} and position.asset_class in {
-        AssetClass.STOCK,
-        AssetClass.ETF,
-    }
+    return position.market in {
+        Market.US,
+        Market.HK,
+        Market.CN,
+    } and position.asset_class in {AssetClass.STOCK, AssetClass.ETF}
 
 
 def _merged_confidence(confidences: Iterable[str]) -> str:
@@ -91,6 +94,131 @@ def _merged_confidence(confidences: Iterable[str]) -> str:
 
 class PortfolioBuildError(ValueError):
     pass
+
+
+def recalculate_portfolio_weights(rows: list[dict[str, str]]) -> None:
+    values = [_required_finite_decimal(row, "market_value_hkd") for row in rows]
+    total = sum(values, Decimal("0"))
+    if total <= 0:
+        raise PortfolioBuildError(f"combined HKD total must be positive, got {total}")
+    percentages = [
+        (value * Decimal("100") / total).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        for value in values
+    ]
+    if percentages:
+        percentages[max(range(len(values)), key=values.__getitem__)] += (
+            Decimal("100.00") - sum(percentages)
+        )
+    for row, percentage in zip(rows, percentages):
+        row["portfolio_weight_hkd"] = f"{percentage:.2f}%"
+
+
+def merge_eastmoney_portfolio_rows(
+    existing_rows: Iterable[dict[str, str]],
+    eastmoney_rows: Iterable[dict[str, str]],
+) -> list[dict[str, str]]:
+    existing = [
+        {field: str(row.get(field, "")) for field in PORTFOLIO_FIELDNAMES}
+        for row in existing_rows
+    ]
+    new = [
+        {field: str(row.get(field, "")) for field in PORTFOLIO_FIELDNAMES}
+        for row in eastmoney_rows
+    ]
+
+    preserved: list[dict[str, str]] = []
+    for row in existing:
+        brokers = _broker_parts(row["brokers"])
+        if "eastmoney" in brokers and brokers != {"eastmoney"}:
+            raise PortfolioBuildError(
+                f"portfolio row {row['symbol']} mixes Eastmoney with other brokers: {row['brokers']}"
+            )
+        if brokers != {"eastmoney"}:
+            preserved.append(row)
+
+    for row in new:
+        if _broker_parts(row["brokers"]) != {"eastmoney"}:
+            raise PortfolioBuildError(f"new Eastmoney row has invalid brokers: {row['brokers']}")
+
+    preserved_ids = {_portfolio_identity(row) for row in preserved}
+    collisions = preserved_ids & {_portfolio_identity(row) for row in new}
+    if collisions:
+        market, symbol, currency = sorted(collisions)[0]
+        raise PortfolioBuildError(
+            f"Eastmoney identity collision with preserved broker: {market}.{symbol}.{currency}"
+        )
+
+    combined = preserved + new
+    for row in combined:
+        market_value = _required_finite_decimal(row, "market_value")
+        if row["currency"].upper() == "HKD":
+            rate = Decimal("1")
+            row["fx_to_hkd"] = number(rate)
+        else:
+            rate = _required_finite_decimal(row, "fx_to_hkd")
+            if rate <= 0:
+                raise PortfolioBuildError(f"invalid fx_to_hkd for {row['symbol']}")
+        row["market_value_hkd"] = money(market_value * rate)
+
+        if row["asset_class"] == AssetClass.CASH.value:
+            _clear_cost_and_profit_fields(row)
+            continue
+
+        cost_value = _optional_finite_decimal(row, "cost_value")
+        if cost_value is None:
+            _clear_cost_and_profit_fields(row)
+            row["risk_flag"] = "data_check"
+            continue
+        unrealized_pnl = market_value - cost_value
+        row["cost_value_hkd"] = money(cost_value * rate)
+        row["unrealized_pnl"] = money(unrealized_pnl)
+        row["unrealized_pnl_pct"] = pct(
+            unrealized_pnl / cost_value if cost_value else None
+        )
+
+    recalculate_portfolio_weights(combined)
+    return sorted(
+        combined,
+        key=lambda row: (int(row["sort_group"]), -Decimal(row["market_value_hkd"])),
+    )
+
+
+def _broker_parts(value: str) -> set[str]:
+    return {
+        part.strip().lower()
+        for chunk in value.split(",")
+        for part in chunk.split(";")
+        if part.strip()
+    }
+
+
+def _portfolio_identity(row: dict[str, str]) -> tuple[str, str, str]:
+    return row["market"].upper(), row["symbol"].upper(), row["currency"].upper()
+
+
+def _required_finite_decimal(row: dict[str, str], field: str) -> Decimal:
+    try:
+        value = Decimal(row[field])
+    except (InvalidOperation, ValueError):
+        raise PortfolioBuildError(f"invalid {field} for {row['symbol']}") from None
+    if not value.is_finite():
+        raise PortfolioBuildError(f"invalid {field} for {row['symbol']}")
+    return value
+
+
+def _optional_finite_decimal(row: dict[str, str], field: str) -> Decimal | None:
+    if not row[field].strip():
+        return None
+    return _required_finite_decimal(row, field)
+
+
+def _clear_cost_and_profit_fields(row: dict[str, str]) -> None:
+    row["avg_cost_price"] = ""
+    row["cost_value_hkd"] = ""
+    row["unrealized_pnl"] = ""
+    row["unrealized_pnl_pct"] = ""
 
 
 _ASSET_CLASS_PRIORITY = {

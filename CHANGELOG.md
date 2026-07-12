@@ -69,6 +69,71 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Verified with focused Kelly/dashboard pytest coverage, compile checks,
   `git diff --check`, live Futu SIMULATE HK order execution/sync, and live
   US/CN simulate-account order probes.
+- Added a mandatory `make acceptance` Dashboard gate with PASS/FAIL/BLOCKED
+  results across tests, real data, refresh stability, process version, logs,
+  and desktop/mobile Chrome flows; fixed OTHER holdings breaking Dashboard loads
+  and Tiger refreshes converting preserved CN rows to OTHER. The gate now also
+  checks the full 33-row portfolio, seven Phillips-linked rows, and the exact
+  Eastmoney statement total; live broker refreshes fail closed and restore the
+  prior CSV if they would remove another broker's holdings. Browser verification
+  ignores Chrome's unattributed favicon 404 while still failing every observed
+  business API or page-resource HTTP error.
+- Fixed newer single-broker imports hiding older brokers' account details by
+  loading the latest detail snapshot per broker; acceptance now rejects an
+  empty Phillips account card in both the API payload and rendered page.
+- Added password-prompted Eastmoney A-share statement imports using an explicit
+  month-end CNY/HKD rate, plus AKShare daily prices for standard-strategy research.
+- Kept the Dashboard holdings layout unchanged while adding the existing A-share
+  market and Eastmoney broker filters.
+- Added one global dashboard workspace for read-only standard-strategy research
+  across current holdings and watchlist symbols, with trend-pullback,
+  breakout-momentum, and range-mean-reversion strategies.
+- Added buy-and-hold and market-index comparisons, explicit actual data dates,
+  fixed cost and sizing assumptions, and standalone auditable artifacts.
+- Preserved real nonzero Futu daily volume for breakout research and fixed the
+  price/action chart to render the serialized close-price series.
+- Verified with `192` focused and `1134` full pytest tests, three fresh real 1Y
+  MSFT/Futu API runs with 320 positive-volume MSFT and SPY rows, and separate
+  Playwright submissions for all three strategies proving visible equity,
+  price-path, and action-marker geometry with no console or network errors.
+
+## 2026-07-11
+
+- Added a dashboard backtest price-sync status line so operators can see when
+  automatic price backfill succeeds or fails during page load.
+
+## 2026-07-10
+
+- Added a dashboard action to fetch missing backtest price CSVs from Futu daily
+  K-line data and refresh the per-holding backtest readiness state.
+- Marked sell-side, hold, and underweight trading plans as unsupported by the
+  first buy-side backtest engine instead of showing misleading missing fields.
+- Added sell-side trading-plan backtests for underweight/reduce/trim/sell
+  ratings, seeded from current dashboard holding quantity and verified through
+  pytest plus a local dashboard click check.
+- Added a dashboard backtest-status filter so operators can isolate holdings
+  that are ready to run, missing prices, missing plan fields, or unsupported.
+- Added live counts to the dashboard backtest-status filter, scoped by the
+  current market and broker filters.
+- Made dashboard loads automatically fetch missing backtest daily K-line price
+  CSVs through Futu so operators do not need to manually fill price data first.
+- Removed the manual backtest price-fetch button from the dashboard detail view;
+  missing price data is now handled by automatic dashboard loading.
+
+## 2026-07-09
+
+- Added a read-only `run-backtest` MVP for active trading-plan rows, producing
+  trades, equity curve, metrics, and Markdown report artifacts without updating
+  `data/latest` or placing orders.
+- Added dashboard backtest entry buttons that open a per-holding回测详情 view
+  without showing backtest metrics on the main holdings table.
+- Added a dashboard-only backtest run action that uses the local latest trading
+  plan and `data/prices/<market>/<symbol>.csv`, then refreshes the detail view.
+- Added dashboard backtest readiness details so operators can see missing plan
+  fields and price CSV paths before running a backtest.
+- Documented the first backtest workflow in both READMEs.
+- Verified with focused backtest/dashboard pytest coverage, the full pytest
+  suite, and a local dashboard click check on `127.0.0.1:8766`.
 
 ## 2026-07-04
 

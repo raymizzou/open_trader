@@ -13,6 +13,7 @@ RiskFlag = Literal["normal", "overweight", "data_check"]
 class Market(StrEnum):
     US = "US"
     HK = "HK"
+    CN = "CN"
     OTHER = "OTHER"
     CASH = "CASH"
 

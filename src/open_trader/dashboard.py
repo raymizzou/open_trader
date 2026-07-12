@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
+
+from .backtest_prices import normalize_backtest_symbol
 
 from .decision_facts import (
     KLINE_FIELDS,
@@ -24,6 +27,10 @@ from .kelly_lab import (
     index_kelly_experiments_by_market_symbol,
     load_kelly_lab_state,
 )
+from .market_scope import MarketScope
+from .models import AssetClass
+from .parsers.base import detect_asset_class
+from .portfolio import PortfolioBuildError, recalculate_portfolio_weights
 from .research_chat import load_research_view_for_holding
 from .t_signal_store import (
     index_t_signals_by_market_symbol,
@@ -45,19 +52,22 @@ from .tradingagents_summary import (
     normalize_ta_view,
     tradingagents_summary_latest_path,
 )
+from .trading_plan import backtest_plan_side, load_trading_plan_rows
 
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
-BROKERS = ("futu", "tiger", "phillips")
+BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 BROKER_LABELS = {
     "futu": "富途",
     "tiger": "老虎",
     "phillips": "辉立",
+    "eastmoney": "东方财富",
 }
 BROKER_SOURCE_KINDS = {
     "futu": "live_account",
     "tiger": "live_account",
     "phillips": "statement",
+    "eastmoney": "statement",
 }
 DETAIL_FX_TO_HKD = {
     "HKD": Decimal("1"),
@@ -90,6 +100,7 @@ class DashboardState:
     cash_details: list[dict[str, str]]
     trade_actions: list[dict[str, str]]
     kelly_lab: dict[str, Any]
+    backtest_universe: dict[str, list[dict[str, str]]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -110,23 +121,26 @@ class DashboardState:
             "cash_details": self.cash_details,
             "trade_actions": self.trade_actions,
             "kelly_lab": self.kelly_lab,
+            "backtest_universe": self.backtest_universe,
         }
 
 
 def load_dashboard_state(config: DashboardConfig) -> DashboardState:
-    portfolio_rows = _read_csv_rows(config.portfolio_path)
+    original_portfolio_rows = _read_csv_rows(config.portfolio_path)
+    portfolio_rows = [
+        _overlay_cn_cached_close(row, config.data_dir) for row in original_portfolio_rows
+    ]
+    overlays_applied = any(
+        updated is not original
+        for original, updated in zip(original_portfolio_rows, portfolio_rows)
+    )
+    if overlays_applied:
+        try:
+            recalculate_portfolio_weights(portfolio_rows)
+        except PortfolioBuildError:
+            portfolio_rows = original_portfolio_rows
     detail_month = latest_broker_detail_month(config.data_dir)
-    detail_dir = config.data_dir / "runs" / detail_month if detail_month else None
-    broker_positions = (
-        _read_csv_rows(detail_dir / "extracted_positions.csv")
-        if detail_dir is not None
-        else []
-    )
-    raw_cash_details = (
-        _read_csv_rows(detail_dir / "extracted_cash.csv")
-        if detail_dir is not None
-        else []
-    )
+    broker_positions, raw_cash_details = _latest_broker_details(config.data_dir)
     cash_details = [_cash_detail_row(row) for row in raw_cash_details]
     holding_rows = [row for row in portfolio_rows if _is_dashboard_holding(row)]
     holding_markets = _markets_from_rows(holding_rows)
@@ -204,6 +218,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         )
         for row in holding_rows
     ]
+    backtest_universe = _build_backtest_universe(
+        holding_rows,
+        _read_csv_rows(config.data_dir / "latest" / "watchlist.csv"),
+    )
 
     return DashboardState(
         config=config,
@@ -226,7 +244,85 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         cash_details=cash_details,
         trade_actions=trade_actions,
         kelly_lab=kelly_lab,
+        backtest_universe=backtest_universe,
     )
+
+
+def _overlay_cn_cached_close(row: dict[str, str], data_dir: Path) -> dict[str, str]:
+    if str(row.get("market") or "").strip().upper() != "CN":
+        return row
+    prices = _read_csv_rows(data_dir / "prices" / "CN" / f"{row.get('symbol', '').strip()}.csv")
+    close = _optional_decimal(prices[-1].get("close", "")) if prices else None
+    quantity = _optional_decimal(row.get("total_quantity", ""))
+    cost = _optional_decimal(row.get("cost_value", ""))
+    fx = _optional_decimal(row.get("fx_to_hkd", ""))
+    if (
+        close is None
+        or close <= 0
+        or quantity is None
+        or quantity <= 0
+        or cost is None
+        or cost < 0
+        or fx is None
+        or fx <= 0
+    ):
+        return row
+    market_value = close * quantity
+    pnl = market_value - cost
+    updated = dict(row)
+    updated.update(
+        {
+            "last_price": format(close, "f").rstrip("0").rstrip("."),
+            "market_value": _money_text(market_value),
+            "market_value_hkd": _money_text(market_value * fx),
+            "unrealized_pnl": _money_text(pnl),
+            "unrealized_pnl_pct": _pct_text(_ratio(pnl, cost)),
+        }
+    )
+    return updated
+
+
+def _build_backtest_universe(
+    holding_rows: list[dict[str, str]],
+    watchlist_rows: list[dict[str, str]],
+) -> dict[str, list[dict[str, str]]]:
+    holdings: list[dict[str, str]] = []
+    watchlist: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def append_valid(target: list[dict[str, str]], row: dict[str, str]) -> None:
+        market = str(row.get("market") or "").strip().upper()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if market not in {"HK", "US", "CN"}:
+            return
+        asset_class = str(row.get("asset_class") or "").strip().lower()
+        if asset_class in {"", "unknown"}:
+            asset_class = detect_asset_class(
+                symbol, str(row.get("name") or "")
+            ).value
+        if asset_class not in {AssetClass.STOCK.value, AssetClass.ETF.value}:
+            return
+        try:
+            normalized_symbol = normalize_backtest_symbol(market, symbol)
+        except ValueError:
+            return
+        key = (market, normalized_symbol)
+        if key in seen:
+            return
+        seen.add(key)
+        target.append(
+            {
+                "market": market,
+                "symbol": symbol,
+                "futu_symbol": f"{market}.{normalized_symbol}",
+            }
+        )
+
+    for row in holding_rows:
+        append_valid(holdings, row)
+    for row in watchlist_rows:
+        append_valid(watchlist, row)
+    return {"holdings": holdings, "watchlist": watchlist}
 
 
 def latest_broker_detail_month(data_dir: Path) -> str:
@@ -242,6 +338,42 @@ def latest_broker_detail_month(data_dir: Path) -> str:
         and _has_broker_detail_files(path)
     ]
     return max(months) if months else ""
+
+
+def _latest_broker_details(
+    data_dir: Path,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    runs_dir = data_dir / "runs"
+    if not runs_dir.exists():
+        return [], []
+    positions: list[dict[str, str]] = []
+    cash: list[dict[str, str]] = []
+    found: set[str] = set()
+    run_dirs = sorted(
+        (
+            path
+            for path in runs_dir.iterdir()
+            if path.is_dir() and DETAIL_DIR_PATTERN.fullmatch(path.name)
+        ),
+        reverse=True,
+    )
+    for run_dir in run_dirs:
+        run_positions = _read_csv_rows(run_dir / "extracted_positions.csv")
+        run_cash = _read_csv_rows(run_dir / "extracted_cash.csv")
+        for broker in BROKERS:
+            if broker in found:
+                continue
+            broker_positions = [
+                row for row in run_positions if _broker_key(row.get("broker", "")) == broker
+            ]
+            broker_cash = [
+                row for row in run_cash if _broker_key(row.get("broker", "")) == broker
+            ]
+            if broker_positions or broker_cash:
+                positions.extend(broker_positions)
+                cash.extend(broker_cash)
+                found.add(broker)
+    return positions, cash
 
 
 def _has_broker_detail_files(path: Path) -> bool:
@@ -450,11 +582,209 @@ def _unavailable_kelly_lab(error: str) -> dict[str, Any]:
     }
 
 
+def _latest_backtests_by_holding(
+    *,
+    data_dir: Path,
+    reports_dir: Path,
+    markets: set[str],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    backtests_dir = data_dir / "backtests"
+    if not backtests_dir.exists():
+        return {}
+
+    records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for metrics_path in backtests_dir.glob("*/metrics.json"):
+        detail = _backtest_detail(metrics_path, reports_dir)
+        if not detail:
+            continue
+        key = (detail["market"], detail["symbol"])
+        if key[0] not in markets:
+            continue
+        current = records_by_key.get(key)
+        if current is None or _backtest_sort_key(detail) > _backtest_sort_key(current):
+            records_by_key[key] = detail
+    return records_by_key
+
+
+def _backtest_detail(metrics_path: Path, reports_dir: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    market = str(payload.get("market", "")).strip().upper()
+    symbol = str(payload.get("symbol", "")).strip().upper()
+    if not market or not symbol:
+        return None
+    run_id = str(payload.get("run_id", "") or metrics_path.parent.name).strip()
+    report_path = reports_dir / "backtests" / f"{run_id}.md"
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else payload
+    metric_keys = (
+        "total_return_pct",
+        "win_rate_pct",
+        "max_drawdown_pct",
+        "trade_count",
+        "round_trips",
+        "initial_cash",
+        "final_equity",
+    )
+    return {
+        "available": True,
+        "run_id": run_id,
+        "run_date": str(payload.get("run_date", "")).strip(),
+        "market": market,
+        "symbol": symbol,
+        "strategy": str(payload.get("strategy", "trading_plan")).strip() or "trading_plan",
+        "adapter": str(payload.get("adapter", "legacy")).strip() or "legacy",
+        "metrics": {
+            key: str(metrics.get(key, ""))
+            for key in metric_keys
+            if isinstance(metrics, dict) and metrics.get(key, "") != ""
+        },
+        "metrics_path": str(metrics_path),
+        "trades_path": str(metrics_path.parent / "trades.csv"),
+        "equity_curve_path": str(metrics_path.parent / "equity_curve.csv"),
+        "trades": _backtest_csv_rows(metrics_path.parent / "trades.csv"),
+        "equity_curve": _backtest_csv_rows(metrics_path.parent / "equity_curve.csv"),
+        "report_path": str(report_path),
+        "status": "ok",
+        "error": "",
+    }
+
+
+def _backtest_csv_rows(path: Path) -> list[dict[str, str]]:
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            return [
+                {str(key): str(value or "") for key, value in row.items()}
+                for row in csv.DictReader(handle)
+                if row
+            ]
+    except OSError:
+        return []
+
+
+def _backtest_sort_key(detail: dict[str, Any]) -> tuple[str, str]:
+    return (str(detail.get("run_date", "")), str(detail.get("run_id", "")))
+
+
+def _backtest_readiness_for_markets(
+    *,
+    data_dir: Path,
+    markets: set[str],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    readiness: dict[tuple[str, str], dict[str, Any]] = {}
+    for market in markets:
+        plan_path = _backtest_plan_path(data_dir, market)
+        if not plan_path.exists():
+            continue
+        try:
+            plans = load_trading_plan_rows(plan_path)
+        except (OSError, ValueError):
+            continue
+        for plan in plans:
+            if plan.status != "active" or plan.market.upper() != market:
+                continue
+            symbol = plan.symbol.upper()
+            detail = _backtest_readiness_detail(
+                data_dir=data_dir,
+                plan_path=plan_path,
+                market=market,
+                symbol=symbol,
+                run_date=plan.run_date,
+                rating=plan.rating,
+                fields={
+                    "entry_zone_low": plan.entry_zone_low,
+                    "entry_zone_high": plan.entry_zone_high,
+                    "max_weight": plan.max_weight,
+                    "stop_loss": plan.stop_loss,
+                    "target_1": plan.target_1,
+                },
+            )
+            key = (market, symbol)
+            current = readiness.get(key)
+            if current is None or _backtest_sort_key(detail) > _backtest_sort_key(current):
+                readiness[key] = detail
+    return readiness
+
+
+def _backtest_plan_path(data_dir: Path, market: str) -> Path:
+    scoped_path = data_dir / "latest" / market / "trading_plan.csv"
+    if scoped_path.exists():
+        return scoped_path
+    return data_dir / "latest" / "trading_plan.csv"
+
+
+def _backtest_readiness_detail(
+    *,
+    data_dir: Path,
+    plan_path: Path,
+    market: str,
+    symbol: str,
+    run_date: str,
+    rating: str,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    prices_path = data_dir / "prices" / market / f"{symbol}.csv"
+    prices_missing = not prices_path.exists()
+    side = backtest_plan_side(rating)
+    if side is None:
+        return {
+            "available": False,
+            "status": "unsupported_strategy",
+            "run_date": run_date,
+            "plan_path": str(plan_path),
+            "prices_path": str(prices_path),
+            "prices_missing": prices_missing,
+            "missing_fields": [],
+            "error": "unsupported backtest strategy rating",
+        }
+    required_fields = (
+        ("entry_zone_high", "max_weight")
+        if side == "buy"
+        else ("stop_loss_or_target_1",)
+    )
+    missing_fields = [
+        field
+        for field in required_fields
+        if (
+            field == "stop_loss_or_target_1"
+            and fields.get("stop_loss") is None
+            and fields.get("target_1") is None
+        )
+        or (
+            field != "stop_loss_or_target_1"
+            and (fields.get(field) is None or str(fields.get(field)).strip() == "")
+        )
+    ]
+    if missing_fields:
+        status = "missing_fields"
+        error = f"missing backtest field(s): {', '.join(missing_fields)}"
+    elif prices_missing:
+        status = "missing_prices"
+        error = f"missing price CSV: {prices_path}"
+    else:
+        status = "ready"
+        error = ""
+    return {
+        "available": status == "ready",
+        "status": status,
+        "run_date": run_date,
+        "plan_path": str(plan_path),
+        "prices_path": str(prices_path),
+        "prices_missing": prices_missing,
+        "missing_fields": missing_fields,
+        "error": error,
+    }
+
+
 def _markets_from_rows(rows: list[dict[str, str]]) -> set[str]:
+    scoped_markets = {market.value for market in MarketScope}
     markets: set[str] = set()
     for row in rows:
         market = row.get("market", "").strip().upper()
-        if market:
+        if market in scoped_markets:
             markets.add(market)
     return markets
 
@@ -592,6 +922,38 @@ def _merge_holding(
         )
     )
     return holding
+
+
+def _backtest_holding_detail(record: dict[str, Any] | None) -> dict[str, Any]:
+    if record is None:
+        return _unavailable_detail()
+    return record
+
+
+def _backtest_readiness_holding_detail(
+    record: dict[str, Any] | None,
+    *,
+    data_dir: Path,
+    key: tuple[str, str] | None,
+) -> dict[str, Any]:
+    if record is not None:
+        return record
+    market = key[0] if key is not None else ""
+    symbol = key[1] if key is not None else ""
+    return {
+        "available": False,
+        "status": "missing_plan",
+        "run_date": "",
+        "plan_path": str(_backtest_plan_path(data_dir, market)) if market else "",
+        "prices_path": str(data_dir / "prices" / market / f"{symbol}.csv") if market and symbol else "",
+        "prices_missing": (
+            not (data_dir / "prices" / market / f"{symbol}.csv").exists()
+            if market and symbol
+            else False
+        ),
+        "missing_fields": [],
+        "error": "no active trading plan found",
+    }
 
 
 def _broker_detail_row(row: dict[str, str]) -> dict[str, str]:

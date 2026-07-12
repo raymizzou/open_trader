@@ -140,6 +140,7 @@ button {
   overflow-wrap: anywhere;
 }
 
+
 .current-view-card {
   background: var(--surface-soft);
   border: 1px solid var(--line);
@@ -383,6 +384,68 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   gap: 14px;
   grid-template-columns: minmax(0, 1fr);
 }
+
+.backtest-workspace {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  margin: 0 auto;
+  max-width: 1180px;
+  padding: 22px;
+}
+
+.backtest-workspace-header {
+  align-items: flex-start;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+}
+
+.backtest-workspace-header h1,
+.backtest-form-section h2,
+.backtest-results h2 {
+  margin: 0;
+}
+
+.backtest-workspace-header p,
+.backtest-form-section p {
+  color: var(--muted);
+  margin: 6px 0 0;
+}
+
+.backtest-form {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.backtest-form-section {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.backtest-form-section h2 { font-size: 16px; }
+.backtest-strategy-section { grid-column: 1 / -1; }
+.backtest-strategy-cards { display: grid; gap: 10px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.backtest-strategy-card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; color: var(--text); cursor: pointer; display: grid; gap: 7px; padding: 14px; text-align: left; }
+.backtest-strategy-card span { color: var(--muted); line-height: 1.45; }
+.backtest-strategy-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(31, 111, 91, 0.12); }
+.backtest-strategy-card:disabled { cursor: not-allowed; opacity: 0.55; }
+.backtest-form label { color: var(--muted); display: grid; gap: 6px; }
+.backtest-form input,
+.backtest-form select { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; color: var(--text); min-height: 40px; padding: 8px 10px; width: 100%; }
+.backtest-input-grid,
+.backtest-custom-range { display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.backtest-run-button { grid-column: 1 / -1; justify-self: end; min-width: 180px; }
+#standard-backtest-status { color: var(--muted); margin-top: 14px; }
+.backtest-results { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 8px; margin-top: 14px; padding: 16px; }
 
 .workspace-grid.detail-mode {
   grid-template-columns: minmax(0, 1fr);
@@ -1038,6 +1101,12 @@ h2 {
   color: var(--warning);
 }
 
+.status-warning {
+  background: #fff1dc;
+  border-color: #efc47e;
+  color: var(--warning);
+}
+
 .status-failed {
   background: #fae8e6;
   border-color: #e3aaa3;
@@ -1214,6 +1283,7 @@ tbody tr.active-row {
   color: var(--accent-strong);
   font-weight: 700;
 }
+
 
 @keyframes t-signal-pulse {
   0% {
@@ -2813,6 +2883,66 @@ tbody tr.active-row {
   overflow-wrap: anywhere;
 }
 
+.backtest-result-section {
+  margin-top: 18px;
+}
+
+.backtest-comparison-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.backtest-metric-card {
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.backtest-metric-card span,
+.backtest-chart-legend,
+.backtest-run-details dt,
+.backtest-artifacts span { color: var(--muted); }
+.backtest-metric-card strong { overflow-wrap: anywhere; }
+.benchmark-unavailable strong { font-size: 0.88rem; }
+
+.backtest-chart {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  padding: 10px;
+}
+
+.backtest-chart svg { display: block; width: 100%; }
+.backtest-chart-legend { display: flex; flex-wrap: wrap; gap: 16px; }
+.backtest-chart-legend span::before { content: ""; display: inline-block; height: 3px; margin-right: 6px; vertical-align: middle; width: 18px; }
+.backtest-line-strategy { stroke: #38bdf8; }
+.backtest-line-buy-hold { stroke: #f59e0b; }
+.backtest-line-market { stroke: #a78bfa; }
+.backtest-chart-legend .backtest-line-strategy::before { background: #38bdf8; }
+.backtest-chart-legend .backtest-line-buy-hold::before { background: #f59e0b; }
+.backtest-chart-legend .backtest-line-market::before { background: #a78bfa; }
+.backtest-price-line { stroke: #94a3b8; }
+.backtest-action-marker circle { fill: #22c55e; }
+.backtest-action-marker.action-reduce circle,
+.backtest-action-marker.action-exit circle { fill: #ef4444; }
+.backtest-action-marker text { fill: currentColor; font-size: 10px; text-anchor: middle; }
+
+.backtest-table-wrap { overflow-x: auto; }
+.backtest-trades-table { border-collapse: collapse; min-width: 680px; width: 100%; }
+.backtest-trades-table th,
+.backtest-trades-table td { border-bottom: 1px solid var(--border); padding: 9px; text-align: left; }
+.backtest-empty-state { color: var(--muted); }
+.backtest-run-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; }
+.backtest-run-details dd { margin: 0; overflow-wrap: anywhere; }
+.backtest-artifacts { list-style: none; margin: 0; padding: 0; }
+.backtest-artifacts li { display: grid; gap: 4px; grid-template-columns: minmax(150px, 220px) minmax(0, 1fr); padding: 5px 0; }
+.backtest-artifacts code { overflow-wrap: anywhere; }
+
 .empty-state {
   color: var(--muted);
   padding: 24px;
@@ -2853,6 +2983,21 @@ tbody tr.active-row {
     grid-template-columns: 1fr;
   }
 
+
+}
+
+@media (max-width: 850px) {
+  .backtest-comparison-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .backtest-form,
+  .backtest-strategy-cards,
+  .backtest-input-grid,
+  .backtest-custom-range {
+    grid-template-columns: 1fr;
+  }
+
+  .backtest-strategy-section { grid-column: auto; }
+  .backtest-run-button { grid-column: auto; justify-self: stretch; width: 100%; }
+  .backtest-workspace-header { gap: 12px; }
 }
 
 @media (max-width: 900px) {
@@ -2866,6 +3011,9 @@ tbody tr.active-row {
 }
 
 @media (max-width: 760px) {
+  .backtest-comparison-grid,
+  .backtest-artifacts li,
+  .backtest-run-details { grid-template-columns: 1fr; }
   .dashboard-shell {
     padding: 10px;
   }

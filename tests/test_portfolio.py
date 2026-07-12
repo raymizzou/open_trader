@@ -4,7 +4,122 @@ import pytest
 
 from open_trader.fx import StaticMonthEndFxProvider
 from open_trader.models import AssetClass, CashBalance, Market, Position
-from open_trader.portfolio import build_portfolio_rows
+import open_trader.portfolio as portfolio
+from open_trader.portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows
+
+
+def portfolio_row(**overrides: str) -> dict[str, str]:
+    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    row.update({
+        "sort_group": "2", "market": "US", "asset_class": "stock", "symbol": "AAPL",
+        "currency": "USD", "market_value": "10", "cost_value": "8", "fx_to_hkd": "7.8",
+        "market_value_hkd": "100.00", "cost_value_hkd": "1.00", "unrealized_pnl": "999.00",
+        "unrealized_pnl_pct": "999.00%", "portfolio_weight_hkd": "99.99%",
+        "brokers": "futu", "risk_flag": "normal",
+    })
+    row.update(overrides)
+    return row
+
+
+def test_merge_eastmoney_rows_preserves_other_brokers_and_recalculates_weights() -> None:
+    preserved = [
+        portfolio_row(symbol="AAPL", brokers="futu", market_value="10", cost_value="8"),
+        portfolio_row(symbol="TSLA", brokers="tiger", market_value="20", cost_value="10"),
+        portfolio_row(symbol="NVDA", brokers="phillips", market_value="30", cost_value="25"),
+        portfolio_row(market="CASH", asset_class="cash", symbol="HKD_CASH", currency="HKD", brokers="futu", market_value="400", fx_to_hkd="1", cost_value="", market_value_hkd="stale"),
+        portfolio_row(market="CN", symbol="600519", currency="CNY", brokers="eastmoney", market_value_hkd="1.00"),
+    ]
+    new = [portfolio_row(market="CN", symbol="000001", currency="CNY", brokers="eastmoney", market_value="1000", fx_to_hkd="1.08")]
+
+    rows = portfolio.merge_eastmoney_portfolio_rows(preserved, new)
+
+    assert list(rows[0]) == PORTFOLIO_FIELDNAMES
+    assert {row["symbol"] for row in rows} == {"AAPL", "TSLA", "NVDA", "HKD_CASH", "000001"}
+    aapl = next(row for row in rows if row["symbol"] == "AAPL")
+    assert (aapl["market"], aapl["symbol"], aapl["brokers"]) == ("US", "AAPL", "futu")
+    assert aapl["market_value_hkd"] == "78.00"
+    assert aapl["cost_value_hkd"] == "62.40"
+    assert aapl["unrealized_pnl"] == "2.00"
+    assert aapl["unrealized_pnl_pct"] == "25.00%"
+    cash = next(row for row in rows if row["symbol"] == "HKD_CASH")
+    assert cash["market_value_hkd"] == "400.00"
+    assert cash["cost_value_hkd"] == cash["unrealized_pnl"] == cash["unrealized_pnl_pct"] == ""
+    assert sum(Decimal(row["market_value_hkd"]) for row in rows) == Decimal("1948.00")
+    assert sum(Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in rows) == Decimal("100.00")
+
+
+def test_merge_eastmoney_rows_rejects_mixed_broker_row() -> None:
+    with pytest.raises(ValueError, match="mixes Eastmoney"):
+        portfolio.merge_eastmoney_portfolio_rows([portfolio_row(brokers="futu;eastmoney")], [])
+
+
+def test_merge_eastmoney_weights_keep_two_decimal_total_at_one_hundred_percent() -> None:
+    rows = portfolio.merge_eastmoney_portfolio_rows(
+        [portfolio_row(symbol="A", market_value_hkd="1"), portfolio_row(symbol="B", market_value_hkd="1")],
+        [portfolio_row(symbol="C", brokers="eastmoney", market_value_hkd="1")],
+    )
+    assert sum(Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in rows) == Decimal("100.00")
+
+
+def test_merge_eastmoney_preserves_valid_non_eastmoney_risk_flag() -> None:
+    rows = portfolio.merge_eastmoney_portfolio_rows(
+        [portfolio_row(symbol="A", market_value="1", cost_value="0.5", fx_to_hkd="1", risk_flag="overweight")],
+        [portfolio_row(symbol="B", brokers="eastmoney", market_value="99", cost_value="50", fx_to_hkd="1")],
+    )
+    preserved = next(row for row in rows if row["symbol"] == "A")
+    assert preserved["portfolio_weight_hkd"] == "1.00%"
+    assert preserved["market_value_hkd"] == "1.00"
+    assert preserved["unrealized_pnl"] == "0.50"
+    assert preserved["risk_flag"] == "overweight"
+
+
+def test_merge_eastmoney_clears_missing_cost_derived_values_and_marks_data_check() -> None:
+    row = portfolio_row(
+        cost_value="",
+        avg_cost_price="stale",
+        cost_value_hkd="stale",
+        unrealized_pnl="stale",
+        unrealized_pnl_pct="stale",
+    )
+    merged = portfolio.merge_eastmoney_portfolio_rows([row], [])[0]
+    assert (
+        merged["avg_cost_price"]
+        == merged["cost_value_hkd"]
+        == merged["unrealized_pnl"]
+        == merged["unrealized_pnl_pct"]
+        == ""
+    )
+    assert merged["risk_flag"] == "data_check"
+
+
+@pytest.mark.parametrize("market_values", [("0", "0"), ("-2", "1")])
+def test_merge_eastmoney_rejects_non_positive_combined_total(market_values: tuple[str, str]) -> None:
+    with pytest.raises(ValueError, match="combined HKD total"):
+        portfolio.merge_eastmoney_portfolio_rows(
+            [portfolio_row(symbol="A", market_value=market_values[0], fx_to_hkd="1")],
+            [portfolio_row(symbol="B", brokers="eastmoney", market_value=market_values[1], fx_to_hkd="1")],
+        )
+
+
+def test_merge_eastmoney_rows_rejects_preserved_new_identity_collision() -> None:
+    with pytest.raises(ValueError, match="identity collision"):
+        portfolio.merge_eastmoney_portfolio_rows(
+            [portfolio_row(symbol="600519", market="CN", currency="CNY", brokers="futu")],
+            [portfolio_row(symbol="600519", market="CN", currency="CNY", brokers="eastmoney")],
+        )
+
+
+@pytest.mark.parametrize("value", ["", "NaN", "Infinity"])
+def test_merge_eastmoney_rows_rejects_invalid_market_values(value: str) -> None:
+    with pytest.raises(ValueError, match="market_value"):
+        portfolio.merge_eastmoney_portfolio_rows([portfolio_row(market_value=value)], [])
+
+
+def test_merge_eastmoney_rows_rejects_missing_non_hkd_fx() -> None:
+    with pytest.raises(ValueError, match="fx_to_hkd"):
+        portfolio.merge_eastmoney_portfolio_rows(
+            [portfolio_row(market="CN", currency="CNY", fx_to_hkd="")], []
+        )
 
 
 def position(
@@ -478,8 +593,8 @@ def test_build_portfolio_rows_sorts_by_group_then_market_value_hkd_desc():
         "0700": "1",
         "MSFT": "2",
         "BABA": "4",
-        "FUNDX": "5",
-        "USD_CASH": "6",
+        "FUNDX": "6",
+        "USD_CASH": "7",
     }
 
 
@@ -561,6 +676,28 @@ def test_hk_stock_and_etf_are_ai_eligible() -> None:
     assert tencent["analysis_symbol"] == "00700"
     assert tracker["ai_eligible"] == "true"
     assert tracker["analysis_symbol"] == "02800"
+
+
+def test_cn_stock_is_strategy_eligible() -> None:
+    cn_position = position(
+        "eastmoney",
+        "600025",
+        "6000",
+        "53346",
+        "57720",
+        market=Market.CN,
+        asset_class=AssetClass.STOCK,
+        currency="CNY",
+    )
+    rows = build_portfolio_rows(
+        "2026-07",
+        [cn_position],
+        [],
+        StaticMonthEndFxProvider("2026-07", {"CNY": Decimal("1.08")}),
+    )
+    assert rows[0]["market"] == "CN"
+    assert rows[0]["ai_eligible"] == "true"
+    assert rows[0]["analysis_symbol"] == "600025"
 
 
 def test_hk_money_market_fund_stays_ai_ineligible() -> None:
