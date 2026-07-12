@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-12
 
+- Added optional Eastmoney statement path and PDF password loading from the
+  existing local premarket environment file, while keeping explicit CLI paths
+  authoritative and secrets outside version control.
+- Imported the encrypted Eastmoney statement into the unified portfolio source,
+  restoring five A-share holdings and one CNY cash row alongside the existing
+  broker data.
+- Restarted the live Dashboard on port `8766` and verified the merged `main`
+  with `1445` passing tests plus desktop/mobile Playwright acceptance (`PASS`)
+  against all 33 portfolio rows.
 - Kept pending Kelly exits available when unified strategy stats are missing,
   malformed, stale, or incomplete, while suppressing entries until stats recover.
 - Bound entry risk approval to the current validated trade evidence and strategy
