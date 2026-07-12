@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import math
 import threading
 import time
@@ -138,6 +139,7 @@ class DashboardAccountSyncService:
 
     def _sync_futu(self, run_date: str) -> BrokerSyncStatus:
         client = None
+        original = _portfolio_snapshot(self.config.portfolio_path)
         try:
             client = self.futu_client_factory()
             snapshot = client.fetch_snapshot()
@@ -149,6 +151,9 @@ class DashboardAccountSyncService:
                 run_date=run_date,
                 update_latest=True,
             )
+            _verify_or_restore_portfolio(
+                self.config.portfolio_path, original, target_broker="futu"
+            )
             return _broker_result(result)
         except Exception as exc:
             return _broker_failure(exc)
@@ -158,6 +163,7 @@ class DashboardAccountSyncService:
 
     def _sync_tiger(self, run_date: str) -> BrokerSyncStatus:
         client = None
+        original = _portfolio_snapshot(self.config.portfolio_path)
         try:
             config = self.tiger_config_loader()
             client = self.tiger_client_factory(config)
@@ -169,6 +175,9 @@ class DashboardAccountSyncService:
                 reports_dir=self.config.reports_dir,
                 run_date=run_date,
                 update_latest=True,
+            )
+            _verify_or_restore_portfolio(
+                self.config.portfolio_path, original, target_broker="tiger"
             )
             return _broker_result(result)
         except Exception as exc:
@@ -228,6 +237,63 @@ def _broker_failure(error: Exception) -> BrokerSyncStatus:
         report_path="",
         message=str(error),
     )
+
+
+def _portfolio_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _portfolio_snapshot(path: Path) -> tuple[bytes | None, list[dict[str, str]]]:
+    return (path.read_bytes() if path.exists() else None, _portfolio_rows(path))
+
+
+def _broker_parts(row: dict[str, str]) -> set[str]:
+    return {
+        part.strip().lower()
+        for chunk in row.get("brokers", "").split(",")
+        for part in chunk.split(";")
+        if part.strip()
+    }
+
+
+def _row_key(row: dict[str, str]) -> tuple[str, str, str]:
+    return tuple(row.get(field, "").strip().upper() for field in ("market", "symbol", "currency"))
+
+
+def _assert_preserves_other_brokers(
+    before: list[dict[str, str]],
+    after: list[dict[str, str]],
+    *,
+    target_broker: str,
+) -> None:
+    after_brokers = {_row_key(row): _broker_parts(row) for row in after}
+    for row in before:
+        required = _broker_parts(row) - {target_broker}
+        missing = required - after_brokers.get(_row_key(row), set())
+        if missing:
+            raise ValueError(
+                f"{target_broker} sync dropped preserved broker(s) "
+                f"{', '.join(sorted(missing))} for {row.get('symbol', '')}"
+            )
+
+
+def _verify_or_restore_portfolio(
+    path: Path, original: tuple[bytes | None, list[dict[str, str]]], *, target_broker: str,
+) -> None:
+    original_bytes, before = original
+    try:
+        _assert_preserves_other_brokers(
+            before, _portfolio_rows(path), target_broker=target_broker
+        )
+    except ValueError:
+        if original_bytes is not None:
+            temp = path.with_name(f".{path.name}.restore")
+            temp.write_bytes(original_bytes)
+            temp.replace(path)
+        raise
 
 
 def _now_text() -> str:

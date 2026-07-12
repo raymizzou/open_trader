@@ -8,7 +8,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Added a mandatory `make acceptance` Dashboard gate with PASS/FAIL/BLOCKED
   results across tests, real data, refresh stability, process version, logs,
   and desktop/mobile Chrome flows; fixed OTHER holdings breaking Dashboard loads
-  and Tiger refreshes converting preserved CN rows to OTHER.
+  and Tiger refreshes converting preserved CN rows to OTHER. The gate now also
+  checks the full 33-row portfolio, seven Phillips-linked rows, and the exact
+  Eastmoney statement total; live broker refreshes fail closed and restore the
+  prior CSV if they would remove another broker's holdings.
 - Added password-prompted Eastmoney A-share statement imports using an explicit
   month-end CNY/HKD rate, plus AKShare daily prices for standard-strategy research.
 - Kept the Dashboard holdings layout unchanged while adding the existing A-share

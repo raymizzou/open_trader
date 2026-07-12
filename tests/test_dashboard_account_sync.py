@@ -3,8 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from open_trader.dashboard import DashboardConfig
-from open_trader.dashboard_account_sync import DashboardAccountSyncService
+from open_trader.dashboard_account_sync import (
+    DashboardAccountSyncService,
+    _assert_preserves_other_brokers,
+)
 from open_trader.futu_account import FutuPortfolioSyncResult
 from open_trader.tiger_account import TigerPortfolioSyncResult
 
@@ -77,6 +82,20 @@ def tiger_result(tmp_path: Path) -> TigerPortfolioSyncResult:
         latest_path=tmp_path / "data/latest/portfolio.csv",
         updated_latest=True,
     )
+
+
+def test_account_sync_rejects_dropping_statement_brokers() -> None:
+    before = [{
+        "market": "US", "symbol": "MSFT", "currency": "USD",
+        "brokers": "futu;phillips;tiger",
+    }]
+    after = [{
+        "market": "US", "symbol": "MSFT", "currency": "USD",
+        "brokers": "futu;tiger",
+    }]
+
+    with pytest.raises(ValueError, match="phillips"):
+        _assert_preserves_other_brokers(before, after, target_broker="tiger")
 
 
 def test_dashboard_account_sync_runs_brokers_in_order_and_throttles(

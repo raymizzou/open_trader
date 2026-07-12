@@ -13,10 +13,23 @@ from urllib.request import urlopen
 def validate_dashboard_payload(
     payload: dict[str, Any], *, expected_cn: int,
     expected_eastmoney_cny: Decimal | None = None,
+    expected_rows: int | None = None,
+    expected_phillips_rows: int | None = None,
 ) -> list[str]:
     errors: list[str] = []
     holdings = payload.get("holdings") or []
     cash_rows = payload.get("cash_rows") or []
+    rows = [*holdings, *cash_rows]
+    if expected_rows is not None and len(rows) != expected_rows:
+        errors.append(f"组合总行数不是 {expected_rows}：{len(rows)}")
+    if expected_phillips_rows is not None:
+        phillips_rows = sum(
+            "phillips" in str(row.get("brokers", "")).split(";") for row in rows
+        )
+        if phillips_rows != expected_phillips_rows:
+            errors.append(
+                f"辉立关联持仓行数不是 {expected_phillips_rows}：{phillips_rows}"
+            )
     cn_rows = [row for row in holdings if row.get("market") == "CN"]
     if len(cn_rows) != expected_cn:
         errors.append(f"A 股持仓数量不是 {expected_cn}：{len(cn_rows)}")
@@ -28,7 +41,10 @@ def validate_dashboard_payload(
 
     try:
         total = sum(
-            (Decimal(str(row["portfolio_weight_hkd"]).rstrip("%")) for row in [*holdings, *cash_rows]),
+            (
+                Decimal(str(row["portfolio_weight_hkd"]).rstrip("%"))
+                for row in [*holdings, *cash_rows]
+            ),
             Decimal("0"),
         )
     except (InvalidOperation, KeyError, TypeError, ValueError):
@@ -52,7 +68,8 @@ def validate_dashboard_payload(
         else:
             if eastmoney_total != expected_eastmoney_cny:
                 errors.append(
-                    f"东方财富总资产不匹配：{eastmoney_total} != {expected_eastmoney_cny} CNY"
+                    "东方财富总资产不匹配："
+                    f"{eastmoney_total} != {expected_eastmoney_cny} CNY"
                 )
     return errors
 
@@ -108,7 +125,12 @@ def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
             ):
                 page = browser.new_page(viewport=viewport)
                 browser_errors: list[str] = []
-                page.on("console", lambda message: browser_errors.append(message.text) if message.type == "error" else None)
+                page.on(
+                    "console",
+                    lambda message: browser_errors.append(message.text)
+                    if message.type == "error"
+                    else None,
+                )
                 page.on("pageerror", lambda error: browser_errors.append(str(error)))
                 page.on("response", lambda response: browser_errors.append(
                     f"HTTP {response.status} {response.url}"
@@ -121,7 +143,9 @@ def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
                 page.wait_for_timeout(500)
                 if page.locator("#visible-count").inner_text().strip() != f"{expected_cn} 条":
                     errors.append(f"{name}：A 股东方财富筛选不是 {expected_cn} 条")
-                errors.extend(f"{name}：浏览器错误：{message}" for message in browser_errors)
+                errors.extend(
+                    f"{name}：浏览器错误：{message}" for message in browser_errors
+                )
                 page.close()
             browser.close()
     except Exception as exc:
@@ -141,6 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8766")
     parser.add_argument("--expected-cn", type=int, default=5)
+    parser.add_argument("--expected-rows", type=int, default=33)
+    parser.add_argument("--expected-phillips-rows", type=int, default=7)
     parser.add_argument(
         "--expected-eastmoney-cny", type=Decimal, default=Decimal("676549.55")
     )
@@ -170,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
         errors.extend(validate_dashboard_payload(
             first, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
+            expected_rows=args.expected_rows,
+            expected_phillips_rows=args.expected_phillips_rows,
         ))
         if not errors and args.wait_seconds:
             time.sleep(args.wait_seconds)
@@ -177,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
         errors.extend(validate_dashboard_payload(
             second, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
+            expected_rows=args.expected_rows,
+            expected_phillips_rows=args.expected_phillips_rows,
         ))
         if dashboard_signature(first) != dashboard_signature(second):
             errors.append("两个刷新周期后的 Dashboard 数据不稳定")
@@ -187,7 +217,8 @@ def main(argv: list[str] | None = None) -> int:
     browser_errors, blocker = _browser_check(args.url, args.expected_cn)
     errors.extend(browser_errors)
     status = classify_result(errors, browser_blocker=blocker)
-    print(json.dumps({"status": status, "pid": pid, "errors": errors, "blocker": blocker}, ensure_ascii=False))
+    result = {"status": status, "pid": pid, "errors": errors, "blocker": blocker}
+    print(json.dumps(result, ensure_ascii=False))
     return {"PASS": 0, "FAIL": 1, "BLOCKED": 2}[status]
 
 

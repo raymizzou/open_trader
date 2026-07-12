@@ -56,6 +56,18 @@ def test_validate_dashboard_payload_checks_eastmoney_statement_total_assets() ->
     assert "东方财富总资产不匹配：100 != 101 CNY" in errors
 
 
+def test_validate_dashboard_payload_checks_full_portfolio_preservation() -> None:
+    payload = valid_payload()
+    payload["holdings"][0]["brokers"] = "eastmoney;phillips"  # type: ignore[index]
+
+    errors = validate_dashboard_payload(
+        payload, expected_cn=5, expected_rows=33, expected_phillips_rows=7
+    )
+
+    assert "组合总行数不是 33：6" in errors
+    assert "辉立关联持仓行数不是 7：1" in errors
+
+
 def test_classify_result_has_only_three_states() -> None:
     assert classify_result([], browser_blocker=None) == "PASS"
     assert classify_result(["API failed"], browser_blocker=None) == "FAIL"
