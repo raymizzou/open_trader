@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 
 
@@ -29,9 +30,18 @@ class StaticMonthEndFxProvider:
 
     source = "external_month_end_static"
 
-    def __init__(self, month: str, rates_to_hkd: dict[str, Decimal]):
+    def __init__(
+        self, month: str, rates_to_hkd: dict[str, Decimal], *, fx_date: str | None = None
+    ):
         self.month = month
-        self.fx_date = month_end_date(month)
+        if fx_date is not None:
+            try:
+                parsed_date = date.fromisoformat(fx_date)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid fx_date: {fx_date}") from exc
+            if parsed_date.isoformat() != fx_date:
+                raise ValueError(f"invalid fx_date: {fx_date}")
+        self.fx_date = fx_date or month_end_date(month)
         self.rates_to_hkd = {
             currency.upper(): rate for currency, rate in rates_to_hkd.items()
         }

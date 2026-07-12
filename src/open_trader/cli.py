@@ -217,6 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Month-end USD/HKD exchange rate",
     )
     import_parser.add_argument("--cny-hkd", type=positive_decimal)
+    import_parser.add_argument("--fx-date", type=canonical_date)
     import_parser.add_argument("--update-latest", action="store_true")
 
     premarket_parser = subparsers.add_parser(
@@ -839,7 +840,9 @@ def main(argv: list[str] | None = None) -> int:
             statement_paths=statement_paths,
             parsers=parsers,
             data_dir=args.data_dir,
-            fx_provider=StaticMonthEndFxProvider(args.month, rates),
+            fx_provider=StaticMonthEndFxProvider(
+                args.month, rates, fx_date=args.fx_date
+            ),
             update_latest=args.update_latest,
         )
         print(f"portfolio: {result.portfolio_path}")

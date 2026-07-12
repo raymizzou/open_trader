@@ -103,7 +103,9 @@ def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
     data_dir = tmp_path / "data"
-    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
+    fx_provider = StaticMonthEndFxProvider(
+        "2026-05", {"USD": Decimal("7.8")}, fx_date="2026-04-30"
+    )
 
     result = run_import(
         month="2026-05",
@@ -124,6 +126,9 @@ def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
     portfolio_content = result.portfolio_path.read_text(encoding="utf-8")
     assert result.latest_path.read_text(encoding="utf-8") == portfolio_content
     assert "NVDA" in portfolio_content
+    assert {
+        row["fx_date"] for row in csv.DictReader(result.portfolio_path.open(encoding="utf-8"))
+    } == {"2026-04-30"}
 
     manifest_rows = list(csv.DictReader((run_dir / "manifest.csv").open(encoding="utf-8")))
     assert manifest_rows == [
@@ -691,6 +696,7 @@ def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[s
     assert "--phillips" in output
     assert "--eastmoney" in output
     assert "--cny-hkd" in output
+    assert "--fx-date" in output
     assert "--update-latest" in output
     assert "--futu" not in output
     assert "--tiger" not in output
@@ -741,12 +747,14 @@ def test_cli_imports_only_eastmoney_and_prompts_password(
     monkeypatch.setattr(cli, "run_import", fake_run_import)
     assert cli.main([
         "import-statements", "--month", "2026-07", "--eastmoney", "statement.pdf",
-        "--cny-hkd", "1.08", "--data-dir", str(tmp_path), "--update-latest",
+        "--cny-hkd", "1.08", "--fx-date", "2026-06-30",
+        "--data-dir", str(tmp_path), "--update-latest",
     ]) == 0
 
     assert captured["statement_paths"] == {"eastmoney": Path("statement.pdf")}
     assert [parser.broker for parser in captured["parsers"]] == ["eastmoney"]
     assert captured["fx_provider"].get_rate_to_hkd("CNY").rate == Decimal("1.08")
+    assert captured["fx_provider"].get_rate_to_hkd("CNY").fx_date == "2026-06-30"
     assert captured["update_latest"] is True
     assert "secret" not in capsys.readouterr().out
 
@@ -773,6 +781,21 @@ def test_import_statements_rejects_invalid_month(
 
     assert exc_info.value.code == 2
     assert "invalid month" in capsys.readouterr().err
+
+
+def test_import_statements_rejects_invalid_fx_date(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args([
+            "import-statements", "--month", "2026-07", "--eastmoney", "statement.pdf",
+            "--cny-hkd", "1.08", "--fx-date", "2026-06-31",
+        ])
+
+    assert exc_info.value.code == 2
+    assert "invalid date" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("rate", ["abc", "0", "-1", "NaN", "Infinity"])

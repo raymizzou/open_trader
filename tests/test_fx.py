@@ -28,6 +28,21 @@ def test_static_fx_provider_returns_configured_rate():
     assert quote.rate == Decimal("7.84")
 
 
+def test_static_fx_provider_uses_explicit_fx_date() -> None:
+    provider = StaticMonthEndFxProvider(
+        "2026-07", {"CNY": Decimal("1.1549")}, fx_date="2026-06-30"
+    )
+
+    assert provider.get_rate_to_hkd("CNY").fx_date == "2026-06-30"
+    assert provider.get_rate_to_hkd("HKD").fx_date == "2026-06-30"
+
+
+@pytest.mark.parametrize("fx_date", ["2026-6-30", "2026-06-31", "not-a-date"])
+def test_static_fx_provider_rejects_invalid_explicit_date(fx_date: str) -> None:
+    with pytest.raises(ValueError, match="fx_date"):
+        StaticMonthEndFxProvider("2026-07", {"CNY": Decimal("1")}, fx_date=fx_date)
+
+
 def test_static_fx_provider_rejects_missing_currency():
     provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.84")})
 
