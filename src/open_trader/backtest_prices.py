@@ -157,6 +157,16 @@ def load_price_rows(path: Path) -> list[StrategyBar]:
     return bars
 
 
+def _price_cache_missing_required_columns(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            fieldnames = next(reader, ())
+    except OSError as exc:
+        raise ValueError(f"无法读取价格文件：{path}") from exc
+    return bool(set(BACKTEST_PRICE_FIELDNAMES) - set(fieldnames))
+
+
 def ensure_backtest_price_range(
     *, data_dir: Path, market: str, symbol: str,
     date_range: BacktestDateRange, provider: DailyKlineProvider,
@@ -165,9 +175,13 @@ def ensure_backtest_price_range(
     normalized_symbol = normalize_backtest_symbol(market_scope.value, symbol)
     prices_path = _backtest_prices_path(data_dir, market_scope.value, normalized_symbol)
     bars: list[StrategyBar] | None = None
-    if prices_path.exists():
+    if prices_path.exists() and not _price_cache_missing_required_columns(prices_path):
         bars = load_price_rows(prices_path)
-        if bars[0].date > date_range.warmup_start or bars[-1].date < date_range.requested_end:
+        if (
+            all(bar.volume == 0 for bar in bars)
+            or bars[0].date > date_range.warmup_start
+            or bars[-1].date < date_range.requested_end
+        ):
             bars = None
     if bars is None:
         fetched = fetch_backtest_prices(

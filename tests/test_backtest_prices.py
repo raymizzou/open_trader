@@ -226,6 +226,71 @@ def test_ensure_price_range_reuses_complete_csv(tmp_path: Path) -> None:
     assert result.actual_end == date(2026, 1, 1)
 
 
+def test_ensure_price_range_refetches_legacy_csv_missing_volume(tmp_path: Path) -> None:
+    path = tmp_path / "prices" / "US" / "MSFT.csv"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "date,open,high,low,close\n"
+        "2024-09-23,1,1,1,1\n"
+        "2026-01-01,2,2,2,2\n",
+        encoding="utf-8",
+    )
+    provider = CoverageProvider()
+
+    result = ensure_backtest_price_range(
+        data_dir=tmp_path, market="US", symbol="MSFT",
+        date_range=BacktestDateRange(date(2025, 1, 1), date(2026, 1, 1), date(2024, 9, 23)),
+        provider=provider,
+    )
+
+    assert provider.requests == [("US.MSFT", "2024-09-23", "2026-01-01")]
+    assert result.actual_end == date(2026, 1, 1)
+    assert path.read_text(encoding="utf-8").splitlines() == [
+        "date,open,high,low,close,volume",
+        "2024-09-23,100,100,100,100,1000",
+        "2026-01-01,101,101,101,101,1000",
+    ]
+
+
+def test_ensure_price_range_refetches_all_zero_volume_csv(tmp_path: Path) -> None:
+    path = tmp_path / "prices" / "US" / "MSFT.csv"
+    path.parent.mkdir(parents=True)
+    _write_prices(path, [
+        "2024-09-23,1,1,1,1,0",
+        "2025-01-01,1,1,1,1,0",
+        "2026-01-01,2,2,2,2,0",
+    ])
+    provider = CoverageProvider()
+
+    result = ensure_backtest_price_range(
+        data_dir=tmp_path, market="US", symbol="MSFT",
+        date_range=BacktestDateRange(date(2025, 1, 1), date(2026, 1, 1), date(2024, 9, 23)),
+        provider=provider,
+    )
+
+    assert provider.requests == [("US.MSFT", "2024-09-23", "2026-01-01")]
+    assert result.actual_end == date(2026, 1, 1)
+    assert all(bar.volume > 0 for bar in result.bars)
+
+
+def test_ensure_price_range_preserves_malformed_complete_csv(tmp_path: Path) -> None:
+    path = tmp_path / "prices" / "US" / "MSFT.csv"
+    path.parent.mkdir(parents=True)
+    original = "date,open,high,low,close,volume\n2025-01-01,x,1,1,1,1\n"
+    path.write_text(original, encoding="utf-8")
+    provider = CoverageProvider()
+
+    with pytest.raises(ValueError, match="^价格文件第 2 行无效$"):
+        ensure_backtest_price_range(
+            data_dir=tmp_path, market="US", symbol="MSFT",
+            date_range=BacktestDateRange(date(2025, 1, 1), date(2026, 1, 1), date(2024, 9, 23)),
+            provider=provider,
+        )
+
+    assert provider.requests == []
+    assert path.read_text(encoding="utf-8") == original
+
+
 def test_ensure_price_range_rejects_no_requested_period_bar_in_chinese(tmp_path: Path) -> None:
     path = tmp_path / "prices" / "US" / "MSFT.csv"
     path.parent.mkdir(parents=True)
