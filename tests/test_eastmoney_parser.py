@@ -21,7 +21,7 @@ POSITIONS = [
 
 def test_parse_eastmoney_first_page_only() -> None:
     result = parse_eastmoney_page(
-        "资金余额(RMB)： 10000.00\n资金可用(RMB)： 405219.55",
+        "总资产(RMB)： 462939.55\n资金余额(RMB)： 10000.00\n资金可用(RMB)： 405219.55",
         [POSITIONS, [["发生日期", "买卖类别", "证券代码"]]],
         "2026-07",
     )
@@ -33,19 +33,20 @@ def test_parse_eastmoney_first_page_only() -> None:
     assert result.positions[0].currency == "CNY"
     assert result.positions[0].cost_value == Decimal("53346.000")
     assert result.positions[0].unrealized_pnl == Decimal("4374.000")
-    assert result.cash_balances[0].cash_balance == Decimal("10000.00")
+    assert result.cash_balances[0].cash_balance == Decimal("405219.55")
     assert result.cash_balances[0].available_balance == Decimal("405219.55")
 
 
 def test_parse_eastmoney_cash_when_currency_balances_share_lines() -> None:
     result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00 总资产(HKD)： 2.00 总资产(USD)： 3.00\n"
         "资金余额(RMB)： 10000.00 资金余额(HKD)： 2.00 资金余额(USD)： 3.00\n"
         "资金可用(RMB)： 405219.55 资金可用(HKD)： 5.00 资金可用(USD)： 6.00",
         [POSITIONS],
         "2026-07",
     )
 
-    assert result.cash_balances[0].cash_balance == Decimal("10000.00")
+    assert result.cash_balances[0].cash_balance == Decimal("10.00")
     assert result.cash_balances[0].available_balance == Decimal("405219.55")
 
 
@@ -64,7 +65,7 @@ def test_parser_rejects_invalid_summary_rows_and_cash() -> None:
 
     with pytest.raises(ValueError, match="持仓行"):
         parse_eastmoney_page(
-            "资金余额(RMB)： 1\n资金可用(RMB)： 1",
+            "总资产(RMB)： 2\n资金余额(RMB)： 1\n资金可用(RMB)： 1",
             [invalid_positions],
             "2026-07",
         )
@@ -78,7 +79,7 @@ def test_encrypted_parser_reads_only_first_page_and_hides_password(
 ) -> None:
     class FakePage:
         def extract_text(self) -> str:
-            return "资金余额(RMB)： 1\n资金可用(RMB)： 2"
+            return "总资产(RMB)： 57722\n资金余额(RMB)： 1\n资金可用(RMB)： 2"
 
         def extract_tables(self) -> list[list[list[str]]]:
             return [POSITIONS]

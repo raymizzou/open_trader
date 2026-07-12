@@ -10,7 +10,10 @@ from typing import Any
 from urllib.request import urlopen
 
 
-def validate_dashboard_payload(payload: dict[str, Any], *, expected_cn: int) -> list[str]:
+def validate_dashboard_payload(
+    payload: dict[str, Any], *, expected_cn: int,
+    expected_eastmoney_cny: Decimal | None = None,
+) -> list[str]:
     errors: list[str] = []
     holdings = payload.get("holdings") or []
     cash_rows = payload.get("cash_rows") or []
@@ -33,6 +36,24 @@ def validate_dashboard_payload(payload: dict[str, Any], *, expected_cn: int) -> 
     else:
         if total != Decimal("100.00"):
             errors.append(f"组合权重合计不是 100.00%：{total}%")
+    if expected_eastmoney_cny is not None:
+        try:
+            eastmoney_total = sum(
+                (
+                    Decimal(str(row["market_value"]))
+                    for row in [*holdings, *cash_rows]
+                    if row.get("currency") == "CNY"
+                    and "eastmoney" in str(row.get("brokers", "")).split(";")
+                ),
+                Decimal("0"),
+            )
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            errors.append("东方财富总资产包含无效值")
+        else:
+            if eastmoney_total != expected_eastmoney_cny:
+                errors.append(
+                    f"东方财富总资产不匹配：{eastmoney_total} != {expected_eastmoney_cny} CNY"
+                )
     return errors
 
 
@@ -96,7 +117,7 @@ def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
                 if "看板数据加载失败" in page.locator("body").inner_text():
                     errors.append(f"{name}：页面显示看板数据加载失败")
                 page.locator('[data-market="CN"]').first.click()
-                page.locator('[data-broker="eastmoney"]').click()
+                page.locator('button[data-broker="eastmoney"]').click()
                 page.wait_for_timeout(500)
                 if page.locator("#visible-count").inner_text().strip() != f"{expected_cn} 条":
                     errors.append(f"{name}：A 股东方财富筛选不是 {expected_cn} 条")
@@ -120,6 +141,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8766")
     parser.add_argument("--expected-cn", type=int, default=5)
+    parser.add_argument(
+        "--expected-eastmoney-cny", type=Decimal, default=Decimal("676549.55")
+    )
     parser.add_argument("--expected-root", type=Path, default=Path.cwd())
     parser.add_argument("--expected-sha")
     parser.add_argument("--log", type=Path, default=Path("/tmp/open_trader_dashboard_8766.log"))
@@ -143,11 +167,17 @@ def main(argv: list[str] | None = None) -> int:
         if running_sha != expected_sha:
             errors.append(f"运行 Git SHA 不匹配：{running_sha[:7]} != {expected_sha[:7]}")
         first = _fetch_payload(args.url)
-        errors.extend(validate_dashboard_payload(first, expected_cn=args.expected_cn))
+        errors.extend(validate_dashboard_payload(
+            first, expected_cn=args.expected_cn,
+            expected_eastmoney_cny=args.expected_eastmoney_cny,
+        ))
         if not errors and args.wait_seconds:
             time.sleep(args.wait_seconds)
         second = _fetch_payload(args.url)
-        errors.extend(validate_dashboard_payload(second, expected_cn=args.expected_cn))
+        errors.extend(validate_dashboard_payload(
+            second, expected_cn=args.expected_cn,
+            expected_eastmoney_cny=args.expected_eastmoney_cny,
+        ))
         if dashboard_signature(first) != dashboard_signature(second):
             errors.append("两个刷新周期后的 Dashboard 数据不稳定")
         errors.extend(_log_errors(args.log))

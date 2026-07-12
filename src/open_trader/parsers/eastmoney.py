@@ -44,9 +44,14 @@ def parse_eastmoney_page(
 
     statement_id = f"{month}-{BROKER}"
     positions = [_parse_position(row, statement_id) for row in table[1:]]
-    cash_balance = _extract_money(first_page_text, "资金余额")
+    total_assets = _extract_money(first_page_text, "总资产")
     available_balance = _extract_money(first_page_text, "资金可用")
-    if cash_balance is None or available_balance is None:
+    securities_value = sum(
+        (position.market_value or Decimal("0") for position in positions),
+        Decimal("0"),
+    )
+    cash_balance = None if total_assets is None else total_assets - securities_value
+    if cash_balance is None or cash_balance < 0 or available_balance is None:
         raise ValueError("东方财富对账单缺少人民币资金汇总")
 
     return ParseResult(
@@ -62,7 +67,7 @@ def parse_eastmoney_page(
                 cash_balance=cash_balance,
                 available_balance=available_balance,
                 confidence="high",
-                notes="",
+                notes="cash derived from statement total assets less securities value",
             )
         ],
     )

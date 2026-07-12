@@ -1542,14 +1542,10 @@ def _cash_to_detail_row(cash: CashBalance) -> dict[str, str]:
 
 
 def _market_from_text(value: str) -> Market:
-    normalized = str(value or "").strip().upper()
-    if normalized == "US":
-        return Market.US
-    if normalized == "HK":
-        return Market.HK
-    if normalized == "CASH":
-        return Market.CASH
-    return Market.OTHER
+    try:
+        return Market(str(value or "").strip().upper())
+    except ValueError:
+        return Market.OTHER
 
 
 def _asset_class_from_text(value: str) -> AssetClass:

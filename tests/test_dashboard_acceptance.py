@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from open_trader.dashboard_acceptance import (
     classify_result,
     dashboard_signature,
@@ -33,6 +35,25 @@ def test_validate_dashboard_payload_rejects_bad_counts_and_weights() -> None:
 
     assert "组合权重合计不是 100.00%：99.99%" in errors
     assert "A 股回测标的数量不是 5：0" in errors
+
+
+def test_validate_dashboard_payload_checks_eastmoney_statement_total_assets() -> None:
+    payload = valid_payload()
+    for row in payload["holdings"][:5]:  # type: ignore[index]
+        row.update({"brokers": "eastmoney", "currency": "CNY", "market_value": "10"})
+    payload["cash_rows"] = [{
+        "market": "CASH", "symbol": "CNY_CASH", "brokers": "eastmoney",
+        "currency": "CNY", "market_value": "50", "portfolio_weight_hkd": "0.00%",
+    }]
+
+    assert validate_dashboard_payload(
+        payload, expected_cn=5, expected_eastmoney_cny=Decimal("100")
+    ) == []
+
+    errors = validate_dashboard_payload(
+        payload, expected_cn=5, expected_eastmoney_cny=Decimal("101")
+    )
+    assert "东方财富总资产不匹配：100 != 101 CNY" in errors
 
 
 def test_classify_result_has_only_three_states() -> None:
