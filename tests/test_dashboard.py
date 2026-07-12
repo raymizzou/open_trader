@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,64 @@ def test_dashboard_refreshes_cn_derived_values_from_cached_close(tmp_path: Path)
     assert holding["unrealized_pnl"] == "6654.00"
     assert holding["unrealized_pnl_pct"] == "12.47%"
     assert state.summary["portfolio_value_hkd"] == "64800.00"
+
+
+def test_dashboard_refreshes_all_weights_after_cn_cached_closes(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    rows = []
+    for values in [
+        {
+            "market": "CN", "asset_class": "stock", "symbol": "600001",
+            "currency": "CNY", "total_quantity": "1", "cost_value": "100",
+            "fx_to_hkd": "1", "market_value_hkd": "100",
+            "portfolio_weight_hkd": "10.00%",
+        },
+        {
+            "market": "CN", "asset_class": "stock", "symbol": "600002",
+            "currency": "CNY", "total_quantity": "1", "cost_value": "200",
+            "fx_to_hkd": "1", "market_value_hkd": "200",
+            "portfolio_weight_hkd": "20.00%",
+        },
+        {
+            "market": "US", "asset_class": "stock", "symbol": "AAPL",
+            "currency": "HKD", "market_value_hkd": "400",
+            "portfolio_weight_hkd": "40.00%",
+        },
+        {
+            "market": "CASH", "asset_class": "cash", "symbol": "HKD_CASH",
+            "currency": "HKD", "market_value_hkd": "100",
+            "portfolio_weight_hkd": "30.00%",
+        },
+    ]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update(values)
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+    original = config.portfolio_path.read_bytes()
+    for symbol, close in [("600001", "201"), ("600002", "302")]:
+        write_csv(
+            config.data_dir / f"prices/CN/{symbol}.csv",
+            ["date", "close"],
+            [{"date": "2026-07-10", "close": close}],
+        )
+
+    payload = load_dashboard_state(config).to_dict()
+    displayed_rows = payload["holdings"] + payload["cash_rows"]
+
+    assert payload["summary"]["portfolio_value_hkd"] == "1003.00"
+    assert sum(Decimal(row["market_value_hkd"]) for row in displayed_rows) == Decimal(
+        "1003.00"
+    )
+    assert {row["symbol"]: row["portfolio_weight_hkd"] for row in displayed_rows} == {
+        "600001": "20.04%",
+        "600002": "30.11%",
+        "AAPL": "39.88%",
+        "HKD_CASH": "9.97%",
+    }
+    assert sum(
+        Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in displayed_rows
+    ) == Decimal("100.00")
+    assert config.portfolio_path.read_bytes() == original
 
 
 @pytest.mark.parametrize(

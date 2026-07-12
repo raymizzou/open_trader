@@ -96,6 +96,25 @@ class PortfolioBuildError(ValueError):
     pass
 
 
+def recalculate_portfolio_weights(rows: list[dict[str, str]]) -> None:
+    values = [_required_finite_decimal(row, "market_value_hkd") for row in rows]
+    total = sum(values, Decimal("0"))
+    if total <= 0:
+        raise PortfolioBuildError(f"combined HKD total must be positive, got {total}")
+    percentages = [
+        (value * Decimal("100") / total).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        for value in values
+    ]
+    if percentages:
+        percentages[max(range(len(values)), key=values.__getitem__)] += (
+            Decimal("100.00") - sum(percentages)
+        )
+    for row, percentage in zip(rows, percentages):
+        row["portfolio_weight_hkd"] = f"{percentage:.2f}%"
+
+
 def merge_eastmoney_portfolio_rows(
     existing_rows: Iterable[dict[str, str]],
     eastmoney_rows: Iterable[dict[str, str]],
@@ -159,21 +178,7 @@ def merge_eastmoney_portfolio_rows(
             unrealized_pnl / cost_value if cost_value else None
         )
 
-    values = [Decimal(row["market_value_hkd"]) for row in combined]
-    total = sum(values, Decimal("0"))
-    if total <= 0:
-        raise PortfolioBuildError(f"combined HKD total must be positive, got {total}")
-    percentages = [
-        (value * Decimal("100") / total).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        if total else Decimal("0.00")
-        for value in values
-    ]
-    if percentages and total:
-        percentages[max(range(len(values)), key=values.__getitem__)] += (
-            Decimal("100.00") - sum(percentages)
-        )
-    for row, percentage in zip(combined, percentages):
-        row["portfolio_weight_hkd"] = f"{percentage:.2f}%"
+    recalculate_portfolio_weights(combined)
     return sorted(
         combined,
         key=lambda row: (int(row["sort_group"]), -Decimal(row["market_value_hkd"])),

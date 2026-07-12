@@ -25,6 +25,7 @@ from .futu_skill_facts import (
 )
 from .models import AssetClass
 from .parsers.base import detect_asset_class
+from .portfolio import PortfolioBuildError, recalculate_portfolio_weights
 from .research_chat import load_research_view_for_holding
 from .t_signal_store import (
     index_t_signals_by_market_symbol,
@@ -118,9 +119,19 @@ class DashboardState:
 
 
 def load_dashboard_state(config: DashboardConfig) -> DashboardState:
+    original_portfolio_rows = _read_csv_rows(config.portfolio_path)
     portfolio_rows = [
-        _overlay_cn_cached_close(row, config.data_dir) for row in _read_csv_rows(config.portfolio_path)
+        _overlay_cn_cached_close(row, config.data_dir) for row in original_portfolio_rows
     ]
+    overlays_applied = any(
+        updated is not original
+        for original, updated in zip(original_portfolio_rows, portfolio_rows)
+    )
+    if overlays_applied:
+        try:
+            recalculate_portfolio_weights(portfolio_rows)
+        except PortfolioBuildError:
+            pass
     detail_month = latest_broker_detail_month(config.data_dir)
     detail_dir = config.data_dir / "runs" / detail_month if detail_month else None
     broker_positions = (
