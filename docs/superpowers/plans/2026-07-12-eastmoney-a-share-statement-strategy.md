@@ -18,6 +18,8 @@
 - Dashboard 的列名、列序、详情入口和响应式布局保持现状；不新增专属卡片或页面。
 - 不接 EMT、EMQ、实时账户、分钟行情或自动下单。
 - 写日期归档产物；只有 `--update-latest` 才更新 `data/latest/portfolio.csv`。
+- `portfolio.csv` 是稳定兼容合同：表头与 `PORTFOLIO_FIELDNAMES` 顺序不得变化；东方财富导入只替换纯 `eastmoney` 行，其他券商行必须保留。
+- 每次合并后必须从全组合重新计算港元总资产、持仓数、换算市值、持仓权重和盈亏派生值；缺失汇率或金额不得用 0 或旧值代替。
 
 ---
 
@@ -193,13 +195,16 @@ git commit -m "feat: parse Eastmoney A-share statements"
 **Files:**
 - Modify: `src/open_trader/pipeline.py`
 - Modify: `src/open_trader/cli.py`
+- Modify: `src/open_trader/portfolio.py`
 - Modify: `tests/test_pipeline.py`
 - Modify: `tests/test_parsers_text.py`
+- Modify: `tests/test_portfolio.py`
 
 **Interfaces:**
 - Consumes: `EastmoneyStatementParser(password)` from Task 2
 - Produces: `run_import(month, statement_paths, parsers, data_dir, fx_provider, update_latest=True) -> ImportResult`
 - Produces CLI: `open-trader import-statements --eastmoney PATH --cny-hkd RATE [--phillips PATH --usd-hkd RATE] [--update-latest]`
+- Produces: broker-safe merge that preserves every non-Eastmoney row and recomputes all portfolio weights from the combined HKD total
 
 - [ ] **Step 1: Write failing import and CLI tests**
 
@@ -236,6 +241,8 @@ def test_cli_imports_only_eastmoney_and_prompts_password(monkeypatch, tmp_path) 
 
 Also assert: at least one statement is required; `--eastmoney` requires `--cny-hkd`; `--phillips` requires `--usd-hkd`; `--update-latest` is forwarded; console output contains paths/counts but not the password.
 
+Add a regression test with existing Futu, Tiger, Phillips, and cash rows plus one stale Eastmoney row. Assert the output field names equal `PORTFOLIO_FIELDNAMES` in the same order; all non-Eastmoney values are preserved except the globally recalculated `portfolio_weight_hkd`; the stale Eastmoney row is replaced; combined HKD value equals the exact sum of all valid rows; holding count is derived from the combined non-cash rows; and recalculated weights sum to `100.00%` within the existing two-decimal rounding contract. Add failure tests for mixed broker rows containing `eastmoney`, identity collisions with a preserved broker, missing CNY FX, and non-finite or missing `market_value_hkd`.
+
 - [ ] **Step 2: Run focused tests and verify failures**
 
 Run: `.venv/bin/pytest tests/test_pipeline.py tests/test_parsers_text.py -q`
@@ -253,7 +260,7 @@ import_parser.add_argument("--cny-hkd", type=positive_decimal)
 import_parser.add_argument("--update-latest", action="store_true")
 ```
 
-Build `statement_paths` and `parsers` only for supplied files. Obtain the Eastmoney password with `getpass("东方财富对账单密码: ")`; do not accept a plaintext password CLI flag. Build the FX map only from supplied rates. In `run_import`, always write and atomically promote the dated run directory; execute the existing latest temp/backup/replace block only when `update_latest` is true. Keep the function default `True` so existing direct Python callers remain compatible; the CLI passes `args.update_latest` explicitly.
+Build `statement_paths` and `parsers` only for supplied files. Obtain the Eastmoney password with `getpass("东方财富对账单密码: ")`; do not accept a plaintext password CLI flag. Build the FX map only from supplied rates. Add the smallest shared merge helper beside `build_portfolio_rows`: it removes only rows whose broker set is exactly `{eastmoney}`, rejects mixed Eastmoney rows and preserved/new identity collisions, appends the newly built Eastmoney rows, validates all required HKD values, and recalculates `portfolio_weight_hkd` over the entire combined portfolio. In `run_import`, always write and atomically promote the dated run directory; execute the existing latest temp/backup/replace block only when `update_latest` is true. Keep the function default `True` so existing direct Python callers remain compatible; the CLI passes `args.update_latest` explicitly.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -264,7 +271,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/open_trader/pipeline.py src/open_trader/cli.py tests/test_pipeline.py tests/test_parsers_text.py
+git add src/open_trader/pipeline.py src/open_trader/cli.py src/open_trader/portfolio.py tests/test_pipeline.py tests/test_parsers_text.py tests/test_portfolio.py
 git commit -m "feat: import Eastmoney statements safely"
 ```
 
