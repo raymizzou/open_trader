@@ -133,12 +133,36 @@ def merge_eastmoney_portfolio_rows(
 
     combined = preserved + new
     for row in combined:
-        if row["currency"].upper() != "HKD":
+        market_value = _required_finite_decimal(row, "market_value")
+        if row["currency"].upper() == "HKD":
+            rate = Decimal("1")
+            row["fx_to_hkd"] = number(rate)
+        else:
             rate = _required_finite_decimal(row, "fx_to_hkd")
             if rate <= 0:
                 raise PortfolioBuildError(f"invalid fx_to_hkd for {row['symbol']}")
-    values = [_required_finite_decimal(row, "market_value_hkd") for row in combined]
+        row["market_value_hkd"] = money(market_value * rate)
+
+        if row["asset_class"] == AssetClass.CASH.value:
+            _clear_cost_and_profit_fields(row)
+            continue
+
+        cost_value = _optional_finite_decimal(row, "cost_value")
+        if cost_value is None:
+            _clear_cost_and_profit_fields(row)
+            row["risk_flag"] = "data_check"
+            continue
+        unrealized_pnl = market_value - cost_value
+        row["cost_value_hkd"] = money(cost_value * rate)
+        row["unrealized_pnl"] = money(unrealized_pnl)
+        row["unrealized_pnl_pct"] = pct(
+            unrealized_pnl / cost_value if cost_value else None
+        )
+
+    values = [Decimal(row["market_value_hkd"]) for row in combined]
     total = sum(values, Decimal("0"))
+    if total <= 0:
+        raise PortfolioBuildError(f"combined HKD total must be positive, got {total}")
     percentages = [
         (value * Decimal("100") / total).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         if total else Decimal("0.00")
@@ -150,6 +174,15 @@ def merge_eastmoney_portfolio_rows(
         )
     for row, percentage in zip(combined, percentages):
         row["portfolio_weight_hkd"] = f"{percentage:.2f}%"
+        if row["risk_flag"] == "data_check":
+            continue
+        if row["asset_class"] not in {
+            AssetClass.CASH.value,
+            AssetClass.MONEY_MARKET_FUND.value,
+        } and percentage > Decimal("10"):
+            row["risk_flag"] = "overweight"
+        else:
+            row["risk_flag"] = "normal"
     return sorted(
         combined,
         key=lambda row: (int(row["sort_group"]), -Decimal(row["market_value_hkd"])),
@@ -177,6 +210,19 @@ def _required_finite_decimal(row: dict[str, str], field: str) -> Decimal:
     if not value.is_finite():
         raise PortfolioBuildError(f"invalid {field} for {row['symbol']}")
     return value
+
+
+def _optional_finite_decimal(row: dict[str, str], field: str) -> Decimal | None:
+    if not row[field].strip():
+        return None
+    return _required_finite_decimal(row, field)
+
+
+def _clear_cost_and_profit_fields(row: dict[str, str]) -> None:
+    row["avg_cost_price"] = ""
+    row["cost_value_hkd"] = ""
+    row["unrealized_pnl"] = ""
+    row["unrealized_pnl_pct"] = ""
 
 
 _ASSET_CLASS_PRIORITY = {

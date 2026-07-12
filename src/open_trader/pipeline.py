@@ -127,7 +127,8 @@ def run_import(
     portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
 
     latest_path = latest_dir / "portfolio.csv"
-    if {parser.broker for parser in parser_list} == {"eastmoney"} and latest_path.exists():
+    eastmoney_mode = {parser.broker for parser in parser_list} == {"eastmoney"}
+    if eastmoney_mode and latest_path.exists():
         with latest_path.open(newline="", encoding="utf-8") as handle:
             portfolio_rows = merge_eastmoney_portfolio_rows(
                 list(csv.DictReader(handle)), portfolio_rows
@@ -201,7 +202,11 @@ def run_import(
         run_dir=run_dir,
         portfolio_path=portfolio_path,
         latest_path=latest_path,
-        positions_count=len(positions),
+        positions_count=(
+            sum(row["asset_class"] != "cash" for row in portfolio_rows)
+            if eastmoney_mode
+            else len(positions)
+        ),
         cash_count=len(cash_balances),
         warnings_count=len(warnings),
     )

@@ -13,6 +13,7 @@ from open_trader.fx import StaticMonthEndFxProvider
 from open_trader.models import AssetClass, CashBalance, Market, Position, WarningRecord
 from open_trader.parsers.base import ParseResult
 from open_trader.pipeline import ImportResult, run_import
+from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 
 
 class FakeParser:
@@ -173,6 +174,36 @@ def test_run_import_can_leave_latest_untouched(tmp_path: Path) -> None:
 
     assert result.portfolio_path.exists()
     assert latest.read_text(encoding="utf-8") == "sentinel\n"
+
+
+def test_eastmoney_import_counts_all_combined_non_cash_holdings(tmp_path: Path) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    latest = tmp_path / "data" / "latest" / "portfolio.csv"
+    latest.parent.mkdir(parents=True)
+    existing = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    existing.update({
+        "sort_group": "2", "market": "US", "asset_class": "stock", "symbol": "AAPL",
+        "currency": "USD", "market_value": "100", "cost_value": "80", "fx_to_hkd": "7.8",
+        "brokers": "futu", "risk_flag": "normal",
+    })
+    with latest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
+        writer.writeheader()
+        writer.writerow(existing)
+
+    result = run_import(
+        month="2026-05",
+        statement_paths={"eastmoney": source},
+        parsers=[FakeParser(broker="eastmoney", position_currency="CNY")],
+        data_dir=tmp_path / "data",
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08"), "USD": Decimal("7.8")}
+        ),
+        update_latest=False,
+    )
+
+    assert result.positions_count == 2
 
 
 def test_run_import_does_not_write_run_dir_when_portfolio_build_fails(

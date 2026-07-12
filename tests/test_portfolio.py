@@ -12,7 +12,9 @@ def portfolio_row(**overrides: str) -> dict[str, str]:
     row = {field: "" for field in PORTFOLIO_FIELDNAMES}
     row.update({
         "sort_group": "2", "market": "US", "asset_class": "stock", "symbol": "AAPL",
-        "currency": "USD", "fx_to_hkd": "7.8", "market_value_hkd": "100.00", "portfolio_weight_hkd": "99.99%",
+        "currency": "USD", "market_value": "10", "cost_value": "8", "fx_to_hkd": "7.8",
+        "market_value_hkd": "100.00", "cost_value_hkd": "1.00", "unrealized_pnl": "999.00",
+        "unrealized_pnl_pct": "999.00%", "portfolio_weight_hkd": "99.99%",
         "brokers": "futu", "risk_flag": "normal",
     })
     row.update(overrides)
@@ -21,24 +23,28 @@ def portfolio_row(**overrides: str) -> dict[str, str]:
 
 def test_merge_eastmoney_rows_preserves_other_brokers_and_recalculates_weights() -> None:
     preserved = [
-        portfolio_row(symbol="AAPL", brokers="futu", market_value_hkd="100.00"),
-        portfolio_row(symbol="TSLA", brokers="tiger", market_value_hkd="200.00"),
-        portfolio_row(symbol="NVDA", brokers="phillips", market_value_hkd="300.00"),
-        portfolio_row(market="CASH", asset_class="cash", symbol="HKD_CASH", currency="HKD", brokers="futu", market_value_hkd="400.00"),
+        portfolio_row(symbol="AAPL", brokers="futu", market_value="10", cost_value="8"),
+        portfolio_row(symbol="TSLA", brokers="tiger", market_value="20", cost_value="10"),
+        portfolio_row(symbol="NVDA", brokers="phillips", market_value="30", cost_value="25"),
+        portfolio_row(market="CASH", asset_class="cash", symbol="HKD_CASH", currency="HKD", brokers="futu", market_value="400", fx_to_hkd="1", cost_value="", market_value_hkd="stale"),
         portfolio_row(market="CN", symbol="600519", currency="CNY", brokers="eastmoney", market_value_hkd="1.00"),
     ]
-    new = [portfolio_row(market="CN", symbol="000001", currency="CNY", brokers="eastmoney", market_value_hkd="1000.00")]
+    new = [portfolio_row(market="CN", symbol="000001", currency="CNY", brokers="eastmoney", market_value="1000", fx_to_hkd="1.08")]
 
     rows = portfolio.merge_eastmoney_portfolio_rows(preserved, new)
 
     assert list(rows[0]) == PORTFOLIO_FIELDNAMES
     assert {row["symbol"] for row in rows} == {"AAPL", "TSLA", "NVDA", "HKD_CASH", "000001"}
-    for original in preserved[:-1]:
-        merged = next(row for row in rows if row["symbol"] == original["symbol"])
-        assert {key: value for key, value in merged.items() if key != "portfolio_weight_hkd"} == {
-            key: value for key, value in original.items() if key != "portfolio_weight_hkd"
-        }
-    assert sum(Decimal(row["market_value_hkd"]) for row in rows) == Decimal("2000.00")
+    aapl = next(row for row in rows if row["symbol"] == "AAPL")
+    assert (aapl["market"], aapl["symbol"], aapl["brokers"]) == ("US", "AAPL", "futu")
+    assert aapl["market_value_hkd"] == "78.00"
+    assert aapl["cost_value_hkd"] == "62.40"
+    assert aapl["unrealized_pnl"] == "2.00"
+    assert aapl["unrealized_pnl_pct"] == "25.00%"
+    cash = next(row for row in rows if row["symbol"] == "HKD_CASH")
+    assert cash["market_value_hkd"] == "400.00"
+    assert cash["cost_value_hkd"] == cash["unrealized_pnl"] == cash["unrealized_pnl_pct"] == ""
+    assert sum(Decimal(row["market_value_hkd"]) for row in rows) == Decimal("1948.00")
     assert sum(Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in rows) == Decimal("100.00")
 
 
@@ -55,6 +61,34 @@ def test_merge_eastmoney_weights_keep_two_decimal_total_at_one_hundred_percent()
     assert sum(Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in rows) == Decimal("100.00")
 
 
+def test_merge_eastmoney_clears_missing_cost_derived_values_and_marks_data_check() -> None:
+    row = portfolio_row(
+        cost_value="",
+        avg_cost_price="stale",
+        cost_value_hkd="stale",
+        unrealized_pnl="stale",
+        unrealized_pnl_pct="stale",
+    )
+    merged = portfolio.merge_eastmoney_portfolio_rows([row], [])[0]
+    assert (
+        merged["avg_cost_price"]
+        == merged["cost_value_hkd"]
+        == merged["unrealized_pnl"]
+        == merged["unrealized_pnl_pct"]
+        == ""
+    )
+    assert merged["risk_flag"] == "data_check"
+
+
+@pytest.mark.parametrize("market_values", [("0", "0"), ("-2", "1")])
+def test_merge_eastmoney_rejects_non_positive_combined_total(market_values: tuple[str, str]) -> None:
+    with pytest.raises(ValueError, match="combined HKD total"):
+        portfolio.merge_eastmoney_portfolio_rows(
+            [portfolio_row(symbol="A", market_value=market_values[0], fx_to_hkd="1")],
+            [portfolio_row(symbol="B", brokers="eastmoney", market_value=market_values[1], fx_to_hkd="1")],
+        )
+
+
 def test_merge_eastmoney_rows_rejects_preserved_new_identity_collision() -> None:
     with pytest.raises(ValueError, match="identity collision"):
         portfolio.merge_eastmoney_portfolio_rows(
@@ -64,9 +98,9 @@ def test_merge_eastmoney_rows_rejects_preserved_new_identity_collision() -> None
 
 
 @pytest.mark.parametrize("value", ["", "NaN", "Infinity"])
-def test_merge_eastmoney_rows_rejects_invalid_hkd_values(value: str) -> None:
-    with pytest.raises(ValueError, match="market_value_hkd"):
-        portfolio.merge_eastmoney_portfolio_rows([portfolio_row(market_value_hkd=value)], [])
+def test_merge_eastmoney_rows_rejects_invalid_market_values(value: str) -> None:
+    with pytest.raises(ValueError, match="market_value"):
+        portfolio.merge_eastmoney_portfolio_rows([portfolio_row(market_value=value)], [])
 
 
 def test_merge_eastmoney_rows_rejects_missing_non_hkd_fx() -> None:
