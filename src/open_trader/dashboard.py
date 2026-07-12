@@ -23,6 +23,7 @@ from .futu_skill_facts import (
     index_futu_skill_facts_by_market_symbol,
     load_futu_skill_facts_cache,
 )
+from .market_scope import MarketScope
 from .models import AssetClass
 from .parsers.base import detect_asset_class
 from .portfolio import PortfolioBuildError, recalculate_portfolio_weights
@@ -717,10 +718,11 @@ def _backtest_readiness_detail(
 
 
 def _markets_from_rows(rows: list[dict[str, str]]) -> set[str]:
+    scoped_markets = {market.value for market in MarketScope}
     markets: set[str] = set()
     for row in rows:
         market = row.get("market", "").strip().upper()
-        if market:
+        if market in scoped_markets:
             markets.add(market)
     return markets
 

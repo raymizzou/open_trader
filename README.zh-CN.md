@@ -414,6 +414,17 @@ curl -sS http://127.0.0.1:8766/api/dashboard | head -c 500
 ps aux | rg 'open_trader dashboard'
 ```
 
+Dashboard 行为改动部署后必须运行统一验收门：
+
+```bash
+make acceptance
+```
+
+它会运行全量测试，并检查真实 API 数据、两个后台刷新周期、运行目录与
+Git SHA、错误日志，以及系统 Chrome 中的桌面和移动端 `A 股` / `东方财富`
+筛选流程。只有 `PASS` 可以标记为完成；`FAIL` 必须修复，浏览器不可用则
+返回 `BLOCKED`，不能用 curl 或单元测试替代。
+
 也可以用结构化检查确认 API 和 SOXX 决策事实是否存在：
 
 ```bash

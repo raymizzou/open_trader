@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import argparse
+from decimal import Decimal, InvalidOperation
+import json
+from pathlib import Path
+import subprocess
+import time
+from typing import Any
+from urllib.request import urlopen
+
+
+def validate_dashboard_payload(payload: dict[str, Any], *, expected_cn: int) -> list[str]:
+    errors: list[str] = []
+    holdings = payload.get("holdings") or []
+    cash_rows = payload.get("cash_rows") or []
+    cn_rows = [row for row in holdings if row.get("market") == "CN"]
+    if len(cn_rows) != expected_cn:
+        errors.append(f"A 股持仓数量不是 {expected_cn}：{len(cn_rows)}")
+
+    universe = (payload.get("backtest_universe") or {}).get("holdings") or []
+    cn_universe = [row for row in universe if row.get("market") == "CN"]
+    if len(cn_universe) != expected_cn:
+        errors.append(f"A 股回测标的数量不是 {expected_cn}：{len(cn_universe)}")
+
+    try:
+        total = sum(
+            (Decimal(str(row["portfolio_weight_hkd"]).rstrip("%")) for row in [*holdings, *cash_rows]),
+            Decimal("0"),
+        )
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        errors.append("组合权重包含无效值")
+    else:
+        if total != Decimal("100.00"):
+            errors.append(f"组合权重合计不是 100.00%：{total}%")
+    return errors
+
+
+def classify_result(errors: list[str], *, browser_blocker: str | None) -> str:
+    if errors:
+        return "FAIL"
+    return "BLOCKED" if browser_blocker else "PASS"
+
+
+def dashboard_signature(payload: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
+    fields = ("market", "symbol", "market_value_hkd", "portfolio_weight_hkd", "brokers")
+    rows = [*(payload.get("holdings") or []), *(payload.get("cash_rows") or [])]
+    return tuple(sorted(tuple(str(row.get(field, "")) for field in fields) for row in rows))
+
+
+def _fetch_payload(url: str) -> dict[str, Any]:
+    with urlopen(f"{url.rstrip('/')}/api/dashboard", timeout=15) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Dashboard API HTTP {response.status}")
+        return json.load(response)
+
+
+def _listener(url: str) -> tuple[int, Path]:
+    port = url.rsplit(":", 1)[-1].rstrip("/")
+    pid_text = subprocess.check_output(
+        ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"], text=True
+    ).strip().splitlines()
+    if len(pid_text) != 1:
+        raise RuntimeError(f"端口 {port} 没有唯一监听进程")
+    pid = int(pid_text[0])
+    output = subprocess.check_output(
+        ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], text=True
+    )
+    cwd_line = next((line for line in output.splitlines() if line.startswith("n")), "")
+    if not cwd_line:
+        raise RuntimeError("无法读取 Dashboard 进程工作目录")
+    return pid, Path(cwd_line[1:]).resolve()
+
+
+def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return [], "Playwright 未安装"
+    errors: list[str] = []
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+            for name, viewport in (
+                ("desktop", {"width": 1440, "height": 1000}),
+                ("mobile", {"width": 390, "height": 844}),
+            ):
+                page = browser.new_page(viewport=viewport)
+                browser_errors: list[str] = []
+                page.on("console", lambda message: browser_errors.append(message.text) if message.type == "error" else None)
+                page.on("pageerror", lambda error: browser_errors.append(str(error)))
+                page.on("response", lambda response: browser_errors.append(
+                    f"HTTP {response.status} {response.url}"
+                ) if response.status >= 400 else None)
+                page.goto(url, wait_until="networkidle")
+                if "看板数据加载失败" in page.locator("body").inner_text():
+                    errors.append(f"{name}：页面显示看板数据加载失败")
+                page.locator('[data-market="CN"]').first.click()
+                page.locator('[data-broker="eastmoney"]').click()
+                page.wait_for_timeout(500)
+                if page.locator("#visible-count").inner_text().strip() != f"{expected_cn} 条":
+                    errors.append(f"{name}：A 股东方财富筛选不是 {expected_cn} 条")
+                errors.extend(f"{name}：浏览器错误：{message}" for message in browser_errors)
+                page.close()
+            browser.close()
+    except Exception as exc:
+        return errors, f"浏览器不可用：{type(exc).__name__}: {exc}"
+    return errors, None
+
+
+def _log_errors(path: Path) -> list[str]:
+    if not path.exists():
+        return [f"日志不存在：{path}"]
+    text = path.read_text(encoding="utf-8", errors="replace")
+    markers = ("Traceback (most recent call last)", "看板数据加载失败")
+    return [f"日志包含错误标记：{marker}" for marker in markers if marker in text]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", default="http://127.0.0.1:8766")
+    parser.add_argument("--expected-cn", type=int, default=5)
+    parser.add_argument("--expected-root", type=Path, default=Path.cwd())
+    parser.add_argument("--expected-sha")
+    parser.add_argument("--log", type=Path, default=Path("/tmp/open_trader_dashboard_8766.log"))
+    parser.add_argument("--wait-seconds", type=float, default=125)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    errors: list[str] = []
+    try:
+        pid, cwd = _listener(args.url)
+        if cwd != args.expected_root.resolve():
+            errors.append(f"运行目录不匹配：{cwd}")
+        running_sha = subprocess.check_output(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"], text=True
+        ).strip()
+        expected_sha = args.expected_sha or subprocess.check_output(
+            ["git", "-C", str(args.expected_root), "rev-parse", "HEAD"], text=True
+        ).strip()
+        if running_sha != expected_sha:
+            errors.append(f"运行 Git SHA 不匹配：{running_sha[:7]} != {expected_sha[:7]}")
+        first = _fetch_payload(args.url)
+        errors.extend(validate_dashboard_payload(first, expected_cn=args.expected_cn))
+        if not errors and args.wait_seconds:
+            time.sleep(args.wait_seconds)
+        second = _fetch_payload(args.url)
+        errors.extend(validate_dashboard_payload(second, expected_cn=args.expected_cn))
+        if dashboard_signature(first) != dashboard_signature(second):
+            errors.append("两个刷新周期后的 Dashboard 数据不稳定")
+        errors.extend(_log_errors(args.log))
+    except Exception as exc:
+        errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
+        pid = None
+    browser_errors, blocker = _browser_check(args.url, args.expected_cn)
+    errors.extend(browser_errors)
+    status = classify_result(errors, browser_blocker=blocker)
+    print(json.dumps({"status": status, "pid": pid, "errors": errors, "blocker": blocker}, ensure_ascii=False))
+    return {"PASS": 0, "FAIL": 1, "BLOCKED": 2}[status]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -19,3 +19,17 @@ Before reporting that the change is done:
 
 Do not describe a change as fully verified if only tests were run and the live
 background process was not checked.
+
+## Dashboard Definition of Done
+
+Run `make acceptance` after every Dashboard behavior change. Its result is the
+only completion status:
+
+- `PASS`: automated tests, real API/data, two refresh cycles, process version,
+  logs, and desktop/mobile browser flows all passed.
+- `FAIL`: a page, data, process, log, or test check failed.
+- `BLOCKED`: the required browser or external environment is unavailable.
+
+Only `PASS` may be described as complete, deployed successfully, or accepted.
+`FAIL` must be fixed. `BLOCKED` must be reported as blocked and must not be
+substituted with curl, fixtures, mocks, screenshots, or unit tests.

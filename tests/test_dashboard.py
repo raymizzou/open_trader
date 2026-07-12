@@ -314,6 +314,31 @@ def test_dashboard_backtest_universe_combines_holdings_and_watchlist(tmp_path: P
     ]
 
 
+def test_dashboard_keeps_other_holdings_out_of_scoped_market_loaders(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    rows: list[dict[str, str]] = []
+    for market, symbol in [("US", "MSFT"), ("OTHER", "PRIVATE")]:
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update({
+            "market": market,
+            "symbol": symbol,
+            "asset_class": "stock",
+            "currency": "HKD",
+            "market_value": "100",
+            "market_value_hkd": "100",
+            "portfolio_weight_hkd": "50.00%",
+        })
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+
+    payload = load_dashboard_state(config).to_dict()
+
+    assert {(row["market"], row["symbol"]) for row in payload["holdings"]} == {
+        ("US", "MSFT"),
+        ("OTHER", "PRIVATE"),
+    }
+
+
 def test_dashboard_backtest_universe_rejects_unsafe_and_option_symbols(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     rows = []

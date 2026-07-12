@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-12
 
+- Added a mandatory `make acceptance` Dashboard gate with PASS/FAIL/BLOCKED
+  results across tests, real data, refresh stability, process version, logs,
+  and desktop/mobile Chrome flows; fixed OTHER holdings breaking Dashboard loads.
 - Added password-prompted Eastmoney A-share statement imports using an explicit
   month-end CNY/HKD rate, plus AKShare daily prices for standard-strategy research.
 - Kept the Dashboard holdings layout unchanged while adding the existing A-share
