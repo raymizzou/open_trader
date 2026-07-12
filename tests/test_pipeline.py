@@ -695,6 +695,7 @@ def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[s
     assert "--usd-hkd" in output
     assert "--phillips" in output
     assert "--eastmoney" in output
+    assert "--config" in output
     assert "--cny-hkd" in output
     assert "--fx-date" in output
     assert "--update-latest" in output
@@ -706,17 +707,36 @@ def test_import_statements_requires_a_statement(capsys: pytest.CaptureFixture[st
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["import-statements", "--month", "2026-07"])
     assert exc_info.value.code == 2
-    assert "one of the arguments" in capsys.readouterr().err
+    assert "OPEN_TRADER_EASTMONEY_STATEMENT" in capsys.readouterr().err
 
 
-def test_import_statements_rejects_both_statement_types(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main([
-            "import-statements", "--month", "2026-07", "--eastmoney", "eastmoney.pdf",
-            "--cny-hkd", "1.08", "--phillips", "phillips.pdf", "--usd-hkd", "7.8",
-        ])
-    assert exc_info.value.code == 2
-    assert "not allowed with" in capsys.readouterr().err
+def test_cli_imports_phillips_and_eastmoney_together(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    eastmoney_path = tmp_path / "eastmoney.pdf"
+    eastmoney_path.write_bytes(b"fake pdf contents")
+    captured: dict[str, object] = {}
+
+    def fake_run_import(**kwargs: object) -> ImportResult:
+        captured.update(kwargs)
+        return ImportResult(tmp_path, tmp_path / "portfolio.csv", tmp_path / "latest.csv", 1, 0, 0)
+
+    monkeypatch.setattr(cli, "getpass", lambda _: "test-password")
+    monkeypatch.setattr(cli, "run_import", fake_run_import)
+
+    assert cli.main([
+        "import-statements", "--month", "2026-07", "--phillips", "phillips.pdf",
+        "--usd-hkd", "7.8", "--eastmoney", str(eastmoney_path), "--cny-hkd", "1.08",
+    ]) == 0
+
+    assert captured["statement_paths"] == {
+        "phillips": Path("phillips.pdf"),
+        "eastmoney": eastmoney_path,
+    }
+    assert [parser.broker for parser in captured["parsers"]] == ["phillips", "eastmoney"]
+    assert captured["fx_provider"].get_rate_to_hkd("USD").rate == Decimal("7.8")
+    assert captured["fx_provider"].get_rate_to_hkd("CNY").rate == Decimal("1.08")
 
 
 @pytest.mark.parametrize(
@@ -737,6 +757,8 @@ def test_cli_imports_only_eastmoney_and_prompts_password(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    statement = tmp_path / "statement.pdf"
+    statement.write_bytes(b"fake pdf contents")
     captured: dict[str, object] = {}
 
     def fake_run_import(**kwargs: object) -> ImportResult:
@@ -746,17 +768,154 @@ def test_cli_imports_only_eastmoney_and_prompts_password(
     monkeypatch.setattr(cli, "getpass", lambda _: "secret")
     monkeypatch.setattr(cli, "run_import", fake_run_import)
     assert cli.main([
-        "import-statements", "--month", "2026-07", "--eastmoney", "statement.pdf",
+        "import-statements", "--month", "2026-07", "--eastmoney", str(statement),
         "--cny-hkd", "1.08", "--fx-date", "2026-06-30",
         "--data-dir", str(tmp_path), "--update-latest",
     ]) == 0
 
-    assert captured["statement_paths"] == {"eastmoney": Path("statement.pdf")}
+    assert captured["statement_paths"] == {"eastmoney": statement}
     assert [parser.broker for parser in captured["parsers"]] == ["eastmoney"]
     assert captured["fx_provider"].get_rate_to_hkd("CNY").rate == Decimal("1.08")
     assert captured["fx_provider"].get_rate_to_hkd("CNY").fx_date == "2026-06-30"
     assert captured["update_latest"] is True
     assert "secret" not in capsys.readouterr().out
+
+
+def test_cli_imports_eastmoney_path_and_password_from_local_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    statement = tmp_path / "statement.pdf"
+    statement.write_bytes(b"fake pdf contents")
+    config = tmp_path / "daily.env"
+    password = "test-password"
+    config.write_text(
+        f"OPEN_TRADER_EASTMONEY_STATEMENT={statement}\n"
+        f"OPEN_TRADER_EASTMONEY_PDF_PASSWORD={password}\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_import(**kwargs: object) -> ImportResult:
+        captured.update(kwargs)
+        return ImportResult(tmp_path, tmp_path / "portfolio.csv", tmp_path / "latest.csv", 1, 0, 0)
+
+    def fake_eastmoney_parser(value: str) -> object:
+        captured["password"] = value
+        return type("FakeEastmoneyParser", (), {"broker": "eastmoney"})()
+
+    monkeypatch.setattr(cli, "getpass", lambda _: pytest.fail("getpass should not be called"))
+    monkeypatch.setattr(cli, "EastmoneyStatementParser", fake_eastmoney_parser)
+    monkeypatch.setattr(cli, "run_import", fake_run_import)
+
+    assert cli.main([
+        "import-statements", "--month", "2026-07", "--config", str(config), "--cny-hkd", "1.08",
+    ]) == 0
+
+    assert captured["statement_paths"] == {"eastmoney": statement}
+    assert captured["password"] == password
+
+
+def test_cli_explicit_eastmoney_path_overrides_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    statement = tmp_path / "explicit.pdf"
+    statement.write_bytes(b"fake pdf contents")
+    config = tmp_path / "daily.env"
+    password = "test-password"
+    config.write_text(
+        "OPEN_TRADER_EASTMONEY_STATEMENT=/missing/configured.pdf\n"
+        f"OPEN_TRADER_EASTMONEY_PDF_PASSWORD={password}\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_import(**kwargs: object) -> ImportResult:
+        captured.update(kwargs)
+        return ImportResult(tmp_path, tmp_path / "portfolio.csv", tmp_path / "latest.csv", 1, 0, 0)
+
+    def fake_eastmoney_parser(value: str) -> object:
+        captured["password"] = value
+        return type("FakeEastmoneyParser", (), {"broker": "eastmoney"})()
+
+    monkeypatch.setattr(cli, "getpass", lambda _: pytest.fail("getpass should not be called"))
+    monkeypatch.setattr(cli, "EastmoneyStatementParser", fake_eastmoney_parser)
+    monkeypatch.setattr(cli, "run_import", fake_run_import)
+
+    assert cli.main([
+        "import-statements", "--month", "2026-07", "--config", str(config),
+        "--eastmoney", str(statement), "--cny-hkd", "1.08",
+    ]) == 0
+
+    assert captured["statement_paths"] == {"eastmoney": statement}
+    assert captured["password"] == password
+
+
+def test_cli_prompts_when_config_password_is_blank(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    statement = tmp_path / "statement.pdf"
+    statement.write_bytes(b"fake pdf contents")
+    config = tmp_path / "daily.env"
+    config.write_text(
+        f"OPEN_TRADER_EASTMONEY_STATEMENT={statement}\n"
+        "OPEN_TRADER_EASTMONEY_PDF_PASSWORD=   \n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_import(**kwargs: object) -> ImportResult:
+        captured.update(kwargs)
+        return ImportResult(tmp_path, tmp_path / "portfolio.csv", tmp_path / "latest.csv", 1, 0, 0)
+
+    def fake_eastmoney_parser(value: str) -> object:
+        captured["password"] = value
+        return type("FakeEastmoneyParser", (), {"broker": "eastmoney"})()
+
+    monkeypatch.setattr(cli, "getpass", lambda _: "prompted-password")
+    monkeypatch.setattr(cli, "EastmoneyStatementParser", fake_eastmoney_parser)
+    monkeypatch.setattr(cli, "run_import", fake_run_import)
+
+    assert cli.main([
+        "import-statements", "--month", "2026-07", "--config", str(config), "--cny-hkd", "1.08",
+    ]) == 0
+
+    assert captured["password"] == "prompted-password"
+
+
+def test_cli_rejects_missing_configured_statement_without_leaking_password(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing_path = tmp_path / "missing.pdf"
+    config = tmp_path / "daily.env"
+    password = "test-password"
+    config.write_text(
+        f"OPEN_TRADER_EASTMONEY_STATEMENT={missing_path}\n"
+        f"OPEN_TRADER_EASTMONEY_PDF_PASSWORD={password}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main([
+            "import-statements", "--month", "2026-07", "--config", str(config), "--cny-hkd", "1.08",
+        ])
+
+    assert exc_info.value.code == 2
+    error = capsys.readouterr().err
+    assert str(missing_path) in error
+    assert password not in error
+
+
+def test_daily_premarket_env_example_has_empty_eastmoney_placeholders() -> None:
+    values = (Path(__file__).parents[1] / "config/daily_premarket.env.example").read_text(
+        encoding="utf-8"
+    ).splitlines()
+
+    assert "OPEN_TRADER_EASTMONEY_STATEMENT=" in values
+    assert "OPEN_TRADER_EASTMONEY_PDF_PASSWORD=" in values
 
 
 @pytest.mark.parametrize("month", ["2026-5", "2026-00", "2026-13", "26-05"])

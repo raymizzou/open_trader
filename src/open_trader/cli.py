@@ -19,6 +19,7 @@ from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
 from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
+    _read_env_file,
     build_notifier,
     load_env_config,
     refresh_live_portfolio,
@@ -198,6 +199,18 @@ def _parse_symbol_set(value: str | None) -> set[str]:
     return _parse_symbol_subset(value) or set()
 
 
+def _load_optional_env_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    return _read_env_file(path)
+
+
+def _optional_path(value: str | None) -> Path | None:
+    if value is None or not value.strip():
+        return None
+    return Path(value.strip()).expanduser()
+
+
 def _load_optional_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -301,9 +314,13 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Statement month, YYYY-MM",
     )
-    statement_group = import_parser.add_mutually_exclusive_group(required=True)
-    statement_group.add_argument("--phillips", type=Path)
-    statement_group.add_argument("--eastmoney", type=Path)
+    import_parser.add_argument("--phillips", type=Path)
+    import_parser.add_argument("--eastmoney", type=Path)
+    import_parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/daily_premarket.env"),
+    )
     import_parser.add_argument("--data-dir", type=Path, default=Path("data"))
     import_parser.add_argument(
         "--usd-hkd",
@@ -1100,16 +1117,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "import-statements":
         if args.phillips is not None and args.usd_hkd is None:
             parser.error("--phillips requires --usd-hkd")
-        if args.eastmoney is not None and args.cny_hkd is None:
+        config_values = _load_optional_env_values(args.config)
+        eastmoney_path = args.eastmoney or (
+            None
+            if args.phillips is not None
+            else _optional_path(config_values.get("OPEN_TRADER_EASTMONEY_STATEMENT"))
+        )
+        if eastmoney_path is not None and args.cny_hkd is None:
             parser.error("--eastmoney requires --cny-hkd")
-        if args.eastmoney is not None:
-            statement_paths = {"eastmoney": args.eastmoney}
-            parsers = [EastmoneyStatementParser(getpass("东方财富对账单密码: "))]
-            rates = {"CNY": args.cny_hkd}
-        else:
-            statement_paths = {"phillips": args.phillips}
-            parsers = [PhillipsStatementParser()]
-            rates = {"USD": args.usd_hkd}
+        if eastmoney_path is not None and not eastmoney_path.is_file():
+            parser.error(f"Eastmoney statement file does not exist: {eastmoney_path}")
+        if args.phillips is None and eastmoney_path is None:
+            parser.error(
+                "provide --phillips, --eastmoney, or "
+                "OPEN_TRADER_EASTMONEY_STATEMENT in --config"
+            )
+
+        statement_paths: dict[str, Path] = {}
+        parsers = []
+        rates: dict[str, Decimal] = {}
+        if args.phillips is not None:
+            statement_paths["phillips"] = args.phillips
+            parsers.append(PhillipsStatementParser())
+            rates["USD"] = args.usd_hkd
+        if eastmoney_path is not None:
+            eastmoney_password = (
+                config_values.get("OPEN_TRADER_EASTMONEY_PDF_PASSWORD", "").strip()
+                or getpass("东方财富对账单密码: ")
+            )
+            statement_paths["eastmoney"] = eastmoney_path
+            parsers.append(EastmoneyStatementParser(eastmoney_password))
+            rates["CNY"] = args.cny_hkd
         result = run_import(
             month=args.month,
             statement_paths=statement_paths,
