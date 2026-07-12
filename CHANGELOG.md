@@ -11,7 +11,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   and Tiger refreshes converting preserved CN rows to OTHER. The gate now also
   checks the full 33-row portfolio, seven Phillips-linked rows, and the exact
   Eastmoney statement total; live broker refreshes fail closed and restore the
-  prior CSV if they would remove another broker's holdings.
+  prior CSV if they would remove another broker's holdings. Browser verification
+  ignores Chrome's unattributed favicon 404 while still failing every observed
+  business API or page-resource HTTP error.
 - Added password-prompted Eastmoney A-share statement imports using an explicit
   month-end CNY/HKD rate, plus AKShare daily prices for standard-strategy research.
 - Kept the Dashboard holdings layout unchanged while adding the existing A-share

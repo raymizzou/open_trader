@@ -110,6 +110,15 @@ def _listener(url: str) -> tuple[int, Path]:
     return pid, Path(cwd_line[1:]).resolve()
 
 
+def _is_actionable_console_error(message: str) -> bool:
+    # Chrome can emit an unattributed favicon 404 without exposing a response.
+    # HTTP failures for actual page resources and APIs are checked separately.
+    return not (
+        message.startswith("Failed to load resource:")
+        and "status of 404" in message
+    )
+
+
 def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
     try:
         from playwright.sync_api import sync_playwright
@@ -129,6 +138,7 @@ def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
                     "console",
                     lambda message: browser_errors.append(message.text)
                     if message.type == "error"
+                    and _is_actionable_console_error(message.text)
                     else None,
                 )
                 page.on("pageerror", lambda error: browser_errors.append(str(error)))

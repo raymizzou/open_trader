@@ -1,10 +1,18 @@
 from decimal import Decimal
 
 from open_trader.dashboard_acceptance import (
+    _is_actionable_console_error,
     classify_result,
     dashboard_signature,
     validate_dashboard_payload,
 )
+
+
+def test_browser_ignores_chrome_unattributed_404_but_not_app_errors() -> None:
+    assert not _is_actionable_console_error(
+        "Failed to load resource: the server responded with a status of 404 (Not Found)"
+    )
+    assert _is_actionable_console_error("Uncaught TypeError: failed")
 
 
 def valid_payload() -> dict[str, object]:
