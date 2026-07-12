@@ -7,6 +7,7 @@ from pathlib import Path
 class MarketScope(StrEnum):
     HK = "HK"
     US = "US"
+    CN = "CN"
 
 
 def parse_market_scope(value: str) -> MarketScope:
@@ -14,7 +15,7 @@ def parse_market_scope(value: str) -> MarketScope:
     try:
         return MarketScope(normalized)
     except ValueError as exc:
-        raise ValueError("market must be one of: HK, US") from exc
+        raise ValueError("market must be one of: HK, US, CN") from exc
 
 
 def market_run_dir(data_dir: Path, run_date: str, market: MarketScope) -> Path:

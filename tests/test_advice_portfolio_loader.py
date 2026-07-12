@@ -196,8 +196,8 @@ def test_load_eligible_portfolio_rows_rejects_invalid_market(tmp_path: Path) -> 
         ],
     )
 
-    with pytest.raises(ValueError, match="market must be one of: HK, US"):
-        load_eligible_portfolio_rows(path, market="CN")
+    with pytest.raises(ValueError, match="market must be one of: HK, US, CN"):
+        load_eligible_portfolio_rows(path, market="JP")
 
 
 def test_load_eligible_portfolio_rows_rejects_blank_market(tmp_path: Path) -> None:
@@ -218,7 +218,7 @@ def test_load_eligible_portfolio_rows_rejects_blank_market(tmp_path: Path) -> No
         ],
     )
 
-    with pytest.raises(ValueError, match="market must be one of: HK, US"):
+    with pytest.raises(ValueError, match="market must be one of: HK, US, CN"):
         load_eligible_portfolio_rows(path, market="")
 
 

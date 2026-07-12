@@ -611,7 +611,7 @@ def test_run_premarket_rejects_invalid_market_scope(tmp_path: Path) -> None:
         ],
     )
 
-    with pytest.raises(ValueError, match="^market must be one of: HK, US$"):
+    with pytest.raises(ValueError, match="^market must be one of: HK, US, CN$"):
         run_premarket(
             run_date="2026-06-19",
             portfolio_path=portfolio,
@@ -619,7 +619,7 @@ def test_run_premarket_rejects_invalid_market_scope(tmp_path: Path) -> None:
             reports_dir=tmp_path / "reports",
             advice_runner=FakeAdviceRunner(),
             classifier=FakeClassifier(),
-            market="CN",
+            market="JP",
             update_latest=True,
             max_workers=1,
         )

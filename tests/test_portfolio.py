@@ -478,8 +478,8 @@ def test_build_portfolio_rows_sorts_by_group_then_market_value_hkd_desc():
         "0700": "1",
         "MSFT": "2",
         "BABA": "4",
-        "FUNDX": "5",
-        "USD_CASH": "6",
+        "FUNDX": "6",
+        "USD_CASH": "7",
     }
 
 
@@ -561,6 +561,28 @@ def test_hk_stock_and_etf_are_ai_eligible() -> None:
     assert tencent["analysis_symbol"] == "00700"
     assert tracker["ai_eligible"] == "true"
     assert tracker["analysis_symbol"] == "02800"
+
+
+def test_cn_stock_is_strategy_eligible() -> None:
+    cn_position = position(
+        "eastmoney",
+        "600025",
+        "6000",
+        "53346",
+        "57720",
+        market=Market.CN,
+        asset_class=AssetClass.STOCK,
+        currency="CNY",
+    )
+    rows = build_portfolio_rows(
+        "2026-07",
+        [cn_position],
+        [],
+        StaticMonthEndFxProvider("2026-07", {"CNY": Decimal("1.08")}),
+    )
+    assert rows[0]["market"] == "CN"
+    assert rows[0]["ai_eligible"] == "true"
+    assert rows[0]["analysis_symbol"] == "600025"
 
 
 def test_hk_money_market_fund_stays_ai_ineligible() -> None:

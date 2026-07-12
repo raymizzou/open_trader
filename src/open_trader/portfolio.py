@@ -68,16 +68,19 @@ def _sort_group(market: Market, asset_class: AssetClass, ai_eligible: bool) -> i
         return 3
     if market == Market.US:
         return 4
+    if market == Market.CN:
+        return 5
     if market == Market.CASH:
-        return 6
-    return 5
+        return 7
+    return 6
 
 
 def _ai_eligible(position: Position) -> bool:
-    return position.market in {Market.US, Market.HK} and position.asset_class in {
-        AssetClass.STOCK,
-        AssetClass.ETF,
-    }
+    return position.market in {
+        Market.US,
+        Market.HK,
+        Market.CN,
+    } and position.asset_class in {AssetClass.STOCK, AssetClass.ETF}
 
 
 def _merged_confidence(confidences: Iterable[str]) -> str:

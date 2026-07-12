@@ -16,11 +16,15 @@ def test_parse_market_scope_accepts_us_and_hk_case_insensitively() -> None:
     assert parse_market_scope("HK") is MarketScope.HK
 
 
+def test_parse_cn_market_scope() -> None:
+    assert parse_market_scope("cn") is MarketScope.CN
+
+
 def test_parse_market_scope_rejects_blank_or_unknown_values() -> None:
-    with pytest.raises(ValueError, match="market must be one of: HK, US"):
+    with pytest.raises(ValueError, match="market must be one of: HK, US, CN"):
         parse_market_scope("")
-    with pytest.raises(ValueError, match="market must be one of: HK, US"):
-        parse_market_scope("CN")
+    with pytest.raises(ValueError, match="market must be one of: HK, US, CN"):
+        parse_market_scope("JP")
 
 
 def test_market_scoped_paths_are_separate_from_legacy_latest() -> None:

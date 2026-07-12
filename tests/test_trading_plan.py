@@ -216,7 +216,7 @@ def test_build_trading_plan_writes_market_scoped_hk_paths(tmp_path: Path) -> Non
     assert rows[0].futu_symbol == "HK.00700"
 
 
-@pytest.mark.parametrize("market", ["CN", "../HK", ""])
+@pytest.mark.parametrize("market", ["JP", "../HK", ""])
 def test_build_trading_plan_rejects_invalid_market_before_writing(
     tmp_path: Path,
     market: str,
@@ -238,7 +238,7 @@ def test_build_trading_plan_rejects_invalid_market_before_writing(
         ],
     )
 
-    with pytest.raises(ValueError, match="market must be one of: HK, US"):
+    with pytest.raises(ValueError, match="market must be one of: HK, US, CN"):
         build_trading_plan(
             advice,
             data_dir,

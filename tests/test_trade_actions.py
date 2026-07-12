@@ -2014,7 +2014,7 @@ def test_generate_trade_actions_writes_market_scoped_hk_paths_and_uses_hkd_cash(
     assert rows[0]["cash_available"] == "10000"
 
 
-@pytest.mark.parametrize("market", ["CN", "../HK", ""])
+@pytest.mark.parametrize("market", ["JP", "../HK", ""])
 def test_generate_trade_actions_rejects_invalid_market_before_writing(
     tmp_path: Path,
     valid_portfolio_path: Path,
@@ -2025,7 +2025,7 @@ def test_generate_trade_actions_rejects_invalid_market_before_writing(
     reports_dir = tmp_path / "reports"
     write_trading_plan(plan_path, [msft_plan_row()])
 
-    with pytest.raises(ValueError, match="market must be one of: HK, US"):
+    with pytest.raises(ValueError, match="market must be one of: HK, US, CN"):
         generate_trade_actions(
             plan_path=plan_path,
             portfolio_path=valid_portfolio_path,
