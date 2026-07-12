@@ -2565,6 +2565,45 @@ def test_load_dashboard_state_prefers_latest_daily_sync_details(
     assert vixy["broker_details"][0]["quantity"] == "100"
 
 
+def test_load_dashboard_state_keeps_latest_details_for_each_broker(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    base = {
+        "account_alias": "main",
+        "market": "HK",
+        "asset_class": "stock",
+        "symbol": "00001",
+        "name": "Holding",
+        "currency": "HKD",
+        "quantity": "1",
+        "cost_price": "",
+        "last_price": "100",
+        "market_value": "100",
+        "cost_value": "",
+        "unrealized_pnl": "",
+        "confidence": "high",
+        "notes": "",
+    }
+    write_csv(
+        config.data_dir / "runs" / "2026-06" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [{**base, "statement_id": "2026-06-phillips", "broker": "phillips"}],
+    )
+    write_csv(
+        config.data_dir / "runs" / "2026-07" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [{**base, "statement_id": "2026-07-eastmoney", "broker": "eastmoney"}],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+    summaries = {row["broker"]: row for row in state["broker_summaries"]}
+
+    assert summaries["phillips"]["portfolio_value_hkd"] == "100.00"
+    assert summaries["eastmoney"]["portfolio_value_hkd"] == "100.00"
+
+
 def test_load_dashboard_state_builds_broker_summaries_from_detail_rows(
     tmp_path: Path,
 ) -> None:

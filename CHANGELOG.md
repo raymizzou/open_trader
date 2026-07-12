@@ -14,6 +14,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   prior CSV if they would remove another broker's holdings. Browser verification
   ignores Chrome's unattributed favicon 404 while still failing every observed
   business API or page-resource HTTP error.
+- Fixed newer single-broker imports hiding older brokers' account details by
+  loading the latest detail snapshot per broker; acceptance now rejects an
+  empty Phillips account card in both the API payload and rendered page.
 - Added password-prompted Eastmoney A-share statement imports using an explicit
   month-end CNY/HKD rate, plus AKShare daily prices for standard-strategy research.
 - Kept the Dashboard holdings layout unchanged while adding the existing A-share

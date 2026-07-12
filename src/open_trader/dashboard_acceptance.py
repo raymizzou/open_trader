@@ -30,6 +30,22 @@ def validate_dashboard_payload(
             errors.append(
                 f"辉立关联持仓行数不是 {expected_phillips_rows}：{phillips_rows}"
             )
+        phillips_summary = next(
+            (
+                row
+                for row in payload.get("broker_summaries") or []
+                if row.get("broker") == "phillips"
+            ),
+            {},
+        )
+        try:
+            phillips_value = Decimal(
+                str(phillips_summary.get("portfolio_value_hkd", ""))
+            )
+        except InvalidOperation:
+            phillips_value = Decimal("0")
+        if not phillips_summary.get("detail_available") or phillips_value <= 0:
+            errors.append("辉立账户卡没有可用月结单资产")
     cn_rows = [row for row in holdings if row.get("market") == "CN"]
     if len(cn_rows) != expected_cn:
         errors.append(f"A 股持仓数量不是 {expected_cn}：{len(cn_rows)}")
@@ -148,6 +164,11 @@ def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
                 page.goto(url, wait_until="networkidle")
                 if "看板数据加载失败" in page.locator("body").inner_text():
                     errors.append(f"{name}：页面显示看板数据加载失败")
+                phillips_card = page.locator(
+                    '#broker-summary-cards [data-broker="phillips"]'
+                )
+                if phillips_card.locator("strong").inner_text().strip() in {"", "-"}:
+                    errors.append(f"{name}：辉立账户卡没有显示资产")
                 page.locator('[data-market="CN"]').first.click()
                 page.locator('button[data-broker="eastmoney"]').click()
                 page.wait_for_timeout(500)

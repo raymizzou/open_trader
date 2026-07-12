@@ -76,6 +76,22 @@ def test_validate_dashboard_payload_checks_full_portfolio_preservation() -> None
     assert "辉立关联持仓行数不是 7：1" in errors
 
 
+def test_validate_dashboard_payload_rejects_empty_phillips_account_card() -> None:
+    payload = valid_payload()
+    payload["broker_summaries"] = [{
+        "broker": "phillips", "detail_available": False, "portfolio_value_hkd": ""
+    }]
+    payload["source_statuses"] = [{
+        "broker": "phillips", "display_text": "暂无月结单明细"
+    }]
+
+    errors = validate_dashboard_payload(
+        payload, expected_cn=5, expected_phillips_rows=0
+    )
+
+    assert "辉立账户卡没有可用月结单资产" in errors
+
+
 def test_classify_result_has_only_three_states() -> None:
     assert classify_result([], browser_blocker=None) == "PASS"
     assert classify_result(["API failed"], browser_blocker=None) == "FAIL"

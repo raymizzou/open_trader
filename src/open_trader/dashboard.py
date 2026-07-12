@@ -134,17 +134,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         except PortfolioBuildError:
             portfolio_rows = original_portfolio_rows
     detail_month = latest_broker_detail_month(config.data_dir)
-    detail_dir = config.data_dir / "runs" / detail_month if detail_month else None
-    broker_positions = (
-        _read_csv_rows(detail_dir / "extracted_positions.csv")
-        if detail_dir is not None
-        else []
-    )
-    raw_cash_details = (
-        _read_csv_rows(detail_dir / "extracted_cash.csv")
-        if detail_dir is not None
-        else []
-    )
+    broker_positions, raw_cash_details = _latest_broker_details(config.data_dir)
     cash_details = [_cash_detail_row(row) for row in raw_cash_details]
     holding_rows = [row for row in portfolio_rows if _is_dashboard_holding(row)]
     holding_markets = _markets_from_rows(holding_rows)
@@ -337,6 +327,42 @@ def latest_broker_detail_month(data_dir: Path) -> str:
         and _has_broker_detail_files(path)
     ]
     return max(months) if months else ""
+
+
+def _latest_broker_details(
+    data_dir: Path,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    runs_dir = data_dir / "runs"
+    if not runs_dir.exists():
+        return [], []
+    positions: list[dict[str, str]] = []
+    cash: list[dict[str, str]] = []
+    found: set[str] = set()
+    run_dirs = sorted(
+        (
+            path
+            for path in runs_dir.iterdir()
+            if path.is_dir() and DETAIL_DIR_PATTERN.fullmatch(path.name)
+        ),
+        reverse=True,
+    )
+    for run_dir in run_dirs:
+        run_positions = _read_csv_rows(run_dir / "extracted_positions.csv")
+        run_cash = _read_csv_rows(run_dir / "extracted_cash.csv")
+        for broker in BROKERS:
+            if broker in found:
+                continue
+            broker_positions = [
+                row for row in run_positions if _broker_key(row.get("broker", "")) == broker
+            ]
+            broker_cash = [
+                row for row in run_cash if _broker_key(row.get("broker", "")) == broker
+            ]
+            if broker_positions or broker_cash:
+                positions.extend(broker_positions)
+                cash.extend(broker_cash)
+                found.add(broker)
+    return positions, cash
 
 
 def _has_broker_detail_files(path: Path) -> bool:
