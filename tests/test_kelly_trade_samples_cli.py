@@ -52,11 +52,11 @@ def test_kelly_build_trade_samples_main_loads_inputs_and_writes_payload(
         data_dir_arg: Path,
         *,
         include_strategy_capital: bool = True,
-        include_trade_samples: bool = True,
+        include_strategy_stats: bool = True,
     ) -> FakeKellyLabState:
         captured["load_data_dir"] = data_dir_arg
         captured["include_strategy_capital"] = include_strategy_capital
-        captured["include_trade_samples"] = include_trade_samples
+        captured["include_strategy_stats"] = include_strategy_stats
         return FakeKellyLabState()
 
     def fake_build(
@@ -99,7 +99,7 @@ def test_kelly_build_trade_samples_main_loads_inputs_and_writes_payload(
     assert result == 0
     assert captured["load_data_dir"] == data_dir
     assert captured["include_strategy_capital"] is False
-    assert captured["include_trade_samples"] is False
+    assert captured["include_strategy_stats"] is False
     assert captured["experiments"] == [{"experiment_id": "trend_us"}]
     assert captured["paper_orders_payload"] == paper_orders_payload
     assert captured["generated_at"] == "2026-07-11 11:00"

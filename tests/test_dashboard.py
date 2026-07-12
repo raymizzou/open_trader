@@ -15,6 +15,7 @@ from open_trader.decision_facts import (
     NEWS_SENTIMENT_FIELDS,
     extract_decision_sources,
 )
+from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.technical_facts import source_hash
 from open_trader.trade_actions import TRADE_ACTION_FIELDNAMES
@@ -2538,6 +2539,39 @@ def test_load_dashboard_state_exposes_kelly_lab_and_holding_detail(
                     }
                 ],
             },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    trade_samples_payload = {
+        "schema_version": "open_trader.kelly_trade_samples.v1",
+        "generated_at": "2026-07-11 12:00",
+        "source_orders_synced_at": "2026-07-11 11:59",
+        "sample_count": 0,
+        "open_position_count": 0,
+        "skipped_order_count": 0,
+        "stats_by_experiment": {},
+        "samples": [],
+        "open_positions": [],
+        "diagnostics": {"skipped_orders": []},
+    }
+    (latest / "kelly_trade_samples.json").write_text(
+        json.dumps(trade_samples_payload),
+        encoding="utf-8",
+    )
+    (latest / "kelly_strategy_stats.json").write_text(
+        json.dumps(
+            build_kelly_strategy_stats_payload(
+                [
+                    {
+                        "experiment_id": "trend_pullback_20d_exp_20260707",
+                        "experiment_name": "趋势回调 20D 第一批",
+                        "market": "US",
+                    }
+                ],
+                trade_samples_payload,
+                generated_at="2026-07-11 12:01",
+            ),
             ensure_ascii=False,
         ),
         encoding="utf-8",

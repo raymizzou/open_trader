@@ -1,11 +1,11 @@
 {
   "schema_version": "open_trader.kelly_order_executions.v1",
-  "environment": "SIMULATE",
-  "source": "futu_simulate_order_execution_client",
-  "executed_at": "2026-07-10 15:28",
+  "environment": "DRY_RUN",
+  "source": "dry_run",
+  "executed_at": "2026-07-12 00:35",
   "execution_count": 2,
-  "submitted_count": 1,
-  "dry_run_count": 0,
+  "submitted_count": 0,
+  "dry_run_count": 1,
   "skipped_count": 1,
   "failed_count": 0,
   "executions": [
@@ -22,13 +22,13 @@
       "order_type": "NORMAL",
       "price": "",
       "qty": "",
-      "planned_notional": "400",
+      "planned_notional": "",
       "budget_currency": "USD",
-      "executed_at": "2026-07-10 15:28",
+      "executed_at": "2026-07-12 00:35",
       "execution_status": "skipped",
       "submitted": false,
       "futu_order_id": "",
-      "error": "missing limit price"
+      "error": "risk check is not ready"
     },
     {
       "intent_id": "trend_pullback_20d_hk_mock_20260707:HK:02840:exit",
@@ -45,10 +45,10 @@
       "qty": "1",
       "planned_notional": "",
       "budget_currency": "HKD",
-      "executed_at": "2026-07-10 15:28",
-      "execution_status": "submitted",
-      "submitted": true,
-      "futu_order_id": "7567462",
+      "executed_at": "2026-07-12 00:35",
+      "execution_status": "dry_run",
+      "submitted": false,
+      "futu_order_id": "",
       "error": ""
     }
   ]

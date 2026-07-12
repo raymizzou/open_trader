@@ -1,15 +1,9 @@
 {
-  "schema_version": "open_trader.kelly_trade_samples.v1",
+  "schema_version": "open_trader.kelly_strategy_stats.v1",
   "generated_at": "2026-07-12 00:35",
-  "source_orders_synced_at": "2026-07-10 15:38",
-  "sample_count": 0,
-  "open_position_count": 0,
-  "skipped_order_count": 0,
-  "samples": [],
-  "open_positions": [],
-  "diagnostics": {
-    "skipped_orders": []
-  },
+  "source_trade_samples_generated_at": "2026-07-12 00:35",
+  "source_trade_samples_digest": "703cd9842e55547f5b68f4e4d710baecdc23906221a73dfc610c0a4da055d815",
+  "experiment_count": 3,
   "stats_by_experiment": {
     "trend_pullback_20d_us_mock_20260707": {
       "experiment_id": "trend_pullback_20d_us_mock_20260707",
@@ -35,7 +29,16 @@
       "last_recomputed_at": "2026-07-12 00:35",
       "win_rate": "0%",
       "parameter_source": "futu_paper_order_samples",
-      "updated_at": "2026-07-12 00:35"
+      "source_trade_samples_generated_at": "2026-07-12 00:35",
+      "source_trade_samples_digest": "703cd9842e55547f5b68f4e4d710baecdc23906221a73dfc610c0a4da055d815",
+      "updated_at": "2026-07-12 00:35",
+      "calculation_inputs": {
+        "raw_win_rate_fraction": "0",
+        "adjusted_win_rate_fraction": "0.5",
+        "avg_net_win_fraction": "0",
+        "avg_net_loss_fraction": "0",
+        "payoff_ratio": "0"
+      }
     },
     "trend_pullback_20d_hk_mock_20260707": {
       "experiment_id": "trend_pullback_20d_hk_mock_20260707",
@@ -61,7 +64,16 @@
       "last_recomputed_at": "2026-07-12 00:35",
       "win_rate": "0%",
       "parameter_source": "futu_paper_order_samples",
-      "updated_at": "2026-07-12 00:35"
+      "source_trade_samples_generated_at": "2026-07-12 00:35",
+      "source_trade_samples_digest": "703cd9842e55547f5b68f4e4d710baecdc23906221a73dfc610c0a4da055d815",
+      "updated_at": "2026-07-12 00:35",
+      "calculation_inputs": {
+        "raw_win_rate_fraction": "0",
+        "adjusted_win_rate_fraction": "0.5",
+        "avg_net_win_fraction": "0",
+        "avg_net_loss_fraction": "0",
+        "payoff_ratio": "0"
+      }
     },
     "breakout_10d_mock_20260707": {
       "experiment_id": "breakout_10d_mock_20260707",
@@ -87,7 +99,16 @@
       "last_recomputed_at": "2026-07-12 00:35",
       "win_rate": "0%",
       "parameter_source": "futu_paper_order_samples",
-      "updated_at": "2026-07-12 00:35"
+      "source_trade_samples_generated_at": "2026-07-12 00:35",
+      "source_trade_samples_digest": "703cd9842e55547f5b68f4e4d710baecdc23906221a73dfc610c0a4da055d815",
+      "updated_at": "2026-07-12 00:35",
+      "calculation_inputs": {
+        "raw_win_rate_fraction": "0",
+        "adjusted_win_rate_fraction": "0.5",
+        "avg_net_win_fraction": "0",
+        "avg_net_loss_fraction": "0",
+        "payoff_ratio": "0"
+      }
     }
   }
 }

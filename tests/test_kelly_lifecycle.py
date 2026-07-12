@@ -71,8 +71,10 @@ def test_decide_lifecycle_state_moves_to_pending_entry_after_entry_trigger() -> 
     )
 
     assert state["status"] == "pending_entry_order"
-    assert state["reason"] == "入场规则触发，Kelly 仓位已计算，风控通过。"
-    assert state["action"] == "准备提交模拟盘买入订单"
+    assert state["reason"] == "入场规则触发，仓位计算与风控检查待执行。"
+    assert state["action"] == "等待仓位计算与风控检查"
+    assert "4%" not in f"{state['reason']} {state['action']}"
+    assert "风控通过" not in f"{state['reason']} {state['action']}"
 
 
 def test_decide_lifecycle_state_marks_risk_blocked_after_entry_trigger() -> None:

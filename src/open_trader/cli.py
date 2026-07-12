@@ -53,8 +53,13 @@ from .kelly_strategy_capital import (
     load_kelly_strategy_capital,
     write_kelly_strategy_capital,
 )
+from .kelly_strategy_stats import (
+    build_kelly_strategy_stats_payload,
+    write_kelly_strategy_stats,
+)
 from .kelly_trade_samples import (
     build_kelly_trade_samples_payload,
+    load_kelly_trade_samples,
     write_kelly_trade_samples,
 )
 from .kelly_lab import load_kelly_lab_state
@@ -814,6 +819,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override sample generation timestamp for deterministic local demos",
     )
 
+    kelly_build_strategy_stats_parser = kelly_subparsers.add_parser(
+        "build-strategy-stats",
+        help="Build Kelly strategy stats from the latest trade samples",
+    )
+    kelly_build_strategy_stats_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    kelly_build_strategy_stats_parser.add_argument(
+        "--generated-at",
+        help="Override stats generation timestamp for deterministic local demos",
+    )
+
     kelly_check_order_risk_parser = kelly_subparsers.add_parser(
         "check-order-risk",
         help="Check Kelly order intents against first-pass risk limits",
@@ -1550,7 +1569,7 @@ def main(argv: list[str] | None = None) -> int:
             lab_state = load_kelly_lab_state(
                 args.data_dir,
                 include_strategy_capital=False,
-                include_trade_samples=False,
+                include_strategy_stats=False,
             )
             if not lab_state.available:
                 raise ValueError(lab_state.error)
@@ -1579,7 +1598,7 @@ def main(argv: list[str] | None = None) -> int:
             lab_state = load_kelly_lab_state(
                 args.data_dir,
                 include_strategy_capital=False,
-                include_trade_samples=False,
+                include_strategy_stats=False,
             )
             if not lab_state.available:
                 raise ValueError(lab_state.error)
@@ -1600,6 +1619,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"samples: {payload['sample_count']}")
         print(f"open_positions: {payload['open_position_count']}")
         print(f"skipped_orders: {payload['skipped_order_count']}")
+        print(f"latest: {latest_path}")
+        return 0
+
+    if args.command == "kelly" and args.kelly_command == "build-strategy-stats":
+        try:
+            lab_state = load_kelly_lab_state(
+                args.data_dir,
+                include_strategy_capital=False,
+                include_strategy_stats=False,
+            )
+            if not lab_state.available:
+                raise ValueError(lab_state.error)
+            trade_samples_payload = load_kelly_trade_samples(args.data_dir)
+            payload = build_kelly_strategy_stats_payload(
+                lab_state.experiments,
+                trade_samples_payload,
+                generated_at=args.generated_at,
+            )
+            latest_path = write_kelly_strategy_stats(args.data_dir, payload)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"experiments: {payload['experiment_count']}")
         print(f"latest: {latest_path}")
         return 0
 

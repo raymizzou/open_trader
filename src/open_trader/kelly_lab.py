@@ -12,6 +12,11 @@ from .kelly_market_rules import (
     kelly_market_currency,
     normalize_kelly_market,
 )
+from .kelly_strategy_stats import (
+    kelly_trade_samples_digest,
+    validate_kelly_strategy_stats_payload,
+    validate_kelly_trade_samples_payload,
+)
 
 
 TEMPLATES_SCHEMA_VERSION = "open_trader.kelly_strategy_templates.v1"
@@ -19,7 +24,6 @@ EXPERIMENTS_SCHEMA_VERSION = "open_trader.kelly_experiments.v1"
 PAPER_ORDERS_SCHEMA_VERSION = "open_trader.kelly_paper_orders.v1"
 ORDER_EXECUTIONS_SCHEMA_VERSION = "open_trader.kelly_order_executions.v1"
 STRATEGY_CAPITAL_SCHEMA_VERSION = "open_trader.kelly_strategy_capital.v1"
-TRADE_SAMPLES_SCHEMA_VERSION = "open_trader.kelly_trade_samples.v1"
 
 ALLOWED_EXPERIMENT_STATUSES = {"draft", "running", "paused", "completed", "failed"}
 
@@ -70,6 +74,7 @@ class KellyLabState:
     templates: list[dict[str, Any]] = field(default_factory=list)
     experiments: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
+    error_kind: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -85,8 +90,9 @@ class KellyLabState:
 def load_kelly_lab_state(
     data_dir: Path,
     *,
+    include_operational_artifacts: bool = True,
     include_strategy_capital: bool = True,
-    include_trade_samples: bool = True,
+    include_strategy_stats: bool = True,
 ) -> KellyLabState:
     latest_dir = data_dir / "latest"
     templates_path = latest_dir / "kelly_strategy_templates.json"
@@ -95,6 +101,7 @@ def load_kelly_lab_state(
     order_executions_path = latest_dir / "kelly_order_executions.json"
     strategy_capital_path = latest_dir / "kelly_strategy_capital.json"
     trade_samples_path = latest_dir / "kelly_trade_samples.json"
+    strategy_stats_path = latest_dir / "kelly_strategy_stats.json"
 
     missing_path = _first_missing_path(templates_path, experiments_path)
     if missing_path is not None:
@@ -113,25 +120,66 @@ def load_kelly_lab_state(
         experiments_path,
         templates_by_key,
     )
-    paper_orders = _load_optional_paper_orders(paper_orders_path)
-    experiments = _attach_paper_orders_to_experiments(experiments, paper_orders)
-    order_execution = _load_optional_order_execution(order_executions_path)
-    experiments = _attach_order_execution_to_experiments(experiments, order_execution)
+    if include_operational_artifacts:
+        paper_orders = _load_optional_paper_orders(paper_orders_path)
+        experiments = _attach_paper_orders_to_experiments(experiments, paper_orders)
+        order_execution = _load_optional_order_execution(order_executions_path)
+        experiments = _attach_order_execution_to_experiments(
+            experiments,
+            order_execution,
+        )
     if include_strategy_capital:
         strategy_capital = _load_optional_strategy_capital(strategy_capital_path)
         experiments = _attach_strategy_capital_to_experiments(
             experiments,
             strategy_capital,
         )
-    if include_trade_samples:
+    if include_strategy_stats:
         try:
-            trade_sample_stats = _load_optional_trade_sample_stats(trade_samples_path)
-            experiments = _attach_trade_sample_stats_to_experiments(
-                experiments,
-                trade_sample_stats,
+            if not trade_samples_path.exists():
+                raise FileNotFoundError(
+                    f"{trade_samples_path.name} not found at {trade_samples_path}"
+                )
+            trade_samples_payload = _load_json_object(trade_samples_path)
+            validate_kelly_trade_samples_payload(
+                trade_samples_payload,
+                artifact_name=trade_samples_path.name,
             )
         except (ValueError, FileNotFoundError) as exc:
-            return KellyLabState(available=False, error=str(exc))
+            return KellyLabState(
+                available=False,
+                error=str(exc),
+                error_kind="trade_samples",
+            )
+        try:
+            if not strategy_stats_path.exists():
+                raise FileNotFoundError(
+                    f"{strategy_stats_path.name} not found at {strategy_stats_path}"
+                )
+            strategy_stats_payload = _load_json_object(strategy_stats_path)
+            strategy_stats = validate_kelly_strategy_stats_payload(
+                strategy_stats_payload,
+                artifact_name=strategy_stats_path.name,
+                expected_experiment_ids={
+                    item["experiment_id"] for item in experiments
+                },
+                expected_trade_samples_generated_at=trade_samples_payload[
+                    "generated_at"
+                ],
+                expected_trade_samples_digest=kelly_trade_samples_digest(
+                    trade_samples_payload
+                ),
+            )
+            experiments = _attach_strategy_stats_to_experiments(
+                experiments,
+                strategy_stats,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            return KellyLabState(
+                available=False,
+                error=str(exc),
+                error_kind="strategy_stats",
+            )
 
     return KellyLabState(
         available=True,
@@ -256,28 +304,6 @@ def _load_optional_strategy_capital(path: Path) -> list[dict[str, Any]]:
     return validated
 
 
-def _load_optional_trade_sample_stats(path: Path) -> dict[str, dict[str, Any]]:
-    if not path.exists():
-        return {}
-    payload = _load_json_object(path)
-    _validate_schema_version(
-        payload,
-        path,
-        expected_schema_version=TRADE_SAMPLES_SCHEMA_VERSION,
-    )
-    stats_by_experiment = payload.get("stats_by_experiment")
-    if not isinstance(stats_by_experiment, dict):
-        raise ValueError(f"{path.name} must contain stats_by_experiment")
-    validated: dict[str, dict[str, Any]] = {}
-    for experiment_id, stats in stats_by_experiment.items():
-        if not isinstance(experiment_id, str) or not experiment_id.strip():
-            raise ValueError(f"{path.name} contains invalid experiment id")
-        if not isinstance(stats, dict):
-            raise ValueError(f"{path.name} stats for {experiment_id} must be an object")
-        validated[experiment_id] = copy.deepcopy(stats)
-    return validated
-
-
 def _attach_paper_orders_to_experiments(
     experiments: list[dict[str, Any]],
     paper_orders: list[dict[str, Any]],
@@ -381,23 +407,16 @@ def _attach_strategy_capital_to_experiments(
     return attached
 
 
-def _attach_trade_sample_stats_to_experiments(
+def _attach_strategy_stats_to_experiments(
     experiments: list[dict[str, Any]],
     stats_by_experiment: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    if not stats_by_experiment:
-        return experiments
     attached: list[dict[str, Any]] = []
     for experiment in experiments:
         normalized = copy.deepcopy(experiment)
         experiment_id = normalized.get("experiment_id")
         if isinstance(experiment_id, str) and experiment_id in stats_by_experiment:
-            current_stats = normalized.get("stats")
-            if not isinstance(current_stats, dict):
-                current_stats = {}
-            merged = copy.deepcopy(current_stats)
-            merged.update(copy.deepcopy(stats_by_experiment[experiment_id]))
-            normalized["stats"] = merged
+            normalized["stats"] = copy.deepcopy(stats_by_experiment[experiment_id])
         attached.append(normalized)
     return attached
 
@@ -497,6 +516,7 @@ def _validate_experiments_payload(
         raise ValueError(f"{path.name} must contain an experiments list")
 
     validated: list[dict[str, Any]] = []
+    seen_experiment_ids: set[str] = set()
     for index, experiment in enumerate(experiments):
         context = f"{path.name} experiment {index}"
         if not isinstance(experiment, dict):
@@ -528,6 +548,9 @@ def _validate_experiments_payload(
             normalized_experiment["experiment_id"],
             f"{context} experiment_id",
         )
+        if experiment_id in seen_experiment_ids:
+            raise ValueError(f"{path.name} contains duplicate experiment_id {experiment_id}")
+        seen_experiment_ids.add(experiment_id)
         experiment_market = normalize_kelly_market(normalized_experiment["market"])
         expected_currency = kelly_market_currency(experiment_market)
         normalized_experiment["market"] = experiment_market

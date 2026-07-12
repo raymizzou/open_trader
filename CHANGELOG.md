@@ -3,8 +3,25 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-12
+
+- Kept pending Kelly exits available when unified strategy stats are missing,
+  malformed, stale, or incomplete, while suppressing entries until stats recover.
+- Bound entry risk approval to the current validated trade evidence and strategy
+  stats through exact timestamps, parameter provenance, and a canonical SHA-256
+  evidence digest; restored the original two-decimal trade-sample rounding rules.
+- Required unified strategy stats to cover every currently configured experiment
+  before any entry can pass risk, while preserving exit approval on config/stats
+  failures and isolating provenance validation from optional order artifacts.
+- Changed pending-entry lifecycle and intent text to state that sizing and risk are
+  still pending, removing pre-risk percentage and approval claims from artifacts
+  and the dashboard.
+
 ## 2026-07-11
 
+- 将 Kelly 交易证据与运行时 `kelly_strategy_stats.json` 分离，让仪表盘与订单
+  仓位统一使用同一策略统计源，并在统计缺失、无效、过期或不完整时关闭入场
+  路径（fail closed）。
 - Completed the Kelly trade-sample closed loop on `main`: synced paper orders can
   now generate `kelly_trade_samples.json`, overlay per-strategy sample stats in
   Kelly Lab, and show the parameter source plus skipped-order count in the

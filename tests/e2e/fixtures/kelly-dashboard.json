@@ -244,8 +244,8 @@
             "status": "pending_entry_order",
             "market": "US",
             "symbol": "RAM",
-            "reason": "入场规则触发，Kelly 建议单标的仓位 4%，风控通过。",
-            "action": "准备提交模拟盘买入订单",
+            "reason": "入场规则触发，仓位计算与风控检查待执行。",
+            "action": "等待仓位计算与风控检查",
             "updated_at": "2026-07-08 10:01"
           },
           {
@@ -342,30 +342,31 @@
           }
         ],
         "stats": {
-          "completed_samples": 0,
-          "open_samples": 0,
+          "completed_samples": 208,
+          "open_samples": 3,
           "observed_win_rate": "56%",
-          "sample_stage": "insufficient",
-          "winning_samples": 0,
-          "losing_samples": 0,
-          "raw_win_rate": "0%",
-          "adjusted_win_rate": "50%",
-          "avg_net_win_pct": "0%",
-          "avg_net_loss_pct": "0%",
-          "payoff_ratio": "0",
-          "full_kelly_pct": "0%",
-          "fractional_kelly_pct": "0%",
-          "suggested_position_pct": "0%",
-          "skipped_order_count": 0,
+          "sample_stage": "sufficient",
+          "winning_samples": 116,
+          "losing_samples": 92,
+          "raw_win_rate": "56%",
+          "adjusted_win_rate": "56%",
+          "avg_net_win_pct": "4.8%",
+          "avg_net_loss_pct": "2.9%",
+          "payoff_ratio": "1.66",
+          "full_kelly_pct": "29.5%",
+          "fractional_kelly_pct": "7.4%",
+          "suggested_position_pct": "4%",
+          "skipped_order_count": 2,
           "flat_samples": 0,
-          "win_rate": "0%",
+          "win_rate": "56%",
           "parameter_source": "futu_paper_order_samples",
+          "source_trade_samples_generated_at": "2026-07-11 11:59",
           "updated_at": "2026-07-11 12:00",
           "experiment_id": "trend_pullback_20d_us_mock_20260707",
           "experiment_name": "趋势回调 20D Mock US 第一批",
           "market": "US",
-          "sample_adjustment": "样本少于 200，向 50% 收缩",
-          "last_sample_closed_at": "",
+          "sample_adjustment": "未收缩",
+          "last_sample_closed_at": "2026-07-11 11:58",
           "last_recomputed_at": "2026-07-11 12:00"
         }
       },
@@ -560,6 +561,7 @@
           "flat_samples": 0,
           "win_rate": "0%",
           "parameter_source": "futu_paper_order_samples",
+          "source_trade_samples_generated_at": "2026-07-11 11:59",
           "updated_at": "2026-07-11 12:00",
           "experiment_id": "trend_pullback_20d_hk_mock_20260707",
           "experiment_name": "趋势回调 20D Mock HK 第一批",
@@ -730,6 +732,7 @@
           "flat_samples": 0,
           "win_rate": "0%",
           "parameter_source": "futu_paper_order_samples",
+          "source_trade_samples_generated_at": "2026-07-11 11:59",
           "updated_at": "2026-07-11 12:00",
           "experiment_id": "breakout_10d_mock_20260707",
           "experiment_name": "突破 10D Mock 第一批",
@@ -740,6 +743,10 @@
         }
       }
     ]
+  },
+  "kelly_lab_unavailable": {
+    "available": false,
+    "error": "kelly_strategy_stats.json stale: source trade sample timestamp does not match"
   },
   "holdings": [
     {

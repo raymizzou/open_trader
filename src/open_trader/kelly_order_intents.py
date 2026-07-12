@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .kelly_lab import load_kelly_lab_state
+from .kelly_lifecycle import PENDING_ENTRY_ACTION, PENDING_ENTRY_REASON
 
 
 ORDER_INTENTS_SCHEMA_VERSION = "open_trader.kelly_order_intents.v1"
@@ -27,10 +28,22 @@ def build_kelly_order_intents(
     state = load_kelly_lab_state(
         data_dir,
         include_strategy_capital=False,
-        include_trade_samples=False,
     )
     if not state.available:
-        raise ValueError(state.error or "Kelly Lab data is not available")
+        if state.error_kind != "strategy_stats":
+            raise ValueError(state.error or "Kelly Lab data is not available")
+        state = load_kelly_lab_state(
+            data_dir,
+            include_strategy_capital=False,
+            include_strategy_stats=False,
+        )
+        if not state.available:
+            raise ValueError(state.error or "Kelly Lab data is not available")
+        return build_kelly_order_intents_payload(
+            state.experiments,
+            created_at=created_at,
+            allowed_source_statuses={"pending_exit_order"},
+        )
     return build_kelly_order_intents_payload(
         state.experiments,
         created_at=created_at,
@@ -41,6 +54,7 @@ def build_kelly_order_intents_payload(
     experiments: list[dict[str, Any]],
     *,
     created_at: str | None = None,
+    allowed_source_statuses: set[str] | None = None,
 ) -> dict[str, Any]:
     timestamp = created_at or _current_timestamp()
     intents: list[dict[str, Any]] = []
@@ -67,6 +81,11 @@ def build_kelly_order_intents_payload(
             if not isinstance(lifecycle_state, dict):
                 continue
             source_status = str(lifecycle_state.get("status", "")).strip()
+            if (
+                allowed_source_statuses is not None
+                and source_status not in allowed_source_statuses
+            ):
+                continue
             mapping = _PENDING_STATUS_TO_INTENT.get(source_status)
             if mapping is None:
                 continue
@@ -80,8 +99,12 @@ def build_kelly_order_intents_payload(
 
             participant = participants_by_key.get((market, symbol), {})
             experiment_id = str(experiment.get("experiment_id", "")).strip()
-            intents.append(
-                {
+            reason = str(lifecycle_state.get("reason", "")).strip()
+            action = str(lifecycle_state.get("action", "")).strip()
+            if intent_type == "entry":
+                reason = PENDING_ENTRY_REASON
+                action = PENDING_ENTRY_ACTION
+            intent = {
                     "intent_id": f"{experiment_id}:{market}:{symbol}:{intent_type}",
                     "experiment_id": experiment_id,
                     "experiment_name": str(
@@ -102,20 +125,37 @@ def build_kelly_order_intents_payload(
                     "created_at": timestamp,
                     "source": "kelly_lifecycle",
                     "source_status": source_status,
-                    "reason": str(lifecycle_state.get("reason", "")).strip(),
-                    "action": str(lifecycle_state.get("action", "")).strip(),
-                    "suggested_position_pct": str(
-                        stats.get("suggested_position_pct", "")
-                    ).strip(),
-                    "per_symbol_budget": str(
-                        participant.get("per_symbol_budget", "")
-                    ).strip(),
+                    "reason": reason,
+                    "action": action,
                     "budget_currency": str(
                         participant.get("budget_currency")
                         or experiment.get("budget_currency", "")
                     ).strip(),
                 }
-            )
+            if intent_type == "entry":
+                intent.update(
+                    {
+                        "suggested_position_pct": str(
+                            stats.get("suggested_position_pct", "")
+                        ).strip(),
+                        "parameter_source": str(
+                            stats.get("parameter_source", "")
+                        ).strip(),
+                        "strategy_stats_generated_at": str(
+                            stats.get("last_recomputed_at", "")
+                        ).strip(),
+                        "strategy_stats_source_samples_generated_at": str(
+                            stats.get("source_trade_samples_generated_at", "")
+                        ).strip(),
+                        "source_trade_samples_digest": str(
+                            stats.get("source_trade_samples_digest", "")
+                        ).strip(),
+                        "per_symbol_budget": str(
+                            participant.get("per_symbol_budget", "")
+                        ).strip(),
+                    }
+                )
+            intents.append(intent)
 
     return {
         "schema_version": ORDER_INTENTS_SCHEMA_VERSION,
