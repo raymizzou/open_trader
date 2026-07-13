@@ -46,11 +46,16 @@ def evaluate_plan(
 ) -> PlanEvaluation:
     del as_of
     for condition in plan.conditions:
-        if (
-            condition.kind == "price_at_or_above"
-            and condition.trigger_price is not None
-            and last_price >= condition.trigger_price
-        ):
+        price_hit = (
+            condition.trigger_price is not None
+            and (
+                condition.kind == "price_at_or_above"
+                and last_price >= condition.trigger_price
+                or condition.kind == "price_at_or_below"
+                and last_price <= condition.trigger_price
+            )
+        )
+        if price_hit:
             return PlanEvaluation(
                 plan_id=plan.plan_id,
                 status="triggered",
