@@ -1,6 +1,12 @@
 from decimal import Decimal
+import sys
+from types import ModuleType
 
+import pytest
+
+from open_trader import dashboard_acceptance
 from open_trader.dashboard_acceptance import (
+    REQUIRED_SOURCE_PATHS,
     _is_actionable_console_error,
     classify_result,
     dashboard_signature,
@@ -17,10 +23,32 @@ def test_browser_ignores_chrome_unattributed_404_but_not_app_errors() -> None:
 
 def valid_payload() -> dict[str, object]:
     cn = [
-        {"market": "CN", "symbol": str(index), "portfolio_weight_hkd": "10.00%"}
+        {
+            "market": "CN",
+            "symbol": str(index),
+            "portfolio_weight_hkd": "10.00%",
+            "agent_report": {"available": False},
+        }
         for index in range(5)
     ]
-    other = [{"market": "US", "symbol": "MSFT", "portfolio_weight_hkd": "50.00%"}]
+    other = [{
+        "market": "US",
+        "symbol": "MSFT",
+        "portfolio_weight_hkd": "50.00%",
+        "agent_report": {"available": True},
+        "tradingagents_summary": {"available": True},
+        "technical_facts": {"available": True},
+        "decision_facts": {
+            "kline": {"available": True},
+            "news_sentiment": {"available": True},
+        },
+        "futu_skill_facts": {
+            "news_sentiment": {"available": True},
+            "technical_anomaly": {"available": True},
+            "capital_anomaly": {"available": True},
+            "derivatives_anomaly": {"available": True},
+        },
+    }]
     return {
         "holdings": cn + other,
         "cash_rows": [],
@@ -28,6 +56,164 @@ def valid_payload() -> dict[str, object]:
             {"market": "CN", "symbol": row["symbol"]} for row in cn
         ]},
     }
+
+
+def nested_get(row: dict[str, object], path: tuple[str, ...]) -> dict[str, object]:
+    value: object = row
+    for key in path:
+        value = value[key]  # type: ignore[index]
+    return value  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize("path", REQUIRED_SOURCE_PATHS)
+def test_validate_dashboard_payload_rejects_each_missing_current_source(
+    path: tuple[str, ...],
+) -> None:
+    payload = valid_payload()
+    source = nested_get(payload["holdings"][-1], path)  # type: ignore[index]
+    source["available"] = False
+    source["status"] = "stale_source_hash"
+
+    errors = validate_dashboard_payload(payload, expected_cn=5)
+
+    assert any("US.MSFT" in error and path[-1] in error for error in errors)
+
+
+def test_validate_dashboard_payload_ignores_missing_sources_without_current_advice() -> None:
+    payload = valid_payload()
+    payload["holdings"][0]["tradingagents_summary"] = {  # type: ignore[index]
+        "available": False,
+        "status": "stale_source_hash",
+    }
+
+    assert validate_dashboard_payload(payload, expected_cn=5) == []
+
+
+def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
+    assert dashboard_acceptance._first_in_scope_holding(valid_payload()) == ("US", "MSFT")
+
+
+def test_first_in_scope_holding_rejects_payload_without_current_advice() -> None:
+    payload = valid_payload()
+    payload["holdings"][-1]["agent_report"]["available"] = False  # type: ignore[index]
+
+    with pytest.raises(AssertionError, match="advice-backed holding"):
+        dashboard_acceptance._first_in_scope_holding(payload)
+
+
+def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None:
+    selectors: list[str] = []
+    clicks: list[str] = []
+
+    class Locator:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+        def count(self) -> int:
+            return {"button": 1, "tabs": 5, "failed": 0, "panel": 1}[self.kind]
+
+        def click(self) -> None:
+            clicks.append(self.kind)
+
+        def all_inner_texts(self) -> list[str]:
+            return ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
+
+        def nth(self, index: int) -> "Locator":
+            return Locator(f"tab-{index}")
+
+        def inner_text(self) -> str:
+            return "source data"
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            selectors.append(selector)
+            if selector.startswith('button[data-detail-mode="decision"]'):
+                return Locator("button")
+            if selector == ".decision-tab-list [data-decision-tab]":
+                return Locator("tabs")
+            if selector == ".decision-tab-list .decision-tab-failed":
+                return Locator("failed")
+            return Locator("panel")
+
+    dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT")
+
+    assert selectors[0] == (
+        'button[data-detail-mode="decision"]'
+        '[data-detail-market="US"]'
+        '[data-detail-symbol="MSFT"]'
+    )
+    assert clicks == ["button", "tab-0", "tab-1", "tab-2", "tab-3", "tab-4"]
+
+
+def test_browser_check_treats_tab_interaction_errors_as_acceptance_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Locator:
+        @property
+        def first(self) -> "Locator":
+            return self
+
+        def locator(self, _selector: str) -> "Locator":
+            return self
+
+        def click(self) -> None:
+            pass
+
+        def inner_text(self) -> str:
+            return "5 条"
+
+    class Page:
+        def on(self, *_args: object) -> None:
+            pass
+
+        def goto(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def locator(self, _selector: str) -> Locator:
+            return Locator()
+
+        def wait_for_timeout(self, _milliseconds: int) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class Browser:
+        def new_page(self, **_kwargs: object) -> Page:
+            return Page()
+
+        def close(self) -> None:
+            pass
+
+    class Playwright:
+        chromium = type("Chromium", (), {"launch": lambda *_args, **_kwargs: Browser()})()
+
+    class Context:
+        def __enter__(self) -> Playwright:
+            return Playwright()
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+    module = ModuleType("playwright.sync_api")
+    module.sync_playwright = Context  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright", ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", module)
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_decision_tabs",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("tab interaction failed")),
+    )
+
+    errors, blocker = dashboard_acceptance._browser_check(
+        "http://dashboard", 5, valid_payload()
+    )
+
+    assert errors == [
+        "desktop：tab interaction failed",
+        "mobile：tab interaction failed",
+    ]
+    assert blocker is None
 
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:

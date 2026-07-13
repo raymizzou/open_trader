@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
@@ -8,6 +9,18 @@ import subprocess
 import time
 from typing import Any
 from urllib.request import urlopen
+
+
+REQUIRED_SOURCE_PATHS = (
+    ("tradingagents_summary",),
+    ("technical_facts",),
+    ("decision_facts", "kline"),
+    ("decision_facts", "news_sentiment"),
+    ("futu_skill_facts", "news_sentiment"),
+    ("futu_skill_facts", "technical_anomaly"),
+    ("futu_skill_facts", "capital_anomaly"),
+    ("futu_skill_facts", "derivatives_anomaly"),
+)
 
 
 def validate_dashboard_payload(
@@ -49,6 +62,27 @@ def validate_dashboard_payload(
     cn_rows = [row for row in holdings if row.get("market") == "CN"]
     if len(cn_rows) != expected_cn:
         errors.append(f"A 股持仓数量不是 {expected_cn}：{len(cn_rows)}")
+
+    for holding in holdings:
+        if (holding.get("agent_report") or {}).get("available") is not True:
+            continue
+        for path in REQUIRED_SOURCE_PATHS:
+            source: Any = holding
+            for key in path:
+                source = source.get(key) if isinstance(source, Mapping) else None
+            if not isinstance(source, Mapping) or source.get("available") is not True:
+                detail = next(
+                    (
+                        str(source.get(key))
+                        for key in ("error", "blocking_reason", "status")
+                        if isinstance(source, Mapping) and source.get(key)
+                    ),
+                    "missing",
+                )
+                errors.append(
+                    f"{holding.get('market', '')}.{holding.get('symbol', '')} "
+                    f"数据源 {'.'.join(path)} 不可用：{detail}"
+                )
 
     universe = (payload.get("backtest_universe") or {}).get("holdings") or []
     cn_universe = [row for row in universe if row.get("market") == "CN"]
@@ -135,7 +169,35 @@ def _is_actionable_console_error(message: str) -> bool:
     )
 
 
-def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
+def _first_in_scope_holding(payload: dict[str, Any]) -> tuple[str, str]:
+    for holding in payload.get("holdings") or []:
+        if (holding.get("agent_report") or {}).get("available") is True:
+            return str(holding.get("market", "")), str(holding.get("symbol", ""))
+    raise AssertionError("no advice-backed holding exists in Dashboard payload")
+
+
+def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
+    button = page.locator(
+        'button[data-detail-mode="decision"]'
+        f'[data-detail-market="{market}"]'
+        f'[data-detail-symbol="{symbol}"]'
+    )
+    assert button.count() == 1, f"{market}.{symbol} trading-decision button count is {button.count()}"
+    button.click()
+    tabs = page.locator(".decision-tab-list [data-decision-tab]")
+    expected_labels = ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
+    assert tabs.all_inner_texts() == expected_labels, "decision tabs are missing or out of order"
+    assert page.locator(".decision-tab-list .decision-tab-failed").count() == 0, "decision tab failed"
+    for index in range(tabs.count()):
+        tabs.nth(index).click()
+        panel = page.locator(".decision-tab-panel:visible")
+        assert panel.count() == 1, f"tab {expected_labels[index]} has {panel.count()} visible panels"
+        assert "数据未生成" not in panel.inner_text(), f"tab {expected_labels[index]} contains 数据未生成"
+
+
+def _browser_check(
+    url: str, expected_cn: int, payload: dict[str, Any]
+) -> tuple[list[str], str | None]:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -144,6 +206,11 @@ def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome", headless=True)
+            try:
+                market, symbol = _first_in_scope_holding(payload)
+            except AssertionError as exc:
+                browser.close()
+                return [str(exc)], None
             for name, viewport in (
                 ("desktop", {"width": 1440, "height": 1000}),
                 ("mobile", {"width": 390, "height": 844}),
@@ -164,6 +231,10 @@ def _browser_check(url: str, expected_cn: int) -> tuple[list[str], str | None]:
                 page.goto(url, wait_until="networkidle")
                 if "看板数据加载失败" in page.locator("body").inner_text():
                     errors.append(f"{name}：页面显示看板数据加载失败")
+                try:
+                    _check_decision_tabs(page, market, symbol)
+                except Exception as exc:
+                    errors.append(f"{name}：{exc}")
                 phillips_card = page.locator(
                     '#broker-summary-cards [data-broker="phillips"]'
                 )
@@ -211,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     errors: list[str] = []
+    browser_payload: dict[str, Any] = {}
     try:
         pid, cwd = _listener(args.url)
         if cwd != args.expected_root.resolve():
@@ -233,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
         if not errors and args.wait_seconds:
             time.sleep(args.wait_seconds)
         second = _fetch_payload(args.url)
+        browser_payload = second
         errors.extend(validate_dashboard_payload(
             second, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
@@ -245,7 +318,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
         pid = None
-    browser_errors, blocker = _browser_check(args.url, args.expected_cn)
+    browser_errors, blocker = _browser_check(
+        args.url, args.expected_cn, browser_payload
+    )
     errors.extend(browser_errors)
     status = classify_result(errors, browser_blocker=blocker)
     result = {"status": status, "pid": pid, "errors": errors, "blocker": blocker}

@@ -2066,7 +2066,7 @@ function renderHoldings() {
       const tSignalClass = tSignalButtonClass(holding);
       rows.push(`
         <tr class="${selectedClass}">
-          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
+          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision" data-detail-market="${escapeHtml(holding.market)}" data-detail-symbol="${escapeHtml(holding.symbol)}">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
           <td>${escapeHtml(formatPlain(holding.market))}</td>
           <td class="symbol-cell">
             <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>

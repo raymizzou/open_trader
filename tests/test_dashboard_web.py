@@ -4260,6 +4260,9 @@ if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
 if (!elements["holdings-body"].innerHTML.includes("交易决策") || !elements["holdings-body"].innerHTML.includes(">做T<") || elements["holdings-body"].innerHTML.includes(">凯利<") || elements["holdings-body"].innerHTML.includes(">详情<")) {
   throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
 }
+if (!elements["holdings-body"].innerHTML.includes('data-detail-market="US"') || !elements["holdings-body"].innerHTML.includes('data-detail-symbol="VIXY"')) {
+  throw new Error("trading decision entry should expose exact holding identity: " + elements["holdings-body"].innerHTML);
+}
 if (!elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
   throw new Error("active BUY_T/SELL_T signals should pulse the t signal button: " + elements["holdings-body"].innerHTML);
 }
