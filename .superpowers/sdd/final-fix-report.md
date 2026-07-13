@@ -234,3 +234,40 @@ Generated evidence digest:
   the same canonical text intentionally appears in reason and meaning; the test
   now asserts an exact count of 2 and both rendered values.
 - Pre-existing untracked `.venv` and `node_modules` symlinks were preserved.
+
+# Trading Decision Tabs Final Review Fix — 2026-07-13
+
+## Fix
+
+- Commit: `eb442b8` (`fix: enable Futu news decision tab`).
+- Files: `src/open_trader/dashboard_static/dashboard.js`, `tests/test_dashboard_web.py`.
+- News availability now accepts either `decision_facts.news_sentiment` or the existing
+  `futuSkillNewsSentimentModule(holding)` result; errors prefer the decision source,
+  then Futu, before the existing `数据未生成` fallback.
+- Replaced the stale placeholder claim with concise copy describing connected decision
+  and market-fact data. No arrow-key or roving-tabindex behavior was added.
+
+## RED / GREEN
+
+- RED: `.venv/bin/python -m pytest -q tests/test_dashboard_web.py::test_dashboard_news_tab_uses_futu_skill_news_sentiment`
+  failed as expected because the News button contained `decision-tab-failed`.
+- GREEN: the new regression plus the existing tab test: `2 passed in 0.27s`.
+- Focused final coverage (new regression, existing tabs, static copy): `3 passed in 0.38s`.
+- The first full run found the intentionally stale copy assertion: `1 failed, 1447 passed
+  in 20.92s`; after correcting it, `make test` returned `1448 passed in 20.13s`.
+
+## Acceptance / Live Evidence
+
+- Final `make acceptance`: tests `1448 passed in 20.21s`; exact gate result:
+  `{"status": "PASS", "pid": 13895, "errors": [], "blocker": null}`.
+- Live PID `13895`, started `Mon Jul 13 11:35:22 2026`, runs
+  `python -m open_trader dashboard ... --port 8766` from the feature worktree.
+- The PASS gate verified real API/data, two refresh cycles, process version, fresh logs,
+  and desktop/mobile browser flows; no acceptance errors or blockers were reported.
+
+## Self-review / Concerns
+
+- Diff is limited to the shared tab-definition path, one runtime regression, and the
+  stale copy assertion; `git diff --check` exited `0` before commit.
+- Real domestic-discussion rendering continues through the existing plugin/helper path.
+- No unresolved concerns. The pre-existing untracked `.venv` symlink was not added.
