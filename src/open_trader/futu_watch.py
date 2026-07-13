@@ -8,6 +8,8 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from .futu_symbols import to_futu_symbol
+
 
 WATCHLIST_REQUIRED_FIELDNAMES = [
     "run_date",
@@ -307,7 +309,10 @@ def _trigger_from_row(
     market = row.get("market", "").strip().upper()
     trigger_type = row.get("trigger_type", "").strip()
     operator = row.get("operator", "").strip()
-    futu_symbol = _to_futu_symbol(market, symbol)
+    try:
+        futu_symbol = to_futu_symbol(market, symbol)
+    except ValueError:
+        return None
     if (
         futu_symbol is None
         or row.get("status", "").strip() != "active"
@@ -333,11 +338,3 @@ def _trigger_from_row(
         severity=row.get("severity", "").strip(),
         trigger_text=row.get("trigger_text", "").strip(),
     )
-
-
-def _to_futu_symbol(market: str, symbol: str) -> str | None:
-    if market == "US" and symbol:
-        return f"US.{symbol}"
-    if market == "HK" and symbol.isdigit() and len(symbol) <= 5:
-        return f"HK.{symbol.zfill(5)}"
-    return None

@@ -163,6 +163,26 @@ def test_load_monitor_triggers_keeps_hk_active_price_rows(tmp_path: Path) -> Non
     assert loaded.skipped_count == 1
 
 
+def test_load_monitor_triggers_maps_cn_exchange_prefixes(tmp_path: Path) -> None:
+    path = tmp_path / "watchlist.csv"
+    write_watchlist(
+        path,
+        [
+            base_row(symbol="600025", market="CN"),
+            base_row(symbol="000001", market="CN"),
+            base_row(symbol="800001", market="CN"),
+        ],
+    )
+
+    loaded = load_monitor_triggers(path, run_date=None)
+
+    assert [trigger.futu_symbol for trigger in loaded.triggers] == [
+        "SH.600025",
+        "SZ.000001",
+    ]
+    assert loaded.skipped_count == 1
+
+
 def test_load_monitor_triggers_skips_malformed_hk_symbols(tmp_path: Path) -> None:
     path = tmp_path / "watchlist.csv"
     write_watchlist(

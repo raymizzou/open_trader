@@ -5,9 +5,11 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from .futu_symbols import to_futu_symbol
+
 
 QUOTEABLE_ASSET_CLASSES = {"stock", "etf", "fund", "option", "unknown"}
-SUPPORTED_MARKETS = {"US", "HK"}
+SUPPORTED_MARKETS = {"US", "HK", "CN"}
 
 
 @dataclass(frozen=True)
@@ -69,7 +71,7 @@ def load_futu_quote_universe(portfolio_path: Path) -> FutuQuoteUniverse:
                     market=market,
                     asset_class=asset_class,
                     symbol=symbol,
-                    futu_symbol=_to_futu_symbol(market, symbol),
+                    futu_symbol=to_futu_symbol(market, symbol),
                     name=name,
                 )
             )
@@ -97,10 +99,8 @@ def _skip_reason(
         return "excluded_asset_class"
     if market not in SUPPORTED_MARKETS:
         return "unsupported_market"
+    try:
+        to_futu_symbol(market, symbol)
+    except ValueError:
+        return "invalid_symbol"
     return None
-
-
-def _to_futu_symbol(market: str, symbol: str) -> str:
-    if market == "HK" and symbol.isdigit():
-        return f"HK.{symbol.zfill(5)}"
-    return f"{market}.{symbol}"

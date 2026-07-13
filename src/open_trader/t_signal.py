@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
+from .futu_symbols import to_futu_symbol
+
 
 SCHEMA_VERSION = "open_trader.t_signal.v1"
 SESSION_PHASES = {"pre_market", "regular", "post_market", "closed", "unknown"}
@@ -309,32 +311,6 @@ class TMarketFacts:
 
     def with_field(self, name: str, value: object) -> TMarketFacts:
         return replace(self, **{name: value})
-
-
-def to_futu_symbol(market: str, symbol: str) -> str:
-    normalized_market = market.strip().upper()
-    normalized_symbol = symbol.strip().upper()
-    if normalized_market not in {"HK", "US"}:
-        raise ValueError(f"unsupported market for t signal: {market}")
-    if "." in normalized_symbol:
-        prefix, normalized_symbol = normalized_symbol.split(".", 1)
-        if prefix == normalized_market:
-            pass
-        elif normalized_market == "US" and prefix not in {"HK", "US", "CN"}:
-            normalized_symbol = f"{prefix}.{normalized_symbol}"
-        else:
-            raise ValueError(
-                f"symbol prefix {prefix} does not match market {normalized_market}"
-            )
-    if not normalized_symbol:
-        raise ValueError(f"empty symbol for market {normalized_market}")
-    if normalized_market == "HK" and normalized_symbol.isdigit():
-        if len(normalized_symbol) > 5:
-            raise ValueError(f"invalid HK symbol length: {symbol}")
-        return f"HK.{normalized_symbol.zfill(5)}"
-    if normalized_market == "US":
-        return f"US.{normalized_symbol}"
-    raise ValueError(f"invalid symbol for market {normalized_market}: {symbol}")
 
 
 def ratio_from_score(score: int) -> str:

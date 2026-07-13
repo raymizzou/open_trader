@@ -188,7 +188,7 @@ def regular_facts(**overrides: object) -> TMarketFacts:
     return facts
 
 
-def test_to_futu_symbol_normalizes_hk_numeric_symbol() -> None:
+def test_to_futu_symbol_normalizes_supported_market_symbols() -> None:
     assert to_futu_symbol("HK", "700") == "HK.00700"
     assert to_futu_symbol("US", "msft") == "US.MSFT"
     assert to_futu_symbol("US", "BRK.B") == "US.BRK.B"
@@ -196,11 +196,20 @@ def test_to_futu_symbol_normalizes_hk_numeric_symbol() -> None:
     assert to_futu_symbol("HK", "HK.00700") == "HK.00700"
     assert to_futu_symbol("US", "us.msft") == "US.MSFT"
     assert to_futu_symbol("US", "US.MSFT") == "US.MSFT"
+    assert to_futu_symbol("CN", "600025") == "SH.600025"
+    assert to_futu_symbol("CN", "000001") == "SZ.000001"
+    assert to_futu_symbol("CN", "000300") == "SH.000300"
+    assert to_futu_symbol("CN", "SH.600025") == "SH.600025"
 
 
 @pytest.mark.parametrize(
     ("market", "symbol"),
-    [("HK", "US.MSFT"), ("CN", "600000"), ("US", "")],
+    [
+        ("HK", "US.MSFT"),
+        ("CN", "800001"),
+        ("CN", "SZ.600025"),
+        ("US", ""),
+    ],
 )
 def test_to_futu_symbol_rejects_invalid_market_or_prefix(
     market: str,
@@ -311,21 +320,17 @@ def test_build_t_signal_blocks_mismatched_futu_symbol_without_raising() -> None:
     )
 
 
-def test_build_t_signal_blocks_unsupported_market_without_raising() -> None:
+def test_build_t_signal_supports_cn_market_symbol() -> None:
     signal = build_t_signal_from_facts(
         facts=regular_facts(market="CN", symbol="600000", futu_symbol=""),
         baseline=TPortfolioBaseline(total_quantity=Decimal("300")),
         previous=None,
-        ai_summary_zh="暂不支持该市场。",
+        ai_summary_zh="使用上海市场富途代码。",
     )
 
-    assert signal.action == "REVIEW"
-    assert signal.suggested_ratio == ""
-    assert signal.status == "review"
-    assert any(
-        gate.name == "symbol" and gate.status == "block"
-        for gate in signal.hard_gates
-    )
+    assert signal.futu_symbol == "SH.600000"
+    assert signal.action == "BUY_T"
+    assert signal.status == "ok"
 
 
 @pytest.mark.parametrize(

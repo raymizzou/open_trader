@@ -244,3 +244,49 @@ def test_load_futu_quote_universe_includes_unknown_supported_market_holdings(
             reason="unsupported_market",
         ),
     ]
+
+
+def test_load_futu_quote_universe_maps_cn_exchange_prefixes(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(
+        path,
+        [
+            {
+                "market": "CN",
+                "asset_class": "stock",
+                "symbol": "600025",
+                "name": "华能水电",
+                "total_quantity": "6000",
+            },
+            {
+                "market": "CN",
+                "asset_class": "etf",
+                "symbol": "159915",
+                "name": "创业板 ETF",
+                "total_quantity": "100",
+            },
+            {
+                "market": "CN",
+                "asset_class": "stock",
+                "symbol": "800001",
+                "name": "Unsupported",
+                "total_quantity": "1",
+            },
+        ],
+    )
+
+    universe = load_futu_quote_universe(path)
+
+    assert [item.futu_symbol for item in universe.items] == [
+        "SH.600025",
+        "SZ.159915",
+    ]
+    assert universe.skipped == [
+        SkippedFutuUniverseRow(
+            row_number=4,
+            market="CN",
+            asset_class="stock",
+            symbol="800001",
+            reason="invalid_symbol",
+        )
+    ]
