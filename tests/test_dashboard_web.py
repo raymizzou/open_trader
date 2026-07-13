@@ -73,6 +73,90 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     assert 'grid-template-areas: "brand" "assets" "source";' in mobile
 
 
+def test_dashboard_renders_validated_and_fallback_decision_plans() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for dashboard helper runtime checks")
+    js_path = STATIC_DIR / "dashboard.js"
+    script = r'''
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync(process.argv[1], "utf8");
+const sandbox = { document: { addEventListener() {} } };
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+vm.runInContext(`
+const validatedPlan = {
+  available: true,
+  mode: "validated_plan",
+  status: "waiting",
+  run_date: "2026-07-13",
+  action_summary: "继续持有，等待条件触发",
+  next_condition_id: "trend-exit",
+  current_quantity: "400",
+  current_weight: "0.078",
+  max_weight: "0.10",
+  risk_status: "within_limit",
+  strategy: {id: "trend_pullback/v1", name_zh: "趋势回调"},
+  conditions: [{
+    condition_id: "trend-exit", priority: "risk", operator: "<=",
+    calculated_value: "57", target_weight: "0", target_quantity: "0",
+    suggested_action: "退出", formula: "min(sma50, active_stop)",
+    inputs: {sma50: "58", active_stop: "57"}, source_date: "2026-07-10",
+    trigger_count: 2,
+  }],
+  backtests: [{
+    range: "1Y", gate: {passed: true},
+    strategy: {total_return_pct: "8", max_drawdown_pct: "6", sharpe_ratio: "1.1"},
+    market_benchmark: {symbol: "SPY", total_return_pct: "5.5"},
+    market_excess_return_pct: "2.5",
+  }],
+  previous_review: {run_date: "2026-07-10", status: "triggered", trigger_count: 1, starting_quantity: "400", closing_quantity: "400"},
+};
+const validated = renderDecisionPlan({decision_plan: validatedPlan});
+for (const text of ["今日交易计划", "下一条件", "目标仓位", "回测闸门", "最大回撤", "夏普比率", "参数来源", "上期复盘"]) {
+  if (!validated.includes(text)) throw new Error("missing " + text + ": " + validated);
+}
+if (!validated.includes("data-plan-condition")) throw new Error("validated plan has no condition cards");
+
+const fallbackPlan = {
+  available: true,
+  mode: "fallback_advice",
+  status: "waiting",
+  run_date: "2026-07-13",
+  max_weight: "0.10",
+  fallback: {
+    label: "非执行型建议", reason: "没有策略通过当前回测闸门", recommendation: "禁止加仓",
+    max_weight: "0.10", tradingagents: {current_action: "观察", core_reason: "等待趋势确认"},
+    facts: [
+      {key: "ma20_distance_pct", calculated_value: "-3.2", formula: "(close/sma20-1)*100", inputs: {close: "47"}, source_date: "2026-07-10"},
+      {key: "rsi14", calculated_value: "31", formula: "RSI(14)", inputs: {period: "14"}, source_date: "2026-07-10"},
+      {key: "bollinger_position", calculated_value: "below_lower", formula: "compare bands", inputs: {close: "47"}, source_date: "2026-07-10"},
+    ],
+  },
+};
+const fallback = renderDecisionPlan({decision_plan: fallbackPlan});
+for (const text of ["非执行型建议", "禁止加仓", "RSI", "布林带", "为什么没有可执行计划"]) {
+  if (!fallback.includes(text)) throw new Error("missing " + text + ": " + fallback);
+}
+if (fallback.includes("data-plan-condition")) throw new Error("fallback rendered executable condition");
+`, sandbox);
+'''
+    subprocess.run([node, "-e", script, str(js_path)], check=True)
+
+
+def test_dashboard_final_tab_uses_plan_contract_and_deep_link_helpers() -> None:
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+
+    final_view = js.split("final: {", 1)[1].split("},", 1)[0]
+    assert "holding.decision_plan" in final_view
+    assert "renderDecisionPlan(holding)" in final_view
+    assert "holding.agent_report" not in final_view
+    assert "restoreDecisionDeepLink" in js
+    assert "syncDecisionDeepLink" in js
+    assert "history.replaceState" in js
+
+
 def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path) -> None:
     from open_trader.dashboard_web import build_standard_backtest_options_payload
 
@@ -799,6 +883,17 @@ const holding = {
   name: "英伟达",
   total_quantity: "10",
   agent_report: { available: true, error: "" },
+  decision_plan: {
+    available: true,
+    mode: "validated_plan",
+    status: "waiting",
+    run_date: "2026-07-13",
+    action_summary: "继续持有，等待条件触发",
+    max_weight: "0.10",
+    strategy: {id: "trend_pullback/v1", name_zh: "趋势回调"},
+    conditions: [],
+    backtests: [],
+  },
   tradingagents_summary: {
     available: true,
     error: "",
@@ -817,10 +912,10 @@ let html = renderTradingDecisionTabs(holding);
 assertOrdered(html, ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]);
 if ((html.match(/role="tabpanel"/g) || []).length !== 1) throw new Error(html);
 if (!html.includes('data-decision-tab="news"') || !html.includes("decision-tab-failed")) throw new Error(html);
-if (!html.includes("大模型决策模板") || html.includes("<h4>TradingAgents</h4>")) throw new Error(html);
+if (!html.includes("今日交易计划") || html.includes("大模型决策模板") || html.includes("<h4>TradingAgents</h4>")) throw new Error(html);
 state.selectedDecisionTab = "tradingagents";
 html = renderTradingDecisionTabs(holding);
-if (!html.includes("<h4>TradingAgents</h4>") || html.includes("大模型决策模板")) throw new Error(html);
+if (!html.includes("<h4>TradingAgents</h4>") || html.includes("今日交易计划")) throw new Error(html);
 const missingSummary = {
   ...holding,
   tradingagents_summary: {

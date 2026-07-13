@@ -12,6 +12,7 @@ const state = {
   selectedHoldingKey: "",
   selectedHoldingDetail: "decision",
   selectedDecisionTab: "final",
+  decisionDeepLinkRestored: false,
   detailLanguage: "zh",
   refreshActive: false,
   quoteIntervalId: null,
@@ -233,6 +234,7 @@ function bindEvents() {
     state.selectedHoldingKey = "";
     state.selectedHoldingDetail = "decision";
     state.selectedDecisionTab = "final";
+    syncDecisionDeepLink();
     setActiveFilter(elements["header-market-filters"], button);
     renderDashboardViews();
   });
@@ -245,6 +247,7 @@ function bindEvents() {
     state.selectedHoldingKey = "";
     state.selectedHoldingDetail = "decision";
     state.selectedDecisionTab = "final";
+    syncDecisionDeepLink();
     setActiveFilter(elements["header-broker-filters"], button);
     renderDashboardViews();
   });
@@ -652,6 +655,7 @@ function handleSymbolDetailClick(event) {
   const decisionTab = event.target.closest("[data-decision-tab]");
   if (decisionTab) {
     state.selectedDecisionTab = decisionTab.dataset.decisionTab || "final";
+    syncDecisionDeepLink();
     renderHoldings();
     return;
   }
@@ -660,6 +664,7 @@ function handleSymbolDetailClick(event) {
     state.selectedHoldingKey = "";
     state.selectedHoldingDetail = "decision";
     state.selectedDecisionTab = "final";
+    syncDecisionDeepLink();
     renderHoldings();
     return;
   }
@@ -699,11 +704,60 @@ async function loadDashboard() {
     }
     state.dashboard = await response.json();
     state.dashboardError = null;
+    restoreDecisionDeepLink();
     scheduleQuotePolling(state.dashboard.poll_seconds);
     renderDashboard();
   } catch (error) {
     renderLoadError(error);
   }
+}
+
+function restoreDecisionDeepLink() {
+  if (state.decisionDeepLinkRestored || typeof window === "undefined") {
+    return;
+  }
+  state.decisionDeepLinkRestored = true;
+  const params = new URLSearchParams(window.location.search || "");
+  const market = String(params.get("market") || "").toUpperCase();
+  const symbol = String(params.get("symbol") || "").toUpperCase();
+  if (!market || !symbol) {
+    return;
+  }
+  const holdings = getHoldings();
+  const index = holdings.findIndex((holding) => (
+    String(holding.market || "").toUpperCase() === market
+    && String(holding.symbol || "").toUpperCase() === symbol
+  ));
+  if (index < 0) {
+    return;
+  }
+  state.marketFilter = "ALL";
+  state.brokerFilter = "ALL";
+  state.selectedHoldingKey = holdingKey(holdings[index], index);
+  state.selectedHoldingDetail = "decision";
+  const decisionTab = String(params.get("decision_tab") || "final");
+  state.selectedDecisionTab = DECISION_TABS.some((tab) => tab.key === decisionTab)
+    ? decisionTab
+    : "final";
+}
+
+function syncDecisionDeepLink() {
+  if (typeof window === "undefined" || !window.history || !window.location) {
+    return;
+  }
+  const params = new URLSearchParams(window.location.search || "");
+  const selected = selectedHolding();
+  if (selected) {
+    params.set("market", String(selected.holding.market || ""));
+    params.set("symbol", String(selected.holding.symbol || ""));
+    params.set("decision_tab", state.selectedDecisionTab || "final");
+  } else {
+    params.delete("market");
+    params.delete("symbol");
+    params.delete("decision_tab");
+  }
+  const query = params.toString();
+  window.history.replaceState(null, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash || ""}`);
 }
 
 function scheduleQuotePolling(pollSeconds) {
@@ -2124,6 +2178,7 @@ function showSymbolDetail(detailKey, detailMode = "decision") {
   state.selectedHoldingKey = detailKey;
   state.selectedHoldingDetail = normalizeHoldingDetailMode(detailMode);
   state.selectedDecisionTab = "final";
+  syncDecisionDeepLink();
   renderHoldings();
 }
 
@@ -2158,6 +2213,7 @@ function openTradeActionDetail(actionKey) {
       state.selectedHoldingKey = holdingKey(holding, index);
       state.selectedHoldingDetail = "decision";
       state.selectedDecisionTab = "final";
+      syncDecisionDeepLink();
       renderDashboardViews();
       return;
     }
@@ -2491,6 +2547,197 @@ function tSignalTimelineLabel(value) {
   return labels[value] || formatPlain(value);
 }
 
+function renderDecisionPlan(holding) {
+  const plan = holding && holding.decision_plan && typeof holding.decision_plan === "object"
+    ? holding.decision_plan
+    : {};
+  if (plan.available !== true) {
+    return `<div class="decision-plan-failed status-failed">${escapeHtml(plan.error || "交易计划未生成")}</div>`;
+  }
+  if (plan.mode === "validated_plan") {
+    return renderValidatedDecisionPlan(plan);
+  }
+  if (plan.mode === "fallback_advice") {
+    return renderFallbackDecisionPlan(plan);
+  }
+  return `<div class="decision-plan-failed status-failed">交易计划类型无效</div>`;
+}
+
+function renderValidatedDecisionPlan(plan) {
+  const conditions = Array.isArray(plan.conditions) ? plan.conditions : [];
+  const next = conditions.find((condition) => condition.condition_id === plan.next_condition_id) || conditions[0];
+  const strategy = plan.strategy && typeof plan.strategy === "object" ? plan.strategy : {};
+  return `
+    <section class="decision-plan decision-plan-validated">
+      ${renderDecisionPlanHeader(plan, "已通过回测闸门", decisionPlanStatusLabel(plan.status))}
+      <div class="decision-plan-overview">
+        <article><span>当前结论</span><strong>${escapeHtml(plan.action_summary || "等待条件触发")}</strong></article>
+        <article><span>下一条件</span><strong>${escapeHtml(next ? decisionConditionSummary(next) : "暂无")}</strong></article>
+        <article><span>策略</span><strong>${escapeHtml(strategy.name_zh || strategy.id || "-")}</strong></article>
+        <article><span>仓位上限</span><strong>${escapeHtml(decisionPlanWeight(plan.max_weight))}</strong></article>
+      </div>
+      <div class="decision-plan-layout">
+        <div>
+          <div class="decision-plan-section-heading"><h4>条件与动作</h4><span>风险条件优先 · 可重复触发</span></div>
+          <div class="decision-plan-condition-list">
+            ${conditions.length ? conditions.map(renderDecisionPlanCondition).join("") : '<p class="decision-plan-empty">当前没有可执行条件。</p>'}
+          </div>
+        </div>
+        <aside class="decision-plan-evidence">
+          <h4>回测闸门</h4>
+          ${renderDecisionPlanBacktests(plan.backtests)}
+        </aside>
+      </div>
+      ${renderPreviousDecisionReview(plan.previous_review)}
+    </section>
+  `;
+}
+
+function renderDecisionPlanHeader(plan, eyebrow, status) {
+  return `
+    <header class="decision-plan-header">
+      <div><span>${escapeHtml(eyebrow)}</span><h3>今日交易计划</h3><p>${escapeHtml(plan.run_date || "-")} · ${escapeHtml(plan.plan_id || "")}</p></div>
+      <strong class="decision-plan-status decision-plan-status-${escapeHtml(plan.status || "waiting")}">${escapeHtml(status)}</strong>
+    </header>
+  `;
+}
+
+function renderDecisionPlanCondition(condition, index) {
+  const tone = condition.priority === "risk" ? "risk" : "ordinary";
+  return `
+    <article class="decision-plan-condition decision-plan-condition-${tone}" data-plan-condition="${escapeHtml(condition.condition_id || String(index))}">
+      <div class="decision-plan-condition-head">
+        <span>${condition.priority === "risk" ? "风险优先" : "普通条件"}</span>
+        <b>已触发 ${escapeHtml(condition.trigger_count || 0)} 次</b>
+      </div>
+      <h5>${escapeHtml(decisionConditionSummary(condition))}</h5>
+      <div class="decision-plan-condition-metrics">
+        <div><span>执行动作</span><strong>${escapeHtml(condition.suggested_action || "-")}</strong></div>
+        <div><span>目标仓位</span><strong>${escapeHtml(decisionPlanWeight(condition.target_weight))}</strong></div>
+        <div><span>目标数量</span><strong>${escapeHtml(condition.target_quantity || "-")}</strong></div>
+      </div>
+      ${renderDecisionPlanProvenance(condition)}
+    </article>
+  `;
+}
+
+function renderDecisionPlanProvenance(item) {
+  const inputs = item.inputs && typeof item.inputs === "object"
+    ? Object.entries(item.inputs).map(([key, value]) => `${key}=${formatPlain(value)}`).join(" · ")
+    : "-";
+  return `
+    <details class="decision-plan-provenance">
+      <summary>参数来源</summary>
+      <dl>
+        <div><dt>公式</dt><dd>${escapeHtml(item.formula || "-")}</dd></div>
+        <div><dt>输入</dt><dd>${escapeHtml(inputs)}</dd></div>
+        <div><dt>数据日期</dt><dd>${escapeHtml(item.source_date || "-")}</dd></div>
+      </dl>
+    </details>
+  `;
+}
+
+function renderDecisionPlanBacktests(backtests) {
+  const rows = Array.isArray(backtests) ? backtests : [];
+  if (!rows.length) {
+    return '<p class="decision-plan-empty">没有回测证据。</p>';
+  }
+  return `
+    <div class="decision-plan-backtests">
+      ${rows.map((item) => {
+        const strategy = item.strategy || {};
+        const benchmark = item.market_benchmark || {};
+        return `
+          <article>
+            <div><strong>${escapeHtml(item.range || "-")}</strong><span class="status-pill status-${item.gate && item.gate.passed === true ? "ok" : "failed"}">${item.gate && item.gate.passed === true ? "通过" : "未通过"}</span></div>
+            <dl>
+              <div><dt>策略收益</dt><dd>${escapeHtml(decisionPlanPercent(strategy.total_return_pct))}</dd></div>
+              <div><dt>${escapeHtml(benchmark.symbol || "基准")}</dt><dd>${escapeHtml(decisionPlanPercent(benchmark.total_return_pct))}</dd></div>
+              <div><dt>超额收益</dt><dd>${escapeHtml(decisionPlanPercent(item.market_excess_return_pct))}</dd></div>
+              <div><dt>最大回撤</dt><dd>${escapeHtml(decisionPlanPercent(strategy.max_drawdown_pct))}</dd></div>
+              <div><dt>夏普比率</dt><dd>${escapeHtml(strategy.sharpe_ratio || "-")}</dd></div>
+            </dl>
+          </article>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderFallbackDecisionPlan(plan) {
+  const fallback = plan.fallback && typeof plan.fallback === "object" ? plan.fallback : {};
+  const facts = Array.isArray(fallback.facts) ? fallback.facts : [];
+  const tradingagents = fallback.tradingagents && typeof fallback.tradingagents === "object"
+    ? fallback.tradingagents : {};
+  return `
+    <section class="decision-plan decision-plan-fallback">
+      ${renderDecisionPlanHeader(plan, fallback.label || "非执行型建议", "禁止自动执行")}
+      <div class="decision-plan-fallback-banner">
+        <div><span>建议</span><strong>${escapeHtml(fallback.recommendation || "禁止加仓")}</strong></div>
+        <div><span>仓位上限</span><strong>${escapeHtml(decisionPlanWeight(fallback.max_weight || plan.max_weight))}</strong></div>
+      </div>
+      <div class="decision-plan-section-heading"><h4>市场事实</h4><span>仅供判断，不构成可触发策略</span></div>
+      <div class="decision-plan-fact-grid">${facts.map(renderDecisionPlanFact).join("")}</div>
+      <div class="decision-plan-fallback-reason">
+        <article><h4>TradingAgents 解读</h4><p>${escapeHtml(tradingagents.core_reason || tradingagents.current_action || "暂无")}</p></article>
+        <article><h4>为什么没有可执行计划</h4><p>${escapeHtml(fallback.reason || "没有策略通过当前回测闸门")}</p></article>
+      </div>
+      ${renderPreviousDecisionReview(plan.previous_review)}
+    </section>
+  `;
+}
+
+function renderDecisionPlanFact(fact) {
+  const labels = {
+    ma20_distance_pct: "距 MA20",
+    rsi14: "RSI 14",
+    bollinger_position: "布林带位置",
+    relative_volume: "相对成交量",
+  };
+  return `
+    <article class="decision-plan-fact">
+      <span>${escapeHtml(labels[fact.key] || fact.key || "事实")}</span>
+      <strong>${escapeHtml(formatPlain(fact.calculated_value))}</strong>
+      ${renderDecisionPlanProvenance(fact)}
+    </article>
+  `;
+}
+
+function renderPreviousDecisionReview(review) {
+  if (!review || typeof review !== "object") {
+    return "";
+  }
+  return `
+    <details class="decision-plan-review">
+      <summary>上期复盘 · ${escapeHtml(review.run_date || "-")}</summary>
+      <div>
+        <span>上期状态 <strong>${escapeHtml(decisionPlanStatusLabel(review.status))}</strong></span>
+        <span>条件触发 <strong>${escapeHtml(review.trigger_count || 0)} 次</strong></span>
+        <span>期初数量 <strong>${escapeHtml(review.starting_quantity || "-")}</strong></span>
+        <span>本期期初数量 <strong>${escapeHtml(review.closing_quantity || "-")}</strong></span>
+      </div>
+    </details>
+  `;
+}
+
+function decisionConditionSummary(condition) {
+  return `价格 ${condition.operator || ""} ${condition.calculated_value || "-"}`.trim();
+}
+
+function decisionPlanWeight(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${(number * 100).toFixed(2).replace(/\.00$/, "")}%` : "-";
+}
+
+function decisionPlanPercent(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(2).replace(/\.00$/, "")}%` : "-";
+}
+
+function decisionPlanStatusLabel(status) {
+  return ({waiting: "等待条件", triggered: "条件已触发", expired: "计划已过期"})[status] || "状态未知";
+}
+
 function decisionTabViews(holding) {
   const facts = holding && holding.decision_facts && typeof holding.decision_facts === "object"
     ? holding.decision_facts : {};
@@ -2505,9 +2752,9 @@ function decisionTabViews(holding) {
   const futuNews = futuSkillNewsSentimentModule(holding);
   const definitions = {
     final: {
-      available: Boolean(holding && holding.agent_report && holding.agent_report.available === true),
-      error: holding && holding.agent_report && holding.agent_report.error,
-      html: renderLLMDecisionTemplate(holding),
+      available: Boolean(holding && holding.decision_plan && holding.decision_plan.available === true),
+      error: holding && holding.decision_plan && holding.decision_plan.error,
+      html: renderDecisionPlan(holding),
     },
     tradingagents: {
       available: summary.available === true,
