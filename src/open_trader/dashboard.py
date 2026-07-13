@@ -19,6 +19,12 @@ from .decision_facts import (
     index_decision_facts_by_market_symbol,
     load_decision_facts_cache,
 )
+from .decision_source_availability import (
+    decision_module_available,
+    futu_module_available,
+    technical_facts_available,
+    tradingagents_available,
+)
 from .futu_skill_facts import (
     index_futu_skill_facts_by_market_symbol,
     load_futu_skill_facts_cache,
@@ -1059,14 +1065,9 @@ def _is_current_tradingagents_summary(
     record: dict[str, Any] | None,
     agent_report: dict[str, str] | None,
 ) -> bool:
-    if record is None or agent_report is None:
-        return False
-    latest_run_date = str(record.get("latest_run_date") or "").strip()
-    current_run_date = agent_report.get("run_date", "").strip()
     return bool(
-        latest_run_date
-        and current_run_date
-        and latest_run_date == current_run_date
+        agent_report
+        and tradingagents_available(record, agent_report.get("run_date", "").strip())
     )
 
 
@@ -1180,13 +1181,15 @@ def _technical_facts_detail(
             error=str(record.get("error") or extraction_status or "extraction failed"),
             **common,
         )
-    if (
-        freshness_payload.get("status") == "missing_timeframe"
-        or technical_facts_has_missing_timeframe(facts_payload)
-    ):
+    if not technical_facts_available(record, advice_row):
         return _technical_facts_unavailable(
             "missing_timeframe",
-            error="technical facts timeframe missing",
+            error=(
+                "technical facts timeframe missing"
+                if freshness_payload.get("status") == "missing_timeframe"
+                or technical_facts_has_missing_timeframe(facts_payload)
+                else "technical facts run date does not match latest advice"
+            ),
             **common,
         )
 
@@ -1263,13 +1266,10 @@ def _decision_module_detail(
 
     source_hash_value = str(module.get("source_hash") or "").strip()
     raw_fields = module.get("fields")
-    module_status = str(module.get("status") or "").strip()
-    if (
-        not current_source_hash
-        or source_hash_value != current_source_hash
-        or module_status != "ok"
-        or not isinstance(raw_fields, dict)
-        or set(raw_fields) != set(fields)
+    if not decision_module_available(
+        module,
+        fields=fields,
+        current_source_hash=current_source_hash,
     ):
         return _decision_module_missing(
             fields,
@@ -1310,7 +1310,7 @@ def _futu_skill_signal_detail(module: object) -> dict[str, Any]:
     signal = str(module.get("signal") or "").strip()
     confidence = str(module.get("confidence") or "").strip()
     return {
-        "available": status in {"ok", "partial"},
+        "available": futu_module_available(module),
         "status": status or "missing",
         "signal": signal,
         "confidence": confidence,
@@ -1362,7 +1362,7 @@ def _futu_skill_news_sentiment_detail(module: object) -> dict[str, Any]:
         }
     evidence = module.get("evidence")
     return {
-        "available": status in {"ok", "partial"},
+        "available": futu_module_available(module),
         "status": status,
         "signal": signal,
         "confidence": confidence,
