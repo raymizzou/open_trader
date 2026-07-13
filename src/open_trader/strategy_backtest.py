@@ -60,6 +60,7 @@ class ExecutionResult:
     total_return_pct: Decimal
     annualized_return_pct: Decimal
     max_drawdown_pct: Decimal
+    sharpe_ratio: Decimal | None
     win_rate_pct: Decimal
     actual_start: date
     actual_end: date
@@ -84,6 +85,7 @@ class StandardBacktestResult:
     strategy_excess_return_pct: Decimal
     market_excess_return_pct: Decimal | None
     market_benchmark_error: str | None
+    gate: dict[str, object]
     assumptions: dict[str, str]
     strategy_definition: dict[str, object]
     signals: Sequence[dict[str, object]]
@@ -345,6 +347,7 @@ class StandardBacktestService:
         market_benchmark = (_run_buy_hold(benchmark_bars, request.initial_cash, allocated, request.commission_bps, request.slippage_bps)
                             if benchmark_bars else None)
         market_excess = strategy.total_return_pct - market_benchmark.total_return_pct if market_benchmark else None
+        gate = _backtest_gate(strategy, market_benchmark)
         request_hash = hashlib.sha256(json.dumps(_json_safe(request), sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
         run_id = _build_run_id(market, symbol, request.strategy_id, request_hash)
         message = "所选区间内没有触发交易" if not any(trade.quantity for trade in strategy.trades) else "标准策略回测完成"
@@ -354,6 +357,7 @@ class StandardBacktestService:
             "strategy_excess_return_pct": str(strategy.total_return_pct - buy_hold.total_return_pct),
             "market_excess_return_pct": str(market_excess) if market_excess is not None else None,
             "market_benchmark_error": benchmark_error,
+            "gate": gate,
         }
         definition = next(item.to_dict() for item in strategy_catalog() if item.strategy_id == request.strategy_id)
         manifest_base = {
@@ -384,6 +388,7 @@ class StandardBacktestService:
             market_benchmark=market_benchmark,
             strategy_excess_return_pct=strategy.total_return_pct - buy_hold.total_return_pct,
             market_excess_return_pct=market_excess, market_benchmark_error=benchmark_error,
+            gate=gate,
             assumptions={"initial_cash": str(request.initial_cash), "max_strategy_weight": str(request.max_strategy_weight),
                          "commission_bps": str(request.commission_bps), "slippage_bps": str(request.slippage_bps)},
             strategy_definition=definition,
@@ -468,7 +473,43 @@ def _execution_result(trades: Sequence[NormalizedTrade], curve: Sequence[dict[st
     days = max(1, (actual_end - actual_start).days)
     annualized = ((final / initial_cash) ** (Decimal("365") / Decimal(days)) - Decimal("1")) * Decimal("100") if final > 0 else Decimal("-100")
     return ExecutionResult(tuple(trades), tuple(curve), final, total, annualized, abs(max_drawdown),
-                           _realized_win_rate(trades), actual_start, actual_end, initial_cash, allocated)
+                           _sharpe_ratio(curve), _realized_win_rate(trades), actual_start,
+                           actual_end, initial_cash, allocated)
+
+
+def _sharpe_ratio(curve: Sequence[dict[str, str]]) -> Decimal | None:
+    equities = [Decimal(row["equity"]) for row in curve]
+    returns = [
+        current / previous - Decimal("1")
+        for previous, current in zip(equities, equities[1:])
+        if previous
+    ]
+    if len(returns) < 2:
+        return None
+    mean = sum(returns, Decimal("0")) / Decimal(len(returns))
+    variance = sum(
+        ((value - mean) ** 2 for value in returns), Decimal("0")
+    ) / Decimal(len(returns))
+    if variance == 0:
+        return None
+    return mean / variance.sqrt() * Decimal(252).sqrt()
+
+
+def _backtest_gate(
+    strategy: ExecutionResult,
+    market_benchmark: ExecutionResult | None,
+) -> dict[str, object]:
+    if market_benchmark is None:
+        reasons = ["benchmark_data_missing"]
+    elif strategy.total_return_pct <= market_benchmark.total_return_pct:
+        reasons = ["did_not_outperform_benchmark"]
+    else:
+        reasons = []
+    return {
+        "passed": not reasons,
+        "policy_id": "benchmark_outperformance/v1",
+        "reasons": reasons,
+    }
 
 
 def _realized_win_rate(trades: Sequence[NormalizedTrade]) -> Decimal:
