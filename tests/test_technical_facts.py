@@ -827,6 +827,55 @@ def test_generate_technical_facts_does_not_reuse_failed_latest_cache(
     assert row["extraction_status"] == "ok"
 
 
+def test_generate_technical_facts_does_not_reuse_unknown_timeframe_cache(
+    tmp_path: Path,
+) -> None:
+    advice_path = tmp_path / "data/runs/2026-06-19/trading_advice.csv"
+    report = "10-day EMA with date-indexed OHLC rows"
+    write_advice(
+        advice_path,
+        [{
+            "run_date": "2026-06-19",
+            "symbol": "02476",
+            "market": "HK",
+            "asset_class": "stock",
+            "portfolio_weight_hkd": "8.97%",
+            "risk_flag": "normal",
+            "source": "tradingagents",
+            "advice_action": "Underweight",
+            "advice_summary": "",
+            "raw_decision": raw_decision_with_market_report(report),
+            "status": "ok",
+            "error": "",
+            "source_status": "ok",
+            "fallback_reason": "",
+            "fallback_from_date": "",
+        }],
+    )
+    generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=UnknownTimeframeExtractor(),
+        update_latest=True,
+        market=None,
+    )
+
+    extractor = FakeExtractor()
+    result = generate_technical_facts(
+        advice_path=advice_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-06-19",
+        extractor=extractor,
+        update_latest=True,
+        market=None,
+    )
+
+    assert result.reused == 0
+    assert result.extracted == 1
+    assert extractor.calls == [report]
+
+
 def test_generate_technical_facts_falls_back_to_bollinger_report_parser(
     tmp_path: Path,
 ) -> None:
@@ -1156,6 +1205,9 @@ def test_llm_extractor_parses_strict_json() -> None:
     prompt_text = json.dumps(client.messages, ensure_ascii=False)
     assert "只抽取客观技术面事实" in prompt_text
     assert "忽略 FINAL TRANSACTION PROPOSAL" in prompt_text
+    assert "status 必须是 present" in prompt_text
+    assert "顶层 timeframes 必须是 JSON 数组" in prompt_text
+    assert "按日期排列的 OHLC 行或日数指标属于 daily" in prompt_text
 
 
 def test_llm_extractor_rejects_non_json_response() -> None:

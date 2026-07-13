@@ -158,6 +158,20 @@ def position(
     )
 
 
+def test_build_portfolio_rows_weights_sum_to_exactly_one_hundred_after_rounding() -> None:
+    fx = StaticMonthEndFxProvider("2026-05", {})
+    positions = [
+        position("futu", symbol, "1", "1", "1", market=Market.HK, currency="HKD")
+        for symbol in ("A", "B", "C")
+    ]
+
+    rows = build_portfolio_rows("2026-05", positions, [], fx)
+
+    assert sum(
+        Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in rows
+    ) == Decimal("100.00")
+
+
 def test_build_portfolio_rows_merges_same_us_symbol_across_brokers():
     fx = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
     positions = [

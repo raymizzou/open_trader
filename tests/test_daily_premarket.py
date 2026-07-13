@@ -5,6 +5,7 @@ import json
 import plistlib
 import shutil
 import subprocess
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import open_trader.daily_premarket as daily_premarket
+from open_trader.advice.premarket import PremarketResult
 from open_trader.daily_premarket import (
     DailyPremarketConfig,
     DailyPremarketRunner as _DailyPremarketRunner,
@@ -21,6 +23,7 @@ from open_trader.daily_premarket import (
     load_env_config,
 )
 from open_trader.futu_quote import FutuQuoteError
+from open_trader.futu_skill_facts import FutuSkillFactResult
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.notifications import (
     CompositeNotifier,
@@ -29,6 +32,9 @@ from open_trader.notifications import (
     XiaozhiVoiceNotifier,
 )
 from open_trader.trade_actions import TradeActionsResult
+from open_trader.technical_facts import source_hash
+from open_trader.decision_facts import extract_decision_sources
+from open_trader.decision_source_availability import SourceFailure
 from open_trader.tradingagents_summary import TradingAgentsSummaryResult
 from open_trader.trading_plan import (
     TRADING_PLAN_FIELDNAMES,
@@ -398,7 +404,7 @@ def test_build_notifier_requires_xiaozhi_config(tmp_path: Path) -> None:
         build_notifier(config)
 
 
-def test_daily_runner_defaults_to_generate_trade_actions_and_skipped_summary(
+def test_daily_runner_defaults_to_generate_trade_actions_and_summary(
     tmp_path: Path,
 ) -> None:
     config = DailyPremarketConfig(
@@ -417,7 +423,7 @@ def test_daily_runner_defaults_to_generate_trade_actions_and_skipped_summary(
     runner = _DailyPremarketRunner(config=config)
 
     assert runner.trade_action_generator is daily_premarket.generate_trade_actions
-    assert runner.summary_generator is daily_premarket._write_skipped_tradingagents_summary
+    assert runner.summary_generator is daily_premarket.generate_tradingagents_summary
     assert (
         runner.summary_extractor_factory
         is daily_premarket.LLMTradingAgentsSummaryExtractor
@@ -559,6 +565,48 @@ def test_blocker_notification_unexpected_status_uses_chinese_fallbacks() -> None
     assert "unexpected_reason" not in body
 
 
+@pytest.mark.parametrize(
+    ("sources", "expected"),
+    [
+        (
+            ["technical_facts"],
+            ".venv/bin/python -m open_trader extract-technical-facts --advice data/latest/US/trading_advice.csv --data-dir data --date 2026-06-19 --market US --update-latest",
+        ),
+        (
+            ["decision_facts.kline", "decision_facts.news_sentiment"],
+            ".venv/bin/python -m open_trader extract-decision-facts --advice data/latest/US/trading_advice.csv --data-dir data --date 2026-06-19 --market US --update-latest",
+        ),
+        (
+            ["tradingagents_summary"],
+            ".venv/bin/python -m open_trader extract-tradingagents-summary --advice data/latest/US/trading_advice.csv --plan data/latest/US/trading_plan.csv --actions data/latest/US/trade_actions.csv --data-dir data --date 2026-06-19 --market US --update-latest",
+        ),
+        (
+            ["futu_skill_facts.news_sentiment", "futu_skill_facts.capital_anomaly"],
+            ".venv/bin/python -m open_trader extract-futu-skill-facts --portfolio data/latest/portfolio.csv --data-dir data --date 2026-06-19 --market US --update-latest",
+        ),
+    ],
+)
+def test_blocker_notification_includes_deduplicated_source_retry_command(
+    sources: list[str], expected: str
+) -> None:
+    failures = [
+        SourceFailure("US", "MSFT", source, "failed") for source in sources
+    ]
+
+    body = daily_premarket._blocker_notification_message(
+        run_date="2026-06-19",
+        status="failed",
+        futu_status={"error": "", "missing": 0, "diagnostic": {}},
+        trade_actions={"review": 0},
+        artifacts={},
+        readiness="blocked",
+        source_failures=failures,
+    )
+
+    assert expected in body
+    assert body.count(expected) == 1
+
+
 def test_blocker_notification_does_not_expose_raw_error_text() -> None:
     body = daily_premarket._blocker_notification_message(
         run_date="2026-06-17",
@@ -690,9 +738,10 @@ def test_run_lock_removes_lock_file_after_release(tmp_path: Path) -> None:
 
 
 class FakePremarket:
-    def __init__(self, *, market: str = "US", symbol: str = "MSFT") -> None:
+    def __init__(self, *, market: str = "US", symbol: str = "MSFT", source_failure: str = "") -> None:
         self.market = market
         self.symbol = symbol
+        self.source_failure = source_failure
         self.calls: list[dict[str, object]] = []
 
     def __call__(self, **kwargs: object):
@@ -710,6 +759,9 @@ class FakePremarket:
         technical_facts_path = run_dir / "technical_facts.json"
         decision_facts_path = run_dir / "decision_facts.json"
         advice_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_decision = json.dumps(
+            {"state": {"market_report": "market report", "sentiment_report": "sentiment report", "news_report": "news report"}}
+        )
         with advice_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
                 handle,
@@ -743,7 +795,7 @@ class FakePremarket:
                     "source": "fake",
                     "advice_action": "Overweight",
                     "advice_summary": "评级：Overweight",
-                    "raw_decision": "{}",
+                    "raw_decision": raw_decision,
                     "status": "ok",
                     "error": "",
                     "source_status": "ok",
@@ -756,20 +808,26 @@ class FakePremarket:
             f"{run_date},{self.symbol},{self.market},ok\n",
             encoding="utf-8",
         )
-        technical_facts_path.write_text(
-            (
-                '{"schema_version":"open_trader.technical_facts_cache.v1",'
-                f'"run_date":"{run_date}","records":[]}}\n'
-            ),
-            encoding="utf-8",
-        )
-        decision_facts_path.write_text(
-            (
-                '{"schema_version":"open_trader.decision_facts.v1",'
-                f'"run_date":"{run_date}","records":[]}}\n'
-            ),
-            encoding="utf-8",
-        )
+        technical_facts_path.write_text(json.dumps({
+            "schema_version": "open_trader.technical_facts_cache.v1",
+            "run_date": run_date,
+            "records": [{"run_date": run_date, "market": self.market, "symbol": self.symbol, "source_hash": source_hash("market report"), "extraction_status": "ok", "facts": {"timeframes": [{"timeframe": "daily"}]}, "freshness": {"status": "fresh"}, "error": ""}],
+        }) + "\n", encoding="utf-8")
+        decision_sources = extract_decision_sources(raw_decision)
+        decision_facts_path.write_text(json.dumps({
+            "schema_version": "open_trader.decision_facts.v1",
+            "run_date": run_date,
+            "records": [{"run_date": run_date, "market": self.market, "symbol": self.symbol, "kline": {"status": "ok", "source_hash": decision_sources.kline_hash, "fields": {field: "值" for field in ("trend", "position", "momentum", "key_levels", "risk")}}, "news_sentiment": {"status": "ok", "source_hash": decision_sources.news_sentiment_hash, "fields": {field: "值" for field in ("direction", "change", "catalyst", "risk", "attention")}}, "error": ""}],
+        }) + "\n", encoding="utf-8")
+        if self.source_failure == "technical_facts":
+            payload = json.loads(technical_facts_path.read_text(encoding="utf-8"))
+            payload["records"][0].update(extraction_status="extraction_failed", error="技术抽取失败")
+            technical_facts_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        elif self.source_failure.startswith("decision_facts."):
+            payload = json.loads(decision_facts_path.read_text(encoding="utf-8"))
+            module = self.source_failure.removeprefix("decision_facts.")
+            payload["records"][0][module].update(status="error", error="决策来源失败")
+            decision_facts_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         if kwargs["update_latest"]:
             latest_dir = data_dir / "latest"
             latest_dir.mkdir(parents=True, exist_ok=True)
@@ -1028,17 +1086,21 @@ class FakeSummaryExtractor:
 
 
 class FakeTradingAgentsSummaryGenerator:
-    def __init__(self) -> None:
+    def __init__(self, source_failure: bool = False) -> None:
         self.calls: list[dict[str, object]] = []
+        self.source_failure = source_failure
 
     def __call__(self, **kwargs: object) -> TradingAgentsSummaryResult:
         self.calls.append(kwargs)
         data_dir = kwargs["data_dir"]
         run_date = kwargs["run_date"]
         market = kwargs["market"]
+        advice_path = kwargs["advice_path"]
         assert isinstance(data_dir, Path)
         assert isinstance(run_date, str)
         assert isinstance(market, str)
+        assert isinstance(advice_path, Path)
+        symbol = next(csv.DictReader(advice_path.open(encoding="utf-8")))["symbol"]
         run_path = data_dir / "runs" / run_date / market / "tradingagents_summary.json"
         latest_path = data_dir / "latest" / market / "tradingagents_summary.json"
         run_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1049,7 +1111,19 @@ class FakeTradingAgentsSummaryGenerator:
                     "generated_at": "2026-06-17T21:05:00+08:00",
                     "latest_run_date": run_date,
                     "market": market,
-                    "records": [],
+                    "records": [{
+                        "schema_version": "open_trader.tradingagents_summary.v1",
+                        "market": market,
+                        "symbol": symbol,
+                        "latest_run_date": run_date,
+                        "ta_report_date": run_date,
+                        "ta_view": "看多",
+                        "current_action": "持有",
+                        "core_reason": "基本面稳健",
+                        "reason_fields": {"main_judgment": "基本面稳健", "evidence_1": "盈利增长", "evidence_2": "现金流充足", "risk_or_counterpoint": "估值偏高", "action_logic": "继续持有"},
+                        "source_hash": "sha256:" + "a" * 64,
+                        "error": "TradingAgents摘要失败" if self.source_failure else "",
+                    }],
                 },
                 ensure_ascii=False,
             )
@@ -1058,8 +1132,8 @@ class FakeTradingAgentsSummaryGenerator:
         )
         return TradingAgentsSummaryResult(
             run_date=run_date,
-            records=0,
-            extracted=0,
+            records=1,
+            extracted=1,
             failed=0,
             reused=0,
             run_path=run_path,
@@ -1075,6 +1149,39 @@ class FailingTradingAgentsSummaryGenerator:
     def __call__(self, **kwargs: object) -> TradingAgentsSummaryResult:
         self.calls.append(kwargs)
         raise RuntimeError(self.message)
+
+
+class FakeFutuFactsGenerator:
+    def __init__(self, source_failure: str = "") -> None:
+        self.calls: list[dict[str, object]] = []
+        self.source_failure = source_failure
+
+    def __call__(self, **kwargs: object) -> FutuSkillFactResult:
+        self.calls.append({key: value for key, value in kwargs.items() if key != "extractor"})
+        data_dir = kwargs["data_dir"]
+        run_date = kwargs["run_date"]
+        market = kwargs["market"]
+        assert isinstance(data_dir, Path)
+        assert isinstance(run_date, str)
+        assert isinstance(market, str)
+        run_path = data_dir / "runs" / run_date / market / "futu_skill_facts.json"
+        latest_path = data_dir / "latest" / market / "futu_skill_facts.json"
+        run_path.parent.mkdir(parents=True, exist_ok=True)
+        symbol = "00700" if market == "HK" else "MSFT"
+        modules = {name: {"status": "ok"} for name in ("news_sentiment", "technical_anomaly", "capital_anomaly", "derivatives_anomaly")}
+        if self.source_failure:
+            modules[self.source_failure] = {"status": "error", "error": "Futu来源失败"}
+        run_path.write_text(json.dumps({
+            "schema_version": "open_trader.futu_skill_facts.v1",
+            "run_date": run_date,
+            "records": [{"run_date": run_date, "market": market, "symbol": symbol, **modules, "error": ""}],
+        }) + "\n", encoding="utf-8")
+        return FutuSkillFactResult(run_date, 1, 1, 0, run_path, latest_path)
+
+
+class FailingFutuFactsGenerator:
+    def __call__(self, **_: object) -> FutuSkillFactResult:
+        raise RuntimeError("futu service unavailable")
 
 
 class FailingNotifier:
@@ -1101,12 +1208,15 @@ def _daily_runner(
     *,
     summary_generator: object | None = None,
     summary_extractor_factory: object = FakeSummaryExtractor,
+    futu_facts_generator: object | None = None,
     **kwargs: object,
 ) -> _DailyPremarketRunner:
     return _DailyPremarketRunner(
         **kwargs,
         summary_generator=summary_generator or FakeTradingAgentsSummaryGenerator(),
         summary_extractor_factory=summary_extractor_factory,
+        futu_facts_generator=futu_facts_generator or FakeFutuFactsGenerator(),
+        futu_facts_extractor_factory=FakeSummaryExtractor,
     )
 
 
@@ -1122,6 +1232,100 @@ def _notification_rows(
             )
         )
     )
+
+
+def test_daily_runner_generates_futu_facts_from_refreshed_portfolio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nold\n", encoding="utf-8")
+    refreshed_portfolio = tmp_path / "data/runs/2026-06-19/portfolio.csv"
+    refreshed_portfolio.parent.mkdir(parents=True, exist_ok=True)
+    refreshed_portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    futu_facts = FakeFutuFactsGenerator()
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        portfolio_refresher=lambda **_: refreshed_portfolio,
+        futu_facts_generator=futu_facts,
+    ).run("2026-06-19", market="US")
+
+    assert result.status == "success"
+    assert futu_facts.calls == [{
+        "portfolio_path": refreshed_portfolio,
+        "data_dir": config.data_dir,
+        "run_date": "2026-06-19",
+        "market": "US",
+        "update_latest": False,
+    }]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_error"),
+    [
+        ("tradingagents_summary", "TradingAgents摘要失败"),
+        ("technical_facts", "技术抽取失败"),
+        ("decision_facts.kline", "决策来源失败"),
+        ("decision_facts.news_sentiment", "决策来源失败"),
+        ("futu_skill_facts.news_sentiment", "Futu来源失败"),
+        ("futu_skill_facts.technical_anomaly", "Futu来源失败"),
+        ("futu_skill_facts.capital_anomaly", "Futu来源失败"),
+        ("futu_skill_facts.derivatives_anomaly", "Futu来源失败"),
+    ],
+)
+def test_daily_runner_publishes_successful_sources_when_record_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    expected_error: str,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = replace(_daily_config(tmp_path), notify_daily_report=True)
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    latest_dir = config.data_dir / "latest/US"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("technical_facts.json", "decision_facts.json", "tradingagents_summary.json", "futu_skill_facts.json"):
+        (latest_dir / name).write_text("stale-old-marker\n", encoding="utf-8")
+    notifier = CapturingNotifier()
+    premarket_source = source if source.startswith(("technical_", "decision_facts.")) else ""
+    summary = FakeTradingAgentsSummaryGenerator(source == "tradingagents_summary")
+    futu_module = source.removeprefix("futu_skill_facts.") if source.startswith("futu_skill_facts.") else ""
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=FakePremarket(source_failure=premarket_source),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        summary_generator=summary,
+        futu_facts_generator=FakeFutuFactsGenerator(futu_module),
+        notifier=notifier,
+    ).run(run_date="2026-06-19", market="US")
+
+    assert result.status == "failed"
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert status["readiness"] == "blocked"
+    assert status["source_failures"] == [{
+        "market": "US",
+        "symbol": "MSFT",
+        "source": source,
+        "error": expected_error,
+    }]
+    assert "source_incomplete" in status["status_reasons"]
+    run_dir = config.data_dir / "runs/2026-06-19/US"
+    for name in ("technical_facts.json", "decision_facts.json", "tradingagents_summary.json", "futu_skill_facts.json"):
+        assert (latest_dir / name).read_text(encoding="utf-8") == (run_dir / name).read_text(encoding="utf-8")
+    assert "stale-old-marker" not in (latest_dir / "technical_facts.json").read_text(encoding="utf-8")
+    blocker = next(message for title, message in notifier.calls if "阻塞通知" in title)
+    assert "US.MSFT" in blocker
+    assert source in blocker
+    assert expected_error in blocker
+    assert "launchctl kickstart -k gui/$(id -u)/com.open-trader.premarket.us" in blocker
 
 
 def test_daily_config_deadline_for_market_uses_hk_and_us_defaults(
@@ -1245,7 +1449,7 @@ def test_daily_runner_refreshes_portfolio_before_premarket(
     assert trade_actions.calls[0]["portfolio_path"] == refreshed_portfolio
 
 
-def test_daily_runner_skips_blocking_facts_generation(
+def test_daily_runner_uses_real_premarket_fact_generators(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1267,23 +1471,45 @@ def test_daily_runner_skips_blocking_facts_generation(
     ).run(run_date="2026-06-19", market="US")
 
     call = premarket.calls[0]
-    technical_result = call["technical_facts_generator"](
-        data_dir=config.data_dir,
-        run_date="2026-06-19",
-        update_latest=False,
-        market="US",
-    )
-    decision_result = call["decision_facts_generator"](
-        data_dir=config.data_dir,
-        run_date="2026-06-19",
-        update_latest=False,
-        market="US",
-    )
-    technical_payload = json.loads(technical_result.run_path.read_text(encoding="utf-8"))
-    decision_payload = json.loads(decision_result.run_path.read_text(encoding="utf-8"))
+    assert "technical_facts_generator" not in call
+    assert "decision_facts_generator" not in call
 
-    assert technical_payload["status"] == "skipped"
-    assert decision_payload["status"] == "skipped"
+
+def test_daily_runner_falls_back_when_premarket_omits_technical_facts_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("portfolio\n", encoding="utf-8")
+    premarket = FakePremarket(market="US", symbol="MSFT")
+
+    def premarket_runner(**kwargs: object) -> PremarketResult:
+        result = premarket(**kwargs)
+        return PremarketResult(
+            eligible_count=result.eligible_count,
+            advice_count=result.advice_count,
+            action_count=result.action_count,
+            advice_path=result.advice_path,
+            classifications_path=result.classifications_path,
+            actions_path=result.actions_path,
+            report_path=result.report_path,
+            decision_facts_path=result.decision_facts_path,
+        )
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=premarket_runner,
+        plan_builder=FakePlanBuilder(market="US", symbol="MSFT"),
+        quote_client_factory=lambda **kwargs: FakeQuoteClient(
+            {"US.MSFT": QuoteSnapshot("US.MSFT", Decimal("390"))}, **kwargs
+        ),
+        trade_action_generator=FakeTradeActionGenerator(market="US", symbol="MSFT"),
+    ).run(run_date="2026-06-19", market="US")
+
+    assert result.status == "success"
+    assert (tmp_path / "data/latest/US/technical_facts.json").exists()
 
 
 def test_hk_daily_runner_uses_market_notification_titles(
@@ -1594,7 +1820,7 @@ def test_daily_runner_stops_when_portfolio_filters_to_no_report_symbols(
     assert "- portfolio: " in report
 
 
-def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
+def test_daily_runner_retains_only_missing_source_latest_when_summary_generation_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1620,7 +1846,7 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
         '{"old": true}\n',
         encoding="utf-8",
     )
-    failing_summary = FailingTradingAgentsSummaryGenerator("summary boom")
+    failing_summary = FailingTradingAgentsSummaryGenerator("summary service unavailable")
     notifier = CapturingNotifier()
 
     result = _daily_runner(
@@ -1633,13 +1859,14 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
         notifier=notifier,
     ).run("2026-06-17", market="US")
 
-    assert result.status == "partial"
+    assert result.status == "failed"
     assert len(failing_summary.calls) == 1
     status = json.loads(result.status_path.read_text(encoding="utf-8"))
     artifacts = status["artifacts"]
-    assert status["status"] == "partial"
-    assert status["readiness"] == "review_required"
+    assert status["status"] == "failed"
+    assert status["readiness"] == "blocked"
     assert "tradingagents_summary_failed" in status["status_reasons"]
+    assert "source_incomplete" in status["status_reasons"]
     assert "error" not in status
     assert artifacts["advice"] == str(
         tmp_path / "data/runs/2026-06-17/US/trading_advice.csv"
@@ -1652,6 +1879,7 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
     )
     assert artifacts["tradingagents_summary"] == ""
     assert artifacts["latest_tradingagents_summary"] == ""
+    assert status["source_failures"][0]["error"] == "summary service unavailable"
     assert (latest_dir / "trading_advice.csv").exists()
     assert (latest_dir / "premarket_actions.csv").exists()
     assert (latest_dir / "trading_plan.csv").exists()
@@ -1660,7 +1888,7 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
         encoding="utf-8"
     ) == '{"old": true}\n'
     report = result.report_path.read_text(encoding="utf-8")
-    assert "- Status: partial" in report
+    assert "- Status: failed" in report
     assert "TradingAgents 摘要生成异常" in report
     assert "- tradingagents_summary: " in report
     assert f"- latest_tradingagents_summary: {latest_dir}" not in report
@@ -1670,8 +1898,44 @@ def test_daily_runner_degrades_when_tradingagents_summary_generation_fails(
     assert len(blocker_calls) == 1
     _, body = blocker_calls[0]
     assert "Open Trader｜阻塞通知" in body
-    assert "原因：TradingAgents 摘要生成异常" in body
+    assert "TradingAgents 摘要生成异常" in body
+    assert "决策来源不完整" in body
     assert "报告：" in body
+
+
+def test_daily_runner_retains_only_missing_source_latest_when_futu_generation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("symbol\nMSFT\n", encoding="utf-8")
+    latest_futu = config.data_dir / "latest/US/futu_skill_facts.json"
+    latest_futu.parent.mkdir(parents=True, exist_ok=True)
+    latest_futu.write_text('{"old": true}\n', encoding="utf-8")
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        futu_facts_generator=FailingFutuFactsGenerator(),
+    ).run("2026-06-17", market="US")
+
+    status = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert result.status == "failed"
+    assert {failure["source"] for failure in status["source_failures"]} == {
+        "futu_skill_facts.news_sentiment",
+        "futu_skill_facts.technical_anomaly",
+        "futu_skill_facts.capital_anomaly",
+        "futu_skill_facts.derivatives_anomaly",
+    }
+    assert {failure["error"] for failure in status["source_failures"]} == {
+        "futu service unavailable"
+    }
+    assert latest_futu.read_text(encoding="utf-8") == '{"old": true}\n'
+    assert (config.data_dir / "latest/US/technical_facts.json").exists()
 
 
 def test_daily_runner_sends_feishu_order_review_after_trade_actions(

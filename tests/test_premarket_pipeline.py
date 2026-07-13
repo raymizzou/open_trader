@@ -513,6 +513,7 @@ def test_run_premarket_generates_technical_facts_after_advice(
         advice_runner=FakeAdviceRunner(),
         classifier=FakeClassifier(),
         technical_facts_generator=generator,
+        market="US",
     )
 
     assert generator.calls == [
@@ -521,11 +522,14 @@ def test_run_premarket_generates_technical_facts_after_advice(
             "data_dir": data_dir,
             "run_date": "2026-06-19",
             "update_latest": False,
-            "market": None,
+            "market": "US",
         }
     ]
-    assert (data_dir / "runs/2026-06-19/technical_facts.json").exists()
-    assert (data_dir / "latest/technical_facts.json").exists()
+    assert result.technical_facts_path == (
+        tmp_path / "data/runs/2026-06-19/US/technical_facts.json"
+    )
+    assert (data_dir / "runs/2026-06-19/US/technical_facts.json").exists()
+    assert (data_dir / "latest/US/technical_facts.json").exists()
 
 
 def test_run_premarket_generates_decision_facts_after_advice(
@@ -563,6 +567,37 @@ def test_run_premarket_generates_decision_facts_after_advice(
     assert (data_dir / "latest/decision_facts.json").read_text(
         encoding="utf-8"
     ) == result.decision_facts_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("failed_source", ["technical", "decision"])
+def test_run_premarket_isolates_fact_generator_failures(
+    tmp_path: Path, failed_source: str
+) -> None:
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    write_portfolio(portfolio_path)
+
+    def fail(**_: object) -> object:
+        raise RuntimeError(f"{failed_source} service unavailable")
+
+    result = run_premarket(
+        run_date="2026-06-19",
+        portfolio_path=portfolio_path,
+        data_dir=data_dir,
+        reports_dir=tmp_path / "reports",
+        advice_runner=FakeAdviceRunner(),
+        classifier=FakeClassifier(),
+        technical_facts_generator=fail if failed_source == "technical" else FakeTechnicalFactsGenerator(),  # type: ignore[arg-type]
+        decision_facts_generator=fail if failed_source == "decision" else FakeDecisionFactsGenerator(),  # type: ignore[arg-type]
+        update_latest=False,
+    )
+
+    assert getattr(result, f"{failed_source}_facts_path") is None
+    assert getattr(result, f"{failed_source}_facts_error") == (
+        f"{failed_source} service unavailable"
+    )
+    other = "decision" if failed_source == "technical" else "technical"
+    assert getattr(result, f"{other}_facts_path").exists()
 
 
 def test_run_premarket_filters_hk_market_and_writes_market_scoped_outputs(
