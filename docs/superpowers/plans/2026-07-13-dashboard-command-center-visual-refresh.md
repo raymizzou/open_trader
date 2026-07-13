@@ -508,10 +508,10 @@ Expected: output identifies the old screen session, process PID, working command
 screen -S open_trader_dashboard_8766 -X quit 2>/dev/null || true
 rm -f /tmp/open_trader_dashboard_8766.log
 screen -dmS open_trader_dashboard_8766 zsh -lc \
-  'cd /Users/ray/projects/open_trader && exec env PYTHONPATH=src .venv/bin/python -m open_trader dashboard --portfolio /Users/ray/projects/open_trader/data/latest/portfolio.csv --data-dir /Users/ray/projects/open_trader/data --reports-dir /Users/ray/projects/open_trader/reports --poll-seconds 5 --host 127.0.0.1 --port 8766 >> /tmp/open_trader_dashboard_8766.log 2>&1'
+  'cd /Users/ray/projects/open_trader/.worktrees/dashboard-command-center-refresh && exec env PYTHONPATH=src .venv/bin/python -m open_trader dashboard --portfolio /Users/ray/projects/open_trader/data/latest/portfolio.csv --data-dir /Users/ray/projects/open_trader/data --reports-dir /Users/ray/projects/open_trader/reports --poll-seconds 5 --host 127.0.0.1 --port 8766 >> /tmp/open_trader_dashboard_8766.log 2>&1'
 ```
 
-Expected: the old listener exits and a new detached screen session starts from `/Users/ray/projects/open_trader`.
+Expected: the old listener exits and a new detached screen session starts from `/Users/ray/projects/open_trader/.worktrees/dashboard-command-center-refresh`.
 
 - [ ] **Step 4: Verify the fresh PID, working directory, SHA, API, and log**
 
@@ -524,7 +524,7 @@ curl -sS http://127.0.0.1:8766/api/dashboard | .venv/bin/python -m json.tool | s
 sed -n '1,120p' /tmp/open_trader_dashboard_8766.log
 ```
 
-Expected: one fresh PID; cwd is `/Users/ray/projects/open_trader`; the API returns JSON; the new log contains no traceback or `看板数据加载失败`.
+Expected: one fresh PID; cwd is `/Users/ray/projects/open_trader/.worktrees/dashboard-command-center-refresh`; the API returns JSON; the new log contains no traceback or `看板数据加载失败`.
 
 - [ ] **Step 5: Run the mandatory final gate**
 
@@ -544,5 +544,5 @@ If the result is `FAIL`, diagnose, fix, recommit, restart the process, and rerun
 
 - Only CSS and focused CSS-contract tests changed after the approved design/spec commits.
 - Current Header data, four broker summaries, source rows, controls, ten holdings columns, Kelly Lab, details, research chat, and backtest behavior remain present.
-- The live process runs the current repository SHA from `/Users/ray/projects/open_trader`.
+- The live process runs the current repository SHA from `/Users/ray/projects/open_trader/.worktrees/dashboard-command-center-refresh`.
 - `make acceptance` returns `PASS` as the final command.
