@@ -3,6 +3,12 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-13
+
+- Refreshed the Dashboard command-center styling without changing its displayed
+  data contract, and added configurable acceptance URL/log settings so isolated
+  worktrees can be verified on a separate port.
+
 ## 2026-07-12
 
 - Added optional Eastmoney statement path and PDF password loading from the
