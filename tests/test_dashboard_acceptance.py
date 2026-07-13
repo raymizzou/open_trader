@@ -121,6 +121,10 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
         def nth(self, index: int) -> "Locator":
             return Locator(f"tab-{index}")
 
+        def get_attribute(self, name: str) -> str:
+            assert name == "aria-controls"
+            return f"decision-panel-{self.kind}"
+
         def inner_text(self) -> str:
             return "source data"
 
@@ -145,9 +149,56 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
     assert clicks == ["button", "tab-0", "tab-1", "tab-2", "tab-3", "tab-4"]
 
 
-def test_browser_check_treats_tab_interaction_errors_as_acceptance_failures(
+def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> None:
+    class Locator:
+        def __init__(self, kind: str, index: int = 0) -> None:
+            self.kind = kind
+            self.index = index
+
+        def count(self) -> int:
+            if self.kind in {"button", "initial-panel"}:
+                return 1
+            if self.kind == "tabs":
+                return 5
+            return 0
+
+        def click(self) -> None:
+            pass
+
+        def all_inner_texts(self) -> list[str]:
+            return ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
+
+        def nth(self, index: int) -> "Locator":
+            return Locator("tab", index)
+
+        def get_attribute(self, name: str) -> str:
+            assert name == "aria-controls"
+            return f"decision-panel-{self.index}"
+
+        def inner_text(self) -> str:
+            return "source data"
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            if selector.startswith('button[data-detail-mode="decision"]'):
+                return Locator("button")
+            if selector == ".decision-tab-list [data-decision-tab]":
+                return Locator("tabs")
+            if selector == ".decision-tab-panel:visible":
+                return Locator("initial-panel")
+            if selector == "#decision-panel-0:visible":
+                return Locator("initial-panel")
+            return Locator("missing")
+
+    with pytest.raises(AssertionError, match="TradingAgents"):
+        dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT")
+
+
+def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    visited: list[str] = []
+
     class Locator:
         @property
         def first(self) -> "Locator":
@@ -163,11 +214,16 @@ def test_browser_check_treats_tab_interaction_errors_as_acceptance_failures(
             return "5 条"
 
     class Page:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
         def on(self, *_args: object) -> None:
             pass
 
         def goto(self, *_args: object, **_kwargs: object) -> None:
-            pass
+            visited.append(self.name)
+            if self.name == "desktop":
+                raise RuntimeError("navigation failed")
 
         def locator(self, _selector: str) -> Locator:
             return Locator()
@@ -179,8 +235,11 @@ def test_browser_check_treats_tab_interaction_errors_as_acceptance_failures(
             pass
 
     class Browser:
+        pages = 0
+
         def new_page(self, **_kwargs: object) -> Page:
-            return Page()
+            self.pages += 1
+            return Page("desktop" if self.pages == 1 else "mobile")
 
         def close(self) -> None:
             pass
@@ -202,18 +261,16 @@ def test_browser_check_treats_tab_interaction_errors_as_acceptance_failures(
     monkeypatch.setattr(
         dashboard_acceptance,
         "_check_decision_tabs",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("tab interaction failed")),
+        lambda *_args: None,
     )
 
     errors, blocker = dashboard_acceptance._browser_check(
         "http://dashboard", 5, valid_payload()
     )
 
-    assert errors == [
-        "desktop：tab interaction failed",
-        "mobile：tab interaction failed",
-    ]
+    assert errors == ["desktop：RuntimeError: navigation failed"]
     assert blocker is None
+    assert visited == ["desktop", "mobile"]
 
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:

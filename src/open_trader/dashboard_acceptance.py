@@ -189,8 +189,11 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
     assert tabs.all_inner_texts() == expected_labels, "decision tabs are missing or out of order"
     assert page.locator(".decision-tab-list .decision-tab-failed").count() == 0, "decision tab failed"
     for index in range(tabs.count()):
-        tabs.nth(index).click()
-        panel = page.locator(".decision-tab-panel:visible")
+        tab = tabs.nth(index)
+        tab.click()
+        panel_id = tab.get_attribute("aria-controls")
+        assert panel_id, f"tab {expected_labels[index]} has no controlled panel"
+        panel = page.locator(f"#{panel_id}:visible")
         assert panel.count() == 1, f"tab {expected_labels[index]} has {panel.count()} visible panels"
         assert "数据未生成" not in panel.inner_text(), f"tab {expected_labels[index]} contains 数据未生成"
 
@@ -215,40 +218,49 @@ def _browser_check(
                 ("desktop", {"width": 1440, "height": 1000}),
                 ("mobile", {"width": 390, "height": 844}),
             ):
-                page = browser.new_page(viewport=viewport)
-                browser_errors: list[str] = []
-                page.on(
-                    "console",
-                    lambda message: browser_errors.append(message.text)
-                    if message.type == "error"
-                    and _is_actionable_console_error(message.text)
-                    else None,
-                )
-                page.on("pageerror", lambda error: browser_errors.append(str(error)))
-                page.on("response", lambda response: browser_errors.append(
-                    f"HTTP {response.status} {response.url}"
-                ) if response.status >= 400 else None)
-                page.goto(url, wait_until="networkidle")
-                if "看板数据加载失败" in page.locator("body").inner_text():
-                    errors.append(f"{name}：页面显示看板数据加载失败")
+                page = None
                 try:
+                    page = browser.new_page(viewport=viewport)
+                    browser_errors: list[str] = []
+                    page.on(
+                        "console",
+                        lambda message: browser_errors.append(message.text)
+                        if message.type == "error"
+                        and _is_actionable_console_error(message.text)
+                        else None,
+                    )
+                    page.on("pageerror", lambda error: browser_errors.append(str(error)))
+                    page.on("response", lambda response: browser_errors.append(
+                        f"HTTP {response.status} {response.url}"
+                    ) if response.status >= 400 else None)
+                    page.goto(url, wait_until="networkidle")
+                    if "看板数据加载失败" in page.locator("body").inner_text():
+                        errors.append(f"{name}：页面显示看板数据加载失败")
                     _check_decision_tabs(page, market, symbol)
+                    phillips_card = page.locator(
+                        '#broker-summary-cards [data-broker="phillips"]'
+                    )
+                    if phillips_card.locator("strong").inner_text().strip() in {"", "-"}:
+                        errors.append(f"{name}：辉立账户卡没有显示资产")
+                    page.locator('[data-market="CN"]').first.click()
+                    page.locator('button[data-broker="eastmoney"]').click()
+                    page.wait_for_timeout(500)
+                    if page.locator("#visible-count").inner_text().strip() != f"{expected_cn} 条":
+                        errors.append(f"{name}：A 股东方财富筛选不是 {expected_cn} 条")
+                    errors.extend(
+                        f"{name}：浏览器错误：{message}" for message in browser_errors
+                    )
+                    page.close()
+                    page = None
                 except Exception as exc:
-                    errors.append(f"{name}：{exc}")
-                phillips_card = page.locator(
-                    '#broker-summary-cards [data-broker="phillips"]'
-                )
-                if phillips_card.locator("strong").inner_text().strip() in {"", "-"}:
-                    errors.append(f"{name}：辉立账户卡没有显示资产")
-                page.locator('[data-market="CN"]').first.click()
-                page.locator('button[data-broker="eastmoney"]').click()
-                page.wait_for_timeout(500)
-                if page.locator("#visible-count").inner_text().strip() != f"{expected_cn} 条":
-                    errors.append(f"{name}：A 股东方财富筛选不是 {expected_cn} 条")
-                errors.extend(
-                    f"{name}：浏览器错误：{message}" for message in browser_errors
-                )
-                page.close()
+                    errors.append(f"{name}：{type(exc).__name__}: {exc}")
+                    if page is not None:
+                        try:
+                            page.close()
+                        except Exception as close_exc:
+                            errors.append(
+                                f"{name}：{type(close_exc).__name__}: {close_exc}"
+                            )
             browser.close()
     except Exception as exc:
         return errors, f"浏览器不可用：{type(exc).__name__}: {exc}"
