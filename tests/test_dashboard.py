@@ -99,7 +99,9 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
     )
 
 
-def test_dashboard_refreshes_cn_derived_values_from_cached_close(tmp_path: Path) -> None:
+def test_dashboard_preserves_cn_statement_values_when_backtest_cache_exists(
+    tmp_path: Path,
+) -> None:
     config = dashboard_config(tmp_path)
     row = {field: "" for field in PORTFOLIO_FIELDNAMES}
     row.update(
@@ -112,6 +114,7 @@ def test_dashboard_refreshes_cn_derived_values_from_cached_close(tmp_path: Path)
             "total_quantity": "6000",
             "last_price": "9.62",
             "market_value": "57720",
+            "market_value_hkd": "62337.60",
             "cost_value": "53346",
             "fx_to_hkd": "1.08",
             "brokers": "eastmoney",
@@ -135,15 +138,14 @@ def test_dashboard_refreshes_cn_derived_values_from_cached_close(tmp_path: Path)
 
     state = load_dashboard_state(config)
     holding = state.holdings[0]
-    assert holding["last_price"] == "10"
-    assert holding["market_value"] == "60000.00"
-    assert holding["market_value_hkd"] == "64800.00"
-    assert holding["unrealized_pnl"] == "6654.00"
-    assert holding["unrealized_pnl_pct"] == "12.47%"
-    assert state.summary["portfolio_value_hkd"] == "64800.00"
+    assert holding["last_price"] == "9.62"
+    assert holding["market_value"] == "57720"
+    assert state.summary["portfolio_value_hkd"] == "62337.60"
 
 
-def test_dashboard_refreshes_all_weights_after_cn_cached_closes(tmp_path: Path) -> None:
+def test_dashboard_preserves_all_statement_weights_when_cn_cache_exists(
+    tmp_path: Path,
+) -> None:
     config = dashboard_config(tmp_path)
     rows = []
     for values in [
@@ -185,15 +187,15 @@ def test_dashboard_refreshes_all_weights_after_cn_cached_closes(tmp_path: Path) 
     payload = load_dashboard_state(config).to_dict()
     displayed_rows = payload["holdings"] + payload["cash_rows"]
 
-    assert payload["summary"]["portfolio_value_hkd"] == "1003.00"
+    assert payload["summary"]["portfolio_value_hkd"] == "800.00"
     assert sum(Decimal(row["market_value_hkd"]) for row in displayed_rows) == Decimal(
-        "1003.00"
+        "800.00"
     )
     assert {row["symbol"]: row["portfolio_weight_hkd"] for row in displayed_rows} == {
-        "600001": "20.04%",
-        "600002": "30.11%",
-        "AAPL": "39.88%",
-        "HKD_CASH": "9.97%",
+        "600001": "10.00%",
+        "600002": "20.00%",
+        "AAPL": "40.00%",
+        "HKD_CASH": "30.00%",
     }
     assert sum(
         Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in displayed_rows
@@ -201,7 +203,7 @@ def test_dashboard_refreshes_all_weights_after_cn_cached_closes(tmp_path: Path) 
     assert config.portfolio_path.read_bytes() == original
 
 
-def test_dashboard_discards_cn_overlay_when_complete_weights_are_invalid(
+def test_dashboard_preserves_statement_when_complete_weights_are_invalid(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -259,7 +261,7 @@ def test_dashboard_discards_cn_overlay_when_complete_weights_are_invalid(
         ("fx_to_hkd", "-1"),
     ],
 )
-def test_dashboard_invalid_cn_cached_inputs_preserve_statement_row_and_summary(
+def test_dashboard_cn_cache_inputs_never_replace_statement_row_and_summary(
     tmp_path: Path,
     field: str,
     value: str,

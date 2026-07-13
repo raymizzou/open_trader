@@ -2060,6 +2060,7 @@ function renderHoldings() {
       const rowKey = holdingKey(holding, index);
       const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
       const quote = quoteForHolding(holding);
+      const displayHolding = quoteAdjustedHolding(holding, quote);
       const selectedDetail = selected && rowKey === state.selectedHoldingKey
         ? normalizeHoldingDetailMode(state.selectedHoldingDetail)
         : "";
@@ -2075,10 +2076,10 @@ function renderHoldings() {
           <td class="number-cell">${escapeHtml(formatPlain(holding.total_quantity))}</td>
           <td class="number-cell">${escapeHtml(formatPlain(holding.avg_cost_price))}</td>
           <td class="number-cell">${renderQuotePrice(holding, quote)}</td>
-          <td class="number-cell">${escapeHtml(renderUsdMarketValue(holding))}</td>
-          <td class="number-cell">${escapeHtml(formatMoney(holding.market_value_hkd, "HKD"))}</td>
+          <td class="number-cell">${escapeHtml(renderUsdMarketValue(displayHolding))}</td>
+          <td class="number-cell">${escapeHtml(formatMoney(displayHolding.market_value_hkd, "HKD"))}</td>
           <td class="number-cell">${escapeHtml(formatPlain(holding.portfolio_weight_hkd))}</td>
-          <td class="number-cell">${escapeHtml(formatPlain(holding.unrealized_pnl_pct))}</td>
+          <td class="number-cell">${escapeHtml(formatPlain(displayHolding.unrealized_pnl_pct))}</td>
         </tr>
       `);
       if (selected && rowKey === state.selectedHoldingKey) {
@@ -5630,6 +5631,25 @@ function quoteForHolding(holding) {
     return null;
   }
   return state.quotes[key] || null;
+}
+
+function quoteAdjustedHolding(holding, quote) {
+  const price = numericValue(quote && quote.last_price);
+  const quantity = numericValue(holding && holding.total_quantity);
+  const cost = numericValue(holding && holding.cost_value);
+  const fx = numericValue(holding && holding.fx_to_hkd);
+  if (price === null || price <= 0 || quantity === null || quantity <= 0
+      || cost === null || cost <= 0 || fx === null || fx <= 0) {
+    return holding;
+  }
+  const marketValue = price * quantity;
+  return {
+    ...holding,
+    market_value: marketValue.toFixed(2),
+    market_value_hkd: (marketValue * fx).toFixed(2),
+    unrealized_pnl: (marketValue - cost).toFixed(2),
+    unrealized_pnl_pct: `${(((marketValue - cost) / cost) * 100).toFixed(2)}%`,
+  };
 }
 
 function quoteNotApplicable(holding) {

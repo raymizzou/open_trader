@@ -796,6 +796,34 @@ console.log(JSON.stringify(values));
     assert json.loads(output) == ["SH.600025", "SZ.000001", "SH.000300"]
 
 
+def test_dashboard_derives_live_holding_values_from_futu_quote() -> None:
+    output = run_dashboard_js(
+        r'''
+const holding = quoteAdjustedHolding({
+  market: "CN",
+  symbol: "600025",
+  total_quantity: "6000",
+  cost_value: "53346",
+  fx_to_hkd: "1.08",
+  market_value: "57720",
+  market_value_hkd: "62337.60",
+  unrealized_pnl_pct: "8.20%",
+}, { last_price: "9.81" });
+console.log(JSON.stringify({
+  market_value: holding.market_value,
+  market_value_hkd: holding.market_value_hkd,
+  unrealized_pnl_pct: holding.unrealized_pnl_pct,
+}));
+'''
+    )
+
+    assert json.loads(output) == {
+        "market_value": "58860.00",
+        "market_value_hkd": "63568.80",
+        "unrealized_pnl_pct": "10.34%",
+    }
+
+
 def test_dashboard_trading_decision_tabs() -> None:
     output = run_dashboard_js(
         r'''

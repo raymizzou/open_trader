@@ -37,7 +37,6 @@ from .kelly_lab import (
 from .market_scope import MarketScope
 from .models import AssetClass
 from .parsers.base import detect_asset_class
-from .portfolio import PortfolioBuildError, recalculate_portfolio_weights
 from .research_chat import load_research_view_for_holding
 from .t_signal_store import (
     index_t_signals_by_market_symbol,
@@ -133,19 +132,7 @@ class DashboardState:
 
 
 def load_dashboard_state(config: DashboardConfig) -> DashboardState:
-    original_portfolio_rows = _read_csv_rows(config.portfolio_path)
-    portfolio_rows = [
-        _overlay_cn_cached_close(row, config.data_dir) for row in original_portfolio_rows
-    ]
-    overlays_applied = any(
-        updated is not original
-        for original, updated in zip(original_portfolio_rows, portfolio_rows)
-    )
-    if overlays_applied:
-        try:
-            recalculate_portfolio_weights(portfolio_rows)
-        except PortfolioBuildError:
-            portfolio_rows = original_portfolio_rows
+    portfolio_rows = _read_csv_rows(config.portfolio_path)
     detail_month = latest_broker_detail_month(config.data_dir)
     broker_positions, raw_cash_details = _latest_broker_details(config.data_dir)
     cash_details = [_cash_detail_row(row) for row in raw_cash_details]
@@ -253,40 +240,6 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         kelly_lab=kelly_lab,
         backtest_universe=backtest_universe,
     )
-
-
-def _overlay_cn_cached_close(row: dict[str, str], data_dir: Path) -> dict[str, str]:
-    if str(row.get("market") or "").strip().upper() != "CN":
-        return row
-    prices = _read_csv_rows(data_dir / "prices" / "CN" / f"{row.get('symbol', '').strip()}.csv")
-    close = _optional_decimal(prices[-1].get("close", "")) if prices else None
-    quantity = _optional_decimal(row.get("total_quantity", ""))
-    cost = _optional_decimal(row.get("cost_value", ""))
-    fx = _optional_decimal(row.get("fx_to_hkd", ""))
-    if (
-        close is None
-        or close <= 0
-        or quantity is None
-        or quantity <= 0
-        or cost is None
-        or cost < 0
-        or fx is None
-        or fx <= 0
-    ):
-        return row
-    market_value = close * quantity
-    pnl = market_value - cost
-    updated = dict(row)
-    updated.update(
-        {
-            "last_price": format(close, "f").rstrip("0").rstrip("."),
-            "market_value": _money_text(market_value),
-            "market_value_hkd": _money_text(market_value * fx),
-            "unrealized_pnl": _money_text(pnl),
-            "unrealized_pnl_pct": _pct_text(_ratio(pnl, cost)),
-        }
-    )
-    return updated
 
 
 def _build_backtest_universe(
