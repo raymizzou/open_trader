@@ -1157,6 +1157,7 @@ def test_llm_extractor_parses_strict_json() -> None:
     assert "只抽取客观技术面事实" in prompt_text
     assert "忽略 FINAL TRANSACTION PROPOSAL" in prompt_text
     assert "status 必须是 present" in prompt_text
+    assert "顶层 timeframes 必须是 JSON 数组" in prompt_text
 
 
 def test_llm_extractor_rejects_non_json_response() -> None:
