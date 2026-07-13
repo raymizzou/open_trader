@@ -15,6 +15,7 @@ from open_trader.dashboard import (
     BROKER_LABELS,
     BROKER_SOURCE_KINDS,
     DashboardConfig,
+    _futu_skill_signal_detail,
     load_dashboard_state,
 )
 from open_trader.decision_facts import (
@@ -59,6 +60,24 @@ CASH_FIELDNAMES = [
     "confidence",
     "notes",
 ]
+
+
+def test_futu_signal_detail_marks_explicit_api_unsupported_reason() -> None:
+    detail = _futu_skill_signal_detail(
+        {
+            "status": "error",
+            "signal": "neutral",
+            "confidence": "low",
+            "summary": "富途接口不支持技术异动：US.BOTZ",
+            "categories": [],
+        },
+        "2026-07-13",
+        {"run_date": "2026-07-13"},
+    )
+
+    assert detail["available"] is False
+    assert detail["unsupported"] is True
+    assert detail["summary"] == "富途接口不支持技术异动：US.BOTZ"
 
 
 def write_csv(path: Path, fieldnames: list[str] | tuple[str, ...], rows: list[dict[str, str]]) -> None:

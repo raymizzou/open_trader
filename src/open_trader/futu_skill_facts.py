@@ -590,10 +590,13 @@ class FutuAnomalyScriptClient:
         *,
         skill_root: Path | None = None,
         runner: Callable[[list[str]], object] | None = None,
+        context_factory: Callable[..., object] | None = None,
     ) -> None:
         codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
         self.skill_root = skill_root or codex_home / "skills"
+        self.runner_explicit = runner is not None
         self.runner = runner or self._run_subprocess
+        self.context_factory = context_factory
 
     def run(
         self,
@@ -605,6 +608,8 @@ class FutuAnomalyScriptClient:
     ) -> dict[str, object]:
         script = self._script_path(module)
         stock_symbol = f"{market.upper()}.{symbol.upper()}"
+        if not script.exists() and not self.runner_explicit:
+            return self._run_native(module, stock_symbol, window_days)
         command = [
             sys.executable,
             str(script),
@@ -630,6 +635,44 @@ class FutuAnomalyScriptClient:
         if not isinstance(payload, dict):
             raise RuntimeError(f"{module} anomaly script returned non-object JSON")
         return payload
+
+    def _run_native(
+        self,
+        module: str,
+        stock_symbol: str,
+        window_days: int,
+    ) -> dict[str, object]:
+        if self.context_factory is None:
+            from futu import OpenQuoteContext
+
+            context_factory = OpenQuoteContext
+        else:
+            context_factory = self.context_factory
+        context = context_factory(
+            host=os.environ.get("OPEN_TRADER_FUTU_HOST", "127.0.0.1"),
+            port=int(os.environ.get("OPEN_TRADER_FUTU_PORT", "11111")),
+        )
+        method_name = {
+            "technical": "get_technical_unusual",
+            "capital": "get_financial_unusual",
+            "derivatives": "get_derivative_unusual",
+        }.get(module)
+        if method_name is None:
+            context.close()
+            raise ValueError(f"unknown anomaly module: {module}")
+        try:
+            ret_code, data = getattr(context, method_name)(
+                stock_symbol,
+                time_range=window_days,
+            )
+        finally:
+            context.close()
+        if ret_code != 0:
+            raise RuntimeError(str(data))
+        if isinstance(data, dict) and data.get("err_code") == -12301:
+            label = {"technical": "技术", "capital": "资金", "derivatives": "衍生品"}[module]
+            raise RuntimeError(f"富途接口不支持{label}异动：{stock_symbol}")
+        return {"data": data}
 
     def _script_path(self, module: str) -> Path:
         mapping = {

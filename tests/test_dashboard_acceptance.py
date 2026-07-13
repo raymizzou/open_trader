@@ -89,6 +89,19 @@ def test_validate_dashboard_payload_ignores_missing_sources_without_current_advi
     assert validate_dashboard_payload(payload, expected_cn=5) == []
 
 
+def test_validate_dashboard_payload_accepts_explicitly_unsupported_source() -> None:
+    payload = valid_payload()
+    source = payload["holdings"][-1]["futu_skill_facts"]["technical_anomaly"]  # type: ignore[index]
+    source.update(
+        available=False,
+        unsupported=True,
+        status="error",
+        summary="富途接口不支持技术异动：US.MSFT",
+    )
+
+    assert validate_dashboard_payload(payload, expected_cn=5) == []
+
+
 def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
     assert dashboard_acceptance._first_in_scope_holding(valid_payload()) == ("US", "MSFT")
 

@@ -671,6 +671,48 @@ def test_futu_anomaly_script_client_invokes_expected_scripts(tmp_path: Path) -> 
     assert "handle_derivatives_anomaly.py" in calls[2][1]
 
 
+def test_futu_anomaly_client_uses_native_sdk_when_skill_script_is_missing(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, int]] = []
+
+    class FakeContext:
+        def get_financial_unusual(self, symbol: str, time_range: int) -> tuple[int, object]:
+            calls.append(("capital", symbol, time_range))
+            return 0, {"err_code": 1, "content": "资金面异动无异常"}
+
+        def close(self) -> None:
+            calls.append(("close", "", 0))
+
+    client = FutuAnomalyScriptClient(
+        skill_root=tmp_path / "skills",
+        context_factory=lambda **_kwargs: FakeContext(),
+    )
+
+    payload = client.run("capital", market="US", symbol="DRAM", window_days=7)
+
+    assert payload == {"data": {"err_code": 1, "content": "资金面异动无异常"}}
+    assert calls == [("capital", "US.DRAM", 7), ("close", "", 0)]
+
+
+def test_futu_anomaly_client_reports_native_sdk_unsupported_reason(tmp_path: Path) -> None:
+    class FakeContext:
+        def get_technical_unusual(self, symbol: str, time_range: int) -> tuple[int, object]:
+            del symbol, time_range
+            return 0, {"err_code": -12301, "retMsg": "", "content": ""}
+
+        def close(self) -> None:
+            pass
+
+    client = FutuAnomalyScriptClient(
+        skill_root=tmp_path / "skills",
+        context_factory=lambda **_kwargs: FakeContext(),
+    )
+
+    with pytest.raises(RuntimeError, match="富途接口不支持技术异动：US.BOTZ"):
+        client.run("technical", market="US", symbol="BOTZ", window_days=7)
+
+
 def test_futu_anomaly_script_client_extracts_json_from_sdk_logs(
     tmp_path: Path,
 ) -> None:

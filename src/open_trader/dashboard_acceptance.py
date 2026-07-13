@@ -70,7 +70,10 @@ def validate_dashboard_payload(
             source: Any = holding
             for key in path:
                 source = source.get(key) if isinstance(source, Mapping) else None
-            if not isinstance(source, Mapping) or source.get("available") is not True:
+            if not isinstance(source, Mapping) or (
+                source.get("available") is not True
+                and source.get("unsupported") is not True
+            ):
                 detail = next(
                     (
                         str(source.get(key))

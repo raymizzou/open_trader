@@ -22,6 +22,7 @@ from .decision_facts import (
 from .decision_source_availability import (
     decision_module_available,
     futu_module_available,
+    futu_module_unsupported,
     technical_facts_available,
     tradingagents_available,
 )
@@ -1345,6 +1346,7 @@ def _futu_skill_signal_detail(
     stale_run_date = futu_module_available(module) and not available
     return {
         "available": available,
+        "unsupported": futu_module_unsupported(module),
         "status": "stale_run_date" if stale_run_date else status or "missing",
         "error": "Futu facts run date does not match latest advice" if stale_run_date else "",
         "signal": signal,

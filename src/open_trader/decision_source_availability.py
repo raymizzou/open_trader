@@ -85,6 +85,14 @@ def futu_module_available(
     return bool(available and advice_run_date and record_run_date == advice_run_date)
 
 
+def futu_module_unsupported(module: object) -> bool:
+    return bool(
+        isinstance(module, dict)
+        and module.get("status") == "error"
+        and str(module.get("summary") or "").startswith("富途接口不支持")
+    )
+
+
 def evaluate_required_sources(
     *,
     advice_rows: list[dict[str, str]],
@@ -153,7 +161,15 @@ def _futu_checks(
 ) -> tuple[tuple[str, object, bool], ...]:
     current = bool(record and record.get("run_date") == run_date)
     return tuple(
-        (f"futu_skill_facts.{name}", _module(record, name), current and futu_module_available(_module(record, name)))
+        (
+            f"futu_skill_facts.{name}",
+            _module(record, name),
+            current
+            and (
+                futu_module_available(_module(record, name))
+                or futu_module_unsupported(_module(record, name))
+            ),
+        )
         for name in (
             "news_sentiment",
             "technical_anomaly",

@@ -564,7 +564,7 @@ def _technical_facts_system_prompt() -> str:
         "交易建议和执行建议。每个 RSI、MACD、均线、布林带、ATR、成交量信号都必须带"
         "timeframe。若报告没有明确周期，timeframe 使用 unknown，timeframe_label 使用"
         "\"周期缺失\"。缺失字段使用空字符串或空数组，不要猜测。schema_version 必须是 "
-        f"{FACTS_SCHEMA_VERSION}。"
+        f"{FACTS_SCHEMA_VERSION}。status 必须是 present。"
         "布林带必须放在每个 timeframe 的 bollinger 对象中，字段包含 upper、middle、"
         "lower、position、status、reference_band、reference_value、distance_pct、"
         "summary_zh、detail_zh。position 只能使用 above_upper、near_upper、"
