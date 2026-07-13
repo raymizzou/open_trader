@@ -8,6 +8,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Refreshed the Dashboard command-center styling without changing its displayed
   data contract, and added configurable acceptance URL/log settings so isolated
   worktrees can be verified on a separate port.
+- Replaced the stale Phillips snapshot with the latest archived 2026-07-10
+  statement, using its authoritative HKD base cash total and excluding closed
+  zero-value positions; the Dashboard now reports HKD 628,554.06 total assets.
+- Made Dashboard acceptance verify the latest archived Phillips PDF instead of
+  fixed portfolio row counts, preserved partial-source results with visible
+  failures, and verified merged `main` with `1504` tests plus desktop/mobile
+  acceptance (`PASS`).
 
 ## 2026-07-12
 
