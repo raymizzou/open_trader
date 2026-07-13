@@ -10,7 +10,11 @@ from typing import Mapping
 from zoneinfo import ZoneInfo
 
 from .akshare_quote import AkShareDailyKlineProvider
-from .backtest_prices import DailyKlineProvider, ensure_resolved_backtest_price_range
+from .backtest_prices import (
+    DailyKlineProvider,
+    ensure_backtest_price_range,
+    resolve_backtest_range,
+)
 from .decision_plan import build_decision_plan, publish_decision_plans
 from .futu_quote import FutuQuoteClient
 from .standard_strategies import build_current_strategy_snapshot, strategy_catalog
@@ -22,6 +26,22 @@ class DecisionPlansBuildResult:
     run_path: Path
     latest_path: Path
     records: int
+
+
+class _RangeCachingProvider:
+    def __init__(self, provider: DailyKlineProvider) -> None:
+        self.provider = provider
+        self._ranges: dict[str, list[tuple[str, str, list[object]]]] = {}
+
+    def get_daily_kline(self, futu_symbol: str, *, start: str, end: str) -> list[object]:
+        for cached_start, cached_end, bars in self._ranges.get(futu_symbol, []):
+            if cached_start <= start and end <= cached_end:
+                return [bar for bar in bars if start <= str(getattr(bar, "date")) <= end]
+        bars = list(self.provider.get_daily_kline(futu_symbol, start=start, end=end))
+        if bars:
+            dates = [str(getattr(bar, "date")) for bar in bars]
+            self._ranges.setdefault(futu_symbol, []).append((min(dates), max(dates), bars))
+        return bars
 
 
 def generate_daily_decision_plans(
@@ -42,11 +62,12 @@ def generate_daily_decision_plans(
         raise ValueError("每日计划缺少技术事实或 TradingAgents 摘要")
     normalized_market = market.strip().upper()
     owned_provider = price_provider is None
-    provider = price_provider or (
+    raw_provider = price_provider or (
         AkShareDailyKlineProvider()
         if normalized_market == "CN"
         else FutuQuoteClient(host=futu_host, port=futu_port)
     )
+    provider = _RangeCachingProvider(raw_provider)
     provider_source = "akshare" if normalized_market == "CN" else "futu"
     try:
         rows = _portfolio_rows(portfolio_path)
@@ -60,12 +81,18 @@ def generate_daily_decision_plans(
             if not _eligible(row, normalized_market):
                 continue
             symbol = (row.get("analysis_symbol") or row.get("symbol") or "").strip().upper()
-            resolved = ensure_resolved_backtest_price_range(
-                data_dir=data_dir, market=normalized_market, symbol=symbol,
-                preset="5Y", custom_start=None, custom_end=date.fromisoformat(run_date),
+            run_day = date.fromisoformat(run_date)
+            price_range = ensure_backtest_price_range(
+                data_dir=data_dir,
+                market=normalized_market,
+                symbol=symbol,
+                date_range=resolve_backtest_range(
+                    preset="5Y", custom_start=None, custom_end=run_day,
+                    latest_available=run_day,
+                ),
                 provider=provider,
             )
-            bars = tuple(resolved.price_range.bars)
+            bars = tuple(price_range.bars)
             if not bars:
                 raise ValueError(f"{normalized_market}.{symbol} 没有可用日线")
             snapshots = [
@@ -85,7 +112,7 @@ def generate_daily_decision_plans(
                             data_dir=data_dir, reports_dir=reports_dir,
                             market=normalized_market, symbol=symbol,
                             strategy_id=definition.strategy_id,
-                            range_preset=range_name, custom_start=None, custom_end=None,
+                            range_preset=range_name, custom_start=None, custom_end=run_day,
                             initial_cash=Decimal("100000"),
                             max_strategy_weight=Decimal("0.10"),
                             commission_bps=Decimal("10"), slippage_bps=Decimal("5"),
@@ -119,8 +146,8 @@ def generate_daily_decision_plans(
         )
         return DecisionPlansBuildResult(run_path, latest_path, len(plans))
     finally:
-        if owned_provider and hasattr(provider, "close"):
-            provider.close()  # type: ignore[attr-defined]
+        if owned_provider and hasattr(raw_provider, "close"):
+            raw_provider.close()  # type: ignore[attr-defined]
 
 
 def _portfolio_rows(path: Path) -> list[dict[str, str]]:

@@ -264,7 +264,8 @@ def build_current_strategy_snapshot(
         else None
     )
     position = (
-        "below_lower" if lower is not None and bars[-1].close < lower
+        "insufficient_history" if bands is None
+        else "below_lower" if lower is not None and bars[-1].close < lower
         else "above_upper" if upper is not None and bars[-1].close > upper
         else "inside"
     )
@@ -358,9 +359,12 @@ def _fact(
 ) -> dict[str, object]:
     return {
         "formula": formula,
-        "inputs": {key: str(item) for key, item in inputs.items()},
+        "inputs": {
+            key: "insufficient_history" if item is None else str(item)
+            for key, item in inputs.items()
+        },
         "source_date": source_date.isoformat(),
-        "calculated_value": None if value is None else str(value),
+        "calculated_value": "insufficient_history" if value is None else str(value),
     }
 
 
