@@ -4,7 +4,7 @@
 
 **Goal:** Make the existing HK/US daily premarket jobs synchronously produce every Dashboard decision source, expose TradingAgents as its own tab, and make `make acceptance` fail unless every current advice symbol has all eight real sources available.
 
-**Architecture:** Keep the two existing launchd jobs and the existing artifact formats. Remove the daily runner's explicit skipped generators, add Futu skill-fact generation to the same run, validate generated run artifacts before latest promotion, and reuse the Dashboard payload as the public acceptance contract. Preserve the last valid latest files when a run fails, while recording exact market/symbol/source failures in daily status, reports, logs, and blocker notifications.
+**Architecture:** Keep the two existing launchd jobs and the existing artifact formats. Remove the daily runner's explicit skipped generators, add Futu skill-fact generation to the same run, validate generated run artifacts, and reuse the Dashboard payload as the public acceptance contract. Publish each generated source so successes remain visible and failures render red; retain an old latest file only when that source produced no artifact, while recording exact market/symbol/source failures in daily status, reports, logs, and blocker notifications.
 
 **Tech Stack:** Python 3.12, pytest, vanilla JavaScript/CSS, Playwright, launchd, Make.
 
@@ -24,7 +24,7 @@
   - `futu_skill_facts.capital_anomaly`
   - `futu_skill_facts.derivatives_anomaly`
 - Missing sources stay visible in the UI as red failed tabs/panels with the real error.
-- Do not overwrite a valid old latest fact file with an incomplete new run artifact.
+- Publish every generated fact artifact so successful records remain visible and failed records render red; retain the old latest file only when that source produced no new artifact.
 - `make acceptance` is the final and only completion gate. `FAIL` must be fixed and rerun; `BLOCKED` must be reported as blocked. Only `PASS` permits asking the user to review.
 
 ### Task 1: Replace skipped daily generators with real synchronous generation
@@ -177,12 +177,11 @@ assert status["source_failures"] == [{
 assert "source_incomplete" in status["status_reasons"]
 ```
 
-Add promotion protection to each failure test:
+Add partial-publication coverage to each failure test:
 
 ```python
-old_latest = latest_path.read_text(encoding="utf-8")
 runner.run(run_date="2026-06-19", market="US")
-assert latest_path.read_text(encoding="utf-8") == old_latest
+assert latest_path.read_text(encoding="utf-8") == run_path.read_text(encoding="utf-8")
 ```
 
 Add a notification assertion that the blocker body contains `US.MSFT`, the source name, the error, and the existing retry command:
@@ -279,9 +278,9 @@ Pass the failures into `_derive_daily_state`; any non-empty list yields `status=
 
 Add `source_failures` to the status JSON and Markdown report. Extend `_blocker_notification_message` to render each failure and the market-specific retry command.
 
-**Step 5: Promote only a complete artifact set**
+**Step 5: Promote every generated artifact**
 
-Add `futu_skill_facts_path` to `_promote_latest_set`. Call promotion only when `source_failures` is empty. This preserves all prior latest files as one coherent set if any new source is incomplete.
+Add `futu_skill_facts_path` to `_promote_latest_set`. Call promotion whenever the run reaches publication, regardless of `source_failures`. Optional paths with no generated artifact are omitted, retaining only that source's prior latest file; generated artifacts containing failed records are promoted so the Dashboard can mark those records red while showing successful records.
 
 Add these artifact keys everywhere status payloads are constructed:
 
