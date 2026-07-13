@@ -2516,7 +2516,7 @@ function decisionTabViews(holding) {
     },
     kline: {
       available: Boolean(facts.kline && facts.kline.available === true) || technicalFactsUsable(technicalFacts),
-      error: facts.kline && facts.kline.error,
+      error: (facts.kline && facts.kline.error) || (technicalFacts && technicalFacts.error),
       html: renderDecisionPluginCard(klineDecisionFactsPlugin(holding)),
     },
     news: {

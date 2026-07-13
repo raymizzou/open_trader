@@ -817,6 +817,19 @@ state.selectedDecisionTab = "kline";
 html = renderTradingDecisionTabs(technicalHolding);
 if (html.includes("decision-tab-empty") || !html.includes("趋势 / K 线")) throw new Error(html);
 
+const staleTechnicalHolding = {
+  ...holding,
+  decision_facts: { kline: { available: false, error: "" } },
+  technical_facts: {
+    available: false,
+    status: "stale_run_date",
+    error: "technical facts run date does not match latest advice",
+  },
+};
+state.selectedDecisionTab = "kline";
+html = renderTradingDecisionTabs(staleTechnicalHolding);
+if (!html.includes("status-failed") || !html.includes("technical facts run date does not match latest advice") || html.includes("数据未生成")) throw new Error(html);
+
 let renders = 0;
 renderHoldings = () => { renders += 1; };
 handleSymbolDetailClick({ target: { closest: (selector) => selector === "[data-decision-tab]" ? { dataset: { decisionTab: "kline" } } : null } });
