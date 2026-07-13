@@ -28,6 +28,8 @@ from .daily_premarket import (
 from .dashboard import DashboardConfig
 from .dashboard_web import serve_dashboard
 from .decision_facts import LLMDecisionFactsExtractor, generate_decision_facts
+from .decision_plan import load_decision_plans
+from .decision_plan_watch import run_decision_plan_watch
 from .futu_account import FutuAccountClient, FutuAccountError, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_skill_facts import FutuSkillFactsExtractor, generate_futu_skill_facts
@@ -638,6 +640,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fetch one quote snapshot and exit",
     )
+
+    watch_decision_parser = subparsers.add_parser(
+        "watch-decision-plans",
+        help="Watch validated daily decision-plan conditions with Futu quotes",
+    )
+    watch_decision_parser.add_argument(
+        "--plans", type=Path, required=True,
+    )
+    watch_decision_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    watch_decision_parser.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env"),
+    )
+    watch_decision_parser.add_argument("--host", default="127.0.0.1")
+    watch_decision_parser.add_argument("--port", type=positive_int, default=11111)
+    watch_decision_parser.add_argument("--poll-seconds", type=positive_float, default=5.0)
+    watch_decision_parser.add_argument("--once", action="store_true")
 
     watch_t_parser = subparsers.add_parser(
         "watch-t",
@@ -1425,6 +1443,38 @@ def main(argv: list[str] | None = None) -> int:
         print(f"skipped: {result.skipped_count}")
         print(f"alerts: {result.alert_count}")
         print(f"alerts_csv: {result.alerts_path}")
+        return 0
+
+    if args.command == "watch-decision-plans":
+        try:
+            plans = load_decision_plans(args.plans)
+            if not plans:
+                raise ValueError("decision plans 文件没有记录")
+            run_date = str(plans[0]["run_date"])
+            market = str(plans[0]["market"])
+            if market not in {"US", "HK"}:
+                raise ValueError("v1 计划 watcher 仅支持美股和港股")
+            if any(
+                plan.get("run_date") != run_date or plan.get("market") != market
+                for plan in plans
+            ):
+                raise ValueError("decision plans 包含跨日期或跨市场记录")
+            result = run_decision_plan_watch(
+                plans=plans,
+                events_path=args.data_dir / "runs" / run_date / market / "plan_events.jsonl",
+                quote_client=FutuQuoteClient(host=args.host, port=args.port),
+                notifier=build_notifier(load_env_config(args.config)),
+                poll_seconds=args.poll_seconds,
+                once=args.once,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+            parser.error(str(exc))
+        print(f"plans: {result.watched_plan_count}")
+        print(f"triggers: {result.trigger_count}")
+        print(f"resets: {result.reset_count}")
+        print(f"notifications_sent: {result.notification_sent_count}")
+        print(f"notifications_failed: {result.notification_failed_count}")
+        print(f"events_jsonl: {result.events_path}")
         return 0
 
     if args.command == "watch-t":

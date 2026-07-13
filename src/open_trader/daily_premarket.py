@@ -42,6 +42,7 @@ from .decision_facts import (
     load_decision_facts_cache,
 )
 from .decision_source_availability import SourceFailure, evaluate_required_sources
+from .decision_plan_generation import generate_daily_decision_plans
 from .futu_skill_facts import (
     FutuSkillFactResult,
     FutuSkillFactsExtractor,
@@ -403,6 +404,7 @@ class DailyPremarketRunner:
         ] = LLMTradingAgentsSummaryExtractor,
         futu_facts_generator: Callable[..., FutuSkillFactResult] = generate_futu_skill_facts,
         futu_facts_extractor_factory: Callable[[], object] = FutuSkillFactsExtractor,
+        decision_plan_generator: Callable[..., object] = generate_daily_decision_plans,
         notifier: Notifier | None = None,
     ) -> None:
         self.config = config
@@ -415,6 +417,7 @@ class DailyPremarketRunner:
         self.summary_extractor_factory = summary_extractor_factory
         self.futu_facts_generator = futu_facts_generator
         self.futu_facts_extractor_factory = futu_facts_extractor_factory
+        self.decision_plan_generator = decision_plan_generator
         self.notifier = notifier or NullNotifier()
 
     def run(
@@ -749,6 +752,21 @@ class DailyPremarketRunner:
             tradingagents_summary_path = Path(
                 getattr(tradingagents_summary_result, "run_path")
             )
+        decision_plans_path: Path | None = None
+        if technical_facts_path is not None and tradingagents_summary_path is not None:
+            decision_plans_result = self.decision_plan_generator(
+                portfolio_path=portfolio_path,
+                technical_facts_path=technical_facts_path,
+                tradingagents_summary_path=tradingagents_summary_path,
+                data_dir=config.data_dir,
+                reports_dir=config.reports_dir,
+                run_date=run_date,
+                market=market,
+                futu_host=config.futu_host,
+                futu_port=config.futu_port,
+                update_latest=False,
+            )
+            decision_plans_path = Path(getattr(decision_plans_result, "run_path"))
         source_failures = _evaluate_source_failures(
             advice_path=advice_path,
             technical_facts_path=technical_facts_path,
@@ -781,6 +799,7 @@ class DailyPremarketRunner:
         latest_decision_facts_path = latest_dir / "decision_facts.json"
         latest_tradingagents_summary_path = latest_dir / "tradingagents_summary.json"
         latest_futu_skill_facts_path = futu_skill_facts_latest_path(config.data_dir, market)
+        latest_decision_plans_path = latest_dir / "decision_plans.json"
         artifacts = {
             "portfolio": str(portfolio_path),
             "advice": str(advice_path),
@@ -796,6 +815,7 @@ class DailyPremarketRunner:
                 str(tradingagents_summary_path) if tradingagents_summary_path else ""
             ),
             "futu_skill_facts": str(futu_skill_facts_path) if futu_skill_facts_path else "",
+            "decision_plans": str(decision_plans_path) if decision_plans_path else "",
             "latest_advice": str(latest_advice_path),
             "latest_actions": str(latest_actions_path),
             "latest_trading_plan": str(latest_plan_path),
@@ -808,6 +828,9 @@ class DailyPremarketRunner:
                 else ""
             ),
             "latest_futu_skill_facts": str(latest_futu_skill_facts_path),
+            "latest_decision_plans": (
+                str(latest_decision_plans_path) if decision_plans_path else ""
+            ),
             "status": str(status_path),
             "report": str(report_path),
             "log": str(log_path),
@@ -845,6 +868,7 @@ class DailyPremarketRunner:
                 decision_facts_path=decision_facts_path,
                 tradingagents_summary_path=tradingagents_summary_path,
                 futu_skill_facts_path=futu_skill_facts_path,
+                decision_plans_path=decision_plans_path,
                 data_dir=config.data_dir,
                 market=market,
             )
@@ -1523,6 +1547,7 @@ def _promote_latest_set(
     decision_facts_path: Path | None = None,
     tradingagents_summary_path: Path | None = None,
     futu_skill_facts_path: Path | None = None,
+    decision_plans_path: Path | None = None,
     data_dir: Path,
     market: str | None = None,
 ) -> None:
@@ -1576,6 +1601,13 @@ def _promote_latest_set(
             _LatestPromotion(
                 source_path=futu_skill_facts_path,
                 latest_path=latest_dir / "futu_skill_facts.json",
+            )
+        )
+    if decision_plans_path is not None:
+        promotions.append(
+            _LatestPromotion(
+                source_path=decision_plans_path,
+                latest_path=latest_dir / "decision_plans.json",
             )
         )
 

@@ -16,6 +16,7 @@ from open_trader.futu_watch import FutuWatchResult
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.notifications import NullNotifier
 from open_trader.t_signal_runner import TSignalWatchResult
+from open_trader.decision_plan_watch import DecisionPlanWatchResult
 
 
 def test_watch_futu_help_includes_expected_options(
@@ -120,6 +121,47 @@ def test_watch_futu_main_reports_runner_error_without_traceback(
     stderr = capsys.readouterr().err
     assert "OpenD connection failed" in stderr
     assert "Traceback" not in stderr
+
+
+def test_watch_decision_plans_main_wires_published_plan_and_notifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    plan = {"run_date": "2026-07-13", "market": "US", "symbol": "MSFT"}
+    notifier = NullNotifier()
+
+    class FakeFutuQuoteClient:
+        def __init__(self, *, host: str, port: int) -> None:
+            captured.update(host=host, port=port)
+
+    monkeypatch.setattr(cli, "load_decision_plans", lambda path: [plan])
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run=False: object())
+    monkeypatch.setattr(cli, "build_notifier", lambda config: notifier)
+    monkeypatch.setattr(cli, "FutuQuoteClient", FakeFutuQuoteClient)
+
+    def fake_watch(**kwargs: object) -> DecisionPlanWatchResult:
+        captured.update(kwargs)
+        return DecisionPlanWatchResult(
+            watched_plan_count=1, trigger_count=1, reset_count=0,
+            notification_sent_count=1, notification_failed_count=0,
+            events_path=kwargs["events_path"],
+        )
+
+    monkeypatch.setattr(cli, "run_decision_plan_watch", fake_watch)
+
+    result = cli.main([
+        "watch-decision-plans", "--plans", "plans.json",
+        "--data-dir", str(tmp_path / "data"), "--config", "daily.env",
+        "--host", "127.0.0.1", "--port", "11111", "--once",
+    ])
+
+    assert result == 0
+    assert captured["events_path"] == tmp_path / "data/runs/2026-07-13/US/plan_events.jsonl"
+    assert captured["notifier"] is notifier
+    assert captured["once"] is True
+    assert "triggers: 1" in capsys.readouterr().out
 
 
 def test_watch_t_help_includes_expected_options(
