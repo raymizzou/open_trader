@@ -44,7 +44,6 @@ def evaluate_plan(
     last_price: Decimal,
     as_of: datetime,
 ) -> PlanEvaluation:
-    del as_of
     for condition in plan.conditions:
         price_hit = (
             condition.trigger_price is not None
@@ -55,7 +54,12 @@ def evaluate_plan(
                 and last_price <= condition.trigger_price
             )
         )
-        if price_hit:
+        deadline_hit = (
+            condition.kind == "deadline"
+            and condition.deadline is not None
+            and as_of >= condition.deadline
+        )
+        if price_hit or deadline_hit:
             return PlanEvaluation(
                 plan_id=plan.plan_id,
                 status="triggered",

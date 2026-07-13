@@ -62,3 +62,31 @@ def test_plan_targets_zero_when_protection_price_is_reached() -> None:
     assert result.status == "triggered"
     assert result.condition_id == "exit-at-protection"
     assert result.target_quantity == Decimal("0")
+
+
+def test_plan_targets_reduced_position_when_deadline_is_reached() -> None:
+    plan = StrategyPlan(
+        plan_id="US.DRAM:2026-07-13:v1",
+        market="US",
+        symbol="DRAM",
+        current_quantity=Decimal("400"),
+        conditions=(
+            PlanCondition(
+                condition_id="trim-at-deadline",
+                kind="deadline",
+                target_quantity=Decimal("300"),
+                deadline=datetime.fromisoformat("2026-07-15T16:00:00"),
+                reason="bounce window expired",
+            ),
+        ),
+    )
+
+    result = evaluate_plan(
+        plan,
+        last_price=Decimal("63"),
+        as_of=datetime.fromisoformat("2026-07-15T16:00:00"),
+    )
+
+    assert result.status == "triggered"
+    assert result.condition_id == "trim-at-deadline"
+    assert result.target_quantity == Decimal("300")
