@@ -236,7 +236,10 @@ def _browser_check(
                     page.goto(url, wait_until="networkidle")
                     if "看板数据加载失败" in page.locator("body").inner_text():
                         errors.append(f"{name}：页面显示看板数据加载失败")
-                    _check_decision_tabs(page, market, symbol)
+                    try:
+                        _check_decision_tabs(page, market, symbol)
+                    except Exception as exc:
+                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     phillips_card = page.locator(
                         '#broker-summary-cards [data-broker="phillips"]'
                     )

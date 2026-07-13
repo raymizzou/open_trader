@@ -198,6 +198,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     visited: list[str] = []
+    selectors: list[tuple[str, str]] = []
+    state = {"fail_desktop_navigation": True}
 
     class Locator:
         @property
@@ -222,10 +224,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
         def goto(self, *_args: object, **_kwargs: object) -> None:
             visited.append(self.name)
-            if self.name == "desktop":
+            if self.name == "desktop" and state["fail_desktop_navigation"]:
                 raise RuntimeError("navigation failed")
 
-        def locator(self, _selector: str) -> Locator:
+        def locator(self, selector: str) -> Locator:
+            selectors.append((self.name, selector))
             return Locator()
 
         def wait_for_timeout(self, _milliseconds: int) -> None:
@@ -271,6 +274,29 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     assert errors == ["desktop：RuntimeError: navigation failed"]
     assert blocker is None
     assert visited == ["desktop", "mobile"]
+
+    state["fail_desktop_navigation"] = False
+    visited.clear()
+    selectors.clear()
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_decision_tabs",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("decision failed")),
+    )
+
+    errors, blocker = dashboard_acceptance._browser_check(
+        "http://dashboard", 5, valid_payload()
+    )
+
+    assert errors == [
+        "desktop：AssertionError: decision failed",
+        "mobile：AssertionError: decision failed",
+    ]
+    assert blocker is None
+    for viewport in ("desktop", "mobile"):
+        assert (viewport, '#broker-summary-cards [data-broker="phillips"]') in selectors
+        assert (viewport, '[data-market="CN"]') in selectors
+        assert (viewport, 'button[data-broker="eastmoney"]') in selectors
 
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:
