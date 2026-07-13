@@ -107,17 +107,18 @@ const validatedPlan = {
   }],
   backtests: [{
     range: "1Y", gate: {passed: true},
-    strategy: {total_return_pct: "8", max_drawdown_pct: "6", sharpe_ratio: "1.1"},
+    strategy: {total_return_pct: "8", max_drawdown_pct: "6", sharpe_ratio: "1.1", calmar_ratio: "1.3"},
     market_benchmark: {symbol: "SPY", total_return_pct: "5.5"},
     market_excess_return_pct: "2.5",
   }],
   previous_review: {run_date: "2026-07-10", status: "triggered", trigger_count: 1, starting_quantity: "400", closing_quantity: "400"},
 };
 const validated = renderDecisionPlan({decision_plan: validatedPlan});
-for (const text of ["今日交易计划", "下一条件", "目标仓位", "回测闸门", "最大回撤", "夏普比率", "参数来源", "上期复盘"]) {
+for (const text of ["今日交易计划", "下一条件", "目标仓位", "回测闸门", "最大回撤", "夏普比率", "卡玛比率", "参数来源", "上期复盘"]) {
   if (!validated.includes(text)) throw new Error("missing " + text + ": " + validated);
 }
 if (!validated.includes("data-plan-condition")) throw new Error("validated plan has no condition cards");
+if (!validated.includes("<dt>卡玛比率</dt><dd>1.30</dd>")) throw new Error("calmar ratio is not readable: " + validated);
 
 const fallbackPlan = {
   available: true,

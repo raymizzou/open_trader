@@ -2656,6 +2656,7 @@ function renderDecisionPlanBacktests(backtests) {
               <div><dt>超额收益</dt><dd>${escapeHtml(decisionPlanPercent(item.market_excess_return_pct))}</dd></div>
               <div><dt>最大回撤</dt><dd>${escapeHtml(decisionPlanPercent(strategy.max_drawdown_pct))}</dd></div>
               <div><dt>夏普比率</dt><dd>${escapeHtml(strategy.sharpe_ratio || "-")}</dd></div>
+              <div><dt>卡玛比率</dt><dd>${escapeHtml(decisionPlanRatio(strategy.calmar_ratio))}</dd></div>
             </dl>
           </article>
         `;
@@ -2732,6 +2733,11 @@ function decisionPlanWeight(value) {
 function decisionPlanPercent(value) {
   const number = Number(value);
   return Number.isFinite(number) ? `${number.toFixed(2).replace(/\.00$/, "")}%` : "-";
+}
+
+function decisionPlanRatio(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(2) : "-";
 }
 
 function decisionPlanStatusLabel(status) {

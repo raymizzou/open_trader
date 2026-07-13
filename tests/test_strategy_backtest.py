@@ -180,6 +180,7 @@ def test_standard_backtest_serializes_sharpe_and_passing_gate(tmp_path: Path) ->
     ).to_dict()
 
     assert payload["strategy"]["sharpe_ratio"] is not None
+    assert "calmar_ratio" in payload["strategy"]
     assert payload["gate"] == {
         "passed": True,
         "policy_id": "benchmark_outperformance/v1",
@@ -431,6 +432,7 @@ def test_annualized_return_and_drawdown_match_hand_calculation() -> None:
     assert result.annualized_return_pct == Decimal("21.00")
     assert result.max_drawdown_pct == Decimal("20")
     assert result.sharpe_ratio is not None
+    assert result.calmar_ratio == Decimal("1.05")
 
 
 def test_existing_publication_lock_refuses_run_without_touching_artifacts(

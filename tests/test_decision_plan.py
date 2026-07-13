@@ -150,3 +150,11 @@ def test_validation_rejects_non_decimal_backtest_metric() -> None:
 
     with pytest.raises(ValueError, match="max_drawdown_pct"):
         validate_decision_plan(plan)
+
+
+def test_validation_rejects_non_decimal_calmar_ratio() -> None:
+    plan = build_plan()
+    plan["backtests"][0]["strategy"]["calmar_ratio"] = "bad"
+
+    with pytest.raises(ValueError, match="calmar_ratio"):
+        validate_decision_plan(plan)

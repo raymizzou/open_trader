@@ -202,9 +202,9 @@ def _validate_backtests(backtests: Sequence[object]) -> None:
             raise ValueError("backtest strategy 缺失")
         for key in ("total_return_pct", "max_drawdown_pct"):
             _decimal(strategy, key)
-        sharpe = strategy.get("sharpe_ratio")
-        if sharpe is not None:
-            _decimal(strategy, "sharpe_ratio")
+        for key in ("sharpe_ratio", "calmar_ratio"):
+            if strategy.get(key) is not None:
+                _decimal(strategy, key)
         benchmark = item.get("market_benchmark")
         if benchmark is not None:
             if not isinstance(benchmark, Mapping):

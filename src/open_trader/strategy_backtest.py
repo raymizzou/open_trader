@@ -61,6 +61,7 @@ class ExecutionResult:
     annualized_return_pct: Decimal
     max_drawdown_pct: Decimal
     sharpe_ratio: Decimal | None
+    calmar_ratio: Decimal | None
     win_rate_pct: Decimal
     actual_start: date
     actual_end: date
@@ -472,8 +473,10 @@ def _execution_result(trades: Sequence[NormalizedTrade], curve: Sequence[dict[st
     total = (final / initial_cash - Decimal("1")) * Decimal("100")
     days = max(1, (actual_end - actual_start).days)
     annualized = ((final / initial_cash) ** (Decimal("365") / Decimal(days)) - Decimal("1")) * Decimal("100") if final > 0 else Decimal("-100")
-    return ExecutionResult(tuple(trades), tuple(curve), final, total, annualized, abs(max_drawdown),
-                           _sharpe_ratio(curve), _realized_win_rate(trades), actual_start,
+    drawdown = abs(max_drawdown)
+    return ExecutionResult(tuple(trades), tuple(curve), final, total, annualized, drawdown,
+                           _sharpe_ratio(curve), annualized / drawdown if drawdown else None,
+                           _realized_win_rate(trades), actual_start,
                            actual_end, initial_cash, allocated)
 
 
