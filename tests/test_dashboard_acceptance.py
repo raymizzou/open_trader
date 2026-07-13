@@ -381,12 +381,14 @@ def test_classify_result_has_only_three_states() -> None:
     assert classify_result(["API failed"], browser_blocker="Chrome unavailable") == "FAIL"
 
 
-def test_dashboard_signature_ignores_refresh_metadata_but_detects_data_change() -> None:
+def test_dashboard_signature_ignores_live_values_but_detects_structural_change() -> None:
     first = valid_payload()
     second = valid_payload()
     first["last_refresh"] = "one"
     second["last_refresh"] = "two"
+    second["holdings"][0]["market_value_hkd"] = "123.45"  # type: ignore[index]
+    second["holdings"][0]["portfolio_weight_hkd"] = "9.99%"  # type: ignore[index]
     assert dashboard_signature(first) == dashboard_signature(second)
 
-    second["holdings"][0]["portfolio_weight_hkd"] = "9.99%"  # type: ignore[index]
+    second["holdings"][0]["brokers"] = "changed"  # type: ignore[index]
     assert dashboard_signature(first) != dashboard_signature(second)

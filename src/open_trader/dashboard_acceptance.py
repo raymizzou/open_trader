@@ -134,7 +134,7 @@ def classify_result(errors: list[str], *, browser_blocker: str | None) -> str:
 
 
 def dashboard_signature(payload: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
-    fields = ("market", "symbol", "market_value_hkd", "portfolio_weight_hkd", "brokers")
+    fields = ("market", "symbol", "brokers")
     rows = [*(payload.get("holdings") or []), *(payload.get("cash_rows") or [])]
     return tuple(sorted(tuple(str(row.get(field, "")) for field in fields) for row in rows))
 
