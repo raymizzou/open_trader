@@ -911,9 +911,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "老虎暂无数据" in html
     assert "futuAnomalySignalsPlugin" in js
     assert "translateFutuSignalValue" in js
-    assert ".futu-signal-card" in css
     assert ".futu-signal-module-grid" in css
-    assert ".decision-plugin-grid .futu-signal-card" in css
 
     assert "辉立暂无数据" in html
     assert "right-rail" not in html
@@ -982,8 +980,6 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".decision-dashboard" in css
     assert ".decision-card.primary" in css
     assert ".decision-metric-strip" in css
-    decision_plugin_grid_css = css.split(".decision-plugin-grid {", 1)[1].split("}", 1)[0]
-    assert "align-items: start;" in decision_plugin_grid_css
     decision_plugin_card_css = css.split(".decision-plugin-card {", 1)[1].split("}", 1)[0]
     assert "align-content: start;" in decision_plugin_card_css
     kelly_experiment_card_css = css.split(".kelly-experiment-card {", 1)[1].split("}", 1)[0]
@@ -1137,6 +1133,17 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".workspace-grid.detail-mode {" in mobile_css
     assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
+
+
+def test_trading_decision_tab_css() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    assert ".decision-tab-list" in css
+    assert "overflow-x: auto" in css
+    assert "flex-wrap: nowrap" in css
+    assert ".decision-tab.active" in css
+    assert ".decision-tab-failed" in css
+    assert ".decision-tab-panel" in css
 
 
 def test_dashboard_static_contains_kelly_lab_panel_mount() -> None:

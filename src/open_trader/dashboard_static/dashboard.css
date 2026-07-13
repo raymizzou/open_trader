@@ -1633,11 +1633,57 @@ tbody tr.active-row {
   margin: 0;
 }
 
-.decision-plugin-grid {
-  align-items: start;
-  display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+.decision-tab-list {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.decision-tab {
+  background: transparent;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  flex: 0 0 auto;
+  font: inherit;
+  font-weight: 800;
+  padding: 10px 12px;
+}
+
+.decision-tab.active {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+.decision-tab-failed {
+  color: var(--danger);
+}
+
+.decision-tab-failed.active {
+  border-bottom-color: var(--danger);
+}
+
+.decision-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.decision-tab-panel {
+  min-width: 0;
+  padding-top: 12px;
+  width: 100%;
+}
+
+.decision-tab-empty {
+  background: #fff1f1;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  color: var(--danger);
+  padding: 16px;
 }
 
 .decision-plugin-card {
@@ -1693,10 +1739,6 @@ tbody tr.active-row {
   font-size: 12px;
   line-height: 1.45;
   margin-top: 3px;
-}
-
-.decision-plugin-grid .futu-signal-card {
-  grid-column: span 2;
 }
 
 .futu-signal-overall {
@@ -2970,7 +3012,6 @@ tbody tr.active-row {
 
   .decision-dashboard,
   .decision-metric-strip,
-  .decision-plugin-grid,
   .decision-fact-grid,
   .final-conclusion-list,
   .llm-template-grid,
@@ -3094,7 +3135,6 @@ tbody tr.active-row {
 
   .decision-dashboard,
   .decision-metric-strip,
-  .decision-plugin-grid,
   .decision-fact-grid,
   .futu-signal-overall,
   .futu-signal-module-grid,
@@ -3119,10 +3159,6 @@ tbody tr.active-row {
   .technical-bollinger-labels span:nth-child(2),
   .technical-bollinger-labels span:nth-child(3) {
     text-align: left;
-  }
-
-  .decision-plugin-grid .futu-signal-card {
-    grid-column: 1 / -1;
   }
 
   .futu-signal-pill-row {
