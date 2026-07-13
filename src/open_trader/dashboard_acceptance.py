@@ -323,7 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-cn", type=int, default=5)
     parser.add_argument("--expected-rows", type=int)
     parser.add_argument(
-        "--expected-eastmoney-cny", type=Decimal, default=Decimal("676549.55")
+        "--expected-eastmoney-cny", type=Decimal
     )
     parser.add_argument("--expected-root", type=Path, default=Path.cwd())
     parser.add_argument("--expected-sha")

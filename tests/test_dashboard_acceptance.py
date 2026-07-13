@@ -356,6 +356,14 @@ def test_validate_dashboard_payload_checks_eastmoney_statement_total_assets() ->
     assert "东方财富总资产不匹配：100 != 101 CNY" in errors
 
 
+def test_acceptance_parser_does_not_hardcode_mark_to_market_eastmoney_total() -> None:
+    from open_trader.dashboard_acceptance import build_parser
+
+    args = build_parser().parse_args([])
+
+    assert args.expected_eastmoney_cny is None
+
+
 def test_validate_dashboard_payload_checks_latest_phillips_statement() -> None:
     payload = valid_payload()
     payload["broker_summaries"] = [{
