@@ -524,6 +524,9 @@ def test_run_premarket_generates_technical_facts_after_advice(
             "market": None,
         }
     ]
+    assert result.technical_facts_path == (
+        tmp_path / "data/runs/2026-06-19/technical_facts.json"
+    )
     assert (data_dir / "runs/2026-06-19/technical_facts.json").exists()
     assert (data_dir / "latest/technical_facts.json").exists()
 

@@ -398,7 +398,7 @@ def test_build_notifier_requires_xiaozhi_config(tmp_path: Path) -> None:
         build_notifier(config)
 
 
-def test_daily_runner_defaults_to_generate_trade_actions_and_skipped_summary(
+def test_daily_runner_defaults_to_generate_trade_actions_and_summary(
     tmp_path: Path,
 ) -> None:
     config = DailyPremarketConfig(
@@ -417,7 +417,7 @@ def test_daily_runner_defaults_to_generate_trade_actions_and_skipped_summary(
     runner = _DailyPremarketRunner(config=config)
 
     assert runner.trade_action_generator is daily_premarket.generate_trade_actions
-    assert runner.summary_generator is daily_premarket._write_skipped_tradingagents_summary
+    assert runner.summary_generator is daily_premarket.generate_tradingagents_summary
     assert (
         runner.summary_extractor_factory
         is daily_premarket.LLMTradingAgentsSummaryExtractor
@@ -1245,7 +1245,7 @@ def test_daily_runner_refreshes_portfolio_before_premarket(
     assert trade_actions.calls[0]["portfolio_path"] == refreshed_portfolio
 
 
-def test_daily_runner_skips_blocking_facts_generation(
+def test_daily_runner_uses_real_premarket_fact_generators(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1267,23 +1267,8 @@ def test_daily_runner_skips_blocking_facts_generation(
     ).run(run_date="2026-06-19", market="US")
 
     call = premarket.calls[0]
-    technical_result = call["technical_facts_generator"](
-        data_dir=config.data_dir,
-        run_date="2026-06-19",
-        update_latest=False,
-        market="US",
-    )
-    decision_result = call["decision_facts_generator"](
-        data_dir=config.data_dir,
-        run_date="2026-06-19",
-        update_latest=False,
-        market="US",
-    )
-    technical_payload = json.loads(technical_result.run_path.read_text(encoding="utf-8"))
-    decision_payload = json.loads(decision_result.run_path.read_text(encoding="utf-8"))
-
-    assert technical_payload["status"] == "skipped"
-    assert decision_payload["status"] == "skipped"
+    assert "technical_facts_generator" not in call
+    assert "decision_facts_generator" not in call
 
 
 def test_hk_daily_runner_uses_market_notification_titles(

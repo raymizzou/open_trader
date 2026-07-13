@@ -406,7 +406,7 @@ class DailyPremarketRunner:
         self.quote_client_factory = quote_client_factory
         self.trade_action_generator = trade_action_generator
         self.portfolio_refresher = portfolio_refresher or _no_op_portfolio_refresher
-        self.summary_generator = summary_generator or _write_skipped_tradingagents_summary
+        self.summary_generator = summary_generator or generate_tradingagents_summary
         self.summary_extractor_factory = summary_extractor_factory
         self.notifier = notifier or NullNotifier()
 
@@ -549,8 +549,6 @@ class DailyPremarketRunner:
             use_fallback=True,
             deadline_reached=_deadline_reached(config, run_date),
             market=market,
-            technical_facts_generator=_write_skipped_technical_facts,
-            decision_facts_generator=_write_skipped_decision_facts,
         )
         advice_path = Path(getattr(premarket_result, "advice_path"))
         actions_path = Path(getattr(premarket_result, "actions_path"))

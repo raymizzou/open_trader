@@ -73,6 +73,7 @@ class PremarketResult:
     classifications_path: Path
     actions_path: Path
     report_path: Path
+    technical_facts_path: Path | None = None
     decision_facts_path: Path | None = None
 
 
@@ -254,6 +255,7 @@ def run_premarket(
         classifications_path=classifications_path,
         actions_path=actions_path,
         report_path=report_path,
+        technical_facts_path=technical_facts_result.run_path,
         decision_facts_path=decision_facts_result.run_path,
     )
 
