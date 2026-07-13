@@ -11,6 +11,7 @@ const state = {
   selectedKellyExperimentId: "",
   selectedHoldingKey: "",
   selectedHoldingDetail: "decision",
+  selectedDecisionTab: "final",
   detailLanguage: "zh",
   refreshActive: false,
   quoteIntervalId: null,
@@ -42,6 +43,13 @@ const state = {
 const elements = {};
 
 const HOLDINGS_TABLE_COLUMN_COUNT = 10;
+
+const DECISION_TABS = [
+  { key: "final", label: "最终决策" },
+  { key: "kline", label: "趋势 / K 线" },
+  { key: "news", label: "新闻 / 舆论" },
+  { key: "futu", label: "富途异动" },
+];
 
 const MARKET_SECTION_CONFIGS = [
   { market: "US_STOCK", marketGroup: "US", label: "美股正股", className: "market-section-us-stock" },
@@ -223,6 +231,7 @@ function bindEvents() {
     state.marketFilter = button.dataset.market || "ALL";
     state.selectedHoldingKey = "";
     state.selectedHoldingDetail = "decision";
+    state.selectedDecisionTab = "final";
     setActiveFilter(elements["header-market-filters"], button);
     renderDashboardViews();
   });
@@ -234,6 +243,7 @@ function bindEvents() {
     state.brokerFilter = button.dataset.broker || "ALL";
     state.selectedHoldingKey = "";
     state.selectedHoldingDetail = "decision";
+    state.selectedDecisionTab = "final";
     setActiveFilter(elements["header-broker-filters"], button);
     renderDashboardViews();
   });
@@ -638,10 +648,17 @@ function decimalAsPercent(value, fallback) {
 }
 
 function handleSymbolDetailClick(event) {
+  const decisionTab = event.target.closest("[data-decision-tab]");
+  if (decisionTab) {
+    state.selectedDecisionTab = decisionTab.dataset.decisionTab || "final";
+    renderHoldings();
+    return;
+  }
   const backButton = event.target.closest("[data-back-to-holdings]");
   if (backButton) {
     state.selectedHoldingKey = "";
     state.selectedHoldingDetail = "decision";
+    state.selectedDecisionTab = "final";
     renderHoldings();
     return;
   }
@@ -2105,6 +2122,7 @@ function selectedHolding(holdings = filteredHoldings()) {
 function showSymbolDetail(detailKey, detailMode = "decision") {
   state.selectedHoldingKey = detailKey;
   state.selectedHoldingDetail = normalizeHoldingDetailMode(detailMode);
+  state.selectedDecisionTab = "final";
   renderHoldings();
 }
 
@@ -2138,6 +2156,7 @@ function openTradeActionDetail(actionKey) {
       resetHoldingFilters();
       state.selectedHoldingKey = holdingKey(holding, index);
       state.selectedHoldingDetail = "decision";
+      state.selectedDecisionTab = "final";
       renderDashboardViews();
       return;
     }
@@ -2172,8 +2191,7 @@ function renderSymbolDetail(holding, index) {
       <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
     </div>
     <div class="trading-decision-layout">
-      ${renderTradingDecisionPlugins(holding)}
-      ${renderLLMDecisionTemplate(holding)}
+      ${renderTradingDecisionTabs(holding)}
     </div>
   `;
 }
@@ -2472,69 +2490,55 @@ function tSignalTimelineLabel(value) {
   return labels[value] || formatPlain(value);
 }
 
-function renderTradingDecisionPlugins(holding) {
-  const plugins = [
-    klineDecisionFactsPlugin(holding),
-    newsSentimentPlugin(holding),
-    futuAnomalySignalsPlugin(holding),
-    {
-      title: "公司行动",
-      status: "占位",
-      tone: "muted",
-      score: "-",
-      headline: "待接入",
-      detail: "未来确认分红、拆股、增发、回购、停牌等事件。",
-      condition: "事实确认：是否有会改变交易计划的公司行动公告。",
+function decisionTabViews(holding) {
+  const facts = holding && holding.decision_facts && typeof holding.decision_facts === "object"
+    ? holding.decision_facts : {};
+  const futuFacts = holding && holding.futu_skill_facts && typeof holding.futu_skill_facts === "object"
+    ? holding.futu_skill_facts : {};
+  const summary = holding && holding.tradingagents_summary && typeof holding.tradingagents_summary === "object"
+    ? holding.tradingagents_summary : {};
+  const technicalFacts = holding && typeof holding.technical_facts === "object"
+    ? holding.technical_facts : null;
+  const futuModules = ["technical_anomaly", "capital_anomaly", "derivatives_anomaly"]
+    .map((key) => futuFacts[key]);
+  const definitions = {
+    final: {
+      available: [summary.ta_view, summary.current_action, summary.core_reason].some(hasValue),
+      error: summary.error,
+      html: `${renderLLMDecisionTemplate(holding)}${renderTradingAgentsSummaryCard(holding)}`,
     },
-    {
-      title: "基本面",
-      status: "占位",
-      tone: "muted",
-      score: "-",
-      headline: "待接入",
-      detail: "未来确认估值、增长假设和业务趋势是否支持继续持仓。",
-      condition: "条件：基本面证据是否足以支持当前仓位或需要降低风险。",
+    kline: {
+      available: Boolean(facts.kline && facts.kline.available === true) || technicalFactsUsable(technicalFacts),
+      error: facts.kline && facts.kline.error,
+      html: renderDecisionPluginCard(klineDecisionFactsPlugin(holding)),
     },
-    renderTradingAgentsSummaryCard(holding),
-    {
-      title: "财报",
-      status: "占位",
-      tone: "muted",
-      score: "-",
-      headline: "待接入",
-      detail: "未来确认财报发布日期、业绩预期和财报后复评要求。",
-      condition: "事实确认：财报是否临近，以及是否必须等财报后再执行。",
+    news: {
+      available: facts.news_sentiment && facts.news_sentiment.available === true,
+      error: facts.news_sentiment && facts.news_sentiment.error,
+      html: renderDecisionPluginCard(newsSentimentPlugin(holding)),
     },
-    {
-      title: "大盘 / 行业",
-      status: "占位",
-      tone: "muted",
-      score: "-",
-      headline: "待接入",
-      detail: "未来确认大盘和半导体行业环境是否支持继续持仓。",
-      condition: "条件：大盘与行业趋势是否对当前仓位形成顺风或逆风。",
+    futu: {
+      available: futuModules.some((module) => module && module.available === true),
+      error: futuModules.map((module) => module && module.error).find(hasValue),
+      html: futuAnomalySignalsPlugin(holding),
     },
-    {
-      title: "组合风险",
-      status: "占位",
-      tone: "muted",
-      score: "-",
-      headline: `当前权重 ${formatPlain(holding.portfolio_weight_hkd || "-")}`,
-      detail: "这里只展示现有字段，尚未接入独立组合风险插件。",
-      condition: "条件：单一标的权重是否过高、波动是否需要降仓。",
-    },
-  ];
+  };
+  return DECISION_TABS.map((tab) => ({ ...tab, ...definitions[tab.key] }));
+}
+
+function renderTradingDecisionTabs(holding) {
+  const views = decisionTabViews(holding);
+  const selected = views.find((view) => view.key === state.selectedDecisionTab) || views[0];
+  const panel = selected.available
+    ? selected.html
+    : `<div class="decision-tab-empty status-failed">${escapeHtml(selected.error || "数据未生成")}</div>`;
   return `
     <section class="detail-section trading-decision-section">
-      <div class="trading-decision-section-header">
-        <div>
-          <h3>插件模块</h3>
-          <p>每个模块说明条件是否达成，或正在确认的事实；趋势 / K 线、新闻 / 舆论与富途异动信号读取固定决策事实，其余插件仍为占位。</p>
-        </div>
+      <div class="trading-decision-section-header"><div><h3>交易决策</h3><p>结论先行，按证据模块逐项复核。</p></div></div>
+      <div class="decision-tab-list" role="tablist" aria-label="交易决策模块">
+        ${views.map((view) => `<button id="decision-tab-${view.key}" class="decision-tab${view.key === selected.key ? " active" : ""}${view.available ? "" : " decision-tab-failed"}" type="button" role="tab" aria-selected="${view.key === selected.key}" aria-controls="decision-panel-${view.key}" data-decision-tab="${view.key}">${escapeHtml(view.label)}</button>`).join("")}
       </div>
-      <div class="decision-plugin-grid">
-        ${plugins.map((plugin) => typeof plugin === "string" ? plugin : renderDecisionPluginCard(plugin)).join("")}
-      </div>
+      <div id="decision-panel-${selected.key}" class="decision-tab-panel" role="tabpanel" aria-labelledby="decision-tab-${selected.key}">${panel}</div>
     </section>
   `;
 }

@@ -744,6 +744,73 @@ const sandbox = { document: { addEventListener() {} }, console };
     return result.stdout
 
 
+def test_dashboard_trading_decision_tabs() -> None:
+    output = run_dashboard_js(
+        r'''
+function assertOrdered(html, labels) {
+  let cursor = -1;
+  for (const label of labels) {
+    const next = html.indexOf(label, cursor + 1);
+    if (next <= cursor) throw new Error("tab order mismatch: " + html);
+    cursor = next;
+  }
+}
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  name: "英伟达",
+  total_quantity: "10",
+  tradingagents_summary: {
+    ta_view: "偏多",
+    current_action: "持有",
+    core_reason: "趋势仍在",
+  },
+  decision_facts: {
+    kline: { available: true, fields: { trend: "上涨" } },
+    news_sentiment: { available: false, error: "新闻任务失败" },
+  },
+  futu_skill_facts: {},
+};
+state.selectedDecisionTab = "final";
+let html = renderTradingDecisionTabs(holding);
+assertOrdered(html, ["最终决策", "趋势 / K 线", "新闻 / 舆论", "富途异动"]);
+if ((html.match(/role="tabpanel"/g) || []).length !== 1) throw new Error(html);
+if (!html.includes('data-decision-tab="news"') || !html.includes("decision-tab-failed")) throw new Error(html);
+if (!html.includes("大模型决策模板") || !html.includes("TradingAgents")) throw new Error(html);
+state.selectedDecisionTab = "news";
+html = renderTradingDecisionTabs(holding);
+if ((html.match(/role="tabpanel"/g) || []).length !== 1 || !html.includes("新闻任务失败")) throw new Error(html);
+state.selectedDecisionTab = "futu";
+html = renderTradingDecisionTabs(holding);
+if ((html.match(/role="tabpanel"/g) || []).length !== 1 || !html.includes("数据未生成")) throw new Error(html);
+
+const technicalHolding = {
+  ...holding,
+  decision_facts: {},
+  technical_facts: {
+    available: true,
+    status: "usable",
+    facts: { timeframes: [{ timeframe_label: "日线" }] },
+  },
+};
+state.selectedDecisionTab = "kline";
+html = renderTradingDecisionTabs(technicalHolding);
+if (html.includes("decision-tab-empty") || !html.includes("趋势 / K 线")) throw new Error(html);
+
+let renders = 0;
+renderHoldings = () => { renders += 1; };
+handleSymbolDetailClick({ target: { closest: (selector) => selector === "[data-decision-tab]" ? { dataset: { decisionTab: "kline" } } : null } });
+if (state.selectedDecisionTab !== "kline" || renders !== 1) throw new Error("tab click did not render");
+state.selectedDecisionTab = "news";
+showSymbolDetail("US|NVDA", "decision");
+if (state.selectedDecisionTab !== "final") throw new Error("new holding did not reset tab");
+console.log("ok");
+'''
+    )
+
+    assert "ok" in output
+
+
 class FakeResearchChatService:
     def __init__(self) -> None:
         self.created: list[dict[str, str]] = []
@@ -939,7 +1006,8 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "交易决策" in js
     assert "插件模块" in js
     assert "大模型决策模板" in js
-    assert "趋势 / K 线、新闻 / 舆论与富途异动信号读取固定决策事实，其余插件仍为占位" in js
+    assert 'selectedDecisionTab: "final"' in js
+    assert "const DECISION_TABS" in js
     assert "decisionFactsPlugin" in js
     assert "decision_facts" in js
     assert "futuSkillNewsSentimentPlugin" in js
@@ -2123,10 +2191,10 @@ const holding = {
     }
   }
 };
-const html = renderTradingDecisionPlugins(holding);
+const html = futuAnomalySignalsPlugin(holding);
 const start = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
-const end = html.indexOf("<h4>公司行动</h4>");
-if (start < 0 || end < 0 || start >= end) {
+const end = html.length;
+if (start < 0 || start >= end) {
   throw new Error("Futu signal card boundary missing: " + html);
 }
 console.log(html.slice(start, end));
@@ -2199,7 +2267,7 @@ const holding = {
     }
   }
 };
-const html = renderTradingDecisionPlugins(holding);
+const html = futuAnomalySignalsPlugin(holding);
 const start = html.indexOf('<div class="futu-signal-overall">');
 const end = html.indexOf('<div class="futu-signal-module-grid">');
 if (start < 0 || end < 0 || start >= end) {
@@ -2251,7 +2319,7 @@ const holding = {
     }
   }
 };
-const html = renderTradingDecisionPlugins(holding);
+const html = futuAnomalySignalsPlugin(holding);
 const start = html.indexOf('<div class="futu-signal-module-grid">');
 const end = html.indexOf('<p class="condition-box">');
 if (start < 0 || end < 0 || start >= end) {
@@ -2303,7 +2371,7 @@ const holding = {
     }
   }
 };
-const html = renderTradingDecisionPlugins(holding);
+const html = futuAnomalySignalsPlugin(holding);
 const start = html.indexOf('<div class="futu-signal-overall">');
 const end = html.indexOf('<div class="futu-signal-module-grid">');
 if (start < 0 || end < 0 || start >= end) {
@@ -2358,10 +2426,10 @@ const holding = {
     }
   }
 };
-const html = renderTradingDecisionPlugins(holding);
+const html = futuAnomalySignalsPlugin(holding);
 const start = html.indexOf("<h4>市场信号 · 富途异动信号</h4>");
-const end = html.indexOf("<h4>公司行动</h4>");
-if (start < 0 || end < 0 || start >= end) {
+const end = html.length;
+if (start < 0 || start >= end) {
   throw new Error("Futu signal card boundary missing: " + html);
 }
 console.log(html.slice(start, end));
@@ -2660,6 +2728,11 @@ function fixedDecisionFactCards(html) {
   }
   return html.slice(klineStart, nextStart);
 }
+function renderDecisionFactCards(holding) {
+  return renderDecisionPluginCard(klineDecisionFactsPlugin(holding))
+    + renderDecisionPluginCard(newsSentimentPlugin(holding))
+    + futuAnomalySignalsPlugin(holding);
+}
 function cardBefore(cards, nextTitle) {
   const end = cards.indexOf(nextTitle);
   if (end < 0) {
@@ -2734,7 +2807,7 @@ const holding = {
     }
   }
 };
-const cards = fixedDecisionFactCards(renderTradingDecisionPlugins(holding));
+const cards = fixedDecisionFactCards(renderDecisionFactCards(holding));
 const klineCard = cardBefore(cards, "<h4>新闻 / 舆论</h4>");
 const newsCard = cardFrom(cards, "<h4>新闻 / 舆论</h4>");
 assertOrdered(klineCard, ["趋势", "位置", "动能", "关键位", "风险"]);
@@ -2815,6 +2888,11 @@ function fixedDecisionFactCards(html) {
   }
   return html.slice(klineStart, nextStart);
 }
+function renderDecisionFactCards(holding) {
+  return renderDecisionPluginCard(klineDecisionFactsPlugin(holding))
+    + renderDecisionPluginCard(newsSentimentPlugin(holding))
+    + futuAnomalySignalsPlugin(holding);
+}
 function cardBefore(cards, nextTitle) {
   const end = cards.indexOf(nextTitle);
   if (end < 0) {
@@ -2861,7 +2939,7 @@ const baseHolding = {
     }
   },
 };
-const completeCards = fixedDecisionFactCards(renderTradingDecisionPlugins({
+const completeCards = fixedDecisionFactCards(renderDecisionFactCards({
   ...baseHolding,
   decision_facts: {
     kline: {available: true, fields: {trend: "过热拉升", position: "显著高于均线", momentum: "RSI 高位", key_levels: "支撑 580", risk: "超买风险"}},
@@ -2870,7 +2948,7 @@ const completeCards = fixedDecisionFactCards(renderTradingDecisionPlugins({
 }));
 assertStatus(cardBefore(completeCards, "<h4>新闻 / 舆论</h4>"), "可用", "ok");
 assertStatus(cardFrom(completeCards, "<h4>新闻 / 舆论</h4>"), "可用", "ok");
-const partialCards = fixedDecisionFactCards(renderTradingDecisionPlugins({
+const partialCards = fixedDecisionFactCards(renderDecisionFactCards({
   ...baseHolding,
   decision_facts: {
     kline: {available: true, fields: {trend: "过热拉升", position: "", momentum: "缺失"}},
@@ -2885,7 +2963,7 @@ for (const required of ["过热拉升", "<strong>缺失</strong>"]) {
     throw new Error("partial K-line card missing fixed field value " + required + ": " + partialKlineCard);
   }
 }
-const missingCards = fixedDecisionFactCards(renderTradingDecisionPlugins({
+const missingCards = fixedDecisionFactCards(renderDecisionFactCards({
   ...baseHolding,
   decision_facts: {
     kline: {available: false, fields: {trend: "缺失", position: "缺失", momentum: "缺失", key_levels: "缺失", risk: "缺失"}},
@@ -2930,10 +3008,10 @@ vm.runInContext(`
 function tradingAgentsCard(html) {
   const start = html.indexOf("<h4>TradingAgents</h4>");
   const end = html.indexOf("<h4>财报</h4>");
-  if (start < 0 || end < 0 || start >= end) {
+  if (start < 0) {
     throw new Error("TradingAgents card boundaries missing: " + html);
   }
-  return html.slice(start, end);
+  return html.slice(start, end < 0 ? html.length : end);
 }
 function rowLabels(card) {
   return card
@@ -2953,7 +3031,7 @@ function assertOrderedValues(card, pairs) {
     cursor = next;
   }
 }
-const html = renderTradingDecisionPlugins({
+const html = renderTradingAgentsSummaryCard({
   market: "US",
   symbol: "DRAM",
   portfolio_weight_hkd: "7.11%",
@@ -3029,7 +3107,7 @@ for (const forbidden of [
     throw new Error("forbidden TradingAgents content leaked " + forbidden + ": " + card);
   }
 }
-const missingCard = tradingAgentsCard(renderTradingDecisionPlugins({
+const missingCard = tradingAgentsCard(renderTradingAgentsSummaryCard({
   market: "US",
   symbol: "MISSING",
   agent_report: {available: false},
@@ -3245,7 +3323,7 @@ const holding = {
     },
   },
 };
-const html = renderTradingDecisionPlugins(holding);
+const html = renderDecisionPluginCard(klineDecisionFactsPlugin(holding));
 console.log(html);
 '''
     html = run_dashboard_js(script)
@@ -3361,7 +3439,7 @@ const holding = {
     error: "technical facts status is missing",
   },
 };
-const html = renderTradingDecisionPlugins(holding);
+const html = renderDecisionPluginCard(klineDecisionFactsPlugin(holding));
 console.log(html);
 '''
     html = run_dashboard_js(script)
@@ -4227,7 +4305,7 @@ if (!malformedSection.includes("2 个标的 · 港元市值 - · 权重 -") || m
 if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
   throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
 }
-for (const required of ["交易决策 ·", "插件模块", "大模型决策模板", "TradingAgents", "趋势 / K 线、新闻 / 舆论与富途异动信号读取固定决策事实，其余插件仍为占位", "占位"]) {
+for (const required of ["交易决策 ·", "最终决策", "趋势 / K 线", "新闻 / 舆论", "富途异动", "数据未生成"]) {
   if (!elements["holdings-body"].innerHTML.includes(required)) {
     throw new Error("trading decision detail missing " + required + ": " + elements["holdings-body"].innerHTML);
   }
