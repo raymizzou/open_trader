@@ -811,6 +811,30 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_news_tab_uses_futu_skill_news_sentiment() -> None:
+    output = run_dashboard_js(
+        r'''
+const holding = {
+  decision_facts: {},
+  futu_skill_facts: {
+    news_sentiment: {
+      available: true,
+      domestic_discussion: { summary: "国内投资者关注存储链联动" },
+    },
+  },
+};
+state.selectedDecisionTab = "news";
+const html = renderTradingDecisionTabs(holding);
+const tab = html.match(/<button[^>]*data-decision-tab="news"[^>]*>/)[0];
+if (tab.includes("decision-tab-failed")) throw new Error(tab);
+if (!html.includes("富途社区 / 国内讨论") || !html.includes("国内投资者关注存储链联动")) throw new Error(html);
+console.log("ok");
+'''
+    )
+
+    assert "ok" in output
+
+
 class FakeResearchChatService:
     def __init__(self) -> None:
         self.created: list[dict[str, str]] = []
@@ -1000,7 +1024,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert 'firstValue(strategy, ["plan_text_zh", "rationale_zh"])' not in js
     assert "暂无中文策略译文" not in js
     assert "交易决策" in js
-    assert "插件模块" in js
+    assert "基于已接入的交易决策与市场事实数据展示" in js
     assert "大模型决策模板" in js
     assert 'selectedDecisionTab: "final"' in js
     assert "const DECISION_TABS" in js

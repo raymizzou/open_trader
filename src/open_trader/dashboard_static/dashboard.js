@@ -2186,7 +2186,7 @@ function renderSymbolDetail(holding, index) {
       <div>
         <button class="raw-toggle" type="button" data-back-to-holdings>返回持仓列表</button>
         <h2>交易决策 · ${escapeHtml(title)}</h2>
-        <p>${escapeHtml(formatPlain(holding.name))} · 基于现有持仓数据展示；除 TradingAgents 外，插件模块目前仅为 UI 占位。</p>
+        <p>${escapeHtml(formatPlain(holding.name))} · 基于已接入的交易决策与市场事实数据展示。</p>
       </div>
       <button class="raw-toggle" type="button" data-back-to-holdings>收起</button>
     </div>
@@ -2501,6 +2501,7 @@ function decisionTabViews(holding) {
     ? holding.technical_facts : null;
   const futuModules = ["technical_anomaly", "capital_anomaly", "derivatives_anomaly"]
     .map((key) => futuFacts[key]);
+  const futuNews = futuSkillNewsSentimentModule(holding);
   const definitions = {
     final: {
       available: [summary.ta_view, summary.current_action, summary.core_reason].some(hasValue),
@@ -2513,8 +2514,9 @@ function decisionTabViews(holding) {
       html: renderDecisionPluginCard(klineDecisionFactsPlugin(holding)),
     },
     news: {
-      available: facts.news_sentiment && facts.news_sentiment.available === true,
-      error: facts.news_sentiment && facts.news_sentiment.error,
+      available: Boolean(facts.news_sentiment && facts.news_sentiment.available === true)
+        || Boolean(futuNews && futuNews.available === true),
+      error: (facts.news_sentiment && facts.news_sentiment.error) || (futuNews && futuNews.error),
       html: renderDecisionPluginCard(newsSentimentPlugin(holding)),
     },
     futu: {
