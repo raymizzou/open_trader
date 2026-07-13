@@ -7,6 +7,7 @@ import math
 from typing import Any
 
 from .futu_watch import QuoteSnapshot
+from .futu_symbols import to_futu_symbol
 from .kline_technical_facts import DailyKlineBar
 
 
@@ -150,8 +151,12 @@ class FutuQuoteClient:
             ktype = KLType.K_DAY
         except ImportError:
             ktype = "K_DAY"
+        market, symbol = futu_symbol.split(".", 1)
+        wire_symbol = (
+            futu_symbol if market in {"SH", "SZ"} else to_futu_symbol(market, symbol)
+        )
         response = self.context.request_history_kline(
-            futu_symbol,
+            wire_symbol,
             start=start,
             end=end,
             ktype=ktype,

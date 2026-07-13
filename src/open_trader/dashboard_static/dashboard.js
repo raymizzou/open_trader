@@ -5654,6 +5654,10 @@ function futuSymbolForHolding(holding) {
   if (market === "HK" && /^\d+$/.test(symbol)) {
     symbol = symbol.padStart(5, "0");
   }
+  if (market === "CN" && /^\d{6}$/.test(symbol)) {
+    const exchange = symbol === "000300" || /^[569]/.test(symbol) ? "SH" : "SZ";
+    return `${exchange}.${symbol}`;
+  }
   return `${market}.${symbol}`;
 }
 

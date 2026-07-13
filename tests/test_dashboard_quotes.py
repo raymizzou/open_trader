@@ -180,6 +180,38 @@ def test_quote_service_returns_ok_and_never_writes_portfolio(tmp_path: Path) -> 
     assert config.portfolio_path.read_text(encoding="utf-8") == original_portfolio
 
 
+def test_quote_service_requests_cn_holding_with_futu_exchange_prefix(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    with config.portfolio_path.open("a", encoding="utf-8", newline="") as handle:
+        csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES).writerow(
+            {
+                "market": "CN",
+                "asset_class": "stock",
+                "symbol": "600025",
+                "name": "华能水电",
+                "total_quantity": "6000",
+            }
+        )
+    client = FakeQuoteClient(
+        {
+            "US.MSFT": QuoteSnapshot("US.MSFT", Decimal("500")),
+            "US.AAPL": QuoteSnapshot("US.AAPL", Decimal("160")),
+            "SH.600025": QuoteSnapshot("SH.600025", Decimal("9.81")),
+        }
+    )
+
+    result = DashboardQuoteService(
+        config=config,
+        client_factory=lambda: client,
+    ).refresh()
+
+    assert client.requested_symbols == ["SH.600025", "US.AAPL", "US.MSFT"]
+    assert result.quotes["SH.600025"]["last_price"] == "9.81"
+
+
 def test_quote_service_returns_partial_for_missing_quotes(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_portfolio(config.portfolio_path)

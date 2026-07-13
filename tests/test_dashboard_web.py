@@ -91,7 +91,7 @@ def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path) -
     assert payload["benchmarks"]["CN"] == "000300"
 
 
-def test_cn_standard_backtest_owns_akshare_provider(tmp_path, monkeypatch) -> None:
+def test_cn_standard_backtest_owns_futu_provider(tmp_path, monkeypatch) -> None:
     import open_trader.dashboard_web as dashboard_web
 
     config = dashboard_config(tmp_path)
@@ -99,8 +99,7 @@ def test_cn_standard_backtest_owns_akshare_provider(tmp_path, monkeypatch) -> No
     row.update({"market": "CN", "symbol": "600025", "asset_class": "stock"})
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
     provider = object()
-    monkeypatch.setattr(dashboard_web, "AkShareDailyKlineProvider", lambda: provider)
-    monkeypatch.setattr(dashboard_web, "FutuQuoteClient", lambda **_: pytest.fail("Futu must not serve CN"))
+    monkeypatch.setattr(dashboard_web, "FutuQuoteClient", lambda **_: provider)
     monkeypatch.setattr(dashboard_web, "run_standard_backtest", lambda request, *, price_provider: type("Result", (), {"to_dict": lambda self: {"provider": price_provider}})())
 
     result = dashboard_web.build_standard_backtest_run_payload(config, {
@@ -780,6 +779,21 @@ const sandbox = { document: { addEventListener() {} }, console };
     )
     assert result.returncode == 0, result.stderr + result.stdout
     return result.stdout
+
+
+def test_dashboard_maps_cn_holdings_to_futu_quote_keys() -> None:
+    output = run_dashboard_js(
+        r'''
+const values = [
+  futuSymbolForHolding({ market: "CN", symbol: "600025" }),
+  futuSymbolForHolding({ market: "CN", symbol: "000001" }),
+  futuSymbolForHolding({ market: "CN", symbol: "000300" }),
+];
+console.log(JSON.stringify(values));
+'''
+    )
+
+    assert json.loads(output) == ["SH.600025", "SZ.000001", "SH.000300"]
 
 
 def test_dashboard_trading_decision_tabs() -> None:

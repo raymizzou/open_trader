@@ -11,7 +11,6 @@ from urllib.parse import urlparse
 
 from .backtest import run_backtest
 from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
-from .akshare_quote import AkShareDailyKlineProvider
 from .dashboard import (
     DashboardConfig,
     _backtest_holding_detail,
@@ -142,9 +141,9 @@ def build_standard_backtest_run_payload(
     parsed = parse_standard_backtest_request(config, request)
     owned_provider = provider is None
     try:
-        price_provider = provider or (
-            AkShareDailyKlineProvider() if parsed.market == "CN" else
-            FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+        price_provider = provider or FutuQuoteClient(
+            host=config.futu_host,
+            port=config.futu_port,
         )
     except Exception as exc:
         raise StandardBacktestExecutionError(f"行情服务连接失败：{exc}") from exc

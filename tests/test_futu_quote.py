@@ -183,6 +183,19 @@ def test_futu_quote_client_returns_normalized_daily_kline() -> None:
     assert client.context.requested_history["end"] == "2026-07-04"
 
 
+def test_futu_quote_client_maps_cn_symbol_for_daily_kline() -> None:
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    client.get_daily_kline("CN.600025", start="2026-07-01", end="2026-07-14")
+
+    assert client.context.requested_history["symbol"] == "SH.600025"
+
+
 def test_futu_quote_client_raises_clear_error_on_sdk_failure() -> None:
     client = FutuQuoteClient(
         host="127.0.0.1",
