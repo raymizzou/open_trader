@@ -22,8 +22,8 @@ background process was not checked.
 
 ## Dashboard Definition of Done
 
-Run `make acceptance` after every Dashboard behavior change. Its result is the
-only completion status:
+Run `make acceptance` after every modification. Its result is the only
+completion status:
 
 - `PASS`: automated tests, real API/data, two refresh cycles, process version,
   logs, and desktop/mobile browser flows all passed.
@@ -33,6 +33,16 @@ only completion status:
 Only `PASS` may be described as complete, deployed successfully, or accepted.
 `FAIL` must be fixed. `BLOCKED` must be reported as blocked and must not be
 substituted with curl, fixtures, mocks, screenshots, or unit tests.
+
+## Post-Acceptance Review Deployment
+
+After `make acceptance` returns `PASS`, redeploy the exact accepted Git SHA
+before asking the user to review it. Then verify the new process PID, working
+directory, Git SHA, fresh logs, and an HTTP 200 response from the review URL.
+Provide that URL so the user can open it directly.
+
+This post-acceptance restart does not require another acceptance run when it
+deploys the exact already-accepted SHA and makes no source or data changes.
 
 ## Task Handoff Gate
 
