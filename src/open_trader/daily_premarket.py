@@ -654,33 +654,52 @@ class DailyPremarketRunner:
                 dry_run=dry_run,
             )
             return result
-        technical_facts_value = getattr(
-            premarket_result, "technical_facts_path", None
+        technical_facts_error = str(
+            getattr(premarket_result, "technical_facts_error", "")
         )
+        decision_facts_error = str(
+            getattr(premarket_result, "decision_facts_error", "")
+        )
+        technical_facts_value = getattr(premarket_result, "technical_facts_path", None)
         technical_facts_path = (
             Path(technical_facts_value)
             if technical_facts_value
-            else advice_path.with_name("technical_facts.json")
+            else (
+                None
+                if technical_facts_error
+                else advice_path.with_name("technical_facts.json")
+            )
         )
-        if not technical_facts_path.exists():
+        if technical_facts_path is not None and not technical_facts_path.exists():
             technical_facts_path = None
         decision_facts_value = getattr(premarket_result, "decision_facts_path", None)
         decision_facts_path = (
             Path(decision_facts_value)
             if decision_facts_value
-            else advice_path.with_name("decision_facts.json")
+            else (
+                None
+                if decision_facts_error
+                else advice_path.with_name("decision_facts.json")
+            )
         )
-        if not decision_facts_path.exists():
+        if decision_facts_path is not None and not decision_facts_path.exists():
             decision_facts_path = None
-        futu_facts_result = self.futu_facts_generator(
-            portfolio_path=portfolio_path,
-            data_dir=config.data_dir,
-            run_date=run_date,
-            market=market,
-            extractor=self.futu_facts_extractor_factory(),
-            update_latest=False,
-        )
-        futu_skill_facts_path = Path(futu_facts_result.run_path)
+        futu_skill_facts_path: Path | None = None
+        futu_facts_error = ""
+        try:
+            futu_facts_result = self.futu_facts_generator(
+                portfolio_path=portfolio_path,
+                data_dir=config.data_dir,
+                run_date=run_date,
+                market=market,
+                extractor=self.futu_facts_extractor_factory(),
+                update_latest=False,
+            )
+        except Exception as exc:
+            futu_facts_error = str(exc) or exc.__class__.__name__
+            LOGGER.warning("Futu skill facts generation failed", exc_info=True)
+        else:
+            futu_skill_facts_path = Path(futu_facts_result.run_path)
         plan_result = self.plan_builder(
             advice_path=advice_path,
             data_dir=config.data_dir,
@@ -707,6 +726,7 @@ class DailyPremarketRunner:
         }
         tradingagents_summary_path: Path | None = None
         tradingagents_summary_failed = False
+        tradingagents_summary_error = ""
         try:
             tradingagents_summary_result = self.summary_generator(
                 advice_path=advice_path,
@@ -718,8 +738,9 @@ class DailyPremarketRunner:
                 extractor=self.summary_extractor_factory(),
                 update_latest=False,
             )
-        except Exception:
+        except Exception as exc:
             tradingagents_summary_failed = True
+            tradingagents_summary_error = str(exc) or exc.__class__.__name__
             LOGGER.warning(
                 "TradingAgents summary generation failed",
                 exc_info=True,
@@ -734,6 +755,10 @@ class DailyPremarketRunner:
             decision_facts_path=decision_facts_path,
             tradingagents_summary_path=tradingagents_summary_path,
             futu_skill_facts_path=futu_skill_facts_path,
+            technical_facts_error=technical_facts_error,
+            decision_facts_error=decision_facts_error,
+            tradingagents_summary_error=tradingagents_summary_error,
+            futu_facts_error=futu_facts_error,
         )
         advice_counts = _count_advice(advice_path)
         plan_counts = _count_plan(plan_result.plan_path)
@@ -770,7 +795,7 @@ class DailyPremarketRunner:
             "tradingagents_summary": (
                 str(tradingagents_summary_path) if tradingagents_summary_path else ""
             ),
-            "futu_skill_facts": str(futu_skill_facts_path),
+            "futu_skill_facts": str(futu_skill_facts_path) if futu_skill_facts_path else "",
             "latest_advice": str(latest_advice_path),
             "latest_actions": str(latest_actions_path),
             "latest_trading_plan": str(latest_plan_path),
@@ -810,7 +835,7 @@ class DailyPremarketRunner:
             log_path=log_path,
             source_failures=source_failures,
         )
-        if not dry_run and not source_failures:
+        if not dry_run:
             _promote_latest_set(
                 advice_path=advice_path,
                 actions_path=actions_path,
@@ -1706,12 +1731,16 @@ def _evaluate_source_failures(
     technical_facts_path: Path | None,
     decision_facts_path: Path | None,
     tradingagents_summary_path: Path | None,
-    futu_skill_facts_path: Path,
+    futu_skill_facts_path: Path | None,
+    technical_facts_error: str = "",
+    decision_facts_error: str = "",
+    tradingagents_summary_error: str = "",
+    futu_facts_error: str = "",
 ) -> list[SourceFailure]:
     csv.field_size_limit(sys.maxsize)
     with advice_path.open(encoding="utf-8-sig", newline="") as handle:
         advice_rows = list(csv.DictReader(handle))
-    return evaluate_required_sources(
+    failures = evaluate_required_sources(
         advice_rows=advice_rows,
         technical_records=index_technical_facts_by_market_symbol(
             load_technical_facts_cache(technical_facts_path) if technical_facts_path else {}
@@ -1726,8 +1755,28 @@ def _evaluate_source_failures(
         ),
         futu_records=index_futu_skill_facts_by_market_symbol(
             load_futu_skill_facts_cache(futu_skill_facts_path)
+            if futu_skill_facts_path
+            else {}
         ),
     )
+    errors = {
+        "technical_facts": technical_facts_error,
+        "tradingagents_summary": tradingagents_summary_error,
+    }
+    return [
+        SourceFailure(
+            failure.market,
+            failure.symbol,
+            failure.source,
+            (
+                errors.get(failure.source)
+                or (decision_facts_error if failure.source.startswith("decision_facts.") else "")
+                or (futu_facts_error if failure.source.startswith("futu_skill_facts.") else "")
+                or failure.error
+            ),
+        )
+        for failure in failures
+    ]
 
 
 def _count_plan(plan_path: Path) -> dict[str, int]:
@@ -2092,9 +2141,14 @@ def _blocker_notification_message(
         ]
     )
     if source_failures:
-        market = source_failures[0].market.lower()
+        market = source_failures[0].market
+        for command in dict.fromkeys(
+            _source_retry_command(failure.source, market, run_date)
+            for failure in source_failures
+        ):
+            lines.append(f"来源重试：{command}")
         lines.append(
-            f"重试：launchctl kickstart -k gui/$(id -u)/com.open-trader.premarket.{market}"
+            f"重试：launchctl kickstart -k gui/$(id -u)/com.open-trader.premarket.{market.lower()}"
         )
 
     status_path = str(artifacts.get("status", "")).strip()
@@ -2107,6 +2161,34 @@ def _blocker_notification_message(
     if artifact_lines:
         lines.extend(["", *artifact_lines])
     return "\n".join(lines).strip() + "\n"
+
+
+def _source_retry_command(source: str, market: str, run_date: str) -> str:
+    latest = f"data/latest/{market}"
+    if source == "technical_facts":
+        return (
+            ".venv/bin/python -m open_trader extract-technical-facts "
+            f"--advice {latest}/trading_advice.csv --data-dir data "
+            f"--date {run_date} --market {market} --update-latest"
+        )
+    if source.startswith("decision_facts."):
+        return (
+            ".venv/bin/python -m open_trader extract-decision-facts "
+            f"--advice {latest}/trading_advice.csv --data-dir data "
+            f"--date {run_date} --market {market} --update-latest"
+        )
+    if source == "tradingagents_summary":
+        return (
+            ".venv/bin/python -m open_trader extract-tradingagents-summary "
+            f"--advice {latest}/trading_advice.csv --plan {latest}/trading_plan.csv "
+            f"--actions {latest}/trade_actions.csv --data-dir data "
+            f"--date {run_date} --market {market} --update-latest"
+        )
+    return (
+        ".venv/bin/python -m open_trader extract-futu-skill-facts "
+        "--portfolio data/latest/portfolio.csv --data-dir data "
+        f"--date {run_date} --market {market} --update-latest"
+    )
 
 
 def _daily_status_label(status: str) -> str:

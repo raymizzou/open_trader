@@ -105,13 +105,13 @@ def evaluate_required_sources(
         decision_sources = extract_decision_sources(row.get("raw_decision", ""))
         checks = (
             (
-                "tradingagents",
+                "tradingagents_summary",
                 tradingagents,
                 tradingagents_available(tradingagents, run_date),
             ),
             ("technical_facts", technical, technical_facts_available(technical, row)),
             (
-                "decision_kline",
+                "decision_facts.kline",
                 _module(decision, "kline"),
                 decision_module_available(
                     _module(decision, "kline"),
@@ -120,7 +120,7 @@ def evaluate_required_sources(
                 ),
             ),
             (
-                "decision_news_sentiment",
+                "decision_facts.news_sentiment",
                 _module(decision, "news_sentiment"),
                 decision_module_available(
                     _module(decision, "news_sentiment"),
@@ -146,7 +146,7 @@ def _futu_checks(
 ) -> tuple[tuple[str, object, bool], ...]:
     current = bool(record and record.get("run_date") == run_date)
     return tuple(
-        (f"futu_{name}", _module(record, name), current and futu_module_available(_module(record, name)))
+        (f"futu_skill_facts.{name}", _module(record, name), current and futu_module_available(_module(record, name)))
         for name in (
             "news_sentiment",
             "technical_anomaly",

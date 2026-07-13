@@ -75,6 +75,8 @@ class PremarketResult:
     report_path: Path
     technical_facts_path: Path | None = None
     decision_facts_path: Path | None = None
+    technical_facts_error: str = ""
+    decision_facts_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -221,28 +223,42 @@ def run_premarket(
         update_latest=False,
         market=market_scope,
     )
-    technical_facts_result = _generate_technical_facts_after_advice(
-        advice_path=advice_path,
-        data_dir=data_dir,
-        run_date=run_date,
-        update_latest=False,
-        market=market_scope,
-        technical_facts_generator=technical_facts_generator,
-    )
-    decision_facts_result = _generate_decision_facts_after_advice(
-        advice_path=advice_path,
-        data_dir=data_dir,
-        run_date=run_date,
-        update_latest=False,
-        market=market_scope,
-        decision_facts_generator=decision_facts_generator,
-    )
+    technical_facts_result: TechnicalFactsResult | None = None
+    technical_facts_error = ""
+    try:
+        technical_facts_result = _generate_technical_facts_after_advice(
+            advice_path=advice_path,
+            data_dir=data_dir,
+            run_date=run_date,
+            update_latest=False,
+            market=market_scope,
+            technical_facts_generator=technical_facts_generator,
+        )
+    except Exception as exc:
+        technical_facts_error = str(exc) or exc.__class__.__name__
+    decision_facts_result: DecisionFactsResult | None = None
+    decision_facts_error = ""
+    try:
+        decision_facts_result = _generate_decision_facts_after_advice(
+            advice_path=advice_path,
+            data_dir=data_dir,
+            run_date=run_date,
+            update_latest=False,
+            market=market_scope,
+            decision_facts_generator=decision_facts_generator,
+        )
+    except Exception as exc:
+        decision_facts_error = str(exc) or exc.__class__.__name__
     if update_latest:
         _promote_latest_outputs(
             advice_path=advice_path,
             actions_path=actions_path,
-            technical_facts_path=technical_facts_result.run_path,
-            decision_facts_path=decision_facts_result.run_path,
+            technical_facts_path=(
+                technical_facts_result.run_path if technical_facts_result else None
+            ),
+            decision_facts_path=(
+                decision_facts_result.run_path if decision_facts_result else None
+            ),
             data_dir=data_dir,
             market=market_scope,
         )
@@ -255,8 +271,14 @@ def run_premarket(
         classifications_path=classifications_path,
         actions_path=actions_path,
         report_path=report_path,
-        technical_facts_path=technical_facts_result.run_path,
-        decision_facts_path=decision_facts_result.run_path,
+        technical_facts_path=(
+            technical_facts_result.run_path if technical_facts_result else None
+        ),
+        decision_facts_path=(
+            decision_facts_result.run_path if decision_facts_result else None
+        ),
+        technical_facts_error=technical_facts_error,
+        decision_facts_error=decision_facts_error,
     )
 
 

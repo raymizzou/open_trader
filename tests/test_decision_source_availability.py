@@ -94,14 +94,14 @@ def test_evaluate_required_sources_accepts_complete_current_records() -> None:
 @pytest.mark.parametrize(
     ("source", "mutate", "expected_error"),
     [
-        ("tradingagents", lambda records: records["tradingagents_records"].clear(), "数据未生成"),
+        ("tradingagents_summary", lambda records: records["tradingagents_records"].clear(), "数据未生成"),
         ("technical_facts", lambda records: records["technical_records"][('US', 'MSFT')].update(error="技术抽取失败", extraction_status="extraction_failed"), "技术抽取失败"),
-        ("decision_kline", lambda records: records["decision_records"][('US', 'MSFT')]["kline"].update(error="K线缺失", status="error"), "K线缺失"),
-        ("decision_news_sentiment", lambda records: records["decision_records"][('US', 'MSFT')]["news_sentiment"].update(blocking_reason="新闻过期", status="missing_source"), "新闻过期"),
-        ("futu_news_sentiment", lambda records: records["futu_records"][('US', 'MSFT')]["news_sentiment"].update(error="Futu新闻失败", status="error"), "Futu新闻失败"),
-        ("futu_technical_anomaly", lambda records: records["futu_records"][('US', 'MSFT')]["technical_anomaly"].update(status="missing"), "missing"),
-        ("futu_capital_anomaly", lambda records: records["futu_records"][('US', 'MSFT')]["capital_anomaly"].update(blocking_reason="资金数据缺失", status="error"), "资金数据缺失"),
-        ("futu_derivatives_anomaly", lambda records: records["futu_records"][('US', 'MSFT')]["derivatives_anomaly"].update(error="衍生品失败", status="error"), "衍生品失败"),
+        ("decision_facts.kline", lambda records: records["decision_records"][('US', 'MSFT')]["kline"].update(error="K线缺失", status="error"), "K线缺失"),
+        ("decision_facts.news_sentiment", lambda records: records["decision_records"][('US', 'MSFT')]["news_sentiment"].update(blocking_reason="新闻过期", status="missing_source"), "新闻过期"),
+        ("futu_skill_facts.news_sentiment", lambda records: records["futu_records"][('US', 'MSFT')]["news_sentiment"].update(error="Futu新闻失败", status="error"), "Futu新闻失败"),
+        ("futu_skill_facts.technical_anomaly", lambda records: records["futu_records"][('US', 'MSFT')]["technical_anomaly"].update(status="missing"), "missing"),
+        ("futu_skill_facts.capital_anomaly", lambda records: records["futu_records"][('US', 'MSFT')]["capital_anomaly"].update(blocking_reason="资金数据缺失", status="error"), "资金数据缺失"),
+        ("futu_skill_facts.derivatives_anomaly", lambda records: records["futu_records"][('US', 'MSFT')]["derivatives_anomaly"].update(error="衍生品失败", status="error"), "衍生品失败"),
     ],
 )
 def test_evaluate_required_sources_reports_each_canonical_source(
@@ -118,3 +118,29 @@ def test_evaluate_required_sources_reports_each_canonical_source(
         ],
         **records,
     )] == [{"market": "US", "symbol": "MSFT", "source": source, "error": expected_error}]
+
+
+def test_evaluate_required_sources_uses_canonical_source_names() -> None:
+    records = _records()
+    records["technical_records"].clear()
+    records["decision_records"].clear()
+    records["tradingagents_records"].clear()
+    records["futu_records"].clear()
+
+    failures = evaluate_required_sources(
+        advice_rows=[
+            {"run_date": RUN_DATE, "market": "US", "symbol": "MSFT", "raw_decision": RAW_DECISION}
+        ],
+        **records,
+    )
+
+    assert [failure.source for failure in failures] == [
+        "tradingagents_summary",
+        "technical_facts",
+        "decision_facts.kline",
+        "decision_facts.news_sentiment",
+        "futu_skill_facts.news_sentiment",
+        "futu_skill_facts.technical_anomaly",
+        "futu_skill_facts.capital_anomaly",
+        "futu_skill_facts.derivatives_anomaly",
+    ]
