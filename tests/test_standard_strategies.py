@@ -2,6 +2,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
+import open_trader.standard_strategies as strategies
 
 from open_trader.standard_strategies import (
     ACTION_TARGET_FRACTIONS,
@@ -136,6 +137,44 @@ def test_appending_future_bar_does_not_change_prior_decisions() -> None:
     )
     assert original[-1].earliest_execution_date is None
     assert former_final.earliest_execution_date == future_shock_bar().date
+
+
+def test_current_snapshot_uses_versioned_formulas_and_risk_first() -> None:
+    bars = lifecycle_fixture("trend_pullback/v1")[:-1]
+
+    snapshot = strategies.build_current_strategy_snapshot(
+        "trend_pullback/v1", bars, Decimal("0.10"),
+    )
+
+    assert snapshot["strategy"]["id"] == "trend_pullback/v1"
+    assert snapshot["conditions"][0]["priority"] == "risk"
+    assert snapshot["conditions"][0]["formula"] == "min(sma50, active_stop)"
+    assert snapshot["conditions"][0]["source_date"] == bars[-1].date.isoformat()
+    assert snapshot["conditions"][0]["target_weight"] == "0"
+    assert snapshot["facts"]["rsi14"]["formula"] == "Wilder RSI(close, 14)"
+
+
+@pytest.mark.parametrize(
+    "strategy_id",
+    ["trend_pullback/v1", "breakout_momentum/v1", "range_mean_reversion/v1"],
+)
+def test_current_snapshot_conditions_have_decimal_targets_and_provenance(
+    strategy_id: str,
+) -> None:
+    bars = lifecycle_fixture(strategy_id)[:-1]
+
+    snapshot = strategies.build_current_strategy_snapshot(
+        strategy_id, bars, Decimal("0.10"),
+    )
+
+    assert snapshot["conditions"]
+    assert {"ma20_distance_pct", "rsi14", "bollinger_position", "relative_volume"} <= snapshot["facts"].keys()
+    for condition in snapshot["conditions"]:
+        assert Decimal(condition["target_weight"]) <= Decimal("0.10")
+        assert condition["formula"]
+        assert condition["inputs"]
+        assert condition["source_date"] == bars[-1].date.isoformat()
+        assert condition["calculated_value"] is not None
 
 
 def test_warmup_bars_never_emit_trade_actions() -> None:
