@@ -781,19 +781,22 @@ const sandbox = { document: { addEventListener() {} }, console };
     return result.stdout
 
 
-def test_dashboard_maps_cn_holdings_to_futu_quote_keys() -> None:
+def test_dashboard_matches_holding_to_backend_canonical_quote() -> None:
     output = run_dashboard_js(
         r'''
-const values = [
-  futuSymbolForHolding({ market: "CN", symbol: "600025" }),
-  futuSymbolForHolding({ market: "CN", symbol: "000001" }),
-  futuSymbolForHolding({ market: "CN", symbol: "000300" }),
-];
-console.log(JSON.stringify(values));
+state.quotes = {
+  "backend-owned-key": {
+    market: "CN",
+    symbol: "600025",
+    futu_symbol: "SH.600025",
+    last_price: "9.81",
+  },
+};
+console.log(JSON.stringify(quoteForHolding({ market: "CN", symbol: "600025" })));
 '''
     )
 
-    assert json.loads(output) == ["SH.600025", "SZ.000001", "SH.000300"]
+    assert json.loads(output)["futu_symbol"] == "SH.600025"
 
 
 def test_dashboard_derives_live_holding_values_from_futu_quote() -> None:
@@ -822,6 +825,36 @@ console.log(JSON.stringify({
         "market_value_hkd": "63568.80",
         "unrealized_pnl_pct": "10.34%",
     }
+
+
+def test_dashboard_live_holdings_recalculate_values_and_weights() -> None:
+    output = run_dashboard_js(
+        r'''
+state.dashboard = {
+  holdings: [{
+    market: "CN",
+    symbol: "600025",
+    total_quantity: "10",
+    cost_value: "50",
+    fx_to_hkd: "1",
+    market_value: "50",
+    market_value_hkd: "50",
+    unrealized_pnl_pct: "0.00%",
+    portfolio_weight_hkd: "50.00%",
+  }],
+  cash_rows: [{ market_value_hkd: "50" }],
+};
+state.quotes = {
+  anything: { market: "CN", symbol: "600025", last_price: "10" },
+};
+console.log(JSON.stringify(getHoldings()[0]));
+'''
+    )
+
+    holding = json.loads(output)
+    assert holding["market_value_hkd"] == "100.00"
+    assert holding["unrealized_pnl_pct"] == "100.00%"
+    assert holding["portfolio_weight_hkd"] == "66.67%"
 
 
 def test_dashboard_trading_decision_tabs() -> None:

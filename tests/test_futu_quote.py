@@ -196,6 +196,21 @@ def test_futu_quote_client_maps_cn_symbol_for_daily_kline() -> None:
     assert client.context.requested_history["symbol"] == "SH.600025"
 
 
+@pytest.mark.parametrize("symbol", ["SH.000001", "SZ.600025", "SH.BAD"])
+def test_futu_quote_client_rejects_invalid_cn_wire_symbol(symbol: str) -> None:
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    with pytest.raises(ValueError):
+        client.get_daily_kline(symbol, start="2026-07-01", end="2026-07-14")
+
+    assert not hasattr(client.context, "requested_history")
+
+
 def test_futu_quote_client_raises_clear_error_on_sdk_failure() -> None:
     client = FutuQuoteClient(
         host="127.0.0.1",

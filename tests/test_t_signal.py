@@ -208,6 +208,8 @@ def test_to_futu_symbol_normalizes_supported_market_symbols() -> None:
         ("HK", "US.MSFT"),
         ("CN", "800001"),
         ("CN", "SZ.600025"),
+        ("US", "$$$"),
+        ("US", "MS FT"),
         ("US", ""),
     ],
 )

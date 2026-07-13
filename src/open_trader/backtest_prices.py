@@ -179,7 +179,11 @@ def ensure_backtest_price_range(
     normalized_symbol = normalize_backtest_symbol(market_scope.value, symbol)
     prices_path = _backtest_prices_path(data_dir, market_scope.value, normalized_symbol)
     bars: list[StrategyBar] | None = None
-    if prices_path.exists() and not _price_cache_missing_required_columns(prices_path):
+    if (
+        market_scope is not MarketScope.CN
+        and prices_path.exists()
+        and not _price_cache_missing_required_columns(prices_path)
+    ):
         bars = load_price_rows(prices_path)
         if (
             all(bar.volume == 0 for bar in bars)

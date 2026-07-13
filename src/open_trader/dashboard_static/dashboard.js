@@ -1809,6 +1809,7 @@ function currentViewSummary() {
   if (
     state.marketFilter === "ALL"
     && state.brokerFilter !== "ALL"
+    && Object.keys(state.quotes).length === 0
   ) {
     const summary = currentBrokerSummary();
     if (summary) {
@@ -1883,6 +1884,9 @@ function sumHoldingValues(rows) {
 }
 
 function brokerHoldingValue(holding) {
+  if (quoteForHolding(holding)) {
+    return sumMoneyValues([holding]);
+  }
   const brokers = rowBrokers(holding);
   const details = brokerDetailRowsForCurrentFilter(holding);
   if (details.length) {
@@ -2060,7 +2064,6 @@ function renderHoldings() {
       const rowKey = holdingKey(holding, index);
       const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
       const quote = quoteForHolding(holding);
-      const displayHolding = quoteAdjustedHolding(holding, quote);
       const selectedDetail = selected && rowKey === state.selectedHoldingKey
         ? normalizeHoldingDetailMode(state.selectedHoldingDetail)
         : "";
@@ -2076,10 +2079,10 @@ function renderHoldings() {
           <td class="number-cell">${escapeHtml(formatPlain(holding.total_quantity))}</td>
           <td class="number-cell">${escapeHtml(formatPlain(holding.avg_cost_price))}</td>
           <td class="number-cell">${renderQuotePrice(holding, quote)}</td>
-          <td class="number-cell">${escapeHtml(renderUsdMarketValue(displayHolding))}</td>
-          <td class="number-cell">${escapeHtml(formatMoney(displayHolding.market_value_hkd, "HKD"))}</td>
+          <td class="number-cell">${escapeHtml(renderUsdMarketValue(holding))}</td>
+          <td class="number-cell">${escapeHtml(formatMoney(holding.market_value_hkd, "HKD"))}</td>
           <td class="number-cell">${escapeHtml(formatPlain(holding.portfolio_weight_hkd))}</td>
-          <td class="number-cell">${escapeHtml(formatPlain(displayHolding.unrealized_pnl_pct))}</td>
+          <td class="number-cell">${escapeHtml(formatPlain(holding.unrealized_pnl_pct))}</td>
         </tr>
       `);
       if (selected && rowKey === state.selectedHoldingKey) {
@@ -5342,9 +5345,29 @@ function renderUsdMarketValue(holding) {
 }
 
 function getHoldings() {
-  return (state.dashboard && Array.isArray(state.dashboard.holdings))
+  const holdings = (state.dashboard && Array.isArray(state.dashboard.holdings))
     ? state.dashboard.holdings
     : [];
+  const adjusted = holdings.map((holding) => (
+    quoteAdjustedHolding(holding, quoteForHolding(holding))
+  ));
+  const values = [...adjusted, ...getCashRows()].map(
+    (row) => numericValue(row.market_value_hkd),
+  );
+  if (values.some((value) => value === null)) {
+    return adjusted;
+  }
+  const total = values.reduce((sum, value) => sum + value, 0);
+  if (total <= 0) {
+    return adjusted;
+  }
+  return adjusted.map((holding) => ({
+    ...holding,
+    portfolio_weight_hkd: percentValue(
+      numericValue(holding.market_value_hkd),
+      total,
+    ),
+  }));
 }
 
 function numericValue(value) {
@@ -5626,11 +5649,12 @@ function brokerDisplayName(value) {
 }
 
 function quoteForHolding(holding) {
-  const key = futuSymbolForHolding(holding);
-  if (!key) {
-    return null;
-  }
-  return state.quotes[key] || null;
+  const market = String(holding && holding.market || "").trim().toUpperCase();
+  const symbol = String(holding && holding.symbol || "").trim().toUpperCase();
+  return Object.values(state.quotes).find((quote) => (
+    String(quote && quote.market || "").trim().toUpperCase() === market
+    && String(quote && quote.symbol || "").trim().toUpperCase() === symbol
+  )) || null;
 }
 
 function quoteAdjustedHolding(holding, quote) {
@@ -5645,6 +5669,7 @@ function quoteAdjustedHolding(holding, quote) {
   const marketValue = price * quantity;
   return {
     ...holding,
+    last_price: String(price),
     market_value: marketValue.toFixed(2),
     market_value_hkd: (marketValue * fx).toFixed(2),
     unrealized_pnl: (marketValue - cost).toFixed(2),
@@ -5663,22 +5688,6 @@ function detailLivePrice(holding, quote) {
     return "-";
   }
   return quote && hasValue(quote.last_price) ? quote.last_price : "缺行情";
-}
-
-function futuSymbolForHolding(holding) {
-  const market = String(holding.market || "").trim().toUpperCase();
-  let symbol = String(holding.symbol || "").trim().toUpperCase();
-  if (!market || !symbol || market === "CASH") {
-    return "";
-  }
-  if (market === "HK" && /^\d+$/.test(symbol)) {
-    symbol = symbol.padStart(5, "0");
-  }
-  if (market === "CN" && /^\d{6}$/.test(symbol)) {
-    const exchange = symbol === "000300" || /^[569]/.test(symbol) ? "SH" : "SZ";
-    return `${exchange}.${symbol}`;
-  }
-  return `${market}.${symbol}`;
 }
 
 function renderQuotePrice(holding, quote) {

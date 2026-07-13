@@ -153,7 +153,9 @@ class FutuQuoteClient:
             ktype = "K_DAY"
         market, symbol = futu_symbol.split(".", 1)
         wire_symbol = (
-            futu_symbol if market in {"SH", "SZ"} else to_futu_symbol(market, symbol)
+            to_futu_symbol("CN", futu_symbol)
+            if market in {"SH", "SZ"}
+            else to_futu_symbol(market, symbol)
         )
         response = self.context.request_history_kline(
             wire_symbol,

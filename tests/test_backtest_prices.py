@@ -253,6 +253,37 @@ def test_ensure_price_range_reuses_complete_csv(tmp_path: Path) -> None:
     assert result.actual_end == date(2026, 1, 1)
 
 
+def test_ensure_cn_price_range_refetches_complete_unknown_source_cache(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "prices" / "CN" / "600025.csv"
+    path.parent.mkdir(parents=True)
+    _write_prices(
+        path,
+        [
+            "2024-09-23,1,1,1,1,1",
+            "2025-01-01,1,1,1,1,1",
+            "2026-01-01,2,2,2,2,2",
+        ],
+    )
+    provider = CoverageProvider()
+
+    result = ensure_backtest_price_range(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600025",
+        date_range=BacktestDateRange(
+            date(2025, 1, 1),
+            date(2026, 1, 1),
+            date(2024, 9, 23),
+        ),
+        provider=provider,
+    )
+
+    assert provider.requests == [("CN.600025", "2024-09-23", "2026-01-01")]
+    assert result.bars[0].close == 100
+
+
 def test_ensure_price_range_refetches_legacy_csv_missing_volume(tmp_path: Path) -> None:
     path = tmp_path / "prices" / "US" / "MSFT.csv"
     path.parent.mkdir(parents=True)

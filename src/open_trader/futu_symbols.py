@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import re
+
 
 KNOWN_PREFIXES = {"HK", "US", "CN", "SH", "SZ"}
+US_SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:[.-][A-Z0-9]+)*")
 
 
 def to_futu_symbol(market: str, symbol: str) -> str:
@@ -24,6 +27,8 @@ def to_futu_symbol(market: str, symbol: str) -> str:
     if not normalized_symbol:
         raise ValueError(f"empty symbol for market {normalized_market}")
     if normalized_market == "US":
+        if US_SYMBOL_PATTERN.fullmatch(normalized_symbol) is None:
+            raise ValueError(f"invalid US symbol: {symbol}")
         return f"US.{normalized_symbol}"
     if (
         normalized_market == "HK"
