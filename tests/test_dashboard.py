@@ -24,7 +24,9 @@ from open_trader.decision_facts import (
     NEWS_SENTIMENT_FIELDS,
     extract_decision_sources,
 )
+from open_trader.decision_plan import build_decision_plan, publish_decision_plans
 from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
+from open_trader.plan_events import PlanEvent, append_plan_event
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.technical_facts import source_hash
 from open_trader.trade_actions import TRADE_ACTION_FIELDNAMES
@@ -96,6 +98,83 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
         poll_seconds=1.5,
         futu_host="127.0.0.1",
         futu_port=11111,
+    )
+
+
+def dashboard_decision_plan(run_date: str) -> dict[str, object]:
+    facts = {
+        "ma20_distance_pct": {
+            "formula": "(close / sma20 - 1) * 100",
+            "inputs": {"close": "48.5", "sma20": "47"},
+            "source_date": run_date,
+            "calculated_value": "3.1915",
+        },
+        "rsi14": {
+            "formula": "Wilder RSI(close, 14)",
+            "inputs": {"period": "14"},
+            "source_date": run_date,
+            "calculated_value": "52",
+        },
+        "bollinger_position": {
+            "formula": "compare(close, bollinger bands)",
+            "inputs": {"close": "48.5"},
+            "source_date": run_date,
+            "calculated_value": "inside",
+        },
+        "relative_volume": {
+            "formula": "volume / SMA(previous volume, 20)",
+            "inputs": {"volume": "120", "average_volume": "100"},
+            "source_date": run_date,
+            "calculated_value": "1.2",
+        },
+    }
+    snapshot = {
+        "strategy": {"id": "trend_pullback/v1", "name_zh": "趋势回调"},
+        "facts": facts,
+        "conditions": [
+            {
+                "condition_id": "trend-exit",
+                "priority": "risk",
+                "operator": "<=",
+                "calculated_value": "42",
+                "target_weight": "0",
+                "suggested_action": "退出",
+                "formula": "min(sma50, active_stop)",
+                "inputs": {"sma50": "43", "active_stop": "42"},
+                "source_date": run_date,
+            }
+        ],
+    }
+    backtests = [
+        {
+            "strategy_id": "trend_pullback/v1",
+            "range": range_name,
+            "gate": {
+                "passed": True,
+                "policy_id": "benchmark_outperformance/v1",
+                "reasons": [],
+            },
+            "strategy": {
+                "total_return_pct": "8",
+                "max_drawdown_pct": "6",
+                "sharpe_ratio": "1.1",
+            },
+            "market_benchmark": {"symbol": "SPY", "total_return_pct": "5"},
+            "market_excess_return_pct": "3",
+        }
+        for range_name in ("6M", "1Y")
+    ]
+    return build_decision_plan(
+        run_date=run_date,
+        market="US",
+        symbol="VIXY",
+        position={"quantity": "100", "weight": "0.08", "nav": "60625", "price": "48.5"},
+        strategy_snapshots=[snapshot],
+        backtests=backtests,
+        technical_facts=facts,
+        tradingagents_summary={"current_action": "观察"},
+        effective_at=f"{run_date}T09:30:00-04:00",
+        expires_at=f"{run_date}T16:00:00-04:00",
     )
 
 
@@ -3425,3 +3504,61 @@ def test_load_dashboard_state_degrades_invalid_kelly_lab_artifacts(
     assert vixy["kelly"]["available"] is False
     assert vixy["kelly"]["experiment_count"] == 0
     assert vixy["kelly"]["status"] == "missing_experiment"
+
+
+def test_dashboard_attaches_plan_events_and_previous_review(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    current = dashboard_decision_plan("2026-07-13")
+    previous = dashboard_decision_plan("2026-07-10")
+    publish_decision_plans(
+        data_dir=config.data_dir,
+        run_date="2026-07-13",
+        market="US",
+        records=[current],
+        update_latest=True,
+    )
+    publish_decision_plans(
+        data_dir=config.data_dir,
+        run_date="2026-07-10",
+        market="US",
+        records=[previous],
+        update_latest=False,
+    )
+    events_path = config.data_dir / "runs/2026-07-13/US/plan_events.jsonl"
+    for index in range(2):
+        append_plan_event(
+            events_path,
+            PlanEvent(
+                event_id=f"trigger-{index}",
+                plan_id=str(current["plan_id"]),
+                event_type="condition_triggered",
+                condition_id="trend-exit",
+                occurred_at=f"2026-07-13T10:0{index}:00-04:00",
+                payload={"price": "42"},
+            ),
+        )
+
+    holding = load_dashboard_state(config).to_dict()["holdings"][0]
+
+    assert holding["decision_plan"]["available"] is True
+    assert holding["decision_plan"]["status"] == "triggered"
+    assert holding["decision_plan"]["conditions"][0]["trigger_count"] == 2
+    review = holding["decision_plan"]["previous_review"]
+    assert review["run_date"] == "2026-07-10"
+    assert review["starting_quantity"] == "100"
+    assert review["closing_quantity"] == "100"
+    assert "compliance" not in review
+
+
+def test_dashboard_exposes_invalid_plan_as_failed_state(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    current_path = config.data_dir / "latest/US/decision_plans.json"
+    current_path.parent.mkdir(parents=True, exist_ok=True)
+    current_path.write_text('{"schema_version":"invalid"}', encoding="utf-8")
+
+    plan = load_dashboard_state(config).to_dict()["holdings"][0]["decision_plan"]
+
+    assert plan["available"] is False
+    assert plan["error"] == "decision_plans.json 无效"

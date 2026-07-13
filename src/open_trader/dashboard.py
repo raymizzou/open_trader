@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 import re
 import sys
@@ -26,6 +27,7 @@ from .decision_source_availability import (
     technical_facts_available,
     tradingagents_available,
 )
+from .decision_plan import load_decision_plans
 from .futu_skill_facts import (
     index_futu_skill_facts_by_market_symbol,
     load_futu_skill_facts_cache,
@@ -38,6 +40,7 @@ from .market_scope import MarketScope
 from .models import AssetClass
 from .parsers.base import detect_asset_class
 from .portfolio import PortfolioBuildError, recalculate_portfolio_weights
+from .plan_events import load_plan_events, replay_plan_status
 from .research_chat import load_research_view_for_holding
 from .t_signal_store import (
     index_t_signals_by_market_symbol,
@@ -204,6 +207,9 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
     premarket_actions_by_holding = _latest_by_market_symbol(premarket_actions)
     actions_by_holding = _latest_by_market_symbol(trade_actions)
+    decision_plans_by_holding, decision_plan_errors_by_market = (
+        _latest_decision_plans_for_markets(config.data_dir, holding_markets)
+    )
     cash_rows = [row for row in portfolio_rows if _is_cash_like_row(row)]
     holdings = [
         _merge_holding(
@@ -222,6 +228,8 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             tradingagents_summary_by_holding,
             t_signals_by_holding,
             kelly_experiments_by_holding,
+            decision_plans_by_holding,
+            decision_plan_errors_by_market,
         )
         for row in holding_rows
     ]
@@ -849,6 +857,127 @@ def _is_cash_like_row(row: dict[str, str]) -> bool:
     return False
 
 
+def _latest_decision_plans_for_markets(
+    data_dir: Path,
+    markets: set[str],
+) -> tuple[
+    dict[tuple[str, str], dict[str, Any]],
+    dict[str, str],
+]:
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    errors: dict[str, str] = {}
+    for market in markets:
+        path = data_dir / "latest" / market / "decision_plans.json"
+        if not path.exists():
+            errors[market] = "decision_plans.json 不存在"
+            continue
+        try:
+            plans = load_decision_plans(path)
+        except ValueError:
+            errors[market] = "decision_plans.json 无效"
+            continue
+        for plan in plans:
+            key = (str(plan["market"]), str(plan["symbol"]))
+            try:
+                indexed[key] = _project_decision_plan(data_dir, plan)
+            except ValueError:
+                errors[market] = "plan_events.jsonl 无效"
+    return indexed, errors
+
+
+def _project_decision_plan(
+    data_dir: Path,
+    plan: dict[str, object],
+) -> dict[str, Any]:
+    projected = copy.deepcopy(plan)
+    run_date = str(plan["run_date"])
+    market = str(plan["market"])
+    plan_id = str(plan["plan_id"])
+    events = load_plan_events(
+        data_dir / "runs" / run_date / market / "plan_events.jsonl"
+    )
+    trigger_counts: dict[str, int] = {}
+    for event in events:
+        if event.plan_id == plan_id and event.event_type == "condition_triggered":
+            trigger_counts[event.condition_id] = trigger_counts.get(event.condition_id, 0) + 1
+    projected["available"] = True
+    projected["error"] = ""
+    projected["status"] = replay_plan_status(events, plan_id)
+    projected["conditions"] = [
+        {**condition, "trigger_count": trigger_counts.get(str(condition["condition_id"]), 0)}
+        for condition in projected["conditions"]
+    ]
+    projected["trigger_count"] = sum(trigger_counts.values())
+    projected["previous_review"] = _previous_decision_plan_review(data_dir, plan)
+    return projected
+
+
+def _previous_decision_plan_review(
+    data_dir: Path,
+    current: dict[str, object],
+) -> dict[str, Any] | None:
+    current_date = str(current["run_date"])
+    market = str(current["market"])
+    symbol = str(current["symbol"])
+    runs_dir = data_dir / "runs"
+    if not runs_dir.exists():
+        return None
+    for run_dir in sorted(runs_dir.iterdir(), reverse=True):
+        if not run_dir.is_dir() or run_dir.name >= current_date:
+            continue
+        path = run_dir / market / "decision_plans.json"
+        if not path.exists():
+            continue
+        try:
+            previous = next(
+                (
+                    item
+                    for item in load_decision_plans(path)
+                    if item["market"] == market and item["symbol"] == symbol
+                ),
+                None,
+            )
+        except ValueError:
+            continue
+        if previous is None:
+            continue
+        events = load_plan_events(
+            data_dir / "runs" / str(previous["run_date"]) / market / "plan_events.jsonl"
+        )
+        plan_id = str(previous["plan_id"])
+        triggered: dict[str, int] = {}
+        for event in events:
+            if event.plan_id == plan_id and event.event_type == "condition_triggered":
+                triggered[event.condition_id] = triggered.get(event.condition_id, 0) + 1
+        return {
+            "run_date": previous["run_date"],
+            "plan_id": plan_id,
+            "mode": previous["mode"],
+            "status": replay_plan_status(events, plan_id),
+            "action_summary": previous["action_summary"],
+            "starting_quantity": previous["current_quantity"],
+            "closing_quantity": current["current_quantity"],
+            "trigger_count": sum(triggered.values()),
+            "triggered_conditions": [
+                {"condition_id": condition_id, "trigger_count": count}
+                for condition_id, count in triggered.items()
+            ],
+        }
+    return None
+
+
+def _decision_plan_detail(
+    plan: dict[str, Any] | None,
+    error: str,
+) -> dict[str, Any]:
+    if plan is not None:
+        return plan
+    return {
+        "available": False,
+        "error": error or "当前标的没有交易计划",
+    }
+
+
 def _merge_holding(
     row: dict[str, str],
     data_dir: Path,
@@ -865,6 +994,8 @@ def _merge_holding(
     tradingagents_summary_by_holding: dict[tuple[str, str], dict[str, Any]],
     t_signals_by_holding: dict[tuple[str, str], dict[str, Any]],
     kelly_experiments_by_holding: dict[tuple[str, str], list[dict[str, Any]]],
+    decision_plans_by_holding: dict[tuple[str, str], dict[str, Any]],
+    decision_plan_errors_by_market: dict[str, str],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
     key = _market_symbol_key(row)
@@ -915,6 +1046,10 @@ def _merge_holding(
     )
     holding["kelly"] = _kelly_detail(
         kelly_experiments_by_holding.get(key, []) if key is not None else [],
+    )
+    holding["decision_plan"] = _decision_plan_detail(
+        decision_plans_by_holding.get(key) if key is not None else None,
+        decision_plan_errors_by_market.get(key[0], "") if key is not None else "",
     )
     holding["research_view"] = (
         load_research_view_for_holding(
