@@ -237,8 +237,7 @@ Equity XHKG 002476 VGT 300 12/05/26 300 378.8000 113,640.00 0.5000 56,820.00
     )
 
     assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
-        ("HKD", Decimal("-89367.42")),
-        ("USD", Decimal("63.20")),
+        ("HKD", Decimal("-88872.17")),
     ]
     assert len(result.positions) == 1
     position = result.positions[0]
@@ -248,6 +247,25 @@ Equity XHKG 002476 VGT 300 12/05/26 300 378.8000 113,640.00 0.5000 56,820.00
     assert position.currency == "HKD"
     assert position.quantity == Decimal("300")
     assert position.market_value == Decimal("113640.00")
+
+
+def test_parse_phillips_text_uses_base_cash_and_drops_closed_positions() -> None:
+    result = parse_phillips_text(
+        """戶口資料 Account Details
+HKD 54,558.56 10,350.11 43,708.40 0.00 0.00 500.05 1.0000 列表1(Sch1)
+USD 63.20 0.00 0.00 0.00 0.00 63.20 7.8359 列表1(Sch1)
+HKD(Base) 55,053.79 10,350.11 43,708.40 0.00 0.00 995.28
+證券投資組合 Securities Portfolio
+Equity XHKG 003433 CSOP UST20 610 10/07/26 0 66.5600 0.00 0.0000 0.00
+Equity XHKG 000200 GOLDEN RES 522 19/05/26 522 3.3800 1,764.36 0.5000 882.18
+""",
+        "2026-07",
+    )
+
+    assert [position.symbol for position in result.positions] == ["00200"]
+    assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
+        ("HKD", Decimal("55053.79")),
+    ]
 
 
 def test_parse_phillips_text_extracts_ut_money_market_fund_row() -> None:

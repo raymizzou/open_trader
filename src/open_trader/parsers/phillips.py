@@ -26,6 +26,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
     statement_id = f"{month}-{BROKER}"
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
+    base_cash: CashBalance | None = None
     in_positions = False
     in_cash = False
     in_account_details = False
@@ -44,7 +45,10 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         if in_account_details:
             account_cash = _parse_account_cash_line(line, statement_id)
             if account_cash is not None:
-                _upsert_cash_balance(cash_balances, account_cash)
+                if "HKD(Base)" in account_cash.notes:
+                    base_cash = account_cash
+                elif base_cash is None:
+                    _upsert_cash_balance(cash_balances, account_cash)
                 continue
 
         if (
@@ -70,7 +74,9 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
 
         if in_positions:
             position = _parse_position_line(line, statement_id)
-            if position is not None:
+            if position is not None and (
+                position.quantity != 0 or position.market_value != 0
+            ):
                 positions.append(position)
         elif in_cash:
             cash_balance = _parse_cash_line(line, statement_id)
@@ -83,7 +89,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         statement_id=statement_id,
         broker=BROKER,
         positions=positions,
-        cash_balances=cash_balances,
+        cash_balances=[base_cash] if base_cash is not None else cash_balances,
     )
 
 
@@ -236,7 +242,7 @@ def _parse_account_cash_line(line: str, statement_id: str) -> CashBalance | None
         rf"(?P<balance>{NUMERIC})\s+.*",
         line,
     )
-    if match is None or match.group("base"):
+    if match is None:
         return None
 
     balance = parse_decimal(match.group("balance")) or Decimal("0")
@@ -244,11 +250,11 @@ def _parse_account_cash_line(line: str, statement_id: str) -> CashBalance | None
         statement_id=statement_id,
         broker=BROKER,
         account_alias=ACCOUNT_ALIAS,
-        currency=match.group("currency"),
+        currency="HKD" if match.group("base") else match.group("currency"),
         cash_balance=balance,
         available_balance=balance,
         confidence="high",
-        notes="",
+        notes="statement HKD(Base)" if match.group("base") else "",
     )
 
 

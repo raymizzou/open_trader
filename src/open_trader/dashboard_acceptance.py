@@ -10,6 +10,8 @@ import time
 from typing import Any
 from urllib.request import urlopen
 
+from .parsers.phillips import PhillipsStatementParser
+
 
 REQUIRED_SOURCE_PATHS = (
     ("tradingagents_summary",),
@@ -23,11 +25,37 @@ REQUIRED_SOURCE_PATHS = (
 )
 
 
+def _latest_phillips_expectation(data_dir: Path) -> tuple[Decimal, str]:
+    statements = list((data_dir / "statements/phillips").glob("*/*.pdf"))
+    if not statements:
+        raise FileNotFoundError("找不到项目内辉立结单 PDF")
+    latest = max(statements, key=lambda path: (path.parent.name, path.name))
+    period = latest.parent.name[:7]
+    parsed = PhillipsStatementParser().parse(latest, period)
+    assets = [
+        *((position.currency, position.market_value) for position in parsed.positions),
+        *((cash.currency, cash.cash_balance) for cash in parsed.cash_balances),
+    ]
+    if any(currency != "HKD" or value is None for currency, value in assets):
+        raise ValueError("最新辉立结单包含无法直接核对的非港币或缺失资产")
+    return sum((value for _, value in assets if value is not None), Decimal("0")), period
+
+
+def _project_data_dir(root: Path) -> Path:
+    common = Path(subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "--git-common-dir"], text=True
+    ).strip())
+    if not common.is_absolute():
+        common = root / common
+    return common.resolve().parent / "data"
+
+
 def validate_dashboard_payload(
     payload: dict[str, Any], *, expected_cn: int,
     expected_eastmoney_cny: Decimal | None = None,
     expected_rows: int | None = None,
-    expected_phillips_rows: int | None = None,
+    expected_phillips_total: Decimal | None = None,
+    expected_phillips_period: str | None = None,
 ) -> list[str]:
     errors: list[str] = []
     holdings = payload.get("holdings") or []
@@ -35,14 +63,7 @@ def validate_dashboard_payload(
     rows = [*holdings, *cash_rows]
     if expected_rows is not None and len(rows) != expected_rows:
         errors.append(f"组合总行数不是 {expected_rows}：{len(rows)}")
-    if expected_phillips_rows is not None:
-        phillips_rows = sum(
-            "phillips" in str(row.get("brokers", "")).split(";") for row in rows
-        )
-        if phillips_rows != expected_phillips_rows:
-            errors.append(
-                f"辉立关联持仓行数不是 {expected_phillips_rows}：{phillips_rows}"
-            )
+    if expected_phillips_total is not None:
         phillips_summary = next(
             (
                 row
@@ -55,10 +76,25 @@ def validate_dashboard_payload(
             phillips_value = Decimal(
                 str(phillips_summary.get("portfolio_value_hkd", ""))
             )
-        except InvalidOperation:
+        except (InvalidOperation, TypeError, ValueError):
             phillips_value = Decimal("0")
         if not phillips_summary.get("detail_available") or phillips_value <= 0:
             errors.append("辉立账户卡没有可用月结单资产")
+        elif phillips_value != expected_phillips_total:
+            errors.append(
+                f"辉立总资产不匹配：{phillips_value} != "
+                f"{expected_phillips_total} HKD"
+            )
+    if expected_phillips_period is not None:
+        phillips_status = next(
+            (
+                row for row in payload.get("source_statuses") or []
+                if row.get("broker") == "phillips"
+            ),
+            {},
+        )
+        if expected_phillips_period not in str(phillips_status.get("display_text", "")):
+            errors.append(f"辉立未使用最新结单：{expected_phillips_period}")
     cn_rows = [row for row in holdings if row.get("market") == "CN"]
     if len(cn_rows) != expected_cn:
         errors.append(f"A 股持仓数量不是 {expected_cn}：{len(cn_rows)}")
@@ -285,8 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8766")
     parser.add_argument("--expected-cn", type=int, default=5)
-    parser.add_argument("--expected-rows", type=int, default=33)
-    parser.add_argument("--expected-phillips-rows", type=int, default=7)
+    parser.add_argument("--expected-rows", type=int)
     parser.add_argument(
         "--expected-eastmoney-cny", type=Decimal, default=Decimal("676549.55")
     )
@@ -302,6 +337,9 @@ def main(argv: list[str] | None = None) -> int:
     errors: list[str] = []
     browser_payload: dict[str, Any] = {}
     try:
+        phillips_total, phillips_period = _latest_phillips_expectation(
+            _project_data_dir(args.expected_root)
+        )
         pid, cwd = _listener(args.url)
         if cwd != args.expected_root.resolve():
             errors.append(f"运行目录不匹配：{cwd}")
@@ -318,7 +356,8 @@ def main(argv: list[str] | None = None) -> int:
             first, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
             expected_rows=args.expected_rows,
-            expected_phillips_rows=args.expected_phillips_rows,
+            expected_phillips_total=phillips_total,
+            expected_phillips_period=phillips_period,
         ))
         if not errors and args.wait_seconds:
             time.sleep(args.wait_seconds)
@@ -328,7 +367,8 @@ def main(argv: list[str] | None = None) -> int:
             second, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
             expected_rows=args.expected_rows,
-            expected_phillips_rows=args.expected_phillips_rows,
+            expected_phillips_total=phillips_total,
+            expected_phillips_period=phillips_period,
         ))
         if dashboard_signature(first) != dashboard_signature(second):
             errors.append("两个刷新周期后的 Dashboard 数据不稳定")

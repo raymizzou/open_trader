@@ -1,6 +1,6 @@
 from decimal import Decimal
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -346,16 +346,48 @@ def test_validate_dashboard_payload_checks_eastmoney_statement_total_assets() ->
     assert "东方财富总资产不匹配：100 != 101 CNY" in errors
 
 
-def test_validate_dashboard_payload_checks_full_portfolio_preservation() -> None:
+def test_validate_dashboard_payload_checks_latest_phillips_statement() -> None:
     payload = valid_payload()
-    payload["holdings"][0]["brokers"] = "eastmoney;phillips"  # type: ignore[index]
+    payload["broker_summaries"] = [{
+        "broker": "phillips", "detail_available": True,
+        "portfolio_value_hkd": "628554.05",
+    }]
+    payload["source_statuses"] = [{
+        "broker": "phillips", "display_text": "2026-07 月结单导入"
+    }]
 
     errors = validate_dashboard_payload(
-        payload, expected_cn=5, expected_rows=33, expected_phillips_rows=7
+        payload, expected_cn=5,
+        expected_phillips_total=Decimal("628554.06"),
+        expected_phillips_period="2026-07",
     )
 
-    assert "组合总行数不是 33：6" in errors
-    assert "辉立关联持仓行数不是 7：1" in errors
+    assert "辉立总资产不匹配：628554.05 != 628554.06 HKD" in errors
+    assert not any("行数" in error for error in errors)
+
+
+def test_latest_phillips_expectation_uses_newest_archived_pdf(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = tmp_path / "statements/phillips/2026-06-30/statement.pdf"
+    latest = tmp_path / "statements/phillips/2026-07-10/statement.pdf"
+    old.parent.mkdir(parents=True)
+    latest.parent.mkdir(parents=True)
+    old.write_bytes(b"old")
+    latest.write_bytes(b"latest")
+
+    def parse(_self, path, _month):
+        assert path == latest
+        return SimpleNamespace(
+            positions=[SimpleNamespace(currency="HKD", market_value=Decimal("100"))],
+            cash_balances=[SimpleNamespace(currency="HKD", cash_balance=Decimal("20"))],
+        )
+
+    monkeypatch.setattr("open_trader.parsers.phillips.PhillipsStatementParser.parse", parse)
+
+    assert dashboard_acceptance._latest_phillips_expectation(tmp_path) == (
+        Decimal("120"), "2026-07",
+    )
 
 
 def test_validate_dashboard_payload_rejects_empty_phillips_account_card() -> None:
@@ -368,7 +400,7 @@ def test_validate_dashboard_payload_rejects_empty_phillips_account_card() -> Non
     }]
 
     errors = validate_dashboard_payload(
-        payload, expected_cn=5, expected_phillips_rows=0
+        payload, expected_cn=5, expected_phillips_total=Decimal("628554.06")
     )
 
     assert "辉立账户卡没有可用月结单资产" in errors
