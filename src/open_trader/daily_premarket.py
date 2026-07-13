@@ -645,12 +645,13 @@ class DailyPremarketRunner:
                 dry_run=dry_run,
             )
             return result
-        technical_facts_path = Path(
-            getattr(
-                premarket_result,
-                "technical_facts_path",
-                advice_path.with_name("technical_facts.json"),
-            )
+        technical_facts_value = getattr(
+            premarket_result, "technical_facts_path", None
+        )
+        technical_facts_path = (
+            Path(technical_facts_value)
+            if technical_facts_value
+            else advice_path.with_name("technical_facts.json")
         )
         if not technical_facts_path.exists():
             technical_facts_path = None

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import open_trader.daily_premarket as daily_premarket
+from open_trader.advice.premarket import PremarketResult
 from open_trader.daily_premarket import (
     DailyPremarketConfig,
     DailyPremarketRunner as _DailyPremarketRunner,
@@ -1269,6 +1270,43 @@ def test_daily_runner_uses_real_premarket_fact_generators(
     call = premarket.calls[0]
     assert "technical_facts_generator" not in call
     assert "decision_facts_generator" not in call
+
+
+def test_daily_runner_falls_back_when_premarket_omits_technical_facts_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("portfolio\n", encoding="utf-8")
+    premarket = FakePremarket(market="US", symbol="MSFT")
+
+    def premarket_runner(**kwargs: object) -> PremarketResult:
+        result = premarket(**kwargs)
+        return PremarketResult(
+            eligible_count=result.eligible_count,
+            advice_count=result.advice_count,
+            action_count=result.action_count,
+            advice_path=result.advice_path,
+            classifications_path=result.classifications_path,
+            actions_path=result.actions_path,
+            report_path=result.report_path,
+            decision_facts_path=result.decision_facts_path,
+        )
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=premarket_runner,
+        plan_builder=FakePlanBuilder(market="US", symbol="MSFT"),
+        quote_client_factory=lambda **kwargs: FakeQuoteClient(
+            {"US.MSFT": QuoteSnapshot("US.MSFT", Decimal("390"))}, **kwargs
+        ),
+        trade_action_generator=FakeTradeActionGenerator(market="US", symbol="MSFT"),
+    ).run(run_date="2026-06-19", market="US")
+
+    assert result.status == "success"
+    assert (tmp_path / "data/latest/US/technical_facts.json").exists()
 
 
 def test_hk_daily_runner_uses_market_notification_titles(

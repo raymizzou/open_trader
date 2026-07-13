@@ -513,6 +513,7 @@ def test_run_premarket_generates_technical_facts_after_advice(
         advice_runner=FakeAdviceRunner(),
         classifier=FakeClassifier(),
         technical_facts_generator=generator,
+        market="US",
     )
 
     assert generator.calls == [
@@ -521,14 +522,14 @@ def test_run_premarket_generates_technical_facts_after_advice(
             "data_dir": data_dir,
             "run_date": "2026-06-19",
             "update_latest": False,
-            "market": None,
+            "market": "US",
         }
     ]
     assert result.technical_facts_path == (
-        tmp_path / "data/runs/2026-06-19/technical_facts.json"
+        tmp_path / "data/runs/2026-06-19/US/technical_facts.json"
     )
-    assert (data_dir / "runs/2026-06-19/technical_facts.json").exists()
-    assert (data_dir / "latest/technical_facts.json").exists()
+    assert (data_dir / "runs/2026-06-19/US/technical_facts.json").exists()
+    assert (data_dir / "latest/US/technical_facts.json").exists()
 
 
 def test_run_premarket_generates_decision_facts_after_advice(
