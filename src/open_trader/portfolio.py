@@ -508,6 +508,9 @@ def build_portfolio_rows(
             }
         )
 
+    if not portfolio_value_incomplete and total_hkd > 0:
+        recalculate_portfolio_weights(output)
+
     return sorted(
         output,
         key=lambda item: (
