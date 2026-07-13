@@ -35,6 +35,44 @@ def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
         assert f'id="{forbidden_id}"' not in html
 
 
+def test_dashboard_command_center_theme_preserves_the_data_contract() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    assert holdings_table_header_labels(html) == [
+        "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值",
+        "港元市值", "持仓占总资产的占比", "盈亏",
+    ]
+    for element_id in (
+        "open-standard-backtest", "header-market-filters",
+        "header-broker-filters", "current-view-value",
+        "broker-summary-cards", "quote-status", "refresh-quotes",
+        "source-status-list", "last-refresh", "kelly-lab-panel",
+        "holdings-body", "cash-detail-panel", "symbol-detail-panel",
+        "standard-backtest-workspace", "research-chat-layer",
+    ):
+        assert f'id="{element_id}"' in html
+    assert "今日结论" not in html
+    assert 'id="trade-actions"' not in html
+    assert "--bg: #f5f7fa;" in css
+    assert "--text: #101828;" in css
+    assert "--accent: #2563eb;" in css
+    assert "--primary: #101828;" in css
+    assert "font-variant-numeric: tabular-nums;" in css
+
+
+def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    assert "button:focus-visible" in css
+    assert "outline: 3px solid rgba(37, 99, 235, 0.32);" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+    assert "transition-duration: 0.01ms !important;" in css
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+    assert "min-height: 44px;" in mobile
+    assert 'grid-template-areas: "brand" "assets" "source";' in mobile
+
+
 def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path) -> None:
     from open_trader.dashboard_web import build_standard_backtest_options_payload
 
