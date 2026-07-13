@@ -1,17 +1,19 @@
 :root {
   color-scheme: light;
-  --bg: #f4f1eb;
+  --bg: #f5f7fa;
   --surface: #ffffff;
-  --surface-soft: #f7f8f4;
-  --text: #202124;
-  --muted: #6f766d;
-  --line: #d9ddd2;
-  --accent: #1f6f5b;
-  --accent-strong: #145443;
-  --warning: #a15c10;
-  --danger: #a83d3d;
-  --ok: #216e46;
-  --shadow: 0 8px 24px rgba(35, 42, 32, 0.08);
+  --surface-soft: #f8fafc;
+  --text: #101828;
+  --muted: #667085;
+  --line: #e4e7ec;
+  --accent: #2563eb;
+  --accent-strong: #1d4ed8;
+  --primary: #101828;
+  --on-primary: #ffffff;
+  --warning: #b54708;
+  --danger: #b42318;
+  --ok: #027a48;
+  --shadow: 0 12px 32px rgba(16, 24, 40, 0.07);
 }
 
 * {
@@ -24,6 +26,7 @@ body {
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 14px;
+  font-variant-numeric: tabular-nums;
   letter-spacing: 0;
 }
 
@@ -36,16 +39,18 @@ button {
 }
 
 .dashboard-shell {
+  margin: 0 auto;
+  max-width: 1600px;
   min-height: 100vh;
-  padding: 18px;
+  padding: 16px;
 }
 
 .dashboard-header {
   display: grid;
-  gap: 12px;
-  grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(260px, 0.8fr);
+  gap: 10px;
+  grid-template-columns: minmax(280px, 1fr) minmax(480px, 1.5fr) minmax(300px, 1.05fr);
   grid-template-areas: "brand assets source";
-  margin-bottom: 14px;
+  margin-bottom: 10px;
 }
 
 .header-brand-panel,
@@ -53,10 +58,10 @@ button {
 .header-source-panel {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 12px;
   box-shadow: var(--shadow);
   min-width: 0;
-  padding: 12px;
+  padding: 14px;
 }
 
 .header-brand-panel {
@@ -100,8 +105,9 @@ button {
 }
 
 .brand {
-  font-size: 18px;
-  font-weight: 700;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
 }
 
 .page-title {
@@ -142,19 +148,28 @@ button {
 
 
 .current-view-card {
-  background: var(--surface-soft);
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  background: var(--primary);
+  border: 1px solid var(--primary);
+  border-radius: 10px;
+  color: var(--on-primary);
   display: grid;
   gap: 7px;
   min-width: 0;
-  padding: 10px;
+  padding: 12px;
 }
 
 .current-view-card strong {
-  font-size: 22px;
+  font-size: 25px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.04em;
   line-height: 1.15;
   overflow-wrap: anywhere;
+}
+
+.current-view-card .summary-label,
+.current-view-card .summary-note,
+.current-view-card .current-view-breakdown span {
+  color: #98a2b3;
 }
 
 .current-view-breakdown {
@@ -172,27 +187,27 @@ button {
 }
 
 .current-view-breakdown strong {
-  color: var(--accent);
+  color: #84adff;
   flex: 0 0 auto;
   font-size: 13px;
 }
 
 .broker-summary-cards {
   display: grid;
-  gap: 8px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .broker-summary-card,
 .broker-summary-empty {
-  background: #fbfcf8;
+  background: var(--surface);
   border: 1px solid var(--line);
   border-left: 3px solid transparent;
   border-radius: 8px;
   display: grid;
   gap: 5px;
   min-width: 0;
-  padding: 8px 9px;
+  padding: 8px;
 }
 
 .broker-summary-card.active,
@@ -201,14 +216,15 @@ button {
 body:has(#header-broker-filters [data-broker="futu"].active) .broker-summary-card[data-broker="futu"],
 body:has(#header-broker-filters [data-broker="tiger"].active) .broker-summary-card[data-broker="tiger"],
 body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary-card[data-broker="phillips"] {
-  background: #f4faf6;
-  border-color: #b8dac6;
+  background: #eff4ff;
+  border-color: #b2ccff;
   border-left-color: var(--accent);
 }
 
 .broker-summary-card strong,
 .broker-summary-empty strong {
   font-size: 15px;
+  font-variant-numeric: tabular-nums;
   line-height: 1.2;
   overflow-wrap: anywhere;
 }
@@ -269,9 +285,9 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 .filter-button,
 .expand-button {
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 7px;
   cursor: pointer;
-  min-height: 34px;
+  min-height: 38px;
 }
 
 .primary-button {
@@ -308,7 +324,7 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 .info-panel {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 12px;
   box-shadow: var(--shadow);
 }
 
@@ -464,7 +480,7 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   display: grid;
   gap: 10px;
   min-width: 0;
-  padding: 14px;
+  padding: 12px 14px;
 }
 
 .kelly-lab-heading {
@@ -1028,16 +1044,16 @@ h2 {
 }
 
 .filter-button {
-  background: var(--surface-soft);
-  color: var(--text);
+  background: var(--surface);
+  color: #475467;
   padding: 0 10px;
   text-align: left;
 }
 
 .filter-button.active {
-  background: #e4efe9;
-  border-color: var(--accent);
-  color: var(--accent-strong);
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
   font-weight: 700;
 }
 
@@ -1051,7 +1067,7 @@ h2 {
   display: flex;
   gap: 12px;
   justify-content: space-between;
-  padding: 14px;
+  padding: 14px 16px;
 }
 
 .section-heading.compact {
@@ -1174,27 +1190,28 @@ table {
 
 th,
 td {
-  border-bottom: 1px solid var(--line);
-  padding: 10px 12px;
+  border-bottom: 1px solid #f0f2f5;
+  padding: 11px 12px;
   text-align: left;
   vertical-align: top;
 }
 
 th {
-  background: var(--surface-soft);
+  background: #f9fafb;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
+  letter-spacing: 0.02em;
   position: sticky;
   top: 0;
 }
 
 tbody tr:hover {
-  background: #fbfcf8;
+  background: #f8fafc;
 }
 
 tbody tr.active-row {
-  background: #fffaf1;
+  background: #eff4ff;
 }
 
 .market-section-row td {
