@@ -8,6 +8,7 @@ from typing import Literal
 
 ConditionKind = Literal["price_at_or_above", "price_at_or_below", "deadline"]
 EvaluationStatus = Literal["waiting", "triggered"]
+OrderSide = Literal["buy", "sell"]
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,26 @@ class PlanEvaluation:
     condition_id: str
     target_quantity: Decimal
     reason: str
+
+
+@dataclass(frozen=True)
+class TargetOrder:
+    side: OrderSide
+    quantity: Decimal
+
+
+def order_for_target(
+    *,
+    current_quantity: Decimal,
+    target_quantity: Decimal,
+) -> TargetOrder | None:
+    difference = target_quantity - current_quantity
+    if difference == 0:
+        return None
+    return TargetOrder(
+        side="buy" if difference > 0 else "sell",
+        quantity=abs(difference),
+    )
 
 
 def evaluate_plan(

@@ -5,6 +5,7 @@ from open_trader.systematic_plan import (
     PlanCondition,
     StrategyPlan,
     evaluate_plan,
+    order_for_target,
 )
 
 
@@ -90,3 +91,21 @@ def test_plan_targets_reduced_position_when_deadline_is_reached() -> None:
     assert result.status == "triggered"
     assert result.condition_id == "trim-at-deadline"
     assert result.target_quantity == Decimal("300")
+
+
+def test_order_uses_only_the_remaining_difference_to_target() -> None:
+    first = order_for_target(
+        current_quantity=Decimal("400"),
+        target_quantity=Decimal("300"),
+    )
+    after_partial_fill = order_for_target(
+        current_quantity=Decimal("330"),
+        target_quantity=Decimal("300"),
+    )
+
+    assert first is not None
+    assert first.side == "sell"
+    assert first.quantity == Decimal("100")
+    assert after_partial_fill is not None
+    assert after_partial_fill.side == "sell"
+    assert after_partial_fill.quantity == Decimal("30")
