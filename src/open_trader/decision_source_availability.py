@@ -74,8 +74,15 @@ def decision_module_available(
     )
 
 
-def futu_module_available(module: object) -> bool:
-    return isinstance(module, dict) and module.get("status") in {"ok", "partial"}
+def futu_module_available(
+    module: object,
+    record_run_date: str | None = None,
+    advice_run_date: str | None = None,
+) -> bool:
+    available = isinstance(module, dict) and module.get("status") in {"ok", "partial"}
+    if record_run_date is None and advice_run_date is None:
+        return available
+    return bool(available and advice_run_date and record_run_date == advice_run_date)
 
 
 def evaluate_required_sources(

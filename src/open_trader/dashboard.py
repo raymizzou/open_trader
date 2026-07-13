@@ -907,6 +907,7 @@ def _merge_holding(
     )
     holding["futu_skill_facts"] = _futu_skill_facts_detail(
         futu_skill_facts_by_holding.get(key) if key is not None else None,
+        agent_report,
     )
     holding["t_signal"] = _t_signal_detail(
         t_signals_by_holding.get(key) if key is not None else None,
@@ -1044,6 +1045,8 @@ def _tradingagents_summary_detail(
     if _is_current_tradingagents_summary(record, agent_report):
         return {
             "available": True,
+            "status": "available",
+            "error": "",
             "ta_view": _display_or_missing(record.get("ta_view")),
             "current_action": _display_or_missing(record.get("current_action")),
             "core_reason": _display_or_missing(record.get("core_reason")),
@@ -1053,6 +1056,8 @@ def _tradingagents_summary_detail(
 
     return {
         "available": False,
+        "status": "missing_current_summary",
+        "error": "TradingAgents summary is unavailable for current advice",
         "ta_view": _fallback_ta_view(agent_report),
         "current_action": _fallback_current_action(action),
         "core_reason": "缺失",
@@ -1156,6 +1161,13 @@ def _technical_facts_detail(
         "current_source_hash": current_source_hash,
         "freshness": freshness_payload,
     }
+    advice_run_date = str((advice_row or {}).get("run_date") or "")
+    if run_date != advice_run_date:
+        return _technical_facts_unavailable(
+            "stale_run_date",
+            error="technical facts run date does not match latest advice",
+            **common,
+        )
     if requires_advice_hash and not current_source_hash:
         return _technical_facts_unavailable(
             "missing_source_hash",
@@ -1188,7 +1200,7 @@ def _technical_facts_detail(
                 "technical facts timeframe missing"
                 if freshness_payload.get("status") == "missing_timeframe"
                 or technical_facts_has_missing_timeframe(facts_payload)
-                else "technical facts run date does not match latest advice"
+                else "technical facts unavailable"
             ),
             **common,
         )
@@ -1286,32 +1298,55 @@ def _decision_module_detail(
     }
 
 
-def _futu_skill_facts_detail(record: dict[str, Any] | None) -> dict[str, Any]:
+def _futu_skill_facts_detail(
+    record: dict[str, Any] | None,
+    advice_row: dict[str, str] | None,
+) -> dict[str, Any]:
+    run_date = str((record or {}).get("run_date") or "")
     return {
         "news_sentiment": _futu_skill_news_sentiment_detail(
-            record.get("news_sentiment") if isinstance(record, dict) else None
+            record.get("news_sentiment") if isinstance(record, dict) else None,
+            run_date,
+            advice_row,
         ),
         "technical_anomaly": _futu_skill_signal_detail(
-            record.get("technical_anomaly") if isinstance(record, dict) else None
+            record.get("technical_anomaly") if isinstance(record, dict) else None,
+            run_date,
+            advice_row,
         ),
         "capital_anomaly": _futu_skill_signal_detail(
-            record.get("capital_anomaly") if isinstance(record, dict) else None
+            record.get("capital_anomaly") if isinstance(record, dict) else None,
+            run_date,
+            advice_row,
         ),
         "derivatives_anomaly": _futu_skill_signal_detail(
-            record.get("derivatives_anomaly") if isinstance(record, dict) else None
+            record.get("derivatives_anomaly") if isinstance(record, dict) else None,
+            run_date,
+            advice_row,
         ),
     }
 
 
-def _futu_skill_signal_detail(module: object) -> dict[str, Any]:
+def _futu_skill_signal_detail(
+    module: object,
+    run_date: str,
+    advice_row: dict[str, str] | None,
+) -> dict[str, Any]:
     if not isinstance(module, dict):
         return _missing_futu_skill_signal()
     status = str(module.get("status") or "").strip()
     signal = str(module.get("signal") or "").strip()
     confidence = str(module.get("confidence") or "").strip()
+    available = futu_module_available(
+        module,
+        run_date,
+        str((advice_row or {}).get("run_date") or ""),
+    )
+    stale_run_date = futu_module_available(module) and not available
     return {
-        "available": futu_module_available(module),
-        "status": status or "missing",
+        "available": available,
+        "status": "stale_run_date" if stale_run_date else status or "missing",
+        "error": "Futu facts run date does not match latest advice" if stale_run_date else "",
         "signal": signal,
         "confidence": confidence,
         "suggested_constraint": str(module.get("suggested_constraint") or ""),
@@ -1347,7 +1382,11 @@ def _futu_skill_signal_categories(categories: object) -> list[dict[str, str]]:
     return normalized
 
 
-def _futu_skill_news_sentiment_detail(module: object) -> dict[str, Any]:
+def _futu_skill_news_sentiment_detail(
+    module: object,
+    run_date: str,
+    advice_row: dict[str, str] | None,
+) -> dict[str, Any]:
     if not isinstance(module, dict):
         return _missing_futu_skill_news_sentiment()
     status = str(module.get("status") or "").strip()
@@ -1361,9 +1400,16 @@ def _futu_skill_news_sentiment_detail(module: object) -> dict[str, Any]:
             "confidence": confidence,
         }
     evidence = module.get("evidence")
+    available = futu_module_available(
+        module,
+        run_date,
+        str((advice_row or {}).get("run_date") or ""),
+    )
+    stale_run_date = futu_module_available(module) and not available
     return {
-        "available": futu_module_available(module),
-        "status": status,
+        "available": available,
+        "status": "stale_run_date" if stale_run_date else status,
+        "error": "Futu facts run date does not match latest advice" if stale_run_date else "",
         "signal": signal,
         "confidence": confidence,
         "freshness": module.get("freshness") if isinstance(module.get("freshness"), dict) else {},

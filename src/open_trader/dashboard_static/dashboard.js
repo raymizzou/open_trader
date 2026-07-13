@@ -46,6 +46,7 @@ const HOLDINGS_TABLE_COLUMN_COUNT = 10;
 
 const DECISION_TABS = [
   { key: "final", label: "最终决策" },
+  { key: "tradingagents", label: "TradingAgents" },
   { key: "kline", label: "趋势 / K 线" },
   { key: "news", label: "新闻 / 舆论" },
   { key: "futu", label: "富途异动" },
@@ -2504,9 +2505,14 @@ function decisionTabViews(holding) {
   const futuNews = futuSkillNewsSentimentModule(holding);
   const definitions = {
     final: {
-      available: [summary.ta_view, summary.current_action, summary.core_reason].some(hasValue),
+      available: Boolean(holding && holding.agent_report && holding.agent_report.available === true),
+      error: holding && holding.agent_report && holding.agent_report.error,
+      html: renderLLMDecisionTemplate(holding),
+    },
+    tradingagents: {
+      available: summary.available === true,
       error: summary.error,
-      html: `${renderLLMDecisionTemplate(holding)}${renderTradingAgentsSummaryCard(holding)}`,
+      html: renderTradingAgentsSummaryCard(holding),
     },
     kline: {
       available: Boolean(facts.kline && facts.kline.available === true) || technicalFactsUsable(technicalFacts),

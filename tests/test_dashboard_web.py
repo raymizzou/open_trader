@@ -760,7 +760,10 @@ const holding = {
   symbol: "NVDA",
   name: "英伟达",
   total_quantity: "10",
+  agent_report: { available: true, error: "" },
   tradingagents_summary: {
+    available: true,
+    error: "",
     ta_view: "偏多",
     current_action: "持有",
     core_reason: "趋势仍在",
@@ -773,10 +776,27 @@ const holding = {
 };
 state.selectedDecisionTab = "final";
 let html = renderTradingDecisionTabs(holding);
-assertOrdered(html, ["最终决策", "趋势 / K 线", "新闻 / 舆论", "富途异动"]);
+assertOrdered(html, ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]);
 if ((html.match(/role="tabpanel"/g) || []).length !== 1) throw new Error(html);
 if (!html.includes('data-decision-tab="news"') || !html.includes("decision-tab-failed")) throw new Error(html);
-if (!html.includes("大模型决策模板") || !html.includes("TradingAgents")) throw new Error(html);
+if (!html.includes("大模型决策模板") || html.includes("<h4>TradingAgents</h4>")) throw new Error(html);
+state.selectedDecisionTab = "tradingagents";
+html = renderTradingDecisionTabs(holding);
+if (!html.includes("<h4>TradingAgents</h4>") || html.includes("大模型决策模板")) throw new Error(html);
+const missingSummary = {
+  ...holding,
+  tradingagents_summary: {
+    available: false,
+    error: "TradingAgents summary is unavailable for current advice",
+    ta_view: "低配",
+    current_action: "持有",
+    core_reason: "缺失",
+  },
+};
+state.selectedDecisionTab = "tradingagents";
+html = renderTradingDecisionTabs(missingSummary);
+const tradingagentsTab = html.match(/<button[^>]*data-decision-tab="tradingagents"[^>]*>/)[0];
+if (!tradingagentsTab.includes("decision-tab-failed") || !html.includes("status-failed") || !html.includes("TradingAgents summary is unavailable for current advice")) throw new Error(html);
 state.selectedDecisionTab = "news";
 html = renderTradingDecisionTabs(holding);
 if ((html.match(/role="tabpanel"/g) || []).length !== 1 || !html.includes("新闻任务失败")) throw new Error(html);

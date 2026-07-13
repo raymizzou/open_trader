@@ -433,19 +433,19 @@ def write_decision_facts(path: Path, kline_hash: str, news_hash: str) -> None:
     )
 
 
-def write_futu_skill_facts(path: Path) -> None:
+def write_futu_skill_facts(path: Path, *, run_date: str = "2026-07-01") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
                 "schema_version": "open_trader.futu_skill_facts.v1",
                 "generated_at": "2026-07-01T09:15:00+08:00",
-                "run_date": "2026-07-01",
+                "run_date": run_date,
                 "market": "US",
                 "records": [
                     {
                         "schema_version": "open_trader.futu_skill_facts.v1",
-                        "run_date": "2026-07-01",
+                        "run_date": run_date,
                         "market": "US",
                         "symbol": "VIXY",
                         "name": "ProShares VIX Short-Term Futures ETF",
@@ -1494,6 +1494,8 @@ def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallb
     holdings = {row["symbol"]: row for row in state["holdings"]}
     assert holdings["VIXY"]["tradingagents_summary"] == {
         "available": True,
+        "status": "available",
+        "error": "",
         "ta_view": "低配",
         "current_action": "减仓",
         "core_reason": "波动率仓位短期风险回报转差，所以 TA 建议降低仓位。",
@@ -1502,6 +1504,8 @@ def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallb
     }
     assert set(holdings["VIXY"]["tradingagents_summary"]) == {
         "available",
+        "status",
+        "error",
         "ta_view",
         "current_action",
         "core_reason",
@@ -1510,6 +1514,8 @@ def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallb
     }
     assert holdings["DRAM"]["tradingagents_summary"] == {
         "available": False,
+        "status": "missing_current_summary",
+        "error": "TradingAgents summary is unavailable for current advice",
         "ta_view": "低配",
         "current_action": "减仓",
         "core_reason": "缺失",
@@ -1584,6 +1590,8 @@ def test_dashboard_ignores_stale_tradingagents_summary_latest(
     dram_holding = next(row for row in state["holdings"] if row["symbol"] == "DRAM")
     assert dram_holding["tradingagents_summary"] == {
         "available": False,
+        "status": "missing_current_summary",
+        "error": "TradingAgents summary is unavailable for current advice",
         "ta_view": "超配",
         "current_action": "缺失",
         "core_reason": "缺失",
@@ -1630,6 +1638,8 @@ def test_dashboard_attaches_unscoped_tradingagents_summary_latest(
     vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
     assert vixy["tradingagents_summary"] == {
         "available": True,
+        "status": "available",
+        "error": "",
         "ta_view": "低配",
         "current_action": "减仓",
         "core_reason": "波动率仓位短期风险回报转差，所以 TA 建议降低仓位。",
@@ -1638,6 +1648,8 @@ def test_dashboard_attaches_unscoped_tradingagents_summary_latest(
     }
     assert set(vixy["tradingagents_summary"]) == {
         "available",
+        "status",
+        "error",
         "ta_view",
         "current_action",
         "core_reason",
@@ -1750,6 +1762,45 @@ def test_load_dashboard_state_accepts_kline_sourced_technical_facts_without_advi
     assert vixy["technical_facts"]["status"] == "usable"
     assert vixy["technical_facts"]["source_hash"] == "futu-kline:US.VIXY:2026-06-18"
     assert vixy["technical_facts"]["current_source_hash"] == ""
+
+
+def test_decision_tab_marks_healthy_technical_facts_from_older_run_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    report = "Daily RSI is 56.88 with price above the 50 day average."
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [{
+            "run_date": "2026-06-20",
+            "symbol": "VIXY",
+            "market": "US",
+            "asset_class": "etf",
+            "portfolio_weight_hkd": "97.80%",
+            "risk_flag": "overweight",
+            "source": "tradingagents",
+            "advice_action": "hold",
+            "advice_summary": "Watch volatility.",
+            "raw_decision": raw_decision_with_market_report(report),
+            "status": "ok",
+            "error": "",
+            "source_status": "ok",
+            "fallback_reason": "",
+            "fallback_from_date": "",
+        }],
+    )
+    write_technical_facts(
+        config.data_dir / "latest" / "technical_facts.json",
+        report_hash=source_hash("Older report with a different source hash."),
+    )
+
+    technical = load_dashboard_state(config).to_dict()["holdings"][0]["technical_facts"]
+
+    assert technical["available"] is False
+    assert technical["status"] == "stale_run_date"
+    assert technical["error"] == "technical facts run date does not match latest advice"
 
 
 def test_load_dashboard_state_marks_missing_technical_facts_file_unavailable(
@@ -2112,6 +2163,27 @@ def test_dashboard_stale_decision_facts_render_missing_fields(
 def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [{
+            "run_date": "2026-07-01",
+            "symbol": "VIXY",
+            "market": "US",
+            "asset_class": "etf",
+            "portfolio_weight_hkd": "97.80%",
+            "risk_flag": "overweight",
+            "source": "tradingagents",
+            "advice_action": "hold",
+            "advice_summary": "Watch volatility.",
+            "raw_decision": "",
+            "status": "ok",
+            "error": "",
+            "source_status": "ok",
+            "fallback_reason": "",
+            "fallback_from_date": "",
+        }],
+    )
     write_futu_skill_facts(
         config.data_dir / "latest" / "US" / "futu_skill_facts.json",
     )
@@ -2138,6 +2210,60 @@ def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     assert technical["categories"][0]["name"] == "MACD"
     assert capital["suggested_constraint"] == "no_add"
     assert derivatives["status"] == "partial"
+
+
+def test_decision_tab_marks_healthy_futu_facts_from_older_run_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "latest" / "US" / "trading_advice.csv",
+        TRADING_ADVICE_FIELDNAMES,
+        [{
+            "run_date": "2026-07-02",
+            "symbol": "VIXY",
+            "market": "US",
+            "asset_class": "etf",
+            "portfolio_weight_hkd": "97.80%",
+            "risk_flag": "overweight",
+            "source": "tradingagents",
+            "advice_action": "hold",
+            "advice_summary": "Watch volatility.",
+            "raw_decision": "",
+            "status": "ok",
+            "error": "",
+            "source_status": "ok",
+            "fallback_reason": "",
+            "fallback_from_date": "",
+        }],
+    )
+    write_futu_skill_facts(
+        config.data_dir / "latest" / "US" / "futu_skill_facts.json",
+        run_date="2026-07-01",
+    )
+
+    futu = load_dashboard_state(config).to_dict()["holdings"][0]["futu_skill_facts"]
+
+    assert futu["technical_anomaly"]["available"] is False
+    assert futu["technical_anomaly"]["status"] == "stale_run_date"
+    assert futu["technical_anomaly"]["error"] == "Futu facts run date does not match latest advice"
+
+
+def test_decision_tab_marks_futu_facts_without_current_advice_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_futu_skill_facts(
+        config.data_dir / "latest" / "US" / "futu_skill_facts.json",
+    )
+
+    futu = load_dashboard_state(config).to_dict()["holdings"][0]["futu_skill_facts"]
+
+    assert futu["technical_anomaly"]["available"] is False
+    assert futu["technical_anomaly"]["status"] == "stale_run_date"
+    assert futu["technical_anomaly"]["error"] == "Futu facts run date does not match latest advice"
 
 
 def test_load_dashboard_state_marks_missing_anomaly_modules_unavailable(
