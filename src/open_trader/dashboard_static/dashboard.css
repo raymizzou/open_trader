@@ -34,6 +34,30 @@ button {
   font: inherit;
 }
 
+button,
+[role="tab"],
+.broker-summary-card {
+  transition: background-color 180ms ease, border-color 180ms ease,
+    box-shadow 180ms ease, color 180ms ease;
+}
+
+button:focus-visible,
+[role="tab"]:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.32);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 .hidden {
   display: none !important;
 }
@@ -3073,12 +3097,12 @@ tbody tr.active-row {
   .backtest-artifacts li,
   .backtest-run-details { grid-template-columns: 1fr; }
   .dashboard-shell {
+    max-width: 100%;
     padding: 10px;
   }
 
   .dashboard-header,
   .header-assets-panel,
-  .broker-summary-cards,
   .topbar,
   .workspace-grid,
   .workspace-grid.detail-mode {
@@ -3093,7 +3117,20 @@ tbody tr.active-row {
   .header-brand-panel,
   .header-assets-panel,
   .header-source-panel {
+    border-radius: 10px;
     padding: 10px;
+  }
+
+  .broker-summary-cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .primary-button,
+  .secondary-button,
+  .filter-button,
+  .expand-button,
+  .raw-toggle {
+    min-height: 44px;
   }
 
   .segmented-control {

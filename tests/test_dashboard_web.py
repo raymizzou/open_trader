@@ -61,6 +61,18 @@ def test_dashboard_command_center_theme_preserves_the_data_contract() -> None:
     assert "font-variant-numeric: tabular-nums;" in css
 
 
+def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    assert "button:focus-visible" in css
+    assert "outline: 3px solid rgba(37, 99, 235, 0.32);" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+    assert "transition-duration: 0.01ms !important;" in css
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+    assert "min-height: 44px;" in mobile
+    assert 'grid-template-areas: "brand" "assets" "source";' in mobile
+
+
 def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path) -> None:
     from open_trader.dashboard_web import build_standard_backtest_options_payload
 
