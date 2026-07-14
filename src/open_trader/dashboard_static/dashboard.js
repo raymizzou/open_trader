@@ -44,6 +44,7 @@ const state = {
 const elements = {};
 
 const HOLDINGS_TABLE_COLUMN_COUNT = 10;
+const ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT = 11;
 
 const ACCOUNT_STRATEGY_PROFILES = {
   futu: {horizon: "中短线", strategy: "股票与期权"},
@@ -189,7 +190,6 @@ function bindElements() {
     "last-refresh",
     "refresh-quotes",
     "header-market-filters",
-    "header-broker-filters",
     "current-view-label",
     "current-view-value",
     "current-view-holding-value",
@@ -198,7 +198,6 @@ function bindElements() {
     "broker-summary-cards",
     "source-status-list",
     "kelly-lab-panel",
-    "tiger-long-term-panel",
     "cash-detail-panel",
     "summary-value",
     "summary-holding-bar",
@@ -215,7 +214,7 @@ function bindElements() {
     "broker-filters",
     "visible-count",
     "symbol-detail-panel",
-    "holdings-body",
+    "account-holdings",
     "action-count",
     "trade-actions",
     "connection-status",
@@ -253,7 +252,7 @@ function bindElements() {
   ].forEach((id) => {
     elements[id] = document.getElementById(id);
   });
-  elements["holdings-table-wrap"] = document.querySelector(".table-wrap");
+  elements["holdings-body"] = elements["account-holdings"];
   elements["workspace-grid"] = document.querySelector(".workspace-grid");
 }
 
@@ -286,20 +285,7 @@ function bindEvents() {
     setActiveFilter(elements["header-market-filters"], button);
     renderDashboardViews();
   });
-  elements["header-broker-filters"].addEventListener("click", (event) => {
-    const button = event.target.closest("[data-broker]");
-    if (!button) {
-      return;
-    }
-    state.brokerFilter = button.dataset.broker || "ALL";
-    state.selectedHoldingKey = "";
-    state.selectedHoldingDetail = "decision";
-    state.selectedDecisionTab = "final";
-    syncDecisionDeepLink();
-    setActiveFilter(elements["header-broker-filters"], button);
-    renderDashboardViews();
-  });
-  elements["holdings-body"].addEventListener("click", (event) => {
+  elements["account-holdings"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-detail-key]");
     if (button) {
       showSymbolDetail(button.dataset.detailKey || "", button.dataset.detailMode || "decision");
@@ -771,17 +757,16 @@ function restoreDecisionDeepLink() {
   if (!market || !symbol) {
     return;
   }
-  const holdings = getHoldings();
-  const index = holdings.findIndex((holding) => (
-    String(holding.market || "").toUpperCase() === market
-    && String(holding.symbol || "").toUpperCase() === symbol
+  const row = accountHoldingGroups().flatMap((group) => group.rows).find(({display}) => (
+    String(display.market || "").toUpperCase() === market
+    && String(display.symbol || "").toUpperCase() === symbol
   ));
-  if (index < 0) {
+  if (!row) {
     return;
   }
   state.marketFilter = "ALL";
   state.brokerFilter = "ALL";
-  state.selectedHoldingKey = holdingKey(holdings[index], index);
+  state.selectedHoldingKey = row.key;
   state.selectedHoldingDetail = "decision";
   const decisionTab = String(params.get("decision_tab") || "final");
   state.selectedDecisionTab = DECISION_TABS.some((tab) => tab.key === decisionTab)
@@ -871,7 +856,6 @@ function accountSyncReloadNeeded(accountSync) {
 }
 
 function renderDashboard() {
-  renderBrokerFilters();
   renderBrokerCards();
   renderSourceStatusListIntoHeader();
   renderWorkspaceChrome();
@@ -1883,106 +1867,54 @@ function kellySampleStageLabel(stage) {
 
 function renderDashboardViews() {
   renderHeaderSummary();
-  renderTigerLongTermStrategy();
-  renderHoldings();
+  renderAccountHoldings();
 }
 
-function renderTigerLongTermStrategy() {
-  const panel = elements["tiger-long-term-panel"];
-  if (!panel) {
-    return;
+function renderAccountStrategy(group) {
+  if (group.broker !== "tiger") {
+    return `<div class="account-strategy-summary"><strong>${escapeHtml(`${group.profile.horizon} · ${group.profile.strategy}`)}</strong><span>策略指标待接入</span></div>`;
   }
-  const strategy = state.dashboard?.tiger_long_term_strategy || {
-    available: false,
-    error: "影子验证产物暂不可用",
-  };
-  if (strategy.available === false) {
-    panel.innerHTML = `
-      <div class="tiger-panel-heading">
-        <div>
-          <span class="section-eyebrow">老虎账户 · 长线策略</span>
-          <h2>老虎长线组合</h2>
-          <p>SMA200 · 条件验证，不含选股</p>
-        </div>
-        <span class="status-pill status-failed">不可用</span>
-      </div>
-      <div class="tiger-unavailable">${escapeHtml(strategy.error || "影子验证产物暂不可用")}</div>
-    `;
-    return;
+  const strategy = state.dashboard?.tiger_long_term_strategy || {};
+  if (strategy.available === false || !strategy.validation && !strategy.strategy) {
+    return `<div class="account-strategy-summary"><strong>${escapeHtml(group.profile.strategy)}</strong><span>${escapeHtml(strategy.error || "影子验证产物暂不可用")}</span></div>`;
   }
-
   const validation = strategy.validation || {};
-  const metrics = [
-    ["SMA200 策略", validation.strategy || strategy.strategy || {}],
-    ["同池永久持有", validation.benchmark || strategy.benchmark || {}],
-    ["SPY 买入持有", validation.spy || strategy.spy || {}],
-  ];
-  const metricCards = metrics.map(([label, values]) => `
-    <article class="tiger-metric-card">
-      <h3>${escapeHtml(label)}</h3>
-      <dl>
-        <div><dt>年化收益</dt><dd>${escapeHtml(decisionPlanPercent(values.annualized_return_pct))}</dd></div>
-        <div><dt>最大回撤</dt><dd>${escapeHtml(decisionPlanPercent(values.max_drawdown_pct))}</dd></div>
-        <div><dt>夏普比率</dt><dd>${escapeHtml(decisionPlanRatio(values.sharpe_ratio))}</dd></div>
-        <div><dt>卡玛比率</dt><dd>${escapeHtml(decisionPlanRatio(values.calmar_ratio))}</dd></div>
-      </dl>
-    </article>
-  `).join("");
-
-  const members = Array.isArray(strategy.members) ? strategy.members : [];
-  const memberRows = members.map((member) => {
-    const eligibilityReason = member.eligibility_reason
-      ? TIGER_ELIGIBILITY_LABELS[member.eligibility_reason] || "资格条件未满足"
-      : member.eligible ? "可用" : "不符合资格";
-    const rebalanceReason = member.rebalance_reason
-      ? TIGER_REBALANCE_LABELS[member.rebalance_reason] || "未说明"
-      : "无";
-    return `
-      <div class="tiger-member-row" role="row">
-        ${tigerMemberCell("标的", member.symbol, "tiger-symbol")}
-        ${tigerMemberCell("风险组", TIGER_RISK_GROUP_LABELS[member.risk_group] || "其他")}
-        ${tigerMemberCell("趋势", TIGER_TREND_LABELS[member.trend] || "未知")}
-        ${tigerMemberCell("实际权重", decisionPlanWeight(member.actual_weight), "tiger-number")}
-        ${tigerMemberCell("目标权重", decisionPlanWeight(member.target_weight), "tiger-number")}
-        ${tigerMemberCell("漂移", decisionPlanWeight(member.drift), "tiger-number")}
-        ${tigerMemberCell("资格原因", eligibilityReason)}
-        ${tigerMemberCell("再平衡原因", rebalanceReason)}
-      </div>
-    `;
-  }).join("");
+  const values = validation.strategy || strategy.strategy || {};
   const gate = validation.gate || strategy.gate || {};
-  const reasons = Array.isArray(gate.reasons) && gate.reasons.length ? gate.reasons : ["无"];
-
-  panel.innerHTML = `
-    <div class="tiger-panel-heading">
-      <div>
-        <span class="section-eyebrow">老虎账户 · 长线策略</span>
-        <h2>老虎长线组合</h2>
-        <p>SMA200 · 条件验证，不含选股</p>
-      </div>
-      <div class="tiger-panel-status">
-        <span class="status-pill status-review">影子验证</span>
-        <span>${escapeHtml(strategy.run_date || "-")}</span>
-      </div>
-    </div>
-    <div class="tiger-rule-strip" aria-label="组合约束">
-      <span>单标的上限 10%</span>
-      <span>风险组上限 30%</span>
-      <span>仅供人工复核</span>
-      <span class="tiger-gate-reasons">门槛：${reasons.map((reason) => escapeHtml(TIGER_GATE_LABELS[reason] || (reason === "无" ? "无" : "其他门槛未满足"))).join(" · ")}</span>
-    </div>
-    <div class="tiger-metric-grid">${metricCards}</div>
-    <div class="tiger-member-table" role="table" aria-label="老虎长线组合成员">
-      <div class="tiger-member-header" role="row">
-        ${["标的", "风险组", "趋势", "实际权重", "目标权重", "漂移", "资格原因", "再平衡原因"].map((label) => `<span role="columnheader">${label}</span>`).join("")}
-      </div>
-      ${memberRows || '<div class="tiger-unavailable">当前没有组合成员。</div>'}
-    </div>
-  `;
+  const reasons = Array.isArray(gate.reasons) && gate.reasons.length
+    ? gate.reasons.map((reason) => TIGER_GATE_LABELS[reason] || "其他门槛未满足")
+    : ["无"];
+  return `<div class="account-strategy-summary">
+    <div class="tiger-panel-heading"><div><strong>SMA200 策略</strong><span>影子验证 · 仅供人工复核</span></div><span>${escapeHtml(strategy.run_date || "-")}</span></div>
+    <div class="tiger-rule-strip"><span>单标的上限 10%</span><span>风险组上限 30%</span><span>门槛：${reasons.map(escapeHtml).join(" · ")}</span></div>
+    <article class="tiger-metric-card"><dl>
+      <div><dt>年化收益</dt><dd>${escapeHtml(decisionPlanPercent(values.annualized_return_pct))}</dd></div>
+      <div><dt>最大回撤</dt><dd>${escapeHtml(decisionPlanPercent(values.max_drawdown_pct))}</dd></div>
+      <div><dt>夏普比率</dt><dd>${escapeHtml(decisionPlanRatio(values.sharpe_ratio))}</dd></div>
+      <div><dt>卡玛比率</dt><dd>${escapeHtml(decisionPlanRatio(values.calmar_ratio))}</dd></div>
+    </dl></article>
+  </div>`;
 }
 
-function tigerMemberCell(label, value, className = "") {
-  return `<span class="tiger-member-cell ${className}" role="cell"><span class="tiger-mobile-label">${escapeHtml(label)}</span><span>${escapeHtml(value || "-")}</span></span>`;
+function tigerMemberBySymbol(symbol) {
+  const members = state.dashboard?.tiger_long_term_strategy?.members;
+  return (Array.isArray(members) ? members : []).find((member) => (
+    String(member.symbol || "").toUpperCase() === String(symbol || "").toUpperCase()
+  )) || null;
+}
+
+function renderAccountStrategyCell(group, row) {
+  if (group.broker !== "tiger") {
+    return `<strong>${escapeHtml(group.profile.strategy)}</strong><span>策略指标待接入</span>`;
+  }
+  const member = tigerMemberBySymbol(row.display.symbol);
+  if (!member) return "策略数据缺失";
+  const trend = TIGER_TREND_LABELS[member.trend] || "未知";
+  const reason = member.eligibility_reason
+    ? TIGER_ELIGIBILITY_LABELS[member.eligibility_reason] || "资格条件未满足" : "";
+  return `<strong>${escapeHtml(trend)}</strong><span>${escapeHtml(
+    `目标 ${decisionPlanWeight(member.target_weight)} · 漂移 ${decisionPlanWeight(member.drift)}${reason ? ` · ${reason}` : ""}`
+  )}</span>`;
 }
 
 function renderHeaderSummary() {
@@ -2186,48 +2118,17 @@ function firstPresent(...values) {
   return values.find((value) => hasValue(value));
 }
 
-function renderBrokerFilters() {
-  const brokers = new Map();
-  for (const holding of getHoldings()) {
-    for (const broker of splitList(holding.brokers)) {
-      brokers.set(broker, brokerDisplayName(broker));
-    }
-  }
-  for (const row of getCashRows()) {
-    for (const broker of rowBrokers(row)) {
-      brokers.set(broker, brokerDisplayName(broker));
-    }
-  }
-  for (const summary of brokerSummaries()) {
-    const broker = brokerKey(summary);
-    if (broker) {
-      brokers.set(broker, brokerDisplayName(summary));
-    }
-  }
-  for (const status of sourceStatuses()) {
-    const broker = brokerKey(status);
-    if (broker) {
-      brokers.set(broker, brokerDisplayName(status));
-    }
-  }
-  const buttons = [
-    `<button class="filter-button active" type="button" data-broker="ALL">全部券商</button>`,
-  ];
-  for (const [broker, label] of [...brokers.entries()].sort((left, right) => left[1].localeCompare(right[1]))) {
-    buttons.push(
-      `<button class="filter-button" type="button" data-broker="${escapeHtml(broker)}">${escapeHtml(label)}</button>`,
-    );
-  }
-  elements["header-broker-filters"].innerHTML = buttons.join("");
-  setFilterActiveByDataset(elements["header-broker-filters"], "broker", state.brokerFilter);
+function renderHoldings() {
+  renderAccountHoldings();
 }
 
-function renderHoldings() {
+function renderAccountHoldings() {
+  const container = elements["account-holdings"] || elements["holdings-body"];
   if (state.marketFilter === "CASH") {
     const cashRows = filteredCashRows();
     elements["visible-count"].textContent = `${cashRows.length} 条`;
     elements["workspace-grid"].classList.remove("detail-mode");
-    elements["holdings-table-wrap"].classList.add("hidden");
+    container.classList.add("hidden");
     elements["symbol-detail-panel"].classList.add("hidden");
     elements["symbol-detail-panel"].innerHTML = "";
     elements["cash-detail-panel"].classList.remove("hidden");
@@ -2236,11 +2137,13 @@ function renderHoldings() {
   }
   elements["cash-detail-panel"].classList.add("hidden");
   elements["cash-detail-panel"].innerHTML = "";
-  const holdings = filteredHoldings();
-  elements["visible-count"].textContent = `${holdings.length} 条`;
-  const selected = selectedHolding(holdings);
+  const groups = accountHoldingGroups();
+  const visibleCount = groups.reduce((count, group) => count + group.rows.filter(({display}) => (
+    state.marketFilter === "ALL" || String(display.market || "").toUpperCase() === state.marketFilter
+  )).length, 0);
+  elements["visible-count"].textContent = `${visibleCount} 条`;
   elements["workspace-grid"].classList.remove("detail-mode");
-  elements["holdings-table-wrap"].classList.remove("hidden");
+  container.classList.remove("hidden");
   elements["symbol-detail-panel"].classList.add("hidden");
   elements["symbol-detail-panel"].innerHTML = "";
   if (state.dashboardError) {
@@ -2248,60 +2151,69 @@ function renderHoldings() {
     return;
   }
   if (!state.dashboard) {
-    elements["holdings-body"].innerHTML = holdingsEmptyRow("加载中");
+    container.innerHTML = '<div class="empty-state">加载中</div>';
     return;
   }
-  if (holdings.length === 0) {
-    elements["holdings-body"].innerHTML = holdingsEmptyRow("没有匹配的持仓");
-    return;
-  }
+  container.innerHTML = groups.map(renderAccountSection).join("");
+}
 
-  const rows = [];
-  groupedHoldingsByMarketSection(holdings).forEach((section) => {
-    rows.push(renderMarketSectionRow(section));
-    section.rows.forEach((entry) => {
-      const holding = entry.holding;
-      const index = entry.index;
-      const rowKey = holdingKey(holding, index);
-      const selectedClass = selected && rowKey === state.selectedHoldingKey ? "active-row" : "";
-      const quote = quoteForHolding(holding);
-      const selectedDetail = selected && rowKey === state.selectedHoldingKey
-        ? normalizeHoldingDetailMode(state.selectedHoldingDetail)
-        : "";
-      const tSignalClass = tSignalButtonClass(holding);
-      rows.push(`
-        <tr class="${selectedClass}">
-          <td><button class="expand-button" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="decision" data-detail-market="${escapeHtml(holding.market)}" data-detail-symbol="${escapeHtml(holding.symbol)}">交易决策</button><button class="${escapeHtml(tSignalClass)}" type="button" data-detail-key="${escapeHtml(rowKey)}" data-detail-mode="t_signal">做T</button></td>
-          <td>${escapeHtml(formatPlain(holding.market))}</td>
-          <td class="symbol-cell">
-            <strong>${escapeHtml(formatPlain(holding.symbol))}</strong>
-            <span class="meta-text">${escapeHtml(formatPlain(holding.name))}</span>
-          </td>
-          <td class="number-cell">${escapeHtml(formatPlain(holding.total_quantity))}</td>
-          <td class="number-cell">${escapeHtml(formatPlain(holding.avg_cost_price))}</td>
-          <td class="number-cell">${renderQuotePrice(holding, quote)}</td>
-          <td class="number-cell">${escapeHtml(renderUsdMarketValue(holding))}</td>
-          <td class="number-cell">${escapeHtml(formatMoney(holding.market_value_hkd, "HKD"))}</td>
-          <td class="number-cell">${escapeHtml(formatPlain(holding.portfolio_weight_hkd))}</td>
-          <td class="number-cell">${escapeHtml(formatPlain(holding.unrealized_pnl_pct))}</td>
-        </tr>
-      `);
-      if (selected && rowKey === state.selectedHoldingKey) {
-        rows.push(`
-          <tr class="decision-detail-row">
-            <td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}">
-              <div class="symbol-detail-panel inline-symbol-detail">
-                ${selectedDetail === "t_signal"
-                  ? renderTSignalDetail(selected.holding)
-                  : renderSymbolDetail(selected.holding, selected.index)}
-              </div>
-            </td>
-          </tr>
-        `);
-      }
-    });
-  });
-  elements["holdings-body"].innerHTML = rows.join("");
+function renderAccountSection(group) {
+  const headingId = `account-${group.broker}-title`;
+  const rows = group.rows.filter(({display}) => state.marketFilter === "ALL"
+    || String(display.market || "").toUpperCase() === state.marketFilter);
+  const alias = firstPresent(group.rows[0]?.display?.account_alias, "-");
+  const source = firstPresent(brokerSummarySourceText(group.summary), "-");
+  const sourceTime = firstPresent(
+    group.summary.generated_at, group.summary.as_of, state.dashboard?.broker_detail_month, "-",
+  );
+  return `<section id="account-${escapeHtml(group.broker)}" class="account-section" aria-labelledby="${headingId}">
+    <header class="account-section-header">
+      <div><h2 id="${headingId}">${escapeHtml(brokerDisplayName(group.summary))}</h2>
+      <span>${escapeHtml(group.profile.horizon)} · ${escapeHtml(group.profile.strategy)}</span>
+      <span>${escapeHtml(formatPlain(alias))}</span></div>
+      <strong>${escapeHtml(formatMoney(group.summary.portfolio_value_hkd, "HKD"))}</strong>
+      <div class="account-section-meta">
+        <span>持仓资产 ${escapeHtml(formatMoney(group.summary.holding_value_hkd, "HKD"))}</span>
+        <span>现金 ${escapeHtml(formatMoney(group.summary.cash_like_value_hkd, "HKD"))}</span>
+        <span>持仓 ${escapeHtml(formatPlain(group.summary.holding_count))}</span>
+        <span>来源 ${escapeHtml(formatPlain(source))}</span>
+        <span>时间 ${escapeHtml(formatPlain(sourceTime))}</span>
+      </div>
+    </header>
+    ${renderAccountStrategy(group)}
+    ${rows.length ? renderAccountTable(group, rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
+  </section>`;
+}
+
+function renderAccountTable(group, rows) {
+  const selected = selectedHolding();
+  const body = rows.map((row) => {
+    const holding = row.holding;
+    const display = row.display;
+    const isSelected = selected && row.key === state.selectedHoldingKey;
+    const selectedDetail = isSelected ? normalizeHoldingDetailMode(state.selectedHoldingDetail) : "";
+    const cells = `
+      <tr class="account-holding-row ${isSelected ? "active-row" : ""}">
+        <td><span class="account-mobile-label">明细</span><button class="expand-button" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="decision" data-detail-market="${escapeHtml(display.market)}" data-detail-symbol="${escapeHtml(display.symbol)}">交易决策</button><button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button></td>
+        <td><span class="account-mobile-label">市场</span>${escapeHtml(formatPlain(display.market))}</td>
+        <td class="symbol-cell"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span></td>
+        <td class="number-cell"><span class="account-mobile-label">数量</span>${escapeHtml(formatPlain(display.total_quantity))}</td>
+        <td class="number-cell"><span class="account-mobile-label">成本价</span>${escapeHtml(formatPlain(display.avg_cost_price))}</td>
+        <td class="number-cell"><span class="account-mobile-label">实时价</span>${renderQuotePrice(display, quoteForHolding(display))}</td>
+        <td class="number-cell"><span class="account-mobile-label">美元市值</span>${escapeHtml(renderUsdMarketValue(display))}</td>
+        <td class="number-cell"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
+        <td class="number-cell"><span class="account-mobile-label">权重</span><strong>${escapeHtml(formatPlain(display.account_weight))}</strong><span class="meta-text">全组合 ${escapeHtml(formatPlain(display.portfolio_weight))}</span></td>
+        <td class="number-cell"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatPlain(display.unrealized_pnl_pct))}</td>
+        <td class="account-strategy-cell"><span class="account-mobile-label">策略</span>${renderAccountStrategyCell(group, row)}</td>
+      </tr>`;
+    if (!isSelected) return cells;
+    return `${cells}<tr class="decision-detail-row"><td colspan="${ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT}"><div class="symbol-detail-panel inline-symbol-detail">${selectedDetail === "t_signal"
+      ? renderTSignalDetail(holding)
+      : renderSymbolDetail(holding, row.index)}</div></td></tr>`;
+  }).join("");
+  return `<table class="account-holdings-table"><thead><tr>${[
+    "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值", "港元市值", "权重", "盈亏", "策略",
+  ].map((label) => `<th>${label}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
 function holdingKey(holding, index) {
@@ -2313,16 +2225,11 @@ function holdingKey(holding, index) {
   ].map((part) => String(part)).join(":");
 }
 
-function selectedHolding(holdings = filteredHoldings()) {
+function selectedHolding(rows = accountHoldingGroups().flatMap((group) => group.rows)) {
   if (!state.selectedHoldingKey) {
     return null;
   }
-  for (let index = 0; index < holdings.length; index += 1) {
-    if (holdingKey(holdings[index], index) === state.selectedHoldingKey) {
-      return { holding: holdings[index], index };
-    }
-  }
-  return null;
+  return rows.find((row) => row.key === state.selectedHoldingKey) || null;
 }
 
 function showSymbolDetail(detailKey, detailMode = "decision") {
@@ -2356,12 +2263,11 @@ function openTradeActionDetail(actionKey) {
   if (!normalizedActionKey) {
     return;
   }
-  const holdings = getHoldings();
-  for (let index = 0; index < holdings.length; index += 1) {
-    const holding = holdings[index];
-    if (holdingActionKeys(holding).includes(normalizedActionKey)) {
+  const rows = accountHoldingGroups().flatMap((group) => group.rows);
+  for (const row of rows) {
+    if (holdingActionKeys(row.holding).includes(normalizedActionKey)) {
       resetHoldingFilters();
-      state.selectedHoldingKey = holdingKey(holding, index);
+      state.selectedHoldingKey = row.key;
       state.selectedHoldingDetail = "decision";
       state.selectedDecisionTab = "final";
       syncDecisionDeepLink();
@@ -5578,7 +5484,8 @@ function setElementText(id, text) {
 }
 
 function renderDashboardErrorState() {
-  elements["holdings-body"].innerHTML = holdingsEmptyRow("看板数据加载失败");
+  const container = elements["account-holdings"] || elements["holdings-body"];
+  container.innerHTML = '<div class="empty-state">看板数据加载失败</div>';
 }
 
 function filteredHoldings() {
@@ -5869,13 +5776,16 @@ function renderBrokerSummaryCards() {
   if (!summaries.length) {
     return `<article class="broker-summary-card"><span class="summary-label">券商暂无数据</span><strong>-</strong></article>`;
   }
-  return summaries.map((summary) => `
-    <article class="broker-summary-card" data-broker="${escapeHtml(brokerKey(summary))}">
+  return summaries.map((summary) => {
+    const broker = brokerKey(summary);
+    const profile = ACCOUNT_STRATEGY_PROFILES[broker] || {horizon: "-", strategy: "-"};
+    return `<a class="broker-summary-card" data-broker="${escapeHtml(broker)}" href="#account-${escapeHtml(broker)}">
       <span class="summary-label">${escapeHtml(brokerDisplayName(summary))}</span>
+      <span class="account-horizon-label">${escapeHtml(profile.horizon)} · ${escapeHtml(profile.strategy)}</span>
       <strong>${escapeHtml(formatMoney(summary.portfolio_value_hkd, "HKD"))}</strong>
       <span class="summary-note">持仓 ${escapeHtml(formatPlain(summary.holding_count))} · ${escapeHtml(brokerSummarySourceText(summary))}</span>
-    </article>
-  `).join("");
+    </a>`;
+  }).join("");
 }
 
 function brokerSummarySourceText(summary) {
@@ -6086,6 +5996,7 @@ function brokerDisplayName(value) {
   }
   const key = brokerKey(value);
   const labels = {
+    eastmoney: "东方财富",
     futu: "富途",
     tiger: "老虎",
     phillips: "辉立",
