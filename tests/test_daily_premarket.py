@@ -22,6 +22,7 @@ from open_trader.daily_premarket import (
     RunLock,
     build_notifier,
     load_env_config,
+    send_notification_with_results,
 )
 from open_trader.futu_quote import FutuQuoteError
 from open_trader.futu_skill_facts import FutuSkillFactResult
@@ -30,6 +31,7 @@ from open_trader.notifications import (
     CompositeNotifier,
     FeishuAppNotifier,
     FeishuWebhookNotifier,
+    MacOSNotifier,
     XiaozhiVoiceNotifier,
 )
 from open_trader.trade_actions import TradeActionsResult
@@ -65,6 +67,9 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "OPEN_TRADER_XIAOZHI_TOKEN=voice-token",
                 "OPEN_TRADER_NOTIFY_DAILY_REPORT=yes",
                 "OPEN_TRADER_NOTIFY_ACTION_TRIGGERS=1",
+                "TREND_ANIMALS_API_KEY=trend-secret",
+                "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID=622466",
+                "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID=697199",
                 "DEEPSEEK_API_KEY=secret",
             ]
         ),
@@ -92,6 +97,59 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.xiaozhi_token == "voice-token"
     assert config.notify_daily_report is True
     assert config.notify_action_triggers is True
+    assert config.trend_animals_api_key == "trend-secret"
+    assert config.trend_animals_a_share_tm_id == 622466
+    assert config.trend_animals_etf_tm_id == 697199
+
+
+def test_notification_results_can_select_only_feishu_channels() -> None:
+    sent: list[str] = []
+
+    class Feishu(FeishuWebhookNotifier):
+        def __init__(self) -> None:
+            pass
+
+        def notify(self, title: str, message: str) -> None:
+            sent.append("feishu")
+
+    class MacOS(MacOSNotifier):
+        def notify(self, title: str, message: str) -> None:
+            sent.append("macos")
+
+    attempts = send_notification_with_results(
+        CompositeNotifier([Feishu(), MacOS()]),
+        "title",
+        "message",
+        channels={"feishu", "feishu_app"},
+    )
+
+    assert sent == ["feishu"]
+    assert [attempt.channel for attempt in attempts] == ["feishu"]
+
+
+def test_notification_results_can_select_only_macos() -> None:
+    sent: list[str] = []
+
+    class Feishu(FeishuWebhookNotifier):
+        def __init__(self) -> None:
+            pass
+
+        def notify(self, title: str, message: str) -> None:
+            sent.append("feishu")
+
+    class MacOS(MacOSNotifier):
+        def notify(self, title: str, message: str) -> None:
+            sent.append("macos")
+
+    attempts = send_notification_with_results(
+        CompositeNotifier([Feishu(), MacOS()]),
+        "title",
+        "message",
+        channels={"macos"},
+    )
+
+    assert sent == ["macos"]
+    assert [attempt.channel for attempt in attempts] == ["macos"]
 
 
 def test_load_env_config_rejects_unsupported_feishu_message_format(

@@ -106,6 +106,9 @@ class DailyPremarketConfig:
     xiaozhi_token: str = ""
     notify_daily_report: bool = False
     notify_action_triggers: bool = False
+    trend_animals_api_key: str = ""
+    trend_animals_a_share_tm_id: int = 0
+    trend_animals_etf_tm_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -228,6 +231,13 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         notify_action_triggers=_bool_config(
             values.get("OPEN_TRADER_NOTIFY_ACTION_TRIGGERS", ""),
         ),
+        trend_animals_api_key=values.get("TREND_ANIMALS_API_KEY", ""),
+        trend_animals_a_share_tm_id=int(
+            values.get("TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID", "0") or "0"
+        ),
+        trend_animals_etf_tm_id=int(
+            values.get("TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID", "0") or "0"
+        ),
     )
 
 
@@ -346,6 +356,8 @@ def send_notification_with_results(
     notifier: Notifier,
     title: str,
     message: str,
+    *,
+    channels: set[str] | None = None,
 ) -> list[NotificationAttempt]:
     if isinstance(notifier, CompositeNotifier):
         targets = list(notifier._notifiers)
@@ -355,6 +367,8 @@ def send_notification_with_results(
     attempts: list[NotificationAttempt] = []
     for target in targets:
         channel = _notifier_channel(target)
+        if channels is not None and channel not in channels:
+            continue
         try:
             target.notify(title, message)
         except Exception as exc:

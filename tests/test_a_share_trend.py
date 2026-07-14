@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from open_trader.a_share_trend import (
+    AShareTrendRunResult,
     AccountPosition,
     AccountSnapshot,
     CandidateInput,
@@ -26,11 +27,16 @@ from open_trader.a_share_trend import (
     load_protection_state,
     load_watch_events,
     render_markdown,
+    run_a_share_trend_report,
     update_protection_line,
     write_protection_state,
     write_frozen_report,
 )
+from open_trader.daily_premarket import DailyPremarketConfig, RunLock
+from open_trader.futu_quote import FutuQuoteError
 from open_trader.kline_technical_facts import DailyKlineBar
+from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, MacOSNotifier
+from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -1008,3 +1014,458 @@ def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> No
         ("BUY", "600001"),
     ]
     assert "no_action" not in payload
+
+
+def trend_config(tmp_path: Path) -> DailyPremarketConfig:
+    portfolio = tmp_path / "data/latest/portfolio.csv"
+    portfolio.parent.mkdir(parents=True, exist_ok=True)
+    write_portfolio(
+        portfolio,
+        [
+            portfolio_row(
+                market="CASH",
+                asset_class="cash",
+                symbol="CNY_CASH",
+                name="人民币现金",
+                currency="CNY",
+                total_quantity="100000",
+                avg_cost_price="1",
+                market_value="100000",
+            )
+        ],
+    )
+    timestamp = datetime(2026, 7, 14, 12, tzinfo=SHANGHAI).timestamp()
+    os.utime(portfolio, (timestamp, timestamp))
+    return DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=portfolio,
+        trend_animals_api_key="secret-value",
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+    )
+
+
+class RecordingMacOS(MacOSNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+
+
+class RecordingFeishu(FeishuWebhookNotifier):
+    def __init__(self, *, fail: bool = False) -> None:
+        self.messages: list[tuple[str, str]] = []
+        self.fail = fail
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+        if self.fail:
+            raise RuntimeError("delivery failed")
+
+
+class ReadyApi:
+    def __init__(
+        self,
+        calls: list[str],
+        *,
+        ready: bool = True,
+        snapshot_date: str = "2026-07-14",
+        holding_error: Exception | None = None,
+        invalid_billing: bool = False,
+    ) -> None:
+        self.calls = calls
+        self.ready = ready
+        self.snapshot_date = snapshot_date
+        self.holding_error = holding_error
+        self.invalid_billing = invalid_billing
+        self.balance_calls = 0
+
+    def get_update_status(self) -> list[dict[str, object]]:
+        self.calls.append("api.update_status")
+        date = "2026-07-14" if self.ready else "2026-07-13"
+        return [{"asset": "A股", "asOfDate": date}, {"asset": "ETF基金", "asOfDate": date}]
+
+    def get_account_balance(self) -> dict[str, object]:
+        self.balance_calls += 1
+        self.calls.append("api.balance_before" if self.balance_calls == 1 else "api.balance_after")
+        return {"balance": "100" if self.balance_calls == 1 else "99"}
+
+    def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
+        self.calls.append(f"api.components.{tm_id}")
+        component_id = 1 if tm_id == 622466 else 2
+        return [{"tmId": component_id, "tickerSymbol": f"60000{component_id}.SH", "asOfDate": expected_date}]
+
+    def search_exact_symbol(self, symbol: str) -> int:
+        self.calls.append(f"api.search.{symbol}")
+        if self.holding_error:
+            raise self.holding_error
+        return int(symbol)
+
+    def get_snapshot_billing(self) -> list[dict[str, object]]:
+        self.calls.append("api.billing")
+        return [{"field": field, "price": "bad" if self.invalid_billing else "0.01"} for field in {
+            "tmId", "tickerName", "tickerSymbol", "asset", "asOfDate",
+            "tradableFlag", "industryName", "amount1d", "isTrendRightSide",
+            "daysSinceTrendEntry", "trendStrengthLocalCurr",
+            "stopwinFlagByDangerSignal", "stopwinFlagByBoilingTemperature",
+            "stopwinFlagByPopChampagne",
+        }]
+
+    def get_snapshots(self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str) -> list[dict[str, object]]:
+        self.calls.append("api.snapshots")
+        rows = []
+        for tm_id in tm_ids:
+            rows.append({
+                "tmId": tm_id,
+                "tickerName": f"股票{tm_id:06d}",
+                "tickerSymbol": f"{tm_id:06d}.SH",
+                "asset": "A股",
+                "asOfDate": self.snapshot_date,
+                "tradableFlag": True,
+                "industryName": "电力",
+                "amount1d": "2",
+                "isTrendRightSide": True,
+                "daysSinceTrendEntry": 3,
+                "trendStrengthLocalCurr": "96",
+                "stopwinFlagByDangerSignal": False,
+                "stopwinFlagByBoilingTemperature": False,
+                "stopwinFlagByPopChampagne": False,
+            })
+        return rows
+
+
+class ReadyQuote:
+    def __init__(
+        self,
+        calls: list[str],
+        *,
+        trading_days: list[str] | None = None,
+        fail_calendar: bool = False,
+        failed_klines: set[str] | None = None,
+        kline_error: FutuQuoteError | None = None,
+    ) -> None:
+        self.calls = calls
+        self.trading_days = trading_days or ["2026-07-14", "2026-07-15"]
+        self.fail_calendar = fail_calendar
+        self.failed_klines = failed_klines or set()
+        self.kline_error = kline_error
+
+    def get_cn_trading_days(self, *, start: str, end: str) -> list[str]:
+        self.calls.append("futu.calendar")
+        if self.fail_calendar:
+            raise FutuQuoteError("calendar unavailable")
+        return self.trading_days
+
+    def get_daily_kline(self, symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
+        self.calls.append(f"futu.kline.{symbol}")
+        if symbol in self.failed_klines:
+            raise self.kline_error or FutuQuoteError("kline unavailable")
+        return bars()
+
+    def close(self) -> None:
+        pass
+
+
+def test_report_runner_checks_calendar_status_billing_then_paid_data(tmp_path: Path) -> None:
+    calls: list[str] = []
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 17, 0, tzinfo=SHANGHAI),
+        sleep_fn=lambda seconds: None,
+        api_factory=lambda **kwargs: ReadyApi(calls),
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.status == "generated"
+    assert calls[:5] == [
+        "futu.calendar", "api.update_status", "api.balance_before",
+        "api.components.622466", "api.components.697199",
+    ]
+    assert calls.index("api.billing") < calls.index("api.snapshots")
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["execution_date"] == "2026-07-15"
+    assert payload["delivery_status"] == "sent"
+    assert payload["process_version"]
+
+
+def test_report_runner_holiday_is_silent_and_free(tmp_path: Path) -> None:
+    calls: list[str] = []
+    notifier = RecordingMacOS()
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("paid API must not be built"),
+        quote_factory=lambda **kwargs: ReadyQuote(calls, trading_days=["2026-07-15"]),
+        notifier=notifier,
+    )
+    assert result.status == "holiday"
+    assert calls == ["futu.calendar"]
+    assert notifier.messages == []
+
+
+def test_report_runner_waits_once_then_retries_until_ready(tmp_path: Path) -> None:
+    calls: list[str] = []
+    sleeps: list[float] = []
+    notifier = RecordingMacOS()
+    attempts = iter([False, True])
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 17, 0, tzinfo=SHANGHAI),
+        sleep_fn=sleeps.append,
+        api_factory=lambda **kwargs: ReadyApi(calls, ready=next(attempts)),
+        quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=notifier,
+    )
+    assert result.status == "generated"
+    assert sleeps == [600.0]
+    assert [title for title, _ in notifier.messages] == ["A股趋势数据等待中", "A股趋势计划发送失败"]
+    assert calls[:4] == ["futu.calendar", "api.update_status", "futu.calendar", "api.update_status"]
+
+
+def test_report_runner_inclusive_1800_attempt_fails_without_artifacts(tmp_path: Path) -> None:
+    calls: list[str] = []
+    sleeps: list[float] = []
+    notifier = RecordingMacOS()
+    times = iter([
+        datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+    ])
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14", now_fn=lambda: next(times),
+        sleep_fn=sleeps.append, api_factory=lambda **kwargs: ReadyApi(calls, ready=False),
+        quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=notifier,
+    )
+    assert result == AShareTrendRunResult("failed", None, None)
+    assert sleeps == [600.0]
+    assert [title for title, _ in notifier.messages] == ["A股趋势数据等待中", "A股趋势计划失败"]
+    assert not list((tmp_path / "reports").rglob("*.md"))
+    assert not list((tmp_path / "reports").rglob("*.json"))
+
+
+def test_report_runner_retries_systemic_futu_failure_through_deadline(tmp_path: Path) -> None:
+    calls: list[str] = []
+    times = iter([
+        datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+    ])
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14", now_fn=lambda: next(times),
+        sleep_fn=lambda seconds: None,
+        api_factory=lambda **kwargs: pytest.fail("paid API must not be built"),
+        quote_factory=lambda **kwargs: ReadyQuote(calls, fail_calendar=True),
+        notifier=RecordingMacOS(),
+    )
+    assert result.status == "failed"
+    assert calls == ["futu.calendar", "futu.calendar"]
+    assert not list((tmp_path / "reports").rglob("*.md"))
+
+
+def test_report_runner_existing_base_makes_no_external_or_notification_call(tmp_path: Path) -> None:
+    config = trend_config(tmp_path)
+    report_dir = config.reports_dir / "trend_a_share"
+    report_dir.mkdir(parents=True)
+    (report_dir / "2026-07-14.md").write_text("frozen", encoding="utf-8")
+    (report_dir / "2026-07-14.json").write_text("{}", encoding="utf-8")
+    notifier = RecordingMacOS()
+    result = run_a_share_trend_report(
+        config=config, run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("no API"),
+        quote_factory=lambda **kwargs: pytest.fail("no Futu"), notifier=notifier,
+    )
+    assert result.status == "existing"
+    assert notifier.messages == []
+
+
+def test_report_runner_keeps_files_when_feishu_delivery_fails_without_refetch(tmp_path: Path) -> None:
+    calls: list[str] = []
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(calls),
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        notifier=RecordingFeishu(fail=True),
+    )
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert result.status == "generated"
+    assert result.report_path.exists() and result.json_path.exists()
+    assert payload["delivery_status"] == "delivery_failed"
+    assert calls.count("api.snapshots") == 1
+
+
+def test_report_runner_sends_full_report_only_to_feishu_and_short_status_to_macos(tmp_path: Path) -> None:
+    calls: list[str] = []
+    feishu = RecordingFeishu()
+    macos = RecordingMacOS()
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(calls),
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        notifier=CompositeNotifier([feishu, macos]),
+    )
+    assert result.status == "generated"
+    assert len(feishu.messages) == len(macos.messages) == 1
+    assert feishu.messages[0][1].startswith("# A股趋势操作计划")
+    assert "# A股趋势操作计划" not in macos.messages[0][1]
+
+
+def test_report_runner_excludes_only_candidate_with_failed_kline(tmp_path: Path) -> None:
+    calls: list[str] = []
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(calls),
+        quote_factory=lambda **kwargs: ReadyQuote(calls, failed_klines={"SH.000001"}),
+        notifier=RecordingFeishu(),
+    )
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["excluded"]["000001"] == ["atr_unavailable"]
+    assert [item["symbol"] for item in payload["strategy_judgments"]["top10_candidates"]] == ["000002"]
+
+
+@pytest.mark.parametrize("with_prior", [False, True])
+def test_report_runner_degrades_holding_kline_without_blocking_report(
+    tmp_path: Path, with_prior: bool
+) -> None:
+    config = trend_config(tmp_path)
+    write_portfolio(config.portfolio, [portfolio_row(symbol="600009")])
+    timestamp = datetime(2026, 7, 14, 12, tzinfo=SHANGHAI).timestamp()
+    os.utime(config.portfolio, (timestamp, timestamp))
+    if with_prior:
+        write_protection_state(
+            config.data_dir / "trend_a_share/protection_state.json",
+            {"schema_version": 1, "positions": {"600009": {
+                "initial_line": "8", "active_line": "8.5", "atr14": "1",
+                "updated_for": "2026-07-13",
+            }}},
+        )
+    calls: list[str] = []
+    result = run_a_share_trend_report(
+        config=config, run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(calls),
+        quote_factory=lambda **kwargs: ReadyQuote(calls, failed_klines={"SH.600009"}),
+        notifier=RecordingFeishu(),
+    )
+    decision = json.loads(result.json_path.read_text(encoding="utf-8"))[
+        "strategy_judgments"
+    ]["holding_decisions"][0]
+    if with_prior:
+        assert (decision["action"], decision["active_line"]) == ("HOLD", "8.5")
+    else:
+        assert (decision["action"], decision["reason"]) == (
+            "MANUAL_REVIEW", "holding_kline_unavailable"
+        )
+
+
+def test_report_runner_snapshot_date_mismatch_uses_deadline_contract(tmp_path: Path) -> None:
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        api_factory=lambda **kwargs: ReadyApi([], snapshot_date="2026-07-13"),
+        quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
+    )
+    assert result.status == "failed"
+    assert not list((tmp_path / "reports").rglob("*.json"))
+
+
+def test_report_runner_retries_systemic_kline_outage_without_formal_report(tmp_path: Path) -> None:
+    outage = FutuQuoteError("network down", error_type="quote_server_interrupted")
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote(
+            [], failed_klines={"SH.000001"}, kline_error=outage
+        ),
+        notifier=RecordingMacOS(),
+    )
+    assert result.status == "failed"
+    assert not list((tmp_path / "reports").rglob("*.md"))
+
+
+def test_report_runner_rejects_invalid_live_billing_price(tmp_path: Path) -> None:
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        api_factory=lambda **kwargs: ReadyApi([], invalid_billing=True),
+        quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
+    )
+    assert result.status == "failed"
+    assert not list((tmp_path / "reports").rglob("*.json"))
+
+
+def test_report_runner_losing_lock_does_not_overwrite_active_log(tmp_path: Path) -> None:
+    config = trend_config(tmp_path)
+    log_path = config.logs_dir / "trend_a_share/2026-07-14.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text('{"process_version":"active"}\n', encoding="utf-8")
+    with RunLock(config.data_dir / "runs/.trend_a_share_report.lock"):
+        with pytest.raises(RuntimeError, match="already active"):
+            run_a_share_trend_report(config=config, run_date="2026-07-14")
+    assert log_path.read_text(encoding="utf-8") == '{"process_version":"active"}\n'
+
+
+def test_report_runner_uses_first_later_cn_session_across_closed_days(tmp_path: Path) -> None:
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote(
+            [], trading_days=["2026-07-14", "2026-07-20", "2026-07-21"]
+        ),
+        notifier=RecordingFeishu(),
+    )
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["execution_date"] == "2026-07-20"
+
+
+def test_report_runner_lookup_miss_is_manual_but_transport_failure_blocks(tmp_path: Path) -> None:
+    config = trend_config(tmp_path)
+    write_portfolio(config.portfolio, [portfolio_row(symbol="600009")])
+    timestamp = datetime(2026, 7, 14, 12, tzinfo=SHANGHAI).timestamp()
+    os.utime(config.portfolio, (timestamp, timestamp))
+    calls: list[str] = []
+    result = run_a_share_trend_report(
+        config=config, run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(calls, holding_error=TrendAnimalsLookupError("missing")),
+        quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=RecordingFeishu(),
+    )
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    decision = payload["strategy_judgments"]["holding_decisions"][0]
+    assert (decision["symbol"], decision["action"]) == ("600009", "MANUAL_REVIEW")
+
+    blocked = trend_config(tmp_path / "blocked")
+    write_portfolio(blocked.portfolio, [portfolio_row(symbol="600009")])
+    os.utime(blocked.portfolio, (timestamp, timestamp))
+    blocked_result = run_a_share_trend_report(
+        config=blocked, run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        api_factory=lambda **kwargs: ReadyApi([], holding_error=TrendAnimalsError("transport")),
+        quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
+    )
+    assert blocked_result.status == "failed"
+
+
+def test_report_runner_redacts_api_key_from_all_outputs(tmp_path: Path) -> None:
+    config = trend_config(tmp_path)
+    notifier = RecordingMacOS()
+
+    class SecretApi(ReadyApi):
+        def get_update_status(self) -> list[dict[str, object]]:
+            raise TrendAnimalsError(f"failed {config.trend_animals_api_key}")
+
+    result = run_a_share_trend_report(
+        config=config, run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        api_factory=lambda **kwargs: SecretApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]), notifier=notifier,
+    )
+    captured = repr(result) + repr(notifier.messages)
+    for path in [*config.logs_dir.rglob("*"), *config.reports_dir.rglob("*")]:
+        if path.is_file():
+            captured += path.read_text(encoding="utf-8")
+    assert config.trend_animals_api_key not in captured

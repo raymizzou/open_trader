@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
+from .a_share_trend import run_a_share_trend_report
 from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
@@ -451,6 +452,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         help="Override OPEN_TRADER_MAX_WORKERS for this daily run",
     )
+
+    trend_report = subparsers.add_parser(
+        "trend-a-share-report", help="Generate the Eastmoney A-share trend plan"
+    )
+    trend_report.add_argument("--date", default="today")
+    trend_report.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    trend_report.add_argument("--revision", action="store_true")
 
     test_notification_parser = subparsers.add_parser(
         "test-notification",
@@ -1244,6 +1254,58 @@ def main(argv: list[str] | None = None) -> int:
         print(f"actions_csv: {result.actions_path}")
         print(f"report: {result.report_path}")
         return 0
+
+    if args.command == "trend-a-share-report":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            missing = []
+            if not config.trend_animals_api_key:
+                missing.append("TREND_ANIMALS_API_KEY")
+            if config.trend_animals_a_share_tm_id <= 0:
+                missing.append("TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID")
+            if config.trend_animals_etf_tm_id <= 0:
+                missing.append("TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID")
+            if missing:
+                raise ValueError(f"missing config value(s): {', '.join(missing)}")
+            run_date = (
+                datetime.now(ZoneInfo(config.timezone)).date().isoformat()
+                if args.date == "today"
+                else canonical_date(args.date)
+            )
+            notifier = build_notifier(config)
+        except (
+            FileNotFoundError,
+            ValueError,
+            argparse.ArgumentTypeError,
+            ZoneInfoNotFoundError,
+        ) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        try:
+            result = run_a_share_trend_report(
+                config=config,
+                run_date=run_date,
+                revision=args.revision,
+                notifier=notifier,
+            )
+        except (
+            FileNotFoundError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "status": result.status,
+                    "report_path": str(result.report_path) if result.report_path else None,
+                    "json_path": str(result.json_path) if result.json_path else None,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0 if result.status in {"generated", "existing", "holiday"} else 1
 
     if args.command == "test-notification":
         try:

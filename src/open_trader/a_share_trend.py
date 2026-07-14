@@ -2,22 +2,61 @@ from __future__ import annotations
 
 import csv
 import json
+import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import sleep
+from typing import Callable
 from zoneinfo import ZoneInfo
 
+from .daily_premarket import (
+    DailyPremarketConfig,
+    RunLock,
+    send_notification_with_results,
+)
+from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .kline_technical_facts import DailyKlineBar
+from .notifications import Notifier, NullNotifier
+from .trend_animals import (
+    TrendAnimalsClient,
+    TrendAnimalsError,
+    TrendAnimalsLookupError,
+)
 
 
 NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
 DISCLAIMER_TEXT = (
     "本报告是确定性纪律清单，不是订单或成交事实；所有交易由用户人工确认与执行。"
 )
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+CANDIDATE_FIELDS = (
+    "tmId",
+    "tickerName",
+    "tickerSymbol",
+    "asset",
+    "asOfDate",
+    "tradableFlag",
+    "industryName",
+    "amount1d",
+    "isTrendRightSide",
+    "daysSinceTrendEntry",
+    "trendStrengthLocalCurr",
+    "stopwinFlagByDangerSignal",
+)
+HOLDING_FIELDS = CANDIDATE_FIELDS + (
+    "stopwinFlagByBoilingTemperature",
+    "stopwinFlagByPopChampagne",
+)
+@dataclass(frozen=True)
+class AShareTrendRunResult:
+    status: str
+    report_path: Path | None
+    json_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -901,3 +940,394 @@ def write_frozen_report(
             markdown_backup.unlink(missing_ok=True)
         if json_backup is not None:
             json_backup.unlink(missing_ok=True)
+
+
+def _process_version(repo: Path) -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def _redact_api_key(value: object, secret: str) -> str:
+    text = str(value)
+    return text.replace(secret, "<redacted>") if secret else text
+
+
+def _write_run_log(path: Path, payload: Mapping[str, object], *, append: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a" if append else "w", encoding="utf-8") as handle:
+        json.dump(dict(payload), handle, ensure_ascii=False, sort_keys=True)
+        handle.write("\n")
+
+
+def _patch_json(path: Path, values: Mapping[str, object]) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("frozen report JSON must be an object")
+    payload.update(values)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=path.parent) as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _notify_status(notifier: Notifier, title: str, message: str) -> None:
+    send_notification_with_results(
+        notifier,
+        title,
+        message,
+        channels={"macos"},
+    )
+
+
+def _status_date(row: Mapping[str, object]) -> str:
+    for key in ("asOfDate", "updateDate", "latestDate", "date"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _updates_ready(rows: Sequence[Mapping[str, object]], run_date: str) -> bool:
+    dates = {
+        row.get("asset"): _status_date(row)
+        for row in rows
+        if row.get("asset") in {"A股", "ETF基金"}
+    }
+    return dates == {"A股": run_date, "ETF基金": run_date}
+
+
+def _row_tm_id(row: Mapping[str, object]) -> int:
+    value = row.get("tmId")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise TrendAnimalsError("Trend Animals returned an invalid tmId")
+    return value
+
+
+def _billing_field(row: Mapping[str, object]) -> str:
+    for key in ("field", "fieldName", "column", "columnName"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _billing_price(row: Mapping[str, object]) -> Decimal:
+    for key in ("price", "cost", "unitPrice", "billing"):
+        if key in row:
+            try:
+                value = _decimal(row[key])
+            except ValueError:
+                raise TrendAnimalsError("snapshot billing returned an invalid price") from None
+            if value < 0:
+                raise TrendAnimalsError("snapshot billing returned a negative price")
+            return value
+    raise TrendAnimalsError("snapshot billing returned no price")
+
+
+def _is_systemic_futu_error(exc: FutuQuoteError) -> bool:
+    return exc.error_type in {
+        "opend_unreachable",
+        "context_failed",
+        "quote_server_interrupted",
+    }
+
+
+def _balance(row: Mapping[str, object]) -> Decimal:
+    for key in ("balance", "remainingBalance", "amount"):
+        if key in row:
+            try:
+                return _decimal(row[key])
+            except ValueError:
+                break
+    raise TrendAnimalsError("getAccountBalance returned no valid balance")
+
+
+def _holding_snapshot(row: Mapping[str, object]) -> HoldingSnapshot:
+    symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
+    return HoldingSnapshot(
+        tm_id=_row_tm_id(row),
+        symbol=symbol,
+        exchange=exchange,
+        name=str(row.get("tickerName") or "").strip(),
+        as_of_date=str(row.get("asOfDate") or "").strip(),
+        right_side=(
+            row.get("isTrendRightSide")
+            if isinstance(row.get("isTrendRightSide"), bool)
+            else None
+        ),
+        danger=(
+            row.get("stopwinFlagByDangerSignal")
+            if isinstance(row.get("stopwinFlagByDangerSignal"), bool)
+            else None
+        ),
+        boiling=(
+            row.get("stopwinFlagByBoilingTemperature")
+            if isinstance(row.get("stopwinFlagByBoilingTemperature"), bool)
+            else None
+        ),
+        champagne=(
+            row.get("stopwinFlagByPopChampagne")
+            if isinstance(row.get("stopwinFlagByPopChampagne"), bool)
+            else None
+        ),
+        industry=str(row.get("industryName") or "").strip(),
+    )
+
+
+def _attempt_report(
+    *,
+    config: DailyPremarketConfig,
+    run_date: str,
+    revision: bool,
+    process_version: str,
+    api_factory: Callable[..., object],
+    quote_factory: Callable[..., object],
+    notifier: Notifier,
+) -> AShareTrendRunResult:
+    run_day = date.fromisoformat(run_date)
+    quote = quote_factory(host=config.futu_host, port=config.futu_port)
+    try:
+        calendar = quote.get_cn_trading_days(
+            start=run_date,
+            end=(run_day + timedelta(days=14)).isoformat(),
+        )
+        if run_date not in calendar:
+            return AShareTrendRunResult("holiday", None, None)
+        execution_dates = sorted(item for item in calendar if item > run_date)
+        if not execution_dates:
+            raise FutuQuoteError("Futu CN calendar has no later trading day")
+        execution_date = execution_dates[0]
+
+        api = api_factory(
+            api_key=config.trend_animals_api_key,
+            cache_dir=config.data_dir / "trend_a_share/cache",
+        )
+        update_rows = api.get_update_status()
+        if not _updates_ready(update_rows, run_date):
+            return AShareTrendRunResult("waiting", None, None)
+
+        balance_before = _balance(api.get_account_balance())
+        component_rows = []
+        for tm_id in (
+            config.trend_animals_a_share_tm_id,
+            config.trend_animals_etf_tm_id,
+        ):
+            component_rows.extend(api.get_components(tm_id=tm_id, expected_date=run_date))
+        component_ids = {_row_tm_id(row) for row in component_rows}
+
+        account = load_eastmoney_account(
+            config.portfolio,
+            expected_date=run_date,
+            timezone=ZoneInfo(config.timezone),
+        )
+        holding_ids: dict[str, int] = {}
+        for position in account.positions:
+            try:
+                holding_ids[position.symbol] = api.search_exact_symbol(position.symbol)
+            except TrendAnimalsLookupError:
+                continue
+
+        requested_ids = sorted(component_ids | set(holding_ids.values()))
+        fields = HOLDING_FIELDS if holding_ids else CANDIDATE_FIELDS
+        billing_rows = api.get_snapshot_billing()
+        billing = {_billing_field(row): row for row in billing_rows}
+        missing_billing = [field for field in fields if field not in billing]
+        if missing_billing:
+            raise TrendAnimalsError(
+                "getSnapshotColumnBilling missing requested field(s): "
+                + ", ".join(missing_billing)
+            )
+        snapshot_rows = (
+            api.get_snapshots(
+                tm_ids=requested_ids,
+                fields=fields,
+                expected_date=run_date,
+            )
+            if requested_ids
+            else []
+        )
+        if any(row.get("asOfDate") != run_date for row in snapshot_rows):
+            raise TrendAnimalsError("getTickerSnapshot returned a stale data date")
+        balance_after = _balance(api.get_account_balance())
+
+        candidates: list[CandidateInput] = []
+        holding_snapshots: dict[str, HoldingSnapshot | None] = {
+            position.symbol: None for position in account.positions
+        }
+        rows_by_tm_id = {_row_tm_id(row): row for row in snapshot_rows}
+        kline_start = (run_day - timedelta(days=60)).isoformat()
+        bars_by_symbol: dict[str, Sequence[DailyKlineBar] | None] = {}
+        for tm_id in sorted(component_ids):
+            row = rows_by_tm_id.get(tm_id)
+            if row is None:
+                continue
+            try:
+                symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
+                daily_bars = quote.get_daily_kline(
+                    f"{exchange}.{symbol}", start=kline_start, end=run_date
+                )
+            except FutuQuoteError as exc:
+                if _is_systemic_futu_error(exc):
+                    raise
+                daily_bars = None
+            except ValueError:
+                daily_bars = None
+            candidates.append(evaluate_candidate(row, daily_bars))
+        for symbol, tm_id in holding_ids.items():
+            row = rows_by_tm_id.get(tm_id)
+            if row is not None:
+                try:
+                    holding_snapshots[symbol] = _holding_snapshot(row)
+                except ValueError:
+                    holding_snapshots[symbol] = None
+            try:
+                returned = holding_snapshots[symbol]
+                exchange = returned.exchange if returned is not None else "SH"
+                bars_by_symbol[symbol] = quote.get_daily_kline(
+                    f"{exchange}.{symbol}", start=kline_start, end=run_date
+                )
+            except FutuQuoteError as exc:
+                if _is_systemic_futu_error(exc):
+                    raise
+                bars_by_symbol[symbol] = None
+
+        estimated_cost = sum(
+            (_billing_price(billing[field]) for field in fields), Decimal("0")
+        ) * len(requested_ids)
+        actual_cost = max(Decimal("0"), balance_before - balance_after)
+        report = build_report(
+            as_of_date=run_date,
+            execution_date=execution_date,
+            account=account,
+            candidates=candidates,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol=bars_by_symbol,
+            prior_state=load_protection_state(
+                config.data_dir / "trend_a_share/protection_state.json"
+            ),
+            watch_events=load_watch_events(
+                config.data_dir / "trend_a_share/watch_events.jsonl"
+            ),
+            api_facts=(
+                f"getUpdateStatus rows={len(update_rows)}",
+                f"getComponentTicker rows={len(component_rows)} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(fields)} rows={len(snapshot_rows)} cache=client-managed",
+            ),
+            data_sources=("Trend Animals", "Futu CN calendar/QFQ daily K-line", str(config.portfolio)),
+            estimated_api_cost=estimated_cost,
+            actual_api_cost=actual_cost,
+        )
+        markdown_path, json_path = write_frozen_report(
+            report,
+            config.reports_dir / "trend_a_share",
+            revision=revision,
+        )
+        write_protection_state(
+            config.data_dir / "trend_a_share/protection_state.json",
+            report.protection_state,
+        )
+        markdown = markdown_path.read_text(encoding="utf-8")
+        attempts = send_notification_with_results(
+            notifier,
+            f"A股趋势操作计划 · {report.as_of_date}",
+            markdown,
+            channels={"feishu", "feishu_app"},
+        )
+        delivery_status = (
+            "sent"
+            if any(item.channel.startswith("feishu") and item.success for item in attempts)
+            else "delivery_failed"
+        )
+        _patch_json(
+            json_path,
+            {"delivery_status": delivery_status, "process_version": process_version},
+        )
+        _notify_status(
+            notifier,
+            (
+                "A股趋势计划已生成"
+                if delivery_status == "sent"
+                else "A股趋势计划发送失败"
+            ),
+            f"{run_date} 本地报告已冻结；飞书状态：{delivery_status}",
+        )
+        return AShareTrendRunResult("generated", markdown_path, json_path)
+    finally:
+        close = getattr(quote, "close", None)
+        if callable(close):
+            close()
+
+
+def run_a_share_trend_report(
+    *,
+    config: DailyPremarketConfig,
+    run_date: str,
+    revision: bool = False,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(SHANGHAI),
+    sleep_fn: Callable[[float], None] = sleep,
+    api_factory: Callable[..., object] = TrendAnimalsClient,
+    quote_factory: Callable[..., object] = FutuQuoteClient,
+    notifier: Notifier | None = None,
+) -> AShareTrendRunResult:
+    run_day = date.fromisoformat(run_date)
+    notifier = notifier or NullNotifier()
+    report_dir = config.reports_dir / "trend_a_share"
+    base_markdown = report_dir / f"{run_date}.md"
+    base_json = report_dir / f"{run_date}.json"
+    if not revision and base_markdown.exists() and base_json.exists():
+        return AShareTrendRunResult("existing", base_markdown, base_json)
+
+    version = _process_version(config.repo)
+    log_path = config.logs_dir / "trend_a_share" / f"{run_date}.log"
+    deadline = datetime.combine(run_day, time(18, 0), tzinfo=SHANGHAI)
+    notified_waiting = False
+    last_error = "Trend Animals update status is not ready"
+    with RunLock(config.data_dir / "runs/.trend_a_share_report.lock"):
+        _write_run_log(
+            log_path,
+            {"event": "start", "process_version": version, "run_date": run_date},
+            append=False,
+        )
+        while True:
+            try:
+                attempt = _attempt_report(
+                    config=config,
+                    run_date=run_date,
+                    revision=revision,
+                    process_version=version,
+                    api_factory=api_factory,
+                    quote_factory=quote_factory,
+                    notifier=notifier,
+                )
+                if attempt.status in {"generated", "existing", "holiday"}:
+                    return attempt
+                last_error = "Trend Animals update status is not ready"
+            except (TrendAnimalsError, FutuQuoteError) as exc:
+                last_error = _redact_api_key(exc, config.trend_animals_api_key)
+            _write_run_log(
+                log_path,
+                {"event": "retry", "error": last_error, "run_date": run_date},
+                append=True,
+            )
+            now = now_fn()
+            if now >= deadline:
+                _notify_status(notifier, "A股趋势计划失败", last_error)
+                return AShareTrendRunResult("failed", None, None)
+            if not notified_waiting:
+                _notify_status(notifier, "A股趋势数据等待中", last_error)
+                notified_waiting = True
+            sleep_fn(min(600.0, max(1.0, (deadline - now).total_seconds())))

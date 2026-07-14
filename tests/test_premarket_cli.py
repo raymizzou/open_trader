@@ -277,6 +277,76 @@ def test_run_daily_premarket_help_includes_expected_options(
     assert "--max-workers" in output
 
 
+def test_trend_a_share_report_parser_has_expected_defaults() -> None:
+    args = build_parser().parse_args(["trend-a-share-report"])
+
+    assert args.date == "today"
+    assert args.config == Path("config/daily_premarket.env")
+    assert args.revision is False
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("generated", 0), ("existing", 0), ("holiday", 0), ("failed", 1)],
+)
+def test_trend_a_share_report_main_dispatches_and_returns_status(
+    status: str,
+    expected: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    config = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        trend_animals_api_key="secret",
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+    )
+
+    def fake_runner(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            status=status,
+            report_path=tmp_path / "report.md" if status == "generated" else None,
+            json_path=tmp_path / "report.json" if status == "generated" else None,
+        )
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
+    monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
+    monkeypatch.setattr(cli, "run_a_share_trend_report", fake_runner)
+
+    result = cli.main([
+        "trend-a-share-report", "--date", "2026-07-14",
+        "--config", str(tmp_path / "daily.env"), "--revision",
+    ])
+
+    assert result == expected
+    assert captured == {
+        "config": config,
+        "run_date": "2026-07-14",
+        "revision": True,
+        "notifier": "notifier",
+    }
+    assert json.loads(capsys.readouterr().out)["status"] == status
+
+
+def test_trend_a_share_report_invalid_private_config_returns_two(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        trend_animals_api_key="",
+        trend_animals_a_share_tm_id=0,
+        trend_animals_etf_tm_id=0,
+    )
+    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
+
+    assert cli.main(["trend-a-share-report"]) == 2
+    assert "TREND_ANIMALS_API_KEY" in capsys.readouterr().err
+
+
 def test_run_daily_premarket_requires_market() -> None:
     parser = build_parser()
 
