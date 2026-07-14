@@ -6,6 +6,8 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from open_trader.a_share_trend_watch import (
     append_watch_event,
     watch_a_share_protection,
@@ -330,6 +332,51 @@ def test_symbol_absent_from_latest_portfolio_is_not_watched(tmp_path: Path) -> N
     assert quote.snapshot_calls == []
 
 
+@pytest.mark.parametrize("initial_state", ["empty_portfolio", "missing_line"])
+def test_watcher_without_comparable_symbols_keeps_polling_for_updates(
+    tmp_path: Path, initial_state: str
+) -> None:
+    portfolio_path = portfolio(
+        tmp_path, symbol=None if initial_state == "empty_portfolio" else "600900"
+    )
+    state_path = state(
+        tmp_path, active_line=None if initial_state == "missing_line" else "27.31"
+    )
+    quote = SequenceQuote([{"SH.600900": Decimal("28")}])
+    sleeps: list[float] = []
+
+    def make_comparable(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) != 1:
+            return
+        if initial_state == "empty_portfolio":
+            portfolio(tmp_path, symbol="600900")
+        else:
+            state(tmp_path, active_line="27.31")
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio_path,
+        state_path=state_path,
+        events_path=tmp_path / "events.jsonl",
+        quote_client=quote,
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        now_fn=SequenceClock(
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:05+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
+        ),
+        sleep_fn=make_comparable,
+    )
+
+    assert result.status == "closed"
+    assert quote.snapshot_calls == [["SH.600900"]]
+    assert sleeps == [5, 5]
+
+
 def test_position_removed_after_start_is_not_watched_again(tmp_path: Path) -> None:
     portfolio_path = portfolio(tmp_path)
     quote = SequenceQuote([{"SH.600900": Decimal("28")}])
@@ -346,11 +393,16 @@ def test_position_removed_after_start_is_not_watched_again(tmp_path: Path) -> No
         poll_seconds=5,
         reconnect_seconds=60,
         now_fn=SequenceClock(
-            ["2026-07-15T09:30:00+08:00", "2026-07-15T09:30:05+08:00"]
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:05+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
         ),
         sleep_fn=remove_position,
     )
 
+    assert result.status == "closed"
     assert result.watched_symbol_count == 0
     assert quote.snapshot_calls == [["SH.600900"]]
 

@@ -244,14 +244,18 @@ def watch_a_share_protection(
                 comparable[to_futu_symbol("CN", symbol)] = (symbol, active_line)
 
             if not comparable:
-                return _result(
-                    "completed",
-                    positions,
-                    trigger_count,
-                    exception_count,
-                    unknown_quote_count,
-                    events_path,
-                )
+                if once:
+                    return _result(
+                        "completed",
+                        positions,
+                        trigger_count,
+                        exception_count,
+                        unknown_quote_count,
+                        events_path,
+                    )
+                sleep_fn(poll_seconds)
+                now = now_fn()
+                continue
 
             try:
                 snapshots = client.get_snapshots(sorted(comparable))
