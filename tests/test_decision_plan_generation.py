@@ -135,3 +135,37 @@ def test_new_listing_with_short_history_publishes_explainable_fallback(
     facts = {item["key"]: item for item in plan["fallback"]["facts"]}
     assert facts["ma20_distance_pct"]["calculated_value"] == "insufficient_history"
     assert facts["bollinger_position"]["calculated_value"] == "insufficient_history"
+
+
+def test_cn_generator_defaults_to_futu_provider(tmp_path: Path, monkeypatch) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,total_quantity,portfolio_weight_hkd,market_value_hkd,fx_to_hkd,ai_eligible\n"
+        "CN,stock,600025,600025,100,2.00%,10000,1.08,true\n",
+        encoding="utf-8",
+    )
+    technical = tmp_path / "technical.json"
+    technical.write_text("{}\n", encoding="utf-8")
+    summary = tmp_path / "summary.json"
+    summary.write_text('{"records":[{"symbol":"600025"}]}', encoding="utf-8")
+    provider = ShortHistoryPriceProvider()
+    monkeypatch.setattr(
+        "open_trader.decision_plan_generation.FutuQuoteClient",
+        lambda **kwargs: provider,
+    )
+
+    result = generate_daily_decision_plans(
+        portfolio_path=portfolio,
+        technical_facts_path=technical,
+        tradingagents_summary_path=summary,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-07-13",
+        market="CN",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        update_latest=True,
+    )
+
+    plan = load_decision_plans(result.latest_path)[0]
+    assert plan["market_data_source"] == "futu"

@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
-from .akshare_quote import AkShareDailyKlineProvider
 from .backtest_prices import (
     DailyKlineProvider,
     ensure_backtest_price_range,
@@ -62,13 +61,9 @@ def generate_daily_decision_plans(
         raise ValueError("每日计划缺少技术事实或 TradingAgents 摘要")
     normalized_market = market.strip().upper()
     owned_provider = price_provider is None
-    raw_provider = price_provider or (
-        AkShareDailyKlineProvider()
-        if normalized_market == "CN"
-        else FutuQuoteClient(host=futu_host, port=futu_port)
-    )
+    raw_provider = price_provider or FutuQuoteClient(host=futu_host, port=futu_port)
     provider = _RangeCachingProvider(raw_provider)
-    provider_source = "akshare" if normalized_market == "CN" else "futu"
+    provider_source = "futu"
     try:
         rows = _portfolio_rows(portfolio_path)
         nav_hkd = sum(
