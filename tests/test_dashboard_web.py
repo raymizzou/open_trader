@@ -3026,6 +3026,7 @@ console.log(html.slice(start, end));
 def test_dashboard_holdings_table_uses_compact_asset_columns() -> None:
     js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
 
+    assert "function renderAccountTable(group, rows)" not in js
     for label in (
         "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值",
         "港元市值", "账户权重", "组合权重", "盈亏",

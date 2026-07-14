@@ -2125,11 +2125,11 @@ function renderAccountSection(group) {
       </div>
     </header>
     ${renderAccountStrategy(group)}
-    ${rows.length ? renderAccountTable(group, rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
+    ${rows.length ? renderAccountTable(rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
   </section>`;
 }
 
-function renderAccountTable(group, rows) {
+function renderAccountTable(rows) {
   const selected = selectedHolding();
   const body = rows.map((row) => {
     const holding = row.holding;
