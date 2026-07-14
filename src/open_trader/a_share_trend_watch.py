@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time as time_module
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
@@ -11,7 +12,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .a_share_trend import load_eastmoney_account, load_watch_events
-from .daily_premarket import send_notification_with_results
+from .daily_premarket import RunLock, send_notification_with_results
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .notifications import Notifier
@@ -78,6 +79,7 @@ def watch_a_share_protection(
     reconnect_seconds: float,
     once: bool = False,
     quote_client_factory: Callable[[], object] | None = None,
+    report_lock_path: Path | None = None,
     now_fn: Callable[[], datetime] = lambda: datetime.now(SHANGHAI),
     sleep_fn: Callable[[float], None] = time_module.sleep,
 ) -> AShareWatchResult:
@@ -95,7 +97,6 @@ def watch_a_share_protection(
     alerted: set[str] = set()
     reported_lines: set[str] = set()
     reported_quotes: set[str] = set()
-    inputs_loaded = False
 
     trigger_count = exception_count = unknown_quote_count = 0
     calendar_checked = False
@@ -159,39 +160,6 @@ def watch_a_share_protection(
                         events_path,
                     )
 
-            if not inputs_loaded:
-                account = load_eastmoney_account(
-                    portfolio_path,
-                    expected_date=trading_date,
-                    timezone=SHANGHAI,
-                )
-                positions = {
-                    item.symbol: item
-                    for item in account.positions
-                    if _eligible_position(item.symbol, item.name)
-                }
-                active_lines = _load_active_lines(state_path)
-                prior_events = load_watch_events(events_path)
-                alerted = {
-                    str(event.get("symbol", ""))
-                    for event in prior_events
-                    if event.get("trading_date") == trading_date
-                    and event.get("event_type") == "protection_triggered"
-                }
-                reported_lines = {
-                    str(event.get("symbol", ""))
-                    for event in prior_events
-                    if event.get("trading_date") == trading_date
-                    and event.get("event_type") == "protection_line_missing"
-                }
-                reported_quotes = {
-                    str(event.get("symbol", ""))
-                    for event in prior_events
-                    if event.get("trading_date") == trading_date
-                    and event.get("event_type") == "quote_unknown"
-                }
-                inputs_loaded = True
-
             if session == "before":
                 opening = now.astimezone(SHANGHAI).replace(
                     hour=9, minute=30, second=0, microsecond=0
@@ -204,6 +172,49 @@ def watch_a_share_protection(
                     hour=13, minute=0, second=0, microsecond=0
                 )
                 sleep_fn((afternoon - now.astimezone(SHANGHAI)).total_seconds())
+                now = now_fn()
+                continue
+
+            try:
+                with (
+                    RunLock(report_lock_path)
+                    if report_lock_path is not None
+                    else nullcontext()
+                ):
+                    account = load_eastmoney_account(
+                        portfolio_path,
+                        expected_date=trading_date,
+                        timezone=SHANGHAI,
+                    )
+                    positions = {
+                        item.symbol: item
+                        for item in account.positions
+                        if _eligible_position(item.symbol, item.name)
+                    }
+                    active_lines = _load_active_lines(state_path)
+                    prior_events = load_watch_events(events_path)
+                    alerted = {
+                        str(event.get("symbol", ""))
+                        for event in prior_events
+                        if event.get("trading_date") == trading_date
+                        and event.get("event_type") == "protection_triggered"
+                    }
+                    reported_lines = {
+                        str(event.get("symbol", ""))
+                        for event in prior_events
+                        if event.get("trading_date") == trading_date
+                        and event.get("event_type") == "protection_line_missing"
+                    }
+                    reported_quotes = {
+                        str(event.get("symbol", ""))
+                        for event in prior_events
+                        if event.get("trading_date") == trading_date
+                        and event.get("event_type") == "quote_unknown"
+                    }
+            except RuntimeError as exc:
+                if str(exc) != "daily premarket run already active":
+                    raise
+                sleep_fn(poll_seconds)
                 now = now_fn()
                 continue
 
@@ -225,6 +236,7 @@ def watch_a_share_protection(
                             notifier,
                             f"A股保护线缺失 · {symbol}",
                             "当前持仓缺少活动保护线，未进行价格比较；请立即人工检查。",
+                            channels={"feishu", "feishu_app"},
                         )
                         reported_lines.add(symbol)
                         exception_count += 1
@@ -275,6 +287,7 @@ def watch_a_share_protection(
                             notifier,
                             f"A股实时价格未知 · {symbol}",
                             f"未取得有效实时价格，活动保护线 {active_line} 的状态未知；请立即人工核价。",
+                            channels={"feishu", "feishu_app"},
                         )
                         reported_quotes.add(symbol)
                         unknown_quote_count += 1

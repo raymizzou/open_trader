@@ -372,6 +372,17 @@ def test_watch_trend_a_share_parser_has_safe_defaults() -> None:
     assert args.once is False
 
 
+@pytest.mark.parametrize("value", ["0", "-1"])
+@pytest.mark.parametrize("option", ["--poll-seconds", "--reconnect-seconds"])
+def test_watch_trend_a_share_rejects_non_positive_intervals(
+    option: str, value: str
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["watch-trend-a-share", option, value])
+
+    assert exc_info.value.code == 2
+
+
 def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -431,6 +442,7 @@ def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
     assert captured["portfolio_path"] == config.portfolio
     assert captured["state_path"] == tmp_path / "data/trend_a_share/protection_state.json"
     assert captured["events_path"] == tmp_path / "data/trend_a_share/watch_events.jsonl"
+    assert captured["report_lock_path"] == tmp_path / "data/runs/.trend_a_share_report.lock"
     assert captured["quote_client"] is None
     assert callable(captured["quote_client_factory"])
     assert captured["quote_client_factory"]() is quote

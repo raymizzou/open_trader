@@ -470,8 +470,10 @@ def build_parser() -> argparse.ArgumentParser:
     trend_watch.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
-    trend_watch.add_argument("--poll-seconds", type=float, default=5.0)
-    trend_watch.add_argument("--reconnect-seconds", type=float, default=60.0)
+    trend_watch.add_argument("--poll-seconds", type=positive_float, default=5.0)
+    trend_watch.add_argument(
+        "--reconnect-seconds", type=positive_float, default=60.0
+    )
     trend_watch.add_argument("--once", action="store_true")
 
     test_notification_parser = subparsers.add_parser(
@@ -1337,6 +1339,8 @@ def main(argv: list[str] | None = None) -> int:
                     state_path=config.data_dir
                     / "trend_a_share/protection_state.json",
                     events_path=config.data_dir / "trend_a_share/watch_events.jsonl",
+                    report_lock_path=config.data_dir
+                    / "runs/.trend_a_share_report.lock",
                     quote_client=None,
                     quote_client_factory=quote_factory,
                     notifier=notifier,

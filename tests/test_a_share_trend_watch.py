@@ -10,8 +10,14 @@ from open_trader.a_share_trend_watch import (
     append_watch_event,
     watch_a_share_protection,
 )
+from open_trader.daily_premarket import RunLock
 from open_trader.futu_quote import FutuQuoteError
 from open_trader.futu_watch import QuoteSnapshot
+from open_trader.notifications import (
+    CompositeNotifier,
+    FeishuWebhookNotifier,
+    MacOSNotifier,
+)
 
 
 class SequenceClock:
@@ -61,7 +67,15 @@ class SequenceQuote:
         self.closed = True
 
 
-class RecordingNotifier:
+class RecordingNotifier(FeishuWebhookNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+
+
+class RecordingMacOSNotifier(MacOSNotifier):
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
 
@@ -316,6 +330,31 @@ def test_symbol_absent_from_latest_portfolio_is_not_watched(tmp_path: Path) -> N
     assert quote.snapshot_calls == []
 
 
+def test_position_removed_after_start_is_not_watched_again(tmp_path: Path) -> None:
+    portfolio_path = portfolio(tmp_path)
+    quote = SequenceQuote([{"SH.600900": Decimal("28")}])
+
+    def remove_position(_: float) -> None:
+        portfolio(tmp_path, symbol=None)
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio_path,
+        state_path=state(tmp_path),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=quote,
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        now_fn=SequenceClock(
+            ["2026-07-15T09:30:00+08:00", "2026-07-15T09:30:05+08:00"]
+        ),
+        sleep_fn=remove_position,
+    )
+
+    assert result.watched_symbol_count == 0
+    assert quote.snapshot_calls == [["SH.600900"]]
+
+
 def test_domestic_etf_is_watched(tmp_path: Path) -> None:
     quote = SequenceQuote([{"SH.510300": Decimal("3.50")}])
 
@@ -499,3 +538,57 @@ def test_missing_quote_is_recorded_unknown_not_safe(tmp_path: Path) -> None:
     ]
     assert any("未知" in message for _, message in notifier.messages)
     assert not any("安全" in message for _, message in notifier.messages)
+
+
+def test_manual_quote_exception_is_sent_to_feishu_not_macos(tmp_path: Path) -> None:
+    quote = SequenceQuote([{}])
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+
+    watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=quote,
+        notifier=CompositeNotifier([feishu, macos]),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert len(feishu.messages) == 1
+    assert macos.messages == []
+
+
+def test_report_lock_contention_retries_without_stopping_watcher(
+    tmp_path: Path,
+) -> None:
+    report_lock_path = tmp_path / "data/runs/.trend_a_share_report.lock"
+    held_lock = RunLock(report_lock_path)
+    held_lock.__enter__()
+    sleeps: list[float] = []
+
+    def release_report_lock(seconds: float) -> None:
+        sleeps.append(seconds)
+        held_lock.__exit__(None, None, None)
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=report_lock_path,
+        quote_client=SequenceQuote([{"SH.600900": Decimal("28")}]),
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=SequenceClock(
+            ["2026-07-15T09:30:00+08:00", "2026-07-15T09:30:05+08:00"]
+        ),
+        sleep_fn=release_report_lock,
+    )
+
+    assert result.status == "completed"
+    assert sleeps == [5]
