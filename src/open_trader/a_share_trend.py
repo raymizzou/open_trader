@@ -1086,16 +1086,29 @@ def _write_run_log(path: Path, payload: Mapping[str, object], *, append: bool) -
         handle.write("\n")
 
 
-def _payload_hashes(markdown: str, report_json: str) -> dict[str, str]:
+def _payload_hashes(
+    markdown: str,
+    report_json: str,
+    protection_state: Mapping[str, object] | None = None,
+) -> dict[str, str]:
     markdown_bytes = markdown.encode("utf-8")
     json_bytes = report_json.encode("utf-8")
-    return {
+    payload = {
         "markdown_sha256": hashlib.sha256(markdown_bytes).hexdigest(),
         "json_sha256": hashlib.sha256(json_bytes).hexdigest(),
-        "content_hash": hashlib.sha256(
-            markdown_bytes + b"\0" + json_bytes
-        ).hexdigest(),
     }
+    content = markdown_bytes + b"\0" + json_bytes
+    if protection_state is not None:
+        state_bytes = json.dumps(
+            protection_state,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        payload["protection_state_sha256"] = hashlib.sha256(state_bytes).hexdigest()
+        content += b"\0" + state_bytes
+    payload["content_hash"] = hashlib.sha256(content).hexdigest()
+    return payload
 
 
 def _write_delivery_receipt(
@@ -1106,15 +1119,20 @@ def _write_delivery_receipt(
     artifact_stem: str,
     markdown: str,
     report_json: str,
+    protection_state: Mapping[str, object],
 ) -> dict[str, object]:
     path.parent.mkdir(parents=True, exist_ok=True)
+    frozen_state = json.loads(
+        json.dumps(protection_state, ensure_ascii=False, sort_keys=True)
+    )
     payload = {
         "status": status,
         "generated_at": generated_at,
         "artifact_stem": artifact_stem,
         "markdown": markdown,
         "report_json": report_json,
-        **_payload_hashes(markdown, report_json),
+        "protection_state": frozen_state,
+        **_payload_hashes(markdown, report_json, frozen_state),
     }
     temp_path: Path | None = None
     try:
@@ -1141,21 +1159,26 @@ def _read_delivery_receipt(
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise ValueError("delivery receipt is unreadable or malformed") from None
     status = payload.get("status") if isinstance(payload, dict) else None
-    if status not in {"pending", "sent", "delivery_failed", "delivery_unknown"}:
+    if status not in {
+        "prepared", "pending", "sent", "delivery_failed", "delivery_unknown"
+    }:
         raise ValueError("delivery receipt has an invalid status")
     if payload.get("artifact_stem") != artifact_stem:
         raise ValueError("delivery receipt artifact stem mismatch")
     markdown = payload.get("markdown")
     report_json = payload.get("report_json")
+    protection_state = payload.get("protection_state")
     if not isinstance(markdown, str) or not isinstance(report_json, str):
         raise ValueError("delivery receipt has no embedded report payload")
+    if not isinstance(protection_state, dict):
+        raise ValueError("delivery receipt has no embedded protection state")
     try:
         report_payload = json.loads(report_json)
     except json.JSONDecodeError:
         raise ValueError("delivery receipt report JSON is malformed") from None
     if not isinstance(report_payload, dict):
         raise ValueError("delivery receipt report JSON must be an object")
-    hashes = _payload_hashes(markdown, report_json)
+    hashes = _payload_hashes(markdown, report_json, protection_state)
     if any(payload.get(key) != value for key, value in hashes.items()):
         raise ValueError("delivery receipt content hash mismatch")
     return payload
@@ -1186,6 +1209,7 @@ def _transition_delivery_receipt(
         report_json=(
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         ),
+        protection_state=receipt["protection_state"],  # type: ignore[arg-type]
     )
 
 
@@ -1355,7 +1379,12 @@ def _recover_receipt_report(
     if receipt is None:
         return None
     prior_status = str(receipt["status"])
-    if prior_status == "delivery_failed":
+    if prior_status in {"prepared", "delivery_failed"}:
+        if prior_status == "prepared":
+            write_protection_state(
+                config.data_dir / "trend_a_share/protection_state.json",
+                receipt["protection_state"],  # type: ignore[arg-type]
+            )
         receipt = _transition_delivery_receipt(
             receipt_path,
             receipt,
@@ -1678,22 +1707,18 @@ def _attempt_report(
             actual_api_cost=actual_cost,
             metadata={"paid_response_cache": cache_metadata},
         )
-        write_protection_state(
-            config.data_dir / "trend_a_share/protection_state.json",
-            report.protection_state,
-        )
         report = replace(
             report,
             metadata={
                 **report.metadata,
-                "delivery_status": "pending",
+                "delivery_status": "prepared",
                 "process_version": process_version,
             },
         )
         receipt_path = _receipt_path(config.data_dir, artifact_stem)
         receipt = _write_delivery_receipt(
             receipt_path,
-            status="pending",
+            status="prepared",
             generated_at=report.generated_at,
             artifact_stem=artifact_stem,
             markdown=render_markdown(report),
@@ -1706,6 +1731,17 @@ def _attempt_report(
                 )
                 + "\n"
             ),
+            protection_state=report.protection_state,
+        )
+        write_protection_state(
+            config.data_dir / "trend_a_share/protection_state.json",
+            report.protection_state,
+        )
+        receipt = _transition_delivery_receipt(
+            receipt_path,
+            receipt,
+            status="pending",
+            delivery_status="pending",
         )
         attempts = send_notification_with_results(
             notifier,

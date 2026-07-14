@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Mapping
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -1685,6 +1686,15 @@ def test_initial_receipt_failure_leaves_no_stage_or_reusable_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = trend_config(tmp_path)
+    state_path = config.data_dir / "trend_a_share/protection_state.json"
+    write_protection_state(state_path, {"schema_version": 1, "positions": {}})
+    original_state = state_path.read_bytes()
+    state_writes: list[Mapping[str, object]] = []
+    monkeypatch.setattr(
+        trend_module,
+        "write_protection_state",
+        lambda path, state: state_writes.append(state),
+    )
     monkeypatch.setattr(
         trend_module,
         "_write_delivery_receipt",
@@ -1702,6 +1712,113 @@ def test_initial_receipt_failure_leaves_no_stage_or_reusable_payload(
 
     assert not list((config.data_dir / "trend_a_share/staged").rglob("*"))
     assert not (config.data_dir / "trend_a_share/delivery/2026-07-14.json").exists()
+    assert state_writes == []
+    assert state_path.read_bytes() == original_state
+
+
+def test_prepared_receipt_recovers_state_write_failure_without_refetch_or_resend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-14.json"
+    state_path = config.data_dir / "trend_a_share/protection_state.json"
+    notifier = RecordingFeishu()
+    original_write_state = trend_module.write_protection_state
+    prepared_receipt: dict[str, object] = {}
+
+    def fail_state_once(path: Path, state: Mapping[str, object]) -> None:
+        prepared_receipt.update(json.loads(receipt_path.read_text(encoding="utf-8")))
+        assert prepared_receipt["status"] == "prepared"
+        assert prepared_receipt["protection_state"] == state
+        assert len(str(prepared_receipt["protection_state_sha256"])) == 64
+        raise OSError("state write failed")
+
+    monkeypatch.setattr(trend_module, "write_protection_state", fail_state_once)
+    with pytest.raises(OSError, match="state write failed"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: ReadyApi([]),
+            quote_factory=lambda **kwargs: ReadyQuote([]),
+            notifier=notifier,
+        )
+
+    assert notifier.messages == []
+    monkeypatch.setattr(trend_module, "write_protection_state", original_write_state)
+    recovered = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("prepared recovery must not refetch"),
+        quote_factory=lambda **kwargs: pytest.fail("prepared recovery must not refetch"),
+        notifier=notifier,
+    )
+
+    assert len(notifier.messages) == 1
+    assert recovered.report_path.read_text(encoding="utf-8") == prepared_receipt["markdown"]
+    assert load_protection_state(state_path) == prepared_receipt["protection_state"]
+    prepared_payload = json.loads(str(prepared_receipt["report_json"]))
+    recovered_payload = json.loads(recovered.json_path.read_text(encoding="utf-8"))
+    prepared_payload.pop("delivery_status")
+    recovered_payload.pop("delivery_status")
+    prepared_payload["metadata"].pop("delivery_status")
+    recovered_payload["metadata"].pop("delivery_status")
+    assert recovered_payload == prepared_payload
+
+
+def test_pending_transition_failure_recovers_prepared_receipt_without_refetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    notifier = RecordingFeishu()
+    original_transition = trend_module._transition_delivery_receipt
+
+    def fail_pending_transition(
+        *args: object, status: str, **kwargs: object
+    ) -> object:
+        if status == "pending":
+            raise OSError("pending transition failed")
+        return original_transition(*args, status=status, **kwargs)
+
+    monkeypatch.setattr(
+        trend_module, "_transition_delivery_receipt", fail_pending_transition
+    )
+    with pytest.raises(OSError, match="pending transition failed"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: ReadyApi([]),
+            quote_factory=lambda **kwargs: ReadyQuote([]),
+            notifier=notifier,
+        )
+
+    receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-14.json"
+    prepared = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert prepared["status"] == "prepared"
+    assert load_protection_state(
+        config.data_dir / "trend_a_share/protection_state.json"
+    ) == prepared["protection_state"]
+    assert notifier.messages == []
+
+    monkeypatch.setattr(
+        trend_module, "_transition_delivery_receipt", original_transition
+    )
+    recovered = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("prepared retry must not refetch"),
+        quote_factory=lambda **kwargs: pytest.fail("prepared retry must not refetch"),
+        notifier=notifier,
+    )
+
+    assert recovered.report_path.read_text(encoding="utf-8") == prepared["markdown"]
+    assert len(notifier.messages) == 1
+    prepared_payload = json.loads(str(prepared["report_json"]))
+    recovered_payload = json.loads(recovered.json_path.read_text(encoding="utf-8"))
+    prepared_payload.pop("delivery_status")
+    recovered_payload.pop("delivery_status")
+    prepared_payload["metadata"].pop("delivery_status")
+    recovered_payload["metadata"].pop("delivery_status")
+    assert recovered_payload == prepared_payload
 
 
 def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
@@ -1715,6 +1832,7 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
         artifact_stem="2026-07-14",
         markdown="old report",
         report_json='{\n  "delivery_status": "delivery_failed"\n}\n',
+        protection_state={"schema_version": 1, "positions": {}},
     )
     old_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     original_replace = Path.replace
@@ -1733,6 +1851,7 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
             artifact_stem="2026-07-14",
             markdown="new report",
             report_json='{\n  "delivery_status": "sent"\n}\n',
+            protection_state={"schema_version": 1, "positions": {}},
         )
 
     assert json.loads(receipt_path.read_text(encoding="utf-8")) == old_receipt
@@ -1899,12 +2018,17 @@ def test_delivery_result_receipt_write_failure_recovers_unknown_without_resend(
     notifier = RecordingFeishu(fail=not delivery_succeeds)
     original_transition = trend_module._transition_delivery_receipt
 
+    def fail_result_transition(
+        *args: object, status: str, **kwargs: object
+    ) -> object:
+        if status in {"sent", "delivery_failed"}:
+            raise OSError("delivery result receipt write failed")
+        return original_transition(*args, status=status, **kwargs)
+
     monkeypatch.setattr(
         trend_module,
         "_transition_delivery_receipt",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            OSError("delivery result receipt write failed")
-        ),
+        fail_result_transition,
     )
     with pytest.raises(OSError, match="receipt write failed"):
         run_a_share_trend_report(
