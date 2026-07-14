@@ -874,11 +874,11 @@ const sandbox = { document: { addEventListener() {} }, console };
 def test_dashboard_derives_account_groups_from_existing_broker_details() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
-  summary: {portfolio_value_hkd: "3000"}, broker_summaries: [
-    {broker: "futu", portfolio_value_hkd: "1000"},
-    {broker: "tiger", portfolio_value_hkd: "2000"},
-    {broker: "phillips", portfolio_value_hkd: "0"},
-    {broker: "eastmoney", portfolio_value_hkd: "0"},
+  summary: {portfolio_value_hkd: "3000", cash_like_value_hkd: "700"}, broker_summaries: [
+    {broker: "futu", portfolio_value_hkd: "1000", cash_like_value_hkd: "300"},
+    {broker: "tiger", portfolio_value_hkd: "2000", cash_like_value_hkd: "400"},
+    {broker: "phillips", portfolio_value_hkd: "0", cash_like_value_hkd: "0"},
+    {broker: "eastmoney", portfolio_value_hkd: "0", cash_like_value_hkd: "0"},
   ], source_statuses: [], cash_rows: [],
   holdings: [{market: "US", symbol: "QQQ", brokers: "futu;tiger", broker_details: [
     {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},
@@ -899,15 +899,15 @@ console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
 def test_dashboard_account_rows_recalculate_live_values_from_broker_details() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
-  summary: {portfolio_value_hkd: "3000"}, broker_summaries: [
-    {broker: "futu", portfolio_value_hkd: "1000"},
-    {broker: "tiger", portfolio_value_hkd: "2000"},
+  summary: {portfolio_value_hkd: "3000", cash_like_value_hkd: "300"}, broker_summaries: [
+    {broker: "futu", portfolio_value_hkd: "1000", cash_like_value_hkd: "100"},
+    {broker: "tiger", portfolio_value_hkd: "2000", cash_like_value_hkd: "200"},
   ], cash_rows: [], holdings: [{
     market: "US", symbol: "QQQ", brokers: "futu;tiger", total_quantity: "3",
     cost_value: "210", fx_to_hkd: "7.8", market_value_hkd: "2300",
     broker_details: [
       {broker: "futu", quantity: "1", cost_value: "60", fx_to_hkd: "7.8", market_value_hkd: "700", unrealized_pnl: "30"},
-      {broker: "tiger", quantity: "2", cost_value: "150", fx_to_hkd: "7.8", market_value_hkd: "1600", unrealized_pnl: "50"},
+      {broker: "tiger", quantity: "2", cost_value: "150", fx_to_hkd: "8", market_value_hkd: "1600", unrealized_pnl: "50"},
     ],
   }],
 };
@@ -929,16 +929,16 @@ console.log(JSON.stringify(accountHoldingGroups().slice(0, 2).map((group) => {
         {
             "broker": "futu",
             "marketValueHkd": "780.00",
-            "accountWeight": "78.00%",
-            "overallWeight": "26.00%",
+            "accountWeight": "88.64%",
+            "overallWeight": "29.10%",
             "pnl": "40.00",
             "pnlPercent": "66.67%",
         },
         {
             "broker": "tiger",
-            "marketValueHkd": "1560.00",
-            "accountWeight": "78.00%",
-            "overallWeight": "52.00%",
+            "marketValueHkd": "1600.00",
+            "accountWeight": "88.89%",
+            "overallWeight": "59.70%",
             "pnl": "50.00",
             "pnlPercent": "33.33%",
         },

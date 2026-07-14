@@ -5509,7 +5509,7 @@ function getHoldings() {
 
 function accountHoldingGroups() {
   const portfolioTotal = state.dashboard?.summary?.portfolio_value_hkd;
-  return Object.entries(ACCOUNT_STRATEGY_PROFILES).map(([broker, profile]) => {
+  const groups = Object.entries(ACCOUNT_STRATEGY_PROFILES).map(([broker, profile]) => {
     const summary = brokerSummaries().find((item) => brokerKey(item) === broker) || {broker};
     const rows = [];
     getHoldings().forEach((holding, index) => {
@@ -5526,6 +5526,22 @@ function accountHoldingGroups() {
     });
     return {broker, profile, summary, rows};
   });
+  const holdingTotal = sumMoneyValues(groups.flatMap((group) => group.rows.map((row) => row.display)));
+  const cashTotal = numericValue(state.dashboard?.summary?.cash_like_value_hkd);
+  const livePortfolioTotal = holdingTotal.complete && cashTotal !== null
+    ? holdingTotal.value + cashTotal : null;
+  groups.forEach((group) => {
+    const accountHoldingTotal = sumMoneyValues(group.rows.map((row) => row.display));
+    const accountCashTotal = numericValue(group.summary.cash_like_value_hkd);
+    const liveAccountTotal = accountHoldingTotal.complete && accountCashTotal !== null
+      ? accountHoldingTotal.value + accountCashTotal : null;
+    group.rows.forEach((row) => {
+      const marketValue = numericValue(row.display.market_value_hkd);
+      row.display.account_weight = percentValue(marketValue, liveAccountTotal);
+      row.display.portfolio_weight = percentValue(marketValue, livePortfolioTotal);
+    });
+  });
+  return groups;
 }
 
 function accountDisplayRow(holding, detail, summary, portfolioTotal) {
