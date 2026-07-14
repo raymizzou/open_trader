@@ -63,6 +63,19 @@ def test_dashboard_command_center_theme_preserves_the_data_contract() -> None:
     assert "font-variant-numeric: tabular-nums;" in css
 
 
+def test_dashboard_account_sections_use_distinct_broker_tints() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    for selector, color in {
+        "#account-futu": "#eff6ff",
+        "#account-tiger": "#fff7ed",
+        "#account-phillips": "#f0fdf4",
+        "#account-eastmoney": "#fef2f2",
+    }.items():
+        assert f"{selector} {{ --account-tint: {color}; }}" in css
+    assert "background: var(--account-tint, var(--surface-soft));" in css
+    assert ".account-holdings-table {\n  background: var(--surface);" in css
+
+
 def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
 

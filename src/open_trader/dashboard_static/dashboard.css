@@ -1390,9 +1390,18 @@ table {
   overflow: hidden;
 }
 
+#account-futu { --account-tint: #eff6ff; }
+#account-tiger { --account-tint: #fff7ed; }
+#account-phillips { --account-tint: #f0fdf4; }
+#account-eastmoney { --account-tint: #fef2f2; }
+
+.account-section-header,
+.account-strategy-summary {
+  background: var(--account-tint, var(--surface-soft));
+}
+
 .account-section-header {
   align-items: flex-start;
-  background: var(--surface-soft);
   display: flex;
   gap: 16px;
   justify-content: space-between;
@@ -1405,6 +1414,7 @@ table {
 }
 
 .account-holdings-table {
+  background: var(--surface);
   border-collapse: collapse;
   table-layout: fixed;
   width: 100%;
