@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-14
 
+- Grouped holdings by broker account with strategy-horizon labels, split account
+  and whole-portfolio weights into separate columns, and added distinct low-
+  saturation broker colors to account headers and strategy summaries while
+  keeping holding tables white; verified merged `main` with `1622` tests and
+  the full Dashboard acceptance gate (`PASS`) on a dedicated port.
 - Added one daily decision plan per holding with a 10% position cap, repeatable
   condition notifications, mandatory benchmark backtest gates, and non-executable
   fallback evidence showing maximum drawdown, Sharpe, and Calmar ratios; Dashboard
