@@ -136,18 +136,25 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
     clicks: list[str] = []
 
     class Locator:
-        def __init__(self, kind: str, index: int = 0) -> None:
+        def __init__(
+            self, kind: str, index: int = 0, visible: tuple[bool, ...] = (True,),
+        ) -> None:
             self.kind = kind
             self.index = index
+            self.visible = visible
 
         def count(self) -> int:
-            return {"button": 2, "tabs": 5, "failed": 0, "panel": 1}[self.kind]
+            return {
+                "button": len(self.visible), "tabs": 5, "failed": 0, "panel": 1,
+            }[self.kind]
 
         @property
         def first(self) -> "Locator":
-            return self
+            return Locator(self.kind, self.index, self.visible[:1])
 
         def click(self) -> None:
+            if self.kind == "button":
+                assert self.visible[0], "clicked hidden duplicate"
             clicks.append(self.kind)
 
         def all_inner_texts(self) -> list[str]:
@@ -170,7 +177,14 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
     class Page:
         def locator(self, selector: str) -> Locator:
             selectors.append(selector)
-            if selector.startswith('button[data-detail-mode="decision"]'):
+            button_selector = (
+                'button[data-detail-mode="decision"]'
+                '[data-detail-market="US"]'
+                '[data-detail-symbol="MSFT"]'
+            )
+            if selector == button_selector:
+                return Locator("button", visible=(False, True))
+            if selector == f"{button_selector}:visible":
                 return Locator("button")
             if selector == ".decision-tab-list [data-decision-tab]":
                 return Locator("tabs")
@@ -184,7 +198,7 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
     assert selectors[0] == (
         'button[data-detail-mode="decision"]'
         '[data-detail-market="US"]'
-        '[data-detail-symbol="MSFT"]'
+        '[data-detail-symbol="MSFT"]:visible'
     )
     assert clicks == ["button", "tab", "tab", "tab", "tab", "tab"]
 

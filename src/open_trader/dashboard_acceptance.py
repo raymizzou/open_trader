@@ -230,7 +230,7 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
     button = page.locator(
         'button[data-detail-mode="decision"]'
         f'[data-detail-market="{market}"]'
-        f'[data-detail-symbol="{symbol}"]'
+        f'[data-detail-symbol="{symbol}"]:visible'
     )
     assert button.count() >= 1, f"{market}.{symbol} has no trading-decision button"
     button.first.click()
