@@ -254,19 +254,20 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
             assert not re.search(r"当前价\s*缺失", panel_text), "趋势 / K 线当前价缺失"
 
 
-def _check_tiger_panel(page: Any) -> None:
-    text = page.locator("#tiger-long-term-panel").inner_text()
+def _check_account_holdings(page: Any) -> None:
+    text = page.locator("#account-holdings").inner_text()
     for required in (
-        "老虎长线组合", "夏普比率", "卡玛比率",
-        "需要校准", "仅供人工复核",
+        "富途", "中短线", "股票与期权", "老虎", "长线", "SMA200 组合策略",
+        "辉立", "中线策略", "东方财富", "偏短线", "趋势交易",
+        "策略指标待接入", "夏普比率", "卡玛比率", "目标", "漂移",
     ):
-        assert required in text, f"老虎长线组合缺少 {required}"
-    for forbidden in (
-        "TIGER · LONG TERM", "broad_us_growth", "semiconductor",
-        "INELIGIBLE", "LONG", "CASH", "insufficient_sma200_history",
-        "state_change", "provenance_incomplete", "calibration_required",
-    ):
-        assert forbidden not in text, f"老虎长线组合仍显示英文代码 {forbidden}"
+        assert required in text, f"账户持仓视图缺少 {required}"
+    assert page.locator(".account-section").count() == 4, "账户区块数量不是 4"
+    for forbidden in ("tiger-long-term-panel", "calibration_required", "provenance_incomplete"):
+        assert forbidden not in text, f"账户持仓视图泄漏内部代码 {forbidden}"
+    assert page.evaluate(
+        "document.documentElement.scrollWidth <= window.innerWidth"
+    ), "页面出现横向滚动"
 
 
 def _browser_check(
@@ -312,7 +313,14 @@ def _browser_check(
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
-                        _check_tiger_panel(page)
+                        _check_account_holdings(page)
+                        page.locator('a[href="#account-tiger"]').click()
+                        assert page.locator("#account-tiger:visible").count() == 1, (
+                            "点击老虎账户锚点后账户区块不可见"
+                        )
+                        assert page.locator(".account-section").count() == 4, (
+                            "点击老虎账户锚点后账户区块数量不是 4"
+                        )
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     phillips_card = page.locator(
