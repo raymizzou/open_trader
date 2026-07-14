@@ -877,6 +877,57 @@ const sandbox = { document: { addEventListener() {} }, console };
     return result.stdout
 
 
+def test_dashboard_derives_account_groups_from_existing_broker_details() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {
+  summary: {portfolio_value_hkd: "3000"}, broker_summaries: [
+    {broker: "futu", portfolio_value_hkd: "1000"},
+    {broker: "tiger", portfolio_value_hkd: "2000"},
+    {broker: "phillips", portfolio_value_hkd: "0"},
+    {broker: "eastmoney", portfolio_value_hkd: "0"},
+  ], source_statuses: [], cash_rows: [],
+  holdings: [{market: "US", symbol: "QQQ", brokers: "futu;tiger", broker_details: [
+    {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},
+    {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600", cost_value: "1100", unrealized_pnl: "500"},
+  ]}],
+};
+console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
+  broker: group.broker, horizon: group.profile.horizon,
+  rows: group.rows.map((row) => ({key: row.key, quantity: row.display.total_quantity, accountWeight: row.display.account_weight})),
+}))));
+''')
+    groups = json.loads(output)
+    assert [group["broker"] for group in groups] == ["futu", "tiger", "phillips", "eastmoney"]
+    assert groups[0]["rows"] == [{"key": "futu:US:QQQ:0", "quantity": "1", "accountWeight": "70.00%"}]
+    assert groups[1]["rows"] == [{"key": "tiger:US:QQQ:0", "quantity": "2", "accountWeight": "80.00%"}]
+
+
+def test_dashboard_account_rows_do_not_turn_unknown_values_into_zero() -> None:
+    output = run_dashboard_js(r'''
+const display = accountDisplayRow(
+  {market: "US", symbol: "QQQ"},
+  {broker: "futu", quantity: "", cost_price: "", market_value_hkd: "", cost_value: "0", unrealized_pnl: "0"},
+  {broker: "futu", portfolio_value_hkd: ""},
+  "",
+);
+console.log(JSON.stringify({
+  quantity: display.total_quantity,
+  costPrice: display.avg_cost_price,
+  accountWeight: display.account_weight,
+  portfolioWeight: display.portfolio_weight,
+  pnlPercent: display.unrealized_pnl_pct,
+}));
+''')
+
+    assert json.loads(output) == {
+        "quantity": "-",
+        "costPrice": "-",
+        "accountWeight": "-",
+        "portfolioWeight": "-",
+        "pnlPercent": "-",
+    }
+
+
 def test_dashboard_matches_holding_to_backend_canonical_quote() -> None:
     output = run_dashboard_js(
         r'''

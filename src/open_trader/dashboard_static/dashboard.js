@@ -45,6 +45,13 @@ const elements = {};
 
 const HOLDINGS_TABLE_COLUMN_COUNT = 10;
 
+const ACCOUNT_STRATEGY_PROFILES = {
+  futu: {horizon: "中短线", strategy: "股票与期权"},
+  tiger: {horizon: "长线", strategy: "SMA200 组合策略"},
+  phillips: {horizon: "中线", strategy: "中线策略"},
+  eastmoney: {horizon: "偏短线", strategy: "趋势交易"},
+};
+
 const DECISION_TABS = [
   { key: "final", label: "最终决策" },
   { key: "tradingagents", label: "TradingAgents" },
@@ -5765,6 +5772,47 @@ function getHoldings() {
       total,
     ),
   }));
+}
+
+function accountHoldingGroups() {
+  const portfolioTotal = state.dashboard?.summary?.portfolio_value_hkd;
+  return Object.entries(ACCOUNT_STRATEGY_PROFILES).map(([broker, profile]) => {
+    const summary = brokerSummaries().find((item) => brokerKey(item) === broker) || {broker};
+    const rows = [];
+    getHoldings().forEach((holding, index) => {
+      const details = (Array.isArray(holding.broker_details) ? holding.broker_details : [])
+        .filter((detail) => brokerKey(detail) === broker);
+      details.forEach((detail) => rows.push({
+        key: accountHoldingKey(broker, holding, index), broker, holding,
+        display: accountDisplayRow(holding, detail, summary, portfolioTotal), index,
+      }));
+      if (!details.length && rowBrokers(holding).length === 1 && rowBrokers(holding)[0] === broker) {
+        rows.push({key: accountHoldingKey(broker, holding, index), broker, holding,
+          display: accountDisplayRow(holding, null, summary, portfolioTotal), index});
+      }
+    });
+    return {broker, profile, summary, rows};
+  });
+}
+
+function accountDisplayRow(holding, detail, summary, portfolioTotal) {
+  const display = {...holding, ...(detail || {})};
+  const marketValue = numericValue(display.market_value_hkd);
+  return {
+    ...display,
+    total_quantity: formatPlain(detail ? detail.quantity : holding.total_quantity),
+    avg_cost_price: formatPlain(detail ? detail.cost_price : holding.avg_cost_price),
+    account_weight: percentValue(marketValue, numericValue(summary.portfolio_value_hkd)),
+    portfolio_weight: percentValue(marketValue, numericValue(portfolioTotal)),
+    unrealized_pnl_pct: detail
+      ? percentValue(numericValue(detail.unrealized_pnl), numericValue(detail.cost_value))
+      : formatPlain(holding.unrealized_pnl_pct),
+  };
+}
+
+function accountHoldingKey(broker, holding, index) {
+  return [broker, holding.market || "", holding.symbol || "", index]
+    .map((part) => String(part)).join(":");
 }
 
 function numericValue(value) {
