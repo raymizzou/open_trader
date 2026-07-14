@@ -20,6 +20,7 @@ from .daily_premarket import (
     send_notification_with_results,
 )
 from .futu_quote import FutuQuoteClient, FutuQuoteError
+from .futu_symbols import to_futu_symbol
 from .kline_technical_facts import DailyKlineBar
 from .notifications import Notifier, NullNotifier
 from .trend_animals import (
@@ -300,6 +301,9 @@ def _symbol_parts(value: object) -> tuple[str, str]:
     if not isinstance(value, str):
         raise ValueError("tickerSymbol must be a string")
     parts = value.strip().upper().rsplit(".", 1)
+    if len(parts) == 1:
+        exchange, symbol = to_futu_symbol("CN", parts[0]).split(".", 1)
+        return symbol, exchange
     if len(parts) != 2 or len(parts[0]) != 6 or not parts[0].isdigit() or not parts[1]:
         raise ValueError(f"invalid tickerSymbol: {value!r}")
     return parts[0], parts[1]
@@ -1114,7 +1118,7 @@ def _attempt_report(
 
         api = api_factory(
             api_key=config.trend_animals_api_key,
-            cache_dir=config.data_dir / "trend_a_share/cache",
+            cache_dir=config.data_dir / "trend_animals/cache",
         )
         update_rows = api.get_update_status()
         if not _updates_ready(update_rows, run_date):

@@ -240,6 +240,33 @@ def test_candidate_normalizes_returned_exchange_without_inference() -> None:
 
 
 @pytest.mark.parametrize(
+    ("ticker_symbol", "exchange"), [("159835", "SZ"), ("515120", "SH")]
+)
+def test_candidate_infers_exchange_when_api_omits_suffix(
+    ticker_symbol: str, exchange: str
+) -> None:
+    item = evaluate_candidate(
+        {
+            "tmId": 1,
+            "tickerSymbol": ticker_symbol,
+            "tickerName": "示例ETF",
+            "asset": "ETF基金",
+            "industryName": "医药",
+            "asOfDate": "2026-07-14",
+            "tradableFlag": True,
+            "amount1d": "2",
+            "isTrendRightSide": True,
+            "daysSinceTrendEntry": 3,
+            "trendStrengthLocalCurr": "96",
+            "stopwinFlagByDangerSignal": False,
+        },
+        bars(),
+    )
+
+    assert (item.symbol, item.exchange) == (ticker_symbol, exchange)
+
+
+@pytest.mark.parametrize(
     ("overrides", "reason"),
     [
         ({"right_side": None}, "right_side_not_true"),
@@ -1180,11 +1207,18 @@ class ReadyQuote:
 
 def test_report_runner_checks_calendar_status_billing_then_paid_data(tmp_path: Path) -> None:
     calls: list[str] = []
+    api_kwargs: dict[str, object] = {}
+    config = trend_config(tmp_path)
+
+    def api_factory(**kwargs: object) -> ReadyApi:
+        api_kwargs.update(kwargs)
+        return ReadyApi(calls)
+
     result = run_a_share_trend_report(
-        config=trend_config(tmp_path), run_date="2026-07-14",
+        config=config, run_date="2026-07-14",
         now_fn=lambda: datetime(2026, 7, 14, 17, 0, tzinfo=SHANGHAI),
         sleep_fn=lambda seconds: None,
-        api_factory=lambda **kwargs: ReadyApi(calls),
+        api_factory=api_factory,
         quote_factory=lambda **kwargs: ReadyQuote(calls),
         notifier=RecordingFeishu(),
     )
@@ -1195,6 +1229,7 @@ def test_report_runner_checks_calendar_status_billing_then_paid_data(tmp_path: P
         "api.components.622466", "api.components.697199",
     ]
     assert calls.index("api.billing") < calls.index("api.snapshots")
+    assert api_kwargs["cache_dir"] == config.data_dir / "trend_animals/cache"
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["execution_date"] == "2026-07-15"
     assert payload["delivery_status"] == "sent"
