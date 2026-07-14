@@ -13,6 +13,7 @@ from open_trader.tiger_long_term_backtest import (
     cash_growth,
     ensure_dgs3mo_rates,
     load_dgs3mo_csv,
+    run_spy_buy_hold_backtest,
     run_tiger_long_term_backtest,
 )
 from open_trader.standard_strategies import StrategyBar
@@ -218,6 +219,19 @@ def test_portfolio_backtest_emits_metrics_and_ten_segments() -> None:
         assert Decimal(portfolio["max_drawdown_pct"]) >= 0
         assert "sharpe_ratio" in portfolio
         assert "calmar_ratio" in portfolio
+
+
+def test_spy_context_is_full_buy_and_hold() -> None:
+    result = run_spy_buy_hold_backtest(
+        _six_year_bars(crossing=False),
+        {date(2019, 12, 31): Decimal("4.0")},
+        initial_cash=Decimal("100000"),
+    )
+
+    assert len(result["orders"]) == 1
+    assert result["orders"][0]["side"] == "BUY"
+    assert Decimal(result["time_in_market_pct"]) > Decimal("99")
+    assert Decimal(result["final_invested_weight"]) > Decimal("0.99")
 
 
 def test_gate_requires_risk_adjusted_floors_and_calibration() -> None:

@@ -225,6 +225,92 @@ def run_tiger_long_term_backtest(
     }
 
 
+def run_spy_buy_hold_backtest(
+    bars: Sequence[StrategyBar],
+    rates: Mapping[date, Decimal],
+    *,
+    initial_cash: Decimal,
+) -> dict[str, object]:
+    ordered = _validated_bars("SPY", bars)
+    if not initial_cash.is_finite() or initial_cash <= 0:
+        raise ValueError("initial cash must be positive and finite")
+    evaluation_start = _add_months(ordered[0].date, 12)
+    boundary = _add_months(evaluation_start, 60)
+    evaluation = [bar for bar in ordered if evaluation_start <= bar.date < boundary]
+    if len(evaluation) < 2:
+        raise ValueError("SPY buy-and-hold requires a five-year evaluation range")
+
+    fee_model = TigerUsFeeModel()
+    cash = initial_cash
+    cash_interest = Decimal("0")
+    quantity = Decimal("0")
+    fees = Decimal("0")
+    slippage = Decimal("0")
+    curve: list[dict[str, str]] = []
+    orders: list[dict[str, str]] = []
+    previous_date: date | None = None
+    for index, bar in enumerate(evaluation):
+        if previous_date is not None:
+            interest = cash * cash_growth(
+                _rate_on_or_before(rates, previous_date),
+                (bar.date - previous_date).days,
+            )
+            cash += interest
+            cash_interest += interest
+        if index == 1:
+            execution_price = bar.open * Decimal("1.0005")
+            quantity = cash / execution_price
+            fee = fee_model.fee("BUY", quantity, execution_price)
+            quantity = (cash - fee) / execution_price
+            fee = fee_model.fee("BUY", quantity, execution_price)
+            quantity = (cash - fee) / execution_price
+            notional = quantity * execution_price
+            cash -= notional + fee
+            fees += fee
+            slippage = quantity * (execution_price - bar.open)
+            orders.append({
+                "symbol": "SPY",
+                "side": "BUY",
+                "decision_date": evaluation[0].date.isoformat(),
+                "execution_date": bar.date.isoformat(),
+                "quantity": _decimal_text(quantity),
+                "open_price": _decimal_text(bar.open),
+                "execution_price": _decimal_text(execution_price),
+                "fees": _decimal_text(fee),
+                "slippage_cost": _decimal_text(slippage),
+                "reason": "buy_and_hold_entry",
+            })
+        equity = cash + quantity * bar.close
+        curve.append({
+            "date": bar.date.isoformat(),
+            "equity": _decimal_text(equity),
+            "cash": _decimal_text(cash),
+        })
+        previous_date = bar.date
+
+    metrics = _portfolio_metrics(curve, rates, initial_cash)
+    final_equity = Decimal(curve[-1]["equity"])
+    final_invested_weight = quantity * evaluation[-1].close / final_equity
+    metrics.update({
+        "orders": orders,
+        "cash_interest": _decimal_text(cash_interest),
+        "fees": _decimal_text(fees),
+        "slippage_cost": _decimal_text(slippage),
+        "costs": _decimal_text(fees + slippage),
+        "turnover_pct": _decimal_text(
+            quantity * Decimal(orders[0]["execution_price"]) / initial_cash
+            * Decimal("100")
+        ),
+        "time_in_market_pct": _decimal_text(
+            Decimal(len(evaluation) - 1) / Decimal(len(evaluation)) * Decimal("100")
+        ),
+        "round_trips": 0,
+        "final_invested_weight": _decimal_text(final_invested_weight),
+        "segments": _six_month_segments(curve, rates, initial_cash, evaluation_start),
+    })
+    return metrics
+
+
 def build_validation_gate(
     strategy: Mapping[str, object],
     benchmark: Mapping[str, object],

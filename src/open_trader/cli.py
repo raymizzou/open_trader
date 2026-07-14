@@ -96,6 +96,7 @@ from .tiger_account import (
     mask_account_id,
     sync_tiger_portfolio,
 )
+from .tiger_long_term import generate_tiger_long_term_strategy
 from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_facts
 from .trade_actions import generate_trade_actions
 from .tradingagents_summary import (
@@ -780,6 +781,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--update-latest",
         action="store_true",
         help="Update data/latest/portfolio.csv after writing dated artifacts",
+    )
+
+    tiger_strategy_parser = subparsers.add_parser(
+        "run-tiger-long-term-strategy",
+        help="Generate the Tiger long-term portfolio shadow strategy",
+    )
+    tiger_strategy_parser.add_argument("--date", type=canonical_date, required=True)
+    tiger_strategy_parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/tiger_long_term_strategy.json"),
+    )
+    tiger_strategy_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    tiger_strategy_parser.add_argument("--host", default="127.0.0.1")
+    tiger_strategy_parser.add_argument("--port", type=positive_int, default=11111)
+    tiger_strategy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write the dated shadow artifact without promoting latest",
     )
 
     kelly_parser = subparsers.add_parser(
@@ -1668,6 +1688,29 @@ def main(argv: list[str] | None = None) -> int:
                 account_client.close()
         _print_tiger_sync_result(result)
         return 0
+
+    if args.command == "run-tiger-long-term-strategy":
+        quote_client = None
+        try:
+            quote_client = FutuQuoteClient(host=args.host, port=args.port)
+            result = generate_tiger_long_term_strategy(
+                args.date,
+                args.data_dir,
+                args.config,
+                quote_client,
+                update_latest=not args.dry_run,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+            parser.error(str(exc))
+        finally:
+            if quote_client is not None:
+                quote_client.close()
+        print(f"status: {result.status}")
+        print(f"members: {result.member_count}")
+        print(f"eligible: {result.eligible_count}")
+        print(f"run: {result.run_path}")
+        print(f"latest: {result.latest_path or ''}")
+        return 0 if result.status == "shadow" else 1
 
     if args.command == "kelly" and args.kelly_command == "sync-paper-orders":
         client = None

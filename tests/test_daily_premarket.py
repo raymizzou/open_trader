@@ -1216,6 +1216,33 @@ class FakeDecisionPlanGenerator:
         return SimpleNamespace(run_path=run_path, latest_path=latest_path, records=0)
 
 
+class FakeTigerLongTermGenerator:
+    def __init__(self, *, status: str = "shadow") -> None:
+        self.status = status
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        self.calls.append((args, kwargs))
+        run_date, data_dir = args[0], args[1]
+        assert isinstance(run_date, str)
+        assert isinstance(data_dir, Path)
+        run_path = data_dir / "runs" / run_date / "US" / "tiger_long_term_strategy.json"
+        run_path.parent.mkdir(parents=True, exist_ok=True)
+        run_path.write_text(json.dumps({"status": self.status}) + "\n", encoding="utf-8")
+        latest_path = None
+        if kwargs.get("update_latest") and self.status == "shadow":
+            latest_path = data_dir / "latest" / "US" / "tiger_long_term_strategy.json"
+            latest_path.parent.mkdir(parents=True, exist_ok=True)
+            latest_path.write_bytes(run_path.read_bytes())
+        return SimpleNamespace(
+            status=self.status,
+            member_count=8 if self.status == "shadow" else 0,
+            eligible_count=5 if self.status == "shadow" else 0,
+            run_path=run_path,
+            latest_path=latest_path,
+        )
+
+
 def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
     return DailyPremarketConfig(
         repo=tmp_path,
@@ -1237,6 +1264,7 @@ def _daily_runner(
     summary_extractor_factory: object = FakeSummaryExtractor,
     futu_facts_generator: object | None = None,
     decision_plan_generator: object | None = None,
+    tiger_long_term_generator: object | None = None,
     **kwargs: object,
 ) -> _DailyPremarketRunner:
     return _DailyPremarketRunner(
@@ -1246,7 +1274,102 @@ def _daily_runner(
         futu_facts_generator=futu_facts_generator or FakeFutuFactsGenerator(),
         futu_facts_extractor_factory=FakeSummaryExtractor,
         decision_plan_generator=decision_plan_generator or FakeDecisionPlanGenerator(),
+        tiger_long_term_generator=(
+            tiger_long_term_generator or FakeTigerLongTermGenerator()
+        ),
     )
+
+
+def test_daily_runner_runs_tiger_strategy_only_for_us(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    refreshed = tmp_path / "data/runs/2026-06-19/portfolio.csv"
+    refreshed.parent.mkdir(parents=True, exist_ok=True)
+    refreshed.write_text("symbol\nMSFT\n", encoding="utf-8")
+    tiger_generator = FakeTigerLongTermGenerator()
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        portfolio_refresher=lambda **_: refreshed,
+        tiger_long_term_generator=tiger_generator,
+    ).run("2026-06-19", market="US")
+
+    assert result.status == "success"
+    assert len(tiger_generator.calls) == 1
+    args, kwargs = tiger_generator.calls[0]
+    assert args[:3] == (
+        "2026-06-19",
+        config.data_dir,
+        config.repo / "config" / "tiger_long_term_strategy.json",
+    )
+    assert isinstance(args[3], FakeQuoteClient)
+    assert args[3].closed is True
+    assert kwargs == {"update_latest": True}
+    payload = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert payload["artifacts"]["tiger_long_term_status"] == "shadow"
+    assert payload["artifacts"]["tiger_long_term_strategy"]
+    assert payload["artifacts"]["latest_tiger_long_term_strategy"]
+
+
+def test_daily_runner_skips_tiger_strategy_for_hk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    refreshed = tmp_path / "data/runs/2026-06-19/portfolio.csv"
+    refreshed.parent.mkdir(parents=True, exist_ok=True)
+    refreshed.write_text("symbol\n00700\n", encoding="utf-8")
+    tiger_generator = FakeTigerLongTermGenerator()
+
+    _daily_runner(
+        config=config,
+        premarket_runner=FakePremarket(market="HK", symbol="00700"),
+        plan_builder=FakePlanBuilder(market="HK", symbol="00700"),
+        quote_client_factory=lambda **kwargs: FakeQuoteClient({
+            "HK.00700": QuoteSnapshot("HK.00700", Decimal("500")),
+        }, **kwargs),
+        trade_action_generator=FakeTradeActionGenerator(market="HK", symbol="00700"),
+        portfolio_refresher=lambda **_: refreshed,
+        tiger_long_term_generator=tiger_generator,
+    ).run("2026-06-19", market="HK")
+
+    assert tiger_generator.calls == []
+
+
+def test_daily_runner_surfaces_tiger_strategy_failure_without_stopping_other_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    config = _daily_config(tmp_path)
+    refreshed = tmp_path / "data/runs/2026-06-19/portfolio.csv"
+    refreshed.parent.mkdir(parents=True, exist_ok=True)
+    refreshed.write_text("symbol\nMSFT\n", encoding="utf-8")
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=FakePremarket(),
+        plan_builder=FakePlanBuilder(),
+        quote_client_factory=FakeQuoteClient,
+        trade_action_generator=FakeTradeActionGenerator(),
+        portfolio_refresher=lambda **_: refreshed,
+        tiger_long_term_generator=FakeTigerLongTermGenerator(status="failed"),
+    ).run("2026-06-19", market="US")
+
+    payload = json.loads(result.status_path.read_text(encoding="utf-8"))
+    assert result.status == "partial"
+    assert payload["readiness"] == "review_required"
+    assert "tiger_long_term_strategy_failed" in payload["status_reasons"]
+    assert Path(payload["artifacts"]["trade_actions"]).exists()
+    assert Path(payload["artifacts"]["decision_plans"]).exists()
 
 
 def _notification_rows(
