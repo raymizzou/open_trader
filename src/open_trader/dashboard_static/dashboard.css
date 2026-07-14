@@ -246,10 +246,7 @@ select:focus-visible {
 
 .broker-summary-card.active,
 .broker-summary-card[aria-current="true"],
-.broker-summary-card[aria-selected="true"],
-body:has(#header-broker-filters [data-broker="futu"].active) .broker-summary-card[data-broker="futu"],
-body:has(#header-broker-filters [data-broker="tiger"].active) .broker-summary-card[data-broker="tiger"],
-body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary-card[data-broker="phillips"] {
+.broker-summary-card[aria-selected="true"] {
   background: #eff4ff;
   border-color: #b2ccff;
   border-left-color: var(--accent);
@@ -1420,6 +1417,10 @@ table {
 }
 
 .account-mobile-label {
+  display: none;
+}
+
+.account-mobile-actions {
   display: none;
 }
 
@@ -3506,33 +3507,49 @@ tbody tr.active-row {
     border: 1px solid var(--line);
     border-radius: 8px;
     display: grid;
-    grid-template-columns: 1fr;
+    grid-template-areas:
+      "symbol symbol market-value weight pnl"
+      "market quantity price strategy strategy";
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     padding: 10px;
   }
 
   .account-holding-row td {
     border: 0;
     display: grid;
-    gap: 8px;
-    grid-template-columns: 88px minmax(0, 1fr);
+    gap: 3px;
+    grid-template-columns: minmax(0, 1fr);
     min-width: 0;
     overflow-wrap: anywhere;
-    padding: 4px 0;
+    padding: 6px 4px;
     text-align: left;
     white-space: normal;
   }
 
-  .account-holding-row td:nth-child(3) { order: 1; }
-  .account-holding-row td:nth-child(8) { order: 2; }
-  .account-holding-row td:nth-child(9) { order: 3; }
-  .account-holding-row td:nth-child(10) { order: 4; }
-  .account-holding-row td:nth-child(2) { order: 5; }
-  .account-holding-row td:nth-child(4) { order: 6; }
-  .account-holding-row td:nth-child(5) { order: 7; }
-  .account-holding-row td:nth-child(6) { order: 8; }
-  .account-holding-row td:nth-child(7) { order: 9; }
-  .account-holding-row td:nth-child(11) { order: 10; }
-  .account-holding-row td:nth-child(1) { order: 11; }
+  .account-holding-symbol { grid-area: symbol; }
+  .account-holding-market-value { grid-area: market-value; }
+  .account-holding-weight { grid-area: weight; }
+  .account-holding-pnl { grid-area: pnl; }
+  .account-holding-market { grid-area: market; }
+  .account-holding-quantity { grid-area: quantity; }
+  .account-holding-price { grid-area: price; }
+  .account-holding-strategy { grid-area: strategy; }
+
+  .account-holding-row .account-holding-actions,
+  .account-holding-row .account-holding-cost,
+  .account-holding-row .account-holding-usd-value {
+    display: none;
+  }
+
+  .account-mobile-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .account-mobile-actions .expand-button + .expand-button {
+    margin-left: 0;
+  }
 
   .account-mobile-label {
     color: var(--muted);

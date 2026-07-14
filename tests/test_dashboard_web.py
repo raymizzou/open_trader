@@ -1582,13 +1582,34 @@ console.log(renderBrokerSummaryCards() + elements["account-holdings"].innerHTML)
 
 def test_dashboard_account_holdings_mobile_layout_css() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
     mobile = css.split("@media (max-width: 760px) {", 1)[1]
 
     assert ".account-holdings-table thead" in mobile
     assert ".account-holding-row" in mobile
-    assert "grid-template-columns: 1fr;" in mobile
+    assert 'grid-template-areas:\n      "symbol symbol market-value weight pnl"\n      "market quantity price strategy strategy";' in mobile
+    assert "grid-template-columns: repeat(5, minmax(0, 1fr));" in mobile
+    for area in ("symbol", "market-value", "weight", "pnl", "market", "quantity", "price", "strategy"):
+        assert f"grid-area: {area};" in mobile
+    assert (
+        ".account-holding-row .account-holding-actions,\n"
+        "  .account-holding-row .account-holding-cost,\n"
+        "  .account-holding-row .account-holding-usd-value {"
+    ) in mobile
+    assert ".account-mobile-actions" in mobile
+    assert "display: flex;" in mobile
+    assert 'class="account-mobile-actions"' in js
+    assert "min-height: 44px;" in mobile
     assert ".account-mobile-label" in mobile
     assert "overflow-x: hidden;" in mobile
+
+
+def test_dashboard_has_no_removed_header_broker_filter_references() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+
+    assert "header-broker-filters" not in css
+    assert "header-broker-filters" not in js
 
 
 def test_dashboard_account_holdings_selects_only_one_broker_row_for_duplicate_symbol() -> None:

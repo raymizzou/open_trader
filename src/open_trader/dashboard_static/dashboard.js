@@ -2167,19 +2167,20 @@ function renderAccountTable(group, rows) {
     const display = row.display;
     const isSelected = selected && row.key === state.selectedHoldingKey;
     const selectedDetail = isSelected ? normalizeHoldingDetailMode(state.selectedHoldingDetail) : "";
+    const detailActions = `<button class="expand-button" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="decision" data-detail-market="${escapeHtml(display.market)}" data-detail-symbol="${escapeHtml(display.symbol)}">交易决策</button><button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
     const cells = `
       <tr class="account-holding-row ${isSelected ? "active-row" : ""}">
-        <td><span class="account-mobile-label">明细</span><button class="expand-button" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="decision" data-detail-market="${escapeHtml(display.market)}" data-detail-symbol="${escapeHtml(display.symbol)}">交易决策</button><button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button></td>
-        <td><span class="account-mobile-label">市场</span>${escapeHtml(formatPlain(display.market))}</td>
-        <td class="symbol-cell"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span></td>
-        <td class="number-cell"><span class="account-mobile-label">数量</span>${escapeHtml(formatPlain(display.total_quantity))}</td>
-        <td class="number-cell"><span class="account-mobile-label">成本价</span>${escapeHtml(formatPlain(display.avg_cost_price))}</td>
-        <td class="number-cell"><span class="account-mobile-label">实时价</span>${renderQuotePrice(display, quoteForHolding(display))}</td>
-        <td class="number-cell"><span class="account-mobile-label">美元市值</span>${escapeHtml(renderUsdMarketValue(display))}</td>
-        <td class="number-cell"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
-        <td class="number-cell"><span class="account-mobile-label">权重</span><strong>${escapeHtml(formatPlain(display.account_weight))}</strong><span class="meta-text">全组合 ${escapeHtml(formatPlain(display.portfolio_weight))}</span></td>
-        <td class="number-cell"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatPlain(display.unrealized_pnl_pct))}</td>
-        <td class="account-strategy-cell"><span class="account-mobile-label">策略</span>${renderAccountStrategyCell(group, row)}</td>
+        <td class="account-holding-actions"><span class="account-mobile-label">明细</span>${detailActions}</td>
+        <td class="account-holding-market"><span class="account-mobile-label">市场</span>${escapeHtml(formatPlain(display.market))}</td>
+        <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span></td>
+        <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatPlain(display.total_quantity))}</td>
+        <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatPlain(display.avg_cost_price))}</td>
+        <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderQuotePrice(display, quoteForHolding(display))}</td>
+        <td class="number-cell account-holding-usd-value"><span class="account-mobile-label">美元市值</span>${escapeHtml(renderUsdMarketValue(display))}</td>
+        <td class="number-cell account-holding-market-value"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
+        <td class="number-cell account-holding-weight"><span class="account-mobile-label">权重</span><strong>${escapeHtml(formatPlain(display.account_weight))}</strong><span class="meta-text">全组合 ${escapeHtml(formatPlain(display.portfolio_weight))}</span></td>
+        <td class="number-cell account-holding-pnl"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatPlain(display.unrealized_pnl_pct))}</td>
+        <td class="account-strategy-cell account-holding-strategy"><span class="account-mobile-label">策略</span>${renderAccountStrategyCell(group, row)}<span class="account-mobile-actions">${detailActions}</span></td>
       </tr>`;
     if (!isSelected) return cells;
     return `${cells}<tr class="decision-detail-row"><td colspan="${ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT}"><div class="symbol-detail-panel inline-symbol-detail">${selectedDetail === "t_signal"
@@ -2256,7 +2257,6 @@ function resetHoldingFilters() {
   state.marketFilter = "ALL";
   state.brokerFilter = "ALL";
   setFilterActiveByDataset(elements["header-market-filters"], "market", "ALL");
-  setFilterActiveByDataset(elements["header-broker-filters"], "broker", "ALL");
 }
 
 function setFilterActiveByDataset(container, datasetKey, value) {
