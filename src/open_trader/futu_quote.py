@@ -138,6 +138,38 @@ class FutuQuoteClient:
                 snapshots[code] = QuoteSnapshot(futu_symbol=code, last_price=price)
         return snapshots
 
+    def get_cn_trading_days(self, *, start: str, end: str) -> list[str]:
+        try:
+            from futu import TradeDateMarket
+
+            market = TradeDateMarket.CN
+        except ImportError:
+            market = "CN"
+        ret_code, data = self.context.request_trading_days(
+            market=market, start=start, end=end
+        )
+        if ret_code != 0:
+            message = str(data)
+            raise FutuQuoteError(
+                message,
+                error_type=(
+                    "quote_server_interrupted" if "网络中断" in message
+                    else "snapshot_failed"
+                ),
+                next_step=(
+                    QUOTE_INTERRUPTED_NEXT_STEP if "网络中断" in message
+                    else SNAPSHOT_FAILED_NEXT_STEP
+                ),
+                opend_reachable=True,
+                context_ok=True,
+                snapshot_ok=False,
+            )
+        return [
+            str(item.get("time", "")).strip()
+            for item in data
+            if str(item.get("time", "")).strip()
+        ]
+
     def get_daily_kline(
         self,
         futu_symbol: str,

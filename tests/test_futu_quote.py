@@ -37,6 +37,15 @@ class FakeOpenQuoteContext:
             ),
         )
 
+    def request_trading_days(
+        self, *, market: object, start: str, end: str
+    ) -> tuple[int, object]:
+        self.requested_trading_days = {"market": market, "start": start, "end": end}
+        return 0, [
+            {"time": "2026-07-14", "trade_date_type": "WHOLE"},
+            {"time": "", "trade_date_type": "WHOLE"},
+        ]
+
     def request_history_kline(
         self,
         symbol: str,
@@ -190,6 +199,42 @@ def test_futu_quote_client_returns_normalized_snapshots() -> None:
         "US.QQQ": QuoteSnapshot("US.QQQ", Decimal("510.25")),
     }
     assert client.context.requested_symbols == ["US.VIXY", "US.QQQ"]
+
+
+def test_futu_quote_client_returns_cn_trading_days() -> None:
+    from futu import TradeDateMarket
+
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    assert client.get_cn_trading_days(
+        start="2026-07-14", end="2026-07-20"
+    ) == ["2026-07-14"]
+    assert client.context.requested_trading_days == {
+        "market": TradeDateMarket.CN,
+        "start": "2026-07-14",
+        "end": "2026-07-20",
+    }
+
+
+def test_futu_quote_client_classifies_trading_calendar_failure() -> None:
+    class FailingCalendarContext(FakeOpenQuoteContext):
+        def request_trading_days(self, **kwargs: object) -> tuple[int, object]:
+            return -1, "网络中断"
+
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=FailingCalendarContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    with pytest.raises(FutuQuoteError) as exc_info:
+        client.get_cn_trading_days(start="2026-07-14", end="2026-07-14")
+
+    assert exc_info.value.error_type == "quote_server_interrupted"
 
 
 def test_futu_quote_client_returns_normalized_daily_kline() -> None:
