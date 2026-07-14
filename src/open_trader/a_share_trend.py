@@ -14,6 +14,12 @@ from zoneinfo import ZoneInfo
 from .kline_technical_facts import DailyKlineBar
 
 
+NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
+DISCLAIMER_TEXT = (
+    "本报告是确定性纪律清单，不是订单或成交事实；所有交易由用户人工确认与执行。"
+)
+
+
 @dataclass(frozen=True)
 class AccountPosition:
     symbol: str
@@ -535,7 +541,7 @@ def build_report(
             )
         if active_line is None and action == "HOLD":
             action, reason = "MANUAL_REVIEW", "holding_kline_unavailable"
-        effective_atr = current_atr or old_atr
+        effective_atr = current_atr if current_atr is not None else old_atr
         industry = snapshot.industry if snapshot else ""
         if industry:
             industries[industry] += 1
@@ -654,7 +660,7 @@ def render_markdown(report: TrendReport) -> str:
             "按东方财富实时价格向下重算为 100 股整数倍且不得超过建议金额。"
         )
     if not sells and not report.buy_actions:
-        lines.append("现金也是有效仓位，本日无需交易。")
+        lines.append(NO_ACTION_TEXT)
     lines.extend(["", "## 行业集中度", ""])
     if report.industry_concentration:
         lines.extend(
@@ -684,7 +690,7 @@ def render_markdown(report: TrendReport) -> str:
             "",
             "## 免责声明",
             "",
-            "本报告是确定性纪律清单，不是订单或成交事实；所有交易由用户人工确认与执行。",
+            DISCLAIMER_TEXT,
             "",
         ]
     )
@@ -699,6 +705,46 @@ def _json_value(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return [_json_value(item) for item in value]
     return value
+
+
+def _report_payload(report: TrendReport) -> dict[str, object]:
+    holding_decisions = [_json_value(asdict(item)) for item in report.holdings]
+    top10_candidates = [_json_value(asdict(item)) for item in report.candidates]
+    formal_actions = [
+        _json_value(asdict(item))
+        for item in report.holdings
+        if item.action == "SELL_ALL"
+    ]
+    formal_actions.extend(
+        {
+            **_json_value(asdict(item)),  # type: ignore[arg-type]
+            "action": "BUY",
+            "valid_window": f"{report.execution_date} 09:30–10:00",
+        }
+        for item in report.buy_actions
+    )
+    payload = {
+        "schema_version": report.schema_version,
+        "as_of_date": report.as_of_date,
+        "execution_date": report.execution_date,
+        "account": _json_value(asdict(report.account)),
+        "api_facts": list(report.api_facts),
+        "strategy_judgments": {
+            "holding_decisions": holding_decisions,
+            "top10_candidates": top10_candidates,
+            "formal_actions": formal_actions,
+        },
+        "industry_concentration": _json_value(report.industry_concentration),
+        "excluded": report.excluded,
+        "data_sources": list(report.data_sources),
+        "estimated_api_cost": _json_value(report.estimated_api_cost),
+        "actual_api_cost": _json_value(report.actual_api_cost),
+        "protection_state": report.protection_state,
+        "disclaimer": DISCLAIMER_TEXT,
+    }
+    if not formal_actions:
+        payload["no_action"] = NO_ACTION_TEXT
+    return payload
 
 
 def load_protection_state(path: Path) -> dict[str, object]:
@@ -798,6 +844,8 @@ def write_frozen_report(
 
     markdown_temp: Path | None = None
     json_temp: Path | None = None
+    markdown_backup: Path | None = None
+    json_backup: Path | None = None
     try:
         with NamedTemporaryFile(
             "w", encoding="utf-8", delete=False, dir=reports_dir
@@ -808,7 +856,7 @@ def write_frozen_report(
             "w", encoding="utf-8", delete=False, dir=reports_dir
         ) as handle:
             json.dump(
-                _json_value(asdict(report)),
+                _report_payload(report),
                 handle,
                 ensure_ascii=False,
                 indent=2,
@@ -816,11 +864,40 @@ def write_frozen_report(
             )
             handle.write("\n")
             json_temp = Path(handle.name)
-        markdown_temp.replace(markdown_path)
-        json_temp.replace(json_path)
+        if markdown_path.exists():
+            with NamedTemporaryFile("wb", delete=False, dir=reports_dir) as handle:
+                handle.write(markdown_path.read_bytes())
+                markdown_backup = Path(handle.name)
+        if json_path.exists():
+            with NamedTemporaryFile("wb", delete=False, dir=reports_dir) as handle:
+                handle.write(json_path.read_bytes())
+                json_backup = Path(handle.name)
+        try:
+            markdown_temp.replace(markdown_path)
+            json_temp.replace(json_path)
+        except Exception as replace_error:
+            rollback_error: Exception | None = None
+            for final_path, backup_path in (
+                (markdown_path, markdown_backup),
+                (json_path, json_backup),
+            ):
+                try:
+                    if backup_path is None:
+                        final_path.unlink(missing_ok=True)
+                    else:
+                        backup_path.replace(final_path)
+                except Exception as exc:
+                    rollback_error = rollback_error or exc
+            if rollback_error is not None:
+                raise rollback_error from replace_error
+            raise
         return markdown_path, json_path
     finally:
         if markdown_temp is not None:
             markdown_temp.unlink(missing_ok=True)
         if json_temp is not None:
             json_temp.unlink(missing_ok=True)
+        if markdown_backup is not None:
+            markdown_backup.unlink(missing_ok=True)
+        if json_backup is not None:
+            json_backup.unlink(missing_ok=True)

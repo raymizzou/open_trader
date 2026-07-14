@@ -868,6 +868,32 @@ def test_candidate_row_shows_industry_slots_and_weight() -> None:
     assert "行业 电力（已占 0 个席位，当前仓位 0.00%）" in markdown
 
 
+def test_flat_bars_keep_zero_atr_in_state_and_render() -> None:
+    flat = [
+        DailyKlineBar(
+            date=f"2026-06-{index + 1:02d}",
+            open=10,
+            high=10,
+            low=10,
+            close=10,
+            volume=100,
+        )
+        for index in range(15)
+    ]
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={"600001": flat},
+    )
+
+    assert built.holdings[0].atr == Decimal("0")
+    assert built.protection_state["positions"]["600001"]["atr14"] == "0"
+    assert "活动保护线 10.00" in render_markdown(built)
+
+
 def test_frozen_base_artifact_is_idempotent(tmp_path: Path) -> None:
     first = report()
     markdown_path, json_path = write_frozen_report(first, tmp_path)
@@ -888,3 +914,97 @@ def test_frozen_revisions_choose_first_free_pair(tmp_path: Path) -> None:
     base = report()
     assert write_frozen_report(base, tmp_path, revision=True)[0].name == "2026-07-14-r1.md"
     assert write_frozen_report(base, tmp_path, revision=True)[0].name == "2026-07-14-r2.md"
+
+
+@pytest.mark.parametrize("failed_suffix", [".md", ".json"])
+def test_new_frozen_pair_rolls_back_any_failed_final_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_suffix: str
+) -> None:
+    original_replace = Path.replace
+    failed = False
+
+    def fail_once(path: Path, target: Path) -> Path:
+        nonlocal failed
+        if not failed and Path(target).suffix == failed_suffix:
+            failed = True
+            raise OSError("injected final replace failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_once)
+
+    with pytest.raises(OSError, match="injected final replace failure"):
+        write_frozen_report(report(), tmp_path)
+
+    assert not (tmp_path / "2026-07-14.md").exists()
+    assert not (tmp_path / "2026-07-14.json").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("existing_suffix", [".md", ".json"])
+@pytest.mark.parametrize("failed_suffix", [".md", ".json"])
+def test_partial_frozen_pair_restores_preexisting_final_on_any_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_suffix: str,
+    failed_suffix: str,
+) -> None:
+    existing = tmp_path / f"2026-07-14{existing_suffix}"
+    existing.write_text("old generation", encoding="utf-8")
+    original_replace = Path.replace
+    failed = False
+
+    def fail_once(path: Path, target: Path) -> Path:
+        nonlocal failed
+        if not failed and Path(target).suffix == failed_suffix:
+            failed = True
+            raise OSError("injected final replace failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_once)
+
+    with pytest.raises(OSError, match="injected final replace failure"):
+        write_frozen_report(report(), tmp_path)
+
+    assert existing.read_text(encoding="utf-8") == "old generation"
+    other_suffix = ".json" if existing_suffix == ".md" else ".md"
+    assert not (tmp_path / f"2026-07-14{other_suffix}").exists()
+    assert set(tmp_path.iterdir()) == {existing}
+
+
+def test_frozen_json_has_explicit_no_action_strategy_contract(tmp_path: Path) -> None:
+    _, json_path = write_frozen_report(report(), tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert payload["disclaimer"] == (
+        "本报告是确定性纪律清单，不是订单或成交事实；所有交易由用户人工确认与执行。"
+    )
+    assert payload["no_action"] == "现金也是有效仓位，本日无需交易。"
+    assert payload["api_facts"] == ["A股数据日期：2026-07-14"]
+    assert payload["strategy_judgments"] == {
+        "holding_decisions": [],
+        "top10_candidates": [],
+        "formal_actions": [],
+    }
+
+
+def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600009"),
+        candidates=(candidate("600001"),),
+        holding_snapshots={"600009": holding("600009", danger=True)},
+        bars_by_symbol={"600009": None},
+        api_facts=("A股数据日期：2026-07-14",),
+    )
+    _, json_path = write_frozen_report(built, tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    judgments = payload["strategy_judgments"]
+
+    assert [item["symbol"] for item in judgments["holding_decisions"]] == ["600009"]
+    assert [item["symbol"] for item in judgments["top10_candidates"]] == ["600001"]
+    assert [(item["action"], item["symbol"]) for item in judgments["formal_actions"]] == [
+        ("SELL_ALL", "600009"),
+        ("BUY", "600001"),
+    ]
+    assert "no_action" not in payload
