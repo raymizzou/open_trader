@@ -259,7 +259,7 @@ def _check_account_holdings(page: Any) -> None:
     for required in (
         "富途", "中短线", "股票与期权", "老虎", "长线", "SMA200 组合策略",
         "辉立", "中线策略", "东方财富", "偏短线", "趋势交易",
-        "策略指标待接入", "夏普比率", "卡玛比率", "目标", "漂移",
+        "策略指标待接入", "夏普比率", "卡玛比率",
     ):
         assert required in text, f"账户持仓视图缺少 {required}"
     assert page.locator(".account-section").count() == 4, "账户区块数量不是 4"

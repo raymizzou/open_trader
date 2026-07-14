@@ -1410,17 +1410,7 @@ table {
   width: 100%;
 }
 
-.account-strategy-cell {
-  display: grid;
-  gap: 3px;
-  overflow-wrap: anywhere;
-}
-
 .account-mobile-label {
-  display: none;
-}
-
-.account-mobile-actions {
   display: none;
 }
 
@@ -3508,9 +3498,9 @@ tbody tr.active-row {
     border-radius: 8px;
     display: grid;
     grid-template-areas:
-      "symbol symbol market-value weight pnl"
-      "market quantity price strategy strategy";
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+      "symbol symbol market-value account-weight portfolio-weight pnl"
+      "market quantity price actions actions actions";
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     padding: 10px;
   }
 
@@ -3528,27 +3518,17 @@ tbody tr.active-row {
 
   .account-holding-symbol { grid-area: symbol; }
   .account-holding-market-value { grid-area: market-value; }
-  .account-holding-weight { grid-area: weight; }
+  .account-holding-account-weight { grid-area: account-weight; }
+  .account-holding-portfolio-weight { grid-area: portfolio-weight; }
   .account-holding-pnl { grid-area: pnl; }
   .account-holding-market { grid-area: market; }
   .account-holding-quantity { grid-area: quantity; }
   .account-holding-price { grid-area: price; }
-  .account-holding-strategy { grid-area: strategy; }
+  .account-holding-actions { grid-area: actions; }
 
-  .account-holding-row .account-holding-actions,
   .account-holding-row .account-holding-cost,
   .account-holding-row .account-holding-usd-value {
     display: none;
-  }
-
-  .account-mobile-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-  }
-
-  .account-mobile-actions .expand-button + .expand-button {
-    margin-left: 0;
   }
 
   .account-mobile-label {

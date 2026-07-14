@@ -127,16 +127,6 @@ const REASON_LABELS = {
   "missing quote": "缺失行情。",
 };
 
-const TIGER_TREND_LABELS = {
-  LONG: "多头",
-  CASH: "现金",
-  INELIGIBLE: "不符合资格",
-};
-
-const TIGER_ELIGIBILITY_LABELS = {
-  insufficient_sma200_history: "SMA200 历史不足",
-};
-
 const TIGER_GATE_LABELS = {
   sharpe_undefined: "夏普比率无法计算",
   sharpe_below_floor: "夏普比率低于门槛",
@@ -1871,27 +1861,6 @@ function renderAccountStrategy(group) {
   </div>`;
 }
 
-function tigerMemberBySymbol(symbol) {
-  const members = state.dashboard?.tiger_long_term_strategy?.members;
-  return (Array.isArray(members) ? members : []).find((member) => (
-    String(member.symbol || "").toUpperCase() === String(symbol || "").toUpperCase()
-  )) || null;
-}
-
-function renderAccountStrategyCell(group, row) {
-  if (group.broker !== "tiger") {
-    return `<strong>${escapeHtml(group.profile.strategy)}</strong><span>策略指标待接入</span>`;
-  }
-  const member = tigerMemberBySymbol(row.display.symbol);
-  if (!member) return "策略数据缺失";
-  const trend = TIGER_TREND_LABELS[member.trend] || "未知";
-  const reason = member.eligibility_reason
-    ? TIGER_ELIGIBILITY_LABELS[member.eligibility_reason] || "资格条件未满足" : "";
-  return `<strong>${escapeHtml(trend)}</strong><span>${escapeHtml(
-    `目标 ${decisionPlanWeight(member.target_weight)} · 漂移 ${decisionPlanWeight(member.drift)}${reason ? ` · ${reason}` : ""}`
-  )}</span>`;
-}
-
 function renderHeaderSummary() {
   const summary = currentViewSummary();
   elements["current-view-value"].textContent = formatMoney(summary.portfolio_value_hkd, "HKD");
@@ -2178,9 +2147,9 @@ function renderAccountTable(group, rows) {
         <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderQuotePrice(display, quoteForHolding(display))}</td>
         <td class="number-cell account-holding-usd-value"><span class="account-mobile-label">美元市值</span>${escapeHtml(renderUsdMarketValue(display))}</td>
         <td class="number-cell account-holding-market-value"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
-        <td class="number-cell account-holding-weight"><span class="account-mobile-label">权重</span><strong>${escapeHtml(formatPlain(display.account_weight))}</strong><span class="meta-text">全组合 ${escapeHtml(formatPlain(display.portfolio_weight))}</span></td>
+        <td class="number-cell account-holding-account-weight"><span class="account-mobile-label">账户权重</span>${escapeHtml(formatPlain(display.account_weight))}</td>
+        <td class="number-cell account-holding-portfolio-weight"><span class="account-mobile-label">组合权重</span>${escapeHtml(formatPlain(display.portfolio_weight))}</td>
         <td class="number-cell account-holding-pnl"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatPlain(display.unrealized_pnl_pct))}</td>
-        <td class="account-strategy-cell account-holding-strategy"><span class="account-mobile-label">策略</span>${renderAccountStrategyCell(group, row)}<span class="account-mobile-actions">${detailActions}</span></td>
       </tr>`;
     if (!isSelected) return cells;
     return `${cells}<tr class="decision-detail-row"><td colspan="${ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT}"><div class="symbol-detail-panel inline-symbol-detail">${selectedDetail === "t_signal"
@@ -2188,7 +2157,7 @@ function renderAccountTable(group, rows) {
       : renderSymbolDetail(holding, row.index)}</div></td></tr>`;
   }).join("");
   return `<table class="account-holdings-table"><thead><tr>${[
-    "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值", "港元市值", "权重", "盈亏", "策略",
+    "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值", "港元市值", "账户权重", "组合权重", "盈亏",
   ].map((label) => `<th>${label}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
 }
 

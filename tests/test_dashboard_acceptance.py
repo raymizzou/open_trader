@@ -282,7 +282,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             if self.selector == "#account-holdings":
                 return (
                     "富途中短线股票与期权策略指标待接入 "
-                    "老虎长线SMA200 组合策略夏普比率卡玛比率多头目标 10% 漂移 "
+                    "老虎长线SMA200 组合策略夏普比率卡玛比率 "
                     "辉立中线中线策略策略指标待接入 "
                     "东方财富偏短线趋势交易策略指标待接入"
                 )
@@ -448,7 +448,7 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
         def inner_text(self) -> str:
             return (
                 "富途中短线股票与期权策略指标待接入 "
-                "老虎长线SMA200 组合策略夏普比率卡玛比率多头目标 10% 漂移 "
+                "老虎长线SMA200 组合策略夏普比率卡玛比率 "
                 "辉立中线中线策略策略指标待接入 "
                 "东方财富偏短线趋势交易策略指标待接入"
             )
@@ -655,7 +655,7 @@ def test_check_cn_filter_keeps_four_accounts_and_validates_rows_or_empty_state()
 def test_check_account_holdings_rejects_missing_profile_or_metric(missing: str) -> None:
     text = (
         "富途中短线股票与期权策略指标待接入 "
-        "老虎长线SMA200 组合策略夏普比率卡玛比率多头目标 10% 漂移 "
+        "老虎长线SMA200 组合策略夏普比率卡玛比率 "
         "辉立中线中线策略策略指标待接入 "
         "东方财富偏短线趋势交易策略指标待接入"
     ).replace(missing, "")

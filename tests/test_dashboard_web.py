@@ -29,7 +29,10 @@ def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
 
-    for label in ("明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值", "港元市值", "权重", "盈亏", "策略"):
+    for label in (
+        "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值",
+        "港元市值", "账户权重", "组合权重", "盈亏",
+    ):
         assert f'"{label}"' in js
     assert 'data-market="CN">A 股</button>' in html
     for forbidden_id in ("a-share-panel", "a-share-card", "cn-panel", "cn-card"):
@@ -1574,8 +1577,13 @@ console.log(renderBrokerSummaryCards() + elements["account-holdings"].innerHTML)
         assert label in output
     for metric in ("年化收益", "最大回撤", "夏普比率", "卡玛比率"):
         assert metric in output
-    for required in ("多头", "目标 10%", "漂移", "策略指标待接入"):
-        assert required in output
+    assert "策略指标待接入" in output
+    assert "<th>账户权重</th>" in output
+    assert "<th>组合权重</th>" in output
+    assert "<th>策略</th>" not in output
+    assert "account-holding-account-weight" in output
+    assert "account-holding-portfolio-weight" in output
+    assert "account-holding-strategy" not in output
     assert "calibration_required" not in output
     assert "tiger-long-term-panel" not in output
 
@@ -1587,18 +1595,19 @@ def test_dashboard_account_holdings_mobile_layout_css() -> None:
 
     assert ".account-holdings-table thead" in mobile
     assert ".account-holding-row" in mobile
-    assert 'grid-template-areas:\n      "symbol symbol market-value weight pnl"\n      "market quantity price strategy strategy";' in mobile
-    assert "grid-template-columns: repeat(5, minmax(0, 1fr));" in mobile
-    for area in ("symbol", "market-value", "weight", "pnl", "market", "quantity", "price", "strategy"):
+    assert 'grid-template-areas:\n      "symbol symbol market-value account-weight portfolio-weight pnl"\n      "market quantity price actions actions actions";' in mobile
+    assert "grid-template-columns: repeat(6, minmax(0, 1fr));" in mobile
+    for area in (
+        "symbol", "market-value", "account-weight", "portfolio-weight", "pnl",
+        "market", "quantity", "price", "actions",
+    ):
         assert f"grid-area: {area};" in mobile
     assert (
-        ".account-holding-row .account-holding-actions,\n"
-        "  .account-holding-row .account-holding-cost,\n"
+        ".account-holding-row .account-holding-cost,\n"
         "  .account-holding-row .account-holding-usd-value {"
     ) in mobile
-    assert ".account-mobile-actions" in mobile
-    assert "display: flex;" in mobile
-    assert 'class="account-mobile-actions"' in js
+    assert ".account-mobile-actions" not in mobile
+    assert 'class="account-mobile-actions"' not in js
     assert "min-height: 44px;" in mobile
     assert ".account-mobile-label" in mobile
     assert "overflow-x: hidden;" in mobile
@@ -1655,7 +1664,7 @@ def test_dashboard_static_contains_account_holdings_mount() -> None:
     assert 'aria-live="polite"' in html
 
 
-def test_dashboard_js_renders_tiger_strategy_inside_account() -> None:
+def test_dashboard_js_renders_tiger_strategy_summary_inside_account() -> None:
     strategy = tiger_long_term_dashboard_payload()
     strategy["members"].append({  # type: ignore[union-attr]
         "symbol": "DRAM",
@@ -1677,7 +1686,7 @@ def test_dashboard_js_renders_tiger_strategy_inside_account() -> None:
     output = run_dashboard_js(f"""
 state.dashboard = {{ tiger_long_term_strategy: {payload} }};
 const group = {{broker: "tiger", profile: ACCOUNT_STRATEGY_PROFILES.tiger}};
-console.log(renderAccountStrategy(group) + renderAccountStrategyCell(group, {{display: {{symbol: "DRAM"}}}}));
+console.log(renderAccountStrategy(group));
 """)
 
     for required in (
@@ -1689,12 +1698,8 @@ console.log(renderAccountStrategy(group) + renderAccountStrategyCell(group, {{di
         "卡玛比率",
         "风险组上限 30%",
         "仅供人工复核",
-        "不符合资格",
-        "SMA200 历史不足",
         "数据来源不完整",
         "需要校准",
-        "目标 0%",
-        "漂移",
     ):
         assert required in output
     for forbidden in (
@@ -3021,9 +3026,14 @@ console.log(html.slice(start, end));
 def test_dashboard_holdings_table_uses_compact_asset_columns() -> None:
     js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
 
-    for label in ("明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值", "港元市值", "权重", "盈亏", "策略"):
+    for label in (
+        "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值",
+        "港元市值", "账户权重", "组合权重", "盈亏",
+    ):
         assert f'"{label}"' in js
-    assert '"券商"' not in js.split("function renderAccountTable", 1)[1].split("function holdingKey", 1)[0]
+    table_renderer = js.split("function renderAccountTable", 1)[1].split("function holdingKey", 1)[0]
+    assert '"券商"' not in table_renderer
+    assert '"策略"' not in table_renderer
 
 
 def test_dashboard_display_helpers_keep_raw_english_out_of_chinese_ui() -> None:
@@ -4768,10 +4778,13 @@ for (const broker of ["futu", "tiger", "phillips", "eastmoney"]) {
 if (renderedHoldings.includes("美股正股") || renderedHoldings.includes("美股期权")) {
   throw new Error("account tables should not contain nested market sections: " + renderedHoldings);
 }
-for (const required of ["成本价", "美元市值", "港元市值", "权重", "策略", "USD 1940.00", "HKD 15132.00", "策略指标待接入"]) {
+for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1940.00", "HKD 15132.00", "策略指标待接入"]) {
   if (!renderedHoldings.includes(required)) {
     throw new Error("account holdings missing " + required + ": " + renderedHoldings);
   }
+}
+if (renderedHoldings.includes("<th>策略</th>")) {
+  throw new Error("account holdings should not render row strategy column: " + renderedHoldings);
 }
 const holdingRows = renderedHoldings.match(/account-holding-row/g) || [];
 if (holdingRows.length !== 6) throw new Error("account tables should render six broker rows: " + renderedHoldings);
