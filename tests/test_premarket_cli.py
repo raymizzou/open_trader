@@ -363,6 +363,27 @@ def test_trend_a_share_report_whitespace_api_key_returns_two(
     assert "TREND_ANIMALS_API_KEY" in capsys.readouterr().err
 
 
+def test_trend_a_share_report_wrong_positive_pool_id_returns_two(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        trend_animals_api_key="secret",
+        trend_animals_a_share_tm_id=1,
+        trend_animals_etf_tm_id=697199,
+    )
+    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
+    monkeypatch.setattr(
+        cli,
+        "run_a_share_trend_report",
+        lambda **kwargs: pytest.fail("invalid config must not run"),
+    )
+
+    assert cli.main(["trend-a-share-report"]) == 2
+    assert "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID" in capsys.readouterr().err
+
+
 def test_watch_trend_a_share_parser_has_safe_defaults() -> None:
     args = build_parser().parse_args(["watch-trend-a-share"])
 

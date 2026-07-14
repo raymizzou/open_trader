@@ -227,6 +227,29 @@ def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("symbol", "name", "futu_symbol"),
+    [
+        ("920000", "北交所持仓", "BJ.920000"),
+        ("600001", "*ST持仓", "SH.600001"),
+    ],
+)
+def test_watcher_monitors_every_current_cn_holding_even_if_not_candidate_eligible(
+    tmp_path: Path, symbol: str, name: str, futu_symbol: str
+) -> None:
+    quote = SequenceQuote([{futu_symbol: Decimal("10")}])
+
+    result = run_once(
+        tmp_path,
+        quote=quote,
+        portfolio_path=portfolio(tmp_path, symbol=symbol, name=name),
+        state_path=state(tmp_path, symbol=symbol, active_line="9"),
+    )
+
+    assert result.watched_symbol_count == 1
+    assert quote.snapshot_calls == [[futu_symbol]]
+
+
 def test_holiday_exits_silently(tmp_path: Path) -> None:
     quote = SequenceQuote([], trading_days=[])
     notifier = RecordingNotifier()

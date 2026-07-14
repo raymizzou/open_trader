@@ -189,7 +189,6 @@ def watch_a_share_protection(
                     positions = {
                         item.symbol: item
                         for item in account.positions
-                        if _eligible_position(item.symbol, item.name)
                     }
                     active_lines = _load_active_lines(state_path)
                     prior_events = load_watch_events(events_path)
@@ -358,17 +357,6 @@ def _optional_decimal(value: object) -> Decimal | None:
     except (InvalidOperation, ValueError, AttributeError):
         return None
     return result if result.is_finite() else None
-
-
-def _eligible_position(symbol: str, name: str) -> bool:
-    normalized_name = name.strip().upper()
-    return (
-        len(symbol) == 6
-        and symbol.isdigit()
-        and symbol[0] in "01356"
-        and not normalized_name.startswith(("ST", "*ST"))
-        and "退" not in normalized_name
-    )
 
 
 def _record_interruption(

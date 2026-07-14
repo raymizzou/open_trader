@@ -5,7 +5,7 @@ import json
 import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -145,6 +145,7 @@ class HoldingDecision:
 @dataclass(frozen=True)
 class TrendReport:
     schema_version: int
+    generated_at: str
     as_of_date: str
     execution_date: str
     account: AccountSnapshot
@@ -158,6 +159,8 @@ class TrendReport:
     estimated_api_cost: Decimal | None
     actual_api_cost: Decimal | None
     protection_state: dict[str, object]
+    signal_snapshots: dict[str, object]
+    metadata: dict[str, object]
 
 
 def _broker_set(value: str) -> set[str]:
@@ -339,7 +342,7 @@ def evaluate_candidate(
 
 def _excluded_name(name: str) -> bool:
     normalized = name.strip().upper()
-    return normalized.startswith("ST") or normalized.startswith("*ST") or "退" in name
+    return "ST" in normalized or "退" in name
 
 
 def _candidate_reasons(
@@ -439,7 +442,7 @@ def estimate_buy_actions(
                 estimated_initial_line=item.close - Decimal("2") * item.atr,
             )
         )
-        remaining_cash -= item.close * shares
+        remaining_cash -= amount
         slots -= 1
     return actions
 
@@ -475,12 +478,20 @@ def _holding_action(
 ) -> tuple[str, str]:
     if symbol in triggered:
         return "SELL_ALL", "protection_line_already_triggered"
-    if snapshot is None or snapshot.right_side is None or snapshot.danger is None:
-        return "MANUAL_REVIEW", "holding_signal_unknown"
-    if snapshot.danger is True:
+    if snapshot is not None and snapshot.danger is True:
         return "SELL_ALL", "danger_signal"
-    if snapshot.right_side is False:
+    if snapshot is not None and snapshot.right_side is False:
         return "SELL_ALL", "left_trend_right_side"
+    if snapshot is None or any(
+        signal is None
+        for signal in (
+            snapshot.right_side,
+            snapshot.danger,
+            snapshot.boiling,
+            snapshot.champagne,
+        )
+    ):
+        return "MANUAL_REVIEW", "holding_signal_unknown"
     return "HOLD", "trend_intact"
 
 
@@ -522,6 +533,8 @@ def build_report(
     data_sources: Sequence[str] = (),
     estimated_api_cost: Decimal | None = None,
     actual_api_cost: Decimal | None = None,
+    generated_at: str | None = None,
+    metadata: Mapping[str, object] | None = None,
 ) -> TrendReport:
     held_symbols = {position.symbol for position in account.positions}
     candidate_decision = build_candidate_list(
@@ -623,8 +636,22 @@ def build_report(
         )
         for industry, count in sorted(industries.items())
     )
+    holding_signals = {
+        position.symbol: (
+            _holding_signal(holding_snapshots[position.symbol])
+            if holding_snapshots.get(position.symbol) is not None
+            else None
+        )
+        for position in account.positions
+    }
+    excluded_signals = {
+        symbol: [_candidate_signal(item) for item in candidates if item.symbol == symbol]
+        for symbol in candidate_decision.excluded
+    }
     return TrendReport(
         schema_version=1,
+        generated_at=generated_at
+        or datetime.now(SHANGHAI).isoformat(timespec="seconds"),
         as_of_date=as_of_date,
         execution_date=execution_date,
         account=account,
@@ -638,7 +665,38 @@ def build_report(
         estimated_api_cost=estimated_api_cost,
         actual_api_cost=actual_api_cost,
         protection_state={"schema_version": 1, "positions": new_positions},
+        signal_snapshots={
+            "holdings": holding_signals,
+            "excluded": excluded_signals,
+        },
+        metadata=dict(metadata or {}),
     )
+
+
+def _holding_signal(item: HoldingSnapshot) -> dict[str, object]:
+    return {
+        "tm_id": item.tm_id,
+        "symbol": item.symbol,
+        "as_of_date": item.as_of_date,
+        "right_side": item.right_side,
+        "danger": item.danger,
+        "boiling": item.boiling,
+        "champagne": item.champagne,
+    }
+
+
+def _candidate_signal(item: CandidateInput) -> dict[str, object]:
+    return {
+        "tm_id": item.tm_id,
+        "symbol": item.symbol,
+        "as_of_date": item.as_of_date,
+        "tradable": item.tradable,
+        "amount": item.amount,
+        "right_side": item.right_side,
+        "days": item.days,
+        "strength": item.strength,
+        "danger": item.danger,
+    }
 
 
 def _money(value: Decimal) -> str:
@@ -656,6 +714,7 @@ def render_markdown(report: TrendReport) -> str:
         "",
         "## 日期与账户新鲜度",
         "",
+        f"- 生成时间：{report.generated_at}",
         f"- 数据日期：{report.as_of_date}",
         f"- 下一执行日：{report.execution_date}",
         f"- 东方财富账户日期：{report.account.source_date}（{freshness}）",
@@ -673,6 +732,13 @@ def render_markdown(report: TrendReport) -> str:
             line = f"- {item.symbol} {item.name}：{item.action}（{item.reason}）"
             if item.active_line is not None:
                 line += f"，活动保护线 {_money(item.active_line)}"
+            signal = report.signal_snapshots["holdings"].get(item.symbol)  # type: ignore[union-attr]
+            if isinstance(signal, Mapping):
+                line += (
+                    f"；API信号 right_side={signal.get('right_side')}, "
+                    f"danger={signal.get('danger')}, boiling={signal.get('boiling')}, "
+                    f"champagne={signal.get('champagne')}"
+                )
             lines.append(line)
     else:
         lines.append("- 当前无趋势持仓。")
@@ -714,7 +780,13 @@ def render_markdown(report: TrendReport) -> str:
         lines.append("- 当前无行业持仓集中事实。")
     lines.extend(["", "## 排除项与账户例外", ""])
     for symbol, reasons in report.excluded.items():
-        lines.append(f"- {symbol}：{', '.join(reasons)}")
+        snapshots = report.signal_snapshots["excluded"].get(symbol)  # type: ignore[union-attr]
+        signal_text = ""
+        if isinstance(snapshots, list) and snapshots:
+            signal_text = "; API信号 " + ", ".join(
+                f"{key}={value}" for key, value in snapshots[0].items()
+            )
+        lines.append(f"- {symbol}：{', '.join(reasons)}{signal_text}")
     lines.extend(f"- 账户例外：{item}" for item in report.account.exceptions)
     if not report.excluded and not report.account.exceptions:
         lines.append("- 无。")
@@ -768,6 +840,7 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
     )
     payload = {
         "schema_version": report.schema_version,
+        "generated_at": report.generated_at,
         "as_of_date": report.as_of_date,
         "execution_date": report.execution_date,
         "account": _json_value(asdict(report.account)),
@@ -783,8 +856,14 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "estimated_api_cost": _json_value(report.estimated_api_cost),
         "actual_api_cost": _json_value(report.actual_api_cost),
         "protection_state": report.protection_state,
+        "signal_snapshots": _json_value(report.signal_snapshots),
+        "metadata": _json_value(report.metadata),
         "disclaimer": DISCLAIMER_TEXT,
     }
+    for key in ("delivery_status", "process_version"):
+        value = report.metadata.get(key)
+        if isinstance(value, str) and value:
+            payload[key] = value
     if not formal_actions:
         payload["no_action"] = NO_ACTION_TEXT
     return payload
@@ -971,21 +1050,36 @@ def _write_run_log(path: Path, payload: Mapping[str, object], *, append: bool) -
         handle.write("\n")
 
 
-def _patch_json(path: Path, values: Mapping[str, object]) -> None:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("frozen report JSON must be an object")
-    payload.update(values)
+def _write_delivery_receipt(path: Path, *, status: str, generated_at: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     try:
         with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=path.parent) as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(
+                {"status": status, "generated_at": generated_at},
+                handle,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
             handle.write("\n")
             temp_path = Path(handle.name)
         temp_path.replace(path)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+def _read_delivery_receipt(path: Path) -> str:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ""
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("delivery receipt is unreadable or malformed") from None
+    status = payload.get("status") if isinstance(payload, dict) else None
+    if status not in {"pending", "sent", "delivery_failed"}:
+        raise ValueError("delivery receipt has an invalid status")
+    return status
 
 
 def _notify_status(notifier: Notifier, title: str, message: str) -> None:
@@ -1205,9 +1299,13 @@ def _attempt_report(
                     holding_snapshots[symbol] = None
             try:
                 returned = holding_snapshots[symbol]
-                exchange = returned.exchange if returned is not None else "SH"
+                futu_symbol = (
+                    f"{returned.exchange}.{symbol}"
+                    if returned is not None
+                    else to_futu_symbol("CN", symbol)
+                )
                 bars_by_symbol[symbol] = quote.get_daily_kline(
-                    f"{exchange}.{symbol}", start=kline_start, end=run_date
+                    futu_symbol, start=kline_start, end=run_date
                 )
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
@@ -1217,7 +1315,14 @@ def _attempt_report(
         estimated_cost = sum(
             (_billing_price(billing[field]) for field in fields), Decimal("0")
         ) * len(requested_ids)
-        actual_cost = max(Decimal("0"), balance_before - balance_after)
+        balance_delta = balance_before - balance_after
+        actual_cost = balance_delta if balance_delta >= 0 else None
+        cache_events = tuple(getattr(api, "paid_cache_events", ()))
+        cache_metadata = {
+            "hits": sum(event.get("cache") == "hit" for event in cache_events),
+            "misses": sum(event.get("cache") == "miss" for event in cache_events),
+            "events": [dict(event) for event in cache_events],
+        }
         report = build_report(
             as_of_date=run_date,
             execution_date=execution_date,
@@ -1239,31 +1344,53 @@ def _attempt_report(
             data_sources=("Trend Animals", "Futu CN calendar/QFQ daily K-line", str(config.portfolio)),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost,
-        )
-        markdown_path, json_path = write_frozen_report(
-            report,
-            config.reports_dir / "trend_a_share",
-            revision=revision,
+            metadata={"paid_response_cache": cache_metadata},
         )
         write_protection_state(
             config.data_dir / "trend_a_share/protection_state.json",
             report.protection_state,
         )
-        markdown = markdown_path.read_text(encoding="utf-8")
-        attempts = send_notification_with_results(
-            notifier,
-            f"A股趋势操作计划 · {report.as_of_date}",
-            markdown,
-            channels={"feishu", "feishu_app"},
+        receipt_path = config.data_dir / "trend_a_share/delivery" / f"{run_date}.json"
+        prior_delivery = _read_delivery_receipt(receipt_path)
+        if prior_delivery:
+            delivery_status = f"{prior_delivery}_prior_attempt"
+        else:
+            _write_delivery_receipt(
+                receipt_path,
+                status="pending",
+                generated_at=report.generated_at,
+            )
+            attempts = send_notification_with_results(
+                notifier,
+                f"A股趋势操作计划 · {report.as_of_date}",
+                render_markdown(report),
+                channels={"feishu", "feishu_app"},
+            )
+            delivery_status = (
+                "sent"
+                if any(
+                    item.channel.startswith("feishu") and item.success
+                    for item in attempts
+                )
+                else "delivery_failed"
+            )
+            _write_delivery_receipt(
+                receipt_path,
+                status=delivery_status,
+                generated_at=report.generated_at,
+            )
+        report = replace(
+            report,
+            metadata={
+                **report.metadata,
+                "delivery_status": delivery_status,
+                "process_version": process_version,
+            },
         )
-        delivery_status = (
-            "sent"
-            if any(item.channel.startswith("feishu") and item.success for item in attempts)
-            else "delivery_failed"
-        )
-        _patch_json(
-            json_path,
-            {"delivery_status": delivery_status, "process_version": process_version},
+        markdown_path, json_path = write_frozen_report(
+            report,
+            config.reports_dir / "trend_a_share",
+            revision=revision,
         )
         _notify_status(
             notifier,
@@ -1297,15 +1424,14 @@ def run_a_share_trend_report(
     report_dir = config.reports_dir / "trend_a_share"
     base_markdown = report_dir / f"{run_date}.md"
     base_json = report_dir / f"{run_date}.json"
-    if not revision and base_markdown.exists() and base_json.exists():
-        return AShareTrendRunResult("existing", base_markdown, base_json)
-
-    version = _process_version(config.repo)
-    log_path = config.logs_dir / "trend_a_share" / f"{run_date}.log"
-    deadline = datetime.combine(run_day, time(18, 0), tzinfo=SHANGHAI)
-    notified_waiting = False
-    last_error = "Trend Animals update status is not ready"
     with RunLock(config.data_dir / "runs/.trend_a_share_report.lock"):
+        if not revision and base_markdown.exists() and base_json.exists():
+            return AShareTrendRunResult("existing", base_markdown, base_json)
+        version = _process_version(config.repo)
+        log_path = config.logs_dir / "trend_a_share" / f"{run_date}.log"
+        deadline = datetime.combine(run_day, time(18, 0), tzinfo=SHANGHAI)
+        notified_waiting = False
+        last_error = "Trend Animals update status is not ready"
         _write_run_log(
             log_path,
             {"event": "start", "process_version": version, "run_date": run_date},

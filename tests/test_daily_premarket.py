@@ -102,6 +102,39 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.trend_animals_etf_tm_id == 697199
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID", "1"),
+        ("TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID", "2"),
+    ],
+)
+def test_load_env_config_rejects_wrong_positive_trend_pool_id(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    values = {
+        "OPEN_TRADER_REPO": str(tmp_path),
+        "OPEN_TRADER_PYTHON": str(tmp_path / ".venv/bin/python"),
+        "OPEN_TRADER_TIMEZONE": "Asia/Shanghai",
+        "OPEN_TRADER_DEADLINE": "21:10",
+        "OPEN_TRADER_FUTU_HOST": "127.0.0.1",
+        "OPEN_TRADER_FUTU_PORT": "11111",
+        "DEEPSEEK_API_KEY": "secret",
+        "TREND_ANIMALS_API_KEY": "trend-secret",
+        "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID": "622466",
+        "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID": "697199",
+    }
+    values[key] = value
+    env = tmp_path / "daily.env"
+    env.write_text(
+        "\n".join(f"{name}={item}" for name, item in values.items()),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=key):
+        load_env_config(env)
+
+
 def test_notification_results_can_select_only_feishu_channels() -> None:
     sent: list[str] = []
 

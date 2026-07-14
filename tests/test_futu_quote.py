@@ -184,6 +184,30 @@ def test_futu_quote_client_classifies_quote_server_interruption() -> None:
     assert "qot_logined=True" in error.next_step
 
 
+def test_futu_quote_client_omits_nonpositive_and_nonfinite_prices() -> None:
+    class InvalidPriceContext(FakeOpenQuoteContext):
+        def get_market_snapshot(self, symbols: list[str]) -> tuple[int, object]:
+            return 0, FakeDataFrame(
+                [
+                    {"code": "SH.ZERO", "last_price": "0"},
+                    {"code": "SH.NEG", "last_price": "-1"},
+                    {"code": "SH.NAN", "last_price": "NaN"},
+                    {"code": "SH.OK", "last_price": "1.01"},
+                ]
+            )
+
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=InvalidPriceContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    assert client.get_snapshots(["SH.ZERO", "SH.NEG", "SH.NAN", "SH.OK"]) == {
+        "SH.OK": QuoteSnapshot(futu_symbol="SH.OK", last_price=Decimal("1.01"))
+    }
+
+
 def test_futu_quote_client_returns_normalized_snapshots() -> None:
     client = FutuQuoteClient(
         host="127.0.0.1",

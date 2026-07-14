@@ -72,6 +72,10 @@ def test_paid_response_cache_uses_date_endpoint_and_sorted_params(
     cache_path = next((tmp_path / "responses").glob("*.json"))
     assert "secret-value" not in cache_path.read_text(encoding="utf-8")
     assert "secret-value" not in cache_path.name
+    assert client.paid_cache_events == (
+        {"endpoint": "getComponentTicker", "cache": "miss"},
+        {"endpoint": "getComponentTicker", "cache": "hit"},
+    )
 
 
 def test_snapshot_cache_normalizes_id_and_field_order(tmp_path: Path) -> None:

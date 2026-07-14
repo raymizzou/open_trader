@@ -66,6 +66,11 @@ class TrendAnimalsClient:
         self.cache_dir = cache_dir
         self.transport = transport
         self.timeout_seconds = float(timeout_seconds)
+        self._paid_cache_events: list[dict[str, str]] = []
+
+    @property
+    def paid_cache_events(self) -> tuple[dict[str, str], ...]:
+        return tuple(dict(event) for event in self._paid_cache_events)
 
     def get_update_status(self) -> list[dict[str, object]]:
         return self._get("getUpdateStatus", {})
@@ -199,6 +204,9 @@ class TrendAnimalsClient:
         ).hexdigest()
         cache_path = self.cache_dir / "responses" / f"{digest}.json"
         cached = self._read_cache(cache_path)
+        self._paid_cache_events.append(
+            {"endpoint": endpoint, "cache": "hit" if cached is not None else "miss"}
+        )
         if cached is not None:
             if not isinstance(cached, list) or any(
                 not isinstance(row, dict) or not _is_json_value(row) for row in cached

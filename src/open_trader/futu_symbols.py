@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 
-KNOWN_PREFIXES = {"HK", "US", "CN", "SH", "SZ"}
+KNOWN_PREFIXES = {"HK", "US", "CN", "SH", "SZ", "BJ"}
 US_SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:[.-][A-Z0-9]+)*")
 
 
@@ -16,7 +16,7 @@ def to_futu_symbol(market: str, symbol: str) -> str:
         prefix, remainder = normalized_symbol.split(".", 1)
         if prefix == normalized_market:
             normalized_symbol = remainder
-        elif normalized_market == "CN" and prefix in {"SH", "SZ"}:
+        elif normalized_market == "CN" and prefix in {"SH", "SZ", "BJ"}:
             if prefix != _cn_exchange(remainder):
                 raise ValueError(f"symbol prefix {prefix} does not match {symbol}")
             return f"{prefix}.{remainder}"
@@ -44,6 +44,8 @@ def to_futu_symbol(market: str, symbol: str) -> str:
 def _cn_exchange(symbol: str) -> str:
     if len(symbol) != 6 or not symbol.isdigit():
         raise ValueError(f"invalid CN symbol: {symbol}")
+    if symbol.startswith("92") or symbol[0] in "48":
+        return "BJ"
     if symbol == "000300" or symbol[0] in "569":
         return "SH"
     if symbol[0] in "0123":

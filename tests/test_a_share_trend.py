@@ -10,6 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+import open_trader.a_share_trend as trend_module
 
 from open_trader.a_share_trend import (
     AShareTrendRunResult,
@@ -188,7 +189,7 @@ def test_candidates_filter_then_sort_deterministically() -> None:
     assert decisions.excluded["600006"] == ["danger_signal"]
 
 
-@pytest.mark.parametrize("name", ["ST示例", "*ST示例", "退市示例"])
+@pytest.mark.parametrize("name", ["ST示例", "*ST示例", "示例ST", "退市示例"])
 def test_candidate_excludes_special_treatment_and_delisting_names(name: str) -> None:
     decisions = build_candidate_list([candidate("600001", name=name)], held_symbols=set())
     assert decisions.excluded["600001"] == ["excluded_security"]
@@ -213,6 +214,31 @@ def test_candidate_preserves_bj_suffix_for_exclusion() -> None:
     item = evaluate_candidate(row, bars())
 
     assert (item.symbol, item.exchange) == ("920000", "BJ")
+    assert build_candidate_list([item], held_symbols=set()).excluded["920000"] == [
+        "excluded_security"
+    ]
+
+
+def test_candidate_infers_bj_exchange_without_suffix_for_exclusion() -> None:
+    item = evaluate_candidate(
+        {
+            "tmId": 920000,
+            "tickerSymbol": "920000",
+            "tickerName": "示例",
+            "asset": "A股",
+            "industryName": "工业",
+            "asOfDate": "2026-07-14",
+            "tradableFlag": True,
+            "amount1d": "2",
+            "isTrendRightSide": True,
+            "daysSinceTrendEntry": 3,
+            "trendStrengthLocalCurr": "96",
+            "stopwinFlagByDangerSignal": False,
+        },
+        bars(),
+    )
+
+    assert item.exchange == "BJ"
     assert build_candidate_list([item], held_symbols=set()).excluded["920000"] == [
         "excluded_security"
     ]
@@ -358,6 +384,23 @@ def test_buy_actions_use_one_percent_cash_slots_and_round_lots() -> None:
     assert [
         (item.symbol, item.target_amount, item.estimated_shares) for item in actions
     ] == [("600001", Decimal("6765.50"), 600)]
+
+
+def test_buy_action_targets_never_reserve_more_than_available_cash() -> None:
+    actions = estimate_buy_actions(
+        ranked=[candidate("600001"), candidate("600002")],
+        account_fresh=True,
+        net_value=Decimal("676549.55"),
+        available_cash=Decimal("7000"),
+        current_position_count=8,
+    )
+
+    assert [(item.symbol, item.target_amount) for item in actions] == [
+        ("600001", Decimal("6765.50"))
+    ]
+    assert sum((item.target_amount for item in actions), Decimal("0")) <= Decimal(
+        "7000"
+    )
 
 
 def test_stale_account_has_no_formal_buys() -> None:
@@ -580,6 +623,55 @@ def test_holding_danger_and_left_trend_force_full_sell(
         bars_by_symbol={"600001": None},
     )
     assert (built.holdings[0].action, built.holdings[0].reason) == ("SELL_ALL", reason)
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "reason"),
+    [
+        (holding("600001", right_side=None, danger=True), "danger_signal"),
+        (holding("600001", right_side=False, danger=None), "left_trend_right_side"),
+    ],
+)
+def test_strong_holding_sell_signal_wins_over_other_unknowns(
+    snapshot: HoldingSnapshot, reason: str
+) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": snapshot},
+        bars_by_symbol={"600001": bars()},
+    )
+    assert (built.holdings[0].action, built.holdings[0].reason) == ("SELL_ALL", reason)
+
+
+@pytest.mark.parametrize("field", ["boiling", "champagne"])
+def test_unknown_overheat_signal_requires_review_and_preserves_line(field: str) -> None:
+    snapshot = replace(holding("600001"), **{field: None})
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": snapshot},
+        bars_by_symbol={"600001": bars()},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
+    assert (built.holdings[0].action, built.holdings[0].active_line) == (
+        "MANUAL_REVIEW",
+        Decimal("8.5"),
+    )
 
 
 def test_all_current_holdings_are_checked_outside_candidate_pools() -> None:
@@ -1043,6 +1135,61 @@ def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> No
     assert "no_action" not in payload
 
 
+def test_report_records_generation_time_and_whitelisted_signal_audit(
+    tmp_path: Path,
+) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        generated_at="2026-07-14T17:00:01+08:00",
+        account=account("600009"),
+        candidates=(candidate("600001", danger=True),),
+        holding_snapshots={"600009": replace(holding("600009"), boiling=None)},
+        bars_by_symbol={"600009": bars()},
+        metadata={
+            "paid_response_cache": {
+                "hits": 1,
+                "misses": 2,
+                "events": [
+                    {"endpoint": "getComponentTicker", "cache": "hit"},
+                    {"endpoint": "getTickerSnapshot", "cache": "miss"},
+                ],
+            }
+        },
+    )
+
+    markdown_path, json_path = write_frozen_report(built, tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert payload["generated_at"] == "2026-07-14T17:00:01+08:00"
+    assert payload["metadata"]["paid_response_cache"]["hits"] == 1
+    assert payload["signal_snapshots"]["holdings"]["600009"] == {
+        "tm_id": 600009,
+        "symbol": "600009",
+        "as_of_date": "2026-07-14",
+        "right_side": True,
+        "danger": False,
+        "boiling": None,
+        "champagne": False,
+    }
+    excluded = payload["signal_snapshots"]["excluded"]["600001"][0]
+    assert excluded["danger"] is True
+    assert set(excluded) == {
+        "tm_id",
+        "symbol",
+        "as_of_date",
+        "tradable",
+        "amount",
+        "right_side",
+        "days",
+        "strength",
+        "danger",
+    }
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "2026-07-14T17:00:01+08:00" in markdown
+    assert "danger=True" in markdown
+
+
 def trend_config(tmp_path: Path) -> DailyPremarketConfig:
     portfolio = tmp_path / "data/latest/portfolio.csv"
     portfolio.parent.mkdir(parents=True, exist_ok=True)
@@ -1322,6 +1469,107 @@ def test_report_runner_existing_base_makes_no_external_or_notification_call(tmp_
     assert notifier.messages == []
 
 
+def test_report_runner_takes_lock_before_accepting_existing_pair(tmp_path: Path) -> None:
+    config = trend_config(tmp_path)
+    report_dir = config.reports_dir / "trend_a_share"
+    report_dir.mkdir(parents=True)
+    (report_dir / "2026-07-14.md").write_text("frozen", encoding="utf-8")
+    (report_dir / "2026-07-14.json").write_text("{}", encoding="utf-8")
+
+    with RunLock(config.data_dir / "runs/.trend_a_share_report.lock"):
+        with pytest.raises(RuntimeError, match="already active"):
+            run_a_share_trend_report(config=config, run_date="2026-07-14")
+
+
+def test_report_runner_persists_state_before_delivery_and_freezes_pair_last(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    report_dir = config.reports_dir / "trend_a_share"
+
+    class OrderingFeishu(RecordingFeishu):
+        def notify(self, title: str, message: str) -> None:
+            assert (config.data_dir / "trend_a_share/protection_state.json").exists()
+            assert not (report_dir / "2026-07-14.md").exists()
+            assert not (report_dir / "2026-07-14.json").exists()
+            super().notify(title, message)
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=OrderingFeishu(),
+    )
+
+    assert result.report_path.exists() and result.json_path.exists()
+
+
+def test_report_runner_state_failure_leaves_no_formal_pair_or_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    notifier = RecordingFeishu()
+    monkeypatch.setattr(
+        trend_module,
+        "write_protection_state",
+        lambda path, state: (_ for _ in ()).throw(OSError("state write failed")),
+    )
+
+    with pytest.raises(OSError, match="state write failed"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: ReadyApi([]),
+            quote_factory=lambda **kwargs: ReadyQuote([]),
+            notifier=notifier,
+        )
+
+    assert notifier.messages == []
+    assert not list((config.reports_dir / "trend_a_share").glob("2026-07-14.*"))
+
+
+def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    notifier = RecordingFeishu()
+    original_write = trend_module.write_frozen_report
+    failed = False
+
+    def fail_once(*args: object, **kwargs: object) -> tuple[Path, Path]:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("final freeze failed")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(trend_module, "write_frozen_report", fail_once)
+    with pytest.raises(OSError, match="final freeze failed"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: ReadyApi([]),
+            quote_factory=lambda **kwargs: ReadyQuote([]),
+            notifier=notifier,
+        )
+
+    assert len(notifier.messages) == 1
+    assert not list((config.reports_dir / "trend_a_share").glob("2026-07-14.*"))
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=notifier,
+    )
+
+    assert len(notifier.messages) == 1
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["delivery_status"] == "sent_prior_attempt"
+
+
 def test_report_runner_keeps_files_when_feishu_delivery_fails_without_refetch(tmp_path: Path) -> None:
     calls: list[str] = []
     result = run_a_share_trend_report(
@@ -1453,6 +1701,26 @@ def test_report_runner_rejects_invalid_live_billing_price(tmp_path: Path) -> Non
     )
     assert result.status == "failed"
     assert not list((tmp_path / "reports").rglob("*.json"))
+
+
+def test_report_runner_does_not_invent_zero_cost_when_balance_increases(
+    tmp_path: Path,
+) -> None:
+    class IncreasedBalanceApi(ReadyApi):
+        def get_account_balance(self) -> dict[str, object]:
+            self.balance_calls += 1
+            return {"balance": "99" if self.balance_calls == 1 else "100"}
+
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: IncreasedBalanceApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["actual_api_cost"] is None
 
 
 def test_report_runner_losing_lock_does_not_overwrite_active_log(tmp_path: Path) -> None:

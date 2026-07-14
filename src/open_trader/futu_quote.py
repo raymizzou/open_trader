@@ -135,7 +135,7 @@ class FutuQuoteClient:
                 price = Decimal(str(raw_price))
             except (InvalidOperation, ValueError):
                 continue
-            if price.is_finite():
+            if price.is_finite() and price > 0:
                 snapshots[code] = QuoteSnapshot(futu_symbol=code, last_price=price)
         return snapshots
 
