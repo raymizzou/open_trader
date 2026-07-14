@@ -29,13 +29,12 @@ def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
 
-    assert holdings_table_header_labels(html) == [
+    for label in (
         "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值",
-        "港元市值", "持仓占总资产的占比", "盈亏",
-    ]
+        "港元市值", "账户权重", "组合权重", "盈亏",
+    ):
+        assert f'"{label}"' in js
     assert 'data-market="CN">A 股</button>' in html
-    assert 'label: "A 股正股"' in js
-    assert 'market === "CN"' in js
     for forbidden_id in ("a-share-panel", "a-share-card", "cn-panel", "cn-card"):
         assert f'id="{forbidden_id}"' not in html
 
@@ -43,17 +42,15 @@ def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
 def test_dashboard_command_center_theme_preserves_the_data_contract() -> None:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
 
-    assert holdings_table_header_labels(html) == [
-        "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值",
-        "港元市值", "持仓占总资产的占比", "盈亏",
-    ]
+    assert "account-holdings-table" in js
     for element_id in (
         "open-standard-backtest", "header-market-filters",
-        "header-broker-filters", "current-view-value",
+        "current-view-value",
         "broker-summary-cards", "quote-status", "refresh-quotes",
         "source-status-list", "last-refresh", "kelly-lab-panel",
-        "holdings-body", "cash-detail-panel", "symbol-detail-panel",
+        "account-holdings", "cash-detail-panel", "symbol-detail-panel",
         "standard-backtest-workspace", "research-chat-layer",
     ):
         assert f'id="{element_id}"' in html
@@ -64,6 +61,19 @@ def test_dashboard_command_center_theme_preserves_the_data_contract() -> None:
     assert "--accent: #2563eb;" in css
     assert "--primary: #101828;" in css
     assert "font-variant-numeric: tabular-nums;" in css
+
+
+def test_dashboard_account_sections_use_distinct_broker_tints() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    for selector, color in {
+        "#account-futu": "#eff6ff",
+        "#account-tiger": "#fff7ed",
+        "#account-phillips": "#f0fdf4",
+        "#account-eastmoney": "#fef2f2",
+    }.items():
+        assert f"{selector} {{ --account-tint: {color}; }}" in css
+    assert "background: var(--account-tint, var(--surface-soft));" in css
+    assert ".account-holdings-table {\n  background: var(--surface);" in css
 
 
 def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> None:
@@ -877,6 +887,106 @@ const sandbox = { document: { addEventListener() {} }, console };
     return result.stdout
 
 
+def test_dashboard_derives_account_groups_from_existing_broker_details() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {
+  summary: {portfolio_value_hkd: "3000", cash_like_value_hkd: "700"}, broker_summaries: [
+    {broker: "futu", portfolio_value_hkd: "1000", cash_like_value_hkd: "300"},
+    {broker: "tiger", portfolio_value_hkd: "2000", cash_like_value_hkd: "400"},
+    {broker: "phillips", portfolio_value_hkd: "0", cash_like_value_hkd: "0"},
+    {broker: "eastmoney", portfolio_value_hkd: "0", cash_like_value_hkd: "0"},
+  ], source_statuses: [], cash_rows: [],
+  holdings: [{market: "US", symbol: "QQQ", brokers: "futu;tiger", broker_details: [
+    {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},
+    {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600", cost_value: "1100", unrealized_pnl: "500"},
+  ]}],
+};
+console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
+  broker: group.broker, horizon: group.profile.horizon,
+  rows: group.rows.map((row) => ({key: row.key, quantity: row.display.total_quantity, accountWeight: row.display.account_weight})),
+}))));
+''')
+    groups = json.loads(output)
+    assert [group["broker"] for group in groups] == ["futu", "tiger", "phillips", "eastmoney"]
+    assert groups[0]["rows"] == [{"key": "futu:US:QQQ:0", "quantity": "1", "accountWeight": "70.00%"}]
+    assert groups[1]["rows"] == [{"key": "tiger:US:QQQ:0", "quantity": "2", "accountWeight": "80.00%"}]
+
+
+def test_dashboard_account_rows_reprice_with_unmapped_assets_and_negative_cash() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {
+  summary: {portfolio_value_hkd: "5000", cash_like_value_hkd: "300"}, broker_summaries: [
+    {broker: "futu", portfolio_value_hkd: "2000", cash_like_value_hkd: "100"},
+    {broker: "tiger", portfolio_value_hkd: "3000", cash_like_value_hkd: "-200"},
+  ], cash_rows: [], holdings: [{
+    market: "US", symbol: "QQQ", brokers: "futu;tiger", total_quantity: "3",
+    cost_value: "210", fx_to_hkd: "7.8", market_value_hkd: "2300",
+    broker_details: [
+      {broker: "futu", quantity: "1", cost_value: "60", fx_to_hkd: "7.8", market_value_hkd: "700", unrealized_pnl: "30"},
+      {broker: "tiger", quantity: "2", cost_value: "150", fx_to_hkd: "8", market_value_hkd: "1600", unrealized_pnl: "50"},
+    ],
+  }],
+};
+state.quotes = {qqq: {market: "US", symbol: "QQQ", last_price: "100"}};
+console.log(JSON.stringify(accountHoldingGroups().slice(0, 2).map((group) => {
+  const display = group.rows[0].display;
+  return {
+    broker: group.broker,
+    marketValueHkd: display.market_value_hkd,
+    accountWeight: display.account_weight,
+    overallWeight: display.portfolio_weight,
+    pnl: display.unrealized_pnl,
+    pnlPercent: display.unrealized_pnl_pct,
+  };
+})));
+''')
+
+    assert json.loads(output) == [
+        {
+            "broker": "futu",
+            "marketValueHkd": "780.00",
+            "accountWeight": "37.50%",
+            "overallWeight": "15.35%",
+            "pnl": "40.00",
+            "pnlPercent": "66.67%",
+        },
+        {
+            "broker": "tiger",
+            "marketValueHkd": "1600.00",
+            "accountWeight": "53.33%",
+            "overallWeight": "31.50%",
+            "pnl": "50.00",
+            "pnlPercent": "33.33%",
+        },
+    ]
+
+
+def test_dashboard_account_rows_do_not_turn_unknown_values_into_zero() -> None:
+    output = run_dashboard_js(r'''
+const display = accountDisplayRow(
+  {market: "US", symbol: "QQQ"},
+  {broker: "futu", quantity: "", cost_price: "", market_value_hkd: "", cost_value: "0", unrealized_pnl: "0"},
+  {broker: "futu", portfolio_value_hkd: ""},
+  "",
+);
+console.log(JSON.stringify({
+  quantity: display.total_quantity,
+  costPrice: display.avg_cost_price,
+  accountWeight: display.account_weight,
+  portfolioWeight: display.portfolio_weight,
+  pnlPercent: display.unrealized_pnl_pct,
+}));
+''')
+
+    assert json.loads(output) == {
+        "quantity": "-",
+        "costPrice": "-",
+        "accountWeight": "-",
+        "portfolioWeight": "-",
+        "pnlPercent": "-",
+    }
+
+
 def test_dashboard_matches_holding_to_backend_canonical_quote() -> None:
     output = run_dashboard_js(
         r'''
@@ -1168,7 +1278,8 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "symbol-detail-panel" in html
     assert "dashboard-header" in html
     assert "header-market-filters" in html
-    assert "header-broker-filters" in html
+    assert "account-holdings" in html
+    assert "header-broker-filters" not in html
     assert "header-backtest-filters" not in html
     assert "backtest-price-sync-status" not in html
     assert "data-backtest=\"READY\"" not in html
@@ -1429,14 +1540,144 @@ def test_dashboard_static_contains_kelly_lab_panel_mount() -> None:
     assert 'id="kelly-lab-panel"' in html
 
 
-def test_dashboard_static_contains_tiger_long_term_panel_mount() -> None:
+def test_dashboard_static_mounts_account_holdings_without_standalone_tiger_panel() -> None:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
-    assert 'id="tiger-long-term-panel"' in html
+    assert 'id="account-holdings"' in html
+    assert 'id="tiger-long-term-panel"' not in html
+    assert 'id="header-broker-filters"' not in html
+
+
+def test_dashboard_account_sections_and_links_are_semantic() -> None:
+    strategy = tiger_long_term_dashboard_payload()
+    payload = json.dumps(strategy, ensure_ascii=False)
+    output = run_dashboard_js(f'''
+const mount = () => ({{innerHTML: "", textContent: "", classList: {{add() {{}}, remove() {{}}}}}});
+elements["account-holdings"] = mount();
+elements["visible-count"] = mount();
+elements["workspace-grid"] = mount();
+elements["symbol-detail-panel"] = mount();
+elements["cash-detail-panel"] = mount();
+state.dashboard = {{
+  summary: {{portfolio_value_hkd: "4000"}},
+  broker_summaries: [
+    {{broker: "futu", display_name: "富途", portfolio_value_hkd: "1000", holding_value_hkd: "700", cash_like_value_hkd: "300", holding_count: "1"}},
+    {{broker: "tiger", display_name: "老虎", portfolio_value_hkd: "1000", holding_value_hkd: "800", cash_like_value_hkd: "200", holding_count: "1"}},
+    {{broker: "phillips", display_name: "辉立", portfolio_value_hkd: "1000", holding_value_hkd: "900", cash_like_value_hkd: "100", holding_count: "1"}},
+    {{broker: "eastmoney", display_name: "东方财富", portfolio_value_hkd: "1000", holding_value_hkd: "600", cash_like_value_hkd: "400", holding_count: "1"}},
+  ],
+  source_statuses: [], cash_rows: [], tiger_long_term_strategy: {payload},
+  holdings: [
+    {{market: "US", symbol: "QQQ", name: "Nasdaq 100", brokers: "tiger", broker_details: [{{broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "800"}}]}},
+    {{market: "US", symbol: "AAPL", brokers: "futu", broker_details: [{{broker: "futu", account_alias: "futu_1", market: "US", symbol: "AAPL", quantity: "1", market_value_hkd: "700"}}]}},
+    {{market: "HK", symbol: "0005", brokers: "phillips", broker_details: [{{broker: "phillips", account_alias: "phillips_1", market: "HK", symbol: "0005", quantity: "1", market_value_hkd: "900"}}]}},
+    {{market: "CN", symbol: "600519", brokers: "eastmoney", broker_details: [{{broker: "eastmoney", account_alias: "eastmoney_1", market: "CN", symbol: "600519", quantity: "1", market_value_hkd: "600"}}]}},
+  ],
+}};
+renderAccountHoldings();
+console.log(renderBrokerSummaryCards() + elements["account-holdings"].innerHTML);
+''')
+
+    for broker in ("futu", "tiger", "phillips", "eastmoney"):
+        assert f'href="#account-{broker}"' in output
+        assert f'id="account-{broker}"' in output
+        assert f'aria-labelledby="account-{broker}-title"' in output
+    assert output.count('<a class="broker-summary-card"') == 4
+    for label in (
+        "中短线 · 股票与期权", "长线 · SMA200 组合策略",
+        "中线 · 中线策略", "偏短线 · 趋势交易",
+    ):
+        assert label in output
+    for metric in ("年化收益", "最大回撤", "夏普比率", "卡玛比率"):
+        assert metric in output
+    assert "策略指标待接入" in output
+    assert "<th>账户权重</th>" in output
+    assert "<th>组合权重</th>" in output
+    assert "<th>策略</th>" not in output
+    assert "account-holding-account-weight" in output
+    assert "account-holding-portfolio-weight" in output
+    assert "account-holding-strategy" not in output
+    assert "calibration_required" not in output
+    assert "tiger-long-term-panel" not in output
+
+
+def test_dashboard_account_holdings_mobile_layout_css() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+
+    assert ".account-holdings-table thead" in mobile
+    assert ".account-holding-row" in mobile
+    assert 'grid-template-areas:\n      "symbol symbol market-value account-weight portfolio-weight pnl"\n      "market quantity price actions actions actions";' in mobile
+    assert "grid-template-columns: repeat(6, minmax(0, 1fr));" in mobile
+    for area in (
+        "symbol", "market-value", "account-weight", "portfolio-weight", "pnl",
+        "market", "quantity", "price", "actions",
+    ):
+        assert f"grid-area: {area};" in mobile
+    assert (
+        ".account-holding-row .account-holding-cost,\n"
+        "  .account-holding-row .account-holding-usd-value {"
+    ) in mobile
+    assert ".account-mobile-actions" not in mobile
+    assert 'class="account-mobile-actions"' not in js
+    assert "min-height: 44px;" in mobile
+    assert ".account-mobile-label" in mobile
+    assert "overflow-x: hidden;" in mobile
+
+
+def test_dashboard_has_no_removed_header_broker_filter_references() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+
+    assert "header-broker-filters" not in css
+    assert "header-broker-filters" not in js
+
+
+def test_dashboard_account_holdings_selects_only_one_broker_row_for_duplicate_symbol() -> None:
+    run_dashboard_js(r'''
+const mount = () => ({innerHTML: "", textContent: "", classList: {add() {}, remove() {}}});
+elements["account-holdings"] = mount();
+elements["visible-count"] = mount();
+elements["workspace-grid"] = mount();
+elements["symbol-detail-panel"] = mount();
+elements["cash-detail-panel"] = mount();
+renderSymbolDetail = (holding) => `DETAIL:${holding.symbol}`;
+state.dashboard = {
+  summary: {portfolio_value_hkd: "3000"},
+  broker_summaries: [
+    {broker: "futu", portfolio_value_hkd: "1000"},
+    {broker: "tiger", portfolio_value_hkd: "2000"},
+    {broker: "phillips", portfolio_value_hkd: "0"},
+    {broker: "eastmoney", portfolio_value_hkd: "0"},
+  ], source_statuses: [], cash_rows: [],
+  holdings: [{market: "US", symbol: "QQQ", brokers: "futu;tiger", broker_details: [
+    {broker: "futu", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700"},
+    {broker: "tiger", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600"},
+  ]}],
+};
+state.selectedHoldingKey = "tiger:US:QQQ:0";
+renderAccountHoldings();
+const html = elements["account-holdings"].innerHTML;
+if ((html.match(/active-row/g) || []).length !== 1) throw new Error("expected one active broker row: " + html);
+if ((html.match(/inline-symbol-detail/g) || []).length !== 1) throw new Error("expected one inline detail: " + html);
+const futu = html.split('id="account-futu"', 2)[1].split('id="account-tiger"', 1)[0];
+const tiger = html.split('id="account-tiger"', 2)[1].split('id="account-phillips"', 1)[0];
+if (futu.includes("active-row") || !tiger.includes("active-row") || !tiger.includes("DETAIL:QQQ")) {
+  throw new Error("selected Tiger QQQ should not activate Futu QQQ: " + html);
+}
+''')
+
+
+def test_dashboard_static_contains_account_holdings_mount() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="account-holdings"' in html
+    assert 'id="tiger-long-term-panel"' not in html
     assert 'aria-live="polite"' in html
 
 
-def test_dashboard_js_renders_tiger_long_term_strategy_panel() -> None:
+def test_dashboard_js_renders_tiger_strategy_summary_inside_account() -> None:
     strategy = tiger_long_term_dashboard_payload()
     strategy["members"].append({  # type: ignore[union-attr]
         "symbol": "DRAM",
@@ -1456,57 +1697,38 @@ def test_dashboard_js_renders_tiger_long_term_strategy_panel() -> None:
     strategy["validation"]["gate"] = strategy["gate"]  # type: ignore[index]
     payload = json.dumps(strategy, ensure_ascii=False)
     output = run_dashboard_js(f"""
-elements["tiger-long-term-panel"] = {{ innerHTML: "" }};
 state.dashboard = {{ tiger_long_term_strategy: {payload} }};
-renderTigerLongTermStrategy();
-console.log(elements["tiger-long-term-panel"].innerHTML);
+const group = {{broker: "tiger", profile: ACCOUNT_STRATEGY_PROFILES.tiger}};
+console.log(renderAccountStrategy(group));
 """)
 
     for required in (
-        "老虎长线组合",
         "影子验证",
-        "SMA200",
+        "SMA200 策略",
+        "年化收益",
+        "最大回撤",
         "夏普比率",
         "卡玛比率",
-        "同池永久持有",
-        "条件验证，不含选股",
         "风险组上限 30%",
         "仅供人工复核",
-        "QQQ",
-        "美股大盘成长",
-        "半导体",
-        "多头",
-        "不符合资格",
-        "SMA200 历史不足",
-        "状态变化",
         "数据来源不完整",
         "需要校准",
-        "实际权重",
-        "目标权重",
-        "漂移",
-        "资格原因",
-        "再平衡原因",
     ):
         assert required in output
     for forbidden in (
-        "TIGER · LONG TERM", "broad_us_growth", "semiconductor",
-        "INELIGIBLE", "LONG", "insufficient_sma200_history",
-        "state_change", "provenance_incomplete", "calibration_required",
+        "INELIGIBLE", "insufficient_sma200_history", "provenance_incomplete",
+        "calibration_required",
     ):
         assert forbidden not in output
-    assert 'role="table"' in output
-    assert 'class="tiger-mobile-label"' in output
 
 
-def test_dashboard_js_renders_tiger_long_term_unavailable_state() -> None:
+def test_dashboard_js_renders_tiger_strategy_unavailable_state() -> None:
     output = run_dashboard_js("""
-elements["tiger-long-term-panel"] = { innerHTML: "" };
 state.dashboard = { tiger_long_term_strategy: { available: false, error: "产物不存在" } };
-renderTigerLongTermStrategy();
-console.log(elements["tiger-long-term-panel"].innerHTML);
+console.log(renderAccountStrategy({broker: "tiger", profile: ACCOUNT_STRATEGY_PROFILES.tiger}));
 """)
 
-    assert "老虎长线组合" in output
+    assert "SMA200 组合策略" in output
     assert "产物不存在" in output
 
 
@@ -2815,24 +3037,17 @@ console.log(html.slice(start, end));
 
 
 def test_dashboard_holdings_table_uses_compact_asset_columns() -> None:
-    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
 
-    assert holdings_table_header_labels(html) == [
-        "明细",
-        "市场",
-        "标的",
-        "数量",
-        "成本价",
-        "实时价",
-        "美元市值",
-        "港元市值",
-        "持仓占总资产的占比",
-        "盈亏",
-    ]
-    assert "<th>券商</th>" not in html
-    assert "<th>动作</th>" not in html
-    assert "<th>持仓价</th>" not in html
-    assert '<td colspan="10" class="empty-state">加载中</td>' in html
+    assert "function renderAccountTable(group, rows)" not in js
+    for label in (
+        "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值",
+        "港元市值", "账户权重", "组合权重", "盈亏",
+    ):
+        assert f'"{label}"' in js
+    table_renderer = js.split("function renderAccountTable", 1)[1].split("function holdingKey", 1)[0]
+    assert '"券商"' not in table_renderer
+    assert '"策略"' not in table_renderer
 
 
 def test_dashboard_display_helpers_keep_raw_english_out_of_chinese_ui() -> None:
@@ -4521,7 +4736,6 @@ function makeElement() {
 }
 elements["visible-count"] = makeElement();
 elements["workspace-grid"] = makeElement();
-elements["holdings-table-wrap"] = makeElement();
 elements["symbol-detail-panel"] = makeElement();
 elements["cash-detail-panel"] = makeElement();
 elements["holdings-body"] = makeElement();
@@ -4529,9 +4743,6 @@ state.selectedHoldingKey = "";
 state.dashboardError = null;
 state.quotes = {};
 renderHoldings();
-if (!elements["holdings-table-wrap"].classList.contains("hidden")) {
-  throw new Error("cash view should hide holdings table");
-}
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
   throw new Error("cash view should hide symbol detail panel");
 }
@@ -4553,11 +4764,8 @@ if (!elements["cash-detail-panel"].classList.contains("hidden")) {
   throw new Error("non-cash view should hide cash detail panel");
 }
 state.brokerFilter = "ALL";
-state.selectedHoldingKey = holdingKey(state.dashboard.holdings[1], 1);
+state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.holdings[1], 1);
 renderHoldings();
-if (elements["holdings-table-wrap"].classList.contains("hidden")) {
-  throw new Error("trading decision should keep holdings table visible");
-}
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
   throw new Error("trading decision should keep bottom symbol detail panel hidden");
 }
@@ -4578,60 +4786,22 @@ if (elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
 state.dashboard.holdings[1].t_signal.session_phase = "regular";
 renderHoldings();
 const renderedHoldings = elements["holdings-body"].innerHTML;
-const usStockSectionIndex = renderedHoldings.indexOf("美股正股");
-const usOptionSectionIndex = renderedHoldings.indexOf("美股期权");
-const hkStockSectionIndex = renderedHoldings.indexOf("港股正股");
-const hkOptionSectionIndex = renderedHoldings.indexOf("港股期权");
-if (
-  usStockSectionIndex === -1
-  || usOptionSectionIndex === -1
-  || hkStockSectionIndex === -1
-  || hkOptionSectionIndex === -1
-  || usStockSectionIndex > usOptionSectionIndex
-  || usOptionSectionIndex > hkStockSectionIndex
-  || hkStockSectionIndex > hkOptionSectionIndex
-) {
-  throw new Error("holdings should render stock/option market sections in requested order: " + renderedHoldings);
+for (const broker of ["futu", "tiger", "phillips", "eastmoney"]) {
+  if (!renderedHoldings.includes('id="account-' + broker + '"')) throw new Error("missing account section " + broker);
 }
-if (!renderedHoldings.includes("2 个标的 · 港元市值 HKD 49162.50 · 权重 10.00%")) {
-  throw new Error("US stock section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
+if (renderedHoldings.includes("美股正股") || renderedHoldings.includes("美股期权")) {
+  throw new Error("account tables should not contain nested market sections: " + renderedHoldings);
 }
-if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 15982.00 · 权重 3.25%")) {
-  throw new Error("HK stock section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
-}
-if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 300.00 · 权重 0.50%")) {
-  throw new Error("US option section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
-}
-if (!renderedHoldings.includes("1 个标的 · 港元市值 HKD 200.00 · 权重 0.40%")) {
-  throw new Error("HK option section should render count, HKD subtotal, and weight subtotal: " + renderedHoldings);
-}
-if (renderedHoldings.includes("其他市场持仓")) {
-  throw new Error("OTHER section should not render without an OTHER-market holding: " + renderedHoldings);
-}
-for (const required of ["成本价", "美元市值", "港元市值", "持仓占总资产的占比"]) {
-  if (renderedHoldings.includes("<th>" + required + "</th>")) {
-    throw new Error("body should not render table headers inside market sections: " + renderedHoldings);
+for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1940.00", "HKD 15132.00", "策略指标待接入"]) {
+  if (!renderedHoldings.includes(required)) {
+    throw new Error("account holdings missing " + required + ": " + renderedHoldings);
   }
 }
-if (!renderedHoldings.includes("USD 6250.00")) {
-  throw new Error("USD holding should show original USD market value: " + renderedHoldings);
+if (renderedHoldings.includes("<th>策略</th>")) {
+  throw new Error("account holdings should not render row strategy column: " + renderedHoldings);
 }
-if (!renderedHoldings.includes("HKD 49062.50")) {
-  throw new Error("HKD converted market value should remain visible: " + renderedHoldings);
-}
-if (!renderedHoldings.includes("<td class=\\"number-cell\\">-</td>")) {
-  throw new Error("non-USD holding should show dash in USD market value column: " + renderedHoldings);
-}
-const holdingRows = Array.from(renderedHoldings.matchAll(/<tr class="[^"]*">\\s*<td><button class="expand-button"[\\s\\S]*?<\\/tr>/g)).map((match) => match[0]);
-if (holdingRows.length !== 5) {
-  throw new Error("main holdings table should render exactly 5 holding rows: " + renderedHoldings);
-}
-for (const row of holdingRows) {
-  const cellCount = (row.match(/<td(?:\\s|>)/g) || []).length;
-  if (cellCount !== 10) {
-    throw new Error("holding row should render exactly 10 cells: " + row);
-  }
-}
+const holdingRows = renderedHoldings.match(/account-holding-row/g) || [];
+if (holdingRows.length !== 6) throw new Error("account tables should render six broker rows: " + renderedHoldings);
 for (const unexpected of ["<td>futu;tiger</td>", "<td>phillips</td>", "<td>futu</td>", "<td>tiger</td>", "<span class=\\"badge\\">"]) {
   if (renderedHoldings.includes(unexpected)) {
     throw new Error("main holdings table should not render broker/action cell " + unexpected + ": " + renderedHoldings);
@@ -4639,39 +4809,6 @@ for (const unexpected of ["<td>futu;tiger</td>", "<td>phillips</td>", "<td>futu<
 }
 if (renderedHoldings.includes("观察 ·") || renderedHoldings.includes("人工复核 ·")) {
   throw new Error("main holdings table should not render action badges: " + renderedHoldings);
-}
-const sortedSections = groupedHoldingsByMarketSection([
-  { market: "US", symbol: "LOW", portfolio_weight_hkd: "1.00%" },
-  { market: "US", symbol: "HIGH", portfolio_weight_hkd: "9.00%" },
-  { market: "US", symbol: "MISSING", portfolio_weight_hkd: "" },
-]);
-const sortedSymbols = sortedSections[0].rows.map((row) => row.holding.symbol).join(",");
-if (sortedSymbols !== "HIGH,LOW,MISSING") {
-  throw new Error("holdings should sort by portfolio weight descending within market section: " + sortedSymbols);
-}
-const emptyOptionSections = groupedHoldingsByMarketSection([
-  { market: "US", symbol: "US_STOCK", portfolio_weight_hkd: "2.00%" },
-  { market: "HK", symbol: "HK_STOCK", portfolio_weight_hkd: "1.00%" },
-]);
-const emptyOptionKeys = emptyOptionSections.map((section) => section.market).join(",");
-if (emptyOptionKeys !== "US_STOCK,US_OPTION,HK_STOCK,HK_OPTION") {
-  throw new Error("stock/option sections should render in fixed order, including empty option sections: " + emptyOptionKeys);
-}
-const emptyOptionRow = renderMarketSectionRow(emptyOptionSections[3]);
-if (!emptyOptionRow.includes("0 个标的 · 港元市值 HKD 0.00 · 权重 0.00%")) {
-  throw new Error("empty option section should render explicit zero totals: " + emptyOptionRow);
-}
-const malformedSection = renderMarketSectionRow({
-  market: "OTHER",
-  label: "其他市场持仓",
-  className: "market-section-other",
-  rows: [
-    { holding: { market_value_hkd: "bad", portfolio_weight_hkd: "1.00%" }, index: 99 },
-    { holding: { market_value_hkd: "300.00", portfolio_weight_hkd: "" }, index: 100 },
-  ],
-});
-if (!malformedSection.includes("2 个标的 · 港元市值 - · 权重 -") || malformedSection.includes("HKD 0.00")) {
-  throw new Error("malformed section subtotal data should render dash instead of zero: " + malformedSection);
 }
 if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
   throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
@@ -4715,8 +4852,8 @@ state.dashboard.holdings.push({
 state.selectedHoldingKey = "";
 renderHoldings();
 const renderedWithOther = elements["holdings-body"].innerHTML;
-if (!renderedWithOther.includes("其他市场持仓") || !renderedWithOther.includes("1 个标的 · 港元市值 HKD 300.00 · 权重 1.50%")) {
-  throw new Error("OTHER section should render only when an OTHER-market holding exists: " + renderedWithOther);
+if (!renderedWithOther.includes(">JP<") || !renderedWithOther.includes(">Toyota<") || !renderedWithOther.includes("HKD 300.00")) {
+  throw new Error("non-standard markets should remain ordinary account rows: " + renderedWithOther);
 }
 `, sandbox);
 """

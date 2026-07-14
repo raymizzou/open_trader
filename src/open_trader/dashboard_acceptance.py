@@ -230,10 +230,10 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
     button = page.locator(
         'button[data-detail-mode="decision"]'
         f'[data-detail-market="{market}"]'
-        f'[data-detail-symbol="{symbol}"]'
+        f'[data-detail-symbol="{symbol}"]:visible'
     )
-    assert button.count() == 1, f"{market}.{symbol} trading-decision button count is {button.count()}"
-    button.click()
+    assert button.count() >= 1, f"{market}.{symbol} has no trading-decision button"
+    button.first.click()
     tabs = page.locator(".decision-tab-list [data-decision-tab]")
     expected_labels = ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
     assert tabs.all_inner_texts() == expected_labels, "decision tabs are missing or out of order"
@@ -254,19 +254,75 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
             assert not re.search(r"当前价\s*缺失", panel_text), "趋势 / K 线当前价缺失"
 
 
-def _check_tiger_panel(page: Any) -> None:
-    text = page.locator("#tiger-long-term-panel").inner_text()
+def _check_account_holdings(page: Any) -> None:
+    text = page.locator("#account-holdings").inner_text()
     for required in (
-        "老虎长线组合", "夏普比率", "卡玛比率",
-        "需要校准", "仅供人工复核",
+        "富途", "中短线", "股票与期权", "老虎", "长线", "SMA200 组合策略",
+        "辉立", "中线策略", "东方财富", "偏短线", "趋势交易",
+        "策略指标待接入", "夏普比率", "卡玛比率",
     ):
-        assert required in text, f"老虎长线组合缺少 {required}"
+        assert required in text, f"账户持仓视图缺少 {required}"
+    assert page.locator(".account-section").count() == 4, "账户区块数量不是 4"
+    for forbidden in ("tiger-long-term-panel", "calibration_required", "provenance_incomplete"):
+        assert forbidden not in text, f"账户持仓视图泄漏内部代码 {forbidden}"
+    assert page.evaluate(
+        "document.documentElement.scrollWidth <= window.innerWidth"
+    ), "页面出现横向滚动"
+
+
+def _check_page_safety(page: Any) -> None:
+    assert page.locator("#tiger-long-term-panel").count() == 0, "页面仍包含独立老虎长线面板"
+    assert page.locator("#trade-actions").count() == 0, "页面仍包含交易动作面板"
+    visible_text = page.locator("body").inner_text()
     for forbidden in (
         "TIGER · LONG TERM", "broad_us_growth", "semiconductor",
         "INELIGIBLE", "LONG", "CASH", "insufficient_sma200_history",
         "state_change", "provenance_incomplete", "calibration_required",
     ):
-        assert forbidden not in text, f"老虎长线组合仍显示英文代码 {forbidden}"
+        assert forbidden not in visible_text, f"页面泄漏英文内部状态 {forbidden}"
+    for label in page.locator("a:visible, button:visible").all_inner_texts():
+        assert "下单" not in label, f"页面包含下单入口：{label}"
+
+
+def _check_tiger_anchor(page: Any) -> None:
+    page.locator('a[href="#account-tiger"]').click()
+    assert page.evaluate("window.location.hash") == "#account-tiger", (
+        "点击老虎账户锚点后 location.hash 不正确"
+    )
+    assert page.locator("#account-tiger").evaluate(
+        """element => {
+          const rect = element.getBoundingClientRect();
+          return rect.bottom > 0 && rect.top < window.innerHeight;
+        }"""
+    ), "点击老虎账户锚点后目标不在 viewport 内"
+
+
+def _check_cn_filter(page: Any, expected_cn: int) -> None:
+    page.locator('[data-market="CN"]').first.click()
+    page.wait_for_timeout(500)
+    assert page.locator("#visible-count").inner_text().strip() == f"{expected_cn} 条", (
+        f"A 股筛选不是 {expected_cn} 条"
+    )
+    sections = page.locator(".account-section:visible")
+    assert sections.count() == 4, "A 股筛选后账户区块数量不是 4"
+    for index in range(sections.count()):
+        section = sections.nth(index)
+        rows = section.locator(".account-holding-row:visible")
+        empty = section.locator(".account-empty:visible")
+        if rows.count() == 0:
+            assert empty.count() == 1 and empty.inner_text().strip() == "当前筛选下没有持仓", (
+                f"A 股筛选后第 {index + 1} 个无持仓账户缺少中文空状态"
+            )
+            continue
+        assert empty.count() == 0, f"A 股筛选后第 {index + 1} 个账户错误显示空状态"
+        markets = section.locator(
+            ".account-holding-row:visible td:nth-child(2)"
+        ).all_inner_texts()
+        assert len(markets) == rows.count(), f"A 股筛选后第 {index + 1} 个账户市场列缺失"
+        assert all(
+            re.sub(r"\s+", " ", market).strip() in {"CN", "市场 CN"}
+            for market in markets
+        ), f"A 股筛选后第 {index + 1} 个账户包含非 CN 持仓"
 
 
 def _browser_check(
@@ -308,11 +364,25 @@ def _browser_check(
                     if "看板数据加载失败" in page.locator("body").inner_text():
                         errors.append(f"{name}：页面显示看板数据加载失败")
                     try:
+                        _check_page_safety(page)
+                    except Exception as exc:
+                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
+                    try:
                         _check_decision_tabs(page, market, symbol)
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
-                        _check_tiger_panel(page)
+                        _check_account_holdings(page)
+                    except Exception as exc:
+                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
+                    try:
+                        _check_tiger_anchor(page)
+                        assert page.locator("#account-tiger:visible").count() == 1, (
+                            "点击老虎账户锚点后账户区块不可见"
+                        )
+                        assert page.locator(".account-section").count() == 4, (
+                            "点击老虎账户锚点后账户区块数量不是 4"
+                        )
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     phillips_card = page.locator(
@@ -320,11 +390,10 @@ def _browser_check(
                     )
                     if phillips_card.locator("strong").inner_text().strip() in {"", "-"}:
                         errors.append(f"{name}：辉立账户卡没有显示资产")
-                    page.locator('[data-market="CN"]').first.click()
-                    page.locator('button[data-broker="eastmoney"]').click()
-                    page.wait_for_timeout(500)
-                    if page.locator("#visible-count").inner_text().strip() != f"{expected_cn} 条":
-                        errors.append(f"{name}：A 股东方财富筛选不是 {expected_cn} 条")
+                    try:
+                        _check_cn_filter(page, expected_cn)
+                    except Exception as exc:
+                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     errors.extend(
                         f"{name}：浏览器错误：{message}" for message in browser_errors
                     )

@@ -136,14 +136,25 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
     clicks: list[str] = []
 
     class Locator:
-        def __init__(self, kind: str, index: int = 0) -> None:
+        def __init__(
+            self, kind: str, index: int = 0, visible: tuple[bool, ...] = (True,),
+        ) -> None:
             self.kind = kind
             self.index = index
+            self.visible = visible
 
         def count(self) -> int:
-            return {"button": 1, "tabs": 5, "failed": 0, "panel": 1}[self.kind]
+            return {
+                "button": len(self.visible), "tabs": 5, "failed": 0, "panel": 1,
+            }[self.kind]
+
+        @property
+        def first(self) -> "Locator":
+            return Locator(self.kind, self.index, self.visible[:1])
 
         def click(self) -> None:
+            if self.kind == "button":
+                assert self.visible[0], "clicked hidden duplicate"
             clicks.append(self.kind)
 
         def all_inner_texts(self) -> list[str]:
@@ -166,7 +177,14 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
     class Page:
         def locator(self, selector: str) -> Locator:
             selectors.append(selector)
-            if selector.startswith('button[data-detail-mode="decision"]'):
+            button_selector = (
+                'button[data-detail-mode="decision"]'
+                '[data-detail-market="US"]'
+                '[data-detail-symbol="MSFT"]'
+            )
+            if selector == button_selector:
+                return Locator("button", visible=(False, True))
+            if selector == f"{button_selector}:visible":
                 return Locator("button")
             if selector == ".decision-tab-list [data-decision-tab]":
                 return Locator("tabs")
@@ -180,7 +198,7 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
     assert selectors[0] == (
         'button[data-detail-mode="decision"]'
         '[data-detail-market="US"]'
-        '[data-detail-symbol="MSFT"]'
+        '[data-detail-symbol="MSFT"]:visible'
     )
     assert clicks == ["button", "tab", "tab", "tab", "tab", "tab"]
 
@@ -197,6 +215,10 @@ def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> No
             if self.kind == "tabs":
                 return 5
             return 0
+
+        @property
+        def first(self) -> "Locator":
+            return self
 
         def click(self) -> None:
             pass
@@ -235,21 +257,65 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 ) -> None:
     visited: list[str] = []
     selectors: list[tuple[str, str]] = []
+    clicks: list[tuple[str, str]] = []
+    evaluated: list[str] = []
     state = {"fail_desktop_navigation": True}
 
     class Locator:
+        def __init__(self, name: str, selector: str) -> None:
+            self.name = name
+            self.selector = selector
+
         @property
         def first(self) -> "Locator":
             return self
 
-        def locator(self, _selector: str) -> "Locator":
-            return self
+        def locator(self, selector: str) -> "Locator":
+            return Locator(self.name, f"{self.selector} {selector}")
 
         def click(self) -> None:
-            pass
+            clicks.append((self.name, self.selector))
+            if self.selector == 'a[href="#account-tiger"]':
+                state[f"{self.name}_hash"] = "#account-tiger"
 
         def inner_text(self) -> str:
+            if self.selector == "#account-holdings":
+                return (
+                    "富途中短线股票与期权策略指标待接入 "
+                    "老虎长线SMA200 组合策略夏普比率卡玛比率 "
+                    "辉立中线中线策略策略指标待接入 "
+                    "东方财富偏短线趋势交易策略指标待接入"
+                )
+            if self.selector == "body":
+                return "持仓与策略"
+            if self.selector.endswith(".account-empty:visible"):
+                return "当前筛选下没有持仓"
             return "5 条"
+
+        def count(self) -> int:
+            if self.selector in {".account-section", ".account-section:visible"}:
+                return 4
+            if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
+                return 0
+            if self.selector.endswith(".account-empty:visible"):
+                return 0
+            return 1
+
+        def all_inner_texts(self) -> list[str]:
+            if self.selector == "a:visible, button:visible":
+                return ["刷新账户与行情", "策略回测"]
+            if self.selector.endswith(
+                ".account-holding-row:visible td:nth-child(2)"
+            ):
+                return ["市场\nCN"]
+            return []
+
+        def nth(self, index: int) -> "Locator":
+            return Locator(self.name, f"{self.selector}:nth({index})")
+
+        def evaluate(self, expression: str) -> bool:
+            assert "getBoundingClientRect" in expression
+            return True
 
     class Page:
         def __init__(self, name: str) -> None:
@@ -265,7 +331,14 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
         def locator(self, selector: str) -> Locator:
             selectors.append((self.name, selector))
-            return Locator()
+            return Locator(self.name, selector)
+
+        def evaluate(self, expression: str) -> object:
+            if expression == "window.location.hash":
+                return state.get(f"{self.name}_hash", "")
+            assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
+            evaluated.append(self.name)
+            return True
 
         def wait_for_timeout(self, _milliseconds: int) -> None:
             pass
@@ -302,12 +375,6 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         "_check_decision_tabs",
         lambda *_args: None,
     )
-    monkeypatch.setattr(
-        dashboard_acceptance,
-        "_check_tiger_panel",
-        lambda *_args: None,
-    )
-
     errors, blocker = dashboard_acceptance._browser_check(
         "http://dashboard", 5, valid_payload()
     )
@@ -319,6 +386,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     state["fail_desktop_navigation"] = False
     visited.clear()
     selectors.clear()
+    clicks.clear()
+    evaluated.clear()
     monkeypatch.setattr(
         dashboard_acceptance,
         "_check_decision_tabs",
@@ -337,7 +406,19 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     for viewport in ("desktop", "mobile"):
         assert (viewport, '#broker-summary-cards [data-broker="phillips"]') in selectors
         assert (viewport, '[data-market="CN"]') in selectors
-        assert (viewport, 'button[data-broker="eastmoney"]') in selectors
+        assert (viewport, '[data-market="CN"]') in clicks
+        assert (viewport, 'button[data-broker="eastmoney"]') not in selectors
+        assert (viewport, '#visible-count') in selectors
+        assert (viewport, '#account-holdings') in selectors
+        assert (viewport, '.account-section') in selectors
+        assert (viewport, '.account-section:visible') in selectors
+        assert (viewport, '#account-tiger:visible') in selectors
+        assert (viewport, '#tiger-long-term-panel') in selectors
+        assert (viewport, '#trade-actions') in selectors
+        assert (viewport, 'body') in selectors
+        assert (viewport, 'a:visible, button:visible') in selectors
+        assert (viewport, 'a[href="#account-tiger"]') in clicks
+    assert evaluated == ["desktop", "mobile"]
 
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:
@@ -362,20 +443,241 @@ def test_validate_dashboard_payload_rejects_invalid_tiger_strategy(
     assert expected in validate_dashboard_payload(payload, expected_cn=5)
 
 
-def test_check_tiger_panel_requires_shadow_metrics_and_safety_copy() -> None:
+def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> None:
     class Locator:
         def inner_text(self) -> str:
             return (
-                "老虎长线组合 夏普比率 卡玛比率 数据来源不完整 "
-                "需要校准 半导体 多头 仅供人工复核"
+                "富途中短线股票与期权策略指标待接入 "
+                "老虎长线SMA200 组合策略夏普比率卡玛比率 "
+                "辉立中线中线策略策略指标待接入 "
+                "东方财富偏短线趋势交易策略指标待接入"
             )
+
+        def count(self) -> int:
+            return 4
 
     class Page:
         def locator(self, selector: str) -> Locator:
-            assert selector == "#tiger-long-term-panel"
+            assert selector in {"#account-holdings", ".account-section"}
             return Locator()
 
-    dashboard_acceptance._check_tiger_panel(Page())
+        def evaluate(self, expression: str) -> bool:
+            assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
+            return True
+
+    dashboard_acceptance._check_account_holdings(Page())
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    (
+        "TIGER · LONG TERM",
+        "broad_us_growth",
+        "semiconductor",
+        "INELIGIBLE",
+        "LONG",
+        "CASH",
+        "insufficient_sma200_history",
+        "state_change",
+        "provenance_incomplete",
+        "calibration_required",
+    ),
+)
+def test_check_page_safety_rejects_visible_internal_statuses(forbidden: str) -> None:
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        def count(self) -> int:
+            return 0
+
+        def inner_text(self) -> str:
+            assert self.selector == "body"
+            return f"持仓与策略 {forbidden}"
+
+        def all_inner_texts(self) -> list[str]:
+            return ["刷新账户与行情"]
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+    with pytest.raises(AssertionError, match=forbidden):
+        dashboard_acceptance._check_page_safety(Page())
+
+
+@pytest.mark.parametrize(
+    ("selector", "control_text", "expected"),
+    (
+        ("#tiger-long-term-panel", "", "独立老虎长线面板"),
+        ("#trade-actions", "", "交易动作面板"),
+        ("a:visible, button:visible", "立即下单", "下单入口"),
+    ),
+)
+def test_check_page_safety_rejects_removed_panels_and_order_controls(
+    selector: str, control_text: str, expected: str,
+) -> None:
+    class Locator:
+        def __init__(self, current: str) -> None:
+            self.current = current
+
+        def count(self) -> int:
+            return int(self.current == selector and not control_text)
+
+        def inner_text(self) -> str:
+            assert self.current == "body"
+            return "持仓与策略"
+
+        def all_inner_texts(self) -> list[str]:
+            return [control_text] if self.current == selector and control_text else []
+
+    class Page:
+        def locator(self, current: str) -> Locator:
+            return Locator(current)
+
+    with pytest.raises(AssertionError, match=expected):
+        dashboard_acceptance._check_page_safety(Page())
+
+
+def test_check_page_safety_only_reads_visible_text_not_javascript_source() -> None:
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        def count(self) -> int:
+            return 0
+
+        def inner_text(self) -> str:
+            assert self.selector == "body"
+            return "持仓与策略"
+
+        def all_inner_texts(self) -> list[str]:
+            return ["策略回测", "刷新账户与行情"]
+
+    class Page:
+        javascript_source = "INELIGIBLE state_change calibration_required"
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+    dashboard_acceptance._check_page_safety(Page())
+
+
+def test_check_tiger_anchor_requires_hash_and_target_in_viewport() -> None:
+    state = {"hash": "", "in_viewport": True}
+
+    class Locator:
+        def click(self) -> None:
+            state["hash"] = "#account-tiger"
+
+        def evaluate(self, expression: str) -> bool:
+            assert "getBoundingClientRect" in expression
+            return bool(state["in_viewport"])
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            assert selector in {'a[href="#account-tiger"]', "#account-tiger"}
+            return Locator()
+
+        def evaluate(self, expression: str) -> str:
+            assert expression == "window.location.hash"
+            return str(state["hash"])
+
+    dashboard_acceptance._check_tiger_anchor(Page())
+
+    state["in_viewport"] = False
+    with pytest.raises(AssertionError, match="viewport"):
+        dashboard_acceptance._check_tiger_anchor(Page())
+
+
+def test_check_cn_filter_keeps_four_accounts_and_validates_rows_or_empty_state() -> None:
+    class Locator:
+        def __init__(self, kind: str, index: int = 0) -> None:
+            self.kind = kind
+            self.index = index
+
+        @property
+        def first(self) -> "Locator":
+            return self
+
+        def click(self) -> None:
+            pass
+
+        def count(self) -> int:
+            if self.kind == "sections":
+                return 4
+            if self.kind == "rows":
+                return 1 if self.index in {0, 2} else 0
+            if self.kind == "empty":
+                return 1 if self.index in {1, 3} else 0
+            return 1
+
+        def nth(self, index: int) -> "Locator":
+            return Locator("section", index)
+
+        def locator(self, selector: str) -> "Locator":
+            if selector == ".account-holding-row:visible":
+                return Locator("rows", self.index)
+            if selector == ".account-holding-row:visible td:nth-child(2)":
+                return Locator("markets", self.index)
+            if selector == ".account-empty:visible":
+                return Locator("empty", self.index)
+            raise AssertionError(selector)
+
+        def all_inner_texts(self) -> list[str]:
+            assert self.kind == "markets"
+            return ["市场\nCN"]
+
+        def inner_text(self) -> str:
+            if self.kind == "count":
+                return "2 条"
+            assert self.kind == "empty"
+            return "当前筛选下没有持仓"
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            return {
+                '[data-market="CN"]': Locator("filter"),
+                "#visible-count": Locator("count"),
+                ".account-section:visible": Locator("sections"),
+            }[selector]
+
+        def wait_for_timeout(self, milliseconds: int) -> None:
+            assert milliseconds == 500
+
+    dashboard_acceptance._check_cn_filter(Page(), expected_cn=2)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ("富途", "老虎", "辉立", "东方财富", "策略指标待接入", "夏普比率", "卡玛比率"),
+)
+def test_check_account_holdings_rejects_missing_profile_or_metric(missing: str) -> None:
+    text = (
+        "富途中短线股票与期权策略指标待接入 "
+        "老虎长线SMA200 组合策略夏普比率卡玛比率 "
+        "辉立中线中线策略策略指标待接入 "
+        "东方财富偏短线趋势交易策略指标待接入"
+    ).replace(missing, "")
+
+    class Locator:
+        def inner_text(self) -> str:
+            return text
+
+        def count(self) -> int:
+            return 4
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            assert selector in {"#account-holdings", ".account-section"}
+            return Locator()
+
+        def evaluate(self, expression: str) -> bool:
+            assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
+            return True
+
+    with pytest.raises(AssertionError):
+        dashboard_acceptance._check_account_holdings(Page())
 
 
 def test_validate_dashboard_payload_rejects_bad_counts_and_weights() -> None:

@@ -234,12 +234,19 @@ select:focus-visible {
   padding: 8px;
 }
 
+.broker-summary-card {
+  color: inherit;
+  text-decoration: none;
+}
+
+.broker-summary-card:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.32);
+  outline-offset: 2px;
+}
+
 .broker-summary-card.active,
 .broker-summary-card[aria-current="true"],
-.broker-summary-card[aria-selected="true"],
-body:has(#header-broker-filters [data-broker="futu"].active) .broker-summary-card[data-broker="futu"],
-body:has(#header-broker-filters [data-broker="tiger"].active) .broker-summary-card[data-broker="tiger"],
-body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary-card[data-broker="phillips"] {
+.broker-summary-card[aria-selected="true"] {
   background: #eff4ff;
   border-color: #b2ccff;
   border-left-color: var(--accent);
@@ -1368,6 +1375,53 @@ table {
 
 .holdings-panel > .table-wrap > table > thead > tr > th:nth-child(10) {
   width: 120px;
+}
+
+.account-holdings {
+  display: grid;
+  gap: 14px;
+  padding: 0 14px 14px;
+}
+
+.account-section {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+#account-futu { --account-tint: #eff6ff; }
+#account-tiger { --account-tint: #fff7ed; }
+#account-phillips { --account-tint: #f0fdf4; }
+#account-eastmoney { --account-tint: #fef2f2; }
+
+.account-section-header,
+.account-strategy-summary {
+  background: var(--account-tint, var(--surface-soft));
+}
+
+.account-section-header {
+  align-items: flex-start;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  padding: 12px;
+}
+
+.account-strategy-summary {
+  border-top: 1px solid var(--line);
+  padding: 12px;
+}
+
+.account-holdings-table {
+  background: var(--surface);
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+}
+
+.account-mobile-label {
+  display: none;
 }
 
 th,
@@ -3423,6 +3477,75 @@ tbody tr.active-row {
 
   .broker-summary-cards {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .account-holdings {
+    padding: 0 10px 10px;
+  }
+
+  .account-section-header {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .account-holdings-table {
+    display: block;
+    overflow-x: hidden;
+  }
+
+  .account-holdings-table thead {
+    display: none;
+  }
+
+  .account-holdings-table tbody {
+    display: grid;
+    gap: 8px;
+    padding: 8px;
+  }
+
+  .account-holding-row {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    display: grid;
+    grid-template-areas:
+      "symbol symbol market-value account-weight portfolio-weight pnl"
+      "market quantity price actions actions actions";
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    padding: 10px;
+  }
+
+  .account-holding-row td {
+    border: 0;
+    display: grid;
+    gap: 3px;
+    grid-template-columns: minmax(0, 1fr);
+    min-width: 0;
+    overflow-wrap: anywhere;
+    padding: 6px 4px;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .account-holding-symbol { grid-area: symbol; }
+  .account-holding-market-value { grid-area: market-value; }
+  .account-holding-account-weight { grid-area: account-weight; }
+  .account-holding-portfolio-weight { grid-area: portfolio-weight; }
+  .account-holding-pnl { grid-area: pnl; }
+  .account-holding-market { grid-area: market; }
+  .account-holding-quantity { grid-area: quantity; }
+  .account-holding-price { grid-area: price; }
+  .account-holding-actions { grid-area: actions; }
+
+  .account-holding-row .account-holding-cost,
+  .account-holding-row .account-holding-usd-value {
+    display: none;
+  }
+
+  .account-mobile-label {
+    color: var(--muted);
+    display: inline;
+    font-size: 11px;
+    font-weight: 700;
   }
 
   .primary-button,

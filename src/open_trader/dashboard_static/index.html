@@ -24,7 +24,6 @@
               <button class="filter-button" type="button" data-market="CN">A 股</button>
               <button class="filter-button" type="button" data-market="CASH">现金</button>
             </div>
-            <div id="header-broker-filters" class="segmented-control dynamic-filters" aria-label="券商筛选"></div>
           </div>
           <span id="current-view-label" class="current-view-label">当前视图：全部市场 · 全部券商</span>
         </section>
@@ -89,38 +88,12 @@
 
       <main class="workspace-grid">
         <section id="kelly-lab-panel" class="kelly-lab-panel" aria-label="Kelly 模拟盘策略实验室"></section>
-        <section id="tiger-long-term-panel" class="tiger-long-term-panel" aria-label="老虎长线组合" aria-live="polite"></section>
-        <section class="holdings-panel">
+        <section class="holdings-panel" aria-labelledby="account-holdings-title">
           <div class="section-heading">
-            <div>
-              <h1>持仓列表</h1>
-              <p>合并持仓可展开查看券商与账户明细。</p>
-            </div>
+            <div><h1 id="account-holdings-title">持仓与策略</h1><p>按券商账户查看持仓、交易周期与策略状态。</p></div>
             <span id="visible-count" class="count-pill">-</span>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>明细</th>
-                  <th>市场</th>
-                  <th>标的</th>
-                  <th>数量</th>
-                  <th>成本价</th>
-                  <th>实时价</th>
-                  <th>美元市值</th>
-                  <th>港元市值</th>
-                  <th>持仓占总资产的占比</th>
-                  <th>盈亏</th>
-                </tr>
-              </thead>
-              <tbody id="holdings-body">
-                <tr>
-                  <td colspan="10" class="empty-state">加载中</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+          <div id="account-holdings" class="account-holdings" aria-live="polite"></div>
           <div id="cash-detail-panel" class="cash-detail-panel hidden" aria-live="polite"></div>
           <div id="symbol-detail-panel" class="symbol-detail-panel hidden" aria-live="polite"></div>
         </section>
