@@ -9,6 +9,12 @@
   <key>WorkingDirectory</key>
   <string>OPEN_TRADER_REPO</string>
 
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>OPEN_TRADER_REPO/src</string>
+  </dict>
+
   <key>ProgramArguments</key>
   <array>
     <string>OPEN_TRADER_PYTHON</string>

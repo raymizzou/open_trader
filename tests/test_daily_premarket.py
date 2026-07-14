@@ -4114,6 +4114,8 @@ def test_launchd_installer_renders_cn_report_and_watcher(tmp_path: Path) -> None
     by_label = {item["Label"]: item for item in plists}
     report = by_label["com.open-trader.trend-a-share-report"]
     watch = by_label["com.open-trader.trend-a-share-watch"]
+    assert report["EnvironmentVariables"] == {"PYTHONPATH": f"{repo}/src"}
+    assert watch["EnvironmentVariables"] == {"PYTHONPATH": f"{repo}/src"}
     assert report["ProgramArguments"] == [
         f"{repo}/.venv/bin/python",
         "-m",
