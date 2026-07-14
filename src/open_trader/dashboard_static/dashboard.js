@@ -129,6 +129,46 @@ const REASON_LABELS = {
   "missing quote": "缺失行情。",
 };
 
+const TIGER_RISK_GROUP_LABELS = {
+  semiconductor: "半导体",
+  software: "软件",
+  broad_us_growth: "美股大盘成长",
+  agriculture: "农业",
+};
+
+const TIGER_TREND_LABELS = {
+  LONG: "多头",
+  CASH: "现金",
+  INELIGIBLE: "不符合资格",
+};
+
+const TIGER_ELIGIBILITY_LABELS = {
+  insufficient_sma200_history: "SMA200 历史不足",
+};
+
+const TIGER_REBALANCE_LABELS = {
+  state_change: "状态变化",
+  state_change_reallocation: "状态变化后重新分配",
+  symbol_cap: "单标的超过上限",
+  risk_group_cap: "风险组超过上限",
+  drift: "权重漂移",
+};
+
+const TIGER_GATE_LABELS = {
+  sharpe_undefined: "夏普比率无法计算",
+  sharpe_below_floor: "夏普比率低于门槛",
+  benchmark_sharpe_undefined: "基准夏普比率无法计算",
+  sharpe_below_benchmark: "夏普比率低于基准",
+  calmar_undefined: "卡玛比率无法计算",
+  calmar_below_floor: "卡玛比率低于门槛",
+  benchmark_calmar_undefined: "基准卡玛比率无法计算",
+  calmar_below_benchmark: "卡玛比率低于基准",
+  return_below_cash: "年化收益不高于现金",
+  drawdown_above_benchmark: "最大回撤高于基准",
+  provenance_incomplete: "数据来源不完整",
+  calibration_required: "需要校准",
+};
+
 document.addEventListener("DOMContentLoaded", () => {
   bindElements();
   bindEvents();
@@ -1853,7 +1893,7 @@ function renderTigerLongTermStrategy() {
     panel.innerHTML = `
       <div class="tiger-panel-heading">
         <div>
-          <span class="section-eyebrow">TIGER · LONG TERM</span>
+          <span class="section-eyebrow">老虎账户 · 长线策略</span>
           <h2>老虎长线组合</h2>
           <p>SMA200 · 条件验证，不含选股</p>
         </div>
@@ -1884,13 +1924,17 @@ function renderTigerLongTermStrategy() {
 
   const members = Array.isArray(strategy.members) ? strategy.members : [];
   const memberRows = members.map((member) => {
-    const eligibilityReason = member.eligibility_reason || (member.eligible ? "可用" : "不符合资格");
-    const rebalanceReason = member.rebalance_reason || "无";
+    const eligibilityReason = member.eligibility_reason
+      ? TIGER_ELIGIBILITY_LABELS[member.eligibility_reason] || "资格条件未满足"
+      : member.eligible ? "可用" : "不符合资格";
+    const rebalanceReason = member.rebalance_reason
+      ? TIGER_REBALANCE_LABELS[member.rebalance_reason] || "未说明"
+      : "无";
     return `
       <div class="tiger-member-row" role="row">
         ${tigerMemberCell("标的", member.symbol, "tiger-symbol")}
-        ${tigerMemberCell("风险组", member.risk_group)}
-        ${tigerMemberCell("趋势", member.trend)}
+        ${tigerMemberCell("风险组", TIGER_RISK_GROUP_LABELS[member.risk_group] || "其他")}
+        ${tigerMemberCell("趋势", TIGER_TREND_LABELS[member.trend] || "未知")}
         ${tigerMemberCell("实际权重", decisionPlanWeight(member.actual_weight), "tiger-number")}
         ${tigerMemberCell("目标权重", decisionPlanWeight(member.target_weight), "tiger-number")}
         ${tigerMemberCell("漂移", decisionPlanWeight(member.drift), "tiger-number")}
@@ -1905,7 +1949,7 @@ function renderTigerLongTermStrategy() {
   panel.innerHTML = `
     <div class="tiger-panel-heading">
       <div>
-        <span class="section-eyebrow">TIGER · LONG TERM</span>
+        <span class="section-eyebrow">老虎账户 · 长线策略</span>
         <h2>老虎长线组合</h2>
         <p>SMA200 · 条件验证，不含选股</p>
       </div>
@@ -1918,7 +1962,7 @@ function renderTigerLongTermStrategy() {
       <span>单标的上限 10%</span>
       <span>风险组上限 30%</span>
       <span>仅供人工复核</span>
-      <span class="tiger-gate-reasons">门槛：${reasons.map(escapeHtml).join(" · ")}</span>
+      <span class="tiger-gate-reasons">门槛：${reasons.map((reason) => escapeHtml(TIGER_GATE_LABELS[reason] || (reason === "无" ? "无" : "其他门槛未满足"))).join(" · ")}</span>
     </div>
     <div class="tiger-metric-grid">${metricCards}</div>
     <div class="tiger-member-table" role="table" aria-label="老虎长线组合成员">

@@ -1437,7 +1437,24 @@ def test_dashboard_static_contains_tiger_long_term_panel_mount() -> None:
 
 
 def test_dashboard_js_renders_tiger_long_term_strategy_panel() -> None:
-    payload = json.dumps(tiger_long_term_dashboard_payload(), ensure_ascii=False)
+    strategy = tiger_long_term_dashboard_payload()
+    strategy["members"].append({  # type: ignore[union-attr]
+        "symbol": "DRAM",
+        "risk_group": "semiconductor",
+        "eligible": False,
+        "eligibility_reason": "insufficient_sma200_history",
+        "validation_eligible": False,
+        "trend": "INELIGIBLE",
+        "actual_weight": "0.243",
+        "target_weight": "0",
+        "drift": "0.243",
+        "rebalance_reason": "state_change",
+    })
+    strategy["gate"]["reasons"] = [  # type: ignore[index]
+        "provenance_incomplete", "calibration_required",
+    ]
+    strategy["validation"]["gate"] = strategy["gate"]  # type: ignore[index]
+    payload = json.dumps(strategy, ensure_ascii=False)
     output = run_dashboard_js(f"""
 elements["tiger-long-term-panel"] = {{ innerHTML: "" }};
 state.dashboard = {{ tiger_long_term_strategy: {payload} }};
@@ -1456,16 +1473,27 @@ console.log(elements["tiger-long-term-panel"].innerHTML);
         "风险组上限 30%",
         "仅供人工复核",
         "QQQ",
-        "broad_us_growth",
-        "LONG",
+        "美股大盘成长",
+        "半导体",
+        "多头",
+        "不符合资格",
+        "SMA200 历史不足",
+        "状态变化",
+        "数据来源不完整",
+        "需要校准",
         "实际权重",
         "目标权重",
         "漂移",
         "资格原因",
         "再平衡原因",
-        "calibration_required",
     ):
         assert required in output
+    for forbidden in (
+        "TIGER · LONG TERM", "broad_us_growth", "semiconductor",
+        "INELIGIBLE", "LONG", "insufficient_sma200_history",
+        "state_change", "provenance_incomplete", "calibration_required",
+    ):
+        assert forbidden not in output
     assert 'role="table"' in output
     assert 'class="tiger-mobile-label"' in output
 

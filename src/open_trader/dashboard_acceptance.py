@@ -258,9 +258,15 @@ def _check_tiger_panel(page: Any) -> None:
     text = page.locator("#tiger-long-term-panel").inner_text()
     for required in (
         "老虎长线组合", "夏普比率", "卡玛比率",
-        "calibration_required", "仅供人工复核",
+        "需要校准", "仅供人工复核",
     ):
         assert required in text, f"老虎长线组合缺少 {required}"
+    for forbidden in (
+        "TIGER · LONG TERM", "broad_us_growth", "semiconductor",
+        "INELIGIBLE", "LONG", "CASH", "insufficient_sma200_history",
+        "state_change", "provenance_incomplete", "calibration_required",
+    ):
+        assert forbidden not in text, f"老虎长线组合仍显示英文代码 {forbidden}"
 
 
 def _browser_check(

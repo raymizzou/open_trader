@@ -365,7 +365,10 @@ def test_validate_dashboard_payload_rejects_invalid_tiger_strategy(
 def test_check_tiger_panel_requires_shadow_metrics_and_safety_copy() -> None:
     class Locator:
         def inner_text(self) -> str:
-            return "老虎长线组合 夏普比率 卡玛比率 calibration_required 仅供人工复核"
+            return (
+                "老虎长线组合 夏普比率 卡玛比率 数据来源不完整 "
+                "需要校准 半导体 多头 仅供人工复核"
+            )
 
     class Page:
         def locator(self, selector: str) -> Locator:
