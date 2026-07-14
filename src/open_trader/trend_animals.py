@@ -180,7 +180,7 @@ class TrendAnimalsClient:
         ):
             raise TrendAnimalsError(f"{endpoint} returned invalid data")
         rows = list(data)
-        if self._api_key in json.dumps(rows, ensure_ascii=False, separators=(",", ":")):
+        if self._contains_secret(rows):
             raise TrendAnimalsError(f"{endpoint} returned unsafe data")
         return rows
 
@@ -211,9 +211,11 @@ class TrendAnimalsClient:
             raise TrendAnimalsError(f"{endpoint} returned unsafe data")
         for row in rows:
             if row.get("asOfDate") != expected_date:
+                actual_date = row.get("asOfDate")
+                if isinstance(actual_date, str):
+                    actual_date = self._redact(actual_date)
                 raise TrendAnimalsError(
-                    f"{endpoint} returned data for "
-                    f"{self._redact(repr(row.get('asOfDate')))}; "
+                    f"{endpoint} returned data for {actual_date!r}; "
                     f"expected {self._redact(expected_date)}"
                 )
         if cached is None:
@@ -254,9 +256,16 @@ class TrendAnimalsClient:
         return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
     def _contains_secret(self, payload: object) -> bool:
-        return self._api_key in json.dumps(
-            payload, ensure_ascii=False, separators=(",", ":")
-        )
+        if isinstance(payload, str):
+            return self._api_key in payload
+        if isinstance(payload, list):
+            return any(self._contains_secret(item) for item in payload)
+        if isinstance(payload, dict):
+            return any(
+                self._api_key in key or self._contains_secret(item)
+                for key, item in payload.items()
+            )
+        return False
 
     def _redact(self, value: str) -> str:
         return value.replace(self._api_key, "<redacted>")

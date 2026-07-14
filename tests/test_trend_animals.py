@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -24,6 +25,15 @@ class FakeTransport:
 
 def success(data: object) -> dict[str, object]:
     return {"code": "00000", "msg": "操作成功", "success": True, "data": data}
+
+
+def secret_forms(secret: str) -> set[str]:
+    return {
+        secret,
+        json.dumps(secret, ensure_ascii=True)[1:-1],
+        repr(secret)[1:-1],
+        secret.encode("unicode_escape").decode("ascii"),
+    }
 
 
 def test_paid_response_cache_uses_date_endpoint_and_sorted_params(
@@ -88,6 +98,55 @@ def test_snapshot_cache_normalizes_id_and_field_order(tmp_path: Path) -> None:
     assert first_transport.calls[0][1]["tmIds"] == ["7,8"]
     assert first_transport.calls[0][1]["fields"] == ["asOfDate,tickerSymbol,tmId"]
     assert second_transport.calls == []
+
+
+def test_paid_cache_identity_separates_dates_endpoints_and_parameters(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport(
+        {
+            "getComponentTicker": success(
+                [{"marker": "date-14-tm-1", "asOfDate": "2026-07-14"}]
+            ),
+            "getTickerSnapshot": success(
+                [{"marker": "snapshot", "asOfDate": "2026-07-14"}]
+            ),
+        }
+    )
+    client = TrendAnimalsClient(
+        api_key="secret-value", cache_dir=tmp_path, transport=transport
+    )
+
+    date_14_tm_1 = client.get_components(tm_id=1, expected_date="2026-07-14")
+    transport.responses["getComponentTicker"] = success(
+        [{"marker": "date-15-tm-1", "asOfDate": "2026-07-15"}]
+    )
+    date_15_tm_1 = client.get_components(tm_id=1, expected_date="2026-07-15")
+    transport.responses["getComponentTicker"] = success(
+        [{"marker": "date-14-tm-2", "asOfDate": "2026-07-14"}]
+    )
+    date_14_tm_2 = client.get_components(tm_id=2, expected_date="2026-07-14")
+    snapshot = client.get_snapshots(
+        tm_ids=[1], fields=["tmId"], expected_date="2026-07-14"
+    )
+
+    assert len(list((tmp_path / "responses").glob("*.json"))) == 4
+    assert len(transport.calls) == 4
+    cached_client = TrendAnimalsClient(
+        api_key="another-secret", cache_dir=tmp_path, transport=FakeTransport({})
+    )
+    assert cached_client.get_components(
+        tm_id=1, expected_date="2026-07-14"
+    ) == date_14_tm_1
+    assert cached_client.get_components(
+        tm_id=1, expected_date="2026-07-15"
+    ) == date_15_tm_1
+    assert cached_client.get_components(
+        tm_id=2, expected_date="2026-07-14"
+    ) == date_14_tm_2
+    assert cached_client.get_snapshots(
+        tm_ids=[1], fields=["tmId"], expected_date="2026-07-14"
+    ) == snapshot
 
 
 def test_search_exact_symbol_caches_tm_id_without_guessing(tmp_path: Path) -> None:
@@ -311,6 +370,81 @@ def test_paid_response_that_echoes_secret_is_not_cached(tmp_path: Path) -> None:
 
     assert "secret-value" not in str(exc_info.value)
     assert not (tmp_path / "responses").exists()
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    [
+        "quote-key'\"value",
+        "backslash-key\\value",
+        "newline-key\nvalue",
+        "control-key\x01value",
+    ],
+)
+def test_escaped_api_key_in_response_never_reaches_cache_error_or_repr(
+    api_key: str, tmp_path: Path
+) -> None:
+    client = TrendAnimalsClient(
+        api_key=api_key,
+        cache_dir=tmp_path,
+        transport=FakeTransport(
+            {
+                "getComponentTicker": success(
+                    [
+                        {
+                            "asOfDate": "2026-07-14",
+                            "nested": {"echo": [api_key]},
+                        }
+                    ]
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(TrendAnimalsError, match="unsafe") as exc_info:
+        client.get_components(tm_id=1, expected_date="2026-07-14")
+
+    cache_paths = list(tmp_path.rglob("*"))
+    text_values = [str(exc_info.value), repr(client)]
+    text_values.extend(path.name for path in cache_paths)
+    text_values.extend(
+        path.read_text(encoding="utf-8") for path in cache_paths if path.is_file()
+    )
+    for form in secret_forms(api_key):
+        assert all(form not in text for text in text_values)
+    assert not list((tmp_path / "responses").glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    [
+        "quote-key'\"value",
+        "backslash-key\\value",
+        "newline-key\nvalue",
+        "control-key\x01value",
+    ],
+)
+def test_escaped_api_key_is_redacted_before_date_error_formatting(
+    api_key: str, tmp_path: Path
+) -> None:
+    client = TrendAnimalsClient(
+        api_key=api_key,
+        cache_dir=tmp_path,
+        transport=FakeTransport(
+            {
+                "getComponentTicker": success(
+                    [{"tmId": 1, "asOfDate": api_key}]
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(TrendAnimalsError) as exc_info:
+        client.get_components(tm_id=1, expected_date="2026-07-14")
+
+    error_text = str(exc_info.value)
+    for form in secret_forms(api_key):
+        assert form not in error_text
 
 
 def test_cached_response_that_contains_current_secret_is_rejected(tmp_path: Path) -> None:
