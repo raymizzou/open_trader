@@ -146,11 +146,13 @@ class FutuQuoteClient:
         end: str,
     ) -> list[DailyKlineBar]:
         try:
-            from futu import KLType
+            from futu import AuType, KLType
 
             ktype = KLType.K_DAY
+            autype = AuType.QFQ
         except ImportError:
             ktype = "K_DAY"
+            autype = "QFQ"
         market, symbol = futu_symbol.split(".", 1)
         wire_symbol = (
             to_futu_symbol("CN", futu_symbol)
@@ -166,6 +168,7 @@ class FutuQuoteClient:
                 start=start,
                 end=end,
                 ktype=ktype,
+                autype=autype,
                 max_count=1000,
                 page_req_key=page_req_key,
             )
@@ -238,6 +241,25 @@ class FutuQuoteClient:
             seen_page_keys.add(next_key)
             page_req_key = next_key
         return bars
+
+    def get_rehab_rows(self, futu_symbol: str) -> list[dict[str, str]]:
+        ret_code, data = self.context.get_rehab(futu_symbol)
+        if ret_code != 0:
+            raise FutuQuoteError(
+                str(data),
+                error_type="snapshot_failed",
+                next_step=SNAPSHOT_FAILED_NEXT_STEP,
+                opend_reachable=True,
+                context_ok=True,
+                snapshot_ok=False,
+            )
+        return [
+            {
+                str(key): "" if value is None else str(value)
+                for key, value in sorted(row.items(), key=lambda item: str(item[0]))
+            }
+            for row in data.to_dict("records")
+        ]
 
     def close(self) -> None:
         self.context.close()

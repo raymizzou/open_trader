@@ -44,6 +44,7 @@ class FakeOpenQuoteContext:
         start: str,
         end: str,
         ktype: object,
+        autype: object,
         max_count: int,
         page_req_key: object,
     ) -> tuple[int, object, object]:
@@ -52,6 +53,7 @@ class FakeOpenQuoteContext:
             "start": start,
             "end": end,
             "ktype": ktype,
+            "autype": autype,
             "max_count": max_count,
             "page_req_key": page_req_key,
         }
@@ -79,6 +81,17 @@ class FakeOpenQuoteContext:
             None,
         )
 
+    def get_rehab(self, symbol: str) -> tuple[int, object]:
+        self.requested_rehab_symbol = symbol
+        return 0, FakeDataFrame([
+            {
+                "time": "2026-06-20",
+                "company_act": "DIVIDEND",
+                "ex_dividend": 0.42,
+                "forward_adj_factorA": None,
+            },
+        ])
+
     def close(self) -> None:
         self.closed = True
 
@@ -96,7 +109,7 @@ class FakeInterruptedContext(FakeOpenQuoteContext):
 class FakePaginatedContext(FakeOpenQuoteContext):
     def request_history_kline(
         self, symbol: str, *, start: str, end: str, ktype: object,
-        max_count: int, page_req_key: object,
+        autype: object, max_count: int, page_req_key: object,
     ) -> tuple[int, object, object]:
         self.page_keys = getattr(self, "page_keys", []) + [page_req_key]
         day = "2026-06-18" if page_req_key is None else "2026-06-19"
@@ -204,6 +217,29 @@ def test_futu_quote_client_returns_normalized_daily_kline() -> None:
     assert client.context.requested_history["start"] == "2026-01-01"
     assert client.context.requested_history["end"] == "2026-07-04"
     assert client.context.requested_history["max_count"] == 1000
+
+
+def test_futu_quote_client_requests_qfq_and_exposes_rehab_rows() -> None:
+    from futu import AuType
+
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    client.get_daily_kline("US.QQQ", start="2026-01-01", end="2026-07-04")
+    rehab = client.get_rehab_rows("US.QQQ")
+
+    assert client.context.requested_history["autype"] == AuType.QFQ
+    assert client.context.requested_rehab_symbol == "US.QQQ"
+    assert rehab == [{
+        "company_act": "DIVIDEND",
+        "ex_dividend": "0.42",
+        "forward_adj_factorA": "",
+        "time": "2026-06-20",
+    }]
 
 
 def test_futu_quote_client_reads_all_history_pages() -> None:
