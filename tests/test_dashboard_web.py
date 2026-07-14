@@ -17,7 +17,12 @@ from open_trader.dashboard_web import STATIC_DIR
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 
-from tests.test_dashboard import dashboard_config, portfolio_rows, write_csv
+from tests.test_dashboard import (
+    dashboard_config,
+    portfolio_rows,
+    tiger_long_term_dashboard_payload,
+    write_csv,
+)
 
 
 def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
@@ -1422,6 +1427,59 @@ def test_dashboard_static_contains_kelly_lab_panel_mount() -> None:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
     assert 'id="kelly-lab-panel"' in html
+
+
+def test_dashboard_static_contains_tiger_long_term_panel_mount() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="tiger-long-term-panel"' in html
+    assert 'aria-live="polite"' in html
+
+
+def test_dashboard_js_renders_tiger_long_term_strategy_panel() -> None:
+    payload = json.dumps(tiger_long_term_dashboard_payload(), ensure_ascii=False)
+    output = run_dashboard_js(f"""
+elements["tiger-long-term-panel"] = {{ innerHTML: "" }};
+state.dashboard = {{ tiger_long_term_strategy: {payload} }};
+renderTigerLongTermStrategy();
+console.log(elements["tiger-long-term-panel"].innerHTML);
+""")
+
+    for required in (
+        "老虎长线组合",
+        "影子验证",
+        "SMA200",
+        "夏普比率",
+        "卡玛比率",
+        "同池永久持有",
+        "条件验证，不含选股",
+        "风险组上限 30%",
+        "仅供人工复核",
+        "QQQ",
+        "broad_us_growth",
+        "LONG",
+        "实际权重",
+        "目标权重",
+        "漂移",
+        "资格原因",
+        "再平衡原因",
+        "calibration_required",
+    ):
+        assert required in output
+    assert 'role="table"' in output
+    assert 'class="tiger-mobile-label"' in output
+
+
+def test_dashboard_js_renders_tiger_long_term_unavailable_state() -> None:
+    output = run_dashboard_js("""
+elements["tiger-long-term-panel"] = { innerHTML: "" };
+state.dashboard = { tiger_long_term_strategy: { available: false, error: "产物不存在" } };
+renderTigerLongTermStrategy();
+console.log(elements["tiger-long-term-panel"].innerHTML);
+""")
+
+    assert "老虎长线组合" in output
+    assert "产物不存在" in output
 
 
 def test_dashboard_js_renders_kelly_lab_panel() -> None:

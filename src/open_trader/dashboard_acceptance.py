@@ -161,6 +161,16 @@ def validate_dashboard_payload(
                     "东方财富总资产不匹配："
                     f"{eastmoney_total} != {expected_eastmoney_cny} CNY"
                 )
+    tiger_strategy = payload.get("tiger_long_term_strategy") or {}
+    if tiger_strategy.get("status") != "shadow":
+        errors.append("老虎长线策略不是 shadow 状态")
+    if not tiger_strategy.get("members"):
+        errors.append("老虎长线策略没有组合成员")
+    tiger_gate = tiger_strategy.get("gate") or {}
+    if "calibration_required" not in (tiger_gate.get("reasons") or []):
+        errors.append("老虎长线策略缺少 calibration_required")
+    if tiger_strategy.get("order_requests"):
+        errors.append("老虎长线策略包含下单请求")
     return errors
 
 
@@ -244,6 +254,15 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
             assert not re.search(r"当前价\s*缺失", panel_text), "趋势 / K 线当前价缺失"
 
 
+def _check_tiger_panel(page: Any) -> None:
+    text = page.locator("#tiger-long-term-panel").inner_text()
+    for required in (
+        "老虎长线组合", "夏普比率", "卡玛比率",
+        "calibration_required", "仅供人工复核",
+    ):
+        assert required in text, f"老虎长线组合缺少 {required}"
+
+
 def _browser_check(
     url: str, expected_cn: int, payload: dict[str, Any]
 ) -> tuple[list[str], str | None]:
@@ -284,6 +303,10 @@ def _browser_check(
                         errors.append(f"{name}：页面显示看板数据加载失败")
                     try:
                         _check_decision_tabs(page, market, symbol)
+                    except Exception as exc:
+                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
+                    try:
+                        _check_tiger_panel(page)
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     phillips_card = page.locator(

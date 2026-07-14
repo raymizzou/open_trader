@@ -344,6 +344,7 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
 .summary-card,
 .filter-panel,
 .kelly-lab-panel,
+.tiger-long-term-panel,
 .holdings-panel,
 .info-panel {
   background: var(--surface);
@@ -491,7 +492,8 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   grid-template-columns: minmax(0, 1fr);
 }
 
-.workspace-grid.kelly-lab-view .holdings-panel {
+.workspace-grid.kelly-lab-view .holdings-panel,
+.workspace-grid.kelly-lab-view .tiger-long-term-panel {
   display: none;
 }
 
@@ -505,6 +507,162 @@ body:has(#header-broker-filters [data-broker="phillips"].active) .broker-summary
   gap: 10px;
   min-width: 0;
   padding: 12px 14px;
+}
+
+.tiger-long-term-panel {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.tiger-panel-heading {
+  align-items: flex-start;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.tiger-panel-heading h2,
+.tiger-metric-card h3 {
+  margin: 0;
+}
+
+.tiger-panel-heading p {
+  color: var(--muted);
+  margin: 5px 0 0;
+}
+
+.tiger-panel-status {
+  align-items: flex-end;
+  color: var(--muted);
+  display: grid;
+  flex: 0 0 auto;
+  font-size: 12px;
+  gap: 5px;
+  justify-items: end;
+}
+
+.tiger-rule-strip {
+  align-items: center;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 14px;
+  padding: 9px 11px;
+}
+
+.tiger-rule-strip span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.tiger-rule-strip .tiger-gate-reasons {
+  color: var(--text);
+  margin-left: auto;
+  overflow-wrap: anywhere;
+}
+
+.tiger-metric-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.tiger-metric-card {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+  padding: 11px;
+}
+
+.tiger-metric-card h3 {
+  font-size: 14px;
+}
+
+.tiger-metric-card dl {
+  display: grid;
+  gap: 6px 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 10px 0 0;
+}
+
+.tiger-metric-card dl div {
+  min-width: 0;
+}
+
+.tiger-metric-card dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tiger-metric-card dd {
+  font-size: 14px;
+  font-weight: 800;
+  margin: 2px 0 0;
+}
+
+.tiger-member-table {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tiger-member-header,
+.tiger-member-row {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: .65fr 1.1fr .65fr .75fr .75fr .65fr 1fr 1fr;
+  min-width: 0;
+  padding: 9px 11px;
+}
+
+.tiger-member-header {
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.tiger-member-row + .tiger-member-row {
+  border-top: 1px solid var(--line);
+}
+
+.tiger-member-cell,
+.tiger-member-header span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tiger-member-cell {
+  align-items: center;
+  display: flex;
+  font-size: 12px;
+}
+
+.tiger-number {
+  font-variant-numeric: tabular-nums;
+}
+
+.tiger-symbol {
+  font-weight: 800;
+}
+
+.tiger-mobile-label {
+  display: none;
+}
+
+.tiger-unavailable {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  padding: 14px;
 }
 
 .kelly-lab-heading {
@@ -3228,6 +3386,10 @@ tbody tr.active-row {
   .kelly-capital-breakdown-grid {
     grid-template-columns: 1fr;
   }
+
+  .tiger-metric-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 760px) {
@@ -3310,6 +3472,45 @@ tbody tr.active-row {
 
   .summary-grid {
     grid-template-columns: 1fr;
+  }
+
+  .tiger-panel-heading,
+  .tiger-rule-strip {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .tiger-panel-status {
+    justify-items: start;
+  }
+
+  .tiger-rule-strip .tiger-gate-reasons {
+    margin-left: 0;
+  }
+
+  .tiger-member-header {
+    display: none;
+  }
+
+  .tiger-member-row {
+    gap: 7px;
+    grid-template-columns: 1fr;
+    padding: 11px;
+  }
+
+  .tiger-member-cell {
+    align-items: start;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: 88px minmax(0, 1fr);
+  }
+
+  .tiger-mobile-label {
+    color: var(--muted);
+    display: inline;
+    font-size: 11px;
+    font-weight: 800;
   }
 
   .action-card-metrics,

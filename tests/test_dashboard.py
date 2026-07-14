@@ -101,6 +101,107 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
     )
 
 
+def tiger_long_term_dashboard_payload() -> dict[str, object]:
+    strategy = {
+        "annualized_return_pct": "8.1",
+        "max_drawdown_pct": "7.2",
+        "sharpe_ratio": "1.05",
+        "calmar_ratio": "1.12",
+    }
+    benchmark = {
+        "annualized_return_pct": "7.8",
+        "max_drawdown_pct": "8.0",
+        "sharpe_ratio": "0.91",
+        "calmar_ratio": "0.98",
+    }
+    spy = {
+        "annualized_return_pct": "9.2",
+        "max_drawdown_pct": "18.0",
+        "sharpe_ratio": "0.88",
+        "calmar_ratio": "0.51",
+    }
+    gate = {
+        "passed": False,
+        "policy_id": "tiger_risk_adjusted/v1",
+        "reasons": ["calibration_required"],
+    }
+    validation = {
+        "strategy": strategy,
+        "benchmark": benchmark,
+        "spy": spy,
+        "gate": gate,
+    }
+    return {
+        "schema_version": "open_trader.tiger_long_term_strategy.v1",
+        "run_date": "2026-07-14",
+        "status": "shadow",
+        "strategy_id": "tiger_sma200_equal_weight/v1",
+        "account_alias": "tiger_5683",
+        "nav": "100000",
+        "validation_hash": "a" * 64,
+        "validation_reused": False,
+        "members": [{
+            "symbol": "QQQ",
+            "risk_group": "broad_us_growth",
+            "eligible": True,
+            "eligibility_reason": "",
+            "validation_eligible": True,
+            "trend": "LONG",
+            "actual_weight": "0.08",
+            "target_weight": "0.10",
+            "drift": "-0.02",
+            "rebalance_reason": "",
+        }],
+        "validation": validation,
+        "strategy": strategy,
+        "benchmark": benchmark,
+        "spy": spy,
+        "gate": gate,
+        "notes": ["条件验证，不含选股", "仅供人工复核"],
+        "order_requests": [],
+    }
+
+
+def test_dashboard_exposes_valid_tiger_long_term_strategy_unchanged(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
+    payload = tiger_long_term_dashboard_payload()
+    path = config.data_dir / "latest" / "US" / "tiger_long_term_strategy.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    state = load_dashboard_state(config).to_dict()
+
+    assert state["tiger_long_term_strategy"] == payload
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected_error"),
+    [
+        (None, "不存在"),
+        ("{}", "无效"),
+    ],
+)
+def test_dashboard_marks_tiger_long_term_strategy_unavailable(
+    tmp_path: Path,
+    contents: str | None,
+    expected_error: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
+    if contents is not None:
+        path = config.data_dir / "latest" / "US" / "tiger_long_term_strategy.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(contents, encoding="utf-8")
+
+    strategy = load_dashboard_state(config).to_dict()["tiger_long_term_strategy"]
+
+    assert strategy["available"] is False
+    assert expected_error in strategy["error"]
+
+
 def dashboard_decision_plan(run_date: str) -> dict[str, object]:
     facts = {
         "ma20_distance_pct": {

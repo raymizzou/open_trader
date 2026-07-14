@@ -66,6 +66,12 @@ def valid_payload() -> dict[str, object]:
         "backtest_universe": {"holdings": [
             {"market": "CN", "symbol": row["symbol"]} for row in cn
         ]},
+        "tiger_long_term_strategy": {
+            "status": "shadow",
+            "members": [{"symbol": "QQQ"}],
+            "gate": {"reasons": ["calibration_required"]},
+            "order_requests": [],
+        },
     }
 
 
@@ -296,6 +302,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         "_check_decision_tabs",
         lambda *_args: None,
     )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_tiger_panel",
+        lambda *_args: None,
+    )
 
     errors, blocker = dashboard_acceptance._browser_check(
         "http://dashboard", 5, valid_payload()
@@ -331,6 +342,37 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:
     assert validate_dashboard_payload(valid_payload(), expected_cn=5) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("status", "failed", "老虎长线策略不是 shadow 状态"),
+        ("members", [], "老虎长线策略没有组合成员"),
+        ("gate", {"reasons": []}, "老虎长线策略缺少 calibration_required"),
+        ("order_requests", [{"symbol": "QQQ"}], "老虎长线策略包含下单请求"),
+    ],
+)
+def test_validate_dashboard_payload_rejects_invalid_tiger_strategy(
+    field: str, value: object, expected: str,
+) -> None:
+    payload = valid_payload()
+    payload["tiger_long_term_strategy"][field] = value  # type: ignore[index]
+
+    assert expected in validate_dashboard_payload(payload, expected_cn=5)
+
+
+def test_check_tiger_panel_requires_shadow_metrics_and_safety_copy() -> None:
+    class Locator:
+        def inner_text(self) -> str:
+            return "老虎长线组合 夏普比率 卡玛比率 calibration_required 仅供人工复核"
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            assert selector == "#tiger-long-term-panel"
+            return Locator()
+
+    dashboard_acceptance._check_tiger_panel(Page())
 
 
 def test_validate_dashboard_payload_rejects_bad_counts_and_weights() -> None:

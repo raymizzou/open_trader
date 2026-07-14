@@ -151,6 +151,7 @@ function bindElements() {
     "broker-summary-cards",
     "source-status-list",
     "kelly-lab-panel",
+    "tiger-long-term-panel",
     "cash-detail-panel",
     "summary-value",
     "summary-holding-bar",
@@ -1835,7 +1836,102 @@ function kellySampleStageLabel(stage) {
 
 function renderDashboardViews() {
   renderHeaderSummary();
+  renderTigerLongTermStrategy();
   renderHoldings();
+}
+
+function renderTigerLongTermStrategy() {
+  const panel = elements["tiger-long-term-panel"];
+  if (!panel) {
+    return;
+  }
+  const strategy = state.dashboard?.tiger_long_term_strategy || {
+    available: false,
+    error: "影子验证产物暂不可用",
+  };
+  if (strategy.available === false) {
+    panel.innerHTML = `
+      <div class="tiger-panel-heading">
+        <div>
+          <span class="section-eyebrow">TIGER · LONG TERM</span>
+          <h2>老虎长线组合</h2>
+          <p>SMA200 · 条件验证，不含选股</p>
+        </div>
+        <span class="status-pill status-failed">不可用</span>
+      </div>
+      <div class="tiger-unavailable">${escapeHtml(strategy.error || "影子验证产物暂不可用")}</div>
+    `;
+    return;
+  }
+
+  const validation = strategy.validation || {};
+  const metrics = [
+    ["SMA200 策略", validation.strategy || strategy.strategy || {}],
+    ["同池永久持有", validation.benchmark || strategy.benchmark || {}],
+    ["SPY 买入持有", validation.spy || strategy.spy || {}],
+  ];
+  const metricCards = metrics.map(([label, values]) => `
+    <article class="tiger-metric-card">
+      <h3>${escapeHtml(label)}</h3>
+      <dl>
+        <div><dt>年化收益</dt><dd>${escapeHtml(decisionPlanPercent(values.annualized_return_pct))}</dd></div>
+        <div><dt>最大回撤</dt><dd>${escapeHtml(decisionPlanPercent(values.max_drawdown_pct))}</dd></div>
+        <div><dt>夏普比率</dt><dd>${escapeHtml(decisionPlanRatio(values.sharpe_ratio))}</dd></div>
+        <div><dt>卡玛比率</dt><dd>${escapeHtml(decisionPlanRatio(values.calmar_ratio))}</dd></div>
+      </dl>
+    </article>
+  `).join("");
+
+  const members = Array.isArray(strategy.members) ? strategy.members : [];
+  const memberRows = members.map((member) => {
+    const eligibilityReason = member.eligibility_reason || (member.eligible ? "可用" : "不符合资格");
+    const rebalanceReason = member.rebalance_reason || "无";
+    return `
+      <div class="tiger-member-row" role="row">
+        ${tigerMemberCell("标的", member.symbol, "tiger-symbol")}
+        ${tigerMemberCell("风险组", member.risk_group)}
+        ${tigerMemberCell("趋势", member.trend)}
+        ${tigerMemberCell("实际权重", decisionPlanWeight(member.actual_weight), "tiger-number")}
+        ${tigerMemberCell("目标权重", decisionPlanWeight(member.target_weight), "tiger-number")}
+        ${tigerMemberCell("漂移", decisionPlanWeight(member.drift), "tiger-number")}
+        ${tigerMemberCell("资格原因", eligibilityReason)}
+        ${tigerMemberCell("再平衡原因", rebalanceReason)}
+      </div>
+    `;
+  }).join("");
+  const gate = validation.gate || strategy.gate || {};
+  const reasons = Array.isArray(gate.reasons) && gate.reasons.length ? gate.reasons : ["无"];
+
+  panel.innerHTML = `
+    <div class="tiger-panel-heading">
+      <div>
+        <span class="section-eyebrow">TIGER · LONG TERM</span>
+        <h2>老虎长线组合</h2>
+        <p>SMA200 · 条件验证，不含选股</p>
+      </div>
+      <div class="tiger-panel-status">
+        <span class="status-pill status-review">影子验证</span>
+        <span>${escapeHtml(strategy.run_date || "-")}</span>
+      </div>
+    </div>
+    <div class="tiger-rule-strip" aria-label="组合约束">
+      <span>单标的上限 10%</span>
+      <span>风险组上限 30%</span>
+      <span>仅供人工复核</span>
+      <span class="tiger-gate-reasons">门槛：${reasons.map(escapeHtml).join(" · ")}</span>
+    </div>
+    <div class="tiger-metric-grid">${metricCards}</div>
+    <div class="tiger-member-table" role="table" aria-label="老虎长线组合成员">
+      <div class="tiger-member-header" role="row">
+        ${["标的", "风险组", "趋势", "实际权重", "目标权重", "漂移", "资格原因", "再平衡原因"].map((label) => `<span role="columnheader">${label}</span>`).join("")}
+      </div>
+      ${memberRows || '<div class="tiger-unavailable">当前没有组合成员。</div>'}
+    </div>
+  `;
+}
+
+function tigerMemberCell(label, value, className = "") {
+  return `<span class="tiger-member-cell ${className}" role="cell"><span class="tiger-mobile-label">${escapeHtml(label)}</span><span>${escapeHtml(value || "-")}</span></span>`;
 }
 
 function renderHeaderSummary() {
