@@ -329,7 +329,6 @@ def _browser_check(
                     if phillips_card.locator("strong").inner_text().strip() in {"", "-"}:
                         errors.append(f"{name}：辉立账户卡没有显示资产")
                     page.locator('[data-market="CN"]').first.click()
-                    page.locator('button[data-broker="eastmoney"]').click()
                     page.wait_for_timeout(500)
                     if page.locator("#visible-count").inner_text().strip() != f"{expected_cn} 条":
                         errors.append(f"{name}：A 股东方财富筛选不是 {expected_cn} 条")

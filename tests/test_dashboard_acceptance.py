@@ -354,7 +354,9 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     for viewport in ("desktop", "mobile"):
         assert (viewport, '#broker-summary-cards [data-broker="phillips"]') in selectors
         assert (viewport, '[data-market="CN"]') in selectors
-        assert (viewport, 'button[data-broker="eastmoney"]') in selectors
+        assert (viewport, '[data-market="CN"]') in clicks
+        assert (viewport, 'button[data-broker="eastmoney"]') not in selectors
+        assert (viewport, '#visible-count') in selectors
         assert (viewport, '#account-holdings') in selectors
         assert (viewport, '.account-section') in selectors
         assert (viewport, '#account-tiger:visible') in selectors
