@@ -3,6 +3,12 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-14
+
+- Replaced AKShare with Futu OpenD as the sole A-share real-time and historical
+  market-data source across Dashboard quotes, backtests, watches, and T signals;
+  verified 26/26 live quotes and the full Dashboard acceptance gate (`PASS`).
+
 ## 2026-07-13
 
 - Refreshed the Dashboard command-center styling without changing its displayed
