@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 from collections.abc import Callable, Mapping, Sequence
+from datetime import date
 from decimal import Decimal, InvalidOperation
 import math
 from typing import Any
@@ -173,8 +174,9 @@ class FutuQuoteClient:
                 if not isinstance(time, str):
                     raise TypeError("trading calendar time is not a string")
                 if time := time.strip():
+                    date.fromisoformat(time)
                     trading_days.append(time)
-        except (AttributeError, TypeError) as exc:
+        except (AttributeError, TypeError, ValueError) as exc:
             raise FutuQuoteError(
                 "Futu trading calendar returned malformed data",
                 error_type="snapshot_failed",
