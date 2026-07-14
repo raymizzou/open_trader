@@ -1160,6 +1160,11 @@ def _attempt_report(
             if requested_ids
             else []
         )
+        returned_ids = [_row_tm_id(row) for row in snapshot_rows]
+        if len(returned_ids) != len(set(returned_ids)) or sorted(
+            returned_ids
+        ) != requested_ids:
+            raise TrendAnimalsError("getTickerSnapshot returned mismatched tmIds")
         if any(row.get("asOfDate") != run_date for row in snapshot_rows):
             raise TrendAnimalsError("getTickerSnapshot returned a stale data date")
         balance_after = _balance(api.get_account_balance())

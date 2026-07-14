@@ -347,6 +347,22 @@ def test_trend_a_share_report_invalid_private_config_returns_two(
     assert "TREND_ANIMALS_API_KEY" in capsys.readouterr().err
 
 
+def test_trend_a_share_report_whitespace_api_key_returns_two(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        trend_animals_api_key="   ",
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+    )
+    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
+
+    assert cli.main(["trend-a-share-report"]) == 2
+    assert "TREND_ANIMALS_API_KEY" in capsys.readouterr().err
+
+
 def test_run_daily_premarket_requires_market() -> None:
     parser = build_parser()
 

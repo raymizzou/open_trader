@@ -1081,12 +1081,14 @@ class ReadyApi:
         snapshot_date: str = "2026-07-14",
         holding_error: Exception | None = None,
         invalid_billing: bool = False,
+        snapshot_ids: list[object] | None = None,
     ) -> None:
         self.calls = calls
         self.ready = ready
         self.snapshot_date = snapshot_date
         self.holding_error = holding_error
         self.invalid_billing = invalid_billing
+        self.snapshot_ids = snapshot_ids
         self.balance_calls = 0
 
     def get_update_status(self) -> list[dict[str, object]]:
@@ -1123,11 +1125,12 @@ class ReadyApi:
     def get_snapshots(self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str) -> list[dict[str, object]]:
         self.calls.append("api.snapshots")
         rows = []
-        for tm_id in tm_ids:
+        for tm_id in self.snapshot_ids if self.snapshot_ids is not None else tm_ids:
+            symbol = f"{tm_id:06d}" if isinstance(tm_id, int) else "600099"
             rows.append({
                 "tmId": tm_id,
-                "tickerName": f"股票{tm_id:06d}",
-                "tickerSymbol": f"{tm_id:06d}.SH",
+                "tickerName": f"股票{symbol}",
+                "tickerSymbol": f"{symbol}.SH",
                 "asset": "A股",
                 "asOfDate": self.snapshot_date,
                 "tradableFlag": True,
@@ -1367,6 +1370,24 @@ def test_report_runner_snapshot_date_mismatch_uses_deadline_contract(tmp_path: P
         config=trend_config(tmp_path), run_date="2026-07-14",
         now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], snapshot_date="2026-07-13"),
+        quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
+    )
+    assert result.status == "failed"
+    assert not list((tmp_path / "reports").rglob("*.json"))
+
+
+@pytest.mark.parametrize(
+    "snapshot_ids",
+    [[1], [1, 2, 3], [1, 1, 2], [1, "bad"]],
+    ids=["missing", "unexpected", "duplicate", "malformed"],
+)
+def test_report_runner_rejects_snapshot_tm_id_integrity_failures(
+    tmp_path: Path, snapshot_ids: list[object]
+) -> None:
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path), run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        api_factory=lambda **kwargs: ReadyApi([], snapshot_ids=snapshot_ids),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
     assert result.status == "failed"

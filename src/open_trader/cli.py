@@ -1259,7 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             config = load_env_config(args.config, dry_run=False)
             missing = []
-            if not config.trend_animals_api_key:
+            if not config.trend_animals_api_key.strip():
                 missing.append("TREND_ANIMALS_API_KEY")
             if config.trend_animals_a_share_tm_id <= 0:
                 missing.append("TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID")
