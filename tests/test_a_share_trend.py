@@ -1325,6 +1325,51 @@ def trend_config(tmp_path: Path) -> DailyPremarketConfig:
     )
 
 
+def write_9885_receipt(
+    config: DailyPremarketConfig,
+    *,
+    status: str,
+    protection_state: object | None = None,
+    write_final_pair: bool = False,
+) -> tuple[Path, str, str]:
+    markdown = "# 9885 frozen report\n"
+    report_payload = {
+        "delivery_status": status,
+        "metadata": {"delivery_status": status},
+        "protection_state": (
+            {"schema_version": 1, "positions": {}}
+            if protection_state is None
+            else protection_state
+        ),
+    }
+    report_json = json.dumps(
+        report_payload, ensure_ascii=False, indent=2, sort_keys=True
+    ) + "\n"
+    markdown_bytes = markdown.encode("utf-8")
+    json_bytes = report_json.encode("utf-8")
+    receipt = {
+        "status": status,
+        "generated_at": "2026-07-14T17:00:00+08:00",
+        "artifact_stem": "2026-07-14",
+        "markdown": markdown,
+        "report_json": report_json,
+        "markdown_sha256": hashlib.sha256(markdown_bytes).hexdigest(),
+        "json_sha256": hashlib.sha256(json_bytes).hexdigest(),
+        "content_hash": hashlib.sha256(
+            markdown_bytes + b"\0" + json_bytes
+        ).hexdigest(),
+    }
+    receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-14.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    if write_final_pair:
+        report_dir = config.reports_dir / "trend_a_share"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / "2026-07-14.md").write_text(markdown, encoding="utf-8")
+        (report_dir / "2026-07-14.json").write_text(report_json, encoding="utf-8")
+    return receipt_path, markdown, report_json
+
+
 class RecordingMacOS(MacOSNotifier):
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
@@ -1620,6 +1665,131 @@ def test_report_runner_accepts_complete_pair_bound_to_legacy_sent_receipt(
     )
 
     assert result.status == "existing"
+
+
+def test_9885_sent_receipt_migrates_and_keeps_complete_pair_existing(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    receipt_path, _, _ = write_9885_receipt(
+        config, status="sent", write_final_pair=True
+    )
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("9885 migration must not refetch"),
+        quote_factory=lambda **kwargs: pytest.fail("9885 migration must not refetch"),
+        notifier=RecordingMacOS(),
+    )
+
+    migrated = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert result.status == "existing"
+    assert migrated["status"] == "sent"
+    assert migrated["protection_state"] == {"schema_version": 1, "positions": {}}
+    assert len(migrated["protection_state_sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_delivery_status", "expected_send_count"),
+    [("pending", "delivery_unknown", 0), ("delivery_failed", "sent", 1)],
+)
+def test_9885_unfinished_receipt_migrates_and_recovers_without_refetch(
+    tmp_path: Path,
+    status: str,
+    expected_delivery_status: str,
+    expected_send_count: int,
+) -> None:
+    config = trend_config(tmp_path)
+    receipt_path, _, _ = write_9885_receipt(config, status=status)
+    notifier = RecordingFeishu()
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("9885 recovery must not refetch"),
+        quote_factory=lambda **kwargs: pytest.fail("9885 recovery must not refetch"),
+        notifier=notifier,
+    )
+
+    assert json.loads(result.json_path.read_text(encoding="utf-8"))[
+        "delivery_status"
+    ] == expected_delivery_status
+    assert len(notifier.messages) == expected_send_count
+    assert "protection_state_sha256" in json.loads(
+        receipt_path.read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.parametrize("failure", ["tampered_hash", "invalid_state"])
+def test_9885_migration_fails_closed_for_tampering_or_invalid_state(
+    tmp_path: Path, failure: str
+) -> None:
+    config = trend_config(tmp_path)
+    receipt_path, _, _ = write_9885_receipt(
+        config,
+        status="pending",
+        protection_state=(
+            {"schema_version": 2, "positions": {}}
+            if failure == "invalid_state"
+            else None
+        ),
+    )
+    if failure == "tampered_hash":
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["content_hash"] = "0" * 64
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: pytest.fail("invalid receipt must not refetch"),
+            quote_factory=lambda **kwargs: pytest.fail("invalid receipt must not refetch"),
+            notifier=RecordingFeishu(),
+        )
+
+    assert "protection_state_sha256" not in json.loads(
+        receipt_path.read_text(encoding="utf-8")
+    )
+
+
+def test_9885_migration_replace_failure_preserves_old_receipt_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    receipt_path, _, _ = write_9885_receipt(config, status="pending")
+    old_receipt = receipt_path.read_bytes()
+    original_replace = Path.replace
+
+    def fail_migration_replace(path: Path, target: Path) -> Path:
+        if Path(target) == receipt_path:
+            raise OSError("migration replace failed")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_migration_replace)
+    with pytest.raises(OSError, match="migration replace failed"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: pytest.fail("migration must not refetch"),
+            quote_factory=lambda **kwargs: pytest.fail("migration must not refetch"),
+            notifier=RecordingFeishu(),
+        )
+
+    assert receipt_path.read_bytes() == old_receipt
+    monkeypatch.setattr(Path, "replace", original_replace)
+    recovered = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("migration retry must not refetch"),
+        quote_factory=lambda **kwargs: pytest.fail("migration retry must not refetch"),
+        notifier=RecordingFeishu(),
+    )
+
+    assert json.loads(recovered.json_path.read_text(encoding="utf-8"))[
+        "delivery_status"
+    ] == "delivery_unknown"
 
 
 def test_report_runner_takes_lock_before_accepting_existing_pair(tmp_path: Path) -> None:

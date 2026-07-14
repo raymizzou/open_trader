@@ -912,6 +912,10 @@ def load_protection_state(path: Path) -> dict[str, object]:
         return {"schema_version": 1, "positions": {}}
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise ValueError("protection state is unreadable or malformed") from None
+    return _validate_protection_state(payload)
+
+
+def _validate_protection_state(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise ValueError("protection state has an invalid schema")
     positions = payload.get("positions")
@@ -1165,19 +1169,40 @@ def _read_delivery_receipt(
         raise ValueError("delivery receipt has an invalid status")
     if payload.get("artifact_stem") != artifact_stem:
         raise ValueError("delivery receipt artifact stem mismatch")
+    generated_at = payload.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at:
+        raise ValueError("delivery receipt has no generation timestamp")
     markdown = payload.get("markdown")
     report_json = payload.get("report_json")
-    protection_state = payload.get("protection_state")
     if not isinstance(markdown, str) or not isinstance(report_json, str):
         raise ValueError("delivery receipt has no embedded report payload")
-    if not isinstance(protection_state, dict):
-        raise ValueError("delivery receipt has no embedded protection state")
     try:
         report_payload = json.loads(report_json)
     except json.JSONDecodeError:
         raise ValueError("delivery receipt report JSON is malformed") from None
     if not isinstance(report_payload, dict):
         raise ValueError("delivery receipt report JSON must be an object")
+    protection_state = payload.get("protection_state")
+    if "protection_state" not in payload and "protection_state_sha256" not in payload:
+        if status == "prepared":
+            raise ValueError("delivery receipt has no embedded protection state")
+        legacy_hashes = _payload_hashes(markdown, report_json)
+        if any(payload.get(key) != value for key, value in legacy_hashes.items()):
+            raise ValueError("delivery receipt content hash mismatch")
+        protection_state = _validate_protection_state(
+            report_payload.get("protection_state")
+        )
+        return _write_delivery_receipt(
+            path,
+            status=str(status),
+            generated_at=generated_at,
+            artifact_stem=artifact_stem,
+            markdown=markdown,
+            report_json=report_json,
+            protection_state=protection_state,
+        )
+    if not isinstance(protection_state, dict):
+        raise ValueError("delivery receipt has no embedded protection state")
     hashes = _payload_hashes(markdown, report_json, protection_state)
     if any(payload.get(key) != value for key, value in hashes.items()):
         raise ValueError("delivery receipt content hash mismatch")
