@@ -44,7 +44,7 @@ def to_futu_symbol(market: str, symbol: str) -> str:
 def _cn_exchange(symbol: str) -> str:
     if len(symbol) != 6 or not symbol.isdigit():
         raise ValueError(f"invalid CN symbol: {symbol}")
-    if symbol.startswith("92") or symbol[0] in "48":
+    if symbol.startswith("92"):
         return "BJ"
     if symbol == "000300" or symbol[0] in "569":
         return "SH"
