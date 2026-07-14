@@ -16,6 +16,7 @@ from .tiger_long_term import allocate_target_weights, rebalance_reasons, sma200_
 
 
 CENT = Decimal("0.01")
+MAX_DGS3MO_PUBLICATION_LAG_DAYS = 10
 
 
 class TigerUsFeeModel:
@@ -82,12 +83,11 @@ def load_dgs3mo_csv(path: Path) -> dict[date, Decimal]:
     try:
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
-            if reader.fieldnames is None or not {"DATE", "DGS3MO"}.issubset(reader.fieldnames):
-                raise ValueError("DGS3MO CSV must contain DATE and DGS3MO")
+            date_field = _dgs3mo_date_field(reader.fieldnames)
             for row in reader:
-                raw_date = str(row.get("DATE") or "").strip()
+                raw_date = str(row.get(date_field) or "").strip()
                 raw_rate = str(row.get("DGS3MO") or "").strip()
-                if raw_rate == ".":
+                if raw_rate in {"", "."}:
                     continue
                 try:
                     observation_date = date.fromisoformat(raw_date)
@@ -143,8 +143,9 @@ def ensure_dgs3mo_rates(
     try:
         temp_path.write_bytes(body)
         rates = load_dgs3mo_csv(temp_path)
-        if _last_csv_date(temp_path) < end_date:
-            raise ValueError("DGS3MO download does not reach the requested end date")
+        latest = _last_csv_date(temp_path)
+        if (end_date - latest).days > MAX_DGS3MO_PUBLICATION_LAG_DAYS:
+            raise ValueError("DGS3MO download is stale")
         os.replace(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -155,15 +156,27 @@ def _last_csv_date(path: Path) -> date:
     latest: date | None = None
     try:
         with path.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
+            reader = csv.DictReader(handle)
+            date_field = _dgs3mo_date_field(reader.fieldnames)
+            for row in reader:
                 try:
-                    observation_date = date.fromisoformat(str(row.get("DATE") or "").strip())
+                    observation_date = date.fromisoformat(
+                        str(row.get(date_field) or "").strip()
+                    )
                 except ValueError:
                     continue
                 latest = observation_date if latest is None else max(latest, observation_date)
     except OSError as exc:
         raise ValueError(f"cannot read DGS3MO CSV: {path}") from exc
     return latest or date.min
+
+
+def _dgs3mo_date_field(fieldnames: Sequence[str] | None) -> str:
+    if fieldnames and "DGS3MO" in fieldnames:
+        for candidate in ("DATE", "observation_date"):
+            if candidate in fieldnames:
+                return candidate
+    raise ValueError("DGS3MO CSV must contain DATE or observation_date and DGS3MO")
 
 
 def run_tiger_long_term_backtest(

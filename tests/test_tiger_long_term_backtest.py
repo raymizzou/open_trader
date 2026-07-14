@@ -66,6 +66,20 @@ def test_dgs3mo_loader_skips_missing_observations(tmp_path: Path) -> None:
     assert cash_growth(Decimal("4"), 365) == Decimal("0.04")
 
 
+def test_dgs3mo_loader_accepts_current_fred_observation_date_header(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rates.csv"
+    path.write_text(
+        "observation_date,DGS3MO\n2026-01-02,4.00\n2026-01-05,\n",
+        encoding="utf-8",
+    )
+
+    assert load_dgs3mo_csv(path) == {
+        date(2026, 1, 2): Decimal("4.00"),
+    }
+
+
 @pytest.mark.parametrize(
     "csv_text",
     [
@@ -141,6 +155,31 @@ def test_ensure_dgs3mo_rates_rejects_empty_download(tmp_path: Path) -> None:
             tmp_path,
             date(2026, 1, 6),
             opener=lambda url: FakeHttpResponse(b""),
+        )
+
+
+def test_ensure_dgs3mo_rates_allows_normal_fred_publication_lag(
+    tmp_path: Path,
+) -> None:
+    body = b"observation_date,DGS3MO\n2026-01-02,4.00\n"
+
+    rates, _ = ensure_dgs3mo_rates(
+        tmp_path,
+        date(2026, 1, 6),
+        opener=lambda url: FakeHttpResponse(body),
+    )
+
+    assert rates[date(2026, 1, 2)] == Decimal("4.00")
+
+
+def test_ensure_dgs3mo_rates_rejects_stale_download(tmp_path: Path) -> None:
+    body = b"observation_date,DGS3MO\n2026-01-02,4.00\n"
+
+    with pytest.raises(ValueError, match="stale"):
+        ensure_dgs3mo_rates(
+            tmp_path,
+            date(2026, 1, 13),
+            opener=lambda url: FakeHttpResponse(body),
         )
 
 
