@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-14
 
+- Added one daily decision plan per holding with a 10% position cap, repeatable
+  condition notifications, mandatory benchmark backtest gates, and non-executable
+  fallback evidence showing maximum drawdown, Sharpe, and Calmar ratios; Dashboard
+  acceptance now rejects missing risk metrics or K-line current prices.
 - Replaced AKShare with Futu OpenD as the sole A-share real-time and historical
   market-data source across Dashboard quotes, backtests, watches, and T signals;
   verified 26/26 live quotes and the full Dashboard acceptance gate (`PASS`).
