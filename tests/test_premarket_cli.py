@@ -363,6 +363,84 @@ def test_trend_a_share_report_whitespace_api_key_returns_two(
     assert "TREND_ANIMALS_API_KEY" in capsys.readouterr().err
 
 
+def test_watch_trend_a_share_parser_has_safe_defaults() -> None:
+    args = build_parser().parse_args(["watch-trend-a-share"])
+
+    assert args.config == Path("config/daily_premarket.env")
+    assert args.poll_seconds == 5.0
+    assert args.reconnect_seconds == 60.0
+    assert args.once is False
+
+
+def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    config = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        data_dir=tmp_path / "data",
+        portfolio=tmp_path / "portfolio.csv",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+    )
+    quote = object()
+
+    class RecordingLock:
+        def __init__(self, path: Path) -> None:
+            captured["lock_path"] = path
+
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    def fake_watcher(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            status="completed",
+            watched_symbol_count=1,
+            trigger_count=0,
+            exception_count=0,
+            unknown_quote_count=0,
+            events_path=tmp_path / "data/trend_a_share/watch_events.jsonl",
+        )
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
+    monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
+    monkeypatch.setattr(cli, "FutuQuoteClient", lambda **kwargs: quote)
+    monkeypatch.setattr(cli, "RunLock", RecordingLock)
+    monkeypatch.setattr(cli, "watch_a_share_protection", fake_watcher)
+
+    assert cli.main(
+        [
+            "watch-trend-a-share",
+            "--config",
+            str(tmp_path / "daily.env"),
+            "--poll-seconds",
+            "2.5",
+            "--reconnect-seconds",
+            "30",
+            "--once",
+        ]
+    ) == 0
+
+    assert captured["lock_path"] == tmp_path / "data/runs/.trend_a_share_watch.lock"
+    assert captured["portfolio_path"] == config.portfolio
+    assert captured["state_path"] == tmp_path / "data/trend_a_share/protection_state.json"
+    assert captured["events_path"] == tmp_path / "data/trend_a_share/watch_events.jsonl"
+    assert captured["quote_client"] is None
+    assert callable(captured["quote_client_factory"])
+    assert captured["quote_client_factory"]() is quote
+    assert captured["notifier"] == "notifier"
+    assert captured["poll_seconds"] == 2.5
+    assert captured["reconnect_seconds"] == 30.0
+    assert captured["once"] is True
+    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+
+
 def test_run_daily_premarket_requires_market() -> None:
     parser = build_parser()
 

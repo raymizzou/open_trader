@@ -17,9 +17,11 @@ from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
 from .a_share_trend import run_a_share_trend_report
+from .a_share_trend_watch import watch_a_share_protection
 from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
+    RunLock,
     _read_env_file,
     build_notifier,
     load_env_config,
@@ -461,6 +463,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
     trend_report.add_argument("--revision", action="store_true")
+
+    trend_watch = subparsers.add_parser(
+        "watch-trend-a-share", help="Watch Eastmoney A-share protection lines"
+    )
+    trend_watch.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    trend_watch.add_argument("--poll-seconds", type=float, default=5.0)
+    trend_watch.add_argument("--reconnect-seconds", type=float, default=60.0)
+    trend_watch.add_argument("--once", action="store_true")
 
     test_notification_parser = subparsers.add_parser(
         "test-notification",
@@ -1306,6 +1318,49 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0 if result.status in {"generated", "existing", "holiday"} else 1
+
+    if args.command == "watch-trend-a-share":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            notifier = build_notifier(config)
+        except (FileNotFoundError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
+        def quote_factory() -> FutuQuoteClient:
+            return FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+
+        try:
+            with RunLock(config.data_dir / "runs/.trend_a_share_watch.lock"):
+                result = watch_a_share_protection(
+                    portfolio_path=config.portfolio,
+                    state_path=config.data_dir
+                    / "trend_a_share/protection_state.json",
+                    events_path=config.data_dir / "trend_a_share/watch_events.jsonl",
+                    quote_client=None,
+                    quote_client_factory=quote_factory,
+                    notifier=notifier,
+                    poll_seconds=args.poll_seconds,
+                    reconnect_seconds=args.reconnect_seconds,
+                    once=args.once,
+                )
+        except (FileNotFoundError, FutuQuoteError, RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "status": result.status,
+                    "watched_symbol_count": result.watched_symbol_count,
+                    "trigger_count": result.trigger_count,
+                    "exception_count": result.exception_count,
+                    "unknown_quote_count": result.unknown_quote_count,
+                    "events_path": str(result.events_path),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
 
     if args.command == "test-notification":
         try:
