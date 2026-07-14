@@ -1532,7 +1532,7 @@ def test_dashboard_static_mounts_account_holdings_without_standalone_tiger_panel
     assert 'id="header-broker-filters"' not in html
 
 
-def test_dashboard_renders_account_strategy_sections() -> None:
+def test_dashboard_account_sections_and_links_are_semantic() -> None:
     strategy = tiger_long_term_dashboard_payload()
     payload = json.dumps(strategy, ensure_ascii=False)
     output = run_dashboard_js(f'''
@@ -1559,11 +1559,14 @@ state.dashboard = {{
   ],
 }};
 renderAccountHoldings();
-console.log(elements["account-holdings"].innerHTML);
+console.log(renderBrokerSummaryCards() + elements["account-holdings"].innerHTML);
 ''')
 
     for broker in ("futu", "tiger", "phillips", "eastmoney"):
+        assert f'href="#account-{broker}"' in output
         assert f'id="account-{broker}"' in output
+        assert f'aria-labelledby="account-{broker}-title"' in output
+    assert output.count('<a class="broker-summary-card"') == 4
     for label in (
         "中短线 · 股票与期权", "长线 · SMA200 组合策略",
         "中线 · 中线策略", "偏短线 · 趋势交易",
@@ -1575,6 +1578,17 @@ console.log(elements["account-holdings"].innerHTML);
         assert required in output
     assert "calibration_required" not in output
     assert "tiger-long-term-panel" not in output
+
+
+def test_dashboard_account_holdings_mobile_layout_css() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+
+    assert ".account-holdings-table thead" in mobile
+    assert ".account-holding-row" in mobile
+    assert "grid-template-columns: 1fr;" in mobile
+    assert ".account-mobile-label" in mobile
+    assert "overflow-x: hidden;" in mobile
 
 
 def test_dashboard_account_holdings_selects_only_one_broker_row_for_duplicate_symbol() -> None:
