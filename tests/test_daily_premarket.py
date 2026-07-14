@@ -4344,6 +4344,44 @@ def test_launchd_installer_removes_legacy_agent_for_single_market_install(
     assert not (agents / "com.open-trader.premarket.us.plist").exists()
 
 
+def test_launchd_installer_cn_only_preserves_legacy_agent(tmp_path: Path) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    legacy = agents / "com.open-trader.premarket.plist"
+    legacy.write_text("legacy\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--market",
+            "CN",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert legacy.exists()
+    assert "removed legacy launchd agent" not in result.stdout
+    assert (agents / "com.open-trader.trend-a-share-report.plist").exists()
+    assert (agents / "com.open-trader.trend-a-share-watch.plist").exists()
+    assert not (agents / "com.open-trader.premarket.hk.plist").exists()
+    assert not (agents / "com.open-trader.premarket.us.plist").exists()
+
+
 def test_launchd_installer_dry_run_does_not_remove_legacy_agent(
     tmp_path: Path,
 ) -> None:

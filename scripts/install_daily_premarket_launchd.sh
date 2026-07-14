@@ -221,7 +221,7 @@ render_cn_jobs() {
   done
 }
 
-if [[ "$DRY_RUN" -eq 0 ]]; then
+if [[ "$DRY_RUN" -eq 0 && "$MARKET" != "CN" ]]; then
   remove_legacy_agent
 fi
 
