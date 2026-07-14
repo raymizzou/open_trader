@@ -5485,9 +5485,10 @@ function getHoldings() {
   const holdings = (state.dashboard && Array.isArray(state.dashboard.holdings))
     ? state.dashboard.holdings
     : [];
-  const adjusted = holdings.map((holding) => (
-    quoteAdjustedHolding(holding, quoteForHolding(holding))
-  ));
+  const adjusted = holdings.map((holding) => ({
+    ...quoteAdjustedHolding(holding, quoteForHolding(holding)),
+    snapshot_market_value_hkd: holding.market_value_hkd,
+  }));
   const values = [...adjusted, ...getCashRows()].map(
     (row) => numericValue(row.market_value_hkd),
   );
@@ -5517,24 +5518,23 @@ function accountHoldingGroups() {
         .filter((detail) => brokerKey(detail) === broker);
       details.forEach((detail) => rows.push({
         key: accountHoldingKey(broker, holding, index), broker, holding,
-        display: accountDisplayRow(holding, detail, summary, portfolioTotal), index,
+        display: accountDisplayRow(holding, detail, summary, portfolioTotal),
+        snapshot_market_value_hkd: detail.market_value_hkd, index,
       }));
       if (!details.length && rowBrokers(holding).length === 1 && rowBrokers(holding)[0] === broker) {
         rows.push({key: accountHoldingKey(broker, holding, index), broker, holding,
-          display: accountDisplayRow(holding, null, summary, portfolioTotal), index});
+          display: accountDisplayRow(holding, null, summary, portfolioTotal),
+          snapshot_market_value_hkd: holding.snapshot_market_value_hkd, index});
       }
     });
     return {broker, profile, summary, rows};
   });
-  const holdingTotal = sumMoneyValues(groups.flatMap((group) => group.rows.map((row) => row.display)));
-  const cashTotal = numericValue(state.dashboard?.summary?.cash_like_value_hkd);
-  const livePortfolioTotal = holdingTotal.complete && cashTotal !== null
-    ? holdingTotal.value + cashTotal : null;
+  const livePortfolioTotal = quoteAdjustedTotal(
+    state.dashboard?.summary?.portfolio_value_hkd,
+    groups.flatMap((group) => group.rows),
+  );
   groups.forEach((group) => {
-    const accountHoldingTotal = sumMoneyValues(group.rows.map((row) => row.display));
-    const accountCashTotal = numericValue(group.summary.cash_like_value_hkd);
-    const liveAccountTotal = accountHoldingTotal.complete && accountCashTotal !== null
-      ? accountHoldingTotal.value + accountCashTotal : null;
+    const liveAccountTotal = quoteAdjustedTotal(group.summary.portfolio_value_hkd, group.rows);
     group.rows.forEach((row) => {
       const marketValue = numericValue(row.display.market_value_hkd);
       row.display.account_weight = percentValue(marketValue, liveAccountTotal);
@@ -5542,6 +5542,18 @@ function accountHoldingGroups() {
     });
   });
   return groups;
+}
+
+function quoteAdjustedTotal(snapshotTotal, rows) {
+  let total = numericValue(snapshotTotal);
+  if (total === null) return null;
+  for (const row of rows) {
+    const liveValue = numericValue(row.display.market_value_hkd);
+    const snapshotValue = numericValue(row.snapshot_market_value_hkd);
+    if (liveValue === null || snapshotValue === null) return null;
+    total += liveValue - snapshotValue;
+  }
+  return total;
 }
 
 function accountDisplayRow(holding, detail, summary, portfolioTotal) {

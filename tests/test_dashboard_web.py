@@ -896,12 +896,12 @@ console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
     assert groups[1]["rows"] == [{"key": "tiger:US:QQQ:0", "quantity": "2", "accountWeight": "80.00%"}]
 
 
-def test_dashboard_account_rows_recalculate_live_values_from_broker_details() -> None:
+def test_dashboard_account_rows_reprice_with_unmapped_assets_and_negative_cash() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
-  summary: {portfolio_value_hkd: "3000", cash_like_value_hkd: "300"}, broker_summaries: [
-    {broker: "futu", portfolio_value_hkd: "1000", cash_like_value_hkd: "100"},
-    {broker: "tiger", portfolio_value_hkd: "2000", cash_like_value_hkd: "200"},
+  summary: {portfolio_value_hkd: "5000", cash_like_value_hkd: "300"}, broker_summaries: [
+    {broker: "futu", portfolio_value_hkd: "2000", cash_like_value_hkd: "100"},
+    {broker: "tiger", portfolio_value_hkd: "3000", cash_like_value_hkd: "-200"},
   ], cash_rows: [], holdings: [{
     market: "US", symbol: "QQQ", brokers: "futu;tiger", total_quantity: "3",
     cost_value: "210", fx_to_hkd: "7.8", market_value_hkd: "2300",
@@ -929,16 +929,16 @@ console.log(JSON.stringify(accountHoldingGroups().slice(0, 2).map((group) => {
         {
             "broker": "futu",
             "marketValueHkd": "780.00",
-            "accountWeight": "88.64%",
-            "overallWeight": "29.10%",
+            "accountWeight": "37.50%",
+            "overallWeight": "15.35%",
             "pnl": "40.00",
             "pnlPercent": "66.67%",
         },
         {
             "broker": "tiger",
             "marketValueHkd": "1600.00",
-            "accountWeight": "88.89%",
-            "overallWeight": "59.70%",
+            "accountWeight": "53.33%",
+            "overallWeight": "31.50%",
             "pnl": "50.00",
             "pnlPercent": "33.33%",
         },
