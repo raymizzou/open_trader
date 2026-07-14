@@ -1141,7 +1141,7 @@ class ReadyApi:
 
     def get_snapshot_billing(self) -> list[dict[str, object]]:
         self.calls.append("api.billing")
-        return [{"field": field, "price": "bad" if self.invalid_billing else "0.01"} for field in {
+        return [{"columnName": field, "priceCost": "bad" if self.invalid_billing else "0.01"} for field in {
             "tmId", "tickerName", "tickerSymbol", "asset", "asOfDate",
             "tradableFlag", "industryName", "amount1d", "isTrendRightSide",
             "daysSinceTrendEntry", "trendStrengthLocalCurr",
@@ -1216,7 +1216,7 @@ def test_report_runner_checks_calendar_status_billing_then_paid_data(tmp_path: P
 
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 17, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
         sleep_fn=lambda seconds: None,
         api_factory=api_factory,
         quote_factory=lambda **kwargs: ReadyQuote(calls),

@@ -1030,7 +1030,7 @@ def _billing_field(row: Mapping[str, object]) -> str:
 
 
 def _billing_price(row: Mapping[str, object]) -> Decimal:
-    for key in ("price", "cost", "unitPrice", "billing"):
+    for key in ("priceCost", "price", "cost", "unitPrice", "billing"):
         if key in row:
             try:
                 value = _decimal(row[key])
