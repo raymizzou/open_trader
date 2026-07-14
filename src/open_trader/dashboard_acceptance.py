@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
+import re
 import subprocess
 import time
 from typing import Any
@@ -234,7 +235,13 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
         assert panel_id, f"tab {expected_labels[index]} has no controlled panel"
         panel = page.locator(f"#{panel_id}:visible")
         assert panel.count() == 1, f"tab {expected_labels[index]} has {panel.count()} visible panels"
-        assert "数据未生成" not in panel.inner_text(), f"tab {expected_labels[index]} contains 数据未生成"
+        panel_text = panel.inner_text()
+        assert "数据未生成" not in panel_text, f"tab {expected_labels[index]} contains 数据未生成"
+        if index == 0:
+            assert "夏普比率" in panel_text, "最终决策缺少夏普比率"
+            assert "卡玛比率" in panel_text, "最终决策缺少卡玛比率"
+        if index == 2:
+            assert not re.search(r"当前价\s*缺失", panel_text), "趋势 / K 线当前价缺失"
 
 
 def _browser_check(

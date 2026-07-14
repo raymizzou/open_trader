@@ -2647,9 +2647,10 @@ function renderDecisionPlanBacktests(backtests) {
       ${rows.map((item) => {
         const strategy = item.strategy || {};
         const benchmark = item.market_benchmark || {};
+        const heading = [item.range, item.strategy_id].filter(hasValue).join(" · ") || "-";
         return `
           <article>
-            <div><strong>${escapeHtml(item.range || "-")}</strong><span class="status-pill status-${item.gate && item.gate.passed === true ? "ok" : "failed"}">${item.gate && item.gate.passed === true ? "通过" : "未通过"}</span></div>
+            <div><strong>${escapeHtml(heading)}</strong><span class="status-pill status-${item.gate && item.gate.passed === true ? "ok" : "failed"}">${item.gate && item.gate.passed === true ? "通过" : "未通过"}</span></div>
             <dl>
               <div><dt>策略收益</dt><dd>${escapeHtml(decisionPlanPercent(strategy.total_return_pct))}</dd></div>
               <div><dt>${escapeHtml(benchmark.symbol || "基准")}</dt><dd>${escapeHtml(decisionPlanPercent(benchmark.total_return_pct))}</dd></div>
@@ -2683,6 +2684,8 @@ function renderFallbackDecisionPlan(plan) {
         <article><h4>TradingAgents 解读</h4><p>${escapeHtml(tradingagents.core_reason || tradingagents.current_action || "暂无")}</p></article>
         <article><h4>为什么没有可执行计划</h4><p>${escapeHtml(fallback.reason || "没有策略通过当前回测闸门")}</p></article>
       </div>
+      <div class="decision-plan-section-heading"><h4>回测闸门</h4><span>候选策略均未通过，仅展示证据</span></div>
+      ${renderDecisionPlanBacktests(plan.backtests)}
       ${renderPreviousDecisionReview(plan.previous_review)}
     </section>
   `;
@@ -2886,7 +2889,7 @@ function klineDecisionFactsPlugin(holding) {
   }
   return {
     ...plugin,
-    bodyHtml: `${timeframes.length ? renderBollingerSection(timeframes) : ""}${plugin.bodyHtml}`,
+    bodyHtml: `${timeframes.length ? renderBollingerSection(timeframes, holding.last_price) : ""}${plugin.bodyHtml}`,
   };
 }
 
@@ -3239,7 +3242,7 @@ function klineTechnicalFactsPlugin(holding) {
     const timeframes = detail.facts && Array.isArray(detail.facts.timeframes)
       ? detail.facts.timeframes
       : [];
-    const bollingerHtml = renderBollingerSection(timeframes);
+    const bollingerHtml = renderBollingerSection(timeframes, holding.last_price);
     const dateText = technicalFactsDateText(detail);
     return {
       title: "趋势 / K 线",
@@ -3340,7 +3343,7 @@ function renderTechnicalFactsMeta(detail) {
   return `<div class="technical-facts-meta">${escapeHtml(dates)}</div>`;
 }
 
-function renderBollingerSection(timeframes) {
+function renderBollingerSection(timeframes, holdingPrice) {
   const timeframesWithObjects = Array.isArray(timeframes)
     ? timeframes.filter((timeframe) => timeframe && typeof timeframe === "object")
     : [];
@@ -3354,7 +3357,8 @@ function renderBollingerSection(timeframes) {
   const bollinger = preferred.bollinger && typeof preferred.bollinger === "object"
     ? preferred.bollinger
     : {};
-  return renderBollingerCard(bollinger, preferred.current_price, timeframeLabel(preferred));
+  const currentPrice = firstPresent(holdingPrice, preferred.current_price, bollinger.current_price);
+  return renderBollingerCard(bollinger, currentPrice, timeframeLabel(preferred));
 }
 
 function renderBollingerCard(bollinger, currentPrice, timeframe) {

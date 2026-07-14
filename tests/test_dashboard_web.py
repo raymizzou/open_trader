@@ -126,6 +126,12 @@ const fallbackPlan = {
   status: "waiting",
   run_date: "2026-07-13",
   max_weight: "0.10",
+  backtests: [{
+    range: "1Y", strategy_id: "range_mean_reversion/v1", gate: {passed: false},
+    strategy: {total_return_pct: "-1", max_drawdown_pct: "8", sharpe_ratio: "-0.03", calmar_ratio: "-0.04"},
+    market_benchmark: {symbol: "SPY", total_return_pct: "5.5"},
+    market_excess_return_pct: "-6.5",
+  }],
   fallback: {
     label: "非执行型建议", reason: "没有策略通过当前回测闸门", recommendation: "禁止加仓",
     max_weight: "0.10", tradingagents: {current_action: "观察", core_reason: "等待趋势确认"},
@@ -137,7 +143,7 @@ const fallbackPlan = {
   },
 };
 const fallback = renderDecisionPlan({decision_plan: fallbackPlan});
-for (const text of ["非执行型建议", "禁止加仓", "RSI", "布林带", "为什么没有可执行计划"]) {
+for (const text of ["非执行型建议", "禁止加仓", "RSI", "布林带", "为什么没有可执行计划", "回测闸门", "夏普比率", "卡玛比率", "range_mean_reversion/v1"]) {
   if (!fallback.includes(text)) throw new Error("missing " + text + ": " + fallback);
 }
 if (fallback.includes("data-plan-condition")) throw new Error("fallback rendered executable condition");
@@ -3489,6 +3495,7 @@ def test_dashboard_renders_bollinger_card_in_current_kline_plugin_path() -> None
 const holding = {
   market: "US",
   symbol: "MSFT",
+  last_price: "710.55",
   portfolio_weight_hkd: "10.00%",
   decision_facts: {
     kline: {available: false, fields: {}},
@@ -3504,8 +3511,8 @@ const holding = {
       timeframes: [{
         timeframe: "daily",
         timeframe_label: "日线",
-        current_price: "466.20",
         bollinger: {
+          current_price: "47.00",
           upper: "459.13",
           middle: "399.62",
           lower: "340.11",
@@ -3530,6 +3537,8 @@ console.log(html);
     assert "technical-bollinger-card upper-risk" in html
     assert "回调风险升高" in html
     assert "当前价格已超过日线布林带上轨" in html
+    assert "当前价</span>\n          <strong>710.55</strong>" in html
+    assert "当前价</span>\n          <strong>缺失</strong>" not in html
     assert "status-pill status-ok\">可用" in html
     assert "趋势</span>" not in html
     assert "upper_risk" not in html
