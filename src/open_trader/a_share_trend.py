@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import subprocess
 from collections import Counter, defaultdict
@@ -97,6 +98,7 @@ class CandidateInput:
     danger: object
     close: Decimal | None
     atr: Decimal | None
+    pools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -313,7 +315,10 @@ def _symbol_parts(value: object) -> tuple[str, str]:
 
 
 def evaluate_candidate(
-    row: Mapping[str, object], bars: Sequence[DailyKlineBar] | None
+    row: Mapping[str, object],
+    bars: Sequence[DailyKlineBar] | None,
+    *,
+    pools: Sequence[str] = (),
 ) -> CandidateInput:
     symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
     daily_bars = tuple(bars or ())
@@ -337,6 +342,7 @@ def evaluate_candidate(
         danger=row.get("stopwinFlagByDangerSignal"),
         close=close,
         atr=atr,
+        pools=tuple(sorted(set(pools))),
     )
 
 
@@ -361,6 +367,10 @@ def _candidate_reasons(
         reasons.append("amount_below_1")
     if item.danger is not False:
         reasons.append("danger_signal" if item.danger else "danger_unknown")
+    if not item.name:
+        reasons.append("name_missing")
+    if not item.asset:
+        reasons.append("asset_missing")
     if item.symbol in held_symbols:
         reasons.append("already_held")
     if item.exchange == "BJ" or _excluded_name(item.name):
@@ -648,6 +658,23 @@ def build_report(
         symbol: [_candidate_signal(item) for item in candidates if item.symbol == symbol]
         for symbol in candidate_decision.excluded
     }
+    ranks = {
+        (item.tm_id, item.symbol): rank
+        for rank, item in enumerate(candidate_decision.eligible, 1)
+    }
+    candidate_signals = [
+        {
+            **_candidate_signal(item),
+            "eligible": (item.tm_id, item.symbol) in ranks,
+            "excluded_reasons": _candidate_reasons(
+                item, held_symbols, as_of_date
+            ),
+            "rank": ranks.get((item.tm_id, item.symbol)),
+            "pools": list(item.pools),
+            "source": "Trend Animals",
+        }
+        for item in candidates
+    ]
     return TrendReport(
         schema_version=1,
         generated_at=generated_at
@@ -668,6 +695,7 @@ def build_report(
         signal_snapshots={
             "holdings": holding_signals,
             "excluded": excluded_signals,
+            "candidates": candidate_signals,
         },
         metadata=dict(metadata or {}),
     )
@@ -689,6 +717,10 @@ def _candidate_signal(item: CandidateInput) -> dict[str, object]:
     return {
         "tm_id": item.tm_id,
         "symbol": item.symbol,
+        "exchange": item.exchange,
+        "name": item.name,
+        "asset": item.asset,
+        "industry": item.industry,
         "as_of_date": item.as_of_date,
         "tradable": item.tradable,
         "amount": item.amount,
@@ -1050,17 +1082,36 @@ def _write_run_log(path: Path, payload: Mapping[str, object], *, append: bool) -
         handle.write("\n")
 
 
-def _write_delivery_receipt(path: Path, *, status: str, generated_at: str) -> None:
+def _staged_hashes(markdown_path: Path, json_path: Path) -> dict[str, str]:
+    markdown = markdown_path.read_bytes()
+    json_bytes = json_path.read_bytes()
+    return {
+        "markdown_sha256": hashlib.sha256(markdown).hexdigest(),
+        "json_sha256": hashlib.sha256(json_bytes).hexdigest(),
+        "content_hash": hashlib.sha256(markdown + b"\0" + json_bytes).hexdigest(),
+    }
+
+
+def _write_delivery_receipt(
+    path: Path,
+    *,
+    status: str,
+    generated_at: str,
+    artifact_stem: str,
+    markdown_path: Path,
+    json_path: Path,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": status,
+        "generated_at": generated_at,
+        "artifact_stem": artifact_stem,
+        **_staged_hashes(markdown_path, json_path),
+    }
     temp_path: Path | None = None
     try:
         with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=path.parent) as handle:
-            json.dump(
-                {"status": status, "generated_at": generated_at},
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-            )
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
             handle.write("\n")
             temp_path = Path(handle.name)
         temp_path.replace(path)
@@ -1069,17 +1120,148 @@ def _write_delivery_receipt(path: Path, *, status: str, generated_at: str) -> No
             temp_path.unlink(missing_ok=True)
 
 
-def _read_delivery_receipt(path: Path) -> str:
+def _read_delivery_receipt(
+    path: Path,
+    *,
+    artifact_stem: str,
+    markdown_path: Path,
+    json_path: Path,
+) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return ""
+        return None
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise ValueError("delivery receipt is unreadable or malformed") from None
     status = payload.get("status") if isinstance(payload, dict) else None
-    if status not in {"pending", "sent", "delivery_failed"}:
+    if status not in {"pending", "sent", "delivery_failed", "delivery_unknown"}:
         raise ValueError("delivery receipt has an invalid status")
-    return status
+    if payload.get("artifact_stem") != artifact_stem:
+        raise ValueError("delivery receipt artifact stem mismatch")
+    hashes = _staged_hashes(markdown_path, json_path)
+    if any(payload.get(key) != value for key, value in hashes.items()):
+        raise ValueError("delivery receipt content hash mismatch")
+    return payload
+
+
+def _patch_staged_delivery(json_path: Path, status: str) -> None:
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("staged report JSON must be an object")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        payload["metadata"] = metadata
+    metadata["delivery_status"] = status
+    payload["delivery_status"] = status
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", delete=False, dir=json_path.parent
+        ) as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            temp_path = Path(handle.name)
+        temp_path.replace(json_path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _freeze_staged_report(
+    *,
+    markdown_source: Path,
+    json_source: Path,
+    reports_dir: Path,
+    artifact_stem: str,
+) -> tuple[Path, Path]:
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = reports_dir / f"{artifact_stem}.md"
+    json_path = reports_dir / f"{artifact_stem}.json"
+    markdown_temp: Path | None = None
+    json_temp: Path | None = None
+    markdown_backup: Path | None = None
+    json_backup: Path | None = None
+    try:
+        with NamedTemporaryFile("wb", delete=False, dir=reports_dir) as handle:
+            handle.write(markdown_source.read_bytes())
+            markdown_temp = Path(handle.name)
+        with NamedTemporaryFile("wb", delete=False, dir=reports_dir) as handle:
+            handle.write(json_source.read_bytes())
+            json_temp = Path(handle.name)
+        if markdown_path.exists():
+            with NamedTemporaryFile("wb", delete=False, dir=reports_dir) as handle:
+                handle.write(markdown_path.read_bytes())
+                markdown_backup = Path(handle.name)
+        if json_path.exists():
+            with NamedTemporaryFile("wb", delete=False, dir=reports_dir) as handle:
+                handle.write(json_path.read_bytes())
+                json_backup = Path(handle.name)
+        try:
+            markdown_temp.replace(markdown_path)
+            json_temp.replace(json_path)
+        except Exception:
+            for final_path, backup_path in (
+                (markdown_path, markdown_backup),
+                (json_path, json_backup),
+            ):
+                if backup_path is None:
+                    final_path.unlink(missing_ok=True)
+                else:
+                    backup_path.replace(final_path)
+            raise
+        return markdown_path, json_path
+    finally:
+        if markdown_temp is not None:
+            markdown_temp.unlink(missing_ok=True)
+        if json_temp is not None:
+            json_temp.unlink(missing_ok=True)
+        if markdown_backup is not None:
+            markdown_backup.unlink(missing_ok=True)
+        if json_backup is not None:
+            json_backup.unlink(missing_ok=True)
+
+
+def _artifact_stem(
+    *, run_date: str, revision: bool, reports_dir: Path, data_dir: Path
+) -> str:
+    if not revision:
+        return run_date
+    number = 1
+    while True:
+        stem = f"{run_date}-r{number}"
+        final_exists = (reports_dir / f"{stem}.md").exists() or (
+            reports_dir / f"{stem}.json"
+        ).exists()
+        receipt_exists = (
+            data_dir / "trend_a_share/delivery" / f"{stem}.json"
+        ).exists()
+        if receipt_exists:
+            try:
+                receipt = json.loads(
+                    (
+                        data_dir / "trend_a_share/delivery" / f"{stem}.json"
+                    ).read_text(encoding="utf-8")
+                )
+                status = receipt.get("status") if isinstance(receipt, dict) else None
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                status = None
+            if status != "sent" or not final_exists:
+                return stem
+        if not final_exists and not receipt_exists:
+            return stem
+        number += 1
+
+
+def _staged_paths(
+    data_dir: Path, artifact_stem: str, run_date: str
+) -> tuple[Path, Path, Path]:
+    directory = data_dir / "trend_a_share/staged" / artifact_stem
+    return (
+        directory / f"{run_date}.md",
+        directory / f"{run_date}.json",
+        data_dir / "trend_a_share/delivery" / f"{artifact_stem}.json",
+    )
 
 
 def _notify_status(notifier: Notifier, title: str, message: str) -> None:
@@ -1089,6 +1271,86 @@ def _notify_status(notifier: Notifier, title: str, message: str) -> None:
         message,
         channels={"macos"},
     )
+
+
+def _notify_delivery_status(
+    notifier: Notifier, *, run_date: str, delivery_status: str
+) -> None:
+    if delivery_status in {"sent", "sent_prior_attempt"}:
+        title = "A股趋势计划已生成"
+    elif delivery_status == "delivery_unknown":
+        title = "A股趋势计划交付状态未知"
+    else:
+        title = "A股趋势计划发送失败"
+    _notify_status(
+        notifier,
+        title,
+        f"{run_date} 本地报告已冻结；飞书状态：{delivery_status}",
+    )
+
+
+def _recover_staged_report(
+    *,
+    config: DailyPremarketConfig,
+    run_date: str,
+    artifact_stem: str,
+    notifier: Notifier,
+) -> AShareTrendRunResult | None:
+    staged_markdown, staged_json, receipt_path = _staged_paths(
+        config.data_dir, artifact_stem, run_date
+    )
+    receipt = _read_delivery_receipt(
+        receipt_path,
+        artifact_stem=artifact_stem,
+        markdown_path=staged_markdown,
+        json_path=staged_json,
+    )
+    if receipt is None:
+        return None
+    prior_status = str(receipt["status"])
+    receipt_status = prior_status
+    if prior_status == "delivery_failed":
+        attempts = send_notification_with_results(
+            notifier,
+            f"A股趋势操作计划 · {run_date}",
+            staged_markdown.read_text(encoding="utf-8"),
+            channels={"feishu", "feishu_app"},
+        )
+        delivery_status = (
+            "sent"
+            if any(
+                item.channel.startswith("feishu") and item.success
+                for item in attempts
+            )
+            else "delivery_failed"
+        )
+        receipt_status = delivery_status
+    elif prior_status == "sent":
+        delivery_status = "sent_prior_attempt"
+    else:
+        delivery_status = "delivery_unknown"
+        receipt_status = "delivery_unknown"
+    _patch_staged_delivery(staged_json, delivery_status)
+    _write_delivery_receipt(
+        receipt_path,
+        status=receipt_status,
+        generated_at=str(receipt["generated_at"]),
+        artifact_stem=artifact_stem,
+        markdown_path=staged_markdown,
+        json_path=staged_json,
+    )
+    markdown_path, json_path = _freeze_staged_report(
+        markdown_source=staged_markdown,
+        json_source=staged_json,
+        reports_dir=config.reports_dir / "trend_a_share",
+        artifact_stem=artifact_stem,
+    )
+    _notify_delivery_status(
+        notifier,
+        run_date=run_date,
+        delivery_status=delivery_status,
+    )
+    return AShareTrendRunResult("generated", markdown_path, json_path)
 
 
 def _status_date(row: Mapping[str, object]) -> str:
@@ -1190,7 +1452,7 @@ def _attempt_report(
     *,
     config: DailyPremarketConfig,
     run_date: str,
-    revision: bool,
+    artifact_stem: str,
     process_version: str,
     api_factory: Callable[..., object],
     quote_factory: Callable[..., object],
@@ -1220,11 +1482,15 @@ def _attempt_report(
 
         balance_before = _balance(api.get_account_balance())
         component_rows = []
+        component_pools: defaultdict[int, set[str]] = defaultdict(set)
         for tm_id in (
             config.trend_animals_a_share_tm_id,
             config.trend_animals_etf_tm_id,
         ):
-            component_rows.extend(api.get_components(tm_id=tm_id, expected_date=run_date))
+            rows = api.get_components(tm_id=tm_id, expected_date=run_date)
+            component_rows.extend(rows)
+            for row in rows:
+                component_pools[_row_tm_id(row)].add(str(tm_id))
         component_ids = {_row_tm_id(row) for row in component_rows}
 
         account = load_eastmoney_account(
@@ -1289,7 +1555,13 @@ def _attempt_report(
                 daily_bars = None
             except ValueError:
                 daily_bars = None
-            candidates.append(evaluate_candidate(row, daily_bars))
+            candidates.append(
+                evaluate_candidate(
+                    row,
+                    daily_bars,
+                    pools=component_pools[tm_id],
+                )
+            )
         for symbol, tm_id in holding_ids.items():
             row = rows_by_tm_id.get(tm_id)
             if row is not None:
@@ -1310,6 +1582,8 @@ def _attempt_report(
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
                     raise
+                bars_by_symbol[symbol] = None
+            except ValueError:
                 bars_by_symbol[symbol] = None
 
         estimated_cost = sum(
@@ -1350,56 +1624,59 @@ def _attempt_report(
             config.data_dir / "trend_a_share/protection_state.json",
             report.protection_state,
         )
-        receipt_path = config.data_dir / "trend_a_share/delivery" / f"{run_date}.json"
-        prior_delivery = _read_delivery_receipt(receipt_path)
-        if prior_delivery:
-            delivery_status = f"{prior_delivery}_prior_attempt"
-        else:
-            _write_delivery_receipt(
-                receipt_path,
-                status="pending",
-                generated_at=report.generated_at,
-            )
-            attempts = send_notification_with_results(
-                notifier,
-                f"A股趋势操作计划 · {report.as_of_date}",
-                render_markdown(report),
-                channels={"feishu", "feishu_app"},
-            )
-            delivery_status = (
-                "sent"
-                if any(
-                    item.channel.startswith("feishu") and item.success
-                    for item in attempts
-                )
-                else "delivery_failed"
-            )
-            _write_delivery_receipt(
-                receipt_path,
-                status=delivery_status,
-                generated_at=report.generated_at,
-            )
         report = replace(
             report,
             metadata={
                 **report.metadata,
-                "delivery_status": delivery_status,
+                "delivery_status": "pending",
                 "process_version": process_version,
             },
         )
-        markdown_path, json_path = write_frozen_report(
-            report,
-            config.reports_dir / "trend_a_share",
-            revision=revision,
+        staged_markdown, staged_json, receipt_path = _staged_paths(
+            config.data_dir, artifact_stem, run_date
         )
-        _notify_status(
+        write_frozen_report(
+            report,
+            staged_markdown.parent,
+        )
+        _write_delivery_receipt(
+            receipt_path,
+            status="pending",
+            generated_at=report.generated_at,
+            artifact_stem=artifact_stem,
+            markdown_path=staged_markdown,
+            json_path=staged_json,
+        )
+        attempts = send_notification_with_results(
             notifier,
-            (
-                "A股趋势计划已生成"
-                if delivery_status == "sent"
-                else "A股趋势计划发送失败"
-            ),
-            f"{run_date} 本地报告已冻结；飞书状态：{delivery_status}",
+            f"A股趋势操作计划 · {report.as_of_date}",
+            staged_markdown.read_text(encoding="utf-8"),
+            channels={"feishu", "feishu_app"},
+        )
+        delivery_status = (
+            "sent"
+            if any(item.channel.startswith("feishu") and item.success for item in attempts)
+            else "delivery_failed"
+        )
+        _patch_staged_delivery(staged_json, delivery_status)
+        _write_delivery_receipt(
+            receipt_path,
+            status=delivery_status,
+            generated_at=report.generated_at,
+            artifact_stem=artifact_stem,
+            markdown_path=staged_markdown,
+            json_path=staged_json,
+        )
+        markdown_path, json_path = _freeze_staged_report(
+            markdown_source=staged_markdown,
+            json_source=staged_json,
+            reports_dir=config.reports_dir / "trend_a_share",
+            artifact_stem=artifact_stem,
+        )
+        _notify_delivery_status(
+            notifier,
+            run_date=run_date,
+            delivery_status=delivery_status,
         )
         return AShareTrendRunResult("generated", markdown_path, json_path)
     finally:
@@ -1421,12 +1698,44 @@ def run_a_share_trend_report(
 ) -> AShareTrendRunResult:
     run_day = date.fromisoformat(run_date)
     notifier = notifier or NullNotifier()
+    if config.trend_animals_a_share_tm_id != 622466:
+        raise ValueError("TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID must be 622466")
+    if config.trend_animals_etf_tm_id != 697199:
+        raise ValueError("TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID must be 697199")
     report_dir = config.reports_dir / "trend_a_share"
     base_markdown = report_dir / f"{run_date}.md"
     base_json = report_dir / f"{run_date}.json"
     with RunLock(config.data_dir / "runs/.trend_a_share_report.lock"):
-        if not revision and base_markdown.exists() and base_json.exists():
+        artifact_stem = _artifact_stem(
+            run_date=run_date,
+            revision=revision,
+            reports_dir=report_dir,
+            data_dir=config.data_dir,
+        )
+        staged_markdown, staged_json, receipt_path = _staged_paths(
+            config.data_dir, artifact_stem, run_date
+        )
+        receipt = _read_delivery_receipt(
+            receipt_path,
+            artifact_stem=artifact_stem,
+            markdown_path=staged_markdown,
+            json_path=staged_json,
+        )
+        if (
+            not revision
+            and base_markdown.exists()
+            and base_json.exists()
+            and (receipt is None or receipt["status"] == "sent")
+        ):
             return AShareTrendRunResult("existing", base_markdown, base_json)
+        recovered = _recover_staged_report(
+            config=config,
+            run_date=run_date,
+            artifact_stem=artifact_stem,
+            notifier=notifier,
+        )
+        if recovered is not None:
+            return recovered
         version = _process_version(config.repo)
         log_path = config.logs_dir / "trend_a_share" / f"{run_date}.log"
         deadline = datetime.combine(run_day, time(18, 0), tzinfo=SHANGHAI)
@@ -1442,7 +1751,7 @@ def run_a_share_trend_report(
                 attempt = _attempt_report(
                     config=config,
                     run_date=run_date,
-                    revision=revision,
+                    artifact_stem=artifact_stem,
                     process_version=version,
                     api_factory=api_factory,
                     quote_factory=quote_factory,

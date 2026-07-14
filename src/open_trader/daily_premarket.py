@@ -186,15 +186,13 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
     if missing:
         raise ValueError(f"missing config value(s): {', '.join(missing)}")
 
-    trend_a_share_tm_id = _fixed_optional_tm_id(
+    trend_a_share_tm_id = _optional_positive_tm_id(
         values,
         "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID",
-        622466,
     )
-    trend_etf_tm_id = _fixed_optional_tm_id(
+    trend_etf_tm_id = _optional_positive_tm_id(
         values,
         "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID",
-        697199,
     )
 
     for key, value in values.items():
@@ -248,16 +246,14 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
     )
 
 
-def _fixed_optional_tm_id(
-    values: dict[str, str], key: str, expected: int
-) -> int:
+def _optional_positive_tm_id(values: dict[str, str], key: str) -> int:
     raw = values.get(key, "0") or "0"
     try:
         value = int(raw)
     except ValueError:
-        raise ValueError(f"{key} must be {expected}") from None
-    if value not in {0, expected}:
-        raise ValueError(f"{key} must be {expected}")
+        raise ValueError(f"{key} must be a positive integer") from None
+    if value < 0:
+        raise ValueError(f"{key} must be a positive integer")
     return value
 
 

@@ -205,7 +205,7 @@ class FutuQuoteClient:
         market, symbol = futu_symbol.split(".", 1)
         wire_symbol = (
             to_futu_symbol("CN", futu_symbol)
-            if market in {"SH", "SZ"}
+            if market in {"SH", "SZ", "BJ"}
             else to_futu_symbol(market, symbol)
         )
         bars: list[DailyKlineBar] = []

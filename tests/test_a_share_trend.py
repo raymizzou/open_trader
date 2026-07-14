@@ -62,7 +62,7 @@ def candidate(
         tm_id=int(symbol),
         symbol=symbol,
         exchange=exchange,
-        name=name or f"股票{symbol}",
+        name=f"股票{symbol}" if name is None else name,
         asset="A股",
         industry=industry,
         as_of_date="2026-07-14",
@@ -307,6 +307,18 @@ def test_candidate_rejects_exact_hard_gate_boundaries(
     overrides: dict[str, object], reason: str
 ) -> None:
     item = candidate("600001", **overrides)  # type: ignore[arg-type]
+    assert reason in build_candidate_list([item], held_symbols=set()).excluded["600001"]
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [({"name": ""}, "name_missing"), ({"asset": ""}, "asset_missing")],
+)
+def test_candidate_missing_identity_field_is_excluded(
+    changes: dict[str, object], reason: str
+) -> None:
+    item = replace(candidate("600001"), **changes)
+
     assert reason in build_candidate_list([item], held_symbols=set()).excluded["600001"]
 
 
@@ -1177,6 +1189,10 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
     assert set(excluded) == {
         "tm_id",
         "symbol",
+        "exchange",
+        "name",
+        "asset",
+        "industry",
         "as_of_date",
         "tradable",
         "amount",
@@ -1188,6 +1204,58 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
     markdown = markdown_path.read_text(encoding="utf-8")
     assert "2026-07-14T17:00:01+08:00" in markdown
     assert "danger=True" in markdown
+
+
+def test_candidate_audit_includes_all_ranked_and_excluded_pool_facts() -> None:
+    ranked = [
+        replace(
+            candidate(f"6000{index:02d}", strength=str(100 - index / 10)),
+            pools=("622466",),
+        )
+        for index in range(1, 13)
+    ]
+    excluded = replace(
+        candidate("600099", name="", danger=True),
+        pools=("697199",),
+    )
+
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(*ranked, excluded),
+        holding_snapshots={},
+        bars_by_symbol={},
+    )
+
+    audit = built.signal_snapshots["candidates"]
+    assert len(audit) == 13
+    number_eleven = next(item for item in audit if item["symbol"] == "600011")
+    assert (number_eleven["eligible"], number_eleven["rank"]) == (True, 11)
+    rejected = next(item for item in audit if item["symbol"] == "600099")
+    assert rejected["excluded_reasons"] == ["danger_signal", "name_missing"]
+    assert rejected["pools"] == ["697199"]
+    assert rejected["source"] == "Trend Animals"
+    assert set(rejected) == {
+        "tm_id",
+        "symbol",
+        "exchange",
+        "name",
+        "asset",
+        "industry",
+        "as_of_date",
+        "tradable",
+        "amount",
+        "right_side",
+        "days",
+        "strength",
+        "danger",
+        "eligible",
+        "excluded_reasons",
+        "rank",
+        "pools",
+        "source",
+    }
 
 
 def trend_config(tmp_path: Path) -> DailyPremarketConfig:
@@ -1397,6 +1465,22 @@ def test_report_runner_holiday_is_silent_and_free(tmp_path: Path) -> None:
     assert notifier.messages == []
 
 
+def test_report_execution_rejects_wrong_pool_ids_before_external_calls(
+    tmp_path: Path,
+) -> None:
+    config = replace(trend_config(tmp_path), trend_animals_a_share_tm_id=1)
+
+    with pytest.raises(
+        ValueError, match="TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID"
+    ):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: pytest.fail("invalid config must not call API"),
+            quote_factory=lambda **kwargs: pytest.fail("invalid config must not call Futu"),
+        )
+
+
 def test_report_runner_waits_once_then_retries_until_ready(tmp_path: Path) -> None:
     calls: list[str] = []
     sleeps: list[float] = []
@@ -1534,17 +1618,18 @@ def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(
 ) -> None:
     config = trend_config(tmp_path)
     notifier = RecordingFeishu()
-    original_write = trend_module.write_frozen_report
     failed = False
+    delivered = ""
+    original_replace = Path.replace
 
-    def fail_once(*args: object, **kwargs: object) -> tuple[Path, Path]:
+    def fail_once(path: Path, target: Path) -> Path:
         nonlocal failed
-        if not failed:
+        if not failed and Path(target).parent == config.reports_dir / "trend_a_share":
             failed = True
             raise OSError("final freeze failed")
-        return original_write(*args, **kwargs)
+        return original_replace(path, target)
 
-    monkeypatch.setattr(trend_module, "write_frozen_report", fail_once)
+    monkeypatch.setattr(Path, "replace", fail_once)
     with pytest.raises(OSError, match="final freeze failed"):
         run_a_share_trend_report(
             config=config,
@@ -1555,19 +1640,195 @@ def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(
         )
 
     assert len(notifier.messages) == 1
+    delivered = notifier.messages[0][1]
     assert not list((config.reports_dir / "trend_a_share").glob("2026-07-14.*"))
 
     result = run_a_share_trend_report(
         config=config,
         run_date="2026-07-14",
-        api_factory=lambda **kwargs: ReadyApi([]),
-        quote_factory=lambda **kwargs: ReadyQuote([]),
+        api_factory=lambda **kwargs: pytest.fail("recovery must not refetch API"),
+        quote_factory=lambda **kwargs: pytest.fail("recovery must not refetch Futu"),
         notifier=notifier,
     )
 
     assert len(notifier.messages) == 1
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["delivery_status"] == "sent_prior_attempt"
+    assert result.report_path.read_text(encoding="utf-8") == delivered
+    receipt = json.loads(
+        (config.data_dir / "trend_a_share/delivery/2026-07-14.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["artifact_stem"] == "2026-07-14"
+    assert len(receipt["content_hash"]) == 64
+
+
+def test_pending_delivery_crash_recovers_unknown_from_stage_without_refetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    original_send = trend_module.send_notification_with_results
+
+    def crash_on_delivery(*args: object, **kwargs: object) -> object:
+        if kwargs.get("channels") == {"feishu", "feishu_app"}:
+            raise RuntimeError("crash before delivery result")
+        return original_send(*args, **kwargs)
+
+    monkeypatch.setattr(trend_module, "send_notification_with_results", crash_on_delivery)
+    with pytest.raises(RuntimeError, match="crash before delivery result"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: ReadyApi([]),
+            quote_factory=lambda **kwargs: ReadyQuote([]),
+            notifier=RecordingFeishu(),
+        )
+
+    monkeypatch.setattr(trend_module, "send_notification_with_results", original_send)
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("pending recovery must not refetch"),
+        quote_factory=lambda **kwargs: pytest.fail("pending recovery must not refetch"),
+        notifier=RecordingMacOS(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["delivery_status"] == "delivery_unknown"
+
+
+def test_sent_prior_attempt_status_is_not_reported_as_delivery_failure() -> None:
+    notifier = RecordingMacOS()
+
+    trend_module._notify_delivery_status(
+        notifier,
+        run_date="2026-07-14",
+        delivery_status="sent_prior_attempt",
+    )
+
+    assert notifier.messages == [
+        (
+            "A股趋势计划已生成",
+            "2026-07-14 本地报告已冻结；飞书状态：sent_prior_attempt",
+        )
+    ]
+
+
+def test_delivery_failed_stage_retries_without_refetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    original_replace = Path.replace
+    failed_freeze = False
+
+    def fail_final_once(path: Path, target: Path) -> Path:
+        nonlocal failed_freeze
+        if (
+            not failed_freeze
+            and Path(target).parent == config.reports_dir / "trend_a_share"
+        ):
+            failed_freeze = True
+            raise OSError("final freeze failed")
+        return original_replace(path, target)
+
+    class FailDeliveryOnce(RecordingFeishu):
+        def notify(self, title: str, message: str) -> None:
+            self.messages.append((title, message))
+            if len(self.messages) == 1:
+                raise RuntimeError("delivery failed")
+
+    notifier = FailDeliveryOnce()
+    monkeypatch.setattr(Path, "replace", fail_final_once)
+    with pytest.raises(OSError, match="final freeze failed"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: ReadyApi([]),
+            quote_factory=lambda **kwargs: ReadyQuote([]),
+            notifier=notifier,
+        )
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("failed delivery retry must not refetch"),
+        quote_factory=lambda **kwargs: pytest.fail("failed delivery retry must not refetch"),
+        notifier=notifier,
+    )
+
+    assert len(notifier.messages) == 2
+    assert json.loads(result.json_path.read_text(encoding="utf-8"))[
+        "delivery_status"
+    ] == "sent"
+
+
+def test_existing_delivery_failed_report_retries_stage_without_refetch(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+
+    class FailDeliveryOnce(RecordingFeishu):
+        def notify(self, title: str, message: str) -> None:
+            self.messages.append((title, message))
+            if len(self.messages) == 1:
+                raise RuntimeError("delivery failed")
+
+    notifier = FailDeliveryOnce()
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=notifier,
+    )
+    assert json.loads(first.json_path.read_text(encoding="utf-8"))[
+        "delivery_status"
+    ] == "delivery_failed"
+
+    retried = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("delivery retry must not refetch"),
+        quote_factory=lambda **kwargs: pytest.fail("delivery retry must not refetch"),
+        notifier=notifier,
+    )
+
+    assert len(notifier.messages) == 2
+    assert retried.status == "generated"
+    assert json.loads(retried.json_path.read_text(encoding="utf-8"))[
+        "delivery_status"
+    ] == "sent"
+
+
+def test_revision_uses_independent_receipt_and_sends_normally(tmp_path: Path) -> None:
+    config = trend_config(tmp_path)
+    notifier = RecordingFeishu()
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=notifier,
+    )
+    revision = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=notifier,
+    )
+
+    assert (first.report_path.name, revision.report_path.name) == (
+        "2026-07-14.md",
+        "2026-07-14-r1.md",
+    )
+    assert len(notifier.messages) == 2
+    assert {
+        path.stem
+        for path in (config.data_dir / "trend_a_share/delivery").glob("*.json")
+    } == {"2026-07-14", "2026-07-14-r1"}
 
 
 def test_report_runner_keeps_files_when_feishu_delivery_fails_without_refetch(tmp_path: Path) -> None:
@@ -1646,6 +1907,42 @@ def test_report_runner_degrades_holding_kline_without_blocking_report(
         assert (decision["action"], decision["reason"]) == (
             "MANUAL_REVIEW", "holding_kline_unavailable"
         )
+
+
+def test_report_runner_degrades_beijing_holding_kline_value_error(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    write_portfolio(config.portfolio, [portfolio_row(symbol="920000", name="北交所持仓")])
+    timestamp = datetime(2026, 7, 14, 12, tzinfo=SHANGHAI).timestamp()
+    os.utime(config.portfolio, (timestamp, timestamp))
+
+    class BeijingApi(ReadyApi):
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            rows = super().get_snapshots(**kwargs)
+            for row in rows:
+                if row["tmId"] == 920000:
+                    row["tickerSymbol"] = "920000.BJ"
+            return rows
+
+    class RejectingBeijingQuote(ReadyQuote):
+        def get_daily_kline(self, symbol: str, **kwargs: object) -> list[DailyKlineBar]:
+            if symbol == "BJ.920000":
+                raise ValueError("unsupported BJ symbol")
+            return super().get_daily_kline(symbol, **kwargs)
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: BeijingApi([]),
+        quote_factory=lambda **kwargs: RejectingBeijingQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    decision = json.loads(result.json_path.read_text(encoding="utf-8"))[
+        "strategy_judgments"
+    ]["holding_decisions"][0]
+    assert (decision["symbol"], decision["action"]) == ("920000", "MANUAL_REVIEW")
 
 
 def test_report_runner_snapshot_date_mismatch_uses_deadline_contract(tmp_path: Path) -> None:
