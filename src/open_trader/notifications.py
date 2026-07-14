@@ -34,7 +34,7 @@ class MacOSNotifier:
             f'display notification "{_escape_osascript(message)}" '
             f'with title "{_escape_osascript(title)}"'
         )
-        subprocess.run(["osascript", "-e", script], check=False)
+        subprocess.run(["osascript", "-e", script], check=True)
 
 
 class CompositeNotifier:

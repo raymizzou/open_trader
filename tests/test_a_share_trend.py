@@ -77,10 +77,20 @@ def candidate(
     )
 
 
-def bars(count: int = 15, *, close: float = 10, low: float = 9) -> list[DailyKlineBar]:
+def bars(
+    count: int = 15,
+    *,
+    close: float = 10,
+    low: float = 9,
+    as_of_date: str = "2026-07-14",
+) -> list[DailyKlineBar]:
     return [
         DailyKlineBar(
-            date=f"2026-06-{index + 1:02d}",
+            date=(
+                as_of_date
+                if index == count - 1
+                else f"2026-06-{index + 1:02d}"
+            ),
             open=close,
             high=close + 1,
             low=low,
@@ -529,6 +539,35 @@ def test_stale_candidate_is_excluded_from_formal_buys() -> None:
     assert built.excluded["600001"] == ["data_date_mismatch"]
 
 
+@pytest.mark.parametrize("latest_date", ["2026-07-13", "2026-07-15", ""])
+def test_candidate_kline_date_must_match_snapshot_date(latest_date: str) -> None:
+    row = {
+        "tmId": 600001,
+        "tickerSymbol": "600001.SH",
+        "tickerName": "股票600001",
+        "asset": "A股",
+        "industryName": "电力",
+        "asOfDate": "2026-07-14",
+        "tradableFlag": True,
+        "amount1d": "1",
+        "isTrendRightSide": True,
+        "daysSinceTrendEntry": 3,
+        "trendStrengthLocalCurr": "95",
+        "stopwinFlagByDangerSignal": False,
+    }
+    daily_bars = bars()
+    daily_bars[-1] = replace(daily_bars[-1], date=latest_date)
+
+    item = evaluate_candidate(row, daily_bars)
+    decision = build_candidate_list(
+        [item], held_symbols=set(), expected_date="2026-07-14"
+    )
+
+    assert (item.atr, item.close) == (None, None)
+    assert decision.eligible == ()
+    assert "atr_unavailable" in decision.excluded["600001"]
+
+
 def test_overheat_line_uses_prior_five_lows_and_never_decreases() -> None:
     assert update_protection_line(
         old_line=Decimal("27.31"),
@@ -568,6 +607,39 @@ def test_holding_kline_failure_preserves_old_line() -> None:
     )
     assert built.holdings[0].action == "HOLD"
     assert built.holdings[0].active_line == Decimal("8.5")
+
+
+@pytest.mark.parametrize("latest_date", ["2026-07-13", "2026-07-15", ""])
+def test_holding_kline_date_mismatch_requires_review_and_preserves_line(
+    latest_date: str,
+) -> None:
+    daily_bars = bars()
+    daily_bars[-1] = replace(daily_bars[-1], date=latest_date)
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={"600001": daily_bars},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
+
+    assert (
+        built.holdings[0].action,
+        built.holdings[0].reason,
+        built.holdings[0].active_line,
+    ) == ("MANUAL_REVIEW", "holding_kline_unavailable", Decimal("8.5"))
 
 
 def test_invalid_holding_kline_preserves_old_line() -> None:
@@ -779,7 +851,9 @@ def test_tracking_activation_persists_after_overheat_signal_clears() -> None:
                 holding("600001", boiling=False), as_of_date="2026-07-15"
             )
         },
-        bars_by_symbol={"600001": bars(close=12, low=11)},
+        bars_by_symbol={
+            "600001": bars(close=12, low=11, as_of_date="2026-07-15")
+        },
         prior_state=activated.protection_state,
     )
     assert activated.protection_state["positions"]["600001"]["tracking_active"] is True
@@ -870,7 +944,7 @@ def test_signal_sell_persists_across_days_until_position_disappears() -> None:
         holding_snapshots={
             "600001": replace(holding("600001"), as_of_date="2026-07-15")
         },
-        bars_by_symbol={"600001": bars()},
+        bars_by_symbol={"600001": bars(as_of_date="2026-07-15")},
         prior_state=first.protection_state,
     )
     gone = build_report(
@@ -905,7 +979,7 @@ def test_old_trigger_does_not_poison_a_later_reentry() -> None:
         holding_snapshots={
             "600001": replace(holding("600001"), as_of_date="2026-07-16")
         },
-        bars_by_symbol={"600001": bars()},
+        bars_by_symbol={"600001": bars(as_of_date="2026-07-16")},
         prior_state={"schema_version": 1, "positions": {}},
         watch_events=(event,),
     )
@@ -917,7 +991,7 @@ def test_old_trigger_does_not_poison_a_later_reentry() -> None:
         holding_snapshots={
             "600001": replace(holding("600001"), as_of_date="2026-07-17")
         },
-        bars_by_symbol={"600001": bars()},
+        bars_by_symbol={"600001": bars(as_of_date="2026-07-17")},
         prior_state=repurchased.protection_state,
         watch_events=(event,),
     )
@@ -1084,6 +1158,7 @@ def test_flat_bars_keep_zero_atr_in_state_and_render() -> None:
         )
         for index in range(15)
     ]
+    flat[-1] = replace(flat[-1], date="2026-07-14")
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",

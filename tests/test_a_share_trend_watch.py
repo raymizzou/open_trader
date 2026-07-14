@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import subprocess
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -531,6 +532,59 @@ def test_failed_trigger_notification_is_visible_and_retried_after_restart(
         "protection_triggered",
     ]
     assert sum("全部卖出" in message for _, message in recovered_notifier.messages) == 1
+
+
+def test_all_failed_channels_retry_during_the_same_watch_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailingFeishu(RecordingNotifier):
+        def notify(self, title: str, message: str) -> None:
+            raise RuntimeError("Feishu unavailable")
+
+    osascript_checks: list[bool] = []
+
+    def run_osascript(
+        command: list[str], *, check: bool
+    ) -> subprocess.CompletedProcess[str]:
+        osascript_checks.append(check)
+        if len(osascript_checks) == 1:
+            if check:
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 1)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("open_trader.notifications.subprocess.run", run_osascript)
+    events_path = tmp_path / "events.jsonl"
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=events_path,
+        quote_client=SequenceQuote(
+            [
+                {"SH.600900": Decimal("27.30")},
+                {"SH.600900": Decimal("27.20")},
+            ]
+        ),
+        notifier=CompositeNotifier([FailingFeishu(), MacOSNotifier()]),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        now_fn=SequenceClock(
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:05+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
+        ),
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert result.trigger_count == 1
+    assert osascript_checks == [True, True]
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "protection_notification_failed",
+        "protection_triggered",
+    ]
 
 
 def test_opend_failure_reconnects_once_and_announces_recovery(tmp_path: Path) -> None:

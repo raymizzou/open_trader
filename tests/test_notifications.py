@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import subprocess
 import urllib.request
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from open_trader.notifications import (
     CompositeNotifier,
     FeishuAppNotifier,
     FeishuWebhookNotifier,
+    MacOSNotifier,
     NotificationError,
     XiaozhiVoiceNotifier,
     render_feishu_order_review,
@@ -51,6 +53,23 @@ FIELDNAMES = [
     "status",
     "error",
 ]
+
+
+def test_macos_notifier_raises_when_osascript_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[bool] = []
+
+    def failed_run(command: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+        calls.append(check)
+        if check:
+            raise subprocess.CalledProcessError(1, command)
+        return subprocess.CompletedProcess(command, 1)
+
+    monkeypatch.setattr("open_trader.notifications.subprocess.run", failed_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        MacOSNotifier().notify("title", "message")
+
+    assert calls == [True]
 
 
 def test_feishu_webhook_notifier_sends_text_payload() -> None:

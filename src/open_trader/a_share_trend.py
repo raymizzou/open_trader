@@ -285,10 +285,15 @@ def atr14(bars: Sequence[DailyKlineBar]) -> Decimal | None:
 
 
 def _kline_metrics(
-    bars: Sequence[DailyKlineBar], *, before: str | None = None
-) -> tuple[Decimal | None, Decimal | None, tuple[Decimal, ...]]:
+    bars: Sequence[DailyKlineBar],
+    *,
+    as_of_date: str,
+    before: str | None = None,
+) -> tuple[Decimal | None, Decimal | None, tuple[Decimal, ...], bool | None]:
     if not bars:
-        return None, None, ()
+        return None, None, (), None
+    if bars[-1].date != as_of_date:
+        return None, None, (), False
     try:
         atr = atr14(bars)
         close = _decimal(bars[-1].close)
@@ -298,8 +303,8 @@ def _kline_metrics(
             if before is not None and bar.date < before and bar.low is not None
         )[-5:]
     except ValueError:
-        return None, None, ()
-    return atr, close, lows
+        return None, None, (), True
+    return atr, close, lows, True
 
 
 def _symbol_parts(value: object) -> tuple[str, str]:
@@ -322,7 +327,8 @@ def evaluate_candidate(
 ) -> CandidateInput:
     symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
     daily_bars = tuple(bars or ())
-    atr, close, _ = _kline_metrics(daily_bars)
+    as_of_date = str(row.get("asOfDate") or "").strip()
+    atr, close, _, _ = _kline_metrics(daily_bars, as_of_date=as_of_date)
     tm_id = row.get("tmId")
     if isinstance(tm_id, bool) or not isinstance(tm_id, int):
         raise ValueError("tmId must be an integer")
@@ -333,7 +339,7 @@ def evaluate_candidate(
         name=str(row.get("tickerName") or "").strip(),
         asset=str(row.get("asset") or "").strip(),
         industry=str(row.get("industryName") or "").strip(),
-        as_of_date=str(row.get("asOfDate") or "").strip(),
+        as_of_date=as_of_date,
         tradable=row.get("tradableFlag"),
         amount=_optional_decimal(row.get("amount1d")),
         right_side=row.get("isTrendRightSide"),
@@ -608,7 +614,11 @@ def build_report(
             tracking_active = True
         historical = not old_state
         daily_bars = tuple(bars_by_symbol.get(symbol) or ())
-        current_atr, close, lows = _kline_metrics(daily_bars, before=as_of_date)
+        current_atr, close, lows, kline_date_valid = _kline_metrics(
+            daily_bars, as_of_date=as_of_date, before=as_of_date
+        )
+        if kline_date_valid is False and action == "HOLD":
+            action, reason = "MANUAL_REVIEW", "holding_kline_unavailable"
         if active_line is None and current_atr is not None and close is not None:
             initial_line = active_line = close - Decimal("2") * current_atr
         if active_line is not None and tracking_active and action == "HOLD":
