@@ -157,56 +157,86 @@ class FutuQuoteClient:
             if market in {"SH", "SZ"}
             else to_futu_symbol(market, symbol)
         )
-        response = self.context.request_history_kline(
-            wire_symbol,
-            start=start,
-            end=end,
-            ktype=ktype,
-        )
-        ret_code = response[0]
-        data = response[1]
-        if ret_code != 0:
-            message = str(data)
-            if "网络中断" in message:
+        bars: list[DailyKlineBar] = []
+        page_req_key: object = None
+        seen_page_keys: set[object] = set()
+        while True:
+            response = self.context.request_history_kline(
+                wire_symbol,
+                start=start,
+                end=end,
+                ktype=ktype,
+                max_count=1000,
+                page_req_key=page_req_key,
+            )
+            ret_code, data = response[0], response[1]
+            if ret_code != 0:
+                message = str(data)
+                if "网络中断" in message:
+                    raise FutuQuoteError(
+                        message,
+                        error_type="quote_server_interrupted",
+                        next_step=QUOTE_INTERRUPTED_NEXT_STEP,
+                        opend_reachable=True,
+                        context_ok=True,
+                        snapshot_ok=False,
+                    )
                 raise FutuQuoteError(
                     message,
-                    error_type="quote_server_interrupted",
-                    next_step=QUOTE_INTERRUPTED_NEXT_STEP,
+                    error_type="snapshot_failed",
+                    next_step=SNAPSHOT_FAILED_NEXT_STEP,
                     opend_reachable=True,
                     context_ok=True,
                     snapshot_ok=False,
                 )
-            raise FutuQuoteError(
-                message,
-                error_type="snapshot_failed",
-                next_step=SNAPSHOT_FAILED_NEXT_STEP,
-                opend_reachable=True,
-                context_ok=True,
-                snapshot_ok=False,
-            )
-        bars: list[DailyKlineBar] = []
-        for record in data.to_dict("records"):
-            date_text = str(record.get("time_key") or record.get("date") or "").strip()
-            close_text = record.get("close")
-            volume_text = record.get("volume")
-            if not date_text or close_text in {None, ""} or volume_text in {None, ""}:
-                continue
-            try:
-                close = float(str(close_text))
-                volume = float(str(volume_text))
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(close) and math.isfinite(volume) and volume >= 0:
-                bars.append(
-                    DailyKlineBar(
-                        date=date_text[:10],
-                        open=_optional_float(record.get("open")),
-                        high=_optional_float(record.get("high")),
-                        low=_optional_float(record.get("low")),
-                        close=close,
-                        volume=volume,
+            for record in data.to_dict("records"):
+                date_text = str(record.get("time_key") or record.get("date") or "").strip()
+                close_text = record.get("close")
+                volume_text = record.get("volume")
+                if not date_text or close_text in {None, ""} or volume_text in {None, ""}:
+                    continue
+                try:
+                    close = float(str(close_text))
+                    volume = float(str(volume_text))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(close) and math.isfinite(volume) and volume >= 0:
+                    open_ = _optional_float(record.get("open"))
+                    high = _optional_float(record.get("high"))
+                    low = _optional_float(record.get("low"))
+                    comparable_open = close if open_ is None else open_
+                    comparable_high = close if high is None else high
+                    comparable_low = close if low is None else low
+                    if (
+                        comparable_low > min(comparable_open, close)
+                        or comparable_high < max(comparable_open, close)
+                        or comparable_low > comparable_high
+                    ):
+                        continue
+                    bars.append(
+                        DailyKlineBar(
+                            date=date_text[:10],
+                            open=open_,
+                            high=high,
+                            low=low,
+                            close=close,
+                            volume=volume,
+                        )
                     )
+            next_key = response[2] if len(response) > 2 else None
+            if next_key is None:
+                break
+            if next_key in seen_page_keys:
+                raise FutuQuoteError(
+                    "富途历史 K 线分页游标重复",
+                    error_type="snapshot_failed",
+                    next_step=SNAPSHOT_FAILED_NEXT_STEP,
+                    opend_reachable=True,
+                    context_ok=True,
+                    snapshot_ok=False,
                 )
+            seen_page_keys.add(next_key)
+            page_req_key = next_key
         return bars
 
     def close(self) -> None:

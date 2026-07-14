@@ -1,5 +1,6 @@
 from decimal import Decimal
 from pathlib import Path
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -129,8 +130,9 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
     clicks: list[str] = []
 
     class Locator:
-        def __init__(self, kind: str) -> None:
+        def __init__(self, kind: str, index: int = 0) -> None:
             self.kind = kind
+            self.index = index
 
         def count(self) -> int:
             return {"button": 1, "tabs": 5, "failed": 0, "panel": 1}[self.kind]
@@ -142,13 +144,17 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
             return ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
 
         def nth(self, index: int) -> "Locator":
-            return Locator(f"tab-{index}")
+            return Locator("tab", index)
 
         def get_attribute(self, name: str) -> str:
             assert name == "aria-controls"
-            return f"decision-panel-{self.kind}"
+            return f"decision-panel-{self.index}"
 
         def inner_text(self) -> str:
+            if self.index == 0:
+                return "回测闸门 夏普比率 1.2 卡玛比率 0.8"
+            if self.index == 2:
+                return "当前价 710.55"
             return "source data"
 
     class Page:
@@ -160,7 +166,8 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
                 return Locator("tabs")
             if selector == ".decision-tab-list .decision-tab-failed":
                 return Locator("failed")
-            return Locator("panel")
+            match = re.search(r"decision-panel-(\d+)", selector)
+            return Locator("panel", int(match.group(1)) if match else 0)
 
     dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT")
 
@@ -169,7 +176,7 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
         '[data-detail-market="US"]'
         '[data-detail-symbol="MSFT"]'
     )
-    assert clicks == ["button", "tab-0", "tab-1", "tab-2", "tab-3", "tab-4"]
+    assert clicks == ["button", "tab", "tab", "tab", "tab", "tab"]
 
 
 def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> None:
@@ -199,7 +206,7 @@ def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> No
             return f"decision-panel-{self.index}"
 
         def inner_text(self) -> str:
-            return "source data"
+            return "source data 夏普比率 1.2 卡玛比率 0.8"
 
     class Page:
         def locator(self, selector: str) -> Locator:
@@ -354,6 +361,14 @@ def test_validate_dashboard_payload_checks_eastmoney_statement_total_assets() ->
         payload, expected_cn=5, expected_eastmoney_cny=Decimal("101")
     )
     assert "东方财富总资产不匹配：100 != 101 CNY" in errors
+
+
+def test_acceptance_parser_does_not_hardcode_mark_to_market_eastmoney_total() -> None:
+    from open_trader.dashboard_acceptance import build_parser
+
+    args = build_parser().parse_args([])
+
+    assert args.expected_eastmoney_cny is None
 
 
 def test_validate_dashboard_payload_checks_latest_phillips_statement() -> None:

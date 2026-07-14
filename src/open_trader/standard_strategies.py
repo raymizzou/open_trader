@@ -229,3 +229,177 @@ def generate_strategy_signals(
             data_cutoff=bar.date,
         ))
     return signals
+
+
+def build_current_strategy_snapshot(
+    strategy_id: str,
+    bars: Sequence[StrategyBar],
+    max_strategy_weight: Decimal,
+) -> dict[str, object]:
+    if strategy_id not in {item.strategy_id for item in _CATALOG}:
+        raise ValueError(f"未知策略：{strategy_id}")
+    if not bars:
+        raise ValueError("策略快照需要日线数据")
+    if max_strategy_weight < 0:
+        raise ValueError("最大策略权重不能为负数")
+
+    definition = next(item for item in _CATALOG if item.strategy_id == strategy_id)
+    source_date = bars[-1].date
+    closes = [bar.close for bar in bars]
+    sma10, sma20, sma50 = _sma(closes, 10), _sma(closes, 20), _sma(closes, 50)
+    atr14, rsi14 = _atr(bars, 14), _rsi(closes, 14)
+    bands = _bollinger(closes, 20, Decimal("2"))
+    lower, middle, upper = bands or (None, None, None)
+    prior5 = _prior_high(closes, 5)
+    prior20 = _prior_high([bar.high for bar in bars], 20)
+    prior_volume = _sma([bar.volume for bar in bars[:-1]], 20)
+    relative_volume = (
+        bars[-1].volume / prior_volume
+        if prior_volume not in (None, Decimal("0"))
+        else None
+    )
+    ma20_distance = (
+        (bars[-1].close / sma20 - Decimal("1")) * Decimal("100")
+        if sma20 not in (None, Decimal("0"))
+        else None
+    )
+    position = (
+        "insufficient_history" if bands is None
+        else "below_lower" if lower is not None and bars[-1].close < lower
+        else "above_upper" if upper is not None and bars[-1].close > upper
+        else "inside"
+    )
+    state = _replay_strategy_state(strategy_id, bars, max_strategy_weight)
+    facts = {
+        "close": _fact(bars[-1].close, "latest completed close", {}, source_date),
+        "sma10": _fact(sma10, "SMA(close, 10)", {"period": 10}, source_date),
+        "sma20": _fact(sma20, "SMA(close, 20)", {"period": 20}, source_date),
+        "sma50": _fact(sma50, "SMA(close, 50)", {"period": 50}, source_date),
+        "ma20_distance_pct": _fact(
+            ma20_distance, "(close / sma20 - 1) * 100", {"close": bars[-1].close, "sma20": sma20}, source_date,
+        ),
+        "atr14": _fact(atr14, "ATR(high, low, close, 14)", {"period": 14}, source_date),
+        "rsi14": _fact(rsi14, "Wilder RSI(close, 14)", {"period": 14}, source_date),
+        "bollinger_lower": _fact(lower, "sma20 - 2 * stddev(close, 20)", {"period": 20, "multiplier": 2}, source_date),
+        "bollinger_middle": _fact(middle, "SMA(close, 20)", {"period": 20}, source_date),
+        "bollinger_upper": _fact(upper, "sma20 + 2 * stddev(close, 20)", {"period": 20, "multiplier": 2}, source_date),
+        "bollinger_position": _fact(position, "compare(close, bollinger bands)", {"close": bars[-1].close}, source_date),
+        "relative_volume": _fact(
+            relative_volume, "volume / SMA(previous volume, 20)",
+            {"volume": bars[-1].volume, "average_volume": prior_volume}, source_date,
+        ),
+    }
+    conditions: list[dict[str, object]] = []
+
+    def add(
+        condition_id: str, priority: str, operator: str, value: Decimal | None,
+        target_weight: Decimal, action: str, formula: str, inputs: Mapping[str, object],
+    ) -> None:
+        if value is None:
+            return
+        conditions.append({
+            "condition_id": condition_id,
+            "priority": priority,
+            "operator": operator,
+            "calculated_value": str(value),
+            "target_weight": str(target_weight),
+            "suggested_action": action,
+            "formula": formula,
+            "inputs": {key: str(item) for key, item in inputs.items()},
+            "source_date": source_date.isoformat(),
+        })
+
+    half = max_strategy_weight * Decimal("0.5")
+    active_stop = state["active_stop"]
+    if strategy_id == "trend_pullback/v1":
+        protection = min(sma50, active_stop) if sma50 is not None and active_stop is not None else sma50 or active_stop
+        add("trend-exit", "risk", "<=", protection, Decimal("0"), "退出",
+            "min(sma50, active_stop)", {"sma50": sma50, "active_stop": active_stop})
+        add("trend-reduce", "ordinary", ">=", sma20 + Decimal("2") * atr14 if sma20 is not None and atr14 is not None else None,
+            half, "减仓", "sma20 + 2 * atr14", {"sma20": sma20, "atr14": atr14})
+        add("trend-add", "ordinary", ">=", prior5, max_strategy_weight, "加仓",
+            "max(previous 5 closes)", {"prior5": prior5})
+        add("trend-buy", "ordinary", ">=", sma20, half, "建立观察仓",
+            "SMA(close, 20)", {"sma20": sma20})
+    elif strategy_id == "breakout_momentum/v1":
+        breakout = state["breakout_level"] or prior20
+        protection = min(breakout, active_stop) if breakout is not None and active_stop is not None else breakout or active_stop
+        add("breakout-exit", "risk", "<=", protection, Decimal("0"), "退出",
+            "min(breakout_level, active_stop)", {"breakout_level": breakout, "active_stop": active_stop})
+        add("breakout-reduce", "ordinary", "<=", sma10, half, "减仓",
+            "SMA(close, 10)", {"sma10": sma10})
+        add("breakout-add", "ordinary", ">=", state["entry_price"] + atr14 if state["entry_price"] is not None and atr14 is not None else None,
+            max_strategy_weight, "加仓", "entry_price + atr14", {"entry_price": state["entry_price"], "atr14": atr14})
+        add("breakout-buy", "ordinary", ">=", prior20, half, "建立观察仓",
+            "max(previous 20 highs)", {"prior20_high": prior20, "relative_volume_required": "1.5"})
+    else:
+        add("range-stop", "risk", "<=", active_stop, Decimal("0"), "止损退出",
+            "active_stop", {"active_stop": active_stop})
+        add("range-exit", "risk", ">=", upper, Decimal("0"), "止盈退出",
+            "bollinger_upper", {"bollinger_upper": upper})
+        add("range-reduce", "ordinary", ">=", middle, half, "减仓",
+            "bollinger_middle", {"bollinger_middle": middle})
+        add("range-add", "ordinary", ">=", lower, max_strategy_weight, "加仓",
+            "bollinger_lower", {"bollinger_lower": lower})
+        add("range-buy", "ordinary", "<=", lower, half, "建立观察仓",
+            "bollinger_lower and rsi14 <= 30", {"bollinger_lower": lower, "rsi14_required": 30})
+
+    return {
+        "strategy": definition.to_dict(),
+        "facts": facts,
+        "conditions": conditions,
+    }
+
+
+def _fact(
+    value: object,
+    formula: str,
+    inputs: Mapping[str, object],
+    source_date: date,
+) -> dict[str, object]:
+    return {
+        "formula": formula,
+        "inputs": {
+            key: "insufficient_history" if item is None else str(item)
+            for key, item in inputs.items()
+        },
+        "source_date": source_date.isoformat(),
+        "calculated_value": "insufficient_history" if value is None else str(value),
+    }
+
+
+def _replay_strategy_state(
+    strategy_id: str,
+    bars: Sequence[StrategyBar],
+    max_strategy_weight: Decimal,
+) -> dict[str, Decimal | None]:
+    signals = generate_strategy_signals(
+        strategy_id, bars, start_date=bars[0].date,
+        max_strategy_weight=max_strategy_weight,
+    )
+    bar_by_date = {bar.date: bar for bar in bars}
+    index_by_date = {bar.date: index for index, bar in enumerate(bars)}
+    active_stop: Decimal | None = None
+    entry_price: Decimal | None = None
+    breakout_level: Decimal | None = None
+    for signal in signals:
+        execution = bar_by_date.get(signal.earliest_execution_date)
+        if execution is None or signal.action == "HOLD":
+            continue
+        history = bars[: index_by_date[signal.decision_date] + 1]
+        atr14 = _atr(history, 14)
+        if signal.action == "BUY":
+            entry_price = execution.open
+            if atr14 is not None:
+                active_stop = execution.open - Decimal("2") * atr14
+            if strategy_id == "breakout_momentum/v1":
+                breakout_level = _prior_high([bar.high for bar in history], 20)
+        elif signal.action == "ADD" and atr14 is not None and strategy_id != "range_mean_reversion/v1":
+            active_stop = execution.open - Decimal("2") * atr14
+        elif signal.action == "EXIT":
+            active_stop = entry_price = breakout_level = None
+    return {
+        "active_stop": active_stop,
+        "entry_price": entry_price,
+        "breakout_level": breakout_level,
+    }

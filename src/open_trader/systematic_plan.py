@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from typing import Literal
+
+
+ConditionKind = Literal["price_at_or_above", "price_at_or_below", "deadline"]
+EvaluationStatus = Literal["waiting", "triggered"]
+OrderSide = Literal["buy", "sell"]
+
+
+@dataclass(frozen=True)
+class PlanCondition:
+    condition_id: str
+    kind: ConditionKind
+    target_quantity: Decimal
+    reason: str
+    trigger_price: Decimal | None = None
+    deadline: datetime | None = None
+
+
+@dataclass(frozen=True)
+class StrategyPlan:
+    plan_id: str
+    market: str
+    symbol: str
+    current_quantity: Decimal
+    conditions: tuple[PlanCondition, ...]
+
+
+@dataclass(frozen=True)
+class PlanEvaluation:
+    plan_id: str
+    status: EvaluationStatus
+    condition_id: str
+    target_quantity: Decimal
+    reason: str
+
+
+@dataclass(frozen=True)
+class TargetOrder:
+    side: OrderSide
+    quantity: Decimal
+
+
+def order_for_target(
+    *,
+    current_quantity: Decimal,
+    target_quantity: Decimal,
+) -> TargetOrder | None:
+    difference = target_quantity - current_quantity
+    if difference == 0:
+        return None
+    return TargetOrder(
+        side="buy" if difference > 0 else "sell",
+        quantity=abs(difference),
+    )
+
+
+def evaluate_plan(
+    plan: StrategyPlan,
+    *,
+    last_price: Decimal,
+    as_of: datetime,
+) -> PlanEvaluation:
+    for condition in plan.conditions:
+        price_hit = (
+            condition.trigger_price is not None
+            and (
+                condition.kind == "price_at_or_above"
+                and last_price >= condition.trigger_price
+                or condition.kind == "price_at_or_below"
+                and last_price <= condition.trigger_price
+            )
+        )
+        deadline_hit = (
+            condition.kind == "deadline"
+            and condition.deadline is not None
+            and as_of >= condition.deadline
+        )
+        if price_hit or deadline_hit:
+            return PlanEvaluation(
+                plan_id=plan.plan_id,
+                status="triggered",
+                condition_id=condition.condition_id,
+                target_quantity=condition.target_quantity,
+                reason=condition.reason,
+            )
+    return PlanEvaluation(
+        plan_id=plan.plan_id,
+        status="waiting",
+        condition_id="",
+        target_quantity=plan.current_quantity,
+        reason="",
+    )

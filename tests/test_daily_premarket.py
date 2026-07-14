@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -428,6 +429,7 @@ def test_daily_runner_defaults_to_generate_trade_actions_and_summary(
         runner.summary_extractor_factory
         is daily_premarket.LLMTradingAgentsSummaryExtractor
     )
+    assert runner.decision_plan_generator is daily_premarket.generate_daily_decision_plans
 
 
 def test_snapshots_from_futu_status_ignores_nonfinite_last_prices() -> None:
@@ -1189,6 +1191,31 @@ class FailingNotifier:
         raise RuntimeError("delivery failed")
 
 
+class FakeDecisionPlanGenerator:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("decision plan failed")
+        data_dir = kwargs["data_dir"]
+        run_date = kwargs["run_date"]
+        market = kwargs["market"]
+        assert isinstance(data_dir, Path)
+        run_path = data_dir / "runs" / str(run_date) / str(market) / "decision_plans.json"
+        latest_path = data_dir / "latest" / str(market) / "decision_plans.json"
+        run_path.parent.mkdir(parents=True, exist_ok=True)
+        run_path.write_text(json.dumps({
+            "schema_version": "open_trader.decision_plans.v1",
+            "run_date": run_date,
+            "market": market,
+            "records": [],
+        }) + "\n", encoding="utf-8")
+        return SimpleNamespace(run_path=run_path, latest_path=latest_path, records=0)
+
+
 def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
     return DailyPremarketConfig(
         repo=tmp_path,
@@ -1209,6 +1236,7 @@ def _daily_runner(
     summary_generator: object | None = None,
     summary_extractor_factory: object = FakeSummaryExtractor,
     futu_facts_generator: object | None = None,
+    decision_plan_generator: object | None = None,
     **kwargs: object,
 ) -> _DailyPremarketRunner:
     return _DailyPremarketRunner(
@@ -1217,6 +1245,7 @@ def _daily_runner(
         summary_extractor_factory=summary_extractor_factory,
         futu_facts_generator=futu_facts_generator or FakeFutuFactsGenerator(),
         futu_facts_extractor_factory=FakeSummaryExtractor,
+        decision_plan_generator=decision_plan_generator or FakeDecisionPlanGenerator(),
     )
 
 
@@ -2563,6 +2592,7 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     premarket = FakePremarket()
     plan_builder = FakePlanBuilder()
     fake_trade_actions = FakeTradeActionGenerator()
+    fake_decision_plans = FakeDecisionPlanGenerator()
 
     runner = _daily_runner(
         config=config,
@@ -2570,6 +2600,7 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
         plan_builder=plan_builder,
         quote_client_factory=FakeQuoteClient,
         trade_action_generator=fake_trade_actions,
+        decision_plan_generator=fake_decision_plans,
         notifier=NullNotifier(),
     )
 
@@ -2579,6 +2610,7 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     assert premarket.calls[0]["update_latest"] is False
     assert plan_builder.calls[0]["update_latest"] is False
     assert fake_trade_actions.calls[0]["update_latest"] is False
+    assert fake_decision_plans.calls[0]["update_latest"] is False
     assert (tmp_path / "data/latest/US/trading_advice.csv").read_text(
         encoding="utf-8"
     ) == (tmp_path / "data/runs/2026-06-17/US/trading_advice.csv").read_text(
@@ -2597,6 +2629,11 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     assert (tmp_path / "data/latest/US/trade_actions.csv").read_text(
         encoding="utf-8"
     ) == (tmp_path / "data/runs/2026-06-17/US/trade_actions.csv").read_text(
+        encoding="utf-8"
+    )
+    assert (tmp_path / "data/latest/US/decision_plans.json").read_text(
+        encoding="utf-8"
+    ) == (tmp_path / "data/runs/2026-06-17/US/decision_plans.json").read_text(
         encoding="utf-8"
     )
     assert (tmp_path / "data/latest/US/technical_facts.json").read_text(

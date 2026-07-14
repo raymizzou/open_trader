@@ -156,6 +156,36 @@ def test_missing_market_benchmark_degrades_only_market_comparison(tmp_path: Path
     assert payload["market_excess_return_pct"] is None
     assert payload["market_benchmark_error"] == "基准行情缺失，无法比较"
     assert payload["market_benchmark_equity_path"] is None
+    assert payload["gate"] == {
+        "passed": False,
+        "policy_id": "benchmark_outperformance/v1",
+        "reasons": ["benchmark_data_missing"],
+    }
+
+
+def test_standard_backtest_serializes_sharpe_and_passing_gate(tmp_path: Path) -> None:
+    class FlatBenchmarkProvider(FixtureProvider):
+        def get_daily_kline(self, futu_symbol: str, *, start: str, end: str) -> list[DailyKlineBar]:
+            bars = super().get_daily_kline(futu_symbol, start=start, end=end)
+            if not futu_symbol.endswith(".SPY"):
+                return bars
+            return [
+                replace(bar, open=200.0, high=201.0, low=199.0, close=200.0)
+                for bar in bars
+            ]
+
+    payload = run_standard_backtest(
+        standard_request(tmp_path, strategy_id="breakout_momentum/v1"),
+        price_provider=FlatBenchmarkProvider("breakout_next_open"),
+    ).to_dict()
+
+    assert payload["strategy"]["sharpe_ratio"] is not None
+    assert "calmar_ratio" in payload["strategy"]
+    assert payload["gate"] == {
+        "passed": True,
+        "policy_id": "benchmark_outperformance/v1",
+        "reasons": [],
+    }
 
 
 def test_market_benchmark_degradation_does_not_swallow_unrelated_failures(tmp_path: Path) -> None:
@@ -401,6 +431,8 @@ def test_annualized_return_and_drawdown_match_hand_calculation() -> None:
     assert result.total_return_pct == Decimal("21.00")
     assert result.annualized_return_pct == Decimal("21.00")
     assert result.max_drawdown_pct == Decimal("20")
+    assert result.sharpe_ratio is not None
+    assert result.calmar_ratio == Decimal("1.05")
 
 
 def test_existing_publication_lock_refuses_run_without_touching_artifacts(

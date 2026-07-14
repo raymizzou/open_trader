@@ -1727,6 +1727,138 @@ tbody tr.active-row {
   padding: 16px;
 }
 
+.decision-plan {
+  color: var(--text);
+  display: grid;
+  font-variant-numeric: tabular-nums;
+  gap: 16px;
+}
+
+.decision-plan-header {
+  align-items: center;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 10px;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  padding: 16px;
+}
+
+.decision-plan-header span,
+.decision-plan-overview span,
+.decision-plan-fallback-banner span,
+.decision-plan-condition-metrics span,
+.decision-plan-fact > span {
+  color: var(--muted);
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.decision-plan-header h3 { font-size: 22px; margin: 3px 0; }
+.decision-plan-header p { color: var(--muted); font-size: 12px; margin: 0; overflow-wrap: anywhere; }
+.decision-plan-status { border: 1px solid var(--line); border-radius: 999px; flex: 0 0 auto; padding: 8px 12px; }
+.decision-plan-status-triggered { background: #fff7e8; border-color: #efc47e; }
+.decision-plan-status-expired { background: #fff1f1; border-color: var(--danger); color: var(--danger); }
+
+.decision-plan-overview,
+.decision-plan-fallback-banner {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.decision-plan-overview article,
+.decision-plan-fallback-banner > div,
+.decision-plan-fact {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.decision-plan-overview strong,
+.decision-plan-fallback-banner strong,
+.decision-plan-fact > strong { display: block; margin-top: 6px; overflow-wrap: anywhere; }
+
+.decision-plan-layout {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.8fr);
+}
+
+.decision-plan-section-heading,
+.decision-plan-condition-head,
+.decision-plan-backtests article > div:first-child {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.decision-plan-section-heading h4,
+.decision-plan-evidence h4,
+.decision-plan-fallback-reason h4 { margin: 0; }
+.decision-plan-section-heading span { color: var(--muted); font-size: 12px; }
+.decision-plan-condition-list,
+.decision-plan-backtests { display: grid; gap: 10px; margin-top: 10px; }
+
+.decision-plan-condition {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 9px;
+  padding: 14px;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.decision-plan-condition-risk { border-left-color: var(--danger); }
+.decision-plan-condition:hover { box-shadow: 0 4px 12px rgba(16, 24, 40, 0.08); }
+.decision-plan-condition-head span { color: var(--muted); font-size: 12px; font-weight: 800; }
+.decision-plan-condition-head b { font-size: 12px; }
+.decision-plan-condition h5 { font-size: 18px; margin: 10px 0; }
+.decision-plan-condition-metrics { display: grid; gap: 8px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.decision-plan-condition-metrics > div { background: var(--surface-soft); border-radius: 6px; padding: 9px; }
+.decision-plan-condition-metrics strong { display: block; margin-top: 4px; }
+
+.decision-plan-provenance,
+.decision-plan-review { border-top: 1px solid var(--line); margin-top: 10px; }
+.decision-plan-provenance summary,
+.decision-plan-review summary {
+  cursor: pointer;
+  font-weight: 800;
+  min-height: 44px;
+  padding: 12px 2px;
+}
+.decision-plan-provenance summary:focus-visible,
+.decision-plan-review summary:focus-visible { outline: 3px solid rgba(37, 99, 235, 0.32); outline-offset: 2px; }
+.decision-plan-provenance dl { display: grid; gap: 6px; margin: 0; }
+.decision-plan-provenance dl div { display: grid; gap: 8px; grid-template-columns: 72px minmax(0, 1fr); }
+.decision-plan-provenance dt { color: var(--muted); }
+.decision-plan-provenance dd { margin: 0; overflow-wrap: anywhere; }
+
+.decision-plan-evidence { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 9px; padding: 14px; }
+.decision-plan-backtests article { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 11px; }
+.decision-plan-backtests dl { display: grid; gap: 6px; margin: 10px 0 0; }
+.decision-plan-backtests dl div { display: flex; gap: 10px; justify-content: space-between; }
+.decision-plan-backtests dd { font-weight: 800; margin: 0; }
+.decision-plan-backtests dt { color: var(--muted); }
+
+.decision-plan-fallback-banner { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.decision-plan-fallback-banner > div:first-child { background: #fff7e8; border-color: #efc47e; }
+.decision-plan-fact-grid,
+.decision-plan-fallback-reason { display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.decision-plan-fallback-reason article { border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+.decision-plan-fallback-reason p { line-height: 1.55; margin: 8px 0 0; }
+.decision-plan-review { border: 1px solid var(--line); border-radius: 8px; padding: 0 12px; }
+.decision-plan-review > div { display: grid; gap: 10px; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 0 0 12px; }
+.decision-plan-review span { color: var(--muted); }
+.decision-plan-review strong { color: var(--text); display: block; margin-top: 4px; }
+.decision-plan-failed { border: 1px solid var(--danger); border-radius: 8px; padding: 16px; }
+.decision-plan-empty { color: var(--muted); margin: 10px 0 0; }
+
 .decision-plugin-card {
   align-content: start;
   border: 1px solid var(--line);
@@ -3083,6 +3215,12 @@ tbody tr.active-row {
 }
 
 @media (max-width: 900px) {
+  .decision-plan-layout,
+  .decision-plan-fact-grid,
+  .decision-plan-fallback-reason {
+    grid-template-columns: 1fr;
+  }
+
   .kelly-capital-metric-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -3188,6 +3326,10 @@ tbody tr.active-row {
   }
 
   .decision-dashboard,
+  .decision-plan-overview,
+  .decision-plan-fallback-banner,
+  .decision-plan-condition-metrics,
+  .decision-plan-review > div,
   .decision-metric-strip,
   .decision-fact-grid,
   .futu-signal-overall,
@@ -3199,6 +3341,16 @@ tbody tr.active-row {
   .technical-fact-grid {
     grid-template-columns: 1fr;
   }
+
+  .decision-plan-header,
+  .decision-plan-section-heading,
+  .decision-plan-condition-head {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .decision-plan-status { justify-self: start; }
 
   .technical-bollinger-header {
     align-items: stretch;

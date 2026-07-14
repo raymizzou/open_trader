@@ -44,12 +44,16 @@ class FakeOpenQuoteContext:
         start: str,
         end: str,
         ktype: object,
-    ) -> tuple[int, object]:
+        max_count: int,
+        page_req_key: object,
+    ) -> tuple[int, object, object]:
         self.requested_history = {
             "symbol": symbol,
             "start": start,
             "end": end,
             "ktype": ktype,
+            "max_count": max_count,
+            "page_req_key": page_req_key,
         }
         return (
             0,
@@ -64,6 +68,10 @@ class FakeOpenQuoteContext:
                         "volume": "123456",
                     },
                     {"time_key": "2026-06-19", "close": 19.1, "volume": 654321},
+                    {
+                        "time_key": "2026-06-20", "open": 20, "high": 21,
+                        "low": 20.5, "close": 19, "volume": 100,
+                    },
                     {"time_key": "2026-06-19", "close": 19.1, "volume": "NaN"},
                     {"time_key": "2026-06-20", "close": None},
                 ]
@@ -83,6 +91,20 @@ class FakeFailingContext(FakeOpenQuoteContext):
 class FakeInterruptedContext(FakeOpenQuoteContext):
     def get_market_snapshot(self, symbols: list[str]) -> tuple[int, object]:
         return -1, "网络中断"
+
+
+class FakePaginatedContext(FakeOpenQuoteContext):
+    def request_history_kline(
+        self, symbol: str, *, start: str, end: str, ktype: object,
+        max_count: int, page_req_key: object,
+    ) -> tuple[int, object, object]:
+        self.page_keys = getattr(self, "page_keys", []) + [page_req_key]
+        day = "2026-06-18" if page_req_key is None else "2026-06-19"
+        next_key = b"page-2" if page_req_key is None else None
+        return 0, FakeDataFrame([{
+            "time_key": day, "open": "18", "high": "20", "low": "17",
+            "close": "19", "volume": "100",
+        }]), next_key
 
 
 def test_futu_quote_error_preserves_diagnostic_metadata() -> None:
@@ -181,6 +203,20 @@ def test_futu_quote_client_returns_normalized_daily_kline() -> None:
     assert client.context.requested_history["symbol"] == "US.VIXY"
     assert client.context.requested_history["start"] == "2026-01-01"
     assert client.context.requested_history["end"] == "2026-07-04"
+    assert client.context.requested_history["max_count"] == 1000
+
+
+def test_futu_quote_client_reads_all_history_pages() -> None:
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=FakePaginatedContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    bars = client.get_daily_kline("US.SPY", start="2021-01-01", end="2026-07-13")
+
+    assert [bar.date for bar in bars] == ["2026-06-18", "2026-06-19"]
+    assert client.context.page_keys == [None, b"page-2"]
 
 
 def test_futu_quote_client_maps_cn_symbol_for_daily_kline() -> None:
