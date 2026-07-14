@@ -215,7 +215,7 @@ def test_candidate_preserves_bj_suffix_for_exclusion() -> None:
 
     assert (item.symbol, item.exchange) == ("920000", "BJ")
     assert build_candidate_list([item], held_symbols=set()).excluded["920000"] == [
-        "excluded_security"
+        "unsupported_exchange"
     ]
 
 
@@ -240,7 +240,7 @@ def test_candidate_infers_bj_exchange_without_suffix_for_exclusion() -> None:
 
     assert item.exchange == "BJ"
     assert build_candidate_list([item], held_symbols=set()).excluded["920000"] == [
-        "excluded_security"
+        "unsupported_exchange"
     ]
 
 
@@ -324,6 +324,35 @@ def test_candidate_missing_identity_field_is_excluded(
 
 def test_candidate_accepts_days_amount_and_strength_boundaries() -> None:
     item = candidate("600001", days=9, amount="1", strength="90.001")
+    assert build_candidate_list([item], held_symbols=set()).eligible == (item,)
+
+
+@pytest.mark.parametrize(
+    ("asset", "exchange", "reason"),
+    [
+        ("可转债", "SH", "unsupported_asset"),
+        ("股票", "SH", "unsupported_asset"),
+        ("", "SH", "asset_missing"),
+        ("A股", "BJ", "unsupported_exchange"),
+        ("A股", "HK", "unsupported_exchange"),
+        ("A股", "", "unsupported_exchange"),
+    ],
+)
+def test_candidate_asset_and_exchange_fail_closed(
+    asset: str, exchange: str, reason: str
+) -> None:
+    item = replace(candidate("600001", exchange=exchange), asset=asset)
+
+    decision = build_candidate_list([item], held_symbols=set())
+
+    assert decision.eligible == ()
+    assert reason in decision.excluded["600001"]
+
+
+@pytest.mark.parametrize("asset", ["A股", "ETF基金"])
+def test_candidate_accepts_only_supported_assets(asset: str) -> None:
+    item = replace(candidate("600001"), asset=asset)
+
     assert build_candidate_list([item], held_symbols=set()).eligible == (item,)
 
 
@@ -820,6 +849,44 @@ def test_triggered_protection_replays_until_position_disappears() -> None:
     assert (current.holdings[0].action, current.holdings[0].reason) == (
         "SELL_ALL",
         "protection_line_already_triggered",
+    )
+    assert gone.protection_state == {"schema_version": 1, "positions": {}}
+
+
+def test_signal_sell_persists_across_days_until_position_disappears() -> None:
+    first = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", danger=True)},
+        bars_by_symbol={"600001": bars()},
+    )
+    recovered_signal = build_report(
+        as_of_date="2026-07-15",
+        execution_date="2026-07-16",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={
+            "600001": replace(holding("600001"), as_of_date="2026-07-15")
+        },
+        bars_by_symbol={"600001": bars()},
+        prior_state=first.protection_state,
+    )
+    gone = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=recovered_signal.protection_state,
+    )
+
+    assert first.protection_state["positions"]["600001"]["pending_sell"] is True
+    assert (recovered_signal.holdings[0].action, recovered_signal.holdings[0].reason) == (
+        "SELL_ALL",
+        "danger_signal",
     )
     assert gone.protection_state == {"schema_version": 1, "positions": {}}
 
@@ -1613,6 +1680,43 @@ def test_report_runner_state_failure_leaves_no_formal_pair_or_delivery(
     assert not list((config.reports_dir / "trend_a_share").glob("2026-07-14.*"))
 
 
+def test_initial_receipt_failure_leaves_no_stage_or_reusable_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    original_write = trend_module._write_delivery_receipt
+
+    monkeypatch.setattr(
+        trend_module,
+        "_write_delivery_receipt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("receipt write failed")),
+    )
+    with pytest.raises(OSError, match="receipt write failed"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: ReadyApi([]),
+            quote_factory=lambda **kwargs: ReadyQuote([]),
+            notifier=RecordingFeishu(),
+        )
+
+    assert not list((config.data_dir / "trend_a_share/staged").rglob("*"))
+    assert not (config.data_dir / "trend_a_share/delivery/2026-07-14.json").exists()
+
+    monkeypatch.setattr(trend_module, "_write_delivery_receipt", original_write)
+    calls: list[str] = []
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(calls),
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.status == "generated"
+    assert calls.count("api.snapshots") == 1
+
+
 def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1696,6 +1800,106 @@ def test_pending_delivery_crash_recovers_unknown_from_stage_without_refetch(
 
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["delivery_status"] == "delivery_unknown"
+
+
+def test_atomic_receipt_keeps_old_content_addressed_stage_if_publish_crashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt_path = tmp_path / "data/trend_a_share/delivery/2026-07-14.json"
+    trend_module._write_delivery_receipt(
+        receipt_path,
+        status="delivery_failed",
+        generated_at="2026-07-14T17:00:00+08:00",
+        artifact_stem="2026-07-14",
+        markdown="old report",
+        report_json='{\n  "delivery_status": "delivery_failed"\n}\n',
+    )
+    old_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert "markdown" not in old_receipt and "report_json" not in old_receipt
+    assert Path(old_receipt["stage_markdown"]).name == (
+        f"{old_receipt['content_hash']}.md"
+    )
+    assert Path(old_receipt["stage_json"]).name == (
+        f"{old_receipt['content_hash']}.json"
+    )
+    original_replace = Path.replace
+
+    def crash_before_receipt_swap(path: Path, target: Path) -> Path:
+        if Path(target) == receipt_path:
+            raise OSError("receipt swap crashed")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", crash_before_receipt_swap)
+    with pytest.raises(OSError, match="receipt swap crashed"):
+        trend_module._write_delivery_receipt(
+            receipt_path,
+            status="sent",
+            generated_at="2026-07-14T17:00:00+08:00",
+            artifact_stem="2026-07-14",
+            markdown="new report",
+            report_json='{\n  "delivery_status": "sent"\n}\n',
+        )
+
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == old_receipt
+    recovered = trend_module._read_delivery_receipt(
+        receipt_path,
+        artifact_stem="2026-07-14",
+    )
+    assert recovered is not None
+    assert recovered["status"] == "delivery_failed"
+    assert Path(recovered["stage_markdown"]).read_text(encoding="utf-8") == "old report"
+    assert Path(recovered["stage_json"]).read_text(encoding="utf-8") == (
+        '{\n  "delivery_status": "delivery_failed"\n}\n'
+    )
+
+
+def test_failed_delivery_retry_marks_pending_before_send_and_crash_becomes_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(fail=True),
+    )
+    assert json.loads(first.json_path.read_text(encoding="utf-8"))[
+        "delivery_status"
+    ] == "delivery_failed"
+    receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-14.json"
+    send_calls = 0
+
+    def sent_then_crashed(*args: object, **kwargs: object) -> object:
+        nonlocal send_calls
+        if kwargs.get("channels") == {"feishu", "feishu_app"}:
+            send_calls += 1
+            assert json.loads(receipt_path.read_text(encoding="utf-8"))["status"] == "pending"
+            raise RuntimeError("crash after Feishu accepted message")
+        return []
+
+    monkeypatch.setattr(trend_module, "send_notification_with_results", sent_then_crashed)
+    with pytest.raises(RuntimeError, match="crash after Feishu"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **kwargs: pytest.fail("retry must not refetch API"),
+            quote_factory=lambda **kwargs: pytest.fail("retry must not refetch Futu"),
+            notifier=RecordingFeishu(),
+        )
+
+    recovered = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: pytest.fail("unknown recovery must not refetch API"),
+        quote_factory=lambda **kwargs: pytest.fail("unknown recovery must not refetch Futu"),
+        notifier=RecordingFeishu(),
+    )
+
+    assert send_calls == 1
+    assert json.loads(recovered.json_path.read_text(encoding="utf-8"))[
+        "delivery_status"
+    ] == "delivery_unknown"
 
 
 def test_sent_prior_attempt_status_is_not_reported_as_delivery_failure() -> None:
@@ -1829,6 +2033,57 @@ def test_revision_uses_independent_receipt_and_sends_normally(tmp_path: Path) ->
         path.stem
         for path in (config.data_dir / "trend_a_share/delivery").glob("*.json")
     } == {"2026-07-14", "2026-07-14-r1"}
+
+
+def test_revision_recovers_same_stem_after_kill_between_final_replaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = trend_config(tmp_path)
+    notifier = RecordingFeishu()
+    run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=notifier,
+    )
+    report_dir = config.reports_dir / "trend_a_share"
+    original_replace = Path.replace
+
+    def kill_before_revision_json(path: Path, target: Path) -> Path:
+        if Path(target) == report_dir / "2026-07-14-r1.json":
+            raise KeyboardInterrupt("killed between final replaces")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", kill_before_revision_json)
+    with pytest.raises(KeyboardInterrupt, match="between final replaces"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            revision=True,
+            api_factory=lambda **kwargs: ReadyApi([]),
+            quote_factory=lambda **kwargs: ReadyQuote([]),
+            notifier=notifier,
+        )
+
+    assert (report_dir / "2026-07-14-r1.md").exists()
+    assert not (report_dir / "2026-07-14-r1.json").exists()
+
+    monkeypatch.setattr(Path, "replace", original_replace)
+    recovered = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        api_factory=lambda **kwargs: pytest.fail("half-pair recovery must not refetch"),
+        quote_factory=lambda **kwargs: pytest.fail("half-pair recovery must not refetch"),
+        notifier=notifier,
+    )
+
+    assert recovered.report_path.name == "2026-07-14-r1.md"
+    assert recovered.json_path.name == "2026-07-14-r1.json"
+    assert len(notifier.messages) == 2
+    assert not (report_dir / "2026-07-14-r2.md").exists()
+    assert not (report_dir / "2026-07-14-r2.json").exists()
 
 
 def test_report_runner_keeps_files_when_feishu_delivery_fails_without_refetch(tmp_path: Path) -> None:

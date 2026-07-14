@@ -496,6 +496,43 @@ def test_existing_same_day_trigger_suppresses_repeat_after_restart(
     assert not any("全部卖出" in message for _, message in notifier.messages)
 
 
+def test_failed_trigger_notification_is_visible_and_retried_after_restart(
+    tmp_path: Path,
+) -> None:
+    class FailingNotifier(RecordingNotifier):
+        def notify(self, title: str, message: str) -> None:
+            self.messages.append((title, message))
+            raise RuntimeError("Feishu unavailable")
+
+    events_path = tmp_path / "events.jsonl"
+    failed = run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        events_path=events_path,
+        notifier=FailingNotifier(),
+    )
+
+    assert failed.trigger_count == 0
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "protection_notification_failed"
+    ]
+
+    recovered_notifier = RecordingNotifier()
+    recovered = run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.20")}]),
+        events_path=events_path,
+        notifier=recovered_notifier,
+    )
+
+    assert recovered.trigger_count == 1
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "protection_notification_failed",
+        "protection_triggered",
+    ]
+    assert sum("全部卖出" in message for _, message in recovered_notifier.messages) == 1
+
+
 def test_opend_failure_reconnects_once_and_announces_recovery(tmp_path: Path) -> None:
     failed = SequenceQuote([interrupted()])
     recovered = SequenceQuote([{"SH.600900": Decimal("28")}])

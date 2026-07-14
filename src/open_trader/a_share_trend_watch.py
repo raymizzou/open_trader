@@ -297,21 +297,28 @@ def watch_a_share_protection(
                     continue
                 if symbol in alerted or snapshot.last_price > active_line:
                     continue
-                append_watch_event(
-                    events_path,
-                    symbol=symbol,
-                    trading_date=trading_date,
-                    event_type="protection_triggered",
-                    occurred_at=now.isoformat(timespec="seconds"),
-                    last_price=snapshot.last_price,
-                    active_line=active_line,
-                )
-                send_notification_with_results(
+                attempts = send_notification_with_results(
                     notifier,
                     f"A股保护线触发 · {symbol}",
                     f"最新价 {snapshot.last_price} <= 活动保护线 {active_line}\n"
                     "建议动作：全部卖出（人工执行）",
                 )
+                delivered = any(attempt.success for attempt in attempts)
+                append_watch_event(
+                    events_path,
+                    symbol=symbol,
+                    trading_date=trading_date,
+                    event_type=(
+                        "protection_triggered"
+                        if delivered
+                        else "protection_notification_failed"
+                    ),
+                    occurred_at=now.isoformat(timespec="seconds"),
+                    last_price=snapshot.last_price,
+                    active_line=active_line,
+                )
+                if not delivered:
+                    continue
                 alerted.add(symbol)
                 trigger_count += 1
 
