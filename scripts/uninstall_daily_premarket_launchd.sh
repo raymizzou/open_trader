@@ -2,9 +2,10 @@
 set -euo pipefail
 
 MARKET="all"
+MARKET_REQUESTED=0
 
 usage() {
-  echo "usage: $0 [--market HK|US|all]" >&2
+  echo "usage: $0 [--market HK|US|CN|all]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -15,6 +16,7 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       MARKET="$2"
+      MARKET_REQUESTED=1
       shift 2
       ;;
     *)
@@ -24,7 +26,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$MARKET" != "HK" && "$MARKET" != "US" && "$MARKET" != "all" ]]; then
+if [[ "$MARKET" != "HK" && "$MARKET" != "US" && "$MARKET" != "CN" && "$MARKET" != "all" ]]; then
   usage
   exit 2
 fi
@@ -50,4 +52,9 @@ fi
 
 if [[ "$MARKET" == "all" ]]; then
   remove_target "$HOME/Library/LaunchAgents/com.open-trader.premarket.plist"
+fi
+
+if [[ "$MARKET_REQUESTED" -eq 1 && ( "$MARKET" == "CN" || "$MARKET" == "all" ) ]]; then
+  remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-a-share-report.plist"
+  remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-a-share-watch.plist"
 fi
