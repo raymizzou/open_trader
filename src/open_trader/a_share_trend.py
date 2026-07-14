@@ -371,10 +371,14 @@ def _candidate_reasons(
         reasons.append("name_missing")
     if not item.asset:
         reasons.append("asset_missing")
+    elif item.asset not in {"A股", "ETF基金"}:
+        reasons.append("unsupported_asset")
     if item.symbol in held_symbols:
         reasons.append("already_held")
     if item.exchange == "BJ" or _excluded_name(item.name):
         reasons.append("excluded_security")
+    elif item.exchange not in {"SH", "SZ"}:
+        reasons.append("unsupported_exchange")
     if item.atr is None:
         reasons.append("atr_unavailable")
     if expected_date is not None and item.as_of_date != expected_date:
@@ -1082,13 +1086,15 @@ def _write_run_log(path: Path, payload: Mapping[str, object], *, append: bool) -
         handle.write("\n")
 
 
-def _staged_hashes(markdown_path: Path, json_path: Path) -> dict[str, str]:
-    markdown = markdown_path.read_bytes()
-    json_bytes = json_path.read_bytes()
+def _payload_hashes(markdown: str, report_json: str) -> dict[str, str]:
+    markdown_bytes = markdown.encode("utf-8")
+    json_bytes = report_json.encode("utf-8")
     return {
-        "markdown_sha256": hashlib.sha256(markdown).hexdigest(),
+        "markdown_sha256": hashlib.sha256(markdown_bytes).hexdigest(),
         "json_sha256": hashlib.sha256(json_bytes).hexdigest(),
-        "content_hash": hashlib.sha256(markdown + b"\0" + json_bytes).hexdigest(),
+        "content_hash": hashlib.sha256(
+            markdown_bytes + b"\0" + json_bytes
+        ).hexdigest(),
     }
 
 
@@ -1098,15 +1104,17 @@ def _write_delivery_receipt(
     status: str,
     generated_at: str,
     artifact_stem: str,
-    markdown_path: Path,
-    json_path: Path,
-) -> None:
+    markdown: str,
+    report_json: str,
+) -> dict[str, object]:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "status": status,
         "generated_at": generated_at,
         "artifact_stem": artifact_stem,
-        **_staged_hashes(markdown_path, json_path),
+        "markdown": markdown,
+        "report_json": report_json,
+        **_payload_hashes(markdown, report_json),
     }
     temp_path: Path | None = None
     try:
@@ -1118,14 +1126,13 @@ def _write_delivery_receipt(
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+    return payload
 
 
 def _read_delivery_receipt(
     path: Path,
     *,
     artifact_stem: str,
-    markdown_path: Path,
-    json_path: Path,
 ) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1138,40 +1145,53 @@ def _read_delivery_receipt(
         raise ValueError("delivery receipt has an invalid status")
     if payload.get("artifact_stem") != artifact_stem:
         raise ValueError("delivery receipt artifact stem mismatch")
-    hashes = _staged_hashes(markdown_path, json_path)
+    markdown = payload.get("markdown")
+    report_json = payload.get("report_json")
+    if not isinstance(markdown, str) or not isinstance(report_json, str):
+        raise ValueError("delivery receipt has no embedded report payload")
+    try:
+        report_payload = json.loads(report_json)
+    except json.JSONDecodeError:
+        raise ValueError("delivery receipt report JSON is malformed") from None
+    if not isinstance(report_payload, dict):
+        raise ValueError("delivery receipt report JSON must be an object")
+    hashes = _payload_hashes(markdown, report_json)
     if any(payload.get(key) != value for key, value in hashes.items()):
         raise ValueError("delivery receipt content hash mismatch")
     return payload
 
 
-def _patch_staged_delivery(json_path: Path, status: str) -> None:
-    payload = json.loads(json_path.read_text(encoding="utf-8"))
+def _transition_delivery_receipt(
+    path: Path,
+    receipt: Mapping[str, object],
+    *,
+    status: str,
+    delivery_status: str,
+) -> dict[str, object]:
+    payload = json.loads(str(receipt["report_json"]))
     if not isinstance(payload, dict):
-        raise ValueError("staged report JSON must be an object")
+        raise ValueError("delivery receipt report JSON must be an object")
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
         payload["metadata"] = metadata
-    metadata["delivery_status"] = status
-    payload["delivery_status"] = status
-    temp_path: Path | None = None
-    try:
-        with NamedTemporaryFile(
-            "w", encoding="utf-8", delete=False, dir=json_path.parent
-        ) as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-            temp_path = Path(handle.name)
-        temp_path.replace(json_path)
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+    metadata["delivery_status"] = delivery_status
+    payload["delivery_status"] = delivery_status
+    return _write_delivery_receipt(
+        path,
+        status=status,
+        generated_at=str(receipt["generated_at"]),
+        artifact_stem=str(receipt["artifact_stem"]),
+        markdown=str(receipt["markdown"]),
+        report_json=(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ),
+    )
 
 
-def _freeze_staged_report(
+def _freeze_receipt_report(
     *,
-    markdown_source: Path,
-    json_source: Path,
+    receipt: Mapping[str, object],
     reports_dir: Path,
     artifact_stem: str,
 ) -> tuple[Path, Path]:
@@ -1184,10 +1204,10 @@ def _freeze_staged_report(
     json_backup: Path | None = None
     try:
         with NamedTemporaryFile("wb", delete=False, dir=reports_dir) as handle:
-            handle.write(markdown_source.read_bytes())
+            handle.write(str(receipt["markdown"]).encode("utf-8"))
             markdown_temp = Path(handle.name)
         with NamedTemporaryFile("wb", delete=False, dir=reports_dir) as handle:
-            handle.write(json_source.read_bytes())
+            handle.write(str(receipt["report_json"]).encode("utf-8"))
             json_temp = Path(handle.name)
         if markdown_path.exists():
             with NamedTemporaryFile("wb", delete=False, dir=reports_dir) as handle:
@@ -1230,37 +1250,68 @@ def _artifact_stem(
     number = 1
     while True:
         stem = f"{run_date}-r{number}"
-        final_exists = (reports_dir / f"{stem}.md").exists() or (
-            reports_dir / f"{stem}.json"
-        ).exists()
-        receipt_exists = (
-            data_dir / "trend_a_share/delivery" / f"{stem}.json"
-        ).exists()
-        if receipt_exists:
-            try:
-                receipt = json.loads(
-                    (
-                        data_dir / "trend_a_share/delivery" / f"{stem}.json"
-                    ).read_text(encoding="utf-8")
-                )
-                status = receipt.get("status") if isinstance(receipt, dict) else None
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                status = None
-            if status != "sent" or not final_exists:
+        receipt_path = _receipt_path(data_dir, stem)
+        markdown_path = reports_dir / f"{stem}.md"
+        json_path = reports_dir / f"{stem}.json"
+        if _legacy_sent_pair_matches(
+            receipt_path, stem, markdown_path, json_path
+        ):
+            number += 1
+            continue
+        receipt = _read_delivery_receipt(receipt_path, artifact_stem=stem)
+        if receipt is not None:
+            if receipt["status"] != "sent" or not _final_pair_matches(
+                receipt, markdown_path, json_path
+            ):
                 return stem
-        if not final_exists and not receipt_exists:
+        elif markdown_path.exists() and json_path.exists():
+            markdown_path.read_text(encoding="utf-8")
+            json.loads(json_path.read_text(encoding="utf-8"))
+        else:
             return stem
         number += 1
 
 
-def _staged_paths(
-    data_dir: Path, artifact_stem: str, run_date: str
-) -> tuple[Path, Path, Path]:
-    directory = data_dir / "trend_a_share/staged" / artifact_stem
+def _receipt_path(data_dir: Path, artifact_stem: str) -> Path:
+    return data_dir / "trend_a_share/delivery" / f"{artifact_stem}.json"
+
+
+def _final_pair_matches(
+    receipt: Mapping[str, object], markdown_path: Path, json_path: Path
+) -> bool:
+    try:
+        return (
+            markdown_path.read_text(encoding="utf-8") == receipt["markdown"]
+            and json_path.read_text(encoding="utf-8") == receipt["report_json"]
+        )
+    except (OSError, UnicodeError):
+        return False
+
+
+def _legacy_sent_pair_matches(
+    receipt_path: Path,
+    artifact_stem: str,
+    markdown_path: Path,
+    json_path: Path,
+) -> bool:
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        markdown = markdown_path.read_text(encoding="utf-8")
+        report_json = json_path.read_text(encoding="utf-8")
+        json.loads(report_json)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(receipt, dict) or any(
+        key in receipt for key in ("markdown", "report_json")
+    ):
+        return False
     return (
-        directory / f"{run_date}.md",
-        directory / f"{run_date}.json",
-        data_dir / "trend_a_share/delivery" / f"{artifact_stem}.json",
+        receipt.get("status") == "sent"
+        and receipt.get("artifact_stem") == artifact_stem
+        and all(
+            receipt.get(key) == value
+            for key, value in _payload_hashes(markdown, report_json).items()
+        )
     )
 
 
@@ -1289,31 +1340,32 @@ def _notify_delivery_status(
     )
 
 
-def _recover_staged_report(
+def _recover_receipt_report(
     *,
     config: DailyPremarketConfig,
     run_date: str,
     artifact_stem: str,
     notifier: Notifier,
 ) -> AShareTrendRunResult | None:
-    staged_markdown, staged_json, receipt_path = _staged_paths(
-        config.data_dir, artifact_stem, run_date
-    )
+    receipt_path = _receipt_path(config.data_dir, artifact_stem)
     receipt = _read_delivery_receipt(
         receipt_path,
         artifact_stem=artifact_stem,
-        markdown_path=staged_markdown,
-        json_path=staged_json,
     )
     if receipt is None:
         return None
     prior_status = str(receipt["status"])
-    receipt_status = prior_status
     if prior_status == "delivery_failed":
+        receipt = _transition_delivery_receipt(
+            receipt_path,
+            receipt,
+            status="pending",
+            delivery_status="pending",
+        )
         attempts = send_notification_with_results(
             notifier,
             f"A股趋势操作计划 · {run_date}",
-            staged_markdown.read_text(encoding="utf-8"),
+            str(receipt["markdown"]),
             channels={"feishu", "feishu_app"},
         )
         delivery_status = (
@@ -1324,24 +1376,30 @@ def _recover_staged_report(
             )
             else "delivery_failed"
         )
-        receipt_status = delivery_status
+        receipt = _transition_delivery_receipt(
+            receipt_path,
+            receipt,
+            status=delivery_status,
+            delivery_status=delivery_status,
+        )
     elif prior_status == "sent":
         delivery_status = "sent_prior_attempt"
+        receipt = _transition_delivery_receipt(
+            receipt_path,
+            receipt,
+            status="sent",
+            delivery_status=delivery_status,
+        )
     else:
         delivery_status = "delivery_unknown"
-        receipt_status = "delivery_unknown"
-    _patch_staged_delivery(staged_json, delivery_status)
-    _write_delivery_receipt(
-        receipt_path,
-        status=receipt_status,
-        generated_at=str(receipt["generated_at"]),
-        artifact_stem=artifact_stem,
-        markdown_path=staged_markdown,
-        json_path=staged_json,
-    )
-    markdown_path, json_path = _freeze_staged_report(
-        markdown_source=staged_markdown,
-        json_source=staged_json,
+        receipt = _transition_delivery_receipt(
+            receipt_path,
+            receipt,
+            status="delivery_unknown",
+            delivery_status=delivery_status,
+        )
+    markdown_path, json_path = _freeze_receipt_report(
+        receipt=receipt,
         reports_dir=config.reports_dir / "trend_a_share",
         artifact_stem=artifact_stem,
     )
@@ -1632,25 +1690,27 @@ def _attempt_report(
                 "process_version": process_version,
             },
         )
-        staged_markdown, staged_json, receipt_path = _staged_paths(
-            config.data_dir, artifact_stem, run_date
-        )
-        write_frozen_report(
-            report,
-            staged_markdown.parent,
-        )
-        _write_delivery_receipt(
+        receipt_path = _receipt_path(config.data_dir, artifact_stem)
+        receipt = _write_delivery_receipt(
             receipt_path,
             status="pending",
             generated_at=report.generated_at,
             artifact_stem=artifact_stem,
-            markdown_path=staged_markdown,
-            json_path=staged_json,
+            markdown=render_markdown(report),
+            report_json=(
+                json.dumps(
+                    _report_payload(report),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ),
         )
         attempts = send_notification_with_results(
             notifier,
             f"A股趋势操作计划 · {report.as_of_date}",
-            staged_markdown.read_text(encoding="utf-8"),
+            str(receipt["markdown"]),
             channels={"feishu", "feishu_app"},
         )
         delivery_status = (
@@ -1658,18 +1718,14 @@ def _attempt_report(
             if any(item.channel.startswith("feishu") and item.success for item in attempts)
             else "delivery_failed"
         )
-        _patch_staged_delivery(staged_json, delivery_status)
-        _write_delivery_receipt(
+        receipt = _transition_delivery_receipt(
             receipt_path,
+            receipt,
             status=delivery_status,
-            generated_at=report.generated_at,
-            artifact_stem=artifact_stem,
-            markdown_path=staged_markdown,
-            json_path=staged_json,
+            delivery_status=delivery_status,
         )
-        markdown_path, json_path = _freeze_staged_report(
-            markdown_source=staged_markdown,
-            json_source=staged_json,
+        markdown_path, json_path = _freeze_receipt_report(
+            receipt=receipt,
             reports_dir=config.reports_dir / "trend_a_share",
             artifact_stem=artifact_stem,
         )
@@ -1712,23 +1768,28 @@ def run_a_share_trend_report(
             reports_dir=report_dir,
             data_dir=config.data_dir,
         )
-        staged_markdown, staged_json, receipt_path = _staged_paths(
-            config.data_dir, artifact_stem, run_date
-        )
+        if not revision and _legacy_sent_pair_matches(
+            _receipt_path(config.data_dir, artifact_stem),
+            artifact_stem,
+            base_markdown,
+            base_json,
+        ):
+            return AShareTrendRunResult("existing", base_markdown, base_json)
+        receipt_path = _receipt_path(config.data_dir, artifact_stem)
         receipt = _read_delivery_receipt(
             receipt_path,
             artifact_stem=artifact_stem,
-            markdown_path=staged_markdown,
-            json_path=staged_json,
         )
-        if (
-            not revision
-            and base_markdown.exists()
-            and base_json.exists()
-            and (receipt is None or receipt["status"] == "sent")
-        ):
-            return AShareTrendRunResult("existing", base_markdown, base_json)
-        recovered = _recover_staged_report(
+        if not revision and base_markdown.exists() and base_json.exists():
+            if receipt is None:
+                base_markdown.read_text(encoding="utf-8")
+                json.loads(base_json.read_text(encoding="utf-8"))
+                return AShareTrendRunResult("existing", base_markdown, base_json)
+            if receipt["status"] == "sent" and _final_pair_matches(
+                receipt, base_markdown, base_json
+            ):
+                return AShareTrendRunResult("existing", base_markdown, base_json)
+        recovered = _recover_receipt_report(
             config=config,
             run_date=run_date,
             artifact_stem=artifact_stem,
