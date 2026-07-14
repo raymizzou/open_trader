@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import socket
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 import math
 from typing import Any
@@ -164,11 +164,26 @@ class FutuQuoteClient:
                 context_ok=True,
                 snapshot_ok=False,
             )
-        return [
-            str(item.get("time", "")).strip()
-            for item in data
-            if str(item.get("time", "")).strip()
-        ]
+        trading_days: list[str] = []
+        try:
+            for item in data:
+                if not isinstance(item, Mapping):
+                    raise TypeError("trading calendar row is not a mapping")
+                time = item.get("time", "")
+                if not isinstance(time, str):
+                    raise TypeError("trading calendar time is not a string")
+                if time := time.strip():
+                    trading_days.append(time)
+        except (AttributeError, TypeError) as exc:
+            raise FutuQuoteError(
+                "Futu trading calendar returned malformed data",
+                error_type="snapshot_failed",
+                next_step=SNAPSHOT_FAILED_NEXT_STEP,
+                opend_reachable=True,
+                context_ok=True,
+                snapshot_ok=False,
+            ) from exc
+        return trading_days
 
     def get_daily_kline(
         self,

@@ -237,6 +237,54 @@ def test_futu_quote_client_classifies_trading_calendar_failure() -> None:
     assert exc_info.value.error_type == "quote_server_interrupted"
 
 
+@pytest.mark.parametrize("data", [None, ["not-a-row"]])
+def test_futu_quote_client_rejects_malformed_trading_calendar_data(
+    data: object,
+) -> None:
+    class MalformedCalendarContext(FakeOpenQuoteContext):
+        def request_trading_days(self, **kwargs: object) -> tuple[int, object]:
+            return 0, data
+
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=MalformedCalendarContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    with pytest.raises(FutuQuoteError) as exc_info:
+        client.get_cn_trading_days(start="2026-07-14", end="2026-07-14")
+
+    assert exc_info.value.error_type == "snapshot_failed"
+    assert exc_info.value.opend_reachable is True
+    assert exc_info.value.context_ok is True
+    assert exc_info.value.snapshot_ok is False
+    assert "行情服务状态" in exc_info.value.next_step
+
+
+@pytest.mark.parametrize("time_value", [None, 20260714])
+def test_futu_quote_client_rejects_non_string_trading_day(
+    time_value: object,
+) -> None:
+    class MalformedCalendarContext(FakeOpenQuoteContext):
+        def request_trading_days(self, **kwargs: object) -> tuple[int, object]:
+            return 0, [{"time": time_value}]
+
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=MalformedCalendarContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    with pytest.raises(FutuQuoteError) as exc_info:
+        client.get_cn_trading_days(start="2026-07-14", end="2026-07-14")
+
+    assert exc_info.value.error_type == "snapshot_failed"
+    assert exc_info.value.opend_reachable is True
+    assert exc_info.value.context_ok is True
+    assert exc_info.value.snapshot_ok is False
+    assert "行情服务状态" in exc_info.value.next_step
+
+
 def test_futu_quote_client_returns_normalized_daily_kline() -> None:
     client = FutuQuoteClient(
         host="127.0.0.1",
