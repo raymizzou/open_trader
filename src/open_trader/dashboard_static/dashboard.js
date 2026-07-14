@@ -43,7 +43,6 @@ const state = {
 
 const elements = {};
 
-const HOLDINGS_TABLE_COLUMN_COUNT = 10;
 const ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT = 11;
 
 const ACCOUNT_STRATEGY_PROFILES = {
@@ -59,15 +58,6 @@ const DECISION_TABS = [
   { key: "kline", label: "趋势 / K 线" },
   { key: "news", label: "新闻 / 舆论" },
   { key: "futu", label: "富途异动" },
-];
-
-const MARKET_SECTION_CONFIGS = [
-  { market: "US_STOCK", marketGroup: "US", label: "美股正股", className: "market-section-us-stock" },
-  { market: "US_OPTION", marketGroup: "US", label: "美股期权", className: "market-section-us-option" },
-  { market: "HK_STOCK", marketGroup: "HK", label: "港股正股", className: "market-section-hk-stock" },
-  { market: "HK_OPTION", marketGroup: "HK", label: "港股期权", className: "market-section-hk-option" },
-  { market: "CN_STOCK", marketGroup: "CN", label: "A 股正股", className: "market-section-cn-stock" },
-  { market: "OTHER", marketGroup: "OTHER", label: "其他市场持仓", className: "market-section-other" },
 ];
 
 const ACTION_LABELS = {
@@ -137,13 +127,6 @@ const REASON_LABELS = {
   "missing quote": "缺失行情。",
 };
 
-const TIGER_RISK_GROUP_LABELS = {
-  semiconductor: "半导体",
-  software: "软件",
-  broad_us_growth: "美股大盘成长",
-  agriculture: "农业",
-};
-
 const TIGER_TREND_LABELS = {
   LONG: "多头",
   CASH: "现金",
@@ -152,14 +135,6 @@ const TIGER_TREND_LABELS = {
 
 const TIGER_ELIGIBILITY_LABELS = {
   insufficient_sma200_history: "SMA200 历史不足",
-};
-
-const TIGER_REBALANCE_LABELS = {
-  state_change: "状态变化",
-  state_change_reallocation: "状态变化后重新分配",
-  symbol_cap: "单标的超过上限",
-  risk_group_cap: "风险组超过上限",
-  drift: "权重漂移",
 };
 
 const TIGER_GATE_LABELS = {
@@ -5498,155 +5473,6 @@ function filteredHoldings() {
   });
 }
 
-function holdingsEmptyRow(message) {
-  return `<tr><td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}" class="empty-state">${escapeHtml(message)}</td></tr>`;
-}
-
-function marketSectionKey(holding) {
-  const market = String(holding && holding.market || "").trim().toUpperCase();
-  if (market === "US") {
-    return isOptionHolding(holding) ? "US_OPTION" : "US_STOCK";
-  }
-  if (market === "HK") {
-    return isOptionHolding(holding) ? "HK_OPTION" : "HK_STOCK";
-  }
-  if (market === "CN") {
-    return "CN_STOCK";
-  }
-  return "OTHER";
-}
-
-function isOptionHolding(holding) {
-  const optionFields = [
-    holding && holding.asset_class,
-    holding && holding.security_type,
-    holding && holding.sec_type,
-    holding && holding.instrument_type,
-    holding && holding.product_type,
-  ];
-  if (optionFields.some((value) => isOptionText(value))) {
-    return true;
-  }
-  const symbol = String(holding && holding.symbol || "").trim().toUpperCase();
-  if (/^[A-Z]{1,8}\d{6}[CP]\d{5,8}$/.test(symbol) || /^[A-Z]{1,8}\s+\d{6}[CP]\d{5,8}$/.test(symbol)) {
-    return true;
-  }
-  const name = String(holding && holding.name || "").trim();
-  const fundLike = /ETF|基金|FUND/i.test(name);
-  return !fundLike && /(?:CALL|PUT|OPTION|期权|期權|\d{6}\s+\d+(?:\.\d+)?[CP])/.test(name);
-}
-
-function isOptionText(value) {
-  if (!hasValue(value)) {
-    return false;
-  }
-  const text = String(value).trim();
-  return /^(option|options)$/i.test(text) || /(?:期权|期權)/.test(text);
-}
-
-function groupedHoldingsByMarketSection(holdings) {
-  const sections = MARKET_SECTION_CONFIGS.map((config) => ({
-    ...config,
-    rows: [],
-  }));
-  const sectionByMarket = new Map(sections.map((section) => [section.market, section]));
-  const presentMarketGroups = new Set();
-  holdings.forEach((holding, index) => {
-    const sectionKey = marketSectionKey(holding);
-    const section = sectionByMarket.get(sectionKey) || sectionByMarket.get("OTHER");
-    presentMarketGroups.add(section.marketGroup);
-    section.rows.push({ holding, index });
-  });
-  sections.forEach((section) => {
-    section.rows.sort(compareRowsByPortfolioWeight);
-  });
-  return sections.filter((section) => {
-    if (section.rows.length > 0) {
-      return true;
-    }
-    return section.marketGroup !== "OTHER" && presentMarketGroups.has(section.marketGroup);
-  });
-}
-
-function sectionRowHolding(row) {
-  return row && row.holding ? row.holding : row;
-}
-
-function compareRowsByPortfolioWeight(left, right) {
-  const leftWeight = numericPercentValue(sectionRowHolding(left).portfolio_weight_hkd);
-  const rightWeight = numericPercentValue(sectionRowHolding(right).portfolio_weight_hkd);
-  if (leftWeight === null && rightWeight === null) {
-    return left.index - right.index;
-  }
-  if (leftWeight === null) {
-    return 1;
-  }
-  if (rightWeight === null) {
-    return -1;
-  }
-  if (rightWeight !== leftWeight) {
-    return rightWeight - leftWeight;
-  }
-  return left.index - right.index;
-}
-
-function sumNumericField(rows, fieldName) {
-  if (rows.length === 0) {
-    return 0;
-  }
-  let total = 0;
-  for (const row of rows) {
-    const value = numericValue(sectionRowHolding(row)[fieldName]);
-    if (value === null) {
-      return null;
-    }
-    total += value;
-  }
-  return rows.length ? total : null;
-}
-
-function sumPercentField(rows, fieldName) {
-  if (rows.length === 0) {
-    return 0;
-  }
-  let total = 0;
-  for (const row of rows) {
-    const parsed = numericPercentValue(sectionRowHolding(row)[fieldName]);
-    if (parsed === null) {
-      return null;
-    }
-    total += parsed;
-  }
-  return rows.length ? total : null;
-}
-
-function numericPercentValue(value) {
-  if (!hasValue(value)) {
-    return null;
-  }
-  const raw = String(value).trim();
-  if (!/^[+-]?(?:\d+|\d*\.\d+)%$/.test(raw)) {
-    return null;
-  }
-  const parsed = Number(raw.slice(0, -1));
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function renderMarketSectionRow(section) {
-  const hkdTotal = sumNumericField(section.rows, "market_value_hkd");
-  const weightTotal = sumPercentField(section.rows, "portfolio_weight_hkd");
-  const hkdText = hkdTotal === null ? "-" : formatMoney(moneyValue(hkdTotal), "HKD");
-  const weightText = weightTotal === null ? "-" : `${weightTotal.toFixed(2)}%`;
-  return `
-    <tr class="market-section-row ${escapeHtml(section.className)}">
-      <td colspan="${HOLDINGS_TABLE_COLUMN_COUNT}">
-        <strong>${escapeHtml(section.label)}</strong>
-        <span class="meta-text">${escapeHtml(`${section.rows.length} 个标的 · 港元市值 ${hkdText} · 权重 ${weightText}`)}</span>
-      </td>
-    </tr>
-  `;
-}
-
 function renderUsdMarketValue(holding) {
   const currency = String(holding && holding.currency || "").trim().toUpperCase();
   if (currency !== "USD") {
@@ -5703,7 +5529,11 @@ function accountHoldingGroups() {
 }
 
 function accountDisplayRow(holding, detail, summary, portfolioTotal) {
-  const display = {...holding, ...(detail || {})};
+  const display = quoteAdjustedHolding({
+    ...holding,
+    ...(detail || {}),
+    total_quantity: detail ? detail.quantity : holding.total_quantity,
+  }, quoteForHolding(holding));
   const marketValue = numericValue(display.market_value_hkd);
   return {
     ...display,
@@ -5712,7 +5542,7 @@ function accountDisplayRow(holding, detail, summary, portfolioTotal) {
     account_weight: percentValue(marketValue, numericValue(summary.portfolio_value_hkd)),
     portfolio_weight: percentValue(marketValue, numericValue(portfolioTotal)),
     unrealized_pnl_pct: detail
-      ? percentValue(numericValue(detail.unrealized_pnl), numericValue(detail.cost_value))
+      ? percentValue(numericValue(display.unrealized_pnl), numericValue(display.cost_value))
       : formatPlain(holding.unrealized_pnl_pct),
   };
 }

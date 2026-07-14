@@ -32,8 +32,6 @@ def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
     for label in ("明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值", "港元市值", "权重", "盈亏", "策略"):
         assert f'"{label}"' in js
     assert 'data-market="CN">A 股</button>' in html
-    assert 'label: "A 股正股"' in js
-    assert 'market === "CN"' in js
     for forbidden_id in ("a-share-panel", "a-share-card", "cn-panel", "cn-card"):
         assert f'id="{forbidden_id}"' not in html
 
@@ -896,6 +894,55 @@ console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
     assert [group["broker"] for group in groups] == ["futu", "tiger", "phillips", "eastmoney"]
     assert groups[0]["rows"] == [{"key": "futu:US:QQQ:0", "quantity": "1", "accountWeight": "70.00%"}]
     assert groups[1]["rows"] == [{"key": "tiger:US:QQQ:0", "quantity": "2", "accountWeight": "80.00%"}]
+
+
+def test_dashboard_account_rows_recalculate_live_values_from_broker_details() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {
+  summary: {portfolio_value_hkd: "3000"}, broker_summaries: [
+    {broker: "futu", portfolio_value_hkd: "1000"},
+    {broker: "tiger", portfolio_value_hkd: "2000"},
+  ], cash_rows: [], holdings: [{
+    market: "US", symbol: "QQQ", brokers: "futu;tiger", total_quantity: "3",
+    cost_value: "210", fx_to_hkd: "7.8", market_value_hkd: "2300",
+    broker_details: [
+      {broker: "futu", quantity: "1", cost_value: "60", fx_to_hkd: "7.8", market_value_hkd: "700", unrealized_pnl: "30"},
+      {broker: "tiger", quantity: "2", cost_value: "150", fx_to_hkd: "7.8", market_value_hkd: "1600", unrealized_pnl: "50"},
+    ],
+  }],
+};
+state.quotes = {qqq: {market: "US", symbol: "QQQ", last_price: "100"}};
+console.log(JSON.stringify(accountHoldingGroups().slice(0, 2).map((group) => {
+  const display = group.rows[0].display;
+  return {
+    broker: group.broker,
+    marketValueHkd: display.market_value_hkd,
+    accountWeight: display.account_weight,
+    overallWeight: display.portfolio_weight,
+    pnl: display.unrealized_pnl,
+    pnlPercent: display.unrealized_pnl_pct,
+  };
+})));
+''')
+
+    assert json.loads(output) == [
+        {
+            "broker": "futu",
+            "marketValueHkd": "780.00",
+            "accountWeight": "78.00%",
+            "overallWeight": "26.00%",
+            "pnl": "40.00",
+            "pnlPercent": "66.67%",
+        },
+        {
+            "broker": "tiger",
+            "marketValueHkd": "1560.00",
+            "accountWeight": "78.00%",
+            "overallWeight": "52.00%",
+            "pnl": "50.00",
+            "pnlPercent": "33.33%",
+        },
+    ]
 
 
 def test_dashboard_account_rows_do_not_turn_unknown_values_into_zero() -> None:
