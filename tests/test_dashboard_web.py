@@ -893,18 +893,99 @@ def test_dashboard_workspace_navigation_uses_one_shared_state_machine() -> None:
     output = run_dashboard_js(r'''
 const element=()=>({hidden:false,innerHTML:"",classList:{values:new Set(),add(...n){n.forEach(x=>this.values.add(x))},remove(...n){n.forEach(x=>this.values.delete(x))},toggle(n,f){f?this.add(n):this.remove(n)},contains(n){return this.values.has(n)}}});
 for(const id of ["dashboard-shell","workspace-grid","kelly-lab-panel","holdings-panel","standard-backtest-workspace","trend-report-workspace","return-to-portfolio"])elements[id]=element();
-for(const view of ["kelly_lab","standard_backtest","trend_report","portfolio"]){
-  setWorkspaceView(view);
-  console.log(JSON.stringify({view:state.workspaceView,tool:elements["dashboard-shell"].classList.contains("tool-workspace-view"),backHidden:elements["return-to-portfolio"].hidden}));
+const snapshot=(requested)=>{
+  setWorkspaceView(requested);
+  const hiddenClass=(id)=>elements[id].classList.contains("hidden");
+  return {
+    requested,view:state.workspaceView,
+    shellTool:elements["dashboard-shell"].classList.contains("tool-workspace-view"),
+    returnHidden:elements["return-to-portfolio"].hidden,
+    returnHiddenClass:hiddenClass("return-to-portfolio"),
+    gridHiddenClass:hiddenClass("workspace-grid"),
+    holdingsHiddenClass:hiddenClass("holdings-panel"),
+    kellyHiddenClass:hiddenClass("kelly-lab-panel"),
+    backtestHidden:elements["standard-backtest-workspace"].hidden,
+    backtestHiddenClass:hiddenClass("standard-backtest-workspace"),
+    trendHidden:elements["trend-report-workspace"].hidden,
+    trendHiddenClass:hiddenClass("trend-report-workspace"),
+  };
+};
+for(const view of ["kelly_lab","standard_backtest","trend_report","portfolio","invalid"]){
+  console.log(JSON.stringify(snapshot(view)));
 }
 ''')
     states = [json.loads(line) for line in output.splitlines()]
     assert states == [
-        {"view": "kelly_lab", "tool": True, "backHidden": False},
-        {"view": "standard_backtest", "tool": True, "backHidden": False},
-        {"view": "trend_report", "tool": True, "backHidden": False},
-        {"view": "portfolio", "tool": False, "backHidden": True},
+        {
+            "requested": "kelly_lab", "view": "kelly_lab", "shellTool": True,
+            "returnHidden": False, "returnHiddenClass": False, "gridHiddenClass": False,
+            "holdingsHiddenClass": True, "kellyHiddenClass": False,
+            "backtestHidden": True, "backtestHiddenClass": True,
+            "trendHidden": True, "trendHiddenClass": True,
+        },
+        {
+            "requested": "standard_backtest", "view": "standard_backtest", "shellTool": True,
+            "returnHidden": False, "returnHiddenClass": False, "gridHiddenClass": True,
+            "holdingsHiddenClass": True, "kellyHiddenClass": True,
+            "backtestHidden": False, "backtestHiddenClass": False,
+            "trendHidden": True, "trendHiddenClass": True,
+        },
+        {
+            "requested": "trend_report", "view": "trend_report", "shellTool": True,
+            "returnHidden": False, "returnHiddenClass": False, "gridHiddenClass": True,
+            "holdingsHiddenClass": True, "kellyHiddenClass": True,
+            "backtestHidden": True, "backtestHiddenClass": True,
+            "trendHidden": False, "trendHiddenClass": False,
+        },
+        {
+            "requested": "portfolio", "view": "portfolio", "shellTool": False,
+            "returnHidden": True, "returnHiddenClass": True, "gridHiddenClass": False,
+            "holdingsHiddenClass": False, "kellyHiddenClass": True,
+            "backtestHidden": True, "backtestHiddenClass": True,
+            "trendHidden": True, "trendHiddenClass": True,
+        },
+        {
+            "requested": "invalid", "view": "portfolio", "shellTool": False,
+            "returnHidden": True, "returnHiddenClass": True, "gridHiddenClass": False,
+            "holdingsHiddenClass": False, "kellyHiddenClass": True,
+            "backtestHidden": True, "backtestHiddenClass": True,
+            "trendHidden": True, "trendHiddenClass": True,
+        },
     ]
+
+
+def test_dashboard_workspace_bindings_open_kelly_and_return_without_resetting_filters() -> None:
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.hidden=false;this.innerHTML="";this.textContent="";this.listeners={};this.classes=new Set();this.classList={add:(...names)=>names.forEach((name)=>this.classes.add(name)),remove:(...names)=>names.forEach((name)=>this.classes.delete(name)),toggle:(name,force)=>force?this.classes.add(name):this.classes.delete(name)};}
+  addEventListener(name,listener){this.listeners[name]=listener;}
+  click(){if(typeof this.listeners.click!=="function")throw new Error("missing click binding");return this.listeners.click({target:this,preventDefault(){}});}
+}
+const nodes={};
+document.getElementById=(id)=>nodes[id]||(nodes[id]=new Element());
+bindElements();
+bindEvents();
+state.brokerFilter="tiger";
+state.marketFilter="HK";
+elements["open-kelly-lab"].click();
+if(state.workspaceView!=="kelly_lab")throw new Error("Kelly binding did not open the workspace");
+if(elements["kelly-lab-panel"].classes.has("hidden")||!elements["holdings-panel"].classes.has("hidden")||elements["return-to-portfolio"].hidden||elements["return-to-portfolio"].classes.has("hidden"))throw new Error("Kelly binding did not render the workspace");
+elements["return-to-portfolio"].click();
+console.log(JSON.stringify({
+  view:state.workspaceView,
+  broker:state.brokerFilter,
+  market:state.marketFilter,
+  returnHidden:elements["return-to-portfolio"].hidden,
+  holdingsHidden:elements["holdings-panel"].classes.has("hidden"),
+}));
+''')
+    assert json.loads(output) == {
+        "view": "portfolio",
+        "broker": "tiger",
+        "market": "HK",
+        "returnHidden": True,
+        "holdingsHidden": False,
+    }
 
 
 def test_dashboard_derives_account_groups_from_existing_broker_details() -> None:
