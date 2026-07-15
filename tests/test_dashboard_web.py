@@ -1034,6 +1034,86 @@ console.log(JSON.stringify({
     }
 
 
+@pytest.mark.parametrize(
+    ("quantity", "cost_value", "last_price", "expected"),
+    [
+        (
+            "2", "3", "2",
+            {
+                "market_value": "400.00",
+                "market_value_hkd": "3120.00",
+                "unrealized_pnl": "100.00",
+                "unrealized_pnl_pct": "33.33%",
+            },
+        ),
+        (
+            "-2", "-3", "1",
+            {
+                "market_value": "-200.00",
+                "market_value_hkd": "-1560.00",
+                "unrealized_pnl": "100.00",
+                "unrealized_pnl_pct": "33.33%",
+            },
+        ),
+    ],
+    ids=("long", "short"),
+)
+def test_dashboard_account_option_row_uses_selected_quote_with_standard_multiplier(
+    quantity: str, cost_value: str, last_price: str, expected: dict[str, str],
+) -> None:
+    scenario = json.dumps({
+        "quantity": quantity,
+        "cost_value": cost_value,
+        "last_price": last_price,
+    })
+    output = run_dashboard_js(f"const scenario = {scenario};\n" + r'''
+state.quotes = {selected: {
+  market: "US", symbol: "DRAM260731P55000", last_price: scenario.last_price,
+}};
+const display = accountDisplayRow(
+  {
+    market: "US", symbol: "DRAM260731P55000", asset_class: "option",
+    fx_to_hkd: "7.8", unrealized_pnl_pct: "-999%",
+  },
+  {
+    broker: "tiger", quantity: scenario.quantity,
+    cost_value: scenario.cost_value, market_value: "999",
+    market_value_hkd: "999", unrealized_pnl: "999",
+  },
+  {broker: "tiger", portfolio_value_hkd: "10000"},
+  "20000",
+);
+console.log(JSON.stringify({
+  market_value: display.market_value,
+  market_value_hkd: display.market_value_hkd,
+  unrealized_pnl: display.unrealized_pnl,
+  unrealized_pnl_pct: display.unrealized_pnl_pct,
+}));
+''')
+
+    assert json.loads(output) == expected
+
+
+def test_dashboard_non_us_option_preserves_unit_multiplier() -> None:
+    output = run_dashboard_js(r'''
+const holding = quoteAdjustedHolding({
+  market: "HK", asset_class: "option", total_quantity: "2",
+  cost_value: "3", fx_to_hkd: "1",
+}, {last_price: "2"});
+console.log(JSON.stringify({
+  market_value: holding.market_value,
+  unrealized_pnl: holding.unrealized_pnl,
+  unrealized_pnl_pct: holding.unrealized_pnl_pct,
+}));
+''')
+
+    assert json.loads(output) == {
+        "market_value": "4.00",
+        "unrealized_pnl": "1.00",
+        "unrealized_pnl_pct": "33.33%",
+    }
+
+
 def test_dashboard_renders_one_compact_us_session_price_and_header_time() -> None:
     output = run_dashboard_js(r'''
 const active = renderQuotePrice({market:"US", asset_class:"stock"}, {

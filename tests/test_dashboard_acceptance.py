@@ -13,6 +13,7 @@ from open_trader.dashboard_acceptance import (
     classify_result,
     dashboard_signature,
     validate_dashboard_payload,
+    validate_quote_refresh_cycle,
     validate_quotes_payload,
 )
 
@@ -93,6 +94,26 @@ def valid_quotes_payload() -> dict[str, object]:
 
 def test_validate_quotes_payload_accepts_one_selected_us_session_price() -> None:
     assert validate_quotes_payload(valid_quotes_payload()) == []
+
+
+@pytest.mark.parametrize(
+    ("second_fetched_at", "valid"),
+    [
+        ("2026-07-15T15:03:13+08:00", False),
+        ("2026-07-15T15:03:12+08:00", False),
+        ("2026-07-15T15:03:14+08:00", True),
+        ("not-a-timestamp", False),
+    ],
+    ids=("identical", "older", "newer", "invalid"),
+)
+def test_validate_quote_refresh_cycle_requires_strictly_newer_timestamp(
+    second_fetched_at: str, valid: bool,
+) -> None:
+    first = valid_quotes_payload()
+    second = valid_quotes_payload()
+    second["fetched_at"] = second_fetched_at
+
+    assert (validate_quote_refresh_cycle(first, second) == []) is valid
 
 
 @pytest.mark.parametrize(

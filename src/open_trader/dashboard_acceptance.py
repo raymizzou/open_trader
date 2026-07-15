@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
@@ -203,6 +204,21 @@ def validate_quotes_payload(payload: dict[str, Any]) -> list[str]:
         if quote.get("current_session_quote") is True and not quote.get("price_time"):
             errors.append(f"US.{symbol} 当前时段行情时间缺失")
     return errors
+
+
+def validate_quote_refresh_cycle(
+    first: dict[str, Any], second: dict[str, Any],
+) -> list[str]:
+    try:
+        first_at = datetime.fromisoformat(str(first.get("fetched_at", "")))
+        second_at = datetime.fromisoformat(str(second.get("fetched_at", "")))
+        if first_at.utcoffset() is None or second_at.utcoffset() is None:
+            raise ValueError("timestamp has no timezone")
+        if second_at <= first_at:
+            return ["第二次行情 API 获取时间没有更新"]
+    except (TypeError, ValueError):
+        return ["行情 API 获取时间格式无效"]
+    return []
 
 
 def classify_result(errors: list[str], *, browser_blocker: str | None) -> str:
@@ -538,6 +554,7 @@ def main(argv: list[str] | None = None) -> int:
         second = _fetch_payload(args.url)
         second_quotes = _fetch_quotes_payload(args.url)
         errors.extend(validate_quotes_payload(second_quotes))
+        errors.extend(validate_quote_refresh_cycle(first_quotes, second_quotes))
         browser_payload = second
         errors.extend(validate_dashboard_payload(
             second, expected_cn=args.expected_cn,

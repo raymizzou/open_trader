@@ -5552,11 +5552,12 @@ function quoteAdjustedTotal(snapshotTotal, rows) {
 }
 
 function accountDisplayRow(holding, detail, summary, portfolioTotal) {
+  const quote = quoteForHolding(holding);
   const display = quoteAdjustedHolding({
     ...holding,
     ...(detail || {}),
     total_quantity: detail ? detail.quantity : holding.total_quantity,
-  }, quoteForHolding(holding));
+  }, quote);
   const marketValue = numericValue(display.market_value_hkd);
   return {
     ...display,
@@ -5564,9 +5565,9 @@ function accountDisplayRow(holding, detail, summary, portfolioTotal) {
     avg_cost_price: formatPlain(detail ? detail.cost_price : holding.avg_cost_price),
     account_weight: percentValue(marketValue, numericValue(summary.portfolio_value_hkd)),
     portfolio_weight: percentValue(marketValue, numericValue(portfolioTotal)),
-    unrealized_pnl_pct: detail
+    unrealized_pnl_pct: detail && !quote
       ? percentValue(numericValue(display.unrealized_pnl), numericValue(display.cost_value))
-      : formatPlain(holding.unrealized_pnl_pct),
+      : formatPlain(display.unrealized_pnl_pct),
   };
 }
 
@@ -5871,18 +5872,23 @@ function quoteAdjustedHolding(holding, quote) {
   const quantity = numericValue(holding && holding.total_quantity);
   const cost = numericValue(holding && holding.cost_value);
   const fx = numericValue(holding && holding.fx_to_hkd);
-  if (price === null || price <= 0 || quantity === null || quantity <= 0
-      || cost === null || cost <= 0 || fx === null || fx <= 0) {
+  if (price === null || price <= 0 || quantity === null || quantity === 0
+      || cost === null || cost === 0 || fx === null || fx <= 0) {
     return holding;
   }
-  const marketValue = price * quantity;
+  // ponytail: standard US contracts only; use a feed multiplier for adjusted contracts.
+  const multiplier = String(holding.market || "").toUpperCase() === "US"
+    && String(holding.asset_class || "").toLowerCase() === "option" ? 100 : 1;
+  const marketValue = price * quantity * multiplier;
+  const costBasis = cost * multiplier;
+  const unrealizedPnl = marketValue - costBasis;
   return {
     ...holding,
     last_price: String(price),
     market_value: marketValue.toFixed(2),
     market_value_hkd: (marketValue * fx).toFixed(2),
-    unrealized_pnl: (marketValue - cost).toFixed(2),
-    unrealized_pnl_pct: `${(((marketValue - cost) / cost) * 100).toFixed(2)}%`,
+    unrealized_pnl: unrealizedPnl.toFixed(2),
+    unrealized_pnl_pct: `${((unrealizedPnl / Math.abs(costBasis)) * 100).toFixed(2)}%`,
   };
 }
 
