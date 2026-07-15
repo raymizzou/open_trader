@@ -8,7 +8,7 @@
     <script src="/static/dashboard.js" defer></script>
   </head>
   <body>
-    <div class="dashboard-shell">
+    <div id="dashboard-shell" class="dashboard-shell">
       <header class="dashboard-header">
         <section class="header-brand-panel" aria-label="看板筛选">
           <div class="brand-block">
@@ -88,9 +88,9 @@
         <span id="summary-health-note"></span>
       </div>
 
-      <main class="workspace-grid">
+      <main id="workspace-grid" class="workspace-grid">
         <section id="kelly-lab-panel" class="kelly-lab-panel" aria-label="Kelly 模拟盘策略实验室"></section>
-        <section class="holdings-panel" aria-labelledby="account-holdings-title">
+        <section id="holdings-panel" class="holdings-panel" aria-labelledby="account-holdings-title">
           <div class="section-heading">
             <div><h1 id="account-holdings-title">持仓与策略</h1><p>按券商账户查看持仓、交易周期与策略状态。</p></div>
             <span id="visible-count" class="count-pill">-</span>
@@ -104,7 +104,6 @@
       <section id="standard-backtest-workspace" class="backtest-workspace hidden" hidden>
         <header class="backtest-workspace-header">
           <div><h1>策略回测</h1><p>一次选择一个标的和一套策略。</p></div>
-          <button id="close-standard-backtest" class="raw-toggle" type="button">返回持仓看板</button>
         </header>
         <form id="standard-backtest-form" class="backtest-form">
           <section class="backtest-form-section">

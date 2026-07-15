@@ -45,6 +45,7 @@ const state = {
 const elements = {};
 
 const ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT = 11;
+const WORKSPACE_VIEWS = new Set(["portfolio", "kelly_lab", "standard_backtest", "trend_report"]);
 
 const ACCOUNT_STRATEGY_PROFILES = {
   futu: {horizon: "短线", strategy: "美股趋势交易"},
@@ -165,7 +166,10 @@ function bindElements() {
     "current-view-cash-note",
     "broker-summary-cards",
     "source-status-list",
+    "dashboard-shell",
+    "workspace-grid",
     "kelly-lab-panel",
+    "holdings-panel",
     "open-kelly-lab",
     "return-to-portfolio",
     "summary-value",
@@ -202,7 +206,6 @@ function bindElements() {
     "research-chat-finalize",
     "research-chat-status",
     "open-standard-backtest",
-    "close-standard-backtest",
     "standard-backtest-workspace",
     "trend-report-workspace",
     "standard-backtest-form",
@@ -224,7 +227,6 @@ function bindElements() {
     elements[id] = document.getElementById(id);
   });
   elements["holdings-body"] = elements["account-holdings"];
-  elements["workspace-grid"] = document.querySelector(".workspace-grid");
 }
 
 function bindEvents() {
@@ -236,10 +238,6 @@ function bindEvents() {
         state.selectedKellyExperimentId = strategyTab.dataset.kellyExperiment || "";
         renderKellyLab();
         return;
-      }
-      const viewButton = event.target.closest("[data-workspace-view]");
-      if (viewButton) {
-        setWorkspaceView(viewButton.dataset.workspaceView || "portfolio");
       }
     });
   }
@@ -291,14 +289,8 @@ function bindEvents() {
   });
   elements["symbol-detail-panel"].addEventListener("click", handleSymbolDetailClick);
   elements["open-kelly-lab"].addEventListener("click", () => setWorkspaceView("kelly_lab"));
-  elements["return-to-portfolio"].addEventListener("click", () => setWorkspaceView("portfolio"));
+  elements["return-to-portfolio"].addEventListener("click", returnToPortfolio);
   elements["open-standard-backtest"].addEventListener("click", openStandardBacktest);
-  elements["close-standard-backtest"].addEventListener("click", closeStandardBacktest);
-  elements["trend-report-workspace"].addEventListener("click", (event) => {
-    if (event.target.closest("[data-close-trend-report]")) {
-      closeTrendReport();
-    }
-  });
   elements["backtest-symbol-source"].addEventListener("click", handleBacktestChoice);
   elements["backtest-strategy-cards"].addEventListener("click", handleBacktestChoice);
   elements["backtest-range-controls"].addEventListener("click", handleBacktestChoice);
@@ -309,9 +301,7 @@ function bindEvents() {
 }
 
 async function openStandardBacktest() {
-  elements["workspace-grid"].classList.add("hidden");
-  elements["standard-backtest-workspace"].hidden = false;
-  elements["standard-backtest-workspace"].classList.remove("hidden");
+  setWorkspaceView("standard_backtest");
   if (!state.standardBacktest.options) {
     elements["standard-backtest-status"].textContent = "正在加载回测选项…";
     try {
@@ -334,35 +324,31 @@ async function openStandardBacktest() {
 }
 
 function closeStandardBacktest() {
-  syncStandardBacktestInputs();
-  elements["standard-backtest-workspace"].hidden = true;
-  elements["standard-backtest-workspace"].classList.add("hidden");
-  elements["workspace-grid"].classList.remove("hidden");
+  returnToPortfolio();
 }
 
 function openTrendReport(broker) {
   const report = state.dashboard?.trend_reports?.[broker];
   if (!report?.available) return;
   state.selectedTrendBroker = broker;
-  elements["workspace-grid"].classList.add("hidden");
-  elements["standard-backtest-workspace"].hidden = true;
-  elements["standard-backtest-workspace"].classList.add("hidden");
   elements["trend-report-workspace"].innerHTML = renderTrendReportWorkspace(report);
-  elements["trend-report-workspace"].hidden = false;
-  elements["trend-report-workspace"].classList.remove("hidden");
-  elements["trend-report-workspace"].querySelector("[data-close-trend-report]")?.focus();
+  setWorkspaceView("trend_report");
+  elements["return-to-portfolio"].focus();
 }
 
 function closeTrendReport() {
-  const broker = state.selectedTrendBroker;
-  const accountSection = document.getElementById(`account-${broker}`);
-  elements["trend-report-workspace"].hidden = true;
-  elements["trend-report-workspace"].classList.add("hidden");
-  elements["trend-report-workspace"].innerHTML = "";
-  elements["workspace-grid"].classList.remove("hidden");
+  returnToPortfolio();
+}
+
+function returnToPortfolio() {
+  const trendBroker = state.selectedTrendBroker;
+  if (state.workspaceView === "standard_backtest") syncStandardBacktestInputs();
   state.selectedTrendBroker = "";
-  accountSection?.scrollIntoView({block: "start"});
-  accountSection?.querySelector("[data-trend-report]")?.focus();
+  setWorkspaceView("portfolio");
+  renderAccountHoldings();
+  if (trendBroker) {
+    document.querySelector(`#account-${trendBroker} [data-trend-report]`)?.focus();
+  }
 }
 
 function handleBacktestChoice(event) {
@@ -880,22 +866,24 @@ function renderDashboard() {
 }
 
 function setWorkspaceView(view) {
-  state.workspaceView = view === "kelly_lab" ? "kelly_lab" : "portfolio";
+  state.workspaceView = WORKSPACE_VIEWS.has(view) ? view : "portfolio";
   renderWorkspaceChrome();
-  renderKellyLab();
+  if (state.workspaceView === "kelly_lab") renderKellyLab();
 }
 
 function renderWorkspaceChrome() {
-  if (!elements["workspace-grid"]) {
-    return;
-  }
-  const labOpen = state.workspaceView === "kelly_lab";
-  elements["workspace-grid"].classList.toggle("kelly-lab-view", labOpen);
-  if (elements["open-kelly-lab"]) elements["open-kelly-lab"].hidden = labOpen;
-  if (elements["return-to-portfolio"]) {
-    elements["return-to-portfolio"].hidden = !labOpen;
-    elements["return-to-portfolio"].classList.toggle("hidden", !labOpen);
-  }
+  const view = state.workspaceView;
+  const toolView = view !== "portfolio";
+  elements["dashboard-shell"].classList.toggle("tool-workspace-view", toolView);
+  elements["return-to-portfolio"].hidden = !toolView;
+  elements["return-to-portfolio"].classList.toggle("hidden", !toolView);
+  elements["workspace-grid"].classList.toggle("hidden", view === "standard_backtest" || view === "trend_report");
+  elements["holdings-panel"].classList.toggle("hidden", view !== "portfolio");
+  elements["kelly-lab-panel"].classList.toggle("hidden", view !== "kelly_lab");
+  elements["standard-backtest-workspace"].hidden = view !== "standard_backtest";
+  elements["standard-backtest-workspace"].classList.toggle("hidden", view !== "standard_backtest");
+  elements["trend-report-workspace"].hidden = view !== "trend_report";
+  elements["trend-report-workspace"].classList.toggle("hidden", view !== "trend_report");
 }
 
 function renderKellyLab() {
@@ -920,7 +908,6 @@ function renderKellyLabPanel() {
           <p>看板数据加载失败。</p>
         </div>
         <div class="kelly-lab-heading-actions">
-          <button class="secondary-button" type="button" data-workspace-view="portfolio">返回主页</button>
           <span class="status-pill status-failed">不可用</span>
         </div>
       </div>
@@ -935,7 +922,6 @@ function renderKellyLabPanel() {
           <p>等待看板数据。</p>
         </div>
         <div class="kelly-lab-heading-actions">
-          <button class="secondary-button" type="button" data-workspace-view="portfolio">返回主页</button>
           <span class="status-pill status-muted">加载中</span>
         </div>
       </div>
@@ -953,7 +939,6 @@ function renderKellyLabPanel() {
           <p>${escapeHtml(formatPlain(message))}</p>
         </div>
         <div class="kelly-lab-heading-actions">
-          <button class="secondary-button" type="button" data-workspace-view="portfolio">返回主页</button>
           <span class="status-pill status-muted">不可用</span>
         </div>
       </div>
@@ -975,7 +960,6 @@ function renderKellyLabPanel() {
         <p>只读实验结果。</p>
       </div>
       <div class="kelly-lab-heading-actions">
-        <button class="secondary-button" type="button" data-workspace-view="portfolio">返回主页</button>
         <span class="count-pill">${escapeHtml(formatPlain(count))} 个实验</span>
       </div>
     </div>
@@ -1955,7 +1939,6 @@ function renderTrendReportWorkspace(report) {
   const audit = report.audit || {};
   return `<header class="trend-report-header">
       <div><p>${escapeHtml(`${report.broker_label}｜${report.market_label}`)}</p><h1>当天趋势报告</h1></div>
-      <button type="button" data-close-trend-report>返回持仓看板</button>
       <dl>
         <div><dt>报告日期</dt><dd>${escapeHtml(formatPlain(report.report_date))}</dd></div>
         <div><dt>数据截至</dt><dd>${escapeHtml(formatPlain(report.data_date))}</dd></div>

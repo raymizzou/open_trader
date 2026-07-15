@@ -542,7 +542,7 @@ const nodes={}; document.getElementById=(id)=>nodes[id]||(nodes[id]=new E()); do
 const posts=[]; fetch=async(url,init={})=>{
  if(url==="/api/backtests/options")return{ok:true,json:async()=>({strategies:[{id:"trend_pullback/v1",name_zh:"趋势回调",description_zh:"说明"},{id:"breakout_momentum/v1",name_zh:"突破动量",description_zh:"说明"},{id:"range_mean_reversion/v1",name_zh:"区间均值回归",description_zh:"说明"}],ranges:["1Y","3Y","CUSTOM"],defaults:{range:"1Y",initial_cash:"100000",max_strategy_weight:"0.10",commission_bps:"10",slippage_bps:"5"},universe:{holdings:[{market:"US",symbol:"MSFT",name:"微软"}],watchlist:[{market:"HK",symbol:"00700",name:"腾讯"}]}})};
  posts.push({url,body:JSON.parse(init.body)});if(posts.length===2)return{ok:false,json:async()=>{throw new Error("html")}};return{ok:true,json:async()=>({status:"ok"})};};
-bindElements();bindEvents();await elements["open-standard-backtest"].click();
+bindElements();bindEvents();state.brokerFilter="tiger";state.marketFilter="HK";await elements["open-standard-backtest"].click();
 if(elements["standard-backtest-workspace"].hidden||state.standardBacktest.symbolKey!=="US:MSFT")throw new Error("open failed");
 const watch=new E();watch.dataset.backtestSource="watchlist";elements["backtest-symbol-source"].click(watch);
 const range=new E();range.dataset.rangePreset="3Y";elements["backtest-range-controls"].click(range);
@@ -554,7 +554,7 @@ await elements["standard-backtest-form"].submit();if(elements["standard-backtest
 const custom=new E();custom.dataset.rangePreset="CUSTOM";elements["backtest-range-controls"].click(custom);if(!elements["backtest-custom-start"].required||elements["backtest-custom-end"].required)throw new Error("required mismatch");
 elements["backtest-custom-start"].value="";await elements["standard-backtest-form"].submit();if(posts.length!==2||elements["standard-backtest-status"].textContent!=="自定义区间必须填写开始日期。")throw new Error("missing start fetched");
 elements["backtest-custom-start"].value="2026-01-02";elements["backtest-custom-end"].value="2026-01-02";await elements["standard-backtest-form"].submit();if(posts.length!==2||elements["standard-backtest-status"].textContent!=="开始日期必须早于结束日期。")throw new Error("date order fetched");
-elements["close-standard-backtest"].click();await elements["open-standard-backtest"].click();if(state.standardBacktest.initialCash!=="250000"||state.standardBacktest.source!=="watchlist")throw new Error("state lost");
+elements["return-to-portfolio"].click();if(state.workspaceView!=="portfolio"||state.brokerFilter!=="tiger"||state.marketFilter!=="HK")throw new Error("return failed");await elements["open-standard-backtest"].click();if(state.standardBacktest.initialCash!=="250000"||state.standardBacktest.source!=="watchlist")throw new Error("state lost");
 console.log("ok");
 """)
     assert "ok" in output
@@ -887,6 +887,24 @@ const sandbox = { document: { addEventListener() {} }, console, URLSearchParams 
     )
     assert result.returncode == 0, result.stderr + result.stdout
     return result.stdout
+
+
+def test_dashboard_workspace_navigation_uses_one_shared_state_machine() -> None:
+    output = run_dashboard_js(r'''
+const element=()=>({hidden:false,innerHTML:"",classList:{values:new Set(),add(...n){n.forEach(x=>this.values.add(x))},remove(...n){n.forEach(x=>this.values.delete(x))},toggle(n,f){f?this.add(n):this.remove(n)},contains(n){return this.values.has(n)}}});
+for(const id of ["dashboard-shell","workspace-grid","kelly-lab-panel","holdings-panel","standard-backtest-workspace","trend-report-workspace","return-to-portfolio"])elements[id]=element();
+for(const view of ["kelly_lab","standard_backtest","trend_report","portfolio"]){
+  setWorkspaceView(view);
+  console.log(JSON.stringify({view:state.workspaceView,tool:elements["dashboard-shell"].classList.contains("tool-workspace-view"),backHidden:elements["return-to-portfolio"].hidden}));
+}
+''')
+    states = [json.loads(line) for line in output.splitlines()]
+    assert states == [
+        {"view": "kelly_lab", "tool": True, "backHidden": False},
+        {"view": "standard_backtest", "tool": True, "backHidden": False},
+        {"view": "trend_report", "tool": True, "backHidden": False},
+        {"view": "portfolio", "tool": False, "backHidden": True},
+    ]
 
 
 def test_dashboard_derives_account_groups_from_existing_broker_details() -> None:
@@ -1724,6 +1742,10 @@ def test_dashboard_static_contains_kelly_lab_panel_mount() -> None:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
     assert 'id="kelly-lab-panel"' in html
+    assert 'id="dashboard-shell"' in html
+    assert 'id="workspace-grid"' in html
+    assert 'id="holdings-panel"' in html
+    assert 'id="close-standard-backtest"' not in html
 
 
 def test_dashboard_static_mounts_account_holdings_without_standalone_tiger_panel() -> None:
@@ -1892,16 +1914,11 @@ class E {
   addEventListener(name,listener){this.listeners[name]=listener;}
   click(target=this){return this.listeners.click&&this.listeners.click({target,preventDefault(){}});}
   focus(){document.activeElement=this;}
-  closest(selector){
-    if(selector==="[data-trend-report]"&&Object.hasOwn(this.dataset,"trendReport"))return this;
-    if(selector==="[data-close-trend-report]"&&Object.hasOwn(this.dataset,"closeTrendReport"))return this;
-    return null;
-  }
-  scrollIntoView(){this.scrolled=true;}
+  closest(selector){if(selector==="[data-trend-report]"&&Object.hasOwn(this.dataset,"trendReport"))return this;return null;}
 }
 const nodes={};
 document.getElementById=(id)=>nodes[id]||(nodes[id]=new E());
-document.querySelector=(selector)=>selector===".workspace-grid"?document.getElementById("workspace-grid"):new E();
+document.querySelector=(selector)=>selector===".workspace-grid"?document.getElementById("workspace-grid"):selector==="#account-futu [data-trend-report]"?open:new E();
 bindElements();bindEvents();
 
 const report=(broker,brokerLabel,marketLabel)=>({
@@ -1928,12 +1945,10 @@ if(html.includes('data-trend-report="tiger"'))throw new Error(html);
 if(!html.includes("报告日期 2026-07-15")||!html.includes("数据截至 2026-07-14"))throw new Error(html);
 
 const open=new E();open.dataset.trendReport="futu";
-const returnButton=new E();
-elements["trend-report-workspace"].querySelector=()=>returnButton;
 document.getElementById("account-futu").querySelector=()=>open;
 elements["account-holdings"].click(open);
 if(!elements["workspace-grid"].classList.contains("hidden")||elements["trend-report-workspace"].hidden||elements["trend-report-workspace"].classList.contains("hidden"))throw new Error("workspace state");
-if(document.activeElement!==returnButton)throw new Error("workspace focus");
+if(document.activeElement!==elements["return-to-portfolio"])throw new Error("workspace focus");
 const workspace=elements["trend-report-workspace"].innerHTML;
 const order=["开盘前","美股常规交易时段","盘中持续","人工复核"].map((text)=>workspace.indexOf(`<h2>${text}</h2>`));
 if(order.some((index)=>index<0)||!order.every((index,i)=>i===0||order[i-1]<index))throw new Error(workspace);
@@ -1942,8 +1957,8 @@ if(!workspace.includes("账户数据非实时，执行前核对现金与持仓")
 if(!workspace.includes('<details class="trend-audit"><summary>审计详情</summary>')||workspace.includes('<details class="trend-audit" open'))throw new Error(workspace);
 for(const text of ["确认全部卖出动作","按顺序考虑允许买入项","盘中观察活动保护线","完成人工复核"]){if(!workspace.includes(text))throw new Error(workspace);}
 
-const close=new E();close.dataset.closeTrendReport="";elements["trend-report-workspace"].click(close);
-if(elements["trend-report-workspace"].hidden!==true||!elements["trend-report-workspace"].classList.contains("hidden")||elements["workspace-grid"].classList.contains("hidden")||state.selectedTrendBroker!==""||!nodes["account-futu"].scrolled)throw new Error("close state");
+elements["return-to-portfolio"].click();
+if(elements["trend-report-workspace"].hidden!==true||!elements["trend-report-workspace"].classList.contains("hidden")||elements["workspace-grid"].classList.contains("hidden")||state.selectedTrendBroker!=="")throw new Error("close state");
 if(document.activeElement!==open)throw new Error("trigger focus");
 
 state.dashboard.trend_reports.futu={available:false,status_text:"今日暂无趋势报告",sell_actions:[{symbol:"STALE_ACTION"}]};
@@ -2574,8 +2589,8 @@ if (html.includes("风控通过") || html.includes("Kelly 建议单标的仓位 
 if (html.includes("第一目标") || html.includes("延续")) {
   throw new Error("kelly strategy rules contain vague terms: " + html);
 }
-if (!html.includes("data-workspace-view=\\\"portfolio\\\"")) {
-  throw new Error("kelly lab panel missing return button: " + html);
+if (html.includes("data-workspace-view=\\\"portfolio\\\"") || html.includes("返回主页")) {
+  throw new Error("kelly lab panel has a workspace-local return button: " + html);
 }
 const fallbackHtml = renderKellyExperimentCard({
   experiment_name: "无状态样本策略",
