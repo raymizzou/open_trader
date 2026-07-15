@@ -1901,7 +1901,7 @@ function renderTrendReportEntry(broker) {
   if (!report.available) {
     return `<div class="trend-report-entry trend-report-entry-empty">
       <button type="button" disabled>当天趋势报告</button>
-      <span>今日暂无趋势报告</span>
+      <span>${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</span>
     </div>`;
   }
   return `<div class="trend-report-entry">
@@ -1929,16 +1929,24 @@ function renderTrendAction(item, kind) {
 }
 
 function renderTrendStage(title, items, kind) {
+  const rows = Array.isArray(items)
+    ? items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    : [];
   return `<section class="trend-stage">
     <h2>${escapeHtml(title)}</h2>
-    ${items.length ? `<ol>${items.map((item) => renderTrendAction(item, kind)).join("")}</ol>` : "<p>无</p>"}
+    ${rows.length ? `<ol>${rows.map((item) => renderTrendAction(item, kind)).join("")}</ol>` : "<p>无</p>"}
   </section>`;
 }
 
 function renderTrendAudit(audit) {
-  const candidates = Array.isArray(audit.candidates) ? audit.candidates : [];
-  const excluded = audit.excluded && typeof audit.excluded === "object" ? audit.excluded : {};
-  const industries = Array.isArray(audit.industry_concentration) ? audit.industry_concentration : [];
+  const candidates = Array.isArray(audit.candidates)
+    ? audit.candidates.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    : [];
+  const excluded = audit.excluded && typeof audit.excluded === "object" && !Array.isArray(audit.excluded) ? audit.excluded : {};
+  const industries = Array.isArray(audit.industry_concentration)
+    ? audit.industry_concentration.filter(Array.isArray)
+    : [];
+  const dataSources = Array.isArray(audit.data_sources) ? audit.data_sources : [];
   return `<details class="trend-audit"><summary>审计详情</summary>
     <section><h3>候选榜</h3><ol>${candidates.length
       ? candidates.map((item) => `<li>${escapeHtml([item.symbol, item.name, `强度 ${item.strength ?? "-"}`].filter(Boolean).map(formatPlain).join("｜"))}</li>`).join("")
@@ -1949,7 +1957,7 @@ function renderTrendAudit(audit) {
     <section><h3>行业集中度</h3><ul>${industries.length
       ? industries.map((item) => `<li>${escapeHtml((Array.isArray(item) ? item : []).map(formatPlain).join("｜"))}</li>`).join("")
       : "<li>无</li>"}</ul></section>
-    <p>数据来源：${escapeHtml((audit.data_sources || []).map(formatPlain).join("、") || "无")}</p>
+    <p>数据来源：${escapeHtml(dataSources.map(formatPlain).join("、") || "无")}</p>
     <p>API 成本：${escapeHtml(formatPlain(audit.actual_api_cost ?? audit.estimated_api_cost ?? "未知"))}</p>
   </details>`;
 }

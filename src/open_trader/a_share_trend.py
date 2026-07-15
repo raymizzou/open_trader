@@ -931,24 +931,22 @@ def render_trend_feishu_text(
     sells = [
         item
         for item in formal
-        if item.get("action") == "SELL_ALL" and item.get("reason") in REASON_LABELS
+        if item.get("action") == "SELL_ALL" and not _trend_action_needs_review(item)
     ]
-    buys = [item for item in formal if item.get("action") == "BUY"]
+    buys = [
+        item
+        for item in formal
+        if item.get("action") == "BUY" and not _trend_action_needs_review(item)
+    ]
     holds = [
         item
         for item in holdings
-        if item.get("action") == "HOLD" and item.get("reason") in REASON_LABELS
+        if item.get("action") == "HOLD" and not _trend_action_needs_review(item)
     ]
-    reviews = [
-        item
-        for item in holdings
-        if item.get("action") == "MANUAL_REVIEW"
-        or item.get("action") not in ACTION_LABELS
-        or (
-            item.get("action") in {"SELL_ALL", "HOLD"}
-            and item.get("reason") not in REASON_LABELS
-        )
-    ]
+    reviews: list[dict[str, object]] = []
+    for item in formal + holdings:
+        if _trend_action_needs_review(item) and item not in reviews:
+            reviews.append(item)
     title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
     fresh = bool(account.get("fresh"))
     status = "已更新" if fresh else ("已过期，禁止买入" if buys else "已过期")
@@ -965,6 +963,19 @@ def render_trend_feishu_text(
     _append_feishu_action_sections(lines, sells, buys, reviews, market=market)
     lines.extend(["", "请人工确认，不自动下单。"])
     return title, "\n".join(lines)
+
+
+def _trend_action_needs_review(item: Mapping[str, object]) -> bool:
+    action = item.get("action")
+    reason = item.get("reason")
+    known_reason = isinstance(reason, str) and reason in REASON_LABELS
+    if action == "BUY":
+        return reason not in (None, "") and not known_reason
+    return (
+        action == "MANUAL_REVIEW"
+        or action not in ACTION_LABELS
+        or action in {"SELL_ALL", "HOLD"} and not known_reason
+    )
 
 
 def render_trend_failure_text(
@@ -2021,7 +2032,11 @@ def _attempt_report(
             data_sources=("Trend Animals", "Futu CN calendar/QFQ daily K-line", str(config.portfolio)),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost,
-            metadata={"paid_response_cache": cache_metadata},
+            metadata={
+                "market": "CN",
+                "broker": "eastmoney",
+                "paid_response_cache": cache_metadata,
+            },
         )
         report = replace(
             report,

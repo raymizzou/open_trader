@@ -283,8 +283,8 @@ def test_market_report_failure_owns_day_at_one_hour_deadline(tmp_path: Path) -> 
     assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
 
 
-def test_hk_report_uses_real_api_fields_and_auto_manages_advised_buys(
-    tmp_path: Path,
+def test_hk_report_suppresses_buys_when_statement_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
     write_details(
@@ -313,9 +313,12 @@ def test_hk_report_uses_real_api_fields_and_auto_manages_advised_buys(
             "stopwinFlagByPopChampagne": False,
         }
 
+    api_instances = 0
+
     class Api:
         def __init__(self, **kwargs: object) -> None:
-            pass
+            nonlocal api_instances
+            api_instances += 1
 
         def get_update_status(self) -> list[dict[str, object]]:
             return [{"asset": "港股", "asOfDate": "2026-07-15"}]
@@ -364,12 +367,38 @@ def test_hk_report_uses_real_api_fields_and_auto_manages_advised_buys(
             self.closed = True
 
     notifier = RecordingFeishu()
+    from open_trader import market_trend
+
+    original_freeze = market_trend._freeze_receipt_report
+    freeze_attempts = 0
+
+    def fail_first_freeze(**kwargs: object) -> tuple[Path, Path]:
+        nonlocal freeze_attempts
+        freeze_attempts += 1
+        if freeze_attempts == 1:
+            raise OSError("simulated report persistence failure after delivery")
+        return original_freeze(**kwargs)
+
+    monkeypatch.setattr(market_trend, "_freeze_receipt_report", fail_first_freeze)
     result = run_market_trend_report(
         config=cfg,
         market="HK",
         run_date="2026-07-15",
         notifier=notifier,
         api_factory=Api,
+        quote_factory=Quote,
+        sleep_fn=lambda seconds: None,
+    )
+    assert result.report_path is not None and result.json_path is not None
+    frozen_json = result.json_path.read_text(encoding="utf-8")
+    result.report_path.unlink()
+    result.json_path.unlink()
+    recovered = run_market_trend_report(
+        config=cfg,
+        market="HK",
+        run_date="2026-07-15",
+        notifier=notifier,
+        api_factory=lambda **kwargs: pytest.fail("receipt recovery must not refetch"),
         quote_factory=Quote,
     )
     revised = run_market_trend_report(
@@ -382,18 +411,23 @@ def test_hk_report_uses_real_api_fields_and_auto_manages_advised_buys(
         quote_factory=Quote,
     )
 
-    assert result.status == revised.status == "generated"
+    assert result.status == recovered.status == revised.status == "generated"
+    assert recovered.json_path is not None
+    assert recovered.json_path.read_text(encoding="utf-8") == frozen_json
     assert len(notifier.messages) == 1
+    assert api_instances == 2  # initial report plus explicit revision; recovery did not refetch
     title, message = notifier.messages[0]
     assert title == "【辉立｜港股趋势报告｜2026-07-16】"
-    assert "09:30–10:00" in message
+    assert "今日无买卖动作" in message
+    assert "已过期" in message
+    assert "\n买入\n" not in message
     assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
     actions = payload["strategy_judgments"]["formal_actions"]
-    assert [(item["action"], item["symbol"]) for item in actions] == [("BUY", "02800")]
+    assert actions == []
     assert payload["account"]["fresh"] is False
     assert payload["metadata"]["account_check_required"] is True
-    assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
+    assert payload["protection_state"]["managed_symbols"] == ["00700"]
 
 
 def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) -> None:

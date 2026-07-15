@@ -6,10 +6,11 @@ import json
 import re
 import sys
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .a_share_trend import ACTION_LABELS, REASON_LABELS
 from .backtest_prices import normalize_backtest_symbol
@@ -92,6 +93,7 @@ TREND_REPORT_SOURCES = {
     "phillips": ("HK", "港股", "辉立", "trend_hk_phillips", "09:30–10:00"),
     "eastmoney": ("CN", "A股", "东方财富", "trend_a_share", "09:30–10:00"),
 }
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -288,7 +290,7 @@ def _load_dashboard_tiger_long_term_strategy(data_dir: Path) -> dict[str, Any]:
 def _load_trend_reports(
     data_dir: Path, reports_dir: Path, *, today: date | None = None
 ) -> dict[str, dict[str, Any]]:
-    report_date = (today or date.today()).isoformat()
+    report_date = (today or _shanghai_date()).isoformat()
     return {
         broker: _load_broker_trend_report(
             data_dir=data_dir,
@@ -303,6 +305,10 @@ def _load_trend_reports(
         for broker, (market, market_label, broker_label, directory, buy_window)
         in TREND_REPORT_SOURCES.items()
     }
+
+
+def _shanghai_date(now: datetime | None = None) -> date:
+    return (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI).date()
 
 
 def _same_day_report_payload(
@@ -336,6 +342,40 @@ def _trend_action_needs_review(item: dict[str, Any]) -> bool:
     )
 
 
+def _valid_trend_collections(
+    payload: dict[str, Any], judgments: dict[str, Any]
+) -> bool:
+    if any(
+        not all(isinstance(item, dict) for item in judgments[key])
+        for key in ("formal_actions", "holding_decisions", "top10_candidates")
+    ):
+        return False
+    excluded = payload.get("excluded", {})
+    if not isinstance(excluded, dict) or any(
+        not isinstance(symbol, str)
+        or not isinstance(reasons, list)
+        or not all(isinstance(reason, str) for reason in reasons)
+        for symbol, reasons in excluded.items()
+    ):
+        return False
+    industries = payload.get("industry_concentration", [])
+    if not isinstance(industries, list) or any(
+        not isinstance(row, list)
+        or len(row) != 3
+        or any(isinstance(value, (dict, list)) for value in row)
+        for row in industries
+    ):
+        return False
+    return all(
+        isinstance(values, list)
+        and all(isinstance(value, str) for value in values)
+        for values in (
+            payload.get("data_sources", []),
+            payload.get("api_facts", []),
+        )
+    )
+
+
 def _load_broker_trend_report(
     *,
     data_dir: Path,
@@ -360,6 +400,7 @@ def _load_broker_trend_report(
     path, payload = selected
     judgments = payload.get("strategy_judgments")
     account = payload.get("account")
+    metadata = payload.get("metadata")
     if (
         not isinstance(judgments, dict)
         or any(
@@ -371,14 +412,14 @@ def _load_broker_trend_report(
         or not payload["as_of_date"].strip()
         or not isinstance(payload.get("generated_at"), str)
         or not payload["generated_at"].strip()
+        or not isinstance(metadata, dict)
+        or str(metadata.get("market") or "").upper() != market
+        or str(metadata.get("broker") or "").lower() != broker
+        or not _valid_trend_collections(payload, judgments)
     ):
         return {**unavailable, "status_text": "今日趋势报告无效"}
-    formal = [
-        item for item in judgments["formal_actions"] if isinstance(item, dict)
-    ]
-    holdings = [
-        item for item in judgments["holding_decisions"] if isinstance(item, dict)
-    ]
+    formal = judgments["formal_actions"]
+    holdings = judgments["holding_decisions"]
     sell_actions = [
         item
         for item in formal
@@ -388,7 +429,9 @@ def _load_broker_trend_report(
     buy_actions = [
         item
         for item in formal
-        if item.get("action") == "BUY" and not _trend_action_needs_review(item)
+        if item.get("action") == "BUY"
+        and account.get("fresh") is not False
+        and not _trend_action_needs_review(item)
     ]
     hold_actions = [
         item
@@ -398,10 +441,11 @@ def _load_broker_trend_report(
     ]
     review_actions: list[dict[str, Any]] = []
     for item in formal + holdings:
-        if _trend_action_needs_review(item) and item not in review_actions:
+        if (
+            _trend_action_needs_review(item)
+            or item.get("action") == "BUY" and account.get("fresh") is False
+        ) and item not in review_actions:
             review_actions.append(item)
-    metadata = payload.get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
     directory = reports_dir.name
     return {
         "available": True,

@@ -1200,6 +1200,37 @@ def test_trend_feishu_text_moves_unknown_hold_reason_to_review() -> None:
     assert "future_hold_reason" not in message
 
 
+def test_trend_feishu_text_moves_unknown_formal_buy_reason_to_review() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": True},
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [
+                {
+                    "action": "BUY",
+                    "symbol": "600001",
+                    "name": "未知原因买入",
+                    "reason": "future_reason",
+                    "estimated_shares": 100,
+                    "target_amount": "1000",
+                    "estimated_initial_line": "9",
+                }
+            ],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+
+    assert "今日无买卖动作｜持有 0｜复核 1" in message
+    assert "\n买入\n" not in message
+    assert "600001 未知原因买入｜未知动作或原因，需人工确认" in message
+
+
 def test_trend_feishu_text_lists_reviews_on_no_trade_days() -> None:
     payload = {
         "execution_date": "2026-07-15",
@@ -1977,6 +2008,8 @@ def test_report_runner_sends_exact_broker_v1_text(tmp_path: Path) -> None:
     assert payload["execution_date"] == "2026-07-15"
     assert payload["delivery_status"] == "sent"
     assert payload["process_version"]
+    assert payload["metadata"]["market"] == "CN"
+    assert payload["metadata"]["broker"] == "eastmoney"
 
 
 def test_report_runner_holiday_is_silent_and_free(tmp_path: Path) -> None:

@@ -26,6 +26,11 @@ REQUIRED_SOURCE_PATHS = (
 )
 
 TREND_REPORT_BROKERS = ("futu", "phillips", "eastmoney")
+TREND_REPORT_DIRECTORIES = {
+    "futu": "trend_us_futu",
+    "phillips": "trend_hk_phillips",
+    "eastmoney": "trend_a_share",
+}
 TREND_REASON_LABELS = {
     "protection_line_already_triggered": "活动保护线已触发",
     "danger_signal": "危险信号触发",
@@ -282,6 +287,108 @@ def _plain(value: Any) -> str:
     return "-" if value is None or str(value).strip() == "" else str(value)
 
 
+def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
+    action = item.get("action")
+    reason = item.get("reason")
+    known_reason = isinstance(reason, str) and reason in TREND_REASON_LABELS
+    if action == "BUY":
+        return reason not in (None, "") and not known_reason
+    return (
+        action == "MANUAL_REVIEW"
+        or action not in {"SELL_ALL", "HOLD", "MANUAL_REVIEW"}
+        or action in {"SELL_ALL", "HOLD"} and not known_reason
+    )
+
+
+def _check_trend_artifact_projection(
+    reports_dir: Path, broker: str, report: Mapping[str, Any]
+) -> None:
+    audit = report.get("audit")
+    audit = audit if isinstance(audit, Mapping) else {}
+    artifact = audit.get("artifact")
+    assert (
+        isinstance(artifact, str)
+        and artifact.endswith(".json")
+        and Path(artifact).name == artifact
+    ), f"{broker} 趋势报告产物文件名无效"
+    directory = TREND_REPORT_DIRECTORIES[broker]
+    path = reports_dir / directory / artifact
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"{broker} 冻结趋势报告无法读取：{exc}") from exc
+    assert isinstance(payload, Mapping), f"{broker} 冻结趋势报告不是对象"
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    expected_market = {"futu": "US", "phillips": "HK", "eastmoney": "CN"}[broker]
+    assert (
+        payload.get("execution_date") == report.get("report_date")
+        and payload.get("as_of_date") == report.get("data_date")
+        and payload.get("generated_at") == report.get("generated_at")
+        and metadata.get("market") == expected_market
+        and metadata.get("broker") == broker
+    ), f"{broker} 冻结报告身份与 API 投影不一致"
+    judgments = payload.get("strategy_judgments")
+    assert isinstance(judgments, Mapping), f"{broker} 冻结报告缺少策略判断"
+    formal = judgments.get("formal_actions")
+    holdings = judgments.get("holding_decisions")
+    account = payload.get("account")
+    stale_account = isinstance(account, Mapping) and account.get("fresh") is False
+    assert isinstance(formal, list) and all(
+        isinstance(item, Mapping) for item in formal
+    ), f"{broker} 冻结报告正式动作无效"
+    assert isinstance(holdings, list) and all(
+        isinstance(item, Mapping) for item in holdings
+    ), f"{broker} 冻结报告持仓动作无效"
+    sells = [
+        item for item in formal
+        if item.get("action") == "SELL_ALL" and not _trend_action_needs_review(item)
+    ]
+    buys = [
+        item for item in formal
+        if item.get("action") == "BUY"
+        and not stale_account
+        and not _trend_action_needs_review(item)
+    ]
+    holds = [
+        item for item in holdings
+        if item.get("action") == "HOLD" and not _trend_action_needs_review(item)
+    ]
+    reviews: list[Mapping[str, Any]] = []
+    for item in [*formal, *holdings]:
+        if (
+            _trend_action_needs_review(item)
+            or stale_account and item.get("action") == "BUY"
+        ) and item not in reviews:
+            reviews.append(item)
+    expected_actions = {
+        "sell_actions": sells,
+        "buy_actions": buys,
+        "hold_actions": holds,
+        "review_actions": reviews,
+    }
+    assert all(
+        report.get(key) == value for key, value in expected_actions.items()
+    ), f"{broker} 冻结报告动作与 API 投影不一致"
+    assert report.get("counts") == {
+        "sell": len(sells),
+        "buy": len(buys),
+        "hold": len(holds),
+        "review": len(reviews),
+    }, f"{broker} 冻结报告计数与 API 投影不一致"
+    assert audit.get("candidates") == judgments.get("top10_candidates", []), (
+        f"{broker} 冻结报告候选榜与 API 投影不一致"
+    )
+    for key, default in (
+        ("excluded", {}),
+        ("industry_concentration", []),
+        ("data_sources", []),
+    ):
+        assert audit.get(key) == payload.get(key, default), (
+            f"{broker} 冻结报告审计字段 {key} 与 API 投影不一致"
+        )
+
+
 def _check_trend_stage(
     text: str, items: Any, *, kind: str, broker: str,
 ) -> None:
@@ -365,7 +472,9 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
     assert f"API 成本：{_plain(cost)}" in audit_text, f"{broker} 审计详情缺少 API 成本"
 
 
-def _check_account_holdings(page: Any, payload: dict[str, Any]) -> None:
+def _check_account_holdings(
+    page: Any, payload: dict[str, Any], *, reports_dir: Path | None = None
+) -> None:
     text = page.locator("#account-holdings").inner_text()
     for required in (
         "富途", "短线", "美股趋势交易", "老虎", "长线", "SMA200 组合策略",
@@ -412,6 +521,8 @@ def _check_account_holdings(page: Any, payload: dict[str, Any]) -> None:
             )
             continue
         assert trigger.count() == 1, f"{broker} 可用报告缺少入口"
+        if reports_dir is not None:
+            _check_trend_artifact_projection(reports_dir, broker, report)
         entry_text = entry.inner_text()
         for label, key in (("报告日期", "report_date"), ("数据截至", "data_date")):
             assert f"{label} {_plain(report.get(key))}" in entry_text, (
@@ -532,7 +643,10 @@ def _check_cn_filter(page: Any, expected_cn: int) -> None:
 
 
 def _browser_check(
-    url: str, expected_cn: int, payload: dict[str, Any]
+    url: str,
+    expected_cn: int,
+    payload: dict[str, Any],
+    reports_dir: Path | None = None,
 ) -> tuple[list[str], str | None]:
     try:
         from playwright.sync_api import sync_playwright
@@ -578,7 +692,9 @@ def _browser_check(
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
-                        _check_account_holdings(page, payload)
+                        _check_account_holdings(
+                            page, payload, reports_dir=reports_dir
+                        )
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
@@ -688,7 +804,10 @@ def main(argv: list[str] | None = None) -> int:
         errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
         pid = None
     browser_errors, blocker = _browser_check(
-        args.url, args.expected_cn, browser_payload
+        args.url,
+        args.expected_cn,
+        browser_payload,
+        args.expected_root / "reports",
     )
     errors.extend(browser_errors)
     status = classify_result(errors, browser_blocker=blocker)

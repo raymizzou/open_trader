@@ -1,4 +1,5 @@
 from decimal import Decimal
+import json
 from pathlib import Path
 import re
 import sys
@@ -30,6 +31,63 @@ def test_browser_ignores_chrome_unattributed_404_but_not_app_errors() -> None:
         "Failed to load resource: the server responded with a status of 404 (Not Found)"
     )
     assert _is_actionable_console_error("Uncaught TypeError: failed")
+
+
+def test_acceptance_rejects_api_projection_that_drops_frozen_action(
+    tmp_path: Path,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_us_futu" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": {"fresh": True},
+        "metadata": {"market": "US", "broker": "futu"},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": "VIXY"}],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }), encoding="utf-8")
+    projected = {
+        "available": True,
+        "broker": "futu",
+        "market": "US",
+        "report_date": "2026-07-15",
+        "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "sell_actions": [],
+        "buy_actions": [],
+        "hold_actions": [],
+        "review_actions": [],
+        "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 0},
+        "audit": {
+            "artifact": "2026-07-15.json",
+            "candidates": [],
+            "excluded": {},
+            "industry_concentration": [],
+            "data_sources": [],
+        },
+    }
+
+    with pytest.raises(AssertionError, match="冻结报告动作与 API 投影不一致"):
+        dashboard_acceptance._check_trend_artifact_projection(
+            reports, "futu", projected
+        )
+
+
+def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
+    with pytest.raises(AssertionError, match="产物文件名无效"):
+        dashboard_acceptance._check_trend_artifact_projection(
+            tmp_path,
+            "futu",
+            {"available": True, "audit": {"artifact": "../secret.json"}},
+        )
 
 
 def trend_reports() -> dict[str, dict[str, object]]:

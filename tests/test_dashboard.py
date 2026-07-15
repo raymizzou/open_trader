@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -211,12 +211,9 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
 
-    class FixedDate(date):
-        @classmethod
-        def today(cls) -> date:
-            return cls(2026, 7, 15)
-
-    monkeypatch.setattr(dashboard_module, "date", FixedDate)
+    monkeypatch.setattr(
+        dashboard_module, "_shanghai_date", lambda: date(2026, 7, 15)
+    )
     for directory, account_source_date, data_sources in [
         (
             "trend_us_futu",
@@ -234,6 +231,11 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
             ["Trend Animals"],
         ),
     ]:
+        market, broker = {
+            "trend_us_futu": ("US", "futu"),
+            "trend_hk_phillips": ("HK", "phillips"),
+            "trend_a_share": ("CN", "eastmoney"),
+        }[directory]
         path = config.reports_dir / directory / "2026-07-15-b.json"
         path.parent.mkdir(parents=True)
         payload = {
@@ -258,7 +260,11 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
             "data_sources": data_sources,
             "estimated_api_cost": "1.20",
             "actual_api_cost": "1.00",
-            "metadata": {"delivery_status": "generated"},
+            "metadata": {
+                "market": market,
+                "broker": broker,
+                "delivery_status": "generated",
+            },
         }
         path.write_text(json.dumps(payload), encoding="utf-8")
         if directory == "trend_us_futu":
@@ -339,6 +345,12 @@ def test_dashboard_trend_report_does_not_fall_back_to_stale_report(
     assert "buy_actions" not in report
 
 
+def test_dashboard_trend_report_today_uses_shanghai_date_at_utc_boundary() -> None:
+    assert dashboard_module._shanghai_date(
+        datetime(2026, 7, 14, 16, 30, tzinfo=UTC)
+    ) == date(2026, 7, 15)
+
+
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     [
@@ -366,6 +378,7 @@ def test_dashboard_trend_report_rejects_selected_invalid_structure_without_fallb
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "account": {},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VALID-BUT-OLDER"}],
             "holding_decisions": [],
@@ -413,6 +426,7 @@ def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "account": {},
+        "metadata": {"market": "CN", "broker": "eastmoney"},
         "strategy_judgments": {
             "formal_actions": [
                 unknown_action, unknown_reason, valid_buy, unknown_buy_reason,
@@ -433,6 +447,123 @@ def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
     ]
     assert report["counts"]["review"] == 3
     assert report["buy_actions"] == [valid_buy]
+
+
+def test_dashboard_trend_report_rejects_misrouted_broker_metadata(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": {},
+        "metadata": {"market": "HK", "broker": "phillips"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "industry_concentration": [],
+        "excluded": {},
+        "data_sources": [],
+    }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["futu"]
+
+    assert report["available"] is False
+    assert report["status_text"] == "今日趋势报告无效"
+
+
+def test_dashboard_trend_report_never_projects_stale_account_buy_as_actionable(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_hk_phillips" / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    stale_buy = {"action": "BUY", "symbol": "02800", "name": "盈富基金"}
+    path.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": {"fresh": False},
+        "metadata": {"market": "HK", "broker": "phillips"},
+        "strategy_judgments": {
+            "formal_actions": [stale_buy],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["phillips"]
+
+    assert report["buy_actions"] == []
+    assert report["review_actions"] == [stale_buy]
+    assert report["counts"]["buy"] == 0
+    assert report["counts"]["review"] == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("formal_actions", [None]),
+        ("holding_decisions", [None]),
+        ("top10_candidates", [None]),
+        ("excluded", {"BAD": "not-a-list"}),
+        ("industry_concentration", [None]),
+        ("data_sources", "not-a-list"),
+        ("api_facts", [None]),
+    ],
+)
+def test_dashboard_trend_report_rejects_malformed_nested_audit_collections(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": {},
+        "metadata": {"market": "US", "broker": "futu"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+        "api_facts": [],
+    }
+    if field in payload["strategy_judgments"]:
+        payload["strategy_judgments"][field] = value
+    else:
+        payload[field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["futu"]
+
+    assert report["available"] is False
+    assert report["status_text"] == "今日趋势报告无效"
 
 
 def dashboard_decision_plan(run_date: str) -> dict[str, object]:

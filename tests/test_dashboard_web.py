@@ -1691,6 +1691,26 @@ def test_dashboard_trend_report_mobile_layout_css() -> None:
     assert ".trend-report-entry button,\n  .trend-report-header button { min-height: 44px; }" in mobile
 
 
+def test_dashboard_trend_report_defensively_handles_malformed_arrays() -> None:
+    output = run_dashboard_js(r'''
+const html=renderTrendReportWorkspace({
+  broker_label:"富途",market_label:"美股",report_date:"2026-07-15",
+  data_date:"2026-07-14",generated_at:"now",account_status:"已更新",
+  buy_window:"美股常规交易时段",counts:{},
+  sell_actions:{bad:true},buy_actions:null,hold_actions:"bad",review_actions:42,
+  audit:{candidates:[null],excluded:{},industry_concentration:[null],data_sources:{bad:true}},
+});
+state.dashboard={trend_reports:{futu:{available:false,status_text:"今日趋势报告无效"}}};
+const unavailable=renderTrendReportEntry("futu");
+if((html.match(/<p>无<\/p>/g)||[]).length!==4)throw new Error(html);
+if(!html.includes("数据来源：无"))throw new Error(html);
+if(!unavailable.includes("今日趋势报告无效"))throw new Error(unavailable);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_trend_report_escapes_report_strings() -> None:
     output = run_dashboard_js(r'''
 const attack='<img src=x onerror=alert(1)>';
