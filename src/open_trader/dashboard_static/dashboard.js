@@ -342,16 +342,19 @@ function openTrendReport(broker) {
   elements["trend-report-workspace"].innerHTML = renderTrendReportWorkspace(report);
   elements["trend-report-workspace"].hidden = false;
   elements["trend-report-workspace"].classList.remove("hidden");
+  elements["trend-report-workspace"].querySelector("[data-close-trend-report]")?.focus();
 }
 
 function closeTrendReport() {
   const broker = state.selectedTrendBroker;
+  const accountSection = document.getElementById(`account-${broker}`);
   elements["trend-report-workspace"].hidden = true;
   elements["trend-report-workspace"].classList.add("hidden");
   elements["trend-report-workspace"].innerHTML = "";
   elements["workspace-grid"].classList.remove("hidden");
   state.selectedTrendBroker = "";
-  document.getElementById(`account-${broker}`)?.scrollIntoView({block: "start"});
+  accountSection?.scrollIntoView({block: "start"});
+  accountSection?.querySelector("[data-trend-report]")?.focus();
 }
 
 function handleBacktestChoice(event) {

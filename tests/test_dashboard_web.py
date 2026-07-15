@@ -1617,6 +1617,7 @@ class E {
   constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.listeners={};this.classes=new Set();this.scrolled=false;this.classList={add:(...names)=>names.forEach((name)=>this.classes.add(name)),remove:(...names)=>names.forEach((name)=>this.classes.delete(name)),toggle:(name,force)=>force===undefined?(this.classes.has(name)?this.classes.delete(name):this.classes.add(name)):force?this.classes.add(name):this.classes.delete(name),contains:(name)=>this.classes.has(name)};}
   addEventListener(name,listener){this.listeners[name]=listener;}
   click(target=this){return this.listeners.click&&this.listeners.click({target,preventDefault(){}});}
+  focus(){document.activeElement=this;}
   closest(selector){
     if(selector==="[data-trend-report]"&&Object.hasOwn(this.dataset,"trendReport"))return this;
     if(selector==="[data-close-trend-report]"&&Object.hasOwn(this.dataset,"closeTrendReport"))return this;
@@ -1652,8 +1653,13 @@ for(const broker of ["futu","phillips","eastmoney"]){if(!html.includes(`data-tre
 if(html.includes('data-trend-report="tiger"'))throw new Error(html);
 if(!html.includes("报告日期 2026-07-15")||!html.includes("数据截至 2026-07-14"))throw new Error(html);
 
-const open=new E();open.dataset.trendReport="futu";elements["account-holdings"].click(open);
+const open=new E();open.dataset.trendReport="futu";
+const returnButton=new E();
+elements["trend-report-workspace"].querySelector=()=>returnButton;
+document.getElementById("account-futu").querySelector=()=>open;
+elements["account-holdings"].click(open);
 if(!elements["workspace-grid"].classList.contains("hidden")||elements["trend-report-workspace"].hidden||elements["trend-report-workspace"].classList.contains("hidden"))throw new Error("workspace state");
+if(document.activeElement!==returnButton)throw new Error("workspace focus");
 const workspace=elements["trend-report-workspace"].innerHTML;
 const order=["开盘前","美股常规交易时段","盘中持续","人工复核"].map((text)=>workspace.indexOf(`<h2>${text}</h2>`));
 if(order.some((index)=>index<0)||!order.every((index,i)=>i===0||order[i-1]<index))throw new Error(workspace);
@@ -1663,6 +1669,7 @@ for(const text of ["确认全部卖出动作","按顺序考虑允许买入项","
 
 const close=new E();close.dataset.closeTrendReport="";elements["trend-report-workspace"].click(close);
 if(elements["trend-report-workspace"].hidden!==true||!elements["trend-report-workspace"].classList.contains("hidden")||elements["workspace-grid"].classList.contains("hidden")||state.selectedTrendBroker!==""||!nodes["account-futu"].scrolled)throw new Error("close state");
+if(document.activeElement!==open)throw new Error("trigger focus");
 
 state.dashboard.trend_reports.futu={available:false,status_text:"今日暂无趋势报告",sell_actions:[{symbol:"STALE_ACTION"}]};
 const stale=renderAccountSection(group("futu"));

@@ -32,6 +32,46 @@ def test_browser_ignores_chrome_unattributed_404_but_not_app_errors() -> None:
     assert _is_actionable_console_error("Uncaught TypeError: failed")
 
 
+def trend_reports() -> dict[str, dict[str, object]]:
+    return {
+        "futu": {
+            "available": True, "broker": "futu", "broker_label": "富途",
+            "market_label": "美股", "report_date": "2026-07-15",
+            "data_date": "2026-07-14", "generated_at": "2026-07-15T11:30:36+08:00",
+            "account_status": "已更新", "buy_window": "美股常规交易时段",
+            "sell_actions": [{"symbol": "AAPL", "name": "苹果", "reason": "danger_signal", "active_line": "190"}],
+            "buy_actions": [{"symbol": "VIXY", "name": "波动率ETF", "estimated_shares": "20", "target_amount": "5000", "estimated_initial_line": "18.50"}],
+            "hold_actions": [{"symbol": "SPY", "name": "标普ETF", "reason": "trend_intact", "active_line": "500"}],
+            "review_actions": [{"symbol": "QQQ", "name": "纳指ETF", "reason": "holding_signal_unknown"}],
+            "counts": {"sell": 1, "buy": 1, "hold": 1, "review": 1},
+            "audit": {
+                "candidates": [{"symbol": "VIXY", "name": "波动率ETF", "strength": "95"}],
+                "excluded": {"QQQ": ["already_held"]},
+                "industry_concentration": [["科技", 1, "0.25"]],
+                "data_sources": ["Trend Animals", "Futu US daily K-line"],
+                "actual_api_cost": "1.00",
+            },
+        },
+        "phillips": {
+            "available": True, "broker": "phillips", "broker_label": "辉立",
+            "market_label": "港股", "report_date": "2026-07-15",
+            "data_date": "2026-07-14", "generated_at": "2026-07-15T11:31:00+08:00",
+            "account_status": "已更新", "buy_window": "09:30–10:00",
+            "sell_actions": [], "buy_actions": [], "hold_actions": [],
+            "review_actions": [], "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 0},
+            "audit": {
+                "candidates": [], "excluded": {}, "industry_concentration": [],
+                "data_sources": ["Trend Animals"], "estimated_api_cost": "1.20",
+                "actual_api_cost": None,
+            },
+        },
+        "eastmoney": {
+            "available": False, "broker": "eastmoney", "broker_label": "东方财富",
+            "market_label": "A股", "status_text": "今日暂无趋势报告",
+        },
+    }
+
+
 def valid_payload() -> dict[str, object]:
     cn = [
         {
@@ -66,6 +106,7 @@ def valid_payload() -> dict[str, object]:
         "backtest_universe": {"holdings": [
             {"market": "CN", "symbol": row["symbol"]} for row in cn
         ]},
+        "trend_reports": trend_reports(),
         "tiger_long_term_strategy": {
             "status": "shadow",
             "members": [{"symbol": "QQQ"}],
@@ -82,6 +123,52 @@ def trend_account_text() -> str:
         "辉立短线港股趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14 "
         "东方财富偏短线趋势交易当天趋势报告今日暂无趋势报告"
     )
+
+
+def trend_workspace_text(broker: str) -> str:
+    if broker == "phillips":
+        return (
+            "辉立｜港股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
+            "生成时间 2026-07-15T11:31:00+08:00 账户状态 已更新 "
+            "卖出 0 买入 0 持有 0 人工复核 0 今日执行检查 "
+            "确认全部卖出动作 按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
+        )
+    return (
+        "富途｜美股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
+        "生成时间 2026-07-15T11:30:36+08:00 账户状态 已更新 "
+        "卖出 1 买入 1 持有 1 人工复核 1 今日执行检查 "
+        "确认全部卖出动作 按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
+    )
+
+
+def trend_stage_texts(broker: str) -> list[str]:
+    if broker == "phillips":
+        return ["开盘前\n无", "09:30–10:00\n无", "盘中持续\n无", "人工复核\n无"]
+    return [
+        "开盘前\nAAPL 苹果 危险信号触发 活动保护线 190",
+        "美股常规交易时段\nVIXY 波动率ETF 约 20 股 金额上限 5000 预计保护线 18.50",
+        "盘中持续\nSPY 标普ETF 趋势保持完好 活动保护线 500",
+        "人工复核\nQQQ 纳指ETF 趋势信号不完整",
+    ]
+
+
+def trend_audit_text(broker: str) -> str:
+    if broker == "phillips":
+        return "审计详情 候选榜 无 排除项 无 行业集中度 无 数据来源：Trend Animals API 成本：1.20"
+    return (
+        "审计详情 候选榜 VIXY 波动率ETF 强度 95 排除项 QQQ 当前账户已经持有 "
+        "行业集中度 科技 1 0.25 数据来源：Trend Animals、Futu US daily K-line API 成本：1.00"
+    )
+
+
+def trend_audit_sections(broker: str) -> list[str]:
+    if broker == "phillips":
+        return ["候选榜 无", "排除项 无", "行业集中度 无"]
+    return [
+        "候选榜 VIXY 波动率ETF 强度 95",
+        "排除项 QQQ 当前账户已经持有",
+        "行业集中度 科技 1 0.25",
+    ]
 
 
 def nested_get(row: dict[str, object], path: tuple[str, ...]) -> dict[str, object]:
@@ -264,6 +351,8 @@ def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> No
 def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    payload = valid_payload()
+    reports = payload["trend_reports"]
     visited: list[str] = []
     selectors: list[tuple[str, str]] = []
     clicks: list[tuple[str, str]] = []
@@ -287,20 +376,44 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             if self.selector == 'a[href="#account-tiger"]':
                 state[f"{self.name}_hash"] = "#account-tiger"
             if self.selector == ".trend-report-entry [data-trend-report]":
-                state[f"{self.name}_trend_open"] = True
+                state[f"{self.name}_trend_broker"] = "futu"
+            match = re.match(
+                r"#account-(\w+) \.trend-report-entry \[data-trend-report\]$",
+                self.selector,
+            )
+            if match:
+                state[f"{self.name}_trend_broker"] = match.group(1)
+                state[f"{self.name}_active"] = (
+                    "#trend-report-workspace:visible [data-close-trend-report]"
+                )
+            if self.selector.endswith(".trend-audit summary"):
+                state[f"{self.name}_active"] = self.selector
             if self.selector.endswith("[data-close-trend-report]"):
-                state[f"{self.name}_trend_open"] = False
+                broker = state.get(f"{self.name}_trend_broker")
+                state[f"{self.name}_active"] = (
+                    f"#account-{broker} .trend-report-entry [data-trend-report]"
+                )
+                state[f"{self.name}_trend_broker"] = None
+
+        def is_disabled(self) -> bool:
+            match = re.match(r"#account-(\w+) \.trend-report-entry button$", self.selector)
+            assert match
+            return not bool(reports[match.group(1)]["available"])  # type: ignore[index]
 
         def inner_text(self) -> str:
             if self.selector == "#account-holdings":
                 return trend_account_text()
-            if self.selector == "#trend-report-workspace:visible":
+            match = re.match(r"#account-(\w+) \.trend-report-entry$", self.selector)
+            if match:
+                report = reports[match.group(1)]  # type: ignore[index]
                 return (
-                    "富途｜美股 当天趋势报告 报告日期 2026-07-15 "
-                    "数据截至 2026-07-14 生成时间 2026-07-15T11:30:36+08:00 "
-                    "账户状态 已更新 今日执行检查 确认全部卖出动作 "
-                    "按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
+                    f"当天趋势报告 报告日期 {report.get('report_date', '-')} "
+                    f"数据截至 {report.get('data_date', '-')}"
                 )
+            if self.selector == "#trend-report-workspace:visible":
+                return trend_workspace_text(str(state.get(f"{self.name}_trend_broker")))
+            if self.selector.endswith(".trend-audit"):
+                return trend_audit_text(str(state.get(f"{self.name}_trend_broker")))
             if self.selector == "body":
                 return "持仓与策略"
             if self.selector.endswith(".account-empty:visible"):
@@ -315,11 +428,21 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             if self.selector == "#account-tiger .trend-report-entry":
                 return 0
             if self.selector == ".trend-report-entry [data-trend-report]":
+                return 2
+            if re.match(r"#account-\w+ \.trend-report-entry$", self.selector):
+                return 1
+            match = re.match(
+                r"#account-(\w+) \.trend-report-entry \[data-trend-report\]$",
+                self.selector,
+            )
+            if match:
+                return int(bool(reports[match.group(1)]["available"]))  # type: ignore[index]
+            if re.match(r"#account-\w+ \.trend-report-entry button$", self.selector):
                 return 1
             if self.selector == "#trend-report-workspace:visible":
-                return int(bool(state.get(f"{self.name}_trend_open")))
+                return int(bool(state.get(f"{self.name}_trend_broker")))
             if self.selector == ".workspace-grid:visible":
-                return int(not state.get(f"{self.name}_trend_open", False))
+                return int(not state.get(f"{self.name}_trend_broker"))
             if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
                 return 0
             if self.selector.endswith(".account-empty:visible"):
@@ -329,10 +452,18 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def all_inner_texts(self) -> list[str]:
             if self.selector == "a:visible, button:visible":
                 return ["刷新账户与行情", "策略回测"]
+            broker = str(state.get(f"{self.name}_trend_broker"))
+            if self.selector.endswith(".trend-stage"):
+                return trend_stage_texts(broker)
             if self.selector.endswith(".trend-stage h2"):
-                return ["开盘前", "美股常规交易时段", "盘中持续", "人工复核"]
+                return [text.split("\n", 1)[0] for text in trend_stage_texts(broker)]
             if self.selector.endswith(".trend-report-header dd"):
-                return ["2026-07-15", "2026-07-14", "2026-07-15T11:30:36+08:00", "已更新"]
+                report = reports[broker]  # type: ignore[index]
+                return [str(report[key]) for key in (
+                    "report_date", "data_date", "generated_at", "account_status",
+                )]
+            if self.selector.endswith(".trend-audit section"):
+                return trend_audit_sections(broker)
             if self.selector.endswith(
                 ".account-holding-row:visible td:nth-child(2)"
             ):
@@ -347,6 +478,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             return Locator(self.name, f"{self.selector}:nth({index})")
 
         def evaluate(self, expression: str) -> bool:
+            if "document.activeElement" in expression:
+                return self.selector == state.get(f"{self.name}_active")
             assert "getBoundingClientRect" in expression
             return True
 
@@ -409,7 +542,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         lambda *_args: None,
     )
     errors, blocker = dashboard_acceptance._browser_check(
-        "http://dashboard", 5, valid_payload()
+        "http://dashboard", 5, payload
     )
 
     assert errors == ["desktop：RuntimeError: navigation failed"]
@@ -428,7 +561,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     )
 
     errors, blocker = dashboard_acceptance._browser_check(
-        "http://dashboard", 5, valid_payload()
+        "http://dashboard", 5, payload
     )
 
     assert errors == [
@@ -446,7 +579,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, '.account-section') in selectors
         assert (viewport, '.trend-report-entry') in selectors
         assert (viewport, '#account-tiger .trend-report-entry') in selectors
-        assert (viewport, '.trend-report-entry [data-trend-report]') in clicks
+        assert (viewport, '#account-futu .trend-report-entry [data-trend-report]') in clicks
+        assert (viewport, '#account-phillips .trend-report-entry [data-trend-report]') in clicks
         assert (viewport, '#trend-report-workspace:visible') in selectors
         assert (viewport, '.workspace-grid:visible') in selectors
         assert (viewport, '.account-section:visible') in selectors
@@ -456,7 +590,9 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, 'body') in selectors
         assert (viewport, 'a:visible, button:visible') in selectors
         assert (viewport, 'a[href="#account-tiger"]') in clicks
-    assert evaluated == ["desktop", "desktop", "mobile", "mobile"]
+    assert evaluated == [
+        "desktop", "desktop", "desktop", "mobile", "mobile", "mobile",
+    ]
 
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:
@@ -482,7 +618,11 @@ def test_validate_dashboard_payload_rejects_invalid_tiger_strategy(
 
 
 def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> None:
-    state = {"trend_open": False}
+    payload = valid_payload()
+    reports = payload["trend_reports"]
+    state: dict[str, object] = {
+        "broker": None, "active": None, "opened": [], "disabled_checked": set(),
+    }
 
     class Locator:
         def __init__(self, selector: str) -> None:
@@ -493,10 +633,32 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
             return self
 
         def click(self) -> None:
-            if self.selector == ".trend-report-entry [data-trend-report]":
-                state["trend_open"] = True
+            match = re.match(
+                r"#account-(\w+) \.trend-report-entry \[data-trend-report\]$",
+                self.selector,
+            )
+            if match:
+                broker = match.group(1)
+                state["broker"] = broker
+                state["active"] = "#trend-report-workspace:visible [data-close-trend-report]"
+                state["opened"].append(broker)  # type: ignore[union-attr]
+            elif self.selector.endswith(".trend-audit summary"):
+                state["active"] = self.selector
             elif self.selector.endswith("[data-close-trend-report]"):
-                state["trend_open"] = False
+                broker = state["broker"]
+                state["active"] = f"#account-{broker} .trend-report-entry [data-trend-report]"
+                state["broker"] = None
+
+        def is_disabled(self) -> bool:
+            match = re.match(r"#account-(\w+) \.trend-report-entry button$", self.selector)
+            assert match
+            broker = match.group(1)
+            state["disabled_checked"].add(broker)  # type: ignore[union-attr]
+            return not bool(reports[broker]["available"])  # type: ignore[index]
+
+        def evaluate(self, expression: str) -> bool:
+            assert "document.activeElement" in expression
+            return self.selector == state["active"]
 
         def locator(self, selector: str) -> "Locator":
             return Locator(f"{self.selector} {selector}")
@@ -504,30 +666,58 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
         def inner_text(self) -> str:
             if self.selector == "#account-holdings":
                 return trend_account_text()
-            assert self.selector == "#trend-report-workspace:visible"
-            return (
-                "富途｜美股 当天趋势报告 报告日期 2026-07-15 "
-                "数据截至 2026-07-14 生成时间 2026-07-15T11:30:36+08:00 "
-                "账户状态 已更新 今日执行检查 确认全部卖出动作 "
-                "按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
-            )
+            match = re.match(r"#account-(\w+) \.trend-report-entry$", self.selector)
+            if match:
+                report = reports[match.group(1)]  # type: ignore[index]
+                return (
+                    f"当天趋势报告 报告日期 {report.get('report_date', '-')} "
+                    f"数据截至 {report.get('data_date', '-')}"
+                )
+            if self.selector == "#trend-report-workspace:visible":
+                return trend_workspace_text(str(state["broker"]))
+            if self.selector.endswith(".trend-audit"):
+                return trend_audit_text(str(state["broker"]))
+            raise AssertionError(self.selector)
 
         def count(self) -> int:
-            return {
-                ".account-section": 4,
-                ".trend-report-entry": 3,
-                "#account-tiger .trend-report-entry": 0,
-                ".trend-report-entry [data-trend-report]": 1,
-                "#trend-report-workspace:visible": int(state["trend_open"]),
-                ".workspace-grid:visible": int(not state["trend_open"]),
-                "#trend-report-workspace:visible .trend-audit": 1,
-            }.get(self.selector, 1)
+            if self.selector == ".account-section":
+                return 4
+            if self.selector == ".trend-report-entry":
+                return 3
+            if self.selector == "#account-tiger .trend-report-entry":
+                return 0
+            if self.selector == ".trend-report-entry [data-trend-report]":
+                return 2
+            match = re.match(r"#account-(\w+) \.trend-report-entry$", self.selector)
+            if match:
+                return 1
+            match = re.match(
+                r"#account-(\w+) \.trend-report-entry \[data-trend-report\]$",
+                self.selector,
+            )
+            if match:
+                return int(bool(reports[match.group(1)]["available"]))  # type: ignore[index]
+            if re.match(r"#account-\w+ \.trend-report-entry button$", self.selector):
+                return 1
+            if self.selector == "#trend-report-workspace:visible":
+                return int(state["broker"] is not None)
+            if self.selector == ".workspace-grid:visible":
+                return int(state["broker"] is None)
+            return 1
 
         def all_inner_texts(self) -> list[str]:
+            broker = str(state["broker"])
+            if self.selector.endswith(".trend-stage"):
+                return trend_stage_texts(broker)
             if self.selector.endswith(".trend-stage h2"):
-                return ["开盘前", "美股常规交易时段", "盘中持续", "人工复核"]
+                return [text.split("\n", 1)[0] for text in trend_stage_texts(broker)]
             if self.selector.endswith(".trend-report-header dd"):
-                return ["2026-07-15", "2026-07-14", "2026-07-15T11:30:36+08:00", "已更新"]
+                report = reports[broker]  # type: ignore[index]
+                return [str(report[key]) for key in (
+                    "report_date", "data_date", "generated_at", "account_status",
+                )]
+            if self.selector.endswith(".trend-audit section"):
+                return trend_audit_sections(broker)
             return []
 
         def get_attribute(self, name: str) -> str | None:
@@ -542,7 +732,27 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
             assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
             return True
 
-    dashboard_acceptance._check_account_holdings(Page())
+    dashboard_acceptance._check_account_holdings(Page(), payload)
+
+    assert state["opened"] == ["futu", "phillips"]
+    assert state["disabled_checked"] == {"eastmoney"}
+
+
+@pytest.mark.parametrize(
+    "legacy", ("数据日", "账户源", "最近保护提醒", "策略指标待接入"),
+)
+def test_check_account_holdings_rejects_legacy_trend_summary_copy(legacy: str) -> None:
+    class Locator:
+        def inner_text(self) -> str:
+            return f"{trend_account_text()} {legacy}"
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            assert selector == "#account-holdings", "checker continued past legacy copy"
+            return Locator()
+
+    with pytest.raises(AssertionError, match=f"旧趋势摘要.*{legacy}"):
+        dashboard_acceptance._check_account_holdings(Page(), valid_payload())
 
 
 @pytest.mark.parametrize(
@@ -749,7 +959,7 @@ def test_check_account_holdings_rejects_missing_profile_or_metric(missing: str) 
             return True
 
     with pytest.raises(AssertionError):
-        dashboard_acceptance._check_account_holdings(Page())
+        dashboard_acceptance._check_account_holdings(Page(), valid_payload())
 
 
 def test_validate_dashboard_payload_rejects_bad_counts_and_weights() -> None:

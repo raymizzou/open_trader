@@ -25,6 +25,30 @@ REQUIRED_SOURCE_PATHS = (
     ("futu_skill_facts", "derivatives_anomaly"),
 )
 
+TREND_REPORT_BROKERS = ("futu", "phillips", "eastmoney")
+TREND_REASON_LABELS = {
+    "protection_line_already_triggered": "活动保护线已触发",
+    "danger_signal": "危险信号触发",
+    "left_trend_right_side": "右侧趋势已结束",
+    "holding_signal_unknown": "趋势信号不完整",
+    "holding_kline_unavailable": "持仓日线数据不可用",
+    "trend_intact": "趋势保持完好",
+    "right_side_not_true": "尚未进入右侧趋势",
+    "strength_not_above_90": "趋势强度未超过 90",
+    "right_side_days_not_below_10": "进入右侧趋势已满 10 天",
+    "not_tradable": "当前不可交易",
+    "amount_below_1": "日成交额不足 1 亿元",
+    "danger_unknown": "危险信号未知",
+    "name_missing": "标的名称缺失",
+    "asset_missing": "资产类型缺失",
+    "unsupported_asset": "不属于 A 股股票或境内 ETF",
+    "already_held": "当前账户已经持有",
+    "excluded_security": "北交所、ST 或退市标的",
+    "unsupported_exchange": "不属于沪深市场",
+    "atr_unavailable": "缺少 ATR 数据",
+    "data_date_mismatch": "数据日期不一致",
+}
+
 
 def _latest_phillips_expectation(data_dir: Path) -> tuple[Decimal, str]:
     statements = list((data_dir / "statements/phillips").glob("*/*.pdf"))
@@ -254,7 +278,92 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
             assert not re.search(r"当前价\s*缺失", panel_text), "趋势 / K 线当前价缺失"
 
 
-def _check_account_holdings(page: Any) -> None:
+def _plain(value: Any) -> str:
+    return "-" if value is None or str(value).strip() == "" else str(value)
+
+
+def _check_trend_stage(
+    text: str, items: Any, *, kind: str, broker: str,
+) -> None:
+    rows = items if isinstance(items, list) else []
+    if not rows:
+        assert "无" in text, f"{broker} 的 {kind} 空阶段未显示 无"
+        return
+    for item in rows:
+        assert isinstance(item, Mapping), f"{broker} 的 {kind} 动作格式无效"
+        for key in ("symbol", "name"):
+            if item.get(key):
+                assert str(item[key]) in text, f"{broker} 的 {kind} 动作缺少 {key}"
+        if kind == "buy":
+            for label, key in (
+                ("约", "estimated_shares"),
+                ("金额上限", "target_amount"),
+                ("预计保护线", "estimated_initial_line"),
+            ):
+                assert f"{label} {_plain(item.get(key))}" in text, (
+                    f"{broker} 的买入动作缺少 {label}"
+                )
+            continue
+        reason = TREND_REASON_LABELS.get(
+            str(item.get("reason", "")), "未知动作或原因，需人工确认"
+        )
+        assert reason in text, f"{broker} 的 {kind} 动作缺少原因 {reason}"
+        if item.get("active_line") not in (None, ""):
+            assert f"活动保护线 {_plain(item['active_line'])}" in text, (
+                f"{broker} 的 {kind} 动作缺少活动保护线"
+            )
+
+
+def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> None:
+    assert audit.count() == 1 and audit.get_attribute("open") is None, (
+        f"{broker} 趋势报告审计详情未保持收起"
+    )
+    summary = audit.locator("summary")
+    assert summary.count() == 1, f"{broker} 趋势报告缺少审计摘要"
+    summary.click()
+    sections = audit.locator("section").all_inner_texts()
+    assert len(sections) == 3, f"{broker} 趋势报告审计区块数量不是 3"
+    data = report.get("audit") if isinstance(report.get("audit"), Mapping) else {}
+    candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
+    if not candidates:
+        assert "无" in sections[0], f"{broker} 空候选榜未显示 无"
+    for item in candidates:
+        if not isinstance(item, Mapping):
+            continue
+        for value in (item.get("symbol"), item.get("name")):
+            if value:
+                assert str(value) in sections[0], f"{broker} 候选榜缺少 {value}"
+        assert f"强度 {_plain(item.get('strength'))}" in sections[0], (
+            f"{broker} 候选榜缺少强度"
+        )
+    excluded = data.get("excluded") if isinstance(data.get("excluded"), Mapping) else {}
+    if not excluded:
+        assert "无" in sections[1], f"{broker} 空排除项未显示 无"
+    for symbol, reasons in excluded.items():
+        assert str(symbol) in sections[1], f"{broker} 排除项缺少 {symbol}"
+        for reason in reasons if isinstance(reasons, list) else []:
+            label = TREND_REASON_LABELS.get(str(reason), "未知原因")
+            assert label in sections[1], f"{broker} 排除项缺少原因 {label}"
+    industries = (
+        data.get("industry_concentration")
+        if isinstance(data.get("industry_concentration"), list) else []
+    )
+    if not industries:
+        assert "无" in sections[2], f"{broker} 空行业集中度未显示 无"
+    for row in industries:
+        for value in row if isinstance(row, list) else []:
+            assert _plain(value) in sections[2], f"{broker} 行业集中度缺少 {value}"
+    audit_text = audit.inner_text()
+    sources = data.get("data_sources") if isinstance(data.get("data_sources"), list) else []
+    for source in sources:
+        assert str(source) in audit_text, f"{broker} 审计详情缺少数据来源 {source}"
+    cost = data.get("actual_api_cost")
+    if cost is None:
+        cost = data.get("estimated_api_cost", "未知")
+    assert f"API 成本：{_plain(cost)}" in audit_text, f"{broker} 审计详情缺少 API 成本"
+
+
+def _check_account_holdings(page: Any, payload: dict[str, Any]) -> None:
     text = page.locator("#account-holdings").inner_text()
     for required in (
         "富途", "短线", "美股趋势交易", "老虎", "长线", "SMA200 组合策略",
@@ -262,6 +371,8 @@ def _check_account_holdings(page: Any) -> None:
         "当天趋势报告", "报告日期", "数据截至", "夏普比率", "卡玛比率",
     ):
         assert required in text, f"账户持仓视图缺少 {required}"
+    for legacy in ("数据日", "账户源", "最近保护提醒", "策略指标待接入"):
+        assert legacy not in text, f"账户持仓视图仍包含旧趋势摘要 {legacy}"
     assert page.locator(".account-section").count() == 4, "账户区块数量不是 4"
     assert page.locator(".trend-report-entry").count() == 3, "趋势报告入口数量不是 3"
     assert page.locator("#account-tiger .trend-report-entry").count() == 0, (
@@ -273,42 +384,94 @@ def _check_account_holdings(page: Any) -> None:
         "document.documentElement.scrollWidth <= window.innerWidth"
     ), "页面出现横向滚动"
 
-    available = page.locator(".trend-report-entry [data-trend-report]")
-    assert available.count() >= 1, "没有可打开的当天趋势报告"
-    available.first.click()
-    workspace = page.locator("#trend-report-workspace:visible")
-    assert workspace.count() == 1, "趋势报告工作区未显示"
-    workspace_text = workspace.inner_text()
-    for required in (
-        "报告日期", "数据截至", "生成时间", "账户状态", "今日执行检查",
-        "确认全部卖出动作", "按顺序考虑允许买入项", "盘中观察活动保护线",
-        "完成人工复核",
-    ):
-        assert required in workspace_text, f"趋势报告工作区缺少 {required}"
-    header_values = workspace.locator(".trend-report-header dd").all_inner_texts()
-    assert len(header_values) == 4 and all(
-        value.strip() not in {"", "-"} for value in header_values
-    ), "趋势报告头部日期、生成时间或账户状态缺失"
-    stages = workspace.locator(".trend-stage h2").all_inner_texts()
-    assert len(stages) == 4 and stages[0] == "开盘前" and stages[1].strip() and (
-        stages[2:] == ["盘中持续", "人工复核"]
-    ), f"趋势报告阶段顺序不正确：{stages}"
-    audit = workspace.locator(".trend-audit")
-    assert audit.count() == 1 and audit.get_attribute("open") is None, (
-        "趋势报告审计详情未保持收起"
-    )
-    assert page.evaluate(
-        "document.documentElement.scrollWidth <= window.innerWidth"
-    ), "趋势报告工作区出现横向滚动"
-    close = workspace.locator("[data-close-trend-report]")
-    assert close.count() == 1, "趋势报告工作区缺少返回按钮"
-    close.click()
-    assert page.locator("#trend-report-workspace:visible").count() == 0, (
-        "返回后趋势报告工作区仍可见"
-    )
-    assert page.locator(".workspace-grid:visible").count() == 1, (
-        "返回后持仓工作区未恢复"
-    )
+    reports = payload.get("trend_reports") or {}
+    expected_available = [
+        broker for broker in TREND_REPORT_BROKERS
+        if isinstance(reports.get(broker), Mapping)
+        and reports[broker].get("available") is True
+    ]
+    assert page.locator(".trend-report-entry [data-trend-report]").count() == len(
+        expected_available
+    ), "可用趋势报告入口数量与 API 不一致"
+    for broker in TREND_REPORT_BROKERS:
+        report = reports.get(broker) if isinstance(reports, Mapping) else None
+        assert isinstance(report, Mapping), f"API 缺少 {broker} 趋势报告状态"
+        entry = page.locator(f"#account-{broker} .trend-report-entry")
+        assert entry.count() == 1, f"{broker} 趋势报告入口数量不是 1"
+        trigger = entry.locator("[data-trend-report]")
+        if report.get("available") is not True:
+            assert trigger.count() == 0, f"{broker} 不可用报告仍可打开"
+            button = entry.locator("button")
+            assert button.count() == 1 and button.is_disabled(), (
+                f"{broker} 不可用报告入口未禁用"
+            )
+            assert page.locator("#trend-report-workspace:visible").count() == 0, (
+                f"{broker} 不可用报告错误打开工作区"
+            )
+            continue
+        assert trigger.count() == 1, f"{broker} 可用报告缺少入口"
+        entry_text = entry.inner_text()
+        for label, key in (("报告日期", "report_date"), ("数据截至", "data_date")):
+            assert f"{label} {_plain(report.get(key))}" in entry_text, (
+                f"{broker} 入口缺少 {label}"
+            )
+        trigger.click()
+        workspace = page.locator("#trend-report-workspace:visible")
+        assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
+        close = workspace.locator("[data-close-trend-report]")
+        assert close.count() == 1, f"{broker} 趋势报告工作区缺少返回按钮"
+        assert close.evaluate("element => element === document.activeElement"), (
+            f"{broker} 趋势报告打开后焦点未进入工作区"
+        )
+        workspace_text = workspace.inner_text()
+        identity = f"{_plain(report.get('broker_label'))}｜{_plain(report.get('market_label'))}"
+        assert identity in workspace_text, f"{broker} 趋势报告身份不匹配"
+        for required in (
+            "报告日期", "数据截至", "生成时间", "账户状态", "今日执行检查",
+            "确认全部卖出动作", "按顺序考虑允许买入项", "盘中观察活动保护线",
+            "完成人工复核",
+        ):
+            assert required in workspace_text, f"{broker} 趋势报告工作区缺少 {required}"
+        header_values = workspace.locator(".trend-report-header dd").all_inner_texts()
+        assert header_values == [
+            _plain(report.get(key)) for key in (
+                "report_date", "data_date", "generated_at", "account_status",
+            )
+        ], f"{broker} 趋势报告头部内容与 API 不一致"
+        counts = report.get("counts") if isinstance(report.get("counts"), Mapping) else {}
+        for label, key in (("卖出", "sell"), ("买入", "buy"), ("持有", "hold"), ("人工复核", "review")):
+            assert f"{label} {_plain(counts.get(key) or 0)}" in workspace_text, (
+                f"{broker} 趋势报告缺少 {label}计数"
+            )
+        stage_texts = workspace.locator(".trend-stage").all_inner_texts()
+        expected_titles = [
+            "开盘前", _plain(report.get("buy_window")), "盘中持续", "人工复核",
+        ]
+        assert len(stage_texts) == 4 and all(
+            title in stage_texts[index] for index, title in enumerate(expected_titles)
+        ), f"{broker} 趋势报告阶段顺序不正确"
+        for stage_text, key, kind in zip(
+            stage_texts,
+            ("sell_actions", "buy_actions", "hold_actions", "review_actions"),
+            ("sell", "buy", "hold", "review"),
+            strict=True,
+        ):
+            _check_trend_stage(stage_text, report.get(key), kind=kind, broker=broker)
+        audit = workspace.locator(".trend-audit")
+        _check_trend_audit(audit, report, broker)
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        ), f"{broker} 趋势报告工作区出现横向滚动"
+        close.click()
+        assert page.locator("#trend-report-workspace:visible").count() == 0, (
+            f"{broker} 返回后趋势报告工作区仍可见"
+        )
+        assert page.locator(".workspace-grid:visible").count() == 1, (
+            f"{broker} 返回后持仓工作区未恢复"
+        )
+        assert trigger.evaluate("element => element === document.activeElement"), (
+            f"{broker} 返回后焦点未恢复到报告入口"
+        )
 
 
 def _check_page_safety(page: Any) -> None:
@@ -413,7 +576,7 @@ def _browser_check(
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
-                        _check_account_holdings(page)
+                        _check_account_holdings(page, payload)
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
