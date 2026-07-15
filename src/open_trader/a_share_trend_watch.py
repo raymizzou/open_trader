@@ -94,8 +94,10 @@ def watch_a_share_protection(
     trading_date = first_now.astimezone(SHANGHAI).date().isoformat()
     positions: dict[str, object] = {}
     active_lines: dict[str, Decimal | None] = {}
+    trigger_events: dict[str, Mapping[str, object]] = {}
     alerted: set[str] = set()
-    delivered_alerts: set[str] = set()
+    delivered_alerts_feishu: set[str] = set()
+    delivered_alerts_macos: set[str] = set()
     reported_lines: set[str] = set()
     delivered_lines: set[str] = set()
     reported_quotes: set[str] = set()
@@ -195,18 +197,26 @@ def watch_a_share_protection(
                     }
                     active_lines = _load_active_lines(state_path)
                     prior_events = load_watch_events(events_path)
-                    alerted = {
-                        str(event.get("symbol", ""))
+                    trigger_events = {
+                        str(event.get("symbol", "")): event
                         for event in prior_events
                         if event.get("trading_date") == trading_date
                         and event.get("event_type") == "protection_triggered"
                     }
-                    delivered_alerts = {
+                    alerted = set(trigger_events)
+                    delivered_alerts_feishu = {
                         str(event.get("symbol", ""))
                         for event in prior_events
                         if event.get("trading_date") == trading_date
                         and event.get("event_type")
-                        == "protection_triggered_notification_delivered"
+                        == "protection_triggered_notification_delivered_feishu"
+                    }
+                    delivered_alerts_macos = {
+                        str(event.get("symbol", ""))
+                        for event in prior_events
+                        if event.get("trading_date") == trading_date
+                        and event.get("event_type")
+                        == "protection_triggered_notification_delivered_macos"
                     }
                     reported_lines = {
                         str(event.get("symbol", ""))
@@ -240,6 +250,20 @@ def watch_a_share_protection(
                 sleep_fn(poll_seconds)
                 now = now_fn()
                 continue
+
+            for symbol, event in sorted(trigger_events.items()):
+                _deliver_trigger_notification(
+                    events_path=events_path,
+                    notifier=notifier,
+                    trading_date=trading_date,
+                    now=now,
+                    symbol=symbol,
+                    last_price=_optional_decimal(event.get("last_price")),
+                    active_line=_optional_decimal(event.get("active_line")),
+                    delivered_feishu=delivered_alerts_feishu,
+                    delivered_macos=delivered_alerts_macos,
+                    replay=True,
+                )
 
             comparable: dict[str, tuple[str, Decimal]] = {}
             for symbol in sorted(positions):
@@ -359,24 +383,18 @@ def watch_a_share_protection(
                     )
                     alerted.add(symbol)
                     trigger_count += 1
-                if symbol not in delivered_alerts:
-                    attempts = send_notification_with_results(
-                        notifier,
-                        f"A股保护线触发 · {symbol}",
-                        f"最新价 {snapshot.last_price} <= 活动保护线 {active_line}\n"
-                        "建议动作：全部卖出（人工执行）",
+                    _deliver_trigger_notification(
+                        events_path=events_path,
+                        notifier=notifier,
+                        trading_date=trading_date,
+                        now=now,
+                        symbol=symbol,
+                        last_price=snapshot.last_price,
+                        active_line=active_line,
+                        delivered_feishu=delivered_alerts_feishu,
+                        delivered_macos=delivered_alerts_macos,
+                        replay=False,
                     )
-                    if any(attempt.success for attempt in attempts):
-                        append_watch_event(
-                            events_path,
-                            symbol=symbol,
-                            trading_date=trading_date,
-                            event_type="protection_triggered_notification_delivered",
-                            occurred_at=now.isoformat(timespec="seconds"),
-                            last_price=snapshot.last_price,
-                            active_line=active_line,
-                        )
-                        delivered_alerts.add(symbol)
 
             if once:
                 return _result(
@@ -392,6 +410,62 @@ def watch_a_share_protection(
     finally:
         if client is not None:
             _close(client)
+
+
+def _deliver_trigger_notification(
+    *,
+    events_path: Path,
+    notifier: Notifier,
+    trading_date: str,
+    now: datetime,
+    symbol: str,
+    last_price: Decimal | None,
+    active_line: Decimal | None,
+    delivered_feishu: set[str],
+    delivered_macos: set[str],
+    replay: bool,
+) -> None:
+    if replay:
+        message = (
+            f"今日已触发活动保护线 {active_line if active_line is not None else '未知'}；"
+            "此前提醒未完整送达，建议动作：全部卖出（人工执行）"
+        )
+    else:
+        message = (
+            f"最新价 {last_price} <= 活动保护线 {active_line}\n"
+            "建议动作：全部卖出（人工执行）"
+        )
+    for channels, event_type, delivered in (
+        (
+            {"feishu", "feishu_app"},
+            "protection_triggered_notification_delivered_feishu",
+            delivered_feishu,
+        ),
+        (
+            {"macos"},
+            "protection_triggered_notification_delivered_macos",
+            delivered_macos,
+        ),
+    ):
+        if symbol in delivered:
+            continue
+        attempts = send_notification_with_results(
+            notifier,
+            f"A股保护线触发 · {symbol}",
+            message,
+            channels=channels,
+        )
+        if any(attempt.success for attempt in attempts):
+            append_watch_event(
+                events_path,
+                symbol=symbol,
+                trading_date=trading_date,
+                event_type=event_type,
+                occurred_at=now.isoformat(timespec="seconds"),
+                last_price=last_price,
+                active_line=active_line,
+            )
+            delivered.add(symbol)
 
 
 def _load_active_lines(path: Path) -> dict[str, Decimal | None]:
