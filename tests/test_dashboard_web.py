@@ -889,6 +889,113 @@ const sandbox = { document: { addEventListener() {} }, console, URLSearchParams 
     return result.stdout
 
 
+def test_dashboard_display_number_preserves_precision_and_identifiers() -> None:
+    output = run_dashboard_js(r'''
+console.log(JSON.stringify({
+  money: formatDisplayNumber("3064187.62"),
+  integer: formatDisplayNumber("10000"),
+  trailing: formatDisplayNumber("2932.00"),
+  signed: formatDisplayNumber("+1234567.50"),
+  symbol: formatPlain("02840"),
+  percent: formatPlain("21.13%"),
+  input: "100000",
+  profit: pnlClass("12.50%"),
+  loss: pnlClass("-12.50%"),
+}));
+''')
+    assert json.loads(output) == {
+        "money": "3,064,187.62",
+        "integer": "10,000",
+        "trailing": "2,932.00",
+        "signed": "+1,234,567.50",
+        "symbol": "02840",
+        "percent": "21.13%",
+        "input": "100000",
+        "profit": "pnl-profit",
+        "loss": "pnl-loss",
+    }
+
+
+def test_dashboard_account_table_formats_values_but_not_symbol() -> None:
+    output = run_dashboard_js(r'''
+console.log(renderAccountTable([{key:"futu:HK:02840:0",holding:{},display:{
+  market:"HK",symbol:"02840",name:"SPDR 金",total_quantity:"10000",
+  avg_cost_price:"2932.00",market_value_hkd:"31845000.00",
+  account_weight:"3.28%",portfolio_weight:"1.04%",unrealized_pnl_pct:"-1.26%"
+}}]));
+''')
+    assert "10,000" in output
+    assert "2,932.00" in output
+    assert "HKD 31,845,000.00" in output
+    assert ">02840<" in output
+    assert 'class="number-cell account-holding-pnl pnl-loss"' in output
+
+
+def test_dashboard_formats_named_read_only_numeric_surfaces_only() -> None:
+    output = run_dashboard_js(r'''
+const quote = renderQuotePrice({market:"HK"}, {last_price:"1234567.50"});
+const kelly = [
+  renderKellyStrategyCapital({capital:{
+    available:true,currency:"USD",budget:"1234567.50",occupied_notional:"10000.00",
+    available_notional:"1224567.50",utilization_pct:"0.80",open_buy_order_count:"10000",
+    realized_pnl:"+2932.00",position_notional:"10000.00",reserved_order_notional:"0",
+  }}),
+  renderKellyOrderSync({order_sync:{
+    status:"ok",environment:"SIMULATE",last_synced_at:"2026-07-16 09:30",
+    order_count:"10000",fill_count:"2932",orders:[{
+      market:"HK",symbol:"02840",order_id:"00001234",submitted_at:"2026-07-16 09:30",
+      order_price:"1234567.50",order_qty:"10000",filled_qty:"2932",avg_fill_price:"2932.00",status:"filled",
+    }],
+  }}),
+  renderKellyOrderExecution({order_execution:{
+    status:"ok",environment:"SIMULATE",last_executed_at:"2026-07-16 09:31",
+    execution_count:"10000",dry_run_count:"2932",submitted_count:"0",skipped_count:"0",failed_count:"0",
+    executions:[{futu_code:"HK.02840",executed_at:"2026-07-16 09:31",side:"buy",price:"1234567.50",qty:"10000",planned_notional:"29320000.00",futu_order_id:"00001234",execution_status:"dry_run"}],
+  }}),
+].join("");
+const backtest = [
+  renderBacktestComparisonMetrics({
+    strategy:{total_return_pct:"21.13",max_drawdown_pct:"-12.50",win_rate_pct:"50.00",trades:Array.from({length:10000},()=>({quantity:"1"}))},
+    buy_hold:{total_return_pct:"10.00"},strategy_excess_return_pct:"11.13",
+  }),
+  renderBacktestTradeTable({strategy:{trades:[{execution_date:"2026-07-16",action:"BUY",quantity:"10000",execution_price:"2932.00",fees:"1234.50",reason:"记录"}]}}),
+  renderBacktestRunAssumptions({
+    requested_start:"2026-01-01",requested_end:"2026-07-16",actual_start:"2026-01-02",actual_end:"2026-07-16",
+    strategy_id:"trend_pullback/v1",adapter_version:"v1",run_id:"00001234",
+    assumptions:{initial_cash:"100000",max_strategy_weight:"0.10",commission_bps:"1000",slippage_bps:"5"},
+    strategy_definition:{name_zh:"趋势回调",description_zh:"说明",parameters:{sma_long:"10000"}},
+    strategy:{trades:[{fees:"1234.50"}]},signals:[],
+  }),
+].join("");
+const trend = renderTrendReportWorkspace({
+  broker_label:"富途",market_label:"港股",report_date:"2026-07-16",data_date:"2026-07-15",
+  generated_at:"2026-07-16 09:30",account_status:"正常",counts:{sell:"10000",buy:"2932",hold:"0",review:"0"},audit:{},
+});
+const decision = Object.fromEntries(decisionMetricCells({
+  strategy:{target_1:"1234567.50",view:"bullish"},trade_action:{status:"pending"},
+}));
+console.log(JSON.stringify({quote,kelly,backtest,trend,decision,input:state.standardBacktest.initialCash}));
+''')
+    rendered = json.loads(output)
+    assert rendered["quote"] == "1,234,567.50"
+    for expected in (
+        "USD 1,234,567.50", "USD +2,932.00", "<dt>订单</dt>",
+        "<dd>10,000</dd>", "HK.02840", "00001234", "1,234,567.50",
+        "29,320,000.00",
+    ):
+        assert expected in rendered["kelly"]
+    for expected in (
+        "10,000", "21.13%", "2026-07-16", "2,932.00", "1,234.50",
+        "100,000", "1,000 基点", "00001234",
+    ):
+        assert expected in rendered["backtest"]
+    assert "卖出 10,000" in rendered["trend"]
+    assert "买入 2,932" in rendered["trend"]
+    assert "2026-07-16" in rendered["trend"]
+    assert rendered["decision"]["目标价"] == ">= 1,234,567.50"
+    assert rendered["input"] == "100000"
+
+
 def test_dashboard_workspace_navigation_uses_one_shared_state_machine() -> None:
     output = run_dashboard_js(r'''
 const element=()=>({hidden:false,innerHTML:"",classList:{values:new Set(),add(...n){n.forEach(x=>this.values.add(x))},remove(...n){n.forEach(x=>this.values.delete(x))},toggle(n,f){f?this.add(n):this.remove(n)},contains(n){return this.values.has(n)}}});
@@ -1889,9 +1996,9 @@ console.log(JSON.stringify({first,second,market,cards:renderBrokerSummaryCards()
     assert result["second"]["broker"] == "tiger"
     assert 'id="account-tiger"' in result["second"]["html"]
     assert "老虎" in result["second"]["label"]
-    assert result["first"]["value"] == "HKD 4000.00"
-    assert result["second"]["value"] == "HKD 4000.00"
-    assert result["market"]["value"] == "HKD 4000.00"
+    assert result["first"]["value"] == "HKD 4,000.00"
+    assert result["second"]["value"] == "HKD 4,000.00"
+    assert result["market"]["value"] == "HKD 4,000.00"
     assert "HK · 老虎 · 0 条" in result["market"]["label"]
     assert 'data-broker="tiger"' in result["cards"]
     assert 'href="#account-tiger"' not in result["cards"]
@@ -2556,7 +2663,7 @@ function expectMetric(html, label, value, description) {
   }
 }
 expectMetric(html, "市场", "US", "kelly lab panel missing market metric");
-expectMetric(html, "模拟资金池", "USD 30000", "kelly lab panel missing capital pool metric");
+expectMetric(html, "模拟资金池", "USD 30,000", "kelly lab panel missing capital pool metric");
 for (const forbidden of ["US.MSFT", "US.TSM", "HK.06951"]) {
   if (html.includes(forbidden)) {
     throw new Error("kelly first tab leaked another strategy symbol " + forbidden + ": " + html);
@@ -2696,7 +2803,7 @@ if (!fallbackHtml.includes("标的状态") || !fallbackHtml.includes("US.IBM") |
   throw new Error("kelly participant fallback lifecycle missing: " + fallbackHtml);
 }
 expectMetric(fallbackHtml, "市场", "US", "kelly fallback market metric missing");
-expectMetric(fallbackHtml, "模拟资金池", "USD 25000", "kelly fallback capital pool missing");
+expectMetric(fallbackHtml, "模拟资金池", "USD 25,000", "kelly fallback capital pool missing");
 const disabledPoolHtml = renderKellyExperimentCard({
   experiment_name: "禁用市场资金池策略",
   market: "CN",
@@ -5103,14 +5210,14 @@ for (const id of ["current-view-value", "current-view-holding-value", "current-v
   elements[id] = {textContent: ""};
 }
 renderHeaderSummary();
-if (elements["current-view-value"].textContent !== "HKD 123456.78") {
+if (elements["current-view-value"].textContent !== "HKD 123,456.78") {
   throw new Error("header total should use the unfiltered payload summary");
 }
 if (!elements["current-view-label"].textContent.includes("富途") || !elements["current-view-label"].textContent.includes("2 条")) {
   throw new Error("header label should describe the selected broker and market: " + elements["current-view-label"].textContent);
 }
 const brokerCards = renderBrokerSummaryCards();
-if (!brokerCards.includes("富途") || !brokerCards.includes("HKD -99071.35")) {
+if (!brokerCards.includes("富途") || !brokerCards.includes("HKD -99,071.35")) {
   throw new Error("broker card missing expected text: " + brokerCards);
 }
 if (!brokerCards.includes("老虎") || !brokerCards.includes("账户实时同步，行情走富途")) {
@@ -5217,7 +5324,7 @@ renderHoldings();
 if (renderedHoldings.includes("美股正股") || renderedHoldings.includes("美股期权")) {
   throw new Error("account tables should not contain nested market sections: " + renderedHoldings);
 }
-for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1940.00", "HKD 15132.00", "当天趋势报告", "今日暂无趋势报告"]) {
+for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1,940.00", "HKD 15,132.00", "当天趋势报告", "今日暂无趋势报告"]) {
   if (!renderedHoldings.includes(required)) {
     throw new Error("account holdings missing " + required + ": " + renderedHoldings);
   }

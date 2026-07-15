@@ -500,7 +500,7 @@ function renderBacktestComparisonMetrics(result) {
   ];
   return `<section class="backtest-result-section" aria-labelledby="backtest-comparison-title"><h3 id="backtest-comparison-title">回测对比</h3><div class="backtest-comparison-grid">${rows.map(([label, value, kind]) => {
     const unavailable = (label === benchmarkLabel || label === "相对市场指数") && !benchmark;
-    const display = unavailable ? "基准行情缺失，无法比较" : kind === "count" ? String(value) : backtestPercent(value);
+    const display = unavailable ? "基准行情缺失，无法比较" : kind === "count" ? formatDisplayNumber(value) : backtestPercent(value);
     return `<article class="backtest-metric-card${unavailable ? " benchmark-unavailable" : ""}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display)}</strong></article>`;
   }).join("")}</div></section>`;
 }
@@ -612,8 +612,8 @@ function renderBacktestTradeTable(result) {
   const trades = result.strategy && Array.isArray(result.strategy.trades) ? result.strategy.trades : [];
   if (!trades.length) return '<section class="backtest-result-section"><h3>交易记录</h3><p class="backtest-empty-state">所选区间内没有触发交易</p></section>';
   const visible = trades.slice(0, 500);
-  const notice = trades.length > visible.length ? `<p>仅显示前 500 笔，共 ${trades.length} 笔</p>` : "";
-  return `<section class="backtest-result-section"><h3>交易记录</h3>${notice}<div class="backtest-table-wrap"><table class="backtest-trades-table"><thead><tr><th>执行日期</th><th>动作</th><th>数量</th><th>成交价</th><th>费用</th><th>原因</th></tr></thead><tbody>${visible.map((trade) => `<tr><td>${escapeHtml(trade.execution_date)}</td><td>${escapeHtml(trade.action)}</td><td>${escapeHtml(trade.quantity)}</td><td>${escapeHtml(trade.execution_price)}</td><td>${escapeHtml(trade.fees)}</td><td>${escapeHtml(trade.reason)}</td></tr>`).join("")}</tbody></table></div></section>`;
+  const notice = trades.length > visible.length ? `<p>仅显示前 500 笔，共 ${formatDisplayNumber(trades.length)} 笔</p>` : "";
+  return `<section class="backtest-result-section"><h3>交易记录</h3>${notice}<div class="backtest-table-wrap"><table class="backtest-trades-table"><thead><tr><th>执行日期</th><th>动作</th><th>数量</th><th>成交价</th><th>费用</th><th>原因</th></tr></thead><tbody>${visible.map((trade) => `<tr><td>${escapeHtml(trade.execution_date)}</td><td>${escapeHtml(trade.action)}</td><td>${escapeHtml(formatDisplayNumber(trade.quantity))}</td><td>${escapeHtml(formatDisplayNumber(trade.execution_price))}</td><td>${escapeHtml(formatDisplayNumber(trade.fees))}</td><td>${escapeHtml(trade.reason)}</td></tr>`).join("")}</tbody></table></div></section>`;
 }
 
 function renderBacktestRunAssumptions(result) {
@@ -627,7 +627,7 @@ function renderBacktestRunAssumptions(result) {
   const signals = Array.isArray(result.signals) ? result.signals : [];
   const holdSignals = signals.filter((signal) => signal.action === "HOLD");
   const artifacts = [["manifest_path", "运行清单"], ["signals_path", "策略信号"], ["trades_path", "交易记录"], ["equity_curve_path", "策略净值"], ["buy_hold_equity_path", "买入持有净值"], ["market_benchmark_equity_path", "市场指数净值"], ["metrics_path", "指标数据"], ["report_path", "回测报告"]];
-  return `<section class="backtest-result-section"><h3>运行详情</h3><dl class="backtest-run-details"><dt>请求范围</dt><dd>${escapeHtml(result.requested_start || "-")} 至 ${escapeHtml(result.requested_end || "-")}</dd><dt>实际数据</dt><dd>${escapeHtml(result.actual_start || "-")} 至 ${escapeHtml(result.actual_end || "-")}</dd><dt>策略版本</dt><dd>${escapeHtml(result.strategy_id || "-")}</dd><dt>策略名称</dt><dd>${escapeHtml(definition.name_zh || "-")} · ${escapeHtml(definition.description_zh || "-")}</dd><dt>执行器版本</dt><dd>${escapeHtml(result.adapter_version || "-")}</dd><dt>运行编号</dt><dd>${escapeHtml(result.run_id || "-")}</dd></dl><h4>交易假设</h4><dl class="backtest-run-details"><dt>初始资金</dt><dd>${escapeHtml(assumptions.initial_cash || "-")}</dd><dt>最大策略仓位</dt><dd>${backtestPercent(Number(assumptions.max_strategy_weight) * 100)}</dd><dt>佣金</dt><dd>${escapeHtml(assumptions.commission_bps || "-")} 基点</dd><dt>滑点</dt><dd>${escapeHtml(assumptions.slippage_bps || "-")} 基点</dd><dt>已实现交易费用</dt><dd>${escapeHtml(totalFees.toFixed(2))}</dd></dl><h4>固定参数</h4><dl class="backtest-run-details">${parameters.map(([key, value]) => `<dt>${escapeHtml(parameterLabels[key] || key)}</dt><dd>${escapeHtml(value)}</dd>`).join("")}</dl><p class="backtest-signal-summary">HOLD（观察）信号 ${holdSignals.length} 次${holdSignals.length ? `；${escapeHtml(holdSignals.slice(0, 10).map((signal) => signal.decision_date).join("、"))}` : ""}</p><h4>结果文件</h4><ul class="backtest-artifacts">${artifacts.filter(([key]) => result[key]).map(([key, label]) => `<li><span>${label}</span><code>${escapeHtml(result[key])}</code></li>`).join("")}</ul></section>`;
+  return `<section class="backtest-result-section"><h3>运行详情</h3><dl class="backtest-run-details"><dt>请求范围</dt><dd>${escapeHtml(result.requested_start || "-")} 至 ${escapeHtml(result.requested_end || "-")}</dd><dt>实际数据</dt><dd>${escapeHtml(result.actual_start || "-")} 至 ${escapeHtml(result.actual_end || "-")}</dd><dt>策略版本</dt><dd>${escapeHtml(result.strategy_id || "-")}</dd><dt>策略名称</dt><dd>${escapeHtml(definition.name_zh || "-")} · ${escapeHtml(definition.description_zh || "-")}</dd><dt>执行器版本</dt><dd>${escapeHtml(result.adapter_version || "-")}</dd><dt>运行编号</dt><dd>${escapeHtml(result.run_id || "-")}</dd></dl><h4>交易假设</h4><dl class="backtest-run-details"><dt>初始资金</dt><dd>${escapeHtml(formatDisplayNumber(assumptions.initial_cash))}</dd><dt>最大策略仓位</dt><dd>${backtestPercent(Number(assumptions.max_strategy_weight) * 100)}</dd><dt>佣金</dt><dd>${escapeHtml(formatDisplayNumber(assumptions.commission_bps))} 基点</dd><dt>滑点</dt><dd>${escapeHtml(formatDisplayNumber(assumptions.slippage_bps))} 基点</dd><dt>已实现交易费用</dt><dd>${escapeHtml(formatDisplayNumber(totalFees.toFixed(2)))}</dd></dl><h4>固定参数</h4><dl class="backtest-run-details">${parameters.map(([key, value]) => `<dt>${escapeHtml(parameterLabels[key] || key)}</dt><dd>${escapeHtml(formatDisplayNumber(value))}</dd>`).join("")}</dl><p class="backtest-signal-summary">HOLD（观察）信号 ${formatDisplayNumber(holdSignals.length)} 次${holdSignals.length ? `；${escapeHtml(holdSignals.slice(0, 10).map((signal) => signal.decision_date).join("、"))}` : ""}</p><h4>结果文件</h4><ul class="backtest-artifacts">${artifacts.filter(([key]) => result[key]).map(([key, label]) => `<li><span>${label}</span><code>${escapeHtml(result[key])}</code></li>`).join("")}</ul></section>`;
 }
 
 function finiteBacktestExtent(values) {
@@ -1120,8 +1120,8 @@ function renderKellyOrderSync(experiment) {
   const rows = [
     ["环境", sync.environment],
     ["最近同步", sync.last_synced_at],
-    ["订单", sync.order_count],
-    ["成交", sync.fill_count],
+    ["订单", formatDisplayNumber(sync.order_count)],
+    ["成交", formatDisplayNumber(sync.fill_count)],
   ];
   return `
     <section class="kelly-order-sync" aria-label="Kelly 订单同步">
@@ -1176,10 +1176,10 @@ function renderKellyOrderSyncOrder(order) {
     symbolCell,
     escapeHtml(kellyOrderSideLabel(item.side)),
     escapeHtml(formatPlain(item.submitted_at || "-")),
-    escapeHtml(formatPlain(item.order_price || "-")),
-    escapeHtml(formatPlain(item.order_qty || "-")),
-    escapeHtml(formatPlain(item.filled_qty || "-")),
-    escapeHtml(formatPlain(item.avg_fill_price || "-")),
+    escapeHtml(formatDisplayNumber(item.order_price)),
+    escapeHtml(formatDisplayNumber(item.order_qty)),
+    escapeHtml(formatDisplayNumber(item.filled_qty)),
+    escapeHtml(formatDisplayNumber(item.avg_fill_price)),
     escapeHtml(kellyOrderStatusLabel(item.status)),
   ];
   return `
@@ -1201,11 +1201,11 @@ function renderKellyOrderExecution(experiment) {
   const rows = [
     ["环境", execution.environment],
     ["最近执行", execution.last_executed_at],
-    ["执行", execution.execution_count],
-    ["预演", execution.dry_run_count],
-    ["提交", execution.submitted_count],
-    ["跳过", execution.skipped_count],
-    ["失败", execution.failed_count],
+    ["执行", formatDisplayNumber(execution.execution_count)],
+    ["预演", formatDisplayNumber(execution.dry_run_count)],
+    ["提交", formatDisplayNumber(execution.submitted_count)],
+    ["跳过", formatDisplayNumber(execution.skipped_count)],
+    ["失败", formatDisplayNumber(execution.failed_count)],
   ];
   return `
     <section class="kelly-order-sync" aria-label="Kelly 订单执行">
@@ -1260,9 +1260,9 @@ function renderKellyOrderExecutionRow(execution) {
   const cells = [
     symbolCell,
     escapeHtml(kellyOrderSideLabel(item.side)),
-    escapeHtml(formatPlain(item.price || "-")),
-    escapeHtml(formatPlain(item.qty || "-")),
-    escapeHtml(formatPlain(item.planned_notional || "-")),
+    escapeHtml(formatDisplayNumber(item.price)),
+    escapeHtml(formatDisplayNumber(item.qty)),
+    escapeHtml(formatDisplayNumber(item.planned_notional)),
     escapeHtml(formatPlain(item.futu_order_id || "-")),
     escapeHtml(kellyExecutionStatusLabel(item.execution_status)),
     escapeHtml(formatPlain(item.error || "-")),
@@ -1398,7 +1398,7 @@ function renderKellyStrategyCapital(experiment) {
     ["已占用", formatCapitalMoney(capital.occupied_notional, currency), ""],
     ["可用资金", formatCapitalMoney(capital.available_notional, currency), "primary"],
     ["占用率", firstPresent(utilization, "-"), ""],
-    ["未完成买单", capital.open_buy_order_count, ""],
+    ["未完成买单", formatDisplayNumber(capital.open_buy_order_count), ""],
     ["已实现盈亏", formatCapitalMoney(capital.realized_pnl, currency), ""],
   ];
   return `
@@ -1543,11 +1543,7 @@ function formatCapitalMoney(value, currency) {
   if (!hasValue(value)) {
     return "-";
   }
-  const parsed = Number.parseFloat(String(value).replace(/,/g, ""));
-  const amount = Number.isFinite(parsed)
-    ? parsed.toLocaleString("en-US", { maximumFractionDigits: 2 })
-    : formatPlain(value);
-  return formatMoney(amount, currency);
+  return formatMoney(value, currency);
 }
 
 function capitalSegmentWidth(value, budget, offset = 0) {
@@ -1625,7 +1621,7 @@ function kellyMarketCapitalPool(experiment) {
   }
   const currency = firstPresent(pool.currency, entry.budget_currency);
   const amount = firstPresent(pool.amount, entry.experiment_budget);
-  return hasValue(currency) && hasValue(amount) ? `${formatPlain(currency)} ${formatPlain(amount)}` : "";
+  return hasValue(currency) && hasValue(amount) ? `${formatPlain(currency)} ${formatDisplayNumber(amount)}` : "";
 }
 
 function renderKellyStrategyRules(template, ruleDescriptions) {
@@ -1945,7 +1941,7 @@ function renderTrendReportWorkspace(report) {
         <div><dt>生成时间</dt><dd>${escapeHtml(formatPlain(report.generated_at))}</dd></div>
         <div><dt>账户状态</dt><dd>${escapeHtml(formatPlain(report.account_status))}</dd></div>
       </dl>
-      <div class="trend-report-metrics"><span>卖出 ${escapeHtml(formatPlain(counts.sell || 0))}</span><span>买入 ${escapeHtml(formatPlain(counts.buy || 0))}</span><span>持有 ${escapeHtml(formatPlain(counts.hold || 0))}</span><span>人工复核 ${escapeHtml(formatPlain(counts.review || 0))}</span></div>
+      <div class="trend-report-metrics"><span>卖出 ${escapeHtml(formatDisplayNumber(counts.sell || 0))}</span><span>买入 ${escapeHtml(formatDisplayNumber(counts.buy || 0))}</span><span>持有 ${escapeHtml(formatDisplayNumber(counts.hold || 0))}</span><span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span></div>
     </header>
     <div class="trend-report-body">
       <main class="trend-timeline">
@@ -2130,20 +2126,21 @@ function renderAccountTable(rows) {
     const display = row.display;
     const isSelected = selected && row.key === state.selectedHoldingKey;
     const selectedDetail = isSelected ? normalizeHoldingDetailMode(state.selectedHoldingDetail) : "";
+    const pnlTone = pnlClass(display.unrealized_pnl_pct);
     const detailActions = `<button class="expand-button" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="decision" data-detail-market="${escapeHtml(display.market)}" data-detail-symbol="${escapeHtml(display.symbol)}">交易决策</button><button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
     const cells = `
       <tr class="account-holding-row ${isSelected ? "active-row" : ""}">
         <td class="account-holding-actions"><span class="account-mobile-label">明细</span>${detailActions}</td>
         <td class="account-holding-market"><span class="account-mobile-label">市场</span>${escapeHtml(formatPlain(display.market))}</td>
         <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span></td>
-        <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatPlain(display.total_quantity))}</td>
-        <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatPlain(display.avg_cost_price))}</td>
+        <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatDisplayNumber(display.total_quantity))}</td>
+        <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatDisplayNumber(display.avg_cost_price))}</td>
         <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderQuotePrice(display, quoteForHolding(display))}</td>
         <td class="number-cell account-holding-usd-value"><span class="account-mobile-label">美元市值</span>${escapeHtml(renderUsdMarketValue(display))}</td>
         <td class="number-cell account-holding-market-value"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
         <td class="number-cell account-holding-account-weight"><span class="account-mobile-label">账户权重</span>${escapeHtml(formatPlain(display.account_weight))}</td>
         <td class="number-cell account-holding-portfolio-weight"><span class="account-mobile-label">组合权重</span>${escapeHtml(formatPlain(display.portfolio_weight))}</td>
-        <td class="number-cell account-holding-pnl"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatPlain(display.unrealized_pnl_pct))}</td>
+        <td class="number-cell account-holding-pnl${pnlTone ? ` ${pnlTone}` : ""}"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatPlain(display.unrealized_pnl_pct))}</td>
       </tr>`;
     if (!isSelected) return cells;
     return `${cells}<tr class="decision-detail-row"><td colspan="${ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT}"><div class="symbol-detail-panel inline-symbol-detail">${selectedDetail === "t_signal"
@@ -4625,9 +4622,13 @@ function watchPointText(holding) {
 function decisionMetricCells(holding) {
   const action = currentDecisionAction(holding);
   const strategy = holding.strategy || {};
+  const target = safeRangeText(
+    formatDisplayNumber(strategy.target_1),
+    formatDisplayNumber(strategy.target_2),
+  ) || formatDisplayNumber(safePrimaryValue(strategy.target_range));
   return [
     ["观点", analystViewText(holding)],
-    ["目标价", safeRangeText(strategy.target_1, strategy.target_2) || safePrimaryValue(strategy.target_range)],
+    ["目标价", formatDisplayNumber(target)],
     ["触发状态", decisionTriggerText(action)],
     ["动作状态", mappedActionStatusLabel(action.status)],
     ["下次复评", nextReviewText(holding)],
@@ -5794,11 +5795,11 @@ function renderQuotePrice(holding, quote) {
   const sessionKey = String(quote.price_session || "");
   const session = String(holding && holding.market || "").toUpperCase() === "US"
     ? sessionQuoteLabel(sessionKey) : "";
-  if (!session) return escapeHtml(String(quote.last_price));
+  if (!session) return escapeHtml(formatDisplayNumber(quote.last_price));
   const detail = quote.current_session_quote
     ? quoteTimeEt(quote.price_time)
     : "上一有效价";
-  return `<span class="session-quote"><span class="session-quote-label" data-session="${escapeHtml(sessionKey)}">${escapeHtml(session)}</span><strong class="session-quote-price">${escapeHtml(String(quote.last_price))}</strong>${detail ? `<span class="session-quote-time">· ${escapeHtml(detail)}</span>` : ""}</span>`;
+  return `<span class="session-quote"><span class="session-quote-label" data-session="${escapeHtml(sessionKey)}">${escapeHtml(session)}</span><strong class="session-quote-price">${escapeHtml(formatDisplayNumber(quote.last_price))}</strong>${detail ? `<span class="session-quote-time">· ${escapeHtml(detail)}</span>` : ""}</span>`;
 }
 
 function sessionQuoteLabel(value) {
@@ -5925,11 +5926,22 @@ function splitList(value) {
     .filter(Boolean);
 }
 
+function formatDisplayNumber(value) {
+  const raw = formatPlain(value).trim();
+  const match = raw.match(/^([+-]?)(\d+)(\.\d+)?$/);
+  if (!match) return raw;
+  const [, sign, integer, fraction = ""] = match;
+  return `${sign}${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${fraction}`;
+}
+
 function formatMoney(value, currency) {
-  if (!hasValue(value)) {
-    return "-";
-  }
-  return `${currency} ${value}`;
+  if (!hasValue(value)) return "-";
+  return `${currency} ${formatDisplayNumber(value)}`;
+}
+
+function pnlClass(value) {
+  const number = numericValue(String(value || "").replace("%", ""));
+  return number > 0 ? "pnl-profit" : number < 0 ? "pnl-loss" : "";
 }
 
 function formatPlain(value) {
