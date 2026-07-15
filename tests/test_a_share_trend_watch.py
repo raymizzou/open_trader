@@ -905,6 +905,37 @@ def test_legacy_generic_trigger_receipt_does_not_suppress_required_groups(
     ]
 
 
+def test_trigger_notification_does_not_replay_after_position_is_removed(
+    tmp_path: Path,
+) -> None:
+    events_path = tmp_path / "events.jsonl"
+    append_watch_event(
+        events_path,
+        symbol="600900",
+        trading_date="2026-07-15",
+        event_type="protection_triggered",
+        occurred_at="2026-07-15T09:31:00+08:00",
+        last_price=Decimal("27.30"),
+        active_line=Decimal("27.31"),
+    )
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+
+    result = run_once(
+        tmp_path,
+        quote=SequenceQuote([]),
+        portfolio_path=portfolio(tmp_path, symbol=None),
+        events_path=events_path,
+        notifier=CompositeNotifier([feishu, macos]),
+    )
+
+    assert result.watched_symbol_count == 0
+    assert feishu.messages == macos.messages == []
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "protection_triggered"
+    ]
+
+
 @pytest.mark.parametrize(
     ("active_line", "snapshots", "fact_type"),
     [

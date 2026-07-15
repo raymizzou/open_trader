@@ -252,6 +252,8 @@ def watch_a_share_protection(
                 continue
 
             for symbol, event in sorted(trigger_events.items()):
+                if symbol not in positions:
+                    continue
                 _deliver_trigger_notification(
                     events_path=events_path,
                     notifier=notifier,
