@@ -339,6 +339,65 @@ def test_dashboard_trend_report_does_not_fall_back_to_stale_report(
     assert "buy_actions" not in report
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("strategy_judgments", None),
+        ("formal_actions", {}),
+        ("holding_decisions", {}),
+        ("top10_candidates", {}),
+        ("account", []),
+        ("as_of_date", ""),
+        ("as_of_date", 20260714),
+        ("generated_at", ""),
+        ("generated_at", 20260715113036),
+    ],
+)
+def test_dashboard_trend_report_rejects_selected_invalid_structure_without_fallback(
+    tmp_path: Path,
+    field: str,
+    invalid_value: object,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_futu"
+    reports_dir.mkdir(parents=True)
+    valid_payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": {},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": "VALID-BUT-OLDER"}],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+    }
+    invalid_payload = json.loads(json.dumps(valid_payload))
+    if field in {"formal_actions", "holding_decisions", "top10_candidates"}:
+        invalid_payload["strategy_judgments"][field] = invalid_value
+    else:
+        invalid_payload[field] = invalid_value
+    (reports_dir / "2026-07-15-b.json").write_text(
+        json.dumps(invalid_payload), encoding="utf-8"
+    )
+    if field != "generated_at":
+        valid_payload["generated_at"] = "2026-07-15T10:00:00+08:00"
+        (reports_dir / "2026-07-15-a.json").write_text(
+            json.dumps(valid_payload), encoding="utf-8"
+        )
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["futu"]
+
+    assert report["available"] is False
+    assert "sell_actions" not in report
+    assert "buy_actions" not in report
+    assert "review_actions" not in report
+
+
 def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
     tmp_path: Path,
 ) -> None:
@@ -346,13 +405,20 @@ def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
     path = config.reports_dir / "trend_a_share" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
     unknown_action = {"action": "WAIT", "reason": "trend_intact", "symbol": "600001"}
-    unknown_reason = {"action": "HOLD", "reason": "new_reason", "symbol": "600002"}
+    unknown_reason = {"action": "SELL_ALL", "reason": "new_reason", "symbol": "600002"}
+    valid_buy = {"action": "BUY", "symbol": "600003"}
+    unknown_buy_reason = {"action": "BUY", "reason": "new_reason", "symbol": "600004"}
     path.write_text(json.dumps({
         "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": {},
         "strategy_judgments": {
-            "formal_actions": [],
-            "holding_decisions": [unknown_action, unknown_reason],
+            "formal_actions": [
+                unknown_action, unknown_reason, valid_buy, unknown_buy_reason,
+            ],
+            "holding_decisions": [unknown_reason],
+            "top10_candidates": [],
         },
     }), encoding="utf-8")
 
@@ -362,8 +428,11 @@ def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
         today=date(2026, 7, 15),
     )["eastmoney"]
 
-    assert report["review_actions"] == [unknown_action, unknown_reason]
-    assert report["counts"]["review"] == 2
+    assert report["review_actions"] == [
+        unknown_action, unknown_reason, unknown_buy_reason,
+    ]
+    assert report["counts"]["review"] == 3
+    assert report["buy_actions"] == [valid_buy]
 
 
 def dashboard_decision_plan(run_date: str) -> dict[str, object]:

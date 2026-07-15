@@ -323,6 +323,19 @@ def _same_day_report_payload(
     return path, payload
 
 
+def _trend_action_needs_review(item: dict[str, Any]) -> bool:
+    action = item.get("action")
+    reason = item.get("reason")
+    known_reason = isinstance(reason, str) and reason in REASON_LABELS
+    if action == "BUY":
+        return reason not in (None, "") and not known_reason
+    return (
+        action == "MANUAL_REVIEW"
+        or action not in ACTION_LABELS
+        or action in {"SELL_ALL", "HOLD"} and not known_reason
+    )
+
+
 def _load_broker_trend_report(
     *,
     data_dir: Path,
@@ -334,46 +347,59 @@ def _load_broker_trend_report(
     buy_window: str,
     report_date: str,
 ) -> dict[str, Any]:
+    unavailable = {
+        "available": False,
+        "broker": broker,
+        "broker_label": broker_label,
+        "market": market,
+        "market_label": market_label,
+    }
     selected = _same_day_report_payload(reports_dir, report_date)
     if selected is None:
-        return {
-            "available": False,
-            "broker": broker,
-            "broker_label": broker_label,
-            "market": market,
-            "market_label": market_label,
-            "status_text": "今日暂无趋势报告",
-        }
+        return {**unavailable, "status_text": "今日暂无趋势报告"}
     path, payload = selected
     judgments = payload.get("strategy_judgments")
-    judgments = judgments if isinstance(judgments, dict) else {}
-    formal = judgments.get("formal_actions")
-    formal = [item for item in formal if isinstance(item, dict)] if isinstance(formal, list) else []
-    holdings = judgments.get("holding_decisions")
-    holdings = [item for item in holdings if isinstance(item, dict)] if isinstance(holdings, list) else []
+    account = payload.get("account")
+    if (
+        not isinstance(judgments, dict)
+        or any(
+            not isinstance(judgments.get(key), list)
+            for key in ("formal_actions", "holding_decisions", "top10_candidates")
+        )
+        or not isinstance(account, dict)
+        or not isinstance(payload.get("as_of_date"), str)
+        or not payload["as_of_date"].strip()
+        or not isinstance(payload.get("generated_at"), str)
+        or not payload["generated_at"].strip()
+    ):
+        return {**unavailable, "status_text": "今日趋势报告无效"}
+    formal = [
+        item for item in judgments["formal_actions"] if isinstance(item, dict)
+    ]
+    holdings = [
+        item for item in judgments["holding_decisions"] if isinstance(item, dict)
+    ]
     sell_actions = [
         item
         for item in formal
-        if item.get("action") == "SELL_ALL" and item.get("reason") in REASON_LABELS
+        if item.get("action") == "SELL_ALL"
+        and not _trend_action_needs_review(item)
     ]
-    buy_actions = [item for item in formal if item.get("action") == "BUY"]
+    buy_actions = [
+        item
+        for item in formal
+        if item.get("action") == "BUY" and not _trend_action_needs_review(item)
+    ]
     hold_actions = [
         item
         for item in holdings
-        if item.get("action") == "HOLD" and item.get("reason") in REASON_LABELS
+        if item.get("action") == "HOLD"
+        and not _trend_action_needs_review(item)
     ]
-    review_actions = [
-        item
-        for item in holdings
-        if item.get("action") == "MANUAL_REVIEW"
-        or item.get("action") not in ACTION_LABELS
-        or (
-            item.get("action") in {"SELL_ALL", "HOLD"}
-            and item.get("reason") not in REASON_LABELS
-        )
-    ]
-    account = payload.get("account")
-    account = account if isinstance(account, dict) else {}
+    review_actions: list[dict[str, Any]] = []
+    for item in formal + holdings:
+        if _trend_action_needs_review(item) and item not in review_actions:
+            review_actions.append(item)
     metadata = payload.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
     directory = reports_dir.name
