@@ -5553,6 +5553,7 @@ function quoteAdjustedTotal(snapshotTotal, rows) {
 
 function accountDisplayRow(holding, detail, summary, portfolioTotal) {
   const quote = quoteForHolding(holding);
+  const hasQuotePrice = numericValue(quote && quote.last_price) > 0;
   const display = quoteAdjustedHolding({
     ...holding,
     ...(detail || {}),
@@ -5565,7 +5566,7 @@ function accountDisplayRow(holding, detail, summary, portfolioTotal) {
     avg_cost_price: formatPlain(detail ? detail.cost_price : holding.avg_cost_price),
     account_weight: percentValue(marketValue, numericValue(summary.portfolio_value_hkd)),
     portfolio_weight: percentValue(marketValue, numericValue(portfolioTotal)),
-    unrealized_pnl_pct: detail && !quote
+    unrealized_pnl_pct: detail && !hasQuotePrice
       ? percentValue(numericValue(display.unrealized_pnl), numericValue(display.cost_value))
       : formatPlain(display.unrealized_pnl_pct),
   };
@@ -5872,13 +5873,15 @@ function quoteAdjustedHolding(holding, quote) {
   const quantity = numericValue(holding && holding.total_quantity);
   const cost = numericValue(holding && holding.cost_value);
   const fx = numericValue(holding && holding.fx_to_hkd);
-  if (price === null || price <= 0 || quantity === null || quantity === 0
-      || cost === null || cost === 0 || fx === null || fx <= 0) {
+  const isStandardUsOption = String(holding.market || "").toUpperCase() === "US"
+    && String(holding.asset_class || "").toLowerCase() === "option";
+  if (price === null || price <= 0 || quantity === null
+      || (isStandardUsOption ? quantity === 0 : quantity <= 0) || cost === null
+      || (isStandardUsOption ? cost === 0 : cost <= 0) || fx === null || fx <= 0) {
     return holding;
   }
   // ponytail: standard US contracts only; use a feed multiplier for adjusted contracts.
-  const multiplier = String(holding.market || "").toUpperCase() === "US"
-    && String(holding.asset_class || "").toLowerCase() === "option" ? 100 : 1;
+  const multiplier = isStandardUsOption ? 100 : 1;
   const marketValue = price * quantity * multiplier;
   const costBasis = cost * multiplier;
   const unrealizedPnl = marketValue - costBasis;

@@ -1114,6 +1114,56 @@ console.log(JSON.stringify({
     }
 
 
+@pytest.mark.parametrize(
+    ("market", "asset_class"),
+    [("US", "stock"), ("HK", "option")],
+    ids=("negative-stock", "negative-non-us-option"),
+)
+def test_dashboard_negative_non_us_option_or_stock_keeps_stale_values(
+    market: str, asset_class: str,
+) -> None:
+    scenario = json.dumps({"market": market, "asset_class": asset_class})
+    output = run_dashboard_js(f"const scenario = {scenario};\n" + r'''
+const holding = {
+  market: scenario.market, asset_class: scenario.asset_class,
+  total_quantity: "-2", cost_value: "-3", fx_to_hkd: "1",
+  market_value: "stale-market", market_value_hkd: "stale-hkd",
+  unrealized_pnl: "stale-pnl", unrealized_pnl_pct: "stale-pct",
+};
+const adjusted = quoteAdjustedHolding(holding, {last_price: "2"});
+console.log(JSON.stringify({
+  same: adjusted === holding,
+  market_value: adjusted.market_value,
+  market_value_hkd: adjusted.market_value_hkd,
+  unrealized_pnl: adjusted.unrealized_pnl,
+  unrealized_pnl_pct: adjusted.unrealized_pnl_pct,
+}));
+''')
+
+    assert json.loads(output) == {
+        "same": True,
+        "market_value": "stale-market",
+        "market_value_hkd": "stale-hkd",
+        "unrealized_pnl": "stale-pnl",
+        "unrealized_pnl_pct": "stale-pct",
+    }
+
+
+def test_dashboard_account_detail_uses_own_percentage_when_quote_price_is_missing() -> None:
+    output = run_dashboard_js(r'''
+state.quotes = {missing: {market: "US", symbol: "QQQ", last_price: ""}};
+const display = accountDisplayRow(
+  {market: "US", symbol: "QQQ", unrealized_pnl_pct: "77.77%"},
+  {broker: "futu", quantity: "1", cost_value: "100", unrealized_pnl: "20"},
+  {broker: "futu", portfolio_value_hkd: "1000"},
+  "2000",
+);
+console.log(display.unrealized_pnl_pct);
+''')
+
+    assert output.strip() == "20.00%"
+
+
 def test_dashboard_renders_one_compact_us_session_price_and_header_time() -> None:
     output = run_dashboard_js(r'''
 const active = renderQuotePrice({market:"US", asset_class:"stock"}, {
