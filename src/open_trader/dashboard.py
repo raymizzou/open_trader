@@ -6,10 +6,12 @@ import json
 import re
 import sys
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from .a_share_trend import ACTION_LABELS, REASON_LABELS
 from .backtest_prices import normalize_backtest_symbol
 
 from .decision_facts import (
@@ -85,6 +87,11 @@ DETAIL_FX_TO_HKD = {
     "USD": Decimal("7.8"),
     "CNY": Decimal("1.08"),
 }
+TREND_REPORT_SOURCES = {
+    "futu": ("US", "美股", "富途", "trend_us_futu", "美股常规交易时段"),
+    "phillips": ("HK", "港股", "辉立", "trend_hk_phillips", "09:30–10:00"),
+    "eastmoney": ("CN", "A股", "东方财富", "trend_a_share", "09:30–10:00"),
+}
 
 
 @dataclass(frozen=True)
@@ -113,7 +120,7 @@ class DashboardState:
     kelly_lab: dict[str, Any]
     backtest_universe: dict[str, list[dict[str, str]]]
     tiger_long_term_strategy: dict[str, Any]
-    trend_market_summaries: dict[str, dict[str, Any]]
+    trend_reports: dict[str, dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,7 +143,7 @@ class DashboardState:
             "kelly_lab": self.kelly_lab,
             "backtest_universe": self.backtest_universe,
             "tiger_long_term_strategy": self.tiger_long_term_strategy,
-            "trend_market_summaries": self.trend_market_summaries,
+            "trend_reports": self.trend_reports,
         }
 
 
@@ -256,7 +263,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         tiger_long_term_strategy=_load_dashboard_tiger_long_term_strategy(
             config.data_dir
         ),
-        trend_market_summaries=_load_trend_market_summaries(
+        trend_reports=_load_trend_reports(
             config.data_dir, config.reports_dir
         ),
     )
@@ -278,81 +285,138 @@ def _load_dashboard_tiger_long_term_strategy(data_dir: Path) -> dict[str, Any]:
         }
 
 
-def _load_trend_market_summaries(
-    data_dir: Path, reports_dir: Path
+def _load_trend_reports(
+    data_dir: Path, reports_dir: Path, *, today: date | None = None
 ) -> dict[str, dict[str, Any]]:
+    report_date = (today or date.today()).isoformat()
     return {
-        market: _load_trend_market_summary(
+        broker: _load_broker_trend_report(
             data_dir=data_dir,
-            reports_dir=reports_dir,
+            reports_dir=reports_dir / directory,
+            broker=broker,
             market=market,
-            directory=directory,
+            market_label=market_label,
+            broker_label=broker_label,
+            buy_window=buy_window,
+            report_date=report_date,
         )
-        for market, directory in (
-            ("US", "trend_us_futu"),
-            ("HK", "trend_hk_phillips"),
-        )
+        for broker, (market, market_label, broker_label, directory, buy_window)
+        in TREND_REPORT_SOURCES.items()
     }
 
 
-def _load_trend_market_summary(
-    *, data_dir: Path, reports_dir: Path, market: str, directory: str
+def _same_day_report_payload(
+    reports_dir: Path, report_date: str
+) -> tuple[Path, dict[str, Any]] | None:
+    matches: list[tuple[str, str, Path, dict[str, Any]]] = []
+    for path in reports_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("execution_date") != report_date:
+            continue
+        matches.append((str(payload.get("generated_at") or ""), path.name, path, payload))
+    if not matches:
+        return None
+    _, _, path, payload = max(matches, key=lambda item: (item[0], item[1]))
+    return path, payload
+
+
+def _load_broker_trend_report(
+    *,
+    data_dir: Path,
+    reports_dir: Path,
+    broker: str,
+    market: str,
+    market_label: str,
+    broker_label: str,
+    buy_window: str,
+    report_date: str,
 ) -> dict[str, Any]:
-    candidates = list((reports_dir / directory).glob("*.json"))
-    if not candidates:
+    selected = _same_day_report_payload(reports_dir, report_date)
+    if selected is None:
         return {
             "available": False,
+            "broker": broker,
+            "broker_label": broker_label,
             "market": market,
-            "error": "趋势报告尚未生成",
+            "market_label": market_label,
+            "status_text": "今日暂无趋势报告",
         }
-    path = max(candidates, key=lambda item: (item.stat().st_mtime_ns, item.name))
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        judgments = payload["strategy_judgments"]
-        formal_actions = judgments["formal_actions"]
-        holding_decisions = judgments["holding_decisions"]
-        if not isinstance(formal_actions, list) or not isinstance(holding_decisions, list):
-            raise ValueError("invalid strategy judgments")
-        account = payload.get("account") or {}
-        metadata = payload.get("metadata") or {}
-        return {
-            "available": True,
-            "market": market,
-            "data_date": str(payload.get("as_of_date") or ""),
-            "account_source_date": str(account.get("source_date") or ""),
-            "run_status": _latest_trend_run_status(
-                data_dir / directory / "run.log",
-                str(
-                    payload.get("delivery_status")
-                    or metadata.get("delivery_status")
-                    or "generated"
-                ),
-            ),
-            "buy_count": sum(
-                item.get("action") == "BUY"
-                for item in formal_actions
-                if isinstance(item, dict)
-            ),
-            "sell_count": sum(
-                item.get("action") == "SELL_ALL"
-                for item in holding_decisions
-                if isinstance(item, dict)
-            ),
-            "manual_review_count": sum(
-                item.get("action") == "MANUAL_REVIEW"
-                for item in holding_decisions
-                if isinstance(item, dict)
-            ),
-            "recent_protection_alert": _recent_trend_protection_alert(
-                data_dir / directory / "watch_events.jsonl"
-            ),
-        }
-    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, ValueError) as exc:
-        return {
-            "available": False,
-            "market": market,
-            "error": f"趋势报告无效：{exc}",
-        }
+    path, payload = selected
+    judgments = payload.get("strategy_judgments")
+    judgments = judgments if isinstance(judgments, dict) else {}
+    formal = judgments.get("formal_actions")
+    formal = [item for item in formal if isinstance(item, dict)] if isinstance(formal, list) else []
+    holdings = judgments.get("holding_decisions")
+    holdings = [item for item in holdings if isinstance(item, dict)] if isinstance(holdings, list) else []
+    sell_actions = [
+        item
+        for item in formal
+        if item.get("action") == "SELL_ALL" and item.get("reason") in REASON_LABELS
+    ]
+    buy_actions = [item for item in formal if item.get("action") == "BUY"]
+    hold_actions = [
+        item
+        for item in holdings
+        if item.get("action") == "HOLD" and item.get("reason") in REASON_LABELS
+    ]
+    review_actions = [
+        item
+        for item in holdings
+        if item.get("action") == "MANUAL_REVIEW"
+        or item.get("action") not in ACTION_LABELS
+        or (
+            item.get("action") in {"SELL_ALL", "HOLD"}
+            and item.get("reason") not in REASON_LABELS
+        )
+    ]
+    account = payload.get("account")
+    account = account if isinstance(account, dict) else {}
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    directory = reports_dir.name
+    return {
+        "available": True,
+        "broker": broker,
+        "broker_label": broker_label,
+        "market": market,
+        "market_label": market_label,
+        "report_date": str(payload.get("execution_date") or ""),
+        "data_date": str(payload.get("as_of_date") or ""),
+        "generated_at": str(payload.get("generated_at") or ""),
+        "account_source_date": str(account.get("source_date") or ""),
+        "account_fresh": bool(account.get("fresh")),
+        "account_status": "已更新" if account.get("fresh") else "已过期，禁止买入",
+        "buy_window": buy_window,
+        "run_status": _latest_trend_run_status(
+            data_dir / directory / "run.log",
+            str(payload.get("delivery_status") or metadata.get("delivery_status") or "generated"),
+        ),
+        "sell_actions": sell_actions,
+        "buy_actions": buy_actions,
+        "hold_actions": hold_actions,
+        "review_actions": review_actions,
+        "counts": {
+            "sell": len(sell_actions),
+            "buy": len(buy_actions),
+            "hold": len(hold_actions),
+            "review": len(review_actions),
+        },
+        "recent_protection_alert": _recent_trend_protection_alert(
+            data_dir / directory / "watch_events.jsonl"
+        ),
+        "audit": {
+            "candidates": judgments.get("top10_candidates", []),
+            "excluded": payload.get("excluded", {}),
+            "industry_concentration": payload.get("industry_concentration", []),
+            "data_sources": payload.get("data_sources", []),
+            "estimated_api_cost": payload.get("estimated_api_cost"),
+            "actual_api_cost": payload.get("actual_api_cost"),
+            "artifact": path.name,
+        },
+    }
 
 
 def _recent_trend_protection_alert(path: Path) -> str:

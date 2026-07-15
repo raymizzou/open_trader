@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import csv
 import json
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import open_trader.dashboard as dashboard_module
 
 from open_trader.advice.models import (
     PREMARKET_ACTION_FIELDNAMES,
@@ -202,33 +204,72 @@ def test_dashboard_marks_tiger_long_term_strategy_unavailable(
     assert expected_error in strategy["error"]
 
 
-def test_dashboard_loads_separate_us_hk_trend_summaries(tmp_path: Path) -> None:
+def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
-    for directory, market, as_of, actions, holdings in [
+
+    class FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return cls(2026, 7, 15)
+
+    monkeypatch.setattr(dashboard_module, "date", FixedDate)
+    for directory, account_source_date, data_sources in [
         (
-            "trend_us_futu", "US", "2026-07-14",
-            [{"action": "BUY", "symbol": "VIXY"}, {"action": "SELL_ALL", "symbol": "AAPL"}],
-            [{"action": "SELL_ALL"}, {"action": "MANUAL_REVIEW"}],
+            "trend_us_futu",
+            "2026-07-14",
+            ["Trend Animals", "Futu US daily K-line"],
         ),
         (
-            "trend_hk_phillips", "HK", "2026-07-15",
-            [{"action": "BUY", "symbol": "02800"}],
-            [{"action": "MANUAL_REVIEW"}, {"action": "MANUAL_REVIEW"}],
+            "trend_hk_phillips",
+            "2026-06",
+            ["Trend Animals", "Futu HK daily K-line"],
+        ),
+        (
+            "trend_a_share",
+            "2026-07-14",
+            ["Trend Animals"],
         ),
     ]:
-        path = config.reports_dir / directory / f"{as_of}.json"
+        path = config.reports_dir / directory / "2026-07-15-b.json"
         path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({
-            "as_of_date": as_of,
-            "generated_at": f"{as_of}T18:00:00+08:00",
+        payload = {
+            "execution_date": "2026-07-15",
+            "as_of_date": "2026-07-14",
+            "generated_at": "2026-07-15T11:30:36+08:00",
             "delivery_status": "sent",
-            "account": {"source_date": "2026-06" if market == "HK" else as_of},
+            "account": {"source_date": account_source_date, "fresh": directory != "trend_hk_phillips"},
             "strategy_judgments": {
-                "formal_actions": actions,
-                "holding_decisions": holdings,
+                "formal_actions": [
+                    {"action": "SELL_ALL", "reason": "danger_signal", "symbol": "AAPL"},
+                    {"action": "BUY", "symbol": "VIXY", "target_amount": "5000"},
+                ],
+                "holding_decisions": [
+                    {"action": "SELL_ALL", "reason": "danger_signal", "symbol": "AAPL"},
+                    {"action": "HOLD", "reason": "trend_intact", "symbol": "SPY"},
+                ],
+                "top10_candidates": [{"symbol": "VIXY", "strength": "95"}],
             },
-        }), encoding="utf-8")
+            "industry_concentration": [["科技", 1, "0.25"]],
+            "excluded": {"QQQ": ["already_held"]},
+            "data_sources": data_sources,
+            "estimated_api_cost": "1.20",
+            "actual_api_cost": "1.00",
+            "metadata": {"delivery_status": "generated"},
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        if directory == "trend_us_futu":
+            for filename, generated_at, symbol in (
+                ("2026-07-15-a.json", "2026-07-15T11:30:36+08:00", "WRONG-A"),
+                ("2026-07-15-z.json", "2026-07-15T10:00:00+08:00", "WRONG-Z"),
+            ):
+                revision = json.loads(json.dumps(payload))
+                revision["generated_at"] = generated_at
+                revision["strategy_judgments"]["formal_actions"][0]["symbol"] = symbol
+                (path.parent / filename).write_text(json.dumps(revision), encoding="utf-8")
     events = config.data_dir / "trend_us_futu/watch_events.jsonl"
     events.parent.mkdir(parents=True)
     events.write_text(json.dumps({
@@ -240,22 +281,89 @@ def test_dashboard_loads_separate_us_hk_trend_summaries(tmp_path: Path) -> None:
         "event": "failed", "run_date": "2026-07-15",
     }) + "\n", encoding="utf-8")
 
-    summaries = load_dashboard_state(config).to_dict()["trend_market_summaries"]
+    state = load_dashboard_state(config).to_dict()
+    reports = state["trend_reports"]
 
-    assert summaries["US"] == {
-        "available": True,
-        "market": "US",
-        "data_date": "2026-07-14",
-        "account_source_date": "2026-07-14",
-        "run_status": "failed",
-        "buy_count": 1,
-        "sell_count": 1,
-        "manual_review_count": 1,
-        "recent_protection_alert": "AAPL · 2026-07-15T22:00:00+08:00 · 保护线 190",
+    assert set(reports) == {"futu", "phillips", "eastmoney"}
+    assert "trend_market_summaries" not in state
+    assert reports["futu"]["report_date"] == "2026-07-15"
+    assert reports["futu"]["data_date"] == "2026-07-14"
+    assert reports["futu"]["generated_at"] == "2026-07-15T11:30:36+08:00"
+    assert reports["futu"]["sell_actions"][0]["symbol"] == "AAPL"
+    assert reports["futu"]["counts"] == {"sell": 1, "buy": 1, "hold": 1, "review": 0}
+    assert reports["futu"]["run_status"] == "failed"
+    assert reports["futu"]["recent_protection_alert"] == (
+        "AAPL · 2026-07-15T22:00:00+08:00 · 保护线 190"
+    )
+    assert reports["futu"]["audit"] == {
+        "candidates": [{"symbol": "VIXY", "strength": "95"}],
+        "excluded": {"QQQ": ["already_held"]},
+        "industry_concentration": [["科技", 1, "0.25"]],
+        "data_sources": ["Trend Animals", "Futu US daily K-line"],
+        "estimated_api_cost": "1.20",
+        "actual_api_cost": "1.00",
+        "artifact": "2026-07-15-b.json",
     }
-    assert summaries["HK"]["buy_count"] == 1
-    assert summaries["HK"]["manual_review_count"] == 2
-    assert summaries["HK"]["recent_protection_alert"] == "无"
+    assert reports["phillips"]["buy_window"] == "09:30–10:00"
+    assert reports["phillips"]["account_status"] == "已过期，禁止买入"
+    assert reports["eastmoney"]["market_label"] == "A股"
+    assert reports["eastmoney"]["audit"]["data_sources"] == ["Trend Animals"]
+
+
+def test_dashboard_trend_report_does_not_fall_back_to_stale_report(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_us_futu" / "2026-07-14.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "execution_date": "2026-07-14",
+        "generated_at": "2026-07-14T18:00:00+08:00",
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": "STALE-BUY"}],
+            "holding_decisions": [
+                {"action": "SELL_ALL", "reason": "danger_signal", "symbol": "STALE-SELL"},
+            ],
+        },
+    }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["futu"]
+
+    assert report["available"] is False
+    assert report["status_text"] == "今日暂无趋势报告"
+    assert "sell_actions" not in report
+    assert "buy_actions" not in report
+
+
+def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share" / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    unknown_action = {"action": "WAIT", "reason": "trend_intact", "symbol": "600001"}
+    unknown_reason = {"action": "HOLD", "reason": "new_reason", "symbol": "600002"}
+    path.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [unknown_action, unknown_reason],
+        },
+    }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert report["review_actions"] == [unknown_action, unknown_reason]
+    assert report["counts"]["review"] == 2
 
 
 def dashboard_decision_plan(run_date: str) -> dict[str, object]:
