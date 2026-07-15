@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 import math
@@ -24,6 +25,26 @@ QUOTE_INTERRUPTED_NEXT_STEP = (
 SNAPSHOT_FAILED_NEXT_STEP = (
     "请检查 OpenD 行情服务状态和网络连接，然后重新运行每日盘前流程。"
 )
+
+
+@dataclass(frozen=True)
+class DashboardQuoteSnapshot:
+    futu_symbol: str
+    last_price: Decimal | None
+    pre_price: Decimal | None
+    after_price: Decimal | None
+    overnight_price: Decimal | None
+    update_time: str
+
+
+def _positive_decimal(value: object) -> Decimal | None:
+    if value in {None, ""}:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() and parsed > 0 else None
 
 
 class FutuQuoteError(RuntimeError):
@@ -108,37 +129,61 @@ class FutuQuoteClient:
         requested = set(futu_symbols)
         ret_code, data = self.context.get_market_snapshot(list(futu_symbols))
         if ret_code != 0:
-            message = str(data)
-            if "网络中断" in message:
-                raise FutuQuoteError(
-                    message,
-                    error_type="quote_server_interrupted",
-                    next_step=QUOTE_INTERRUPTED_NEXT_STEP,
-                    opend_reachable=True,
-                    context_ok=True,
-                    snapshot_ok=False,
-                )
-            raise FutuQuoteError(
-                message,
-                error_type="snapshot_failed",
-                next_step=SNAPSHOT_FAILED_NEXT_STEP,
-                opend_reachable=True,
-                context_ok=True,
-                snapshot_ok=False,
-            )
+            self._raise_quote_error(str(data), error_type="snapshot_failed")
         snapshots: dict[str, QuoteSnapshot] = {}
         for record in data.to_dict("records"):
             code = str(record.get("code", "")).strip()
-            raw_price = record.get("last_price")
-            if code not in requested or raw_price in {None, ""}:
+            price = _positive_decimal(record.get("last_price"))
+            if code not in requested or price is None:
                 continue
-            try:
-                price = Decimal(str(raw_price))
-            except (InvalidOperation, ValueError):
-                continue
-            if price.is_finite() and price > 0:
-                snapshots[code] = QuoteSnapshot(futu_symbol=code, last_price=price)
+            snapshots[code] = QuoteSnapshot(futu_symbol=code, last_price=price)
         return snapshots
+
+    def get_dashboard_snapshots(
+        self, futu_symbols: Sequence[str]
+    ) -> dict[str, DashboardQuoteSnapshot]:
+        requested = set(futu_symbols)
+        ret_code, data = self.context.get_market_snapshot(list(futu_symbols))
+        if ret_code != 0:
+            self._raise_quote_error(str(data), error_type="snapshot_failed")
+        snapshots: dict[str, DashboardQuoteSnapshot] = {}
+        for record in data.to_dict("records"):
+            code = str(record.get("code", "")).strip()
+            if code not in requested:
+                continue
+            snapshots[code] = DashboardQuoteSnapshot(
+                futu_symbol=code,
+                last_price=_positive_decimal(record.get("last_price")),
+                pre_price=_positive_decimal(record.get("pre_price")),
+                after_price=_positive_decimal(record.get("after_price")),
+                overnight_price=_positive_decimal(record.get("overnight_price")),
+                update_time=str(record.get("update_time", "")).strip(),
+            )
+        return snapshots
+
+    def get_market_states(self, futu_symbols: Sequence[str]) -> dict[str, str]:
+        requested = set(futu_symbols)
+        ret_code, data = self.context.get_market_state(list(futu_symbols))
+        if ret_code != 0:
+            self._raise_quote_error(str(data), error_type="market_state_failed")
+        return {
+            code: str(record.get("market_state", "")).strip()
+            for record in data.to_dict("records")
+            if (code := str(record.get("code", "")).strip()) in requested
+        }
+
+    def _raise_quote_error(self, message: str, *, error_type: str) -> None:
+        interrupted = "网络中断" in message
+        raise FutuQuoteError(
+            message,
+            error_type="quote_server_interrupted" if interrupted else error_type,
+            next_step=(
+                QUOTE_INTERRUPTED_NEXT_STEP if interrupted else SNAPSHOT_FAILED_NEXT_STEP
+            ),
+            opend_reachable=True,
+            context_ok=True,
+            snapshot_ok=error_type == "market_state_failed",
+        )
 
     def get_cn_trading_days(self, *, start: str, end: str) -> list[str]:
         return self.get_trading_days(market="CN", start=start, end=end)

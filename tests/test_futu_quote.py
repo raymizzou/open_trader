@@ -4,7 +4,11 @@ from decimal import Decimal
 
 import pytest
 
-from open_trader.futu_quote import FutuQuoteClient, FutuQuoteError
+from open_trader.futu_quote import (
+    DashboardQuoteSnapshot,
+    FutuQuoteClient,
+    FutuQuoteError,
+)
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.kline_technical_facts import DailyKlineBar
 
@@ -37,6 +41,13 @@ class FakeOpenQuoteContext:
                 ]
             ),
         )
+
+    def get_market_state(self, symbols: list[str]) -> tuple[int, object]:
+        self.requested_market_state_symbols = symbols
+        return 0, FakeDataFrame([
+            {"code": "US.VIXY", "market_state": "OVERNIGHT"},
+            {"code": "US.QQQ", "market_state": "PRE_MARKET_BEGIN"},
+        ])
 
     def request_trading_days(
         self, *, market: object, start: str, end: str
@@ -224,6 +235,81 @@ def test_futu_quote_client_returns_normalized_snapshots() -> None:
         "US.QQQ": QuoteSnapshot("US.QQQ", Decimal("510.25")),
     }
     assert client.context.requested_symbols == ["US.VIXY", "US.QQQ"]
+
+
+def test_futu_quote_client_returns_dashboard_session_snapshots() -> None:
+    class SessionContext(FakeOpenQuoteContext):
+        def get_market_snapshot(self, symbols: list[str]) -> tuple[int, object]:
+            self.requested_symbols = symbols
+            return 0, FakeDataFrame([
+                {
+                    "code": "US.DRAM",
+                    "last_price": "61.23",
+                    "pre_price": "60.73",
+                    "after_price": "62.22",
+                    "overnight_price": "61.50",
+                    "update_time": "2026-07-15 03:03:01.150",
+                },
+                {
+                    "code": "US.BAD",
+                    "last_price": "NaN",
+                    "pre_price": "0",
+                    "after_price": "-1",
+                    "overnight_price": "",
+                    "update_time": "2026-07-15 03:04:00",
+                },
+            ])
+
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=SessionContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    assert client.get_dashboard_snapshots(["US.DRAM", "US.BAD"]) == {
+        "US.DRAM": DashboardQuoteSnapshot(
+            futu_symbol="US.DRAM",
+            last_price=Decimal("61.23"),
+            pre_price=Decimal("60.73"),
+            after_price=Decimal("62.22"),
+            overnight_price=Decimal("61.50"),
+            update_time="2026-07-15 03:03:01.150",
+        ),
+        "US.BAD": DashboardQuoteSnapshot(
+            futu_symbol="US.BAD",
+            last_price=None,
+            pre_price=None,
+            after_price=None,
+            overnight_price=None,
+            update_time="2026-07-15 03:04:00",
+        ),
+    }
+
+
+def test_futu_quote_client_returns_per_symbol_market_states() -> None:
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    assert client.get_market_states(["US.VIXY", "US.QQQ"]) == {
+        "US.VIXY": "OVERNIGHT",
+        "US.QQQ": "PRE_MARKET_BEGIN",
+    }
+    assert client.context.requested_market_state_symbols == ["US.VIXY", "US.QQQ"]
+
+
+def test_futu_quote_client_keeps_watcher_snapshot_contract() -> None:
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    assert client.get_snapshots(["US.VIXY"]) == {
+        "US.VIXY": QuoteSnapshot("US.VIXY", Decimal("94.5"))
+    }
 
 
 def test_futu_quote_client_returns_cn_trading_days() -> None:
