@@ -375,6 +375,56 @@ def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
     )
 
 
+def _finite_decimal(value: object) -> bool:
+    try:
+        return Decimal(str(value)).is_finite()
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _valid_account_source_date(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    format_ = {7: "%Y-%m", 10: "%Y-%m-%d"}.get(len(value))
+    if format_ is None:
+        return False
+    try:
+        return datetime.strptime(value, format_).strftime(format_) == value
+    except ValueError:
+        return False
+
+
+def _valid_trend_position(value: object) -> bool:
+    if not isinstance(value, Mapping) or any(
+        not isinstance(value.get(field), str) or not value[field].strip()
+        for field in ("symbol", "name", "asset_class")
+    ):
+        return False
+    average_cost = value.get("avg_cost_price")
+    return (
+        _finite_decimal(value.get("quantity"))
+        and _finite_decimal(value.get("market_value"))
+        and "avg_cost_price" in value
+        and (average_cost is None or _finite_decimal(average_cost))
+    )
+
+
+def _valid_trend_account(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    positions = value.get("positions")
+    exceptions = value.get("exceptions")
+    return (
+        _valid_account_source_date(value.get("source_date"))
+        and _finite_decimal(value.get("net_value"))
+        and _finite_decimal(value.get("available_cash"))
+        and isinstance(positions, list)
+        and all(_valid_trend_position(item) for item in positions)
+        and isinstance(exceptions, list)
+        and all(isinstance(item, str) for item in exceptions)
+    )
+
+
 def _check_trend_artifact_projection(
     reports_dir: Path, broker: str, report: Mapping[str, Any]
 ) -> None:
@@ -403,12 +453,13 @@ def _check_trend_artifact_projection(
         and metadata.get("market") == expected_market
         and metadata.get("broker") == broker
     ), f"{broker} 冻结报告身份与 API 投影不一致"
+    assert _valid_trend_account(payload.get("account")), (
+        f"{broker} 冻结报告账户快照无效"
+    )
     judgments = payload.get("strategy_judgments")
     assert isinstance(judgments, Mapping), f"{broker} 冻结报告缺少策略判断"
     formal = judgments.get("formal_actions")
     holdings = judgments.get("holding_decisions")
-    account = payload.get("account")
-    buy_allowed = isinstance(account, Mapping) and account.get("fresh") is True
     assert isinstance(formal, list) and all(
         isinstance(item, Mapping) for item in formal
     ), f"{broker} 冻结报告正式动作无效"
@@ -422,7 +473,6 @@ def _check_trend_artifact_projection(
     buys = [
         item for item in formal
         if item.get("action") == "BUY"
-        and buy_allowed
         and not _trend_action_needs_review(item)
     ]
     holds = [
@@ -431,10 +481,7 @@ def _check_trend_artifact_projection(
     ]
     reviews: list[Mapping[str, Any]] = []
     for item in [*formal, *holdings]:
-        if (
-            _trend_action_needs_review(item)
-            or not buy_allowed and item.get("action") == "BUY"
-        ) and item not in reviews:
+        if _trend_action_needs_review(item) and item not in reviews:
             reviews.append(item)
     expected_actions = {
         "sell_actions": sells,

@@ -19,6 +19,35 @@ from open_trader.dashboard_acceptance import (
 )
 
 
+MISSING_FRESH = object()
+
+
+def serialized_trend_account(
+    *, fresh: object = MISSING_FRESH,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "source_date": "2026-07-14",
+        "net_value": "100000",
+        "available_cash": "50000",
+        "positions": [],
+        "exceptions": [],
+    }
+    if fresh is not MISSING_FRESH:
+        payload["fresh"] = fresh
+    return payload
+
+
+def serialized_trend_position() -> dict[str, object]:
+    return {
+        "symbol": "VIXY",
+        "name": "ProShares VIX",
+        "asset_class": "etf",
+        "quantity": "10",
+        "avg_cost_price": None,
+        "market_value": "500",
+    }
+
+
 def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
     makefile = Path("Makefile").read_text(encoding="utf-8")
 
@@ -190,7 +219,7 @@ def test_acceptance_rejects_api_projection_that_drops_frozen_action(
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": {"fresh": True},
+        "account": serialized_trend_account(fresh=True),
         "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VIXY"}],
@@ -238,10 +267,10 @@ def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
+    "fresh", [False, MISSING_FRESH, None, "yes"]
 )
-def test_acceptance_rejects_actionable_buy_without_explicit_fresh_account(
-    tmp_path: Path, account: dict[str, object],
+def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
+    tmp_path: Path, fresh: object,
 ) -> None:
     reports = tmp_path / "reports"
     artifact = reports / "trend_us_futu" / "2026-07-15.json"
@@ -251,7 +280,7 @@ def test_acceptance_rejects_actionable_buy_without_explicit_fresh_account(
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": account,
+        "account": serialized_trend_account(fresh=fresh),
         "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [buy],
@@ -280,7 +309,90 @@ def test_acceptance_rejects_actionable_buy_without_explicit_fresh_account(
         },
     }
 
-    with pytest.raises(AssertionError, match="冻结报告动作与 API 投影不一致"):
+    dashboard_acceptance._check_trend_artifact_projection(
+        reports, "futu", projected
+    )
+
+
+@pytest.mark.parametrize(
+    "account",
+    [
+        None,
+        {},
+        {**serialized_trend_account(), "source_date": ""},
+        {**serialized_trend_account(), "source_date": "not-a-date"},
+        {**serialized_trend_account(), "source_date": "2026-13"},
+        {**serialized_trend_account(), "source_date": "2026-02-30"},
+        {**serialized_trend_account(), "net_value": "NaN"},
+        {**serialized_trend_account(), "available_cash": None},
+        {**serialized_trend_account(), "positions": ["not-a-position"]},
+        {**serialized_trend_account(), "positions": [{}]},
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "symbol": ""}
+            ],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [{**serialized_trend_position(), "name": ""}],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "asset_class": ""}
+            ],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "quantity": "NaN"}
+            ],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "market_value": None}
+            ],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "avg_cost_price": "Infinity"}
+            ],
+        },
+        {**serialized_trend_account(), "exceptions": [1]},
+    ],
+)
+def test_acceptance_rejects_missing_or_malformed_account(
+    tmp_path: Path, account: object,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_us_futu" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "metadata": {"market": "US", "broker": "futu"},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": "VIXY"}],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+    }
+    if account is not None:
+        payload["account"] = account
+    artifact.write_text(json.dumps(payload), encoding="utf-8")
+    projected = {
+        "report_date": "2026-07-15",
+        "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "buy_actions": [{"action": "BUY", "symbol": "VIXY"}],
+        "audit": {"artifact": artifact.name},
+    }
+
+    with pytest.raises(AssertionError, match="账户快照无效"):
         dashboard_acceptance._check_trend_artifact_projection(
             reports, "futu", projected
         )

@@ -283,7 +283,7 @@ def test_market_report_failure_owns_day_at_one_hour_deadline(tmp_path: Path) -> 
     assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
 
 
-def test_hk_report_suppresses_buys_when_statement_is_stale(
+def test_hk_report_keeps_buys_when_statement_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
@@ -387,6 +387,7 @@ def test_hk_report_suppresses_buys_when_statement_is_stale(
         notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
+        now_fn=lambda: datetime(2026, 7, 15, 16, tzinfo=SHANGHAI),
         sleep_fn=lambda seconds: None,
     )
     assert result.report_path is not None and result.json_path is not None
@@ -418,16 +419,22 @@ def test_hk_report_suppresses_buys_when_statement_is_stale(
     assert api_instances == 2  # initial report plus explicit revision; recovery did not refetch
     title, message = notifier.messages[0]
     assert title == "【辉立｜港股趋势报告｜2026-07-16】"
-    assert "今日无买卖动作" in message
-    assert "已过期" in message
-    assert "\n买入\n" not in message
+    assert "账户状态：账户数据非实时，执行前核对现金与持仓" in message
+    assert "今日动作：卖出 0｜买入 1｜持有 1｜复核 0" in message
+    assert "\n买入\n" in message
+    assert "02800 盈富基金" in message
+    assert "禁止买入" not in message
     assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
     actions = payload["strategy_judgments"]["formal_actions"]
-    assert actions == []
+    assert actions[0]["action"] == "BUY"
+    assert actions[0]["symbol"] == "02800"
+    assert actions[0]["target_amount"] == "4000.00"
+    assert actions[0]["estimated_shares"] == 400
     assert payload["account"]["fresh"] is False
-    assert payload["metadata"]["account_check_required"] is True
-    assert payload["protection_state"]["managed_symbols"] == ["00700"]
+    assert payload["metadata"]["position_weight"] == "0.04"
+    assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
 
 
 def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) -> None:

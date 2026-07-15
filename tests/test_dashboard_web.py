@@ -1817,7 +1817,7 @@ bindElements();bindEvents();
 const report=(broker,brokerLabel,marketLabel)=>({
   available:true,broker,broker_label:brokerLabel,market_label:marketLabel,
   report_date:"2026-07-15",data_date:"2026-07-14",generated_at:"2026-07-15T11:30:36+08:00",
-  account_status:"已更新",buy_window:"美股常规交易时段",
+  account_status:"账户数据非实时，执行前核对现金与持仓",buy_window:"美股常规交易时段",
   sell_actions:[{symbol:"SELLX",name:"卖出标的",reason:"danger_signal",active_line:"90"}],
   buy_actions:[{symbol:"BUYX",name:"买入标的",estimated_shares:"20",target_amount:"5000",estimated_initial_line:"88"}],
   hold_actions:[{symbol:"HOLDX",name:"持有标的",reason:"trend_intact",active_line:"80"}],
@@ -1848,6 +1848,7 @@ const workspace=elements["trend-report-workspace"].innerHTML;
 const order=["开盘前","美股常规交易时段","盘中持续","人工复核"].map((text)=>workspace.indexOf(`<h2>${text}</h2>`));
 if(order.some((index)=>index<0)||!order.every((index,i)=>i===0||order[i-1]<index))throw new Error(workspace);
 for(const symbol of ["SELLX","BUYX","HOLDX","REVIEWX"]){if(!workspace.includes(symbol))throw new Error(workspace);}
+if(!workspace.includes("账户数据非实时，执行前核对现金与持仓"))throw new Error(workspace);
 if(!workspace.includes('<details class="trend-audit"><summary>审计详情</summary>')||workspace.includes('<details class="trend-audit" open'))throw new Error(workspace);
 for(const text of ["确认全部卖出动作","按顺序考虑允许买入项","盘中观察活动保护线","完成人工复核"]){if(!workspace.includes(text))throw new Error(workspace);}
 

@@ -46,6 +46,7 @@ from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+MISSING_FRESH = object()
 
 
 def candidate(
@@ -108,6 +109,30 @@ def account(*symbols: str, fresh: bool = True) -> AccountSnapshot:
         ),
         exceptions=(),
     )
+
+
+def serialized_account(*, fresh: object = MISSING_FRESH) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "source_date": "2026-07-14",
+        "net_value": "100000",
+        "available_cash": "50000",
+        "positions": [],
+        "exceptions": [],
+    }
+    if fresh is not MISSING_FRESH:
+        payload["fresh"] = fresh
+    return payload
+
+
+def serialized_position() -> dict[str, object]:
+    return {
+        "symbol": "600001",
+        "name": "测试股票",
+        "asset_class": "stock",
+        "quantity": "100",
+        "avg_cost_price": "9.5",
+        "market_value": "1000",
+    }
 
 
 def holding(
@@ -454,50 +479,52 @@ def test_atr14_requires_fifteen_valid_bars() -> None:
     assert atr14(bars(15)) == Decimal("2")
 
 
-def test_buy_actions_use_one_percent_cash_slots_and_round_lots() -> None:
+def test_buy_actions_respect_four_percent_cash_slots_and_round_lots() -> None:
     ranked = [candidate("600001"), candidate("600002")]
 
     actions = estimate_buy_actions(
         ranked=ranked,
-        account_fresh=True,
         net_value=Decimal("676549.55"),
         available_cash=Decimal("7000"),
         current_position_count=9,
+        position_weight=Decimal("0.04"),
     )
 
     assert [
         (item.symbol, item.target_amount, item.estimated_shares) for item in actions
-    ] == [("600001", Decimal("6765.50"), 600)]
+    ] == [("600001", Decimal("7000"), 700)]
 
 
 def test_buy_action_targets_never_reserve_more_than_available_cash() -> None:
     actions = estimate_buy_actions(
         ranked=[candidate("600001"), candidate("600002")],
-        account_fresh=True,
         net_value=Decimal("676549.55"),
         available_cash=Decimal("7000"),
         current_position_count=8,
+        position_weight=Decimal("0.04"),
     )
 
     assert [(item.symbol, item.target_amount) for item in actions] == [
-        ("600001", Decimal("6765.50"))
+        ("600001", Decimal("7000"))
     ]
     assert sum((item.target_amount for item in actions), Decimal("0")) <= Decimal(
         "7000"
     )
 
 
-def test_stale_account_has_no_formal_buys() -> None:
-    assert (
-        estimate_buy_actions(
-            ranked=[candidate("600001")],
-            account_fresh=False,
-            net_value=Decimal("676549.55"),
-            available_cash=Decimal("405219.55"),
-            current_position_count=5,
-        )
-        == []
+def test_buy_actions_use_four_percent_even_when_account_is_stale() -> None:
+    actions = estimate_buy_actions(
+        ranked=[candidate("600001")],
+        net_value=Decimal("100000"),
+        available_cash=Decimal("10000"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
     )
+
+    assert [
+        (item.symbol, item.target_amount, item.estimated_shares)
+        for item in actions
+    ] == [("600001", Decimal("4000.00"), 400)]
 
 
 def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
@@ -506,19 +533,18 @@ def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
 
     us_actions = estimate_buy_actions(
         ranked=[us],
-        account_fresh=True,
         net_value=Decimal("100000"),
         available_cash=Decimal("1000"),
         current_position_count=0,
+        position_weight=Decimal("0.04"),
         market="US",
     )
     hk_actions = estimate_buy_actions(
         ranked=[hk],
-        account_fresh=False,
-        require_fresh_account=False,
         net_value=Decimal("1000000"),
         available_cash=Decimal("6000"),
         current_position_count=0,
+        position_weight=Decimal("0.04"),
         market="HK",
         lot_sizes={"00700": 100},
     )
@@ -527,14 +553,36 @@ def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
     assert hk_actions[0].estimated_shares == 100
 
 
+def test_hk_four_percent_weight_can_buy_one_board_lot() -> None:
+    hk = replace(
+        candidate("600002", close="127.6"),
+        symbol="06821",
+        exchange="HK",
+    )
+
+    actions = estimate_buy_actions(
+        ranked=[hk],
+        net_value=Decimal("628554.06"),
+        available_cash=Decimal("55053.79"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="HK",
+        lot_sizes={"06821": 100},
+    )
+
+    assert len(actions) == 1
+    assert actions[0].target_amount == Decimal("25142.16")
+    assert actions[0].estimated_shares == 100
+
+
 def test_more_than_ten_positions_has_no_formal_buys() -> None:
     assert (
         estimate_buy_actions(
             ranked=[candidate("600001")],
-            account_fresh=True,
             net_value=Decimal("100000"),
             available_cash=Decimal("100000"),
             current_position_count=11,
+            position_weight=Decimal("0.04"),
         )
         == []
     )
@@ -546,13 +594,13 @@ def test_unaffordable_candidate_does_not_consume_cash_or_slot() -> None:
             candidate("600001", close="20"),
             candidate("600002", close="1"),
         ],
-        account_fresh=True,
         net_value=Decimal("10000"),
         available_cash=Decimal("600"),
         current_position_count=9,
+        position_weight=Decimal("0.04"),
     )
     assert [(item.symbol, item.target_amount, item.estimated_shares) for item in actions] == [
-        ("600002", Decimal("100.00"), 100)
+        ("600002", Decimal("400.00"), 400)
     ]
 
 
@@ -584,6 +632,8 @@ def test_duplicate_pool_members_produce_one_candidate_and_one_buy() -> None:
     )
     assert decisions.eligible == (item,)
     assert [action.symbol for action in built.buy_actions] == ["600001"]
+    assert built.metadata["position_weight"] == "0.04"
+    assert built.metadata["position_weight_source"] == "fallback_4pct"
 
 
 def test_stale_candidate_is_excluded_from_formal_buys() -> None:
@@ -1063,7 +1113,7 @@ def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": True},
+        "account": serialized_account(fresh=True),
         "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "holding_decisions": [
@@ -1145,7 +1195,7 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": False},
+        "account": serialized_account(fresh=False),
         "metadata": {"market": "HK", "broker": "phillips"},
         "strategy_judgments": {
             "holding_decisions": [
@@ -1160,7 +1210,7 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     assert title == "【辉立｜港股趋势报告｜2026-07-15】"
     assert message == (
         "数据截至：2026-07-14\n"
-        "账户状态：已过期\n"
+        "账户状态：账户数据非实时，执行前核对现金与持仓\n"
         "今日无买卖动作｜持有 1｜复核 0\n\n"
         "请人工确认，不自动下单。"
     )
@@ -1170,7 +1220,7 @@ def test_trend_feishu_text_moves_unknown_hold_reason_to_review() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": True},
+        "account": serialized_account(fresh=True),
         "metadata": {"market": "HK"},
         "strategy_judgments": {
             "holding_decisions": [
@@ -1204,7 +1254,7 @@ def test_trend_feishu_text_moves_unknown_formal_buy_reason_to_review() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": True},
+        "account": serialized_account(fresh=True),
         "metadata": {"market": "CN", "broker": "eastmoney"},
         "strategy_judgments": {
             "holding_decisions": [],
@@ -1232,15 +1282,15 @@ def test_trend_feishu_text_moves_unknown_formal_buy_reason_to_review() -> None:
 
 
 @pytest.mark.parametrize(
-    "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
+    "fresh", [False, MISSING_FRESH, None, "yes"]
 )
-def test_trend_feishu_text_never_lists_buy_without_explicit_fresh_account(
-    account: dict[str, object],
+def test_trend_feishu_text_keeps_buy_for_non_realtime_account(
+    fresh: object,
 ) -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": account,
+        "account": serialized_account(fresh=fresh),
         "metadata": {"market": "HK", "broker": "phillips"},
         "strategy_judgments": {
             "holding_decisions": [],
@@ -1261,16 +1311,81 @@ def test_trend_feishu_text_never_lists_buy_without_explicit_fresh_account(
         payload, broker_label="辉立", market_label="港股"
     )
 
-    assert "今日无买卖动作｜持有 0｜复核 1" in message
-    assert "\n买入\n" not in message
-    assert "02800 盈富基金｜未知动作或原因，需人工确认" in message
+    assert "账户状态：账户数据非实时，执行前核对现金与持仓" in message
+    assert "今日动作：卖出 0｜买入 1｜持有 0｜复核 0" in message
+    assert "\n买入\n" in message
+    assert "02800 盈富基金" in message
+    assert "禁止买入" not in message
+
+
+@pytest.mark.parametrize(
+    "account",
+    [
+        None,
+        {},
+        {**serialized_account(), "source_date": ""},
+        {**serialized_account(), "source_date": "not-a-date"},
+        {**serialized_account(), "source_date": "2026-13"},
+        {**serialized_account(), "source_date": "2026-02-30"},
+        {**serialized_account(), "net_value": "NaN"},
+        {**serialized_account(), "available_cash": None},
+        {**serialized_account(), "positions": ["not-a-position"]},
+        {**serialized_account(), "positions": [{}]},
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "symbol": ""}],
+        },
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "name": ""}],
+        },
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "asset_class": ""}],
+        },
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "quantity": "NaN"}],
+        },
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "market_value": None}],
+        },
+        {
+            **serialized_account(),
+            "positions": [
+                {**serialized_position(), "avg_cost_price": "Infinity"}
+            ],
+        },
+        {**serialized_account(), "exceptions": [1]},
+    ],
+)
+def test_trend_feishu_text_rejects_missing_or_malformed_account(
+    account: object,
+) -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "metadata": {"market": "HK", "broker": "phillips"},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [{"action": "BUY", "symbol": "02800"}],
+        },
+    }
+    if account is not None:
+        payload["account"] = account
+
+    with pytest.raises(ValueError, match="账户快照无效"):
+        render_trend_feishu_text(
+            payload, broker_label="辉立", market_label="港股"
+        )
 
 
 def test_trend_feishu_text_lists_reviews_on_no_trade_days() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": True},
+        "account": serialized_account(fresh=True),
         "metadata": {"market": "CN"},
         "strategy_judgments": {
             "holding_decisions": [
@@ -1343,6 +1458,22 @@ def test_markdown_is_operation_first_and_translates_internal_codes() -> None:
     assert "SELL_ALL" not in markdown
     assert "HOLD" not in markdown
     assert "left_trend_right_side" not in markdown
+
+
+@pytest.mark.parametrize("market", ["US", "HK", "CN"])
+def test_markdown_uses_shared_warning_for_stale_account(market: str) -> None:
+    built = report()
+    built = replace(
+        built,
+        account=account(fresh=False),
+        metadata={**built.metadata, "market": market},
+    )
+
+    markdown = render_markdown(built)
+
+    assert "账户：账户数据非实时，执行前核对现金与持仓" in markdown
+    assert "已过期" not in markdown
+    assert "日结单" not in markdown
 
 
 def test_markdown_translates_exclusion_and_api_facts_without_paths() -> None:
@@ -1529,8 +1660,8 @@ def test_no_action_report_uses_exact_cash_sentence() -> None:
 def test_formal_buy_text_includes_window_estimates_target_and_line() -> None:
     markdown = render_markdown(report(candidates=(candidate("600001"),)))
     assert "09:30–10:00" in markdown
-    assert "约 600 股" in markdown
-    assert "金额上限 6765.50 元" in markdown
+    assert "约 2700 股" in markdown
+    assert "金额上限 27061.98 元" in markdown
     assert "预计保护线 9.00" in markdown
     assert "按东方财富实时价格向下取整为 100 股整数倍" in markdown
 
@@ -1841,6 +1972,7 @@ def write_9885_receipt(
     markdown = "# 9885 frozen report\n"
     report_payload = {
         "delivery_status": status,
+        "account": serialized_account(fresh=False),
         "metadata": {"delivery_status": status},
         "protection_state": (
             {"schema_version": 1, "positions": {}}
@@ -2035,8 +2167,8 @@ def test_report_runner_sends_exact_broker_v1_text(tmp_path: Path) -> None:
             "账户状态：已更新\n"
             "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n\n"
             "买入\n"
-            "1. 000001 股票000001｜09:30–10:00｜约 100 股｜金额上限 1000｜保护线 6\n"
-            "2. 000002 股票000002｜09:30–10:00｜约 100 股｜金额上限 1000｜保护线 6\n\n"
+            "1. 000001 股票000001｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 6\n"
+            "2. 000002 股票000002｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 6\n\n"
             "请人工确认，不自动下单。",
         )
     ]

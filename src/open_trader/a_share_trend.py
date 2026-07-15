@@ -36,6 +36,7 @@ NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
 DISCLAIMER_TEXT = (
     "本报告是确定性纪律清单，不是订单或成交事实；所有交易由用户人工确认与执行。"
 )
+NON_REALTIME_ACCOUNT_WARNING = "账户数据非实时，执行前核对现金与持仓"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 CANDIDATE_FIELDS = (
     "tmId",
@@ -80,6 +81,56 @@ class AccountSnapshot:
     available_cash: Decimal
     positions: tuple[AccountPosition, ...]
     exceptions: tuple[str, ...]
+
+
+def _finite_decimal(value: object) -> bool:
+    try:
+        return Decimal(str(value)).is_finite()
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _valid_account_source_date(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    format_ = {7: "%Y-%m", 10: "%Y-%m-%d"}.get(len(value))
+    if format_ is None:
+        return False
+    try:
+        return datetime.strptime(value, format_).strftime(format_) == value
+    except ValueError:
+        return False
+
+
+def _valid_serialized_position(value: object) -> bool:
+    if not isinstance(value, Mapping) or any(
+        not isinstance(value.get(field), str) or not value[field].strip()
+        for field in ("symbol", "name", "asset_class")
+    ):
+        return False
+    average_cost = value.get("avg_cost_price")
+    return (
+        _finite_decimal(value.get("quantity"))
+        and _finite_decimal(value.get("market_value"))
+        and "avg_cost_price" in value
+        and (average_cost is None or _finite_decimal(average_cost))
+    )
+
+
+def valid_serialized_account(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    positions = value.get("positions")
+    exceptions = value.get("exceptions")
+    return (
+        _valid_account_source_date(value.get("source_date"))
+        and _finite_decimal(value.get("net_value"))
+        and _finite_decimal(value.get("available_cash"))
+        and isinstance(positions, list)
+        and all(_valid_serialized_position(item) for item in positions)
+        and isinstance(exceptions, list)
+        and all(isinstance(item, str) for item in exceptions)
+    )
 
 
 @dataclass(frozen=True)
@@ -443,18 +494,17 @@ def build_candidate_list(
 def estimate_buy_actions(
     *,
     ranked: Sequence[CandidateInput],
-    account_fresh: bool,
     net_value: Decimal,
     available_cash: Decimal,
     current_position_count: int,
+    position_weight: Decimal,
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
-    require_fresh_account: bool = True,
 ) -> list[BuyAction]:
     slots = max(0, 10 - current_position_count)
-    if (require_fresh_account and not account_fresh) or slots == 0:
+    if slots == 0:
         return []
-    target = (net_value * Decimal("0.01")).quantize(Decimal("0.01"))
+    target = (net_value * position_weight).quantize(Decimal("0.01"))
     remaining_cash = available_cash
     actions: list[BuyAction] = []
     for item in ranked:
@@ -577,7 +627,8 @@ def build_report(
     metadata: Mapping[str, object] | None = None,
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
-    require_fresh_account: bool = True,
+    position_weight: Decimal = Decimal("0.04"),
+    position_weight_source: str = "fallback_4pct",
 ) -> TrendReport:
     held_symbols = {position.symbol for position in account.positions}
     candidate_decision = build_candidate_list(
@@ -589,13 +640,12 @@ def build_report(
     displayed_candidates = candidate_decision.eligible[:10]
     buy_actions = estimate_buy_actions(
         ranked=displayed_candidates,
-        account_fresh=account.fresh,
         net_value=account.net_value,
         available_cash=account.available_cash,
         current_position_count=len(account.positions),
+        position_weight=position_weight,
         market=market,
         lot_sizes=lot_sizes,
-        require_fresh_account=require_fresh_account,
     )
     old_positions = _state_positions(prior_state)
     holdings: list[HoldingDecision] = []
@@ -736,7 +786,11 @@ def build_report(
             "excluded": excluded_signals,
             "candidates": candidate_signals,
         },
-        metadata=dict(metadata or {}),
+        metadata={
+            **dict(metadata or {}),
+            "position_weight": str(position_weight),
+            "position_weight_source": position_weight_source,
+        },
     )
 
 
@@ -912,7 +966,9 @@ def render_trend_feishu_text(
     execution_date = str(payload.get("execution_date") or "-")
     as_of_date = str(payload.get("as_of_date") or "-")
     account = payload.get("account")
-    account = account if isinstance(account, dict) else {}
+    if not valid_serialized_account(account):
+        raise ValueError("趋势报告账户快照无效")
+    assert isinstance(account, Mapping)
     metadata = payload.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
     market = str(metadata.get("market") or "CN").upper()
@@ -938,7 +994,6 @@ def render_trend_feishu_text(
         item
         for item in formal
         if item.get("action") == "BUY"
-        and fresh
         and not _trend_action_needs_review(item)
     ]
     holds = [
@@ -948,21 +1003,10 @@ def render_trend_feishu_text(
     ]
     reviews: list[dict[str, object]] = []
     for item in formal + holdings:
-        if (
-            _trend_action_needs_review(item)
-            or item.get("action") == "BUY" and not fresh
-        ) and item not in reviews:
+        if _trend_action_needs_review(item) and item not in reviews:
             reviews.append(item)
     title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
-    status = (
-        "已更新"
-        if fresh
-        else (
-            "已过期，禁止买入"
-            if any(item.get("action") == "BUY" for item in formal)
-            else "已过期"
-        )
-    )
+    status = "已更新" if fresh else NON_REALTIME_ACCOUNT_WARNING
     summary = (
         f"今日动作：卖出 {len(sells)}｜买入 {len(buys)}｜持有 {len(holds)}｜复核 {len(reviews)}"
         if sells or buys
@@ -1009,12 +1053,11 @@ def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
     market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(market, market)
     currency = {"CN": "元", "US": "美元", "HK": "港元"}.get(market, "")
-    if market == "HK":
-        freshness = (
-            f"日结单 {report.account.source_date}，交易前须人工核对实际仓位与现金"
-        )
-    else:
-        freshness = "已更新" if report.account.fresh else "已过期，禁止正式买入"
+    freshness = (
+        "已更新"
+        if report.account.fresh is True
+        else NON_REALTIME_ACCOUNT_WARNING
+    )
     sells = [item for item in report.holdings if item.action == "SELL_ALL"]
     holds = [item for item in report.holdings if item.action == "HOLD"]
     reviews = [item for item in report.holdings if item.action == "MANUAL_REVIEW"]
@@ -2045,6 +2088,8 @@ def _attempt_report(
             data_sources=("Trend Animals", "Futu CN calendar/QFQ daily K-line", str(config.portfolio)),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost,
+            position_weight=Decimal("0.04"),
+            position_weight_source="fallback_4pct",
             metadata={
                 "market": "CN",
                 "broker": "eastmoney",
