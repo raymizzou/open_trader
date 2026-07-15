@@ -88,7 +88,7 @@ from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
 from .market_scope import parse_market_scope
-from .notifications import SHANGHAI, NullNotifier, xiaozhi_voice_allowed
+from .notifications import SHANGHAI, NullNotifier, xiaoai_voice_allowed
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.eastmoney import EastmoneyStatementParser
 from .pipeline import run_import, validate_month
@@ -1483,8 +1483,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             config = load_env_config(args.config, dry_run=False)
             voice_suppressed = (
-                "xiaozhi" in getattr(config, "notifiers", ())
-                and not xiaozhi_voice_allowed(datetime.now(SHANGHAI))
+                "xiaoai" in getattr(config, "notifiers", ())
+                and not xiaoai_voice_allowed(datetime.now(SHANGHAI))
             )
             notifier = build_notifier(config)
             attempts = send_notification_with_results(
@@ -1501,7 +1501,11 @@ def main(argv: list[str] | None = None) -> int:
         ) as exc:
             print(f"通知测试失败：{exc}", file=sys.stderr)
             return 1
-        failed_attempts = [attempt for attempt in attempts if not attempt.success]
+        failed_attempts = [
+            attempt
+            for attempt in attempts
+            if not attempt.success and not attempt.suppressed
+        ]
         if failed_attempts:
             for attempt in failed_attempts:
                 print(

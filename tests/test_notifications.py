@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
-import io
 import json
+import shlex
+import subprocess
+import threading
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -14,11 +17,11 @@ from open_trader.notifications import (
     FeishuAppNotifier,
     FeishuWebhookNotifier,
     NotificationError,
-    XiaozhiVoiceNotifier,
+    XiaoaiSSHNotifier,
+    XiaoaiVoiceSuppressed,
     render_feishu_order_review,
-    render_xiaozhi_voice_notification,
-    xiaozhi_not_after,
-    xiaozhi_voice_allowed,
+    render_xiaoai_voice_notification,
+    xiaoai_voice_allowed,
 )
 
 
@@ -277,48 +280,72 @@ def test_feishu_app_notifier_raises_on_token_error() -> None:
         notifier.notify("Open Trader", "hello")
 
 
-def test_xiaozhi_voice_notifier_sends_payload_and_bearer_header() -> None:
-    calls: list[dict[str, object]] = []
+def test_xiaoai_voice_notifier_runs_native_tts_over_ssh(tmp_path: Path) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    key = tmp_path / "speaker-key"
 
-    def fake_post(
-        url: str,
-        payload: dict[str, object],
-        headers: dict[str, str],
-        timeout_seconds: float,
-    ) -> dict[str, object]:
-        calls.append(
-            {
-                "url": url,
-                "payload": payload,
-                "headers": headers,
-                "timeout": timeout_seconds,
-            }
-        )
-        return {"code": 0, "message": "queued"}
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
 
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
-        post_json=fake_post,
+    notifier = XiaoaiSSHNotifier(
+        host="192.168.1.107",
+        ssh_key=key,
+        run_command=fake_run,
         timeout_seconds=2.5,
+        lock_path=tmp_path / "voice.lock",
         now_fn=ALLOWED_NOW,
     )
 
-    notifier.notify("Open Trader 测试通知", "这是一条测试通知。")
+    notifier.notify("Open Trader 测试通知", "测试文本")
 
     assert calls == [
-        {
-            "url": "http://127.0.0.1:8003/xiaozhi/notify/speak",
-            "payload": {
-                "device_id": "speaker-1",
-                "title": "Open Trader 测试通知",
-                "message": "这是一条测试通知。",
-                "not_after": "2026-07-15T23:00:00+08:00",
+        (
+            [
+                "ssh",
+                "-i",
+                str(key),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "HostKeyAlgorithms=+ssh-rsa",
+                "-o",
+                "PubkeyAcceptedAlgorithms=+ssh-rsa",
+                "root@192.168.1.107",
+                "/usr/sbin/tts_play.sh '测试文本'",
+            ],
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": 2.5,
+                "check": False,
             },
-            "headers": {"Authorization": "Bearer voice-token"},
-            "timeout": 2.5,
-        }
+        )
+    ]
+
+
+def test_xiaoai_voice_notifier_quotes_spoken_text_as_one_argument(
+    tmp_path: Path,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    XiaoaiSSHNotifier(
+        host="speaker.local",
+        ssh_key=tmp_path / "key",
+        run_command=fake_run,
+        lock_path=tmp_path / "voice.lock",
+        now_fn=ALLOWED_NOW,
+    ).notify("Open Trader 测试通知", "孩子的提醒; reboot")
+
+    assert shlex.split(commands[0][-1]) == [
+        "/usr/sbin/tts_play.sh",
+        "孩子的提醒; reboot",
     ]
 
 
@@ -342,10 +369,10 @@ def test_xiaozhi_voice_notifier_sends_payload_and_bearer_header() -> None:
         ),
     ],
 )
-def test_render_xiaozhi_protection_template(
+def test_render_xiaoai_protection_template(
     title: str, message: str, expected: str
 ) -> None:
-    assert render_xiaozhi_voice_notification(title, message) == expected
+    assert render_xiaoai_voice_notification(title, message) == expected
 
 
 @pytest.mark.parametrize(
@@ -360,8 +387,8 @@ def test_render_xiaozhi_protection_template(
         "Open Trader 其他通知",
     ],
 )
-def test_render_xiaozhi_skips_non_protection_business_events(title: str) -> None:
-    assert render_xiaozhi_voice_notification(title, "正文") is None
+def test_render_xiaoai_skips_non_protection_business_events(title: str) -> None:
+    assert render_xiaoai_voice_notification(title, "正文") is None
 
 
 @pytest.mark.parametrize(
@@ -373,227 +400,133 @@ def test_render_xiaozhi_skips_non_protection_business_events(title: str) -> None
         ("2026-07-15T23:00:00+08:00", False),
     ],
 )
-def test_xiaozhi_voice_hours(value: str, allowed: bool) -> None:
-    assert xiaozhi_voice_allowed(datetime.fromisoformat(value)) is allowed
+def test_xiaoai_voice_hours(value: str, allowed: bool) -> None:
+    assert xiaoai_voice_allowed(datetime.fromisoformat(value)) is allowed
 
 
-def test_xiaozhi_deadline_is_23_shanghai() -> None:
-    assert xiaozhi_not_after(ALLOWED_NOW()) == "2026-07-15T23:00:00+08:00"
+def test_xiaoai_voice_notifier_sends_rendered_protection_text(tmp_path: Path) -> None:
+    commands: list[list[str]] = []
 
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
 
-def test_xiaozhi_voice_notifier_sends_protection_payload() -> None:
-    calls: list[dict[str, object]] = []
-
-    def fake_post(
-        url: str,
-        payload: dict[str, object],
-        headers: dict[str, str],
-        timeout_seconds: float,
-    ) -> dict[str, object]:
-        calls.append(
-            {
-                "url": url,
-                "payload": payload,
-                "headers": headers,
-                "timeout": timeout_seconds,
-            }
-        )
-        return {"code": 0, "message": "queued"}
-
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
-        post_json=fake_post,
-        timeout_seconds=2.5,
+    XiaoaiSSHNotifier(
+        host="speaker.local",
+        ssh_key=tmp_path / "key",
+        run_command=fake_run,
+        lock_path=tmp_path / "voice.lock",
         now_fn=ALLOWED_NOW,
+    ).notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
+
+    assert shlex.split(commands[0][-1])[1] == (
+        "Open Trader 紧急提醒：A股浦发银行，代码600000，最新价9.98，"
+        "已触及活动保护线10.01。建议全部卖出，请查看飞书确认并人工执行。"
     )
 
-    notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
 
-    assert calls == [
-        {
-            "url": "http://127.0.0.1:8003/xiaozhi/notify/speak",
-            "payload": {
-                "device_id": "speaker-1",
-                "title": PROTECTION_TITLE,
-                "message": "Open Trader 紧急提醒：A股浦发银行，代码600000，最新价9.98，已触及活动保护线10.01。建议全部卖出，请查看飞书确认并人工执行。",
-                "not_after": "2026-07-15T23:00:00+08:00",
-            },
-            "headers": {"Authorization": "Bearer voice-token"},
-            "timeout": 2.5,
-        }
-    ]
-
-
-def test_xiaozhi_voice_notifier_skips_daily_action_notification() -> None:
-    calls: list[dict[str, object]] = []
-
-    def fake_post(
-        url: str,
-        payload: dict[str, object],
-        headers: dict[str, str],
-        timeout_seconds: float,
-    ) -> dict[str, object]:
-        calls.append({"payload": payload})
-        return {"code": 0}
-
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
-        post_json=fake_post,
-    )
-
-    notifier.notify("Open Trader 美股行动通知", "Open Trader｜行动通知")
-
-    assert calls == []
-
-
-def test_xiaozhi_voice_notifier_skips_quiet_hours() -> None:
+def test_xiaoai_voice_notifier_skips_disallowed_and_quiet_messages(
+    tmp_path: Path,
+) -> None:
     calls: list[object] = []
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
-        post_json=lambda *args: calls.append(args) or {"code": 0},
+    notifier = XiaoaiSSHNotifier(
+        host="speaker.local",
+        ssh_key=tmp_path / "key",
+        run_command=lambda *args, **kwargs: calls.append(args),
+        lock_path=tmp_path / "voice.lock",
         now_fn=lambda: datetime.fromisoformat("2026-07-15T23:00:00+08:00"),
     )
 
+    notifier.notify("Open Trader 美股行动通知", "Open Trader｜行动通知")
     notifier.notify("Open Trader 测试通知", "测试")
 
     assert calls == []
 
 
-def test_xiaozhi_voice_notifier_raises_on_api_error() -> None:
-    def fake_post(
-        url: str,
-        payload: dict[str, object],
-        headers: dict[str, str],
-        timeout_seconds: float,
-    ) -> dict[str, object]:
-        return {"code": 404, "message": "device_offline"}
-
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
-        post_json=fake_post,
-        now_fn=ALLOWED_NOW,
-    )
-
-    with pytest.raises(NotificationError, match="Xiaozhi voice error 404: device_offline"):
-        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
-
-
-def test_xiaozhi_voice_notifier_preserves_http_error_json(
-    monkeypatch: pytest.MonkeyPatch,
+def test_xiaoai_voice_notifier_suppresses_after_waiting_for_lock(
+    tmp_path: Path,
 ) -> None:
-    def fake_urlopen(
-        request: urllib.request.Request, *, timeout: float
-    ) -> object:
-        raise urllib.error.HTTPError(
-            request.full_url,
-            404,
-            "Not Found",
-            {},
-            io.BytesIO(b'{"code": 404, "message": "device_offline"}'),
-        )
-
-    monkeypatch.setattr(
-        "open_trader.notifications.urllib.request.urlopen", fake_urlopen
+    times = iter(
+        [
+            datetime.fromisoformat("2026-07-15T22:59:59+08:00"),
+            datetime.fromisoformat("2026-07-15T23:00:00+08:00"),
+        ]
     )
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
-        now_fn=ALLOWED_NOW,
+    notifier = XiaoaiSSHNotifier(
+        host="speaker.local",
+        ssh_key=tmp_path / "key",
+        run_command=lambda *args, **kwargs: pytest.fail("must not run ssh"),
+        lock_path=tmp_path / "voice.lock",
+        now_fn=lambda: next(times),
     )
 
-    with pytest.raises(
-        NotificationError, match="Xiaozhi voice error 404: device_offline"
-    ):
-        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
+    with pytest.raises(XiaoaiVoiceSuppressed, match="quiet hours"):
+        notifier.notify("Open Trader 测试通知", "测试")
 
 
-def test_xiaozhi_voice_notifier_raises_when_response_omits_code() -> None:
-    def fake_post(
-        url: str,
-        payload: dict[str, object],
-        headers: dict[str, str],
-        timeout_seconds: float,
-    ) -> dict[str, object]:
-        return {"message": "queued"}
-
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
-        post_json=fake_post,
-        now_fn=ALLOWED_NOW,
-    )
-
-    with pytest.raises(NotificationError, match="Xiaozhi voice error missing: code"):
-        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
-
-
-def test_xiaozhi_voice_notifier_wraps_transport_failure() -> None:
-    def fake_post(
-        url: str,
-        payload: dict[str, object],
-        headers: dict[str, str],
-        timeout_seconds: float,
-    ) -> dict[str, object]:
-        raise TimeoutError("timed out")
-
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
-        post_json=fake_post,
-        now_fn=ALLOWED_NOW,
-    )
-
-    with pytest.raises(NotificationError, match="Xiaozhi voice request failed: timed out"):
-        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
-
-
-def test_xiaozhi_voice_notifier_raises_on_invalid_json_response(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (subprocess.CompletedProcess([], 255), "exit code 255"),
+        (subprocess.TimeoutExpired([], 30), "command failed"),
+    ],
+)
+def test_xiaoai_voice_notifier_reports_redacted_transport_failure(
+    tmp_path: Path,
+    result: subprocess.CompletedProcess[str] | subprocess.TimeoutExpired,
+    expected: str,
 ) -> None:
-    monkeypatch.setattr(
-        "open_trader.notifications.urllib.request.urlopen",
-        _fake_urlopen_with_body("not-json"),
-    )
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(result, Exception):
+            raise result
+        return result
 
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
+    notifier = XiaoaiSSHNotifier(
+        host="speaker.local",
+        ssh_key=tmp_path / "key",
+        run_command=fake_run,
+        lock_path=tmp_path / "voice.lock",
         now_fn=ALLOWED_NOW,
     )
 
-    with pytest.raises(NotificationError, match="Xiaozhi voice returned invalid JSON"):
-        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
+    with pytest.raises(NotificationError, match=expected) as captured:
+        notifier.notify("Open Trader 测试通知", "secret spoken text")
+    assert "secret spoken text" not in str(captured.value)
 
 
-def test_xiaozhi_voice_notifier_raises_on_non_object_json_response(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "open_trader.notifications.urllib.request.urlopen",
-        _fake_urlopen_with_body("[0]"),
-    )
+def test_xiaoai_voice_notifier_serializes_process_playback(tmp_path: Path) -> None:
+    entered: list[str] = []
+    first_entered = threading.Event()
+    release_first = threading.Event()
 
-    notifier = XiaozhiVoiceNotifier(
-        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        device_id="speaker-1",
-        token="voice-token",
-        now_fn=ALLOWED_NOW,
-    )
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        entered.append(command[-1])
+        if len(entered) == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=1)
+        return subprocess.CompletedProcess(command, 0)
 
-    with pytest.raises(NotificationError, match="Xiaozhi voice returned non-object JSON"):
-        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
+    def play(message: str) -> None:
+        XiaoaiSSHNotifier(
+            host="speaker.local",
+            ssh_key=tmp_path / "key",
+            run_command=fake_run,
+            lock_path=tmp_path / "voice.lock",
+            now_fn=ALLOWED_NOW,
+        ).notify("Open Trader 测试通知", message)
+
+    first = threading.Thread(target=play, args=("first",))
+    second = threading.Thread(target=play, args=("second",))
+    first.start()
+    assert first_entered.wait(timeout=1)
+    second.start()
+    time.sleep(0.05)
+    assert len(entered) == 1
+    release_first.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert [shlex.split(command)[1] for command in entered] == ["first", "second"]
 
 
 def test_composite_notifier_continues_after_child_failure() -> None:

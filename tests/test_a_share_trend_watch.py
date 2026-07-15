@@ -21,7 +21,8 @@ from open_trader.notifications import (
     FeishuWebhookNotifier,
     MacOSNotifier,
     NullNotifier,
-    XiaozhiVoiceNotifier,
+    XiaoaiSSHNotifier,
+    XiaoaiVoiceSuppressed,
 )
 
 
@@ -116,7 +117,7 @@ class FlakyMacOSNotifier(RecordingMacOSNotifier):
         super().notify(title, message)
 
 
-class RecordingXiaozhiNotifier(XiaozhiVoiceNotifier):
+class RecordingXiaoaiNotifier(XiaoaiSSHNotifier):
     def __init__(self, fail: bool = False) -> None:
         self.messages: list[tuple[str, str]] = []
         self.fail = fail
@@ -125,8 +126,14 @@ class RecordingXiaozhiNotifier(XiaozhiVoiceNotifier):
     def notify(self, title: str, message: str) -> None:
         self.attempt_count += 1
         if self.fail:
-            raise RuntimeError("device_offline")
+            raise RuntimeError("ssh failed")
         self.messages.append((title, message))
+
+
+class SuppressedXiaoaiNotifier(RecordingXiaoaiNotifier):
+    def notify(self, title: str, message: str) -> None:
+        self.attempt_count += 1
+        raise XiaoaiVoiceSuppressed("quiet hours")
 
 
 def portfolio(
@@ -278,7 +285,7 @@ def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:
 
 
 def test_trigger_queues_one_voice_alert_with_name(tmp_path: Path) -> None:
-    voice = RecordingXiaozhiNotifier()
+    voice = RecordingXiaoaiNotifier()
     events_path = tmp_path / "events.jsonl"
 
     run_once(
@@ -294,11 +301,11 @@ def test_trigger_queues_one_voice_alert_with_name(tmp_path: Path) -> None:
             "名称：长江电力\n最新价 27.30 <= 活动保护线 27.31\n建议动作：全部卖出（人工执行）",
         )
     ]
-    assert read_events(events_path)[-1]["event_type"].endswith("queued_xiaozhi")
+    assert read_events(events_path)[-1]["event_type"].endswith("queued_xiaoai")
 
 
 def test_voice_failure_is_terminal_and_warns_feishu(tmp_path: Path) -> None:
-    voice = RecordingXiaozhiNotifier(fail=True)
+    voice = RecordingXiaoaiNotifier(fail=True)
     feishu = RecordingNotifier()
     events_path = tmp_path / "events.jsonl"
 
@@ -311,19 +318,19 @@ def test_voice_failure_is_terminal_and_warns_feishu(tmp_path: Path) -> None:
 
     assert voice.attempt_count == 1
     assert sum("语音播报失败" in title for title, _ in feishu.messages) == 1
-    assert read_events(events_path)[-1]["reason"] == "设备离线"
+    assert read_events(events_path)[-1]["reason"] == "音箱连接或播放失败"
 
 
 def test_restart_never_replays_voice(tmp_path: Path) -> None:
     events_path = tmp_path / "events.jsonl"
-    first = RecordingXiaozhiNotifier(fail=True)
+    first = RecordingXiaoaiNotifier(fail=True)
     run_once(
         tmp_path,
         quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
         events_path=events_path,
         notifier=CompositeNotifier([RecordingNotifier(), first]),
     )
-    restarted = RecordingXiaozhiNotifier()
+    restarted = RecordingXiaoaiNotifier()
 
     run_once(
         tmp_path,
@@ -339,7 +346,7 @@ def test_restart_never_replays_voice(tmp_path: Path) -> None:
 def test_trigger_quiet_hours_suppresses_voice_without_failure_warning(
     tmp_path: Path,
 ) -> None:
-    voice = RecordingXiaozhiNotifier()
+    voice = RecordingXiaoaiNotifier()
     feishu = RecordingNotifier()
     events_path = tmp_path / "events.jsonl"
 
@@ -360,12 +367,40 @@ def test_trigger_quiet_hours_suppresses_voice_without_failure_warning(
     assert voice.messages == []
     assert not any("语音播报失败" in title for title, _ in feishu.messages)
     assert read_events(events_path)[-1]["event_type"].endswith(
-        "suppressed_quiet_hours_xiaozhi"
+        "suppressed_quiet_hours_xiaoai"
+    )
+
+
+def test_voice_suppressed_after_lock_wait_does_not_warn_feishu(
+    tmp_path: Path,
+) -> None:
+    voice = SuppressedXiaoaiNotifier()
+    feishu = RecordingNotifier()
+    events_path = tmp_path / "events.jsonl"
+
+    _deliver_trigger_notification(
+        events_path=events_path,
+        notifier=CompositeNotifier([feishu, voice]),
+        trading_date="2026-07-15",
+        now=datetime.fromisoformat("2026-07-15T22:59:59+08:00"),
+        symbol="600900",
+        position_name="长江电力",
+        last_price=Decimal("27.30"),
+        active_line=Decimal("27.31"),
+        delivered_feishu=set(),
+        delivered_macos=set(),
+        replay=False,
+    )
+
+    assert voice.attempt_count == 1
+    assert not any("语音播报失败" in title for title, _ in feishu.messages)
+    assert read_events(events_path)[-1]["event_type"].endswith(
+        "suppressed_quiet_hours_xiaoai"
     )
 
 
 def test_voice_and_feishu_failure_never_recurse(tmp_path: Path) -> None:
-    voice = RecordingXiaozhiNotifier(fail=True)
+    voice = RecordingXiaoaiNotifier(fail=True)
     feishu = FlakyNotifier(failures=10)
 
     run_once(
@@ -380,14 +415,14 @@ def test_voice_and_feishu_failure_never_recurse(tmp_path: Path) -> None:
 
 def test_held_symbol_can_speak_again_on_next_trading_date(tmp_path: Path) -> None:
     events_path = tmp_path / "events.jsonl"
-    first = RecordingXiaozhiNotifier()
+    first = RecordingXiaoaiNotifier()
     run_once(
         tmp_path,
         quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
         events_path=events_path,
         notifier=CompositeNotifier([RecordingNotifier(), first]),
     )
-    next_day = RecordingXiaozhiNotifier()
+    next_day = RecordingXiaoaiNotifier()
 
     run_once(
         tmp_path,

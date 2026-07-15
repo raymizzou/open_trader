@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import re
+import shlex
 import subprocess
 import urllib.error
 import urllib.request
@@ -17,6 +19,10 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class NotificationError(RuntimeError):
+    pass
+
+
+class XiaoaiVoiceSuppressed(RuntimeError):
     pass
 
 
@@ -152,7 +158,7 @@ class FeishuAppNotifier:
         return token
 
 
-def render_xiaozhi_voice_notification(title: str, message: str) -> str | None:
+def render_xiaoai_voice_notification(title: str, message: str) -> str | None:
     title, message = title.strip(), message.strip()
     if "测试通知" in title:
         return message or title
@@ -177,65 +183,67 @@ def render_xiaozhi_voice_notification(title: str, message: str) -> str | None:
     )
 
 
-def xiaozhi_voice_allowed(now: datetime) -> bool:
+def xiaoai_voice_allowed(now: datetime) -> bool:
     local = now.astimezone(SHANGHAI).time()
     return time(8) <= local < time(23)
 
 
-def xiaozhi_not_after(now: datetime) -> str:
-    local = now.astimezone(SHANGHAI)
-    return local.replace(hour=23, minute=0, second=0, microsecond=0).isoformat()
-
-
-class XiaozhiVoiceNotifier:
+class XiaoaiSSHNotifier:
     def __init__(
         self,
         *,
-        speak_url: str,
-        device_id: str,
-        token: str,
-        post_json: PostJsonWithHeaders | None = None,
-        timeout_seconds: float = 10.0,
+        host: str,
+        ssh_key: Path,
+        run_command: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        timeout_seconds: float = 30.0,
+        lock_path: Path = Path("/tmp/open_trader_xiaoai_voice.lock"),
         now_fn: Callable[[], datetime] = lambda: datetime.now(SHANGHAI),
     ) -> None:
-        self.speak_url = speak_url
-        self.device_id = device_id
-        self.token = token
-        self._post_json = post_json or _post_xiaozhi_json_with_headers
+        self.host = host
+        self.ssh_key = ssh_key
+        self._run_command = run_command
         self.timeout_seconds = timeout_seconds
+        self.lock_path = lock_path
         self._now_fn = now_fn
 
     def notify(self, title: str, message: str) -> None:
-        voice_message = render_xiaozhi_voice_notification(title, message)
-        if voice_message is None:
+        voice_message = render_xiaoai_voice_notification(title, message)
+        if voice_message is None or not xiaoai_voice_allowed(self._now_fn()):
             return
-        now = self._now_fn()
-        if not xiaozhi_voice_allowed(now):
-            return
-        payload: dict[str, object] = {
-            "device_id": self.device_id,
-            "title": title,
-            "message": voice_message,
-            "not_after": xiaozhi_not_after(now),
-        }
-        try:
-            response = self._post_json(
-                self.speak_url,
-                payload,
-                {"Authorization": f"Bearer {self.token}"},
-                self.timeout_seconds,
-            )
-        except NotificationError:
-            raise
-        except Exception as exc:
-            raise NotificationError(f"Xiaozhi voice request failed: {exc}") from exc
-
-        if "code" not in response:
-            raise NotificationError("Xiaozhi voice error missing: code")
-        code = response.get("code")
-        if code not in {0, "0"}:
-            message_text = response.get("message") or response.get("msg") or ""
-            raise NotificationError(f"Xiaozhi voice error {code}: {message_text}")
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if not xiaoai_voice_allowed(self._now_fn()):
+                raise XiaoaiVoiceSuppressed("quiet hours")
+            command = [
+                "ssh",
+                "-i",
+                str(self.ssh_key),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "HostKeyAlgorithms=+ssh-rsa",
+                "-o",
+                "PubkeyAcceptedAlgorithms=+ssh-rsa",
+                f"root@{self.host}",
+                f"/usr/sbin/tts_play.sh {shlex.quote(voice_message)}",
+            ]
+            try:
+                result = self._run_command(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_seconds,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise NotificationError("XiaoAI voice command failed") from exc
+            if result.returncode != 0:
+                raise NotificationError(
+                    f"XiaoAI voice command failed with exit code {result.returncode}"
+                )
 
 
 def _voice_field(message: str, name: str) -> str:
@@ -730,21 +738,6 @@ def _post_json_with_headers(
 ) -> dict[str, object]:
     return _post_json_with_headers_for_channel(
         "Feishu app",
-        url,
-        payload,
-        headers,
-        timeout_seconds,
-    )
-
-
-def _post_xiaozhi_json_with_headers(
-    url: str,
-    payload: dict[str, object],
-    headers: dict[str, str],
-    timeout_seconds: float,
-) -> dict[str, object]:
-    return _post_json_with_headers_for_channel(
-        "Xiaozhi voice",
         url,
         payload,
         headers,

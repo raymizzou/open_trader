@@ -18,8 +18,8 @@ from .futu_symbols import to_futu_symbol
 from .notifications import (
     CompositeNotifier,
     Notifier,
-    XiaozhiVoiceNotifier,
-    xiaozhi_voice_allowed,
+    XiaoaiSSHNotifier,
+    xiaoai_voice_allowed,
 )
 
 
@@ -505,7 +505,7 @@ def _deliver_trigger_notification(
             )
             delivered.add(symbol)
 
-    if replay or not _has_xiaozhi_notifier(notifier):
+    if replay or not _has_xiaoai_notifier(notifier):
         return
 
     voice_message = "\n".join(
@@ -515,13 +515,13 @@ def _deliver_trigger_notification(
             "建议动作：全部卖出（人工执行）",
         ]
     )
-    if not xiaozhi_voice_allowed(now):
+    if not xiaoai_voice_allowed(now):
         append_watch_event(
             events_path,
             symbol=symbol,
             trading_date=trading_date,
             event_type=(
-                "protection_triggered_notification_suppressed_quiet_hours_xiaozhi"
+                "protection_triggered_notification_suppressed_quiet_hours_xiaoai"
             ),
             occurred_at=now.isoformat(timespec="seconds"),
             last_price=last_price,
@@ -534,20 +534,34 @@ def _deliver_trigger_notification(
         notifier,
         f"{market_label}保护线触发 · {symbol}",
         voice_message,
-        channels={"xiaozhi"},
+        channels={"xiaoai"},
     )
     if not attempts:
         return
     attempt = attempts[0]
+    if attempt.suppressed:
+        append_watch_event(
+            events_path,
+            symbol=symbol,
+            trading_date=trading_date,
+            event_type=(
+                "protection_triggered_notification_suppressed_quiet_hours_xiaoai"
+            ),
+            occurred_at=now.isoformat(timespec="seconds"),
+            last_price=last_price,
+            active_line=active_line,
+            market=market_label,
+        )
+        return
     reason = "" if attempt.success else _voice_failure_reason(attempt.error)
     append_watch_event(
         events_path,
         symbol=symbol,
         trading_date=trading_date,
         event_type=(
-            "protection_triggered_notification_queued_xiaozhi"
+            "protection_triggered_notification_queued_xiaoai"
             if attempt.success
-            else "protection_triggered_notification_failed_xiaozhi"
+            else "protection_triggered_notification_failed_xiaoai"
         ),
         occurred_at=now.isoformat(timespec="seconds"),
         last_price=last_price,
@@ -573,25 +587,17 @@ def _deliver_trigger_notification(
     )
 
 
-def _has_xiaozhi_notifier(notifier: Notifier) -> bool:
+def _has_xiaoai_notifier(notifier: Notifier) -> bool:
     targets = (
         notifier._notifiers
         if isinstance(notifier, CompositeNotifier)
         else [notifier]
     )
-    return any(isinstance(target, XiaozhiVoiceNotifier) for target in targets)
+    return any(isinstance(target, XiaoaiSSHNotifier) for target in targets)
 
 
-def _voice_failure_reason(error: str) -> str:
-    if "device_offline" in error:
-        return "设备离线"
-    if "tts_not_ready" in error:
-        return "播放队列未就绪"
-    if "unauthorized" in error:
-        return "语音服务鉴权失败"
-    if "notify_api_disabled" in error:
-        return "语音服务未启用"
-    return "语音服务不可用"
+def _voice_failure_reason(_error: str) -> str:
+    return "音箱连接或播放失败"
 
 
 def _load_active_lines(path: Path) -> dict[str, Decimal | None]:

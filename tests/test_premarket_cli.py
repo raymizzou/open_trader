@@ -813,7 +813,7 @@ def test_test_notification_reports_quiet_hour_voice_suppression(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    config = SimpleNamespace(notifiers=("feishu_app", "xiaozhi"))
+    config = SimpleNamespace(notifiers=("feishu_app", "xiaoai"))
 
     class FakeNotifier:
         def notify(self, title: str, message: str) -> None:
@@ -821,7 +821,7 @@ def test_test_notification_reports_quiet_hour_voice_suppression(
 
     monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
     monkeypatch.setattr(cli, "build_notifier", lambda loaded: FakeNotifier())
-    monkeypatch.setattr(cli, "xiaozhi_voice_allowed", lambda now: False, raising=False)
+    monkeypatch.setattr(cli, "xiaoai_voice_allowed", lambda now: False, raising=False)
 
     result = cli.main(["test-notification", "--config", str(tmp_path / "daily.env")])
 
