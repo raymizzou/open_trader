@@ -2,7 +2,7 @@
   color-scheme: light;
   --bg: #fafaf9;
   --surface: #ffffff;
-  --surface-soft: #f5f2eb;
+  --surface-soft: #faf8f4;
   --text: #1c1917;
   --muted: #78716c;
   --accent: #a16207;
@@ -1780,16 +1780,6 @@ tbody tr.active-row {
 
 .inline-symbol-detail {
   border-top: 0;
-}
-
-.cash-detail-panel {
-  border-top: 1px solid var(--line);
-  padding: 14px;
-}
-
-.cash-detail-panel h2 {
-  font-size: 16px;
-  margin-bottom: 10px;
 }
 
 .detail-header {
@@ -3874,6 +3864,10 @@ table {
   .filter-button,
   .expand-button,
   .raw-toggle {
+    min-height: 44px;
+  }
+
+  .segmented-control .filter-button {
     min-height: 44px;
   }
 

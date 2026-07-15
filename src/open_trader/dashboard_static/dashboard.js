@@ -255,6 +255,7 @@ function bindEvents() {
     renderDashboardViews();
   });
   elements["account-tabs"].addEventListener("click", handleBrokerSelection);
+  elements["account-tabs"].addEventListener("keydown", handleBrokerTabKeydown);
   elements["broker-summary-cards"].addEventListener("click", handleBrokerSelection);
   elements["account-holdings"].addEventListener("click", (event) => {
     const trendReport = event.target.closest("[data-trend-report]");
@@ -323,10 +324,6 @@ async function openStandardBacktest() {
   renderStandardBacktest();
 }
 
-function closeStandardBacktest() {
-  returnToPortfolio();
-}
-
 function openTrendReport(broker) {
   const report = state.dashboard?.trend_reports?.[broker];
   if (!report?.available) return;
@@ -334,10 +331,6 @@ function openTrendReport(broker) {
   elements["trend-report-workspace"].innerHTML = renderTrendReportWorkspace(report);
   setWorkspaceView("trend_report");
   elements["return-to-portfolio"].focus();
-}
-
-function closeTrendReport() {
-  returnToPortfolio();
 }
 
 function returnToPortfolio() {
@@ -489,19 +482,23 @@ function renderBacktestComparisonMetrics(result) {
   const benchmark = result.market_benchmark;
   const benchmarkLabel = result.benchmark_symbol || "市场指数";
   const rows = [
-    ["策略收益", strategy.total_return_pct],
-    ["买入持有", buyHold.total_return_pct],
-    [benchmarkLabel, benchmark && benchmark.total_return_pct],
-    ["相对买入持有", result.strategy_excess_return_pct],
-    ["相对市场指数", benchmark && result.market_excess_return_pct],
-    ["最大回撤", strategy.max_drawdown_pct],
+    ["策略收益", strategy.total_return_pct, "pnl"],
+    ["买入持有", buyHold.total_return_pct, "pnl"],
+    [benchmarkLabel, benchmark && benchmark.total_return_pct, "pnl"],
+    ["相对买入持有", result.strategy_excess_return_pct, "pnl"],
+    ["相对市场指数", benchmark && result.market_excess_return_pct, "pnl"],
+    ["最大回撤", strategy.max_drawdown_pct, "drawdown"],
     ["交易次数", Array.isArray(strategy.trades) ? strategy.trades.filter((trade) => Number(trade.quantity) !== 0).length : 0, "count"],
-    ["胜率", strategy.win_rate_pct],
+    ["胜率", strategy.win_rate_pct, "percent"],
   ];
   return `<section class="backtest-result-section" aria-labelledby="backtest-comparison-title"><h3 id="backtest-comparison-title">回测对比</h3><div class="backtest-comparison-grid">${rows.map(([label, value, kind]) => {
     const unavailable = (label === benchmarkLabel || label === "相对市场指数") && !benchmark;
-    const display = unavailable ? "基准行情缺失，无法比较" : kind === "count" ? formatDisplayNumber(value) : backtestPercent(value);
-    return `<article class="backtest-metric-card${unavailable ? " benchmark-unavailable" : ""}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display)}</strong></article>`;
+    const rawDisplay = unavailable ? "基准行情缺失，无法比较" : kind === "count" ? formatDisplayNumber(value) : backtestPercent(value);
+    const display = kind === "pnl" ? formatSignedPnl(rawDisplay)
+      : kind === "drawdown" ? drawdownPercent(value, backtestPercent)
+        : rawDisplay;
+    const tone = kind === "pnl" || kind === "drawdown" ? pnlClass(display) : "";
+    return `<article class="backtest-metric-card${unavailable ? " benchmark-unavailable" : ""}"><span>${escapeHtml(label)}</span><strong${tone ? ` class="${tone}"` : ""}>${escapeHtml(display)}</strong></article>`;
   }).join("")}</div></section>`;
 }
 
@@ -660,6 +657,14 @@ function downsampleBacktestRows(rows, valueKey, preservedDates, limit = 600) {
 function backtestPercent(value) {
   const number = Number(value);
   return Number.isFinite(number) ? `${number.toFixed(2)}%` : "-";
+}
+
+function drawdownPercent(value, formatter = decisionPlanPercent) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  const magnitude = Math.abs(number);
+  const display = formatter(magnitude);
+  return magnitude === 0 ? display : `-${display}`;
 }
 
 function validateStandardBacktestDates() {
@@ -1399,7 +1404,7 @@ function renderKellyStrategyCapital(experiment) {
     ["可用资金", formatCapitalMoney(capital.available_notional, currency), "primary"],
     ["占用率", firstPresent(utilization, "-"), ""],
     ["未完成买单", formatDisplayNumber(capital.open_buy_order_count), ""],
-    ["已实现盈亏", formatCapitalMoney(capital.realized_pnl, currency), pnlClass(capital.realized_pnl)],
+    ["已实现盈亏", formatSignedMoney(capital.realized_pnl, currency), pnlClass(capital.realized_pnl)],
   ];
   return `
     <section class="kelly-strategy-capital" aria-label="Kelly 策略资金">
@@ -1773,7 +1778,7 @@ function renderKellyParameterDerivation(stats) {
   const payoffRatio = hasValue(item.payoff_ratio) ? formatDisplayNumber(item.payoff_ratio) : "";
   const payoffDetail = [item.avg_net_win_pct, item.avg_net_loss_pct]
     .filter(hasValue)
-    .map(formatPlain)
+    .map(formatSignedPnl)
     .join(" / ");
   const sourceLabel = item.parameter_source === "futu_paper_order_samples"
     ? "富途模拟盘订单样本"
@@ -1972,12 +1977,16 @@ function renderAccountStrategy(group) {
   const reasons = Array.isArray(gate.reasons) && gate.reasons.length
     ? gate.reasons.map((reason) => TIGER_GATE_LABELS[reason] || "其他门槛未满足")
     : ["无"];
+  const annualizedReturn = formatSignedPnl(decisionPlanPercent(values.annualized_return_pct));
+  const maxDrawdown = drawdownPercent(values.max_drawdown_pct);
+  const annualizedTone = pnlClass(annualizedReturn);
+  const drawdownTone = pnlClass(maxDrawdown);
   return `<div class="account-strategy-summary">
     <div class="tiger-panel-heading"><div><strong>SMA200 策略</strong><span>影子验证 · 仅供人工复核</span></div><span>${escapeHtml(strategy.run_date || "-")}</span></div>
     <div class="tiger-rule-strip"><span>单标的上限 10%</span><span>风险组上限 30%</span><span>门槛：${reasons.map(escapeHtml).join(" · ")}</span></div>
     <article class="tiger-metric-card"><dl>
-      <div><dt>年化收益</dt><dd>${escapeHtml(decisionPlanPercent(values.annualized_return_pct))}</dd></div>
-      <div><dt>最大回撤</dt><dd>${escapeHtml(decisionPlanPercent(values.max_drawdown_pct))}</dd></div>
+      <div><dt>年化收益</dt><dd${annualizedTone ? ` class="${annualizedTone}"` : ""}>${escapeHtml(annualizedReturn)}</dd></div>
+      <div><dt>最大回撤</dt><dd${drawdownTone ? ` class="${drawdownTone}"` : ""}>${escapeHtml(maxDrawdown)}</dd></div>
       <div><dt>夏普比率</dt><dd>${escapeHtml(decisionPlanRatio(values.sharpe_ratio))}</dd></div>
       <div><dt>卡玛比率</dt><dd>${escapeHtml(decisionPlanRatio(values.calmar_ratio))}</dd></div>
     </dl></article>
@@ -2045,8 +2054,8 @@ function renderAccountTabs(groups) {
   const counts = new Map(groups.map((group) => [group.broker, group.rows.length]));
   return ACCOUNT_BROKERS.map((broker) => {
     const selected = broker === state.brokerFilter;
-    return `<button class="account-tab ${selected ? "active" : ""}" type="button" role="tab"
-      data-broker="${escapeHtml(broker)}" aria-selected="${selected}">
+    return `<button id="account-tab-${escapeHtml(broker)}" class="account-tab ${selected ? "active" : ""}" type="button" role="tab"
+      data-broker="${escapeHtml(broker)}" aria-selected="${selected}" tabindex="${selected ? "0" : "-1"}" aria-controls="account-holdings">
       ${escapeHtml(brokerDisplayName(broker))}<span>${escapeHtml(formatDisplayNumber(counts.get(broker) || 0))}</span>
     </button>`;
   }).join("");
@@ -2057,6 +2066,7 @@ function selectBroker(broker) {
   state.brokerFilter = broker;
   state.selectedHoldingKey = "";
   state.selectedHoldingDetail = "decision";
+  syncDecisionDeepLink();
   renderAccountHoldings();
   if (elements["current-view-label"]) renderHeaderSummary();
 }
@@ -2066,12 +2076,28 @@ function handleBrokerSelection(event) {
   if (button) selectBroker(button.dataset.broker || "");
 }
 
+function handleBrokerTabKeydown(event) {
+  const tab = event.target.closest('[role="tab"][data-broker]');
+  if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const current = ACCOUNT_BROKERS.indexOf(tab.dataset.broker || "");
+  const index = event.key === "Home" ? 0
+    : event.key === "End" ? ACCOUNT_BROKERS.length - 1
+      : (current + (event.key === "ArrowRight" ? 1 : -1) + ACCOUNT_BROKERS.length) % ACCOUNT_BROKERS.length;
+  const broker = ACCOUNT_BROKERS[index];
+  selectBroker(broker);
+  elements["account-tabs"].querySelector(`[data-broker="${broker}"]`)?.focus();
+}
+
 function renderAccountHoldings() {
   const container = elements["account-holdings"] || elements["holdings-body"];
   const groups = accountHoldingGroups();
   const active = groups.find((group) => group.broker === state.brokerFilter) || groups[0];
   if (active && active.broker !== state.brokerFilter) state.brokerFilter = active.broker;
   elements["account-tabs"].innerHTML = renderAccountTabs(groups);
+  if (active && typeof container.setAttribute === "function") {
+    container.setAttribute("aria-labelledby", `account-tab-${active.broker}`);
+  }
   const rows = active ? active.rows.filter(({display}) => state.marketFilter === "ALL"
     || String(display.market || "").toUpperCase() === state.marketFilter) : [];
   elements["visible-count"].textContent = `${formatDisplayNumber(rows.length)} 条`;
@@ -2095,12 +2121,12 @@ function renderAccountHoldings() {
 function renderAccountSection(group) {
   const headingId = `account-${group.broker}-title`;
   const rows = group.rows;
-  const alias = firstPresent(group.rows[0]?.display?.account_alias, "-");
+  const alias = brokerAccountAlias(group.broker, group.summary);
   const source = firstPresent(brokerSummarySourceText(group.summary), "-");
   const sourceTime = firstPresent(
     group.summary.generated_at, group.summary.as_of, state.dashboard?.broker_detail_month, "-",
   );
-  return `<section id="account-${escapeHtml(group.broker)}" class="account-section" aria-labelledby="${headingId}">
+  return `<section id="account-${escapeHtml(group.broker)}" class="account-section">
     <header class="account-section-header">
       <div><h2 id="${headingId}">${escapeHtml(brokerDisplayName(group.summary))}</h2>
       <span>${escapeHtml(group.profile.horizon)} · ${escapeHtml(group.profile.strategy)}</span>
@@ -2141,7 +2167,7 @@ function renderAccountTable(rows) {
         <td class="number-cell account-holding-market-value"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
         <td class="number-cell account-holding-account-weight"><span class="account-mobile-label">账户权重</span>${escapeHtml(formatPlain(display.account_weight))}</td>
         <td class="number-cell account-holding-portfolio-weight"><span class="account-mobile-label">组合权重</span>${escapeHtml(formatPlain(display.portfolio_weight))}</td>
-        <td class="number-cell account-holding-pnl${pnlTone ? ` ${pnlTone}` : ""}"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatPlain(display.unrealized_pnl_pct))}</td>
+        <td class="number-cell account-holding-pnl${pnlTone ? ` ${pnlTone}` : ""}"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatSignedPnl(display.unrealized_pnl_pct))}</td>
       </tr>`;
     if (!isSelected) return cells;
     return `${cells}<tr class="decision-detail-row"><td colspan="${ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT}"><div class="symbol-detail-panel inline-symbol-detail">${selectedDetail === "t_signal"
@@ -2601,13 +2627,13 @@ function renderDecisionPlanCondition(condition, index) {
     <article class="decision-plan-condition decision-plan-condition-${tone}" data-plan-condition="${escapeHtml(condition.condition_id || String(index))}">
       <div class="decision-plan-condition-head">
         <span>${condition.priority === "risk" ? "风险优先" : "普通条件"}</span>
-        <b>已触发 ${escapeHtml(condition.trigger_count || 0)} 次</b>
+        <b>已触发 ${escapeHtml(formatDisplayNumber(condition.trigger_count || 0))} 次</b>
       </div>
       <h5>${escapeHtml(decisionConditionSummary(condition))}</h5>
       <div class="decision-plan-condition-metrics">
         <div><span>执行动作</span><strong>${escapeHtml(condition.suggested_action || "-")}</strong></div>
         <div><span>目标仓位</span><strong>${escapeHtml(decisionPlanWeight(condition.target_weight))}</strong></div>
-        <div><span>目标数量</span><strong>${escapeHtml(condition.target_quantity || "-")}</strong></div>
+        <div><span>目标数量</span><strong>${escapeHtml(formatDisplayNumber(condition.target_quantity))}</strong></div>
       </div>
       ${renderDecisionPlanProvenance(condition)}
     </article>
@@ -2641,14 +2667,23 @@ function renderDecisionPlanBacktests(backtests) {
         const strategy = item.strategy || {};
         const benchmark = item.market_benchmark || {};
         const heading = [item.range, item.strategy_id].filter(hasValue).join(" · ") || "-";
+        const returns = [
+          ["策略收益", strategy.total_return_pct, "pnl"],
+          [benchmark.symbol || "基准", benchmark.total_return_pct, "pnl"],
+          ["超额收益", item.market_excess_return_pct, "pnl"],
+          ["最大回撤", strategy.max_drawdown_pct, "drawdown"],
+        ];
         return `
           <article>
             <div><strong>${escapeHtml(heading)}</strong><span class="status-pill status-${item.gate && item.gate.passed === true ? "ok" : "failed"}">${item.gate && item.gate.passed === true ? "通过" : "未通过"}</span></div>
             <dl>
-              <div><dt>策略收益</dt><dd>${escapeHtml(decisionPlanPercent(strategy.total_return_pct))}</dd></div>
-              <div><dt>${escapeHtml(benchmark.symbol || "基准")}</dt><dd>${escapeHtml(decisionPlanPercent(benchmark.total_return_pct))}</dd></div>
-              <div><dt>超额收益</dt><dd>${escapeHtml(decisionPlanPercent(item.market_excess_return_pct))}</dd></div>
-              <div><dt>最大回撤</dt><dd>${escapeHtml(decisionPlanPercent(strategy.max_drawdown_pct))}</dd></div>
+              ${returns.map(([label, value, kind]) => {
+                const display = kind === "drawdown"
+                  ? drawdownPercent(value)
+                  : formatSignedPnl(decisionPlanPercent(value));
+                const tone = pnlClass(display);
+                return `<div><dt>${escapeHtml(label)}</dt><dd${tone ? ` class="${tone}"` : ""}>${escapeHtml(display)}</dd></div>`;
+              }).join("")}
               <div><dt>夏普比率</dt><dd>${escapeHtml(strategy.sharpe_ratio || "-")}</dd></div>
               <div><dt>卡玛比率</dt><dd>${escapeHtml(decisionPlanRatio(strategy.calmar_ratio))}</dd></div>
             </dl>
@@ -2694,7 +2729,7 @@ function renderDecisionPlanFact(fact) {
   return `
     <article class="decision-plan-fact">
       <span>${escapeHtml(labels[fact.key] || fact.key || "事实")}</span>
-      <strong>${escapeHtml(formatPlain(fact.calculated_value))}</strong>
+      <strong>${escapeHtml(formatDisplayNumber(fact.calculated_value))}</strong>
       ${renderDecisionPlanProvenance(fact)}
     </article>
   `;
@@ -2709,16 +2744,16 @@ function renderPreviousDecisionReview(review) {
       <summary>上期复盘 · ${escapeHtml(review.run_date || "-")}</summary>
       <div>
         <span>上期状态 <strong>${escapeHtml(decisionPlanStatusLabel(review.status))}</strong></span>
-        <span>条件触发 <strong>${escapeHtml(review.trigger_count || 0)} 次</strong></span>
-        <span>期初数量 <strong>${escapeHtml(review.starting_quantity || "-")}</strong></span>
-        <span>本期期初数量 <strong>${escapeHtml(review.closing_quantity || "-")}</strong></span>
+        <span>条件触发 <strong>${escapeHtml(formatDisplayNumber(review.trigger_count || 0))} 次</strong></span>
+        <span>期初数量 <strong>${escapeHtml(formatDisplayNumber(review.starting_quantity))}</strong></span>
+        <span>本期期初数量 <strong>${escapeHtml(formatDisplayNumber(review.closing_quantity))}</strong></span>
       </div>
     </details>
   `;
 }
 
 function decisionConditionSummary(condition) {
-  return `价格 ${condition.operator || ""} ${condition.calculated_value || "-"}`.trim();
+  return `价格 ${condition.operator || ""} ${formatDisplayNumber(condition.calculated_value)}`.trim();
 }
 
 function decisionPlanWeight(value) {
@@ -3173,7 +3208,7 @@ function renderDomesticKeywordTags(keywordCounts) {
       ${items.map((item) => `
         <b class="domestic-keyword">
           <span>${escapeHtml(formatPlain(item.keyword))}</span>
-          <em>${escapeHtml(formatPlain(item.count))}</em>
+          <em>${escapeHtml(formatDisplayNumber(item.count))}</em>
         </b>
       `).join("")}
     </div>
@@ -3437,9 +3472,9 @@ function renderBollingerBand(bollinger, currentPrice) {
         <span class="technical-bollinger-marker" style="${escapeHtml(markerStyle)}"></span>
       </div>
       <div class="technical-bollinger-labels">
-        <span>下轨 ${escapeHtml(formatPlain(lower || "缺失"))}</span>
-        <span>中轨 ${escapeHtml(formatPlain(middle || "缺失"))}</span>
-        <span>上轨 ${escapeHtml(formatPlain(upper || "缺失"))}</span>
+        <span>下轨 ${escapeHtml(formatDisplayNumber(lower || "缺失"))}</span>
+        <span>中轨 ${escapeHtml(formatDisplayNumber(middle || "缺失"))}</span>
+        <span>上轨 ${escapeHtml(formatDisplayNumber(upper || "缺失"))}</span>
       </div>
     </div>
   `;
@@ -3472,7 +3507,7 @@ function renderBollingerMetrics(bollinger, currentPrice, status) {
 }
 
 function bollingerMetricValue(value) {
-  return hasValue(value) ? formatPlain(value) : "缺失";
+  return hasValue(value) ? formatDisplayNumber(value) : "缺失";
 }
 
 function bollingerReferenceLabel(bollinger, status) {
@@ -3557,7 +3592,7 @@ function technicalFactRowsForTimeframe(timeframe) {
 
 function addTechnicalFactRow(rows, label, value) {
   if (hasValue(value)) {
-    rows.push({ label, value: formatPlain(value) });
+    rows.push({ label, value: formatDisplayNumber(value) });
   }
 }
 
@@ -3591,15 +3626,20 @@ function indicatorValue(value) {
   return firstPresent(value.value, value.text, value.status, value.signal, value.summary);
 }
 
+function indicatorDisplayNumber(value) {
+  const item = indicatorValue(value);
+  return hasValue(item) ? formatDisplayNumber(item) : "";
+}
+
 function macdValue(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return value;
   }
   const macdLine = firstPresent(value.macd, value.value);
   const parts = [
-    hasValue(macdLine) ? `MACD ${macdLine}` : "",
-    hasValue(value.signal) ? `Signal ${value.signal}` : "",
-    hasValue(value.histogram) ? `Hist ${value.histogram}` : "",
+    hasValue(macdLine) ? `MACD ${formatDisplayNumber(macdLine)}` : "",
+    hasValue(value.signal) ? `Signal ${formatDisplayNumber(value.signal)}` : "",
+    hasValue(value.histogram) ? `Hist ${formatDisplayNumber(value.histogram)}` : "",
     indicatorValue(value.crossover),
     goldenCrossText(value.golden_cross),
   ].filter(Boolean);
@@ -3611,8 +3651,8 @@ function atrValue(value) {
     return value;
   }
   return [
-    indicatorValue(value.value),
-    indicatorValue(value.percent_of_price),
+    indicatorDisplayNumber(value.value),
+    indicatorDisplayNumber(value.percent_of_price),
   ].filter((part) => hasValue(part)).join(" · ");
 }
 
@@ -3630,12 +3670,11 @@ function supportResistanceValue(timeframe, kind) {
 function listValue(value) {
   if (Array.isArray(value)) {
     return value
-      .map((item) => indicatorValue(item))
+      .map((item) => indicatorDisplayNumber(item))
       .filter((item) => hasValue(item))
-      .map((item) => formatPlain(item))
       .join(" · ");
   }
-  return indicatorValue(value);
+  return indicatorDisplayNumber(value);
 }
 
 function goldenCrossText(value) {
@@ -3653,15 +3692,15 @@ function movingAverageValue(timeframe) {
   if (averages && typeof averages === "object" && !Array.isArray(averages)) {
     const parts = Object.entries(averages)
       .filter(([, value]) => hasValue(value))
-      .map(([key, value]) => `${key.toUpperCase()} ${formatPlain(value)}`);
+      .map(([key, value]) => `${key.toUpperCase()} ${formatDisplayNumber(value)}`);
     if (parts.length) {
       return parts.join(" · ");
     }
   }
   const parts = [
-    hasValue(timeframe.ma20) ? `MA20 ${timeframe.ma20}` : "",
-    hasValue(timeframe.ma50) ? `MA50 ${timeframe.ma50}` : "",
-    hasValue(timeframe.ma200) ? `MA200 ${timeframe.ma200}` : "",
+    hasValue(timeframe.ma20) ? `MA20 ${formatDisplayNumber(timeframe.ma20)}` : "",
+    hasValue(timeframe.ma50) ? `MA50 ${formatDisplayNumber(timeframe.ma50)}` : "",
+    hasValue(timeframe.ma200) ? `MA200 ${formatDisplayNumber(timeframe.ma200)}` : "",
   ].filter(Boolean);
   return parts.join(" · ");
 }
@@ -4295,10 +4334,10 @@ function renderTradeDecisionBand(action, holding) {
         <h4>操作方向与价位</h4>
         <dl class="compact-kv">
           ${renderCompactKv("动作", reportActionStatusLabel(action))}
-          ${renderCompactKv("限价", firstSafePrimaryValue(action.limit_price, action.last_price))}
-          ${renderCompactKv("数量", firstSafePrimaryValue(action.suggested_quantity, action.target_quantity, action.quantity))}
+          ${renderCompactKv("限价", formatDisplayNumber(firstSafePrimaryValue(action.limit_price, action.last_price)))}
+          ${renderCompactKv("数量", formatDisplayNumber(firstSafePrimaryValue(action.suggested_quantity, action.target_quantity, action.quantity)))}
           ${renderCompactKv("金额", safeActionNotionalText(action))}
-          ${renderCompactKv("止损", firstSafePrimaryValue(action.stop_price))}
+          ${renderCompactKv("止损", formatDisplayNumber(firstSafePrimaryValue(action.stop_price)))}
         </dl>
       </article>
       <article class="decision-block">
@@ -4311,8 +4350,8 @@ function renderTradeDecisionBand(action, holding) {
 
 function renderTradeImpactGrid(action, holding) {
   const cells = [
-    ["当前数量", firstSafePrimaryValue(action.current_quantity, holding.total_quantity)],
-    ["交易后数量", firstSafePrimaryValue(action.post_trade_quantity)],
+    ["当前数量", formatDisplayNumber(firstSafePrimaryValue(action.current_quantity, holding.total_quantity))],
+    ["交易后数量", formatDisplayNumber(firstSafePrimaryValue(action.post_trade_quantity))],
     ["建议金额", safeActionNotionalText(action)],
     ["交易后权重", firstSafePrimaryValue(action.post_trade_weight)],
     ["下一触发", nextTriggerText(action, holding)],
@@ -4769,7 +4808,7 @@ function renderBrokerDetailSection(details) {
         <td class="number-cell">${escapeHtml(formatDisplayNumber(detail.cost_price))}</td>
         <td class="number-cell">${escapeHtml(formatDisplayNumber(detail.last_price))}</td>
         <td class="number-cell">${escapeHtml(formatDisplayNumber(detail.market_value))}</td>
-        <td class="number-cell${pnlTone ? ` ${pnlTone}` : ""}">${escapeHtml(formatDisplayNumber(detail.unrealized_pnl))}</td>
+        <td class="number-cell${pnlTone ? ` ${pnlTone}` : ""}">${escapeHtml(formatSignedPnl(detail.unrealized_pnl))}</td>
       </tr>
     `;
   }).join("");
@@ -5168,7 +5207,8 @@ function compactSentence(text, maxLength) {
 function actionNotionalText(action) {
   if (hasValue(action.suggested_notional)) {
     const currency = formatPlain(action.notional_currency);
-    return currency === "-" ? action.suggested_notional : `${currency} ${action.suggested_notional}`;
+    const notional = formatDisplayNumber(action.suggested_notional);
+    return currency === "-" ? notional : `${currency} ${notional}`;
   }
   if (hasValue(action.order_value_hkd)) {
     return formatMoney(action.order_value_hkd, "HKD");
@@ -5180,7 +5220,8 @@ function safeActionNotionalText(action) {
   const notional = safePrimaryValue(action.suggested_notional);
   if (notional) {
     const currency = safePrimaryValue(action.notional_currency);
-    return currency ? `${currency} ${notional}` : notional;
+    const formattedNotional = formatDisplayNumber(notional);
+    return currency ? `${currency} ${formattedNotional}` : formattedNotional;
   }
   const orderValueHkd = safePrimaryValue(action.order_value_hkd);
   if (orderValueHkd) {
@@ -5582,19 +5623,26 @@ function renderBrokerCards() {
 
 function renderBrokerSummaryCards() {
   const summaries = brokerSummaries();
-  if (!summaries.length) {
-    return `<article class="broker-summary-card"><span class="summary-label">券商暂无数据</span><strong>-</strong></article>`;
-  }
-  return summaries.map((summary) => {
-    const broker = brokerKey(summary);
+  return ACCOUNT_BROKERS.map((broker) => {
+    const summary = summaries.find((item) => brokerKey(item) === broker) || {broker};
     const profile = ACCOUNT_STRATEGY_PROFILES[broker] || {horizon: "-", strategy: "-"};
     return `<button class="broker-summary-card" type="button" data-broker="${escapeHtml(broker)}">
       <span class="summary-label">${escapeHtml(brokerDisplayName(summary))}</span>
       <span class="account-horizon-label">${escapeHtml(profile.horizon)} · ${escapeHtml(profile.strategy)}</span>
+      <span class="broker-account-alias">账户 ${escapeHtml(formatPlain(brokerAccountAlias(broker, summary)))}</span>
       <strong>${escapeHtml(formatMoney(summary.portfolio_value_hkd, "HKD"))}</strong>
       <span class="summary-note">持仓 ${escapeHtml(formatDisplayNumber(summary.holding_count))} · ${escapeHtml(brokerSummarySourceText(summary))}</span>
     </button>`;
   }).join("");
+}
+
+function brokerAccountAlias(broker, summary = {}) {
+  const cash = getCashRows().find((row) => brokerKey(row) === broker) || {};
+  const detail = (state.dashboard?.holdings || []).flatMap((holding) => (
+    Array.isArray(holding.broker_details) ? holding.broker_details : []
+  )).find((row) => brokerKey(row) === broker) || {};
+  return firstPresent(summary.account_alias, summary.accounts, cash.account_alias, cash.accounts,
+    detail.account_alias, detail.accounts, "-");
 }
 
 function brokerSummarySourceText(summary) {
@@ -5950,6 +5998,21 @@ function formatDecisionTarget(value) {
 function formatMoney(value, currency) {
   if (!hasValue(value)) return "-";
   return `${currency} ${formatDisplayNumber(value)}`;
+}
+
+function formatSignedPnl(value) {
+  const raw = formatPlain(value).trim();
+  const suffix = raw.endsWith("%") ? "%" : "";
+  const numberText = suffix ? raw.slice(0, -1) : raw;
+  const number = numericValue(numberText);
+  if (number === null) return raw;
+  const digits = formatDisplayNumber(numberText.replace(/^[+-]/, "").replace(/,/g, ""));
+  const sign = number > 0 ? "+" : number < 0 ? "-" : "";
+  return `${sign}${digits}${suffix}`;
+}
+
+function formatSignedMoney(value, currency) {
+  return hasValue(value) ? `${currency} ${formatSignedPnl(value)}` : "-";
 }
 
 function pnlClass(value) {

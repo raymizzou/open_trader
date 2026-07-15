@@ -324,14 +324,30 @@ def _is_actionable_console_error(message: str) -> bool:
     )
 
 
-def _first_in_scope_holding(payload: dict[str, Any]) -> tuple[str, str]:
+def _first_in_scope_holding(payload: dict[str, Any]) -> tuple[str, str, str]:
     for holding in payload.get("holdings") or []:
         if (holding.get("agent_report") or {}).get("available") is True:
-            return str(holding.get("market", "")), str(holding.get("symbol", ""))
+            brokers = {
+                "phillips" if value == "phillip" else value
+                for value in [
+                    *(str(holding.get("brokers") or "").lower().split(";")),
+                    str(holding.get("broker") or "").lower(),
+                    *(
+                        str(detail.get("broker") or "").lower()
+                        for detail in holding.get("broker_details") or []
+                        if isinstance(detail, Mapping)
+                    ),
+                ]
+                if value
+            }
+            broker = next((item for item in ACCOUNT_BROKERS if item in brokers), "")
+            assert broker, "advice-backed holding has no account broker"
+            return str(holding.get("market", "")), str(holding.get("symbol", "")), broker
     raise AssertionError("no advice-backed holding exists in Dashboard payload")
 
 
-def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
+def _check_decision_tabs(page: Any, market: str, symbol: str, broker: str) -> None:
+    _select_account_tab(page, broker)
     button = page.locator(
         'button[data-detail-mode="decision"]'
         f'[data-detail-market="{market}"]'
@@ -361,6 +377,16 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
 
 def _plain(value: Any) -> str:
     return "-" if value is None or str(value).strip() == "" else str(value)
+
+
+def _display_number(value: Any) -> str:
+    raw = _plain(value).strip()
+    match = re.fullmatch(r"([+-]?)(\d+)(\.\d+)?", raw)
+    if match is None:
+        return raw
+    sign, integer, fraction = match.groups()
+    grouped = re.sub(r"\B(?=(\d{3})+(?!\d))", ",", integer)
+    return f"{sign}{grouped}{fraction or ''}"
 
 
 def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
@@ -530,7 +556,7 @@ def _check_trend_stage(
                 ("金额上限", "target_amount"),
                 ("预计保护线", "estimated_initial_line"),
             ):
-                assert f"{label} {_plain(item.get(key))}" in text, (
+                assert f"{label} {_display_number(item.get(key))}" in text, (
                     f"{broker} 的买入动作缺少 {label}"
                 )
             continue
@@ -539,7 +565,7 @@ def _check_trend_stage(
         )
         assert reason in text, f"{broker} 的 {kind} 动作缺少原因 {reason}"
         if item.get("active_line") not in (None, ""):
-            assert f"活动保护线 {_plain(item['active_line'])}" in text, (
+            assert f"活动保护线 {_display_number(item['active_line'])}" in text, (
                 f"{broker} 的 {kind} 动作缺少活动保护线"
             )
 
@@ -563,7 +589,7 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
         for value in (item.get("symbol"), item.get("name")):
             if value:
                 assert str(value) in sections[0], f"{broker} 候选榜缺少 {value}"
-        assert f"强度 {_plain(item.get('strength'))}" in sections[0], (
+        assert f"强度 {_display_number(item.get('strength'))}" in sections[0], (
             f"{broker} 候选榜缺少强度"
         )
     excluded = data.get("excluded") if isinstance(data.get("excluded"), Mapping) else {}
@@ -581,8 +607,9 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
     if not industries:
         assert "无" in sections[2], f"{broker} 空行业集中度未显示 无"
     for row in industries:
-        for value in row if isinstance(row, list) else []:
-            assert _plain(value) in sections[2], f"{broker} 行业集中度缺少 {value}"
+        for index, value in enumerate(row if isinstance(row, list) else []):
+            expected = _plain(value) if index == 0 else _display_number(value)
+            assert expected in sections[2], f"{broker} 行业集中度缺少 {value}"
     audit_text = audit.inner_text()
     sources = data.get("data_sources") if isinstance(data.get("data_sources"), list) else []
     for source in sources:
@@ -592,7 +619,7 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
         cost = data.get("estimated_api_cost")
     if cost is None:
         cost = "未知"
-    assert f"API 成本：{_plain(cost)}" in audit_text, f"{broker} 审计详情缺少 API 成本"
+    assert f"API 成本：{_display_number(cost)}" in audit_text, f"{broker} 审计详情缺少 API 成本"
 
 
 def _check_account_holdings(
@@ -695,7 +722,7 @@ def _check_account_holdings(
         ], f"{broker} 趋势报告头部内容与 API 不一致"
         counts = report.get("counts") if isinstance(report.get("counts"), Mapping) else {}
         for label, key in (("卖出", "sell"), ("买入", "buy"), ("持有", "hold"), ("人工复核", "review")):
-            assert f"{label} {_plain(counts.get(key) or 0)}" in workspace_text, (
+            assert f"{label} {_display_number(counts.get(key) or 0)}" in workspace_text, (
                 f"{broker} 趋势报告缺少 {label}计数"
             )
         stage_texts = workspace.locator(".trend-stage").all_inner_texts()
@@ -827,7 +854,7 @@ def _browser_check(
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome", headless=True)
             try:
-                market, symbol = _first_in_scope_holding(payload)
+                market, symbol, decision_broker = _first_in_scope_holding(payload)
             except AssertionError as exc:
                 browser.close()
                 return [str(exc)], None
@@ -858,7 +885,7 @@ def _browser_check(
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
-                        _check_decision_tabs(page, market, symbol)
+                        _check_decision_tabs(page, market, symbol, decision_broker)
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:

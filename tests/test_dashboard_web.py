@@ -117,6 +117,61 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     assert "overflow-x: hidden;" in mobile
 
 
+def test_dashboard_muted_text_meets_aa_on_soft_surface() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    assert "--muted: #78716c;" in css
+    assert "--surface-soft: #faf8f4;" in css
+
+
+def test_dashboard_account_tabs_register_roving_keyboard_and_panel_semantics() -> None:
+    output = run_dashboard_js(r'''
+let focused="";
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.listeners={};
+    this.attributes={};this.classList={add(){},remove(){},toggle(){},contains(){return false;}};}
+  addEventListener(name,listener){this.listeners[name]=listener;}
+  setAttribute(name,value){this.attributes[name]=value;}
+  querySelectorAll(){return [];}
+  querySelector(selector){return {focus(){focused=selector;}};}
+}
+const nodes={};
+document.getElementById=(id)=>nodes[id]||(nodes[id]=new Element());
+document.querySelector=()=>nodes["workspace-grid"]||(nodes["workspace-grid"]=new Element());
+bindElements();bindEvents();
+state.dashboard={summary:{portfolio_value_hkd:"0"},broker_summaries:[],source_statuses:[],cash_rows:[],holdings:[]};
+renderAccountHoldings();
+const initial={tabs:nodes["account-tabs"].innerHTML,panel:nodes["account-holdings"].innerHTML,labelledBy:nodes["account-holdings"].attributes["aria-labelledby"]};
+const press=(key)=>{
+  let prevented=false;
+  nodes["account-tabs"].listeners.keydown({key,target:{closest(selector){return selector==='[role="tab"][data-broker]'?{dataset:{broker:state.brokerFilter}}:null;}},preventDefault(){prevented=true;}});
+  return {broker:state.brokerFilter,focused,prevented};
+};
+console.log(JSON.stringify({initial,left:press("ArrowLeft"),home:press("Home"),end:press("End"),right:press("ArrowRight")}));
+''')
+    rendered = json.loads(output)
+    assert 'id="account-tab-futu"' in rendered["initial"]["tabs"]
+    assert rendered["initial"]["tabs"].count('aria-controls="account-holdings"') == 4
+    assert 'aria-selected="true" tabindex="0"' in rendered["initial"]["tabs"]
+    assert 'aria-selected="false" tabindex="-1"' in rendered["initial"]["tabs"]
+    assert 'id="account-futu" class="account-section"' in rendered["initial"]["panel"]
+    assert rendered["initial"]["labelledBy"] == "account-tab-futu"
+    for broker in ("tiger", "phillips", "eastmoney"):
+        assert f'id="account-{broker}"' not in rendered["initial"]["panel"]
+    assert rendered["left"] == {
+        "broker": "eastmoney", "focused": '[data-broker="eastmoney"]', "prevented": True,
+    }
+    assert rendered["home"] == {
+        "broker": "futu", "focused": '[data-broker="futu"]', "prevented": True,
+    }
+    assert rendered["end"] == {
+        "broker": "eastmoney", "focused": '[data-broker="eastmoney"]', "prevented": True,
+    }
+    assert rendered["right"] == {
+        "broker": "futu", "focused": '[data-broker="futu"]', "prevented": True,
+    }
+
+
 def test_dashboard_renders_validated_and_fallback_decision_plans() -> None:
     node = shutil.which("node")
     if node is None:
@@ -1116,6 +1171,52 @@ console.log(JSON.stringify({tabs,section,cards:renderBrokerSummaryCards(),label:
     assert rendered["label"].endswith("10,000 条")
 
 
+def test_dashboard_broker_cards_always_render_four_accounts_and_derive_aliases() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard={
+  broker_summaries:[{broker:"futu",account_alias:"futu_summary",portfolio_value_hkd:"1000"}],
+  source_statuses:[{broker:"eastmoney",status:"failed",display_text:"同步失败：账单缺失"}],
+  cash_rows:[{broker:"tiger",account_alias:"tiger_cash"}],
+  holdings:[
+    {market:"HK",symbol:"02840",brokers:"phillips",broker_details:[{broker:"phillips",account_alias:"phillips_detail"}]},
+    {market:"CN",symbol:"600519",brokers:"eastmoney",broker_details:[{broker:"eastmoney",account_alias:"eastmoney_detail"}]},
+  ],
+};
+const cards=renderBrokerSummaryCards();
+const groups=accountHoldingGroups();
+console.log(JSON.stringify({cards,sections:Object.fromEntries(groups.map((group)=>[group.broker,renderAccountSection(group)]))}));
+''')
+    rendered = json.loads(output)
+    assert rendered["cards"].count('class="broker-summary-card"') == 4
+    for broker, label, alias in (
+        ("futu", "富途", "futu_summary"),
+        ("tiger", "老虎", "tiger_cash"),
+        ("phillips", "辉立", "phillips_detail"),
+        ("eastmoney", "东方财富", "eastmoney_detail"),
+    ):
+        assert f'data-broker="{broker}"' in rendered["cards"]
+        assert label in rendered["cards"]
+        assert alias in rendered["cards"]
+        assert alias in rendered["sections"][broker]
+    assert "同步失败：账单缺失" in rendered["cards"]
+
+
+def test_dashboard_empty_payload_keeps_all_broker_cards_and_static_placeholders() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard={broker_summaries:[],source_statuses:[],cash_rows:[],holdings:[]};
+console.log(renderBrokerSummaryCards());
+''')
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert output.count('class="broker-summary-card"') == 4
+    for broker, label in (
+        ("futu", "富途"), ("tiger", "老虎"),
+        ("phillips", "辉立"), ("eastmoney", "东方财富"),
+    ):
+        assert f'data-broker="{broker}"' in output
+        assert label in output
+        assert f'data-broker-placeholder="{broker}"' in html
+
+
 def test_dashboard_visible_count_formats_the_filtered_row_count() -> None:
     output = run_dashboard_js(r'''
 const mount = () => ({innerHTML:"",textContent:"",classList:{add(){},remove(){}}});
@@ -1178,6 +1279,119 @@ console.log(JSON.stringify({profit:render("+1234.50"),loss:render("-1234.50"),ze
     assert '<div>\n            <dt>已实现盈亏</dt>\n            <dd>USD 0.00</dd>' in rendered["zero"]
     assert "pnl-profit" not in rendered["zero"]
     assert "pnl-loss" not in rendered["zero"]
+
+
+def test_dashboard_signed_pnl_formats_signs_groups_and_only_actual_pnl() -> None:
+    output = run_dashboard_js(r'''
+const account = renderAccountTable([{key:"futu:US:AAPL:0",holding:{},display:{
+  market:"US",symbol:"AAPL",name:"Apple",total_quantity:"1",avg_cost_price:"1",
+  market_value_hkd:"1",account_weight:"12.50%",portfolio_weight:"6.25%",unrealized_pnl_pct:"16.67%",
+}}]);
+const backtest = renderBacktestComparisonMetrics({
+  strategy:{total_return_pct:12.5,max_drawdown_pct:8.25,trades:[],win_rate_pct:60},
+  buy_hold:{total_return_pct:0},market_benchmark:{total_return_pct:"+3.50"},benchmark_symbol:"SPY",
+  strategy_excess_return_pct:-2.5,market_excess_return_pct:9.25,
+});
+const plan = renderDecisionPlanBacktests([{
+  range:"1Y",strategy_id:"demo",strategy:{total_return_pct:12.5,max_drawdown_pct:8.25,sharpe_ratio:1,calmar_ratio:1},
+  market_benchmark:{symbol:"SPY",total_return_pct:0},market_excess_return_pct:"+3.50",gate:{passed:true},
+}]);
+console.log(JSON.stringify({
+  values:[formatSignedPnl("1234567.50"),formatSignedPnl("+1234567.50"),formatSignedPnl("-1234567.50"),formatSignedPnl("0.00"),formatSignedPnl("12.50%")],
+  drawdowns:[drawdownPercent(8.25),drawdownPercent(-8.25),drawdownPercent(0)],account,backtest,plan,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["values"] == [
+        "+1,234,567.50", "+1,234,567.50", "-1,234,567.50", "0.00", "+12.50%",
+    ]
+    assert rendered["drawdowns"] == ["-8.25%", "-8.25%", "0%"]
+    assert ">+16.67%</td>" in rendered["account"]
+    assert ">12.50%</td>" in rendered["account"]  # generic account weight stays unsigned
+    assert '<strong class="pnl-profit">+12.50%</strong>' in rendered["backtest"]
+    assert '<span>最大回撤</span><strong class="pnl-loss">-8.25%</strong>' in rendered["backtest"]
+    assert ">60.00%</strong>" in rendered["backtest"]
+    assert ">+12.50%</dd>" in rendered["plan"]
+    assert '<dt>最大回撤</dt><dd class="pnl-loss">-8.25%</dd>' in rendered["plan"]
+
+
+def test_dashboard_signed_pnl_covers_tiger_returns_and_kelly_sample_pnl() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard={tiger_long_term_strategy:{validation:{
+  strategy:{annualized_return_pct:12.5,max_drawdown_pct:8.25,sharpe_ratio:1,calmar_ratio:1},gate:{reasons:[]},
+}}};
+const tiger=renderAccountStrategy({broker:"tiger",profile:ACCOUNT_STRATEGY_PROFILES.tiger});
+const kelly=renderKellyParameterDerivation({sample_stage:"sufficient",avg_net_win_pct:"12.50%",avg_net_loss_pct:"-8.25%"});
+console.log(JSON.stringify({tiger,kelly}));
+''')
+    rendered = json.loads(output)
+    assert '<dd class="pnl-profit">+12.50%</dd>' in rendered["tiger"]
+    assert '<dt>最大回撤</dt><dd class="pnl-loss">-8.25%</dd>' in rendered["tiger"]
+    assert "+12.50% / -8.25%" in rendered["kelly"]
+
+
+def test_dashboard_remaining_numeric_leaves_group_only_numeric_values() -> None:
+    output = run_dashboard_js(r'''
+const condition=renderDecisionPlanCondition({
+  condition_id:"00001234",priority:"ordinary",trigger_count:5000,operator:">=",calculated_value:"25142.16",
+  suggested_action:"观察",target_weight:"0.1",target_quantity:"25142.16",source_date:"2026-07-16",
+},0);
+const facts=[
+  renderDecisionPlanFact({key:"rsi14",calculated_value:"25142.16"}),
+  renderDecisionPlanFact({key:"ma20_distance_pct",calculated_value:"21.13%"}),
+].join("");
+const keywords=renderDomesticKeywordTags([{keyword:"00001234",count:5000}]);
+const bollinger=renderBollingerBand({lower:"1234567.50",middle:"2000000.00",upper:"3000000.00"},"25142.16")
+  +renderBollingerMetrics({middle:"2000000.00",distance_pct:"21.13%"},"1234567.50","neutral");
+const technical=renderTechnicalFactRows(technicalFactRows({timeframes:[{
+  timeframe_label:"2026-07-16",current_price:"1234567.50",rsi:"21.13%",trend:"等待确认",
+  macd:{macd:"1234567.50",signal:"2000000.00",histogram:"3000000.00"},
+  atr:{value:"1234567.50",percent_of_price:"21.13%"},
+  support_resistance:{support_levels:["1234567.50"],resistance_levels:["2000000.00"]},
+  moving_averages:{ma20:"1234567.50"},
+}]}));
+const action=renderTradeDecisionBand({
+  action:"HOLD",limit_price:"1234567.50",suggested_quantity:"25142.16",order_value_hkd:"29320000.00",
+  stop_price:"2000000.00",reason:"等待确认",
+},{total_quantity:"5000"});
+const review=renderPreviousDecisionReview({
+  run_date:"2026-07-16",status:"triggered",trigger_count:5000,starting_quantity:"25142.16",closing_quantity:"00001234",
+});
+console.log(JSON.stringify({condition,facts,keywords,bollinger,technical,action,review}));
+''')
+    rendered = json.loads(output)
+    assert "已触发 5,000 次" in rendered["condition"]
+    assert "目标数量</span><strong>25,142.16</strong>" in rendered["condition"]
+    assert 'data-plan-condition="00001234"' in rendered["condition"]
+    assert "25,142.16" in rendered["facts"] and "21.13%" in rendered["facts"]
+    assert ">00001234</span>" in rendered["keywords"] and ">5,000</em>" in rendered["keywords"]
+    for expected in ("1,234,567.50", "2,000,000.00", "3,000,000.00"):
+        assert expected in rendered["bollinger"]
+    assert "21.13%" in rendered["bollinger"]
+    assert "2026-07-16 当前价" in rendered["technical"]
+    assert "1,234,567.50" in rendered["technical"]
+    assert "21.13%" in rendered["technical"] and "等待确认" in rendered["technical"]
+    for expected in ("MACD 1,234,567.50", "Signal 2,000,000.00", "Hist 3,000,000.00", "MA20 1,234,567.50"):
+        assert expected in rendered["technical"]
+    for expected in ("1,234,567.50", "25,142.16", "HKD 29,320,000.00", "2,000,000.00"):
+        assert expected in rendered["action"]
+    assert "上期复盘 · 2026-07-16" in rendered["review"]
+    assert "条件触发 <strong>5,000 次</strong>" in rendered["review"]
+    assert "期初数量 <strong>25,142.16</strong>" in rendered["review"]
+    assert "本期期初数量 <strong>00,001,234</strong>" in rendered["review"]
+
+
+def test_dashboard_formats_numeric_suggested_notional_in_both_action_views() -> None:
+    output = run_dashboard_js(r'''
+const action={
+  market:"US",symbol:"AAPL",action:"HOLD",status:"ready",suggested_notional:"29320000.00",
+  notional_currency:"USD",reason:"等待人工确认",
+};
+console.log(JSON.stringify({band:renderTradeDecisionBand(action,{}),card:renderActionCard(action)}));
+''')
+    rendered = json.loads(output)
+    assert "USD 29,320,000.00" in rendered["band"]
+    assert "USD 29,320,000.00" in rendered["card"]
 
 
 def test_dashboard_decision_target_fallback_formats_only_numeric_tokens() -> None:
@@ -2034,7 +2248,9 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".source-header-row" in css
     assert ".source-status-list" in css
     assert ".source-status-row" in css
-    assert ".cash-detail-panel" in css
+    assert ".cash-detail-panel" not in css
+    assert "function closeStandardBacktest(" not in js
+    assert "function closeTrendReport(" not in js
     assert ".market-section-row" in css
     assert ".market-section-us-stock" in css
     assert ".market-section-us-option" in css
@@ -2296,6 +2512,39 @@ console.log(JSON.stringify({broker:state.brokerFilter,key:state.selectedHoldingK
         "key": "futu:US:QQQ:0",
         "market": "ALL",
         "tab": "news",
+    }
+
+
+def test_dashboard_broker_switch_clears_stale_decision_deep_link_before_reload() -> None:
+    output = run_dashboard_js(r'''
+globalThis.window={
+  location:{pathname:"/",search:"?market=US&symbol=AAPL&decision_tab=news",hash:""},
+  history:{replaceState(_state,_title,url){
+    const query=String(url).split("?",2)[1]||"";
+    window.location.search=query?`?${query.split("#",1)[0]}`:"";
+  }},
+};
+const mount=()=>({innerHTML:"",textContent:"",classList:{add(){},remove(){}}});
+for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"])elements[id]=mount();
+state.dashboard={
+  summary:{portfolio_value_hkd:"3000"},broker_summaries:[],source_statuses:[],cash_rows:[],
+  holdings:[{market:"US",symbol:"AAPL",brokers:"futu",broker_details:[
+    {broker:"futu",market:"US",symbol:"AAPL",quantity:"1"},
+  ]}],
+};
+state.brokerFilter="futu";
+state.selectedHoldingKey="futu:US:AAPL:0";
+state.selectedDecisionTab="news";
+selectBroker("tiger");
+const afterSwitch={search:window.location.search,key:state.selectedHoldingKey,broker:state.brokerFilter};
+state.selectedHoldingKey="";
+state.decisionDeepLinkRestored=false;
+restoreDecisionDeepLink();
+console.log(JSON.stringify({afterSwitch,afterReload:{key:state.selectedHoldingKey,broker:state.brokerFilter}}));
+''')
+    assert json.loads(output) == {
+        "afterSwitch": {"search": "", "key": "", "broker": "tiger"},
+        "afterReload": {"key": "", "broker": "tiger"},
     }
 
 

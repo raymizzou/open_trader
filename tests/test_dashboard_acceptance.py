@@ -406,12 +406,12 @@ def trend_reports() -> dict[str, dict[str, object]]:
             "data_date": "2026-07-14", "generated_at": "2026-07-15T11:30:36+08:00",
             "account_status": "已更新", "buy_window": "美股常规交易时段",
             "sell_actions": [{"symbol": "AAPL", "name": "苹果", "reason": "danger_signal", "active_line": "190"}],
-            "buy_actions": [{"symbol": "VIXY", "name": "波动率ETF", "estimated_shares": "20", "target_amount": "5000", "estimated_initial_line": "18.50"}],
+            "buy_actions": [{"symbol": "VIXY", "name": "波动率ETF", "estimated_shares": "5000", "target_amount": "25142.16", "estimated_initial_line": "18.50"}],
             "hold_actions": [{"symbol": "SPY", "name": "标普ETF", "reason": "trend_intact", "active_line": "500"}],
             "review_actions": [{"symbol": "QQQ", "name": "纳指ETF", "reason": "holding_signal_unknown"}],
             "counts": {"sell": 1, "buy": 1, "hold": 1, "review": 1},
             "audit": {
-                "candidates": [{"symbol": "VIXY", "name": "波动率ETF", "strength": "95"}],
+                "candidates": [{"symbol": "VIXY", "name": "波动率ETF", "strength": "5000"}],
                 "excluded": {"QQQ": ["already_held"]},
                 "industry_concentration": [["科技", 1, "0.25"]],
                 "data_sources": ["Trend Animals", "Futu US daily K-line"],
@@ -451,6 +451,7 @@ def valid_payload() -> dict[str, object]:
     other = [{
         "market": "US",
         "symbol": "MSFT",
+        "brokers": "tiger",
         "portfolio_weight_hkd": "50.00%",
         "agent_report": {"available": True},
         "tradingagents_summary": {"available": True},
@@ -568,7 +569,7 @@ def trend_stage_texts(broker: str) -> list[str]:
         return ["开盘前\n无", "09:30–10:00\n无", "盘中持续\n无", "人工复核\n无"]
     return [
         "开盘前\nAAPL 苹果 危险信号触发 活动保护线 190",
-        "美股常规交易时段\nVIXY 波动率ETF 约 20 股 金额上限 5000 预计保护线 18.50",
+        "美股常规交易时段\nVIXY 波动率ETF 约 5,000 股 金额上限 25,142.16 预计保护线 18.50",
         "盘中持续\nSPY 标普ETF 趋势保持完好 活动保护线 500",
         "人工复核\nQQQ 纳指ETF 趋势信号不完整",
     ]
@@ -578,7 +579,7 @@ def trend_audit_text(broker: str) -> str:
     if broker == "phillips":
         return "审计详情 候选榜 无 排除项 无 行业集中度 无 数据来源：Trend Animals API 成本：1.20"
     return (
-        "审计详情 候选榜 VIXY 波动率ETF 强度 95 排除项 QQQ 当前账户已经持有 "
+        "审计详情 候选榜 VIXY 波动率ETF 强度 5,000 排除项 QQQ 当前账户已经持有 "
         "行业集中度 科技 1 0.25 数据来源：Trend Animals、Futu US daily K-line API 成本：1.00"
     )
 
@@ -587,7 +588,7 @@ def trend_audit_sections(broker: str) -> list[str]:
     if broker == "phillips":
         return ["候选榜 无", "排除项 无", "行业集中度 无"]
     return [
-        "候选榜 VIXY 波动率ETF 强度 95",
+        "候选榜 VIXY 波动率ETF 强度 5,000",
         "排除项 QQQ 当前账户已经持有",
         "行业集中度 科技 1 0.25",
     ]
@@ -941,7 +942,7 @@ def test_validate_dashboard_payload_accepts_explicitly_unsupported_source() -> N
 
 
 def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
-    assert dashboard_acceptance._first_in_scope_holding(valid_payload()) == ("US", "MSFT")
+    assert dashboard_acceptance._first_in_scope_holding(valid_payload()) == ("US", "MSFT", "tiger")
 
 
 def test_first_in_scope_holding_rejects_payload_without_current_advice() -> None:
@@ -967,6 +968,7 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
         def count(self) -> int:
             return {
                 "button": len(self.visible), "tabs": 5, "failed": 0, "panel": 1,
+                "account-tab": 1, "account-section": 1, "account-sections": 1,
             }[self.kind]
 
         @property
@@ -985,6 +987,9 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
             return Locator("tab", index)
 
         def get_attribute(self, name: str) -> str:
+            if self.kind == "account-tab":
+                assert name == "aria-selected"
+                return "true"
             assert name == "aria-controls"
             return f"decision-panel-{self.index}"
 
@@ -998,6 +1003,12 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
     class Page:
         def locator(self, selector: str) -> Locator:
             selectors.append(selector)
+            if selector == '#account-tabs [data-broker="tiger"]':
+                return Locator("account-tab")
+            if selector == "#account-tiger:visible":
+                return Locator("account-section")
+            if selector == ".account-section:visible":
+                return Locator("account-sections")
             button_selector = (
                 'button[data-detail-mode="decision"]'
                 '[data-detail-market="US"]'
@@ -1014,14 +1025,15 @@ def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None
             match = re.search(r"decision-panel-(\d+)", selector)
             return Locator("panel", int(match.group(1)) if match else 0)
 
-    dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT")
+    dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT", "tiger")
 
-    assert selectors[0] == (
+    assert selectors[0] == '#account-tabs [data-broker="tiger"]'
+    assert selectors[3] == (
         'button[data-detail-mode="decision"]'
         '[data-detail-market="US"]'
         '[data-detail-symbol="MSFT"]:visible'
     )
-    assert clicks == ["button", "tab", "tab", "tab", "tab", "tab"]
+    assert clicks == ["account-tab", "button", "tab", "tab", "tab", "tab", "tab"]
 
 
 def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> None:
@@ -1031,7 +1043,7 @@ def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> No
             self.index = index
 
         def count(self) -> int:
-            if self.kind in {"button", "initial-panel"}:
+            if self.kind in {"button", "initial-panel", "account-tab", "account-section", "account-sections"}:
                 return 1
             if self.kind == "tabs":
                 return 5
@@ -1051,6 +1063,9 @@ def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> No
             return Locator("tab", index)
 
         def get_attribute(self, name: str) -> str:
+            if self.kind == "account-tab":
+                assert name == "aria-selected"
+                return "true"
             assert name == "aria-controls"
             return f"decision-panel-{self.index}"
 
@@ -1059,6 +1074,12 @@ def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> No
 
     class Page:
         def locator(self, selector: str) -> Locator:
+            if selector == '#account-tabs [data-broker="futu"]':
+                return Locator("account-tab")
+            if selector == "#account-futu:visible":
+                return Locator("account-section")
+            if selector == ".account-section:visible":
+                return Locator("account-sections")
             if selector.startswith('button[data-detail-mode="decision"]'):
                 return Locator("button")
             if selector == ".decision-tab-list [data-decision-tab]":
@@ -1070,7 +1091,25 @@ def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> No
             return Locator("missing")
 
     with pytest.raises(AssertionError, match="TradingAgents"):
-        dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT")
+        dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT", "futu")
+
+
+def test_acceptance_formats_grouped_numeric_expectations_without_touching_text() -> None:
+    assert dashboard_acceptance._display_number("5000") == "5,000"
+    assert dashboard_acceptance._display_number("25142.16") == "25,142.16"
+    assert dashboard_acceptance._display_number("+25142.16") == "+25,142.16"
+    for value in ("02840", "2026-07-16", "21.13%", "等待确认"):
+        assert dashboard_acceptance._plain(value) == value
+
+    dashboard_acceptance._check_trend_stage(
+        "VIXY 波动率ETF 约 5,000 股 金额上限 25,142.16 预计保护线 1,234.50",
+        [{
+            "symbol": "VIXY", "name": "波动率ETF", "estimated_shares": "5000",
+            "target_amount": "25142.16", "estimated_initial_line": "1234.50",
+        }],
+        kind="buy",
+        broker="futu",
+    )
 
 
 def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(

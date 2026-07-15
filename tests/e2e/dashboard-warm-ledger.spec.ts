@@ -56,12 +56,26 @@ test('switches every broker tab and card while preserving US-filtered ledgers', 
   await page.goto('/');
 
   await expect(page.getByRole('tab')).toHaveCount(4);
+  await expect(page.getByRole('tabpanel')).toHaveCount(1);
+  await expect(page.getByRole('tabpanel')).toHaveAttribute('id', 'account-holdings');
+  for (const tab of await page.getByRole('tab').all()) {
+    await expect(tab).toHaveAttribute('aria-controls', 'account-holdings');
+  }
   await expect(page.locator('#current-view-value')).toHaveText('HKD 3,064,187.62');
+  const desktopTargets = page.locator('button:visible, a:visible');
+  for (const target of await desktopTargets.evaluateAll((elements) => elements.map((element) => ({
+    height: element.getBoundingClientRect().height,
+    label: (element.textContent || '').trim(),
+    width: element.getBoundingClientRect().width,
+  })))) {
+    expect(Math.min(target.height, target.width), target.label).toBeGreaterThanOrEqual(24);
+  }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   for (const broker of brokers) {
     const tab = page.getByRole('tab', { name: new RegExp(broker.label) });
     await tab.click();
     await expect(tab).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', `account-tab-${broker.key}`);
     await expect(page.locator(`#account-${broker.key}`)).toBeVisible();
     await expect(page.locator('.account-section')).toHaveCount(1);
     await expect(page.locator(`#account-${broker.key}`)).toContainText(broker.symbol);
@@ -119,6 +133,7 @@ test('opens every warm-ledger destination, using real UI paths where available',
 
   await page.locator('.account-holding-actions [data-detail-mode="decision"]').click();
   await expectWarmSurface(page, '.symbol-detail-panel.inline-symbol-detail');
+  await expect(page.locator('[data-research-chat]')).toHaveCount(0);
   // The display-only dashboard has no reachable research-chat trigger; activate its existing surface directly.
   await page.evaluate(() => (window as any).openResearchChat('US:AAPL:Apple:0'));
   await expectWarmSurface(page, '.research-chat-modal');
@@ -167,6 +182,31 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
     await expect(tab).toHaveCSS('outline-offset', '-3px');
   }
   await page.emulateMedia({ forcedColors: 'none' });
+
+  await tabs.first().focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect(page.getByRole('tab', { name: /东方财富/ })).toBeFocused();
+  await expect(page.getByRole('tab', { name: /东方财富/ })).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Home');
+  await expect(page.getByRole('tab', { name: /富途/ })).toBeFocused();
+  await page.keyboard.press('End');
+  await expect(page.getByRole('tab', { name: /东方财富/ })).toBeFocused();
+  await page.keyboard.press('ArrowRight');
+  await expect(page.getByRole('tab', { name: /富途/ })).toBeFocused();
+
+  const mobileTargets = page.locator([
+    '#account-tabs [role="tab"]:visible',
+    '#header-market-filters button:visible',
+    '.strategy-tools button:visible',
+    '#refresh-quotes:visible',
+    '.account-holding-actions button:visible',
+  ].join(','));
+  for (const target of await mobileTargets.evaluateAll((elements) => elements.map((element) => ({
+    height: element.getBoundingClientRect().height,
+    label: (element.textContent || '').trim(),
+  })))) {
+    expect(target.height, target.label).toBeGreaterThanOrEqual(44);
+  }
 
   await page.getByRole('tab', { name: /老虎/ }).click();
   await page.getByRole('button', { name: '凯利实验室' }).click();
