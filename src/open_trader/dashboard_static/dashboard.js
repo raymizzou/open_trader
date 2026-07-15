@@ -1838,7 +1838,14 @@ function renderDashboardViews() {
 function renderAccountStrategy(group) {
   if (group.broker === "futu" || group.broker === "phillips") {
     const market = group.broker === "futu" ? "US" : "HK";
-    const summary = state.dashboard?.trend_market_summaries?.[market] || {};
+    const report = state.dashboard?.trend_reports?.[group.broker];
+    const summary = report ? {
+      ...report,
+      error: report.status_text,
+      buy_count: report.counts?.buy,
+      sell_count: report.counts?.sell,
+      manual_review_count: report.counts?.review,
+    } : state.dashboard?.trend_market_summaries?.[market] || {};
     if (summary.available === false || !summary.data_date) {
       return `<div class="account-strategy-summary"><strong>${escapeHtml(`${group.profile.horizon} · ${group.profile.strategy}`)}</strong><span>${escapeHtml(summary.error || "趋势报告尚未生成")}</span></div>`;
     }

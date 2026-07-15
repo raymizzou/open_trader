@@ -1607,6 +1607,31 @@ console.log(renderBrokerSummaryCards() + elements["account-holdings"].innerHTML)
     assert "tiger-long-term-panel" not in output
 
 
+def test_dashboard_js_renders_account_strategy_from_trend_report() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {trend_reports: {futu: {
+  available: true,
+  data_date: "2026-07-14",
+  account_source_date: "2026-07-14",
+  run_status: "failed",
+  counts: {buy: 2, sell: 1, review: 3},
+  recent_protection_alert: "AAPL · 2026-07-15T22:00:00+08:00 · 保护线 190",
+}}};
+console.log(renderAccountStrategy({broker: "futu", profile: ACCOUNT_STRATEGY_PROFILES.futu}));
+''')
+
+    for text in (
+        "数据日 2026-07-14",
+        "账户源 2026-07-14",
+        "买入 2",
+        "卖出 1",
+        "人工复核 3",
+        "本轮失败",
+        "最近保护提醒",
+    ):
+        assert text in output
+
+
 def test_dashboard_account_holdings_mobile_layout_css() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
