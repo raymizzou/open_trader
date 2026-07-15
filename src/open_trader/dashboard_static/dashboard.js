@@ -6,7 +6,7 @@ const state = {
   quotes: {},
   quotePayload: null,
   marketFilter: "ALL",
-  brokerFilter: "ALL",
+  brokerFilter: "futu",
   workspaceView: "portfolio",
   selectedKellyExperimentId: "",
   selectedHoldingKey: "",
@@ -52,6 +52,8 @@ const ACCOUNT_STRATEGY_PROFILES = {
   phillips: {horizon: "短线", strategy: "港股趋势交易"},
   eastmoney: {horizon: "偏短线", strategy: "趋势交易"},
 };
+
+const ACCOUNT_BROKERS = Object.keys(ACCOUNT_STRATEGY_PROFILES);
 
 const DECISION_TABS = [
   { key: "final", label: "最终决策" },
@@ -164,7 +166,8 @@ function bindElements() {
     "broker-summary-cards",
     "source-status-list",
     "kelly-lab-panel",
-    "cash-detail-panel",
+    "open-kelly-lab",
+    "return-to-portfolio",
     "summary-value",
     "summary-holding-bar",
     "summary-holding-value",
@@ -180,6 +183,7 @@ function bindElements() {
     "broker-filters",
     "visible-count",
     "symbol-detail-panel",
+    "account-tabs",
     "account-holdings",
     "action-count",
     "trade-actions",
@@ -252,6 +256,8 @@ function bindEvents() {
     setActiveFilter(elements["header-market-filters"], button);
     renderDashboardViews();
   });
+  elements["account-tabs"].addEventListener("click", handleBrokerSelection);
+  elements["broker-summary-cards"].addEventListener("click", handleBrokerSelection);
   elements["account-holdings"].addEventListener("click", (event) => {
     const trendReport = event.target.closest("[data-trend-report]");
     if (trendReport) {
@@ -284,6 +290,8 @@ function bindEvents() {
     }
   });
   elements["symbol-detail-panel"].addEventListener("click", handleSymbolDetailClick);
+  elements["open-kelly-lab"].addEventListener("click", () => setWorkspaceView("kelly_lab"));
+  elements["return-to-portfolio"].addEventListener("click", () => setWorkspaceView("portfolio"));
   elements["open-standard-backtest"].addEventListener("click", openStandardBacktest);
   elements["close-standard-backtest"].addEventListener("click", closeStandardBacktest);
   elements["trend-report-workspace"].addEventListener("click", (event) => {
@@ -759,16 +767,20 @@ function restoreDecisionDeepLink() {
   if (!market || !symbol) {
     return;
   }
-  const row = accountHoldingGroups().flatMap((group) => group.rows).find(({display}) => (
-    String(display.market || "").toUpperCase() === market
-    && String(display.symbol || "").toUpperCase() === symbol
+  const groups = accountHoldingGroups();
+  const match = ACCOUNT_BROKERS.flatMap((broker) => {
+    const group = groups.find((item) => item.broker === broker);
+    return (group?.rows || []).map((row) => ({broker, row}));
+  }).find(({row}) => (
+    String(row.display.market || "").toUpperCase() === market
+    && String(row.display.symbol || "").toUpperCase() === symbol
   ));
-  if (!row) {
+  if (!match) {
     return;
   }
   state.marketFilter = "ALL";
-  state.brokerFilter = "ALL";
-  state.selectedHoldingKey = row.key;
+  state.brokerFilter = match.broker;
+  state.selectedHoldingKey = match.row.key;
   state.selectedHoldingDetail = "decision";
   const decisionTab = String(params.get("decision_tab") || "final");
   state.selectedDecisionTab = DECISION_TABS.some((tab) => tab.key === decisionTab)
@@ -877,7 +889,13 @@ function renderWorkspaceChrome() {
   if (!elements["workspace-grid"]) {
     return;
   }
-  elements["workspace-grid"].classList.toggle("kelly-lab-view", state.workspaceView === "kelly_lab");
+  const labOpen = state.workspaceView === "kelly_lab";
+  elements["workspace-grid"].classList.toggle("kelly-lab-view", labOpen);
+  if (elements["open-kelly-lab"]) elements["open-kelly-lab"].hidden = labOpen;
+  if (elements["return-to-portfolio"]) {
+    elements["return-to-portfolio"].hidden = !labOpen;
+    elements["return-to-portfolio"].classList.toggle("hidden", !labOpen);
+  }
 }
 
 function renderKellyLab() {
@@ -889,7 +907,7 @@ function renderKellyLab() {
 
 function renderKellyLabPanel() {
   if (state.workspaceView !== "kelly_lab") {
-    return renderKellyLabEntry();
+    return "";
   }
 
   const dashboard = state.dashboard || {};
@@ -964,36 +982,6 @@ function renderKellyLabPanel() {
     ${renderKellyStrategyTabs(experiments, activeExperimentId)}
     <div class="kelly-experiment-grid single">
       ${cards}
-    </div>
-  `;
-}
-
-function renderKellyLabEntry() {
-  const dashboard = state.dashboard || {};
-  const lab = dashboard.kelly_lab;
-  const experiments = lab && typeof lab === "object" && Array.isArray(lab.experiments)
-    ? lab.experiments
-    : [];
-  const count = lab && typeof lab === "object" && hasValue(lab.experiment_count)
-    ? lab.experiment_count
-    : experiments.length;
-  const statusText = state.dashboardError
-    ? "不可用"
-    : !state.dashboard
-      ? "加载中"
-      : lab && typeof lab === "object" && lab.available
-        ? `${formatPlain(count)} 个实验`
-        : "未就绪";
-  return `
-    <div class="kelly-lab-entry">
-      <div>
-        <h2>凯利实验室</h2>
-        <p>模拟盘策略实验结果单独查看。</p>
-      </div>
-      <div class="kelly-lab-entry-actions">
-        <span class="count-pill">${escapeHtml(statusText)}</span>
-        <button class="primary-button" type="button" data-workspace-view="kelly_lab">凯利实验室</button>
-      </div>
     </div>
   `;
 }
@@ -2017,172 +2005,24 @@ function renderAccountStrategy(group) {
 }
 
 function renderHeaderSummary() {
-  const summary = currentViewSummary();
+  const summary = state.dashboard?.summary || {};
   elements["current-view-value"].textContent = formatMoney(summary.portfolio_value_hkd, "HKD");
   elements["current-view-holding-value"].textContent = `持仓资产 ${formatMoney(summary.holding_value_hkd, "HKD")}`;
-  elements["current-view-holding-weight"].textContent = summary.holding_weight_hkd;
+  elements["current-view-holding-weight"].textContent = formatPlain(summary.holding_weight_hkd);
   elements["current-view-cash-note"].textContent = `现金类资产 ${formatMoney(summary.cash_like_value_hkd, "HKD")} · 持仓 ${formatPlain(summary.holding_count)}`;
-  elements["current-view-label"].textContent = currentViewLabel(summary.holding_count);
+  elements["current-view-label"].textContent = currentViewLabel(activeAccountRowCount());
 }
 
-function currentViewSummary() {
-  if (state.marketFilter === "CASH") {
-    const cashRows = filteredCashRows();
-    const cashTotal = sumMoneyValues(cashRows);
-    const hasCashTotal = cashTotal.complete && cashTotal.hasValue;
-    return {
-      portfolio_value_hkd: hasCashTotal ? cashTotal.text : "",
-      holding_value_hkd: "",
-      cash_like_value_hkd: hasCashTotal ? cashTotal.text : "",
-      holding_weight_hkd: hasCashTotal ? percentValue(0, cashTotal.value) : "-",
-      holding_count: cashRows.length,
-    };
-  }
-  if (
-    state.marketFilter === "ALL"
-    && state.brokerFilter !== "ALL"
-    && Object.keys(state.quotes).length === 0
-  ) {
-    const summary = currentBrokerSummary();
-    if (summary) {
-      return {
-        portfolio_value_hkd: firstPresent(summary.portfolio_value_hkd, ""),
-        holding_value_hkd: firstPresent(summary.holding_value_hkd, ""),
-        cash_like_value_hkd: firstPresent(summary.cash_like_value_hkd, ""),
-        holding_weight_hkd: brokerSummaryHoldingWeight(summary),
-        holding_count: numericValue(summary.holding_count) === null
-          ? firstPresent(summary.holding_count, 0)
-          : Number(summary.holding_count),
-      };
-    }
-  }
-  const holdingRows = filteredHoldings();
-  const holdingTotal = sumHoldingValues(holdingRows);
-  const cashTotal = state.marketFilter === "ALL"
-    ? sumMoneyValues(filteredCashRows())
-    : emptyMoneySummary(true);
-  const totalsComplete = holdingTotal.complete && cashTotal.complete;
-  const hasTotal = totalsComplete && (holdingTotal.hasValue || cashTotal.hasValue);
-  const portfolioTotal = holdingTotal.value + cashTotal.value;
-  return {
-    portfolio_value_hkd: hasTotal ? moneyValue(portfolioTotal) : "",
-    holding_value_hkd: holdingTotal.text,
-    cash_like_value_hkd: cashTotal.text,
-    holding_weight_hkd: hasTotal ? percentValue(holdingTotal.value, portfolioTotal) : "-",
-    holding_count: holdingRows.length,
-  };
-}
-
-function currentBrokerSummary() {
-  return brokerSummaries().find((summary) => brokerKey(summary) === state.brokerFilter) || null;
-}
-
-function brokerSummaryHoldingWeight(summary) {
-  const holdingValue = numericValue(summary.holding_value_hkd);
-  const portfolioValue = numericValue(summary.portfolio_value_hkd);
-  if (holdingValue === null || portfolioValue === null) {
-    return "-";
-  }
-  return percentValue(holdingValue, portfolioValue);
-}
-
-function sumHoldingValues(rows) {
-  if (state.brokerFilter === "ALL") {
-    return sumMoneyValues(rows);
-  }
-
-  let validValueCount = 0;
-  let total = 0;
-  let complete = true;
-  for (const row of rows) {
-    const value = brokerHoldingValue(row);
-    if (!value.complete) {
-      complete = false;
-      continue;
-    }
-    if (!value.hasValue) {
-      continue;
-    }
-    validValueCount += 1;
-    total += value.value;
-  }
-
-  return {
-    value: total,
-    hasValue: validValueCount > 0,
-    complete,
-    text: complete && validValueCount > 0 ? moneyValue(total) : "",
-  };
-}
-
-function brokerHoldingValue(holding) {
-  if (quoteForHolding(holding)) {
-    return sumMoneyValues([holding]);
-  }
-  const brokers = rowBrokers(holding);
-  const details = brokerDetailRowsForCurrentFilter(holding);
-  if (details.length) {
-    const detailValue = sumMoneyValues(details);
-    if (detailValue.complete && detailValue.hasValue) {
-      return detailValue;
-    }
-    if (brokers.length > 1) {
-      return detailValue.complete ? emptyMoneySummary(false) : detailValue;
-    }
-  }
-  if (brokers.length > 1) {
-    return emptyMoneySummary(false);
-  }
-  return sumMoneyValues([holding]);
-}
-
-function brokerDetailRowsForCurrentFilter(holding) {
-  const details = Array.isArray(holding.broker_details) ? holding.broker_details : [];
-  return details.filter((detail) => {
-    if (brokerKey(detail) !== state.brokerFilter) {
-      return false;
-    }
-    const detailMarket = String(detail.market || "").trim().toUpperCase();
-    const holdingMarket = String(holding.market || "").trim().toUpperCase();
-    if (state.marketFilter !== "ALL" && detailMarket !== state.marketFilter) {
-      return false;
-    }
-    return !detailMarket || !holdingMarket || detailMarket === holdingMarket;
-  });
-}
-
-function sumMoneyValues(rows) {
-  let validValueCount = 0;
-  let complete = true;
-  const total = rows.reduce((sum, row) => {
-    const value = numericValue(row.market_value_hkd);
-    if (value === null) {
-      complete = false;
-      return sum;
-    }
-    validValueCount += 1;
-    return sum + value;
-  }, 0);
-  return {
-    value: total,
-    hasValue: validValueCount > 0,
-    complete,
-    text: complete && validValueCount > 0 ? moneyValue(total) : "",
-  };
-}
-
-function emptyMoneySummary(complete) {
-  return {
-    value: 0,
-    hasValue: false,
-    complete,
-    text: "",
-  };
+function activeAccountRowCount() {
+  const group = accountHoldingGroups().find((item) => item.broker === state.brokerFilter);
+  if (!group) return 0;
+  return group.rows.filter(({display}) => state.marketFilter === "ALL"
+    || String(display.market || "").toUpperCase() === state.marketFilter).length;
 }
 
 function currentViewLabel(count) {
-  const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CASH" ? "现金" : state.marketFilter === "CN" ? "A 股" : state.marketFilter;
-  const brokerLabel = state.brokerFilter === "ALL" ? "全部券商" : brokerDisplayName(state.brokerFilter);
+  const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CN" ? "A 股" : state.marketFilter;
+  const brokerLabel = brokerDisplayName(state.brokerFilter);
   return `当前视图：${marketLabel} · ${brokerLabel} · ${formatPlain(count)} 条`;
 }
 
@@ -2221,26 +2061,40 @@ function renderHoldings() {
   renderAccountHoldings();
 }
 
+function renderAccountTabs(groups) {
+  const counts = new Map(groups.map((group) => [group.broker, group.rows.length]));
+  return ACCOUNT_BROKERS.map((broker) => {
+    const selected = broker === state.brokerFilter;
+    return `<button class="account-tab ${selected ? "active" : ""}" type="button" role="tab"
+      data-broker="${escapeHtml(broker)}" aria-selected="${selected}">
+      ${escapeHtml(brokerDisplayName(broker))}<span>${escapeHtml(formatPlain(counts.get(broker) || 0))}</span>
+    </button>`;
+  }).join("");
+}
+
+function selectBroker(broker) {
+  if (!ACCOUNT_BROKERS.includes(broker)) return;
+  state.brokerFilter = broker;
+  state.selectedHoldingKey = "";
+  state.selectedHoldingDetail = "decision";
+  renderAccountHoldings();
+  if (elements["current-view-label"]) renderHeaderSummary();
+}
+
+function handleBrokerSelection(event) {
+  const button = event.target.closest("[data-broker]");
+  if (button) selectBroker(button.dataset.broker || "");
+}
+
 function renderAccountHoldings() {
   const container = elements["account-holdings"] || elements["holdings-body"];
-  if (state.marketFilter === "CASH") {
-    const cashRows = filteredCashRows();
-    elements["visible-count"].textContent = `${cashRows.length} 条`;
-    elements["workspace-grid"].classList.remove("detail-mode");
-    container.classList.add("hidden");
-    elements["symbol-detail-panel"].classList.add("hidden");
-    elements["symbol-detail-panel"].innerHTML = "";
-    elements["cash-detail-panel"].classList.remove("hidden");
-    renderCashDetailPanel(cashRows);
-    return;
-  }
-  elements["cash-detail-panel"].classList.add("hidden");
-  elements["cash-detail-panel"].innerHTML = "";
   const groups = accountHoldingGroups();
-  const visibleCount = groups.reduce((count, group) => count + group.rows.filter(({display}) => (
-    state.marketFilter === "ALL" || String(display.market || "").toUpperCase() === state.marketFilter
-  )).length, 0);
-  elements["visible-count"].textContent = `${visibleCount} 条`;
+  const active = groups.find((group) => group.broker === state.brokerFilter) || groups[0];
+  if (active && active.broker !== state.brokerFilter) state.brokerFilter = active.broker;
+  elements["account-tabs"].innerHTML = renderAccountTabs(groups);
+  const rows = active ? active.rows.filter(({display}) => state.marketFilter === "ALL"
+    || String(display.market || "").toUpperCase() === state.marketFilter) : [];
+  elements["visible-count"].textContent = `${formatPlain(rows.length)} 条`;
   elements["workspace-grid"].classList.remove("detail-mode");
   container.classList.remove("hidden");
   elements["symbol-detail-panel"].classList.add("hidden");
@@ -2253,13 +2107,14 @@ function renderAccountHoldings() {
     container.innerHTML = '<div class="empty-state">加载中</div>';
     return;
   }
-  container.innerHTML = groups.map(renderAccountSection).join("");
+  container.innerHTML = active
+    ? renderAccountSection({...active, rows})
+    : '<div class="empty-state">暂无券商账户</div>';
 }
 
 function renderAccountSection(group) {
   const headingId = `account-${group.broker}-title`;
-  const rows = group.rows.filter(({display}) => state.marketFilter === "ALL"
-    || String(display.market || "").toUpperCase() === state.marketFilter);
+  const rows = group.rows;
   const alias = firstPresent(group.rows[0]?.display?.account_alias, "-");
   const source = firstPresent(brokerSummarySourceText(group.summary), "-");
   const sourceTime = firstPresent(
@@ -2367,7 +2222,7 @@ function openTradeActionDetail(actionKey) {
   const rows = accountHoldingGroups().flatMap((group) => group.rows);
   for (const row of rows) {
     if (holdingActionKeys(row.holding).includes(normalizedActionKey)) {
-      resetHoldingFilters();
+      resetHoldingFilters(row.broker);
       state.selectedHoldingKey = row.key;
       state.selectedHoldingDetail = "decision";
       state.selectedDecisionTab = "final";
@@ -2378,9 +2233,9 @@ function openTradeActionDetail(actionKey) {
   }
 }
 
-function resetHoldingFilters() {
+function resetHoldingFilters(broker = state.brokerFilter) {
   state.marketFilter = "ALL";
-  state.brokerFilter = "ALL";
+  state.brokerFilter = ACCOUNT_BROKERS.includes(broker) ? broker : ACCOUNT_BROKERS[0];
   setFilterActiveByDataset(elements["header-market-filters"], "market", "ALL");
 }
 
@@ -5591,7 +5446,7 @@ function filteredHoldings() {
     const market = String(holding.market || "").toUpperCase();
     const brokers = rowBrokers(holding);
     const marketMatches = state.marketFilter === "ALL" || market === state.marketFilter;
-    const brokerMatches = state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
+    const brokerMatches = brokers.includes(state.brokerFilter);
     return marketMatches && brokerMatches;
   });
 }
@@ -5720,28 +5575,11 @@ function numericValue(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function moneyValue(value) {
-  return Number.isFinite(value) ? value.toFixed(2) : "";
-}
-
 function percentValue(numerator, denominator) {
   if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) {
     return "-";
   }
   return `${((numerator / denominator) * 100).toFixed(2)}%`;
-}
-
-function isCashLikeRow(row) {
-  if (!row || typeof row !== "object") {
-    return false;
-  }
-  const market = String(row.market || "").trim().toUpperCase();
-  const assetClass = String(row.asset_class || "").trim().toLowerCase();
-  const symbol = String(row.symbol || "").trim().toUpperCase();
-  return market === "CASH"
-    || assetClass === "cash"
-    || assetClass === "money_market_fund"
-    || symbol.endsWith("_CASH");
 }
 
 function brokerSummaries() {
@@ -5762,12 +5600,12 @@ function renderBrokerSummaryCards() {
   return summaries.map((summary) => {
     const broker = brokerKey(summary);
     const profile = ACCOUNT_STRATEGY_PROFILES[broker] || {horizon: "-", strategy: "-"};
-    return `<a class="broker-summary-card" data-broker="${escapeHtml(broker)}" href="#account-${escapeHtml(broker)}">
+    return `<button class="broker-summary-card" type="button" data-broker="${escapeHtml(broker)}">
       <span class="summary-label">${escapeHtml(brokerDisplayName(summary))}</span>
       <span class="account-horizon-label">${escapeHtml(profile.horizon)} · ${escapeHtml(profile.strategy)}</span>
       <strong>${escapeHtml(formatMoney(summary.portfolio_value_hkd, "HKD"))}</strong>
       <span class="summary-note">持仓 ${escapeHtml(formatPlain(summary.holding_count))} · ${escapeHtml(brokerSummarySourceText(summary))}</span>
-    </a>`;
+    </button>`;
   }).join("");
 }
 
@@ -5840,83 +5678,10 @@ function sourceStatusClass(status) {
   return "status-muted";
 }
 
-function filteredCashRows() {
-  if (state.brokerFilter !== "ALL") {
-    const detailRows = brokerCashDetailRows();
-    if (detailRows.length) {
-      return detailRows;
-    }
-  }
-  return getCashRows().filter((row) => {
-    if (!isCashLikeRow(row)) {
-      return false;
-    }
-    const brokers = rowBrokers(row);
-    return state.brokerFilter === "ALL" || brokers.includes(state.brokerFilter);
-  });
-}
-
 function getCashRows() {
   return (state.dashboard && Array.isArray(state.dashboard.cash_rows))
     ? state.dashboard.cash_rows
     : [];
-}
-
-function brokerCashDetailRows() {
-  return getCashDetails().filter((row) => {
-    if (!isCashLikeRow(row)) {
-      return false;
-    }
-    return brokerKey(row) === state.brokerFilter;
-  });
-}
-
-function getCashDetails() {
-  return (state.dashboard && Array.isArray(state.dashboard.cash_details))
-    ? state.dashboard.cash_details
-    : [];
-}
-
-function renderCashDetailPanel(rows) {
-  if (state.dashboardError) {
-    elements["cash-detail-panel"].innerHTML = `<div class="empty-state">看板数据加载失败</div>`;
-    return;
-  }
-  if (!state.dashboard) {
-    elements["cash-detail-panel"].innerHTML = `<div class="empty-state">加载中</div>`;
-    return;
-  }
-  if (!rows.length) {
-    elements["cash-detail-panel"].innerHTML = `<div class="empty-state">没有匹配的现金资产</div>`;
-    return;
-  }
-  elements["cash-detail-panel"].innerHTML = `
-    <h2>现金明细</h2>
-    <div class="compact-detail-table">
-      <table>
-        <thead>
-          <tr>
-            <th>券商</th>
-            <th>币种</th>
-            <th>标的</th>
-            <th>名称</th>
-            <th>港元市值</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows.map((row) => `
-            <tr>
-              <td>${escapeHtml(rowBrokers(row).map(brokerDisplayName).join("; ") || "-")}</td>
-              <td>${escapeHtml(formatPlain(row.currency))}</td>
-              <td>${escapeHtml(formatPlain(row.symbol))}</td>
-              <td>${escapeHtml(formatPlain(row.name))}</td>
-              <td class="number-cell">${escapeHtml(formatMoney(row.market_value_hkd, "HKD"))}</td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-    </div>
-  `;
 }
 
 function quoteDiagnosticActive() {

@@ -50,7 +50,8 @@ def test_dashboard_command_center_theme_preserves_the_data_contract() -> None:
         "current-view-value",
         "broker-summary-cards", "quote-status", "refresh-quotes",
         "source-status-list", "last-refresh", "kelly-lab-panel",
-        "account-holdings", "cash-detail-panel", "symbol-detail-panel",
+        "open-kelly-lab", "return-to-portfolio", "account-tabs",
+        "account-holdings", "symbol-detail-panel",
         "standard-backtest-workspace", "research-chat-layer",
     ):
         assert f'id="{element_id}"' in html
@@ -1470,7 +1471,8 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "current-view-value" in html
     assert "broker-summary-cards" in html
     assert "source-status-list" in html
-    assert "cash-detail-panel" in html
+    assert "account-tabs" in html
+    assert "cash-detail-panel" not in html
     assert "research-chat-modal" in html
     assert "research-chat-messages" in html
     assert "research-chat-input" in html
@@ -1734,65 +1736,55 @@ def test_dashboard_static_mounts_account_holdings_without_standalone_tiger_panel
     assert 'id="header-broker-filters"' not in html
 
 
-def test_dashboard_account_sections_and_links_are_semantic() -> None:
-    strategy = tiger_long_term_dashboard_payload()
-    payload = json.dumps(strategy, ensure_ascii=False)
-    output = run_dashboard_js(f'''
-const mount = () => ({{innerHTML: "", textContent: "", classList: {{add() {{}}, remove() {{}}}}}});
-elements["account-holdings"] = mount();
-elements["visible-count"] = mount();
-elements["workspace-grid"] = mount();
-elements["symbol-detail-panel"] = mount();
-elements["cash-detail-panel"] = mount();
-state.dashboard = {{
-  summary: {{portfolio_value_hkd: "4000"}},
-  broker_summaries: [
-    {{broker: "futu", display_name: "富途", portfolio_value_hkd: "1000", holding_value_hkd: "700", cash_like_value_hkd: "300", holding_count: "1"}},
-    {{broker: "tiger", display_name: "老虎", portfolio_value_hkd: "1000", holding_value_hkd: "800", cash_like_value_hkd: "200", holding_count: "1"}},
-    {{broker: "phillips", display_name: "辉立", portfolio_value_hkd: "1000", holding_value_hkd: "900", cash_like_value_hkd: "100", holding_count: "1"}},
-    {{broker: "eastmoney", display_name: "东方财富", portfolio_value_hkd: "1000", holding_value_hkd: "600", cash_like_value_hkd: "400", holding_count: "1"}},
-  ],
-  source_statuses: [], cash_rows: [], tiger_long_term_strategy: {payload},
-  trend_reports: {{
-    futu: {{available: true, report_date: "2026-07-15", data_date: "2026-07-14"}},
-    phillips: {{available: true, report_date: "2026-07-15", data_date: "2026-07-14"}},
-    eastmoney: {{available: false, status_text: "今日暂无趋势报告"}},
-  }},
-  holdings: [
-    {{market: "US", symbol: "QQQ", name: "Nasdaq 100", brokers: "tiger", broker_details: [{{broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "800"}}]}},
-    {{market: "US", symbol: "AAPL", brokers: "futu", broker_details: [{{broker: "futu", account_alias: "futu_1", market: "US", symbol: "AAPL", quantity: "1", market_value_hkd: "700"}}]}},
-    {{market: "HK", symbol: "0005", brokers: "phillips", broker_details: [{{broker: "phillips", account_alias: "phillips_1", market: "HK", symbol: "0005", quantity: "1", market_value_hkd: "900"}}]}},
-    {{market: "CN", symbol: "600519", brokers: "eastmoney", broker_details: [{{broker: "eastmoney", account_alias: "eastmoney_1", market: "CN", symbol: "600519", quantity: "1", market_value_hkd: "600"}}]}},
-  ],
-}};
-renderAccountHoldings();
-console.log(renderBrokerSummaryCards() + elements["account-holdings"].innerHTML);
-''')
+def test_dashboard_static_mounts_broker_tabs_and_removes_cash_view() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
 
-    for broker in ("futu", "tiger", "phillips", "eastmoney"):
-        assert f'href="#account-{broker}"' in output
-        assert f'id="account-{broker}"' in output
-        assert f'aria-labelledby="account-{broker}-title"' in output
-    assert output.count('<a class="broker-summary-card"') == 4
-    for label in (
-        "短线 · 美股趋势交易", "长线 · SMA200 组合策略",
-        "短线 · 港股趋势交易", "偏短线 · 趋势交易",
-    ):
-        assert label in output
-    for metric in ("年化收益", "最大回撤", "夏普比率", "卡玛比率"):
-        assert metric in output
-    for text in ("报告日期 2026-07-15", "数据截至 2026-07-14", "今日暂无趋势报告"):
-        assert text in output
-    assert output.count("当天趋势报告") == 3
-    assert 'data-trend-report="tiger"' not in output
-    assert "<th>账户权重</th>" in output
-    assert "<th>组合权重</th>" in output
-    assert "<th>策略</th>" not in output
-    assert "account-holding-account-weight" in output
-    assert "account-holding-portfolio-weight" in output
-    assert "account-holding-strategy" not in output
-    assert "calibration_required" not in output
-    assert "tiger-long-term-panel" not in output
+    assert 'id="account-tabs"' in html
+    assert 'data-market="CASH"' not in html
+    assert 'id="cash-detail-panel"' not in html
+    assert 'id="open-kelly-lab"' in html
+    assert 'id="kelly-lab-panel"' in html
+    assert 'state.brokerFilter = "futu"' not in js
+    assert 'brokerFilter: "futu"' in js
+    assert "function renderAccountTabs(" in js
+    assert "function selectBroker(" in js
+
+
+def test_dashboard_renders_one_selected_broker_tab_and_cards_switch_it() -> None:
+    output = run_dashboard_js(r'''
+const mount = () => ({innerHTML:"", textContent:"", classList:{add(){},remove(){}}});
+for (const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel","current-view-value","current-view-holding-value","current-view-holding-weight","current-view-cash-note","current-view-label"]) elements[id]=mount();
+state.dashboard={
+  summary:{portfolio_value_hkd:"4000"}, source_statuses:[], cash_rows:[],
+  broker_summaries:[
+    {broker:"futu",display_name:"富途",portfolio_value_hkd:"1000",holding_count:"1"},
+    {broker:"tiger",display_name:"老虎",portfolio_value_hkd:"1000",holding_count:"1"},
+    {broker:"phillips",display_name:"辉立",portfolio_value_hkd:"1000",holding_count:"0"},
+    {broker:"eastmoney",display_name:"东方财富",portfolio_value_hkd:"1000",holding_count:"0"},
+  ],
+  holdings:[
+    {market:"US",symbol:"AAPL",brokers:"futu",broker_details:[{broker:"futu",market:"US",symbol:"AAPL",quantity:"1"}]},
+    {market:"US",symbol:"QQQ",brokers:"tiger",broker_details:[{broker:"tiger",market:"US",symbol:"QQQ",quantity:"2"}]},
+  ],
+};
+renderAccountHoldings();
+renderHeaderSummary();
+const first={broker:state.brokerFilter,tabs:elements["account-tabs"].innerHTML,html:elements["account-holdings"].innerHTML};
+handleBrokerSelection({target:{closest(){return {dataset:{broker:"tiger"}};}}});
+const second={broker:state.brokerFilter,tabs:elements["account-tabs"].innerHTML,html:elements["account-holdings"].innerHTML,label:elements["current-view-label"].textContent};
+console.log(JSON.stringify({first,second,cards:renderBrokerSummaryCards()}));
+''')
+    result = json.loads(output)
+    assert result["first"]["broker"] == "futu"
+    assert 'aria-selected="true"' in result["first"]["tabs"]
+    assert 'id="account-futu"' in result["first"]["html"]
+    assert 'id="account-tiger"' not in result["first"]["html"]
+    assert result["second"]["broker"] == "tiger"
+    assert 'id="account-tiger"' in result["second"]["html"]
+    assert "老虎" in result["second"]["label"]
+    assert 'data-broker="tiger"' in result["cards"]
+    assert 'href="#account-tiger"' not in result["cards"]
 
 
 def test_dashboard_trend_report_entries_and_workspace_interactions() -> None:
@@ -1957,7 +1949,7 @@ elements["account-holdings"] = mount();
 elements["visible-count"] = mount();
 elements["workspace-grid"] = mount();
 elements["symbol-detail-panel"] = mount();
-elements["cash-detail-panel"] = mount();
+elements["account-tabs"] = mount();
 renderSymbolDetail = (holding) => `DETAIL:${holding.symbol}`;
 state.dashboard = {
   summary: {portfolio_value_hkd: "3000"},
@@ -1972,14 +1964,13 @@ state.dashboard = {
     {broker: "tiger", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600"},
   ]}],
 };
+state.brokerFilter = "tiger";
 state.selectedHoldingKey = "tiger:US:QQQ:0";
 renderAccountHoldings();
 const html = elements["account-holdings"].innerHTML;
 if ((html.match(/active-row/g) || []).length !== 1) throw new Error("expected one active broker row: " + html);
 if ((html.match(/inline-symbol-detail/g) || []).length !== 1) throw new Error("expected one inline detail: " + html);
-const futu = html.split('id="account-futu"', 2)[1].split('id="account-tiger"', 1)[0];
-const tiger = html.split('id="account-tiger"', 2)[1].split('id="account-phillips"', 1)[0];
-if (futu.includes("active-row") || !tiger.includes("active-row") || !tiger.includes("DETAIL:QQQ")) {
+if (html.includes('id="account-futu"') || !html.includes('id="account-tiger"') || !html.includes("DETAIL:QQQ")) {
   throw new Error("selected Tiger QQQ should not activate Futu QQQ: " + html);
 }
 ''')
@@ -2346,11 +2337,8 @@ state.dashboard = {
 };
 state.workspaceView = "portfolio";
 const entryHtml = renderKellyLabPanel();
-if (!entryHtml.includes("凯利实验室") || !entryHtml.includes("data-workspace-view=\\\"kelly_lab\\\"")) {
-  throw new Error("kelly lab entry missing: " + entryHtml);
-}
-if (entryHtml.includes("趋势回调 20D 第一批") || entryHtml.includes("US.AAPL")) {
-  throw new Error("kelly lab entry leaked experiment details: " + entryHtml);
+if (entryHtml !== "") {
+  throw new Error("kelly lab homepage entry should be empty: " + entryHtml);
 }
 state.workspaceView = "kelly_lab";
 const html = renderKellyLabPanel();
@@ -4638,7 +4626,7 @@ if (state.researchChat.messageCount !== 4) {
     subprocess.run([node, "-e", script, str(js_path)], check=True)
 
 
-def test_dashboard_header_filters_and_cash_view_helpers() -> None:
+def test_dashboard_header_account_tabs_and_summary_helpers() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for dashboard helper runtime checks")
@@ -4652,6 +4640,13 @@ vm.createContext(sandbox);
 vm.runInContext(code, sandbox);
 vm.runInContext(`
 state.dashboard = {
+  summary: {
+    portfolio_value_hkd: "123456.78",
+    holding_value_hkd: "200000.00",
+    cash_like_value_hkd: "-76543.22",
+    holding_weight_hkd: "162.00%",
+    holding_count: 5,
+  },
   holdings: [
     {
       market: "HK",
@@ -4910,80 +4905,16 @@ state.dashboard = {
 };
 state.marketFilter = "US";
 state.brokerFilter = "futu";
-const summary = currentViewSummary();
-if (summary.portfolio_value_hkd !== "15432.00") {
-  throw new Error("unexpected portfolio value: " + JSON.stringify(summary));
+for (const id of ["current-view-value", "current-view-holding-value", "current-view-holding-weight", "current-view-cash-note", "current-view-label"]) {
+  elements[id] = {textContent: ""};
 }
-if (summary.holding_value_hkd !== "15432.00") {
-  throw new Error("unexpected holding value: " + JSON.stringify(summary));
+renderHeaderSummary();
+if (elements["current-view-value"].textContent !== "HKD 123456.78") {
+  throw new Error("header total should use the unfiltered payload summary");
 }
-if (summary.cash_like_value_hkd !== "") {
-  throw new Error("unexpected cash value: " + JSON.stringify(summary));
+if (!elements["current-view-label"].textContent.includes("富途") || !elements["current-view-label"].textContent.includes("2 条")) {
+  throw new Error("header label should describe the selected broker and market: " + elements["current-view-label"].textContent);
 }
-if (summary.holding_weight_hkd !== "100.00%") {
-  throw new Error("unexpected holding weight: " + JSON.stringify(summary));
-}
-if (summary.holding_count !== 2) {
-  throw new Error("unexpected holding count: " + JSON.stringify(summary));
-}
-state.marketFilter = "ALL";
-state.brokerFilter = "futu";
-const allFutuSummary = currentViewSummary();
-if (allFutuSummary.portfolio_value_hkd !== "-99071.35") {
-  throw new Error("ALL/futu should use broker summary: " + JSON.stringify(allFutuSummary));
-}
-if (allFutuSummary.holding_value_hkd !== "15132.00") {
-  throw new Error("ALL/futu holding value mismatch: " + JSON.stringify(allFutuSummary));
-}
-if (allFutuSummary.cash_like_value_hkd !== "-114203.35") {
-  throw new Error("ALL/futu cash value mismatch: " + JSON.stringify(allFutuSummary));
-}
-if (allFutuSummary.holding_weight_hkd !== "-") {
-  throw new Error("ALL/futu holding weight mismatch: " + JSON.stringify(allFutuSummary));
-}
-const singleBrokerFallback = brokerHoldingValue({
-  market: "US",
-  symbol: "SINGLE_DETAIL_BLANK",
-  brokers: "futu",
-  market_value_hkd: "780.00",
-  broker_details: [
-    {
-      broker: "futu",
-      market: "US",
-      market_value_hkd: "",
-    },
-  ],
-});
-if (!singleBrokerFallback.complete || singleBrokerFallback.text !== "780.00") {
-  throw new Error("single-broker detail gap should fall back to row value: " + JSON.stringify(singleBrokerFallback));
-}
-state.dashboard.holdings.push({
-  market: "US",
-  symbol: "MISSING_DETAIL",
-  name: "Missing detail",
-  brokers: "futu;tiger",
-  market_value_hkd: "780.00",
-  broker_details: [],
-});
-state.marketFilter = "US";
-const missingDetailSummary = currentViewSummary();
-if (missingDetailSummary.portfolio_value_hkd !== "" || formatMoney(missingDetailSummary.portfolio_value_hkd, "HKD") !== "-") {
-  throw new Error("missing multi-broker detail should make broker summary unknown: " + JSON.stringify(missingDetailSummary));
-}
-state.dashboard.holdings.pop();
-state.dashboard.holdings.push({
-  market: "US",
-  symbol: "BAD",
-  name: "Malformed",
-  brokers: "futu",
-  market_value_hkd: "123abc",
-});
-state.marketFilter = "US";
-const malformedSummary = currentViewSummary();
-if (malformedSummary.portfolio_value_hkd !== "" || formatMoney(malformedSummary.portfolio_value_hkd, "HKD") !== "-") {
-  throw new Error("malformed holding value should make summary unknown: " + JSON.stringify(malformedSummary));
-}
-state.dashboard.holdings.pop();
 const brokerCards = renderBrokerSummaryCards();
 if (!brokerCards.includes("富途") || !brokerCards.includes("HKD -99071.35")) {
   throw new Error("broker card missing expected text: " + brokerCards);
@@ -5012,12 +4943,6 @@ state.quotePayload = {
 sourceList = renderSourceStatusList();
 if (!sourceList.includes("富途") || !sourceList.includes("缺失 1 个标的行情。")) {
   throw new Error("source list missing partial quote diagnostic: " + sourceList);
-}
-state.marketFilter = "CASH";
-state.brokerFilter = "futu";
-const cashRows = filteredCashRows();
-if (cashRows.length !== 2 || cashRows[0].symbol !== "HKD_CASH" || cashRows[1].symbol !== "USD_CASH") {
-  throw new Error("unexpected cash rows: " + JSON.stringify(cashRows));
 }
 function makeElement() {
   const classes = new Set();
@@ -5053,33 +4978,13 @@ function makeElement() {
 elements["visible-count"] = makeElement();
 elements["workspace-grid"] = makeElement();
 elements["symbol-detail-panel"] = makeElement();
-elements["cash-detail-panel"] = makeElement();
+elements["account-tabs"] = makeElement();
 elements["holdings-body"] = makeElement();
 state.selectedHoldingKey = "";
 state.dashboardError = null;
 state.quotes = {};
-renderHoldings();
-if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
-  throw new Error("cash view should hide symbol detail panel");
-}
-if (elements["symbol-detail-panel"].innerHTML !== "") {
-  throw new Error("cash view should clear symbol detail panel");
-}
-if (elements["cash-detail-panel"].classList.contains("hidden")) {
-  throw new Error("cash view should show cash detail panel");
-}
-if (!elements["cash-detail-panel"].innerHTML.includes("现金明细") || !elements["cash-detail-panel"].innerHTML.includes("HKD_CASH")) {
-  throw new Error("cash detail panel missing expected rows: " + elements["cash-detail-panel"].innerHTML);
-}
-if (elements["visible-count"].textContent !== "2 条") {
-  throw new Error("cash view visible count mismatch: " + elements["visible-count"].textContent);
-}
 state.marketFilter = "ALL";
-renderHoldings();
-if (!elements["cash-detail-panel"].classList.contains("hidden")) {
-  throw new Error("non-cash view should hide cash detail panel");
-}
-state.brokerFilter = "ALL";
+state.brokerFilter = "futu";
 state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.holdings[1], 1);
 renderHoldings();
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
@@ -5102,9 +5007,19 @@ if (elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
 state.dashboard.holdings[1].t_signal.session_phase = "regular";
 renderHoldings();
 const renderedHoldings = elements["holdings-body"].innerHTML;
+let renderedRowCount = 0;
 for (const broker of ["futu", "tiger", "phillips", "eastmoney"]) {
-  if (!renderedHoldings.includes('id="account-' + broker + '"')) throw new Error("missing account section " + broker);
+  selectBroker(broker);
+  const accountHtml = elements["holdings-body"].innerHTML;
+  if (!accountHtml.includes('id="account-' + broker + '"')) throw new Error("missing selected account section " + broker);
+  for (const other of ACCOUNT_BROKERS.filter((item) => item !== broker)) {
+    if (accountHtml.includes('id="account-' + other + '"')) throw new Error("rendered unselected account section " + other);
+  }
+  renderedRowCount += (accountHtml.match(/account-holding-row/g) || []).length;
 }
+state.brokerFilter = "futu";
+state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.holdings[1], 1);
+renderHoldings();
 if (renderedHoldings.includes("美股正股") || renderedHoldings.includes("美股期权")) {
   throw new Error("account tables should not contain nested market sections: " + renderedHoldings);
 }
@@ -5116,8 +5031,7 @@ for (const required of ["成本价", "美元市值", "港元市值", "账户权�
 if (renderedHoldings.includes("<th>策略</th>")) {
   throw new Error("account holdings should not render row strategy column: " + renderedHoldings);
 }
-const holdingRows = renderedHoldings.match(/account-holding-row/g) || [];
-if (holdingRows.length !== 6) throw new Error("account tables should render six broker rows: " + renderedHoldings);
+if (renderedRowCount !== 6) throw new Error("account tabs should expose six broker rows in total: " + renderedRowCount);
 for (const unexpected of ["<td>futu;tiger</td>", "<td>phillips</td>", "<td>futu</td>", "<td>tiger</td>", "<span class=\\"badge\\">"]) {
   if (renderedHoldings.includes(unexpected)) {
     throw new Error("main holdings table should not render broker/action cell " + unexpected + ": " + renderedHoldings);
@@ -5166,7 +5080,7 @@ state.dashboard.holdings.push({
   unrealized_pnl_pct: "0.00%",
 });
 state.selectedHoldingKey = "";
-renderHoldings();
+selectBroker("phillips");
 const renderedWithOther = elements["holdings-body"].innerHTML;
 if (!renderedWithOther.includes(">JP<") || !renderedWithOther.includes(">Toyota<") || !renderedWithOther.includes("HKD 300.00")) {
   throw new Error("non-standard markets should remain ordinary account rows: " + renderedWithOther);

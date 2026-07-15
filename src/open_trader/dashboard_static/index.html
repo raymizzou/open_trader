@@ -14,7 +14,11 @@
           <div class="brand-block">
             <span class="brand">Open Trader</span>
             <span class="page-title">持仓实时看板</span>
-            <button id="open-standard-backtest" class="primary-button" type="button">策略回测</button>
+            <div class="strategy-tools" aria-label="策略工具">
+              <button id="open-standard-backtest" class="secondary-button" type="button">策略回测</button>
+              <button id="open-kelly-lab" class="secondary-button" type="button">凯利实验室</button>
+              <button id="return-to-portfolio" class="secondary-button hidden" type="button" hidden>返回持仓</button>
+            </div>
           </div>
           <div class="header-filter-block">
             <div id="header-market-filters" class="segmented-control" aria-label="市场筛选">
@@ -22,7 +26,6 @@
               <button class="filter-button" type="button" data-market="US">US</button>
               <button class="filter-button" type="button" data-market="HK">HK</button>
               <button class="filter-button" type="button" data-market="CN">A 股</button>
-              <button class="filter-button" type="button" data-market="CASH">现金</button>
             </div>
           </div>
           <span id="current-view-label" class="current-view-label">当前视图：全部市场 · 全部券商</span>
@@ -30,7 +33,7 @@
 
         <section class="header-assets-panel" aria-label="当前视图资产">
           <article class="current-view-card">
-            <span class="summary-label">当前视图总资产 HKD</span>
+            <span class="summary-label">全部账户总资产 HKD</span>
             <strong id="current-view-value">-</strong>
             <div class="current-view-breakdown">
               <span id="current-view-holding-value">持仓资产 -</span>
@@ -70,7 +73,6 @@
           <button class="filter-button" type="button" data-market="US">US</button>
           <button class="filter-button" type="button" data-market="HK">HK</button>
           <button class="filter-button" type="button" data-market="CN">A 股</button>
-          <button class="filter-button" type="button" data-market="CASH">现金</button>
         </div>
         <div id="broker-filters"></div>
         <strong id="summary-value">-</strong>
@@ -93,8 +95,8 @@
             <div><h1 id="account-holdings-title">持仓与策略</h1><p>按券商账户查看持仓、交易周期与策略状态。</p></div>
             <span id="visible-count" class="count-pill">-</span>
           </div>
+          <div id="account-tabs" class="account-tab-list" role="tablist" aria-label="券商账户"></div>
           <div id="account-holdings" class="account-holdings" aria-live="polite"></div>
-          <div id="cash-detail-panel" class="cash-detail-panel hidden" aria-live="polite"></div>
           <div id="symbol-detail-panel" class="symbol-detail-panel hidden" aria-live="polite"></div>
         </section>
       </main>
