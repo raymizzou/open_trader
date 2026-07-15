@@ -7,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-import open_trader.notifications as notifications
 
 from open_trader.notifications import (
     CompositeNotifier,
@@ -17,6 +16,8 @@ from open_trader.notifications import (
     XiaozhiVoiceNotifier,
     render_feishu_order_review,
     render_xiaozhi_voice_notification,
+    xiaozhi_not_after,
+    xiaozhi_voice_allowed,
 )
 
 
@@ -24,16 +25,6 @@ WEBHOOK_URL = "https://open.feishu.cn/open-apis/bot/v2/hook/test"
 ALLOWED_NOW = lambda: datetime.fromisoformat("2026-07-15T22:59:59+08:00")
 PROTECTION_TITLE = "A股保护线触发 · 600000"
 PROTECTION_MESSAGE = "名称：浦发银行\n最新价 9.98 <= 活动保护线 10.01"
-
-
-def xiaozhi_voice_allowed(now: datetime) -> bool:
-    assert hasattr(notifications, "xiaozhi_voice_allowed")
-    return notifications.xiaozhi_voice_allowed(now)
-
-
-def xiaozhi_not_after(now: datetime) -> str:
-    assert hasattr(notifications, "xiaozhi_not_after")
-    return notifications.xiaozhi_not_after(now)
 
 FIELDNAMES = [
     "run_date",
