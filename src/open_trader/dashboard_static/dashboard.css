@@ -41,14 +41,14 @@ button,
 [role="tab"],
 .broker-summary-card {
   transition: background-color 180ms ease, border-color 180ms ease,
-    box-shadow 180ms ease, color 180ms ease;
+    color 180ms ease;
 }
 
 button:focus-visible,
 [role="tab"]:focus-visible,
 input:focus-visible,
 select:focus-visible {
-  outline: 3px solid rgba(37, 99, 235, 0.32);
+  outline: 3px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -243,7 +243,7 @@ select:focus-visible {
 }
 
 .broker-summary-card:focus-visible {
-  outline: 3px solid rgba(37, 99, 235, 0.32);
+  outline: 3px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -1617,15 +1617,15 @@ table {
 
 th,
 td {
-  border-bottom: 1px solid #f0f2f5;
+  border-bottom: 1px solid var(--line);
   padding: 11px 12px;
   text-align: left;
   vertical-align: top;
 }
 
 th {
-  background: #f9fafb;
-  color: var(--muted);
+  background: var(--surface-soft);
+  color: var(--text);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.02em;
@@ -1642,10 +1642,10 @@ tbody tr.active-row {
 }
 
 .market-section-row td {
-  background: #eef3ed;
-  border-bottom: 1px solid #b8dac6;
+  background: var(--surface-soft);
+  border-bottom: 1px solid var(--line);
   border-top: 2px solid var(--accent);
-  color: var(--accent-strong);
+  color: var(--text);
   padding: 9px 12px;
 }
 
@@ -1660,31 +1660,31 @@ tbody tr.active-row {
 }
 
 .market-section-us-stock td {
-  background: #eef3ed;
-  border-bottom-color: #b8dac6;
+  background: var(--surface-soft);
+  border-bottom-color: var(--line);
   border-top-color: var(--accent);
-  color: var(--accent-strong);
+  color: var(--text);
 }
 
 .market-section-us-option td {
-  background: #f3f7f1;
-  border-bottom-color: #cbdcba;
+  background: var(--surface-soft);
+  border-bottom-color: var(--line);
   border-top-color: #789a43;
-  color: #4f672b;
+  color: var(--text);
 }
 
 .market-section-hk-stock td {
-  background: #fffaf1;
-  border-bottom-color: #e1c18e;
+  background: var(--surface-soft);
+  border-bottom-color: var(--line);
   border-top-color: var(--warning);
-  color: #7b4208;
+  color: var(--text);
 }
 
 .market-section-hk-option td {
-  background: #fff8ea;
-  border-bottom-color: #dfc083;
+  background: var(--surface-soft);
+  border-bottom-color: var(--line);
   border-top-color: #a56705;
-  color: #6f3a04;
+  color: var(--text);
 }
 
 .market-section-other td {
@@ -2236,7 +2236,7 @@ tbody tr.active-row {
   padding: 12px 2px;
 }
 .decision-plan-provenance summary:focus-visible,
-.decision-plan-review summary:focus-visible { outline: 3px solid rgba(37, 99, 235, 0.32); outline-offset: 2px; }
+.decision-plan-review summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 .decision-plan-provenance dl { display: grid; gap: 6px; margin: 0; }
 .decision-plan-provenance dl div { display: grid; gap: 8px; grid-template-columns: 72px minmax(0, 1fr); }
 .decision-plan-provenance dt { color: var(--muted); }
@@ -3660,6 +3660,7 @@ tbody tr.active-row {
 .account-tab[data-broker="phillips"] { --broker-accent: #15803d; }
 .account-tab[data-broker="eastmoney"] { --broker-accent: #dc2626; }
 .account-tab.active { color: var(--text); border-bottom-color: var(--broker-accent); }
+.account-tab:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; box-shadow: inset 0 0 0 3px var(--accent); }
 
 .pnl-profit { color: #b91c1c; font-weight: 800; }
 .pnl-loss { color: #15803d; font-weight: 800; }
@@ -3671,11 +3672,6 @@ table {
   background: var(--surface);
   border-color: var(--line);
   color: var(--text);
-}
-
-th {
-  background: var(--surface-soft);
-  color: var(--muted);
 }
 
 @media (max-width: 1180px) {

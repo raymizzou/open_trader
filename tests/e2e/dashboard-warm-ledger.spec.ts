@@ -11,6 +11,21 @@ async function installLedgerFixture(page: Page) {
       { broker: 'phillips', display_name: '辉立', portfolio_value_hkd: '628554.06', holding_value_hkd: '600000.00', cash_like_value_hkd: '28554.06', holding_count: 1 },
       { broker: 'eastmoney', display_name: '东方财富', portfolio_value_hkd: '730673.51', holding_value_hkd: '700000.00', cash_like_value_hkd: '30673.51', holding_count: 1 },
     ];
+    fixture.trend_reports = {
+      futu: {
+        available: true,
+        broker_label: '富途',
+        market_label: '美股',
+        report_date: '2026-07-16',
+        data_date: '2026-07-15',
+        generated_at: '2026-07-16 08:00',
+        account_status: '已更新',
+        buy_window: '美股常规交易时段',
+        counts: { sell: 0, buy: 0, hold: 0, review: 0 },
+        sell_actions: [], buy_actions: [], hold_actions: [], review_actions: [],
+        audit: { candidates: [], excluded: {}, industry_concentration: [], data_sources: ['fixture'] },
+      },
+    };
     fixture.holdings = [
       { market: 'US', symbol: 'AAPL', name: 'Apple', currency: 'USD', total_quantity: '10000', avg_cost_price: '180.00', market_value_hkd: '16380000.00', unrealized_pnl_pct: '16.67%', brokers: 'futu', broker_details: [{ broker: 'futu', market: 'US', symbol: 'AAPL', name: 'Apple', quantity: '10000', cost_value: '1800000.00', avg_cost_price: '180.00', market_value_hkd: '16380000.00', unrealized_pnl: '300000.00', unrealized_pnl_pct: '16.67%' }] },
       { market: 'US', symbol: 'QQQ', name: 'Nasdaq 100', currency: 'USD', total_quantity: '2', avg_cost_price: '500.00', market_value_hkd: '7800.00', unrealized_pnl_pct: '-2.00%', brokers: 'tiger', broker_details: [{ broker: 'tiger', market: 'US', symbol: 'QQQ', name: 'Nasdaq 100', quantity: '2', cost_value: '1000.00', avg_cost_price: '500.00', market_value_hkd: '7800.00', unrealized_pnl: '-20.00', unrealized_pnl_pct: '-2.00%' }] },
@@ -21,33 +36,96 @@ async function installLedgerFixture(page: Page) {
   });
 }
 
-test('switches every broker card while keeping global assets and market filter', async ({ page }) => {
+async function expectWarmSurface(page: Page, selector: string) {
+  const surface = page.locator(selector);
+  await expect(surface).toBeVisible();
+  await expect(surface).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  await expect(surface).toHaveCSS('border-top-color', 'rgb(214, 211, 209)');
+  await expect(surface).toHaveCSS('border-top-width', '1px');
+}
+
+const brokers = [
+  { key: 'futu', label: '富途', symbol: 'AAPL', portfolio: '971,244.73', holding: '960,926.44', cash: '10,318.30' },
+  { key: 'tiger', label: '老虎', symbol: 'QQQ', portfolio: '726,091.55', holding: '700,000.00', cash: '26,091.55' },
+  { key: 'phillips', label: '辉立', symbol: '02840', portfolio: '628,554.06', holding: '600,000.00', cash: '28,554.06' },
+  { key: 'eastmoney', label: '东方财富', symbol: '600519', portfolio: '730,673.51', holding: '700,000.00', cash: '30,673.51' },
+] as const;
+
+test('switches every broker tab and card while preserving US-filtered ledgers', async ({ page }) => {
   await installLedgerFixture(page);
   await page.goto('/');
 
   await expect(page.getByRole('tab')).toHaveCount(4);
-  await expect(page.getByRole('tab', { name: /富途/ })).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('#current-view-value')).toHaveText('HKD 3,064,187.62');
-  await expect(page.locator('#account-futu')).toBeVisible();
-  await expect(page.locator('.account-section')).toHaveCount(1);
-  await expect(page.locator('.account-holding-quantity')).toContainText('10,000');
-  await expect(page.locator('.account-holding-market-value')).toContainText('HKD 16,380,000.00');
-  await expect(page.getByText('02840', { exact: true })).toHaveCount(0);
-  await expect(page.locator('.account-holding-pnl.pnl-profit')).toHaveCSS('color', 'rgb(185, 28, 28)');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  for (const broker of brokers) {
+    const tab = page.getByRole('tab', { name: new RegExp(broker.label) });
+    await tab.click();
+    await expect(tab).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator(`#account-${broker.key}`)).toBeVisible();
+    await expect(page.locator('.account-section')).toHaveCount(1);
+    await expect(page.locator(`#account-${broker.key}`)).toContainText(broker.symbol);
+  }
 
   await page.getByRole('button', { name: 'US', exact: true }).click();
-  await page.getByRole('tab', { name: /老虎/ }).click();
-  await expect(page.locator('#account-tiger')).toBeVisible();
-  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('color', 'rgb(21, 128, 61)');
-
-  for (const broker of ['phillips', 'eastmoney', 'futu', 'tiger']) {
-    await page.locator(`.broker-summary-card[data-broker="${broker}"]`).click();
-    await expect(page.locator(`#account-${broker}`)).toBeVisible();
+  for (const broker of brokers) {
+    await page.locator(`.broker-summary-card[data-broker="${broker.key}"]`).click();
+    await expect(page.getByRole('tab', { name: new RegExp(broker.label) })).toHaveAttribute('aria-selected', 'true');
+    const account = page.locator(`#account-${broker.key}`);
+    await expect(account).toBeVisible();
+    await expect(account).toContainText(`HKD ${broker.portfolio}`);
+    await expect(account).toContainText(`持仓资产 HKD ${broker.holding}`);
+    await expect(account).toContainText(`现金 HKD ${broker.cash}`);
     await expect(page.locator('#current-view-value')).toHaveText('HKD 3,064,187.62');
+    await expect(page.locator('#current-view-holding-value')).toHaveText('持仓资产 HKD 647,547.98');
+    await expect(page.locator('#current-view-cash-note')).toHaveText('现金类资产 HKD 2,416,639.64 · 持仓 4');
     await expect(page.getByRole('button', { name: 'US', exact: true })).toHaveClass(/active/);
     await expect(page.locator('.account-section')).toHaveCount(1);
+    await expect(page.getByText('02840', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('600519', { exact: true })).toHaveCount(0);
+    if (broker.key === 'futu' || broker.key === 'tiger') {
+      await expect(page.locator('.account-holding-row')).toHaveCount(1);
+      await expect(account).toContainText(broker.symbol);
+    } else {
+      await expect(page.locator('.account-holding-row')).toHaveCount(0);
+      await expect(account).toContainText('当前筛选下没有持仓');
+    }
   }
+  await page.locator('.broker-summary-card[data-broker="futu"]').click();
+  await expect(page.locator('.account-holding-quantity')).toContainText('10,000');
+  await expect(page.locator('.account-holding-market-value')).toContainText('HKD 16,380,000.00');
+  await expect(page.locator('.account-holding-pnl.pnl-profit')).toHaveCSS('color', 'rgb(185, 28, 28)');
+  await page.locator('.broker-summary-card[data-broker="tiger"]').click();
+  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('color', 'rgb(21, 128, 61)');
   await expect(page.getByRole('button', { name: '现金' })).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('opens every warm-ledger destination, using real UI paths where available', async ({ page }) => {
+  await installLedgerFixture(page);
+  await page.goto('/');
+
+  await page.getByRole('button', { name: '凯利实验室' }).click();
+  await expectWarmSurface(page, '.kelly-lab-panel');
+  await page.getByRole('button', { name: '返回持仓' }).click();
+
+  await page.getByRole('button', { name: '策略回测' }).click();
+  await expectWarmSurface(page, '#standard-backtest-workspace');
+  await page.getByRole('button', { name: '返回持仓' }).click();
+
+  await page.getByRole('button', { name: '当天趋势报告' }).click();
+  await expectWarmSurface(page, '.trend-report-workspace');
+  await page.getByRole('button', { name: '返回持仓' }).click();
+
+  await page.locator('.account-holding-actions [data-detail-mode="decision"]').click();
+  await expectWarmSurface(page, '.symbol-detail-panel.inline-symbol-detail');
+  // The display-only dashboard has no reachable research-chat trigger; activate its existing surface directly.
+  await page.evaluate(() => (window as any).openResearchChat('US:AAPL:Apple:0'));
+  await expectWarmSurface(page, '.research-chat-modal');
+  await page.getByRole('button', { name: '关闭' }).click();
+  await expect(page.locator('.research-chat-modal')).toBeHidden();
+  await page.getByRole('button', { name: '收起' }).click();
+  await expect(page.locator('.symbol-detail-panel.inline-symbol-detail')).toHaveCount(0);
 });
 
 test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) => {
@@ -62,6 +140,33 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
   await expect(page.locator('#account-tabs')).toHaveCSS('overflow-x', 'hidden');
   await expect(page.locator('#account-tabs')).not.toHaveCSS('position', 'sticky');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+
+  for (const index of [0, 3]) {
+    const tab = tabs.nth(index);
+    await tab.focus();
+    await expect(tab).toBeFocused();
+    const focus = await tab.evaluate((element) => {
+      const tabRect = element.getBoundingClientRect();
+      const listRect = element.parentElement!.getBoundingClientRect();
+      return {
+        boxShadow: getComputedStyle(element).boxShadow,
+        inside: tabRect.left >= listRect.left && tabRect.right <= listRect.right,
+      };
+    });
+    expect(focus.boxShadow).toContain('rgb(161, 98, 7)');
+    expect(focus.boxShadow).toContain('inset');
+    expect(focus.inside).toBe(true);
+  }
+
+  await page.emulateMedia({ forcedColors: 'active' });
+  for (const index of [0, 3]) {
+    const tab = tabs.nth(index);
+    await tab.focus();
+    await expect(tab).toHaveCSS('outline-style', 'solid');
+    await expect(tab).toHaveCSS('outline-width', '3px');
+    await expect(tab).toHaveCSS('outline-offset', '-3px');
+  }
+  await page.emulateMedia({ forcedColors: 'none' });
 
   await page.getByRole('tab', { name: /老虎/ }).click();
   await page.getByRole('button', { name: '凯利实验室' }).click();

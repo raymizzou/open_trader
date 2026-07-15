@@ -76,6 +76,25 @@ def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
         ".backtest-workspace,\n.kelly-lab-panel,\n.trend-report-workspace,\n"
         ".symbol-detail-panel,\n.research-chat-modal"
     ) in css
+    assert "outline: 3px solid var(--accent);" in css
+    assert "rgba(37, 99, 235, 0.32)" not in css
+    assert ".account-tab:focus-visible" in css
+    assert "outline-offset: -3px;" in css
+    assert "box-shadow: inset 0 0 0 3px var(--accent);" in css
+    table_header_css = css.split("\nth {", 1)[1].split("}", 1)[0]
+    assert "background: var(--surface-soft);" in table_header_css
+    assert "color: var(--text);" in table_header_css
+    assert css.count("\nth {") == 1
+    assert "#f9fafb" not in css
+    for market_selector in (
+        ".market-section-row td", ".market-section-us-stock td",
+        ".market-section-us-option td", ".market-section-hk-stock td",
+        ".market-section-hk-option td",
+    ):
+        market_css = css.split(f"{market_selector} {{", 1)[1].split("}", 1)[0]
+        assert "background: var(--surface-soft);" in market_css
+        assert "border-bottom" in market_css and "var(--line)" in market_css
+        assert "color: var(--text);" in market_css
     assert "linear-gradient" not in css
     assert "font-variant-numeric: tabular-nums;" in css
 
@@ -84,7 +103,7 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
 
     assert "button:focus-visible" in css
-    assert "outline: 3px solid rgba(37, 99, 235, 0.32);" in css
+    assert "outline: 3px solid var(--accent);" in css
     assert "@media (prefers-reduced-motion: reduce)" in css
     assert "transition-duration: 0.01ms !important;" in css
     mobile = css.split("@media (max-width: 760px) {", 1)[1]
