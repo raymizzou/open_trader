@@ -259,16 +259,56 @@ def _check_account_holdings(page: Any) -> None:
     for required in (
         "富途", "短线", "美股趋势交易", "老虎", "长线", "SMA200 组合策略",
         "辉立", "港股趋势交易", "东方财富", "偏短线", "趋势交易",
-        "数据日", "账户源", "买入", "卖出", "人工复核", "最近保护提醒",
-        "策略指标待接入", "夏普比率", "卡玛比率",
+        "当天趋势报告", "报告日期", "数据截至", "夏普比率", "卡玛比率",
     ):
         assert required in text, f"账户持仓视图缺少 {required}"
     assert page.locator(".account-section").count() == 4, "账户区块数量不是 4"
+    assert page.locator(".trend-report-entry").count() == 3, "趋势报告入口数量不是 3"
+    assert page.locator("#account-tiger .trend-report-entry").count() == 0, (
+        "老虎账户不应包含趋势报告入口"
+    )
     for forbidden in ("tiger-long-term-panel", "calibration_required", "provenance_incomplete"):
         assert forbidden not in text, f"账户持仓视图泄漏内部代码 {forbidden}"
     assert page.evaluate(
         "document.documentElement.scrollWidth <= window.innerWidth"
     ), "页面出现横向滚动"
+
+    available = page.locator(".trend-report-entry [data-trend-report]")
+    assert available.count() >= 1, "没有可打开的当天趋势报告"
+    available.first.click()
+    workspace = page.locator("#trend-report-workspace:visible")
+    assert workspace.count() == 1, "趋势报告工作区未显示"
+    workspace_text = workspace.inner_text()
+    for required in (
+        "报告日期", "数据截至", "生成时间", "账户状态", "今日执行检查",
+        "确认全部卖出动作", "按顺序考虑允许买入项", "盘中观察活动保护线",
+        "完成人工复核",
+    ):
+        assert required in workspace_text, f"趋势报告工作区缺少 {required}"
+    header_values = workspace.locator(".trend-report-header dd").all_inner_texts()
+    assert len(header_values) == 4 and all(
+        value.strip() not in {"", "-"} for value in header_values
+    ), "趋势报告头部日期、生成时间或账户状态缺失"
+    stages = workspace.locator(".trend-stage h2").all_inner_texts()
+    assert len(stages) == 4 and stages[0] == "开盘前" and stages[1].strip() and (
+        stages[2:] == ["盘中持续", "人工复核"]
+    ), f"趋势报告阶段顺序不正确：{stages}"
+    audit = workspace.locator(".trend-audit")
+    assert audit.count() == 1 and audit.get_attribute("open") is None, (
+        "趋势报告审计详情未保持收起"
+    )
+    assert page.evaluate(
+        "document.documentElement.scrollWidth <= window.innerWidth"
+    ), "趋势报告工作区出现横向滚动"
+    close = workspace.locator("[data-close-trend-report]")
+    assert close.count() == 1, "趋势报告工作区缺少返回按钮"
+    close.click()
+    assert page.locator("#trend-report-workspace:visible").count() == 0, (
+        "返回后趋势报告工作区仍可见"
+    )
+    assert page.locator(".workspace-grid:visible").count() == 1, (
+        "返回后持仓工作区未恢复"
+    )
 
 
 def _check_page_safety(page: Any) -> None:

@@ -75,6 +75,15 @@ def valid_payload() -> dict[str, object]:
     }
 
 
+def trend_account_text() -> str:
+    return (
+        "富途短线美股趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14 "
+        "老虎长线SMA200 组合策略夏普比率卡玛比率 "
+        "辉立短线港股趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14 "
+        "东方财富偏短线趋势交易当天趋势报告今日暂无趋势报告"
+    )
+
+
 def nested_get(row: dict[str, object], path: tuple[str, ...]) -> dict[str, object]:
     value: object = row
     for key in path:
@@ -277,14 +286,20 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             clicks.append((self.name, self.selector))
             if self.selector == 'a[href="#account-tiger"]':
                 state[f"{self.name}_hash"] = "#account-tiger"
+            if self.selector == ".trend-report-entry [data-trend-report]":
+                state[f"{self.name}_trend_open"] = True
+            if self.selector.endswith("[data-close-trend-report]"):
+                state[f"{self.name}_trend_open"] = False
 
         def inner_text(self) -> str:
             if self.selector == "#account-holdings":
+                return trend_account_text()
+            if self.selector == "#trend-report-workspace:visible":
                 return (
-                    "富途短线美股趋势交易数据日2026-07-14账户源2026-07-14买入1卖出0人工复核1最近保护提醒无 "
-                    "老虎长线SMA200 组合策略夏普比率卡玛比率 "
-                    "辉立短线港股趋势交易数据日2026-07-15账户源2026-06买入2卖出1人工复核0最近保护提醒无 "
-                    "东方财富偏短线趋势交易策略指标待接入"
+                    "富途｜美股 当天趋势报告 报告日期 2026-07-15 "
+                    "数据截至 2026-07-14 生成时间 2026-07-15T11:30:36+08:00 "
+                    "账户状态 已更新 今日执行检查 确认全部卖出动作 "
+                    "按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
                 )
             if self.selector == "body":
                 return "持仓与策略"
@@ -295,6 +310,16 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def count(self) -> int:
             if self.selector in {".account-section", ".account-section:visible"}:
                 return 4
+            if self.selector == ".trend-report-entry":
+                return 3
+            if self.selector == "#account-tiger .trend-report-entry":
+                return 0
+            if self.selector == ".trend-report-entry [data-trend-report]":
+                return 1
+            if self.selector == "#trend-report-workspace:visible":
+                return int(bool(state.get(f"{self.name}_trend_open")))
+            if self.selector == ".workspace-grid:visible":
+                return int(not state.get(f"{self.name}_trend_open", False))
             if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
                 return 0
             if self.selector.endswith(".account-empty:visible"):
@@ -304,11 +329,19 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def all_inner_texts(self) -> list[str]:
             if self.selector == "a:visible, button:visible":
                 return ["刷新账户与行情", "策略回测"]
+            if self.selector.endswith(".trend-stage h2"):
+                return ["开盘前", "美股常规交易时段", "盘中持续", "人工复核"]
+            if self.selector.endswith(".trend-report-header dd"):
+                return ["2026-07-15", "2026-07-14", "2026-07-15T11:30:36+08:00", "已更新"]
             if self.selector.endswith(
                 ".account-holding-row:visible td:nth-child(2)"
             ):
                 return ["市场\nCN"]
             return []
+
+        def get_attribute(self, name: str) -> str | None:
+            assert self.selector.endswith(".trend-audit") and name == "open"
+            return None
 
         def nth(self, index: int) -> "Locator":
             return Locator(self.name, f"{self.selector}:nth({index})")
@@ -411,6 +444,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, '#visible-count') in selectors
         assert (viewport, '#account-holdings') in selectors
         assert (viewport, '.account-section') in selectors
+        assert (viewport, '.trend-report-entry') in selectors
+        assert (viewport, '#account-tiger .trend-report-entry') in selectors
+        assert (viewport, '.trend-report-entry [data-trend-report]') in clicks
+        assert (viewport, '#trend-report-workspace:visible') in selectors
+        assert (viewport, '.workspace-grid:visible') in selectors
         assert (viewport, '.account-section:visible') in selectors
         assert (viewport, '#account-tiger:visible') in selectors
         assert (viewport, '#tiger-long-term-panel') in selectors
@@ -418,7 +456,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, 'body') in selectors
         assert (viewport, 'a:visible, button:visible') in selectors
         assert (viewport, 'a[href="#account-tiger"]') in clicks
-    assert evaluated == ["desktop", "mobile"]
+    assert evaluated == ["desktop", "desktop", "mobile", "mobile"]
 
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:
@@ -444,22 +482,61 @@ def test_validate_dashboard_payload_rejects_invalid_tiger_strategy(
 
 
 def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> None:
+    state = {"trend_open": False}
+
     class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        @property
+        def first(self) -> "Locator":
+            return self
+
+        def click(self) -> None:
+            if self.selector == ".trend-report-entry [data-trend-report]":
+                state["trend_open"] = True
+            elif self.selector.endswith("[data-close-trend-report]"):
+                state["trend_open"] = False
+
+        def locator(self, selector: str) -> "Locator":
+            return Locator(f"{self.selector} {selector}")
+
         def inner_text(self) -> str:
+            if self.selector == "#account-holdings":
+                return trend_account_text()
+            assert self.selector == "#trend-report-workspace:visible"
             return (
-                "富途短线美股趋势交易数据日2026-07-14账户源2026-07-14买入1卖出0人工复核1最近保护提醒无 "
-                "老虎长线SMA200 组合策略夏普比率卡玛比率 "
-                "辉立短线港股趋势交易数据日2026-07-15账户源2026-06买入2卖出1人工复核0最近保护提醒无 "
-                "东方财富偏短线趋势交易策略指标待接入"
+                "富途｜美股 当天趋势报告 报告日期 2026-07-15 "
+                "数据截至 2026-07-14 生成时间 2026-07-15T11:30:36+08:00 "
+                "账户状态 已更新 今日执行检查 确认全部卖出动作 "
+                "按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
             )
 
         def count(self) -> int:
-            return 4
+            return {
+                ".account-section": 4,
+                ".trend-report-entry": 3,
+                "#account-tiger .trend-report-entry": 0,
+                ".trend-report-entry [data-trend-report]": 1,
+                "#trend-report-workspace:visible": int(state["trend_open"]),
+                ".workspace-grid:visible": int(not state["trend_open"]),
+                "#trend-report-workspace:visible .trend-audit": 1,
+            }.get(self.selector, 1)
+
+        def all_inner_texts(self) -> list[str]:
+            if self.selector.endswith(".trend-stage h2"):
+                return ["开盘前", "美股常规交易时段", "盘中持续", "人工复核"]
+            if self.selector.endswith(".trend-report-header dd"):
+                return ["2026-07-15", "2026-07-14", "2026-07-15T11:30:36+08:00", "已更新"]
+            return []
+
+        def get_attribute(self, name: str) -> str | None:
+            assert self.selector.endswith(".trend-audit") and name == "open"
+            return None
 
     class Page:
         def locator(self, selector: str) -> Locator:
-            assert selector in {"#account-holdings", ".account-section"}
-            return Locator()
+            return Locator(selector)
 
         def evaluate(self, expression: str) -> bool:
             assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
@@ -650,15 +727,10 @@ def test_check_cn_filter_keeps_four_accounts_and_validates_rows_or_empty_state()
 
 @pytest.mark.parametrize(
     "missing",
-    ("富途", "老虎", "辉立", "东方财富", "美股趋势交易", "港股趋势交易", "数据日", "最近保护提醒", "策略指标待接入", "夏普比率", "卡玛比率"),
+    ("富途", "老虎", "辉立", "东方财富", "美股趋势交易", "港股趋势交易", "当天趋势报告", "报告日期", "数据截至", "夏普比率", "卡玛比率"),
 )
 def test_check_account_holdings_rejects_missing_profile_or_metric(missing: str) -> None:
-    text = (
-        "富途短线美股趋势交易数据日2026-07-14账户源2026-07-14买入1卖出0人工复核1最近保护提醒无 "
-        "老虎长线SMA200 组合策略夏普比率卡玛比率 "
-        "辉立短线港股趋势交易数据日2026-07-15账户源2026-06买入2卖出1人工复核0最近保护提醒无 "
-        "东方财富偏短线趋势交易策略指标待接入"
-    ).replace(missing, "")
+    text = trend_account_text().replace(missing, "")
 
     class Locator:
         def inner_text(self) -> str:
