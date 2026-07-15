@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-15
 
+- Made each US holding display and value one Futu-selected overnight, premarket,
+  regular, or after-hours price with a compact session-colored label, truthful
+  fallback text, correct standard-option valuation, and two-cycle acceptance
+  coverage.
 - Moved Open Trader voice playback to the XiaoAI speaker's native TTS over
   serialized SSH calls, removing the runtime dependency on the Xiaozhi HTTP/TTS
   stack while preserving the existing alert allowlist and quiet hours; verified
