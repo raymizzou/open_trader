@@ -20,10 +20,13 @@ Before reporting that the change is done:
 Do not describe a change as fully verified if only tests were run and the live
 background process was not checked.
 
-## Dashboard Definition of Done
+## Dashboard Acceptance Gate
 
-Run `make acceptance` after every modification. Its result is the only
-completion status:
+Do not run `make acceptance` after intermediate modifications. Run focused
+tests and direct workflow checks while developing, and run `make acceptance`
+only as the final gate before asking the user to review or accept a completed
+Dashboard task, unless the user explicitly requests it earlier. Its result is
+the only review-readiness status:
 
 - `PASS`: automated tests, real API/data, two refresh cycles, process version,
   logs, and desktop/mobile browser flows all passed.
