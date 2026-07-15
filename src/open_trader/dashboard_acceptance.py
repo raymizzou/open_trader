@@ -28,6 +28,7 @@ REQUIRED_SOURCE_PATHS = (
 SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
 SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
 
+ACCOUNT_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 TREND_REPORT_BROKERS = ("futu", "phillips", "eastmoney")
 TREND_REPORT_DIRECTORIES = {
     "futu": "trend_us_futu",
@@ -597,39 +598,58 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
 def _check_account_holdings(
     page: Any, payload: dict[str, Any], *, reports_dir: Path | None = None
 ) -> None:
-    text = page.locator("#account-holdings").inner_text()
-    for required in (
-        "富途", "短线", "美股趋势交易", "老虎", "长线", "SMA200 组合策略",
-        "辉立", "港股趋势交易", "东方财富", "偏短线", "趋势交易",
-        "当天趋势报告", "报告日期", "数据截至", "夏普比率", "卡玛比率",
-    ):
-        assert required in text, f"账户持仓视图缺少 {required}"
-    for legacy in ("数据日", "账户源", "最近保护提醒", "策略指标待接入"):
-        assert legacy not in text, f"账户持仓视图仍包含旧趋势摘要 {legacy}"
-    assert page.locator(".account-section").count() == 4, "账户区块数量不是 4"
-    assert page.locator(".trend-report-entry").count() == 3, "趋势报告入口数量不是 3"
-    assert page.locator("#account-tiger .trend-report-entry").count() == 0, (
-        "老虎账户不应包含趋势报告入口"
-    )
-    for forbidden in ("tiger-long-term-panel", "calibration_required", "provenance_incomplete"):
-        assert forbidden not in text, f"账户持仓视图泄漏内部代码 {forbidden}"
-    assert page.evaluate(
-        "document.documentElement.scrollWidth <= window.innerWidth"
-    ), "页面出现横向滚动"
+    tabs = page.locator("#account-tabs [data-broker]")
+    assert tabs.count() == 4, "券商账户 Tab 数量不是 4"
+    assert tuple(
+        tabs.nth(index).get_attribute("data-broker")
+        for index in range(tabs.count())
+    ) == ACCOUNT_BROKERS, "券商账户 Tab 顺序不正确"
+    assert page.locator('[data-market="CASH"]').count() == 0, "页面仍包含现金筛选"
+    assert page.locator("#cash-detail-panel").count() == 0, "页面仍包含现金明细挂载点"
 
     reports = payload.get("trend_reports") or {}
-    expected_available = [
-        broker for broker in TREND_REPORT_BROKERS
-        if isinstance(reports.get(broker), Mapping)
-        and reports[broker].get("available") is True
-    ]
-    assert page.locator(".trend-report-entry [data-trend-report]").count() == len(
-        expected_available
-    ), "可用趋势报告入口数量与 API 不一致"
-    for broker in TREND_REPORT_BROKERS:
+    profiles = {
+        "futu": ("富途", "短线", "美股趋势交易"),
+        "tiger": ("老虎", "长线", "SMA200 组合策略"),
+        "phillips": ("辉立", "短线", "港股趋势交易"),
+        "eastmoney": ("东方财富", "偏短线", "趋势交易"),
+    }
+    for broker in ACCOUNT_BROKERS:
+        section = _select_account_tab(page, broker)
+        text = section.inner_text()
+        for required in (*profiles[broker], "持仓资产", "现金", "持仓", "来源", "时间"):
+            assert required in text, f"{broker} 账户区块缺少 {required}"
+        if broker == "tiger":
+            for required in (
+                "SMA200 策略", "影子验证", "年化收益", "最大回撤", "夏普比率", "卡玛比率",
+            ):
+                assert required in text, f"老虎策略摘要缺少 {required}"
+        for legacy in ("数据日", "账户源", "最近保护提醒", "策略指标待接入"):
+            assert legacy not in text, f"账户持仓视图仍包含旧趋势摘要 {legacy}"
+        for forbidden in (
+            "tiger-long-term-panel", "calibration_required", "provenance_incomplete",
+        ):
+            assert forbidden not in text, f"账户持仓视图泄漏内部代码 {forbidden}"
+        rows = section.locator(".account-holding-row:visible")
+        empty = section.locator(".account-empty:visible")
+        if rows.count() == 0:
+            assert empty.count() == 1 and empty.inner_text().strip() == "当前筛选下没有持仓", (
+                f"{broker} 无持仓账户缺少中文空状态"
+            )
+        else:
+            assert empty.count() == 0, f"{broker} 有持仓账户错误显示空状态"
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        ), f"{broker} 账户区块出现横向滚动"
+        if broker == "tiger":
+            assert section.locator(".trend-report-entry").count() == 0, (
+                "老虎账户不应包含趋势报告入口"
+            )
+            continue
+        assert "当天趋势报告" in text, f"{broker} 账户区块缺少 当天趋势报告"
         report = reports.get(broker) if isinstance(reports, Mapping) else None
         assert isinstance(report, Mapping), f"API 缺少 {broker} 趋势报告状态"
-        entry = page.locator(f"#account-{broker} .trend-report-entry")
+        entry = section.locator(".trend-report-entry")
         assert entry.count() == 1, f"{broker} 趋势报告入口数量不是 1"
         trigger = entry.locator("[data-trend-report]")
         if report.get("available") is not True:
@@ -653,8 +673,8 @@ def _check_account_holdings(
         trigger.click()
         workspace = page.locator("#trend-report-workspace:visible")
         assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
-        close = workspace.locator("[data-close-trend-report]")
-        assert close.count() == 1, f"{broker} 趋势报告工作区缺少返回按钮"
+        close = page.locator("#return-to-portfolio:visible")
+        assert close.count() == 1, f"{broker} 趋势报告工作区缺少共享返回按钮"
         assert close.evaluate("element => element === document.activeElement"), (
             f"{broker} 趋势报告打开后焦点未进入工作区"
         )
@@ -709,6 +729,17 @@ def _check_account_holdings(
         )
 
 
+def _select_account_tab(page: Any, broker: str) -> Any:
+    tab = page.locator(f'#account-tabs [data-broker="{broker}"]')
+    assert tab.count() == 1, f"缺少 {broker} 券商 Tab"
+    tab.click()
+    assert tab.get_attribute("aria-selected") == "true", f"{broker} Tab 未选中"
+    section = page.locator(f"#account-{broker}:visible")
+    assert section.count() == 1, f"{broker} 账户区块未显示"
+    assert page.locator(".account-section:visible").count() == 1, "同时显示多个账户区块"
+    return section
+
+
 def _check_session_prices(page: Any) -> None:
     header = page.locator("#last-refresh").inner_text().strip()
     assert "CST" in header, "Header 获取时间缺少 CST"
@@ -747,45 +778,38 @@ def _check_page_safety(page: Any) -> None:
         assert "下单" not in label, f"页面包含下单入口：{label}"
 
 
-def _check_tiger_anchor(page: Any) -> None:
-    page.locator('a[href="#account-tiger"]').click()
-    assert page.evaluate("window.location.hash") == "#account-tiger", (
-        "点击老虎账户锚点后 location.hash 不正确"
-    )
-    assert page.locator("#account-tiger").evaluate(
-        """element => {
-          const rect = element.getBoundingClientRect();
-          return rect.bottom > 0 && rect.top < window.innerHeight;
-        }"""
-    ), "点击老虎账户锚点后目标不在 viewport 内"
+def _check_tiger_tab(page: Any) -> None:
+    _select_account_tab(page, "tiger")
 
 
 def _check_cn_filter(page: Any, expected_cn: int) -> None:
     page.locator('[data-market="CN"]').first.click()
     page.wait_for_timeout(500)
-    assert page.locator("#visible-count").inner_text().strip() == f"{expected_cn} 条", (
-        f"A 股筛选不是 {expected_cn} 条"
-    )
-    sections = page.locator(".account-section:visible")
-    assert sections.count() == 4, "A 股筛选后账户区块数量不是 4"
-    for index in range(sections.count()):
-        section = sections.nth(index)
+    total = 0
+    for broker in ACCOUNT_BROKERS:
+        section = _select_account_tab(page, broker)
         rows = section.locator(".account-holding-row:visible")
         empty = section.locator(".account-empty:visible")
-        if rows.count() == 0:
+        count = rows.count()
+        total += count
+        assert page.locator("#visible-count").inner_text().strip() == f"{count} 条", (
+            f"{broker} A 股筛选计数不是 {count} 条"
+        )
+        if count == 0:
             assert empty.count() == 1 and empty.inner_text().strip() == "当前筛选下没有持仓", (
-                f"A 股筛选后第 {index + 1} 个无持仓账户缺少中文空状态"
+                f"{broker} A 股筛选后缺少中文空状态"
             )
             continue
-        assert empty.count() == 0, f"A 股筛选后第 {index + 1} 个账户错误显示空状态"
+        assert empty.count() == 0, f"{broker} A 股筛选后错误显示空状态"
         markets = section.locator(
             ".account-holding-row:visible td:nth-child(2)"
         ).all_inner_texts()
-        assert len(markets) == rows.count(), f"A 股筛选后第 {index + 1} 个账户市场列缺失"
+        assert len(markets) == count, f"{broker} A 股筛选后市场列缺失"
         assert all(
             re.sub(r"\s+", " ", market).strip() in {"CN", "市场 CN"}
             for market in markets
-        ), f"A 股筛选后第 {index + 1} 个账户包含非 CN 持仓"
+        ), f"{broker} A 股筛选后包含非 CN 持仓"
+    assert total == expected_cn, f"A 股筛选不是 {expected_cn} 条：{total}"
 
 
 def _browser_check(
@@ -844,17 +868,12 @@ def _browser_check(
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
+                        _select_account_tab(page, "futu")
                         _check_session_prices(page)
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
-                        _check_tiger_anchor(page)
-                        assert page.locator("#account-tiger:visible").count() == 1, (
-                            "点击老虎账户锚点后账户区块不可见"
-                        )
-                        assert page.locator(".account-section").count() == 4, (
-                            "点击老虎账户锚点后账户区块数量不是 4"
-                        )
+                        _check_tiger_tab(page)
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     phillips_card = page.locator(

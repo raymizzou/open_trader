@@ -593,6 +593,271 @@ def trend_audit_sections(broker: str) -> list[str]:
     ]
 
 
+ACCOUNT_SECTION_TEXTS = {
+    "futu": (
+        "富途 短线 · 美股趋势交易 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
+        "来源 Futu 时间 2026-07-15 当天趋势报告 报告日期 2026-07-15 "
+        "数据截至 2026-07-14"
+    ),
+    "tiger": (
+        "老虎 长线 · SMA200 组合策略 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
+        "来源 Tiger 时间 2026-07-15 SMA200 策略 影子验证 · 仅供人工复核 "
+        "年化收益 最大回撤 夏普比率 卡玛比率"
+    ),
+    "phillips": (
+        "辉立 短线 · 港股趋势交易 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
+        "来源 月结单 时间 2026-07 当天趋势报告 报告日期 2026-07-15 "
+        "数据截至 2026-07-14"
+    ),
+    "eastmoney": (
+        "东方财富 偏短线 · 趋势交易 持仓资产 HKD 0 现金 HKD 20 持仓 0 "
+        "来源 东方财富 时间 2026-07-15 当天趋势报告 今日暂无趋势报告 "
+        "当前筛选下没有持仓"
+    ),
+}
+
+
+class TabbedAccountLocator:
+    def __init__(self, page: "TabbedAccountPage", selector: str) -> None:
+        self.page = page
+        self.selector = selector
+
+    @property
+    def first(self) -> "TabbedAccountLocator":
+        return self
+
+    def locator(self, selector: str) -> "TabbedAccountLocator":
+        return self.page.locator(f"{self.selector} {selector}")
+
+    def click(self) -> None:
+        match = re.fullmatch(r'#account-tabs \[data-broker="(\w+)"\]', self.selector)
+        if match:
+            self.page.selected = match.group(1)
+            self.page.selected_brokers.append(self.page.selected)
+            self.page._record_visible_sections()
+            return
+        if self.selector == '[data-market="CN"]':
+            self.page.market = "CN"
+            return
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.trend-report-entry \[data-trend-report\]",
+            self.selector,
+        )
+        if match:
+            broker = match.group(1)
+            self.page.trend_broker = broker
+            self.page.opened_reports.append(broker)
+            self.page.active = "#return-to-portfolio:visible"
+            self.page._record_visible_sections()
+            return
+        if self.selector.endswith(".trend-audit summary"):
+            self.page.active = self.selector
+            return
+        if self.selector == "#return-to-portfolio:visible":
+            broker = self.page.trend_broker
+            self.page.trend_broker = None
+            self.page.active = (
+                f"#account-{broker}:visible .trend-report-entry [data-trend-report]"
+            )
+            self.page._record_visible_sections()
+
+    def count(self) -> int:
+        if self.selector == "#account-tabs [data-broker]":
+            return 4
+        if re.fullmatch(r'#account-tabs \[data-broker="\w+"\]', self.selector):
+            return 1
+        if self.selector in {'[data-market="CASH"]', "#cash-detail-panel"}:
+            return 0
+        if self.selector == ".account-section":
+            return 1
+        if self.selector == ".account-section:visible":
+            return self.page._record_visible_sections()
+        match = re.fullmatch(r"#account-(\w+):visible", self.selector)
+        if match:
+            return int(
+                self.page.trend_broker is None and self.page.selected == match.group(1)
+            )
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.trend-report-entry(?: (.*))?", self.selector
+        )
+        if match:
+            broker, child = match.groups()
+            if self.page.trend_broker is not None or self.page.selected != broker:
+                return 0
+            if broker == "tiger":
+                return 0
+            if child == "[data-trend-report]":
+                return int(bool(self.page.reports[broker]["available"]))
+            if child == "button":
+                return 1
+            return 1
+        if self.selector == "#trend-report-workspace:visible":
+            return int(self.page.trend_broker is not None)
+        if self.selector == "#return-to-portfolio:visible":
+            return int(self.page.trend_broker is not None)
+        if self.selector == ".workspace-grid:visible":
+            return int(self.page.trend_broker is None)
+        if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
+            return 0
+        if self.selector.endswith(".account-holding-row:visible"):
+            return self.page.visible_rows(self.selector)
+        if self.selector.endswith(".account-empty:visible"):
+            return int(self.page.visible_rows(self.selector) == 0)
+        if self.selector.endswith(".session-quote"):
+            return 1
+        if "account-holding-market:has-text(\"US\")" in self.selector:
+            return int(self.page.selected == "futu" and self.page.market != "CN")
+        return 1
+
+    def get_attribute(self, name: str) -> str | None:
+        match = re.fullmatch(
+            r"#account-tabs \[data-broker\]:nth\((\d+)\)", self.selector
+        )
+        if match:
+            assert name == "data-broker"
+            return self.page.tab_order[int(match.group(1))]
+        match = re.fullmatch(r'#account-tabs \[data-broker="(\w+)"\]', self.selector)
+        if match:
+            assert name == "aria-selected"
+            return str(match.group(1) == self.page.selected).lower()
+        assert self.selector.endswith(".trend-audit") and name == "open"
+        return None
+
+    def is_disabled(self) -> bool:
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.trend-report-entry button", self.selector
+        )
+        assert match
+        broker = match.group(1)
+        self.page.disabled_reports.add(broker)
+        return not bool(self.page.reports[broker]["available"])
+
+    def inner_text(self) -> str:
+        if self.selector == "#account-holdings":
+            return self.page.section_texts[self.page.selected]
+        match = re.fullmatch(r"#account-(\w+):visible", self.selector)
+        if match:
+            return self.page.section_texts[match.group(1)]
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.trend-report-entry", self.selector
+        )
+        if match:
+            return self.page.entry_texts[match.group(1)]
+        if self.selector == "#trend-report-workspace:visible":
+            return trend_workspace_text(str(self.page.trend_broker))
+        if self.selector.endswith(".trend-audit"):
+            return trend_audit_text(str(self.page.trend_broker))
+        if self.selector.endswith(".account-empty:visible"):
+            return "当前筛选下没有持仓"
+        if self.selector == "#visible-count":
+            return f"{self.page.visible_rows()} 条"
+        if self.selector == "#last-refresh":
+            return "刷新于 2026-07-15 15:03:13 CST"
+        if ".session-quote" in self.selector:
+            return "夜盘 61.50 · 03:03 ET"
+        if self.selector == "body":
+            return "持仓与策略"
+        if self.selector.endswith(" strong"):
+            return "HKD 628,554.06"
+        raise AssertionError(self.selector)
+
+    def all_inner_texts(self) -> list[str]:
+        if self.selector == "a:visible, button:visible":
+            return ["刷新账户与行情", "策略回测"]
+        broker = str(self.page.trend_broker)
+        if self.selector.endswith(".trend-stage"):
+            return trend_stage_texts(broker)
+        if self.selector.endswith(".trend-report-header dd"):
+            report = self.page.reports[broker]
+            return [str(report[key]) for key in (
+                "report_date", "data_date", "generated_at", "account_status",
+            )]
+        if self.selector.endswith(".trend-audit section"):
+            return trend_audit_sections(broker)
+        if self.selector.endswith(".account-holding-row:visible td:nth-child(2)"):
+            return ["市场\nCN"] * self.page.visible_rows(self.selector)
+        return []
+
+    def nth(self, index: int) -> "TabbedAccountLocator":
+        return self.page.locator(f"{self.selector}:nth({index})")
+
+    def evaluate(self, expression: str) -> bool:
+        assert "document.activeElement" in expression
+        self.page.focus_checks.append(self.selector)
+        return self.selector == self.page.active
+
+    def bounding_box(self) -> dict[str, float]:
+        return {"x": 20, "width": 100}
+
+
+class TabbedAccountPage:
+    viewport_size = {"width": 1440, "height": 1000}
+
+    def __init__(
+        self,
+        payload: dict[str, object] | None = None,
+        *,
+        cn_rows: dict[str, int] | None = None,
+    ) -> None:
+        self.reports = (payload or valid_payload())["trend_reports"]  # type: ignore[assignment,index]
+        self.section_texts = dict(ACCOUNT_SECTION_TEXTS)
+        self.entry_texts = {
+            broker: (
+                f"当天趋势报告 报告日期 {report.get('report_date', '-')} "
+                f"数据截至 {report.get('data_date', '-')}"
+                if report.get("available") is True
+                else f"当天趋势报告 {report.get('status_text', '')}"
+            )
+            for broker, report in self.reports.items()
+        }
+        self.all_rows = {"futu": 1, "tiger": 1, "phillips": 1, "eastmoney": 0}
+        self.cn_rows = cn_rows or {"futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 5}
+        self.market = "ALL"
+        self.selected = "futu"
+        self.tab_order = ["futu", "tiger", "phillips", "eastmoney"]
+        self.selected_brokers: list[str] = []
+        self.visible_account_sections = 1
+        self.max_visible_account_sections = 1
+        self.trend_broker: str | None = None
+        self.active: str | None = None
+        self.opened_reports: list[str] = []
+        self.disabled_reports: set[str] = set()
+        self.focus_checks: list[str] = []
+
+    def _record_visible_sections(self) -> int:
+        visible = self.visible_account_sections if self.trend_broker is None else 0
+        self.max_visible_account_sections = max(
+            self.max_visible_account_sections, visible
+        )
+        return visible
+
+    def visible_rows(self, selector: str = "") -> int:
+        match = re.search(r"#account-(\w+):visible", selector)
+        broker = match.group(1) if match else self.selected
+        rows = self.cn_rows if self.market == "CN" else self.all_rows
+        return rows[broker]
+
+    def locator(self, selector: str) -> TabbedAccountLocator:
+        return TabbedAccountLocator(self, selector)
+
+    def evaluate(self, expression: str) -> bool:
+        assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
+        return True
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        assert milliseconds == 500
+
+
+def tabbed_account_page(payload: dict[str, object]) -> TabbedAccountPage:
+    return TabbedAccountPage(payload)
+
+
+def tabbed_cn_page() -> TabbedAccountPage:
+    return TabbedAccountPage(cn_rows={
+        "futu": 1, "tiger": 0, "phillips": 1, "eastmoney": 0,
+    })
+
+
 def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
     class Locator:
         def __init__(self, selector: str = "audit") -> None:
@@ -819,139 +1084,14 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     evaluated: list[str] = []
     state = {"fail_desktop_navigation": True}
 
-    class Locator:
-        def __init__(self, name: str, selector: str) -> None:
-            self.name = name
-            self.selector = selector
-
-        @property
-        def first(self) -> "Locator":
-            return self
-
-        def locator(self, selector: str) -> "Locator":
-            return Locator(self.name, f"{self.selector} {selector}")
-
+    class Locator(TabbedAccountLocator):
         def click(self) -> None:
-            clicks.append((self.name, self.selector))
-            if self.selector == 'a[href="#account-tiger"]':
-                state[f"{self.name}_hash"] = "#account-tiger"
-            if self.selector == ".trend-report-entry [data-trend-report]":
-                state[f"{self.name}_trend_broker"] = "futu"
-            match = re.match(
-                r"#account-(\w+) \.trend-report-entry \[data-trend-report\]$",
-                self.selector,
-            )
-            if match:
-                state[f"{self.name}_trend_broker"] = match.group(1)
-                state[f"{self.name}_active"] = (
-                    "#trend-report-workspace:visible [data-close-trend-report]"
-                )
-            if self.selector.endswith(".trend-audit summary"):
-                state[f"{self.name}_active"] = self.selector
-            if self.selector.endswith("[data-close-trend-report]"):
-                broker = state.get(f"{self.name}_trend_broker")
-                state[f"{self.name}_active"] = (
-                    f"#account-{broker} .trend-report-entry [data-trend-report]"
-                )
-                state[f"{self.name}_trend_broker"] = None
+            clicks.append((self.page.name, self.selector))  # type: ignore[attr-defined]
+            super().click()
 
-        def is_disabled(self) -> bool:
-            match = re.match(r"#account-(\w+) \.trend-report-entry button$", self.selector)
-            assert match
-            return not bool(reports[match.group(1)]["available"])  # type: ignore[index]
-
-        def inner_text(self) -> str:
-            if self.selector == "#last-refresh":
-                return "刷新于 2026-07-15 15:03:13 CST"
-            if ".session-quote" in self.selector:
-                return "夜盘 61.50 · 03:03 ET"
-            if self.selector == "#account-holdings":
-                return trend_account_text()
-            match = re.match(r"#account-(\w+) \.trend-report-entry$", self.selector)
-            if match:
-                report = reports[match.group(1)]  # type: ignore[index]
-                return (
-                    f"当天趋势报告 报告日期 {report.get('report_date', '-')} "
-                    f"数据截至 {report.get('data_date', '-')}"
-                )
-            if self.selector == "#trend-report-workspace:visible":
-                return trend_workspace_text(str(state.get(f"{self.name}_trend_broker")))
-            if self.selector.endswith(".trend-audit"):
-                return trend_audit_text(str(state.get(f"{self.name}_trend_broker")))
-            if self.selector == "body":
-                return "持仓与策略"
-            if self.selector.endswith(".account-empty:visible"):
-                return "当前筛选下没有持仓"
-            return "5 条"
-
-        def count(self) -> int:
-            if self.selector in {".account-section", ".account-section:visible"}:
-                return 4
-            if self.selector == ".trend-report-entry":
-                return 3
-            if self.selector == "#account-tiger .trend-report-entry":
-                return 0
-            if self.selector == ".trend-report-entry [data-trend-report]":
-                return 2
-            if re.match(r"#account-\w+ \.trend-report-entry$", self.selector):
-                return 1
-            match = re.match(
-                r"#account-(\w+) \.trend-report-entry \[data-trend-report\]$",
-                self.selector,
-            )
-            if match:
-                return int(bool(reports[match.group(1)]["available"]))  # type: ignore[index]
-            if re.match(r"#account-\w+ \.trend-report-entry button$", self.selector):
-                return 1
-            if self.selector == "#trend-report-workspace:visible":
-                return int(bool(state.get(f"{self.name}_trend_broker")))
-            if self.selector == ".workspace-grid:visible":
-                return int(not state.get(f"{self.name}_trend_broker"))
-            if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
-                return 0
-            if self.selector.endswith(".account-empty:visible"):
-                return 0
-            return 1
-
-        def all_inner_texts(self) -> list[str]:
-            if self.selector == "a:visible, button:visible":
-                return ["刷新账户与行情", "策略回测"]
-            broker = str(state.get(f"{self.name}_trend_broker"))
-            if self.selector.endswith(".trend-stage"):
-                return trend_stage_texts(broker)
-            if self.selector.endswith(".trend-stage h2"):
-                return [text.split("\n", 1)[0] for text in trend_stage_texts(broker)]
-            if self.selector.endswith(".trend-report-header dd"):
-                report = reports[broker]  # type: ignore[index]
-                return [str(report[key]) for key in (
-                    "report_date", "data_date", "generated_at", "account_status",
-                )]
-            if self.selector.endswith(".trend-audit section"):
-                return trend_audit_sections(broker)
-            if self.selector.endswith(
-                ".account-holding-row:visible td:nth-child(2)"
-            ):
-                return ["市场\nCN"]
-            return []
-
-        def get_attribute(self, name: str) -> str | None:
-            assert self.selector.endswith(".trend-audit") and name == "open"
-            return None
-
-        def nth(self, index: int) -> "Locator":
-            return Locator(self.name, f"{self.selector}:nth({index})")
-
-        def evaluate(self, expression: str) -> bool:
-            if "document.activeElement" in expression:
-                return self.selector == state.get(f"{self.name}_active")
-            assert "getBoundingClientRect" in expression
-            return True
-
-        def bounding_box(self) -> dict[str, float]:
-            return {"x": 20, "width": 100}
-
-    class Page:
+    class Page(TabbedAccountPage):
         def __init__(self, name: str, viewport: dict[str, int]) -> None:
+            super().__init__(payload)
             self.name = name
             self.viewport_size = viewport
 
@@ -965,17 +1105,12 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
         def locator(self, selector: str) -> Locator:
             selectors.append((self.name, selector))
-            return Locator(self.name, selector)
+            return Locator(self, selector)
 
-        def evaluate(self, expression: str) -> object:
-            if expression == "window.location.hash":
-                return state.get(f"{self.name}_hash", "")
+        def evaluate(self, expression: str) -> bool:
             assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
             evaluated.append(self.name)
             return True
-
-        def wait_for_timeout(self, _milliseconds: int) -> None:
-            pass
 
         def close(self) -> None:
             pass
@@ -1052,12 +1187,23 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             '.account-holding-row:visible:has('
             '.account-holding-market:has-text("US")) .account-holding-price',
         ) in selectors
-        assert (viewport, '#account-holdings') in selectors
-        assert (viewport, '.account-section') in selectors
-        assert (viewport, '.trend-report-entry') in selectors
-        assert (viewport, '#account-tiger .trend-report-entry') in selectors
-        assert (viewport, '#account-futu .trend-report-entry [data-trend-report]') in clicks
-        assert (viewport, '#account-phillips .trend-report-entry [data-trend-report]') in clicks
+        assert (viewport, '#account-tabs [data-broker]') in selectors
+        assert (viewport, '[data-market="CASH"]') in selectors
+        assert (viewport, '#cash-detail-panel') in selectors
+        for broker in ("futu", "tiger", "phillips", "eastmoney"):
+            tab = f'#account-tabs [data-broker="{broker}"]'
+            assert (viewport, tab) in selectors
+            assert (viewport, tab) in clicks
+            assert (viewport, f"#account-{broker}:visible") in selectors
+        assert (
+            viewport,
+            '#account-futu:visible .trend-report-entry [data-trend-report]',
+        ) in clicks
+        assert (
+            viewport,
+            '#account-phillips:visible .trend-report-entry [data-trend-report]',
+        ) in clicks
+        assert (viewport, '#return-to-portfolio:visible') in clicks
         assert (viewport, '#trend-report-workspace:visible') in selectors
         assert (viewport, '.workspace-grid:visible') in selectors
         assert (viewport, '.account-section:visible') in selectors
@@ -1066,9 +1212,9 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, '#trade-actions') in selectors
         assert (viewport, 'body') in selectors
         assert (viewport, 'a:visible, button:visible') in selectors
-        assert (viewport, 'a[href="#account-tiger"]') in clicks
+        assert (viewport, 'a[href="#account-tiger"]') not in clicks
     assert evaluated == [
-        "desktop", "desktop", "desktop", "mobile", "mobile", "mobile",
+        *(["desktop"] * 6), *(["mobile"] * 6),
     ]
 
 
@@ -1094,142 +1240,62 @@ def test_validate_dashboard_payload_rejects_invalid_tiger_strategy(
     assert expected in validate_dashboard_payload(payload, expected_cn=5)
 
 
-def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> None:
+def test_check_account_holdings_visits_every_broker_tab(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     payload = valid_payload()
-    reports = payload["trend_reports"]
-    state: dict[str, object] = {
-        "broker": None, "active": None, "opened": [], "disabled_checked": set(),
-    }
+    page = tabbed_account_page(payload)
+    projections: list[str] = []
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_trend_artifact_projection",
+        lambda _reports_dir, broker, _report: projections.append(broker),
+    )
 
-    class Locator:
-        def __init__(self, selector: str) -> None:
-            self.selector = selector
+    dashboard_acceptance._check_account_holdings(
+        page, payload, reports_dir=tmp_path
+    )
 
-        @property
-        def first(self) -> "Locator":
-            return self
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
+    assert page.max_visible_account_sections == 1
+    assert page.opened_reports == ["futu", "phillips"]
+    assert page.disabled_reports == {"eastmoney"}
+    assert projections == ["futu", "phillips"]
+    assert page.focus_checks == [
+        "#return-to-portfolio:visible",
+        '#account-futu:visible .trend-report-entry [data-trend-report]',
+        "#return-to-portfolio:visible",
+        '#account-phillips:visible .trend-report-entry [data-trend-report]',
+    ]
 
-        def click(self) -> None:
-            match = re.match(
-                r"#account-(\w+) \.trend-report-entry \[data-trend-report\]$",
-                self.selector,
-            )
-            if match:
-                broker = match.group(1)
-                state["broker"] = broker
-                state["active"] = "#trend-report-workspace:visible [data-close-trend-report]"
-                state["opened"].append(broker)  # type: ignore[union-attr]
-            elif self.selector.endswith(".trend-audit summary"):
-                state["active"] = self.selector
-            elif self.selector.endswith("[data-close-trend-report]"):
-                broker = state["broker"]
-                state["active"] = f"#account-{broker} .trend-report-entry [data-trend-report]"
-                state["broker"] = None
 
-        def is_disabled(self) -> bool:
-            match = re.match(r"#account-(\w+) \.trend-report-entry button$", self.selector)
-            assert match
-            broker = match.group(1)
-            state["disabled_checked"].add(broker)  # type: ignore[union-attr]
-            return not bool(reports[broker]["available"])  # type: ignore[index]
+def test_select_account_tab_rejects_multiple_visible_sections() -> None:
+    page = tabbed_account_page(valid_payload())
+    page.visible_account_sections = 2
 
-        def evaluate(self, expression: str) -> bool:
-            assert "document.activeElement" in expression
-            return self.selector == state["active"]
+    with pytest.raises(AssertionError, match="同时显示多个账户区块"):
+        dashboard_acceptance._select_account_tab(page, "futu")
 
-        def locator(self, selector: str) -> "Locator":
-            return Locator(f"{self.selector} {selector}")
+    assert page.max_visible_account_sections == 2
 
-        def inner_text(self) -> str:
-            if self.selector == "#account-holdings":
-                return trend_account_text()
-            match = re.match(r"#account-(\w+) \.trend-report-entry$", self.selector)
-            if match:
-                report = reports[match.group(1)]  # type: ignore[index]
-                return (
-                    f"当天趋势报告 报告日期 {report.get('report_date', '-')} "
-                    f"数据截至 {report.get('data_date', '-')}"
-                )
-            if self.selector == "#trend-report-workspace:visible":
-                return trend_workspace_text(str(state["broker"]))
-            if self.selector.endswith(".trend-audit"):
-                return trend_audit_text(str(state["broker"]))
-            raise AssertionError(self.selector)
 
-        def count(self) -> int:
-            if self.selector == ".account-section":
-                return 4
-            if self.selector == ".trend-report-entry":
-                return 3
-            if self.selector == "#account-tiger .trend-report-entry":
-                return 0
-            if self.selector == ".trend-report-entry [data-trend-report]":
-                return 2
-            match = re.match(r"#account-(\w+) \.trend-report-entry$", self.selector)
-            if match:
-                return 1
-            match = re.match(
-                r"#account-(\w+) \.trend-report-entry \[data-trend-report\]$",
-                self.selector,
-            )
-            if match:
-                return int(bool(reports[match.group(1)]["available"]))  # type: ignore[index]
-            if re.match(r"#account-\w+ \.trend-report-entry button$", self.selector):
-                return 1
-            if self.selector == "#trend-report-workspace:visible":
-                return int(state["broker"] is not None)
-            if self.selector == ".workspace-grid:visible":
-                return int(state["broker"] is None)
-            return 1
+def test_check_account_holdings_rejects_reordered_broker_tabs() -> None:
+    page = tabbed_account_page(valid_payload())
+    page.tab_order = ["tiger", "futu", "phillips", "eastmoney"]
 
-        def all_inner_texts(self) -> list[str]:
-            broker = str(state["broker"])
-            if self.selector.endswith(".trend-stage"):
-                return trend_stage_texts(broker)
-            if self.selector.endswith(".trend-stage h2"):
-                return [text.split("\n", 1)[0] for text in trend_stage_texts(broker)]
-            if self.selector.endswith(".trend-report-header dd"):
-                report = reports[broker]  # type: ignore[index]
-                return [str(report[key]) for key in (
-                    "report_date", "data_date", "generated_at", "account_status",
-                )]
-            if self.selector.endswith(".trend-audit section"):
-                return trend_audit_sections(broker)
-            return []
-
-        def get_attribute(self, name: str) -> str | None:
-            assert self.selector.endswith(".trend-audit") and name == "open"
-            return None
-
-    class Page:
-        def locator(self, selector: str) -> Locator:
-            return Locator(selector)
-
-        def evaluate(self, expression: str) -> bool:
-            assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
-            return True
-
-    dashboard_acceptance._check_account_holdings(Page(), payload)
-
-    assert state["opened"] == ["futu", "phillips"]
-    assert state["disabled_checked"] == {"eastmoney"}
+    with pytest.raises(AssertionError, match="Tab 顺序"):
+        dashboard_acceptance._check_account_holdings(page, valid_payload())
 
 
 @pytest.mark.parametrize(
     "legacy", ("数据日", "账户源", "最近保护提醒", "策略指标待接入"),
 )
 def test_check_account_holdings_rejects_legacy_trend_summary_copy(legacy: str) -> None:
-    class Locator:
-        def inner_text(self) -> str:
-            return f"{trend_account_text()} {legacy}"
-
-    class Page:
-        def locator(self, selector: str) -> Locator:
-            assert selector == "#account-holdings", "checker continued past legacy copy"
-            return Locator()
+    page = tabbed_account_page(valid_payload())
+    page.section_texts["futu"] += f" {legacy}"
 
     with pytest.raises(AssertionError, match=f"旧趋势摘要.*{legacy}"):
-        dashboard_acceptance._check_account_holdings(Page(), valid_payload())
+        dashboard_acceptance._check_account_holdings(page, valid_payload())
 
 
 def session_price_page(
@@ -1416,89 +1482,25 @@ def test_check_page_safety_only_reads_visible_text_not_javascript_source() -> No
     dashboard_acceptance._check_page_safety(Page())
 
 
-def test_check_tiger_anchor_requires_hash_and_target_in_viewport() -> None:
-    state = {"hash": "", "in_viewport": True}
+def test_check_tiger_tab_selects_tiger_and_shows_only_its_section() -> None:
+    page = tabbed_account_page(valid_payload())
 
-    class Locator:
-        def click(self) -> None:
-            state["hash"] = "#account-tiger"
+    dashboard_acceptance._check_tiger_tab(page)
 
-        def evaluate(self, expression: str) -> bool:
-            assert "getBoundingClientRect" in expression
-            return bool(state["in_viewport"])
-
-    class Page:
-        def locator(self, selector: str) -> Locator:
-            assert selector in {'a[href="#account-tiger"]', "#account-tiger"}
-            return Locator()
-
-        def evaluate(self, expression: str) -> str:
-            assert expression == "window.location.hash"
-            return str(state["hash"])
-
-    dashboard_acceptance._check_tiger_anchor(Page())
-
-    state["in_viewport"] = False
-    with pytest.raises(AssertionError, match="viewport"):
-        dashboard_acceptance._check_tiger_anchor(Page())
+    assert page.selected_brokers == ["tiger"]
+    assert page.locator(
+        '#account-tabs [data-broker="tiger"]'
+    ).get_attribute("aria-selected") == "true"
+    assert page.max_visible_account_sections == 1
 
 
-def test_check_cn_filter_keeps_four_accounts_and_validates_rows_or_empty_state() -> None:
-    class Locator:
-        def __init__(self, kind: str, index: int = 0) -> None:
-            self.kind = kind
-            self.index = index
+def test_cn_filter_checks_each_broker_tab_without_all_accounts_view() -> None:
+    page = tabbed_cn_page()
 
-        @property
-        def first(self) -> "Locator":
-            return self
+    dashboard_acceptance._check_cn_filter(page, expected_cn=2)
 
-        def click(self) -> None:
-            pass
-
-        def count(self) -> int:
-            if self.kind == "sections":
-                return 4
-            if self.kind == "rows":
-                return 1 if self.index in {0, 2} else 0
-            if self.kind == "empty":
-                return 1 if self.index in {1, 3} else 0
-            return 1
-
-        def nth(self, index: int) -> "Locator":
-            return Locator("section", index)
-
-        def locator(self, selector: str) -> "Locator":
-            if selector == ".account-holding-row:visible":
-                return Locator("rows", self.index)
-            if selector == ".account-holding-row:visible td:nth-child(2)":
-                return Locator("markets", self.index)
-            if selector == ".account-empty:visible":
-                return Locator("empty", self.index)
-            raise AssertionError(selector)
-
-        def all_inner_texts(self) -> list[str]:
-            assert self.kind == "markets"
-            return ["市场\nCN"]
-
-        def inner_text(self) -> str:
-            if self.kind == "count":
-                return "2 条"
-            assert self.kind == "empty"
-            return "当前筛选下没有持仓"
-
-    class Page:
-        def locator(self, selector: str) -> Locator:
-            return {
-                '[data-market="CN"]': Locator("filter"),
-                "#visible-count": Locator("count"),
-                ".account-section:visible": Locator("sections"),
-            }[selector]
-
-        def wait_for_timeout(self, milliseconds: int) -> None:
-            assert milliseconds == 500
-
-    dashboard_acceptance._check_cn_filter(Page(), expected_cn=2)
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
+    assert page.max_visible_account_sections == 1
 
 
 @pytest.mark.parametrize(
@@ -1506,26 +1508,14 @@ def test_check_cn_filter_keeps_four_accounts_and_validates_rows_or_empty_state()
     ("富途", "老虎", "辉立", "东方财富", "美股趋势交易", "港股趋势交易", "当天趋势报告", "报告日期", "数据截至", "夏普比率", "卡玛比率"),
 )
 def test_check_account_holdings_rejects_missing_profile_or_metric(missing: str) -> None:
-    text = trend_account_text().replace(missing, "")
-
-    class Locator:
-        def inner_text(self) -> str:
-            return text
-
-        def count(self) -> int:
-            return 4
-
-    class Page:
-        def locator(self, selector: str) -> Locator:
-            assert selector in {"#account-holdings", ".account-section"}
-            return Locator()
-
-        def evaluate(self, expression: str) -> bool:
-            assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
-            return True
+    page = tabbed_account_page(valid_payload())
+    for broker, text in page.section_texts.items():
+        page.section_texts[broker] = text.replace(missing, "")
+    for broker, text in page.entry_texts.items():
+        page.entry_texts[broker] = text.replace(missing, "")
 
     with pytest.raises(AssertionError):
-        dashboard_acceptance._check_account_holdings(Page(), valid_payload())
+        dashboard_acceptance._check_account_holdings(page, valid_payload())
 
 
 def test_validate_dashboard_payload_rejects_bad_counts_and_weights() -> None:
