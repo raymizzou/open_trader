@@ -872,7 +872,7 @@ def run_dashboard_js(script: str) -> str:
 const fs = require("fs");
 const vm = require("vm");
 const code = fs.readFileSync(process.argv[1], "utf8");
-const sandbox = { document: { addEventListener() {} }, console };
+const sandbox = { document: { addEventListener() {} }, console, URLSearchParams };
 (async () => {
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
@@ -1756,7 +1756,7 @@ def test_dashboard_renders_one_selected_broker_tab_and_cards_switch_it() -> None
 const mount = () => ({innerHTML:"", textContent:"", classList:{add(){},remove(){}}});
 for (const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel","current-view-value","current-view-holding-value","current-view-holding-weight","current-view-cash-note","current-view-label"]) elements[id]=mount();
 state.dashboard={
-  summary:{portfolio_value_hkd:"4000"}, source_statuses:[], cash_rows:[],
+  summary:{portfolio_value_hkd:"4000.00"}, source_statuses:[], cash_rows:[],
   broker_summaries:[
     {broker:"futu",display_name:"富途",portfolio_value_hkd:"1000",holding_count:"1"},
     {broker:"tiger",display_name:"老虎",portfolio_value_hkd:"1000",holding_count:"1"},
@@ -1770,10 +1770,13 @@ state.dashboard={
 };
 renderAccountHoldings();
 renderHeaderSummary();
-const first={broker:state.brokerFilter,tabs:elements["account-tabs"].innerHTML,html:elements["account-holdings"].innerHTML};
+const first={broker:state.brokerFilter,tabs:elements["account-tabs"].innerHTML,html:elements["account-holdings"].innerHTML,value:elements["current-view-value"].textContent};
 handleBrokerSelection({target:{closest(){return {dataset:{broker:"tiger"}};}}});
-const second={broker:state.brokerFilter,tabs:elements["account-tabs"].innerHTML,html:elements["account-holdings"].innerHTML,label:elements["current-view-label"].textContent};
-console.log(JSON.stringify({first,second,cards:renderBrokerSummaryCards()}));
+const second={broker:state.brokerFilter,tabs:elements["account-tabs"].innerHTML,html:elements["account-holdings"].innerHTML,label:elements["current-view-label"].textContent,value:elements["current-view-value"].textContent};
+state.marketFilter="HK";
+renderDashboardViews();
+const market={label:elements["current-view-label"].textContent,value:elements["current-view-value"].textContent};
+console.log(JSON.stringify({first,second,market,cards:renderBrokerSummaryCards()}));
 ''')
     result = json.loads(output)
     assert result["first"]["broker"] == "futu"
@@ -1783,8 +1786,83 @@ console.log(JSON.stringify({first,second,cards:renderBrokerSummaryCards()}));
     assert result["second"]["broker"] == "tiger"
     assert 'id="account-tiger"' in result["second"]["html"]
     assert "老虎" in result["second"]["label"]
+    assert result["first"]["value"] == "HKD 4000.00"
+    assert result["second"]["value"] == "HKD 4000.00"
+    assert result["market"]["value"] == "HKD 4000.00"
+    assert "HK · 老虎 · 0 条" in result["market"]["label"]
     assert 'data-broker="tiger"' in result["cards"]
     assert 'href="#account-tiger"' not in result["cards"]
+
+
+def test_dashboard_broker_clicks_select_empty_accounts_and_ignore_invalid() -> None:
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){
+    this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.listeners={};
+    this.classList={add(){},remove(){},toggle(){},contains(){return false;}};
+  }
+  addEventListener(name,listener){this.listeners[name]=listener;}
+  querySelectorAll(){return [];}
+}
+const nodes={};
+document.getElementById=(id)=>nodes[id]||(nodes[id]=new Element());
+document.querySelector=()=>nodes["workspace-grid"]||(nodes["workspace-grid"]=new Element());
+bindElements();
+bindEvents();
+state.dashboard={
+  summary:{portfolio_value_hkd:"4000",holding_count:"2"},source_statuses:[],cash_rows:[],
+  broker_summaries:ACCOUNT_BROKERS.map((broker)=>({broker,portfolio_value_hkd:"1000",holding_count:broker==="futu"||broker==="tiger"?"1":"0"})),
+  holdings:[
+    {market:"US",symbol:"AAPL",brokers:"futu",broker_details:[{broker:"futu",market:"US",symbol:"AAPL",quantity:"1"}]},
+    {market:"US",symbol:"QQQ",brokers:"tiger",broker_details:[{broker:"tiger",market:"US",symbol:"QQQ",quantity:"2"}]},
+  ],
+};
+const eventFor=(broker)=>({target:{closest(selector){return selector==="[data-broker]"?{dataset:{broker}}:null;}}});
+if(typeof nodes["account-tabs"].listeners.click!=="function")throw new Error("account tab click listener missing");
+if(typeof nodes["broker-summary-cards"].listeners.click!=="function")throw new Error("broker card click listener missing");
+nodes["account-tabs"].listeners.click(eventFor("phillips"));
+const phillips={broker:state.brokerFilter,html:nodes["account-holdings"].innerHTML,tabs:nodes["account-tabs"].innerHTML};
+nodes["broker-summary-cards"].listeners.click(eventFor("eastmoney"));
+const eastmoney={broker:state.brokerFilter,html:nodes["account-holdings"].innerHTML,tabs:nodes["account-tabs"].innerHTML};
+const beforeInvalid=nodes["account-holdings"].innerHTML;
+nodes["account-tabs"].listeners.click(eventFor("ALL"));
+const invalid={broker:state.brokerFilter,unchanged:beforeInvalid===nodes["account-holdings"].innerHTML};
+console.log(JSON.stringify({phillips,eastmoney,invalid}));
+''')
+    result = json.loads(output)
+    assert result["phillips"]["broker"] == "phillips"
+    assert 'id="account-phillips"' in result["phillips"]["html"]
+    assert "当前筛选下没有持仓" in result["phillips"]["html"]
+    assert 'data-broker="phillips" aria-selected="true"' in result["phillips"]["tabs"]
+    assert result["eastmoney"]["broker"] == "eastmoney"
+    assert 'id="account-eastmoney"' in result["eastmoney"]["html"]
+    assert "当前筛选下没有持仓" in result["eastmoney"]["html"]
+    assert 'data-broker="eastmoney" aria-selected="true"' in result["eastmoney"]["tabs"]
+    assert result["invalid"] == {"broker": "eastmoney", "unchanged": True}
+
+
+def test_dashboard_decision_deep_link_prefers_account_broker_order() -> None:
+    output = run_dashboard_js(r'''
+globalThis.window={location:{search:"?market=US&symbol=QQQ&decision_tab=news"}};
+state.dashboard={
+  summary:{portfolio_value_hkd:"3000"},broker_summaries:[],source_statuses:[],cash_rows:[],
+  holdings:[{market:"US",symbol:"QQQ",brokers:"tiger;futu",broker_details:[
+    {broker:"tiger",market:"US",symbol:"QQQ",quantity:"2"},
+    {broker:"futu",market:"US",symbol:"QQQ",quantity:"1"},
+  ]}],
+};
+state.brokerFilter="tiger";
+state.decisionDeepLinkRestored=false;
+restoreDecisionDeepLink();
+console.log(JSON.stringify({broker:state.brokerFilter,key:state.selectedHoldingKey,tab:state.selectedDecisionTab,market:state.marketFilter}));
+''')
+    result = json.loads(output)
+    assert result == {
+        "broker": "futu",
+        "key": "futu:US:QQQ:0",
+        "market": "ALL",
+        "tab": "news",
+    }
 
 
 def test_dashboard_trend_report_entries_and_workspace_interactions() -> None:
