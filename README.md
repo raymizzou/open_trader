@@ -533,6 +533,44 @@ tail -n 100 logs/daily_premarket/launchd-US.out.log
 tail -n 100 logs/daily_premarket/launchd-US.err.log
 ```
 
+### Deploy HK/US Trend Jobs
+
+The Trend Animals workflows use separate report and protection-watch jobs. HK
+uses Phillips statement positions/cash plus Futu quotes; US refreshes the Futu
+real account directly. Configure the pool lists and explicitly managed current
+positions in `config/daily_premarket.env`, then install:
+
+```bash
+scripts/install_daily_premarket_launchd.sh --dry-run --trend-only --market all
+scripts/install_daily_premarket_launchd.sh --trend-only --market all
+```
+
+Loaded labels and Shanghai start times are:
+
+- `com.open-trader.trend-hk-report` at 18:00 and `trend-hk-watch` at 18:01.
+- `com.open-trader.trend-us-report` at 09:00 and `trend-us-watch` at 09:01,
+  Tuesday through Saturday in Shanghai so Friday's US session is included.
+
+Reports retry every 10 minutes for at most one hour. Watchers preflight
+immediately, then sleep until the next HK or New York regular session. Verify or
+remove them with:
+
+```bash
+launchctl list | rg 'com.open-trader.trend-(hk|us)'
+plutil -lint ~/Library/LaunchAgents/com.open-trader.trend-{hk,us}-{report,watch}.plist
+tail -n 100 logs/daily_premarket/launchd-trend-{HK,US}-{report,watch}.out.log
+scripts/uninstall_daily_premarket_launchd.sh --trend-only --market all
+```
+
+Manual runs use the same generic commands:
+
+```bash
+.venv/bin/python -m open_trader trend-market-report --market HK --date today
+.venv/bin/python -m open_trader trend-market-report --market US --date today
+.venv/bin/python -m open_trader watch-trend-market --market HK --once
+.venv/bin/python -m open_trader watch-trend-market --market US --once
+```
+
 ## Outputs
 
 Run-scoped outputs:

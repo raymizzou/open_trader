@@ -26,11 +26,11 @@
   </array>
   <key>StartCalendarInterval</key>
   <array>
-    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>OPEN_TRADER_WEEKDAY_1</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>OPEN_TRADER_WEEKDAY_2</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>OPEN_TRADER_WEEKDAY_3</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>OPEN_TRADER_WEEKDAY_4</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>OPEN_TRADER_WEEKDAY_5</integer><key>Hour</key><integer>OPEN_TRADER_HOUR</integer><key>Minute</key><integer>0</integer></dict>
   </array>
   <key>StandardOutPath</key>
   <string>OPEN_TRADER_REPO/logs/daily_premarket/launchd-trend-OPEN_TRADER_MARKET-report.out.log</string>

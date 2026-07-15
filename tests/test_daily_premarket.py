@@ -4324,6 +4324,9 @@ def test_launchd_installer_renders_separate_trend_market_jobs(
     assert {item["Minute"] for item in report["StartCalendarInterval"]} == {0}
     assert {item["Hour"] for item in watch["StartCalendarInterval"]} == {watch_hour}
     assert {item["Minute"] for item in watch["StartCalendarInterval"]} == {1}
+    expected_weekdays = {1, 2, 3, 4, 5} if market == "HK" else {2, 3, 4, 5, 6}
+    assert {item["Weekday"] for item in report["StartCalendarInterval"]} == expected_weekdays
+    assert {item["Weekday"] for item in watch["StartCalendarInterval"]} == expected_weekdays
 
 
 def test_launchd_installer_rejects_unsupported_market_argument(

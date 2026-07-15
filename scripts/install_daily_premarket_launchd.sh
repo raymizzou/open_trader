@@ -237,10 +237,19 @@ render_trend_template() {
   local market="$2"
   local label="$3"
   local hour="$4"
+  local first_weekday=1
+  if [[ "$market" == "US" ]]; then
+    first_weekday=2
+  fi
   sed \
     -e "s#OPEN_TRADER_LABEL#$(sed_replacement_escape "$(xml_escape "$label")")#g" \
     -e "s#OPEN_TRADER_MARKET#$(sed_replacement_escape "$(xml_escape "$market")")#g" \
     -e "s#OPEN_TRADER_HOUR#$hour#g" \
+    -e "s#OPEN_TRADER_WEEKDAY_1#$first_weekday#g" \
+    -e "s#OPEN_TRADER_WEEKDAY_2#$((first_weekday + 1))#g" \
+    -e "s#OPEN_TRADER_WEEKDAY_3#$((first_weekday + 2))#g" \
+    -e "s#OPEN_TRADER_WEEKDAY_4#$((first_weekday + 3))#g" \
+    -e "s#OPEN_TRADER_WEEKDAY_5#$((first_weekday + 4))#g" \
     -e "s#OPEN_TRADER_REPO#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_REPO")")#g" \
     -e "s#OPEN_TRADER_PYTHON#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_PYTHON")")#g" \
     "$template"

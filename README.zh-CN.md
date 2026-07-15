@@ -518,6 +518,38 @@ tail -n 100 logs/daily_premarket/launchd-US.out.log
 tail -n 100 logs/daily_premarket/launchd-US.err.log
 ```
 
+### 部署港美趋势定时任务
+
+趋势动物流程为报告和保护线 watcher 使用独立任务。港股读取辉立日结单的仓位与现金，并使用富途行情；美股会直接刷新富途真实账户。先在 `config/daily_premarket.env` 配置候选池列表和需要纳管的当前持仓，再安装：
+
+```bash
+scripts/install_daily_premarket_launchd.sh --dry-run --trend-only --market all
+scripts/install_daily_premarket_launchd.sh --trend-only --market all
+```
+
+加载后的任务和上海时间如下：
+
+- `com.open-trader.trend-hk-report` 18:00，`trend-hk-watch` 18:01。
+- `com.open-trader.trend-us-report` 09:00，`trend-us-watch` 09:01；按上海时间周二至周六运行，确保覆盖周五美股。
+
+报告每 10 分钟重试一次，最多一小时。watcher 会立即预检，然后睡眠到下一个港股或纽约常规交易时段。验证或卸载命令：
+
+```bash
+launchctl list | rg 'com.open-trader.trend-(hk|us)'
+plutil -lint ~/Library/LaunchAgents/com.open-trader.trend-{hk,us}-{report,watch}.plist
+tail -n 100 logs/daily_premarket/launchd-trend-{HK,US}-{report,watch}.out.log
+scripts/uninstall_daily_premarket_launchd.sh --trend-only --market all
+```
+
+手工运行使用同一组通用命令：
+
+```bash
+.venv/bin/python -m open_trader trend-market-report --market HK --date today
+.venv/bin/python -m open_trader trend-market-report --market US --date today
+.venv/bin/python -m open_trader watch-trend-market --market HK --once
+.venv/bin/python -m open_trader watch-trend-market --market US --once
+```
+
 ## 输出文件
 
 单次运行输出：
