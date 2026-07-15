@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from open_trader.a_share_trend_watch import (
+    _deliver_trigger_notification,
     append_watch_event,
     watch_a_share_protection,
 )
@@ -20,6 +21,7 @@ from open_trader.notifications import (
     FeishuWebhookNotifier,
     MacOSNotifier,
     NullNotifier,
+    XiaozhiVoiceNotifier,
 )
 
 
@@ -112,6 +114,19 @@ class FlakyMacOSNotifier(RecordingMacOSNotifier):
             self.failures -= 1
             raise RuntimeError("delivery failed")
         super().notify(title, message)
+
+
+class RecordingXiaozhiNotifier(XiaozhiVoiceNotifier):
+    def __init__(self, fail: bool = False) -> None:
+        self.messages: list[tuple[str, str]] = []
+        self.fail = fail
+        self.attempt_count = 0
+
+    def notify(self, title: str, message: str) -> None:
+        self.attempt_count += 1
+        if self.fail:
+            raise RuntimeError("device_offline")
+        self.messages.append((title, message))
 
 
 def portfolio(
@@ -260,6 +275,132 @@ def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:
         "last_price",
         "active_line",
     }
+
+
+def test_trigger_queues_one_voice_alert_with_name(tmp_path: Path) -> None:
+    voice = RecordingXiaozhiNotifier()
+    events_path = tmp_path / "events.jsonl"
+
+    run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        events_path=events_path,
+        notifier=CompositeNotifier([RecordingNotifier(), voice]),
+    )
+
+    assert voice.messages == [
+        (
+            "A股保护线触发 · 600900",
+            "名称：长江电力\n最新价 27.30 <= 活动保护线 27.31\n建议动作：全部卖出（人工执行）",
+        )
+    ]
+    assert read_events(events_path)[-1]["event_type"].endswith("queued_xiaozhi")
+
+
+def test_voice_failure_is_terminal_and_warns_feishu(tmp_path: Path) -> None:
+    voice = RecordingXiaozhiNotifier(fail=True)
+    feishu = RecordingNotifier()
+    events_path = tmp_path / "events.jsonl"
+
+    run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        events_path=events_path,
+        notifier=CompositeNotifier([feishu, voice]),
+    )
+
+    assert voice.attempt_count == 1
+    assert sum("语音播报失败" in title for title, _ in feishu.messages) == 1
+    assert read_events(events_path)[-1]["reason"] == "设备离线"
+
+
+def test_restart_never_replays_voice(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    first = RecordingXiaozhiNotifier(fail=True)
+    run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        events_path=events_path,
+        notifier=CompositeNotifier([RecordingNotifier(), first]),
+    )
+    restarted = RecordingXiaozhiNotifier()
+
+    run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.20")}]),
+        events_path=events_path,
+        notifier=CompositeNotifier([RecordingNotifier(), restarted]),
+    )
+
+    assert first.attempt_count == 1
+    assert restarted.attempt_count == 0
+
+
+def test_trigger_quiet_hours_suppresses_voice_without_failure_warning(
+    tmp_path: Path,
+) -> None:
+    voice = RecordingXiaozhiNotifier()
+    feishu = RecordingNotifier()
+    events_path = tmp_path / "events.jsonl"
+
+    _deliver_trigger_notification(
+        events_path=events_path,
+        notifier=CompositeNotifier([feishu, voice]),
+        trading_date="2026-07-15",
+        now=datetime.fromisoformat("2026-07-15T23:00:00+08:00"),
+        symbol="600900",
+        position_name="长江电力",
+        last_price=Decimal("27.30"),
+        active_line=Decimal("27.31"),
+        delivered_feishu=set(),
+        delivered_macos=set(),
+        replay=False,
+    )
+
+    assert voice.messages == []
+    assert not any("语音播报失败" in title for title, _ in feishu.messages)
+    assert read_events(events_path)[-1]["event_type"].endswith(
+        "suppressed_quiet_hours_xiaozhi"
+    )
+
+
+def test_voice_and_feishu_failure_never_recurse(tmp_path: Path) -> None:
+    voice = RecordingXiaozhiNotifier(fail=True)
+    feishu = FlakyNotifier(failures=10)
+
+    run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        notifier=CompositeNotifier([feishu, voice]),
+    )
+
+    assert voice.attempt_count == 1
+    assert feishu.attempt_count == 2
+
+
+def test_held_symbol_can_speak_again_on_next_trading_date(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    first = RecordingXiaozhiNotifier()
+    run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        events_path=events_path,
+        notifier=CompositeNotifier([RecordingNotifier(), first]),
+    )
+    next_day = RecordingXiaozhiNotifier()
+
+    run_once(
+        tmp_path,
+        now="2026-07-16T09:30:00+08:00",
+        quote=SequenceQuote(
+            [{"SH.600900": Decimal("27.20")}], trading_days=["2026-07-16"]
+        ),
+        events_path=events_path,
+        notifier=CompositeNotifier([RecordingNotifier(), next_day]),
+    )
+
+    assert first.attempt_count == 1
+    assert next_day.attempt_count == 1
 
 
 @pytest.mark.parametrize(
