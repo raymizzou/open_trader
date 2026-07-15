@@ -580,11 +580,11 @@ function renderPriceActionChart(rows, trades) {
   const explanations = { BUY: "买入", ADD: "加仓", REDUCE: "减仓", EXIT: "退出" };
   const markers = displayedGroups.map((group) => {
     const [x, y] = xy(group.execution_date, group.raw_price);
-    const count = group.count > 1 ? ` ×${group.count}` : "";
+    const count = group.count > 1 ? ` ×${formatDisplayNumber(group.count)}` : "";
     return `<g class="backtest-action-marker action-${group.action.toLowerCase()}"><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5"></circle><text x="${x.toFixed(1)}" y="${(y - 9).toFixed(1)}">${group.action}${count}</text></g>`;
   }).join("");
-  const summary = displayedGroups.map((group) => `${group.execution_date} ${group.action}（${explanations[group.action]}）${group.count > 1 ? `共 ${group.count} 笔` : ""}`).join("；");
-  const omittedNotice = omittedGroups ? `另有 ${omittedGroups} 组交易标记未显示` : "";
+  const summary = displayedGroups.map((group) => `${group.execution_date} ${group.action}（${explanations[group.action]}）${group.count > 1 ? `共 ${formatDisplayNumber(group.count)} 笔` : ""}`).join("；");
+  const omittedNotice = omittedGroups ? `另有 ${formatDisplayNumber(omittedGroups)} 组交易标记未显示` : "";
   return `<div class="backtest-chart" role="img" aria-label="价格曲线与交易动作。${escapeHtml(summary || "没有执行动作")}。${omittedNotice}。HOLD（观察）不绘制标记。"><svg viewBox="0 0 600 200" aria-hidden="true"><path class="backtest-price-line" d="${pricePath}" fill="none" vector-effect="non-scaling-stroke"></path>${markers}</svg></div>`;
 }
 
@@ -960,7 +960,7 @@ function renderKellyLabPanel() {
         <p>只读实验结果。</p>
       </div>
       <div class="kelly-lab-heading-actions">
-        <span class="count-pill">${escapeHtml(formatPlain(count))} 个实验</span>
+        <span class="count-pill">${escapeHtml(formatDisplayNumber(count))} 个实验</span>
       </div>
     </div>
     ${renderKellyStrategyTabs(experiments, activeExperimentId)}
@@ -1577,8 +1577,8 @@ function renderKellyExperimentCard(experiment) {
     ["市场", entry.market],
     ["模拟资金池", pool],
     ["阶段", stage],
-    ["已完成", stats.completed_samples],
-    ["进行中", stats.open_samples],
+    ["已完成", formatDisplayNumber(stats.completed_samples)],
+    ["进行中", formatDisplayNumber(stats.open_samples)],
     ["胜率", stats.observed_win_rate],
     ["预算", budget],
     ["资金使用", hasValue(entry.capital_utilization_pct) ? `${formatPlain(entry.capital_utilization_pct)}%` : ""],
@@ -1768,8 +1768,9 @@ function renderKellyParameterDerivation(stats) {
   }
 
   const winLossCount = hasValue(item.winning_samples) || hasValue(item.losing_samples)
-    ? `${formatPlain(item.winning_samples)} 赢 / ${formatPlain(item.losing_samples)} 亏`
+    ? `${formatDisplayNumber(item.winning_samples)} 赢 / ${formatDisplayNumber(item.losing_samples)} 亏`
     : "";
+  const payoffRatio = hasValue(item.payoff_ratio) ? formatDisplayNumber(item.payoff_ratio) : "";
   const payoffDetail = [item.avg_net_win_pct, item.avg_net_loss_pct]
     .filter(hasValue)
     .map(formatPlain)
@@ -1779,16 +1780,16 @@ function renderKellyParameterDerivation(stats) {
     : item.parameter_source;
   const rows = [
     ["样本状态", sampleStageLabel],
-    ["已完成样本", item.completed_samples],
-    ["进行中样本", item.open_samples],
+    ["已完成样本", hasValue(item.completed_samples) ? formatDisplayNumber(item.completed_samples) : item.completed_samples],
+    ["进行中样本", hasValue(item.open_samples) ? formatDisplayNumber(item.open_samples) : item.open_samples],
     ["原始胜率", [item.raw_win_rate, winLossCount].filter(hasValue).map(formatPlain).join(" · ")],
     ["修正胜率", [item.adjusted_win_rate, item.sample_adjustment].filter(hasValue).map(formatPlain).join(" · ")],
-    ["盈亏比 b", [item.payoff_ratio, payoffDetail].filter(hasValue).map(formatPlain).join(" · ")],
+    ["盈亏比 b", [payoffRatio, payoffDetail].filter(hasValue).map(formatPlain).join(" · ")],
     ["Full Kelly", item.full_kelly_pct],
     ["保守 Kelly", item.fractional_kelly_pct],
     ["建议仓位", item.suggested_position_pct],
     ["参数来源", sourceLabel],
-    ["跳过订单", item.skipped_order_count],
+    ["跳过订单", hasValue(item.skipped_order_count) ? formatDisplayNumber(item.skipped_order_count) : item.skipped_order_count],
     ["来源样本时间", item.source_trade_samples_generated_at],
     ["最近完成样本", item.last_sample_closed_at],
     ["最近计算", item.last_recomputed_at],
@@ -1884,13 +1885,13 @@ function renderTrendAction(item, kind) {
   const reason = TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认";
   const fields = [identity];
   if (kind === "buy") {
-    fields.push(`约 ${formatPlain(item.estimated_shares)} 股`);
-    fields.push(`金额上限 ${formatPlain(item.target_amount)}`);
-    fields.push(`预计保护线 ${formatPlain(item.estimated_initial_line)}`);
+    fields.push(`约 ${formatDisplayNumber(item.estimated_shares)} 股`);
+    fields.push(`金额上限 ${formatDisplayNumber(item.target_amount)}`);
+    fields.push(`预计保护线 ${formatDisplayNumber(item.estimated_initial_line)}`);
   } else {
     fields.push(reason);
     if (item.active_line !== null && item.active_line !== undefined && item.active_line !== "") {
-      fields.push(`活动保护线 ${formatPlain(item.active_line)}`);
+      fields.push(`活动保护线 ${formatDisplayNumber(item.active_line)}`);
     }
   }
   return `<li>${fields.map(escapeHtml).join("<span>｜</span>")}</li>`;
@@ -1917,16 +1918,16 @@ function renderTrendAudit(audit) {
   const dataSources = Array.isArray(audit.data_sources) ? audit.data_sources : [];
   return `<details class="trend-audit"><summary>审计详情</summary>
     <section><h3>候选榜</h3><ol>${candidates.length
-      ? candidates.map((item) => `<li>${escapeHtml([item.symbol, item.name, `强度 ${item.strength ?? "-"}`].filter(Boolean).map(formatPlain).join("｜"))}</li>`).join("")
+      ? candidates.map((item) => `<li>${escapeHtml([item.symbol, item.name, `强度 ${formatDisplayNumber(item.strength)}`].filter(Boolean).map(formatPlain).join("｜"))}</li>`).join("")
       : "<li>无</li>"}</ol></section>
     <section><h3>排除项</h3><ul>${Object.entries(excluded).length
       ? Object.entries(excluded).map(([symbol, reasons]) => `<li>${escapeHtml(formatPlain(symbol))}｜${escapeHtml((Array.isArray(reasons) ? reasons : []).map((reason) => TREND_REASON_LABELS[reason] || "未知原因").join("、"))}</li>`).join("")
       : "<li>无</li>"}</ul></section>
     <section><h3>行业集中度</h3><ul>${industries.length
-      ? industries.map((item) => `<li>${escapeHtml((Array.isArray(item) ? item : []).map(formatPlain).join("｜"))}</li>`).join("")
+      ? industries.map((item) => `<li>${escapeHtml(item.map((value, index) => index ? formatDisplayNumber(value) : formatPlain(value)).join("｜"))}</li>`).join("")
       : "<li>无</li>"}</ul></section>
     <p>数据来源：${escapeHtml(dataSources.map(formatPlain).join("、") || "无")}</p>
-    <p>API 成本：${escapeHtml(formatPlain(audit.actual_api_cost ?? audit.estimated_api_cost ?? "未知"))}</p>
+    <p>API 成本：${escapeHtml(formatDisplayNumber(audit.actual_api_cost ?? audit.estimated_api_cost ?? "未知"))}</p>
   </details>`;
 }
 

@@ -996,6 +996,54 @@ console.log(JSON.stringify({quote,kelly,backtest,trend,decision,input:state.stan
     assert rendered["input"] == "100000"
 
 
+def test_dashboard_formats_remaining_kelly_trend_and_backtest_statistics() -> None:
+    output = run_dashboard_js(r'''
+state.workspaceView = "kelly_lab";
+state.dashboard = {kelly_lab:{available:true,experiment_count:"10000",experiments:[{
+  experiment_id:"stats",experiment_name:"统计",market:"HK",status:"running",
+  market_capital_pool:{currency:"HKD",amount:"29320000.00"},
+  stats:{
+    sample_stage:"insufficient",completed_samples:"10000",open_samples:"2932",
+    winning_samples:"10000",losing_samples:"2932",raw_win_rate:"21.13%",
+    payoff_ratio:"1234.50",skipped_order_count:"10000",last_recomputed_at:"2026-07-16 09:30",
+  },
+}]}};
+const kelly = renderKellyLabPanel();
+const trend = [
+  renderTrendAction({symbol:"02840",name:"SPDR 金",estimated_shares:"10000",target_amount:"29320000.00",estimated_initial_line:"1234567.50"}, "buy"),
+  renderTrendAction({symbol:"02840",name:"SPDR 金",reason:"trend_intact",active_line:"1234567.50"}, "hold"),
+  renderTrendAudit({
+    candidates:[{symbol:"02840",name:"SPDR 金",strength:"10000"}],
+    excluded:{},industry_concentration:[["科技","10000","2932.00"]],
+    data_sources:[],actual_api_cost:"1234.50",
+  }),
+].join("");
+const grouped = renderPriceActionChart(
+  [{date:"same",close:"100"}],
+  Array.from({length:10000},()=>({execution_date:"same",action:"BUY",raw_price:"100"})),
+);
+const rows = Array.from({length:10600},(_,index)=>({date:`d${index}`,close:"100"}));
+const omitted = renderPriceActionChart(rows, rows.map((row)=>({execution_date:row.date,action:"BUY",raw_price:"100"})));
+console.log(JSON.stringify({kelly,trend,grouped,omitted}));
+''')
+    rendered = json.loads(output)
+    for expected in (
+        "10,000 个实验", "HKD 29,320,000.00", "10,000 赢 / 2,932 亏",
+        "1,234.50", "21.13%", "2026-07-16 09:30",
+    ):
+        assert expected in rendered["kelly"]
+    assert ">02840 SPDR 金<" in rendered["trend"]
+    for expected in (
+        "约 10,000 股", "金额上限 29,320,000.00", "预计保护线 1,234,567.50",
+        "活动保护线 1,234,567.50", "强度 10,000", "科技｜10,000｜2,932.00",
+        "API 成本：1,234.50",
+    ):
+        assert expected in rendered["trend"]
+    assert "×10,000" in rendered["grouped"]
+    assert "共 10,000 笔" in rendered["grouped"]
+    assert "另有 10,291 组交易标记未显示" in rendered["omitted"]
+
+
 def test_dashboard_workspace_navigation_uses_one_shared_state_machine() -> None:
     output = run_dashboard_js(r'''
 const element=()=>({hidden:false,innerHTML:"",classList:{values:new Set(),add(...n){n.forEach(x=>this.values.add(x))},remove(...n){n.forEach(x=>this.values.delete(x))},toggle(n,f){f?this.add(n):this.remove(n)},contains(n){return this.values.has(n)}}});
