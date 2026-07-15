@@ -12,6 +12,7 @@ const state = {
   selectedHoldingKey: "",
   selectedHoldingDetail: "decision",
   selectedDecisionTab: "final",
+  selectedTrendBroker: "",
   decisionDeepLinkRestored: false,
   detailLanguage: "zh",
   refreshActive: false,
@@ -199,6 +200,7 @@ function bindElements() {
     "open-standard-backtest",
     "close-standard-backtest",
     "standard-backtest-workspace",
+    "trend-report-workspace",
     "standard-backtest-form",
     "backtest-symbol-source",
     "backtest-symbol",
@@ -251,6 +253,11 @@ function bindEvents() {
     renderDashboardViews();
   });
   elements["account-holdings"].addEventListener("click", (event) => {
+    const trendReport = event.target.closest("[data-trend-report]");
+    if (trendReport) {
+      openTrendReport(trendReport.dataset.trendReport || "");
+      return;
+    }
     const button = event.target.closest("[data-detail-key]");
     if (button) {
       showSymbolDetail(button.dataset.detailKey || "", button.dataset.detailMode || "decision");
@@ -279,6 +286,11 @@ function bindEvents() {
   elements["symbol-detail-panel"].addEventListener("click", handleSymbolDetailClick);
   elements["open-standard-backtest"].addEventListener("click", openStandardBacktest);
   elements["close-standard-backtest"].addEventListener("click", closeStandardBacktest);
+  elements["trend-report-workspace"].addEventListener("click", (event) => {
+    if (event.target.closest("[data-close-trend-report]")) {
+      closeTrendReport();
+    }
+  });
   elements["backtest-symbol-source"].addEventListener("click", handleBacktestChoice);
   elements["backtest-strategy-cards"].addEventListener("click", handleBacktestChoice);
   elements["backtest-range-controls"].addEventListener("click", handleBacktestChoice);
@@ -318,6 +330,31 @@ function closeStandardBacktest() {
   elements["standard-backtest-workspace"].hidden = true;
   elements["standard-backtest-workspace"].classList.add("hidden");
   elements["workspace-grid"].classList.remove("hidden");
+}
+
+function openTrendReport(broker) {
+  const report = state.dashboard?.trend_reports?.[broker];
+  if (!report?.available) return;
+  state.selectedTrendBroker = broker;
+  elements["workspace-grid"].classList.add("hidden");
+  elements["standard-backtest-workspace"].hidden = true;
+  elements["standard-backtest-workspace"].classList.add("hidden");
+  elements["trend-report-workspace"].innerHTML = renderTrendReportWorkspace(report);
+  elements["trend-report-workspace"].hidden = false;
+  elements["trend-report-workspace"].classList.remove("hidden");
+  elements["trend-report-workspace"].querySelector("[data-close-trend-report]")?.focus();
+}
+
+function closeTrendReport() {
+  const broker = state.selectedTrendBroker;
+  const accountSection = document.getElementById(`account-${broker}`);
+  elements["trend-report-workspace"].hidden = true;
+  elements["trend-report-workspace"].classList.add("hidden");
+  elements["trend-report-workspace"].innerHTML = "";
+  elements["workspace-grid"].classList.remove("hidden");
+  state.selectedTrendBroker = "";
+  accountSection?.scrollIntoView({block: "start"});
+  accountSection?.querySelector("[data-trend-report]")?.focus();
 }
 
 function handleBacktestChoice(event) {
@@ -1835,37 +1872,127 @@ function renderDashboardViews() {
   renderAccountHoldings();
 }
 
-function renderAccountStrategy(group) {
-  if (group.broker === "futu" || group.broker === "phillips") {
-    const market = group.broker === "futu" ? "US" : "HK";
-    const summary = state.dashboard?.trend_market_summaries?.[market] || {};
-    if (summary.available === false || !summary.data_date) {
-      return `<div class="account-strategy-summary"><strong>${escapeHtml(`${group.profile.horizon} · ${group.profile.strategy}`)}</strong><span>${escapeHtml(summary.error || "趋势报告尚未生成")}</span></div>`;
-    }
-    const statusLabels = {
-      sent: "已生成并发送",
-      generated: "已生成",
-      delivery_failed: "已生成 · 发送失败",
-      start: "运行中",
-      retry: "等待数据 · 重试中",
-      failed: "本轮失败",
-      existing: "已有报告",
-      holiday: "休市",
-    };
-    return `<div class="account-strategy-summary trend-market-summary">
-      <div class="trend-market-heading"><strong>${escapeHtml(`${group.profile.horizon} · ${group.profile.strategy}`)}</strong><span>${escapeHtml(statusLabels[summary.run_status] || formatPlain(summary.run_status))}</span></div>
-      <div class="trend-market-facts">
-        <span>数据日 ${escapeHtml(formatPlain(summary.data_date))}</span>
-        <span>账户源 ${escapeHtml(formatPlain(summary.account_source_date))}</span>
-        <span>买入 ${escapeHtml(formatPlain(summary.buy_count))}</span>
-        <span>卖出 ${escapeHtml(formatPlain(summary.sell_count))}</span>
-        <span>人工复核 ${escapeHtml(formatPlain(summary.manual_review_count))}</span>
-      </div>
-      <p><strong>最近保护提醒</strong><span>${escapeHtml(formatPlain(summary.recent_protection_alert))}</span></p>
+const TREND_REASON_LABELS = {
+  protection_line_already_triggered: "活动保护线已触发",
+  danger_signal: "危险信号触发",
+  left_trend_right_side: "右侧趋势已结束",
+  holding_signal_unknown: "趋势信号不完整",
+  holding_kline_unavailable: "持仓日线数据不可用",
+  trend_intact: "趋势保持完好",
+  right_side_not_true: "尚未进入右侧趋势",
+  strength_not_above_90: "趋势强度未超过 90",
+  right_side_days_not_below_10: "进入右侧趋势已满 10 天",
+  not_tradable: "当前不可交易",
+  amount_below_1: "日成交额不足 1 亿元",
+  danger_unknown: "危险信号未知",
+  name_missing: "标的名称缺失",
+  asset_missing: "资产类型缺失",
+  unsupported_asset: "不属于 A 股股票或境内 ETF",
+  already_held: "当前账户已经持有",
+  excluded_security: "北交所、ST 或退市标的",
+  unsupported_exchange: "不属于沪深市场",
+  atr_unavailable: "缺少 ATR 数据",
+  data_date_mismatch: "数据日期不一致",
+};
+
+function renderTrendReportEntry(broker) {
+  if (!["futu", "phillips", "eastmoney"].includes(broker)) return "";
+  const report = state.dashboard?.trend_reports?.[broker] || {};
+  if (!report.available) {
+    return `<div class="trend-report-entry trend-report-entry-empty">
+      <button type="button" disabled>当天趋势报告</button>
+      <span>${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</span>
     </div>`;
   }
+  return `<div class="trend-report-entry">
+    <button type="button" data-trend-report="${escapeHtml(broker)}">当天趋势报告</button>
+    <span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span>
+    <span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>
+  </div>`;
+}
+
+function renderTrendAction(item, kind) {
+  const identity = [item.symbol, item.name].filter(Boolean).map(formatPlain).join(" ");
+  const reason = TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认";
+  const fields = [identity];
+  if (kind === "buy") {
+    fields.push(`约 ${formatPlain(item.estimated_shares)} 股`);
+    fields.push(`金额上限 ${formatPlain(item.target_amount)}`);
+    fields.push(`预计保护线 ${formatPlain(item.estimated_initial_line)}`);
+  } else {
+    fields.push(reason);
+    if (item.active_line !== null && item.active_line !== undefined && item.active_line !== "") {
+      fields.push(`活动保护线 ${formatPlain(item.active_line)}`);
+    }
+  }
+  return `<li>${fields.map(escapeHtml).join("<span>｜</span>")}</li>`;
+}
+
+function renderTrendStage(title, items, kind) {
+  const rows = Array.isArray(items)
+    ? items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    : [];
+  return `<section class="trend-stage">
+    <h2>${escapeHtml(title)}</h2>
+    ${rows.length ? `<ol>${rows.map((item) => renderTrendAction(item, kind)).join("")}</ol>` : "<p>无</p>"}
+  </section>`;
+}
+
+function renderTrendAudit(audit) {
+  const candidates = Array.isArray(audit.candidates)
+    ? audit.candidates.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    : [];
+  const excluded = audit.excluded && typeof audit.excluded === "object" && !Array.isArray(audit.excluded) ? audit.excluded : {};
+  const industries = Array.isArray(audit.industry_concentration)
+    ? audit.industry_concentration.filter(Array.isArray)
+    : [];
+  const dataSources = Array.isArray(audit.data_sources) ? audit.data_sources : [];
+  return `<details class="trend-audit"><summary>审计详情</summary>
+    <section><h3>候选榜</h3><ol>${candidates.length
+      ? candidates.map((item) => `<li>${escapeHtml([item.symbol, item.name, `强度 ${item.strength ?? "-"}`].filter(Boolean).map(formatPlain).join("｜"))}</li>`).join("")
+      : "<li>无</li>"}</ol></section>
+    <section><h3>排除项</h3><ul>${Object.entries(excluded).length
+      ? Object.entries(excluded).map(([symbol, reasons]) => `<li>${escapeHtml(formatPlain(symbol))}｜${escapeHtml((Array.isArray(reasons) ? reasons : []).map((reason) => TREND_REASON_LABELS[reason] || "未知原因").join("、"))}</li>`).join("")
+      : "<li>无</li>"}</ul></section>
+    <section><h3>行业集中度</h3><ul>${industries.length
+      ? industries.map((item) => `<li>${escapeHtml((Array.isArray(item) ? item : []).map(formatPlain).join("｜"))}</li>`).join("")
+      : "<li>无</li>"}</ul></section>
+    <p>数据来源：${escapeHtml(dataSources.map(formatPlain).join("、") || "无")}</p>
+    <p>API 成本：${escapeHtml(formatPlain(audit.actual_api_cost ?? audit.estimated_api_cost ?? "未知"))}</p>
+  </details>`;
+}
+
+function renderTrendReportWorkspace(report) {
+  const counts = report.counts || {};
+  const audit = report.audit || {};
+  return `<header class="trend-report-header">
+      <div><p>${escapeHtml(`${report.broker_label}｜${report.market_label}`)}</p><h1>当天趋势报告</h1></div>
+      <button type="button" data-close-trend-report>返回持仓看板</button>
+      <dl>
+        <div><dt>报告日期</dt><dd>${escapeHtml(formatPlain(report.report_date))}</dd></div>
+        <div><dt>数据截至</dt><dd>${escapeHtml(formatPlain(report.data_date))}</dd></div>
+        <div><dt>生成时间</dt><dd>${escapeHtml(formatPlain(report.generated_at))}</dd></div>
+        <div><dt>账户状态</dt><dd>${escapeHtml(formatPlain(report.account_status))}</dd></div>
+      </dl>
+      <div class="trend-report-metrics"><span>卖出 ${escapeHtml(formatPlain(counts.sell || 0))}</span><span>买入 ${escapeHtml(formatPlain(counts.buy || 0))}</span><span>持有 ${escapeHtml(formatPlain(counts.hold || 0))}</span><span>人工复核 ${escapeHtml(formatPlain(counts.review || 0))}</span></div>
+    </header>
+    <div class="trend-report-body">
+      <main class="trend-timeline">
+        ${renderTrendStage("开盘前", report.sell_actions || [], "sell")}
+        ${renderTrendStage(report.buy_window, report.buy_actions || [], "buy")}
+        ${renderTrendStage("盘中持续", report.hold_actions || [], "hold")}
+        ${renderTrendStage("人工复核", report.review_actions || [], "review")}
+        ${renderTrendAudit(audit)}
+      </main>
+      <aside class="trend-checklist"><h2>今日执行检查</h2><ol>
+        <li>确认全部卖出动作</li><li>按顺序考虑允许买入项</li><li>盘中观察活动保护线</li><li>完成人工复核</li>
+      </ol></aside>
+    </div>`;
+}
+
+function renderAccountStrategy(group) {
   if (group.broker !== "tiger") {
-    return `<div class="account-strategy-summary"><strong>${escapeHtml(`${group.profile.horizon} · ${group.profile.strategy}`)}</strong><span>策略指标待接入</span></div>`;
+    return "";
   }
   const strategy = state.dashboard?.tiger_long_term_strategy || {};
   if (strategy.available === false || !strategy.validation && !strategy.strategy) {
@@ -2151,6 +2278,7 @@ function renderAccountSection(group) {
         <span>来源 ${escapeHtml(formatPlain(source))}</span>
         <span>时间 ${escapeHtml(formatPlain(sourceTime))}</span>
       </div>
+      ${renderTrendReportEntry(group.broker)}
     </header>
     ${renderAccountStrategy(group)}
     ${rows.length ? renderAccountTable(rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}

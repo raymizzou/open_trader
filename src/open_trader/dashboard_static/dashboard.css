@@ -1413,31 +1413,186 @@ table {
   padding: 12px;
 }
 
-.trend-market-heading,
-.trend-market-facts {
-  align-items: center;
+.trend-report-entry {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 14px;
+  gap: 5px 10px;
+  max-width: 240px;
 }
 
-.trend-market-heading {
-  justify-content: space-between;
+.trend-report-entry button,
+.trend-report-header button {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  color: var(--accent-strong);
+  cursor: pointer;
+  font-weight: 700;
+  min-height: 38px;
+  padding: 0 12px;
 }
 
-.trend-market-facts {
+.trend-report-entry span {
   color: var(--muted);
-  margin-top: 8px;
+  font-size: 12px;
 }
 
-.trend-market-summary p {
+.trend-report-entry-empty button {
+  border-color: var(--line);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.trend-report-workspace {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  margin: 0 auto;
+  max-width: 1180px;
+  padding: 22px;
+  width: 100%;
+}
+
+.trend-report-header {
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  margin-bottom: 20px;
+  padding-bottom: 18px;
+}
+
+.trend-report-header h1,
+.trend-report-header p,
+.trend-report-header dl,
+.trend-report-header dd,
+.trend-stage h2,
+.trend-stage p,
+.trend-checklist h2,
+.trend-audit h3 {
+  margin: 0;
+}
+
+.trend-report-header p,
+.trend-report-header dt {
+  color: var(--muted);
+}
+
+.trend-report-header dl {
+  display: grid;
+  gap: 10px;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.trend-report-header dl div {
+  background: var(--surface-soft);
+  border-radius: 7px;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.trend-report-header dd,
+.trend-stage li,
+.trend-audit li {
+  overflow-wrap: anywhere;
+}
+
+.trend-report-metrics {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
-  margin: 8px 0 0;
+  grid-column: 1 / -1;
+}
+
+.trend-report-metrics span {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 10px;
+}
+
+.trend-report-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 20px;
+}
+
+.trend-timeline,
+.trend-checklist,
+.trend-stage,
+.trend-report-header {
   min-width: 0;
 }
 
-.trend-market-summary p span {
+.trend-timeline {
+  display: grid;
+  gap: 12px;
+}
+
+.trend-stage {
+  background: var(--surface-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.trend-stage h2,
+.trend-checklist h2 {
+  font-size: 16px;
+}
+
+.trend-stage ol,
+.trend-checklist ol,
+.trend-audit ol,
+.trend-audit ul {
+  margin: 10px 0 0;
+  padding-left: 22px;
+}
+
+.trend-stage li + li,
+.trend-checklist li + li,
+.trend-audit li + li {
+  margin-top: 8px;
+}
+
+.trend-stage p {
+  color: var(--muted);
+  margin-top: 10px;
+}
+
+.trend-checklist {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  position: sticky;
+  top: 16px;
+  align-self: start;
+}
+
+.trend-audit {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+
+.trend-audit summary {
+  color: var(--accent-strong);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.trend-audit section,
+.trend-audit p {
+  margin: 14px 0 0;
+}
+
+.trend-stage li,
+.trend-audit p {
   overflow-wrap: anywhere;
 }
 
@@ -3495,6 +3650,24 @@ tbody tr.active-row {
     gap: 10px;
     grid-template-areas: "brand" "assets" "source";
   }
+
+  .trend-report-workspace {
+    padding: 14px;
+  }
+
+  .trend-report-header,
+  .trend-report-header dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-report-header button {
+    justify-self: stretch;
+  }
+
+  .trend-report-body { grid-template-columns: minmax(0, 1fr); }
+  .trend-checklist { position: static; order: 2; }
+  .trend-report-entry button,
+  .trend-report-header button { min-height: 44px; }
 
   .header-brand-panel,
   .header-assets-panel,

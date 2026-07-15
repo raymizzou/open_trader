@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import open_trader.a_share_trend as trend_module
+import open_trader.trend_delivery as trend_delivery_module
 
 from open_trader.a_share_trend import (
     AShareTrendRunResult,
@@ -29,6 +30,8 @@ from open_trader.a_share_trend import (
     load_eastmoney_account,
     load_protection_state,
     load_watch_events,
+    render_trend_failure_text,
+    render_trend_feishu_text,
     render_markdown,
     run_a_share_trend_report,
     update_protection_line,
@@ -1056,6 +1059,263 @@ def test_markdown_prioritizes_actions_before_source_summary() -> None:
     assert "## API 原始事实" not in markdown
 
 
+def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": True},
+        "metadata": {"market": "US", "broker": "futu"},
+        "strategy_judgments": {
+            "holding_decisions": [
+                {
+                    "action": "SELL_ALL",
+                    "symbol": "AAPL",
+                    "name": "苹果",
+                    "reason": "left_trend_right_side",
+                    "active_line": "190",
+                },
+                {
+                    "action": "HOLD",
+                    "symbol": "MSFT",
+                    "name": "微软",
+                    "reason": "trend_intact",
+                },
+                {
+                    "action": "MANUAL_REVIEW",
+                    "symbol": "TSLA",
+                    "name": "特斯拉",
+                    "reason": "missing_snapshot",
+                },
+                {
+                    "action": "NEW_CODE",
+                    "symbol": "NVDA",
+                    "name": "英伟达",
+                    "reason": "new_reason",
+                },
+            ],
+            "formal_actions": [
+                {
+                    "action": "SELL_ALL",
+                    "symbol": "AAPL",
+                    "name": "苹果",
+                    "reason": "left_trend_right_side",
+                    "active_line": "190",
+                },
+                {
+                    "action": "BUY",
+                    "symbol": "CRWD",
+                    "name": "CrowdStrike",
+                    "estimated_shares": 2,
+                    "target_amount": "500",
+                    "estimated_initial_line": "198",
+                },
+            ],
+        },
+    }
+
+    title, message = render_trend_feishu_text(
+        payload, broker_label="富途", market_label="美股"
+    )
+
+    assert title == "【富途｜美股趋势报告｜2026-07-15】"
+    assert message == "\n".join(
+        [
+            "数据截至：2026-07-14",
+            "账户状态：已更新",
+            "今日动作：卖出 1｜买入 1｜持有 1｜复核 2",
+            "",
+            "卖出",
+            "1. AAPL 苹果｜右侧趋势已结束｜保护线 190",
+            "",
+            "买入",
+            "1. CRWD CrowdStrike｜美股常规交易时段｜约 2 股｜金额上限 500｜保护线 198",
+            "",
+            "人工复核",
+            "1. TSLA 特斯拉｜未知动作或原因，需人工确认",
+            "2. NVDA 英伟达｜未知动作或原因，需人工确认",
+            "",
+            "请人工确认，不自动下单。",
+        ]
+    )
+    assert "MSFT" not in message
+    assert "http" not in message.lower()
+
+
+def test_trend_feishu_text_uses_short_no_trade_template() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": False},
+        "metadata": {"market": "HK", "broker": "phillips"},
+        "strategy_judgments": {
+            "holding_decisions": [
+                {"action": "HOLD", "symbol": "02800", "reason": "trend_intact"}
+            ],
+            "formal_actions": [],
+        },
+    }
+    title, message = render_trend_feishu_text(
+        payload, broker_label="辉立", market_label="港股"
+    )
+    assert title == "【辉立｜港股趋势报告｜2026-07-15】"
+    assert message == (
+        "数据截至：2026-07-14\n"
+        "账户状态：已过期\n"
+        "今日无买卖动作｜持有 1｜复核 0\n\n"
+        "请人工确认，不自动下单。"
+    )
+
+
+def test_trend_feishu_text_moves_unknown_hold_reason_to_review() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": True},
+        "metadata": {"market": "HK"},
+        "strategy_judgments": {
+            "holding_decisions": [
+                {
+                    "action": "HOLD",
+                    "symbol": "02800",
+                    "name": "盈富基金",
+                    "reason": "future_hold_reason",
+                }
+            ],
+            "formal_actions": [],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="辉立", market_label="港股"
+    )
+
+    assert message == (
+        "数据截至：2026-07-14\n"
+        "账户状态：已更新\n"
+        "今日无买卖动作｜持有 0｜复核 1\n\n"
+        "人工复核\n"
+        "1. 02800 盈富基金｜未知动作或原因，需人工确认\n\n"
+        "请人工确认，不自动下单。"
+    )
+    assert "future_hold_reason" not in message
+
+
+def test_trend_feishu_text_moves_unknown_formal_buy_reason_to_review() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": True},
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [
+                {
+                    "action": "BUY",
+                    "symbol": "600001",
+                    "name": "未知原因买入",
+                    "reason": "future_reason",
+                    "estimated_shares": 100,
+                    "target_amount": "1000",
+                    "estimated_initial_line": "9",
+                }
+            ],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+
+    assert "今日无买卖动作｜持有 0｜复核 1" in message
+    assert "\n买入\n" not in message
+    assert "600001 未知原因买入｜未知动作或原因，需人工确认" in message
+
+
+@pytest.mark.parametrize(
+    "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
+)
+def test_trend_feishu_text_never_lists_buy_without_explicit_fresh_account(
+    account: dict[str, object],
+) -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": account,
+        "metadata": {"market": "HK", "broker": "phillips"},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [
+                {
+                    "action": "BUY",
+                    "symbol": "02800",
+                    "name": "盈富基金",
+                    "estimated_shares": 100,
+                    "target_amount": "1000",
+                    "estimated_initial_line": "9",
+                }
+            ],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="辉立", market_label="港股"
+    )
+
+    assert "今日无买卖动作｜持有 0｜复核 1" in message
+    assert "\n买入\n" not in message
+    assert "02800 盈富基金｜未知动作或原因，需人工确认" in message
+
+
+def test_trend_feishu_text_lists_reviews_on_no_trade_days() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": True},
+        "metadata": {"market": "CN"},
+        "strategy_judgments": {
+            "holding_decisions": [
+                {
+                    "action": "MANUAL_REVIEW",
+                    "symbol": "600001",
+                    "name": "测试股票",
+                    "reason": "future_reason_code",
+                }
+            ],
+            "formal_actions": [],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+
+    assert message == (
+        "数据截至：2026-07-14\n"
+        "账户状态：已更新\n"
+        "今日无买卖动作｜持有 0｜复核 1\n\n"
+        "人工复核\n"
+        "1. 600001 测试股票｜未知动作或原因，需人工确认\n\n"
+        "请人工确认，不自动下单。"
+    )
+    assert "future_reason_code" not in message
+
+
+def test_trend_failure_text_is_plain_and_actionable() -> None:
+    title, message = render_trend_failure_text(
+        broker_label="东方财富",
+        market_label="A股",
+        report_date="2026-07-15",
+        reason="趋势数据在截止时间前仍未更新",
+        recovery_action="确认 Trend Animals 数据状态后手动重跑东方财富报告",
+    )
+    assert title == "【东方财富｜A股趋势报告生成失败｜2026-07-15】"
+    assert message == (
+        "原因：趋势数据在截止时间前仍未更新\n"
+        "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n\n"
+        "报告未生成，请勿依据旧报告交易。"
+    )
+
+
 def test_markdown_is_operation_first_and_translates_internal_codes() -> None:
     built = replace(
         report(candidates=(candidate("600001"),)),
@@ -1741,10 +2001,11 @@ class ReadyQuote:
         pass
 
 
-def test_report_runner_checks_calendar_status_billing_then_paid_data(tmp_path: Path) -> None:
+def test_report_runner_sends_exact_broker_v1_text(tmp_path: Path) -> None:
     calls: list[str] = []
     api_kwargs: dict[str, object] = {}
     config = trend_config(tmp_path)
+    notifier = RecordingFeishu()
 
     def api_factory(**kwargs: object) -> ReadyApi:
         api_kwargs.update(kwargs)
@@ -1756,7 +2017,7 @@ def test_report_runner_checks_calendar_status_billing_then_paid_data(tmp_path: P
         sleep_fn=lambda seconds: None,
         api_factory=api_factory,
         quote_factory=lambda **kwargs: ReadyQuote(calls),
-        notifier=RecordingFeishu(),
+        notifier=notifier,
     )
 
     assert result.status == "generated"
@@ -1767,9 +2028,23 @@ def test_report_runner_checks_calendar_status_billing_then_paid_data(tmp_path: P
     assert calls.index("api.billing") < calls.index("api.snapshots")
     assert api_kwargs["cache_dir"] == config.data_dir / "trend_animals/cache"
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert notifier.messages == [
+        (
+            "【东方财富｜A股趋势报告｜2026-07-15】",
+            "数据截至：2026-07-14\n"
+            "账户状态：已更新\n"
+            "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n\n"
+            "买入\n"
+            "1. 000001 股票000001｜09:30–10:00｜约 100 股｜金额上限 1000｜保护线 6\n"
+            "2. 000002 股票000002｜09:30–10:00｜约 100 股｜金额上限 1000｜保护线 6\n\n"
+            "请人工确认，不自动下单。",
+        )
+    ]
     assert payload["execution_date"] == "2026-07-15"
     assert payload["delivery_status"] == "sent"
     assert payload["process_version"]
+    assert payload["metadata"]["market"] == "CN"
+    assert payload["metadata"]["broker"] == "eastmoney"
 
 
 def test_report_runner_holiday_is_silent_and_free(tmp_path: Path) -> None:
@@ -1820,22 +2095,35 @@ def test_report_runner_waits_once_then_retries_until_ready(tmp_path: Path) -> No
     assert calls[:4] == ["futu.calendar", "api.update_status", "futu.calendar", "api.update_status"]
 
 
-def test_report_runner_inclusive_1800_attempt_fails_without_artifacts(tmp_path: Path) -> None:
+def test_report_runner_failure_owns_day_at_inclusive_1800_deadline(tmp_path: Path) -> None:
     calls: list[str] = []
     sleeps: list[float] = []
-    notifier = RecordingMacOS()
+    feishu = RecordingFeishu()
+    macos = RecordingMacOS()
+    notifier = CompositeNotifier([feishu, macos])
+    config = trend_config(tmp_path)
     times = iter([
         datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
         datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
     ])
     result = run_a_share_trend_report(
-        config=trend_config(tmp_path), run_date="2026-07-14", now_fn=lambda: next(times),
+        config=config, run_date="2026-07-14", now_fn=lambda: next(times),
         sleep_fn=sleeps.append, api_factory=lambda **kwargs: ReadyApi(calls, ready=False),
         quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=notifier,
     )
     assert result == AShareTrendRunResult("failed", None, None)
     assert sleeps == [600.0]
-    assert [title for title, _ in notifier.messages] == ["A股趋势数据等待中", "A股趋势计划失败"]
+    assert [title for title, _ in macos.messages] == ["A股趋势数据等待中", "A股趋势计划失败"]
+    assert feishu.messages == [
+        (
+            "【东方财富｜A股趋势报告生成失败｜2026-07-14】",
+            "原因：趋势数据在截止时间前仍未更新\n"
+            "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n\n"
+            "报告未生成，请勿依据旧报告交易。",
+        )
+    ]
+    ledger = config.data_dir / "trend_a_share/daily_delivery/2026-07-14.json"
+    assert json.loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
     assert not list((tmp_path / "reports").rglob("*.md"))
     assert not list((tmp_path / "reports").rglob("*.json"))
 
@@ -1938,9 +2226,9 @@ def test_9885_sent_receipt_migrates_and_keeps_complete_pair_existing(
 
 @pytest.mark.parametrize(
     ("status", "expected_delivery_status", "expected_send_count"),
-    [("pending", "delivery_unknown", 0), ("delivery_failed", "sent", 1)],
+    [("pending", "sent", 1), ("delivery_failed", "sent", 1)],
 )
-def test_9885_unfinished_receipt_migrates_and_recovers_without_refetch(
+def test_9885_pending_receipt_uses_daily_ledger_without_refetch(
     tmp_path: Path,
     status: str,
     expected_delivery_status: str,
@@ -1962,6 +2250,8 @@ def test_9885_unfinished_receipt_migrates_and_recovers_without_refetch(
         "delivery_status"
     ] == expected_delivery_status
     assert len(notifier.messages) == expected_send_count
+    daily_ledger = config.data_dir / "trend_a_share/daily_delivery/2026-07-14.json"
+    assert json.loads(daily_ledger.read_text(encoding="utf-8"))["status"] == "sent"
     assert "protection_state_sha256" in json.loads(
         receipt_path.read_text(encoding="utf-8")
     )
@@ -2035,7 +2325,7 @@ def test_9885_migration_replace_failure_preserves_old_receipt_for_retry(
 
     assert json.loads(recovered.json_path.read_text(encoding="utf-8"))[
         "delivery_status"
-    ] == "delivery_unknown"
+    ] == "sent"
 
 
 def test_report_runner_takes_lock_before_accepting_existing_pair(tmp_path: Path) -> None:
@@ -2285,7 +2575,6 @@ def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(
     config = trend_config(tmp_path)
     notifier = RecordingFeishu()
     failed = False
-    delivered = ""
     original_replace = Path.replace
 
     def fail_once(path: Path, target: Path) -> Path:
@@ -2306,7 +2595,6 @@ def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(
         )
 
     assert len(notifier.messages) == 1
-    delivered = notifier.messages[0][1]
     assert not list((config.reports_dir / "trend_a_share").glob("2026-07-14.*"))
 
     result = run_a_share_trend_report(
@@ -2320,7 +2608,10 @@ def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(
     assert len(notifier.messages) == 1
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["delivery_status"] == "sent_prior_attempt"
-    assert result.report_path.read_text(encoding="utf-8") == delivered
+    assert result.report_path.read_text(encoding="utf-8").startswith(
+        "# A股趋势操作计划"
+    )
+    assert not notifier.messages[0][1].startswith("# A股趋势操作计划")
     receipt = json.loads(
         (config.data_dir / "trend_a_share/delivery/2026-07-14.json").read_text(
             encoding="utf-8"
@@ -2390,18 +2681,20 @@ def test_sent_recovery_receipt_write_failure_can_retry_without_resend(
     ] == "sent_prior_attempt"
 
 
-def test_pending_delivery_crash_recovers_unknown_from_stage_without_refetch(
+def test_pending_delivery_crash_retries_frozen_text_without_refetch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = trend_config(tmp_path)
-    original_send = trend_module.send_notification_with_results
+    original_send = trend_delivery_module.send_notification_with_results
 
     def crash_on_delivery(*args: object, **kwargs: object) -> object:
         if kwargs.get("channels") == {"feishu", "feishu_app"}:
             raise RuntimeError("crash before delivery result")
         return original_send(*args, **kwargs)
 
-    monkeypatch.setattr(trend_module, "send_notification_with_results", crash_on_delivery)
+    monkeypatch.setattr(
+        trend_delivery_module, "send_notification_with_results", crash_on_delivery
+    )
     with pytest.raises(RuntimeError, match="crash before delivery result"):
         run_a_share_trend_report(
             config=config,
@@ -2411,21 +2704,28 @@ def test_pending_delivery_crash_recovers_unknown_from_stage_without_refetch(
             notifier=RecordingFeishu(),
         )
 
-    monkeypatch.setattr(trend_module, "send_notification_with_results", original_send)
+    ledger_path = config.data_dir / "trend_a_share/daily_delivery/2026-07-14.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["status"] == "pending"
+    monkeypatch.setattr(
+        trend_delivery_module, "send_notification_with_results", original_send
+    )
+    notifier = RecordingFeishu()
     result = run_a_share_trend_report(
         config=config,
         run_date="2026-07-14",
         api_factory=lambda **kwargs: pytest.fail("pending recovery must not refetch"),
         quote_factory=lambda **kwargs: pytest.fail("pending recovery must not refetch"),
-        notifier=RecordingMacOS(),
+        notifier=notifier,
     )
 
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
-    assert payload["delivery_status"] == "delivery_unknown"
+    assert payload["delivery_status"] == "sent"
+    assert notifier.messages == [(ledger["title"], ledger["message"])]
 
 
 @pytest.mark.parametrize("delivery_succeeds", [True, False])
-def test_delivery_result_receipt_write_failure_recovers_unknown_without_resend(
+def test_delivery_result_receipt_write_failure_uses_daily_ledger_without_refetch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     delivery_succeeds: bool,
@@ -2462,18 +2762,22 @@ def test_delivery_result_receipt_write_failure_recovers_unknown_without_resend(
     monkeypatch.setattr(
         trend_module, "_transition_delivery_receipt", original_transition
     )
+    recovered_notifier = RecordingFeishu()
     recovered = run_a_share_trend_report(
         config=config,
         run_date="2026-07-14",
         api_factory=lambda **kwargs: pytest.fail("unknown recovery must not refetch"),
         quote_factory=lambda **kwargs: pytest.fail("unknown recovery must not refetch"),
-        notifier=RecordingMacOS(),
+        notifier=recovered_notifier,
     )
 
     assert json.loads(recovered.json_path.read_text(encoding="utf-8"))[
         "delivery_status"
-    ] == "delivery_unknown"
+    ] == ("sent_prior_message" if delivery_succeeds else "sent")
     assert len(notifier.messages) == 1
+    assert recovered_notifier.messages == (
+        [] if delivery_succeeds else notifier.messages
+    )
 
 
 def test_sent_prior_attempt_status_is_not_reported_as_delivery_failure() -> None:
@@ -2634,7 +2938,7 @@ def test_failed_retry_pending_receipt_write_failure_can_retry(
     ] == "sent"
 
 
-def test_failed_retry_is_pending_before_send_and_crash_recovers_unknown(
+def test_failed_retry_crash_resends_frozen_text_from_daily_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = trend_config(tmp_path)
@@ -2646,7 +2950,9 @@ def test_failed_retry_is_pending_before_send_and_crash_recovers_unknown(
         notifier=RecordingFeishu(fail=True),
     )
     receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-14.json"
-    original_send = trend_module.send_notification_with_results
+    ledger_path = config.data_dir / "trend_a_share/daily_delivery/2026-07-14.json"
+    frozen = json.loads(ledger_path.read_text(encoding="utf-8"))
+    original_send = trend_delivery_module.send_notification_with_results
     send_calls = 0
 
     def accepted_then_crashed(*args: object, **kwargs: object) -> object:
@@ -2658,7 +2964,7 @@ def test_failed_retry_is_pending_before_send_and_crash_recovers_unknown(
         return original_send(*args, **kwargs)
 
     monkeypatch.setattr(
-        trend_module, "send_notification_with_results", accepted_then_crashed
+        trend_delivery_module, "send_notification_with_results", accepted_then_crashed
     )
     with pytest.raises(RuntimeError, match="crash after Feishu"):
         run_a_share_trend_report(
@@ -2669,22 +2975,26 @@ def test_failed_retry_is_pending_before_send_and_crash_recovers_unknown(
             notifier=RecordingFeishu(),
         )
 
-    monkeypatch.setattr(trend_module, "send_notification_with_results", original_send)
+    monkeypatch.setattr(
+        trend_delivery_module, "send_notification_with_results", original_send
+    )
+    notifier = RecordingFeishu()
     recovered = run_a_share_trend_report(
         config=config,
         run_date="2026-07-14",
         api_factory=lambda **kwargs: pytest.fail("unknown must not refetch"),
         quote_factory=lambda **kwargs: pytest.fail("unknown must not refetch"),
-        notifier=RecordingMacOS(),
+        notifier=notifier,
     )
 
     assert send_calls == 1
     assert json.loads(recovered.json_path.read_text(encoding="utf-8"))[
         "delivery_status"
-    ] == "delivery_unknown"
+    ] == "sent"
+    assert notifier.messages == [(frozen["title"], frozen["message"])]
 
 
-def test_revision_uses_independent_receipt_and_sends_normally(tmp_path: Path) -> None:
+def test_revision_does_not_resend_semantic_message(tmp_path: Path) -> None:
     config = trend_config(tmp_path)
     notifier = RecordingFeishu()
     first = run_a_share_trend_report(
@@ -2707,7 +3017,7 @@ def test_revision_uses_independent_receipt_and_sends_normally(tmp_path: Path) ->
         "2026-07-14.md",
         "2026-07-14-r1.md",
     )
-    assert len(notifier.messages) == 2
+    assert len(notifier.messages) == 1
     assert {
         path.stem
         for path in (config.data_dir / "trend_a_share/delivery").glob("*.json")
@@ -2760,7 +3070,7 @@ def test_revision_recovers_same_stem_after_kill_between_final_replaces(
 
     assert recovered.report_path.name == "2026-07-14-r1.md"
     assert recovered.json_path.name == "2026-07-14-r1.json"
-    assert len(notifier.messages) == 2
+    assert len(notifier.messages) == 1
     assert not (report_dir / "2026-07-14-r2.md").exists()
     assert not (report_dir / "2026-07-14-r2.json").exists()
 
@@ -2780,7 +3090,7 @@ def test_report_runner_keeps_files_when_feishu_delivery_fails_without_refetch(tm
     assert calls.count("api.snapshots") == 1
 
 
-def test_report_runner_sends_full_report_only_to_feishu_and_short_status_to_macos(tmp_path: Path) -> None:
+def test_report_runner_sends_v1_text_only_to_feishu_and_short_status_to_macos(tmp_path: Path) -> None:
     calls: list[str] = []
     feishu = RecordingFeishu()
     macos = RecordingMacOS()
@@ -2792,7 +3102,8 @@ def test_report_runner_sends_full_report_only_to_feishu_and_short_status_to_maco
     )
     assert result.status == "generated"
     assert len(feishu.messages) == len(macos.messages) == 1
-    assert feishu.messages[0][1].startswith("# A股趋势操作计划")
+    assert feishu.messages[0][0] == "【东方财富｜A股趋势报告｜2026-07-15】"
+    assert "# A股趋势操作计划" not in feishu.messages[0][1]
     assert "# A股趋势操作计划" not in macos.messages[0][1]
 
 

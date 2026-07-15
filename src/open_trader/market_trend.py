@@ -21,17 +21,24 @@ from .a_share_trend import (
     _balance,
     _billing_field,
     _billing_price,
+    _final_pair_matches,
     _holding_snapshot,
     _is_systemic_futu_error,
     _process_version,
+    _read_delivery_receipt,
     _redact_api_key,
+    _report_payload,
     _row_tm_id,
+    _transition_delivery_receipt,
+    _write_delivery_receipt,
+    _freeze_receipt_report,
     build_report,
     evaluate_candidate,
     load_protection_state,
     load_watch_events,
+    render_trend_failure_text,
+    render_trend_feishu_text,
     render_markdown,
-    write_frozen_report,
     write_protection_state,
 )
 from .daily_premarket import (
@@ -44,12 +51,17 @@ from .futu_account import FutuAccountClient, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
+from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MARKET_SETTINGS = {
     "US": {"broker": "futu", "currency": "USD", "asset": "美股", "deadline": time(10)},
     "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
+}
+MARKET_NOTIFICATION_LABELS = {
+    "US": ("富途", "美股", "确认 Trend Animals 与富途账户状态后手动重跑富途报告"),
+    "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
 }
 SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 
@@ -305,6 +317,107 @@ def _refresh_futu_account(config: DailyPremarketConfig, run_date: str) -> None:
     )
 
 
+def _market_receipt_path(paths: MarketTrendPaths, artifact_stem: str) -> Path:
+    return paths.root / "delivery" / f"{artifact_stem}.json"
+
+
+def _market_artifact_stem(
+    paths: MarketTrendPaths, *, as_of_date: str, revision: bool
+) -> str:
+    if not revision:
+        return as_of_date
+    number = 1
+    while True:
+        stem = f"{as_of_date}-r{number}"
+        markdown_path = paths.reports / f"{stem}.md"
+        json_path = paths.reports / f"{stem}.json"
+        receipt = _read_delivery_receipt(
+            _market_receipt_path(paths, stem), artifact_stem=stem
+        )
+        if receipt is not None and (
+            receipt["status"] != "sent"
+            or not _final_pair_matches(receipt, markdown_path, json_path)
+        ):
+            return stem
+        if receipt is None and not markdown_path.exists() and not json_path.exists():
+            return stem
+        number += 1
+
+
+def _deliver_market_daily_text(
+    *,
+    paths: MarketTrendPaths,
+    market: str,
+    run_date: str,
+    notifier: Notifier,
+    payload: Mapping[str, object],
+) -> str:
+    broker_label, market_label, _ = MARKET_NOTIFICATION_LABELS[market]
+    title, message = render_trend_feishu_text(
+        payload, broker_label=broker_label, market_label=market_label
+    )
+    return deliver_daily_trend_text(
+        notifier,
+        ledger_path=paths.root / "daily_delivery" / f"{run_date}.json",
+        title=title,
+        message=message,
+    )
+
+
+def _recover_market_receipt(
+    *,
+    paths: MarketTrendPaths,
+    market: str,
+    run_date: str,
+    artifact_stem: str,
+    notifier: Notifier,
+) -> AShareTrendRunResult | None:
+    receipt_path = _market_receipt_path(paths, artifact_stem)
+    receipt = _read_delivery_receipt(receipt_path, artifact_stem=artifact_stem)
+    if receipt is None:
+        return None
+    markdown_path = paths.reports / f"{artifact_stem}.md"
+    json_path = paths.reports / f"{artifact_stem}.json"
+    if receipt["status"] == "sent" and _final_pair_matches(
+        receipt, markdown_path, json_path
+    ):
+        return AShareTrendRunResult("existing", markdown_path, json_path)
+    if receipt["status"] in {"prepared", "pending", "delivery_failed"}:
+        if receipt["status"] == "prepared":
+            write_protection_state(
+                paths.state, receipt["protection_state"]  # type: ignore[arg-type]
+            )
+        receipt = _transition_delivery_receipt(
+            receipt_path, receipt, status="pending", delivery_status="pending"
+        )
+        payload = json.loads(str(receipt["report_json"]))
+        if not isinstance(payload, dict):
+            raise ValueError("delivery receipt report JSON must be an object")
+        delivery_status = _deliver_market_daily_text(
+            paths=paths,
+            market=market,
+            run_date=run_date,
+            notifier=notifier,
+            payload=payload,
+        )
+        receipt = _transition_delivery_receipt(
+            receipt_path,
+            receipt,
+            status=(
+                "sent"
+                if delivery_status in {"sent", "sent_prior_message"}
+                else delivery_status
+            ),
+            delivery_status=delivery_status,
+        )
+    markdown_path, json_path = _freeze_receipt_report(
+        receipt=receipt,
+        reports_dir=paths.reports,
+        artifact_stem=artifact_stem,
+    )
+    return AShareTrendRunResult("generated", markdown_path, json_path)
+
+
 def _attempt_market_report(
     *,
     config: DailyPremarketConfig,
@@ -329,9 +442,25 @@ def _attempt_market_report(
             return AShareTrendRunResult("holiday", None, None)
         base_markdown = paths.reports / f"{as_of_date}.md"
         base_json = paths.reports / f"{as_of_date}.json"
+        artifact_stem = _market_artifact_stem(
+            paths, as_of_date=as_of_date, revision=revision
+        )
+        recovered = _recover_market_receipt(
+            paths=paths,
+            market=market,
+            run_date=run_date,
+            artifact_stem=artifact_stem,
+            notifier=notifier,
+        )
+        if recovered is not None:
+            return recovered
         if not revision and base_markdown.exists() and base_json.exists():
             base_markdown.read_text(encoding="utf-8")
             json.loads(base_json.read_text(encoding="utf-8"))
+            retry_daily_trend_text(
+                notifier,
+                ledger_path=paths.root / "daily_delivery" / f"{run_date}.json",
+            )
             return AShareTrendRunResult("existing", base_markdown, base_json)
 
         api = api_factory(
@@ -479,7 +608,7 @@ def _attempt_market_report(
             actual_api_cost=actual_cost if actual_cost >= 0 else None,
             market=market,
             lot_sizes=lot_sizes,
-            require_fresh_account=market == "US",
+            require_fresh_account=True,
             metadata={
                 "market": market,
                 "broker": settings["broker"],
@@ -495,23 +624,48 @@ def _attempt_market_report(
             "managed_symbols": sorted(managed),
         }
         report = replace(report, protection_state=protection_state)
-        markdown = render_markdown(report)
-        delivery = send_notification_with_results(
-            notifier,
-            f"{market} 趋势操作计划 · {as_of_date}",
-            markdown,
-            channels={"feishu", "feishu_app"},
-        )
-        delivery_status = (
-            "sent" if any(item.success for item in delivery) else "delivery_failed"
-        )
         report = replace(
             report,
-            metadata={**report.metadata, "delivery_status": delivery_status},
+            metadata={**report.metadata, "delivery_status": "prepared"},
+        )
+        payload = _report_payload(report)
+        receipt_path = _market_receipt_path(paths, artifact_stem)
+        receipt = _write_delivery_receipt(
+            receipt_path,
+            status="prepared",
+            generated_at=report.generated_at,
+            artifact_stem=artifact_stem,
+            markdown=render_markdown(report),
+            report_json=json.dumps(
+                payload, ensure_ascii=False, indent=2, sort_keys=True
+            ) + "\n",
+            protection_state=report.protection_state,
         )
         write_protection_state(paths.state, report.protection_state)
-        markdown_path, json_path = write_frozen_report(
-            report, paths.reports, revision=revision
+        receipt = _transition_delivery_receipt(
+            receipt_path, receipt, status="pending", delivery_status="pending"
+        )
+        delivery_status = _deliver_market_daily_text(
+            paths=paths,
+            market=market,
+            run_date=run_date,
+            notifier=notifier,
+            payload=payload,
+        )
+        receipt = _transition_delivery_receipt(
+            receipt_path,
+            receipt,
+            status=(
+                "sent"
+                if delivery_status in {"sent", "sent_prior_message"}
+                else delivery_status
+            ),
+            delivery_status=delivery_status,
+        )
+        markdown_path, json_path = _freeze_receipt_report(
+            receipt=receipt,
+            reports_dir=paths.reports,
+            artifact_stem=artifact_stem,
         )
         send_notification_with_results(
             notifier,
@@ -611,11 +765,31 @@ def _run_market_trend_retry(
                 "event": "failed", "market": market, "run_date": run_date,
                 "error": last_error, "at": now.isoformat(timespec="seconds"),
             })
+            broker_label, market_label, recovery_action = (
+                MARKET_NOTIFICATION_LABELS[market]
+            )
+            title, message = render_trend_failure_text(
+                broker_label=broker_label,
+                market_label=market_label,
+                report_date=run_date,
+                reason=(
+                    "趋势数据在截止时间前仍未更新"
+                    if "not ready" in last_error.lower()
+                    else "趋势报告生成失败，需检查运行日志"
+                ),
+                recovery_action=recovery_action,
+            )
+            deliver_daily_trend_text(
+                notifier,
+                ledger_path=paths.root / "daily_delivery" / f"{run_date}.json",
+                title=title,
+                message=message,
+            )
             send_notification_with_results(
                 notifier,
                 f"{market} 趋势计划失败",
                 f"{last_error}；本轮一小时重试窗口已结束。",
-                channels={"feishu", "feishu_app", "macos"},
+                channels={"macos"},
             )
             return AShareTrendRunResult("failed", None, None)
         sleep_fn(min(600.0, max(1.0, (deadline - now).total_seconds())))
