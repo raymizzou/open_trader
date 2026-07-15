@@ -808,6 +808,27 @@ def test_test_notification_main_sends_chinese_message(
     assert "通知测试已发送" in capsys.readouterr().out
 
 
+def test_test_notification_reports_quiet_hour_voice_suppression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = SimpleNamespace(notifiers=("feishu_app", "xiaozhi"))
+
+    class FakeNotifier:
+        def notify(self, title: str, message: str) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "build_notifier", lambda loaded: FakeNotifier())
+    monkeypatch.setattr(cli, "xiaozhi_voice_allowed", lambda now: False, raising=False)
+
+    result = cli.main(["test-notification", "--config", str(tmp_path / "daily.env")])
+
+    assert result == 0
+    assert "语音已跳过：静默时段" in capsys.readouterr().out
+
+
 def test_test_notification_main_returns_nonzero_when_send_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
