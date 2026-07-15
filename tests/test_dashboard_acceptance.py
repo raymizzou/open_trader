@@ -33,6 +33,46 @@ def test_browser_ignores_chrome_unattributed_404_but_not_app_errors() -> None:
     assert _is_actionable_console_error("Uncaught TypeError: failed")
 
 
+def test_acceptance_uses_absolute_shared_reports_dir_from_payload(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    reports = tmp_path / "shared" / "reports"
+    worktree.mkdir()
+    reports.mkdir(parents=True)
+
+    assert dashboard_acceptance._effective_reports_dir(
+        {"reports_dir": str(reports)}, process_cwd=worktree
+    ) == reports.resolve()
+
+
+def test_acceptance_resolves_relative_reports_dir_against_process_cwd(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    reports = worktree / "shared" / "reports"
+    reports.mkdir(parents=True)
+
+    assert dashboard_acceptance._effective_reports_dir(
+        {"reports_dir": "shared/reports"}, process_cwd=worktree
+    ) == reports.resolve()
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", 123, "../reports", "missing/reports"]
+)
+def test_acceptance_rejects_invalid_reports_dir_configuration(
+    tmp_path: Path, value: object,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    with pytest.raises(ValueError, match="Dashboard reports_dir"):
+        dashboard_acceptance._effective_reports_dir(
+            {"reports_dir": value}, process_cwd=worktree
+        )
+
+
 def test_acceptance_rejects_api_projection_that_drops_frozen_action(
     tmp_path: Path,
 ) -> None:

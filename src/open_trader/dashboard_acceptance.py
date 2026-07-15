@@ -222,6 +222,27 @@ def _fetch_payload(url: str) -> dict[str, Any]:
         return json.load(response)
 
 
+def _effective_reports_dir(
+    payload: Mapping[str, Any], *, process_cwd: Path
+) -> Path:
+    value = payload.get("reports_dir")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Dashboard reports_dir 缺失或不是非空字符串")
+    try:
+        configured = Path(value)
+        if configured.is_absolute():
+            resolved = configured.resolve()
+        else:
+            root = process_cwd.resolve()
+            resolved = (root / configured).resolve()
+            resolved.relative_to(root)
+        if not resolved.is_dir():
+            raise ValueError("目录不存在或不是目录")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Dashboard reports_dir 无效：{value!r}（{exc}）") from exc
+    return resolved
+
+
 def _listener(url: str) -> tuple[int, Path]:
     port = url.rsplit(":", 1)[-1].rstrip("/")
     pid_text = subprocess.check_output(
@@ -763,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     errors: list[str] = []
     browser_payload: dict[str, Any] = {}
+    reports_dir: Path | None = None
     try:
         phillips_total, phillips_period = _latest_phillips_expectation(
             _project_data_dir(args.expected_root)
@@ -779,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
         if running_sha != expected_sha:
             errors.append(f"运行 Git SHA 不匹配：{running_sha[:7]} != {expected_sha[:7]}")
         first = _fetch_payload(args.url)
+        first_reports_dir = _effective_reports_dir(first, process_cwd=cwd)
         errors.extend(validate_dashboard_payload(
             first, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
@@ -790,6 +813,9 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(args.wait_seconds)
         second = _fetch_payload(args.url)
         browser_payload = second
+        reports_dir = _effective_reports_dir(second, process_cwd=cwd)
+        if first_reports_dir != reports_dir:
+            errors.append("两个刷新周期的 Dashboard reports_dir 不一致")
         errors.extend(validate_dashboard_payload(
             second, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
@@ -807,7 +833,7 @@ def main(argv: list[str] | None = None) -> int:
         args.url,
         args.expected_cn,
         browser_payload,
-        args.expected_root / "reports",
+        reports_dir,
     )
     errors.extend(browser_errors)
     status = classify_result(errors, browser_blocker=blocker)
