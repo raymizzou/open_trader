@@ -3404,6 +3404,31 @@ tbody tr.active-row {
   text-align: center;
 }
 
+.session-quote {
+  align-items: baseline;
+  display: inline-flex;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.session-quote-label {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.session-quote-price {
+  color: inherit;
+  font-size: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.session-quote-time {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+
 @media (max-width: 1180px) {
   .dashboard-header {
     grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);

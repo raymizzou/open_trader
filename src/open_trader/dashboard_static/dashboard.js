@@ -5405,16 +5405,14 @@ function renderActionCard(action) {
 }
 
 function renderQuoteStatus(payload) {
-  const label = quoteStatusLabel(payload.status);
+  const label = quoteStatusText(payload);
   const stale = Boolean(payload.stale);
   const statusClass = stale ? "status-stale" : quoteStatusClass(payload.status);
   elements["quote-status"].className = `status-pill ${statusClass}`;
   elements["quote-status"].textContent = stale && payload.last_success_at
     ? "数据已过期"
     : label;
-  elements["last-refresh"].textContent = payload.last_success_at
-    ? `上次成功 ${payload.last_success_at}`
-    : "尚无成功行情";
+  elements["last-refresh"].textContent = quoteRefreshText(payload);
   renderSourceStatusListIntoHeader();
   renderConnectionPanel();
 }
@@ -5908,7 +5906,40 @@ function renderQuotePrice(holding, quote) {
   if (!quote || !hasValue(quote.last_price)) {
     return `<span class="missing-text">缺行情</span>`;
   }
-  return escapeHtml(String(quote.last_price));
+  const session = String(holding && holding.market || "").toUpperCase() === "US"
+    ? sessionQuoteLabel(quote.price_session) : "";
+  if (!session) return escapeHtml(String(quote.last_price));
+  const detail = quote.current_session_quote
+    ? quoteTimeEt(quote.price_time)
+    : "上一有效价";
+  return `<span class="session-quote"><span class="session-quote-label">${escapeHtml(session)}</span><strong class="session-quote-price">${escapeHtml(String(quote.last_price))}</strong>${detail ? `<span class="session-quote-time">· ${escapeHtml(detail)}</span>` : ""}</span>`;
+}
+
+function sessionQuoteLabel(value) {
+  return ({overnight: "夜盘", pre_market: "盘前", regular: "盘中", after_hours: "盘后"})[value] || "";
+}
+
+function quoteTimeEt(value) {
+  const match = String(value || "").match(/\b\d{4}-\d{2}-\d{2}[ T](\d{2}:\d{2})/);
+  return match ? `${match[1]} ET` : "";
+}
+
+function quoteRefreshText(payload) {
+  const stale = Boolean(payload && payload.stale);
+  const raw = stale ? payload.last_success_at : (payload.fetched_at || payload.last_success_at);
+  if (!hasValue(raw)) return stale ? "尚无成功行情" : "尚未刷新";
+  const text = String(raw).replace("T", " ").replace(/[+-]\d{2}:\d{2}$/, "");
+  return `${stale ? "上次成功" : "刷新于"} ${text} CST`;
+}
+
+function quoteStatusText(payload) {
+  if (payload && payload.fallback_count > 0 && payload.missing_count === 0) {
+    return "部分标的当前时段无报价";
+  }
+  if (payload && payload.status === "ok" && payload.us_session_status === "closed") {
+    return "美股休市";
+  }
+  return quoteStatusLabel(payload && payload.status);
 }
 
 function renderActionBadge(action, status) {

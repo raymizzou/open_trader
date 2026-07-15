@@ -1034,6 +1034,30 @@ console.log(JSON.stringify({
     }
 
 
+def test_dashboard_renders_one_compact_us_session_price_and_header_time() -> None:
+    output = run_dashboard_js(r'''
+const active = renderQuotePrice({market:"US", asset_class:"stock"}, {
+  last_price:"61.50", price_session:"overnight",
+  price_time:"2026-07-15 03:03:01.150", current_session_quote:true,
+});
+if(!active.includes("夜盘") || !active.includes("61.50") || !active.includes("03:03 ET"))throw new Error(active);
+if((active.match(/61\.50/g)||[]).length!==1)throw new Error("price repeated: "+active);
+const fallback = renderQuotePrice({market:"US", asset_class:"option"}, {
+  last_price:"0.59", price_session:"regular", price_time:"",
+  current_session_quote:false,
+});
+if(!fallback.includes("盘中") || !fallback.includes("上一有效价"))throw new Error(fallback);
+const hk = renderQuotePrice({market:"HK", asset_class:"stock"}, {last_price:"510"});
+if(hk!=="510")throw new Error("non-US changed: "+hk);
+if(quoteRefreshText({fetched_at:"2026-07-15T15:03:13+08:00",stale:false})!=="刷新于 2026-07-15 15:03:13 CST")throw new Error("bad header time");
+if(quoteRefreshText({last_success_at:"2026-07-15T14:59:00+08:00",stale:true})!=="上次成功 2026-07-15 14:59:00 CST")throw new Error("bad stale time");
+if(quoteStatusText({status:"ok",us_session_status:"closed",fallback_count:0,missing_count:0})!=="美股休市")throw new Error("bad closed status");
+if(quoteStatusText({status:"partial",us_session_status:"active",fallback_count:2,missing_count:0})!=="部分标的当前时段无报价")throw new Error("bad fallback status");
+console.log("ok");
+''')
+    assert "ok" in output
+
+
 def test_dashboard_live_holdings_recalculate_values_and_weights() -> None:
     output = run_dashboard_js(
         r'''
