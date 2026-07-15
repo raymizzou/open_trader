@@ -443,18 +443,17 @@ def build_candidate_list(
 def estimate_buy_actions(
     *,
     ranked: Sequence[CandidateInput],
-    account_fresh: bool,
     net_value: Decimal,
     available_cash: Decimal,
     current_position_count: int,
+    position_weight: Decimal,
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
-    require_fresh_account: bool = True,
 ) -> list[BuyAction]:
     slots = max(0, 10 - current_position_count)
-    if (require_fresh_account and not account_fresh) or slots == 0:
+    if slots == 0:
         return []
-    target = (net_value * Decimal("0.01")).quantize(Decimal("0.01"))
+    target = (net_value * position_weight).quantize(Decimal("0.01"))
     remaining_cash = available_cash
     actions: list[BuyAction] = []
     for item in ranked:
@@ -577,7 +576,8 @@ def build_report(
     metadata: Mapping[str, object] | None = None,
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
-    require_fresh_account: bool = True,
+    position_weight: Decimal = Decimal("0.04"),
+    position_weight_source: str = "fallback_4pct",
 ) -> TrendReport:
     held_symbols = {position.symbol for position in account.positions}
     candidate_decision = build_candidate_list(
@@ -589,13 +589,12 @@ def build_report(
     displayed_candidates = candidate_decision.eligible[:10]
     buy_actions = estimate_buy_actions(
         ranked=displayed_candidates,
-        account_fresh=account.fresh,
         net_value=account.net_value,
         available_cash=account.available_cash,
         current_position_count=len(account.positions),
+        position_weight=position_weight,
         market=market,
         lot_sizes=lot_sizes,
-        require_fresh_account=require_fresh_account,
     )
     old_positions = _state_positions(prior_state)
     holdings: list[HoldingDecision] = []
@@ -736,7 +735,11 @@ def build_report(
             "excluded": excluded_signals,
             "candidates": candidate_signals,
         },
-        metadata=dict(metadata or {}),
+        metadata={
+            **dict(metadata or {}),
+            "position_weight": str(position_weight),
+            "position_weight_source": position_weight_source,
+        },
     )
 
 
@@ -2045,6 +2048,8 @@ def _attempt_report(
             data_sources=("Trend Animals", "Futu CN calendar/QFQ daily K-line", str(config.portfolio)),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost,
+            position_weight=Decimal("0.04"),
+            position_weight_source="fallback_4pct",
             metadata={
                 "market": "CN",
                 "broker": "eastmoney",

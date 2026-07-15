@@ -283,7 +283,7 @@ def test_market_report_failure_owns_day_at_one_hour_deadline(tmp_path: Path) -> 
     assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
 
 
-def test_hk_report_suppresses_buys_when_statement_is_stale(
+def test_hk_report_keeps_buys_when_statement_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
@@ -424,10 +424,14 @@ def test_hk_report_suppresses_buys_when_statement_is_stale(
     assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
     actions = payload["strategy_judgments"]["formal_actions"]
-    assert actions == []
+    assert actions[0]["action"] == "BUY"
+    assert actions[0]["symbol"] == "02800"
+    assert actions[0]["target_amount"] == "4000.00"
+    assert actions[0]["estimated_shares"] == 400
     assert payload["account"]["fresh"] is False
-    assert payload["metadata"]["account_check_required"] is True
-    assert payload["protection_state"]["managed_symbols"] == ["00700"]
+    assert payload["metadata"]["position_weight"] == "0.04"
+    assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
 
 
 def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) -> None:

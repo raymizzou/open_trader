@@ -608,7 +608,8 @@ def _attempt_market_report(
             actual_api_cost=actual_cost if actual_cost >= 0 else None,
             market=market,
             lot_sizes=lot_sizes,
-            require_fresh_account=True,
+            position_weight=Decimal("0.04"),
+            position_weight_source="fallback_4pct",
             metadata={
                 "market": market,
                 "broker": settings["broker"],

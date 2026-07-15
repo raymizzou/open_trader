@@ -454,50 +454,52 @@ def test_atr14_requires_fifteen_valid_bars() -> None:
     assert atr14(bars(15)) == Decimal("2")
 
 
-def test_buy_actions_use_one_percent_cash_slots_and_round_lots() -> None:
+def test_buy_actions_respect_four_percent_cash_slots_and_round_lots() -> None:
     ranked = [candidate("600001"), candidate("600002")]
 
     actions = estimate_buy_actions(
         ranked=ranked,
-        account_fresh=True,
         net_value=Decimal("676549.55"),
         available_cash=Decimal("7000"),
         current_position_count=9,
+        position_weight=Decimal("0.04"),
     )
 
     assert [
         (item.symbol, item.target_amount, item.estimated_shares) for item in actions
-    ] == [("600001", Decimal("6765.50"), 600)]
+    ] == [("600001", Decimal("7000"), 700)]
 
 
 def test_buy_action_targets_never_reserve_more_than_available_cash() -> None:
     actions = estimate_buy_actions(
         ranked=[candidate("600001"), candidate("600002")],
-        account_fresh=True,
         net_value=Decimal("676549.55"),
         available_cash=Decimal("7000"),
         current_position_count=8,
+        position_weight=Decimal("0.04"),
     )
 
     assert [(item.symbol, item.target_amount) for item in actions] == [
-        ("600001", Decimal("6765.50"))
+        ("600001", Decimal("7000"))
     ]
     assert sum((item.target_amount for item in actions), Decimal("0")) <= Decimal(
         "7000"
     )
 
 
-def test_stale_account_has_no_formal_buys() -> None:
-    assert (
-        estimate_buy_actions(
-            ranked=[candidate("600001")],
-            account_fresh=False,
-            net_value=Decimal("676549.55"),
-            available_cash=Decimal("405219.55"),
-            current_position_count=5,
-        )
-        == []
+def test_buy_actions_use_four_percent_even_when_account_is_stale() -> None:
+    actions = estimate_buy_actions(
+        ranked=[candidate("600001")],
+        net_value=Decimal("100000"),
+        available_cash=Decimal("10000"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
     )
+
+    assert [
+        (item.symbol, item.target_amount, item.estimated_shares)
+        for item in actions
+    ] == [("600001", Decimal("4000.00"), 400)]
 
 
 def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
@@ -506,19 +508,18 @@ def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
 
     us_actions = estimate_buy_actions(
         ranked=[us],
-        account_fresh=True,
         net_value=Decimal("100000"),
         available_cash=Decimal("1000"),
         current_position_count=0,
+        position_weight=Decimal("0.04"),
         market="US",
     )
     hk_actions = estimate_buy_actions(
         ranked=[hk],
-        account_fresh=False,
-        require_fresh_account=False,
         net_value=Decimal("1000000"),
         available_cash=Decimal("6000"),
         current_position_count=0,
+        position_weight=Decimal("0.04"),
         market="HK",
         lot_sizes={"00700": 100},
     )
@@ -527,14 +528,36 @@ def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
     assert hk_actions[0].estimated_shares == 100
 
 
+def test_hk_four_percent_weight_can_buy_one_board_lot() -> None:
+    hk = replace(
+        candidate("600002", close="127.6"),
+        symbol="06821",
+        exchange="HK",
+    )
+
+    actions = estimate_buy_actions(
+        ranked=[hk],
+        net_value=Decimal("628554.06"),
+        available_cash=Decimal("55053.79"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="HK",
+        lot_sizes={"06821": 100},
+    )
+
+    assert len(actions) == 1
+    assert actions[0].target_amount == Decimal("25142.16")
+    assert actions[0].estimated_shares == 100
+
+
 def test_more_than_ten_positions_has_no_formal_buys() -> None:
     assert (
         estimate_buy_actions(
             ranked=[candidate("600001")],
-            account_fresh=True,
             net_value=Decimal("100000"),
             available_cash=Decimal("100000"),
             current_position_count=11,
+            position_weight=Decimal("0.04"),
         )
         == []
     )
@@ -546,13 +569,13 @@ def test_unaffordable_candidate_does_not_consume_cash_or_slot() -> None:
             candidate("600001", close="20"),
             candidate("600002", close="1"),
         ],
-        account_fresh=True,
         net_value=Decimal("10000"),
         available_cash=Decimal("600"),
         current_position_count=9,
+        position_weight=Decimal("0.04"),
     )
     assert [(item.symbol, item.target_amount, item.estimated_shares) for item in actions] == [
-        ("600002", Decimal("100.00"), 100)
+        ("600002", Decimal("400.00"), 400)
     ]
 
 
@@ -584,6 +607,8 @@ def test_duplicate_pool_members_produce_one_candidate_and_one_buy() -> None:
     )
     assert decisions.eligible == (item,)
     assert [action.symbol for action in built.buy_actions] == ["600001"]
+    assert built.metadata["position_weight"] == "0.04"
+    assert built.metadata["position_weight_source"] == "fallback_4pct"
 
 
 def test_stale_candidate_is_excluded_from_formal_buys() -> None:
@@ -1529,8 +1554,8 @@ def test_no_action_report_uses_exact_cash_sentence() -> None:
 def test_formal_buy_text_includes_window_estimates_target_and_line() -> None:
     markdown = render_markdown(report(candidates=(candidate("600001"),)))
     assert "09:30–10:00" in markdown
-    assert "约 600 股" in markdown
-    assert "金额上限 6765.50 元" in markdown
+    assert "约 2700 股" in markdown
+    assert "金额上限 27061.98 元" in markdown
     assert "预计保护线 9.00" in markdown
     assert "按东方财富实时价格向下取整为 100 股整数倍" in markdown
 
@@ -2035,8 +2060,8 @@ def test_report_runner_sends_exact_broker_v1_text(tmp_path: Path) -> None:
             "账户状态：已更新\n"
             "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n\n"
             "买入\n"
-            "1. 000001 股票000001｜09:30–10:00｜约 100 股｜金额上限 1000｜保护线 6\n"
-            "2. 000002 股票000002｜09:30–10:00｜约 100 股｜金额上限 1000｜保护线 6\n\n"
+            "1. 000001 股票000001｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 6\n"
+            "2. 000002 股票000002｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 6\n\n"
             "请人工确认，不自动下单。",
         )
     ]
