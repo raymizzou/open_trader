@@ -148,15 +148,32 @@ class LLMTechnicalFactsExtractor:
                 ),
             },
         ]
-        content = self.client.create(messages=messages, temperature=0)
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise ValueError("LLM technical facts response must be valid JSON") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("LLM technical facts response must be a JSON object")
-        _validate_facts(payload)
-        return payload
+        for attempt in range(2):
+            content = self.client.create(messages=messages, temperature=0)
+            try:
+                try:
+                    payload = json.loads(content)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "LLM technical facts response must be valid JSON"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise ValueError(
+                        "LLM technical facts response must be a JSON object"
+                    )
+                _validate_facts(payload)
+                return payload
+            except ValueError as exc:
+                if attempt:
+                    raise
+                messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": f"上一次输出无效：{exc}。请严格按要求重新输出 JSON。",
+                    },
+                ]
+        raise AssertionError("unreachable")
 
 
 def extract_market_report(raw_decision: str) -> str:
@@ -510,9 +527,12 @@ def _validate_facts(facts: dict[str, object]) -> None:
     timeframes = facts.get("timeframes")
     if not isinstance(timeframes, list):
         raise ValueError("technical facts timeframes must be a list")
+    if not timeframes:
+        raise ValueError("technical facts timeframes must not be empty")
     for timeframe in timeframes:
-        if isinstance(timeframe, dict):
-            _validate_bollinger_payload(timeframe.get("bollinger"))
+        if not isinstance(timeframe, dict):
+            raise ValueError("technical facts timeframe must be an object")
+        _validate_bollinger_payload(timeframe.get("bollinger"))
 
 
 def _validate_bollinger_payload(payload: object) -> None:

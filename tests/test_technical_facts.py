@@ -294,6 +294,22 @@ def test_validate_facts_accepts_fixed_bollinger_schema() -> None:
     _validate_facts(valid_bollinger_facts())
 
 
+def test_validate_facts_rejects_string_timeframe_entries() -> None:
+    facts = valid_bollinger_facts()
+    facts["timeframes"] = ["daily"]
+
+    with pytest.raises(ValueError, match="technical facts timeframe must be an object"):
+        _validate_facts(facts)
+
+
+def test_validate_facts_rejects_empty_timeframes() -> None:
+    facts = valid_bollinger_facts()
+    facts["timeframes"] = []
+
+    with pytest.raises(ValueError, match="technical facts timeframes must not be empty"):
+        _validate_facts(facts)
+
+
 def test_validate_facts_rejects_invalid_bollinger_status() -> None:
     facts = valid_bollinger_facts()
     timeframe = facts["timeframes"][0]  # type: ignore[index]
@@ -1172,6 +1188,16 @@ class FakeLLMClient:
         return self.content
 
 
+class SequencedFakeLLMClient:
+    def __init__(self, contents: list[str]) -> None:
+        self.contents = iter(contents)
+        self.messages: list[list[dict[str, str]]] = []
+
+    def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+        self.messages.append(messages)
+        return next(self.contents)
+
+
 def test_llm_extractor_parses_strict_json() -> None:
     client = FakeLLMClient(
         json.dumps(
@@ -1208,6 +1234,25 @@ def test_llm_extractor_parses_strict_json() -> None:
     assert "status 必须是 present" in prompt_text
     assert "顶层 timeframes 必须是 JSON 数组" in prompt_text
     assert "按日期排列的 OHLC 行或日数指标属于 daily" in prompt_text
+
+
+def test_llm_extractor_retries_invalid_timeframe_shape() -> None:
+    invalid = valid_bollinger_facts()
+    invalid["timeframes"] = ["daily"]
+    valid = valid_bollinger_facts()
+    client = SequencedFakeLLMClient(
+        [json.dumps(invalid), json.dumps(valid)]
+    )
+
+    facts = LLMTechnicalFactsExtractor(client=client).extract(
+        market="US",
+        symbol="MSFT",
+        run_date="2026-07-15",
+        market_report="Daily technical report",
+    )
+
+    assert facts == valid
+    assert len(client.messages) == 2
 
 
 def test_llm_extractor_rejects_non_json_response() -> None:
