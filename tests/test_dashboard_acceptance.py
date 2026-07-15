@@ -59,18 +59,116 @@ def test_acceptance_resolves_relative_reports_dir_against_process_cwd(
 
 
 @pytest.mark.parametrize(
-    "value", [None, "", 123, "../reports", "missing/reports"]
+    "payload",
+    [
+        {},
+        {"reports_dir": None},
+        {"reports_dir": ""},
+        {"reports_dir": 123},
+        {"reports_dir": "../reports"},
+        {"reports_dir": "missing/reports"},
+    ],
 )
 def test_acceptance_rejects_invalid_reports_dir_configuration(
-    tmp_path: Path, value: object,
+    tmp_path: Path, payload: dict[str, object],
 ) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
+    if payload.get("reports_dir") == "../reports":
+        (tmp_path / "reports").mkdir()
 
     with pytest.raises(ValueError, match="Dashboard reports_dir"):
         dashboard_acceptance._effective_reports_dir(
-            {"reports_dir": value}, process_cwd=worktree
+            payload, process_cwd=worktree
         )
+
+
+def _run_acceptance_main_with_reports(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    report_dirs: list[Path],
+) -> tuple[int, dict[str, object], list[Path | None]]:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    payloads = iter({"reports_dir": str(path)} for path in report_dirs)
+    browser_reports: list[Path | None] = []
+    monkeypatch.setattr(
+        dashboard_acceptance, "_project_data_dir", lambda root: tmp_path / "data"
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_latest_phillips_expectation",
+        lambda data_dir: (Decimal("1"), "2026-07"),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance, "_listener", lambda url: (123, worktree.resolve())
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance.subprocess,
+        "check_output",
+        lambda *args, **kwargs: "accepted-sha\n",
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance, "_fetch_payload", lambda url: next(payloads)
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance, "validate_dashboard_payload", lambda *args, **kwargs: []
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_log_errors", lambda path: [])
+
+    def browser_check(
+        url: str, expected_cn: int, payload: dict[str, object],
+        reports_dir: Path | None = None,
+    ) -> tuple[list[str], None]:
+        browser_reports.append(reports_dir)
+        return [], None
+
+    monkeypatch.setattr(dashboard_acceptance, "_browser_check", browser_check)
+    status = dashboard_acceptance.main([
+        "--expected-root", str(worktree),
+        "--wait-seconds", "0",
+        "--log", str(tmp_path / "dashboard.log"),
+    ])
+    result = json.loads(capsys.readouterr().out)
+    return status, result, browser_reports
+
+
+def test_acceptance_main_passes_external_api_reports_dir_to_browser_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    external = tmp_path / "shared" / "reports"
+    external.mkdir(parents=True)
+
+    status, result, browser_reports = _run_acceptance_main_with_reports(
+        monkeypatch, capsys, tmp_path, [external, external]
+    )
+
+    assert status == 0
+    assert result["status"] == "PASS"
+    assert browser_reports == [external.resolve()]
+
+
+def test_acceptance_main_fails_when_reports_dir_changes_between_refreshes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first = tmp_path / "shared" / "reports-one"
+    second = tmp_path / "shared" / "reports-two"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    status, result, browser_reports = _run_acceptance_main_with_reports(
+        monkeypatch, capsys, tmp_path, [first, second]
+    )
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert "两个刷新周期的 Dashboard reports_dir 不一致" in result["errors"]
+    assert browser_reports == [second.resolve()]
 
 
 def test_acceptance_rejects_api_projection_that_drops_frozen_action(
