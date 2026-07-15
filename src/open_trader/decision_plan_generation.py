@@ -38,8 +38,7 @@ class _RangeCachingProvider:
                 return [bar for bar in bars if start <= str(getattr(bar, "date")) <= end]
         bars = list(self.provider.get_daily_kline(futu_symbol, start=start, end=end))
         if bars:
-            dates = [str(getattr(bar, "date")) for bar in bars]
-            self._ranges.setdefault(futu_symbol, []).append((min(dates), max(dates), bars))
+            self._ranges.setdefault(futu_symbol, []).append((start, end, bars))
         return bars
 
 

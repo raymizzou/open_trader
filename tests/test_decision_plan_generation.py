@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from open_trader.decision_plan import load_decision_plans
-from open_trader.decision_plan_generation import generate_daily_decision_plans
+from open_trader.decision_plan_generation import (
+    _RangeCachingProvider,
+    generate_daily_decision_plans,
+)
 from open_trader.kline_technical_facts import DailyKlineBar
 
 
@@ -46,6 +49,26 @@ class ShortHistoryPriceProvider:
             )
             for index in range(13)
         ]
+
+
+def test_range_cache_reuses_requested_end_after_latest_returned_bar() -> None:
+    raw_provider = PriceProvider()
+    provider = _RangeCachingProvider(raw_provider)
+
+    provider.get_daily_kline(
+        "US.MSFT",
+        start="2025-04-20",
+        end="2026-07-15",
+    )
+    bars = provider.get_daily_kline(
+        "US.MSFT",
+        start="2026-07-01",
+        end="2026-07-15",
+    )
+
+    assert raw_provider.calls == 1
+    assert bars
+    assert all("2026-07-01" <= bar.date <= "2026-07-15" for bar in bars)
 
 
 def test_market_generator_runs_available_ranges_and_publishes_futu_source(
