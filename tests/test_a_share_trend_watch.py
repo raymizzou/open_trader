@@ -85,6 +85,20 @@ class RecordingMacOSNotifier(MacOSNotifier):
         self.messages.append((title, message))
 
 
+class FlakyNotifier(RecordingNotifier):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.attempt_count = 0
+
+    def notify(self, title: str, message: str) -> None:
+        self.attempt_count += 1
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("delivery failed")
+        super().notify(title, message)
+
+
 def portfolio(
     tmp_path: Path,
     *,
@@ -215,7 +229,10 @@ def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:
     assert result.trigger_count == 1
     assert sum("全部卖出" in message for _, message in notifier.messages) == 1
     events = read_events(tmp_path / "events.jsonl")
-    assert [event["event_type"] for event in events] == ["protection_triggered"]
+    assert [event["event_type"] for event in events] == [
+        "protection_triggered",
+        "protection_triggered_notification_delivered",
+    ]
     assert set(events[0]) == {
         "event_id",
         "symbol",
@@ -463,12 +480,47 @@ def test_missing_protection_line_is_visible_and_never_compared(tmp_path: Path) -
     assert result.trigger_count == 0
     assert quote.snapshot_calls == []
     assert [event["event_type"] for event in read_events(events_path)] == [
-        "protection_line_missing"
+        "protection_line_missing",
+        "protection_line_missing_notification_delivered",
     ]
     assert any("人工" in message for _, message in notifier.messages)
 
 
-def test_existing_same_day_trigger_suppresses_repeat_after_restart(
+def test_missing_line_notification_retries_next_poll_after_failure(
+    tmp_path: Path,
+) -> None:
+    feishu = FlakyNotifier(failures=1)
+    macos = RecordingMacOSNotifier()
+    events_path = tmp_path / "events.jsonl"
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path, active_line=None),
+        events_path=events_path,
+        quote_client=SequenceQuote([]),
+        notifier=CompositeNotifier([feishu, macos]),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        now_fn=SequenceClock(
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:05+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
+        ),
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert feishu.attempt_count == 2
+    assert macos.messages == []
+    assert result.exception_count == 1
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "protection_line_missing",
+        "protection_line_missing_notification_delivered",
+    ]
+
+
+def test_existing_same_day_trigger_without_receipt_retries_after_restart(
     tmp_path: Path,
 ) -> None:
     events_path = tmp_path / "events.jsonl"
@@ -492,8 +544,11 @@ def test_existing_same_day_trigger_suppresses_repeat_after_restart(
     )
 
     assert result.trigger_count == 0
-    assert len(read_events(events_path)) == 1
-    assert not any("全部卖出" in message for _, message in notifier.messages)
+    assert len(notifier.messages) == 1
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "protection_triggered",
+        "protection_triggered_notification_delivered",
+    ]
 
 
 def test_opend_failure_reconnects_once_and_announces_recovery(tmp_path: Path) -> None:
@@ -609,10 +664,69 @@ def test_missing_quote_is_recorded_unknown_not_safe(tmp_path: Path) -> None:
     assert result.unknown_quote_count == 1
     assert result.trigger_count == 0
     assert [event["event_type"] for event in read_events(events_path)] == [
-        "quote_unknown"
+        "quote_unknown",
+        "quote_unknown_notification_delivered",
     ]
     assert any("未知" in message for _, message in notifier.messages)
     assert not any("安全" in message for _, message in notifier.messages)
+
+
+def test_quote_notification_retries_after_failed_process_restarts(
+    tmp_path: Path,
+) -> None:
+    events_path = tmp_path / "events.jsonl"
+    failed = FlakyNotifier(failures=1)
+    first = run_once(
+        tmp_path,
+        quote=SequenceQuote([{}]),
+        events_path=events_path,
+        notifier=failed,
+    )
+    delivered = RecordingNotifier()
+
+    second = run_once(
+        tmp_path,
+        quote=SequenceQuote([{}]),
+        events_path=events_path,
+        notifier=delivered,
+    )
+
+    assert first.unknown_quote_count == 1
+    assert second.unknown_quote_count == 0
+    assert failed.attempt_count == 1
+    assert len(delivered.messages) == 1
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "quote_unknown",
+        "quote_unknown_notification_delivered",
+    ]
+
+
+def test_trigger_notification_success_suppresses_after_restart(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    first_notifier = RecordingNotifier()
+    first = run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        events_path=events_path,
+        notifier=first_notifier,
+    )
+    restarted_notifier = RecordingNotifier()
+
+    restarted = run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.20")}]),
+        events_path=events_path,
+        notifier=restarted_notifier,
+    )
+
+    assert first.trigger_count == 1
+    assert restarted.trigger_count == 0
+    assert len(first_notifier.messages) == 1
+    assert restarted_notifier.messages == []
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "protection_triggered",
+        "protection_triggered_notification_delivered",
+    ]
 
 
 def test_manual_quote_exception_is_sent_to_feishu_not_macos(tmp_path: Path) -> None:

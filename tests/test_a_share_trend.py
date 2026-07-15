@@ -1062,6 +1062,34 @@ def test_markdown_unknown_reason_is_visible_but_json_keeps_raw_codes() -> None:
     assert payload["excluded"]["600001"] == ["future_reason_code"]
 
 
+def test_markdown_unknown_action_is_visible_and_json_keeps_raw_code() -> None:
+    built = replace(
+        report(),
+        holdings=(
+            trend_module.HoldingDecision(
+                symbol="600025",
+                name="华能水电",
+                industry="电力",
+                action="FUTURE_ACTION",
+                reason="trend_intact",
+                initial_line=Decimal("9.32"),
+                active_line=Decimal("9.32"),
+                atr=Decimal("0.10"),
+                historical=True,
+            ),
+        ),
+    )
+
+    markdown = render_markdown(built)
+    payload = trend_module._report_payload(built)
+
+    assert "其他动作 1" in markdown
+    assert "未知动作（FUTURE_ACTION）" in markdown
+    assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == (
+        "FUTURE_ACTION"
+    )
+
+
 def test_markdown_translates_holding_kline_unavailable() -> None:
     built = replace(
         report(),

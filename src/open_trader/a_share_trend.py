@@ -815,6 +815,7 @@ def render_markdown(report: TrendReport) -> str:
     sells = [item for item in report.holdings if item.action == "SELL_ALL"]
     holds = [item for item in report.holdings if item.action == "HOLD"]
     reviews = [item for item in report.holdings if item.action == "MANUAL_REVIEW"]
+    others = [item for item in report.holdings if item.action not in ACTION_LABELS]
     industry_facts = {
         industry: (count, weight)
         for industry, count, weight in report.industry_concentration
@@ -826,7 +827,7 @@ def render_markdown(report: TrendReport) -> str:
         "",
         f"数据日期：{report.as_of_date}｜生成时间：{report.generated_at}｜账户：{freshness}",
         f"全部卖出 {len(sells)}｜允许买入 {len(report.buy_actions)}｜"
-        f"继续持有 {len(holds)}｜人工复核 {len(reviews)}",
+        f"继续持有 {len(holds)}｜人工复核 {len(reviews)}｜其他动作 {len(others)}",
         "",
         "## 开盘前：确认卖出",
         "",
@@ -858,7 +859,7 @@ def render_markdown(report: TrendReport) -> str:
         lines.extend(["", NO_ACTION_TEXT])
 
     lines.extend(["", "## 继续持有与人工复核", ""])
-    for item in [*holds, *reviews]:
+    for item in [*holds, *reviews, *others]:
         line = (
             f"- {item.symbol} {item.name}｜{_action_label(item.action)}｜"
             f"{_reason_label(item.reason)}"
@@ -866,7 +867,7 @@ def render_markdown(report: TrendReport) -> str:
         if item.active_line is not None:
             line += f"｜活动保护线 {_money(item.active_line)}"
         lines.append(line)
-    if not holds and not reviews:
+    if not holds and not reviews and not others:
         lines.append("- 无。")
 
     lines.extend(["", "## 中文附录", "", "### 前 10 名候选", ""])

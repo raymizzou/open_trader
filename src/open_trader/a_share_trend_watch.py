@@ -95,8 +95,11 @@ def watch_a_share_protection(
     positions: dict[str, object] = {}
     active_lines: dict[str, Decimal | None] = {}
     alerted: set[str] = set()
+    delivered_alerts: set[str] = set()
     reported_lines: set[str] = set()
+    delivered_lines: set[str] = set()
     reported_quotes: set[str] = set()
+    delivered_quotes: set[str] = set()
 
     trigger_count = exception_count = unknown_quote_count = 0
     calendar_checked = False
@@ -198,17 +201,38 @@ def watch_a_share_protection(
                         if event.get("trading_date") == trading_date
                         and event.get("event_type") == "protection_triggered"
                     }
+                    delivered_alerts = {
+                        str(event.get("symbol", ""))
+                        for event in prior_events
+                        if event.get("trading_date") == trading_date
+                        and event.get("event_type")
+                        == "protection_triggered_notification_delivered"
+                    }
                     reported_lines = {
                         str(event.get("symbol", ""))
                         for event in prior_events
                         if event.get("trading_date") == trading_date
                         and event.get("event_type") == "protection_line_missing"
                     }
+                    delivered_lines = {
+                        str(event.get("symbol", ""))
+                        for event in prior_events
+                        if event.get("trading_date") == trading_date
+                        and event.get("event_type")
+                        == "protection_line_missing_notification_delivered"
+                    }
                     reported_quotes = {
                         str(event.get("symbol", ""))
                         for event in prior_events
                         if event.get("trading_date") == trading_date
                         and event.get("event_type") == "quote_unknown"
+                    }
+                    delivered_quotes = {
+                        str(event.get("symbol", ""))
+                        for event in prior_events
+                        if event.get("trading_date") == trading_date
+                        and event.get("event_type")
+                        == "quote_unknown_notification_delivered"
                     }
             except RuntimeError as exc:
                 if str(exc) != "daily premarket run already active":
@@ -231,14 +255,28 @@ def watch_a_share_protection(
                             last_price=None,
                             active_line=None,
                         )
-                        send_notification_with_results(
+                        reported_lines.add(symbol)
+                        exception_count += 1
+                    if symbol not in delivered_lines:
+                        attempts = send_notification_with_results(
                             notifier,
                             f"A股保护线缺失 · {symbol}",
                             "当前持仓缺少活动保护线，未进行价格比较；请立即人工检查。",
                             channels={"feishu", "feishu_app"},
                         )
-                        reported_lines.add(symbol)
-                        exception_count += 1
+                        if any(attempt.success for attempt in attempts):
+                            append_watch_event(
+                                events_path,
+                                symbol=symbol,
+                                trading_date=trading_date,
+                                event_type=(
+                                    "protection_line_missing_notification_delivered"
+                                ),
+                                occurred_at=now.isoformat(timespec="seconds"),
+                                last_price=None,
+                                active_line=None,
+                            )
+                            delivered_lines.add(symbol)
                     continue
                 comparable[to_futu_symbol("CN", symbol)] = (symbol, active_line)
 
@@ -286,34 +324,59 @@ def watch_a_share_protection(
                             last_price=None,
                             active_line=active_line,
                         )
-                        send_notification_with_results(
+                        reported_quotes.add(symbol)
+                        unknown_quote_count += 1
+                    if symbol not in delivered_quotes:
+                        attempts = send_notification_with_results(
                             notifier,
                             f"A股实时价格未知 · {symbol}",
                             f"未取得有效实时价格，活动保护线 {active_line} 的状态未知；请立即人工核价。",
                             channels={"feishu", "feishu_app"},
                         )
-                        reported_quotes.add(symbol)
-                        unknown_quote_count += 1
+                        if any(attempt.success for attempt in attempts):
+                            append_watch_event(
+                                events_path,
+                                symbol=symbol,
+                                trading_date=trading_date,
+                                event_type="quote_unknown_notification_delivered",
+                                occurred_at=now.isoformat(timespec="seconds"),
+                                last_price=None,
+                                active_line=active_line,
+                            )
+                            delivered_quotes.add(symbol)
                     continue
-                if symbol in alerted or snapshot.last_price > active_line:
+                if snapshot.last_price > active_line:
                     continue
-                append_watch_event(
-                    events_path,
-                    symbol=symbol,
-                    trading_date=trading_date,
-                    event_type="protection_triggered",
-                    occurred_at=now.isoformat(timespec="seconds"),
-                    last_price=snapshot.last_price,
-                    active_line=active_line,
-                )
-                send_notification_with_results(
-                    notifier,
-                    f"A股保护线触发 · {symbol}",
-                    f"最新价 {snapshot.last_price} <= 活动保护线 {active_line}\n"
-                    "建议动作：全部卖出（人工执行）",
-                )
-                alerted.add(symbol)
-                trigger_count += 1
+                if symbol not in alerted:
+                    append_watch_event(
+                        events_path,
+                        symbol=symbol,
+                        trading_date=trading_date,
+                        event_type="protection_triggered",
+                        occurred_at=now.isoformat(timespec="seconds"),
+                        last_price=snapshot.last_price,
+                        active_line=active_line,
+                    )
+                    alerted.add(symbol)
+                    trigger_count += 1
+                if symbol not in delivered_alerts:
+                    attempts = send_notification_with_results(
+                        notifier,
+                        f"A股保护线触发 · {symbol}",
+                        f"最新价 {snapshot.last_price} <= 活动保护线 {active_line}\n"
+                        "建议动作：全部卖出（人工执行）",
+                    )
+                    if any(attempt.success for attempt in attempts):
+                        append_watch_event(
+                            events_path,
+                            symbol=symbol,
+                            trading_date=trading_date,
+                            event_type="protection_triggered_notification_delivered",
+                            occurred_at=now.isoformat(timespec="seconds"),
+                            last_price=snapshot.last_price,
+                            active_line=active_line,
+                        )
+                        delivered_alerts.add(symbol)
 
             if once:
                 return _result(
