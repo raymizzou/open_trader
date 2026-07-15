@@ -257,8 +257,9 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
 def _check_account_holdings(page: Any) -> None:
     text = page.locator("#account-holdings").inner_text()
     for required in (
-        "富途", "中短线", "股票与期权", "老虎", "长线", "SMA200 组合策略",
-        "辉立", "中线策略", "东方财富", "偏短线", "趋势交易",
+        "富途", "短线", "美股趋势交易", "老虎", "长线", "SMA200 组合策略",
+        "辉立", "港股趋势交易", "东方财富", "偏短线", "趋势交易",
+        "数据日", "账户源", "买入", "卖出", "人工复核", "最近保护提醒",
         "策略指标待接入", "夏普比率", "卡玛比率",
     ):
         assert required in text, f"账户持仓视图缺少 {required}"

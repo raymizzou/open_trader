@@ -109,6 +109,10 @@ class DailyPremarketConfig:
     trend_animals_api_key: str = ""
     trend_animals_a_share_tm_id: int = 0
     trend_animals_etf_tm_id: int = 0
+    trend_animals_us_tm_ids: tuple[int, ...] = ()
+    trend_animals_hk_tm_ids: tuple[int, ...] = ()
+    trend_us_symbols: tuple[str, ...] = ()
+    trend_hk_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -194,6 +198,12 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         values,
         "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID",
     )
+    trend_us_tm_ids = _positive_tm_ids(
+        values.get("TREND_ANIMALS_WARM_TO_HOT_US_TM_IDS", "")
+    )
+    trend_hk_tm_ids = _positive_tm_ids(
+        values.get("TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS", "")
+    )
 
     for key, value in values.items():
         os.environ[key] = value
@@ -243,6 +253,14 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         trend_animals_api_key=values.get("TREND_ANIMALS_API_KEY", ""),
         trend_animals_a_share_tm_id=trend_a_share_tm_id,
         trend_animals_etf_tm_id=trend_etf_tm_id,
+        trend_animals_us_tm_ids=trend_us_tm_ids,
+        trend_animals_hk_tm_ids=trend_hk_tm_ids,
+        trend_us_symbols=_symbol_config(
+            values.get("OPEN_TRADER_TREND_US_SYMBOLS", "")
+        ),
+        trend_hk_symbols=_symbol_config(
+            values.get("OPEN_TRADER_TREND_HK_SYMBOLS", "")
+        ),
     )
 
 
@@ -255,6 +273,29 @@ def _optional_positive_tm_id(values: dict[str, str], key: str) -> int:
     if value < 0:
         raise ValueError(f"{key} must be a positive integer")
     return value
+
+
+def _positive_tm_ids(value: str) -> tuple[int, ...]:
+    result: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            tm_id = int(item)
+        except ValueError:
+            raise ValueError("Trend Animals tmId list must contain positive integers") from None
+        if tm_id <= 0:
+            raise ValueError("Trend Animals tmId list must contain positive integers")
+        if tm_id not in result:
+            result.append(tm_id)
+    return tuple(result)
+
+
+def _symbol_config(value: str) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(item.strip().upper() for item in value.split(",") if item.strip())
+    )
 
 
 def build_notifier(config: DailyPremarketConfig) -> Notifier:

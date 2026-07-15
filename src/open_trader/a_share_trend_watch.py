@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from .a_share_trend import load_eastmoney_account, load_watch_events
+from .a_share_trend import AccountSnapshot, load_eastmoney_account, load_watch_events
 from .daily_premarket import RunLock, send_notification_with_results
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
@@ -82,6 +82,12 @@ def watch_a_share_protection(
     report_lock_path: Path | None = None,
     now_fn: Callable[[], datetime] = lambda: datetime.now(SHANGHAI),
     sleep_fn: Callable[[float], None] = time_module.sleep,
+    market: str = "CN",
+    market_label: str = "A股",
+    broker_label: str = "东方财富",
+    session_timezone: ZoneInfo = SHANGHAI,
+    session_fn: Callable[[datetime], str] = cn_session,
+    account_loader: Callable[..., AccountSnapshot] = load_eastmoney_account,
 ) -> AShareWatchResult:
     client = quote_client
     if quote_client_factory is None and client is not None:
@@ -91,7 +97,7 @@ def watch_a_share_protection(
             quote_client_factory = lambda: FutuQuoteClient(host=host, port=port)
 
     first_now = now_fn()
-    trading_date = first_now.astimezone(SHANGHAI).date().isoformat()
+    trading_date = first_now.astimezone(session_timezone).date().isoformat()
     positions: dict[str, object] = {}
     active_lines: dict[str, Decimal | None] = {}
     trigger_events: dict[str, Mapping[str, object]] = {}
@@ -109,7 +115,7 @@ def watch_a_share_protection(
     now = first_now
     try:
         while True:
-            session = cn_session(now)
+            session = session_fn(now)
             if session == "closed":
                 return _result(
                     "closed",
@@ -128,7 +134,8 @@ def watch_a_share_protection(
                 except FutuQuoteError as exc:
                     if not interrupted:
                         _record_interruption(
-                            events_path, notifier, trading_date, now, str(exc)
+                            events_path, notifier, trading_date, now, str(exc),
+                            market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
                     sleep_fn(reconnect_seconds)
@@ -137,13 +144,18 @@ def watch_a_share_protection(
 
             if not calendar_checked:
                 try:
-                    trading_days = client.get_cn_trading_days(
-                        start=trading_date, end=trading_date
+                    trading_days = (
+                        client.get_cn_trading_days(start=trading_date, end=trading_date)
+                        if market == "CN"
+                        else client.get_trading_days(
+                            market=market, start=trading_date, end=trading_date
+                        )
                     )
                 except FutuQuoteError as exc:
                     if not interrupted:
                         _record_interruption(
-                            events_path, notifier, trading_date, now, str(exc)
+                            events_path, notifier, trading_date, now, str(exc),
+                            market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
                     _close(client)
@@ -153,7 +165,10 @@ def watch_a_share_protection(
                     continue
                 calendar_checked = True
                 if interrupted:
-                    _record_recovery(events_path, notifier, trading_date, now)
+                    _record_recovery(
+                        events_path, notifier, trading_date, now,
+                        market_label=market_label,
+                    )
                     interrupted = False
                 if trading_date not in trading_days:
                     return _result(
@@ -166,17 +181,17 @@ def watch_a_share_protection(
                     )
 
             if session == "before":
-                opening = now.astimezone(SHANGHAI).replace(
+                opening = now.astimezone(session_timezone).replace(
                     hour=9, minute=30, second=0, microsecond=0
                 )
-                sleep_fn((opening - now.astimezone(SHANGHAI)).total_seconds())
+                sleep_fn((opening - now.astimezone(session_timezone)).total_seconds())
                 now = now_fn()
                 continue
             if session == "lunch":
-                afternoon = now.astimezone(SHANGHAI).replace(
+                afternoon = now.astimezone(session_timezone).replace(
                     hour=13, minute=0, second=0, microsecond=0
                 )
-                sleep_fn((afternoon - now.astimezone(SHANGHAI)).total_seconds())
+                sleep_fn((afternoon - now.astimezone(session_timezone)).total_seconds())
                 now = now_fn()
                 continue
 
@@ -186,10 +201,10 @@ def watch_a_share_protection(
                     if report_lock_path is not None
                     else nullcontext()
                 ):
-                    account = load_eastmoney_account(
+                    account = account_loader(
                         portfolio_path,
                         expected_date=trading_date,
-                        timezone=SHANGHAI,
+                        timezone=session_timezone,
                     )
                     positions = {
                         item.symbol: item
@@ -265,6 +280,7 @@ def watch_a_share_protection(
                     delivered_feishu=delivered_alerts_feishu,
                     delivered_macos=delivered_alerts_macos,
                     replay=True,
+                    market_label=market_label,
                 )
 
             comparable: dict[str, tuple[str, Decimal]] = {}
@@ -286,7 +302,7 @@ def watch_a_share_protection(
                     if symbol not in delivered_lines:
                         attempts = send_notification_with_results(
                             notifier,
-                            f"A股保护线缺失 · {symbol}",
+                            f"{market_label}保护线缺失 · {symbol}",
                             "当前持仓缺少活动保护线，未进行价格比较；请立即人工检查。",
                             channels={"feishu", "feishu_app"},
                         )
@@ -304,7 +320,7 @@ def watch_a_share_protection(
                             )
                             delivered_lines.add(symbol)
                     continue
-                comparable[to_futu_symbol("CN", symbol)] = (symbol, active_line)
+                comparable[to_futu_symbol(market, symbol)] = (symbol, active_line)
 
             if not comparable:
                 if once:
@@ -325,7 +341,8 @@ def watch_a_share_protection(
             except FutuQuoteError as exc:
                 if not interrupted:
                     _record_interruption(
-                        events_path, notifier, trading_date, now, str(exc)
+                        events_path, notifier, trading_date, now, str(exc),
+                        market_label=market_label, broker_label=broker_label,
                     )
                     interrupted = True
                 _close(client)
@@ -334,7 +351,10 @@ def watch_a_share_protection(
                 now = now_fn()
                 continue
             if interrupted:
-                _record_recovery(events_path, notifier, trading_date, now)
+                _record_recovery(
+                    events_path, notifier, trading_date, now,
+                    market_label=market_label,
+                )
                 interrupted = False
 
             for futu_symbol, (symbol, active_line) in comparable.items():
@@ -355,7 +375,7 @@ def watch_a_share_protection(
                     if symbol not in delivered_quotes:
                         attempts = send_notification_with_results(
                             notifier,
-                            f"A股实时价格未知 · {symbol}",
+                            f"{market_label}实时价格未知 · {symbol}",
                             f"未取得有效实时价格，活动保护线 {active_line} 的状态未知；请立即人工核价。",
                             channels={"feishu", "feishu_app"},
                         )
@@ -396,6 +416,7 @@ def watch_a_share_protection(
                         delivered_feishu=delivered_alerts_feishu,
                         delivered_macos=delivered_alerts_macos,
                         replay=False,
+                        market_label=market_label,
                     )
 
             if once:
@@ -426,6 +447,7 @@ def _deliver_trigger_notification(
     delivered_feishu: set[str],
     delivered_macos: set[str],
     replay: bool,
+    market_label: str = "A股",
 ) -> None:
     if replay:
         message = (
@@ -453,7 +475,7 @@ def _deliver_trigger_notification(
             continue
         attempts = send_notification_with_results(
             notifier,
-            f"A股保护线触发 · {symbol}",
+            f"{market_label}保护线触发 · {symbol}",
             message,
             channels=channels,
         )
@@ -504,6 +526,9 @@ def _record_interruption(
     trading_date: str,
     now: datetime,
     error: str,
+    *,
+    market_label: str = "A股",
+    broker_label: str = "东方财富",
 ) -> None:
     append_watch_event(
         events_path,
@@ -516,8 +541,8 @@ def _record_interruption(
     )
     send_notification_with_results(
         notifier,
-        "A股价格监控中断",
-        f"Futu OpenD 实时价格不可用：{error}\n请立即在东方财富人工核价。",
+        f"{market_label}价格监控中断",
+        f"Futu OpenD 实时价格不可用：{error}\n请立即在{broker_label}人工核价。",
     )
 
 
@@ -526,6 +551,8 @@ def _record_recovery(
     notifier: Notifier,
     trading_date: str,
     now: datetime,
+    *,
+    market_label: str = "A股",
 ) -> None:
     append_watch_event(
         events_path,
@@ -538,7 +565,7 @@ def _record_recovery(
     )
     send_notification_with_results(
         notifier,
-        "A股价格监控恢复",
+        f"{market_label}价格监控恢复",
         "Futu OpenD 实时价格已恢复，活动保护线监控继续运行。",
     )
 

@@ -474,6 +474,101 @@ def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
 
 
+def test_trend_market_parsers_have_safe_defaults() -> None:
+    report = build_parser().parse_args(["trend-market-report", "--market", "US"])
+    watch = build_parser().parse_args(["watch-trend-market", "--market", "HK"])
+
+    assert report.market == "US"
+    assert report.date == "today"
+    assert report.revision is False
+    assert watch.market == "HK"
+    assert watch.poll_seconds == 5.0
+    assert watch.reconnect_seconds == 60.0
+    assert watch.once is False
+
+
+def test_trend_market_report_dispatches_generic_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    config = SimpleNamespace(
+        timezone="Asia/Shanghai", trend_animals_api_key="secret",
+        trend_animals_us_tm_ids=(622460,), trend_animals_hk_tm_ids=(622494,),
+    )
+    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
+    monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
+
+    def runner(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            status="generated", report_path=tmp_path / "us.md",
+            json_path=tmp_path / "us.json",
+        )
+
+    monkeypatch.setattr(cli, "run_market_trend_report", runner)
+
+    assert cli.main([
+        "trend-market-report", "--market", "US", "--date", "2026-07-15",
+        "--revision", "--config", str(tmp_path / "daily.env"),
+    ]) == 0
+    assert captured == {
+        "config": config, "market": "US", "run_date": "2026-07-15",
+        "revision": True, "notifier": "notifier",
+    }
+    assert json.loads(capsys.readouterr().out)["status"] == "generated"
+
+
+def test_watch_trend_market_uses_separate_market_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    config = SimpleNamespace(
+        data_dir=tmp_path / "data", reports_dir=tmp_path / "reports",
+        portfolio=tmp_path / "portfolio.csv", futu_host="127.0.0.1", futu_port=11111,
+    )
+
+    class Lock:
+        def __init__(self, path: Path) -> None:
+            captured["watch_lock"] = path
+
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    def watcher(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            status="completed", watched_symbol_count=1, trigger_count=0,
+            exception_count=0, unknown_quote_count=0,
+            events_path=kwargs["events_path"],
+        )
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
+    monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
+    monkeypatch.setattr(cli, "RunLock", Lock)
+    monkeypatch.setattr(cli, "watch_market_protection", watcher)
+
+    assert cli.main([
+        "watch-trend-market", "--market", "HK", "--once",
+        "--config", str(tmp_path / "daily.env"),
+    ]) == 0
+
+    assert captured["watch_lock"] == tmp_path / "data/runs/.trend_hk_phillips_watch.lock"
+    assert captured["state_path"] == tmp_path / "data/trend_hk_phillips/protection_state.json"
+    assert captured["events_path"] == tmp_path / "data/trend_hk_phillips/watch_events.jsonl"
+    assert captured["report_lock_path"] == tmp_path / "data/runs/.trend_hk_phillips_report.lock"
+    assert captured["market"] == "HK"
+    assert captured["quote_client"] is None
+    assert callable(captured["quote_client_factory"])
+    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+
+
 def test_run_daily_premarket_requires_market() -> None:
     parser = build_parser()
 

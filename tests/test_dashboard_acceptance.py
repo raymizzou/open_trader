@@ -281,9 +281,9 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def inner_text(self) -> str:
             if self.selector == "#account-holdings":
                 return (
-                    "富途中短线股票与期权策略指标待接入 "
+                    "富途短线美股趋势交易数据日2026-07-14账户源2026-07-14买入1卖出0人工复核1最近保护提醒无 "
                     "老虎长线SMA200 组合策略夏普比率卡玛比率 "
-                    "辉立中线中线策略策略指标待接入 "
+                    "辉立短线港股趋势交易数据日2026-07-15账户源2026-06买入2卖出1人工复核0最近保护提醒无 "
                     "东方财富偏短线趋势交易策略指标待接入"
                 )
             if self.selector == "body":
@@ -447,9 +447,9 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
     class Locator:
         def inner_text(self) -> str:
             return (
-                "富途中短线股票与期权策略指标待接入 "
+                "富途短线美股趋势交易数据日2026-07-14账户源2026-07-14买入1卖出0人工复核1最近保护提醒无 "
                 "老虎长线SMA200 组合策略夏普比率卡玛比率 "
-                "辉立中线中线策略策略指标待接入 "
+                "辉立短线港股趋势交易数据日2026-07-15账户源2026-06买入2卖出1人工复核0最近保护提醒无 "
                 "东方财富偏短线趋势交易策略指标待接入"
             )
 
@@ -650,13 +650,13 @@ def test_check_cn_filter_keeps_four_accounts_and_validates_rows_or_empty_state()
 
 @pytest.mark.parametrize(
     "missing",
-    ("富途", "老虎", "辉立", "东方财富", "策略指标待接入", "夏普比率", "卡玛比率"),
+    ("富途", "老虎", "辉立", "东方财富", "美股趋势交易", "港股趋势交易", "数据日", "最近保护提醒", "策略指标待接入", "夏普比率", "卡玛比率"),
 )
 def test_check_account_holdings_rejects_missing_profile_or_metric(missing: str) -> None:
     text = (
-        "富途中短线股票与期权策略指标待接入 "
+        "富途短线美股趋势交易数据日2026-07-14账户源2026-07-14买入1卖出0人工复核1最近保护提醒无 "
         "老虎长线SMA200 组合策略夏普比率卡玛比率 "
-        "辉立中线中线策略策略指标待接入 "
+        "辉立短线港股趋势交易数据日2026-07-15账户源2026-06买入2卖出1人工复核0最近保护提醒无 "
         "东方财富偏短线趋势交易策略指标待接入"
     ).replace(missing, "")
 

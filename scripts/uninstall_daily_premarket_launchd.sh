@@ -3,9 +3,10 @@ set -euo pipefail
 
 MARKET="all"
 MARKET_REQUESTED=0
+TREND_ONLY=0
 
 usage() {
-  echo "usage: $0 [--market HK|US|CN|all]" >&2
+  echo "usage: $0 [--trend-only] [--market HK|US|CN|all]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -19,6 +20,10 @@ while [[ $# -gt 0 ]]; do
       MARKET_REQUESTED=1
       shift 2
       ;;
+    --trend-only)
+      TREND_ONLY=1
+      shift
+      ;;
     *)
       usage
       exit 2
@@ -27,6 +32,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$MARKET" != "HK" && "$MARKET" != "US" && "$MARKET" != "CN" && "$MARKET" != "all" ]]; then
+  usage
+  exit 2
+fi
+if [[ "$TREND_ONLY" -eq 1 && "$MARKET" == "CN" ]]; then
   usage
   exit 2
 fi
@@ -42,19 +51,30 @@ remove_target() {
   fi
 }
 
-if [[ "$MARKET" == "all" || "$MARKET" == "HK" ]]; then
+if [[ "$TREND_ONLY" -eq 0 && ( "$MARKET" == "all" || "$MARKET" == "HK" ) ]]; then
   remove_target "$HOME/Library/LaunchAgents/com.open-trader.premarket.hk.plist"
 fi
 
-if [[ "$MARKET" == "all" || "$MARKET" == "US" ]]; then
+if [[ "$TREND_ONLY" -eq 0 && ( "$MARKET" == "all" || "$MARKET" == "US" ) ]]; then
   remove_target "$HOME/Library/LaunchAgents/com.open-trader.premarket.us.plist"
 fi
 
-if [[ "$MARKET" == "all" ]]; then
+if [[ "$TREND_ONLY" -eq 0 && "$MARKET" == "all" ]]; then
   remove_target "$HOME/Library/LaunchAgents/com.open-trader.premarket.plist"
 fi
 
-if [[ "$MARKET_REQUESTED" -eq 1 && ( "$MARKET" == "CN" || "$MARKET" == "all" ) ]]; then
+if [[ "$TREND_ONLY" -eq 0 && "$MARKET_REQUESTED" -eq 1 && ( "$MARKET" == "CN" || "$MARKET" == "all" ) ]]; then
   remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-a-share-report.plist"
   remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-a-share-watch.plist"
+fi
+
+if [[ "$TREND_ONLY" -eq 1 ]]; then
+  for market in HK US; do
+    if [[ "$MARKET" != "all" && "$MARKET" != "$market" ]]; then
+      continue
+    fi
+    lower="$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
+    remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-$lower-report.plist"
+    remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-$lower-watch.plist"
+  done
 fi

@@ -357,6 +357,45 @@ def test_candidate_accepts_days_amount_and_strength_boundaries() -> None:
     assert build_candidate_list([item], held_symbols=set()).eligible == (item,)
 
 
+@pytest.mark.parametrize(
+    ("market", "ticker_symbol", "asset", "symbol", "exchange"),
+    [
+        ("US", "VIXY.US", "美股", "VIXY", "US"),
+        ("HK", "700.HK", "港股", "00700", "HK"),
+    ],
+)
+def test_candidate_supports_hk_us_symbols_and_market_assets(
+    market: str,
+    ticker_symbol: str,
+    asset: str,
+    symbol: str,
+    exchange: str,
+) -> None:
+    item = evaluate_candidate(
+        {
+            "tmId": 1,
+            "tickerSymbol": ticker_symbol,
+            "tickerName": "示例",
+            "asset": asset,
+            "industryName": "ETF",
+            "asOfDate": "2026-07-14",
+            "tradableFlag": True,
+            "amount1d": "1",
+            "isTrendRightSide": True,
+            "daysSinceTrendEntry": 9,
+            "trendStrengthLocalCurr": "90.001",
+            "stopwinFlagByDangerSignal": False,
+        },
+        bars(),
+        market=market,
+    )
+
+    assert (item.symbol, item.exchange) == (symbol, exchange)
+    assert build_candidate_list(
+        [item], held_symbols=set(), market=market
+    ).eligible == (item,)
+
+
 def test_candidate_kline_failure_is_an_atr_exclusion() -> None:
     item = evaluate_candidate(
         {
@@ -456,6 +495,33 @@ def test_stale_account_has_no_formal_buys() -> None:
         )
         == []
     )
+
+
+def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
+    us = replace(candidate("600001", close="123"), symbol="VIXY", exchange="US")
+    hk = replace(candidate("600002", close="51"), symbol="00700", exchange="HK")
+
+    us_actions = estimate_buy_actions(
+        ranked=[us],
+        account_fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("1000"),
+        current_position_count=0,
+        market="US",
+    )
+    hk_actions = estimate_buy_actions(
+        ranked=[hk],
+        account_fresh=False,
+        require_fresh_account=False,
+        net_value=Decimal("1000000"),
+        available_cash=Decimal("6000"),
+        current_position_count=0,
+        market="HK",
+        lot_sizes={"00700": 100},
+    )
+
+    assert us_actions[0].estimated_shares == 8
+    assert hk_actions[0].estimated_shares == 100
 
 
 def test_more_than_ten_positions_has_no_formal_buys() -> None:

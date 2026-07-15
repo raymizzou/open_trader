@@ -302,9 +302,17 @@ def _kline_metrics(
     return atr, close, lows
 
 
-def _symbol_parts(value: object) -> tuple[str, str]:
+def _symbol_parts(value: object, *, market: str = "CN") -> tuple[str, str]:
     if not isinstance(value, str):
         raise ValueError("tickerSymbol must be a string")
+    normalized_market = market.strip().upper()
+    if normalized_market in {"US", "HK"}:
+        text = value.strip().upper()
+        suffix = f".{normalized_market}"
+        raw_symbol = text[: -len(suffix)] if text.endswith(suffix) else text
+        futu_symbol = to_futu_symbol(normalized_market, raw_symbol)
+        exchange, symbol = futu_symbol.split(".", 1)
+        return symbol, exchange
     parts = value.strip().upper().rsplit(".", 1)
     if len(parts) == 1:
         exchange, symbol = to_futu_symbol("CN", parts[0]).split(".", 1)
@@ -319,8 +327,9 @@ def evaluate_candidate(
     bars: Sequence[DailyKlineBar] | None,
     *,
     pools: Sequence[str] = (),
+    market: str = "CN",
 ) -> CandidateInput:
-    symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
+    symbol, exchange = _symbol_parts(row.get("tickerSymbol"), market=market)
     daily_bars = tuple(bars or ())
     atr, close, _ = _kline_metrics(daily_bars)
     tm_id = row.get("tmId")
@@ -352,7 +361,11 @@ def _excluded_name(name: str) -> bool:
 
 
 def _candidate_reasons(
-    item: CandidateInput, held_symbols: set[str], expected_date: str | None = None
+    item: CandidateInput,
+    held_symbols: set[str],
+    expected_date: str | None = None,
+    *,
+    market: str = "CN",
 ) -> list[str]:
     reasons: list[str] = []
     if item.right_side is not True:
@@ -371,13 +384,13 @@ def _candidate_reasons(
         reasons.append("name_missing")
     if not item.asset:
         reasons.append("asset_missing")
-    elif item.asset not in {"A股", "ETF基金"}:
+    elif market == "CN" and item.asset not in {"A股", "ETF基金"}:
         reasons.append("unsupported_asset")
     if item.symbol in held_symbols:
         reasons.append("already_held")
-    if item.exchange == "BJ" or _excluded_name(item.name):
+    if market == "CN" and (item.exchange == "BJ" or _excluded_name(item.name)):
         reasons.append("excluded_security")
-    elif item.exchange not in {"SH", "SZ"}:
+    elif item.exchange not in ({"SH", "SZ"} if market == "CN" else {market}):
         reasons.append("unsupported_exchange")
     if item.atr is None:
         reasons.append("atr_unavailable")
@@ -400,6 +413,7 @@ def build_candidate_list(
     *,
     held_symbols: set[str],
     expected_date: str | None = None,
+    market: str = "CN",
 ) -> CandidateDecision:
     eligible: list[CandidateInput] = []
     excluded: dict[str, list[str]] = {}
@@ -412,7 +426,9 @@ def build_candidate_list(
             dict.fromkeys(
                 reason
                 for item in items
-                for reason in _candidate_reasons(item, held_symbols, expected_date)
+                for reason in _candidate_reasons(
+                    item, held_symbols, expected_date, market=market
+                )
             )
         )
         if reasons:
@@ -430,9 +446,12 @@ def estimate_buy_actions(
     net_value: Decimal,
     available_cash: Decimal,
     current_position_count: int,
+    market: str = "CN",
+    lot_sizes: Mapping[str, int] | None = None,
+    require_fresh_account: bool = True,
 ) -> list[BuyAction]:
     slots = max(0, 10 - current_position_count)
-    if not account_fresh or slots == 0:
+    if (require_fresh_account and not account_fresh) or slots == 0:
         return []
     target = (net_value * Decimal("0.01")).quantize(Decimal("0.01"))
     remaining_cash = available_cash
@@ -443,7 +462,13 @@ def estimate_buy_actions(
         if item.close is None or item.close <= 0 or item.atr is None:
             continue
         amount = min(target, remaining_cash)
-        shares = int(amount / item.close / 100) * 100
+        if market == "CN":
+            lot_size = 100
+        elif market == "HK":
+            lot_size = (lot_sizes or {}).get(item.symbol, 0)
+        else:
+            lot_size = 1
+        shares = int(amount / item.close / lot_size) * lot_size if lot_size > 0 else 0
         if shares <= 0:
             continue
         actions.append(
@@ -549,10 +574,16 @@ def build_report(
     actual_api_cost: Decimal | None = None,
     generated_at: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    market: str = "CN",
+    lot_sizes: Mapping[str, int] | None = None,
+    require_fresh_account: bool = True,
 ) -> TrendReport:
     held_symbols = {position.symbol for position in account.positions}
     candidate_decision = build_candidate_list(
-        candidates, held_symbols=held_symbols, expected_date=as_of_date
+        candidates,
+        held_symbols=held_symbols,
+        expected_date=as_of_date,
+        market=market,
     )
     displayed_candidates = candidate_decision.eligible[:10]
     buy_actions = estimate_buy_actions(
@@ -561,6 +592,9 @@ def build_report(
         net_value=account.net_value,
         available_cash=account.available_cash,
         current_position_count=len(account.positions),
+        market=market,
+        lot_sizes=lot_sizes,
+        require_fresh_account=require_fresh_account,
     )
     old_positions = _state_positions(prior_state)
     holdings: list[HoldingDecision] = []
@@ -671,7 +705,7 @@ def build_report(
             **_candidate_signal(item),
             "eligible": (item.tm_id, item.symbol) in ranks,
             "excluded_reasons": _candidate_reasons(
-                item, held_symbols, as_of_date
+                item, held_symbols, as_of_date, market=market
             ),
             "rank": ranks.get((item.tm_id, item.symbol)),
             "pools": list(item.pools),
@@ -811,7 +845,15 @@ def _data_source_label(value: str) -> str:
 
 
 def render_markdown(report: TrendReport) -> str:
-    freshness = "已更新" if report.account.fresh else "已过期，禁止正式买入"
+    market = str(report.metadata.get("market") or "CN").upper()
+    market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(market, market)
+    currency = {"CN": "元", "US": "美元", "HK": "港元"}.get(market, "")
+    if market == "HK":
+        freshness = (
+            f"日结单 {report.account.source_date}，交易前须人工核对实际仓位与现金"
+        )
+    else:
+        freshness = "已更新" if report.account.fresh else "已过期，禁止正式买入"
     sells = [item for item in report.holdings if item.action == "SELL_ALL"]
     holds = [item for item in report.holdings if item.action == "HOLD"]
     reviews = [item for item in report.holdings if item.action == "MANUAL_REVIEW"]
@@ -821,7 +863,7 @@ def render_markdown(report: TrendReport) -> str:
         for industry, count, weight in report.industry_concentration
     }
     lines = [
-        f"# A股趋势操作计划 · {report.execution_date}",
+        f"# {market_label}趋势操作计划 · {report.execution_date}",
         "",
         "## 操作摘要",
         "",
@@ -841,18 +883,22 @@ def render_markdown(report: TrendReport) -> str:
     else:
         lines.append("- 无需卖出。")
 
-    lines.extend(["", "## 09:30–10:00：按顺序考虑买入", ""])
+    buy_window = "09:30–10:00" if market == "CN" else "下个常规交易时段"
+    lines.extend(["", f"## {buy_window}：按顺序考虑买入", ""])
     if report.buy_actions:
         for index, item in enumerate(report.buy_actions, 1):
             lines.append(
                 f"- {index}. {item.symbol} {item.name}｜约 {item.estimated_shares} 股｜"
-                f"金额上限 {_money(item.target_amount)} 元｜"
+                f"金额上限 {_money(item.target_amount)} {currency}｜"
                 f"预计保护线 {_money(item.estimated_initial_line)}"
             )
-        lines.append(
-            "- 实际股数按东方财富实时价格向下取整为 100 股整数倍，"
-            "不得超过金额上限。"
-        )
+        if market == "CN":
+            quantity_rule = "按东方财富实时价格向下取整为 100 股整数倍"
+        elif market == "HK":
+            quantity_rule = "按富途 lot size 向下取整为整手"
+        else:
+            quantity_rule = "按富途实时价格向下取整为整股，不使用碎股"
+        lines.append(f"- 实际股数{quantity_rule}，不得超过金额上限。")
     else:
         lines.append("- 无允许买入标的。")
     if not sells and not report.buy_actions:
@@ -942,6 +988,12 @@ def _json_value(value: object) -> object:
 
 
 def _report_payload(report: TrendReport) -> dict[str, object]:
+    market = str(report.metadata.get("market") or "CN").upper()
+    buy_window = (
+        f"{report.execution_date} 09:30–10:00"
+        if market == "CN"
+        else f"{report.execution_date} regular session"
+    )
     holding_decisions = [_json_value(asdict(item)) for item in report.holdings]
     top10_candidates = [_json_value(asdict(item)) for item in report.candidates]
     formal_actions = [
@@ -953,7 +1005,7 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         {
             **_json_value(asdict(item)),  # type: ignore[arg-type]
             "action": "BUY",
-            "valid_window": f"{report.execution_date} 09:30–10:00",
+            "valid_window": buy_window,
         }
         for item in report.buy_actions
     )
@@ -1005,8 +1057,8 @@ def _validate_protection_state(payload: object) -> dict[str, object]:
     if not isinstance(positions, dict):
         raise ValueError("protection state positions must be an object")
     for symbol, state in positions.items():
-        if not isinstance(symbol, str) or len(symbol) != 6 or not symbol.isdigit():
-            raise ValueError("protection state symbol must be six digits")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("protection state symbol must be non-empty")
         if not isinstance(state, dict):
             raise ValueError(f"protection state for {symbol} must be an object")
         if _optional_decimal(state.get("initial_line")) is None or _optional_decimal(
@@ -1611,8 +1663,10 @@ def _balance(row: Mapping[str, object]) -> Decimal:
     raise TrendAnimalsError("getAccountBalance returned no valid balance")
 
 
-def _holding_snapshot(row: Mapping[str, object]) -> HoldingSnapshot:
-    symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
+def _holding_snapshot(
+    row: Mapping[str, object], *, market: str = "CN"
+) -> HoldingSnapshot:
+    symbol, exchange = _symbol_parts(row.get("tickerSymbol"), market=market)
     return HoldingSnapshot(
         tm_id=_row_tm_id(row),
         symbol=symbol,

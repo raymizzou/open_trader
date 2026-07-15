@@ -202,6 +202,62 @@ def test_dashboard_marks_tiger_long_term_strategy_unavailable(
     assert expected_error in strategy["error"]
 
 
+def test_dashboard_loads_separate_us_hk_trend_summaries(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
+    for directory, market, as_of, actions, holdings in [
+        (
+            "trend_us_futu", "US", "2026-07-14",
+            [{"action": "BUY", "symbol": "VIXY"}, {"action": "SELL_ALL", "symbol": "AAPL"}],
+            [{"action": "SELL_ALL"}, {"action": "MANUAL_REVIEW"}],
+        ),
+        (
+            "trend_hk_phillips", "HK", "2026-07-15",
+            [{"action": "BUY", "symbol": "02800"}],
+            [{"action": "MANUAL_REVIEW"}, {"action": "MANUAL_REVIEW"}],
+        ),
+    ]:
+        path = config.reports_dir / directory / f"{as_of}.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "as_of_date": as_of,
+            "generated_at": f"{as_of}T18:00:00+08:00",
+            "delivery_status": "sent",
+            "account": {"source_date": "2026-06" if market == "HK" else as_of},
+            "strategy_judgments": {
+                "formal_actions": actions,
+                "holding_decisions": holdings,
+            },
+        }), encoding="utf-8")
+    events = config.data_dir / "trend_us_futu/watch_events.jsonl"
+    events.parent.mkdir(parents=True)
+    events.write_text(json.dumps({
+        "event_type": "protection_triggered", "symbol": "AAPL",
+        "occurred_at": "2026-07-15T22:00:00+08:00", "active_line": "190",
+    }) + "\n", encoding="utf-8")
+    log = config.data_dir / "trend_us_futu/run.log"
+    log.write_text(json.dumps({
+        "event": "failed", "run_date": "2026-07-15",
+    }) + "\n", encoding="utf-8")
+
+    summaries = load_dashboard_state(config).to_dict()["trend_market_summaries"]
+
+    assert summaries["US"] == {
+        "available": True,
+        "market": "US",
+        "data_date": "2026-07-14",
+        "account_source_date": "2026-07-14",
+        "run_status": "failed",
+        "buy_count": 1,
+        "sell_count": 1,
+        "manual_review_count": 1,
+        "recent_protection_alert": "AAPL · 2026-07-15T22:00:00+08:00 · 保护线 190",
+    }
+    assert summaries["HK"]["buy_count"] == 1
+    assert summaries["HK"]["manual_review_count"] == 2
+    assert summaries["HK"]["recent_protection_alert"] == "无"
+
+
 def dashboard_decision_plan(run_date: str) -> dict[str, object]:
     facts = {
         "ma20_distance_pct": {

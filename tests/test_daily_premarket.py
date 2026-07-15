@@ -70,6 +70,10 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "TREND_ANIMALS_API_KEY=trend-secret",
                 "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID=622466",
                 "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID=697199",
+                "TREND_ANIMALS_WARM_TO_HOT_US_TM_IDS=622460, 700001",
+                "TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS=622494",
+                "OPEN_TRADER_TREND_US_SYMBOLS=AAPL, VIXY",
+                "OPEN_TRADER_TREND_HK_SYMBOLS=00700, 02800",
                 "DEEPSEEK_API_KEY=secret",
             ]
         ),
@@ -100,6 +104,10 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.trend_animals_api_key == "trend-secret"
     assert config.trend_animals_a_share_tm_id == 622466
     assert config.trend_animals_etf_tm_id == 697199
+    assert config.trend_animals_us_tm_ids == (622460, 700001)
+    assert config.trend_animals_hk_tm_ids == (622494,)
+    assert config.trend_us_symbols == ("AAPL", "VIXY")
+    assert config.trend_hk_symbols == ("00700", "02800")
 
 
 def test_shared_env_loader_accepts_other_positive_a_share_pool_ids(
@@ -4271,6 +4279,53 @@ def test_launchd_installer_renders_single_market_job(
     )
 
 
+@pytest.mark.parametrize(
+    ("market", "report_hour", "watch_hour"),
+    [("HK", 18, 18), ("US", 9, 9)],
+)
+def test_launchd_installer_renders_separate_trend_market_jobs(
+    market: str,
+    report_hour: int,
+    watch_hour: int,
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (repo / "config/daily_premarket.env").write_text(
+        f"OPEN_TRADER_REPO={repo}\nOPEN_TRADER_PYTHON=.venv/bin/python\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--dry-run", "--trend-only", "--market", market,
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    plists = _launchd_plists(result.stdout)
+    by_label = {item["Label"]: item for item in plists}
+    prefix = f"com.open-trader.trend-{market.lower()}"
+    assert set(by_label) == {f"{prefix}-report", f"{prefix}-watch"}
+    report = by_label[f"{prefix}-report"]
+    watch = by_label[f"{prefix}-watch"]
+    assert report["ProgramArguments"][3:7] == [
+        "trend-market-report", "--market", market, "--date",
+    ]
+    assert watch["ProgramArguments"][3:6] == [
+        "watch-trend-market", "--market", market,
+    ]
+    assert {item["Hour"] for item in report["StartCalendarInterval"]} == {report_hour}
+    assert {item["Minute"] for item in report["StartCalendarInterval"]} == {0}
+    assert {item["Hour"] for item in watch["StartCalendarInterval"]} == {watch_hour}
+    assert {item["Minute"] for item in watch["StartCalendarInterval"]} == {1}
+
+
 def test_launchd_installer_rejects_unsupported_market_argument(
     tmp_path: Path,
 ) -> None:
@@ -4832,6 +4887,8 @@ def _copy_launchd_installer_assets(tmp_path: Path) -> Path:
     for name in [
         "com.open-trader.trend-a-share-report.plist.template",
         "com.open-trader.trend-a-share-watch.plist.template",
+        "com.open-trader.trend-market-report.plist.template",
+        "com.open-trader.trend-market-watch.plist.template",
     ]:
         source = source_root / "ops/launchd" / name
         shutil.copy2(source, repo / "ops/launchd" / name)

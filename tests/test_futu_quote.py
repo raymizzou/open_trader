@@ -31,8 +31,9 @@ class FakeOpenQuoteContext:
             0,
             FakeDataFrame(
                 [
-                    {"code": "US.VIXY", "last_price": 94.5},
-                    {"code": "US.QQQ", "last_price": "510.25"},
+                    {"code": "US.VIXY", "last_price": 94.5, "lot_size": 1},
+                    {"code": "US.QQQ", "last_price": "510.25", "lot_size": 1},
+                    {"code": "HK.00700", "last_price": "510", "lot_size": 100},
                 ]
             ),
         )
@@ -241,6 +242,37 @@ def test_futu_quote_client_returns_cn_trading_days() -> None:
         "market": TradeDateMarket.CN,
         "start": "2026-07-14",
         "end": "2026-07-20",
+    }
+
+
+@pytest.mark.parametrize("market", ["HK", "US"])
+def test_futu_quote_client_returns_market_trading_days(market: str) -> None:
+    from futu import TradeDateMarket
+
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    assert client.get_trading_days(
+        market=market, start="2026-07-14", end="2026-07-20"
+    ) == ["2026-07-14"]
+    assert client.context.requested_trading_days["market"] == getattr(
+        TradeDateMarket, market
+    )
+
+
+def test_futu_quote_client_returns_lot_sizes() -> None:
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    assert client.get_lot_sizes(["HK.00700", "US.QQQ"]) == {
+        "HK.00700": 100,
+        "US.QQQ": 1,
     }
 
 

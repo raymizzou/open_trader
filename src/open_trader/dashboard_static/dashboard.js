@@ -46,9 +46,9 @@ const elements = {};
 const ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT = 11;
 
 const ACCOUNT_STRATEGY_PROFILES = {
-  futu: {horizon: "中短线", strategy: "股票与期权"},
+  futu: {horizon: "短线", strategy: "美股趋势交易"},
   tiger: {horizon: "长线", strategy: "SMA200 组合策略"},
-  phillips: {horizon: "中线", strategy: "中线策略"},
+  phillips: {horizon: "短线", strategy: "港股趋势交易"},
   eastmoney: {horizon: "偏短线", strategy: "趋势交易"},
 };
 
@@ -1836,6 +1836,34 @@ function renderDashboardViews() {
 }
 
 function renderAccountStrategy(group) {
+  if (group.broker === "futu" || group.broker === "phillips") {
+    const market = group.broker === "futu" ? "US" : "HK";
+    const summary = state.dashboard?.trend_market_summaries?.[market] || {};
+    if (summary.available === false || !summary.data_date) {
+      return `<div class="account-strategy-summary"><strong>${escapeHtml(`${group.profile.horizon} · ${group.profile.strategy}`)}</strong><span>${escapeHtml(summary.error || "趋势报告尚未生成")}</span></div>`;
+    }
+    const statusLabels = {
+      sent: "已生成并发送",
+      generated: "已生成",
+      delivery_failed: "已生成 · 发送失败",
+      start: "运行中",
+      retry: "等待数据 · 重试中",
+      failed: "本轮失败",
+      existing: "已有报告",
+      holiday: "休市",
+    };
+    return `<div class="account-strategy-summary trend-market-summary">
+      <div class="trend-market-heading"><strong>${escapeHtml(`${group.profile.horizon} · ${group.profile.strategy}`)}</strong><span>${escapeHtml(statusLabels[summary.run_status] || formatPlain(summary.run_status))}</span></div>
+      <div class="trend-market-facts">
+        <span>数据日 ${escapeHtml(formatPlain(summary.data_date))}</span>
+        <span>账户源 ${escapeHtml(formatPlain(summary.account_source_date))}</span>
+        <span>买入 ${escapeHtml(formatPlain(summary.buy_count))}</span>
+        <span>卖出 ${escapeHtml(formatPlain(summary.sell_count))}</span>
+        <span>人工复核 ${escapeHtml(formatPlain(summary.manual_review_count))}</span>
+      </div>
+      <p><strong>最近保护提醒</strong><span>${escapeHtml(formatPlain(summary.recent_protection_alert))}</span></p>
+    </div>`;
+  }
   if (group.broker !== "tiger") {
     return `<div class="account-strategy-summary"><strong>${escapeHtml(`${group.profile.horizon} · ${group.profile.strategy}`)}</strong><span>策略指标待接入</span></div>`;
   }

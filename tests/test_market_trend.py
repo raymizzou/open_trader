@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import csv
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from open_trader.a_share_trend import AShareTrendRunResult
+from open_trader.daily_premarket import DailyPremarketConfig
+from open_trader.market_trend import (
+    MarketHoliday,
+    _refresh_futu_account,
+    load_market_account,
+    market_paths,
+    resolve_market_dates,
+    run_market_trend_report,
+    updates_ready,
+)
+from open_trader.notifications import NullNotifier
+from open_trader.kline_technical_facts import DailyKlineBar
+from open_trader.a_share_trend import HOLDING_FIELDS
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def config(tmp_path: Path) -> DailyPremarketConfig:
+    return DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        trend_animals_api_key="secret",
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+        trend_us_symbols=("VIXY",),
+        trend_hk_symbols=("00700",),
+    )
+
+
+def write_details(
+    root: Path,
+    run: str,
+    *,
+    positions: list[dict[str, str]],
+    cash: list[dict[str, str]],
+) -> None:
+    run_dir = root / "runs" / run
+    run_dir.mkdir(parents=True)
+    for name, rows in (("extracted_positions.csv", positions), ("extracted_cash.csv", cash)):
+        path = run_dir / name
+        fieldnames = list(rows[0])
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def test_load_market_account_uses_full_native_account_but_only_managed_positions(
+    tmp_path: Path,
+) -> None:
+    write_details(
+        tmp_path / "data",
+        "2026-07-15",
+        positions=[
+            {
+                "statement_id": "2026-07-15-futu-live", "broker": "futu",
+                "market": "US", "asset_class": "etf", "symbol": "VIXY",
+                "name": "VIX Short", "currency": "USD", "quantity": "10",
+                "cost_price": "40", "market_value": "500",
+            },
+            {
+                "statement_id": "2026-07-15-futu-live", "broker": "futu",
+                "market": "US", "asset_class": "stock", "symbol": "AAPL",
+                "name": "Apple", "currency": "USD", "quantity": "2",
+                "cost_price": "200", "market_value": "420",
+            },
+        ],
+        cash=[{
+            "statement_id": "2026-07-15-futu-live", "broker": "futu",
+            "currency": "USD", "cash_balance": "1000", "available_balance": "800",
+        }],
+    )
+
+    account = load_market_account(
+        data_dir=tmp_path / "data",
+        broker="futu",
+        market="US",
+        expected_date="2026-07-15",
+        managed_symbols={"VIXY"},
+    )
+
+    assert account.source_date == "2026-07-15"
+    assert account.fresh is True
+    assert account.net_value == Decimal("1920")
+    assert account.available_cash == Decimal("800")
+    assert [item.symbol for item in account.positions] == ["VIXY"]
+
+
+def test_us_account_refreshes_directly_from_futu_before_reporting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    calls: list[object] = []
+
+    class Client:
+        def __init__(self, *, host: str, port: int) -> None:
+            calls.append(("connect", host, port))
+
+        def fetch_snapshot(self) -> object:
+            calls.append("fetch")
+            return "snapshot"
+
+        def close(self) -> None:
+            calls.append("close")
+
+    def sync(**kwargs: object) -> None:
+        calls.append(("sync", kwargs))
+
+    monkeypatch.setattr("open_trader.market_trend.FutuAccountClient", Client)
+    monkeypatch.setattr("open_trader.market_trend.sync_futu_portfolio", sync)
+
+    _refresh_futu_account(cfg, "2026-07-15")
+
+    assert calls[:3] == [("connect", "127.0.0.1", 11111), "fetch", "close"]
+    assert calls[3][0] == "sync"
+    assert calls[3][1]["snapshot"] == "snapshot"
+    assert calls[3][1]["update_latest"] is True
+
+
+def test_load_phillips_statement_can_be_stale_and_caps_cash_to_known_balance(
+    tmp_path: Path,
+) -> None:
+    write_details(
+        tmp_path / "data",
+        "2026-06",
+        positions=[{
+            "statement_id": "2026-06-phillips", "broker": "phillips",
+            "market": "HK", "asset_class": "stock", "symbol": "700",
+            "name": "腾讯", "currency": "HKD", "quantity": "100",
+            "cost_price": "400", "market_value": "50000",
+        }],
+        cash=[{
+            "statement_id": "2026-06-phillips", "broker": "phillips",
+            "currency": "HKD", "cash_balance": "20000", "available_balance": "15000",
+        }],
+    )
+
+    account = load_market_account(
+        data_dir=tmp_path / "data",
+        broker="phillips",
+        market="HK",
+        expected_date="2026-07-15",
+        managed_symbols={"00700"},
+    )
+
+    assert account.source_date == "2026-06"
+    assert account.fresh is False
+    assert account.available_cash == Decimal("15000")
+    assert account.positions[0].symbol == "00700"
+
+
+def test_market_paths_are_completely_separate() -> None:
+    assert market_paths(Path("data"), Path("reports"), "US").root.name == "trend_us_futu"
+    assert market_paths(Path("data"), Path("reports"), "HK").root.name == "trend_hk_phillips"
+
+
+def test_resolve_market_dates_uses_same_day_hk_and_prior_day_us() -> None:
+    class Quote:
+        def get_trading_days(self, *, market: str, start: str, end: str) -> list[str]:
+            return ["2026-07-13", "2026-07-14", "2026-07-15", "2026-07-16"]
+
+    assert resolve_market_dates(Quote(), market="HK", run_date="2026-07-15") == (
+        "2026-07-15", "2026-07-16"
+    )
+    assert resolve_market_dates(Quote(), market="US", run_date="2026-07-15") == (
+        "2026-07-14", "2026-07-15"
+    )
+
+
+def test_resolve_market_dates_marks_missing_target_session_as_holiday() -> None:
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-10", "2026-07-13", "2026-07-16"]
+
+    with pytest.raises(MarketHoliday):
+        resolve_market_dates(Quote(), market="HK", run_date="2026-07-15")
+    with pytest.raises(MarketHoliday):
+        resolve_market_dates(Quote(), market="US", run_date="2026-07-15")
+
+
+def test_updates_ready_requires_the_market_base_asset_date() -> None:
+    rows = [
+        {"asset": "港股", "asOfDate": "2026-07-15"},
+        {"asset": "美股", "asOfDate": "2026-07-14"},
+    ]
+    assert updates_ready(rows, market="HK", as_of_date="2026-07-15") is True
+    assert updates_ready(rows, market="US", as_of_date="2026-07-14") is True
+    assert updates_ready(rows, market="US", as_of_date="2026-07-15") is False
+
+
+def test_market_report_retries_every_ten_minutes_and_stops_after_success(
+    tmp_path: Path,
+) -> None:
+    attempts = iter([
+        AShareTrendRunResult("waiting", None, None),
+        AShareTrendRunResult("generated", Path("report.md"), Path("report.json")),
+    ])
+    times = iter([
+        datetime(2026, 7, 15, 9, 0, tzinfo=SHANGHAI),
+        datetime(2026, 7, 15, 9, 10, tzinfo=SHANGHAI),
+    ])
+    sleeps: list[float] = []
+
+    result = run_market_trend_report(
+        config=config(tmp_path),
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        attempt_fn=lambda **kwargs: next(attempts),
+        now_fn=lambda: next(times),
+        sleep_fn=sleeps.append,
+    )
+
+    assert result.status == "generated"
+    assert sleeps == [600.0]
+
+
+def test_market_report_stops_at_one_hour_deadline(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 15, 10, 0, tzinfo=SHANGHAI)
+    result = run_market_trend_report(
+        config=config(tmp_path),
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        attempt_fn=lambda **kwargs: AShareTrendRunResult("waiting", None, None),
+        now_fn=lambda: now,
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert result.status == "failed"
+
+
+def test_hk_report_uses_real_api_fields_and_auto_manages_advised_buys(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    write_details(
+        cfg.data_dir,
+        "2026-06",
+        positions=[{
+            "statement_id": "2026-06-phillips", "broker": "phillips",
+            "market": "HK", "asset_class": "stock", "symbol": "700",
+            "name": "腾讯", "currency": "HKD", "quantity": "100",
+            "cost_price": "400", "market_value": "50000",
+        }],
+        cash=[{
+            "statement_id": "2026-06-phillips", "broker": "phillips",
+            "currency": "HKD", "cash_balance": "50000", "available_balance": "50000",
+        }],
+    )
+
+    def snapshot(tm_id: int, symbol: str, name: str) -> dict[str, object]:
+        return {
+            "tmId": tm_id, "tickerName": name, "tickerSymbol": symbol,
+            "asset": "港股", "asOfDate": "2026-07-15", "tradableFlag": True,
+            "industryName": "科技", "amount1d": "2", "isTrendRightSide": True,
+            "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
+            "stopwinFlagByDangerSignal": False,
+            "stopwinFlagByBoilingTemperature": False,
+            "stopwinFlagByPopChampagne": False,
+        }
+
+    class Api:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [{"asset": "港股", "asOfDate": "2026-07-15"}]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
+            assert tm_id == 622494
+            return [{"tmId": 1, "tickerSymbol": "02800.HK", "asOfDate": expected_date}]
+
+        def search_exact_symbol(self, symbol: str) -> int:
+            assert symbol == "00700"
+            return 2
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [{"field": field, "priceCost": "0"} for field in HOLDING_FIELDS]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            assert kwargs["tm_ids"] == [1, 2]
+            return [
+                snapshot(1, "02800.HK", "盈富基金"),
+                snapshot(2, "00700.HK", "腾讯"),
+            ]
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            self.closed = False
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-15", "2026-07-16"]
+
+        def get_daily_kline(self, *args: object, **kwargs: object) -> list[DailyKlineBar]:
+            return [
+                DailyKlineBar(
+                    date=f"2026-06-{index + 1:02d}", open=10, high=11,
+                    low=9, close=10, volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {symbol: 100 for symbol in symbols}
+
+        def close(self) -> None:
+            self.closed = True
+
+    result = run_market_trend_report(
+        config=cfg,
+        market="HK",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+    )
+
+    assert result.status == "generated"
+    payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
+    actions = payload["strategy_judgments"]["formal_actions"]
+    assert [(item["action"], item["symbol"]) for item in actions] == [("BUY", "02800")]
+    assert payload["account"]["fresh"] is False
+    assert payload["metadata"]["account_check_required"] is True
+    assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]

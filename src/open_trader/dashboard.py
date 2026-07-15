@@ -113,6 +113,7 @@ class DashboardState:
     kelly_lab: dict[str, Any]
     backtest_universe: dict[str, list[dict[str, str]]]
     tiger_long_term_strategy: dict[str, Any]
+    trend_market_summaries: dict[str, dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +136,7 @@ class DashboardState:
             "kelly_lab": self.kelly_lab,
             "backtest_universe": self.backtest_universe,
             "tiger_long_term_strategy": self.tiger_long_term_strategy,
+            "trend_market_summaries": self.trend_market_summaries,
         }
 
 
@@ -254,6 +256,9 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         tiger_long_term_strategy=_load_dashboard_tiger_long_term_strategy(
             config.data_dir
         ),
+        trend_market_summaries=_load_trend_market_summaries(
+            config.data_dir, config.reports_dir
+        ),
     )
 
 
@@ -271,6 +276,120 @@ def _load_dashboard_tiger_long_term_strategy(data_dir: Path) -> dict[str, Any]:
             "available": False,
             "error": f"Tiger 长线策略产物无效：{exc}",
         }
+
+
+def _load_trend_market_summaries(
+    data_dir: Path, reports_dir: Path
+) -> dict[str, dict[str, Any]]:
+    return {
+        market: _load_trend_market_summary(
+            data_dir=data_dir,
+            reports_dir=reports_dir,
+            market=market,
+            directory=directory,
+        )
+        for market, directory in (
+            ("US", "trend_us_futu"),
+            ("HK", "trend_hk_phillips"),
+        )
+    }
+
+
+def _load_trend_market_summary(
+    *, data_dir: Path, reports_dir: Path, market: str, directory: str
+) -> dict[str, Any]:
+    candidates = list((reports_dir / directory).glob("*.json"))
+    if not candidates:
+        return {
+            "available": False,
+            "market": market,
+            "error": "趋势报告尚未生成",
+        }
+    path = max(candidates, key=lambda item: (item.stat().st_mtime_ns, item.name))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        judgments = payload["strategy_judgments"]
+        formal_actions = judgments["formal_actions"]
+        holding_decisions = judgments["holding_decisions"]
+        if not isinstance(formal_actions, list) or not isinstance(holding_decisions, list):
+            raise ValueError("invalid strategy judgments")
+        account = payload.get("account") or {}
+        metadata = payload.get("metadata") or {}
+        return {
+            "available": True,
+            "market": market,
+            "data_date": str(payload.get("as_of_date") or ""),
+            "account_source_date": str(account.get("source_date") or ""),
+            "run_status": _latest_trend_run_status(
+                data_dir / directory / "run.log",
+                str(
+                    payload.get("delivery_status")
+                    or metadata.get("delivery_status")
+                    or "generated"
+                ),
+            ),
+            "buy_count": sum(
+                item.get("action") == "BUY"
+                for item in formal_actions
+                if isinstance(item, dict)
+            ),
+            "sell_count": sum(
+                item.get("action") == "SELL_ALL"
+                for item in holding_decisions
+                if isinstance(item, dict)
+            ),
+            "manual_review_count": sum(
+                item.get("action") == "MANUAL_REVIEW"
+                for item in holding_decisions
+                if isinstance(item, dict)
+            ),
+            "recent_protection_alert": _recent_trend_protection_alert(
+                data_dir / directory / "watch_events.jsonl"
+            ),
+        }
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        return {
+            "available": False,
+            "market": market,
+            "error": f"趋势报告无效：{exc}",
+        }
+
+
+def _recent_trend_protection_alert(path: Path) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError, UnicodeError):
+        return "无"
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("event_type") != "protection_triggered":
+            continue
+        symbol = str(event.get("symbol") or "-")
+        occurred_at = str(event.get("occurred_at") or "-")
+        line_value = str(event.get("active_line") or "-")
+        return f"{symbol} · {occurred_at} · 保护线 {line_value}"
+    return "无"
+
+
+def _latest_trend_run_status(path: Path, fallback: str) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError, UnicodeError):
+        return fallback
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        status = str(event.get("event") or "")
+        if status in {"start", "retry", "failed", "generated", "existing", "holiday"}:
+            return status
+    return fallback
 
 
 def _build_backtest_universe(

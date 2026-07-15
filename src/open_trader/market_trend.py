@@ -1,0 +1,618 @@
+from __future__ import annotations
+
+import csv
+import json
+import re
+from collections import defaultdict
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from time import sleep
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from .a_share_trend import (
+    AShareTrendRunResult,
+    AccountPosition,
+    AccountSnapshot,
+    HOLDING_FIELDS,
+    _balance,
+    _billing_field,
+    _billing_price,
+    _holding_snapshot,
+    _is_systemic_futu_error,
+    _process_version,
+    _redact_api_key,
+    _row_tm_id,
+    build_report,
+    evaluate_candidate,
+    load_protection_state,
+    load_watch_events,
+    render_markdown,
+    write_frozen_report,
+    write_protection_state,
+)
+from .daily_premarket import (
+    DailyPremarketConfig,
+    RunLock,
+    send_notification_with_results,
+)
+from .notifications import Notifier, NullNotifier
+from .futu_account import FutuAccountClient, sync_futu_portfolio
+from .futu_quote import FutuQuoteClient, FutuQuoteError
+from .futu_symbols import to_futu_symbol
+from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+MARKET_SETTINGS = {
+    "US": {"broker": "futu", "currency": "USD", "asset": "美股", "deadline": time(10)},
+    "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
+}
+SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
+
+
+class MarketHoliday(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class MarketTrendPaths:
+    root: Path
+    reports: Path
+    state: Path
+    events: Path
+    log: Path
+    report_lock: Path
+    watch_lock: Path
+
+
+def _market(value: str) -> str:
+    market = value.strip().upper()
+    if market not in MARKET_SETTINGS:
+        raise ValueError("market must be US or HK")
+    return market
+
+
+def market_paths(data_dir: Path, reports_dir: Path, market: str) -> MarketTrendPaths:
+    market = _market(market)
+    suffix = "us_futu" if market == "US" else "hk_phillips"
+    root = data_dir / f"trend_{suffix}"
+    return MarketTrendPaths(
+        root=root,
+        reports=reports_dir / f"trend_{suffix}",
+        state=root / "protection_state.json",
+        events=root / "watch_events.jsonl",
+        log=root / "run.log",
+        report_lock=data_dir / "runs" / f".trend_{suffix}_report.lock",
+        watch_lock=data_dir / "runs" / f".trend_{suffix}_watch.lock",
+    )
+
+
+def _read_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _latest_broker_rows(
+    data_dir: Path, broker: str
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    runs = data_dir / "runs"
+    if not runs.exists():
+        return [], []
+    for run_dir in sorted((item for item in runs.iterdir() if item.is_dir()), reverse=True):
+        positions = [
+            row for row in _read_rows(run_dir / "extracted_positions.csv")
+            if row.get("broker", "").strip().lower() == broker
+        ]
+        cash = [
+            row for row in _read_rows(run_dir / "extracted_cash.csv")
+            if row.get("broker", "").strip().lower() == broker
+        ]
+        if positions or cash:
+            return positions, cash
+    return [], []
+
+
+def _decimal(value: object, *, default: Decimal | None = None) -> Decimal:
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, AttributeError):
+        if default is not None:
+            return default
+        raise ValueError(f"invalid decimal value: {value!r}") from None
+    if not parsed.is_finite():
+        if default is not None:
+            return default
+        raise ValueError(f"invalid decimal value: {value!r}")
+    return parsed
+
+
+def _optional_decimal(value: object) -> Decimal | None:
+    if value is None or not str(value).strip():
+        return None
+    return _decimal(value)
+
+
+def _source_date(rows: Sequence[Mapping[str, str]]) -> str:
+    dates = []
+    for row in rows:
+        match = SOURCE_DATE.match(row.get("statement_id", "").strip())
+        if match:
+            dates.append(match.group(1))
+    return max(dates) if dates else "unknown"
+
+
+def _normalized_symbol(market: str, value: str) -> str:
+    normalized = value.strip().upper()
+    suffix = f".{market}"
+    if normalized.endswith(suffix):
+        normalized = normalized[: -len(suffix)]
+    return to_futu_symbol(market, normalized).split(".", 1)[1]
+
+
+def load_market_account(
+    *,
+    data_dir: Path,
+    broker: str,
+    market: str,
+    expected_date: str,
+    managed_symbols: set[str],
+) -> AccountSnapshot:
+    market = _market(market)
+    settings = MARKET_SETTINGS[market]
+    if broker != settings["broker"]:
+        raise ValueError(f"{market} trend account must use {settings['broker']}")
+    currency = str(settings["currency"])
+    position_rows, cash_rows = _latest_broker_rows(data_dir, broker)
+    if not position_rows and not cash_rows:
+        raise FileNotFoundError(f"no {broker} account details found")
+    source_date = _source_date([*position_rows, *cash_rows])
+    normalized_managed = {
+        _normalized_symbol(market, symbol) for symbol in managed_symbols
+    }
+    market_rows = [
+        row for row in position_rows
+        if row.get("market", "").strip().upper() == market
+        and row.get("currency", "").strip().upper() == currency
+    ]
+    native_cash_rows = [
+        row for row in cash_rows
+        if row.get("currency", "").strip().upper() == currency
+    ]
+    exceptions: list[str] = []
+    positions: list[AccountPosition] = []
+    for row in market_rows:
+        symbol = _normalized_symbol(market, row.get("symbol", ""))
+        if symbol not in normalized_managed or _decimal(row.get("quantity", "0"), default=Decimal("0")) <= 0:
+            continue
+        asset_class = row.get("asset_class", "").strip().lower()
+        if asset_class not in {"stock", "etf"}:
+            exceptions.append(f"unsupported managed asset: {symbol} ({asset_class or 'unknown'})")
+            continue
+        positions.append(
+            AccountPosition(
+                symbol=symbol,
+                name=row.get("name", "").strip() or symbol,
+                asset_class=asset_class,
+                quantity=_decimal(row.get("quantity")),
+                avg_cost_price=_optional_decimal(row.get("cost_price")),
+                market_value=_decimal(row.get("market_value")),
+            )
+        )
+    position_value = sum(
+        (_decimal(row.get("market_value"), default=Decimal("0")) for row in market_rows),
+        Decimal("0"),
+    )
+    cash_balance = sum(
+        (_decimal(row.get("cash_balance"), default=Decimal("0")) for row in native_cash_rows),
+        Decimal("0"),
+    )
+    available_cash = sum(
+        (
+            min(
+                _decimal(row.get("cash_balance"), default=Decimal("0")),
+                _decimal(
+                    row.get("available_balance"),
+                    default=_decimal(row.get("cash_balance"), default=Decimal("0")),
+                ),
+            )
+            for row in native_cash_rows
+        ),
+        Decimal("0"),
+    )
+    return AccountSnapshot(
+        source_date=source_date,
+        fresh=source_date == expected_date,
+        net_value=position_value + cash_balance,
+        available_cash=max(Decimal("0"), available_cash),
+        positions=tuple(sorted(positions, key=lambda item: item.symbol)),
+        exceptions=tuple(exceptions),
+    )
+
+
+def resolve_market_dates(quote: object, *, market: str, run_date: str) -> tuple[str, str]:
+    market = _market(market)
+    run_day = date.fromisoformat(run_date)
+    calendar = quote.get_trading_days(
+        market=market,
+        start=(run_day - timedelta(days=10)).isoformat(),
+        end=(run_day + timedelta(days=14)).isoformat(),
+    )
+    as_of_date = run_date if market == "HK" else (run_day - timedelta(days=1)).isoformat()
+    if as_of_date not in calendar:
+        raise MarketHoliday(f"{market} signal date {as_of_date} is not a trading day")
+    later = sorted(day for day in calendar if day > as_of_date)
+    if not later:
+        raise ValueError(f"Futu {market} calendar has no execution trading day")
+    return as_of_date, later[0]
+
+
+def _status_date(row: Mapping[str, object]) -> str:
+    for key in ("asOfDate", "updateDate", "latestDate", "date"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def updates_ready(
+    rows: Sequence[Mapping[str, object]], *, market: str, as_of_date: str
+) -> bool:
+    asset = str(MARKET_SETTINGS[_market(market)]["asset"])
+    return any(row.get("asset") == asset and _status_date(row) == as_of_date for row in rows)
+
+
+def _write_log(path: Path, event: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(dict(event), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _managed_symbols(
+    state: Mapping[str, object], configured: Sequence[str], market: str
+) -> set[str]:
+    values = list(configured)
+    stored = state.get("managed_symbols")
+    if isinstance(stored, list):
+        values.extend(str(item) for item in stored)
+    positions = state.get("positions")
+    if isinstance(positions, Mapping):
+        values.extend(str(item) for item in positions)
+    return {_normalized_symbol(market, value) for value in values if value.strip()}
+
+
+def _refresh_futu_account(config: DailyPremarketConfig, run_date: str) -> None:
+    client = FutuAccountClient(host=config.futu_host, port=config.futu_port)
+    try:
+        snapshot = client.fetch_snapshot()
+    finally:
+        client.close()
+    sync_futu_portfolio(
+        snapshot=snapshot,
+        portfolio_path=config.portfolio,
+        data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
+        run_date=run_date,
+        update_latest=True,
+    )
+
+
+def _attempt_market_report(
+    *,
+    config: DailyPremarketConfig,
+    market: str,
+    run_date: str,
+    revision: bool,
+    notifier: Notifier,
+    api_factory: Callable[..., object] = TrendAnimalsClient,
+    quote_factory: Callable[..., object] = FutuQuoteClient,
+    account_refresher: Callable[[DailyPremarketConfig, str], None] = _refresh_futu_account,
+) -> AShareTrendRunResult:
+    market = _market(market)
+    settings = MARKET_SETTINGS[market]
+    paths = market_paths(config.data_dir, config.reports_dir, market)
+    quote = quote_factory(host=config.futu_host, port=config.futu_port)
+    try:
+        try:
+            as_of_date, execution_date = resolve_market_dates(
+                quote, market=market, run_date=run_date
+            )
+        except MarketHoliday:
+            return AShareTrendRunResult("holiday", None, None)
+        base_markdown = paths.reports / f"{as_of_date}.md"
+        base_json = paths.reports / f"{as_of_date}.json"
+        if not revision and base_markdown.exists() and base_json.exists():
+            base_markdown.read_text(encoding="utf-8")
+            json.loads(base_json.read_text(encoding="utf-8"))
+            return AShareTrendRunResult("existing", base_markdown, base_json)
+
+        api = api_factory(
+            api_key=config.trend_animals_api_key,
+            cache_dir=config.data_dir / "trend_animals/cache",
+        )
+        update_rows = api.get_update_status()
+        if not updates_ready(update_rows, market=market, as_of_date=as_of_date):
+            return AShareTrendRunResult("waiting", None, None)
+
+        if market == "US":
+            account_refresher(config, run_date)
+        prior_state = load_protection_state(paths.state)
+        configured = (
+            config.trend_us_symbols if market == "US" else config.trend_hk_symbols
+        )
+        managed = _managed_symbols(prior_state, configured, market)
+        account = load_market_account(
+            data_dir=config.data_dir,
+            broker=str(settings["broker"]),
+            market=market,
+            expected_date=run_date if market == "US" else as_of_date,
+            managed_symbols=managed,
+        )
+
+        balance_before = _balance(api.get_account_balance())
+        pool_ids = (
+            config.trend_animals_us_tm_ids
+            if market == "US"
+            else config.trend_animals_hk_tm_ids
+        )
+        component_rows: list[Mapping[str, object]] = []
+        component_pools: defaultdict[int, set[str]] = defaultdict(set)
+        for pool_id in pool_ids:
+            rows = api.get_components(tm_id=pool_id, expected_date=as_of_date)
+            component_rows.extend(rows)
+            for row in rows:
+                component_pools[_row_tm_id(row)].add(str(pool_id))
+        component_ids = {_row_tm_id(row) for row in component_rows}
+
+        holding_ids: dict[str, int] = {}
+        for position in account.positions:
+            try:
+                holding_ids[position.symbol] = api.search_exact_symbol(position.symbol)
+            except TrendAnimalsLookupError:
+                continue
+        requested_ids = sorted(component_ids | set(holding_ids.values()))
+        billing = {
+            _billing_field(row): row for row in api.get_snapshot_billing()
+        }
+        missing = [field for field in HOLDING_FIELDS if field not in billing]
+        if missing:
+            raise ValueError(
+                "getSnapshotColumnBilling missing requested field(s): "
+                + ", ".join(missing)
+            )
+        snapshot_rows = (
+            api.get_snapshots(
+                tm_ids=requested_ids,
+                fields=HOLDING_FIELDS,
+                expected_date=as_of_date,
+            )
+            if requested_ids
+            else []
+        )
+        returned_ids = [_row_tm_id(row) for row in snapshot_rows]
+        if sorted(returned_ids) != requested_ids or len(returned_ids) != len(set(returned_ids)):
+            raise ValueError("getTickerSnapshot returned mismatched tmIds")
+        if any(row.get("asOfDate") != as_of_date for row in snapshot_rows):
+            raise ValueError("getTickerSnapshot returned a stale data date")
+        balance_after = _balance(api.get_account_balance())
+
+        rows_by_id = {_row_tm_id(row): row for row in snapshot_rows}
+        start = (date.fromisoformat(as_of_date) - timedelta(days=60)).isoformat()
+        candidates = []
+        bars_by_symbol: dict[str, object] = {}
+        for tm_id in sorted(component_ids):
+            row = rows_by_id.get(tm_id)
+            if row is None:
+                continue
+            try:
+                symbol = _normalized_symbol(market, str(row.get("tickerSymbol", "")))
+                bars = quote.get_daily_kline(
+                    to_futu_symbol(market, symbol), start=start, end=as_of_date
+                )
+            except FutuQuoteError as exc:
+                if _is_systemic_futu_error(exc):
+                    raise
+                bars = None
+            except ValueError:
+                bars = None
+            candidates.append(
+                evaluate_candidate(
+                    row, bars, pools=component_pools[tm_id], market=market
+                )
+            )
+        holding_snapshots = {position.symbol: None for position in account.positions}
+        for symbol, tm_id in holding_ids.items():
+            row = rows_by_id.get(tm_id)
+            if row is not None:
+                try:
+                    holding_snapshots[symbol] = _holding_snapshot(row, market=market)
+                except ValueError:
+                    pass
+            try:
+                bars_by_symbol[symbol] = quote.get_daily_kline(
+                    to_futu_symbol(market, symbol), start=start, end=as_of_date
+                )
+            except FutuQuoteError as exc:
+                if _is_systemic_futu_error(exc):
+                    raise
+                bars_by_symbol[symbol] = None
+
+        lot_sizes: dict[str, int] = {}
+        if market == "HK":
+            symbols = [to_futu_symbol("HK", item.symbol) for item in candidates]
+            wire_lots = quote.get_lot_sizes(symbols) if symbols else {}
+            lot_sizes = {
+                wire.split(".", 1)[1]: size for wire, size in wire_lots.items()
+            }
+        estimated_cost = sum(
+            (_billing_price(billing[field]) for field in HOLDING_FIELDS), Decimal("0")
+        ) * len(requested_ids)
+        actual_cost = balance_before - balance_after
+        report = build_report(
+            as_of_date=as_of_date,
+            execution_date=execution_date,
+            account=account,
+            candidates=candidates,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol=bars_by_symbol,
+            prior_state=prior_state,
+            watch_events=load_watch_events(paths.events),
+            api_facts=(
+                f"getUpdateStatus rows={len(update_rows)}",
+                f"getComponentTicker rows={len(component_rows)} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(HOLDING_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
+            ),
+            data_sources=(
+                "Trend Animals",
+                f"Futu {market} calendar/QFQ daily K-line",
+                "Futu live account" if market == "US" else "Phillips daily statement",
+            ),
+            estimated_api_cost=estimated_cost,
+            actual_api_cost=actual_cost if actual_cost >= 0 else None,
+            market=market,
+            lot_sizes=lot_sizes,
+            require_fresh_account=market == "US",
+            metadata={
+                "market": market,
+                "broker": settings["broker"],
+                "account_check_required": market == "HK",
+                "run_date": run_date,
+                "process_version": _process_version(config.repo),
+            },
+        )
+        managed.update(item.symbol for item in account.positions)
+        managed.update(item.symbol for item in report.buy_actions)
+        protection_state = {
+            **report.protection_state,
+            "managed_symbols": sorted(managed),
+        }
+        report = replace(report, protection_state=protection_state)
+        markdown = render_markdown(report)
+        delivery = send_notification_with_results(
+            notifier,
+            f"{market} 趋势操作计划 · {as_of_date}",
+            markdown,
+            channels={"feishu", "feishu_app"},
+        )
+        delivery_status = (
+            "sent" if any(item.success for item in delivery) else "delivery_failed"
+        )
+        report = replace(
+            report,
+            metadata={**report.metadata, "delivery_status": delivery_status},
+        )
+        write_protection_state(paths.state, report.protection_state)
+        markdown_path, json_path = write_frozen_report(
+            report, paths.reports, revision=revision
+        )
+        send_notification_with_results(
+            notifier,
+            f"{market} 趋势计划已生成",
+            f"数据日 {as_of_date}；报告 {markdown_path}",
+            channels={"macos"},
+        )
+        return AShareTrendRunResult("generated", markdown_path, json_path)
+    finally:
+        close = getattr(quote, "close", None)
+        if callable(close):
+            close()
+
+
+def run_market_trend_report(
+    *,
+    config: DailyPremarketConfig,
+    market: str,
+    run_date: str,
+    revision: bool = False,
+    notifier: Notifier | None = None,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(SHANGHAI),
+    sleep_fn: Callable[[float], None] = sleep,
+    attempt_fn: Callable[..., AShareTrendRunResult] = _attempt_market_report,
+    **attempt_dependencies: object,
+) -> AShareTrendRunResult:
+    market = _market(market)
+    date.fromisoformat(run_date)
+    notifier = notifier or NullNotifier()
+    paths = market_paths(config.data_dir, config.reports_dir, market)
+    configured_ids = (
+        config.trend_animals_us_tm_ids if market == "US" else config.trend_animals_hk_tm_ids
+    )
+    if not configured_ids:
+        raise ValueError(f"Trend Animals {market} tmId list is required")
+    with RunLock(paths.report_lock):
+        return _run_market_trend_retry(
+            config=config,
+            market=market,
+            run_date=run_date,
+            revision=revision,
+            notifier=notifier,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+            attempt_fn=attempt_fn,
+            paths=paths,
+            attempt_dependencies=attempt_dependencies,
+        )
+
+
+def _run_market_trend_retry(
+    *,
+    config: DailyPremarketConfig,
+    market: str,
+    run_date: str,
+    revision: bool,
+    notifier: Notifier,
+    now_fn: Callable[[], datetime],
+    sleep_fn: Callable[[float], None],
+    attempt_fn: Callable[..., AShareTrendRunResult],
+    paths: MarketTrendPaths,
+    attempt_dependencies: Mapping[str, object],
+) -> AShareTrendRunResult:
+    deadline = datetime.combine(
+        date.fromisoformat(run_date),
+        MARKET_SETTINGS[market]["deadline"],
+        tzinfo=SHANGHAI,
+    )
+    last_error = "Trend Animals update status is not ready"
+    _write_log(paths.log, {"event": "start", "market": market, "run_date": run_date})
+    while True:
+        try:
+            result = attempt_fn(
+                config=config,
+                market=market,
+                run_date=run_date,
+                revision=revision,
+                notifier=notifier,
+                **dict(attempt_dependencies),
+            )
+            if result.status in {"generated", "existing", "holiday"}:
+                _write_log(paths.log, {
+                    "event": result.status,
+                    "market": market,
+                    "run_date": run_date,
+                })
+                return result
+        except Exception as exc:
+            last_error = _redact_api_key(exc, config.trend_animals_api_key)
+        now = now_fn().astimezone(SHANGHAI)
+        _write_log(paths.log, {
+            "event": "retry", "market": market, "run_date": run_date,
+            "error": last_error, "at": now.isoformat(timespec="seconds"),
+        })
+        if now >= deadline:
+            _write_log(paths.log, {
+                "event": "failed", "market": market, "run_date": run_date,
+                "error": last_error, "at": now.isoformat(timespec="seconds"),
+            })
+            send_notification_with_results(
+                notifier,
+                f"{market} 趋势计划失败",
+                f"{last_error}；本轮一小时重试窗口已结束。",
+                channels={"feishu", "feishu_app", "macos"},
+            )
+            return AShareTrendRunResult("failed", None, None)
+        sleep_fn(min(600.0, max(1.0, (deadline - now).total_seconds())))

@@ -18,6 +18,8 @@ from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
 from .a_share_trend import run_a_share_trend_report
 from .a_share_trend_watch import watch_a_share_protection
+from .market_trend import market_paths, run_market_trend_report
+from .market_trend_watch import watch_market_protection
 from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
@@ -475,6 +477,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--reconnect-seconds", type=positive_float, default=60.0
     )
     trend_watch.add_argument("--once", action="store_true")
+
+    market_trend_report = subparsers.add_parser(
+        "trend-market-report", help="Generate a Futu US or Phillips HK trend plan"
+    )
+    market_trend_report.add_argument("--market", choices=("US", "HK"), required=True)
+    market_trend_report.add_argument("--date", default="today")
+    market_trend_report.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    market_trend_report.add_argument("--revision", action="store_true")
+
+    market_trend_watch = subparsers.add_parser(
+        "watch-trend-market", help="Watch Futu US or Phillips HK trend protection lines"
+    )
+    market_trend_watch.add_argument("--market", choices=("US", "HK"), required=True)
+    market_trend_watch.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    market_trend_watch.add_argument("--poll-seconds", type=positive_float, default=5.0)
+    market_trend_watch.add_argument(
+        "--reconnect-seconds", type=positive_float, default=60.0
+    )
+    market_trend_watch.add_argument("--once", action="store_true")
 
     test_notification_parser = subparsers.add_parser(
         "test-notification",
@@ -1267,6 +1292,94 @@ def main(argv: list[str] | None = None) -> int:
         print(f"advice_csv: {result.advice_path}")
         print(f"actions_csv: {result.actions_path}")
         print(f"report: {result.report_path}")
+        return 0
+
+    if args.command == "trend-market-report":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            pool_ids = (
+                config.trend_animals_us_tm_ids
+                if args.market == "US"
+                else config.trend_animals_hk_tm_ids
+            )
+            missing = []
+            if not config.trend_animals_api_key.strip():
+                missing.append("TREND_ANIMALS_API_KEY")
+            if not pool_ids:
+                missing.append(f"TREND_ANIMALS_WARM_TO_HOT_{args.market}_TM_IDS")
+            if missing:
+                raise ValueError(f"missing config value(s): {', '.join(missing)}")
+            run_date = (
+                datetime.now(ZoneInfo(config.timezone)).date().isoformat()
+                if args.date == "today"
+                else canonical_date(args.date)
+            )
+            notifier = build_notifier(config)
+        except (
+            FileNotFoundError,
+            ValueError,
+            argparse.ArgumentTypeError,
+            ZoneInfoNotFoundError,
+        ) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        try:
+            result = run_market_trend_report(
+                config=config,
+                market=args.market,
+                run_date=run_date,
+                revision=args.revision,
+                notifier=notifier,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps({
+            "status": result.status,
+            "report_path": str(result.report_path) if result.report_path else None,
+            "json_path": str(result.json_path) if result.json_path else None,
+        }, ensure_ascii=False))
+        return 0 if result.status in {"generated", "existing", "holiday"} else 1
+
+    if args.command == "watch-trend-market":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            notifier = build_notifier(config)
+            paths = market_paths(config.data_dir, config.reports_dir, args.market)
+        except (FileNotFoundError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
+        def market_quote_factory() -> FutuQuoteClient:
+            return FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+
+        try:
+            with RunLock(paths.watch_lock):
+                result = watch_market_protection(
+                    market=args.market,
+                    data_dir=config.data_dir,
+                    portfolio_path=config.portfolio,
+                    state_path=paths.state,
+                    events_path=paths.events,
+                    report_lock_path=paths.report_lock,
+                    quote_client=None,
+                    quote_client_factory=market_quote_factory,
+                    notifier=notifier,
+                    poll_seconds=args.poll_seconds,
+                    reconnect_seconds=args.reconnect_seconds,
+                    once=args.once,
+                )
+        except (FileNotFoundError, FutuQuoteError, RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps({
+            "status": result.status,
+            "watched_symbol_count": result.watched_symbol_count,
+            "trigger_count": result.trigger_count,
+            "exception_count": result.exception_count,
+            "unknown_quote_count": result.unknown_quote_count,
+            "events_path": str(result.events_path),
+        }, ensure_ascii=False))
         return 0
 
     if args.command == "trend-a-share-report":

@@ -1567,6 +1567,10 @@ state.dashboard = {{
     {{broker: "eastmoney", display_name: "东方财富", portfolio_value_hkd: "1000", holding_value_hkd: "600", cash_like_value_hkd: "400", holding_count: "1"}},
   ],
   source_statuses: [], cash_rows: [], tiger_long_term_strategy: {payload},
+  trend_market_summaries: {{
+    US: {{available: true, data_date: "2026-07-14", account_source_date: "2026-07-14", run_status: "sent", buy_count: 1, sell_count: 0, manual_review_count: 1, recent_protection_alert: "VIXY · 2026-07-15T22:00:00+08:00 · 保护线 90"}},
+    HK: {{available: true, data_date: "2026-07-15", account_source_date: "2026-06", run_status: "delivery_failed", buy_count: 2, sell_count: 1, manual_review_count: 0, recent_protection_alert: "无"}},
+  }},
   holdings: [
     {{market: "US", symbol: "QQQ", name: "Nasdaq 100", brokers: "tiger", broker_details: [{{broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "800"}}]}},
     {{market: "US", symbol: "AAPL", brokers: "futu", broker_details: [{{broker: "futu", account_alias: "futu_1", market: "US", symbol: "AAPL", quantity: "1", market_value_hkd: "700"}}]}},
@@ -1584,13 +1588,15 @@ console.log(renderBrokerSummaryCards() + elements["account-holdings"].innerHTML)
         assert f'aria-labelledby="account-{broker}-title"' in output
     assert output.count('<a class="broker-summary-card"') == 4
     for label in (
-        "中短线 · 股票与期权", "长线 · SMA200 组合策略",
-        "中线 · 中线策略", "偏短线 · 趋势交易",
+        "短线 · 美股趋势交易", "长线 · SMA200 组合策略",
+        "短线 · 港股趋势交易", "偏短线 · 趋势交易",
     ):
         assert label in output
     for metric in ("年化收益", "最大回撤", "夏普比率", "卡玛比率"):
         assert metric in output
     assert "策略指标待接入" in output
+    for text in ("数据日 2026-07-14", "账户源 2026-06", "买入 2", "卖出 1", "人工复核 1", "最近保护提醒"):
+        assert text in output
     assert "<th>账户权重</th>" in output
     assert "<th>组合权重</th>" in output
     assert "<th>策略</th>" not in output

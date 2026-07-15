@@ -105,6 +105,7 @@ class FutuQuoteClient:
         self.port = port
 
     def get_snapshots(self, futu_symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
+        requested = set(futu_symbols)
         ret_code, data = self.context.get_market_snapshot(list(futu_symbols))
         if ret_code != 0:
             message = str(data)
@@ -129,7 +130,7 @@ class FutuQuoteClient:
         for record in data.to_dict("records"):
             code = str(record.get("code", "")).strip()
             raw_price = record.get("last_price")
-            if not code or raw_price in {None, ""}:
+            if code not in requested or raw_price in {None, ""}:
                 continue
             try:
                 price = Decimal(str(raw_price))
@@ -140,14 +141,20 @@ class FutuQuoteClient:
         return snapshots
 
     def get_cn_trading_days(self, *, start: str, end: str) -> list[str]:
+        return self.get_trading_days(market="CN", start=start, end=end)
+
+    def get_trading_days(self, *, market: str, start: str, end: str) -> list[str]:
+        normalized_market = market.strip().upper()
+        if normalized_market not in {"CN", "HK", "US"}:
+            raise ValueError(f"unsupported Futu market: {market}")
         try:
             from futu import TradeDateMarket
 
-            market = TradeDateMarket.CN
+            wire_market = getattr(TradeDateMarket, normalized_market)
         except ImportError:
-            market = "CN"
+            wire_market = normalized_market
         ret_code, data = self.context.request_trading_days(
-            market=market, start=start, end=end
+            market=wire_market, start=start, end=end
         )
         if ret_code != 0:
             message = str(data)
@@ -186,6 +193,22 @@ class FutuQuoteClient:
                 snapshot_ok=False,
             ) from exc
         return trading_days
+
+    def get_lot_sizes(self, futu_symbols: Sequence[str]) -> dict[str, int]:
+        requested = set(futu_symbols)
+        ret_code, data = self.context.get_market_snapshot(list(futu_symbols))
+        if ret_code != 0:
+            raise FutuQuoteError(str(data))
+        lot_sizes: dict[str, int] = {}
+        for record in data.to_dict("records"):
+            code = str(record.get("code", "")).strip()
+            try:
+                lot_size = int(str(record.get("lot_size", "")).strip())
+            except (TypeError, ValueError):
+                continue
+            if code in requested and lot_size > 0:
+                lot_sizes[code] = lot_size
+        return lot_sizes
 
     def get_daily_kline(
         self,

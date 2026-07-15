@@ -4,9 +4,10 @@ set -euo pipefail
 DRY_RUN=0
 MARKET="all"
 MARKET_REQUESTED=0
+TREND_ONLY=0
 
 usage() {
-  echo "usage: $0 [--dry-run] [--market HK|US|CN|all]" >&2
+  echo "usage: $0 [--dry-run] [--trend-only] [--market HK|US|CN|all]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -24,6 +25,10 @@ while [[ $# -gt 0 ]]; do
       MARKET_REQUESTED=1
       shift 2
       ;;
+    --trend-only)
+      TREND_ONLY=1
+      shift
+      ;;
     *)
       usage
       exit 2
@@ -35,6 +40,10 @@ if [[ "$MARKET" != "HK" && "$MARKET" != "US" && "$MARKET" != "CN" && "$MARKET" !
   usage
   exit 2
 fi
+if [[ "$TREND_ONLY" -eq 1 && "$MARKET" == "CN" ]]; then
+  usage
+  exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -42,6 +51,8 @@ ENV_FILE="$REPO_ROOT/config/daily_premarket.env"
 TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.premarket.plist.template"
 CN_REPORT_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-a-share-report.plist.template"
 CN_WATCH_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-a-share-watch.plist.template"
+TREND_REPORT_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-market-report.plist.template"
+TREND_WATCH_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-market-watch.plist.template"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "missing required config: $ENV_FILE" >&2
@@ -221,11 +232,56 @@ render_cn_jobs() {
   done
 }
 
-if [[ "$DRY_RUN" -eq 0 && "$MARKET" != "CN" ]]; then
+render_trend_template() {
+  local template="$1"
+  local market="$2"
+  local label="$3"
+  local hour="$4"
+  sed \
+    -e "s#OPEN_TRADER_LABEL#$(sed_replacement_escape "$(xml_escape "$label")")#g" \
+    -e "s#OPEN_TRADER_MARKET#$(sed_replacement_escape "$(xml_escape "$market")")#g" \
+    -e "s#OPEN_TRADER_HOUR#$hour#g" \
+    -e "s#OPEN_TRADER_REPO#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_REPO")")#g" \
+    -e "s#OPEN_TRADER_PYTHON#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_PYTHON")")#g" \
+    "$template"
+}
+
+render_trend_jobs() {
+  local market="$1"
+  local hour label kind template rendered target
+  if [[ "$market" == "HK" ]]; then
+    hour=18
+  else
+    hour=9
+  fi
+  for kind in report watch; do
+    label="com.open-trader.trend-$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')-$kind"
+    if [[ "$kind" == "report" ]]; then
+      template="$TREND_REPORT_TEMPLATE"
+    else
+      template="$TREND_WATCH_TEMPLATE"
+    fi
+    rendered="$(render_trend_template "$template" "$market" "$label" "$hour")"
+    lint_rendered "$rendered"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      printf '%s\n' "$rendered"
+      continue
+    fi
+    target="$HOME/Library/LaunchAgents/$label.plist"
+    mkdir -p "$HOME/Library/LaunchAgents" "$OPEN_TRADER_REPO/logs/daily_premarket"
+    printf '%s\n' "$rendered" > "$target"
+    plutil -lint "$target" >/dev/null
+    launchctl unload "$target" 2>/dev/null || true
+    launchctl load "$target"
+    echo "installed launchd agent: $target"
+  done
+}
+
+if [[ "$TREND_ONLY" -eq 0 && "$DRY_RUN" -eq 0 && "$MARKET" != "CN" ]]; then
   remove_legacy_agent
 fi
 
-if [[ "$MARKET" != "CN" ]]; then
+if [[ "$TREND_ONLY" -eq 0 && "$MARKET" != "CN" ]]; then
   for market in "${markets[@]}"; do
     rendered="$(render_market "$market")"
     lint_rendered "$rendered"
@@ -245,6 +301,12 @@ if [[ "$MARKET" != "CN" ]]; then
   done
 fi
 
-if [[ "$MARKET_REQUESTED" -eq 1 && ( "$MARKET" == "CN" || "$MARKET" == "all" ) ]]; then
+if [[ "$TREND_ONLY" -eq 0 && "$MARKET_REQUESTED" -eq 1 && ( "$MARKET" == "CN" || "$MARKET" == "all" ) ]]; then
   render_cn_jobs
+fi
+
+if [[ "$TREND_ONLY" -eq 1 ]]; then
+  for market in "${markets[@]}"; do
+    render_trend_jobs "$market"
+  done
 fi

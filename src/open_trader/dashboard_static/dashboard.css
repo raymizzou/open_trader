@@ -1413,6 +1413,34 @@ table {
   padding: 12px;
 }
 
+.trend-market-heading,
+.trend-market-facts {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+.trend-market-heading {
+  justify-content: space-between;
+}
+
+.trend-market-facts {
+  color: var(--muted);
+  margin-top: 8px;
+}
+
+.trend-market-summary p {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0 0;
+  min-width: 0;
+}
+
+.trend-market-summary p span {
+  overflow-wrap: anywhere;
+}
+
 .account-holdings-table {
   background: var(--surface);
   border-collapse: collapse;
