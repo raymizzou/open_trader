@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import urllib.request
 from datetime import datetime
@@ -482,6 +483,36 @@ def test_xiaozhi_voice_notifier_raises_on_api_error() -> None:
     )
 
     with pytest.raises(NotificationError, match="Xiaozhi voice error 404: device_offline"):
+        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
+
+
+def test_xiaozhi_voice_notifier_preserves_http_error_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_urlopen(
+        request: urllib.request.Request, *, timeout: float
+    ) -> object:
+        raise urllib.error.HTTPError(
+            request.full_url,
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(b'{"code": 404, "message": "device_offline"}'),
+        )
+
+    monkeypatch.setattr(
+        "open_trader.notifications.urllib.request.urlopen", fake_urlopen
+    )
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+        now_fn=ALLOWED_NOW,
+    )
+
+    with pytest.raises(
+        NotificationError, match="Xiaozhi voice error 404: device_offline"
+    ):
         notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
 
 
