@@ -493,6 +493,16 @@ def _check_trend_artifact_projection(
         if item.get("action") == "BUY"
         and not _trend_action_needs_review(item)
     ]
+    if broker == "eastmoney":
+        for item in buys:
+            for key, label in (
+                ("industry", "行业"),
+                ("filter_price", "筛选价（Trend Animals）"),
+                ("close", "执行参考价（Futu 前复权）"),
+            ):
+                assert item.get(key) is not None and str(item[key]).strip() not in {
+                    "", "-",
+                }, f"A 股正式买入缺少 {label}"
     holds = [
         item for item in holdings
         if item.get("action") == "HOLD" and not _trend_action_needs_review(item)
@@ -570,6 +580,7 @@ def _check_cn_trend_stages(
 ) -> None:
     expected = (
         ("优先处理 · 卖出触发", "sell_actions", "全部卖出"),
+        ("需要确认 · 人工复核", "review_actions", "人工复核"),
         (
             f"{_plain(report.get('buy_window'))} · 正式买入计划",
             "buy_actions",
@@ -620,6 +631,27 @@ def _check_cn_trend_stages(
                 assert _plain(fact) in text, (
                     f"eastmoney 的 {title} 缺少事实 {_plain(fact)}"
                 )
+
+
+def _check_cn_buy_rows(workspace: Any, report: Mapping[str, Any]) -> None:
+    items = report.get("buy_actions")
+    items = items if isinstance(items, list) else []
+    rows = workspace.locator(".cn-trend-buy .cn-trend-card")
+    assert rows.count() == len(items), "eastmoney 正式买入行数与 API 不一致"
+    for index, item in enumerate(items):
+        assert isinstance(item, Mapping), "eastmoney 正式买入动作格式无效"
+        row = rows.nth(index)
+        for label, key in (
+            ("行业", "industry"),
+            ("筛选价（Trend Animals）", "filter_price"),
+            ("执行参考价（Futu 前复权）", "close"),
+        ):
+            expected = _plain(item.get(key))
+            assert expected != "-", f"eastmoney 正式买入缺少 {label}"
+            cell = row.locator(f'td[data-label="{label}"]')
+            assert cell.count() == 1 and cell.inner_text().strip() == expected, (
+                f"eastmoney 正式买入行 {index + 1} 的 {label} 与 API 不一致"
+            )
 
 
 def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> None:
@@ -769,7 +801,7 @@ def _check_account_holdings(
         if broker == "eastmoney":
             for required in (
                 "优先处理 · 卖出触发", "09:30–10:00 · 正式买入计划",
-                "盘中持续 · 已有持仓", "筛选价（Trend Animals）",
+                "需要确认 · 人工复核", "盘中持续 · 已有持仓", "筛选价（Trend Animals）",
                 "执行参考价（Futu 前复权）", "买入纪律", "卖出纪律",
                 "全部卖出", "正式买入", "继续持有",
             ):
@@ -781,7 +813,8 @@ def _check_account_holdings(
             )
             stage_texts = workspace.locator(".cn-trend-stage").all_inner_texts()
             _check_cn_trend_stages(stage_texts, report)
-            assert workspace.locator(".cn-trend-table").count() == 3, (
+            _check_cn_buy_rows(workspace, report)
+            assert workspace.locator(".cn-trend-table").count() == 4, (
                 "eastmoney 趋势报告动作表数量与 API 不一致"
             )
             disciplines = workspace.locator(".trend-discipline")

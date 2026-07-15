@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Mapping
@@ -100,10 +100,17 @@ def candidate(
     )
 
 
-def bars(count: int = 15, *, close: float = 10, low: float = 9) -> list[DailyKlineBar]:
+def bars(
+    count: int = 15,
+    *,
+    close: float = 10,
+    low: float = 9,
+    end_date: str = "2026-07-14",
+) -> list[DailyKlineBar]:
+    end = datetime.fromisoformat(end_date)
     return [
         DailyKlineBar(
-            date=f"2026-06-{index + 1:02d}",
+            date=(end - timedelta(days=count - index - 1)).date().isoformat(),
             open=close,
             high=close + 1,
             low=low,
@@ -286,6 +293,38 @@ def test_candidate_preserves_bj_suffix_for_exclusion() -> None:
     assert build_candidate_list([item], held_symbols=set()).excluded["920000"] == [
         "excluded_security"
     ]
+
+
+def test_stale_candidate_kline_is_unavailable_and_excluded() -> None:
+    row = {
+        "tmId": 600001,
+        "tickerSymbol": "600001.SH",
+        "tickerName": "示例",
+        "asset": "A股",
+        "industryName": "工业",
+        "asOfDate": "2026-07-14",
+        "tradableFlag": True,
+        "amount1d": "2",
+        "isTrendRightSide": True,
+        "daysSinceTrendEntry": 3,
+        "trendStrengthLocalCurr": "96",
+        "stopwinFlagByDangerSignal": False,
+        "industryTmId": 700001,
+        "priceIndex": "10",
+        "marketCap": "100",
+        "trendTemperaturePrev": "温",
+        "trendTemperatureCurr": "热",
+        "trendPhaseCurr": "立夏",
+    }
+
+    item = evaluate_candidate(
+        row, bars(end_date="2026-07-13"), industry_temperature="热"
+    )
+
+    assert (item.close, item.atr) == (None, None)
+    assert build_candidate_list(
+        [item], held_symbols=set(), expected_date="2026-07-14"
+    ).excluded["600001"] == ["atr_unavailable"]
 
 
 def test_candidate_infers_bj_exchange_without_suffix_for_exclusion() -> None:
@@ -655,6 +694,17 @@ def test_cn_buy_weight_follows_current_temperature() -> None:
     ]
 
 
+def test_cn_buy_action_serializes_candidate_industry(tmp_path: Path) -> None:
+    built = report(candidates=(candidate("600001", industry="电力"),))
+    _, json_path = write_frozen_report(built, tmp_path)
+    buy = json.loads(json_path.read_text(encoding="utf-8"))[
+        "strategy_judgments"
+    ]["formal_actions"][0]
+
+    assert built.buy_actions[0].industry == "电力"
+    assert buy["industry"] == "电力"
+
+
 def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
     us = replace(candidate("600001", close="123"), symbol="VIXY", exchange="US")
     hk = replace(candidate("600002", close="51"), symbol="00700", exchange="HK")
@@ -955,6 +1005,77 @@ def test_holding_kline_failure_preserves_old_line() -> None:
     assert built.holdings[0].active_line == Decimal("8.5")
 
 
+def test_stale_holding_kline_requires_review_even_with_old_line() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={"600001": bars(end_date="2026-07-13")},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
+
+    assert (built.holdings[0].action, built.holdings[0].reason) == (
+        "MANUAL_REVIEW",
+        "holding_kline_unavailable",
+    )
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "watch_events", "reason"),
+    [
+        (
+            holding("600001"),
+            ({"event_type": "protection_triggered", "symbol": "600001"},),
+            "protection_line_already_triggered",
+        ),
+        (holding("600001", danger=True), (), "danger_signal"),
+        (holding("600001", right_side=False), (), "left_trend_right_side"),
+    ],
+)
+def test_stale_holding_kline_preserves_stronger_sell_priority(
+    snapshot: HoldingSnapshot,
+    watch_events: tuple[dict[str, str], ...],
+    reason: str,
+) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": snapshot},
+        bars_by_symbol={"600001": bars(end_date="2026-07-13")},
+        watch_events=watch_events,
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
+
+    assert (built.holdings[0].action, built.holdings[0].reason) == (
+        "SELL_ALL",
+        reason,
+    )
+
+
 def test_invalid_holding_kline_preserves_old_line() -> None:
     invalid = bars()
     invalid[-1] = replace(invalid[-1], low=float("nan"))
@@ -1164,7 +1285,7 @@ def test_tracking_activation_persists_after_overheat_signal_clears() -> None:
                 holding("600001", boiling=False), as_of_date="2026-07-15"
             )
         },
-        bars_by_symbol={"600001": bars(close=12, low=11)},
+        bars_by_symbol={"600001": bars(close=12, low=11, end_date="2026-07-15")},
         prior_state=activated.protection_state,
     )
     assert activated.protection_state["positions"]["600001"]["tracking_active"] is True
@@ -1252,7 +1373,7 @@ def test_old_trigger_does_not_poison_a_later_reentry() -> None:
         holding_snapshots={
             "600001": replace(holding("600001"), as_of_date="2026-07-16")
         },
-        bars_by_symbol={"600001": bars()},
+        bars_by_symbol={"600001": bars(end_date="2026-07-16")},
         prior_state={"schema_version": 1, "positions": {}},
         watch_events=(event,),
     )
@@ -1264,7 +1385,7 @@ def test_old_trigger_does_not_poison_a_later_reentry() -> None:
         holding_snapshots={
             "600001": replace(holding("600001"), as_of_date="2026-07-17")
         },
-        bars_by_symbol={"600001": bars()},
+        bars_by_symbol={"600001": bars(end_date="2026-07-17")},
         prior_state=repurchased.protection_state,
         watch_events=(event,),
     )
@@ -1951,15 +2072,8 @@ def test_candidate_row_shows_industry_slots_and_weight() -> None:
 
 def test_flat_bars_keep_zero_atr_in_state_and_render() -> None:
     flat = [
-        DailyKlineBar(
-            date=f"2026-06-{index + 1:02d}",
-            open=10,
-            high=10,
-            low=10,
-            close=10,
-            volume=100,
-        )
-        for index in range(15)
+        replace(item, open=10, high=10, low=10, close=10)
+        for item in bars()
     ]
     built = build_report(
         as_of_date="2026-07-14",

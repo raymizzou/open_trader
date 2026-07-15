@@ -189,6 +189,7 @@ class CandidateDecision:
 class BuyAction:
     symbol: str
     name: str
+    industry: str
     target_weight: Decimal
     target_amount: Decimal
     estimated_shares: int
@@ -387,9 +388,12 @@ def atr14(bars: Sequence[DailyKlineBar]) -> Decimal | None:
 
 
 def _kline_metrics(
-    bars: Sequence[DailyKlineBar], *, before: str | None = None
+    bars: Sequence[DailyKlineBar],
+    *,
+    before: str | None = None,
+    expected_date: str | None = None,
 ) -> tuple[Decimal | None, Decimal | None, tuple[Decimal, ...]]:
-    if not bars:
+    if not bars or expected_date is not None and bars[-1].date != expected_date:
         return None, None, ()
     try:
         atr = atr14(bars)
@@ -434,7 +438,10 @@ def evaluate_candidate(
 ) -> CandidateInput:
     symbol, exchange = _symbol_parts(row.get("tickerSymbol"), market=market)
     daily_bars = tuple(bars or ())
-    atr, close, _ = _kline_metrics(daily_bars)
+    as_of_date = str(row.get("asOfDate") or "").strip()
+    atr, close, _ = _kline_metrics(
+        daily_bars, expected_date=as_of_date or None
+    )
     tm_id = row.get("tmId")
     if isinstance(tm_id, bool) or not isinstance(tm_id, int):
         raise ValueError("tmId must be an integer")
@@ -640,6 +647,7 @@ def estimate_buy_actions(
             BuyAction(
                 symbol=item.symbol,
                 name=item.name,
+                industry=item.industry,
                 target_weight=weight,
                 target_amount=amount,
                 estimated_shares=shares,
@@ -855,7 +863,10 @@ def build_report(
             tracking_active = True
         historical = not old_state
         daily_bars = tuple(bars_by_symbol.get(symbol) or ())
-        current_atr, close, lows = _kline_metrics(daily_bars, before=as_of_date)
+        current_atr, close, lows = _kline_metrics(
+            daily_bars, before=as_of_date, expected_date=as_of_date
+        )
+        stale_kline = bool(daily_bars) and daily_bars[-1].date != as_of_date
         if active_line is None and current_atr is not None and close is not None:
             initial_line = active_line = close - Decimal("2") * current_atr
         if active_line is not None and tracking_active and action == "HOLD":
@@ -865,7 +876,7 @@ def build_report(
                 champagne=False,
                 prior_five_lows=lows,
             )
-        if active_line is None and action == "HOLD":
+        if (active_line is None or stale_kline) and action == "HOLD":
             action, reason = "MANUAL_REVIEW", "holding_kline_unavailable"
         effective_atr = current_atr if current_atr is not None else old_atr
         industry = snapshot.industry if snapshot else ""

@@ -1871,7 +1871,7 @@ const cn = renderTrendReportWorkspace({
   available:true,market:"CN",broker:"eastmoney",broker_label:"东方财富",
   market_label:"A股",report_date:"2026-07-16",data_date:"2026-07-15",
   generated_at:"2026-07-15T20:00:00+08:00",account_status:"已更新",
-  buy_window:"09:30–10:00",counts:{sell:1,buy:1,hold:1,review:0},
+  buy_window:"09:30–10:00",counts:{sell:1,buy:1,hold:1,review:2},
   sell_actions:[{symbol:"601398",name:"工商银行",close:"7.2",
     temperature_prev:"温",temperature_curr:"温",strength:"91.3",
     reason:"left_trend_right_side",active_line:"7.0",
@@ -1886,7 +1886,14 @@ const cn = renderTrendReportWorkspace({
     temperature_prev:"热",temperature_curr:"热",strength:"98.7",
     reason:"trend_intact",active_line:"27.8",
     entry_hints:["不是新的温转热或温转沸入场信号"]}],
-  review_actions:[],audit:{candidates:[
+  review_actions:[
+    {symbol:"600036",name:"招商银行",close:"45.2",temperature_prev:"热",
+     temperature_curr:"热",strength:"97",reason:"holding_kline_unavailable",
+     active_line:"42.0",entry_hints:["筛选价数据不可用"]},
+    {symbol:"600519",name:"贵州茅台",close:"1498",temperature_prev:"热",
+     temperature_curr:"-",strength:"98",reason:"holding_signal_unknown",
+     active_line:"1450",entry_hints:["行业温度数据不可用"]},
+  ],audit:{candidates:[
     {symbol:"AUDIT-ONLY",name:"仅审计",eligible:false,rank:null,
      excluded_reasons:["strength_below_95"],filter_price:"9.8",close:"9.7",
      temperature_prev:"温",temperature_curr:"温",phase:"立夏",strength:"94",
@@ -1895,11 +1902,15 @@ const cn = renderTrendReportWorkspace({
     data_sources:["Trend Animals","Futu CN calendar/QFQ daily K-line"]},
 });
 for (const text of ["优先处理 · 卖出触发","09:30–10:00 · 正式买入计划",
-  "盘中持续 · 已有持仓","筛选价（Trend Animals）","执行参考价（Futu 前复权）",
+  "需要确认 · 人工复核","盘中持续 · 已有持仓","筛选价（Trend Animals）","执行参考价（Futu 前复权）",
   "温 → 热","目标仓位 4%","全部卖出","正式买入","继续持有",
-  "买入纪律","卖出纪律","审计详情"]) {
+  "人工复核","600036","600519","日线数据不可用","筛选价数据不可用",
+  "趋势信号不完整","行业温度数据不可用","买入纪律","卖出纪律","审计详情"]) {
   if (!cn.includes(text)) throw new Error(text + "\n" + cn);
 }
+const stageOrder=["优先处理 · 卖出触发","需要确认 · 人工复核",
+  "09:30–10:00 · 正式买入计划","盘中持续 · 已有持仓"].map((text)=>cn.indexOf(`<h2>${text}</h2>`));
+if(stageOrder.some((index)=>index<0)||!stageOrder.every((index,i)=>i===0||stageOrder[i-1]<index))throw new Error(cn);
 if (!cn.includes('class="cn-trend-report"') ||
     !cn.includes('class="cn-trend-table"') ||
     !cn.includes('class="cn-trend-card"')) throw new Error(cn);
@@ -1933,7 +1944,10 @@ const html=renderTrendReportWorkspace({
     industry:attack,industry_temperature:attack,market_cap:attack,amount:attack,
     target_weight:attack,target_amount:attack,estimated_shares:attack,
     estimated_initial_line:attack}],
-  hold_actions:[],review_actions:[],audit:{candidates:[{symbol:attack,name:attack,
+  hold_actions:[],review_actions:[{symbol:attack,name:attack,close:attack,
+    temperature_prev:attack,temperature_curr:attack,strength:attack,
+    reason:"holding_kline_unavailable",active_line:attack,entry_hints:[attack]}],
+  audit:{candidates:[{symbol:attack,name:attack,
     excluded_reasons:[attack],filter_price:attack,close:attack}],excluded:{[attack]:[attack]},
     industry_concentration:[[attack]],data_sources:[attack],actual_api_cost:attack},
 });
@@ -1972,10 +1986,10 @@ const html=renderTrendReportWorkspace({
   market:"CN",buy_window:"09:30–10:00",counts:{},sell_actions:[],buy_actions:[],
   hold_actions:[],audit:{},
 });
-if ((html.match(/class="cn-trend-table"/g) || []).length !== 3 ||
+if ((html.match(/class="cn-trend-table"/g) || []).length !== 4 ||
     !html.includes("筛选价（Trend Animals）") ||
     !html.includes("执行参考价（Futu 前复权）") ||
-    (html.match(/<p>无<\/p>/g) || []).length !== 3) throw new Error(html);
+    (html.match(/<p>无<\/p>/g) || []).length !== 4) throw new Error(html);
 console.log("ok");
 ''')
 

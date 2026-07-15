@@ -2042,10 +2042,11 @@ function renderCnTrendTable(title, kind, headings, rows, note = "") {
 }
 
 function renderCnSellOrHoldStage(title, items, kind) {
-  const action = kind === "sell" ? "全部卖出" : "继续持有";
+  const action = { sell: "全部卖出", review: "人工复核" }[kind] || "继续持有";
+  const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
   const headings = [
     "标的", "动作", "执行参考价（Futu 前复权）", "温度变化", "强度",
-    kind === "sell" ? "触发原因" : "当前判断", "活动保护线", "持仓提示",
+    reasonHeading, "活动保护线", "持仓提示",
   ];
   const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
     ${renderCnTrendCell("标的", cnTrendIdentity(item))}
@@ -2175,6 +2176,7 @@ function renderCnTrendReportWorkspace(report) {
     </header>
     <div class="cn-trend-actions">
       ${renderCnSellOrHoldStage("优先处理 · 卖出触发", report.sell_actions, "sell")}
+      ${renderCnSellOrHoldStage("需要确认 · 人工复核", report.review_actions, "review")}
       ${renderCnBuyStage(report)}
       ${renderCnSellOrHoldStage("盘中持续 · 已有持仓", report.hold_actions, "hold")}
     </div>

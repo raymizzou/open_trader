@@ -279,6 +279,10 @@ def test_acceptance_checks_complete_cn_signal_candidate_projection(
             "excluded_reasons": ["strength_below_95"],
         },
     ]
+    review = {
+        "action": "MANUAL_REVIEW", "symbol": "600036", "name": "招商银行",
+        "reason": "holding_kline_unavailable",
+    }
     artifact.write_text(json.dumps({
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
@@ -287,7 +291,7 @@ def test_acceptance_checks_complete_cn_signal_candidate_projection(
         "metadata": {"market": "CN", "broker": "eastmoney"},
         "strategy_judgments": {
             "formal_actions": [],
-            "holding_decisions": [],
+            "holding_decisions": [review],
             "top10_candidates": [complete[0]],
         },
         "signal_snapshots": {"candidates": complete},
@@ -297,8 +301,8 @@ def test_acceptance_checks_complete_cn_signal_candidate_projection(
         "data_date": "2026-07-14",
         "generated_at": "2026-07-15T20:00:00+08:00",
         "sell_actions": [], "buy_actions": [], "hold_actions": [],
-        "review_actions": [],
-        "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 0},
+        "review_actions": [review],
+        "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 1},
         "audit": {
             "artifact": artifact.name, "candidates": complete, "excluded": {},
             "industry_concentration": [], "data_sources": [],
@@ -308,6 +312,50 @@ def test_acceptance_checks_complete_cn_signal_candidate_projection(
     dashboard_acceptance._check_trend_artifact_projection(
         reports, "eastmoney", projected
     )
+
+
+@pytest.mark.parametrize("field", ["industry", "filter_price", "close"])
+@pytest.mark.parametrize("value", [None, "", "-"])
+def test_acceptance_rejects_missing_cn_buy_fact(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_a_share" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    buy = {
+        "action": "BUY", "symbol": "688046", "name": "药康生物",
+        "industry": "医疗服务", "filter_price": "29.14", "close": "28.81",
+    }
+    buy[field] = value
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T20:00:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [buy], "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "signal_snapshots": {"candidates": []},
+        "excluded": {}, "industry_concentration": [], "data_sources": [],
+    }), encoding="utf-8")
+    projected = {
+        "report_date": "2026-07-15", "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T20:00:00+08:00",
+        "sell_actions": [], "buy_actions": [buy], "hold_actions": [],
+        "review_actions": [],
+        "counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
+        "audit": {
+            "artifact": artifact.name, "candidates": [], "excluded": {},
+            "industry_concentration": [], "data_sources": [],
+        },
+    }
+
+    with pytest.raises(AssertionError, match="A 股正式买入缺少"):
+        dashboard_acceptance._check_trend_artifact_projection(
+            reports, "eastmoney", projected
+        )
 
 
 @pytest.mark.parametrize(
@@ -500,8 +548,13 @@ def trend_reports() -> dict[str, dict[str, object]]:
                 "strength": "98.7", "reason": "trend_intact", "active_line": "27.8",
                 "entry_hints": ["不是新的温转热或温转沸入场信号"],
             }],
-            "review_actions": [],
-            "counts": {"sell": 1, "buy": 1, "hold": 1, "review": 0},
+            "review_actions": [{
+                "symbol": "600036", "name": "招商银行", "close": "45.2",
+                "temperature_prev": "热", "temperature_curr": "热",
+                "strength": "97", "reason": "holding_kline_unavailable",
+                "active_line": "42.0", "entry_hints": ["筛选价数据不可用"],
+            }],
+            "counts": {"sell": 1, "buy": 1, "hold": 1, "review": 1},
             "audit": {
                 "candidates": [{
                     "symbol": "600000", "name": "浦发银行", "strength": "94",
@@ -631,11 +684,12 @@ def trend_workspace_text(broker: str) -> str:
         return (
             "东方财富｜A股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
             "生成时间 2026-07-15T20:00:00+08:00 账户状态 已更新 "
-            "正式买入 1 全部卖出 1 继续持有 1 人工复核 0 "
-            "优先处理 · 卖出触发 09:30–10:00 · 正式买入计划 "
+            "正式买入 1 全部卖出 1 继续持有 1 人工复核 1 "
+            "优先处理 · 卖出触发 需要确认 · 人工复核 "
+            "09:30–10:00 · 正式买入计划 "
             "盘中持续 · 已有持仓 筛选价（Trend Animals） "
             "执行参考价（Futu 前复权） 全部卖出 正式买入 继续持有 "
-            "买入纪律 卖出纪律 审计详情"
+            "人工复核 买入纪律 卖出纪律 审计详情"
         )
     if broker == "phillips":
         return (
@@ -657,6 +711,8 @@ def trend_stage_texts(broker: str) -> list[str]:
         return [
             "优先处理 · 卖出触发\n601398 工商银行 全部卖出 7.2 温 → 温 "
             "91.3 右侧趋势已结束 7.0 强度 91.3，低于入场线 95",
+            "需要确认 · 人工复核\n600036 招商银行 人工复核 45.2 热 → 热 "
+            "97 持仓日线数据不可用 42.0 筛选价数据不可用",
             "09:30–10:00 · 正式买入计划\n688046 药康生物 正式买入 29.14 "
             "28.81 温 → 热 立夏 99.9 医疗服务 热 110 6 4% 27061.98 900 股 24.55",
             "盘中持续 · 已有持仓\n600900 长江电力 继续持有 28.0 热 → 热 "
@@ -995,6 +1051,15 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
                 return "持仓与策略"
             if self.selector.endswith(".account-empty:visible"):
                 return "当前筛选下没有持仓"
+            match = re.search(r'td\[data-label="([^"]+)"\]$', self.selector)
+            if match:
+                buy = reports["eastmoney"]["buy_actions"][0]  # type: ignore[index]
+                key = {
+                    "行业": "industry",
+                    "筛选价（Trend Animals）": "filter_price",
+                    "执行参考价（Futu 前复权）": "close",
+                }[match.group(1)]
+                return str(buy[key])
             return "5 条"
 
         def count(self) -> int:
@@ -1027,9 +1092,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             if self.selector.endswith(".trend-discipline[open]"):
                 return 0 if self.name == "mobile" else 2
             if self.selector.endswith(".cn-trend-table"):
-                return 3
+                return 4
+            if self.selector.endswith(".cn-trend-buy .cn-trend-card"):
+                return 1
             if self.selector.endswith(".cn-trend-card:visible"):
-                return 3
+                return 4
             if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
                 return 0
             if self.selector.endswith(".account-empty:visible"):
@@ -1196,6 +1263,15 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, '#trend-report-workspace:visible') in selectors
         assert (viewport, '#trend-report-workspace:visible .cn-trend-report') in selectors
         assert (viewport, '#trend-report-workspace:visible .cn-trend-stage') in selectors
+        buy_rows = '#trend-report-workspace:visible .cn-trend-buy .cn-trend-card'
+        assert (viewport, buy_rows) in selectors
+        for label in (
+            "行业", "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
+        ):
+            assert (
+                viewport,
+                f'{buy_rows}:nth(0) td[data-label="{label}"]',
+            ) in selectors
         assert (viewport, '#trend-report-workspace:visible .trend-discipline') in selectors
         assert (viewport, '.workspace-grid:visible') in selectors
         assert (viewport, '.account-section:visible') in selectors
@@ -1294,6 +1370,15 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
                 return trend_workspace_text(str(state["broker"]))
             if self.selector.endswith(".trend-audit"):
                 return trend_audit_text(str(state["broker"]))
+            match = re.search(r'td\[data-label="([^"]+)"\]$', self.selector)
+            if match:
+                buy = reports["eastmoney"]["buy_actions"][0]  # type: ignore[index]
+                key = {
+                    "行业": "industry",
+                    "筛选价（Trend Animals）": "filter_price",
+                    "执行参考价（Futu 前复权）": "close",
+                }[match.group(1)]
+                return str(buy[key])
             raise AssertionError(self.selector)
 
         def count(self) -> int:
@@ -1327,7 +1412,9 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
             if self.selector.endswith(".trend-discipline[open]"):
                 return 2
             if self.selector.endswith(".cn-trend-table"):
-                return 3
+                return 4
+            if self.selector.endswith(".cn-trend-buy .cn-trend-card"):
+                return 1
             return 1
 
         def all_inner_texts(self) -> list[str]:
@@ -1348,6 +1435,9 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
             if self.selector.endswith(".trend-discipline summary"):
                 return ["买入纪律", "卖出纪律"]
             return []
+
+        def nth(self, index: int) -> "Locator":
+            return Locator(f"{self.selector}:nth({index})")
 
         def get_attribute(self, name: str) -> str | None:
             assert self.selector.endswith(".trend-audit") and name == "open"
