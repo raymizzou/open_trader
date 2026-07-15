@@ -1841,6 +1841,26 @@ console.log(JSON.stringify({phillips,eastmoney,invalid}));
     assert result["invalid"] == {"broker": "eastmoney", "unchanged": True}
 
 
+def test_dashboard_render_falls_back_to_first_account_broker() -> None:
+    output = run_dashboard_js(r'''
+const mount=()=>({innerHTML:"",textContent:"",classList:{add(){},remove(){}}});
+for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"])elements[id]=mount();
+state.dashboard={
+  summary:{portfolio_value_hkd:"1000"},broker_summaries:[],source_statuses:[],cash_rows:[],
+  holdings:[{market:"US",symbol:"AAPL",brokers:"futu",broker_details:[{broker:"futu",market:"US",symbol:"AAPL",quantity:"1"}]}],
+};
+state.brokerFilter="invalid";
+renderAccountHoldings();
+console.log(JSON.stringify({broker:state.brokerFilter,tabs:elements["account-tabs"].innerHTML,html:elements["account-holdings"].innerHTML}));
+''')
+    result = json.loads(output)
+    assert result["broker"] == "futu"
+    assert 'data-broker="futu" aria-selected="true"' in result["tabs"]
+    assert 'id="account-futu"' in result["html"]
+    for broker in ("tiger", "phillips", "eastmoney"):
+        assert f'id="account-{broker}"' not in result["html"]
+
+
 def test_dashboard_decision_deep_link_prefers_account_broker_order() -> None:
     output = run_dashboard_js(r'''
 globalThis.window={location:{search:"?market=US&symbol=QQQ&decision_tab=news"}};
