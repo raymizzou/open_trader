@@ -375,25 +375,51 @@ def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
     )
 
 
+def _finite_decimal(value: object) -> bool:
+    try:
+        return Decimal(str(value)).is_finite()
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _valid_account_source_date(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    format_ = {7: "%Y-%m", 10: "%Y-%m-%d"}.get(len(value))
+    if format_ is None:
+        return False
+    try:
+        return datetime.strptime(value, format_).strftime(format_) == value
+    except ValueError:
+        return False
+
+
+def _valid_trend_position(value: object) -> bool:
+    if not isinstance(value, Mapping) or any(
+        not isinstance(value.get(field), str) or not value[field].strip()
+        for field in ("symbol", "name", "asset_class")
+    ):
+        return False
+    average_cost = value.get("avg_cost_price")
+    return (
+        _finite_decimal(value.get("quantity"))
+        and _finite_decimal(value.get("market_value"))
+        and "avg_cost_price" in value
+        and (average_cost is None or _finite_decimal(average_cost))
+    )
+
+
 def _valid_trend_account(value: object) -> bool:
     if not isinstance(value, Mapping):
         return False
-    try:
-        amounts = (
-            Decimal(str(value["net_value"])),
-            Decimal(str(value["available_cash"])),
-        )
-    except (InvalidOperation, KeyError, TypeError, ValueError):
-        return False
-    source_date = value.get("source_date")
     positions = value.get("positions")
     exceptions = value.get("exceptions")
     return (
-        isinstance(source_date, str)
-        and bool(source_date.strip())
-        and all(amount.is_finite() for amount in amounts)
+        _valid_account_source_date(value.get("source_date"))
+        and _finite_decimal(value.get("net_value"))
+        and _finite_decimal(value.get("available_cash"))
         and isinstance(positions, list)
-        and all(isinstance(item, Mapping) for item in positions)
+        and all(_valid_trend_position(item) for item in positions)
         and isinstance(exceptions, list)
         and all(isinstance(item, str) for item in exceptions)
     )

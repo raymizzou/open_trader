@@ -124,6 +124,17 @@ def serialized_account(*, fresh: object = MISSING_FRESH) -> dict[str, object]:
     return payload
 
 
+def serialized_position() -> dict[str, object]:
+    return {
+        "symbol": "600001",
+        "name": "测试股票",
+        "asset_class": "stock",
+        "quantity": "100",
+        "avg_cost_price": "9.5",
+        "market_value": "1000",
+    }
+
+
 def holding(
     symbol: str,
     *,
@@ -1313,9 +1324,39 @@ def test_trend_feishu_text_keeps_buy_for_non_realtime_account(
         None,
         {},
         {**serialized_account(), "source_date": ""},
+        {**serialized_account(), "source_date": "not-a-date"},
+        {**serialized_account(), "source_date": "2026-13"},
+        {**serialized_account(), "source_date": "2026-02-30"},
         {**serialized_account(), "net_value": "NaN"},
         {**serialized_account(), "available_cash": None},
         {**serialized_account(), "positions": ["not-a-position"]},
+        {**serialized_account(), "positions": [{}]},
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "symbol": ""}],
+        },
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "name": ""}],
+        },
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "asset_class": ""}],
+        },
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "quantity": "NaN"}],
+        },
+        {
+            **serialized_account(),
+            "positions": [{**serialized_position(), "market_value": None}],
+        },
+        {
+            **serialized_account(),
+            "positions": [
+                {**serialized_position(), "avg_cost_price": "Infinity"}
+            ],
+        },
         {**serialized_account(), "exceptions": [1]},
     ],
 )

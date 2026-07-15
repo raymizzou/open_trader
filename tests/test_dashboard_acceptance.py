@@ -37,6 +37,17 @@ def serialized_trend_account(
     return payload
 
 
+def serialized_trend_position() -> dict[str, object]:
+    return {
+        "symbol": "VIXY",
+        "name": "ProShares VIX",
+        "asset_class": "etf",
+        "quantity": "10",
+        "avg_cost_price": None,
+        "market_value": "500",
+    }
+
+
 def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
     makefile = Path("Makefile").read_text(encoding="utf-8")
 
@@ -309,9 +320,47 @@ def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
         None,
         {},
         {**serialized_trend_account(), "source_date": ""},
+        {**serialized_trend_account(), "source_date": "not-a-date"},
+        {**serialized_trend_account(), "source_date": "2026-13"},
+        {**serialized_trend_account(), "source_date": "2026-02-30"},
         {**serialized_trend_account(), "net_value": "NaN"},
         {**serialized_trend_account(), "available_cash": None},
         {**serialized_trend_account(), "positions": ["not-a-position"]},
+        {**serialized_trend_account(), "positions": [{}]},
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "symbol": ""}
+            ],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [{**serialized_trend_position(), "name": ""}],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "asset_class": ""}
+            ],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "quantity": "NaN"}
+            ],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "market_value": None}
+            ],
+        },
+        {
+            **serialized_trend_account(),
+            "positions": [
+                {**serialized_trend_position(), "avg_cost_price": "Infinity"}
+            ],
+        },
         {**serialized_trend_account(), "exceptions": [1]},
     ],
 )
