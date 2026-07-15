@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import pytest
-import open_trader.notifications as notifications
 
 from open_trader.notifications import (
     CompositeNotifier,
@@ -17,6 +17,8 @@ from open_trader.notifications import (
     XiaozhiVoiceNotifier,
     render_feishu_order_review,
     render_xiaozhi_voice_notification,
+    xiaozhi_not_after,
+    xiaozhi_voice_allowed,
 )
 
 
@@ -24,16 +26,6 @@ WEBHOOK_URL = "https://open.feishu.cn/open-apis/bot/v2/hook/test"
 ALLOWED_NOW = lambda: datetime.fromisoformat("2026-07-15T22:59:59+08:00")
 PROTECTION_TITLE = "A股保护线触发 · 600000"
 PROTECTION_MESSAGE = "名称：浦发银行\n最新价 9.98 <= 活动保护线 10.01"
-
-
-def xiaozhi_voice_allowed(now: datetime) -> bool:
-    assert hasattr(notifications, "xiaozhi_voice_allowed")
-    return notifications.xiaozhi_voice_allowed(now)
-
-
-def xiaozhi_not_after(now: datetime) -> str:
-    assert hasattr(notifications, "xiaozhi_not_after")
-    return notifications.xiaozhi_not_after(now)
 
 FIELDNAMES = [
     "run_date",
@@ -491,6 +483,36 @@ def test_xiaozhi_voice_notifier_raises_on_api_error() -> None:
     )
 
     with pytest.raises(NotificationError, match="Xiaozhi voice error 404: device_offline"):
+        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
+
+
+def test_xiaozhi_voice_notifier_preserves_http_error_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_urlopen(
+        request: urllib.request.Request, *, timeout: float
+    ) -> object:
+        raise urllib.error.HTTPError(
+            request.full_url,
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(b'{"code": 404, "message": "device_offline"}'),
+        )
+
+    monkeypatch.setattr(
+        "open_trader.notifications.urllib.request.urlopen", fake_urlopen
+    )
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+        now_fn=ALLOWED_NOW,
+    )
+
+    with pytest.raises(
+        NotificationError, match="Xiaozhi voice error 404: device_offline"
+    ):
         notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
 
 

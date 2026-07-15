@@ -772,6 +772,8 @@ def _post_json_with_headers_for_channel(
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
     except Exception as exc:
         raise NotificationError(f"{channel} request failed: {exc}") from exc
     try:

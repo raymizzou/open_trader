@@ -15,7 +15,12 @@ from .a_share_trend import AccountSnapshot, load_eastmoney_account, load_watch_e
 from .daily_premarket import RunLock, send_notification_with_results
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
-from .notifications import Notifier
+from .notifications import (
+    CompositeNotifier,
+    Notifier,
+    XiaozhiVoiceNotifier,
+    xiaozhi_voice_allowed,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -53,6 +58,8 @@ def append_watch_event(
     occurred_at: str,
     last_price: Decimal | None,
     active_line: Decimal | None,
+    market: str = "",
+    reason: str = "",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     event = {
@@ -64,6 +71,10 @@ def append_watch_event(
         "last_price": None if last_price is None else str(last_price),
         "active_line": None if active_line is None else str(active_line),
     }
+    if market:
+        event["market"] = market
+    if reason:
+        event["reason"] = reason
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
@@ -275,6 +286,7 @@ def watch_a_share_protection(
                     trading_date=trading_date,
                     now=now,
                     symbol=symbol,
+                    position_name=str(getattr(positions[symbol], "name", "")),
                     last_price=_optional_decimal(event.get("last_price")),
                     active_line=_optional_decimal(event.get("active_line")),
                     delivered_feishu=delivered_alerts_feishu,
@@ -411,6 +423,7 @@ def watch_a_share_protection(
                         trading_date=trading_date,
                         now=now,
                         symbol=symbol,
+                        position_name=str(getattr(positions[symbol], "name", "")),
                         last_price=snapshot.last_price,
                         active_line=active_line,
                         delivered_feishu=delivered_alerts_feishu,
@@ -442,6 +455,7 @@ def _deliver_trigger_notification(
     trading_date: str,
     now: datetime,
     symbol: str,
+    position_name: str,
     last_price: Decimal | None,
     active_line: Decimal | None,
     delivered_feishu: set[str],
@@ -490,6 +504,94 @@ def _deliver_trigger_notification(
                 active_line=active_line,
             )
             delivered.add(symbol)
+
+    if replay or not _has_xiaozhi_notifier(notifier):
+        return
+
+    voice_message = "\n".join(
+        [
+            f"名称：{position_name}",
+            f"最新价 {last_price} <= 活动保护线 {active_line}",
+            "建议动作：全部卖出（人工执行）",
+        ]
+    )
+    if not xiaozhi_voice_allowed(now):
+        append_watch_event(
+            events_path,
+            symbol=symbol,
+            trading_date=trading_date,
+            event_type=(
+                "protection_triggered_notification_suppressed_quiet_hours_xiaozhi"
+            ),
+            occurred_at=now.isoformat(timespec="seconds"),
+            last_price=last_price,
+            active_line=active_line,
+            market=market_label,
+        )
+        return
+
+    attempts = send_notification_with_results(
+        notifier,
+        f"{market_label}保护线触发 · {symbol}",
+        voice_message,
+        channels={"xiaozhi"},
+    )
+    if not attempts:
+        return
+    attempt = attempts[0]
+    reason = "" if attempt.success else _voice_failure_reason(attempt.error)
+    append_watch_event(
+        events_path,
+        symbol=symbol,
+        trading_date=trading_date,
+        event_type=(
+            "protection_triggered_notification_queued_xiaozhi"
+            if attempt.success
+            else "protection_triggered_notification_failed_xiaozhi"
+        ),
+        occurred_at=now.isoformat(timespec="seconds"),
+        last_price=last_price,
+        active_line=active_line,
+        market=market_label,
+        reason=reason,
+    )
+    if attempt.success:
+        return
+    send_notification_with_results(
+        notifier,
+        "Open Trader 语音播报失败",
+        "\n".join(
+            [
+                f"市场：{market_label}",
+                f"标的：{position_name or symbol}（{symbol}）",
+                "原事件：活动保护线触发",
+                f"失败原因：{reason}",
+                "处理：语音不重试，请按原保护线通知人工确认。",
+            ]
+        ),
+        channels={"feishu", "feishu_app"},
+    )
+
+
+def _has_xiaozhi_notifier(notifier: Notifier) -> bool:
+    targets = (
+        notifier._notifiers
+        if isinstance(notifier, CompositeNotifier)
+        else [notifier]
+    )
+    return any(isinstance(target, XiaozhiVoiceNotifier) for target in targets)
+
+
+def _voice_failure_reason(error: str) -> str:
+    if "device_offline" in error:
+        return "设备离线"
+    if "tts_not_ready" in error:
+        return "播放队列未就绪"
+    if "unauthorized" in error:
+        return "语音服务鉴权失败"
+    if "notify_api_disabled" in error:
+        return "语音服务未启用"
+    return "语音服务不可用"
 
 
 def _load_active_lines(path: Path) -> dict[str, Decimal | None]:

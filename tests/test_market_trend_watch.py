@@ -13,10 +13,22 @@ from open_trader.market_trend_watch import (
     next_market_open,
     watch_market_protection,
 )
-from open_trader.notifications import NullNotifier
+from open_trader.notifications import (
+    CompositeNotifier,
+    NullNotifier,
+    XiaozhiVoiceNotifier,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+class RecordingXiaozhiNotifier(XiaozhiVoiceNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
 
 
 def test_hk_regular_sessions_exclude_lunch_and_auction() -> None:
@@ -82,6 +94,67 @@ def _write_hk_details(data_dir: Path) -> None:
         })
 
 
+def _write_us_details(data_dir: Path) -> None:
+    run_dir = data_dir / "runs/2026-07-15"
+    run_dir.mkdir(parents=True)
+    with (run_dir / "extracted_positions.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "statement_id",
+                "broker",
+                "market",
+                "asset_class",
+                "symbol",
+                "name",
+                "currency",
+                "quantity",
+                "cost_price",
+                "market_value",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "statement_id": "2026-07-15-futu",
+                "broker": "futu",
+                "market": "US",
+                "asset_class": "stock",
+                "symbol": "NVDA",
+                "name": "NVIDIA",
+                "currency": "USD",
+                "quantity": "10",
+                "cost_price": "140",
+                "market_value": "1500",
+            }
+        )
+    with (run_dir / "extracted_cash.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "statement_id",
+                "broker",
+                "currency",
+                "cash_balance",
+                "available_balance",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "statement_id": "2026-07-15-futu",
+                "broker": "futu",
+                "currency": "USD",
+                "cash_balance": "1000",
+                "available_balance": "1000",
+            }
+        )
+
+
 def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _write_hk_details(data_dir)
@@ -113,6 +186,7 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
             pass
 
     now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+    voice = RecordingXiaozhiNotifier()
     result = watch_market_protection(
         market="HK",
         data_dir=data_dir,
@@ -121,7 +195,7 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
         events_path=data_dir / "trend_hk_phillips/watch_events.jsonl",
         report_lock_path=data_dir / "runs/.trend_hk_phillips_report.lock",
         quote_client=Quote(),
-        notifier=NullNotifier(),
+        notifier=CompositeNotifier([NullNotifier(), voice]),
         poll_seconds=5,
         reconnect_seconds=60,
         once=True,
@@ -132,3 +206,68 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
     assert result.status == "completed"
     assert result.watched_symbol_count == 1
     assert result.trigger_count == 1
+    assert voice.messages == [
+        (
+            "港股保护线触发 · 00700",
+            "名称：腾讯\n最新价 10 <= 活动保护线 11\n建议动作：全部卖出（人工执行）",
+        )
+    ]
+
+
+def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_us_details(data_dir)
+    state_path = data_dir / "trend_us_futu/protection_state.json"
+    write_protection_state(
+        state_path,
+        {
+            "schema_version": 1,
+            "managed_symbols": ["NVDA"],
+            "positions": {
+                "NVDA": {
+                    "initial_line": "151",
+                    "active_line": "151",
+                    "atr14": "1",
+                    "position_started_for": "2026-07-15",
+                    "tracking_active": False,
+                    "updated_for": "2026-07-15",
+                }
+            },
+        },
+    )
+
+    class Quote:
+        host = "127.0.0.1"
+        port = 11111
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-15"]
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            assert symbols == ["US.NVDA"]
+            return {"US.NVDA": QuoteSnapshot("US.NVDA", Decimal("150"))}
+
+        def close(self) -> None:
+            pass
+
+    voice = RecordingXiaozhiNotifier()
+    now = datetime(2026, 7, 15, 22, 0, tzinfo=SHANGHAI)
+    result = watch_market_protection(
+        market="US",
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=state_path,
+        events_path=data_dir / "trend_us_futu/watch_events.jsonl",
+        report_lock_path=data_dir / "runs/.trend_us_futu_report.lock",
+        quote_client=Quote(),
+        notifier=CompositeNotifier([NullNotifier(), voice]),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: now,
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert result.status == "completed"
+    assert voice.messages[0][0] == "美股保护线触发 · NVDA"
+    assert voice.messages[0][1].startswith("名称：NVIDIA\n最新价 ")
