@@ -259,6 +259,25 @@ def test_build_notifier_uses_configured_feishu_and_macos(tmp_path: Path) -> None
     assert inner_notifiers[1].__class__.__name__ == "MacOSNotifier"
 
 
+def test_build_notifier_rejects_removed_xiaozhi_channel(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        notifiers=("xiaozhi",),
+    )
+
+    with pytest.raises(ValueError, match="unknown notifier: xiaozhi"):
+        build_notifier(config)
+
+
 def test_build_notifier_uses_configured_feishu_app_and_macos(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,

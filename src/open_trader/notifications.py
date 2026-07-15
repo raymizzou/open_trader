@@ -208,8 +208,10 @@ class XiaoaiSSHNotifier:
 
     def notify(self, title: str, message: str) -> None:
         voice_message = render_xiaoai_voice_notification(title, message)
-        if voice_message is None or not xiaoai_voice_allowed(self._now_fn()):
+        if voice_message is None:
             return
+        if not xiaoai_voice_allowed(self._now_fn()):
+            raise XiaoaiVoiceSuppressed("quiet hours")
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -238,8 +240,10 @@ class XiaoaiSSHNotifier:
                     timeout=self.timeout_seconds,
                     check=False,
                 )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise NotificationError("XiaoAI voice command failed") from exc
+            except (OSError, subprocess.TimeoutExpired):
+                result = None
+            if result is None:
+                raise NotificationError("XiaoAI voice command failed")
             if result.returncode != 0:
                 raise NotificationError(
                     f"XiaoAI voice command failed with exit code {result.returncode}"

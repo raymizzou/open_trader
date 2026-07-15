@@ -19,7 +19,6 @@ from .notifications import (
     CompositeNotifier,
     Notifier,
     XiaoaiSSHNotifier,
-    xiaoai_voice_allowed,
 )
 
 
@@ -515,21 +514,6 @@ def _deliver_trigger_notification(
             "建议动作：全部卖出（人工执行）",
         ]
     )
-    if not xiaoai_voice_allowed(now):
-        append_watch_event(
-            events_path,
-            symbol=symbol,
-            trading_date=trading_date,
-            event_type=(
-                "protection_triggered_notification_suppressed_quiet_hours_xiaoai"
-            ),
-            occurred_at=now.isoformat(timespec="seconds"),
-            last_price=last_price,
-            active_line=active_line,
-            market=market_label,
-        )
-        return
-
     attempts = send_notification_with_results(
         notifier,
         f"{market_label}保护线触发 · {symbol}",
@@ -553,7 +537,7 @@ def _deliver_trigger_notification(
             market=market_label,
         )
         return
-    reason = "" if attempt.success else _voice_failure_reason(attempt.error)
+    reason = "" if attempt.success else "音箱连接或播放失败"
     append_watch_event(
         events_path,
         symbol=symbol,
@@ -594,10 +578,6 @@ def _has_xiaoai_notifier(notifier: Notifier) -> bool:
         else [notifier]
     )
     return any(isinstance(target, XiaoaiSSHNotifier) for target in targets)
-
-
-def _voice_failure_reason(_error: str) -> str:
-    return "音箱连接或播放失败"
 
 
 def _load_active_lines(path: Path) -> dict[str, Decimal | None]:

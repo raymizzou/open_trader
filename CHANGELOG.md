@@ -7,7 +7,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - Moved Open Trader voice playback to the XiaoAI speaker's native TTS over
   serialized SSH calls, removing the runtime dependency on the Xiaozhi HTTP/TTS
-  stack while preserving the existing alert allowlist and quiet hours.
+  stack while preserving the existing alert allowlist and quiet hours; verified
+  with the full test suite, a live native-speaker notification, and the Dashboard
+  acceptance gate.
 - Restored XiaoAI voice playback for queued Open Trader notifications by sending
   explicit external TTS start/stop state without opening a conversation or stop
   listener; verified the test, A-share, HK, and US templates on the live speaker

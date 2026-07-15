@@ -346,7 +346,7 @@ def test_restart_never_replays_voice(tmp_path: Path) -> None:
 def test_trigger_quiet_hours_suppresses_voice_without_failure_warning(
     tmp_path: Path,
 ) -> None:
-    voice = RecordingXiaoaiNotifier()
+    voice = SuppressedXiaoaiNotifier()
     feishu = RecordingNotifier()
     events_path = tmp_path / "events.jsonl"
 
@@ -365,6 +365,7 @@ def test_trigger_quiet_hours_suppresses_voice_without_failure_warning(
     )
 
     assert voice.messages == []
+    assert voice.attempt_count == 1
     assert not any("语音播报失败" in title for title, _ in feishu.messages)
     assert read_events(events_path)[-1]["event_type"].endswith(
         "suppressed_quiet_hours_xiaoai"

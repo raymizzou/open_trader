@@ -438,7 +438,8 @@ def test_xiaoai_voice_notifier_skips_disallowed_and_quiet_messages(
     )
 
     notifier.notify("Open Trader 美股行动通知", "Open Trader｜行动通知")
-    notifier.notify("Open Trader 测试通知", "测试")
+    with pytest.raises(XiaoaiVoiceSuppressed, match="quiet hours"):
+        notifier.notify("Open Trader 测试通知", "测试")
 
     assert calls == []
 
@@ -492,6 +493,8 @@ def test_xiaoai_voice_notifier_reports_redacted_transport_failure(
     with pytest.raises(NotificationError, match=expected) as captured:
         notifier.notify("Open Trader 测试通知", "secret spoken text")
     assert "secret spoken text" not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 def test_xiaoai_voice_notifier_serializes_process_playback(tmp_path: Path) -> None:
