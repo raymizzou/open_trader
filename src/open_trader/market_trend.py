@@ -25,12 +25,14 @@ from .a_share_trend import (
     _is_systemic_futu_error,
     _process_version,
     _redact_api_key,
+    _report_payload,
     _row_tm_id,
     build_report,
     evaluate_candidate,
     load_protection_state,
     load_watch_events,
-    render_markdown,
+    render_trend_failure_text,
+    render_trend_feishu_text,
     write_frozen_report,
     write_protection_state,
 )
@@ -44,12 +46,17 @@ from .futu_account import FutuAccountClient, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
+from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MARKET_SETTINGS = {
     "US": {"broker": "futu", "currency": "USD", "asset": "美股", "deadline": time(10)},
     "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
+}
+MARKET_NOTIFICATION_LABELS = {
+    "US": ("富途", "美股", "确认 Trend Animals 与富途账户状态后手动重跑富途报告"),
+    "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
 }
 SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 
@@ -332,6 +339,10 @@ def _attempt_market_report(
         if not revision and base_markdown.exists() and base_json.exists():
             base_markdown.read_text(encoding="utf-8")
             json.loads(base_json.read_text(encoding="utf-8"))
+            retry_daily_trend_text(
+                notifier,
+                ledger_path=paths.root / "daily_delivery" / f"{run_date}.json",
+            )
             return AShareTrendRunResult("existing", base_markdown, base_json)
 
         api = api_factory(
@@ -495,15 +506,16 @@ def _attempt_market_report(
             "managed_symbols": sorted(managed),
         }
         report = replace(report, protection_state=protection_state)
-        markdown = render_markdown(report)
-        delivery = send_notification_with_results(
-            notifier,
-            f"{market} 趋势操作计划 · {as_of_date}",
-            markdown,
-            channels={"feishu", "feishu_app"},
+        payload = _report_payload(report)
+        broker_label, market_label, _ = MARKET_NOTIFICATION_LABELS[market]
+        title, message = render_trend_feishu_text(
+            payload, broker_label=broker_label, market_label=market_label
         )
-        delivery_status = (
-            "sent" if any(item.success for item in delivery) else "delivery_failed"
+        delivery_status = deliver_daily_trend_text(
+            notifier,
+            ledger_path=paths.root / "daily_delivery" / f"{run_date}.json",
+            title=title,
+            message=message,
         )
         report = replace(
             report,
@@ -611,11 +623,31 @@ def _run_market_trend_retry(
                 "event": "failed", "market": market, "run_date": run_date,
                 "error": last_error, "at": now.isoformat(timespec="seconds"),
             })
+            broker_label, market_label, recovery_action = (
+                MARKET_NOTIFICATION_LABELS[market]
+            )
+            title, message = render_trend_failure_text(
+                broker_label=broker_label,
+                market_label=market_label,
+                report_date=run_date,
+                reason=(
+                    "趋势数据在截止时间前仍未更新"
+                    if "not ready" in last_error.lower()
+                    else "趋势报告生成失败，需检查运行日志"
+                ),
+                recovery_action=recovery_action,
+            )
+            deliver_daily_trend_text(
+                notifier,
+                ledger_path=paths.root / "daily_delivery" / f"{run_date}.json",
+                title=title,
+                message=message,
+            )
             send_notification_with_results(
                 notifier,
                 f"{market} 趋势计划失败",
                 f"{last_error}；本轮一小时重试窗口已结束。",
-                channels={"feishu", "feishu_app", "macos"},
+                channels={"macos"},
             )
             return AShareTrendRunResult("failed", None, None)
         sleep_fn(min(600.0, max(1.0, (deadline - now).total_seconds())))
