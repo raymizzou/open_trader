@@ -52,23 +52,37 @@ class ShortHistoryPriceProvider:
 
 
 def test_range_cache_reuses_requested_end_after_latest_returned_bar() -> None:
-    raw_provider = PriceProvider()
+    class PreviousDayProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_daily_kline(
+            self, futu_symbol: str, *, start: str, end: str
+        ) -> list[DailyKlineBar]:
+            self.calls += 1
+            return [DailyKlineBar(date="2026-07-14", close=100, volume=1000)]
+
+    raw_provider = PreviousDayProvider()
     provider = _RangeCachingProvider(raw_provider)
 
-    provider.get_daily_kline(
+    first = provider.get_daily_kline(
         "US.MSFT",
         start="2025-04-20",
         end="2026-07-15",
     )
-    bars = provider.get_daily_kline(
+    repeated = provider.get_daily_kline(
+        "US.MSFT",
+        start="2025-04-20",
+        end="2026-07-15",
+    )
+    narrower = provider.get_daily_kline(
         "US.MSFT",
         start="2026-07-01",
         end="2026-07-15",
     )
 
     assert raw_provider.calls == 1
-    assert bars
-    assert all("2026-07-01" <= bar.date <= "2026-07-15" for bar in bars)
+    assert first == repeated == narrower
 
 
 def test_market_generator_runs_available_ranges_and_publishes_futu_source(

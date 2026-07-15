@@ -120,10 +120,10 @@ Confirm the scheduled job is not already running, then execute:
 
 ```bash
 launchctl print gui/$(id -u)/com.open-trader.premarket.us | sed -n '1,80p'
-.venv/bin/python -m open_trader run-daily-premarket \
+PYTHONPATH=src .venv/bin/python -m open_trader run-daily-premarket \
   --market US \
   --date 2026-07-15 \
-  --config config/daily_premarket.env \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env \
   --dry-run
 ```
 
