@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from open_trader.decision_plan import load_decision_plans
-from open_trader.decision_plan_generation import generate_daily_decision_plans
+from open_trader.decision_plan_generation import (
+    _RangeCachingProvider,
+    generate_daily_decision_plans,
+)
 from open_trader.kline_technical_facts import DailyKlineBar
 
 
@@ -46,6 +49,44 @@ class ShortHistoryPriceProvider:
             )
             for index in range(13)
         ]
+
+
+def test_range_cache_reuses_requested_end_after_latest_returned_bar() -> None:
+    class PreviousDayProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_daily_kline(
+            self, futu_symbol: str, *, start: str, end: str
+        ) -> list[DailyKlineBar]:
+            self.calls += 1
+            return [
+                DailyKlineBar(date="2026-06-30", close=99, volume=900),
+                DailyKlineBar(date="2026-07-14", close=100, volume=1000),
+            ]
+
+    raw_provider = PreviousDayProvider()
+    provider = _RangeCachingProvider(raw_provider)
+
+    first = provider.get_daily_kline(
+        "US.MSFT",
+        start="2025-04-20",
+        end="2026-07-15",
+    )
+    repeated = provider.get_daily_kline(
+        "US.MSFT",
+        start="2025-04-20",
+        end="2026-07-15",
+    )
+    narrower = provider.get_daily_kline(
+        "US.MSFT",
+        start="2026-07-01",
+        end="2026-07-15",
+    )
+
+    assert raw_provider.calls == 1
+    assert first == repeated
+    assert [bar.date for bar in narrower] == ["2026-07-14"]
 
 
 def test_market_generator_runs_available_ranges_and_publishes_futu_source(
