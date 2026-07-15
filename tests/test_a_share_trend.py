@@ -1108,6 +1108,26 @@ def test_markdown_translates_account_exceptions_without_raw_details() -> None:
     assert "future account exception payload" not in markdown
 
 
+def test_markdown_translates_missing_account_exception_fields(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(
+        path,
+        [portfolio_row(symbol="", name="", asset_class="bond")],
+    )
+    timestamp = datetime(2026, 7, 14, 12, tzinfo=SHANGHAI).timestamp()
+    os.utime(path, (timestamp, timestamp))
+    built = replace(
+        report(),
+        account=load_eastmoney_account(path, expected_date="2026-07-14"),
+    )
+
+    markdown = render_markdown(built)
+
+    assert "东方财富账户不支持的资产：代码缺失 名称缺失" in markdown
+    assert "<missing-symbol>" not in markdown
+    assert "<missing-name>" not in markdown
+
+
 def test_markdown_hides_any_absolute_data_source_path() -> None:
     built = replace(
         report(), data_sources=("/private/tmp/eastmoney-account-export.csv",)

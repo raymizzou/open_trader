@@ -794,6 +794,9 @@ def _account_exception_label(value: str) -> str:
     if value.startswith(prefix):
         identity, separator, details = value[len(prefix) :].rpartition(" (")
         if identity and separator and details.endswith(")"):
+            identity = identity.replace("<missing-symbol>", "代码缺失").replace(
+                "<missing-name>", "名称缺失"
+            )
             return f"东方财富账户不支持的资产：{identity}"
     return "其他账户例外：详见 JSON 审计文件"
 
