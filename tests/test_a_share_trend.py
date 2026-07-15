@@ -1231,6 +1231,39 @@ def test_trend_feishu_text_moves_unknown_formal_buy_reason_to_review() -> None:
     assert "600001 未知原因买入｜未知动作或原因，需人工确认" in message
 
 
+@pytest.mark.parametrize("account", [{"fresh": False}, {}, {"fresh": None}])
+def test_trend_feishu_text_never_lists_buy_without_explicit_fresh_account(
+    account: dict[str, object],
+) -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": account,
+        "metadata": {"market": "HK", "broker": "phillips"},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [
+                {
+                    "action": "BUY",
+                    "symbol": "02800",
+                    "name": "盈富基金",
+                    "estimated_shares": 100,
+                    "target_amount": "1000",
+                    "estimated_initial_line": "9",
+                }
+            ],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="辉立", market_label="港股"
+    )
+
+    assert "今日无买卖动作｜持有 0｜复核 1" in message
+    assert "\n买入\n" not in message
+    assert "02800 盈富基金｜未知动作或原因，需人工确认" in message
+
+
 def test_trend_feishu_text_lists_reviews_on_no_trade_days() -> None:
     payload = {
         "execution_date": "2026-07-15",

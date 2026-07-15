@@ -420,6 +420,7 @@ def _load_broker_trend_report(
         return {**unavailable, "status_text": "今日趋势报告无效"}
     formal = judgments["formal_actions"]
     holdings = judgments["holding_decisions"]
+    account_fresh = account.get("fresh") is True
     sell_actions = [
         item
         for item in formal
@@ -430,7 +431,7 @@ def _load_broker_trend_report(
         item
         for item in formal
         if item.get("action") == "BUY"
-        and account.get("fresh") is not False
+        and account_fresh
         and not _trend_action_needs_review(item)
     ]
     hold_actions = [
@@ -443,7 +444,7 @@ def _load_broker_trend_report(
     for item in formal + holdings:
         if (
             _trend_action_needs_review(item)
-            or item.get("action") == "BUY" and account.get("fresh") is False
+            or item.get("action") == "BUY" and not account_fresh
         ) and item not in review_actions:
             review_actions.append(item)
     directory = reports_dir.name
@@ -457,8 +458,8 @@ def _load_broker_trend_report(
         "data_date": str(payload.get("as_of_date") or ""),
         "generated_at": str(payload.get("generated_at") or ""),
         "account_source_date": str(account.get("source_date") or ""),
-        "account_fresh": bool(account.get("fresh")),
-        "account_status": "已更新" if account.get("fresh") else "已过期，禁止买入",
+        "account_fresh": account_fresh,
+        "account_status": "已更新" if account_fresh else "已过期，禁止买入",
         "buy_window": buy_window,
         "run_status": _latest_trend_run_status(
             data_dir / directory / "run.log",

@@ -928,6 +928,7 @@ def render_trend_feishu_text(
         for item in judgments.get("formal_actions", [])
         if isinstance(item, dict)
     ]
+    fresh = account.get("fresh") is True
     sells = [
         item
         for item in formal
@@ -936,7 +937,9 @@ def render_trend_feishu_text(
     buys = [
         item
         for item in formal
-        if item.get("action") == "BUY" and not _trend_action_needs_review(item)
+        if item.get("action") == "BUY"
+        and fresh
+        and not _trend_action_needs_review(item)
     ]
     holds = [
         item
@@ -945,11 +948,21 @@ def render_trend_feishu_text(
     ]
     reviews: list[dict[str, object]] = []
     for item in formal + holdings:
-        if _trend_action_needs_review(item) and item not in reviews:
+        if (
+            _trend_action_needs_review(item)
+            or item.get("action") == "BUY" and not fresh
+        ) and item not in reviews:
             reviews.append(item)
     title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
-    fresh = bool(account.get("fresh"))
-    status = "已更新" if fresh else ("已过期，禁止买入" if buys else "已过期")
+    status = (
+        "已更新"
+        if fresh
+        else (
+            "已过期，禁止买入"
+            if any(item.get("action") == "BUY" for item in formal)
+            else "已过期"
+        )
+    )
     summary = (
         f"今日动作：卖出 {len(sells)}｜买入 {len(buys)}｜持有 {len(holds)}｜复核 {len(reviews)}"
         if sells or buys

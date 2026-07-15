@@ -90,6 +90,53 @@ def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("freshness", [False, None, "yes"])
+def test_acceptance_rejects_actionable_buy_without_explicit_fresh_account(
+    tmp_path: Path, freshness: object,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_us_futu" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    buy = {"action": "BUY", "symbol": "VIXY"}
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": {"fresh": freshness} if freshness is not None else {},
+        "metadata": {"market": "US", "broker": "futu"},
+        "strategy_judgments": {
+            "formal_actions": [buy],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }), encoding="utf-8")
+    projected = {
+        "report_date": "2026-07-15",
+        "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "sell_actions": [],
+        "buy_actions": [buy],
+        "hold_actions": [],
+        "review_actions": [],
+        "counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
+        "audit": {
+            "artifact": artifact.name,
+            "candidates": [],
+            "excluded": {},
+            "industry_concentration": [],
+            "data_sources": [],
+        },
+    }
+
+    with pytest.raises(AssertionError, match="冻结报告动作与 API 投影不一致"):
+        dashboard_acceptance._check_trend_artifact_projection(
+            reports, "futu", projected
+        )
+
+
 def trend_reports() -> dict[str, dict[str, object]]:
     return {
         "futu": {

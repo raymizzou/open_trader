@@ -377,7 +377,7 @@ def test_dashboard_trend_report_rejects_selected_invalid_structure_without_fallb
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": {},
+        "account": {"fresh": True},
         "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VALID-BUT-OLDER"}],
@@ -425,7 +425,7 @@ def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": {},
+        "account": {"fresh": True},
         "metadata": {"market": "CN", "broker": "eastmoney"},
         "strategy_judgments": {
             "formal_actions": [
@@ -481,8 +481,11 @@ def test_dashboard_trend_report_rejects_misrouted_broker_metadata(
     assert report["status_text"] == "今日趋势报告无效"
 
 
-def test_dashboard_trend_report_never_projects_stale_account_buy_as_actionable(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
+)
+def test_dashboard_trend_report_never_projects_unconfirmed_account_buy_as_actionable(
+    tmp_path: Path, account: dict[str, object],
 ) -> None:
     config = dashboard_config(tmp_path)
     path = config.reports_dir / "trend_hk_phillips" / "2026-07-15.json"
@@ -492,7 +495,7 @@ def test_dashboard_trend_report_never_projects_stale_account_buy_as_actionable(
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": {"fresh": False},
+        "account": account,
         "metadata": {"market": "HK", "broker": "phillips"},
         "strategy_judgments": {
             "formal_actions": [stale_buy],
