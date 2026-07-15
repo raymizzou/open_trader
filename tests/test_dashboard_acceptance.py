@@ -460,7 +460,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, '#last-refresh') in selectors
         assert (
             viewport,
-            '.account-holding-row:visible .account-holding-price .session-quote',
+            '.account-holding-row:visible:has('
+            '.account-holding-market:has-text("US")) .account-holding-price',
         ) in selectors
         assert (viewport, '#account-holdings') in selectors
         assert (viewport, '.account-section') in selectors
@@ -523,22 +524,26 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
 
 def session_price_page(
     *, header: str = "刷新于 2026-07-15 15:03:13 CST",
-    prices: tuple[str, ...] = ("夜盘 61.50 · 03:03 ET",),
+    cells: tuple[tuple[str, ...], ...] = (("夜盘 61.50 · 03:03 ET",),),
     viewport_width: int = 1440,
     box: dict[str, float] | None = None,
 ) -> object:
     class Locator:
-        def __init__(self, texts: tuple[str, ...]) -> None:
-            self.texts = texts
+        def __init__(self, items: tuple[object, ...]) -> None:
+            self.items = items
 
         def inner_text(self) -> str:
-            return self.texts[0]
+            return str(self.items[0])
 
         def count(self) -> int:
-            return len(self.texts)
+            return len(self.items)
 
         def nth(self, index: int) -> "Locator":
-            return Locator((self.texts[index],))
+            return Locator((self.items[index],))
+
+        def locator(self, selector: str) -> "Locator":
+            assert selector == ".session-quote"
+            return Locator(self.items[0])  # type: ignore[arg-type]
 
         def bounding_box(self) -> dict[str, float]:
             return box or {"x": 20, "width": 100}
@@ -549,11 +554,16 @@ def session_price_page(
         def locator(self, selector: str) -> Locator:
             if selector == "#last-refresh":
                 return Locator((header,))
-            assert selector == (
+            if selector == (
                 ".account-holding-row:visible "
                 ".account-holding-price .session-quote"
+            ):
+                return Locator(tuple(price for cell in cells for price in cell))
+            assert selector == (
+                '.account-holding-row:visible:has('
+                '.account-holding-market:has-text("US")) .account-holding-price'
             )
-            return Locator(prices)
+            return Locator(cells)
 
     return Page()
 
@@ -563,15 +573,29 @@ def test_check_session_prices_accepts_compact_session_price() -> None:
 
 
 @pytest.mark.parametrize(
+    "quotes",
+    [(), ("夜盘 61.50 · 03:03 ET", "盘前 62.00 · 04:03 ET")],
+    ids=("missing", "duplicate"),
+)
+def test_check_session_prices_requires_exactly_one_quote_per_us_price_cell(
+    quotes: tuple[str, ...],
+) -> None:
+    page = session_price_page(cells=(("夜盘 60.50 · 02:03 ET",), quotes))
+
+    with pytest.raises(AssertionError, match="恰好一个分时段价格"):
+        dashboard_acceptance._check_session_prices(page)
+
+
+@pytest.mark.parametrize(
     ("page", "expected"),
     [
         (
-            session_price_page(prices=("夜盘 61.50 盘前 62.00 · 03:03 ET",)),
+            session_price_page(cells=(("夜盘 61.50 盘前 62.00 · 03:03 ET",),)),
             "多个时段",
         ),
         (session_price_page(header="刷新于 2026-07-15 15:03:13"), "Header"),
-        (session_price_page(prices=("夜盘 61.50 · 03:03",)), "时间或回退说明"),
-        (session_price_page(prices=("夜盘 61.50 · 15:03 CST",)), "重复展示"),
+        (session_price_page(cells=(("夜盘 61.50 · 03:03",),)), "时间或回退说明"),
+        (session_price_page(cells=(("夜盘 61.50 · 15:03 CST",),)), "重复展示"),
         (
             session_price_page(
                 viewport_width=390, box={"x": 350, "width": 50},

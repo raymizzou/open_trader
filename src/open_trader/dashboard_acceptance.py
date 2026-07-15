@@ -312,12 +312,15 @@ def _check_account_holdings(page: Any) -> None:
 def _check_session_prices(page: Any) -> None:
     header = page.locator("#last-refresh").inner_text().strip()
     assert "CST" in header, "Header 获取时间缺少 CST"
-    prices = page.locator(
-        ".account-holding-row:visible .account-holding-price .session-quote"
+    price_cells = page.locator(
+        '.account-holding-row:visible:has('
+        '.account-holding-market:has-text("US")) .account-holding-price'
     )
-    assert prices.count() >= 1, "美股持仓没有分时段价格"
-    for index in range(prices.count()):
-        price = prices.nth(index)
+    assert price_cells.count() >= 1, "美股持仓没有价格单元格"
+    for index in range(price_cells.count()):
+        prices = price_cells.nth(index).locator(".session-quote")
+        assert prices.count() == 1, "每个可见美股价格单元格必须恰好一个分时段价格"
+        price = prices.nth(0)
         text = re.sub(r"\s+", " ", price.inner_text()).strip()
         assert sum(label in text for label in SESSION_LABELS) == 1, "单个标的展示了多个时段"
         assert "CST" not in text, "标的行重复展示全局获取时间"
