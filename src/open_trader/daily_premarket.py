@@ -27,7 +27,8 @@ from .notifications import (
     MacOSNotifier,
     Notifier,
     NullNotifier,
-    XiaozhiVoiceNotifier,
+    XiaoaiSSHNotifier,
+    XiaoaiVoiceSuppressed,
     render_feishu_order_review,
 )
 from .futu_watch import QuoteSnapshot
@@ -101,9 +102,8 @@ class DailyPremarketConfig:
     feishu_receive_id_type: str = ""
     feishu_receive_id: str = ""
     feishu_message_format: str = "text"
-    xiaozhi_speak_url: str = ""
-    xiaozhi_device_id: str = ""
-    xiaozhi_token: str = ""
+    xiaoai_host: str = ""
+    xiaoai_ssh_key: Path | None = None
     notify_daily_report: bool = False
     notify_action_triggers: bool = False
     trend_animals_api_key: str = ""
@@ -130,6 +130,7 @@ class NotificationAttempt:
     success: bool
     error_type: str = ""
     error: str = ""
+    suppressed: bool = False
 
 
 @dataclass
@@ -241,9 +242,12 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         feishu_message_format=_feishu_message_format_config(
             values.get("OPEN_TRADER_FEISHU_MESSAGE_FORMAT", "text"),
         ),
-        xiaozhi_speak_url=values.get("OPEN_TRADER_XIAOZHI_SPEAK_URL", ""),
-        xiaozhi_device_id=values.get("OPEN_TRADER_XIAOZHI_DEVICE_ID", ""),
-        xiaozhi_token=values.get("OPEN_TRADER_XIAOZHI_TOKEN", ""),
+        xiaoai_host=values.get("OPEN_TRADER_XIAOAI_HOST", ""),
+        xiaoai_ssh_key=(
+            _config_path(values["OPEN_TRADER_XIAOAI_SSH_KEY"], repo)
+            if values.get("OPEN_TRADER_XIAOAI_SSH_KEY")
+            else None
+        ),
         notify_daily_report=_bool_config(
             values.get("OPEN_TRADER_NOTIFY_DAILY_REPORT", ""),
         ),
@@ -329,19 +333,18 @@ def build_notifier(config: DailyPremarketConfig) -> Notifier:
                 )
             )
             continue
-        if name == "xiaozhi":
+        if name == "xiaoai":
             for field_name, value in [
-                ("OPEN_TRADER_XIAOZHI_SPEAK_URL", config.xiaozhi_speak_url),
-                ("OPEN_TRADER_XIAOZHI_DEVICE_ID", config.xiaozhi_device_id),
-                ("OPEN_TRADER_XIAOZHI_TOKEN", config.xiaozhi_token),
+                ("OPEN_TRADER_XIAOAI_HOST", config.xiaoai_host),
+                ("OPEN_TRADER_XIAOAI_SSH_KEY", config.xiaoai_ssh_key),
             ]:
                 if not value:
                     raise ValueError(f"{field_name} is required")
+            assert config.xiaoai_ssh_key is not None
             notifiers.append(
-                XiaozhiVoiceNotifier(
-                    speak_url=config.xiaozhi_speak_url,
-                    device_id=config.xiaozhi_device_id,
-                    token=config.xiaozhi_token,
+                XiaoaiSSHNotifier(
+                    host=config.xiaoai_host,
+                    ssh_key=config.xiaoai_ssh_key,
                 )
             )
             continue
@@ -428,6 +431,16 @@ def send_notification_with_results(
             continue
         try:
             target.notify(title, message)
+        except XiaoaiVoiceSuppressed as exc:
+            attempts.append(
+                NotificationAttempt(
+                    channel=channel,
+                    success=False,
+                    error_type=exc.__class__.__name__,
+                    error=str(exc),
+                    suppressed=True,
+                )
+            )
         except Exception as exc:
             attempts.append(
                 NotificationAttempt(
@@ -447,8 +460,8 @@ def _notifier_channel(notifier: Notifier) -> str:
         return "feishu_app"
     if isinstance(notifier, FeishuWebhookNotifier):
         return "feishu"
-    if isinstance(notifier, XiaozhiVoiceNotifier):
-        return "xiaozhi"
+    if isinstance(notifier, XiaoaiSSHNotifier):
+        return "xiaoai"
     if isinstance(notifier, MacOSNotifier):
         return "macos"
     if isinstance(notifier, NullNotifier):

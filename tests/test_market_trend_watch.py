@@ -16,14 +16,14 @@ from open_trader.market_trend_watch import (
 from open_trader.notifications import (
     CompositeNotifier,
     NullNotifier,
-    XiaozhiVoiceNotifier,
+    XiaoaiSSHNotifier,
 )
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
-class RecordingXiaozhiNotifier(XiaozhiVoiceNotifier):
+class RecordingXiaoaiNotifier(XiaoaiSSHNotifier):
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
 
@@ -186,7 +186,7 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
             pass
 
     now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
-    voice = RecordingXiaozhiNotifier()
+    voice = RecordingXiaoaiNotifier()
     result = watch_market_protection(
         market="HK",
         data_dir=data_dir,
@@ -250,7 +250,7 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
         def close(self) -> None:
             pass
 
-    voice = RecordingXiaozhiNotifier()
+    voice = RecordingXiaoaiNotifier()
     now = datetime(2026, 7, 15, 22, 0, tzinfo=SHANGHAI)
     result = watch_market_protection(
         market="US",

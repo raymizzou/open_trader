@@ -28,6 +28,35 @@ REQUIRED_SOURCE_PATHS = (
 SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
 SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
 
+TREND_REPORT_BROKERS = ("futu", "phillips", "eastmoney")
+TREND_REPORT_DIRECTORIES = {
+    "futu": "trend_us_futu",
+    "phillips": "trend_hk_phillips",
+    "eastmoney": "trend_a_share",
+}
+TREND_REASON_LABELS = {
+    "protection_line_already_triggered": "活动保护线已触发",
+    "danger_signal": "危险信号触发",
+    "left_trend_right_side": "右侧趋势已结束",
+    "holding_signal_unknown": "趋势信号不完整",
+    "holding_kline_unavailable": "持仓日线数据不可用",
+    "trend_intact": "趋势保持完好",
+    "right_side_not_true": "尚未进入右侧趋势",
+    "strength_not_above_90": "趋势强度未超过 90",
+    "right_side_days_not_below_10": "进入右侧趋势已满 10 天",
+    "not_tradable": "当前不可交易",
+    "amount_below_1": "日成交额不足 1 亿元",
+    "danger_unknown": "危险信号未知",
+    "name_missing": "标的名称缺失",
+    "asset_missing": "资产类型缺失",
+    "unsupported_asset": "不属于 A 股股票或境内 ETF",
+    "already_held": "当前账户已经持有",
+    "excluded_security": "北交所、ST 或退市标的",
+    "unsupported_exchange": "不属于沪深市场",
+    "atr_unavailable": "缺少 ATR 数据",
+    "data_date_mismatch": "数据日期不一致",
+}
+
 
 def _latest_phillips_expectation(data_dir: Path) -> tuple[Decimal, str]:
     statements = list((data_dir / "statements/phillips").glob("*/*.pdf"))
@@ -247,6 +276,27 @@ def _fetch_quotes_payload(url: str) -> dict[str, Any]:
         return json.load(response)
 
 
+def _effective_reports_dir(
+    payload: Mapping[str, Any], *, process_cwd: Path
+) -> Path:
+    value = payload.get("reports_dir")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Dashboard reports_dir 缺失或不是非空字符串")
+    try:
+        configured = Path(value)
+        if configured.is_absolute():
+            resolved = configured.resolve()
+        else:
+            root = process_cwd.resolve()
+            resolved = (root / configured).resolve()
+            resolved.relative_to(root)
+        if not resolved.is_dir():
+            raise ValueError("目录不存在或不是目录")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Dashboard reports_dir 无效：{value!r}（{exc}）") from exc
+    return resolved
+
+
 def _listener(url: str) -> tuple[int, Path]:
     port = url.rsplit(":", 1)[-1].rstrip("/")
     pid_text = subprocess.check_output(
@@ -308,21 +358,308 @@ def _check_decision_tabs(page: Any, market: str, symbol: str) -> None:
             assert not re.search(r"当前价\s*缺失", panel_text), "趋势 / K 线当前价缺失"
 
 
-def _check_account_holdings(page: Any) -> None:
+def _plain(value: Any) -> str:
+    return "-" if value is None or str(value).strip() == "" else str(value)
+
+
+def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
+    action = item.get("action")
+    reason = item.get("reason")
+    known_reason = isinstance(reason, str) and reason in TREND_REASON_LABELS
+    if action == "BUY":
+        return reason not in (None, "") and not known_reason
+    return (
+        action == "MANUAL_REVIEW"
+        or action not in {"SELL_ALL", "HOLD", "MANUAL_REVIEW"}
+        or action in {"SELL_ALL", "HOLD"} and not known_reason
+    )
+
+
+def _check_trend_artifact_projection(
+    reports_dir: Path, broker: str, report: Mapping[str, Any]
+) -> None:
+    audit = report.get("audit")
+    audit = audit if isinstance(audit, Mapping) else {}
+    artifact = audit.get("artifact")
+    assert (
+        isinstance(artifact, str)
+        and artifact.endswith(".json")
+        and Path(artifact).name == artifact
+    ), f"{broker} 趋势报告产物文件名无效"
+    directory = TREND_REPORT_DIRECTORIES[broker]
+    path = reports_dir / directory / artifact
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"{broker} 冻结趋势报告无法读取：{exc}") from exc
+    assert isinstance(payload, Mapping), f"{broker} 冻结趋势报告不是对象"
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    expected_market = {"futu": "US", "phillips": "HK", "eastmoney": "CN"}[broker]
+    assert (
+        payload.get("execution_date") == report.get("report_date")
+        and payload.get("as_of_date") == report.get("data_date")
+        and payload.get("generated_at") == report.get("generated_at")
+        and metadata.get("market") == expected_market
+        and metadata.get("broker") == broker
+    ), f"{broker} 冻结报告身份与 API 投影不一致"
+    judgments = payload.get("strategy_judgments")
+    assert isinstance(judgments, Mapping), f"{broker} 冻结报告缺少策略判断"
+    formal = judgments.get("formal_actions")
+    holdings = judgments.get("holding_decisions")
+    account = payload.get("account")
+    buy_allowed = isinstance(account, Mapping) and account.get("fresh") is True
+    assert isinstance(formal, list) and all(
+        isinstance(item, Mapping) for item in formal
+    ), f"{broker} 冻结报告正式动作无效"
+    assert isinstance(holdings, list) and all(
+        isinstance(item, Mapping) for item in holdings
+    ), f"{broker} 冻结报告持仓动作无效"
+    sells = [
+        item for item in formal
+        if item.get("action") == "SELL_ALL" and not _trend_action_needs_review(item)
+    ]
+    buys = [
+        item for item in formal
+        if item.get("action") == "BUY"
+        and buy_allowed
+        and not _trend_action_needs_review(item)
+    ]
+    holds = [
+        item for item in holdings
+        if item.get("action") == "HOLD" and not _trend_action_needs_review(item)
+    ]
+    reviews: list[Mapping[str, Any]] = []
+    for item in [*formal, *holdings]:
+        if (
+            _trend_action_needs_review(item)
+            or not buy_allowed and item.get("action") == "BUY"
+        ) and item not in reviews:
+            reviews.append(item)
+    expected_actions = {
+        "sell_actions": sells,
+        "buy_actions": buys,
+        "hold_actions": holds,
+        "review_actions": reviews,
+    }
+    assert all(
+        report.get(key) == value for key, value in expected_actions.items()
+    ), f"{broker} 冻结报告动作与 API 投影不一致"
+    assert report.get("counts") == {
+        "sell": len(sells),
+        "buy": len(buys),
+        "hold": len(holds),
+        "review": len(reviews),
+    }, f"{broker} 冻结报告计数与 API 投影不一致"
+    assert audit.get("candidates") == judgments.get("top10_candidates", []), (
+        f"{broker} 冻结报告候选榜与 API 投影不一致"
+    )
+    for key, default in (
+        ("excluded", {}),
+        ("industry_concentration", []),
+        ("data_sources", []),
+    ):
+        assert audit.get(key) == payload.get(key, default), (
+            f"{broker} 冻结报告审计字段 {key} 与 API 投影不一致"
+        )
+
+
+def _check_trend_stage(
+    text: str, items: Any, *, kind: str, broker: str,
+) -> None:
+    rows = items if isinstance(items, list) else []
+    if not rows:
+        assert "无" in text, f"{broker} 的 {kind} 空阶段未显示 无"
+        return
+    for item in rows:
+        assert isinstance(item, Mapping), f"{broker} 的 {kind} 动作格式无效"
+        for key in ("symbol", "name"):
+            if item.get(key):
+                assert str(item[key]) in text, f"{broker} 的 {kind} 动作缺少 {key}"
+        if kind == "buy":
+            for label, key in (
+                ("约", "estimated_shares"),
+                ("金额上限", "target_amount"),
+                ("预计保护线", "estimated_initial_line"),
+            ):
+                assert f"{label} {_plain(item.get(key))}" in text, (
+                    f"{broker} 的买入动作缺少 {label}"
+                )
+            continue
+        reason = TREND_REASON_LABELS.get(
+            str(item.get("reason", "")), "未知动作或原因，需人工确认"
+        )
+        assert reason in text, f"{broker} 的 {kind} 动作缺少原因 {reason}"
+        if item.get("active_line") not in (None, ""):
+            assert f"活动保护线 {_plain(item['active_line'])}" in text, (
+                f"{broker} 的 {kind} 动作缺少活动保护线"
+            )
+
+
+def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> None:
+    assert audit.count() == 1 and audit.get_attribute("open") is None, (
+        f"{broker} 趋势报告审计详情未保持收起"
+    )
+    summary = audit.locator("summary")
+    assert summary.count() == 1, f"{broker} 趋势报告缺少审计摘要"
+    summary.click()
+    sections = audit.locator("section").all_inner_texts()
+    assert len(sections) == 3, f"{broker} 趋势报告审计区块数量不是 3"
+    data = report.get("audit") if isinstance(report.get("audit"), Mapping) else {}
+    candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
+    if not candidates:
+        assert "无" in sections[0], f"{broker} 空候选榜未显示 无"
+    for item in candidates:
+        if not isinstance(item, Mapping):
+            continue
+        for value in (item.get("symbol"), item.get("name")):
+            if value:
+                assert str(value) in sections[0], f"{broker} 候选榜缺少 {value}"
+        assert f"强度 {_plain(item.get('strength'))}" in sections[0], (
+            f"{broker} 候选榜缺少强度"
+        )
+    excluded = data.get("excluded") if isinstance(data.get("excluded"), Mapping) else {}
+    if not excluded:
+        assert "无" in sections[1], f"{broker} 空排除项未显示 无"
+    for symbol, reasons in excluded.items():
+        assert str(symbol) in sections[1], f"{broker} 排除项缺少 {symbol}"
+        for reason in reasons if isinstance(reasons, list) else []:
+            label = TREND_REASON_LABELS.get(str(reason), "未知原因")
+            assert label in sections[1], f"{broker} 排除项缺少原因 {label}"
+    industries = (
+        data.get("industry_concentration")
+        if isinstance(data.get("industry_concentration"), list) else []
+    )
+    if not industries:
+        assert "无" in sections[2], f"{broker} 空行业集中度未显示 无"
+    for row in industries:
+        for value in row if isinstance(row, list) else []:
+            assert _plain(value) in sections[2], f"{broker} 行业集中度缺少 {value}"
+    audit_text = audit.inner_text()
+    sources = data.get("data_sources") if isinstance(data.get("data_sources"), list) else []
+    for source in sources:
+        assert str(source) in audit_text, f"{broker} 审计详情缺少数据来源 {source}"
+    cost = data.get("actual_api_cost")
+    if cost is None:
+        cost = data.get("estimated_api_cost")
+    if cost is None:
+        cost = "未知"
+    assert f"API 成本：{_plain(cost)}" in audit_text, f"{broker} 审计详情缺少 API 成本"
+
+
+def _check_account_holdings(
+    page: Any, payload: dict[str, Any], *, reports_dir: Path | None = None
+) -> None:
     text = page.locator("#account-holdings").inner_text()
     for required in (
         "富途", "短线", "美股趋势交易", "老虎", "长线", "SMA200 组合策略",
         "辉立", "港股趋势交易", "东方财富", "偏短线", "趋势交易",
-        "数据日", "账户源", "买入", "卖出", "人工复核", "最近保护提醒",
-        "策略指标待接入", "夏普比率", "卡玛比率",
+        "当天趋势报告", "报告日期", "数据截至", "夏普比率", "卡玛比率",
     ):
         assert required in text, f"账户持仓视图缺少 {required}"
+    for legacy in ("数据日", "账户源", "最近保护提醒", "策略指标待接入"):
+        assert legacy not in text, f"账户持仓视图仍包含旧趋势摘要 {legacy}"
     assert page.locator(".account-section").count() == 4, "账户区块数量不是 4"
+    assert page.locator(".trend-report-entry").count() == 3, "趋势报告入口数量不是 3"
+    assert page.locator("#account-tiger .trend-report-entry").count() == 0, (
+        "老虎账户不应包含趋势报告入口"
+    )
     for forbidden in ("tiger-long-term-panel", "calibration_required", "provenance_incomplete"):
         assert forbidden not in text, f"账户持仓视图泄漏内部代码 {forbidden}"
     assert page.evaluate(
         "document.documentElement.scrollWidth <= window.innerWidth"
     ), "页面出现横向滚动"
+
+    reports = payload.get("trend_reports") or {}
+    expected_available = [
+        broker for broker in TREND_REPORT_BROKERS
+        if isinstance(reports.get(broker), Mapping)
+        and reports[broker].get("available") is True
+    ]
+    assert page.locator(".trend-report-entry [data-trend-report]").count() == len(
+        expected_available
+    ), "可用趋势报告入口数量与 API 不一致"
+    for broker in TREND_REPORT_BROKERS:
+        report = reports.get(broker) if isinstance(reports, Mapping) else None
+        assert isinstance(report, Mapping), f"API 缺少 {broker} 趋势报告状态"
+        entry = page.locator(f"#account-{broker} .trend-report-entry")
+        assert entry.count() == 1, f"{broker} 趋势报告入口数量不是 1"
+        trigger = entry.locator("[data-trend-report]")
+        if report.get("available") is not True:
+            assert trigger.count() == 0, f"{broker} 不可用报告仍可打开"
+            button = entry.locator("button")
+            assert button.count() == 1 and button.is_disabled(), (
+                f"{broker} 不可用报告入口未禁用"
+            )
+            assert page.locator("#trend-report-workspace:visible").count() == 0, (
+                f"{broker} 不可用报告错误打开工作区"
+            )
+            continue
+        assert trigger.count() == 1, f"{broker} 可用报告缺少入口"
+        if reports_dir is not None:
+            _check_trend_artifact_projection(reports_dir, broker, report)
+        entry_text = entry.inner_text()
+        for label, key in (("报告日期", "report_date"), ("数据截至", "data_date")):
+            assert f"{label} {_plain(report.get(key))}" in entry_text, (
+                f"{broker} 入口缺少 {label}"
+            )
+        trigger.click()
+        workspace = page.locator("#trend-report-workspace:visible")
+        assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
+        close = workspace.locator("[data-close-trend-report]")
+        assert close.count() == 1, f"{broker} 趋势报告工作区缺少返回按钮"
+        assert close.evaluate("element => element === document.activeElement"), (
+            f"{broker} 趋势报告打开后焦点未进入工作区"
+        )
+        workspace_text = workspace.inner_text()
+        identity = f"{_plain(report.get('broker_label'))}｜{_plain(report.get('market_label'))}"
+        assert identity in workspace_text, f"{broker} 趋势报告身份不匹配"
+        for required in (
+            "报告日期", "数据截至", "生成时间", "账户状态", "今日执行检查",
+            "确认全部卖出动作", "按顺序考虑允许买入项", "盘中观察活动保护线",
+            "完成人工复核",
+        ):
+            assert required in workspace_text, f"{broker} 趋势报告工作区缺少 {required}"
+        header_values = workspace.locator(".trend-report-header dd").all_inner_texts()
+        assert header_values == [
+            _plain(report.get(key)) for key in (
+                "report_date", "data_date", "generated_at", "account_status",
+            )
+        ], f"{broker} 趋势报告头部内容与 API 不一致"
+        counts = report.get("counts") if isinstance(report.get("counts"), Mapping) else {}
+        for label, key in (("卖出", "sell"), ("买入", "buy"), ("持有", "hold"), ("人工复核", "review")):
+            assert f"{label} {_plain(counts.get(key) or 0)}" in workspace_text, (
+                f"{broker} 趋势报告缺少 {label}计数"
+            )
+        stage_texts = workspace.locator(".trend-stage").all_inner_texts()
+        expected_titles = [
+            "开盘前", _plain(report.get("buy_window")), "盘中持续", "人工复核",
+        ]
+        assert len(stage_texts) == 4 and all(
+            title in stage_texts[index] for index, title in enumerate(expected_titles)
+        ), f"{broker} 趋势报告阶段顺序不正确"
+        for stage_text, key, kind in zip(
+            stage_texts,
+            ("sell_actions", "buy_actions", "hold_actions", "review_actions"),
+            ("sell", "buy", "hold", "review"),
+            strict=True,
+        ):
+            _check_trend_stage(stage_text, report.get(key), kind=kind, broker=broker)
+        audit = workspace.locator(".trend-audit")
+        _check_trend_audit(audit, report, broker)
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        ), f"{broker} 趋势报告工作区出现横向滚动"
+        close.click()
+        assert page.locator("#trend-report-workspace:visible").count() == 0, (
+            f"{broker} 返回后趋势报告工作区仍可见"
+        )
+        assert page.locator(".workspace-grid:visible").count() == 1, (
+            f"{broker} 返回后持仓工作区未恢复"
+        )
+        assert trigger.evaluate("element => element === document.activeElement"), (
+            f"{broker} 返回后焦点未恢复到报告入口"
+        )
 
 
 def _check_session_prices(page: Any) -> None:
@@ -405,7 +742,10 @@ def _check_cn_filter(page: Any, expected_cn: int) -> None:
 
 
 def _browser_check(
-    url: str, expected_cn: int, payload: dict[str, Any]
+    url: str,
+    expected_cn: int,
+    payload: dict[str, Any],
+    reports_dir: Path | None = None,
 ) -> tuple[list[str], str | None]:
     try:
         from playwright.sync_api import sync_playwright
@@ -451,7 +791,9 @@ def _browser_check(
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
-                        _check_account_holdings(page)
+                        _check_account_holdings(
+                            page, payload, reports_dir=reports_dir
+                        )
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
@@ -524,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     errors: list[str] = []
     browser_payload: dict[str, Any] = {}
+    reports_dir: Path | None = None
     try:
         phillips_total, phillips_period = _latest_phillips_expectation(
             _project_data_dir(args.expected_root)
@@ -542,6 +885,7 @@ def main(argv: list[str] | None = None) -> int:
         first = _fetch_payload(args.url)
         first_quotes = _fetch_quotes_payload(args.url)
         errors.extend(validate_quotes_payload(first_quotes))
+        first_reports_dir = _effective_reports_dir(first, process_cwd=cwd)
         errors.extend(validate_dashboard_payload(
             first, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
@@ -556,6 +900,9 @@ def main(argv: list[str] | None = None) -> int:
         errors.extend(validate_quotes_payload(second_quotes))
         errors.extend(validate_quote_refresh_cycle(first_quotes, second_quotes))
         browser_payload = second
+        reports_dir = _effective_reports_dir(second, process_cwd=cwd)
+        if first_reports_dir != reports_dir:
+            errors.append("两个刷新周期的 Dashboard reports_dir 不一致")
         errors.extend(validate_dashboard_payload(
             second, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
@@ -570,7 +917,10 @@ def main(argv: list[str] | None = None) -> int:
         errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
         pid = None
     browser_errors, blocker = _browser_check(
-        args.url, args.expected_cn, browser_payload
+        args.url,
+        args.expected_cn,
+        browser_payload,
+        reports_dir,
     )
     errors.extend(browser_errors)
     status = classify_result(errors, browser_blocker=blocker)

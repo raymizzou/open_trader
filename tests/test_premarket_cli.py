@@ -10,7 +10,7 @@ import pytest
 import open_trader.cli as cli
 from open_trader.advice.premarket import PremarketResult
 from open_trader.cli import build_parser
-from open_trader.daily_premarket import DailyPremarketConfig
+from open_trader.daily_premarket import DailyPremarketConfig, NotificationAttempt
 from open_trader.notifications import CompositeNotifier
 
 
@@ -813,7 +813,7 @@ def test_test_notification_reports_quiet_hour_voice_suppression(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    config = SimpleNamespace(notifiers=("feishu_app", "xiaozhi"))
+    config = SimpleNamespace()
 
     class FakeNotifier:
         def notify(self, title: str, message: str) -> None:
@@ -821,7 +821,17 @@ def test_test_notification_reports_quiet_hour_voice_suppression(
 
     monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
     monkeypatch.setattr(cli, "build_notifier", lambda loaded: FakeNotifier())
-    monkeypatch.setattr(cli, "xiaozhi_voice_allowed", lambda now: False, raising=False)
+    monkeypatch.setattr(
+        cli,
+        "send_notification_with_results",
+        lambda *args, **kwargs: [
+            NotificationAttempt(
+                channel="xiaoai",
+                success=False,
+                suppressed=True,
+            )
+        ],
+    )
 
     result = cli.main(["test-notification", "--config", str(tmp_path / "daily.env")])
 

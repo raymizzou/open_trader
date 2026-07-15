@@ -32,7 +32,8 @@ from open_trader.notifications import (
     FeishuAppNotifier,
     FeishuWebhookNotifier,
     MacOSNotifier,
-    XiaozhiVoiceNotifier,
+    XiaoaiSSHNotifier,
+    XiaoaiVoiceSuppressed,
 )
 from open_trader.trade_actions import TradeActionsResult
 from open_trader.technical_facts import source_hash
@@ -62,9 +63,8 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "OPEN_TRADER_FEISHU_RECEIVE_ID_TYPE=email",
                 "OPEN_TRADER_FEISHU_RECEIVE_ID=ray@example.com",
                 "OPEN_TRADER_FEISHU_MESSAGE_FORMAT=text",
-                "OPEN_TRADER_XIAOZHI_SPEAK_URL=http://127.0.0.1:8003/xiaozhi/notify/speak",
-                "OPEN_TRADER_XIAOZHI_DEVICE_ID=speaker-1",
-                "OPEN_TRADER_XIAOZHI_TOKEN=voice-token",
+                "OPEN_TRADER_XIAOAI_HOST=192.168.1.107",
+                f"OPEN_TRADER_XIAOAI_SSH_KEY={tmp_path / 'speaker-key'}",
                 "OPEN_TRADER_NOTIFY_DAILY_REPORT=yes",
                 "OPEN_TRADER_NOTIFY_ACTION_TRIGGERS=1",
                 "TREND_ANIMALS_API_KEY=trend-secret",
@@ -96,9 +96,8 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.feishu_receive_id_type == "email"
     assert config.feishu_receive_id == "ray@example.com"
     assert config.feishu_message_format == "text"
-    assert config.xiaozhi_speak_url == "http://127.0.0.1:8003/xiaozhi/notify/speak"
-    assert config.xiaozhi_device_id == "speaker-1"
-    assert config.xiaozhi_token == "voice-token"
+    assert config.xiaoai_host == "192.168.1.107"
+    assert config.xiaoai_ssh_key == tmp_path / "speaker-key"
     assert config.notify_daily_report is True
     assert config.notify_action_triggers is True
     assert config.trend_animals_api_key == "trend-secret"
@@ -189,6 +188,27 @@ def test_notification_results_can_select_only_macos() -> None:
     assert [attempt.channel for attempt in attempts] == ["macos"]
 
 
+def test_notification_results_report_xiaoai_quiet_hours_as_suppressed() -> None:
+    class Suppressed(XiaoaiSSHNotifier):
+        def __init__(self) -> None:
+            pass
+
+        def notify(self, title: str, message: str) -> None:
+            raise XiaoaiVoiceSuppressed("quiet hours")
+
+    attempts = send_notification_with_results(
+        Suppressed(),
+        "Open Trader 测试通知",
+        "测试",
+        channels={"xiaoai"},
+    )
+
+    assert len(attempts) == 1
+    assert attempts[0].channel == "xiaoai"
+    assert attempts[0].success is False
+    assert attempts[0].suppressed is True
+
+
 def test_load_env_config_rejects_unsupported_feishu_message_format(
     tmp_path: Path,
 ) -> None:
@@ -239,6 +259,25 @@ def test_build_notifier_uses_configured_feishu_and_macos(tmp_path: Path) -> None
     assert inner_notifiers[1].__class__.__name__ == "MacOSNotifier"
 
 
+def test_build_notifier_rejects_removed_xiaozhi_channel(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path,
+        python=tmp_path / ".venv/bin/python",
+        timezone="Asia/Shanghai",
+        deadline="21:10",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv",
+        notifiers=("xiaozhi",),
+    )
+
+    with pytest.raises(ValueError, match="unknown notifier: xiaozhi"):
+        build_notifier(config)
+
+
 def test_build_notifier_uses_configured_feishu_app_and_macos(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,
@@ -270,7 +309,7 @@ def test_build_notifier_uses_configured_feishu_app_and_macos(tmp_path: Path) -> 
     assert inner_notifiers[1].__class__.__name__ == "MacOSNotifier"
 
 
-def test_build_notifier_uses_configured_feishu_app_and_xiaozhi(tmp_path: Path) -> None:
+def test_build_notifier_uses_configured_feishu_app_and_xiaoai(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -282,14 +321,13 @@ def test_build_notifier_uses_configured_feishu_app_and_xiaozhi(tmp_path: Path) -
         reports_dir=tmp_path / "reports",
         logs_dir=tmp_path / "logs",
         portfolio=tmp_path / "data/latest/portfolio.csv",
-        notifiers=("feishu_app", "xiaozhi"),
+        notifiers=("feishu_app", "xiaoai"),
         feishu_app_id="cli_test",
         feishu_app_secret="secret",
         feishu_receive_id_type="email",
         feishu_receive_id="ray@example.com",
-        xiaozhi_speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        xiaozhi_device_id="speaker-1",
-        xiaozhi_token="voice-token",
+        xiaoai_host="192.168.1.107",
+        xiaoai_ssh_key=tmp_path / "speaker-key",
     )
 
     notifier = build_notifier(config)
@@ -298,10 +336,9 @@ def test_build_notifier_uses_configured_feishu_app_and_xiaozhi(tmp_path: Path) -
     inner_notifiers = notifier._notifiers
     assert len(inner_notifiers) == 2
     assert isinstance(inner_notifiers[0], FeishuAppNotifier)
-    assert isinstance(inner_notifiers[1], XiaozhiVoiceNotifier)
-    assert inner_notifiers[1].speak_url == config.xiaozhi_speak_url
-    assert inner_notifiers[1].device_id == config.xiaozhi_device_id
-    assert inner_notifiers[1].token == config.xiaozhi_token
+    assert isinstance(inner_notifiers[1], XiaoaiSSHNotifier)
+    assert inner_notifiers[1].host == config.xiaoai_host
+    assert inner_notifiers[1].ssh_key == config.xiaoai_ssh_key
 
 
 def test_build_notifier_returns_null_when_none_configured(tmp_path: Path) -> None:
@@ -479,7 +516,7 @@ def test_build_notifier_requires_feishu_app_config(tmp_path: Path) -> None:
         build_notifier(config)
 
 
-def test_build_notifier_requires_xiaozhi_config(tmp_path: Path) -> None:
+def test_build_notifier_requires_xiaoai_config(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -491,12 +528,11 @@ def test_build_notifier_requires_xiaozhi_config(tmp_path: Path) -> None:
         reports_dir=tmp_path / "reports",
         logs_dir=tmp_path / "logs",
         portfolio=tmp_path / "data/latest/portfolio.csv",
-        notifiers=("xiaozhi",),
-        xiaozhi_speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
-        xiaozhi_device_id="speaker-1",
+        notifiers=("xiaoai",),
+        xiaoai_host="192.168.1.107",
     )
 
-    with pytest.raises(ValueError, match="OPEN_TRADER_XIAOZHI_TOKEN is required"):
+    with pytest.raises(ValueError, match="OPEN_TRADER_XIAOAI_SSH_KEY is required"):
         build_notifier(config)
 
 
