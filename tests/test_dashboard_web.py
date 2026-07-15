@@ -1166,6 +1166,19 @@ console.log(display.unrealized_pnl_pct);
 
 def test_dashboard_renders_one_compact_us_session_price_and_header_time() -> None:
     output = run_dashboard_js(r'''
+const sessions = {
+  overnight: "夜盘",
+  pre_market: "盘前",
+  regular: "盘中",
+  after_hours: "盘后",
+};
+for (const [key, label] of Object.entries(sessions)) {
+  const html = renderQuotePrice({market:"US"}, {
+    last_price:"61.50", price_session:key,
+    price_time:"2026-07-15 03:03:01.150", current_session_quote:true,
+  });
+  if(!html.includes(label) || !html.includes(`data-session="${key}"`))throw new Error(`${key}: ${html}`);
+}
 const active = renderQuotePrice({market:"US", asset_class:"stock"}, {
   last_price:"61.50", price_session:"overnight",
   price_time:"2026-07-15 03:03:01.150", current_session_quote:true,
@@ -1186,6 +1199,22 @@ if(quoteStatusText({status:"partial",us_session_status:"active",fallback_count:2
 console.log("ok");
 ''')
     assert "ok" in output
+
+
+def test_dashboard_session_labels_use_distinct_semantic_colors() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    for session, color in {
+        "overnight": "#6941C6",
+        "pre_market": "#B54708",
+        "regular": "#175CD3",
+        "after_hours": "#027A48",
+    }.items():
+        assert (
+            f'.session-quote-label[data-session="{session}"] {{\n'
+            f"  color: {color};\n"
+            "}"
+        ) in css
 
 
 def test_dashboard_live_holdings_recalculate_values_and_weights() -> None:

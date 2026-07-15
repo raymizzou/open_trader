@@ -3417,6 +3417,22 @@ tbody tr.active-row {
   font-weight: 700;
 }
 
+.session-quote-label[data-session="overnight"] {
+  color: #6941C6;
+}
+
+.session-quote-label[data-session="pre_market"] {
+  color: #B54708;
+}
+
+.session-quote-label[data-session="regular"] {
+  color: #175CD3;
+}
+
+.session-quote-label[data-session="after_hours"] {
+  color: #027A48;
+}
+
 .session-quote-price {
   color: inherit;
   font-size: inherit;

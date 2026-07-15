@@ -5915,13 +5915,14 @@ function renderQuotePrice(holding, quote) {
   if (!quote || !hasValue(quote.last_price)) {
     return `<span class="missing-text">缺行情</span>`;
   }
+  const sessionKey = String(quote.price_session || "");
   const session = String(holding && holding.market || "").toUpperCase() === "US"
-    ? sessionQuoteLabel(quote.price_session) : "";
+    ? sessionQuoteLabel(sessionKey) : "";
   if (!session) return escapeHtml(String(quote.last_price));
   const detail = quote.current_session_quote
     ? quoteTimeEt(quote.price_time)
     : "上一有效价";
-  return `<span class="session-quote"><span class="session-quote-label">${escapeHtml(session)}</span><strong class="session-quote-price">${escapeHtml(String(quote.last_price))}</strong>${detail ? `<span class="session-quote-time">· ${escapeHtml(detail)}</span>` : ""}</span>`;
+  return `<span class="session-quote"><span class="session-quote-label" data-session="${escapeHtml(sessionKey)}">${escapeHtml(session)}</span><strong class="session-quote-price">${escapeHtml(String(quote.last_price))}</strong>${detail ? `<span class="session-quote-time">· ${escapeHtml(detail)}</span>` : ""}</span>`;
 }
 
 function sessionQuoteLabel(value) {
