@@ -90,9 +90,11 @@ def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.parametrize("freshness", [False, None, "yes"])
+@pytest.mark.parametrize(
+    "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
+)
 def test_acceptance_rejects_actionable_buy_without_explicit_fresh_account(
-    tmp_path: Path, freshness: object,
+    tmp_path: Path, account: dict[str, object],
 ) -> None:
     reports = tmp_path / "reports"
     artifact = reports / "trend_us_futu" / "2026-07-15.json"
@@ -102,7 +104,7 @@ def test_acceptance_rejects_actionable_buy_without_explicit_fresh_account(
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": {"fresh": freshness} if freshness is not None else {},
+        "account": account,
         "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [buy],

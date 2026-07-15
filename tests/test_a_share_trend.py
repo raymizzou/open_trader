@@ -1231,7 +1231,9 @@ def test_trend_feishu_text_moves_unknown_formal_buy_reason_to_review() -> None:
     assert "600001 未知原因买入｜未知动作或原因，需人工确认" in message
 
 
-@pytest.mark.parametrize("account", [{"fresh": False}, {}, {"fresh": None}])
+@pytest.mark.parametrize(
+    "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
+)
 def test_trend_feishu_text_never_lists_buy_without_explicit_fresh_account(
     account: dict[str, object],
 ) -> None:
