@@ -1077,7 +1077,7 @@ def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
                     "action": "HOLD",
                     "symbol": "MSFT",
                     "name": "微软",
-                    "reason": "right_side",
+                    "reason": "trend_intact",
                 },
                 {
                     "action": "MANUAL_REVIEW",
@@ -1147,7 +1147,9 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
         "account": {"fresh": False},
         "metadata": {"market": "HK", "broker": "phillips"},
         "strategy_judgments": {
-            "holding_decisions": [{"action": "HOLD", "symbol": "02800"}],
+            "holding_decisions": [
+                {"action": "HOLD", "symbol": "02800", "reason": "trend_intact"}
+            ],
             "formal_actions": [],
         },
     }
@@ -1161,6 +1163,40 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
         "今日无买卖动作｜持有 1｜复核 0\n\n"
         "请人工确认，不自动下单。"
     )
+
+
+def test_trend_feishu_text_moves_unknown_hold_reason_to_review() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": True},
+        "metadata": {"market": "HK"},
+        "strategy_judgments": {
+            "holding_decisions": [
+                {
+                    "action": "HOLD",
+                    "symbol": "02800",
+                    "name": "盈富基金",
+                    "reason": "future_hold_reason",
+                }
+            ],
+            "formal_actions": [],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="辉立", market_label="港股"
+    )
+
+    assert message == (
+        "数据截至：2026-07-14\n"
+        "账户状态：已更新\n"
+        "今日无买卖动作｜持有 0｜复核 1\n\n"
+        "人工复核\n"
+        "1. 02800 盈富基金｜未知动作或原因，需人工确认\n\n"
+        "请人工确认，不自动下单。"
+    )
+    assert "future_hold_reason" not in message
 
 
 def test_trend_feishu_text_lists_reviews_on_no_trade_days() -> None:

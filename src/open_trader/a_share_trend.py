@@ -933,14 +933,18 @@ def render_trend_feishu_text(
         if item.get("action") == "SELL_ALL" and item.get("reason") in REASON_LABELS
     ]
     buys = [item for item in formal if item.get("action") == "BUY"]
-    holds = [item for item in holdings if item.get("action") == "HOLD"]
+    holds = [
+        item
+        for item in holdings
+        if item.get("action") == "HOLD" and item.get("reason") in REASON_LABELS
+    ]
     reviews = [
         item
         for item in holdings
         if item.get("action") == "MANUAL_REVIEW"
         or item.get("action") not in ACTION_LABELS
         or (
-            item.get("action") == "SELL_ALL"
+            item.get("action") in {"SELL_ALL", "HOLD"}
             and item.get("reason") not in REASON_LABELS
         )
     ]
