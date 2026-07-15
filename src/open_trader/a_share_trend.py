@@ -739,46 +739,124 @@ def _money(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01')):.2f}"
 
 
+ACTION_LABELS = {
+    "SELL_ALL": "全部卖出",
+    "HOLD": "继续持有",
+    "MANUAL_REVIEW": "人工复核",
+}
+
+REASON_LABELS = {
+    "protection_line_already_triggered": "活动保护线已触发",
+    "danger_signal": "危险信号触发",
+    "left_trend_right_side": "右侧趋势已结束",
+    "holding_signal_unknown": "趋势信号不完整",
+    "trend_intact": "趋势保持完好",
+    "right_side_not_true": "尚未进入右侧趋势",
+    "strength_not_above_90": "趋势强度未超过 90",
+    "right_side_days_not_below_10": "进入右侧趋势已满 10 天",
+    "not_tradable": "当前不可交易",
+    "amount_below_1": "日成交额不足 1 亿元",
+    "danger_unknown": "危险信号未知",
+    "name_missing": "标的名称缺失",
+    "asset_missing": "资产类型缺失",
+    "unsupported_asset": "不属于 A 股股票或境内 ETF",
+    "already_held": "当前账户已经持有",
+    "excluded_security": "北交所、ST 或退市标的",
+    "unsupported_exchange": "不属于沪深市场",
+    "atr_unavailable": "缺少 ATR 数据",
+    "data_date_mismatch": "数据日期不一致",
+}
+
+
+def _action_label(value: str) -> str:
+    return ACTION_LABELS.get(value, f"未知动作（{value}）")
+
+
+def _reason_label(value: str) -> str:
+    return REASON_LABELS.get(value, f"未知原因（{value}）")
+
+
+def _api_fact_label(value: str) -> str:
+    if value.startswith("getUpdateStatus rows="):
+        return f"数据更新状态：已检查 {value.rsplit('=', 1)[-1]} 条"
+    if value.startswith("getComponentTicker rows="):
+        count = value.split(" rows=", 1)[1].split(" ", 1)[0]
+        return f"候选池成分：{count} 条"
+    if value.startswith("getTickerSnapshot fields=") and " rows=" in value:
+        count = value.split(" rows=", 1)[1].split(" ", 1)[0]
+        return f"趋势快照：{count} 条"
+    return "其他接口事实：详见 JSON 审计文件"
+
+
+def _data_source_label(value: str) -> str:
+    if value.endswith("/portfolio.csv"):
+        return "东方财富账户快照"
+    return {
+        "Trend Animals": "趋势动物",
+        "Futu CN calendar/QFQ daily K-line": "富途 A 股交易日历与前复权日线",
+    }.get(value, value)
+
+
 def render_markdown(report: TrendReport) -> str:
-    freshness = "新鲜" if report.account.fresh else "陈旧，禁止正式买入"
+    freshness = "已更新" if report.account.fresh else "已过期，禁止正式买入"
+    sells = [item for item in report.holdings if item.action == "SELL_ALL"]
+    holds = [item for item in report.holdings if item.action == "HOLD"]
+    reviews = [item for item in report.holdings if item.action == "MANUAL_REVIEW"]
     industry_facts = {
         industry: (count, weight)
         for industry, count, weight in report.industry_concentration
     }
     lines = [
-        f"# A股趋势操作计划 · {report.as_of_date}",
+        f"# A股趋势操作计划 · {report.execution_date}",
         "",
-        "## 日期与账户新鲜度",
+        "## 操作摘要",
         "",
-        f"- 生成时间：{report.generated_at}",
-        f"- 数据日期：{report.as_of_date}",
-        f"- 下一执行日：{report.execution_date}",
-        f"- 东方财富账户日期：{report.account.source_date}（{freshness}）",
-        f"- 当前持仓席位：{len(report.account.positions)}/10",
+        f"数据日期：{report.as_of_date}｜生成时间：{report.generated_at}｜账户：{freshness}",
+        f"全部卖出 {len(sells)}｜允许买入 {len(report.buy_actions)}｜"
+        f"继续持有 {len(holds)}｜人工复核 {len(reviews)}",
         "",
-        "## API 原始事实",
+        "## 开盘前：确认卖出",
         "",
     ]
-    lines.extend(f"- {fact}" for fact in report.api_facts)
-    if not report.api_facts:
-        lines.append("- 无可用 API 事实。")
-    lines.extend(["", "## 策略纪律判断", "", "### 全部持仓判断", ""])
-    if report.holdings:
-        for item in report.holdings:
-            line = f"- {item.symbol} {item.name}：{item.action}（{item.reason}）"
+    if sells:
+        for item in sells:
+            line = f"- {item.symbol} {item.name}｜{_reason_label(item.reason)}"
             if item.active_line is not None:
-                line += f"，活动保护线 {_money(item.active_line)}"
-            signal = report.signal_snapshots["holdings"].get(item.symbol)  # type: ignore[union-attr]
-            if isinstance(signal, Mapping):
-                line += (
-                    f"；API信号 right_side={signal.get('right_side')}, "
-                    f"danger={signal.get('danger')}, boiling={signal.get('boiling')}, "
-                    f"champagne={signal.get('champagne')}"
-                )
+                line += f"｜活动保护线 {_money(item.active_line)}"
             lines.append(line)
     else:
-        lines.append("- 当前无趋势持仓。")
-    lines.extend(["", "### 前 10 名开仓序列", ""])
+        lines.append("- 无需卖出。")
+
+    lines.extend(["", "## 09:30–10:00：按顺序考虑买入", ""])
+    if report.buy_actions:
+        for index, item in enumerate(report.buy_actions, 1):
+            lines.append(
+                f"- {index}. {item.symbol} {item.name}｜约 {item.estimated_shares} 股｜"
+                f"金额上限 {_money(item.target_amount)} 元｜"
+                f"预计保护线 {_money(item.estimated_initial_line)}"
+            )
+        lines.append(
+            "- 实际股数按东方财富实时价格向下取整为 100 股整数倍，"
+            "不得超过金额上限。"
+        )
+    else:
+        lines.append("- 无允许买入标的。")
+    if not sells and not report.buy_actions:
+        lines.extend(["", NO_ACTION_TEXT])
+
+    lines.extend(["", "## 继续持有与人工复核", ""])
+    for item in [*holds, *reviews]:
+        line = (
+            f"- {item.symbol} {item.name}｜{_action_label(item.action)}｜"
+            f"{_reason_label(item.reason)}"
+        )
+        if item.active_line is not None:
+            line += f"｜活动保护线 {_money(item.active_line)}"
+        lines.append(line)
+    if not holds and not reviews:
+        lines.append("- 无。")
+
+    lines.extend(["", "## 中文附录", "", "### 前 10 名候选", ""])
     if report.candidates:
         for index, item in enumerate(report.candidates[:10], 1):
             industry_count, industry_weight = industry_facts.get(
@@ -792,21 +870,8 @@ def render_markdown(report: TrendReport) -> str:
             )
     else:
         lines.append("- 无合格候选。")
-    lines.extend(["", "### 下一交易时段正式操作", ""])
-    sells = [item for item in report.holdings if item.action == "SELL_ALL"]
-    for item in sells:
-        lines.append(f"- 卖出全部：{item.symbol} {item.name}（{item.reason}）。")
-    for item in report.buy_actions:
-        lines.append(
-            f"- 买入候选：{item.symbol} {item.name}；仅限 {report.execution_date} "
-            f"09:30–10:00；收盘价估算 {item.estimated_shares} 股；"
-            f"1% 目标金额 {_money(item.target_amount)} 元；"
-            f"预计初始保护线 {_money(item.estimated_initial_line)}；"
-            "按东方财富实时价格向下重算为 100 股整数倍且不得超过建议金额。"
-        )
-    if not sells and not report.buy_actions:
-        lines.append(NO_ACTION_TEXT)
-    lines.extend(["", "## 行业集中度", ""])
+
+    lines.extend(["", "### 行业集中度", ""])
     if report.industry_concentration:
         lines.extend(
             f"- {industry}：当前持仓 {count} 个席位，当前仓位 {_money(weight)}%"
@@ -814,26 +879,27 @@ def render_markdown(report: TrendReport) -> str:
         )
     else:
         lines.append("- 当前无行业持仓集中事实。")
-    lines.extend(["", "## 排除项与账户例外", ""])
+
+    lines.extend(["", "### 排除项", ""])
     for symbol, reasons in report.excluded.items():
-        snapshots = report.signal_snapshots["excluded"].get(symbol)  # type: ignore[union-attr]
-        signal_text = ""
-        if isinstance(snapshots, list) and snapshots:
-            signal_text = "; API信号 " + ", ".join(
-                f"{key}={value}" for key, value in snapshots[0].items()
-            )
-        lines.append(f"- {symbol}：{', '.join(reasons)}{signal_text}")
-    lines.extend(f"- 账户例外：{item}" for item in report.account.exceptions)
+        lines.append(f"- {symbol}｜{'、'.join(_reason_label(reason) for reason in reasons)}")
+    lines.extend(f"- 账户例外｜{item}" for item in report.account.exceptions)
     if not report.excluded and not report.account.exceptions:
         lines.append("- 无。")
-    lines.extend(["", "## 数据来源与 API 成本", ""])
-    lines.extend(f"- 数据来源：{source}" for source in report.data_sources)
+
+    lines.extend(["", "### 数据与成本", ""])
+    lines.extend(f"- {_api_fact_label(fact)}" for fact in report.api_facts)
+    if not report.api_facts:
+        lines.append("- 无可用接口事实。")
+    lines.extend(
+        f"- 数据来源：{_data_source_label(source)}" for source in report.data_sources
+    )
     lines.append(
-        "- API 计费表估算："
+        "- API 计费估算："
         + ("未知" if report.estimated_api_cost is None else str(report.estimated_api_cost))
     )
     lines.append(
-        "- 本次运行窗口实际余额差："
+        "- 本次余额变化："
         + ("未知" if report.actual_api_cost is None else str(report.actual_api_cost))
     )
     lines.extend(

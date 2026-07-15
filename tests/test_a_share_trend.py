@@ -981,11 +981,85 @@ def test_load_account_rejects_mixed_eastmoney_broker_row(tmp_path: Path) -> None
         load_eastmoney_account(path, expected_date="2026-07-14")
 
 
-def test_markdown_separates_source_facts_from_strategy_judgments() -> None:
+def test_markdown_prioritizes_actions_before_source_summary() -> None:
     markdown = render_markdown(report(candidates=(candidate("600001"),)))
-    assert markdown.index("## API 原始事实") < markdown.index("## 策略纪律判断")
-    assert "A股数据日期：2026-07-14" in markdown.split("## 策略纪律判断", 1)[0]
-    assert "600001" in markdown.split("## 策略纪律判断", 1)[1]
+    assert markdown.index("## 09:30–10:00：按顺序考虑买入") < markdown.index(
+        "## 中文附录"
+    )
+    assert "其他接口事实：详见 JSON 审计文件" in markdown
+    assert "## API 原始事实" not in markdown
+
+
+def test_markdown_is_operation_first_and_translates_internal_codes() -> None:
+    built = replace(
+        report(candidates=(candidate("600001"),)),
+        holdings=(
+            trend_module.HoldingDecision(
+                symbol="600025",
+                name="华能水电",
+                industry="电力",
+                action="SELL_ALL",
+                reason="left_trend_right_side",
+                initial_line=Decimal("9.32"),
+                active_line=Decimal("9.32"),
+                atr=Decimal("0.10"),
+                historical=True,
+            ),
+        ),
+    )
+    markdown = render_markdown(built)
+
+    assert markdown.index("## 操作摘要") < markdown.index("## 开盘前：确认卖出")
+    assert markdown.index("## 开盘前：确认卖出") < markdown.index(
+        "## 09:30–10:00：按顺序考虑买入"
+    )
+    assert "全部卖出" in markdown
+    assert "SELL_ALL" not in markdown
+    assert "HOLD" not in markdown
+    assert "left_trend_right_side" not in markdown
+
+
+def test_markdown_translates_exclusion_and_api_facts_without_paths() -> None:
+    built = replace(
+        report(),
+        excluded={
+            "002303": ["right_side_days_not_below_10"],
+            "159835": ["amount_below_1"],
+            "551520": ["atr_unavailable"],
+        },
+        api_facts=(
+            "getUpdateStatus rows=6",
+            "getComponentTicker rows=39 cache=client-managed",
+            "getTickerSnapshot fields=tmId,tickerName rows=44 cache=client-managed",
+        ),
+        data_sources=(
+            "Trend Animals",
+            "Futu CN calendar/QFQ daily K-line",
+            "/Users/ray/projects/open_trader/data/latest/portfolio.csv",
+        ),
+    )
+    markdown = render_markdown(built)
+
+    assert "进入右侧趋势已满 10 天" in markdown
+    assert "日成交额不足 1 亿元" in markdown
+    assert "缺少 ATR 数据" in markdown
+    assert "数据更新状态：已检查 6 条" in markdown
+    assert "候选池成分：39 条" in markdown
+    assert "趋势快照：44 条" in markdown
+    assert "getUpdateStatus" not in markdown
+    assert "cache=client-managed" not in markdown
+    assert "/Users/ray" not in markdown
+    assert "东方财富账户快照" in markdown
+
+
+def test_markdown_unknown_reason_is_visible_but_json_keeps_raw_codes() -> None:
+    built = replace(report(), excluded={"600001": ["future_reason_code"]})
+
+    markdown = render_markdown(built)
+    payload = trend_module._report_payload(built)
+
+    assert "未知原因（future_reason_code）" in markdown
+    assert payload["excluded"]["600001"] == ["future_reason_code"]
 
 
 def test_industry_concentration_includes_slots_and_account_weight() -> None:
@@ -1024,10 +1098,10 @@ def test_no_action_report_uses_exact_cash_sentence() -> None:
 def test_formal_buy_text_includes_window_estimates_target_and_line() -> None:
     markdown = render_markdown(report(candidates=(candidate("600001"),)))
     assert "09:30–10:00" in markdown
-    assert "收盘价估算 600 股" in markdown
-    assert "1% 目标金额 6765.50 元" in markdown
-    assert "预计初始保护线 9.00" in markdown
-    assert "按东方财富实时价格向下重算为 100 股整数倍且不得超过建议金额" in markdown
+    assert "约 600 股" in markdown
+    assert "金额上限 6765.50 元" in markdown
+    assert "预计保护线 9.00" in markdown
+    assert "按东方财富实时价格向下取整为 100 股整数倍" in markdown
 
 
 def test_candidate_row_shows_industry_slots_and_weight() -> None:
@@ -1233,7 +1307,8 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
     }
     markdown = markdown_path.read_text(encoding="utf-8")
     assert "2026-07-14T17:00:01+08:00" in markdown
-    assert "danger=True" in markdown
+    assert "危险信号触发" in markdown
+    assert "danger=True" not in markdown
 
 
 def test_candidate_audit_includes_all_ranked_and_excluded_pool_facts() -> None:
