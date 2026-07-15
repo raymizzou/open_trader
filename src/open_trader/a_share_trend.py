@@ -750,6 +750,7 @@ REASON_LABELS = {
     "danger_signal": "危险信号触发",
     "left_trend_right_side": "右侧趋势已结束",
     "holding_signal_unknown": "趋势信号不完整",
+    "holding_kline_unavailable": "持仓日线数据不可用",
     "trend_intact": "趋势保持完好",
     "right_side_not_true": "尚未进入右侧趋势",
     "strength_not_above_90": "趋势强度未超过 90",
@@ -788,8 +789,17 @@ def _api_fact_label(value: str) -> str:
     return "其他接口事实：详见 JSON 审计文件"
 
 
+def _account_exception_label(value: str) -> str:
+    prefix = "unsupported Eastmoney asset: "
+    if value.startswith(prefix):
+        identity, separator, details = value[len(prefix) :].rpartition(" (")
+        if identity and separator and details.endswith(")"):
+            return f"东方财富账户不支持的资产：{identity}"
+    return "其他账户例外：详见 JSON 审计文件"
+
+
 def _data_source_label(value: str) -> str:
-    if value.endswith("/portfolio.csv"):
+    if Path(value).is_absolute():
         return "东方财富账户快照"
     return {
         "Trend Animals": "趋势动物",
@@ -883,7 +893,10 @@ def render_markdown(report: TrendReport) -> str:
     lines.extend(["", "### 排除项", ""])
     for symbol, reasons in report.excluded.items():
         lines.append(f"- {symbol}｜{'、'.join(_reason_label(reason) for reason in reasons)}")
-    lines.extend(f"- 账户例外｜{item}" for item in report.account.exceptions)
+    lines.extend(
+        f"- 账户例外｜{_account_exception_label(item)}"
+        for item in report.account.exceptions
+    )
     if not report.excluded and not report.account.exceptions:
         lines.append("- 无。")
 

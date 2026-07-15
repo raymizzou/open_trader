@@ -1062,6 +1062,63 @@ def test_markdown_unknown_reason_is_visible_but_json_keeps_raw_codes() -> None:
     assert payload["excluded"]["600001"] == ["future_reason_code"]
 
 
+def test_markdown_translates_holding_kline_unavailable() -> None:
+    built = replace(
+        report(),
+        holdings=(
+            trend_module.HoldingDecision(
+                symbol="600025",
+                name="华能水电",
+                industry="电力",
+                action="MANUAL_REVIEW",
+                reason="holding_kline_unavailable",
+                initial_line=Decimal("9.32"),
+                active_line=Decimal("9.32"),
+                atr=None,
+                historical=True,
+            ),
+        ),
+    )
+
+    markdown = render_markdown(built)
+
+    assert "持仓日线数据不可用" in markdown
+    assert "holding_kline_unavailable" not in markdown
+
+
+def test_markdown_translates_account_exceptions_without_raw_details() -> None:
+    built = report()
+    built = replace(
+        built,
+        account=replace(
+            built.account,
+            exceptions=(
+                "unsupported Eastmoney asset: 110001 可转债 (CN/bond)",
+                "future account exception payload",
+            ),
+        ),
+    )
+
+    markdown = render_markdown(built)
+
+    assert "东方财富账户不支持的资产：110001 可转债" in markdown
+    assert "其他账户例外：详见 JSON 审计文件" in markdown
+    assert "unsupported Eastmoney asset" not in markdown
+    assert "CN/bond" not in markdown
+    assert "future account exception payload" not in markdown
+
+
+def test_markdown_hides_any_absolute_data_source_path() -> None:
+    built = replace(
+        report(), data_sources=("/private/tmp/eastmoney-account-export.csv",)
+    )
+
+    markdown = render_markdown(built)
+
+    assert "东方财富账户快照" in markdown
+    assert "/private/tmp" not in markdown
+
+
 def test_industry_concentration_includes_slots_and_account_weight() -> None:
     snapshot = AccountSnapshot(
         source_date="2026-07-14",
