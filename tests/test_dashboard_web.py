@@ -95,6 +95,9 @@ def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
         assert "background: var(--surface-soft);" in market_css
         assert "border-bottom" in market_css and "var(--line)" in market_css
         assert "color: var(--text);" in market_css
+    for market_text_selector in (".market-section-row span", ".market-section-other td"):
+        market_text_css = css.split(f"{market_text_selector} {{", 1)[1].split("}", 1)[0]
+        assert "color: var(--text);" in market_text_css
     assert "linear-gradient" not in css
     assert "font-variant-numeric: tabular-nums;" in css
 

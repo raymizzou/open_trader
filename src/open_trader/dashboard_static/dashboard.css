@@ -1654,7 +1654,7 @@ tbody tr.active-row {
 }
 
 .market-section-row span {
-  color: var(--muted);
+  color: var(--text);
   font-size: 12px;
   font-weight: 700;
 }
@@ -1691,7 +1691,7 @@ tbody tr.active-row {
   background: var(--surface-soft);
   border-bottom-color: var(--line);
   border-top-color: var(--line);
-  color: var(--muted);
+  color: var(--text);
 }
 
 .decision-detail-row > td {
