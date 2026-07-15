@@ -13,6 +13,7 @@ from open_trader.dashboard_acceptance import (
     classify_result,
     dashboard_signature,
     validate_dashboard_payload,
+    validate_quotes_payload,
 )
 
 
@@ -73,6 +74,42 @@ def valid_payload() -> dict[str, object]:
             "order_requests": [],
         },
     }
+
+
+def valid_quotes_payload() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "fetched_at": "2026-07-15T15:03:13+08:00",
+        "us_session_status": "active",
+        "quotes": {
+            "US.DRAM": {
+                "market": "US", "symbol": "DRAM", "last_price": "61.5",
+                "price_session": "overnight", "price_time": "2026-07-15 03:03:01",
+                "current_session_quote": True, "market_state": "OVERNIGHT",
+            }
+        },
+    }
+
+
+def test_validate_quotes_payload_accepts_one_selected_us_session_price() -> None:
+    assert validate_quotes_payload(valid_quotes_payload()) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("last_price", "", "价格无效"),
+        ("price_session", "", "时段缺失"),
+        ("market_state", "", "市场状态缺失"),
+        ("price_time", "", "当前时段行情时间缺失"),
+    ],
+)
+def test_validate_quotes_payload_rejects_incomplete_current_quote(
+    field: str, value: object, expected: str,
+) -> None:
+    payload = valid_quotes_payload()
+    payload["quotes"]["US.DRAM"][field] = value  # type: ignore[index]
+    assert any(expected in error for error in validate_quotes_payload(payload))
 
 
 def nested_get(row: dict[str, object], path: tuple[str, ...]) -> dict[str, object]:
@@ -279,6 +316,10 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
                 state[f"{self.name}_hash"] = "#account-tiger"
 
         def inner_text(self) -> str:
+            if self.selector == "#last-refresh":
+                return "刷新于 2026-07-15 15:03:13 CST"
+            if ".session-quote" in self.selector:
+                return "夜盘 61.50 · 03:03 ET"
             if self.selector == "#account-holdings":
                 return (
                     "富途短线美股趋势交易数据日2026-07-14账户源2026-07-14买入1卖出0人工复核1最近保护提醒无 "
@@ -317,9 +358,13 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             assert "getBoundingClientRect" in expression
             return True
 
+        def bounding_box(self) -> dict[str, float]:
+            return {"x": 20, "width": 100}
+
     class Page:
-        def __init__(self, name: str) -> None:
+        def __init__(self, name: str, viewport: dict[str, int]) -> None:
             self.name = name
+            self.viewport_size = viewport
 
         def on(self, *_args: object) -> None:
             pass
@@ -351,7 +396,10 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
         def new_page(self, **_kwargs: object) -> Page:
             self.pages += 1
-            return Page("desktop" if self.pages == 1 else "mobile")
+            return Page(
+                "desktop" if self.pages == 1 else "mobile",
+                _kwargs["viewport"],  # type: ignore[arg-type]
+            )
 
         def close(self) -> None:
             pass
@@ -409,6 +457,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, '[data-market="CN"]') in clicks
         assert (viewport, 'button[data-broker="eastmoney"]') not in selectors
         assert (viewport, '#visible-count') in selectors
+        assert (viewport, '#last-refresh') in selectors
+        assert (
+            viewport,
+            '.account-holding-row:visible .account-holding-price .session-quote',
+        ) in selectors
         assert (viewport, '#account-holdings') in selectors
         assert (viewport, '.account-section') in selectors
         assert (viewport, '.account-section:visible') in selectors
@@ -466,6 +519,72 @@ def test_check_account_holdings_requires_all_profiles_and_tiger_metrics() -> Non
             return True
 
     dashboard_acceptance._check_account_holdings(Page())
+
+
+def session_price_page(
+    *, header: str = "刷新于 2026-07-15 15:03:13 CST",
+    prices: tuple[str, ...] = ("夜盘 61.50 · 03:03 ET",),
+    viewport_width: int = 1440,
+    box: dict[str, float] | None = None,
+) -> object:
+    class Locator:
+        def __init__(self, texts: tuple[str, ...]) -> None:
+            self.texts = texts
+
+        def inner_text(self) -> str:
+            return self.texts[0]
+
+        def count(self) -> int:
+            return len(self.texts)
+
+        def nth(self, index: int) -> "Locator":
+            return Locator((self.texts[index],))
+
+        def bounding_box(self) -> dict[str, float]:
+            return box or {"x": 20, "width": 100}
+
+    class Page:
+        viewport_size = {"width": viewport_width, "height": 844}
+
+        def locator(self, selector: str) -> Locator:
+            if selector == "#last-refresh":
+                return Locator((header,))
+            assert selector == (
+                ".account-holding-row:visible "
+                ".account-holding-price .session-quote"
+            )
+            return Locator(prices)
+
+    return Page()
+
+
+def test_check_session_prices_accepts_compact_session_price() -> None:
+    dashboard_acceptance._check_session_prices(session_price_page())
+
+
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        (
+            session_price_page(prices=("夜盘 61.50 盘前 62.00 · 03:03 ET",)),
+            "多个时段",
+        ),
+        (session_price_page(header="刷新于 2026-07-15 15:03:13"), "Header"),
+        (session_price_page(prices=("夜盘 61.50 · 03:03",)), "时间或回退说明"),
+        (session_price_page(prices=("夜盘 61.50 · 15:03 CST",)), "重复展示"),
+        (
+            session_price_page(
+                viewport_width=390, box={"x": 350, "width": 50},
+            ),
+            "超出视口",
+        ),
+    ],
+)
+def test_check_session_prices_rejects_broken_contract(
+    page: object, expected: str,
+) -> None:
+    with pytest.raises(AssertionError, match=expected):
+        dashboard_acceptance._check_session_prices(page)
 
 
 @pytest.mark.parametrize(

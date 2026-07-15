@@ -24,6 +24,8 @@ REQUIRED_SOURCE_PATHS = (
     ("futu_skill_facts", "capital_anomaly"),
     ("futu_skill_facts", "derivatives_anomaly"),
 )
+SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
+SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
 
 
 def _latest_phillips_expectation(data_dir: Path) -> tuple[Decimal, str]:
@@ -174,6 +176,35 @@ def validate_dashboard_payload(
     return errors
 
 
+def validate_quotes_payload(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if not payload.get("fetched_at"):
+        errors.append("行情 API 缺少全局获取时间")
+    if payload.get("us_session_status") not in {"active", "closed", "mixed"}:
+        errors.append("行情 API 缺少有效的美股时段状态")
+    us_quotes = [
+        quote for quote in (payload.get("quotes") or {}).values()
+        if quote.get("market") == "US"
+    ]
+    if not us_quotes:
+        errors.append("行情 API 没有美股报价")
+    for quote in us_quotes:
+        symbol = str(quote.get("symbol", ""))
+        try:
+            price = Decimal(str(quote.get("last_price", "")))
+        except (InvalidOperation, ValueError):
+            price = Decimal("0")
+        if not price.is_finite() or price <= 0:
+            errors.append(f"US.{symbol} 价格无效")
+        if quote.get("price_session") not in SESSION_KEYS:
+            errors.append(f"US.{symbol} 时段缺失")
+        if not quote.get("market_state"):
+            errors.append(f"US.{symbol} 市场状态缺失")
+        if quote.get("current_session_quote") is True and not quote.get("price_time"):
+            errors.append(f"US.{symbol} 当前时段行情时间缺失")
+    return errors
+
+
 def classify_result(errors: list[str], *, browser_blocker: str | None) -> str:
     if errors:
         return "FAIL"
@@ -190,6 +221,13 @@ def _fetch_payload(url: str) -> dict[str, Any]:
     with urlopen(f"{url.rstrip('/')}/api/dashboard", timeout=15) as response:
         if response.status != 200:
             raise RuntimeError(f"Dashboard API HTTP {response.status}")
+        return json.load(response)
+
+
+def _fetch_quotes_payload(url: str) -> dict[str, Any]:
+    with urlopen(f"{url.rstrip('/')}/api/quotes", timeout=15) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Quotes API HTTP {response.status}")
         return json.load(response)
 
 
@@ -269,6 +307,27 @@ def _check_account_holdings(page: Any) -> None:
     assert page.evaluate(
         "document.documentElement.scrollWidth <= window.innerWidth"
     ), "页面出现横向滚动"
+
+
+def _check_session_prices(page: Any) -> None:
+    header = page.locator("#last-refresh").inner_text().strip()
+    assert "CST" in header, "Header 获取时间缺少 CST"
+    prices = page.locator(
+        ".account-holding-row:visible .account-holding-price .session-quote"
+    )
+    assert prices.count() >= 1, "美股持仓没有分时段价格"
+    for index in range(prices.count()):
+        price = prices.nth(index)
+        text = re.sub(r"\s+", " ", price.inner_text()).strip()
+        assert sum(label in text for label in SESSION_LABELS) == 1, "单个标的展示了多个时段"
+        assert "CST" not in text, "标的行重复展示全局获取时间"
+        assert "ET" in text or "上一有效价" in text, "标的价格没有时间或回退说明"
+        if page.viewport_size and page.viewport_size["width"] <= 500:
+            box = price.bounding_box()
+            assert box is not None, "无法读取标的价格位置"
+            assert box["x"] + box["width"] <= page.viewport_size["width"] + 1, (
+                "移动端标的价格超出视口"
+            )
 
 
 def _check_page_safety(page: Any) -> None:
@@ -377,6 +436,10 @@ def _browser_check(
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
+                        _check_session_prices(page)
+                    except Exception as exc:
+                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
+                    try:
                         _check_tiger_anchor(page)
                         assert page.locator("#account-tiger:visible").count() == 1, (
                             "点击老虎账户锚点后账户区块不可见"
@@ -458,6 +521,8 @@ def main(argv: list[str] | None = None) -> int:
         if running_sha != expected_sha:
             errors.append(f"运行 Git SHA 不匹配：{running_sha[:7]} != {expected_sha[:7]}")
         first = _fetch_payload(args.url)
+        first_quotes = _fetch_quotes_payload(args.url)
+        errors.extend(validate_quotes_payload(first_quotes))
         errors.extend(validate_dashboard_payload(
             first, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
@@ -468,6 +533,8 @@ def main(argv: list[str] | None = None) -> int:
         if not errors and args.wait_seconds:
             time.sleep(args.wait_seconds)
         second = _fetch_payload(args.url)
+        second_quotes = _fetch_quotes_payload(args.url)
+        errors.extend(validate_quotes_payload(second_quotes))
         browser_payload = second
         errors.extend(validate_dashboard_payload(
             second, expected_cn=args.expected_cn,
