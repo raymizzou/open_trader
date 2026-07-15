@@ -187,7 +187,10 @@ def load_market_account(
     exceptions: list[str] = []
     positions: list[AccountPosition] = []
     for row in market_rows:
-        symbol = _normalized_symbol(market, row.get("symbol", ""))
+        try:
+            symbol = _normalized_symbol(market, row.get("symbol", ""))
+        except ValueError:
+            continue
         if symbol not in normalized_managed or _decimal(row.get("quantity", "0"), default=Decimal("0")) <= 0:
             continue
         asset_class = row.get("asset_class", "").strip().lower()

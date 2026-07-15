@@ -148,6 +148,11 @@ def test_load_phillips_statement_can_be_stale_and_caps_cash_to_known_balance(
             "market": "HK", "asset_class": "stock", "symbol": "700",
             "name": "腾讯", "currency": "HKD", "quantity": "100",
             "cost_price": "400", "market_value": "50000",
+        }, {
+            "statement_id": "2026-06-phillips", "broker": "phillips",
+            "market": "HK", "asset_class": "stock", "symbol": "UT.SI",
+            "name": "Unmanaged foreign holding", "currency": "HKD", "quantity": "10",
+            "cost_price": "1", "market_value": "100",
         }],
         cash=[{
             "statement_id": "2026-06-phillips", "broker": "phillips",
