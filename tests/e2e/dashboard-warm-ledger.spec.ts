@@ -44,6 +44,17 @@ async function expectWarmSurface(page: Page, selector: string) {
   await expect(surface).toHaveCSS('border-top-width', '1px');
 }
 
+async function expectMobileTargetsAtLeast44(page: Page, surface: string, selector: string) {
+  const targets = page.locator(surface).locator(selector);
+  expect(await targets.count(), `${surface} should expose ${selector}`).toBeGreaterThan(0);
+  for (const target of await targets.evaluateAll((elements) => elements.map((element) => ({
+    height: element.getBoundingClientRect().height,
+    label: element.getAttribute('aria-label') || (element.textContent || '').trim() || element.tagName,
+  })))) {
+    expect(target.height, `${surface}: ${target.label}`).toBeGreaterThanOrEqual(44);
+  }
+}
+
 const brokers = [
   { key: 'futu', label: '富途', symbol: 'AAPL', portfolio: '971,244.73', holding: '960,926.44', cash: '10,318.30' },
   { key: 'tiger', label: '老虎', symbol: 'QQQ', portfolio: '726,091.55', holding: '700,000.00', cash: '26,091.55' },
@@ -194,19 +205,13 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
   await page.keyboard.press('ArrowRight');
   await expect(page.getByRole('tab', { name: /富途/ })).toBeFocused();
 
-  const mobileTargets = page.locator([
+  await expectMobileTargetsAtLeast44(page, 'body', [
     '#account-tabs [role="tab"]:visible',
     '#header-market-filters button:visible',
     '.strategy-tools button:visible',
     '#refresh-quotes:visible',
     '.account-holding-actions button:visible',
   ].join(','));
-  for (const target of await mobileTargets.evaluateAll((elements) => elements.map((element) => ({
-    height: element.getBoundingClientRect().height,
-    label: (element.textContent || '').trim(),
-  })))) {
-    expect(target.height, target.label).toBeGreaterThanOrEqual(44);
-  }
 
   await page.getByRole('tab', { name: /老虎/ }).click();
   await page.getByRole('button', { name: '凯利实验室' }).click();
@@ -214,7 +219,29 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
   await expect(page.locator('.header-assets-panel')).toBeHidden();
   await expect(page.locator('.kelly-lab-panel')).toHaveCSS('background-color', 'rgb(255, 255, 255)');
   await expect(page.locator('.kelly-lab-panel')).toHaveCSS('border-top-color', 'rgb(214, 211, 209)');
+  await expectMobileTargetsAtLeast44(page, 'body', '#return-to-portfolio:visible, .kelly-lab-panel button:visible');
   await page.getByRole('button', { name: '返回持仓' }).click();
   await expect(page.getByRole('tab', { name: /老虎/ })).toHaveAttribute('aria-selected', 'true');
+
+  await page.getByRole('button', { name: '策略回测' }).click();
+  await expect(page.locator('#standard-backtest-workspace')).toBeVisible();
+  await expectMobileTargetsAtLeast44(page, '#standard-backtest-workspace', 'button:visible, input:visible, select:visible');
+  await page.getByRole('button', { name: '返回持仓' }).click();
+
+  await page.getByRole('tab', { name: /富途/ }).click();
+  await page.getByRole('button', { name: '当天趋势报告' }).click();
+  await expect(page.locator('#trend-report-workspace')).toBeVisible();
+  await expectMobileTargetsAtLeast44(page, 'body', '#return-to-portfolio:visible, #trend-report-workspace button:visible');
+  await page.getByRole('button', { name: '返回持仓' }).click();
+
+  await page.locator('.account-holding-actions [data-detail-mode="decision"]').click();
+  await expect(page.locator('.symbol-detail-panel.inline-symbol-detail')).toBeVisible();
+  // The language toggle renderer is dormant in the current decision flow; mount its production markup to verify its mobile CSS contract.
+  await page.evaluate(() => {
+    const panel = document.querySelector('.symbol-detail-panel.inline-symbol-detail');
+    panel?.insertAdjacentHTML('beforeend', (window as any).renderLanguageToggle());
+  });
+  await expectMobileTargetsAtLeast44(page, '.symbol-detail-panel.inline-symbol-detail', '.decision-tab:visible, [data-back-to-holdings]:visible, .language-toggle button:visible');
+  await page.getByRole('button', { name: '收起' }).click();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });

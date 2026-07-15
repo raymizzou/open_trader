@@ -115,6 +115,10 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     assert ".account-tab-list" in mobile
     assert "grid-template-columns: repeat(4, minmax(0, 1fr));" in mobile
     assert "overflow-x: hidden;" in mobile
+    assert ".backtest-form input," in mobile
+    assert ".backtest-form select," in mobile
+    assert ".decision-tab," in mobile
+    assert ".language-toggle button" in mobile
 
 
 def test_dashboard_muted_text_meets_aa_on_soft_surface() -> None:
@@ -170,6 +174,41 @@ console.log(JSON.stringify({initial,left:press("ArrowLeft"),home:press("Home"),e
     assert rendered["right"] == {
         "broker": "futu", "focused": '[data-broker="futu"]', "prevented": True,
     }
+
+
+def test_dashboard_tabpanel_uses_fallback_label_until_real_tabs_exist() -> None:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    account_markup = html.split('id="account-holdings"', 1)[1].split(">", 1)[0]
+    assert 'aria-label="账户持仓加载中"' in account_markup
+    assert "aria-labelledby" not in account_markup
+
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.innerHTML="";this.textContent="";this.attributes={};
+    this.classList={add(){},remove(){},toggle(){},contains(){return false;}};}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+}
+const nodes={};
+for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"]){nodes[id]=new Element();elements[id]=nodes[id];}
+const snapshot=()=>({tabs:nodes["account-tabs"].innerHTML,label:nodes["account-holdings"].attributes["aria-label"]||"",labelledBy:nodes["account-holdings"].attributes["aria-labelledby"]||"",panel:nodes["account-holdings"].innerHTML});
+state.dashboard=null;state.dashboardError=null;renderAccountHoldings();const loading=snapshot();
+state.dashboardError=new Error("offline");renderAccountHoldings();const error=snapshot();
+state.dashboardError=null;state.dashboard={summary:{portfolio_value_hkd:"0"},broker_summaries:[],source_statuses:[],cash_rows:[],holdings:[]};renderAccountHoldings();const ready=snapshot();
+console.log(JSON.stringify({loading,error,ready}));
+''')
+    rendered = json.loads(output)
+    assert rendered["loading"]["tabs"] == ""
+    assert rendered["loading"]["label"] == "账户持仓加载中"
+    assert rendered["loading"]["labelledBy"] == ""
+    assert "加载中" in rendered["loading"]["panel"]
+    assert rendered["error"]["tabs"] == ""
+    assert rendered["error"]["label"] == "账户持仓不可用"
+    assert rendered["error"]["labelledBy"] == ""
+    assert "加载失败" in rendered["error"]["panel"]
+    assert 'id="account-tab-futu"' in rendered["ready"]["tabs"]
+    assert rendered["ready"]["label"] == ""
+    assert rendered["ready"]["labelledBy"] == "account-tab-futu"
 
 
 def test_dashboard_renders_validated_and_fallback_decision_plans() -> None:
@@ -1225,8 +1264,9 @@ accountHoldingGroups = () => [{
   broker:"futu",profile:{horizon:"长期",strategy:"策略"},summary:{},
   rows:new Array(10000).fill({display:{market:"US"}}),
 }];
+renderAccountSection = () => "";
 state.dashboard = {};
-state.dashboardError = new Error("stop before table render");
+state.dashboardError = null;
 renderAccountHoldings();
 console.log(elements["visible-count"].textContent);
 ''')
@@ -1392,6 +1432,28 @@ console.log(JSON.stringify({band:renderTradeDecisionBand(action,{}),card:renderA
     rendered = json.loads(output)
     assert "USD 29,320,000.00" in rendered["band"]
     assert "USD 29,320,000.00" in rendered["card"]
+
+
+def test_dashboard_t_signal_formats_only_price_numeric_leaves() -> None:
+    output = run_dashboard_js(r'''
+const signal={
+  price:{last_price:"1234567.50",day_change_pct:"21.13%",vwap:"2000000.00",day_low:"1234567.50",day_high:"3000000.00"},
+  technical:{rsi_5m:"21.13%",volume_ratio_5m:"00001234",price_position:"below_vwap_reclaim"},
+  liquidity:{depth_status:"pass"},
+  timeline:[{event_at:"2026-07-16T09:30:00+08:00",event_type:"signal_created",message_zh:"编号 00001234"}],
+};
+console.log(JSON.stringify({details:renderTSignalDetails(signal),timeline:renderTSignalTimeline(signal)}));
+''')
+    rendered = json.loads(output)
+    for expected in (
+        "1,234,567.50", "2,000,000.00", "1,234,567.50 / 3,000,000.00",
+    ):
+        assert expected in rendered["details"]
+    assert "21.13%" in rendered["details"]
+    assert "21.13%%" not in rendered["details"]
+    assert "00001234" in rendered["details"]
+    assert "2026-07-16T09:30:00+08:00" in rendered["timeline"]
+    assert "编号 00001234" in rendered["timeline"]
 
 
 def test_dashboard_decision_target_fallback_formats_only_numeric_tokens() -> None:

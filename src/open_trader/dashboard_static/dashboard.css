@@ -3867,6 +3867,13 @@ table {
     min-height: 44px;
   }
 
+  .backtest-form input,
+  .backtest-form select,
+  .decision-tab,
+  .language-toggle button {
+    min-height: 44px;
+  }
+
   .segmented-control .filter-button {
     min-height: 44px;
   }

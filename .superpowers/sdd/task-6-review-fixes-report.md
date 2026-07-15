@@ -90,3 +90,54 @@ exit 0
 - Spec review: all actionable findings are covered by focused unit/DOM tests and real Chromium flows. The research-trigger finding was rejected based on the rendered runtime DOM, with an executable assertion retained.
 - The Python `_display_number()` acceptance oracle intentionally duplicates the JavaScript grouping contract. Keeping it independent improves regression detection, but both implementations must be updated if the display contract changes.
 - No live Dashboard acceptance, deployment, background-process restart, or review-URL verification was performed in this task. Those remain for the parent agent's required final `make acceptance` and post-acceptance deployment workflow.
+
+## Final branch re-review addendum
+
+Four additional Important findings were handled in a second TDD cycle.
+
+1. **Grouped CN filter acceptance count**
+   - RED: a fake Eastmoney account with 5,000 visible CN rows returned `5,000 条`, while `_check_cn_filter()` expected `5000 条`; the focused run failed 1 test.
+   - GREEN: the expectation now uses the existing independent `_display_number(count)` oracle. Both small-count and 5,000-count regressions pass.
+
+2. **Mobile targets across every reachable surface**
+   - RED: the real 390px Chromium flow stopped on the standard-backtest `<select>` at 40px. The CSS regression also showed no mobile overrides for backtest controls, decision tabs, or language buttons.
+   - GREEN: the mobile-only breakpoint gives backtest inputs/selects, decision tabs, and language-toggle buttons a 44px minimum without changing compact desktop styles. Chromium opens and checks portfolio, Kelly, standard backtest, trend report, and inline decision detail controls. The language-toggle renderer is dormant in the current decision path, so its exact production markup is transparently mounted in the already-open detail panel to verify computed CSS; reachable decision tabs and back/detail buttons are measured normally.
+
+3. **Loading/error tabpanel accessible names**
+   - RED: static `#account-holdings` referenced `account-tab-futu` before that tab existed, and loading/error render paths populated tabs and retained `aria-labelledby`.
+   - GREEN: initial/loading markup uses `aria-label="账户持仓加载中"`; error state uses `aria-label="账户持仓不可用"` and has no account tabs; a successful render removes the fallback label and assigns `aria-labelledby` to the active, existing tab. The Node DOM regression covers all three states.
+
+4. **T-signal price leaves**
+   - RED: latest price, VWAP, and the day range rendered ungrouped values above 999; an already-suffixed percentage could also gain a second `%`.
+   - GREEN: field-specific T-signal price helpers group only latest price, VWAP, and day-low/day-high values. The regression preserves `21.13%`, date/timestamp text, and identifier `00001234` unchanged.
+
+Second-cycle focused verification:
+
+```text
+tests/test_dashboard_acceptance.py -k 'cn_filter'
+2 passed, 115 deselected
+
+tests/test_dashboard_web.py -k 'command_center_css_keeps or tabpanel_uses_fallback or account_tabs_register_roving or t_signal_formats_only_price'
+4 passed, 141 deselected
+
+dashboard-warm-ledger.spec.ts -g 'keeps four equal tabs'
+1 passed
+```
+
+The first full Python run exposed one obsolete test setup that used `dashboardError` merely to skip a large table render. Error state now correctly suppresses account counts, so the fixture was changed to stub the section renderer while exercising a successful 10,000-row account. Fresh final verification after that correction:
+
+```text
+.venv/bin/python -m pytest -q tests/test_dashboard_web.py tests/test_dashboard_acceptance.py
+262 passed in 16.36s
+
+OPEN_TRADER_PYTHON=.venv/bin/python npx --no-install playwright test tests/e2e/dashboard-warm-ledger.spec.ts tests/e2e/kelly-lab.spec.ts
+6 passed (1.7s)
+
+node --check src/open_trader/dashboard_static/dashboard.js
+exit 0
+
+git diff --check
+exit 0
+```
+
+`make acceptance` and live deployment remain intentionally unrun for the parent agent's final gate.

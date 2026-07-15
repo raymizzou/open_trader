@@ -751,7 +751,7 @@ class TabbedAccountLocator:
         if self.selector.endswith(".account-empty:visible"):
             return "当前筛选下没有持仓"
         if self.selector == "#visible-count":
-            return f"{self.page.visible_rows()} 条"
+            return f"{self.page.visible_rows():,} 条"
         if self.selector == "#last-refresh":
             return "刷新于 2026-07-15 15:03:13 CST"
         if ".session-quote" in self.selector:
@@ -1540,6 +1540,16 @@ def test_cn_filter_checks_each_broker_tab_without_all_accounts_view() -> None:
 
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.max_visible_account_sections == 1
+
+
+def test_cn_filter_accepts_grouped_visible_count_for_large_account() -> None:
+    page = TabbedAccountPage(cn_rows={
+        "futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 5000,
+    })
+
+    dashboard_acceptance._check_cn_filter(page, expected_cn=5000)
+
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
 
 
 @pytest.mark.parametrize(

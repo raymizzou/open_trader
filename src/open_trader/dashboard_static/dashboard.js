@@ -2091,16 +2091,6 @@ function handleBrokerTabKeydown(event) {
 
 function renderAccountHoldings() {
   const container = elements["account-holdings"] || elements["holdings-body"];
-  const groups = accountHoldingGroups();
-  const active = groups.find((group) => group.broker === state.brokerFilter) || groups[0];
-  if (active && active.broker !== state.brokerFilter) state.brokerFilter = active.broker;
-  elements["account-tabs"].innerHTML = renderAccountTabs(groups);
-  if (active && typeof container.setAttribute === "function") {
-    container.setAttribute("aria-labelledby", `account-tab-${active.broker}`);
-  }
-  const rows = active ? active.rows.filter(({display}) => state.marketFilter === "ALL"
-    || String(display.market || "").toUpperCase() === state.marketFilter) : [];
-  elements["visible-count"].textContent = `${formatDisplayNumber(rows.length)} 条`;
   elements["workspace-grid"].classList.remove("detail-mode");
   container.classList.remove("hidden");
   elements["symbol-detail-panel"].classList.add("hidden");
@@ -2110,12 +2100,32 @@ function renderAccountHoldings() {
     return;
   }
   if (!state.dashboard) {
+    setAccountHoldingsFallbackLabel("账户持仓加载中");
+    elements["visible-count"].textContent = "0 条";
     container.innerHTML = '<div class="empty-state">加载中</div>';
     return;
   }
+  const groups = accountHoldingGroups();
+  const active = groups.find((group) => group.broker === state.brokerFilter) || groups[0];
+  if (active && active.broker !== state.brokerFilter) state.brokerFilter = active.broker;
+  elements["account-tabs"].innerHTML = renderAccountTabs(groups);
+  if (active && typeof container.setAttribute === "function") {
+    if (typeof container.removeAttribute === "function") container.removeAttribute("aria-label");
+    container.setAttribute("aria-labelledby", `account-tab-${active.broker}`);
+  }
+  const rows = active ? active.rows.filter(({display}) => state.marketFilter === "ALL"
+    || String(display.market || "").toUpperCase() === state.marketFilter) : [];
+  elements["visible-count"].textContent = `${formatDisplayNumber(rows.length)} 条`;
   container.innerHTML = active
     ? renderAccountSection({...active, rows})
     : '<div class="empty-state">暂无券商账户</div>';
+}
+
+function setAccountHoldingsFallbackLabel(label) {
+  const container = elements["account-holdings"] || elements["holdings-body"];
+  if (elements["account-tabs"]) elements["account-tabs"].innerHTML = "";
+  if (typeof container.removeAttribute === "function") container.removeAttribute("aria-labelledby");
+  if (typeof container.setAttribute === "function") container.setAttribute("aria-label", label);
 }
 
 function renderAccountSection(group) {
@@ -2381,10 +2391,10 @@ function renderTSignalDetails(signal) {
         <div>
           <h4>价格</h4>
           ${renderDecisionFactRows([
-            { label: "最新价", value: nestedValue(signal.price, "last_price") },
+            { label: "最新价", value: tSignalPriceText(nestedValue(signal.price, "last_price")) },
             { label: "日内涨跌", value: percentText(nestedValue(signal.price, "day_change_pct")) },
-            { label: "VWAP", value: nestedValue(signal.price, "vwap") },
-            { label: "日内区间", value: rangeText(nestedValue(signal.price, "day_low"), nestedValue(signal.price, "day_high")) },
+            { label: "VWAP", value: tSignalPriceText(nestedValue(signal.price, "vwap")) },
+            { label: "日内区间", value: tSignalPriceRangeText(nestedValue(signal.price, "day_low"), nestedValue(signal.price, "day_high")) },
           ])}
         </div>
         <div>
@@ -2424,11 +2434,19 @@ function nestedValue(source, key) {
 }
 
 function percentText(value) {
-  return hasValue(value) ? `${value}%` : "-";
+  if (!hasValue(value)) return "-";
+  const raw = String(value).trim();
+  return raw.endsWith("%") ? raw : `${raw}%`;
 }
 
-function rangeText(low, high) {
-  return hasValue(low) || hasValue(high) ? `${formatPlain(low)} / ${formatPlain(high)}` : "-";
+function tSignalPriceText(value) {
+  return hasValue(value) ? formatDisplayNumber(value) : "-";
+}
+
+function tSignalPriceRangeText(low, high) {
+  return hasValue(low) || hasValue(high)
+    ? `${tSignalPriceText(low)} / ${tSignalPriceText(high)}`
+    : "-";
 }
 
 function tSignalRatioText(value) {
@@ -5467,6 +5485,7 @@ function setElementText(id, text) {
 
 function renderDashboardErrorState() {
   const container = elements["account-holdings"] || elements["holdings-body"];
+  setAccountHoldingsFallbackLabel("账户持仓不可用");
   container.innerHTML = '<div class="empty-state">看板数据加载失败</div>';
 }
 

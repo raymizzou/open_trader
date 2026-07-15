@@ -819,7 +819,7 @@ def _check_cn_filter(page: Any, expected_cn: int) -> None:
         empty = section.locator(".account-empty:visible")
         count = rows.count()
         total += count
-        assert page.locator("#visible-count").inner_text().strip() == f"{count} 条", (
+        assert page.locator("#visible-count").inner_text().strip() == f"{_display_number(count)} 条", (
             f"{broker} A 股筛选计数不是 {count} 条"
         )
         if count == 0:
