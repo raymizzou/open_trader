@@ -19,12 +19,28 @@ from open_trader.market_trend import (
     run_market_trend_report,
     updates_ready,
 )
-from open_trader.notifications import NullNotifier
+from open_trader.notifications import (
+    FeishuWebhookNotifier,
+    NotificationError,
+    NullNotifier,
+)
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import HOLDING_FIELDS
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+class RecordingFeishu(FeishuWebhookNotifier):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__(webhook_url="https://example.invalid")
+        self.fail = fail
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+        if self.fail:
+            raise NotificationError("network down")
 
 
 def config(tmp_path: Path) -> DailyPremarketConfig:
@@ -240,23 +256,35 @@ def test_market_report_retries_every_ten_minutes_and_stops_after_success(
     assert sleeps == [600.0]
 
 
-def test_market_report_stops_at_one_hour_deadline(tmp_path: Path) -> None:
+def test_market_report_failure_owns_day_at_one_hour_deadline(tmp_path: Path) -> None:
     now = datetime(2026, 7, 15, 10, 0, tzinfo=SHANGHAI)
+    cfg = config(tmp_path)
+    notifier = RecordingFeishu()
     result = run_market_trend_report(
-        config=config(tmp_path),
+        config=cfg,
         market="US",
         run_date="2026-07-15",
-        notifier=NullNotifier(),
+        notifier=notifier,
         attempt_fn=lambda **kwargs: AShareTrendRunResult("waiting", None, None),
         now_fn=lambda: now,
         sleep_fn=lambda seconds: None,
     )
 
     assert result.status == "failed"
+    assert notifier.messages == [
+        (
+            "【富途｜美股趋势报告生成失败｜2026-07-15】",
+            "原因：趋势数据在截止时间前仍未更新\n"
+            "现在做：确认 Trend Animals 与富途账户状态后手动重跑富途报告\n\n"
+            "报告未生成，请勿依据旧报告交易。",
+        )
+    ]
+    ledger = cfg.data_dir / "trend_us_futu/daily_delivery/2026-07-15.json"
+    assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
 
 
-def test_hk_report_uses_real_api_fields_and_auto_manages_advised_buys(
-    tmp_path: Path,
+def test_hk_report_suppresses_buys_when_statement_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
     write_details(
@@ -285,9 +313,12 @@ def test_hk_report_uses_real_api_fields_and_auto_manages_advised_buys(
             "stopwinFlagByPopChampagne": False,
         }
 
+    api_instances = 0
+
     class Api:
         def __init__(self, **kwargs: object) -> None:
-            pass
+            nonlocal api_instances
+            api_instances += 1
 
         def get_update_status(self) -> list[dict[str, object]]:
             return [{"asset": "港股", "asOfDate": "2026-07-15"}]
@@ -335,19 +366,103 @@ def test_hk_report_uses_real_api_fields_and_auto_manages_advised_buys(
         def close(self) -> None:
             self.closed = True
 
+    notifier = RecordingFeishu()
+    from open_trader import market_trend
+
+    original_freeze = market_trend._freeze_receipt_report
+    freeze_attempts = 0
+
+    def fail_first_freeze(**kwargs: object) -> tuple[Path, Path]:
+        nonlocal freeze_attempts
+        freeze_attempts += 1
+        if freeze_attempts == 1:
+            raise OSError("simulated report persistence failure after delivery")
+        return original_freeze(**kwargs)
+
+    monkeypatch.setattr(market_trend, "_freeze_receipt_report", fail_first_freeze)
     result = run_market_trend_report(
         config=cfg,
         market="HK",
         run_date="2026-07-15",
-        notifier=NullNotifier(),
+        notifier=notifier,
+        api_factory=Api,
+        quote_factory=Quote,
+        sleep_fn=lambda seconds: None,
+    )
+    assert result.report_path is not None and result.json_path is not None
+    frozen_json = result.json_path.read_text(encoding="utf-8")
+    result.report_path.unlink()
+    result.json_path.unlink()
+    recovered = run_market_trend_report(
+        config=cfg,
+        market="HK",
+        run_date="2026-07-15",
+        notifier=notifier,
+        api_factory=lambda **kwargs: pytest.fail("receipt recovery must not refetch"),
+        quote_factory=Quote,
+    )
+    revised = run_market_trend_report(
+        config=cfg,
+        market="HK",
+        run_date="2026-07-15",
+        revision=True,
+        notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
     )
 
-    assert result.status == "generated"
+    assert result.status == recovered.status == revised.status == "generated"
+    assert recovered.json_path is not None
+    assert recovered.json_path.read_text(encoding="utf-8") == frozen_json
+    assert len(notifier.messages) == 1
+    assert api_instances == 2  # initial report plus explicit revision; recovery did not refetch
+    title, message = notifier.messages[0]
+    assert title == "【辉立｜港股趋势报告｜2026-07-16】"
+    assert "今日无买卖动作" in message
+    assert "已过期" in message
+    assert "\n买入\n" not in message
+    assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
     actions = payload["strategy_judgments"]["formal_actions"]
-    assert [(item["action"], item["symbol"]) for item in actions] == [("BUY", "02800")]
+    assert actions == []
     assert payload["account"]["fresh"] is False
     assert payload["metadata"]["account_check_required"] is True
-    assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
+    assert payload["protection_state"]["managed_symbols"] == ["00700"]
+
+
+def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    reports = cfg.reports_dir / "trend_hk_phillips"
+    reports.mkdir(parents=True)
+    (reports / "2026-07-15.md").write_text("frozen", encoding="utf-8")
+    (reports / "2026-07-15.json").write_text("{}", encoding="utf-8")
+    ledger = cfg.data_dir / "trend_hk_phillips/daily_delivery/2026-07-15.json"
+    failed = RecordingFeishu(fail=True)
+    from open_trader.trend_delivery import deliver_daily_trend_text
+
+    assert deliver_daily_trend_text(
+        failed, ledger_path=ledger, title="frozen title", message="frozen body"
+    ) == "delivery_failed"
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-15", "2026-07-16"]
+
+        def close(self) -> None:
+            pass
+
+    recovered = RecordingFeishu()
+    result = run_market_trend_report(
+        config=cfg,
+        market="HK",
+        run_date="2026-07-15",
+        notifier=recovered,
+        api_factory=lambda **kwargs: pytest.fail("existing report must not refetch"),
+        quote_factory=Quote,
+    )
+
+    assert result.status == "existing"
+    assert recovered.messages == [("frozen title", "frozen body")]

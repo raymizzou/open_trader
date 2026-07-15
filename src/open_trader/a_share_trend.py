@@ -29,6 +29,7 @@ from .trend_animals import (
     TrendAnimalsError,
     TrendAnimalsLookupError,
 )
+from .trend_delivery import deliver_daily_trend_text
 
 
 NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
@@ -844,6 +845,166 @@ def _data_source_label(value: str) -> str:
     }.get(value, value)
 
 
+TREND_BUY_WINDOWS = {
+    "US": "美股常规交易时段",
+    "HK": "09:30–10:00",
+    "CN": "09:30–10:00",
+}
+
+
+def _feishu_identity(item: Mapping[str, object]) -> str:
+    return " ".join(
+        part
+        for part in (
+            str(item.get("symbol") or "-").strip(),
+            str(item.get("name") or "").strip(),
+        )
+        if part
+    )
+
+
+def _feishu_reason(item: Mapping[str, object]) -> str:
+    reason = str(item.get("reason") or "")
+    if reason not in REASON_LABELS:
+        return "未知动作或原因，需人工确认"
+    return _reason_label(reason)
+
+
+def _feishu_money(value: object) -> str:
+    return _money(Decimal(str(value))).rstrip("0").rstrip(".")
+
+
+def _append_feishu_action_sections(
+    lines: list[str],
+    sells: Sequence[Mapping[str, object]],
+    buys: Sequence[Mapping[str, object]],
+    reviews: Sequence[Mapping[str, object]],
+    *,
+    market: str,
+) -> None:
+    if sells:
+        lines.extend(["", "卖出"])
+        for index, item in enumerate(sells, 1):
+            line = f"{index}. {_feishu_identity(item)}｜{_feishu_reason(item)}"
+            if item.get("active_line") not in {None, ""}:
+                line += f"｜保护线 {_feishu_money(item['active_line'])}"
+            lines.append(line)
+    if buys:
+        lines.extend(["", "买入"])
+        for index, item in enumerate(buys, 1):
+            lines.append(
+                f"{index}. {_feishu_identity(item)}｜{TREND_BUY_WINDOWS[market]}｜"
+                f"约 {item.get('estimated_shares', '-')} 股｜"
+                f"金额上限 {_feishu_money(item.get('target_amount') or '0')}｜"
+                f"保护线 {_feishu_money(item.get('estimated_initial_line') or '0')}"
+            )
+    if reviews:
+        lines.extend(["", "人工复核"])
+        lines.extend(
+            f"{index}. {_feishu_identity(item)}｜{_feishu_reason(item)}"
+            for index, item in enumerate(reviews, 1)
+        )
+
+
+def render_trend_feishu_text(
+    payload: Mapping[str, object], *, broker_label: str, market_label: str
+) -> tuple[str, str]:
+    execution_date = str(payload.get("execution_date") or "-")
+    as_of_date = str(payload.get("as_of_date") or "-")
+    account = payload.get("account")
+    account = account if isinstance(account, dict) else {}
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    market = str(metadata.get("market") or "CN").upper()
+    judgments = payload.get("strategy_judgments")
+    judgments = judgments if isinstance(judgments, dict) else {}
+    holdings = [
+        item
+        for item in judgments.get("holding_decisions", [])
+        if isinstance(item, dict)
+    ]
+    formal = [
+        item
+        for item in judgments.get("formal_actions", [])
+        if isinstance(item, dict)
+    ]
+    fresh = account.get("fresh") is True
+    sells = [
+        item
+        for item in formal
+        if item.get("action") == "SELL_ALL" and not _trend_action_needs_review(item)
+    ]
+    buys = [
+        item
+        for item in formal
+        if item.get("action") == "BUY"
+        and fresh
+        and not _trend_action_needs_review(item)
+    ]
+    holds = [
+        item
+        for item in holdings
+        if item.get("action") == "HOLD" and not _trend_action_needs_review(item)
+    ]
+    reviews: list[dict[str, object]] = []
+    for item in formal + holdings:
+        if (
+            _trend_action_needs_review(item)
+            or item.get("action") == "BUY" and not fresh
+        ) and item not in reviews:
+            reviews.append(item)
+    title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
+    status = (
+        "已更新"
+        if fresh
+        else (
+            "已过期，禁止买入"
+            if any(item.get("action") == "BUY" for item in formal)
+            else "已过期"
+        )
+    )
+    summary = (
+        f"今日动作：卖出 {len(sells)}｜买入 {len(buys)}｜持有 {len(holds)}｜复核 {len(reviews)}"
+        if sells or buys
+        else f"今日无买卖动作｜持有 {len(holds)}｜复核 {len(reviews)}"
+    )
+    lines = [
+        f"数据截至：{as_of_date}",
+        f"账户状态：{status}",
+        summary,
+    ]
+    _append_feishu_action_sections(lines, sells, buys, reviews, market=market)
+    lines.extend(["", "请人工确认，不自动下单。"])
+    return title, "\n".join(lines)
+
+
+def _trend_action_needs_review(item: Mapping[str, object]) -> bool:
+    action = item.get("action")
+    reason = item.get("reason")
+    known_reason = isinstance(reason, str) and reason in REASON_LABELS
+    if action == "BUY":
+        return reason not in (None, "") and not known_reason
+    return (
+        action == "MANUAL_REVIEW"
+        or action not in ACTION_LABELS
+        or action in {"SELL_ALL", "HOLD"} and not known_reason
+    )
+
+
+def render_trend_failure_text(
+    *,
+    broker_label: str,
+    market_label: str,
+    report_date: str,
+    reason: str,
+    recovery_action: str,
+) -> tuple[str, str]:
+    return (
+        f"【{broker_label}｜{market_label}趋势报告生成失败｜{report_date}】",
+        f"原因：{reason}\n现在做：{recovery_action}\n\n报告未生成，请勿依据旧报告交易。",
+    )
+
+
 def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
     market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(market, market)
@@ -1511,7 +1672,7 @@ def _notify_status(notifier: Notifier, title: str, message: str) -> None:
 def _notify_delivery_status(
     notifier: Notifier, *, run_date: str, delivery_status: str
 ) -> None:
-    if delivery_status in {"sent", "sent_prior_attempt"}:
+    if delivery_status in {"sent", "sent_prior_attempt", "sent_prior_message"}:
         title = "A股趋势计划已生成"
     elif delivery_status == "delivery_unknown":
         title = "A股趋势计划交付状态未知"
@@ -1521,6 +1682,26 @@ def _notify_delivery_status(
         notifier,
         title,
         f"{run_date} 本地报告已冻结；飞书状态：{delivery_status}",
+    )
+
+
+def _deliver_a_share_daily_text(
+    *,
+    config: DailyPremarketConfig,
+    notifier: Notifier,
+    run_date: str,
+    payload: Mapping[str, object],
+) -> str:
+    title, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+    return deliver_daily_trend_text(
+        notifier,
+        ledger_path=(
+            config.data_dir / "trend_a_share/daily_delivery" / f"{run_date}.json"
+        ),
+        title=title,
+        message=message,
     )
 
 
@@ -1539,7 +1720,7 @@ def _recover_receipt_report(
     if receipt is None:
         return None
     prior_status = str(receipt["status"])
-    if prior_status in {"prepared", "delivery_failed"}:
+    if prior_status in {"prepared", "pending", "delivery_failed"}:
         if prior_status == "prepared":
             write_protection_state(
                 config.data_dir / "trend_a_share/protection_state.json",
@@ -1551,24 +1732,24 @@ def _recover_receipt_report(
             status="pending",
             delivery_status="pending",
         )
-        attempts = send_notification_with_results(
-            notifier,
-            f"A股趋势操作计划 · {run_date}",
-            str(receipt["markdown"]),
-            channels={"feishu", "feishu_app"},
+        payload = json.loads(str(receipt["report_json"]))
+        if not isinstance(payload, dict):
+            raise ValueError("delivery receipt report JSON must be an object")
+        delivery_status = _deliver_a_share_daily_text(
+            config=config,
+            notifier=notifier,
+            run_date=run_date,
+            payload=payload,
         )
-        delivery_status = (
+        receipt_status = (
             "sent"
-            if any(
-                item.channel.startswith("feishu") and item.success
-                for item in attempts
-            )
-            else "delivery_failed"
+            if delivery_status in {"sent", "sent_prior_message"}
+            else delivery_status
         )
         receipt = _transition_delivery_receipt(
             receipt_path,
             receipt,
-            status=delivery_status,
+            status=receipt_status,
             delivery_status=delivery_status,
         )
     elif prior_status == "sent":
@@ -1582,10 +1763,7 @@ def _recover_receipt_report(
     else:
         delivery_status = "delivery_unknown"
         receipt = _transition_delivery_receipt(
-            receipt_path,
-            receipt,
-            status="delivery_unknown",
-            delivery_status=delivery_status,
+            receipt_path, receipt, status=prior_status, delivery_status=delivery_status
         )
     markdown_path, json_path = _freeze_receipt_report(
         receipt=receipt,
@@ -1867,7 +2045,11 @@ def _attempt_report(
             data_sources=("Trend Animals", "Futu CN calendar/QFQ daily K-line", str(config.portfolio)),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost,
-            metadata={"paid_response_cache": cache_metadata},
+            metadata={
+                "market": "CN",
+                "broker": "eastmoney",
+                "paid_response_cache": cache_metadata,
+            },
         )
         report = replace(
             report,
@@ -1878,6 +2060,7 @@ def _attempt_report(
             },
         )
         receipt_path = _receipt_path(config.data_dir, artifact_stem)
+        payload = _report_payload(report)
         receipt = _write_delivery_receipt(
             receipt_path,
             status="prepared",
@@ -1886,7 +2069,7 @@ def _attempt_report(
             markdown=render_markdown(report),
             report_json=(
                 json.dumps(
-                    _report_payload(report),
+                    payload,
                     ensure_ascii=False,
                     indent=2,
                     sort_keys=True,
@@ -1905,21 +2088,21 @@ def _attempt_report(
             status="pending",
             delivery_status="pending",
         )
-        attempts = send_notification_with_results(
-            notifier,
-            f"A股趋势操作计划 · {report.as_of_date}",
-            str(receipt["markdown"]),
-            channels={"feishu", "feishu_app"},
+        delivery_status = _deliver_a_share_daily_text(
+            config=config,
+            notifier=notifier,
+            run_date=run_date,
+            payload=payload,
         )
-        delivery_status = (
+        receipt_status = (
             "sent"
-            if any(item.channel.startswith("feishu") and item.success for item in attempts)
-            else "delivery_failed"
+            if delivery_status in {"sent", "sent_prior_message"}
+            else delivery_status
         )
         receipt = _transition_delivery_receipt(
             receipt_path,
             receipt,
-            status=delivery_status,
+            status=receipt_status,
             delivery_status=delivery_status,
         )
         markdown_path, json_path = _freeze_receipt_report(
@@ -2019,7 +2202,7 @@ def run_a_share_trend_report(
                 if attempt.status in {"generated", "existing", "holiday"}:
                     return attempt
                 last_error = "Trend Animals update status is not ready"
-            except (TrendAnimalsError, FutuQuoteError) as exc:
+            except (TrendAnimalsError, FutuQuoteError, ValueError, RuntimeError) as exc:
                 last_error = _redact_api_key(exc, config.trend_animals_api_key)
             _write_run_log(
                 log_path,
@@ -2028,6 +2211,29 @@ def run_a_share_trend_report(
             )
             now = now_fn()
             if now >= deadline:
+                title, message = render_trend_failure_text(
+                    broker_label="东方财富",
+                    market_label="A股",
+                    report_date=run_date,
+                    reason=(
+                        "趋势数据在截止时间前仍未更新"
+                        if "not ready" in last_error.lower()
+                        else "趋势报告生成失败，需检查运行日志"
+                    ),
+                    recovery_action=(
+                        "确认 Trend Animals 数据状态后手动重跑东方财富报告"
+                    ),
+                )
+                deliver_daily_trend_text(
+                    notifier,
+                    ledger_path=(
+                        config.data_dir
+                        / "trend_a_share/daily_delivery"
+                        / f"{run_date}.json"
+                    ),
+                    title=title,
+                    message=message,
+                )
                 _notify_status(notifier, "A股趋势计划失败", last_error)
                 return AShareTrendRunResult("failed", None, None)
             if not notified_waiting:
