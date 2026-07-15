@@ -39,7 +39,7 @@ def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
         assert f'id="{forbidden_id}"' not in html
 
 
-def test_dashboard_command_center_theme_preserves_the_data_contract() -> None:
+def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
@@ -57,24 +57,27 @@ def test_dashboard_command_center_theme_preserves_the_data_contract() -> None:
         assert f'id="{element_id}"' in html
     assert "今日结论" not in html
     assert 'id="trade-actions"' not in html
-    assert "--bg: #f5f7fa;" in css
-    assert "--text: #101828;" in css
-    assert "--accent: #2563eb;" in css
-    assert "--primary: #101828;" in css
-    assert "font-variant-numeric: tabular-nums;" in css
-
-
-def test_dashboard_account_sections_use_distinct_broker_tints() -> None:
-    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
-    for selector, color in {
-        "#account-futu": "#eff6ff",
-        "#account-tiger": "#fff7ed",
-        "#account-phillips": "#f0fdf4",
-        "#account-eastmoney": "#fef2f2",
+    for token in (
+        "--bg: #fafaf9;", "--surface: #ffffff;", "--text: #1c1917;",
+        "--muted: #78716c;", "--accent: #a16207;", "--line: #d6d3d1;",
+    ):
+        assert token in css
+    for broker, color in {
+        "futu": "#2563eb", "tiger": "#d97706",
+        "phillips": "#15803d", "eastmoney": "#dc2626",
     }.items():
-        assert f"{selector} {{ --account-tint: {color}; }}" in css
-    assert "background: var(--account-tint, var(--surface-soft));" in css
-    assert ".account-holdings-table {\n  background: var(--surface);" in css
+        assert f'.account-tab[data-broker="{broker}"] {{ --broker-accent: {color}; }}' in css
+    assert ".account-tab.active" in css
+    assert "border-bottom-color: var(--broker-accent);" in css
+    assert ".pnl-profit { color: #b91c1c;" in css
+    assert ".pnl-loss { color: #15803d;" in css
+    assert ".tool-workspace-view .header-assets-panel" in css
+    assert (
+        ".backtest-workspace,\n.kelly-lab-panel,\n.trend-report-workspace,\n"
+        ".symbol-detail-panel,\n.research-chat-modal"
+    ) in css
+    assert "linear-gradient" not in css
+    assert "font-variant-numeric: tabular-nums;" in css
 
 
 def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> None:
@@ -87,6 +90,9 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     mobile = css.split("@media (max-width: 760px) {", 1)[1]
     assert "min-height: 44px;" in mobile
     assert 'grid-template-areas: "brand" "assets" "source";' in mobile
+    assert ".account-tab-list" in mobile
+    assert "grid-template-columns: repeat(4, minmax(0, 1fr));" in mobile
+    assert "overflow-x: hidden;" in mobile
 
 
 def test_dashboard_renders_validated_and_fallback_decision_plans() -> None:
@@ -1988,7 +1994,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "暂无触发中的交易计划" in js
     assert ".dashboard-shell" in css
     assert ".dashboard-header" in css
-    assert 'grid-template-areas: "brand assets source";' in css
+    assert 'grid-template-areas: "brand brand" "assets source";' in css
     assert ".header-brand-panel" in css
     assert "grid-area: brand;" in css
     assert ".header-assets-panel" in css
@@ -2034,7 +2040,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "border-bottom-color: var(--line);" in market_section_other_css
     assert "grid-template-columns: minmax(0, 1fr) 300px;" not in css
     assert ".right-rail" not in css
-    assert 'grid-template-areas: "brand source" "assets assets";' in css
+    assert 'grid-template-areas: "brand source" "assets assets";' not in css
     assert 'grid-template-areas: "brand" "assets" "source";' in css
     assert ".symbol-detail-panel" in css
     assert ".language-toggle" in css

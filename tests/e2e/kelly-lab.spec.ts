@@ -72,7 +72,7 @@ async function expectKellyDerivationRow(scope: Locator, label: string, value: st
 test('renders Kelly lab without a holding-level Kelly entry', async ({ page }) => {
   await page.goto('/');
 
-  await expect(page.getByRole('heading', { name: '持仓列表' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '持仓与策略' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toHaveCount(0);
   await expect(page.getByText('趋势回调 20D Mock US 第一批')).toHaveCount(0);
   await page.getByRole('button', { name: '凯利实验室' }).click();
@@ -89,7 +89,7 @@ test('renders Kelly lab without a holding-level Kelly entry', async ({ page }) =
   await expect(usTrendCard.getByText('市场')).toBeVisible();
   await expect(usTrendCard.getByText('US', { exact: true })).toBeVisible();
   await expect(usTrendCard.getByText('模拟资金池')).toBeVisible();
-  await expect(usTrendCard.getByText('USD 30000').first()).toBeVisible();
+  await expect(usTrendCard.getByText('USD 30,000').first()).toBeVisible();
   const usCapital = usTrendCard.getByLabel('Kelly 策略资金');
   await expect(usCapital).toBeVisible();
   await expect(usCapital.getByText('可用资金', { exact: true })).toBeVisible();
@@ -182,7 +182,7 @@ test('renders Kelly lab without a holding-level Kelly entry', async ({ page }) =
   await expect(page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' })).toBeVisible();
   const hkTrendCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '趋势回调 20D Mock HK 第一批' }) });
   await expect(hkTrendCard.getByText('HK', { exact: true })).toBeVisible();
-  await expect(hkTrendCard.getByText('HKD 200000').first()).toBeVisible();
+  await expect(hkTrendCard.getByText('HKD 200,000').first()).toBeVisible();
   const hkCapital = hkTrendCard.getByLabel('Kelly 策略资金');
   await expect(hkCapital.locator('dd', { hasText: 'HKD 155,000' })).toBeVisible();
   await expect(page.getByLabel('Kelly 标的状态').getByText('HK.02840')).toBeVisible();
@@ -201,7 +201,7 @@ test('renders Kelly lab without a holding-level Kelly entry', async ({ page }) =
   await expect(page.getByRole('heading', { name: '突破 10D Mock 第一批' })).toBeVisible();
   const breakoutCard = page.locator('.kelly-experiment-card').filter({ has: page.getByRole('heading', { name: '突破 10D Mock 第一批' }) });
   await expect(breakoutCard.getByText('US', { exact: true })).toBeVisible();
-  await expect(breakoutCard.getByText('USD 30000').first()).toBeVisible();
+  await expect(breakoutCard.getByText('USD 30,000').first()).toBeVisible();
   for (const symbol of ['US.MSFT', 'US.TSM']) {
     await expect(page.getByLabel('Kelly 标的状态').getByText(symbol)).toBeVisible();
   }
@@ -223,7 +223,7 @@ test('renders Kelly lab without a holding-level Kelly entry', async ({ page }) =
   await expect(failedOrderExecution.getByText('OpenD disconnected')).toBeVisible();
   await expect(failedOrderExecution.getByText('US.RAM')).toHaveCount(0);
   await expect(page.getByLabel('Kelly 策略详情').getByText('价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。')).toBeVisible();
-  await page.getByRole('button', { name: '返回主页' }).click();
+  await page.getByRole('button', { name: '返回持仓' }).click();
   await expect(page.getByRole('heading', { name: '模拟盘策略实验室' })).toHaveCount(0);
 
   const aaplRow = page.getByRole('row').filter({ hasText: 'AAPL' }).first();
