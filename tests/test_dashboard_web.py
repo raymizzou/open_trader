@@ -1544,6 +1544,8 @@ def test_dashboard_static_mounts_account_holdings_without_standalone_tiger_panel
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
     assert 'id="account-holdings"' in html
+    assert 'id="trend-report-workspace"' in html
+    assert 'aria-live="polite"' in html
     assert 'id="tiger-long-term-panel"' not in html
     assert 'id="header-broker-filters"' not in html
 
@@ -1567,9 +1569,10 @@ state.dashboard = {{
     {{broker: "eastmoney", display_name: "东方财富", portfolio_value_hkd: "1000", holding_value_hkd: "600", cash_like_value_hkd: "400", holding_count: "1"}},
   ],
   source_statuses: [], cash_rows: [], tiger_long_term_strategy: {payload},
-  trend_market_summaries: {{
-    US: {{available: true, data_date: "2026-07-14", account_source_date: "2026-07-14", run_status: "sent", buy_count: 1, sell_count: 0, manual_review_count: 1, recent_protection_alert: "VIXY · 2026-07-15T22:00:00+08:00 · 保护线 90"}},
-    HK: {{available: true, data_date: "2026-07-15", account_source_date: "2026-06", run_status: "delivery_failed", buy_count: 2, sell_count: 1, manual_review_count: 0, recent_protection_alert: "无"}},
+  trend_reports: {{
+    futu: {{available: true, report_date: "2026-07-15", data_date: "2026-07-14"}},
+    phillips: {{available: true, report_date: "2026-07-15", data_date: "2026-07-14"}},
+    eastmoney: {{available: false, status_text: "今日暂无趋势报告"}},
   }},
   holdings: [
     {{market: "US", symbol: "QQQ", name: "Nasdaq 100", brokers: "tiger", broker_details: [{{broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "800"}}]}},
@@ -1594,9 +1597,10 @@ console.log(renderBrokerSummaryCards() + elements["account-holdings"].innerHTML)
         assert label in output
     for metric in ("年化收益", "最大回撤", "夏普比率", "卡玛比率"):
         assert metric in output
-    assert "策略指标待接入" in output
-    for text in ("数据日 2026-07-14", "账户源 2026-06", "买入 2", "卖出 1", "人工复核 1", "最近保护提醒"):
+    for text in ("报告日期 2026-07-15", "数据截至 2026-07-14", "今日暂无趋势报告"):
         assert text in output
+    assert output.count("当天趋势报告") == 3
+    assert 'data-trend-report="tiger"' not in output
     assert "<th>账户权重</th>" in output
     assert "<th>组合权重</th>" in output
     assert "<th>策略</th>" not in output
@@ -1607,29 +1611,98 @@ console.log(renderBrokerSummaryCards() + elements["account-holdings"].innerHTML)
     assert "tiger-long-term-panel" not in output
 
 
-def test_dashboard_js_renders_account_strategy_from_trend_report() -> None:
+def test_dashboard_trend_report_entries_and_workspace_interactions() -> None:
     output = run_dashboard_js(r'''
-state.dashboard = {trend_reports: {futu: {
-  available: true,
-  data_date: "2026-07-14",
-  account_source_date: "2026-07-14",
-  run_status: "failed",
-  counts: {buy: 2, sell: 1, review: 3},
-  recent_protection_alert: "AAPL · 2026-07-15T22:00:00+08:00 · 保护线 190",
-}}};
-console.log(renderAccountStrategy({broker: "futu", profile: ACCOUNT_STRATEGY_PROFILES.futu}));
+class E {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.listeners={};this.classes=new Set();this.scrolled=false;this.classList={add:(...names)=>names.forEach((name)=>this.classes.add(name)),remove:(...names)=>names.forEach((name)=>this.classes.delete(name)),toggle:(name,force)=>force===undefined?(this.classes.has(name)?this.classes.delete(name):this.classes.add(name)):force?this.classes.add(name):this.classes.delete(name),contains:(name)=>this.classes.has(name)};}
+  addEventListener(name,listener){this.listeners[name]=listener;}
+  click(target=this){return this.listeners.click&&this.listeners.click({target,preventDefault(){}});}
+  closest(selector){
+    if(selector==="[data-trend-report]"&&Object.hasOwn(this.dataset,"trendReport"))return this;
+    if(selector==="[data-close-trend-report]"&&Object.hasOwn(this.dataset,"closeTrendReport"))return this;
+    return null;
+  }
+  scrollIntoView(){this.scrolled=true;}
+}
+const nodes={};
+document.getElementById=(id)=>nodes[id]||(nodes[id]=new E());
+document.querySelector=(selector)=>selector===".workspace-grid"?document.getElementById("workspace-grid"):new E();
+bindElements();bindEvents();
+
+const report=(broker,brokerLabel,marketLabel)=>({
+  available:true,broker,broker_label:brokerLabel,market_label:marketLabel,
+  report_date:"2026-07-15",data_date:"2026-07-14",generated_at:"2026-07-15T11:30:36+08:00",
+  account_status:"已更新",buy_window:"美股常规交易时段",
+  sell_actions:[{symbol:"SELLX",name:"卖出标的",reason:"danger_signal",active_line:"90"}],
+  buy_actions:[{symbol:"BUYX",name:"买入标的",estimated_shares:"20",target_amount:"5000",estimated_initial_line:"88"}],
+  hold_actions:[{symbol:"HOLDX",name:"持有标的",reason:"trend_intact",active_line:"80"}],
+  review_actions:[{symbol:"REVIEWX",name:"复核标的",reason:"holding_signal_unknown"}],
+  counts:{sell:1,buy:1,hold:1,review:1},
+  audit:{candidates:[{symbol:"CANDX",name:"候选标的",strength:"95"}],excluded:{EXCLUDED:["already_held"]},industry_concentration:[["科技",1,"0.25"]],data_sources:["Trend Animals"],actual_api_cost:"1.00"},
+});
+state.dashboard={trend_reports:{
+  futu:report("futu","富途","美股"),
+  phillips:report("phillips","辉立","港股"),
+  eastmoney:report("eastmoney","东方财富","A股"),
+}};
+const group=(broker)=>({broker,profile:ACCOUNT_STRATEGY_PROFILES[broker],rows:[],summary:{broker,display_name:broker,portfolio_value_hkd:"1000",holding_value_hkd:"700",cash_like_value_hkd:"300",holding_count:"1"}});
+const html=["futu","tiger","phillips","eastmoney"].map((broker)=>renderAccountSection(group(broker))).join("");
+if((html.match(/当天趋势报告/g)||[]).length!==3)throw new Error(html);
+for(const broker of ["futu","phillips","eastmoney"]){if(!html.includes(`data-trend-report="${broker}"`))throw new Error(html);}
+if(html.includes('data-trend-report="tiger"'))throw new Error(html);
+if(!html.includes("报告日期 2026-07-15")||!html.includes("数据截至 2026-07-14"))throw new Error(html);
+
+const open=new E();open.dataset.trendReport="futu";elements["account-holdings"].click(open);
+if(!elements["workspace-grid"].classList.contains("hidden")||elements["trend-report-workspace"].hidden||elements["trend-report-workspace"].classList.contains("hidden"))throw new Error("workspace state");
+const workspace=elements["trend-report-workspace"].innerHTML;
+const order=["开盘前","美股常规交易时段","盘中持续","人工复核"].map((text)=>workspace.indexOf(`<h2>${text}</h2>`));
+if(order.some((index)=>index<0)||!order.every((index,i)=>i===0||order[i-1]<index))throw new Error(workspace);
+for(const symbol of ["SELLX","BUYX","HOLDX","REVIEWX"]){if(!workspace.includes(symbol))throw new Error(workspace);}
+if(!workspace.includes('<details class="trend-audit"><summary>审计详情</summary>')||workspace.includes('<details class="trend-audit" open'))throw new Error(workspace);
+for(const text of ["确认全部卖出动作","按顺序考虑允许买入项","盘中观察活动保护线","完成人工复核"]){if(!workspace.includes(text))throw new Error(workspace);}
+
+const close=new E();close.dataset.closeTrendReport="";elements["trend-report-workspace"].click(close);
+if(elements["trend-report-workspace"].hidden!==true||!elements["trend-report-workspace"].classList.contains("hidden")||elements["workspace-grid"].classList.contains("hidden")||state.selectedTrendBroker!==""||!nodes["account-futu"].scrolled)throw new Error("close state");
+
+state.dashboard.trend_reports.futu={available:false,status_text:"今日暂无趋势报告",sell_actions:[{symbol:"STALE_ACTION"}]};
+const stale=renderAccountSection(group("futu"));
+if((stale.match(/当天趋势报告/g)||[]).length!==1||!stale.includes("disabled")||!stale.includes("今日暂无趋势报告")||stale.includes("STALE_ACTION")||stale.includes("data-trend-report"))throw new Error(stale);
+console.log("ok");
 ''')
 
-    for text in (
-        "数据日 2026-07-14",
-        "账户源 2026-07-14",
-        "买入 2",
-        "卖出 1",
-        "人工复核 3",
-        "本轮失败",
-        "最近保护提醒",
-    ):
-        assert text in output
+    assert "ok" in output
+
+
+def test_dashboard_trend_report_mobile_layout_css() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+
+    assert "grid-template-columns: minmax(0, 1fr) 280px;" in css
+    assert ".trend-stage li,\n.trend-audit p {\n  overflow-wrap: anywhere;\n}" in css
+    assert ".trend-report-body { grid-template-columns: minmax(0, 1fr); }" in mobile
+    assert ".trend-checklist { position: static; order: 2; }" in mobile
+    assert ".trend-report-entry button,\n  .trend-report-header button { min-height: 44px; }" in mobile
+
+
+def test_dashboard_trend_report_escapes_report_strings() -> None:
+    output = run_dashboard_js(r'''
+const attack='<img src=x onerror=alert(1)>';
+state.dashboard={trend_reports:{futu:{available:true,report_date:attack,data_date:attack}}};
+const entry=renderTrendReportEntry("futu");
+const workspace=renderTrendReportWorkspace({
+  broker_label:attack,market_label:attack,report_date:attack,data_date:attack,
+  generated_at:attack,account_status:attack,buy_window:attack,
+  sell_actions:[{symbol:attack,name:attack,reason:"unknown",active_line:attack}],
+  buy_actions:[{symbol:attack,name:attack,estimated_shares:attack,target_amount:attack,estimated_initial_line:attack}],
+  hold_actions:[],review_actions:[],counts:{sell:attack},
+  audit:{candidates:[{symbol:attack,name:attack,strength:attack}],excluded:{[attack]:["unknown"]},industry_concentration:[[attack]],data_sources:[attack],actual_api_cost:attack},
+});
+if((entry+workspace).includes(attack))throw new Error(entry+workspace);
+if(!workspace.includes("&lt;img"))throw new Error(workspace);
+console.log("ok");
+''')
+
+    assert "ok" in output
 
 
 def test_dashboard_account_holdings_mobile_layout_css() -> None:
@@ -4823,7 +4896,7 @@ for (const broker of ["futu", "tiger", "phillips", "eastmoney"]) {
 if (renderedHoldings.includes("美股正股") || renderedHoldings.includes("美股期权")) {
   throw new Error("account tables should not contain nested market sections: " + renderedHoldings);
 }
-for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1940.00", "HKD 15132.00", "策略指标待接入"]) {
+for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1940.00", "HKD 15132.00", "当天趋势报告", "今日暂无趋势报告"]) {
   if (!renderedHoldings.includes(required)) {
     throw new Error("account holdings missing " + required + ": " + renderedHoldings);
   }
