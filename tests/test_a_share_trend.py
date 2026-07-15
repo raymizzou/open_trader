@@ -1185,7 +1185,7 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     assert title == "【辉立｜港股趋势报告｜2026-07-15】"
     assert message == (
         "数据截至：2026-07-14\n"
-        "账户状态：已过期\n"
+        "账户状态：账户数据非实时，执行前核对现金与持仓\n"
         "今日无买卖动作｜持有 1｜复核 0\n\n"
         "请人工确认，不自动下单。"
     )
@@ -1259,7 +1259,7 @@ def test_trend_feishu_text_moves_unknown_formal_buy_reason_to_review() -> None:
 @pytest.mark.parametrize(
     "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
 )
-def test_trend_feishu_text_never_lists_buy_without_explicit_fresh_account(
+def test_trend_feishu_text_keeps_buy_for_non_realtime_account(
     account: dict[str, object],
 ) -> None:
     payload = {
@@ -1286,9 +1286,11 @@ def test_trend_feishu_text_never_lists_buy_without_explicit_fresh_account(
         payload, broker_label="辉立", market_label="港股"
     )
 
-    assert "今日无买卖动作｜持有 0｜复核 1" in message
-    assert "\n买入\n" not in message
-    assert "02800 盈富基金｜未知动作或原因，需人工确认" in message
+    assert "账户状态：账户数据非实时，执行前核对现金与持仓" in message
+    assert "今日动作：卖出 0｜买入 1｜持有 0｜复核 0" in message
+    assert "\n买入\n" in message
+    assert "02800 盈富基金" in message
+    assert "禁止买入" not in message
 
 
 def test_trend_feishu_text_lists_reviews_on_no_trade_days() -> None:

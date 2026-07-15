@@ -407,8 +407,6 @@ def _check_trend_artifact_projection(
     assert isinstance(judgments, Mapping), f"{broker} 冻结报告缺少策略判断"
     formal = judgments.get("formal_actions")
     holdings = judgments.get("holding_decisions")
-    account = payload.get("account")
-    buy_allowed = isinstance(account, Mapping) and account.get("fresh") is True
     assert isinstance(formal, list) and all(
         isinstance(item, Mapping) for item in formal
     ), f"{broker} 冻结报告正式动作无效"
@@ -422,7 +420,6 @@ def _check_trend_artifact_projection(
     buys = [
         item for item in formal
         if item.get("action") == "BUY"
-        and buy_allowed
         and not _trend_action_needs_review(item)
     ]
     holds = [
@@ -431,10 +428,7 @@ def _check_trend_artifact_projection(
     ]
     reviews: list[Mapping[str, Any]] = []
     for item in [*formal, *holdings]:
-        if (
-            _trend_action_needs_review(item)
-            or not buy_allowed and item.get("action") == "BUY"
-        ) and item not in reviews:
+        if _trend_action_needs_review(item) and item not in reviews:
             reviews.append(item)
     expected_actions = {
         "sell_actions": sells,

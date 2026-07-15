@@ -418,9 +418,11 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert api_instances == 2  # initial report plus explicit revision; recovery did not refetch
     title, message = notifier.messages[0]
     assert title == "【辉立｜港股趋势报告｜2026-07-16】"
-    assert "今日无买卖动作" in message
-    assert "已过期" in message
-    assert "\n买入\n" not in message
+    assert "账户状态：账户数据非实时，执行前核对现金与持仓" in message
+    assert "今日动作：卖出 0｜买入 1｜持有 1｜复核 0" in message
+    assert "\n买入\n" in message
+    assert "02800 盈富基金" in message
+    assert "禁止买入" not in message
     assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
     actions = payload["strategy_judgments"]["formal_actions"]

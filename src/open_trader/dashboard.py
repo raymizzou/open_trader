@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .a_share_trend import ACTION_LABELS, REASON_LABELS
+from .a_share_trend import (
+    ACTION_LABELS,
+    NON_REALTIME_ACCOUNT_WARNING,
+    REASON_LABELS,
+)
 from .backtest_prices import normalize_backtest_symbol
 
 from .decision_facts import (
@@ -431,7 +435,6 @@ def _load_broker_trend_report(
         item
         for item in formal
         if item.get("action") == "BUY"
-        and account_fresh
         and not _trend_action_needs_review(item)
     ]
     hold_actions = [
@@ -442,10 +445,7 @@ def _load_broker_trend_report(
     ]
     review_actions: list[dict[str, Any]] = []
     for item in formal + holdings:
-        if (
-            _trend_action_needs_review(item)
-            or item.get("action") == "BUY" and not account_fresh
-        ) and item not in review_actions:
+        if _trend_action_needs_review(item) and item not in review_actions:
             review_actions.append(item)
     directory = reports_dir.name
     return {
@@ -459,7 +459,7 @@ def _load_broker_trend_report(
         "generated_at": str(payload.get("generated_at") or ""),
         "account_source_date": str(account.get("source_date") or ""),
         "account_fresh": account_fresh,
-        "account_status": "已更新" if account_fresh else "已过期，禁止买入",
+        "account_status": "已更新" if account_fresh else NON_REALTIME_ACCOUNT_WARNING,
         "buy_window": buy_window,
         "run_status": _latest_trend_run_status(
             data_dir / directory / "run.log",

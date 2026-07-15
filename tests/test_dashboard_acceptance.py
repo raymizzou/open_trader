@@ -240,7 +240,7 @@ def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
 )
-def test_acceptance_rejects_actionable_buy_without_explicit_fresh_account(
+def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
     tmp_path: Path, account: dict[str, object],
 ) -> None:
     reports = tmp_path / "reports"
@@ -280,10 +280,9 @@ def test_acceptance_rejects_actionable_buy_without_explicit_fresh_account(
         },
     }
 
-    with pytest.raises(AssertionError, match="冻结报告动作与 API 投影不一致"):
-        dashboard_acceptance._check_trend_artifact_projection(
-            reports, "futu", projected
-        )
+    dashboard_acceptance._check_trend_artifact_projection(
+        reports, "futu", projected
+    )
 
 
 def trend_reports() -> dict[str, dict[str, object]]:

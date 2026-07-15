@@ -36,6 +36,7 @@ NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
 DISCLAIMER_TEXT = (
     "本报告是确定性纪律清单，不是订单或成交事实；所有交易由用户人工确认与执行。"
 )
+NON_REALTIME_ACCOUNT_WARNING = "账户数据非实时，执行前核对现金与持仓"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 CANDIDATE_FIELDS = (
     "tmId",
@@ -941,7 +942,6 @@ def render_trend_feishu_text(
         item
         for item in formal
         if item.get("action") == "BUY"
-        and fresh
         and not _trend_action_needs_review(item)
     ]
     holds = [
@@ -951,21 +951,10 @@ def render_trend_feishu_text(
     ]
     reviews: list[dict[str, object]] = []
     for item in formal + holdings:
-        if (
-            _trend_action_needs_review(item)
-            or item.get("action") == "BUY" and not fresh
-        ) and item not in reviews:
+        if _trend_action_needs_review(item) and item not in reviews:
             reviews.append(item)
     title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
-    status = (
-        "已更新"
-        if fresh
-        else (
-            "已过期，禁止买入"
-            if any(item.get("action") == "BUY" for item in formal)
-            else "已过期"
-        )
-    )
+    status = "已更新" if fresh else NON_REALTIME_ACCOUNT_WARNING
     summary = (
         f"今日动作：卖出 {len(sells)}｜买入 {len(buys)}｜持有 {len(holds)}｜复核 {len(reviews)}"
         if sells or buys

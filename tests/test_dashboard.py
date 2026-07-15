@@ -311,7 +311,9 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
         "artifact": "2026-07-15-b.json",
     }
     assert reports["phillips"]["buy_window"] == "09:30–10:00"
-    assert reports["phillips"]["account_status"] == "已过期，禁止买入"
+    assert reports["phillips"]["account_status"] == "账户数据非实时，执行前核对现金与持仓"
+    assert reports["phillips"]["buy_actions"][0]["symbol"] == "VIXY"
+    assert reports["phillips"]["counts"] == {"sell": 1, "buy": 1, "hold": 1, "review": 0}
     assert reports["eastmoney"]["market_label"] == "A股"
     assert reports["eastmoney"]["audit"]["data_sources"] == ["Trend Animals"]
 
@@ -484,7 +486,7 @@ def test_dashboard_trend_report_rejects_misrouted_broker_metadata(
 @pytest.mark.parametrize(
     "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
 )
-def test_dashboard_trend_report_never_projects_unconfirmed_account_buy_as_actionable(
+def test_dashboard_trend_report_keeps_buy_for_non_realtime_account(
     tmp_path: Path, account: dict[str, object],
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -513,10 +515,12 @@ def test_dashboard_trend_report_never_projects_unconfirmed_account_buy_as_action
         today=date(2026, 7, 15),
     )["phillips"]
 
-    assert report["buy_actions"] == []
-    assert report["review_actions"] == [stale_buy]
-    assert report["counts"]["buy"] == 0
-    assert report["counts"]["review"] == 1
+    assert report["account_fresh"] is False
+    assert report["account_status"] == "账户数据非实时，执行前核对现金与持仓"
+    assert report["buy_actions"] == [stale_buy]
+    assert report["review_actions"] == []
+    assert report["counts"]["buy"] == 1
+    assert report["counts"]["review"] == 0
 
 
 @pytest.mark.parametrize(
