@@ -226,14 +226,31 @@ class LLMTradingAgentsSummaryExtractor:
                 ),
             },
         ]
-        content = self.client.create(messages=messages, temperature=0)
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise ValueError("LLM TradingAgents summary response must be valid JSON") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("LLM TradingAgents summary response must be a JSON object")
-        return _validate_llm_payload(payload)
+        for attempt in range(2):
+            content = self.client.create(messages=messages, temperature=0)
+            try:
+                try:
+                    payload = json.loads(content)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "LLM TradingAgents summary response must be valid JSON"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise ValueError(
+                        "LLM TradingAgents summary response must be a JSON object"
+                    )
+                return _validate_llm_payload(payload)
+            except ValueError as exc:
+                if attempt:
+                    raise
+                messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": f"上一次输出无效：{exc}。请严格按要求重新输出 JSON。",
+                    },
+                ]
+        raise AssertionError("unreachable")
 
 
 def build_missing_reason_fields() -> dict[str, str]:

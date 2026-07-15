@@ -426,6 +426,16 @@ class FakeTextClient:
         return self.content
 
 
+class SequencedFakeTextClient:
+    def __init__(self, contents: list[str]) -> None:
+        self.contents = iter(contents)
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+        self.calls.append({"messages": messages, "temperature": temperature})
+        return next(self.contents)
+
+
 def test_llm_extractor_sends_prompt_payload_and_parses_valid_json() -> None:
     client = FakeTextClient(json.dumps(valid_llm_payload(), ensure_ascii=False))
     extractor = LLMTradingAgentsSummaryExtractor(client=client)
@@ -448,6 +458,27 @@ def test_llm_extractor_sends_prompt_payload_and_parses_valid_json() -> None:
     user_payload = json.loads(messages[1]["content"])
     assert user_payload["advice_summary"] == "完整 TradingAgents advice summary"
     assert user_payload["final_trade_decision"] == "final decision text"
+
+
+def test_llm_extractor_retries_invalid_json_response() -> None:
+    client = SequencedFakeTextClient(
+        ["not json", json.dumps(valid_llm_payload(), ensure_ascii=False)]
+    )
+    extractor = LLMTradingAgentsSummaryExtractor(client=client)
+
+    result = extractor.extract(
+        market="US",
+        symbol="SOXX",
+        latest_run_date="2026-07-15",
+        ta_report_date="2026-07-15",
+        advice_action="Hold",
+        current_action="观察",
+        advice_summary="完整 TradingAgents advice summary",
+        final_trade_decision="final decision text",
+    )
+
+    assert result["schema_version"] == TRADINGAGENTS_SUMMARY_SCHEMA_VERSION
+    assert len(client.calls) == 2
 
 
 @pytest.mark.parametrize(
