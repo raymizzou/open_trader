@@ -16,6 +16,7 @@ from .a_share_trend import (
     ACTION_LABELS,
     NON_REALTIME_ACCOUNT_WARNING,
     REASON_LABELS,
+    valid_serialized_account,
 )
 from .backtest_prices import normalize_backtest_symbol
 
@@ -411,7 +412,7 @@ def _load_broker_trend_report(
             not isinstance(judgments.get(key), list)
             for key in ("formal_actions", "holding_decisions", "top10_candidates")
         )
-        or not isinstance(account, dict)
+        or not valid_serialized_account(account)
         or not isinstance(payload.get("as_of_date"), str)
         or not payload["as_of_date"].strip()
         or not isinstance(payload.get("generated_at"), str)

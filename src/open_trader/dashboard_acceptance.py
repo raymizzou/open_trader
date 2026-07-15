@@ -375,6 +375,30 @@ def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
     )
 
 
+def _valid_trend_account(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    try:
+        amounts = (
+            Decimal(str(value["net_value"])),
+            Decimal(str(value["available_cash"])),
+        )
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return False
+    source_date = value.get("source_date")
+    positions = value.get("positions")
+    exceptions = value.get("exceptions")
+    return (
+        isinstance(source_date, str)
+        and bool(source_date.strip())
+        and all(amount.is_finite() for amount in amounts)
+        and isinstance(positions, list)
+        and all(isinstance(item, Mapping) for item in positions)
+        and isinstance(exceptions, list)
+        and all(isinstance(item, str) for item in exceptions)
+    )
+
+
 def _check_trend_artifact_projection(
     reports_dir: Path, broker: str, report: Mapping[str, Any]
 ) -> None:
@@ -403,6 +427,9 @@ def _check_trend_artifact_projection(
         and metadata.get("market") == expected_market
         and metadata.get("broker") == broker
     ), f"{broker} 冻结报告身份与 API 投影不一致"
+    assert _valid_trend_account(payload.get("account")), (
+        f"{broker} 冻结报告账户快照无效"
+    )
     judgments = payload.get("strategy_judgments")
     assert isinstance(judgments, Mapping), f"{broker} 冻结报告缺少策略判断"
     formal = judgments.get("formal_actions")

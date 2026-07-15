@@ -83,6 +83,30 @@ class AccountSnapshot:
     exceptions: tuple[str, ...]
 
 
+def valid_serialized_account(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    try:
+        amounts = (
+            Decimal(str(value["net_value"])),
+            Decimal(str(value["available_cash"])),
+        )
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return False
+    positions = value.get("positions")
+    exceptions = value.get("exceptions")
+    source_date = value.get("source_date")
+    return (
+        isinstance(source_date, str)
+        and bool(source_date.strip())
+        and all(amount.is_finite() for amount in amounts)
+        and isinstance(positions, list)
+        and all(isinstance(item, Mapping) for item in positions)
+        and isinstance(exceptions, list)
+        and all(isinstance(item, str) for item in exceptions)
+    )
+
+
 @dataclass(frozen=True)
 class CandidateInput:
     tm_id: int
@@ -916,7 +940,9 @@ def render_trend_feishu_text(
     execution_date = str(payload.get("execution_date") or "-")
     as_of_date = str(payload.get("as_of_date") or "-")
     account = payload.get("account")
-    account = account if isinstance(account, dict) else {}
+    if not valid_serialized_account(account):
+        raise ValueError("趋势报告账户快照无效")
+    assert isinstance(account, Mapping)
     metadata = payload.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
     market = str(metadata.get("market") or "CN").upper()
@@ -1001,12 +1027,11 @@ def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
     market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(market, market)
     currency = {"CN": "元", "US": "美元", "HK": "港元"}.get(market, "")
-    if market == "HK":
-        freshness = (
-            f"日结单 {report.account.source_date}，交易前须人工核对实际仓位与现金"
-        )
-    else:
-        freshness = "已更新" if report.account.fresh else "已过期，禁止正式买入"
+    freshness = (
+        "已更新"
+        if report.account.fresh is True
+        else NON_REALTIME_ACCOUNT_WARNING
+    )
     sells = [item for item in report.holdings if item.action == "SELL_ALL"]
     holds = [item for item in report.holdings if item.action == "HOLD"]
     reviews = [item for item in report.holdings if item.action == "MANUAL_REVIEW"]

@@ -387,6 +387,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
+        now_fn=lambda: datetime(2026, 7, 15, 16, tzinfo=SHANGHAI),
         sleep_fn=lambda seconds: None,
     )
     assert result.report_path is not None and result.json_path is not None

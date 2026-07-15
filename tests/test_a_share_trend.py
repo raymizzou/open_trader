@@ -46,6 +46,7 @@ from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+MISSING_FRESH = object()
 
 
 def candidate(
@@ -108,6 +109,19 @@ def account(*symbols: str, fresh: bool = True) -> AccountSnapshot:
         ),
         exceptions=(),
     )
+
+
+def serialized_account(*, fresh: object = MISSING_FRESH) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "source_date": "2026-07-14",
+        "net_value": "100000",
+        "available_cash": "50000",
+        "positions": [],
+        "exceptions": [],
+    }
+    if fresh is not MISSING_FRESH:
+        payload["fresh"] = fresh
+    return payload
 
 
 def holding(
@@ -1088,7 +1102,7 @@ def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": True},
+        "account": serialized_account(fresh=True),
         "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "holding_decisions": [
@@ -1170,7 +1184,7 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": False},
+        "account": serialized_account(fresh=False),
         "metadata": {"market": "HK", "broker": "phillips"},
         "strategy_judgments": {
             "holding_decisions": [
@@ -1195,7 +1209,7 @@ def test_trend_feishu_text_moves_unknown_hold_reason_to_review() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": True},
+        "account": serialized_account(fresh=True),
         "metadata": {"market": "HK"},
         "strategy_judgments": {
             "holding_decisions": [
@@ -1229,7 +1243,7 @@ def test_trend_feishu_text_moves_unknown_formal_buy_reason_to_review() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": True},
+        "account": serialized_account(fresh=True),
         "metadata": {"market": "CN", "broker": "eastmoney"},
         "strategy_judgments": {
             "holding_decisions": [],
@@ -1257,15 +1271,15 @@ def test_trend_feishu_text_moves_unknown_formal_buy_reason_to_review() -> None:
 
 
 @pytest.mark.parametrize(
-    "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
+    "fresh", [False, MISSING_FRESH, None, "yes"]
 )
 def test_trend_feishu_text_keeps_buy_for_non_realtime_account(
-    account: dict[str, object],
+    fresh: object,
 ) -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": account,
+        "account": serialized_account(fresh=fresh),
         "metadata": {"market": "HK", "broker": "phillips"},
         "strategy_judgments": {
             "holding_decisions": [],
@@ -1293,11 +1307,44 @@ def test_trend_feishu_text_keeps_buy_for_non_realtime_account(
     assert "禁止买入" not in message
 
 
+@pytest.mark.parametrize(
+    "account",
+    [
+        None,
+        {},
+        {**serialized_account(), "source_date": ""},
+        {**serialized_account(), "net_value": "NaN"},
+        {**serialized_account(), "available_cash": None},
+        {**serialized_account(), "positions": ["not-a-position"]},
+        {**serialized_account(), "exceptions": [1]},
+    ],
+)
+def test_trend_feishu_text_rejects_missing_or_malformed_account(
+    account: object,
+) -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "metadata": {"market": "HK", "broker": "phillips"},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [{"action": "BUY", "symbol": "02800"}],
+        },
+    }
+    if account is not None:
+        payload["account"] = account
+
+    with pytest.raises(ValueError, match="账户快照无效"):
+        render_trend_feishu_text(
+            payload, broker_label="辉立", market_label="港股"
+        )
+
+
 def test_trend_feishu_text_lists_reviews_on_no_trade_days() -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
-        "account": {"fresh": True},
+        "account": serialized_account(fresh=True),
         "metadata": {"market": "CN"},
         "strategy_judgments": {
             "holding_decisions": [
@@ -1370,6 +1417,22 @@ def test_markdown_is_operation_first_and_translates_internal_codes() -> None:
     assert "SELL_ALL" not in markdown
     assert "HOLD" not in markdown
     assert "left_trend_right_side" not in markdown
+
+
+@pytest.mark.parametrize("market", ["US", "HK", "CN"])
+def test_markdown_uses_shared_warning_for_stale_account(market: str) -> None:
+    built = report()
+    built = replace(
+        built,
+        account=account(fresh=False),
+        metadata={**built.metadata, "market": market},
+    )
+
+    markdown = render_markdown(built)
+
+    assert "账户：账户数据非实时，执行前核对现金与持仓" in markdown
+    assert "已过期" not in markdown
+    assert "日结单" not in markdown
 
 
 def test_markdown_translates_exclusion_and_api_facts_without_paths() -> None:
@@ -1868,6 +1931,7 @@ def write_9885_receipt(
     markdown = "# 9885 frozen report\n"
     report_payload = {
         "delivery_status": status,
+        "account": serialized_account(fresh=False),
         "metadata": {"delivery_status": status},
         "protection_state": (
             {"schema_version": 1, "positions": {}}

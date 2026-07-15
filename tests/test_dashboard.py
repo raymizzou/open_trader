@@ -64,6 +64,7 @@ CASH_FIELDNAMES = [
     "confidence",
     "notes",
 ]
+MISSING_FRESH = object()
 
 
 def test_futu_signal_detail_marks_explicit_api_unsupported_reason() -> None:
@@ -101,6 +102,21 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
         futu_host="127.0.0.1",
         futu_port=11111,
     )
+
+
+def serialized_trend_account(
+    *, fresh: object = MISSING_FRESH,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "source_date": "2026-07-14",
+        "net_value": "100000",
+        "available_cash": "50000",
+        "positions": [],
+        "exceptions": [],
+    }
+    if fresh is not MISSING_FRESH:
+        payload["fresh"] = fresh
+    return payload
 
 
 def tiger_long_term_dashboard_payload() -> dict[str, object]:
@@ -243,7 +259,12 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
             "as_of_date": "2026-07-14",
             "generated_at": "2026-07-15T11:30:36+08:00",
             "delivery_status": "sent",
-            "account": {"source_date": account_source_date, "fresh": directory != "trend_hk_phillips"},
+            "account": {
+                **serialized_trend_account(
+                    fresh=directory != "trend_hk_phillips"
+                ),
+                "source_date": account_source_date,
+            },
             "strategy_judgments": {
                 "formal_actions": [
                     {"action": "SELL_ALL", "reason": "danger_signal", "symbol": "AAPL"},
@@ -379,7 +400,7 @@ def test_dashboard_trend_report_rejects_selected_invalid_structure_without_fallb
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": {"fresh": True},
+        "account": serialized_trend_account(fresh=True),
         "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VALID-BUT-OLDER"}],
@@ -427,7 +448,7 @@ def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": {"fresh": True},
+        "account": serialized_trend_account(fresh=True),
         "metadata": {"market": "CN", "broker": "eastmoney"},
         "strategy_judgments": {
             "formal_actions": [
@@ -484,10 +505,10 @@ def test_dashboard_trend_report_rejects_misrouted_broker_metadata(
 
 
 @pytest.mark.parametrize(
-    "account", [{"fresh": False}, {}, {"fresh": None}, {"fresh": "yes"}]
+    "fresh", [False, MISSING_FRESH, None, "yes"]
 )
 def test_dashboard_trend_report_keeps_buy_for_non_realtime_account(
-    tmp_path: Path, account: dict[str, object],
+    tmp_path: Path, fresh: object,
 ) -> None:
     config = dashboard_config(tmp_path)
     path = config.reports_dir / "trend_hk_phillips" / "2026-07-15.json"
@@ -497,7 +518,7 @@ def test_dashboard_trend_report_keeps_buy_for_non_realtime_account(
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": account,
+        "account": serialized_trend_account(fresh=fresh),
         "metadata": {"market": "HK", "broker": "phillips"},
         "strategy_judgments": {
             "formal_actions": [stale_buy],
@@ -524,6 +545,53 @@ def test_dashboard_trend_report_keeps_buy_for_non_realtime_account(
 
 
 @pytest.mark.parametrize(
+    "account",
+    [
+        None,
+        {},
+        {**serialized_trend_account(), "source_date": ""},
+        {**serialized_trend_account(), "net_value": "Infinity"},
+        {**serialized_trend_account(), "available_cash": None},
+        {**serialized_trend_account(), "positions": ["not-a-position"]},
+        {**serialized_trend_account(), "exceptions": [1]},
+    ],
+)
+def test_dashboard_trend_report_rejects_missing_or_malformed_account(
+    tmp_path: Path, account: object,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "metadata": {"market": "US", "broker": "futu"},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": "VIXY"}],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }
+    if account is not None:
+        payload["account"] = account
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["futu"]
+
+    assert report["available"] is False
+    assert report["status_text"] == "今日趋势报告无效"
+    assert "buy_actions" not in report
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("formal_actions", [None]),
@@ -545,7 +613,7 @@ def test_dashboard_trend_report_rejects_malformed_nested_audit_collections(
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "account": {},
+        "account": serialized_trend_account(),
         "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [],
