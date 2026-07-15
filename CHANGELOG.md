@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-15
 
+- Decoupled US/HK/CN trend actions from account snapshot freshness, replaced
+  the 1% trial sizing with a 4% fallback weight, kept malformed accounts fail
+  closed, and published the corrected HK revision without resending Feishu;
+  verified `2059` tests and the Dashboard acceptance gate (`PASS`).
 - Made each US holding display and value one Futu-selected overnight, premarket,
   regular, or after-hours price with a compact session-colored label, truthful
   fallback text, correct standard-option valuation, and two-cycle acceptance
