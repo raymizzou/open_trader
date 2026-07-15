@@ -155,14 +155,58 @@ class LLMDecisionFactsExtractor:
                 ),
             },
         ]
-        content = self.client.create(messages=messages, temperature=0)
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise ValueError("LLM decision facts response must be valid JSON") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("LLM decision facts response must be a JSON object")
-        return _validate_llm_payload(payload)
+        for attempt in range(2):
+            content = self.client.create(messages=messages, temperature=0)
+            try:
+                try:
+                    payload = json.loads(content)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "LLM decision facts response must be valid JSON"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise ValueError(
+                        "LLM decision facts response must be a JSON object"
+                    )
+                normalized = _validate_llm_payload(payload)
+                if attempt:
+                    _normalize_provided_source_status(
+                        normalized,
+                        raw_payload=payload,
+                        module_name="kline",
+                        source=kline_source,
+                        fields=KLINE_FIELDS,
+                    )
+                    _normalize_provided_source_status(
+                        normalized,
+                        raw_payload=payload,
+                        module_name="news_sentiment",
+                        source=news_sentiment_source,
+                        fields=NEWS_SENTIMENT_FIELDS,
+                    )
+                else:
+                    _validate_provided_source_status(
+                        normalized,
+                        module_name="kline",
+                        source=kline_source,
+                    )
+                    _validate_provided_source_status(
+                        normalized,
+                        module_name="news_sentiment",
+                        source=news_sentiment_source,
+                    )
+                return normalized
+            except ValueError as exc:
+                if attempt:
+                    raise
+                messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": f"上一次输出无效：{exc}。请严格按要求重新输出 JSON。",
+                    },
+                ]
+        raise AssertionError("unreachable")
 
 
 def extract_decision_sources(raw_decision: str) -> DecisionSources:
@@ -572,6 +616,48 @@ def _validate_llm_payload(payload: dict[str, object]) -> dict[str, object]:
             NEWS_SENTIMENT_FIELDS,
         ),
     }
+
+
+def _validate_provided_source_status(
+    payload: dict[str, object],
+    *,
+    module_name: str,
+    source: str,
+) -> None:
+    module = payload.get(module_name)
+    if (
+        source.strip()
+        and isinstance(module, dict)
+        and module.get("status") != "ok"
+    ):
+        raise ValueError(
+            f"{module_name} source was provided but status is {module.get('status')}"
+        )
+
+
+def _normalize_provided_source_status(
+    payload: dict[str, object],
+    *,
+    raw_payload: dict[str, object],
+    module_name: str,
+    source: str,
+    fields: tuple[str, ...],
+) -> None:
+    if not source.strip():
+        return
+    module = payload.get(module_name)
+    if not isinstance(module, dict) or module.get("status") == "ok":
+        return
+    try:
+        raw_module = _validate_llm_module(
+            raw_payload.get(module_name),
+            module_name,
+            fields,
+        )
+    except ValueError:
+        return
+    if raw_module.get("status") == module.get("status"):
+        module["status"] = "ok"
 
 
 def _coerce_llm_module(

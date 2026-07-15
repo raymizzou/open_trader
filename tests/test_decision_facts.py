@@ -415,6 +415,63 @@ def test_llm_decision_facts_extractor_accepts_hashless_module_payload() -> None:
     assert "source_hash" not in payload["kline"]
 
 
+@pytest.mark.parametrize("invalid_status", ["missing_source", "extraction_failed", "error"])
+def test_llm_decision_facts_extractor_retries_non_ok_status_for_provided_source(
+    invalid_status: str,
+) -> None:
+    valid_payload = {
+        "schema_version": DECISION_FACTS_SCHEMA_VERSION,
+        "kline": {
+            "status": "ok",
+            "fields": {
+                "trend": "趋势偏强",
+                "position": "位于均线上方",
+                "momentum": "动量改善",
+                "key_levels": "关键位缺失",
+                "risk": "波动风险",
+            },
+        },
+        "news_sentiment": {
+            "status": "ok",
+            "fields": {
+                "direction": "偏多",
+                "change": "情绪改善",
+                "catalyst": "需求预期改善",
+                "risk": "估值压力",
+                "attention": "关注度升高",
+            },
+        },
+    }
+    invalid_payload = json.loads(json.dumps(valid_payload, ensure_ascii=False))
+    invalid_payload["news_sentiment"]["status"] = invalid_status
+    responses = iter(
+        [
+            json.dumps(invalid_payload, ensure_ascii=False),
+            json.dumps(invalid_payload, ensure_ascii=False),
+        ]
+    )
+
+    class SequencedFakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
+            self.calls += 1
+            return next(responses)
+
+    client = SequencedFakeClient()
+    payload = LLMDecisionFactsExtractor(client=client).extract(
+        market="HK",
+        symbol="02623",
+        run_date="2026-07-15",
+        kline_source="technical source",
+        news_sentiment_source="news source",
+    )
+
+    assert payload["news_sentiment"]["status"] == "ok"
+    assert client.calls == 2
+
+
 def test_llm_decision_facts_extractor_strips_extra_keys() -> None:
     class FakeClient:
         def create(self, *, messages: list[dict[str, str]], temperature: float) -> str:
