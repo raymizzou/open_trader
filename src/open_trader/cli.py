@@ -88,7 +88,7 @@ from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
 from .market_scope import parse_market_scope
-from .notifications import NullNotifier
+from .notifications import SHANGHAI, NullNotifier, xiaozhi_voice_allowed
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.eastmoney import EastmoneyStatementParser
 from .pipeline import run_import, validate_month
@@ -1482,6 +1482,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "test-notification":
         try:
             config = load_env_config(args.config, dry_run=False)
+            voice_suppressed = (
+                "xiaozhi" in getattr(config, "notifiers", ())
+                and not xiaozhi_voice_allowed(datetime.now(SHANGHAI))
+            )
             notifier = build_notifier(config)
             attempts = send_notification_with_results(
                 notifier,
@@ -1508,7 +1512,10 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
             return 1
-        print("通知测试已发送。")
+        if voice_suppressed:
+            print("通知测试已发送；语音已跳过：静默时段。")
+        else:
+            print("通知测试已发送。")
         return 0
 
     if args.command == "run-daily-premarket":

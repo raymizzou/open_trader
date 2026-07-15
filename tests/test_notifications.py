@@ -3,9 +3,11 @@ from __future__ import annotations
 import csv
 import json
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 import pytest
+import open_trader.notifications as notifications
 
 from open_trader.notifications import (
     CompositeNotifier,
@@ -19,6 +21,19 @@ from open_trader.notifications import (
 
 
 WEBHOOK_URL = "https://open.feishu.cn/open-apis/bot/v2/hook/test"
+ALLOWED_NOW = lambda: datetime.fromisoformat("2026-07-15T22:59:59+08:00")
+PROTECTION_TITLE = "A股保护线触发 · 600000"
+PROTECTION_MESSAGE = "名称：浦发银行\n最新价 9.98 <= 活动保护线 10.01"
+
+
+def xiaozhi_voice_allowed(now: datetime) -> bool:
+    assert hasattr(notifications, "xiaozhi_voice_allowed")
+    return notifications.xiaozhi_voice_allowed(now)
+
+
+def xiaozhi_not_after(now: datetime) -> str:
+    assert hasattr(notifications, "xiaozhi_not_after")
+    return notifications.xiaozhi_not_after(now)
 
 FIELDNAMES = [
     "run_date",
@@ -295,6 +310,7 @@ def test_xiaozhi_voice_notifier_sends_payload_and_bearer_header() -> None:
         token="voice-token",
         post_json=fake_post,
         timeout_seconds=2.5,
+        now_fn=ALLOWED_NOW,
     )
 
     notifier.notify("Open Trader 测试通知", "这是一条测试通知。")
@@ -306,6 +322,7 @@ def test_xiaozhi_voice_notifier_sends_payload_and_bearer_header() -> None:
                 "device_id": "speaker-1",
                 "title": "Open Trader 测试通知",
                 "message": "这是一条测试通知。",
+                "not_after": "2026-07-15T23:00:00+08:00",
             },
             "headers": {"Authorization": "Bearer voice-token"},
             "timeout": 2.5,
@@ -313,175 +330,66 @@ def test_xiaozhi_voice_notifier_sends_payload_and_bearer_header() -> None:
     ]
 
 
-def test_render_xiaozhi_voice_daily_start_template() -> None:
-    assert (
-        render_xiaozhi_voice_notification(
-            "Open Trader 美股开始通知",
-            "\n".join(
-                [
-                    "Open Trader｜开始通知",
-                    "日期：2026-07-05｜市场：美股",
-                    "状态：开始运行｜并发：8",
-                ]
-            ),
-        )
-        == "Open Trader 提醒：美股盘前流程已开始。正在生成今日交易复核清单，完成后会继续通知。"
-    )
-
-
-def test_render_xiaozhi_voice_daily_blocker_uses_priority_reason() -> None:
-    assert (
-        render_xiaozhi_voice_notification(
-            "Open Trader 港股阻塞通知",
-            "\n".join(
-                [
-                    "Open Trader｜阻塞通知",
-                    "日期：2026-07-05｜状态：部分完成",
-                    "可用性：需要人工复核",
-                    "原因：交易动作需要人工复核, Futu 行情异常",
-                ]
-            ),
-        )
-        == (
-            "Open Trader 重要提醒：港股盘前流程遇到阻塞，原因是 Futu 行情异常。"
-            "请先查看飞书或 UI，处理后再决定是否交易。"
-        )
-    )
-
-
-def test_render_xiaozhi_voice_daily_action_is_skipped() -> None:
-    assert (
-        render_xiaozhi_voice_notification(
-            "Open Trader 美股行动通知",
-            "Open Trader｜行动通知\n今日结论：有 1 条可采取行动。",
-        )
-        is None
-    )
-
-
-def test_render_xiaozhi_voice_daily_completion_includes_duration() -> None:
-    assert (
-        render_xiaozhi_voice_notification(
-            "Open Trader 美股完成通知",
-            "\n".join(
-                [
-                    "Open Trader｜完成通知",
-                    "日期：2026-07-05｜市场：美股",
-                    "开始时间：2026-07-05T21:00:00+08:00",
-                    "完成时间：2026-07-05T21:04:18+08:00",
-                    "状态：部分完成｜可用性：需要人工复核",
-                    "交易动作：4 ready，1 review，4 watch",
-                ]
-            ),
-        )
-        == (
-            "Open Trader 完成提醒：美股盘前流程已完成，本次用时 4 分 18 秒，"
-            "状态是部分完成。今日有4项可复核，1项需人工判断。请先人工复核标记项。"
-        )
-    )
-
-
-def test_render_xiaozhi_voice_daily_completion_reads_status_file_duration(
-    tmp_path: Path,
-) -> None:
-    status_path = tmp_path / "daily_run_status.json"
-    status_path.write_text(
-        json.dumps(
-            {
-                "started_at": "2026-07-05T21:00:00+08:00",
-                "finished_at": "2026-07-05T21:04:18+08:00",
-            },
-            ensure_ascii=False,
+@pytest.mark.parametrize(
+    ("title", "message", "expected"),
+    [
+        (
+            PROTECTION_TITLE,
+            PROTECTION_MESSAGE,
+            "Open Trader 紧急提醒：A股浦发银行，代码600000，最新价9.98，已触及活动保护线10.01。建议全部卖出，请查看飞书确认并人工执行。",
         ),
-        encoding="utf-8",
-    )
-
-    assert (
-        render_xiaozhi_voice_notification(
-            "Open Trader 美股完成通知",
-            "\n".join(
-                [
-                    "Open Trader｜完成通知",
-                    "日期：2026-07-05｜市场：美股",
-                    "状态：部分完成｜可用性：需要人工复核",
-                    "交易动作：4 ready，1 review，4 watch",
-                    f"状态文件：{status_path}",
-                ]
-            ),
-        )
-        == (
-            "Open Trader 完成提醒：美股盘前流程已完成，本次用时 4 分 18 秒，"
-            "状态是部分完成。今日有4项可复核，1项需人工判断。请先人工复核标记项。"
-        )
-    )
+        (
+            "港股保护线触发 · 00700",
+            "名称：腾讯控股\n最新价 399.8 <= 活动保护线 400",
+            "Open Trader 紧急提醒：港股腾讯控股，代码00700，最新价399.8，已触及活动保护线400。建议全部卖出，请查看飞书确认并人工执行。",
+        ),
+        (
+            "美股保护线触发 · NVDA",
+            "名称：\n最新价 150.25 <= 活动保护线 151.00",
+            "Open Trader 紧急提醒：美股代码NVDA，最新价150.25，已触及活动保护线151.00。建议全部卖出，请查看飞书确认并人工执行。",
+        ),
+    ],
+)
+def test_render_xiaozhi_protection_template(
+    title: str, message: str, expected: str
+) -> None:
+    assert render_xiaozhi_voice_notification(title, message) == expected
 
 
-def test_render_xiaozhi_voice_daily_completion_omits_missing_duration() -> None:
-    assert (
-        render_xiaozhi_voice_notification(
-            "Open Trader 港股完成通知",
-            "\n".join(
-                [
-                    "Open Trader｜完成通知",
-                    "日期：2026-07-05｜市场：港股",
-                    "状态：成功｜可用性：可复核",
-                    "交易动作：0 ready，0 review，2 watch",
-                ]
-            ),
-        )
-        == (
-            "Open Trader 完成提醒：港股盘前流程已完成，状态是正常。"
-            "今日没有需要立即处理的交易动作。可以查看飞书复核清单。"
-        )
-    )
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Open Trader 美股开始通知",
+        "Open Trader 港股阻塞通知",
+        "Open Trader 美股行动通知",
+        "Open Trader 港股完成通知",
+        "Open Trader｜做T提醒｜US ARM｜买入做T",
+        "A股趋势操作计划 · 2026-07-15",
+        "Open Trader 其他通知",
+    ],
+)
+def test_render_xiaozhi_skips_non_protection_business_events(title: str) -> None:
+    assert render_xiaozhi_voice_notification(title, "正文") is None
 
 
-def test_render_xiaozhi_voice_t_signal_with_ratio() -> None:
-    assert (
-        render_xiaozhi_voice_notification(
-            "Open Trader｜做T提醒｜US ARM｜买入做T",
-            "\n".join(
-                [
-                    "动作：买入做T",
-                    "比例：15%",
-                    "状态：盘中有效，等待执行确认",
-                ]
-            ),
-        )
-        == (
-            "Open Trader 做 T 提醒：US ARM 触发买入做 T 信号，建议比例15%。"
-            "当前状态：盘中有效。请确认后再操作。"
-        )
-    )
+@pytest.mark.parametrize(
+    ("value", "allowed"),
+    [
+        ("2026-07-15T07:59:59+08:00", False),
+        ("2026-07-15T08:00:00+08:00", True),
+        ("2026-07-15T22:59:59+08:00", True),
+        ("2026-07-15T23:00:00+08:00", False),
+    ],
+)
+def test_xiaozhi_voice_hours(value: str, allowed: bool) -> None:
+    assert xiaozhi_voice_allowed(datetime.fromisoformat(value)) is allowed
 
 
-def test_render_xiaozhi_voice_t_signal_without_ratio() -> None:
-    assert (
-        render_xiaozhi_voice_notification(
-            "Open Trader｜做T提醒｜US ARM｜卖出做T",
-            "\n".join(
-                [
-                    "动作：卖出做T",
-                    "比例：-",
-                    "状态：盘中有效，等待执行确认",
-                ]
-            ),
-        )
-        == "Open Trader 做 T 提醒：US ARM 触发卖出做 T 信号。当前状态：盘中有效。请确认后再操作。"
-    )
+def test_xiaozhi_deadline_is_23_shanghai() -> None:
+    assert xiaozhi_not_after(ALLOWED_NOW()) == "2026-07-15T23:00:00+08:00"
 
 
-def test_render_xiaozhi_voice_unknown_fallback() -> None:
-    assert (
-        render_xiaozhi_voice_notification(
-            "Open Trader 其他通知",
-            "长正文",
-        )
-        == "Open Trader 有新通知，请查看飞书或 UI。"
-    )
-
-
-def test_xiaozhi_voice_notifier_sends_short_voice_payload() -> None:
+def test_xiaozhi_voice_notifier_sends_protection_payload() -> None:
     calls: list[dict[str, object]] = []
 
     def fake_post(
@@ -506,20 +414,19 @@ def test_xiaozhi_voice_notifier_sends_short_voice_payload() -> None:
         token="voice-token",
         post_json=fake_post,
         timeout_seconds=2.5,
+        now_fn=ALLOWED_NOW,
     )
 
-    notifier.notify("Open Trader 美股开始通知", "Open Trader｜开始通知")
+    notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
 
     assert calls == [
         {
             "url": "http://127.0.0.1:8003/xiaozhi/notify/speak",
             "payload": {
                 "device_id": "speaker-1",
-                "title": "Open Trader 美股开始通知",
-                "message": (
-                    "Open Trader 提醒：美股盘前流程已开始。"
-                    "正在生成今日交易复核清单，完成后会继续通知。"
-                ),
+                "title": PROTECTION_TITLE,
+                "message": "Open Trader 紧急提醒：A股浦发银行，代码600000，最新价9.98，已触及活动保护线10.01。建议全部卖出，请查看飞书确认并人工执行。",
+                "not_after": "2026-07-15T23:00:00+08:00",
             },
             "headers": {"Authorization": "Bearer voice-token"},
             "timeout": 2.5,
@@ -551,6 +458,21 @@ def test_xiaozhi_voice_notifier_skips_daily_action_notification() -> None:
     assert calls == []
 
 
+def test_xiaozhi_voice_notifier_skips_quiet_hours() -> None:
+    calls: list[object] = []
+    notifier = XiaozhiVoiceNotifier(
+        speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
+        device_id="speaker-1",
+        token="voice-token",
+        post_json=lambda *args: calls.append(args) or {"code": 0},
+        now_fn=lambda: datetime.fromisoformat("2026-07-15T23:00:00+08:00"),
+    )
+
+    notifier.notify("Open Trader 测试通知", "测试")
+
+    assert calls == []
+
+
 def test_xiaozhi_voice_notifier_raises_on_api_error() -> None:
     def fake_post(
         url: str,
@@ -565,10 +487,11 @@ def test_xiaozhi_voice_notifier_raises_on_api_error() -> None:
         device_id="speaker-1",
         token="voice-token",
         post_json=fake_post,
+        now_fn=ALLOWED_NOW,
     )
 
     with pytest.raises(NotificationError, match="Xiaozhi voice error 404: device_offline"):
-        notifier.notify("title", "message")
+        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
 
 
 def test_xiaozhi_voice_notifier_raises_when_response_omits_code() -> None:
@@ -585,10 +508,11 @@ def test_xiaozhi_voice_notifier_raises_when_response_omits_code() -> None:
         device_id="speaker-1",
         token="voice-token",
         post_json=fake_post,
+        now_fn=ALLOWED_NOW,
     )
 
     with pytest.raises(NotificationError, match="Xiaozhi voice error missing: code"):
-        notifier.notify("title", "message")
+        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
 
 
 def test_xiaozhi_voice_notifier_wraps_transport_failure() -> None:
@@ -605,10 +529,11 @@ def test_xiaozhi_voice_notifier_wraps_transport_failure() -> None:
         device_id="speaker-1",
         token="voice-token",
         post_json=fake_post,
+        now_fn=ALLOWED_NOW,
     )
 
     with pytest.raises(NotificationError, match="Xiaozhi voice request failed: timed out"):
-        notifier.notify("title", "message")
+        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
 
 
 def test_xiaozhi_voice_notifier_raises_on_invalid_json_response(
@@ -623,10 +548,11 @@ def test_xiaozhi_voice_notifier_raises_on_invalid_json_response(
         speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
         device_id="speaker-1",
         token="voice-token",
+        now_fn=ALLOWED_NOW,
     )
 
     with pytest.raises(NotificationError, match="Xiaozhi voice returned invalid JSON"):
-        notifier.notify("title", "message")
+        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
 
 
 def test_xiaozhi_voice_notifier_raises_on_non_object_json_response(
@@ -641,10 +567,11 @@ def test_xiaozhi_voice_notifier_raises_on_non_object_json_response(
         speak_url="http://127.0.0.1:8003/xiaozhi/notify/speak",
         device_id="speaker-1",
         token="voice-token",
+        now_fn=ALLOWED_NOW,
     )
 
     with pytest.raises(NotificationError, match="Xiaozhi voice returned non-object JSON"):
-        notifier.notify("title", "message")
+        notifier.notify(PROTECTION_TITLE, PROTECTION_MESSAGE)
 
 
 def test_composite_notifier_continues_after_child_failure() -> None:
