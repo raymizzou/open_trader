@@ -1044,6 +1044,134 @@ console.log(JSON.stringify({kelly,trend,grouped,omitted}));
     assert "另有 10,291 组交易标记未显示" in rendered["omitted"]
 
 
+def test_dashboard_summary_count_fields_format_counts_not_percentages() -> None:
+    output = run_dashboard_js(r'''
+const mount = () => ({textContent:"",style:{}});
+for (const id of [
+  "current-view-value","current-view-holding-value","current-view-holding-weight","current-view-cash-note","current-view-label",
+  "summary-value","summary-holding-value","summary-holding-weight","summary-cash-note","summary-holding-bar",
+  "summary-brokers","summary-detail-month","summary-health","summary-health-note",
+]) elements[id] = mount();
+state.dashboard = {summary:{
+  portfolio_value_hkd:"30000.00",holding_value_hkd:"20000.00",holding_weight_hkd:"21.13%",
+  cash_like_value_hkd:"10000.00",cash_like_weight_hkd:"3.28%",holding_count:"10000",broker_count:"2932",
+},holdings:[],cash_rows:[],broker_summaries:[]};
+renderHeaderSummary();
+const header = {cash:elements["current-view-cash-note"].textContent,weight:elements["current-view-holding-weight"].textContent};
+renderSummary();
+console.log(JSON.stringify({header,summary:{cash:elements["summary-cash-note"].textContent,brokers:elements["summary-brokers"].textContent,weight:elements["summary-holding-weight"].textContent}}));
+''')
+    rendered = json.loads(output)
+    assert rendered["header"]["cash"] == "现金类资产 HKD 10,000.00 · 持仓 10,000"
+    assert rendered["header"]["weight"] == "21.13%"
+    assert rendered["summary"]["cash"] == "现金类资产 HKD 10,000.00 · 3.28% · 持仓 10,000"
+    assert rendered["summary"]["brokers"] == "2,932 个"
+    assert rendered["summary"]["weight"] == "21.13%"
+
+
+def test_dashboard_account_count_renderers_format_each_count_field() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {broker_summaries:[{
+  broker:"futu",display_name:"富途",portfolio_value_hkd:"30000.00",holding_count:"10000",source_status:"real_time",
+}],source_statuses:[]};
+const tabs = renderAccountTabs([{broker:"futu",rows:new Array(10000)}]);
+const section = renderAccountSection({
+  broker:"futu",rows:[],profile:{horizon:"长期",strategy:"策略"},
+  summary:{portfolio_value_hkd:"30000.00",holding_value_hkd:"20000.00",cash_like_value_hkd:"10000.00",holding_count:"10000"},
+});
+console.log(JSON.stringify({tabs,section,cards:renderBrokerSummaryCards(),label:currentViewLabel(10000)}));
+''')
+    rendered = json.loads(output)
+    assert "富途<span>10,000</span>" in rendered["tabs"]
+    assert "<span>持仓 10,000</span>" in rendered["section"]
+    assert '<span class="summary-note">持仓 10,000 · 实时</span>' in rendered["cards"]
+    assert rendered["label"].endswith("10,000 条")
+
+
+def test_dashboard_visible_count_formats_the_filtered_row_count() -> None:
+    output = run_dashboard_js(r'''
+const mount = () => ({innerHTML:"",textContent:"",classList:{add(){},remove(){}}});
+for (const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"]) elements[id] = mount();
+accountHoldingGroups = () => [{
+  broker:"futu",profile:{horizon:"长期",strategy:"策略"},summary:{},
+  rows:new Array(10000).fill({display:{market:"US"}}),
+}];
+state.dashboard = {};
+state.dashboardError = new Error("stop before table render");
+renderAccountHoldings();
+console.log(elements["visible-count"].textContent);
+''')
+    assert output.strip() == "10,000 条"
+
+
+def test_dashboard_broker_detail_formats_each_numeric_field_and_pnl_class() -> None:
+    output = run_dashboard_js(r'''
+console.log(renderBrokerDetailSection([
+  {broker:"futu",account_alias:"00001234",quantity:"10000",cost_price:"2932.00",last_price:"1234567.50",market_value:"29320000.00",unrealized_pnl:"+1234.50"},
+  {broker:"tiger",account_alias:"loss",quantity:"2",cost_price:"3",last_price:"4",market_value:"5",unrealized_pnl:"-12.50%"},
+  {broker:"phillips",account_alias:"zero",quantity:"0",cost_price:"0",last_price:"0",market_value:"0",unrealized_pnl:"0.00%"},
+]));
+''')
+    assert "<td>00001234</td>" in output
+    assert '<td class="number-cell">10,000</td>' in output
+    assert '<td class="number-cell">2,932.00</td>' in output
+    assert '<td class="number-cell">1,234,567.50</td>' in output
+    assert '<td class="number-cell">29,320,000.00</td>' in output
+    assert '<td class="number-cell pnl-profit">+1,234.50</td>' in output
+    assert '<td class="number-cell pnl-loss">-12.50%</td>' in output
+    assert '<td class="number-cell">0.00%</td>' in output
+
+
+def test_dashboard_action_card_formats_price_and_quantity_fields_only() -> None:
+    output = run_dashboard_js(r'''
+console.log(renderActionCard({
+  market:"HK",symbol:"02840",status:"ready",limit_price:"1234567.50",suggested_quantity:"10000",
+  order_value_hkd:"29320000.00",reason:"等待人工确认",
+}));
+''')
+    assert "<strong>HK.02840</strong>" in output
+    assert "<div><span>限价</span><strong>1,234,567.50</strong></div>" in output
+    assert "<div><span>数量</span><strong>10,000</strong></div>" in output
+    assert "<div><span>金额</span><strong>HKD 29,320,000.00</strong></div>" in output
+
+
+def test_dashboard_kelly_realized_pnl_classes_cover_all_polarities() -> None:
+    output = run_dashboard_js(r'''
+const render = (realized_pnl) => renderKellyStrategyCapital({capital:{
+  available:true,currency:"USD",budget:"1",occupied_notional:"0",available_notional:"1",
+  utilization_pct:"0",open_buy_order_count:"0",realized_pnl,position_notional:"0",reserved_order_notional:"0",
+}});
+console.log(JSON.stringify({profit:render("+1234.50"),loss:render("-1234.50"),zero:render("0.00")}));
+''')
+    rendered = json.loads(output)
+    assert '<div class="primary">\n            <dt>可用资金</dt>\n            <dd>USD 1</dd>' in rendered["profit"]
+    assert '<div class="pnl-profit">\n            <dt>已实现盈亏</dt>\n            <dd>USD +1,234.50</dd>' in rendered["profit"]
+    assert '<div class="pnl-loss">\n            <dt>已实现盈亏</dt>\n            <dd>USD -1,234.50</dd>' in rendered["loss"]
+    assert '<div>\n            <dt>已实现盈亏</dt>\n            <dd>USD 0.00</dd>' in rendered["zero"]
+    assert "pnl-profit" not in rendered["zero"]
+    assert "pnl-loss" not in rendered["zero"]
+
+
+def test_dashboard_decision_target_fallback_formats_only_numeric_tokens() -> None:
+    output = run_dashboard_js(r'''
+const target = (value) => Object.fromEntries(decisionMetricCells({strategy:{target_range:value}}))["目标价"];
+console.log(JSON.stringify({
+  lower:target(">= 1234567.50"),range:target("1234567.50 - 2000000.00"),
+  date:target("2026-07-16"),identifier:target("编号 00001234"),numericId:target("00001234-56"),
+  percent:target("21.13%"),text:target("等待确认"),
+}));
+''')
+    assert json.loads(output) == {
+        "lower": ">= 1,234,567.50",
+        "range": "1,234,567.50 - 2,000,000.00",
+        "date": "2026-07-16",
+        "identifier": "编号 00001234",
+        "numericId": "00001234-56",
+        "percent": "21.13%",
+        "text": "等待确认",
+    }
+
+
 def test_dashboard_workspace_navigation_uses_one_shared_state_machine() -> None:
     output = run_dashboard_js(r'''
 const element=()=>({hidden:false,innerHTML:"",classList:{values:new Set(),add(...n){n.forEach(x=>this.values.add(x))},remove(...n){n.forEach(x=>this.values.delete(x))},toggle(n,f){f?this.add(n):this.remove(n)},contains(n){return this.values.has(n)}}});

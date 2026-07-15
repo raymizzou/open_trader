@@ -1399,7 +1399,7 @@ function renderKellyStrategyCapital(experiment) {
     ["可用资金", formatCapitalMoney(capital.available_notional, currency), "primary"],
     ["占用率", firstPresent(utilization, "-"), ""],
     ["未完成买单", formatDisplayNumber(capital.open_buy_order_count), ""],
-    ["已实现盈亏", formatCapitalMoney(capital.realized_pnl, currency), ""],
+    ["已实现盈亏", formatCapitalMoney(capital.realized_pnl, currency), pnlClass(capital.realized_pnl)],
   ];
   return `
     <section class="kelly-strategy-capital" aria-label="Kelly 策略资金">
@@ -1411,7 +1411,7 @@ function renderKellyStrategyCapital(experiment) {
       </div>
       <dl class="kelly-capital-metric-grid">
         ${metrics.map(([label, value, className]) => `
-          <div class="${escapeHtml(className)}">
+          <div${className ? ` class="${escapeHtml(className)}"` : ""}>
             <dt>${escapeHtml(label)}</dt>
             <dd>${escapeHtml(formatPlain(value))}</dd>
           </div>
@@ -1989,7 +1989,7 @@ function renderHeaderSummary() {
   elements["current-view-value"].textContent = formatMoney(summary.portfolio_value_hkd, "HKD");
   elements["current-view-holding-value"].textContent = `持仓资产 ${formatMoney(summary.holding_value_hkd, "HKD")}`;
   elements["current-view-holding-weight"].textContent = formatPlain(summary.holding_weight_hkd);
-  elements["current-view-cash-note"].textContent = `现金类资产 ${formatMoney(summary.cash_like_value_hkd, "HKD")} · 持仓 ${formatPlain(summary.holding_count)}`;
+  elements["current-view-cash-note"].textContent = `现金类资产 ${formatMoney(summary.cash_like_value_hkd, "HKD")} · 持仓 ${formatDisplayNumber(summary.holding_count)}`;
   elements["current-view-label"].textContent = currentViewLabel(activeAccountRowCount());
 }
 
@@ -2003,7 +2003,7 @@ function activeAccountRowCount() {
 function currentViewLabel(count) {
   const marketLabel = state.marketFilter === "ALL" ? "全部市场" : state.marketFilter === "CN" ? "A 股" : state.marketFilter;
   const brokerLabel = brokerDisplayName(state.brokerFilter);
-  return `当前视图：${marketLabel} · ${brokerLabel} · ${formatPlain(count)} 条`;
+  return `当前视图：${marketLabel} · ${brokerLabel} · ${formatDisplayNumber(count)} 条`;
 }
 
 function renderSummary() {
@@ -2012,9 +2012,9 @@ function renderSummary() {
   elements["summary-value"].textContent = formatMoney(summary.portfolio_value_hkd, "HKD");
   elements["summary-holding-value"].textContent = `持仓资产 ${formatMoney(summary.holding_value_hkd, "HKD")}`;
   elements["summary-holding-weight"].textContent = formatPlain(summary.holding_weight_hkd);
-  elements["summary-cash-note"].textContent = `现金类资产 ${formatMoney(summary.cash_like_value_hkd, "HKD")} · ${formatPlain(summary.cash_like_weight_hkd)} · 持仓 ${formatPlain(summary.holding_count)}`;
+  elements["summary-cash-note"].textContent = `现金类资产 ${formatMoney(summary.cash_like_value_hkd, "HKD")} · ${formatPlain(summary.cash_like_weight_hkd)} · 持仓 ${formatDisplayNumber(summary.holding_count)}`;
   elements["summary-holding-bar"].style.width = percentBarWidth(summary.holding_weight_hkd);
-  elements["summary-brokers"].textContent = `${formatPlain(summary.broker_count)} 个`;
+  elements["summary-brokers"].textContent = `${formatDisplayNumber(summary.broker_count)} 个`;
   elements["summary-detail-month"].textContent = dashboard.broker_detail_month
     ? `明细月份 ${dashboard.broker_detail_month}`
     : "暂无券商明细";
@@ -2047,7 +2047,7 @@ function renderAccountTabs(groups) {
     const selected = broker === state.brokerFilter;
     return `<button class="account-tab ${selected ? "active" : ""}" type="button" role="tab"
       data-broker="${escapeHtml(broker)}" aria-selected="${selected}">
-      ${escapeHtml(brokerDisplayName(broker))}<span>${escapeHtml(formatPlain(counts.get(broker) || 0))}</span>
+      ${escapeHtml(brokerDisplayName(broker))}<span>${escapeHtml(formatDisplayNumber(counts.get(broker) || 0))}</span>
     </button>`;
   }).join("");
 }
@@ -2074,7 +2074,7 @@ function renderAccountHoldings() {
   elements["account-tabs"].innerHTML = renderAccountTabs(groups);
   const rows = active ? active.rows.filter(({display}) => state.marketFilter === "ALL"
     || String(display.market || "").toUpperCase() === state.marketFilter) : [];
-  elements["visible-count"].textContent = `${formatPlain(rows.length)} 条`;
+  elements["visible-count"].textContent = `${formatDisplayNumber(rows.length)} 条`;
   elements["workspace-grid"].classList.remove("detail-mode");
   container.classList.remove("hidden");
   elements["symbol-detail-panel"].classList.add("hidden");
@@ -2109,7 +2109,7 @@ function renderAccountSection(group) {
       <div class="account-section-meta">
         <span>持仓资产 ${escapeHtml(formatMoney(group.summary.holding_value_hkd, "HKD"))}</span>
         <span>现金 ${escapeHtml(formatMoney(group.summary.cash_like_value_hkd, "HKD"))}</span>
-        <span>持仓 ${escapeHtml(formatPlain(group.summary.holding_count))}</span>
+        <span>持仓 ${escapeHtml(formatDisplayNumber(group.summary.holding_count))}</span>
         <span>来源 ${escapeHtml(formatPlain(source))}</span>
         <span>时间 ${escapeHtml(formatPlain(sourceTime))}</span>
       </div>
@@ -4626,10 +4626,10 @@ function decisionMetricCells(holding) {
   const target = safeRangeText(
     formatDisplayNumber(strategy.target_1),
     formatDisplayNumber(strategy.target_2),
-  ) || formatDisplayNumber(safePrimaryValue(strategy.target_range));
+  ) || formatDecisionTarget(strategy.target_range);
   return [
     ["观点", analystViewText(holding)],
-    ["目标价", formatDisplayNumber(target)],
+    ["目标价", target],
     ["触发状态", decisionTriggerText(action)],
     ["动作状态", mappedActionStatusLabel(action.status)],
     ["下次复评", nextReviewText(holding)],
@@ -4759,17 +4759,20 @@ function renderBrokerDetailSection(details) {
   if (!Array.isArray(details) || details.length === 0) {
     return renderDetailSection("券商账户明细", renderStatusMessage("暂无券商账户明细"), "broker-detail-section");
   }
-  const rows = details.map((detail) => `
-    <tr>
-      <td>${escapeHtml(formatPlain(detail.broker))}</td>
-      <td>${escapeHtml(formatPlain(detail.account_alias))}</td>
-      <td class="number-cell">${escapeHtml(formatPlain(detail.quantity))}</td>
-      <td class="number-cell">${escapeHtml(formatPlain(detail.cost_price))}</td>
-      <td class="number-cell">${escapeHtml(formatPlain(detail.last_price))}</td>
-      <td class="number-cell">${escapeHtml(formatPlain(detail.market_value))}</td>
-      <td class="number-cell">${escapeHtml(formatPlain(detail.unrealized_pnl))}</td>
-    </tr>
-  `).join("");
+  const rows = details.map((detail) => {
+    const pnlTone = pnlClass(detail.unrealized_pnl);
+    return `
+      <tr>
+        <td>${escapeHtml(formatPlain(detail.broker))}</td>
+        <td>${escapeHtml(formatPlain(detail.account_alias))}</td>
+        <td class="number-cell">${escapeHtml(formatDisplayNumber(detail.quantity))}</td>
+        <td class="number-cell">${escapeHtml(formatDisplayNumber(detail.cost_price))}</td>
+        <td class="number-cell">${escapeHtml(formatDisplayNumber(detail.last_price))}</td>
+        <td class="number-cell">${escapeHtml(formatDisplayNumber(detail.market_value))}</td>
+        <td class="number-cell${pnlTone ? ` ${pnlTone}` : ""}">${escapeHtml(formatDisplayNumber(detail.unrealized_pnl))}</td>
+      </tr>
+    `;
+  }).join("");
   return renderDetailSection("券商账户明细", `
     <div class="compact-detail-table">
       <table>
@@ -5359,8 +5362,8 @@ function renderActionCard(action) {
         <span class="badge">${escapeHtml(actionCardStatusLabel(action))}</span>
       </div>
       <div class="action-card-metrics">
-        <div><span>限价</span><strong>${escapeHtml(formatPlain(firstPresent(action.limit_price, action.last_price)))}</strong></div>
-        <div><span>数量</span><strong>${escapeHtml(formatPlain(action.suggested_quantity))}</strong></div>
+        <div><span>限价</span><strong>${escapeHtml(formatDisplayNumber(firstPresent(action.limit_price, action.last_price)))}</strong></div>
+        <div><span>数量</span><strong>${escapeHtml(formatDisplayNumber(action.suggested_quantity))}</strong></div>
         <div><span>金额</span><strong>${escapeHtml(actionNotionalText(action))}</strong></div>
       </div>
       <div class="action-card-reason">
@@ -5589,7 +5592,7 @@ function renderBrokerSummaryCards() {
       <span class="summary-label">${escapeHtml(brokerDisplayName(summary))}</span>
       <span class="account-horizon-label">${escapeHtml(profile.horizon)} · ${escapeHtml(profile.strategy)}</span>
       <strong>${escapeHtml(formatMoney(summary.portfolio_value_hkd, "HKD"))}</strong>
-      <span class="summary-note">持仓 ${escapeHtml(formatPlain(summary.holding_count))} · ${escapeHtml(brokerSummarySourceText(summary))}</span>
+      <span class="summary-note">持仓 ${escapeHtml(formatDisplayNumber(summary.holding_count))} · ${escapeHtml(brokerSummarySourceText(summary))}</span>
     </button>`;
   }).join("");
 }
@@ -5933,6 +5936,15 @@ function formatDisplayNumber(value) {
   if (!match) return raw;
   const [, sign, integer, fraction = ""] = match;
   return `${sign}${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${fraction}`;
+}
+
+function formatDecisionTarget(value) {
+  const raw = safePrimaryValue(value);
+  const range = raw.match(/^([+-]?\d+(?:\.\d+)?)(\s+-\s+)([+-]?\d+(?:\.\d+)?)$/);
+  if (range) return `${formatDisplayNumber(range[1])}${range[2]}${formatDisplayNumber(range[3])}`;
+  const threshold = raw.match(/^([<>]=?\s*)([+-]?\d+(?:\.\d+)?)$/);
+  if (threshold) return `${threshold[1]}${formatDisplayNumber(threshold[2])}`;
+  return formatDisplayNumber(raw);
 }
 
 function formatMoney(value, currency) {
