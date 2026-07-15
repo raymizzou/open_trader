@@ -844,6 +844,138 @@ def _data_source_label(value: str) -> str:
     }.get(value, value)
 
 
+TREND_BUY_WINDOWS = {
+    "US": "美股常规交易时段",
+    "HK": "09:30–10:00",
+    "CN": "09:30–10:00",
+}
+
+
+def _feishu_identity(item: Mapping[str, object]) -> str:
+    return " ".join(
+        part
+        for part in (
+            str(item.get("symbol") or "-").strip(),
+            str(item.get("name") or "").strip(),
+        )
+        if part
+    )
+
+
+def _feishu_reason(item: Mapping[str, object]) -> str:
+    reason = str(item.get("reason") or "")
+    if reason not in REASON_LABELS:
+        return "未知动作或原因，需人工确认"
+    return _reason_label(reason)
+
+
+def _feishu_money(value: object) -> str:
+    return _money(Decimal(str(value))).rstrip("0").rstrip(".")
+
+
+def _append_feishu_action_sections(
+    lines: list[str],
+    sells: Sequence[Mapping[str, object]],
+    buys: Sequence[Mapping[str, object]],
+    reviews: Sequence[Mapping[str, object]],
+    *,
+    market: str,
+) -> None:
+    if sells:
+        lines.extend(["", "卖出"])
+        for index, item in enumerate(sells, 1):
+            line = f"{index}. {_feishu_identity(item)}｜{_feishu_reason(item)}"
+            if item.get("active_line") not in {None, ""}:
+                line += f"｜保护线 {_feishu_money(item['active_line'])}"
+            lines.append(line)
+    if buys:
+        lines.extend(["", "买入"])
+        for index, item in enumerate(buys, 1):
+            lines.append(
+                f"{index}. {_feishu_identity(item)}｜{TREND_BUY_WINDOWS[market]}｜"
+                f"约 {item.get('estimated_shares', '-')} 股｜"
+                f"金额上限 {_feishu_money(item.get('target_amount') or '0')}｜"
+                f"保护线 {_feishu_money(item.get('estimated_initial_line') or '0')}"
+            )
+    if reviews:
+        lines.extend(["", "人工复核"])
+        lines.extend(
+            f"{index}. {_feishu_identity(item)}｜{_feishu_reason(item)}"
+            for index, item in enumerate(reviews, 1)
+        )
+
+
+def render_trend_feishu_text(
+    payload: Mapping[str, object], *, broker_label: str, market_label: str
+) -> tuple[str, str]:
+    execution_date = str(payload.get("execution_date") or "-")
+    as_of_date = str(payload.get("as_of_date") or "-")
+    account = payload.get("account")
+    account = account if isinstance(account, dict) else {}
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    market = str(metadata.get("market") or "CN").upper()
+    judgments = payload.get("strategy_judgments")
+    judgments = judgments if isinstance(judgments, dict) else {}
+    holdings = [
+        item
+        for item in judgments.get("holding_decisions", [])
+        if isinstance(item, dict)
+    ]
+    formal = [
+        item
+        for item in judgments.get("formal_actions", [])
+        if isinstance(item, dict)
+    ]
+    sells = [
+        item
+        for item in formal
+        if item.get("action") == "SELL_ALL" and item.get("reason") in REASON_LABELS
+    ]
+    buys = [item for item in formal if item.get("action") == "BUY"]
+    holds = [item for item in holdings if item.get("action") == "HOLD"]
+    reviews = [
+        item
+        for item in holdings
+        if item.get("action") == "MANUAL_REVIEW"
+        or item.get("action") not in ACTION_LABELS
+        or (
+            item.get("action") == "SELL_ALL"
+            and item.get("reason") not in REASON_LABELS
+        )
+    ]
+    title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
+    fresh = bool(account.get("fresh"))
+    status = "已更新" if fresh else ("已过期，禁止买入" if buys else "已过期")
+    summary = (
+        f"今日动作：卖出 {len(sells)}｜买入 {len(buys)}｜持有 {len(holds)}｜复核 {len(reviews)}"
+        if sells or buys
+        else f"今日无买卖动作｜持有 {len(holds)}｜复核 {len(reviews)}"
+    )
+    lines = [
+        f"数据截至：{as_of_date}",
+        f"账户状态：{status}",
+        summary,
+    ]
+    _append_feishu_action_sections(lines, sells, buys, reviews, market=market)
+    lines.extend(["", "请人工确认，不自动下单。"])
+    return title, "\n".join(lines)
+
+
+def render_trend_failure_text(
+    *,
+    broker_label: str,
+    market_label: str,
+    report_date: str,
+    reason: str,
+    recovery_action: str,
+) -> tuple[str, str]:
+    return (
+        f"【{broker_label}｜{market_label}趋势报告生成失败｜{report_date}】",
+        f"原因：{reason}\n现在做：{recovery_action}\n\n报告未生成，请勿依据旧报告交易。",
+    )
+
+
 def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
     market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(market, market)

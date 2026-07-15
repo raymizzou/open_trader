@@ -29,6 +29,8 @@ from open_trader.a_share_trend import (
     load_eastmoney_account,
     load_protection_state,
     load_watch_events,
+    render_trend_failure_text,
+    render_trend_feishu_text,
     render_markdown,
     run_a_share_trend_report,
     update_protection_line,
@@ -1054,6 +1056,161 @@ def test_markdown_prioritizes_actions_before_source_summary() -> None:
     )
     assert "其他接口事实：详见 JSON 审计文件" in markdown
     assert "## API 原始事实" not in markdown
+
+
+def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": True},
+        "metadata": {"market": "US", "broker": "futu"},
+        "strategy_judgments": {
+            "holding_decisions": [
+                {
+                    "action": "SELL_ALL",
+                    "symbol": "AAPL",
+                    "name": "苹果",
+                    "reason": "left_trend_right_side",
+                    "active_line": "190",
+                },
+                {
+                    "action": "HOLD",
+                    "symbol": "MSFT",
+                    "name": "微软",
+                    "reason": "right_side",
+                },
+                {
+                    "action": "MANUAL_REVIEW",
+                    "symbol": "TSLA",
+                    "name": "特斯拉",
+                    "reason": "missing_snapshot",
+                },
+                {
+                    "action": "NEW_CODE",
+                    "symbol": "NVDA",
+                    "name": "英伟达",
+                    "reason": "new_reason",
+                },
+            ],
+            "formal_actions": [
+                {
+                    "action": "SELL_ALL",
+                    "symbol": "AAPL",
+                    "name": "苹果",
+                    "reason": "left_trend_right_side",
+                    "active_line": "190",
+                },
+                {
+                    "action": "BUY",
+                    "symbol": "CRWD",
+                    "name": "CrowdStrike",
+                    "estimated_shares": 2,
+                    "target_amount": "500",
+                    "estimated_initial_line": "198",
+                },
+            ],
+        },
+    }
+
+    title, message = render_trend_feishu_text(
+        payload, broker_label="富途", market_label="美股"
+    )
+
+    assert title == "【富途｜美股趋势报告｜2026-07-15】"
+    assert message == "\n".join(
+        [
+            "数据截至：2026-07-14",
+            "账户状态：已更新",
+            "今日动作：卖出 1｜买入 1｜持有 1｜复核 2",
+            "",
+            "卖出",
+            "1. AAPL 苹果｜右侧趋势已结束｜保护线 190",
+            "",
+            "买入",
+            "1. CRWD CrowdStrike｜美股常规交易时段｜约 2 股｜金额上限 500｜保护线 198",
+            "",
+            "人工复核",
+            "1. TSLA 特斯拉｜未知动作或原因，需人工确认",
+            "2. NVDA 英伟达｜未知动作或原因，需人工确认",
+            "",
+            "请人工确认，不自动下单。",
+        ]
+    )
+    assert "MSFT" not in message
+    assert "http" not in message.lower()
+
+
+def test_trend_feishu_text_uses_short_no_trade_template() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": False},
+        "metadata": {"market": "HK", "broker": "phillips"},
+        "strategy_judgments": {
+            "holding_decisions": [{"action": "HOLD", "symbol": "02800"}],
+            "formal_actions": [],
+        },
+    }
+    title, message = render_trend_feishu_text(
+        payload, broker_label="辉立", market_label="港股"
+    )
+    assert title == "【辉立｜港股趋势报告｜2026-07-15】"
+    assert message == (
+        "数据截至：2026-07-14\n"
+        "账户状态：已过期\n"
+        "今日无买卖动作｜持有 1｜复核 0\n\n"
+        "请人工确认，不自动下单。"
+    )
+
+
+def test_trend_feishu_text_lists_reviews_on_no_trade_days() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": {"fresh": True},
+        "metadata": {"market": "CN"},
+        "strategy_judgments": {
+            "holding_decisions": [
+                {
+                    "action": "MANUAL_REVIEW",
+                    "symbol": "600001",
+                    "name": "测试股票",
+                    "reason": "future_reason_code",
+                }
+            ],
+            "formal_actions": [],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+
+    assert message == (
+        "数据截至：2026-07-14\n"
+        "账户状态：已更新\n"
+        "今日无买卖动作｜持有 0｜复核 1\n\n"
+        "人工复核\n"
+        "1. 600001 测试股票｜未知动作或原因，需人工确认\n\n"
+        "请人工确认，不自动下单。"
+    )
+    assert "future_reason_code" not in message
+
+
+def test_trend_failure_text_is_plain_and_actionable() -> None:
+    title, message = render_trend_failure_text(
+        broker_label="东方财富",
+        market_label="A股",
+        report_date="2026-07-15",
+        reason="趋势数据在截止时间前仍未更新",
+        recovery_action="确认 Trend Animals 数据状态后手动重跑东方财富报告",
+    )
+    assert title == "【东方财富｜A股趋势报告生成失败｜2026-07-15】"
+    assert message == (
+        "原因：趋势数据在截止时间前仍未更新\n"
+        "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n\n"
+        "报告未生成，请勿依据旧报告交易。"
+    )
 
 
 def test_markdown_is_operation_first_and_translates_internal_codes() -> None:
