@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-15
 
+- Restored XiaoAI voice playback for queued Open Trader notifications by sending
+  explicit external TTS start/stop state without opening a conversation or stop
+  listener; verified the test, A-share, HK, and US templates on the live speaker
+  with one queue submission each and no notification retry.
 - Added the Eastmoney A-share trend workflow: cached Trend Animals signals,
   Futu protection-line monitoring, frozen Markdown/JSON reports, and a Chinese
   operation-first Feishu checklist for manual execution.
