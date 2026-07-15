@@ -810,7 +810,7 @@ def build_report(
     )
     displayed_candidates = candidate_decision.eligible[:10]
     buy_actions = estimate_buy_actions(
-        ranked=displayed_candidates,
+        ranked=candidate_decision.eligible,
         net_value=account.net_value,
         available_cash=account.available_cash,
         current_position_count=len(account.positions),
@@ -1325,7 +1325,7 @@ def render_markdown(report: TrendReport) -> str:
                     f"预计保护线 {_money(item.estimated_initial_line)}"
                 )
         if market == "CN":
-            quantity_rule = "按东方财富实时价格向下取整为 100 股整数倍"
+            quantity_rule = "按富途数据日前复权日线收盘价向下取整为 100 股整数倍"
         elif market == "HK":
             quantity_rule = "按富途 lot size 向下取整为整手"
         else:

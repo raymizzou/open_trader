@@ -732,7 +732,7 @@ def test_unaffordable_candidate_does_not_consume_cash_or_slot() -> None:
     ]
 
 
-def test_formal_buys_do_not_promote_beyond_displayed_top_ten() -> None:
+def test_unaffordable_top_ten_promotes_later_affordable_candidate() -> None:
     ranked = [candidate(f"6000{index:02d}", close="100") for index in range(1, 11)]
     ranked.append(candidate("600011", close="1"))
     built = build_report(
@@ -744,7 +744,7 @@ def test_formal_buys_do_not_promote_beyond_displayed_top_ten() -> None:
         bars_by_symbol={},
     )
     assert len(built.candidates) == 10
-    assert built.buy_actions == ()
+    assert [item.symbol for item in built.buy_actions] == ["600011"]
 
 
 def test_duplicate_pool_members_produce_one_candidate_and_one_buy() -> None:
@@ -1734,6 +1734,8 @@ def test_cn_markdown_keeps_filter_and_execution_prices_distinct() -> None:
     assert "执行参考价 10.00 元（富途前复权日线）" in markdown
     assert "温→热" in markdown
     assert "目标仓位 4.00%" in markdown
+    assert "实际股数按富途数据日前复权日线收盘价向下取整" in markdown
+    assert "按东方财富实时价格" not in markdown
 
 
 @pytest.mark.parametrize("market", ["US", "HK", "CN"])
@@ -1939,7 +1941,7 @@ def test_formal_buy_text_includes_window_estimates_target_and_line() -> None:
     assert "约 2700 股" in markdown
     assert "金额上限 27061.98 元" in markdown
     assert "预计保护线 9.00" in markdown
-    assert "按东方财富实时价格向下取整为 100 股整数倍" in markdown
+    assert "按富途数据日前复权日线收盘价向下取整为 100 股整数倍" in markdown
 
 
 def test_candidate_row_shows_industry_slots_and_weight() -> None:
@@ -2342,6 +2344,7 @@ class ReadyApi:
         snapshot_ids: list[object] | None = None,
         missing_industry_ids: set[int] | None = None,
         industry_error: Exception | None = None,
+        industry_ids: dict[int, int] | None = None,
     ) -> None:
         self.calls = calls
         self.ready = ready
@@ -2351,6 +2354,7 @@ class ReadyApi:
         self.snapshot_ids = snapshot_ids
         self.missing_industry_ids = missing_industry_ids or set()
         self.industry_error = industry_error
+        self.industry_ids = industry_ids or {}
         self.snapshot_requests: list[tuple[list[int], tuple[str, ...]]] = []
         self.balance_calls = 0
 
@@ -2420,7 +2424,7 @@ class ReadyApi:
                 "stopwinFlagByDangerSignal": False,
                 "stopwinFlagByBoilingTemperature": False,
                 "stopwinFlagByPopChampagne": False,
-                "industryTmId": 700001,
+                "industryTmId": self.industry_ids.get(tm_id, 700001),
                 "priceIndex": "10",
                 "marketCap": "100",
                 "trendTemperaturePrev": "温",
@@ -2453,7 +2457,11 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
 def test_missing_industry_row_excludes_only_affected_candidate(
     tmp_path: Path,
 ) -> None:
-    api = ReadyApi([], missing_industry_ids={700001})
+    api = ReadyApi(
+        [],
+        missing_industry_ids={700001},
+        industry_ids={1: 700001, 2: 700002},
+    )
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
         api_factory=lambda **kwargs: api,
@@ -2463,8 +2471,12 @@ def test_missing_industry_row_excludes_only_affected_candidate(
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["excluded"] == {
         "000001": ["industry_temperature_missing"],
-        "000002": ["industry_temperature_missing"],
     }
+    assert [
+        item["symbol"]
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    ] == ["000002"]
 
 
 def test_industry_snapshot_failure_blocks_report(tmp_path: Path) -> None:
