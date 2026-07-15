@@ -359,7 +359,9 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
         assert str(source) in audit_text, f"{broker} 审计详情缺少数据来源 {source}"
     cost = data.get("actual_api_cost")
     if cost is None:
-        cost = data.get("estimated_api_cost", "未知")
+        cost = data.get("estimated_api_cost")
+    if cost is None:
+        cost = "未知"
     assert f"API 成本：{_plain(cost)}" in audit_text, f"{broker} 审计详情缺少 API 成本"
 
 

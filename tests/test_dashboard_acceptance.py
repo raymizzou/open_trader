@@ -171,6 +171,44 @@ def trend_audit_sections(broker: str) -> list[str]:
     ]
 
 
+def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
+    class Locator:
+        def __init__(self, selector: str = "audit") -> None:
+            self.selector = selector
+
+        def count(self) -> int:
+            return 1
+
+        def get_attribute(self, _name: str) -> None:
+            return None
+
+        def locator(self, selector: str) -> "Locator":
+            return Locator(selector)
+
+        def click(self) -> None:
+            return None
+
+        def all_inner_texts(self) -> list[str]:
+            assert self.selector == "section"
+            return ["候选榜 无", "排除项 无", "行业集中度 无"]
+
+        def inner_text(self) -> str:
+            return "审计详情 API 成本：未知"
+
+    report = {
+        "audit": {
+            "candidates": [],
+            "excluded": {},
+            "industry_concentration": [],
+            "data_sources": [],
+            "actual_api_cost": None,
+            "estimated_api_cost": None,
+        },
+    }
+
+    dashboard_acceptance._check_trend_audit(Locator(), report, "futu")
+
+
 def nested_get(row: dict[str, object], path: tuple[str, ...]) -> dict[str, object]:
     value: object = row
     for key in path:
