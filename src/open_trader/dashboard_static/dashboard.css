@@ -49,6 +49,12 @@ select:focus-visible {
   outline-offset: 2px;
 }
 
+.trend-discipline summary:focus-visible,
+.trend-audit summary:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.32);
+  outline-offset: 2px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -1594,6 +1600,95 @@ table {
 .trend-stage li,
 .trend-audit p {
   overflow-wrap: anywhere;
+}
+
+.cn-trend-report,
+.cn-trend-actions,
+.cn-trend-disciplines {
+  display: grid;
+  gap: 16px;
+}
+
+.cn-trend-report > .trend-report-header {
+  margin-bottom: 0;
+}
+
+.cn-trend-counts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.cn-trend-counts span {
+  border-radius: 8px;
+  padding: 12px;
+  text-align: center;
+}
+
+.cn-trend-stage {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  padding: 14px;
+}
+
+.cn-trend-sell {
+  border-left-color: var(--danger);
+}
+
+.cn-trend-buy {
+  border-left-color: var(--ok);
+}
+
+.cn-trend-table {
+  border-collapse: collapse;
+  margin-top: 10px;
+  table-layout: fixed;
+  width: 100%;
+}
+
+.cn-trend-price-sources {
+  color: var(--muted);
+}
+
+.cn-trend-table th,
+.cn-trend-table td {
+  overflow-wrap: anywhere;
+  padding: 9px 7px;
+  white-space: normal;
+}
+
+.cn-trend-table th {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trend-discipline {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 14px 12px;
+}
+
+.trend-discipline summary,
+.trend-audit summary {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  font-weight: 700;
+  min-height: 44px;
+}
+
+.trend-discipline summary {
+  color: var(--text);
+}
+
+.trend-discipline ol {
+  margin: 4px 0 0;
+  padding-left: 22px;
+}
+
+.trend-discipline li + li {
+  margin-top: 6px;
 }
 
 .account-holdings-table {
@@ -3709,6 +3804,64 @@ tbody tr.active-row {
   .trend-checklist { position: static; order: 2; }
   .trend-report-entry button,
   .trend-report-header button { min-height: 44px; }
+
+  .trend-report-workspace,
+  .cn-trend-report {
+    overflow-x: hidden;
+  }
+
+  .cn-trend-counts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cn-trend-stage {
+    padding: 12px;
+  }
+
+  .cn-trend-table {
+    display: block;
+    max-width: 100%;
+  }
+
+  .cn-trend-table thead {
+    display: none;
+  }
+
+  .cn-trend-table tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .cn-trend-card {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: hidden;
+  }
+
+  .cn-trend-card td {
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    gap: 4px;
+    padding: 10px;
+  }
+
+  .cn-trend-card td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .cn-trend-card td:nth-child(-n + 2) {
+    background: var(--surface-soft);
+  }
+
+  .trend-discipline summary,
+  .trend-audit summary {
+    min-height: 44px;
+  }
 
   .header-brand-panel,
   .header-assets-panel,
