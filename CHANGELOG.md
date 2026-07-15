@@ -3,6 +3,16 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-15
+
+- Added the Eastmoney A-share trend workflow: cached Trend Animals signals,
+  Futu protection-line monitoring, frozen Markdown/JSON reports, and a Chinese
+  operation-first Feishu checklist for manual execution.
+- Made intraday alerts retry until both Feishu and macOS receive a protection
+  trigger, without repeating facts or alerting positions already removed from
+  the account; verified `1859` tests and the final Dashboard acceptance gate
+  (`PASS`).
+
 ## 2026-07-14
 
 - Grouped holdings by broker account with strategy-horizon labels, split account
