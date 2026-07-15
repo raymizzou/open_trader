@@ -757,6 +757,7 @@ def quote_result() -> QuoteRefreshResult:
             }
         },
         diagnostic={},
+        fallback_count=0,
     )
 
 

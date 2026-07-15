@@ -8,19 +8,33 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from .dashboard import DashboardConfig
-from .futu_quote import FutuQuoteClient, FutuQuoteError
+from .futu_quote import DashboardQuoteSnapshot, FutuQuoteClient, FutuQuoteError
 from .futu_universe import FutuUniverseItem, load_futu_quote_universe
-from .futu_watch import QuoteSnapshot
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+ACTIVE_US_SESSION_ORDERS = {
+    "OVERNIGHT": ("overnight", "after_hours", "regular", "pre_market"),
+    "PRE_MARKET_BEGIN": ("pre_market", "overnight", "after_hours", "regular"),
+    "MORNING": ("regular", "pre_market", "overnight", "after_hours"),
+    "AFTERNOON": ("regular", "pre_market", "overnight", "after_hours"),
+    "AFTER_HOURS_BEGIN": ("after_hours", "regular", "pre_market", "overnight"),
+}
+INACTIVE_US_SESSION_ORDERS = {
+    "PRE_MARKET_END": ("pre_market", "overnight", "after_hours", "regular"),
+    "WAITING_OPEN": ("pre_market", "overnight", "after_hours", "regular"),
+    "AFTER_HOURS_END": ("after_hours", "regular", "pre_market", "overnight"),
+}
+CLOSED_US_SESSION_ORDER = ("after_hours", "regular", "pre_market", "overnight")
 
 
 class DashboardQuoteClient(Protocol):
-    def get_snapshots(
-        self,
-        futu_symbols: Sequence[str],
-    ) -> dict[str, QuoteSnapshot]:
+    def get_dashboard_snapshots(
+        self, futu_symbols: Sequence[str]
+    ) -> dict[str, DashboardQuoteSnapshot]:
+        raise NotImplementedError
+
+    def get_market_states(self, futu_symbols: Sequence[str]) -> dict[str, str]:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -38,6 +52,8 @@ class QuoteRefreshResult:
     stale: bool
     quotes: dict[str, dict[str, Any]]
     diagnostic: dict[str, Any]
+    fallback_count: int = 0
+    us_session_status: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,6 +64,8 @@ class QuoteRefreshResult:
             "fetched_at": self.fetched_at,
             "last_success_at": self.last_success_at,
             "stale": self.stale,
+            "fallback_count": self.fallback_count,
+            "us_session_status": self.us_session_status,
             "quotes": {
                 futu_symbol: dict(quote)
                 for futu_symbol, quote in self.quotes.items()
@@ -68,13 +86,21 @@ class DashboardQuoteService:
         universe = load_futu_quote_universe(self.config.portfolio_path)
         items_by_symbol = _items_by_sorted_symbol(universe.items)
         requested_symbols = list(items_by_symbol)
+        us_symbols = [symbol for symbol in requested_symbols if symbol.startswith("US.")]
         client: DashboardQuoteClient | None = None
+        market_states: dict[str, str] = {}
+        state_error: FutuQuoteError | None = None
 
         try:
-            snapshots: dict[str, QuoteSnapshot]
+            snapshots: dict[str, DashboardQuoteSnapshot]
             if requested_symbols:
                 client = self._new_client()
-                snapshots = client.get_snapshots(requested_symbols)
+                snapshots = client.get_dashboard_snapshots(requested_symbols)
+                if us_symbols:
+                    try:
+                        market_states = client.get_market_states(us_symbols)
+                    except FutuQuoteError as exc:
+                        state_error = exc
             else:
                 snapshots = {}
         except FutuQuoteError as exc:
@@ -93,10 +119,23 @@ class DashboardQuoteService:
             if client is not None and hasattr(client, "close"):
                 client.close()
 
+        if state_error is None and any(
+            symbol not in market_states for symbol in us_symbols
+        ):
+            state_error = FutuQuoteError(
+                "incomplete US market states",
+                error_type="market_state_failed",
+                opend_reachable=True,
+                context_ok=True,
+                snapshot_ok=True,
+            )
+
         quotes = {
             futu_symbol: _quote_row(
                 item=items_by_symbol[futu_symbol],
                 snapshot=snapshots.get(futu_symbol),
+                market_state=market_states.get(futu_symbol, ""),
+                use_us_session=state_error is None,
                 fetched_at=fetched_at,
                 stale=False,
             )
@@ -106,11 +145,19 @@ class DashboardQuoteService:
             1 for quote in quotes.values() if quote["status"] == "missing_quote"
         )
         quote_count = len(requested_symbols) - missing_count
-        status = "partial" if missing_count else "ok"
-        diagnostic = (
-            _missing_quotes_diagnostic(missing_count) if missing_count else {}
+        fallback_count = sum(
+            1
+            for futu_symbol, quote in quotes.items()
+            if market_states.get(futu_symbol) in ACTIVE_US_SESSION_ORDERS
+            and quote["status"] == "ok"
+            and not quote["current_session_quote"]
         )
-        if status == "ok":
+        status = "partial" if missing_count or fallback_count or state_error else "ok"
+        diagnostic = _partial_diagnostic(
+            missing_count, fallback_count, state_error
+        )
+        cacheable = missing_count == 0 and state_error is None
+        if cacheable:
             self.last_success_at = fetched_at
             self.last_quotes = {
                 futu_symbol: dict(quote)
@@ -127,6 +174,10 @@ class DashboardQuoteService:
             stale=False,
             quotes=quotes,
             diagnostic=diagnostic,
+            fallback_count=fallback_count,
+            us_session_status=_us_session_status(
+                us_symbols, market_states, state_error
+            ),
         )
 
     def _new_client(self) -> DashboardQuoteClient:
@@ -151,11 +202,23 @@ def _items_by_sorted_symbol(
 def _quote_row(
     *,
     item: FutuUniverseItem,
-    snapshot: QuoteSnapshot | None,
+    snapshot: DashboardQuoteSnapshot | None,
+    market_state: str,
+    use_us_session: bool,
     fetched_at: str,
     stale: bool,
 ) -> dict[str, Any]:
-    if snapshot is None:
+    price: Decimal | None = None
+    price_session = ""
+    current_session_quote = False
+    price_time = ""
+    if snapshot is not None:
+        price = snapshot.last_price
+        if item.futu_symbol.startswith("US.") and use_us_session:
+            price, price_session, current_session_quote, price_time = (
+                _select_us_price(snapshot, market_state)
+            )
+    if price is None:
         return {
             "market": item.market,
             "symbol": item.symbol,
@@ -163,6 +226,10 @@ def _quote_row(
             "futu_symbol": item.futu_symbol,
             "status": "missing_quote",
             "last_price": "",
+            "price_session": "",
+            "price_time": "",
+            "current_session_quote": False,
+            "market_state": market_state,
             "fetched_at": fetched_at,
             "stale": stale,
         }
@@ -172,10 +239,55 @@ def _quote_row(
         "name": item.name,
         "futu_symbol": item.futu_symbol,
         "status": "ok",
-        "last_price": _decimal_text(snapshot.last_price),
+        "last_price": _decimal_text(price),
+        "price_session": price_session,
+        "price_time": price_time,
+        "current_session_quote": current_session_quote,
+        "market_state": market_state,
         "fetched_at": fetched_at,
         "stale": stale,
     }
+
+
+def _session_prices(
+    snapshot: DashboardQuoteSnapshot,
+) -> dict[str, Decimal | None]:
+    return {
+        "regular": snapshot.last_price,
+        "pre_market": snapshot.pre_price,
+        "after_hours": snapshot.after_price,
+        "overnight": snapshot.overnight_price,
+    }
+
+
+def _select_us_price(
+    snapshot: DashboardQuoteSnapshot, market_state: str
+) -> tuple[Decimal | None, str, bool, str]:
+    active_order = ACTIVE_US_SESSION_ORDERS.get(market_state)
+    order = active_order or INACTIVE_US_SESSION_ORDERS.get(
+        market_state, CLOSED_US_SESSION_ORDER
+    )
+    prices = _session_prices(snapshot)
+    for index, session in enumerate(order):
+        if price := prices[session]:
+            current = active_order is not None and index == 0
+            return price, session, current, snapshot.update_time if current else ""
+    return None, "", False, ""
+
+
+def _us_session_status(
+    us_symbols: list[str],
+    market_states: dict[str, str],
+    state_error: FutuQuoteError | None,
+) -> str:
+    if state_error is not None or not us_symbols or not market_states:
+        return "unknown"
+    active_count = sum(
+        market_states[symbol] in ACTIVE_US_SESSION_ORDERS for symbol in us_symbols
+    )
+    if active_count == len(us_symbols):
+        return "active"
+    return "mixed" if active_count else "closed"
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -193,14 +305,41 @@ def _mark_stale(
     return stale_quotes
 
 
-def _missing_quotes_diagnostic(missing_count: int) -> dict[str, Any]:
+def _partial_diagnostic(
+    missing_count: int,
+    fallback_count: int,
+    state_error: FutuQuoteError | None,
+) -> dict[str, Any]:
+    messages: list[str] = []
+    if missing_count:
+        messages.append(f"缺失 {missing_count} 个标的行情。")
+    if fallback_count:
+        messages.append(f"{fallback_count} 个标的当前时段无报价，已使用上一有效价。")
+    if state_error is not None:
+        messages.append("美股市场状态不可用，已使用盘中价。")
+    if not messages:
+        return {}
+    error_type = (
+        state_error.error_type
+        if state_error is not None
+        else "missing_quotes" if missing_count else "session_quote_fallback"
+    )
+    next_step = (
+        state_error.next_step
+        if state_error is not None
+        else f"请人工复核缺失 {missing_count} 个标的行情，再决定是否执行相关交易动作。"
+        if missing_count
+        else "请人工复核当前时段报价，再决定是否执行相关交易动作。"
+    )
     return {
-        "error_type": "missing_quotes",
-        "message": f"缺失 {missing_count} 个标的行情。",
-        "next_step": f"请人工复核缺失 {missing_count} 个标的行情，再决定是否执行相关交易动作。",
-        "opend_reachable": True,
-        "context_ok": True,
-        "snapshot_ok": True,
+        "error_type": error_type,
+        "message": " ".join(messages),
+        "next_step": next_step,
+        "opend_reachable": (
+            state_error.opend_reachable if state_error is not None else True
+        ),
+        "context_ok": state_error.context_ok if state_error is not None else True,
+        "snapshot_ok": state_error.snapshot_ok if state_error is not None else True,
     }
 
 

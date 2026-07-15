@@ -5,22 +5,39 @@ from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from open_trader.dashboard import DashboardConfig
 from open_trader.dashboard_quotes import DashboardQuoteService
-from open_trader.futu_quote import FutuQuoteError
-from open_trader.futu_watch import QuoteSnapshot
+from open_trader.futu_quote import DashboardQuoteSnapshot, FutuQuoteError
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 
 
 class FakeQuoteClient:
-    def __init__(self, snapshots: dict[str, QuoteSnapshot]) -> None:
+    def __init__(
+        self,
+        snapshots: dict[str, DashboardQuoteSnapshot],
+        states: dict[str, str] | None = None,
+        state_error: FutuQuoteError | None = None,
+    ) -> None:
         self.snapshots = snapshots
+        self.states = states or {}
+        self.state_error = state_error
         self.requested_symbols: list[str] = []
+        self.requested_state_symbols: list[str] = []
         self.closed = False
 
-    def get_snapshots(self, futu_symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
+    def get_dashboard_snapshots(
+        self, futu_symbols: Sequence[str]
+    ) -> dict[str, DashboardQuoteSnapshot]:
         self.requested_symbols = list(futu_symbols)
         return self.snapshots
+
+    def get_market_states(self, futu_symbols: Sequence[str]) -> dict[str, str]:
+        self.requested_state_symbols = list(futu_symbols)
+        if self.state_error is not None:
+            raise self.state_error
+        return self.states
 
     def close(self) -> None:
         self.closed = True
@@ -30,7 +47,9 @@ class RaisingQuoteClient:
     def __init__(self) -> None:
         self.closed = False
 
-    def get_snapshots(self, futu_symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
+    def get_dashboard_snapshots(
+        self, futu_symbols: Sequence[str]
+    ) -> dict[str, DashboardQuoteSnapshot]:
         raise FutuQuoteError(
             "网络中断",
             error_type="quote_server_interrupted",
@@ -150,15 +169,151 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
     )
 
 
+def session_snapshot(**prices: str | None) -> DashboardQuoteSnapshot:
+    return DashboardQuoteSnapshot(
+        futu_symbol="US.MSFT",
+        last_price=Decimal(prices["last"]) if prices.get("last") else None,
+        pre_price=Decimal(prices["pre"]) if prices.get("pre") else None,
+        after_price=Decimal(prices["after"]) if prices.get("after") else None,
+        overnight_price=Decimal(prices["overnight"]) if prices.get("overnight") else None,
+        update_time="2026-07-15 03:03:01.150",
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_price", "expected_session"),
+    [
+        ("OVERNIGHT", "61.5", "overnight"),
+        ("PRE_MARKET_BEGIN", "60.73", "pre_market"),
+        ("MORNING", "61.23", "regular"),
+        ("AFTER_HOURS_BEGIN", "62.22", "after_hours"),
+    ],
+)
+def test_quote_service_selects_active_us_session_price(
+    tmp_path: Path, state: str, expected_price: str, expected_session: str
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    snapshot = session_snapshot(
+        last="61.23", pre="60.73", after="62.22", overnight="61.50"
+    )
+    client = FakeQuoteClient(
+        {"US.MSFT": snapshot, "US.AAPL": snapshot},
+        {"US.MSFT": state, "US.AAPL": state},
+    )
+
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+    quote = result.quotes["US.MSFT"]
+
+    assert quote["last_price"] == expected_price
+    assert quote["price_session"] == expected_session
+    assert quote["price_time"] == "2026-07-15 03:03:01.150"
+    assert quote["current_session_quote"] is True
+    assert result.fallback_count == 0
+
+
+def test_quote_service_labels_active_session_fallback_without_fake_time(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    snapshot = session_snapshot(
+        last="61.23", pre=None, after="62.22", overnight=None
+    )
+    client = FakeQuoteClient(
+        {"US.MSFT": snapshot, "US.AAPL": snapshot},
+        {"US.MSFT": "OVERNIGHT", "US.AAPL": "OVERNIGHT"},
+    )
+
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+    quote = result.quotes["US.MSFT"]
+
+    assert result.status == "partial"
+    assert result.fallback_count == 2
+    assert quote["last_price"] == "62.22"
+    assert quote["price_session"] == "after_hours"
+    assert quote["price_time"] == ""
+    assert quote["current_session_quote"] is False
+    assert "当前时段无报价" in result.diagnostic["message"]
+
+
+def test_quote_service_treats_closed_fallback_as_normal(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    snapshot = session_snapshot(
+        last="61.23", pre="60.73", after="62.22", overnight="61.50"
+    )
+    client = FakeQuoteClient(
+        {"US.MSFT": snapshot, "US.AAPL": snapshot},
+        {"US.MSFT": "CLOSED", "US.AAPL": "CLOSED"},
+    )
+
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+
+    assert result.status == "ok"
+    assert result.fallback_count == 0
+    assert result.us_session_status == "closed"
+    assert result.quotes["US.MSFT"]["price_session"] == "after_hours"
+    assert result.quotes["US.MSFT"]["current_session_quote"] is False
+
+
+def test_quote_service_degrades_to_regular_price_when_market_state_fails(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    snapshot = session_snapshot(
+        last="61.23", pre="60.73", after="62.22", overnight="61.50"
+    )
+    error = FutuQuoteError(
+        "state failed", error_type="market_state_failed", snapshot_ok=True
+    )
+    client = FakeQuoteClient(
+        {"US.MSFT": snapshot, "US.AAPL": snapshot}, state_error=error
+    )
+
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+
+    assert result.status == "partial"
+    assert result.us_session_status == "unknown"
+    assert result.quotes["US.MSFT"]["last_price"] == "61.23"
+    assert result.quotes["US.MSFT"]["price_session"] == ""
+    assert result.quotes["US.MSFT"]["current_session_quote"] is False
+    assert result.diagnostic["error_type"] == "market_state_failed"
+
+
+def test_quote_service_degrades_when_any_us_market_state_is_missing(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    snapshot = session_snapshot(
+        last="61.23", pre="60.73", after="62.22", overnight="61.50"
+    )
+    client = FakeQuoteClient(
+        {"US.MSFT": snapshot, "US.AAPL": snapshot},
+        {"US.MSFT": "OVERNIGHT"},
+    )
+
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+
+    assert result.status == "partial"
+    assert result.us_session_status == "unknown"
+    assert result.quotes["US.MSFT"]["last_price"] == "61.23"
+    assert result.quotes["US.MSFT"]["price_session"] == ""
+    assert "市场状态不可用" in result.diagnostic["message"]
+
+
 def test_quote_service_returns_ok_and_never_writes_portfolio(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_portfolio(config.portfolio_path)
     original_portfolio = config.portfolio_path.read_text(encoding="utf-8")
     client = FakeQuoteClient(
         {
-            "US.MSFT": QuoteSnapshot("US.MSFT", Decimal("500")),
-            "US.AAPL": QuoteSnapshot("US.AAPL", Decimal("160")),
-        }
+            "US.MSFT": session_snapshot(last="500"),
+            "US.AAPL": session_snapshot(last="160"),
+        },
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: client)
 
@@ -197,10 +352,11 @@ def test_quote_service_requests_cn_holding_with_futu_exchange_prefix(
         )
     client = FakeQuoteClient(
         {
-            "US.MSFT": QuoteSnapshot("US.MSFT", Decimal("500")),
-            "US.AAPL": QuoteSnapshot("US.AAPL", Decimal("160")),
-            "SH.600025": QuoteSnapshot("SH.600025", Decimal("9.81")),
-        }
+            "US.MSFT": session_snapshot(last="500"),
+            "US.AAPL": session_snapshot(last="160"),
+            "SH.600025": session_snapshot(last="9.81"),
+        },
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
 
     result = DashboardQuoteService(
@@ -216,7 +372,8 @@ def test_quote_service_returns_partial_for_missing_quotes(tmp_path: Path) -> Non
     config = dashboard_config(tmp_path)
     write_portfolio(config.portfolio_path)
     client = FakeQuoteClient(
-        {"US.MSFT": QuoteSnapshot("US.MSFT", Decimal("510.25"))}
+        {"US.MSFT": session_snapshot(last="510.25")},
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: client)
 
@@ -239,9 +396,10 @@ def test_quote_service_returns_failed_and_keeps_last_success(tmp_path: Path) -> 
     write_portfolio(config.portfolio_path)
     first_client = FakeQuoteClient(
         {
-            "US.MSFT": QuoteSnapshot("US.MSFT", Decimal("500")),
-            "US.AAPL": QuoteSnapshot("US.AAPL", Decimal("160")),
-        }
+            "US.MSFT": session_snapshot(last="500"),
+            "US.AAPL": session_snapshot(last="160"),
+        },
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
     first_result = service.refresh().to_dict()
@@ -286,15 +444,17 @@ def test_partial_refresh_does_not_replace_complete_success_cache(
     write_portfolio(config.portfolio_path)
     full_client = FakeQuoteClient(
         {
-            "US.MSFT": QuoteSnapshot("US.MSFT", Decimal("500")),
-            "US.AAPL": QuoteSnapshot("US.AAPL", Decimal("160")),
-        }
+            "US.MSFT": session_snapshot(last="500"),
+            "US.AAPL": session_snapshot(last="160"),
+        },
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: full_client)
     first_result = service.refresh().to_dict()
 
     partial_client = FakeQuoteClient(
-        {"US.MSFT": QuoteSnapshot("US.MSFT", Decimal("510.25"))}
+        {"US.MSFT": session_snapshot(last="510.25")},
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service.client_factory = lambda: partial_client
     partial_result = service.refresh().to_dict()
