@@ -806,7 +806,10 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
     assert summary.count() == 1, f"{broker} 趋势报告缺少审计摘要"
     summary.click()
     sections = audit.locator("section").all_inner_texts()
-    assert len(sections) == 3, f"{broker} 趋势报告审计区块数量不是 3"
+    expected_sections = 3 if broker == "eastmoney" else 4
+    assert len(sections) == expected_sections, (
+        f"{broker} 趋势报告审计区块数量不是 {expected_sections}"
+    )
     data = report.get("audit") if isinstance(report.get("audit"), Mapping) else {}
     candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
     if not candidates:
@@ -828,16 +831,26 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
         for reason in reasons if isinstance(reasons, list) else []:
             label = TREND_REASON_LABELS.get(str(reason), "未知原因")
             assert label in sections[1], f"{broker} 排除项缺少原因 {label}"
+    if broker != "eastmoney":
+        account_exceptions = (
+            data.get("account_exceptions")
+            if isinstance(data.get("account_exceptions"), list) else []
+        )
+        if not account_exceptions:
+            assert "无" in sections[2], f"{broker} 空账户不参与项未显示 无"
+        for item in account_exceptions:
+            assert str(item) in sections[2], f"{broker} 账户不参与项缺少 {item}"
     industries = (
         data.get("industry_concentration")
         if isinstance(data.get("industry_concentration"), list) else []
     )
+    industry_section = sections[-1]
     if not industries:
-        assert "无" in sections[2], f"{broker} 空行业集中度未显示 无"
+        assert "无" in industry_section, f"{broker} 空行业集中度未显示 无"
     for row in industries:
         for index, value in enumerate(row if isinstance(row, list) else []):
             expected = _plain(value) if index == 0 else _display_number(value)
-            assert expected in sections[2], f"{broker} 行业集中度缺少 {value}"
+            assert expected in industry_section, f"{broker} 行业集中度缺少 {value}"
     audit_text = audit.inner_text()
     sources = data.get("data_sources") if isinstance(data.get("data_sources"), list) else []
     for source in sources:

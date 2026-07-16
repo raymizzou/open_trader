@@ -628,6 +628,7 @@ def trend_reports() -> dict[str, dict[str, object]]:
             "audit": {
                 "candidates": [{"symbol": "VIXY", "name": "波动率ETF", "strength": "5000"}],
                 "excluded": {"QQQ": ["already_held"]},
+                "account_exceptions": ["现金类资产不参与趋势判断：CASH（cash）"],
                 "industry_concentration": [["科技", 1, "0.25"]],
                 "data_sources": ["Trend Animals", "Futu US daily K-line"],
                 "actual_api_cost": "1.00",
@@ -875,10 +876,11 @@ def trend_audit_sections(broker: str) -> list[str]:
             "行业集中度 无",
         ]
     if broker == "phillips":
-        return ["候选榜 无", "排除项 无", "行业集中度 无"]
+        return ["候选榜 无", "排除项 无", "账户不参与项 无", "行业集中度 无"]
     return [
         "候选榜 VIXY 波动率ETF 强度 5,000",
         "排除项 QQQ 当前账户已经持有",
+        "账户不参与项 现金类资产不参与趋势判断：CASH（cash）",
         "行业集中度 科技 1 0.25",
     ]
 
@@ -1387,7 +1389,7 @@ def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
 
         def all_inner_texts(self) -> list[str]:
             assert self.selector == "section"
-            return ["候选榜 无", "排除项 无", "行业集中度 无"]
+            return ["候选榜 无", "排除项 无", "账户不参与项 无", "行业集中度 无"]
 
         def inner_text(self) -> str:
             return "审计详情 API 成本：未知"
