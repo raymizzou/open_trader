@@ -479,6 +479,8 @@ def _valid_option_attention(payload: dict[str, Any], *, market: str) -> bool:
     attention = payload["option_attention"]
     if not isinstance(attention, list):
         return False
+    if market == "CN":
+        return not attention
 
     def scalar(value: object) -> bool:
         return (
