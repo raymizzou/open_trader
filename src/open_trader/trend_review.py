@@ -970,7 +970,7 @@ def build_trend_review_projection(
         "available": True,
         "market": market,
         "market_label": {"CN": "A 股", "US": "美股", "HK": "港股"}[market],
-        "broker": {"CN": "eastmoney", "US": "futu", "HK": "phillips"}[market],
+        "broker": {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market],
         "strategy_snapshot": latest_snapshot,
         "batch": batch,
         "batch_path": None if batch_path is None else str(batch_path),

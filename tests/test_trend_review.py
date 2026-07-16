@@ -445,6 +445,41 @@ def test_projection_waits_for_thirty_trades(tmp_path: Path) -> None:
     assert projection["metrics"]["calmar"]["discipline"]["value"] is None
 
 
+def test_us_projection_belongs_to_tiger_trend_account(tmp_path: Path) -> None:
+    daily = tmp_path / "trend_review/daily/US"
+    daily.mkdir(parents=True)
+    daily.joinpath("2026-07-16.json").write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.daily.v1",
+        "market": "US",
+        "date": "2026-07-16",
+        "discipline_equity_after_fees": "100000",
+        "actual_equity": "100000",
+        "strategy_snapshot": {
+            "strategy_id": "trend_animals_warm_to_hot/US/v1",
+            "strategy_name": "美股短线右侧趋势",
+            "strategy_version": "v1",
+            "market": "US",
+            "parameter_rows": [],
+            "parameters": {},
+        },
+        "report_sha256": "report-us",
+        "orders": [],
+        "benchmark": {
+            "date": "2026-07-16",
+            "close": "100",
+            "source_id": "SPY_QFQ",
+            "futu_symbol": "US.SPY",
+        },
+    }), encoding="utf-8")
+    rates = tmp_path / "rates/DGS3MO.csv"
+    rates.parent.mkdir(parents=True)
+    rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    assert projection["broker"] == "tiger"
+
+
 def test_projection_rejects_wrong_benchmark_identity(tmp_path: Path) -> None:
     write_review_history(tmp_path, completed_trades=30, days=40)
     path = sorted((tmp_path / "trend_review/daily/CN").glob("*.json"))[0]
