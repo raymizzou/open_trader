@@ -45,7 +45,11 @@ def parse_eastmoney_page(
         raise ValueError("东方财富对账单缺少汇总股票资料表")
 
     statement_id = f"{month}-{BROKER}"
-    positions = [_parse_position(row, statement_id) for row in table[1:]]
+    positions = [
+        position
+        for row in table[1:]
+        if (position := _parse_position(row, statement_id)) is not None
+    ]
     total_assets = _extract_money(first_page_text, "总资产")
     available_balance = _extract_money(first_page_text, "资金可用")
     securities_value = sum(
@@ -75,7 +79,7 @@ def parse_eastmoney_page(
     )
 
 
-def _parse_position(row: list[str | None], statement_id: str) -> Position:
+def _parse_position(row: list[str | None], statement_id: str) -> Position | None:
     if len(row) != len(POSITION_HEADER):
         raise ValueError("东方财富汇总股票资料包含无效持仓行")
 
@@ -90,12 +94,16 @@ def _parse_position(row: list[str | None], statement_id: str) -> Position:
         market_label not in SUPPORTED_MARKETS
         or re.fullmatch(r"\d{6}", symbol) is None
         or quantity is None
-        or quantity <= 0
+        or quantity < 0
         or last_price is None
         or cost_price is None
         or market_value is None
     ):
         raise ValueError("东方财富汇总股票资料包含无效持仓行")
+    if quantity == 0:
+        if market_value != 0:
+            raise ValueError("东方财富汇总股票资料包含无效持仓行")
+        return None
 
     cost_value = quantity * cost_price
     return Position(
