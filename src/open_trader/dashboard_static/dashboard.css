@@ -1454,8 +1454,20 @@ table {
   max-width: 240px;
 }
 
+.trend-entry-buttons,
+.trend-entry-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.trend-entry-details {
+  gap: 4px 10px;
+}
+
 .trend-report-entry button,
-.trend-report-header button {
+.trend-report-header button,
+.trend-review-header button {
   background: var(--surface);
   border: 1px solid var(--accent);
   border-radius: 7px;
@@ -1465,6 +1477,165 @@ table {
   min-height: 38px;
   padding: 0 12px;
 }
+
+.trend-review {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+}
+
+.trend-review-header {
+  align-items: start;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding-bottom: 18px;
+}
+
+.trend-review-header h1,
+.trend-review-header p,
+.trend-review-parameters h2,
+.trend-review-parameter-list p,
+.trend-review-chart,
+.trend-review-metric h3 {
+  margin: 0;
+}
+
+.trend-review-header p,
+.trend-review-header span,
+.trend-review-parameter-list span {
+  color: var(--muted);
+}
+
+.trend-review-header h1 {
+  font-size: 24px;
+  margin: 4px 0;
+}
+
+.trend-review-parameters {
+  display: grid;
+  gap: 10px;
+}
+
+.trend-review-parameters h2,
+.trend-review-chart figcaption {
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.trend-review-parameter-list {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.trend-review-parameter-list > div {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 120px 160px minmax(0, 1fr);
+  padding: 10px 12px;
+}
+
+.trend-review-parameter-list > div + div {
+  border-top: 1px solid var(--line);
+}
+
+.trend-review-charts {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.trend-review-chart {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 16px;
+}
+
+.trend-review-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.trend-review-legend span::before {
+  background: currentColor;
+  border-radius: 2px;
+  content: "";
+  display: inline-block;
+  height: 8px;
+  margin-right: 6px;
+  width: 16px;
+}
+
+.trend-review-legend .discipline { color: var(--accent); }
+.trend-review-legend .actual { color: var(--primary); }
+.trend-review-legend .benchmark { color: var(--muted); }
+
+.trend-review-metric {
+  display: grid;
+  gap: 7px;
+}
+
+.trend-review-metric + .trend-review-metric {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.trend-review-metric h3 {
+  font-size: 14px;
+}
+
+.trend-review-series {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 64px minmax(80px, 1fr) minmax(56px, auto);
+  min-width: 0;
+}
+
+.trend-review-series strong {
+  text-align: right;
+}
+
+.trend-review-series.unavailable strong {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.trend-review-track {
+  background: var(--line);
+  border-radius: 3px;
+  height: 10px;
+  position: relative;
+}
+
+.trend-review-track::after {
+  background: var(--line);
+  content: "";
+  inset: 0 auto 0 50%;
+  position: absolute;
+  width: 1px;
+}
+
+.trend-review-bar {
+  background: currentColor;
+  height: 100%;
+  position: absolute;
+  width: var(--trend-review-width);
+}
+
+.trend-review-bar.positive { left: 50%; }
+.trend-review-bar.negative { right: 50%; }
+.trend-review-bar.discipline { color: var(--accent); }
+.trend-review-bar.actual { color: var(--primary); }
+.trend-review-bar.benchmark { color: var(--muted); }
 
 .trend-report-entry span {
   color: var(--muted);
@@ -3977,6 +4148,21 @@ table {
 
   .trend-report-header button {
     justify-self: stretch;
+  }
+
+  .trend-review-header,
+  .trend-review-parameter-list > div,
+  .trend-review-charts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-review-header button {
+    justify-self: stretch;
+    min-height: 44px;
+  }
+
+  .trend-review-parameter-list > div {
+    gap: 4px;
   }
 
   .trend-report-body { grid-template-columns: minmax(0, 1fr); }
