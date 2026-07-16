@@ -92,8 +92,6 @@ KNOWN_TEMPERATURES = {"凉", "平", "温", "热", "沸"}
 def trend_strategy_snapshot(
     market: str,
     process_version: str,
-    buy_cost_bps: Decimal | None,
-    sell_cost_bps: Decimal | None,
     candidate_pool_ids: Sequence[int],
 ) -> dict[str, object]:
     market = market.upper()
@@ -213,14 +211,6 @@ def trend_strategy_snapshot(
             ("退出保护", "过热跟踪", "此前 5 个完整交易日最低价；保护线只升不降"),
         ]
 
-    parameters["buy_cost_bps"] = None if buy_cost_bps is None else str(buy_cost_bps)
-    parameters["sell_cost_bps"] = None if sell_cost_bps is None else str(sell_cost_bps)
-    rows.extend(
-        [
-            ("交易费用", "买入综合费率", "未配置" if buy_cost_bps is None else f"{buy_cost_bps} 个基点"),
-            ("交易费用", "卖出综合费率", "未配置" if sell_cost_bps is None else f"{sell_cost_bps} 个基点"),
-        ]
-    )
     return {
         "strategy_id": f"trend_animals_warm_to_hot/{market}/v1",
         "strategy_name": name,
@@ -975,8 +965,6 @@ def build_report(
     position_weight_source: str = "fallback_4pct",
     process_version: str = "",
     candidate_pool_ids: Sequence[int] = (),
-    buy_cost_bps: Decimal | None = None,
-    sell_cost_bps: Decimal | None = None,
     strategy_snapshot: Mapping[str, object] | None = None,
 ) -> TrendReport:
     held_symbols = {position.symbol for position in account.positions}
@@ -1163,8 +1151,6 @@ def build_report(
                 market,
                 process_version
                 or str((metadata or {}).get("process_version") or ""),
-                buy_cost_bps,
-                sell_cost_bps,
                 candidate_pool_ids,
             )
         ),
@@ -2665,8 +2651,6 @@ def _attempt_report(
                 config.trend_animals_a_share_tm_id,
                 config.trend_animals_etf_tm_id,
             ),
-            buy_cost_bps=config.trend_review_cn_buy_cost_bps,
-            sell_cost_bps=config.trend_review_cn_sell_cost_bps,
             metadata={
                 "market": "CN",
                 "broker": "eastmoney",
@@ -2708,8 +2692,6 @@ def _attempt_report(
                 config.trend_animals_etf_tm_id,
             ),
             lot_sizes={},
-            buy_cost_bps=config.trend_review_cn_buy_cost_bps,
-            sell_cost_bps=config.trend_review_cn_sell_cost_bps,
         )
         report = replace(
             report,

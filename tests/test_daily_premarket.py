@@ -77,12 +77,6 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "OPEN_TRADER_TREND_REVIEW_CN_SIMULATE_ACC_ID=101",
                 "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID=102",
                 "OPEN_TRADER_TREND_REVIEW_HK_SIMULATE_ACC_ID=103",
-                "OPEN_TRADER_TREND_REVIEW_CN_BUY_COST_BPS=8.5",
-                "OPEN_TRADER_TREND_REVIEW_CN_SELL_COST_BPS=58.5",
-                "OPEN_TRADER_TREND_REVIEW_US_BUY_COST_BPS=0.5",
-                "OPEN_TRADER_TREND_REVIEW_US_SELL_COST_BPS=0.5",
-                "OPEN_TRADER_TREND_REVIEW_HK_BUY_COST_BPS=3",
-                "OPEN_TRADER_TREND_REVIEW_HK_SELL_COST_BPS=13",
                 "DEEPSEEK_API_KEY=secret",
             ]
         ),
@@ -119,12 +113,6 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.trend_review_cn_simulate_acc_id == 101
     assert config.trend_review_us_simulate_acc_id == 102
     assert config.trend_review_hk_simulate_acc_id == 103
-    assert config.trend_review_cn_buy_cost_bps == Decimal("8.5")
-    assert config.trend_review_cn_sell_cost_bps == Decimal("58.5")
-    assert config.trend_review_us_buy_cost_bps == Decimal("0.5")
-    assert config.trend_review_us_sell_cost_bps == Decimal("0.5")
-    assert config.trend_review_hk_buy_cost_bps == Decimal("3")
-    assert config.trend_review_hk_sell_cost_bps == Decimal("13")
 
 
 def test_shared_env_loader_accepts_other_positive_a_share_pool_ids(
@@ -1415,17 +1403,10 @@ def test_require_trend_review_config_returns_selected_market_values(
         trend_review_cn_simulate_acc_id=101,
         trend_review_us_simulate_acc_id=102,
         trend_review_hk_simulate_acc_id=103,
-        trend_review_cn_buy_cost_bps=Decimal("8.5"),
-        trend_review_cn_sell_cost_bps=Decimal("58.5"),
     )
 
-    assert daily_premarket.require_trend_review_config(config, "CN") == (
-        101,
-        Decimal("8.5"),
-        Decimal("58.5"),
-    )
-    with pytest.raises(ValueError, match="US trend review config is incomplete"):
-        daily_premarket.require_trend_review_config(config, "US")
+    assert daily_premarket.require_trend_review_config(config, "CN") == 101
+    assert daily_premarket.require_trend_review_config(config, "US") == 102
 
 
 def _daily_runner(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import csv
 import hashlib
 import json
 import os
@@ -17,9 +16,14 @@ EVIDENCE_SCHEMA_VERSION = "open_trader.trend_review.evidence.v1"
 REPLAY_SCHEMA_VERSION = "open_trader.trend_review.replay.v1"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 BENCHMARK_SOURCE_IDS = {
-    "CN": "CSI_ALL_SHARE_TOTAL_RETURN",
-    "US": "SPY_ADJUSTED_TOTAL_RETURN",
-    "HK": "HSCI_TOTAL_RETURN",
+    "CN": "CSI_ALL_SHARE_PRICE",
+    "US": "SPY_QFQ",
+    "HK": "HSCI_PRICE",
+}
+BENCHMARK_FUTU_SYMBOLS = {
+    "CN": "SH.000985",
+    "US": "US.SPY",
+    "HK": "HK.800701",
 }
 
 
@@ -29,6 +33,26 @@ class TrendReplayIncompleteError(ValueError):
 
 class TrendReviewAccountStateError(ValueError):
     pass
+
+
+def benchmark_fact(
+    quote: object, market: str, trading_date: str
+) -> dict[str, str]:
+    market = _market(market)
+    symbol = BENCHMARK_FUTU_SYMBOLS[market]
+    bars = quote.get_daily_kline(symbol, start=trading_date, end=trading_date)
+    bar = next((item for item in bars if item.date == trading_date), None)
+    if bar is None:
+        raise ValueError(f"benchmark is missing {trading_date}")
+    close = _required_decimal(bar.close, "benchmark close")
+    if close <= 0:
+        raise ValueError("benchmark close must be positive")
+    return {
+        "date": trading_date,
+        "close": format(close.normalize(), "f"),
+        "source_id": BENCHMARK_SOURCE_IDS[market],
+        "futu_symbol": symbol,
+    }
 
 
 def _json_value(value: object) -> object:
@@ -110,8 +134,6 @@ def freeze_report_evidence(
     responses: Mapping[str, object],
     candidate_pool_ids: object,
     lot_sizes: Mapping[str, int],
-    buy_cost_bps: Decimal | None,
-    sell_cost_bps: Decimal | None,
 ) -> dict[str, str]:
     metadata = getattr(report, "metadata")
     strategy_snapshot = getattr(report, "strategy_snapshot")
@@ -123,10 +145,6 @@ def freeze_report_evidence(
         "market_data": bars_by_symbol,
         "account": getattr(report, "account"),
         "strategy_snapshot": strategy_snapshot,
-        "fees": {
-            "buy_cost_bps": buy_cost_bps,
-            "sell_cost_bps": sell_cost_bps,
-        },
         "process_version": str(strategy_snapshot.get("process_version") or ""),
         "rebuild_inputs": {
             "as_of_date": getattr(report, "as_of_date"),
@@ -146,8 +164,6 @@ def freeze_report_evidence(
             "position_weight": metadata.get("position_weight"),
             "position_weight_source": metadata.get("position_weight_source"),
             "candidate_pool_ids": candidate_pool_ids,
-            "buy_cost_bps": buy_cost_bps,
-            "sell_cost_bps": sell_cost_bps,
             "generated_at": getattr(report, "generated_at"),
             "metadata": metadata,
         },
@@ -482,38 +498,28 @@ def capture_trend_review_close(
     simulate_snapshot: Mapping[str, object],
     orders: list[Mapping[str, object]],
     benchmark: Mapping[str, object],
-    buy_cost_bps: Decimal,
-    sell_cost_bps: Decimal,
 ) -> Path:
     market = _market(market)
     net_value = _required_decimal(
         simulate_snapshot.get("net_value"), "simulate net value"
     )
-    costs = Decimal("0")
-    for order in orders:
-        status = str(order.get("status") or order.get("order_status") or "").upper()
-        if "FILLED" not in status and "DEALT_ALL" not in status:
-            continue
-        side = str(order.get("side") or order.get("trd_side") or "").upper()
-        if side not in {"BUY", "SELL"}:
-            continue
-        notional = order.get("notional")
-        if notional is None:
-            quantity = _required_decimal(
-                order.get("dealt_qty", order.get("qty")), "filled quantity"
-            )
-            price = _required_decimal(
-                order.get("dealt_avg_price", order.get("price")), "filled price"
-            )
-            notional = quantity * price
-        rate = buy_cost_bps if side == "BUY" else sell_cost_bps
-        costs += _required_decimal(notional, "filled notional") * rate / Decimal("10000")
-    discipline_equity = (net_value - costs).quantize(
+    discipline_equity = net_value.quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
+    _validate_benchmark(benchmark, market=market, trading_date=trading_date)
     account = report.get("account")
     if not isinstance(account, Mapping):
         raise ValueError("trend report account is unavailable")
+    strategy_snapshot = report.get("strategy_snapshot")
+    if (
+        not isinstance(strategy_snapshot, Mapping)
+        or not strategy_snapshot.get("strategy_id")
+        or not strategy_snapshot.get("strategy_version")
+        or not strategy_snapshot.get("process_version")
+        or not isinstance(strategy_snapshot.get("parameters"), Mapping)
+        or not strategy_snapshot.get("parameter_rows")
+    ):
+        raise ValueError("trend report strategy snapshot is unavailable")
     actual_equity = _required_decimal(account.get("net_value"), "actual net value")
     payload = {
         "schema_version": "open_trader.trend_review.daily.v1",
@@ -523,14 +529,10 @@ def capture_trend_review_close(
         "discipline_equity_after_fees": str(discipline_equity),
         "actual_equity": str(actual_equity),
         "benchmark": dict(benchmark),
-        "strategy_snapshot": report.get("strategy_snapshot"),
+        "strategy_snapshot": dict(strategy_snapshot),
         "report_sha256": _report_hash(report),
         "orders": orders,
         "positions": simulate_snapshot.get("positions"),
-        "target_cost_bps": {
-            "buy": str(buy_cost_bps),
-            "sell": str(sell_cost_bps),
-        },
     }
     path = (
         data_dir
@@ -542,33 +544,22 @@ def capture_trend_review_close(
     return _write_immutable(path, _canonical_json_bytes(payload))
 
 
-def load_trend_benchmark(data_dir: Path, market: str) -> list[dict[str, str]]:
-    market = _market(market)
-    path = data_dir / "trend_review" / "benchmarks" / f"{market}.csv"
-    try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            if reader.fieldnames != ["date", "close", "source_id"]:
-                raise ValueError("benchmark CSV columns must be date,close,source_id")
-            rows = [dict(row) for row in reader]
-    except OSError as exc:
-        raise ValueError(f"cannot read trend benchmark: {path}") from exc
-    expected = BENCHMARK_SOURCE_IDS[market]
-    dates: list[date] = []
-    for row in rows:
-        try:
-            current_date = date.fromisoformat(row["date"])
-        except (KeyError, ValueError):
-            raise ValueError("benchmark contains an invalid date") from None
-        close = _required_decimal(row.get("close"), "benchmark close")
-        if close <= 0:
-            raise ValueError("benchmark close must be positive")
-        if row.get("source_id") != expected:
-            raise ValueError(f"benchmark source_id must be {expected}")
-        dates.append(current_date)
-    if not rows or any(right <= left for left, right in zip(dates, dates[1:])):
-        raise ValueError("benchmark dates must be non-empty and strictly chronological")
-    return rows
+def _validate_benchmark(
+    benchmark: object, *, market: str, trading_date: str
+) -> Mapping[str, object]:
+    if not isinstance(benchmark, Mapping):
+        raise ValueError("trend review benchmark must be an object")
+    if benchmark.get("date") != trading_date:
+        raise ValueError("benchmark date does not match trend review date")
+    if benchmark.get("source_id") != BENCHMARK_SOURCE_IDS[market]:
+        raise ValueError(
+            f"benchmark source_id must be {BENCHMARK_SOURCE_IDS[market]}"
+        )
+    if benchmark.get("futu_symbol") != BENCHMARK_FUTU_SYMBOLS[market]:
+        raise ValueError("benchmark Futu symbol does not match market")
+    if _required_decimal(benchmark.get("close"), "benchmark close") <= 0:
+        raise ValueError("benchmark close must be positive")
+    return benchmark
 
 
 def _load_daily_facts(data_dir: Path, market: str) -> list[dict[str, object]]:
@@ -583,6 +574,7 @@ def _load_daily_facts(data_dir: Path, market: str) -> list[dict[str, object]]:
             or payload.get("date") != path.stem
         ):
             raise ValueError(f"invalid trend review daily fact: {path}")
+        _validate_benchmark(payload.get("benchmark"), market=market, trading_date=path.stem)
         facts.append(payload)
     if not facts:
         raise ValueError(f"no trend review daily facts for {market}")
@@ -720,7 +712,6 @@ def build_trend_review_projection(
     market = _market(market)
     facts = _load_daily_facts(data_dir, market)
     trades = _completed_trades(facts)
-    benchmark_rows = load_trend_benchmark(data_dir, market)
     from .tiger_long_term_backtest import load_dgs3mo_csv
 
     rates_path = data_dir / "rates" / "DGS3MO.csv"
@@ -756,9 +747,6 @@ def build_trend_review_projection(
         selected_facts = [
             fact for fact in facts if start_date <= str(fact["date"]) <= end_date
         ]
-        benchmark_by_date = {row["date"]: row for row in benchmark_rows}
-        if any(str(fact["date"]) not in benchmark_by_date for fact in selected_facts):
-            raise ValueError("benchmark is missing a strategy trading date")
         discipline_curve = _normalized_curve(
             selected_facts, "discipline_equity_after_fees"
         )
@@ -766,7 +754,7 @@ def build_trend_review_projection(
         benchmark_facts = [
             {
                 "date": fact["date"],
-                "benchmark_equity": benchmark_by_date[str(fact["date"])]["close"],
+                "benchmark_equity": fact["benchmark"]["close"],
             }
             for fact in selected_facts
         ]
@@ -848,7 +836,9 @@ def build_trend_review_projection(
             "completed_trades": selected_trades,
             "benchmark_source_id": BENCHMARK_SOURCE_IDS[market],
             "benchmark_sha256": hashlib.sha256(
-                (data_dir / "trend_review" / "benchmarks" / f"{market}.csv").read_bytes()
+                _canonical_json_bytes({
+                    "benchmarks": [fact["benchmark"] for fact in selected_facts]
+                })
             ).hexdigest(),
             "rates_sha256": hashlib.sha256(rates_path.read_bytes()).hexdigest(),
             "generated_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
@@ -1038,8 +1028,6 @@ def rebuild_trend_report_from_evidence(
         ),
         process_version=process_version,
         candidate_pool_ids=tuple(int(item) for item in inputs["candidate_pool_ids"]),
-        buy_cost_bps=decimal_or_none(inputs.get("buy_cost_bps")),
-        sell_cost_bps=decimal_or_none(inputs.get("sell_cost_bps")),
         strategy_snapshot=snapshot,
     )
     return _report_payload(report)

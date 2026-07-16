@@ -28,7 +28,6 @@ def frozen_evidence() -> dict[str, object]:
         },
         "account": {"net_value": "100000"},
         "strategy_snapshot": {"strategy_version": "v1"},
-        "fees": {"buy_cost_bps": "8.5", "sell_cost_bps": "58.5"},
         "process_version": "oldsha",
     }
 
@@ -80,9 +79,7 @@ def test_rebuild_marks_missing_original_input_instead_of_guessing() -> None:
 
 
 def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
-    snapshot = trend_strategy_snapshot(
-        "CN", "oldsha", None, None, (622466, 697199)
-    )
+    snapshot = trend_strategy_snapshot("CN", "oldsha", (622466, 697199))
     evidence = {
         **frozen_evidence(),
         "process_version": "newsha",
@@ -112,8 +109,6 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
             "position_weight": "0.04",
             "position_weight_source": "fallback_4pct",
             "candidate_pool_ids": [622466, 697199],
-            "buy_cost_bps": None,
-            "sell_cost_bps": None,
             "generated_at": "2026-07-16T17:00:00+08:00",
             "metadata": {"market": "CN", "broker": "eastmoney"},
         },
@@ -158,7 +153,11 @@ def cn_buy_report(*, weight: str = "0.04") -> dict[str, object]:
         "strategy_snapshot": {
             "strategy_id": "trend_animals_warm_to_hot/CN/v1",
             "strategy_version": "v1",
+            "process_version": "abc123",
             "parameters": {"buy_window": "09:30-10:00"},
+            "parameter_rows": [
+                {"group": "仓位执行", "name": "买入窗口", "value": "09:30-10:00"}
+            ],
         },
         "strategy_judgments": {
             "formal_actions": [
@@ -224,7 +223,7 @@ def test_first_open_requires_empty_dedicated_simulate_account(
         )
 
 
-def test_close_subtracts_frozen_target_broker_costs(tmp_path: Path) -> None:
+def test_close_uses_authoritative_simulate_account_nav(tmp_path: Path) -> None:
     path = trend_review.capture_trend_review_close(
         data_dir=tmp_path,
         market="CN",
@@ -238,15 +237,53 @@ def test_close_subtracts_frozen_target_broker_costs(tmp_path: Path) -> None:
         benchmark={
             "date": "2026-07-17",
             "close": "6123.45",
-            "source_id": "CSI_ALL_SHARE_TOTAL_RETURN",
+            "source_id": "CSI_ALL_SHARE_PRICE",
+            "futu_symbol": "SH.000985",
         },
-        buy_cost_bps=Decimal("8.5"),
-        sell_cost_bps=Decimal("58.5"),
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["discipline_equity_after_fees"] == "100972.03"
+    assert payload["discipline_equity_after_fees"] == "101000.00"
     assert payload["actual_equity"] == "735164.41"
+
+
+def test_close_rejects_report_without_strategy_snapshot(tmp_path: Path) -> None:
+    report = cn_buy_report()
+    report.pop("strategy_snapshot")
+
+    with pytest.raises(ValueError, match="strategy snapshot is unavailable"):
+        trend_review.capture_trend_review_close(
+            data_dir=tmp_path,
+            market="CN",
+            trading_date="2026-07-17",
+            report=report,
+            simulate_snapshot={
+                "acc_id": 101,
+                "net_value": "101000",
+                "positions": [],
+            },
+            orders=[],
+            benchmark={
+                "date": "2026-07-17",
+                "close": "6123.45",
+                "source_id": "CSI_ALL_SHARE_PRICE",
+                "futu_symbol": "SH.000985",
+            },
+        )
+
+
+def test_benchmark_fact_uses_exact_market_qfq_close() -> None:
+    class Quote:
+        def get_daily_kline(self, symbol: str, *, start: str, end: str) -> list[object]:
+            assert (symbol, start, end) == ("SH.000985", "2026-07-17", "2026-07-17")
+            return [type("Bar", (), {"date": "2026-07-17", "close": 6123.45})()]
+
+    assert trend_review.benchmark_fact(Quote(), "CN", "2026-07-17") == {
+        "date": "2026-07-17",
+        "close": "6123.45",
+        "source_id": "CSI_ALL_SHARE_PRICE",
+        "futu_symbol": "SH.000985",
+    }
 
 
 def test_stop_sells_full_simulate_position_once(tmp_path: Path) -> None:
@@ -336,6 +373,12 @@ def write_review_history(
             "strategy_snapshot": snapshot,
             "report_sha256": f"report-{index}",
             "orders": orders,
+            "benchmark": {
+                "date": trading_date,
+                "close": str(1000 + index),
+                "source_id": "CSI_ALL_SHARE_PRICE",
+                "futu_symbol": "SH.000985",
+            },
         }
         if index == missing_actual_index:
             payload.pop("actual_equity")
@@ -345,17 +388,6 @@ def write_review_history(
     rates = root / "rates/DGS3MO.csv"
     rates.parent.mkdir(parents=True)
     rates.write_text("DATE,DGS3MO\n2026-04-30,4.0\n", encoding="utf-8")
-    benchmark = root / "trend_review/benchmarks/CN.csv"
-    benchmark.parent.mkdir(parents=True)
-    benchmark.write_text(
-        "date,close,source_id\n"
-        + "\n".join(
-            f"{(start + timedelta(days=index)).isoformat()},{1000 + index},CSI_ALL_SHARE_TOTAL_RETURN"
-            for index in range(days)
-        )
-        + "\n",
-        encoding="utf-8",
-    )
 
 
 def test_projection_closes_non_overlapping_batch_at_thirtieth_trade(
@@ -415,13 +447,10 @@ def test_projection_waits_for_thirty_trades(tmp_path: Path) -> None:
 
 def test_projection_rejects_wrong_benchmark_identity(tmp_path: Path) -> None:
     write_review_history(tmp_path, completed_trades=30, days=40)
-    path = tmp_path / "trend_review/benchmarks/CN.csv"
-    path.write_text(
-        path.read_text(encoding="utf-8").replace(
-            "CSI_ALL_SHARE_TOTAL_RETURN", "WRONG"
-        ),
-        encoding="utf-8",
-    )
+    path = sorted((tmp_path / "trend_review/daily/CN").glob("*.json"))[0]
+    fact = json.loads(path.read_text(encoding="utf-8"))
+    fact["benchmark"]["source_id"] = "WRONG"
+    path.write_text(json.dumps(fact), encoding="utf-8")
 
     with pytest.raises(ValueError, match="benchmark source_id"):
         trend_review.build_trend_review_projection(tmp_path, "CN")

@@ -12,7 +12,7 @@
 
 - 只实现批准的三个市场：东方财富 A 股、富途美股、辉立港股；老虎不显示复盘入口。
 - 入口只放在对应账户头部 `当天趋势报告` 旁，文字固定为 `A 股复盘`、`美股复盘`、`港股复盘`。
-- A 股只对比中证全指全收益，美股只对比 SPY 调整后全收益，港股只对比恒生综合全收益；不同市场不得合并。
+- A 股只对比中证全指前复权收盘价，美股只对比 SPY 前复权收盘价，港股只对比恒生综合指数前复权收盘价；不同市场不得合并。
 - 每个市场使用独立 Futu 模拟账户，并以全现金、零持仓开始；账户中不得混入其他实验。
 - A 股和港股仅在连续交易时段提交市价单；买入数量按模拟账户当时净值与目标仓位重新计算。
 - 批次固定为不重叠的 30 笔完整纪律模拟交易；版本归属以入场时快照为准，不追溯改写。
@@ -21,8 +21,8 @@
 - 不显示结论卡、运行状态卡、回测流程、参数编辑、参数导出、回测按钮、缺陷回放入口、Alpha、Beta、Sortino、胜率或盈亏比。
 - 本期不实现“导出参数到回测”；运行版本不可从复盘页修改。
 - 实际执行曲线使用趋势报告冻结的真实账户净值，因此自动包含纪律外交易；纪律外交易不得进入纪律模拟交易数。
-- 模拟费用使用六个本地必填参数：`OPEN_TRADER_TREND_REVIEW_CN_BUY_COST_BPS`、`OPEN_TRADER_TREND_REVIEW_CN_SELL_COST_BPS`、`OPEN_TRADER_TREND_REVIEW_US_BUY_COST_BPS`、`OPEN_TRADER_TREND_REVIEW_US_SELL_COST_BPS`、`OPEN_TRADER_TREND_REVIEW_HK_BUY_COST_BPS`、`OPEN_TRADER_TREND_REVIEW_HK_SELL_COST_BPS`。它们是包含佣金、平台费、税费等在内的账户实际综合费率校准值；不提供猜测默认值，取值会冻结到策略快照。
-- 基准 CSV 路径固定为 `data/trend_review/benchmarks/CN.csv`、`US.csv`、`HK.csv`，列固定为 `date,close,source_id`；分别使用 `CSI_ALL_SHARE_TOTAL_RETURN`、`SPY_ADJUSTED_TOTAL_RETURN`、`HSCI_TOTAL_RETURN`。
+- 纪律曲线直接采用三个富途模拟账户的权威日终净值，不再叠加手工费率，避免对模拟盘已计费用重复扣减。
+- 基准通过 Futu 行情接口按复盘日冻结：`SH.000985`、`US.SPY`、`HK.800701`；每日事实同时保存日期、前复权收盘价、来源 ID 和 Futu 标的，不维护外部基准 CSV。
 - 不增加第三方依赖；复用现有 Futu、原子 JSON 写入、DGS3MO 和 Dashboard 样式。
 - 开发中只运行聚焦测试和直接工作流；`make acceptance` 只能作为最终门。
 - `make acceptance` 只有 `PASS` 才能请求用户验收；随后必须部署相同已验收 Git SHA，并核对 PID、cwd、SHA、新日志和 Review URL HTTP 200。
@@ -31,7 +31,7 @@
 
 ## File Map
 
-- Create: `src/open_trader/trend_review.py` — 复盘 schema、模拟盘动作、费用、日终快照、批次、指标、证据冻结和纠正回放。
+- Create: `src/open_trader/trend_review.py` — 复盘 schema、模拟盘动作、日终快照、批次、指标、证据冻结和纠正回放。
 - Create: `tests/test_trend_review.py` — 复盘领域逻辑、不可变产物、模拟订单、批次和指标测试。
 - Modify: `src/open_trader/a_share_trend.py` — 将现有规则常量化，生成完整策略快照，冻结 A 股重放证据。
 - Modify: `src/open_trader/market_trend.py` — 生成港美策略快照并冻结同构证据。
@@ -41,7 +41,7 @@
 - Modify: `tests/test_kelly_order_execution.py` — 市价单和快照兼容回归。
 - Modify: `src/open_trader/tiger_long_term_backtest.py` — 将已有 `_portfolio_metrics` 提升为共享 `portfolio_metrics`。
 - Modify: `tests/test_tiger_long_term_backtest.py` — 公共指标函数的边界测试。
-- Modify: `src/open_trader/daily_premarket.py` and `config/daily_premarket.env.example` — 三个模拟账户 ID 与六个费用基点配置。
+- Modify: `src/open_trader/daily_premarket.py` and `config/daily_premarket.env.example` — 三个互不相同的模拟账户 ID。
 - Modify: `src/open_trader/a_share_trend_watch.py` and `src/open_trader/market_trend_watch.py` — 开盘动作与保护线触发回调。
 - Modify: `src/open_trader/cli.py` — `trend-review open|close|replay` 直接工作流，并接入现有报告/watcher 命令。
 - Modify: `tests/test_daily_premarket.py`, `tests/test_a_share_trend_watch.py`, `tests/test_market_trend_watch.py`, `tests/test_premarket_cli.py` — 配置、时窗、幂等和 CLI 测试。
@@ -68,7 +68,7 @@
 
 **Interfaces:**
 - Consumes: current `_candidate_reasons`, `_candidate_sort_key`, `estimate_buy_actions`, `_holding_action`, `update_protection_line`, `_process_version`.
-- Produces: `trend_strategy_snapshot(market: str, process_version: str, buy_cost_bps: Decimal, sell_cost_bps: Decimal, candidate_pool_ids: Sequence[int]) -> dict[str, object]` and report JSON field `strategy_snapshot` consumed by every later task.
+- Produces: `trend_strategy_snapshot(market: str, process_version: str, candidate_pool_ids: Sequence[int]) -> dict[str, object]` and report JSON field `strategy_snapshot` consumed by every later task.
 
 - [ ] **Step 1: Write failing snapshot tests**
 
@@ -118,8 +118,6 @@ def test_cn_strategy_snapshot_contains_every_runtime_parameter() -> None:
             "exit_reasons": ["danger", "left_right_side", "temperature_to_flat", "protection"],
             "trailing_low_days": 5,
             "protection_line_non_decreasing": True,
-            "buy_cost_bps": "8.5",
-            "sell_cost_bps": "58.5",
     }
     assert snapshot["parameter_rows"][0] == {
         "group": "候选来源", "name": "趋势动物组合", "value": "温转热（A 股）、温转热（ETF 基金个股）"
@@ -127,9 +125,9 @@ def test_cn_strategy_snapshot_contains_every_runtime_parameter() -> None:
     assert all(set(row) == {"group", "name", "value"} for row in snapshot["parameter_rows"])
 ```
 
-Add exact US/HK assertions. Both snapshots contain `min_strength_exclusive="90"`, `max_right_side_days_exclusive=10`, `min_amount_100m="1"`, `requires_right_side=true`, `requires_tradable=true`, `requires_no_danger=true`, `requires_matching_data_date=true`, `requires_not_held=true`, `requires_atr14=true`, the same four-field sort, candidate/position limit 10, target weight `0.04`, initial protection multiple 2, trailing low days 5 and a non-decreasing protection line. US additionally contains `allowed_exchange="US"`, `lot_size=1`, `buy_window="美股常规交易时段"`; HK contains `allowed_exchange="HK"`, `lot_size_source="Futu 每标的整手"`, `buy_window="09:30-10:00"`. Each snapshot freezes the configured market pool IDs and its own buy/sell cost bps. Assert all `parameter_rows` group/name/value strings are Chinese and `_report_payload(report)["strategy_snapshot"]` equals the object attached at generation time.
+Add exact US/HK assertions. Both snapshots contain `min_strength_exclusive="90"`, `max_right_side_days_exclusive=10`, `min_amount_100m="1"`, `requires_right_side=true`, `requires_tradable=true`, `requires_no_danger=true`, `requires_matching_data_date=true`, `requires_not_held=true`, `requires_atr14=true`, the same four-field sort, candidate/position limit 10, target weight `0.04`, initial protection multiple 2, trailing low days 5 and a non-decreasing protection line. US additionally contains `allowed_exchange="US"`, `lot_size=1`, `buy_window="美股常规交易时段"`; HK contains `allowed_exchange="HK"`, `lot_size_source="Futu 每标的整手"`, `buy_window="09:30-10:00"`. Each snapshot freezes the configured market pool IDs. Assert all `parameter_rows` group/name/value strings are Chinese and `_report_payload(report)["strategy_snapshot"]` equals the object attached at generation time.
 
-In `tests/test_daily_premarket.py`, load a fixture containing all three positive, distinct simulate account IDs and all six finite non-negative fee values, then assert `DailyPremarketConfig` preserves the exact IDs and `Decimal` bps. Load the example's nine empty values and assert unrelated configuration loading still succeeds. These tests introduce no fee defaults.
+In `tests/test_daily_premarket.py`, load a fixture containing all three positive, distinct simulate account IDs and assert `DailyPremarketConfig` preserves the exact IDs. Load the example's three empty values and assert unrelated configuration loading still succeeds.
 
 - [ ] **Step 2: Run snapshot tests and verify RED**
 
@@ -175,7 +173,7 @@ Add this exact item to the existing `_report_payload` dictionary:
 "strategy_snapshot": _json_value(report.strategy_snapshot),
 ```
 
-Call `trend_strategy_snapshot` from both report generators using the live `process_version`, actual configured pool IDs and required fee bps. The function returns both machine-readable `parameters` and Chinese `parameter_rows` from the same constants; the Dashboard renders only `parameter_rows`. Do not read `纪律.md` at runtime.
+Call `trend_strategy_snapshot` from both report generators using the live `process_version` and actual configured pool IDs. The function returns both machine-readable `parameters` and Chinese `parameter_rows` from the same constants; the Dashboard renders only `parameter_rows`. Do not read `纪律.md` at runtime.
 
 Add `lot_size: int` to each generated buy action and populate it from the same constants as the snapshot: CN is 100, US is 1, and HK is the exact per-symbol Futu lot size resolved when the report is generated. The open executor must reuse this frozen action value rather than querying or inventing a different lot size later.
 
@@ -183,7 +181,7 @@ Before publishing a report, call `validate_report_strategy_snapshot(report)`. It
 
 Update `纪律.md` in the same commit so it states the exact current CN gates, temperature weights, sorting, position limit, buy window, initial `2 × ATR14` protection and five-day non-decreasing trailing line, plus the exact shared US/HK gates and their market-specific lot/window rules. It must not describe planned parameter export or backtesting as available now.
 
-Add the three simulate account IDs and six aggregate fee bps to `DailyPremarketConfig` in this task so live report generation can freeze them. `config/daily_premarket.env.example` contains the nine exact keys with empty values; `load_env_config` accepts empty values for unrelated commands, validates populated IDs as distinct positive integers, and validates populated bps as finite non-negative decimals. Task 5 makes them mandatory only for the selected live review market.
+Add the three simulate account IDs to `DailyPremarketConfig`. `config/daily_premarket.env.example` contains the three exact keys with empty values; `load_env_config` accepts empty values for unrelated commands and validates populated IDs as distinct positive integers. Task 5 makes the selected market account mandatory for the live review workflow.
 
 - [ ] **Step 4: Run focused trend tests and verify GREEN**
 
@@ -232,7 +230,6 @@ def test_freeze_and_replay_never_overwrite_original(tmp_path: Path) -> None:
         "market_data": {"SH.600001": [{"date": "2026-07-16", "close": "10"}]},
         "account": {"net_value": "100000"},
         "strategy_snapshot": {"strategy_version": "v1"},
-        "fees": {"buy_cost_bps": "8.5", "sell_cost_bps": "58.5"},
         "process_version": "oldsha",
     }
     reference = freeze_trend_evidence(tmp_path, evidence)
@@ -359,8 +356,8 @@ git commit -m "feat: freeze replayable trend evidence"
 - Modify: `tests/test_trend_review.py`
 
 **Interfaces:**
-- Consumes: frozen trend report, one market-specific `simulate_acc_id`, six configured cost bps and existing Futu trade context.
-- Produces: `execute_trend_review_open(data_dir, report, client, prices, market, execution_date, now) -> dict[str, object]`, `execute_trend_review_stop(data_dir, market, symbol, trading_date, event_id, client, now) -> dict[str, object]`, `capture_trend_review_close(data_dir, market, trading_date, report, simulate_snapshot, orders, benchmark, buy_cost_bps, sell_cost_bps) -> Path`, daily facts such as `data/trend_review/daily/CN/2026-07-17.json`.
+- Consumes: frozen trend report, one market-specific `simulate_acc_id` and existing Futu trade context.
+- Produces: `execute_trend_review_open(data_dir, report, client, prices, market, execution_date, now) -> dict[str, object]`, `execute_trend_review_stop(data_dir, market, symbol, trading_date, event_id, client, now) -> dict[str, object]`, `capture_trend_review_close(data_dir, market, trading_date, report, simulate_snapshot, orders, benchmark) -> Path`, daily facts such as `data/trend_review/daily/CN/2026-07-17.json`.
 
 - [ ] **Step 1: Write failing Futu market-order compatibility tests**
 
@@ -420,17 +417,16 @@ def test_first_open_requires_an_empty_dedicated_simulate_account(tmp_path: Path)
         )
 
 
-def test_close_subtracts_frozen_target_broker_costs(tmp_path: Path) -> None:
+def test_close_uses_authoritative_simulate_account_nav(tmp_path: Path) -> None:
     path = capture_trend_review_close(
         data_dir=tmp_path, market="CN", trading_date="2026-07-17",
         report=cn_report(account_net_value="735164.41"),
         simulate_snapshot=sim_snapshot(nav="101000"),
         orders=[filled_buy(notional="4000"), filled_sell(notional="4200")],
-        benchmark={"date": "2026-07-17", "close": "6123.45", "source_id": "CSI_ALL_SHARE_TOTAL_RETURN"},
-        buy_cost_bps=Decimal("8.5"), sell_cost_bps=Decimal("58.5"),
+        benchmark={"date": "2026-07-17", "close": "6123.45", "source_id": "CSI_ALL_SHARE_PRICE", "futu_symbol": "SH.000985"},
     )
     payload = json.loads(path.read_text())
-    assert payload["discipline_equity_after_fees"] == "100972.03"
+    assert payload["discipline_equity_after_fees"] == "101000.00"
     assert payload["actual_equity"] == "735164.41"
 ```
 
@@ -484,8 +480,7 @@ stop_result = execute_trend_review_stop(
 daily_path = capture_trend_review_close(
     data_dir=data_dir, market="CN", trading_date="2026-07-17",
     report=report, simulate_snapshot=simulate_snapshot, orders=orders,
-    benchmark=benchmark, buy_cost_bps=Decimal("8.5"),
-    sell_cost_bps=Decimal("58.5"),
+    benchmark=benchmark,
 )
 ```
 
@@ -521,7 +516,7 @@ git commit -m "feat: execute trend discipline simulation"
 - Modify: `tests/test_trend_review.py`
 
 **Interfaces:**
-- Consumes: daily review facts, `data/rates/DGS3MO.csv`, validated benchmark CSV and completed simulated trades.
+- Consumes: daily review facts containing validated frozen Futu benchmark closes, `data/rates/DGS3MO.csv` and completed simulated trades.
 - Produces: public `portfolio_metrics(curve, rates, initial_cash) -> dict[str, object]`, `build_trend_review_projection(data_dir: Path, market: str) -> dict[str, object]`, immutable batch files such as `data/trend_review/batches/CN/0001.json`, and atomic latest files `data/latest/trend_review_cn.json`, `trend_review_us.json`, `trend_review_hk.json`.
 
 - [ ] **Step 1: Write failing public metric tests**
@@ -548,7 +543,6 @@ Rename `_portfolio_metrics` to `portfolio_metrics` and update only internal call
 ```python
 def test_projection_closes_non_overlapping_batch_at_thirtieth_trade(tmp_path: Path) -> None:
     write_daily_facts(tmp_path, completed_trades=31, days=45)
-    write_benchmark_csv(tmp_path, market="CN", source_id="CSI_ALL_SHARE_TOTAL_RETURN")
     projection = build_trend_review_projection(tmp_path, "CN")
     assert projection["batch"]["completed_trade_count"] == 30
     assert projection["batch"]["batch_number"] == 1
@@ -563,7 +557,6 @@ def test_projection_closes_non_overlapping_batch_at_thirtieth_trade(tmp_path: Pa
 
 def test_projection_marks_missing_actual_curve_as_data_insufficient(tmp_path: Path) -> None:
     write_daily_facts(tmp_path, completed_trades=30, days=40, missing_actual_date=True)
-    write_benchmark_csv(tmp_path, market="CN", source_id="CSI_ALL_SHARE_TOTAL_RETURN")
     projection = build_trend_review_projection(tmp_path, "CN")
     assert projection["metrics"]["sharpe"]["actual"] == {
         "value": None, "reason": "实际执行日终净值缺失"
@@ -590,13 +583,13 @@ Add the exact map:
 
 ```python
 BENCHMARK_SOURCE_IDS = {
-    "CN": "CSI_ALL_SHARE_TOTAL_RETURN",
-    "US": "SPY_ADJUSTED_TOTAL_RETURN",
-    "HK": "HSCI_TOTAL_RETURN",
+    "CN": "CSI_ALL_SHARE_PRICE",
+    "US": "SPY_QFQ",
+    "HK": "HSCI_PRICE",
 }
 ```
 
-`load_trend_benchmark` rejects missing columns, duplicate/out-of-order dates, non-finite/non-positive closes and wrong `source_id`. `build_trend_review_projection` intersects all three curves on the same dates, normalizes each to its first value, and passes each normalized curve to `portfolio_metrics`. It writes these exact five keys:
+`benchmark_fact` fetches the exact review date from Futu and rejects missing, non-finite/non-positive closes. Each daily fact validates date, source ID and Futu symbol. `build_trend_review_projection` intersects all three curves on the same dates, normalizes each to its first value, and passes each normalized curve to `portfolio_metrics`. It writes these exact five keys:
 
 ```python
 metrics = {
@@ -980,7 +973,7 @@ Expected: PASS with the exact test count printed by pytest.
 
 - [ ] **Step 4: Run the real review workflow directly**
 
-With the three distinct simulate account IDs, six actual cost bps and three real benchmark CSVs configured, run each market's direct close workflow without submitting duplicate open orders:
+With the three distinct simulate account IDs configured, run each market's direct close workflow. The close command freezes each market's Futu benchmark fact and does not submit duplicate open orders:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m open_trader trend-review close --market CN --date today --config config/daily_premarket.env

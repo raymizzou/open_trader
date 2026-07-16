@@ -116,12 +116,6 @@ class DailyPremarketConfig:
     trend_review_cn_simulate_acc_id: int = 0
     trend_review_us_simulate_acc_id: int = 0
     trend_review_hk_simulate_acc_id: int = 0
-    trend_review_cn_buy_cost_bps: Decimal | None = None
-    trend_review_cn_sell_cost_bps: Decimal | None = None
-    trend_review_us_buy_cost_bps: Decimal | None = None
-    trend_review_us_sell_cost_bps: Decimal | None = None
-    trend_review_hk_buy_cost_bps: Decimal | None = None
-    trend_review_hk_sell_cost_bps: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -223,14 +217,6 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
     populated_review_ids = [value for value in review_account_ids.values() if value]
     if len(populated_review_ids) != len(set(populated_review_ids)):
         raise ValueError("trend review simulate account IDs must be distinct")
-    review_costs = {
-        (market, side): _optional_nonnegative_decimal(
-            values, f"OPEN_TRADER_TREND_REVIEW_{market}_{side}_COST_BPS"
-        )
-        for market in ("CN", "US", "HK")
-        for side in ("BUY", "SELL")
-    }
-
     for key, value in values.items():
         os.environ[key] = value
 
@@ -293,12 +279,6 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         trend_review_cn_simulate_acc_id=review_account_ids["CN"],
         trend_review_us_simulate_acc_id=review_account_ids["US"],
         trend_review_hk_simulate_acc_id=review_account_ids["HK"],
-        trend_review_cn_buy_cost_bps=review_costs[("CN", "BUY")],
-        trend_review_cn_sell_cost_bps=review_costs[("CN", "SELL")],
-        trend_review_us_buy_cost_bps=review_costs[("US", "BUY")],
-        trend_review_us_sell_cost_bps=review_costs[("US", "SELL")],
-        trend_review_hk_buy_cost_bps=review_costs[("HK", "BUY")],
-        trend_review_hk_sell_cost_bps=review_costs[("HK", "SELL")],
     )
 
 
@@ -313,24 +293,9 @@ def _optional_positive_tm_id(values: dict[str, str], key: str) -> int:
     return value
 
 
-def _optional_nonnegative_decimal(
-    values: dict[str, str], key: str
-) -> Decimal | None:
-    raw = values.get(key, "").strip()
-    if not raw:
-        return None
-    try:
-        value = Decimal(raw)
-    except InvalidOperation:
-        raise ValueError(f"{key} must be a finite non-negative decimal") from None
-    if not value.is_finite() or value < 0:
-        raise ValueError(f"{key} must be a finite non-negative decimal")
-    return value
-
-
 def require_trend_review_config(
     config: DailyPremarketConfig, market: str
-) -> tuple[int, Decimal, Decimal]:
+) -> int:
     market = market.upper()
     if market not in {"CN", "US", "HK"}:
         raise ValueError(f"unsupported trend review market: {market}")
@@ -343,19 +308,9 @@ def require_trend_review_config(
     if len(populated) != len(set(populated)):
         raise ValueError("trend review simulate account IDs must be distinct")
     account_id = getattr(config, f"trend_review_{market.lower()}_simulate_acc_id")
-    buy = getattr(config, f"trend_review_{market.lower()}_buy_cost_bps")
-    sell = getattr(config, f"trend_review_{market.lower()}_sell_cost_bps")
-    if (
-        account_id <= 0
-        or buy is None
-        or sell is None
-        or not buy.is_finite()
-        or not sell.is_finite()
-        or buy < 0
-        or sell < 0
-    ):
+    if account_id <= 0:
         raise ValueError(f"{market} trend review config is incomplete")
-    return account_id, buy, sell
+    return account_id
 
 
 def _positive_tm_ids(value: str) -> tuple[int, ...]:

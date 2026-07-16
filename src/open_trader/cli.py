@@ -117,11 +117,11 @@ from .trading_plan import (
 )
 from .watchlist import build_watchlist
 from .trend_review import (
+    benchmark_fact,
     build_trend_review_projection,
     capture_trend_review_close,
     execute_trend_review_open,
     execute_trend_review_stop,
-    load_trend_benchmark,
     rebuild_trend_report_from_evidence,
     replay_trend_evidence,
 )
@@ -154,7 +154,7 @@ def _load_trend_review_report(
 def run_trend_review_open(
     config: object, market: str, trading_date: str
 ) -> dict[str, object]:
-    account_id, _, _ = require_trend_review_config(config, market)
+    account_id = require_trend_review_config(config, market)
     report = _load_trend_review_report(
         config, market, trading_date, date_field="execution_date"
     )
@@ -207,9 +207,7 @@ def run_trend_review_open(
 def run_trend_review_close(
     config: object, market: str, trading_date: str
 ) -> dict[str, object]:
-    account_id, buy_cost_bps, sell_cost_bps = require_trend_review_config(
-        config, market
-    )
+    account_id = require_trend_review_config(config, market)
     existing_path = (
         config.data_dir / "trend_review" / "daily" / market / f"{trading_date}.json"
     )
@@ -224,23 +222,16 @@ def run_trend_review_close(
     report = _load_trend_review_report(
         config, market, trading_date, date_field="as_of_date"
     )
-    benchmark = next(
-        (
-            row
-            for row in load_trend_benchmark(config.data_dir, market)
-            if row["date"] == trading_date
-        ),
-        None,
-    )
-    if benchmark is None:
-        raise ValueError(f"benchmark is missing {trading_date}")
-    client = FutuSimulateOrderExecutionClient(
-        host=config.futu_host,
-        port=config.futu_port,
-        simulate_acc_id=account_id,
-        trd_market=market,
-    )
+    quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+    client = None
     try:
+        benchmark = benchmark_fact(quote, market, trading_date)
+        client = FutuSimulateOrderExecutionClient(
+            host=config.futu_host,
+            port=config.futu_port,
+            simulate_acc_id=account_id,
+            trd_market=market,
+        )
         snapshot = client.account_snapshot()
         orders = client.list_orders()["orders"]
         path = capture_trend_review_close(
@@ -251,12 +242,12 @@ def run_trend_review_close(
             simulate_snapshot=snapshot,
             orders=orders,
             benchmark=benchmark,
-            buy_cost_bps=buy_cost_bps,
-            sell_cost_bps=sell_cost_bps,
         )
         build_trend_review_projection(config.data_dir, market)
     finally:
-        client.close()
+        quote.close()
+        if client is not None:
+            client.close()
     return {
         "status": "captured",
         "market": market,
@@ -270,7 +261,7 @@ def run_trend_review_stop(
 ) -> dict[str, object]:
     if not isinstance(event, dict):
         raise ValueError("trend review protection event must be an object")
-    account_id, _, _ = require_trend_review_config(config, market)
+    account_id = require_trend_review_config(config, market)
     client = FutuSimulateOrderExecutionClient(
         host=config.futu_host,
         port=config.futu_port,

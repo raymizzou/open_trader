@@ -615,12 +615,6 @@ def _attempt_market_report(
             position_weight_source="fallback_4pct",
             process_version=_process_version(config.repo),
             candidate_pool_ids=pool_ids,
-            buy_cost_bps=getattr(
-                config, f"trend_review_{market.lower()}_buy_cost_bps"
-            ),
-            sell_cost_bps=getattr(
-                config, f"trend_review_{market.lower()}_sell_cost_bps"
-            ),
             metadata={
                 "market": market,
                 "broker": settings["broker"],
@@ -639,12 +633,6 @@ def _attempt_market_report(
         report = replace(
             report,
             metadata={**report.metadata, "delivery_status": "prepared"},
-        )
-        buy_cost_bps = getattr(
-            config, f"trend_review_{market.lower()}_buy_cost_bps"
-        )
-        sell_cost_bps = getattr(
-            config, f"trend_review_{market.lower()}_sell_cost_bps"
         )
         evidence = freeze_report_evidence(
             data_dir=config.data_dir,
@@ -665,8 +653,6 @@ def _attempt_market_report(
             },
             candidate_pool_ids=pool_ids,
             lot_sizes=lot_sizes,
-            buy_cost_bps=buy_cost_bps,
-            sell_cost_bps=sell_cost_bps,
         )
         report = replace(
             report,

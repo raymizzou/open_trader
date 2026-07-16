@@ -318,7 +318,7 @@ def test_trend_a_share_report_main_dispatches_and_returns_status(
     monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
     monkeypatch.setattr(cli, "run_a_share_trend_report", fake_runner)
     monkeypatch.setattr(
-        cli, "require_trend_review_config", lambda loaded, market: (101, Decimal("1"), Decimal("1"))
+        cli, "require_trend_review_config", lambda loaded, market: 101
     )
     monkeypatch.setattr(
         cli,
@@ -461,7 +461,7 @@ def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
     monkeypatch.setattr(cli, "RunLock", RecordingLock)
     monkeypatch.setattr(cli, "watch_a_share_protection", fake_watcher)
     monkeypatch.setattr(
-        cli, "require_trend_review_config", lambda loaded, market: (101, Decimal("1"), Decimal("1"))
+        cli, "require_trend_review_config", lambda loaded, market: 101
     )
     monkeypatch.setattr(cli, "run_trend_review_open", lambda *args: None)
     monkeypatch.setattr(cli, "run_trend_review_stop", lambda *args: None, raising=False)
@@ -620,7 +620,7 @@ def test_trend_market_report_dispatches_generic_runner(
 
     monkeypatch.setattr(cli, "run_market_trend_report", runner)
     monkeypatch.setattr(
-        cli, "require_trend_review_config", lambda loaded, market: (102, Decimal("1"), Decimal("1"))
+        cli, "require_trend_review_config", lambda loaded, market: 102
     )
     monkeypatch.setattr(
         cli,
@@ -674,7 +674,7 @@ def test_watch_trend_market_uses_separate_market_paths(
     monkeypatch.setattr(cli, "RunLock", Lock)
     monkeypatch.setattr(cli, "watch_market_protection", watcher)
     monkeypatch.setattr(
-        cli, "require_trend_review_config", lambda loaded, market: (103, Decimal("1"), Decimal("1"))
+        cli, "require_trend_review_config", lambda loaded, market: 103
     )
     monkeypatch.setattr(cli, "run_trend_review_open", lambda *args: None)
     monkeypatch.setattr(cli, "run_trend_review_stop", lambda *args: None, raising=False)

@@ -45,22 +45,18 @@ class RecordingFeishu(FeishuWebhookNotifier):
 
 
 @pytest.mark.parametrize(
-    ("market", "name", "pool_ids", "buy", "sell", "market_parameters"),
+    ("market", "name", "pool_ids", "market_parameters"),
     [
         (
             "US",
             "美股短线右侧趋势",
             (622460,),
-            Decimal("0.5"),
-            Decimal("0.5"),
             {"allowed_exchange": "US", "lot_size": 1, "buy_window": "美股常规交易时段"},
         ),
         (
             "HK",
             "港股短线右侧趋势",
             (622494,),
-            Decimal("3"),
-            Decimal("13"),
             {
                 "allowed_exchange": "HK",
                 "lot_size_source": "Futu 每标的整手",
@@ -73,13 +69,9 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     market: str,
     name: str,
     pool_ids: tuple[int, ...],
-    buy: Decimal,
-    sell: Decimal,
     market_parameters: dict[str, object],
 ) -> None:
-    snapshot = trend_module.trend_strategy_snapshot(
-        market, "abc123", buy, sell, pool_ids
-    )
+    snapshot = trend_module.trend_strategy_snapshot(market, "abc123", pool_ids)
 
     assert snapshot["strategy_name"] == name
     assert snapshot["strategy_version"] == "v1"
@@ -103,8 +95,6 @@ def test_market_strategy_snapshot_matches_runtime_rules(
         "exit_reasons": ["danger", "left_right_side", "protection"],
         "trailing_low_days": 5,
         "protection_line_non_decreasing": True,
-        "buy_cost_bps": str(buy),
-        "sell_cost_bps": str(sell),
     }
     assert snapshot["parameter_rows"]
     assert all(

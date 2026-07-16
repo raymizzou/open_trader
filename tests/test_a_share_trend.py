@@ -241,8 +241,6 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
     snapshot = trend_module.trend_strategy_snapshot(
         "CN",
         "abc123",
-        Decimal("8.5"),
-        Decimal("58.5"),
         (622466, 697199),
     )
 
@@ -297,8 +295,6 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
         ],
         "trailing_low_days": 5,
         "protection_line_non_decreasing": True,
-        "buy_cost_bps": "8.5",
-        "sell_cost_bps": "58.5",
     }
     assert snapshot["parameter_rows"][0] == {
         "group": "候选来源",
