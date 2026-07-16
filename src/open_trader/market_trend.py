@@ -94,6 +94,7 @@ ATTENTION_CHANGE_FIELDS = (
 )
 ATTENTION_RISK_FIELDS = ("danger", "boiling", "champagne")
 ATTENTION_TEMPERATURES = ("凉", "平", "温", "热", "沸")
+REPORT_REVISION = re.compile(r"-r(\d+)\.json$")
 
 
 class MarketHoliday(RuntimeError):
@@ -601,16 +602,18 @@ def _previous_attention_rows(
     paths: MarketTrendPaths, *, current_as_of_date: str, market: str
 ) -> list[Mapping[str, object]]:
     current_date = date.fromisoformat(current_as_of_date)
-    valid_reports: list[tuple[date, str, list[Mapping[str, object]]]] = []
-    if paths.reports.exists():
-        for path in paths.reports.glob("*.json"):
-            loaded = _attention_report_rows(path)
-            if loaded is not None:
-                valid_reports.append((loaded[0], path.name, loaded[1]))
+    valid_reports: list[tuple[date, int, str, list[Mapping[str, object]]]] = []
+    report_files = list(paths.reports.glob("*.json")) if paths.reports.exists() else []
+    for path in report_files:
+        loaded = _attention_report_rows(path)
+        if loaded is not None:
+            match = REPORT_REVISION.search(path.name)
+            revision = int(match.group(1)) if match else 0
+            valid_reports.append((loaded[0], revision, path.name, loaded[1]))
     predecessors = [item for item in valid_reports if item[0] < current_date]
     if predecessors:
-        return max(predecessors, key=lambda item: (item[0], item[1]))[2]
-    if _market(market) == "US" and not valid_reports:
+        return max(predecessors, key=lambda item: (item[0], item[1], item[2]))[3]
+    if _market(market) == "US" and not report_files:
         baseline = _attention_report_rows(paths.root / "attention_baseline.json")
         if baseline is not None and baseline[0] < current_date:
             return baseline[1]
@@ -1017,7 +1020,7 @@ def _attempt_market_report(
             ),
             _attention_actions(payload),
             market,
-            str(settings["broker"]),
+            MARKET_NOTIFICATION_LABELS[market][0],
         )
         receipt_path = _market_receipt_path(paths, artifact_stem)
         receipt = _write_delivery_receipt(

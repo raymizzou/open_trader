@@ -2427,7 +2427,9 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         execution_date="2026-07-15",
         generated_at="2026-07-14T17:00:01+08:00",
         account=account("600009"),
-        candidates=(candidate("600001", danger=True),),
+        candidates=(
+            replace(candidate("600001", danger=True), boiling=True, champagne=None),
+        ),
         holding_snapshots={"600009": replace(holding("600009"), boiling=None)},
         bars_by_symbol={"600009": bars()},
         metadata={
@@ -2476,6 +2478,8 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
     }
     excluded = payload["signal_snapshots"]["excluded"]["600001"][0]
     assert excluded["danger"] is True
+    assert excluded["boiling"] is True
+    assert excluded["champagne"] is None
     assert set(excluded) == {
         "tm_id",
         "symbol",
@@ -2490,6 +2494,8 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "days",
         "strength",
         "danger",
+        "boiling",
+        "champagne",
         "filter_price",
         "close",
         "atr",
@@ -2559,6 +2565,8 @@ def test_candidate_audit_includes_all_ranked_and_excluded_pool_facts() -> None:
         "days",
         "strength",
         "danger",
+        "boiling",
+        "champagne",
         "filter_price",
         "close",
         "atr",

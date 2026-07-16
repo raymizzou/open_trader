@@ -554,6 +554,10 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         "02800",
     ]
     assert "\n期权关注\n" in message
+    assert payload["option_attention"][0]["source_broker"] == "辉立"
+    candidate_snapshot = payload["signal_snapshots"]["candidates"][0]
+    assert candidate_snapshot["boiling"] is False
+    assert candidate_snapshot["champagne"] is False
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert (
         f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
@@ -948,8 +952,9 @@ def test_build_option_attention_emits_only_raw_trend_transitions() -> None:
     assert attention[1]["source_action"] == "BUY"
     assert "headline" not in attention[1]
     assert "summary" not in attention[1]
+    protection_only = [{**row, "active_line": "200"} for row in current]
     assert market_trend.build_option_attention(
-        current, current, {"MSFT": "SELL_ALL"}, "US", "tiger"
+        protection_only, current, {"MSFT": "SELL_ALL"}, "US", "tiger"
     ) == []
 
 
@@ -1029,6 +1034,8 @@ def test_previous_attention_rows_use_strict_dates_and_one_time_tiger_baseline(
     for filename, as_of_date, symbol in (
         ("2026-07-14.json", "2026-07-14", "OLDER"),
         ("2026-07-15.json", "2026-07-15", "PRIOR"),
+        ("2026-07-15-r2.json", "2026-07-15", "REVISION2"),
+        ("2026-07-15-r10.json", "2026-07-15", "REVISION10"),
         ("2026-07-16.json", "2026-07-16", "SAME"),
         ("2026-07-16-r1.json", "2026-07-16", "REVISION"),
     ):
@@ -1048,10 +1055,11 @@ def test_previous_attention_rows_use_strict_dates_and_one_time_tiger_baseline(
     rows = market_trend._previous_attention_rows(
         paths, current_as_of_date="2026-07-16", market="US"
     )
-    assert [row["symbol"] for row in rows] == ["PRIOR"]
+    assert [row["symbol"] for row in rows] == ["REVISION10"]
 
-    (paths.reports / "2026-07-14.json").unlink()
-    (paths.reports / "2026-07-15.json").unlink()
+    for path in paths.reports.glob("*.json"):
+        path.unlink()
+    (paths.reports / "malformed.json").write_text("{", encoding="utf-8")
     assert market_trend._previous_attention_rows(
         paths, current_as_of_date="2026-07-16", market="US"
     ) == []

@@ -176,6 +176,8 @@ class CandidateInput:
     strength_prev_month: Decimal | None = None
     labels: tuple[str, ...] = ()
     kline_supplement: dict[str, bool] | None = None
+    boiling: object = None
+    champagne: object = None
 
 
 @dataclass(frozen=True)
@@ -561,6 +563,16 @@ def evaluate_candidate(
             else None
         ),
         phase=_optional_text(row.get("trendPhaseCurr")),
+        boiling=(
+            row.get("stopwinFlagByBoilingTemperature")
+            if isinstance(row.get("stopwinFlagByBoilingTemperature"), bool)
+            else None
+        ),
+        champagne=(
+            row.get("stopwinFlagByPopChampagne")
+            if isinstance(row.get("stopwinFlagByPopChampagne"), bool)
+            else None
+        ),
         **paid_expansion,
     )
 
@@ -1120,6 +1132,8 @@ def _candidate_signal(item: CandidateInput) -> dict[str, object]:
         "days": item.days,
         "strength": item.strength,
         "danger": item.danger,
+        "boiling": item.boiling,
+        "champagne": item.champagne,
         "filter_price": item.filter_price,
         "close": item.close,
         "atr": item.atr,
