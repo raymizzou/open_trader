@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from datetime import date
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Callable, Mapping, Sequence
@@ -67,10 +68,15 @@ class TrendAnimalsClient:
         self.transport = transport
         self.timeout_seconds = float(timeout_seconds)
         self._paid_cache_events: list[dict[str, str]] = []
+        self._ignored_stale_components: list[dict[str, str]] = []
 
     @property
     def paid_cache_events(self) -> tuple[dict[str, str], ...]:
         return tuple(dict(event) for event in self._paid_cache_events)
+
+    @property
+    def ignored_stale_components(self) -> tuple[dict[str, str], ...]:
+        return tuple(dict(row) for row in self._ignored_stale_components)
 
     def get_update_status(self) -> list[dict[str, object]]:
         return self._get("getUpdateStatus", {})
@@ -130,6 +136,7 @@ class TrendAnimalsClient:
             "getComponentTicker",
             {"tmId": str(tm_id), "getAllBasicComponentsFlag": "0"},
             expected_date,
+            ignore_older=True,
         )
 
     def get_snapshots(
@@ -190,7 +197,12 @@ class TrendAnimalsClient:
         return rows
 
     def _cached_rows(
-        self, endpoint: str, params: Mapping[str, str], expected_date: str
+        self,
+        endpoint: str,
+        params: Mapping[str, str],
+        expected_date: str,
+        *,
+        ignore_older: bool = False,
     ) -> list[dict[str, object]]:
         cache_identity = {
             "date": expected_date,
@@ -217,18 +229,53 @@ class TrendAnimalsClient:
             rows = self._get(endpoint, params)
         if self._contains_secret(rows):
             raise TrendAnimalsError(f"{endpoint} returned unsafe data")
+        current_rows: list[dict[str, object]] = []
+        ignored_rows: list[dict[str, str]] = []
+        try:
+            expected_day = date.fromisoformat(expected_date)
+        except ValueError:
+            expected_day = None
         for row in rows:
-            if row.get("asOfDate") != expected_date:
-                actual_date = row.get("asOfDate")
-                if isinstance(actual_date, str):
-                    actual_date = self._redact(actual_date)
-                raise TrendAnimalsError(
-                    f"{endpoint} returned data for {actual_date!r}; "
-                    f"expected {self._redact(expected_date)}"
+            actual_date = row.get("asOfDate")
+            if actual_date == expected_date:
+                current_rows.append(row)
+                continue
+            try:
+                actual_day = (
+                    date.fromisoformat(actual_date)
+                    if isinstance(actual_date, str)
+                    else None
                 )
-        if cached is None:
-            self._write_cache(cache_path, rows)
-        return rows
+            except ValueError:
+                actual_day = None
+            symbol = row.get("tickerSymbol")
+            if (
+                ignore_older
+                and expected_day is not None
+                and actual_day is not None
+                and actual_day < expected_day
+                and isinstance(symbol, str)
+                and symbol.strip()
+            ):
+                ignored_rows.append(
+                    {"tickerSymbol": symbol.strip(), "asOfDate": actual_date}
+                )
+                continue
+            safe_actual = (
+                self._redact(actual_date)
+                if isinstance(actual_date, str)
+                else actual_date
+            )
+            raise TrendAnimalsError(
+                f"{endpoint} returned data for {safe_actual!r}; "
+                f"expected {self._redact(expected_date)}"
+            )
+        if ignore_older and not current_rows:
+            raise TrendAnimalsError(f"{endpoint} returned no current-date rows")
+        self._ignored_stale_components.extend(ignored_rows)
+        if cached is None and not ignored_rows:
+            self._write_cache(cache_path, current_rows)
+        return current_rows
 
     def _read_cache(self, path: Path) -> object | None:
         try:
