@@ -1187,6 +1187,11 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser.add_argument("--data-dir", type=Path, default=Path("data"))
     dashboard_parser.add_argument("--reports-dir", type=Path, default=Path("reports"))
     dashboard_parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/daily_premarket.env"),
+    )
+    dashboard_parser.add_argument(
         "--poll-seconds",
         type=positive_float,
         default=5.0,
@@ -2329,6 +2334,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dashboard":
+        config_values = _load_optional_env_values(args.config)
         config = DashboardConfig(
             portfolio_path=args.portfolio,
             data_dir=args.data_dir,
@@ -2337,7 +2343,14 @@ def main(argv: list[str] | None = None) -> int:
             futu_host=args.futu_host,
             futu_port=args.futu_port,
         )
-        serve_dashboard(config, host=args.host, port=args.port)
+        serve_dashboard(
+            config,
+            host=args.host,
+            port=args.port,
+            eastmoney_password=config_values.get(
+                "OPEN_TRADER_EASTMONEY_PDF_PASSWORD", ""
+            ).strip(),
+        )
         return 0
 
     parser.error(f"unknown command: {args.command}")
