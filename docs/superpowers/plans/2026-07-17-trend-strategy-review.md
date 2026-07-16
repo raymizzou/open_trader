@@ -31,16 +31,14 @@
 
 ## File Map
 
-- Create: `src/open_trader/trend_review.py` — 复盘 schema、模拟盘动作、日终快照、批次、指标、证据冻结和纠正回放。
-- Create: `tests/test_trend_review.py` — 复盘领域逻辑、不可变产物、模拟订单、批次和指标测试。
+- Create: `src/open_trader/trend_review.py` — 复盘 schema、模拟盘动作、日终快照、批次、私有 `_portfolio_metrics` 指标实现、证据冻结和纠正回放。
+- Create: `tests/test_trend_review.py` — 复盘领域逻辑、不可变产物、模拟订单、批次和私有指标测试。
 - Modify: `src/open_trader/a_share_trend.py` — 将现有规则常量化，生成完整策略快照，冻结 A 股重放证据。
 - Modify: `src/open_trader/market_trend.py` — 生成港美策略快照并冻结同构证据。
 - Modify: `纪律.md` — 同步当前真实运行的 A/美/港趋势规则与参数，仅作人读说明，不作为运行时配置源。
 - Modify: `tests/test_a_share_trend.py` and `tests/test_market_trend.py` — 快照与证据投影回归。
 - Modify: `src/open_trader/kelly_order_execution.py` — 让已有 Futu SIMULATE 客户端兼容市价单及账户/订单快照；Kelly 限价单默认行为保持不变。
 - Modify: `tests/test_kelly_order_execution.py` — 市价单和快照兼容回归。
-- Modify: `src/open_trader/tiger_long_term_backtest.py` — 将已有 `_portfolio_metrics` 提升为共享 `portfolio_metrics`。
-- Modify: `tests/test_tiger_long_term_backtest.py` — 公共指标函数的边界测试。
 - Modify: `src/open_trader/daily_premarket.py` and `config/daily_premarket.env.example` — 三个互不相同的模拟账户 ID。
 - Modify: `src/open_trader/a_share_trend_watch.py` and `src/open_trader/market_trend_watch.py` — 开盘动作与保护线触发回调。
 - Modify: `src/open_trader/cli.py` — `trend-review open|close|replay` 直接工作流，并接入现有报告/watcher 命令。
@@ -510,16 +508,14 @@ git commit -m "feat: execute trend discipline simulation"
 ### Task 4: 生成 30 笔批次、三条曲线和五项指标
 
 **Files:**
-- Modify: `src/open_trader/tiger_long_term_backtest.py`
-- Modify: `tests/test_tiger_long_term_backtest.py`
 - Modify: `src/open_trader/trend_review.py`
 - Modify: `tests/test_trend_review.py`
 
 **Interfaces:**
 - Consumes: daily review facts containing validated frozen Futu benchmark closes, `data/rates/DGS3MO.csv` and completed simulated trades.
-- Produces: public `portfolio_metrics(curve, rates, initial_cash) -> dict[str, object]`, `build_trend_review_projection(data_dir: Path, market: str) -> dict[str, object]`, immutable batch files such as `data/trend_review/batches/CN/0001.json`, and atomic latest files `data/latest/trend_review_cn.json`, `trend_review_us.json`, `trend_review_hk.json`.
+- Produces: private `_portfolio_metrics(curve, rates, initial_cash) -> dict[str, object]`, public `build_trend_review_projection(data_dir: Path, market: str) -> dict[str, object]`, immutable batch files such as `data/trend_review/batches/CN/0001.json`, and atomic latest files `data/latest/trend_review_cn.json`, `trend_review_us.json`, `trend_review_hk.json`.
 
-- [ ] **Step 1: Write failing public metric tests**
+- [ ] **Step 1: Write failing private metric tests**
 
 ```python
 def test_portfolio_metrics_uses_risk_free_excess_returns() -> None:
@@ -528,15 +524,16 @@ def test_portfolio_metrics_uses_risk_free_excess_returns() -> None:
         {"date": "2026-07-02", "equity": "101"},
         {"date": "2026-07-03", "equity": "100"},
     ]
-    metrics = portfolio_metrics(curve, {date(2026, 7, 1): Decimal("4")}, Decimal("100"))
+    metrics = trend_review._portfolio_metrics(
+        curve, {date(2026, 7, 1): Decimal("4")}, Decimal("100")
+    )
     assert set(metrics) == {
-        "total_return_pct", "annualized_return_pct", "max_drawdown_pct",
-        "sharpe_ratio", "calmar_ratio",
+        "total_return_pct", "max_drawdown_pct", "sharpe_ratio", "calmar_ratio",
     }
     assert metrics["sharpe_ratio"] is not None
 ```
 
-Rename `_portfolio_metrics` to `portfolio_metrics` and update only internal callers. Keep formula behavior unchanged.
+Implement `_portfolio_metrics` privately in `trend_review.py` and call it only from the projection helpers. Do not add a public metrics helper.
 
 - [ ] **Step 2: Write failing batch and projection tests**
 
@@ -571,11 +568,10 @@ Run:
 
 ```bash
 .venv/bin/python -m pytest -q \
-  tests/test_tiger_long_term_backtest.py -k portfolio_metrics \
-  tests/test_trend_review.py -k 'projection or batch or metric'
+  tests/test_trend_review.py -k 'portfolio_metrics or projection or batch or metric'
 ```
 
-Expected: FAIL because `portfolio_metrics` is private and no batch builder exists.
+Expected: FAIL because `_portfolio_metrics` and the batch builder do not exist yet.
 
 - [ ] **Step 4: Validate benchmark identity and build aligned curves**
 
@@ -589,7 +585,7 @@ BENCHMARK_SOURCE_IDS = {
 }
 ```
 
-`benchmark_fact` fetches the exact review date from Futu and rejects missing, non-finite/non-positive closes. Each daily fact validates date, source ID and Futu symbol. `build_trend_review_projection` intersects all three curves on the same dates, normalizes each to its first value, and passes each normalized curve to `portfolio_metrics`. It writes these exact five keys:
+`benchmark_fact` fetches the exact review date from Futu and rejects missing, non-finite/non-positive closes. Each daily fact validates date, source ID and Futu symbol. `build_trend_review_projection` intersects all three curves on the same dates, normalizes each to its first value, and passes each normalized curve to `_portfolio_metrics`. It writes these exact five keys:
 
 ```python
 metrics = {
@@ -619,14 +615,13 @@ Run:
 
 ```bash
 .venv/bin/python -m pytest -q \
-  tests/test_tiger_long_term_backtest.py tests/test_trend_review.py
+  tests/test_trend_review.py
 ```
 
 Expected: PASS.
 
 ```bash
-git add src/open_trader/tiger_long_term_backtest.py src/open_trader/trend_review.py \
-  tests/test_tiger_long_term_backtest.py tests/test_trend_review.py
+git add src/open_trader/trend_review.py tests/test_trend_review.py
 git commit -m "feat: build trend review batches and metrics"
 ```
 
@@ -943,7 +938,7 @@ for broker, label in (
     assert page.locator("#trend-report-workspace:visible .trend-review-chart").count() == 2
 ```
 
-Also assert Tiger has no entry, all five metric labels appear once, forbidden content is absent, and the 375px page has no horizontal overflow.
+Also assert Futu has no review entry, all five metric labels appear once, forbidden content is absent, and the 375px page has no horizontal overflow.
 
 - [ ] **Step 2: Run acceptance-helper tests and verify RED, then implement**
 
@@ -962,7 +957,7 @@ Run:
 ```bash
 .venv/bin/python -m pytest -q \
   tests/test_trend_review.py tests/test_a_share_trend.py tests/test_market_trend.py \
-  tests/test_kelly_order_execution.py tests/test_tiger_long_term_backtest.py \
+  tests/test_kelly_order_execution.py \
   tests/test_daily_premarket.py tests/test_a_share_trend_watch.py \
   tests/test_market_trend_watch.py tests/test_premarket_cli.py \
   tests/test_dashboard.py tests/test_dashboard_web.py \
