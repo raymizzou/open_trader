@@ -350,6 +350,23 @@ trading plan 或订单状态。
 `data/latest/portfolio.csv`、`data/broker_positions/` 下的券商明细产物，
 以及已存在的最新交易动作和报告。
 
+桌面端的辉立和东方财富账户标题右侧提供 `上传结单`。选择一份不超过 20 MiB 的
+PDF 后会立即导入，不再显示预览或二次确认；移动端不提供该入口。服务只接受本机
+loopback 请求，并自动读取结单内的完整日期。上传使用固定换算率
+`USD/HKD = 7.8`、`CNY/HKD = 1.08`，只整体替换对应券商的数据并保留其他券商；
+旧于现有来源日期、无法解析或写入失败的文件不会改变当前持仓。
+
+东方财富 PDF 密码只从 Dashboard 使用的本地配置文件读取：
+
+```text
+OPEN_TRADER_EASTMONEY_PDF_PASSWORD=本机密码
+```
+
+密码不会提交给浏览器或写入日志。成功导入后，辉立原件归档到
+`data/statements/phillips/<完整日期>/statement.pdf`，东方财富原件归档到
+`data/statements/eastmoney/<月份>/statement.pdf`；同一期间仅在完整解析和持仓更新
+成功后替换旧归档。这个入口不会重跑趋势报告、发送通知或启动 watcher。
+
 生成盘中做 T 信号：
 
 ```bash
