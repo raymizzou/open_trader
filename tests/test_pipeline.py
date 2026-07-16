@@ -182,31 +182,125 @@ def test_run_import_can_leave_latest_untouched(tmp_path: Path) -> None:
     assert latest.read_text(encoding="utf-8") == "sentinel\n"
 
 
-def test_run_uploaded_statement_uses_full_date_and_replaces_only_target_broker(
+def test_run_uploaded_statement_rebuilds_mixed_rows_from_broker_details(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    monthly_run = data_dir / "runs" / "2026-07"
+    daily_run = data_dir / "runs" / "2026-07-16"
+    monthly_run.mkdir(parents=True)
+    daily_run.mkdir(parents=True)
+
+    def detail_position(
+        broker: str, symbol: str, currency: str, market: str,
+    ) -> dict[str, str]:
+        return {
+            "statement_id": f"2026-07-{broker}",
+            "broker": broker,
+            "account_alias": f"{broker}_main",
+            "market": market,
+            "asset_class": "stock",
+            "symbol": symbol,
+            "name": symbol,
+            "currency": currency,
+            "quantity": "1",
+            "cost_price": "80",
+            "last_price": "100",
+            "market_value": "100",
+            "cost_value": "80",
+            "unrealized_pnl": "20",
+            "confidence": "high",
+            "notes": "",
+        }
+
+    def detail_cash(broker: str, currency: str, value: str) -> dict[str, str]:
+        return {
+            "statement_id": f"2026-07-{broker}",
+            "broker": broker,
+            "account_alias": f"{broker}_main",
+            "currency": currency,
+            "cash_balance": value,
+            "available_balance": value,
+            "confidence": "high",
+            "notes": "",
+        }
+
+    def write_detail_rows(
+        run_dir: Path,
+        positions: list[dict[str, str]],
+        cash: list[dict[str, str]],
+    ) -> None:
+        for filename, fieldnames, rows in (
+            ("extracted_positions.csv", pipeline.POSITION_FIELDNAMES, positions),
+            ("extracted_cash.csv", pipeline.CASH_FIELDNAMES, cash),
+        ):
+            with (run_dir / filename).open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+    write_detail_rows(
+        monthly_run,
+        [
+            detail_position("phillips", "OLD", "USD", "US"),
+            detail_position("eastmoney", "600519", "CNY", "CN"),
+        ],
+        [detail_cash("phillips", "USD", "30"), detail_cash("eastmoney", "CNY", "40")],
+    )
+    write_detail_rows(
+        daily_run,
+        [
+            detail_position("futu", "AAPL", "USD", "US"),
+            detail_position("tiger", "TSLA", "USD", "US"),
+            detail_position("phillips", "OLD", "USD", "US"),
+            detail_position("eastmoney", "600519", "CNY", "CN"),
+        ],
+        [
+            detail_cash("futu", "USD", "10"),
+            detail_cash("tiger", "USD", "20"),
+            detail_cash("phillips", "USD", "30"),
+            detail_cash("eastmoney", "CNY", "40"),
+        ],
+    )
+    (daily_run / "futu_account_snapshot.json").write_text(
+        "sentinel", encoding="utf-8"
+    )
+
     portfolio_path = tmp_path / "custom" / "portfolio.csv"
     portfolio_path.parent.mkdir(parents=True)
-    existing_rows = []
-    for symbol, broker in (("AAPL", "futu"), ("OLD", "phillips")):
+    existing_rows: list[dict[str, str]] = []
+    for symbol, broker, currency, market in (
+        ("AAPL", "futu", "USD", "US"),
+        ("TSLA", "tiger", "USD", "US"),
+        ("OLD", "phillips", "USD", "US"),
+        ("600519", "eastmoney", "CNY", "CN"),
+    ):
         row = {field: "" for field in PORTFOLIO_FIELDNAMES}
         row.update(
             {
                 "sort_group": "2",
-                "market": "US",
+                "market": market,
                 "asset_class": "stock",
                 "symbol": symbol,
-                "currency": "USD",
+                "currency": currency,
                 "market_value": "100",
                 "cost_value": "80",
-                "fx_to_hkd": "7.8",
+                "fx_to_hkd": "1.08" if currency == "CNY" else "7.8",
                 "brokers": broker,
                 "risk_flag": "normal",
             }
         )
         existing_rows.append(row)
+    mixed_cash = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    mixed_cash.update({
+        "sort_group": "7", "market": "CASH", "asset_class": "cash",
+        "symbol": "USD_CASH", "currency": "USD", "market_value": "60",
+        "fx_to_hkd": "7.8", "brokers": "futu;phillips;tiger",
+        "accounts": "futu_main;phillips_main;tiger_main", "risk_flag": "normal",
+    })
+    existing_rows.append(mixed_cash)
     with portfolio_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
         writer.writeheader()
@@ -216,30 +310,40 @@ def test_run_uploaded_statement_uses_full_date_and_replaces_only_target_broker(
         statement_date="2026-07-10",
         statement_path=source,
         parser=FakeParser(broker="phillips"),
-        data_dir=tmp_path / "data",
+        data_dir=data_dir,
         portfolio_path=portfolio_path,
         fx_provider=StaticMonthEndFxProvider(
-            "2026-07", {"USD": Decimal("7.8")}, fx_date="2026-07-10"
+            "2026-07",
+            {"USD": Decimal("7.8"), "CNY": Decimal("1.08")},
+            fx_date="2026-07-10",
         ),
     )
 
-    assert result.run_dir == tmp_path / "data" / "runs" / "2026-07-10"
+    assert result.run_dir == monthly_run
     assert result.latest_path == portfolio_path
     assert result.positions_count == 1
     rows = list(csv.DictReader(portfolio_path.open(encoding="utf-8")))
-    assert {(row["brokers"], row["symbol"]) for row in rows} == {
-        ("futu", "AAPL"),
-        ("phillips", "NVDA"),
-        ("phillips", "USD_CASH"),
+    assert {(row["brokers"], row["symbol"]) for row in rows} >= {
+        ("futu", "AAPL"), ("tiger", "TSLA"),
+        ("eastmoney", "600519"), ("phillips", "NVDA"),
+        ("futu;phillips;tiger", "USD_CASH"),
     }
+    usd_cash = next(row for row in rows if row["symbol"] == "USD_CASH")
+    assert usd_cash["market_value"] == "80"
     detail_rows = list(
         csv.DictReader(
             (result.run_dir / "extracted_positions.csv").open(encoding="utf-8")
         )
     )
-    assert {row["statement_id"] for row in detail_rows} == {
-        "2026-07-10-phillips"
+    assert {(row["broker"], row["symbol"]) for row in detail_rows} == {
+        ("eastmoney", "600519"), ("phillips", "NVDA"),
     }
+    assert next(row for row in detail_rows if row["broker"] == "phillips")[
+        "statement_id"
+    ] == "2026-07-10-phillips"
+    assert (daily_run / "futu_account_snapshot.json").read_text(
+        encoding="utf-8"
+    ) == "sentinel"
 
 
 def test_eastmoney_import_counts_all_combined_non_cash_holdings(tmp_path: Path) -> None:

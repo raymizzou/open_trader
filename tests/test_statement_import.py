@@ -185,6 +185,30 @@ def test_import_pdf_rejects_older_statement_and_preserves_current_data(
     assert not (tmp_path / "data/statements/phillips/2026-07-09").exists()
 
 
+def test_latest_statement_period_uses_newest_statement_id_across_runs(
+    tmp_path: Path,
+) -> None:
+    statement_import = importlib.import_module("open_trader.statement_import")
+    data_dir = tmp_path / "data"
+    for run_name, statement_id in (
+        ("2026-07-16", "2026-07-10-phillips"),
+        ("2026-07", "2026-07-15-phillips"),
+    ):
+        path = data_dir / "runs" / run_name / "extracted_positions.csv"
+        path.parent.mkdir(parents=True)
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["statement_id", "broker"])
+            writer.writeheader()
+            writer.writerow({"statement_id": statement_id, "broker": "phillips"})
+    service = statement_import.StatementImportService(
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "portfolio.csv",
+        eastmoney_password="secret",
+    )
+
+    assert service._latest_statement_period("phillips") == "2026-07-15"
+
+
 def test_import_pdf_restores_archive_when_pipeline_fails(
     tmp_path: Path,
     monkeypatch,

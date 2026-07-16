@@ -16,8 +16,8 @@ from .pipeline import run_uploaded_statement
 
 
 RATES_TO_HKD = {
-    "phillips": {"USD": Decimal("7.8")},
-    "eastmoney": {"CNY": Decimal("1.08")},
+    "phillips": {"USD": Decimal("7.8"), "CNY": Decimal("1.08")},
+    "eastmoney": {"USD": Decimal("7.8"), "CNY": Decimal("1.08")},
 }
 STATEMENT_PERIOD = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)-")
 
@@ -95,6 +95,7 @@ class StatementImportService:
         runs_dir = self.data_dir / "runs"
         if not runs_dir.exists():
             return ""
+        periods: list[str] = []
         for run_dir in sorted(runs_dir.iterdir(), reverse=True):
             if not run_dir.is_dir():
                 continue
@@ -108,8 +109,8 @@ class StatementImportService:
                             continue
                         match = STATEMENT_PERIOD.match(row.get("statement_id", ""))
                         if match is not None:
-                            return match.group(1)
-        return ""
+                            periods.append(match.group(1))
+        return max(periods) if periods else ""
 
 
 def _promote_archive(source: Path, destination: Path) -> Path | None:

@@ -3843,6 +3843,51 @@ def test_load_dashboard_state_uses_phillips_statement_id_for_source_status(
     assert statuses["phillips"]["display_text"] == "2026-05 月结单导入"
 
 
+def test_load_dashboard_state_prefers_newer_statement_over_newer_daily_copy(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+
+    def phillips_row(statement_id: str, symbol: str) -> dict[str, str]:
+        return {
+            "statement_id": statement_id,
+            "broker": "phillips",
+            "account_alias": "phillips_main",
+            "market": "HK",
+            "asset_class": "stock",
+            "symbol": symbol,
+            "name": symbol,
+            "currency": "HKD",
+            "quantity": "1",
+            "cost_price": "80",
+            "last_price": "100",
+            "market_value": "100",
+            "cost_value": "80",
+            "unrealized_pnl": "20",
+            "confidence": "high",
+            "notes": "",
+        }
+
+    write_csv(
+        config.data_dir / "runs" / "2026-07-16" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [phillips_row("2026-07-10-phillips", "OLD")],
+    )
+    write_csv(
+        config.data_dir / "runs" / "2026-07" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [phillips_row("2026-07-15-phillips", "NEW")],
+    )
+
+    details, _ = dashboard_module._latest_broker_details(config.data_dir)
+    details = [row for row in details if row["broker"] == "phillips"]
+    assert [row["symbol"] for row in details] == ["NEW"]
+    state = load_dashboard_state(config).to_dict()
+    statuses = {row["broker"]: row for row in state["source_statuses"]}
+    assert statuses["phillips"]["display_text"] == "2026-07-15 月结单导入"
+
+
 def test_load_dashboard_state_blanks_unsupported_or_malformed_detail_money(
     tmp_path: Path,
 ) -> None:
