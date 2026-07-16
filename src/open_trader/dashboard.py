@@ -1921,16 +1921,28 @@ def _build_broker_summary(
     broker_positions: list[dict[str, str]],
     cash_details: list[dict[str, str]],
 ) -> dict[str, Any]:
-    detail_positions = [
+    broker_detail_positions = [
         row for row in broker_positions if _broker_key(row.get("broker", "")) == broker
+    ]
+    detail_positions = [
+        row for row in broker_detail_positions if not _is_cash_like_row(row)
+    ]
+    position_cash_rows = [
+        row for row in broker_detail_positions if _is_cash_like_row(row)
     ]
     detail_cash_rows = [
         row for row in cash_details if _broker_key(row.get("broker", "")) == broker
     ]
-    detail_available = bool(detail_positions or detail_cash_rows)
+    detail_available = bool(broker_detail_positions or detail_cash_rows)
     if detail_available:
         holding_value = _sum_detail_hkd(detail_positions, "market_value")
-        cash_like_value = _sum_detail_hkd(detail_cash_rows, "cash_balance")
+        cash_balance = _sum_detail_hkd(detail_cash_rows, "cash_balance")
+        position_cash = _sum_detail_hkd(position_cash_rows, "market_value")
+        cash_like_value = (
+            cash_balance + position_cash
+            if cash_balance is not None and position_cash is not None
+            else None
+        )
         portfolio_value = (
             holding_value + cash_like_value
             if holding_value is not None and cash_like_value is not None
