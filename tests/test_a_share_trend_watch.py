@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from collections.abc import Callable, Mapping
 
 import pytest
 
@@ -211,6 +212,8 @@ def run_once(
     state_path: Path | None = None,
     events_path: Path | None = None,
     notifier: RecordingNotifier | None = None,
+    on_session_open: Callable[[str], None] | None = None,
+    on_protection_trigger: Callable[[Mapping[str, object]], None] | None = None,
 ) -> object:
     return watch_a_share_protection(
         portfolio_path=portfolio_path or portfolio(tmp_path),
@@ -223,6 +226,8 @@ def run_once(
         once=True,
         now_fn=SequenceClock([now]),
         sleep_fn=lambda seconds: None,
+        on_session_open=on_session_open,
+        on_protection_trigger=on_protection_trigger,
     )
 
 
@@ -234,6 +239,23 @@ def read_events(path: Path) -> list[dict[str, object]]:
 
 def interrupted(message: str = "网络中断") -> FutuQuoteError:
     return FutuQuoteError(message, error_type="quote_server_interrupted")
+
+
+def test_watcher_calls_review_open_and_stop_hooks_once(tmp_path: Path) -> None:
+    opens: list[str] = []
+    stops: list[Mapping[str, object]] = []
+
+    run_once(
+        tmp_path,
+        quote=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        on_session_open=opens.append,
+        on_protection_trigger=stops.append,
+    )
+
+    assert opens == ["2026-07-15"]
+    assert len(stops) == 1
+    assert stops[0]["event_type"] == "protection_triggered"
+    assert stops[0]["event_id"]
 
 
 def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:

@@ -1407,6 +1407,27 @@ def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
     )
 
 
+def test_require_trend_review_config_returns_selected_market_values(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _daily_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
+        trend_review_cn_buy_cost_bps=Decimal("8.5"),
+        trend_review_cn_sell_cost_bps=Decimal("58.5"),
+    )
+
+    assert daily_premarket.require_trend_review_config(config, "CN") == (
+        101,
+        Decimal("8.5"),
+        Decimal("58.5"),
+    )
+    with pytest.raises(ValueError, match="US trend review config is incomplete"):
+        daily_premarket.require_trend_review_config(config, "US")
+
+
 def _daily_runner(
     *,
     summary_generator: object | None = None,

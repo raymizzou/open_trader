@@ -187,6 +187,8 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
 
     now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
     voice = RecordingXiaoaiNotifier()
+    opens: list[str] = []
+    stops: list[object] = []
     result = watch_market_protection(
         market="HK",
         data_dir=data_dir,
@@ -201,11 +203,15 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
         once=True,
         now_fn=lambda: now,
         sleep_fn=lambda seconds: None,
+        on_session_open=opens.append,
+        on_protection_trigger=stops.append,
     )
 
     assert result.status == "completed"
     assert result.watched_symbol_count == 1
     assert result.trigger_count == 1
+    assert opens == ["2026-07-16"]
+    assert len(stops) == 1
     assert voice.messages == [
         (
             "港股保护线触发 · 00700",

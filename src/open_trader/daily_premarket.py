@@ -328,6 +328,36 @@ def _optional_nonnegative_decimal(
     return value
 
 
+def require_trend_review_config(
+    config: DailyPremarketConfig, market: str
+) -> tuple[int, Decimal, Decimal]:
+    market = market.upper()
+    if market not in {"CN", "US", "HK"}:
+        raise ValueError(f"unsupported trend review market: {market}")
+    account_ids = [
+        config.trend_review_cn_simulate_acc_id,
+        config.trend_review_us_simulate_acc_id,
+        config.trend_review_hk_simulate_acc_id,
+    ]
+    populated = [value for value in account_ids if value > 0]
+    if len(populated) != len(set(populated)):
+        raise ValueError("trend review simulate account IDs must be distinct")
+    account_id = getattr(config, f"trend_review_{market.lower()}_simulate_acc_id")
+    buy = getattr(config, f"trend_review_{market.lower()}_buy_cost_bps")
+    sell = getattr(config, f"trend_review_{market.lower()}_sell_cost_bps")
+    if (
+        account_id <= 0
+        or buy is None
+        or sell is None
+        or not buy.is_finite()
+        or not sell.is_finite()
+        or buy < 0
+        or sell < 0
+    ):
+        raise ValueError(f"{market} trend review config is incomplete")
+    return account_id, buy, sell
+
+
 def _positive_tm_ids(value: str) -> tuple[int, ...]:
     result: list[int] = []
     for item in value.split(","):
