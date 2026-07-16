@@ -8,7 +8,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Unified A-share, US, and HK trend reports around the same action-first desktop
   tables and mobile cards while retaining market-specific facts, excluded closed
   zero-quantity positions from Dashboard holdings, and expanded real acceptance
-  across all three markets; verified `2199` tests and the Dashboard acceptance
+  across all three markets; verified `2200` tests and the Dashboard acceptance
   gate (`PASS`).
 
 ## 2026-07-15
