@@ -236,21 +236,57 @@ test('switches every broker tab and card while preserving US-filtered ledgers', 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
 
+test('shows right-aligned statement upload only on desktop statement accounts', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await installLedgerFixture(page);
+  await page.goto('/');
+
+  for (const broker of [
+    { tab: /辉立/, key: 'phillips' },
+    { tab: /东方财富/, key: 'eastmoney' },
+  ]) {
+    await page.getByRole('tab', { name: broker.tab }).click();
+    const button = page.locator(`[data-statement-upload="${broker.key}"]`);
+    await expect(button).toBeVisible();
+    await expect(button).toHaveText('上传结单');
+    const aligned = await button.evaluate((element) => {
+      const action = element.closest('.account-section-actions')!.getBoundingClientRect();
+      const header = element.closest('.account-section-header')!.getBoundingClientRect();
+      return Math.abs(action.right - header.right) <= 16;
+    });
+    expect(aligned).toBe(true);
+  }
+
+  for (const tab of [/富途/, /老虎/]) {
+    await page.getByRole('tab', { name: tab }).click();
+    await expect(page.locator('[data-statement-upload]')).toHaveCount(0);
+  }
+});
+
+test('hides statement upload on mobile', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 844 });
+  await installLedgerFixture(page);
+  await page.goto('/');
+  await page.getByRole('tab', { name: /辉立/ }).click();
+
+  await expect(page.locator('[data-statement-upload="phillips"]')).toBeHidden();
+});
+
 test('opens every warm-ledger destination, using real UI paths where available', async ({ page }) => {
   await installLedgerFixture(page);
   await page.goto('/');
 
   await page.getByRole('button', { name: '凯利实验室' }).click();
   await expectWarmSurface(page, '.kelly-lab-panel');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
   await page.getByRole('button', { name: '策略回测' }).click();
   await expectWarmSurface(page, '#standard-backtest-workspace');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
   await page.getByRole('button', { name: '当天趋势报告' }).click();
   await expectWarmSurface(page, '.trend-report-workspace');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
   await page.locator('.account-holding-actions [data-detail-mode="decision"]').click();
   await expectWarmSurface(page, '.symbol-detail-panel.inline-symbol-detail');
@@ -332,19 +368,19 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
   await expect(page.locator('.kelly-lab-panel')).toHaveCSS('background-color', rgb.surface);
   await expect(page.locator('.kelly-lab-panel')).toHaveCSS('border-top-color', rgb.line);
   await expectMobileTargetsAtLeast44(page, 'body', '#return-to-portfolio:visible, .kelly-lab-panel button:visible');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
   await expect(page.getByRole('tab', { name: /老虎/ })).toHaveAttribute('aria-selected', 'true');
 
   await page.getByRole('button', { name: '策略回测' }).click();
   await expect(page.locator('#standard-backtest-workspace')).toBeVisible();
   await expectMobileTargetsAtLeast44(page, '#standard-backtest-workspace', 'button:visible, input:visible, select:visible');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
   await page.getByRole('tab', { name: /富途/ }).click();
   await page.getByRole('button', { name: '当天趋势报告' }).click();
   await expect(page.locator('#trend-report-workspace')).toBeVisible();
   await expectMobileTargetsAtLeast44(page, 'body', '#return-to-portfolio:visible, #trend-report-workspace button:visible');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
   await page.locator('.account-holding-actions [data-detail-mode="decision"]').click();
   await expect(page.locator('.symbol-detail-panel.inline-symbol-detail')).toBeVisible();

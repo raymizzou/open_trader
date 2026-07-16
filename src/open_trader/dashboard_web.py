@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import ipaddress
+import threading
 from datetime import date
 from decimal import Decimal
 from http import HTTPStatus
@@ -22,6 +24,7 @@ from .dashboard_quotes import DashboardQuoteService
 from .futu_quote import FutuQuoteClient
 from .research_chat import ResearchChatError, ResearchChatService
 from .standard_strategies import strategy_catalog
+from .statement_import import StatementImportService
 from .strategy_backtest import (
     StandardBacktestRequest,
     run_standard_backtest,
@@ -37,6 +40,7 @@ STANDARD_BACKTEST_REQUEST_KEYS = {
     "initial_cash", "max_strategy_weight", "commission_bps", "slippage_bps",
 }
 MAX_JSON_BODY_BYTES = 1024 * 1024
+MAX_PDF_BODY_BYTES = 20 * 1024 * 1024
 
 
 class RequestBodyTooLargeError(Exception):
@@ -277,9 +281,17 @@ def create_dashboard_server(
     account_sync_service: DashboardAccountSyncService | None = None,
     research_chat_service: ResearchChatService | None = None,
     backtest_price_provider: DailyKlineProvider | None = None,
+    statement_import_service: StatementImportService | None = None,
+    eastmoney_password: str = "",
 ) -> ThreadingHTTPServer:
     service = quote_service or DashboardQuoteService(config=config)
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
+    import_service = statement_import_service or StatementImportService(
+        data_dir=config.data_dir,
+        portfolio_path=config.portfolio_path,
+        eastmoney_password=eastmoney_password,
+    )
+    portfolio_update_lock = threading.Lock()
 
     class DashboardRequestHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -312,12 +324,13 @@ def create_dashboard_server(
                 return
             if path == "/api/quotes":
                 try:
-                    self._send_json(
-                        build_quotes_payload(
-                            service,
-                            account_sync_service=account_sync_service,
+                    with portfolio_update_lock:
+                        self._send_json(
+                            build_quotes_payload(
+                                service,
+                                account_sync_service=account_sync_service,
+                            )
                         )
-                    )
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
@@ -333,6 +346,18 @@ def create_dashboard_server(
         def do_POST(self) -> None:
             path = urlparse(self.path).path
             try:
+                if path in {
+                    "/api/statements/phillips",
+                    "/api/statements/eastmoney",
+                }:
+                    if not _is_loopback_address(self.client_address[0]):
+                        raise PermissionError("结单上传仅允许从本机访问")
+                    broker = path.rsplit("/", 1)[-1]
+                    with portfolio_update_lock:
+                        self._send_json(
+                            import_service.import_pdf(broker, self._read_pdf_body())
+                        )
+                    return
                 if path == "/api/research-chat/sessions":
                     payload = self._read_json_body()
                     market = str(payload.get("market") or "")
@@ -406,6 +431,25 @@ def create_dashboard_server(
                 raise ValueError("请求正文必须是有效的 JSON 对象")
             return payload
 
+        def _read_pdf_body(self) -> bytes:
+            if (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower() != "application/pdf":
+                raise ValueError("请求正文必须是 PDF")
+            raw_content_length = self.headers.get("Content-Length")
+            if raw_content_length is None:
+                raise ValueError("Content-Length 必须是非负整数")
+            try:
+                content_length = int(raw_content_length)
+            except ValueError as exc:
+                raise ValueError("Content-Length 必须是非负整数") from exc
+            if content_length < 0:
+                raise ValueError("Content-Length 必须是非负整数")
+            if content_length > MAX_PDF_BODY_BYTES:
+                raise RequestBodyTooLargeError("PDF 不能超过 20 MiB")
+            body = self.rfile.read(content_length)
+            if not body.startswith(b"%PDF-"):
+                raise ValueError("请求正文必须是有效的 PDF")
+            return body
+
         def _research_chat_session_id(self, path: str) -> str | None:
             parts = path.strip("/").split("/")
             if len(parts) == 4 and parts[:3] == ["api", "research-chat", "sessions"]:
@@ -442,6 +486,8 @@ def create_dashboard_server(
             status = HTTPStatus.INTERNAL_SERVER_ERROR
             if isinstance(error, RequestBodyTooLargeError):
                 status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            elif isinstance(error, PermissionError):
+                status = HTTPStatus.FORBIDDEN
             elif isinstance(error, ValueError):
                 status = HTTPStatus.BAD_REQUEST
             elif isinstance(error, StandardBacktestExecutionError):
@@ -478,13 +524,27 @@ def create_dashboard_server(
     return ThreadingHTTPServer((host, port), DashboardRequestHandler)
 
 
-def serve_dashboard(config: DashboardConfig, *, host: str, port: int) -> None:
+def _is_loopback_address(value: str) -> bool:
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def serve_dashboard(
+    config: DashboardConfig,
+    *,
+    host: str,
+    port: int,
+    eastmoney_password: str = "",
+) -> None:
     account_sync_service = DashboardAccountSyncService(config=config)
     server = create_dashboard_server(
         config=config,
         host=host,
         port=port,
         account_sync_service=account_sync_service,
+        eastmoney_password=eastmoney_password,
     )
     _, actual_port = server.server_address
     try:

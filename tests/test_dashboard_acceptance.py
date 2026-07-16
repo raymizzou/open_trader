@@ -53,8 +53,10 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
 
     assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
     assert 'DASHBOARD_LOG ?= /tmp/open_trader_dashboard_8766.log' in makefile
+    assert 'EXPECTED_CN ?= 5' in makefile
     assert '--url "$(DASHBOARD_URL)"' in makefile
     assert '--log "$(DASHBOARD_LOG)"' in makefile
+    assert '--expected-cn "$(EXPECTED_CN)"' in makefile
     assert "WAIT_SECONDS" not in makefile
     assert "--wait-seconds" not in makefile
 
@@ -1017,6 +1019,18 @@ class TabbedAccountLocator:
             broker = self._require_known_broker(match.group(1))
             return int(
                 self.page.trend_broker is None and self.page.selected == broker
+            )
+        match = re.fullmatch(
+            r'#account-(\w+):visible \[data-statement-upload="(\w+)"\]:visible',
+            self.selector,
+        )
+        if match:
+            section_broker = self._require_known_broker(match.group(1))
+            upload_broker = self._require_known_broker(match.group(2))
+            return int(
+                section_broker == upload_broker
+                and section_broker in {"phillips", "eastmoney"}
+                and self.page.viewport_size["width"] > 760
             )
         for broker in self.page.tab_order:
             entry = f"#account-{broker}:visible .trend-report-entry"
@@ -2478,6 +2492,40 @@ def test_check_account_holdings_visits_every_broker_tab(
         "#trend-report-workspace:visible .cn-trend-buy",
         '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
     ]
+
+
+@pytest.mark.parametrize(
+    ("broker", "width", "count"),
+    [
+        ("futu", 1440, 0),
+        ("tiger", 1440, 0),
+        ("phillips", 1440, 1),
+        ("eastmoney", 1440, 1),
+        ("phillips", 375, 0),
+        ("eastmoney", 375, 0),
+    ],
+)
+def test_check_statement_upload_enforces_desktop_only_controls(
+    broker: str,
+    width: int,
+    count: int,
+) -> None:
+    checked: list[str] = []
+
+    class Locator:
+        def count(self) -> int:
+            return count
+
+    class Section:
+        def locator(self, selector: str) -> Locator:
+            checked.append(selector)
+            return Locator()
+
+    dashboard_acceptance._check_statement_upload(  # type: ignore[attr-defined]
+        Section(), broker, width
+    )
+
+    assert checked == [f'[data-statement-upload="{broker}"]:visible']
 
 
 def test_acceptance_rejects_unavailable_eastmoney_report_for_screenshot(

@@ -864,6 +864,16 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
     assert f"API 成本：{_display_number(cost)}" in audit_text, f"{broker} 审计详情缺少 API 成本"
 
 
+def _check_statement_upload(section: Any, broker: str, width: int) -> None:
+    count = section.locator(
+        f'[data-statement-upload="{broker}"]:visible'
+    ).count()
+    expected = int(width > 760 and broker in {"phillips", "eastmoney"})
+    assert count == expected, (
+        f"{broker} 结单上传入口数量不是 {expected}（视口宽度 {width}）"
+    )
+
+
 def _check_account_holdings(
     page: Any,
     payload: dict[str, Any],
@@ -889,6 +899,8 @@ def _check_account_holdings(
     }
     for broker in ACCOUNT_BROKERS:
         section = _select_account_tab(page, broker)
+        width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+        _check_statement_upload(section, broker, width)
         text = section.inner_text()
         for required in (*profiles[broker], "持仓资产", "现金", "持仓", "来源", "时间"):
             assert required in text, f"{broker} 账户区块缺少 {required}"

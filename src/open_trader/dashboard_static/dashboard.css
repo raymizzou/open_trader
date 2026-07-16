@@ -1442,6 +1442,27 @@ table {
   justify-content: space-between;
 }
 
+.account-section-actions {
+  margin-left: auto;
+  text-align: right;
+}
+
+.statement-upload {
+  margin-top: 8px;
+}
+
+.statement-upload-status {
+  color: var(--muted);
+  display: block;
+  font-size: 0.78rem;
+  margin-top: 4px;
+  max-width: 260px;
+}
+
+.statement-upload-status.error {
+  color: var(--danger);
+}
+
 .account-strategy-summary {
   border-top: 1px solid var(--line);
   padding: 12px;
@@ -4079,6 +4100,10 @@ table {
   .account-section-header {
     display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .statement-upload {
+    display: none;
   }
 
   .account-holdings-table {

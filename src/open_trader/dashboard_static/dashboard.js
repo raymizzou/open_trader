@@ -17,6 +17,7 @@ const state = {
   detailLanguage: "zh",
   refreshActive: false,
   quoteIntervalId: null,
+  statementUpload: {broker: "", busy: false, message: "", error: false},
   researchChat: {
     holdingKey: "",
     sessionId: "",
@@ -264,6 +265,14 @@ function bindEvents() {
   elements["account-tabs"].addEventListener("keydown", handleBrokerTabKeydown);
   elements["broker-summary-cards"].addEventListener("click", handleBrokerSelection);
   elements["account-holdings"].addEventListener("click", (event) => {
+    const statementUpload = event.target.closest("[data-statement-upload]");
+    if (statementUpload) {
+      const broker = statementUpload.dataset.statementUpload || "";
+      elements["account-holdings"].querySelector(
+        `[data-statement-file="${broker}"]`,
+      )?.click();
+      return;
+    }
     const trendReport = event.target.closest("[data-trend-report]");
     if (trendReport) {
       openTrendReport(trendReport.dataset.trendReport || "");
@@ -276,6 +285,7 @@ function bindEvents() {
     }
     handleSymbolDetailClick(event);
   });
+  elements["account-holdings"].addEventListener("change", handleStatementFileSelection);
   if (elements["trade-actions"]) {
     elements["trade-actions"].addEventListener("click", (event) => {
       const button = event.target.closest("[data-action-detail]");
@@ -2369,7 +2379,6 @@ function renderAccountSection(group) {
       <div><h2 id="${headingId}">${escapeHtml(brokerDisplayName(group.summary))}</h2>
       <span>${escapeHtml(group.profile.horizon)} · ${escapeHtml(group.profile.strategy)}</span>
       <span>${escapeHtml(formatPlain(alias))}</span></div>
-      <strong>${escapeHtml(formatMoney(group.summary.portfolio_value_hkd, "HKD"))}</strong>
       <div class="account-section-meta">
         <span>持仓资产 ${escapeHtml(formatMoney(group.summary.holding_value_hkd, "HKD"))}</span>
         <span>现金 ${escapeHtml(formatMoney(group.summary.cash_like_value_hkd, "HKD"))}</span>
@@ -2382,6 +2391,10 @@ function renderAccountSection(group) {
         ${renderAccountCashDetails(group)}
       </div>
       ${renderTrendReportEntry(group.broker)}
+      <div class="account-section-actions">
+        <strong>${escapeHtml(formatMoney(group.summary.portfolio_value_hkd, "HKD"))}</strong>
+        ${renderStatementUpload(group.broker)}
+      </div>
     </header>
     ${renderAccountStrategy(group)}
     ${rows.length ? renderAccountTable(rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
@@ -2395,6 +2408,73 @@ function renderAccountCashDetails(group) {
   if (!components.length) return "";
   const rows = components.map((component) => `<li><span>${escapeHtml(formatPlain(component.label))}</span><strong>${escapeHtml(formatMoney(component.value_hkd, "HKD"))}</strong></li>`).join("");
   return `<details class="account-cash-details"><summary>现金构成</summary><ul>${rows}</ul></details>`;
+}
+
+function renderStatementUpload(broker) {
+  if (!["phillips", "eastmoney"].includes(broker)) return "";
+  const active = state.statementUpload.broker === broker;
+  const busy = active && state.statementUpload.busy;
+  const message = active ? state.statementUpload.message : "";
+  const tone = active && state.statementUpload.error ? " error" : "";
+  return `<div class="statement-upload">
+    <input class="statement-upload-input" type="file" accept=".pdf,application/pdf" data-statement-file="${escapeHtml(broker)}" hidden>
+    <button class="secondary-button" type="button" data-statement-upload="${escapeHtml(broker)}" ${busy ? "disabled" : ""}>${busy ? "上传中…" : "上传结单"}</button>
+    <span class="statement-upload-status${tone}" role="status">${escapeHtml(message)}</span>
+  </div>`;
+}
+
+async function uploadStatement(broker, file) {
+  if (!/\.pdf$/i.test(String(file?.name || ""))) {
+    throw new Error("请选择 PDF 文件");
+  }
+  if (Number(file.size) > 20 * 1024 * 1024) {
+    throw new Error("PDF 不能超过 20 MiB");
+  }
+  const response = await fetch(`/api/statements/${encodeURIComponent(broker)}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/pdf"},
+    body: file,
+  });
+  const payload = await response.json();
+  if (!response.ok || payload.status === "error") {
+    throw new Error(payload.message || `上传失败 (${response.status})`);
+  }
+  await loadDashboard();
+  return payload;
+}
+
+async function handleStatementFileSelection(event) {
+  const input = event.target.closest("[data-statement-file]");
+  const file = input?.files?.[0];
+  if (!input || !file) return;
+  const broker = input.dataset.statementFile || "";
+  state.statementUpload = {broker, busy: true, message: "", error: false};
+  renderAccountHoldings();
+  try {
+    const payload = await uploadStatement(broker, file);
+    state.statementUpload = {
+      broker,
+      busy: false,
+      message: `已导入 ${payload.statement_date} · 持仓 ${payload.positions}`,
+      error: false,
+    };
+    setTimeout(() => {
+      if (state.statementUpload.broker === broker && !state.statementUpload.error) {
+        state.statementUpload.message = "";
+        renderAccountHoldings();
+      }
+    }, 4000);
+  } catch (error) {
+    state.statementUpload = {
+      broker,
+      busy: false,
+      message: error instanceof Error ? error.message : String(error),
+      error: true,
+    };
+  } finally {
+    input.value = "";
+    renderAccountHoldings();
+  }
 }
 
 function renderAccountTable(rows) {

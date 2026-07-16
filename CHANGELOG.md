@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-16
 
+- Added desktop-only, right-aligned Phillips and Eastmoney statement uploads
+  with local PDF validation, transactional per-broker replacement, and closed
+  Eastmoney position handling; verified the real 2026-07-16 upload-to-render
+  Playwright flow, `2243` tests, and the Dashboard acceptance gate (`PASS`).
 - Unified A-share, US, and HK trend reports around the same action-first desktop
   tables and mobile cards while retaining market-specific facts, excluded closed
   zero-quantity positions from Dashboard holdings, and expanded real acceptance

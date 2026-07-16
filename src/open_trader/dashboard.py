@@ -611,6 +611,10 @@ def _latest_broker_details(
     positions: list[dict[str, str]] = []
     cash: list[dict[str, str]] = []
     found: set[str] = set()
+    statement_candidates: dict[
+        str,
+        tuple[tuple[str, str], list[dict[str, str]], list[dict[str, str]]],
+    ] = {}
     run_dirs = sorted(
         (
             path
@@ -635,9 +639,28 @@ def _latest_broker_details(
                 row for row in run_cash if _broker_key(row.get("broker", "")) == broker
             ]
             if broker_positions or broker_cash:
+                if broker in {"phillips", "eastmoney"}:
+                    period = _latest_statement_period(
+                        [*broker_positions, *broker_cash], broker
+                    )
+                    key = (period, run_dir.name)
+                    current = statement_candidates.get(broker)
+                    if current is None or key > current[0]:
+                        statement_candidates[broker] = (
+                            key,
+                            broker_positions,
+                            broker_cash,
+                        )
+                    continue
                 positions.extend(broker_positions)
                 cash.extend(broker_cash)
                 found.add(broker)
+    for broker in ("phillips", "eastmoney"):
+        candidate = statement_candidates.get(broker)
+        if candidate is None:
+            continue
+        positions.extend(candidate[1])
+        cash.extend(candidate[2])
     return positions, cash
 
 

@@ -115,39 +115,46 @@ def recalculate_portfolio_weights(rows: list[dict[str, str]]) -> None:
         row["portfolio_weight_hkd"] = f"{percentage:.2f}%"
 
 
-def merge_eastmoney_portfolio_rows(
+def replace_broker_portfolio_rows(
     existing_rows: Iterable[dict[str, str]],
-    eastmoney_rows: Iterable[dict[str, str]],
+    replacement_rows: Iterable[dict[str, str]],
+    broker: str,
 ) -> list[dict[str, str]]:
+    target = broker.strip().lower()
+    if not target:
+        raise PortfolioBuildError("replacement broker is required")
+    label = "Eastmoney" if target == "eastmoney" else target
     existing = [
         {field: str(row.get(field, "")) for field in PORTFOLIO_FIELDNAMES}
         for row in existing_rows
     ]
     new = [
         {field: str(row.get(field, "")) for field in PORTFOLIO_FIELDNAMES}
-        for row in eastmoney_rows
+        for row in replacement_rows
     ]
 
     preserved: list[dict[str, str]] = []
     for row in existing:
         brokers = _broker_parts(row["brokers"])
-        if "eastmoney" in brokers and brokers != {"eastmoney"}:
+        if target in brokers and brokers != {target}:
             raise PortfolioBuildError(
-                f"portfolio row {row['symbol']} mixes Eastmoney with other brokers: {row['brokers']}"
+                f"portfolio row {row['symbol']} mixes {label} with other brokers: {row['brokers']}"
             )
-        if brokers != {"eastmoney"}:
+        if brokers != {target}:
             preserved.append(row)
 
     for row in new:
-        if _broker_parts(row["brokers"]) != {"eastmoney"}:
-            raise PortfolioBuildError(f"new Eastmoney row has invalid brokers: {row['brokers']}")
+        if _broker_parts(row["brokers"]) != {target}:
+            raise PortfolioBuildError(
+                f"new {label} row has invalid brokers: {row['brokers']}"
+            )
 
     preserved_ids = {_portfolio_identity(row) for row in preserved}
     collisions = preserved_ids & {_portfolio_identity(row) for row in new}
     if collisions:
         market, symbol, currency = sorted(collisions)[0]
         raise PortfolioBuildError(
-            f"Eastmoney identity collision with preserved broker: {market}.{symbol}.{currency}"
+            f"{label} identity collision with preserved broker: {market}.{symbol}.{currency}"
         )
 
     combined = preserved + new
@@ -183,6 +190,13 @@ def merge_eastmoney_portfolio_rows(
         combined,
         key=lambda row: (int(row["sort_group"]), -Decimal(row["market_value_hkd"])),
     )
+
+
+def merge_eastmoney_portfolio_rows(
+    existing_rows: Iterable[dict[str, str]],
+    eastmoney_rows: Iterable[dict[str, str]],
+) -> list[dict[str, str]]:
+    return replace_broker_portfolio_rows(existing_rows, eastmoney_rows, "eastmoney")
 
 
 def _broker_parts(value: str) -> set[str]:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import csv
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from os import close
 from pathlib import Path
@@ -14,9 +14,21 @@ from uuid import uuid4
 
 from .csv_io import write_rows
 from .fx import StaticMonthEndFxProvider
-from .models import CashBalance, ManifestRecord, Position, WarningRecord
+from .models import (
+    AssetClass,
+    CashBalance,
+    ManifestRecord,
+    Market,
+    Position,
+    WarningRecord,
+)
 from .parsers.base import ParseResult, StatementParser, sha256_file
-from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, merge_eastmoney_portfolio_rows
+from .portfolio import (
+    PORTFOLIO_FIELDNAMES,
+    build_portfolio_rows,
+    merge_eastmoney_portfolio_rows,
+    replace_broker_portfolio_rows,
+)
 
 
 MANIFEST_FIELDNAMES = [
@@ -91,25 +103,89 @@ def run_import(
     update_latest: bool = True,
 ) -> ImportResult:
     validate_month(month)
+    return _run_import(
+        month=month,
+        statement_period=month,
+        run_name=month,
+        statement_paths=statement_paths,
+        parsers=parsers,
+        data_dir=data_dir,
+        latest_path=data_dir / "latest" / "portfolio.csv",
+        fx_provider=fx_provider,
+        update_latest=update_latest,
+        replace_latest_broker=None,
+    )
+
+
+def run_uploaded_statement(
+    *,
+    statement_date: str,
+    statement_path: Path,
+    parser: StatementParser,
+    data_dir: Path,
+    portfolio_path: Path,
+    fx_provider: StaticMonthEndFxProvider,
+) -> ImportResult:
+    try:
+        parsed_date = date.fromisoformat(statement_date)
+    except ValueError:
+        raise ValueError(f"invalid statement date: {statement_date}") from None
+    if parsed_date.isoformat() != statement_date:
+        raise ValueError(f"invalid statement date: {statement_date}")
+    return _run_import(
+        month=statement_date[:7],
+        statement_period=statement_date,
+        run_name=statement_date[:7],
+        statement_paths={parser.broker: statement_path},
+        parsers=[parser],
+        data_dir=data_dir,
+        latest_path=portfolio_path,
+        fx_provider=fx_provider,
+        update_latest=True,
+        replace_latest_broker=parser.broker,
+    )
+
+
+def _run_import(
+    *,
+    month: str,
+    statement_period: str,
+    run_name: str,
+    statement_paths: Mapping[str, Path],
+    parsers: Iterable[StatementParser],
+    data_dir: Path,
+    latest_path: Path,
+    fx_provider: StaticMonthEndFxProvider,
+    update_latest: bool,
+    replace_latest_broker: str | None,
+) -> ImportResult:
     parser_list = list(parsers)
     _validate_statement_paths(statement_paths, parser_list)
 
-    run_dir = data_dir / "runs" / month
-    latest_dir = data_dir / "latest"
+    run_dir = data_dir / "runs" / run_name
+    latest_dir = latest_path.parent
 
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
     warnings: list[WarningRecord] = []
     manifest: list[ManifestRecord] = []
+    if replace_latest_broker is not None:
+        positions, cash_balances, warnings, manifest = _preserved_run_records(
+            run_dir, replace_latest_broker
+        )
+    uploaded_positions: list[Position] = []
+    uploaded_cash: list[CashBalance] = []
 
     for parser in parser_list:
         source_path = statement_paths[parser.broker]
         parsed_at = datetime.now(UTC).isoformat()
-        parse_result = parser.parse(source_path, month)
+        parse_result = parser.parse(source_path, statement_period)
         _validate_parse_result_brokers(parser.broker, parse_result)
 
         positions.extend(parse_result.positions)
         cash_balances.extend(parse_result.cash_balances)
+        uploaded_positions.extend(parse_result.positions)
+        uploaded_cash.extend(parse_result.cash_balances)
         warnings.extend(parse_result.warnings)
         manifest.append(
             ManifestRecord(
@@ -125,10 +201,27 @@ def run_import(
         )
 
     portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
+    latest_portfolio_rows = portfolio_rows
 
-    latest_path = latest_dir / "portfolio.csv"
     eastmoney_mode = {parser.broker for parser in parser_list} == {"eastmoney"}
-    if eastmoney_mode and latest_path.exists():
+    if replace_latest_broker is not None and latest_path.exists():
+        detail_dir = _latest_daily_detail_dir(data_dir)
+        if detail_dir is not None:
+            latest_positions, latest_cash, _, _ = _preserved_run_records(
+                detail_dir, replace_latest_broker
+            )
+            latest_portfolio_rows = build_portfolio_rows(
+                month,
+                [*latest_positions, *uploaded_positions],
+                [*latest_cash, *uploaded_cash],
+                fx_provider,
+            )
+        else:
+            with latest_path.open(newline="", encoding="utf-8") as handle:
+                latest_portfolio_rows = replace_broker_portfolio_rows(
+                    list(csv.DictReader(handle)), portfolio_rows, replace_latest_broker
+                )
+    elif eastmoney_mode and latest_path.exists():
         with latest_path.open(newline="", encoding="utf-8") as handle:
             portfolio_rows = merge_eastmoney_portfolio_rows(
                 list(csv.DictReader(handle)), portfolio_rows
@@ -167,7 +260,14 @@ def run_import(
 
         if update_latest:
             assert temp_latest_path is not None
-            copyfile(temp_run_dir / "portfolio.csv", temp_latest_path)
+            if latest_portfolio_rows is portfolio_rows:
+                copyfile(temp_run_dir / "portfolio.csv", temp_latest_path)
+            else:
+                write_rows(
+                    temp_latest_path,
+                    PORTFOLIO_FIELDNAMES,
+                    latest_portfolio_rows,
+                )
             if latest_path.exists():
                 backup_latest_path = _make_backup_latest_path(latest_path)
                 latest_path.rename(backup_latest_path)
@@ -204,12 +304,144 @@ def run_import(
         latest_path=latest_path,
         positions_count=(
             sum(row["asset_class"] != "cash" for row in portfolio_rows)
-            if eastmoney_mode
-            else len(positions)
+            if eastmoney_mode and replace_latest_broker is None
+            else len(uploaded_positions)
         ),
-        cash_count=len(cash_balances),
+        cash_count=len(uploaded_cash),
         warnings_count=len(warnings),
     )
+
+
+def _latest_daily_detail_dir(data_dir: Path) -> Path | None:
+    runs_dir = data_dir / "runs"
+    if not runs_dir.exists():
+        return None
+    candidates = [
+        path
+        for path in runs_dir.iterdir()
+        if path.is_dir()
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.name)
+        and (
+            (path / "extracted_positions.csv").is_file()
+            or (path / "extracted_cash.csv").is_file()
+        )
+    ]
+    return max(candidates, key=lambda path: path.name) if candidates else None
+
+
+def _preserved_run_records(
+    run_dir: Path,
+    target_broker: str,
+) -> tuple[
+    list[Position],
+    list[CashBalance],
+    list[WarningRecord],
+    list[ManifestRecord],
+]:
+    target = target_broker.strip().lower()
+    positions = [
+        _position_from_row(row)
+        for row in _read_rows(run_dir / "extracted_positions.csv")
+        if _detail_broker(row) != target
+    ]
+    cash = [
+        _cash_from_row(row)
+        for row in _read_rows(run_dir / "extracted_cash.csv")
+        if _detail_broker(row) != target
+    ]
+    warnings = [
+        WarningRecord(
+            statement_id=row.get("statement_id", ""),
+            broker=row.get("broker", ""),
+            page=int(row["page"]) if row.get("page", "").strip() else None,
+            severity=row.get("severity", ""),
+            code=row.get("code", ""),
+            message=row.get("message", ""),
+        )
+        for row in _read_rows(run_dir / "parse_warnings.csv")
+        if row.get("broker", "").strip().lower() != target
+    ]
+    manifest = [
+        ManifestRecord(
+            month=row.get("month", ""),
+            broker=row.get("broker", ""),
+            source_file=row.get("source_file", ""),
+            source_sha256=row.get("source_sha256", ""),
+            parsed_at=row.get("parsed_at", ""),
+            page_count=int(row.get("page_count", "0")),
+            parser_version=row.get("parser_version", ""),
+            status=row.get("status", ""),
+        )
+        for row in _read_rows(run_dir / "manifest.csv")
+        if row.get("broker", "").strip().lower() != target
+    ]
+    return positions, cash, warnings, manifest
+
+
+def _read_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _detail_broker(row: dict[str, str]) -> str:
+    broker = row.get("broker", "").strip().lower()
+    if not broker or ";" in broker or "," in broker:
+        raise ValueError(f"invalid detailed broker: {broker or 'missing'}")
+    return broker
+
+
+def _position_from_row(row: dict[str, str]) -> Position:
+    return Position(
+        statement_id=row.get("statement_id", ""),
+        broker=_detail_broker(row),
+        account_alias=row.get("account_alias", ""),
+        market=_enum_or_default(Market, row.get("market", ""), Market.OTHER),
+        asset_class=_enum_or_default(
+            AssetClass, row.get("asset_class", ""), AssetClass.UNKNOWN
+        ),
+        symbol=row.get("symbol", ""),
+        name=row.get("name", ""),
+        currency=row.get("currency", "").upper(),
+        quantity=Decimal(row["quantity"]),
+        cost_price=_optional_decimal(row.get("cost_price", "")),
+        last_price=_optional_decimal(row.get("last_price", "")),
+        market_value=_optional_decimal(row.get("market_value", "")),
+        cost_value=_optional_decimal(row.get("cost_value", "")),
+        unrealized_pnl=_optional_decimal(row.get("unrealized_pnl", "")),
+        confidence=_confidence(row.get("confidence", "")),
+        notes=row.get("notes", ""),
+    )
+
+
+def _cash_from_row(row: dict[str, str]) -> CashBalance:
+    return CashBalance(
+        statement_id=row.get("statement_id", ""),
+        broker=_detail_broker(row),
+        account_alias=row.get("account_alias", ""),
+        currency=row.get("currency", "").upper(),
+        cash_balance=Decimal(row["cash_balance"]),
+        available_balance=_optional_decimal(row.get("available_balance", "")),
+        confidence=_confidence(row.get("confidence", "")),
+        notes=row.get("notes", ""),
+    )
+
+
+def _optional_decimal(value: str) -> Decimal | None:
+    return Decimal(value) if value.strip() else None
+
+
+def _confidence(value: str) -> str:
+    normalized = value.strip().lower()
+    return normalized if normalized in {"high", "medium", "low"} else "low"
+
+
+def _enum_or_default(enum_type, value: str, default):
+    try:
+        return enum_type(value.strip())
+    except ValueError:
+        return default
 
 
 def validate_month(month: str) -> str:

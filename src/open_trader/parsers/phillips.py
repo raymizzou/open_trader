@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 import re
@@ -20,6 +21,10 @@ from open_trader.parsers.base import (
 BROKER = "phillips"
 ACCOUNT_ALIAS = "phillips_main"
 NUMERIC = r"(?:-?[\d,.]+|\([\d,.]+\))"
+ISSUE_DATE = re.compile(
+    r"(?:日期\s*)?Issue Date\s*[:：]\s*(\d{2})/(\d{2})/(\d{2})",
+    re.IGNORECASE,
+)
 
 
 def parse_phillips_text(text: str, month: str) -> ParseResult:
@@ -285,6 +290,18 @@ def _normalize_line(line: str) -> str:
 
 class PhillipsStatementParser(StatementParser):
     broker = BROKER
+
+    def statement_date(self, path: Path) -> str:
+        with pdfplumber.open(path) as pdf:
+            text = pdf.pages[0].extract_text() if pdf.pages else ""
+        match = ISSUE_DATE.search(text or "")
+        if match is None:
+            raise ValueError("辉立结单缺少 Issue Date")
+        day, month, year = match.groups()
+        try:
+            return date(2000 + int(year), int(month), int(day)).isoformat()
+        except ValueError:
+            raise ValueError("辉立结单包含无效 Issue Date") from None
 
     def parse(self, path: Path, month: str) -> ParseResult:
         with pdfplumber.open(path) as pdf:

@@ -20,6 +20,7 @@ def test_dashboard_parser_defaults() -> None:
     assert args.portfolio == Path("data/latest/portfolio.csv")
     assert args.data_dir == Path("data")
     assert args.reports_dir == Path("reports")
+    assert args.config == Path("config/daily_premarket.env")
     assert args.poll_seconds == 5.0
     assert args.futu_host == "127.0.0.1"
     assert args.futu_port == 11111
@@ -36,12 +37,18 @@ def test_dashboard_main_delegates_to_server(
         *,
         host: str,
         port: int,
+        eastmoney_password: str,
     ) -> None:
         captured["config"] = config
         captured["host"] = host
         captured["port"] = port
+        captured["eastmoney_password"] = eastmoney_password
 
     monkeypatch.setattr(cli, "serve_dashboard", fake_serve_dashboard)
+    (tmp_path / "dashboard.env").write_text(
+        "OPEN_TRADER_EASTMONEY_PDF_PASSWORD=local-secret\n",
+        encoding="utf-8",
+    )
 
     result = cli.main(
         [
@@ -56,6 +63,8 @@ def test_dashboard_main_delegates_to_server(
             str(tmp_path / "data"),
             "--reports-dir",
             str(tmp_path / "reports"),
+            "--config",
+            str(tmp_path / "dashboard.env"),
             "--poll-seconds",
             "2.5",
             "--futu-host",
@@ -68,6 +77,7 @@ def test_dashboard_main_delegates_to_server(
     assert result == 0
     assert captured["host"] == "0.0.0.0"
     assert captured["port"] == 9000
+    assert captured["eastmoney_password"] == "local-secret"
     config = captured["config"]
     assert isinstance(config, DashboardConfig)
     assert config.portfolio_path == tmp_path / "portfolio.csv"
@@ -93,6 +103,7 @@ def test_dashboard_help_includes_expected_options(
     assert "--portfolio" in output
     assert "--data-dir" in output
     assert "--reports-dir" in output
+    assert "--config" in output
     assert "--poll-seconds" in output
     assert "--futu-host" in output
     assert "--futu-port" in output

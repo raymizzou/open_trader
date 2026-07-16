@@ -50,6 +50,18 @@ def test_parse_eastmoney_cash_when_currency_balances_share_lines() -> None:
     assert result.cash_balances[0].available_balance == Decimal("405219.55")
 
 
+def test_parse_eastmoney_skips_closed_zero_positions() -> None:
+    closed = ["沪市A股", "600000", "已清仓", "0", "1", "1", "0"]
+
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [[POSITIONS[0], closed, POSITIONS[1]]],
+        "2026-07",
+    )
+
+    assert [position.symbol for position in result.positions] == ["600025"]
+
+
 def test_parser_rejects_missing_summary_table() -> None:
     with pytest.raises(ValueError, match="汇总股票资料"):
         parse_eastmoney_page("资金余额", [], "2026-07")
@@ -132,3 +144,60 @@ def test_encrypted_parser_wraps_errors_without_password(
     assert "sanitized-secret" not in "".join(
         traceback.format_exception(exc_info.value)
     )
+
+
+def test_encrypted_parser_extracts_print_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def extract_text(self) -> str:
+            return "东方财富证券\n打印日期：2026-07-12"
+
+    class FakePdf:
+        pages = [FakePage()]
+
+        def __enter__(self) -> FakePdf:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "open_trader.parsers.eastmoney.pdfplumber.open",
+        lambda path, *, password: FakePdf(),
+    )
+
+    assert (
+        EastmoneyStatementParser(password="sanitized-secret").statement_date(
+            Path("sanitized.pdf")
+        )
+        == "2026-07-12"
+    )
+
+
+def test_encrypted_parser_rejects_missing_print_date_without_password(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def extract_text(self) -> str:
+            return "东方财富证券"
+
+    class FakePdf:
+        pages = [FakePage()]
+
+        def __enter__(self) -> FakePdf:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "open_trader.parsers.eastmoney.pdfplumber.open",
+        lambda path, *, password: FakePdf(),
+    )
+    password = "sanitized-secret"
+
+    with pytest.raises(ValueError, match="打印日期") as exc_info:
+        EastmoneyStatementParser(password=password).statement_date(Path("sanitized.pdf"))
+
+    assert password not in str(exc_info.value)
