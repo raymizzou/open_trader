@@ -2009,7 +2009,15 @@ function cnTrendHints(item) {
 }
 
 function renderCnTrendTable(title, kind, headings, rows, note = "") {
-  return `<section class="trend-stage cn-trend-stage cn-trend-${escapeHtml(kind)}">
+  const desktopScroller = kind === "buy" && (
+    typeof window === "undefined"
+    || typeof window.matchMedia !== "function"
+    || !window.matchMedia("(max-width: 760px)").matches
+  );
+  const scrollerAttributes = kind === "buy"
+    ? ` tabindex="${desktopScroller ? "0" : "-1"}" aria-label="${desktopScroller ? "正式买入计划，可横向滚动" : "正式买入计划"}"`
+    : "";
+  return `<section class="trend-stage cn-trend-stage cn-trend-${escapeHtml(kind)}"${scrollerAttributes}>
     <h2>${escapeHtml(title)}</h2>
     ${note ? `<p class="cn-trend-price-sources">${escapeHtml(note)}</p>` : ""}
     <table class="cn-trend-table"><thead><tr>${headings.map((heading) => `<th scope="col">${escapeHtml(heading)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>

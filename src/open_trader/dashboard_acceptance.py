@@ -48,6 +48,14 @@ WARM_LEDGER_TOKENS = {
     "--success": "#2F855A",
 }
 ACCEPTANCE_SCREENSHOT_DIR = Path("/tmp/open_trader_dashboard_acceptance")
+ACCEPTANCE_SCREENSHOT_NAMES = (
+    "wide_desktop-portfolio.png",
+    "1920-trend-report.png",
+    "desktop-portfolio.png",
+    "1440-trend-report.png",
+    "mobile-portfolio.png",
+    "375-trend-report.png",
+)
 TREND_REASON_LABELS = {
     "protection_line_already_triggered": "活动保护线已触发",
     "danger_signal": "危险信号触发",
@@ -375,6 +383,94 @@ def _first_in_scope_holding(payload: dict[str, Any]) -> tuple[str, str, str]:
             assert broker, "advice-backed holding has no account broker"
             return str(holding.get("market", "")), str(holding.get("symbol", "")), broker
     raise AssertionError("no advice-backed holding exists in Dashboard payload")
+
+
+def _dashboard_holding_key(
+    payload: Mapping[str, Any], market: str, symbol: str,
+) -> str:
+    for index, holding in enumerate(payload.get("holdings") or []):
+        if (
+            isinstance(holding, Mapping)
+            and str(holding.get("market", "")) == market
+            and str(holding.get("symbol", "")) == symbol
+        ):
+            return ":".join((market, symbol, str(holding.get("name", "")), str(index)))
+    raise AssertionError(f"{market}.{symbol} is missing from Dashboard payload")
+
+
+def _check_mobile_targets(page: Any, selector: str) -> None:
+    targets = page.locator(selector)
+    assert targets.count() >= 1, f"移动端缺少交互控件：{selector}"
+    boxes = targets.evaluate_all(
+        "nodes => nodes.map(node => ({"
+        "height: node.getBoundingClientRect().height, "
+        "label: node.getAttribute('aria-label') || node.textContent.trim() || node.tagName"
+        "}))"
+    )
+    for box in boxes:
+        assert box["height"] >= 44, f"{box['label']} 高度不足 44px"
+
+
+def _check_tool_workspaces(page: Any, detail_key: str) -> None:
+    mobile = (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760
+    if mobile:
+        _check_mobile_targets(
+            page,
+            '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
+            ".strategy-tools button:visible, #refresh-quotes:visible, "
+            ".account-holding-actions button:visible",
+        )
+        _check_mobile_targets(
+            page,
+            ".symbol-detail-panel.inline-symbol-detail:visible .decision-tab:visible, "
+            ".symbol-detail-panel.inline-symbol-detail:visible [data-back-to-holdings]:visible",
+        )
+
+    page.locator("#open-kelly-lab").click()
+    assert page.locator(".kelly-lab-panel:visible").count() == 1, (
+        "Kelly Lab 工作区未显示"
+    )
+    if mobile:
+        _check_mobile_targets(
+            page, "#return-to-portfolio:visible, .kelly-lab-panel button:visible"
+        )
+    page.locator("#return-to-portfolio:visible").click()
+    assert page.locator(".holdings-panel:visible").count() == 1, (
+        "Kelly Lab 返回后持仓未恢复"
+    )
+
+    page.locator("#open-standard-backtest").click()
+    assert page.locator("#standard-backtest-workspace:visible").count() == 1, (
+        "标准回测工作区未显示"
+    )
+    if mobile:
+        _check_mobile_targets(
+            page,
+            "#standard-backtest-workspace button:visible, "
+            "#standard-backtest-workspace input:visible, "
+            "#standard-backtest-workspace select:visible",
+        )
+    page.locator("#return-to-portfolio:visible").click()
+    assert page.locator(".holdings-panel:visible").count() == 1, (
+        "标准回测返回后持仓未恢复"
+    )
+
+    trigger = page.locator("[data-research-chat]:visible")
+    if trigger.count():
+        trigger.first.click()
+    else:
+        page.evaluate("detailKey => openResearchChat(detailKey)", detail_key)
+    assert page.locator(".research-chat-modal:visible").count() == 1, (
+        "投研讨论弹窗未显示"
+    )
+    if mobile:
+        _check_mobile_targets(
+            page, ".research-chat-modal button:visible, .research-chat-modal input:visible"
+        )
+    page.locator("#research-chat-close:visible").click()
+    assert page.locator(".research-chat-modal:visible").count() == 0, (
+        "投研讨论弹窗关闭失败"
+    )
 
 
 def _check_decision_tabs(page: Any, market: str, symbol: str, broker: str) -> None:
@@ -816,6 +912,8 @@ def _check_account_holdings(
             assert page.locator("#trend-report-workspace:visible").count() == 0, (
                 f"{broker} 不可用报告错误打开工作区"
             )
+            if broker == "eastmoney" and screenshot_dir is not None:
+                raise AssertionError("eastmoney 趋势报告不可用，无法生成验收截图")
             continue
         assert trigger.count() == 1, f"{broker} 可用报告缺少入口"
         if reports_dir is not None:
@@ -828,18 +926,31 @@ def _check_account_holdings(
         trigger.click()
         workspace = page.locator("#trend-report-workspace:visible")
         assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
-        _check_open_report_layout(page, workspace, broker)
+        close = page.locator("#return-to-portfolio:visible")
+        assert close.count() == 1, f"{broker} 趋势报告工作区缺少共享返回按钮"
+        assert close.evaluate("element => element === document.activeElement"), (
+            f"{broker} 趋势报告打开后焦点未进入工作区"
+        )
+        buy_actions = report.get("buy_actions")
+        expected_buy_count = len(buy_actions) if isinstance(buy_actions, list) else 0
+        _check_open_report_layout(
+            page, workspace, broker, expected_buy_count=expected_buy_count
+        )
+        if (
+            (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760
+        ):
+            _check_mobile_targets(
+                page,
+                "#return-to-portfolio:visible, "
+                "#trend-report-workspace:visible button:visible, "
+                "#trend-report-workspace:visible summary:visible",
+            )
         if broker == "eastmoney" and screenshot_dir is not None:
             width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
             page.screenshot(
                 path=str(screenshot_dir / f"{width}-trend-report.png"),
                 full_page=True,
             )
-        close = page.locator("#return-to-portfolio:visible")
-        assert close.count() == 1, f"{broker} 趋势报告工作区缺少共享返回按钮"
-        assert close.evaluate("element => element === document.activeElement"), (
-            f"{broker} 趋势报告打开后焦点未进入工作区"
-        )
         workspace_text = workspace.inner_text()
         identity = f"{_plain(report.get('broker_label'))}｜{_plain(report.get('market_label'))}"
         assert identity in workspace_text, f"{broker} 趋势报告身份不匹配"
@@ -905,7 +1016,6 @@ def _check_account_holdings(
                     "document.documentElement.scrollWidth <= window.innerWidth"
                 ), "A 股趋势报告在 375px 产生横向滚动"
                 cards = workspace.locator(".cn-trend-card:visible")
-                assert cards.count() >= 1, "A 股趋势报告在 375px 没有可见动作卡"
                 assert all(
                     box is not None and box["x"] + box["width"] <= 376
                     for box in cards.evaluate_all(
@@ -1010,6 +1120,11 @@ def _check_visual_contract(page: Any) -> None:
             "backgroundColor": "rgb(36, 33, 29)",
             "borderTopColor": "rgb(36, 33, 29)",
         },
+        "#last-refresh": {"color": "rgb(116, 110, 100)"},
+        ".research-chat-context .status-ok": {
+            "backgroundColor": "rgb(231, 244, 236)",
+            "color": "rgb(32, 29, 24)",
+        },
     }
     surface = {
         "backgroundColor": "rgb(255, 254, 250)",
@@ -1047,7 +1162,9 @@ def _check_visual_contract(page: Any) -> None:
     }, f"主操作焦点未使用 A 色板：{focus}"
 
 
-def _check_open_report_layout(page: Any, workspace: Any, broker: str) -> None:
+def _check_open_report_layout(
+    page: Any, workspace: Any, broker: str, *, expected_buy_count: int | None = None,
+) -> None:
     viewport = getattr(page, "viewport_size", None) or {}
     width = viewport.get("width", 0)
     if width >= 1920:
@@ -1055,8 +1172,18 @@ def _check_open_report_layout(page: Any, workspace: Any, broker: str) -> None:
           const shell = document.querySelector('.dashboard-shell').getBoundingClientRect();
           const header = document.querySelector('.dashboard-header').getBoundingClientRect();
           const report = document.querySelector('#trend-report-workspace').getBoundingClientRect();
+          const grid = document.querySelector('.workspace-grid');
+          const holdings = document.querySelector('.holdings-panel');
+          const gridHidden = grid.classList.contains('hidden');
+          const holdingsHidden = holdings.classList.contains('hidden');
+          grid.classList.remove('hidden');
+          holdings.classList.remove('hidden');
+          const holdingsRect = holdings.getBoundingClientRect();
+          if (holdingsHidden) holdings.classList.add('hidden');
+          if (gridHidden) grid.classList.add('hidden');
           return {shellWidth: shell.width, headerLeft: header.left, headerRight: header.right,
-                  reportLeft: report.left, reportRight: report.right};
+                  reportLeft: report.left, reportRight: report.right,
+                  holdingsLeft: holdingsRect.left, holdingsRight: holdingsRect.right};
         }""")
         assert abs(geometry["shellWidth"] - 1600) <= 1, (
             "1920px 下 Dashboard shell 不是 1600px"
@@ -1067,14 +1194,52 @@ def _check_open_report_layout(page: Any, workspace: Any, broker: str) -> None:
         assert abs(geometry["headerRight"] - geometry["reportRight"]) <= 1, (
             "趋势报告右边线未与 Header 对齐"
         )
+        assert abs(geometry["holdingsLeft"] - geometry["reportLeft"]) <= 1, (
+            "趋势报告左边线未与持仓面板左边线对齐"
+        )
+        assert abs(geometry["holdingsRight"] - geometry["reportRight"]) <= 1, (
+            "趋势报告右边线未与持仓面板右边线对齐"
+        )
 
     if broker != "eastmoney":
         return
     buy_stage = workspace.locator(".cn-trend-buy")
     assert buy_stage.count() == 1, "A 股趋势报告缺少正式买入区"
+    expected_buy_count = 1 if expected_buy_count is None else expected_buy_count
+    cards = buy_stage.locator(".cn-trend-card:visible")
     if width <= 760:
-        cards = buy_stage.locator(".cn-trend-card:visible")
-        assert cards.count() >= 1, "A 股趋势报告手机端缺少卡片"
+        assert buy_stage.get_attribute("tabindex") == "-1", (
+            "A 股正式买入区在手机端产生多余 Tab 停靠点"
+        )
+        assert buy_stage.get_attribute("aria-label") == "正式买入计划", (
+            "A 股正式买入区手机端标签不正确"
+        )
+        assert cards.count() == expected_buy_count, (
+            "A 股趋势报告手机端买入卡数量与 API 不一致"
+        )
+        if expected_buy_count == 0:
+            assert "无" in buy_stage.inner_text(), "A 股零买入报告未显示 无"
+        return
+    assert buy_stage.get_attribute("tabindex") == "0", (
+        "A 股正式买入滚动区不可通过键盘聚焦"
+    )
+    assert buy_stage.get_attribute("aria-label") == "正式买入计划，可横向滚动", (
+        "A 股正式买入滚动区缺少无障碍标签"
+    )
+    buy_stage.focus()
+    assert buy_stage.evaluate("element => element === document.activeElement"), (
+        "A 股正式买入滚动区无法获得焦点"
+    )
+    focus = buy_stage.evaluate(
+        "element => { const styles = getComputedStyle(element); return {"
+        "outlineColor: styles.outlineColor, outlineStyle: styles.outlineStyle, "
+        "outlineWidth: styles.outlineWidth}; }"
+    )
+    assert focus == {
+        "outlineColor": "rgb(139, 94, 52)",
+        "outlineStyle": "solid", "outlineWidth": "3px",
+    }, f"A 股正式买入滚动区焦点样式不正确：{focus}"
+    if expected_buy_count == 0:
         return
     overflow = buy_stage.evaluate(
         "element => ({clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, "
@@ -1134,6 +1299,29 @@ def _check_cn_filter(page: Any, expected_cn: int) -> None:
     assert total == expected_cn, f"A 股筛选不是 {expected_cn} 条：{total}"
 
 
+def _prepare_acceptance_screenshots() -> int:
+    ACCEPTANCE_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    for name in ACCEPTANCE_SCREENSHOT_NAMES:
+        (ACCEPTANCE_SCREENSHOT_DIR / name).unlink(missing_ok=True)
+    return time.time_ns()
+
+
+def _validate_acceptance_screenshots(started_at_ns: int) -> list[str]:
+    errors: list[str] = []
+    for name in ACCEPTANCE_SCREENSHOT_NAMES:
+        path = ACCEPTANCE_SCREENSHOT_DIR / name
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            errors.append(f"验收截图缺失：{name}")
+            continue
+        if stat.st_size == 0:
+            errors.append(f"验收截图是空文件：{name}")
+        if stat.st_mtime_ns < started_at_ns:
+            errors.append(f"验收截图过期：{name}")
+    return errors
+
+
 def _browser_check(
     url: str,
     expected_cn: int,
@@ -1145,12 +1333,13 @@ def _browser_check(
     except ImportError:
         return [], "Playwright 未安装"
     errors: list[str] = []
+    screenshot_started_at_ns = _prepare_acceptance_screenshots()
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome", headless=True)
-            ACCEPTANCE_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
             try:
                 market, symbol, decision_broker = _first_in_scope_holding(payload)
+                detail_key = _dashboard_holding_key(payload, market, symbol)
             except AssertionError as exc:
                 browser.close()
                 return [str(exc)], None
@@ -1190,6 +1379,10 @@ def _browser_check(
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
                         _check_decision_tabs(page, market, symbol, decision_broker)
+                    except Exception as exc:
+                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
+                    try:
+                        _check_tool_workspaces(page, detail_key)
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
@@ -1236,6 +1429,7 @@ def _browser_check(
             browser.close()
     except Exception as exc:
         return errors, f"浏览器不可用：{type(exc).__name__}: {exc}"
+    errors.extend(_validate_acceptance_screenshots(screenshot_started_at_ns))
     return errors, None
 
 

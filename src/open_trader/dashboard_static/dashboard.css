@@ -1299,7 +1299,7 @@ h2 {
 .status-ok {
   background: #e7f4ec;
   border-color: #b8dac6;
-  color: var(--ok);
+  color: var(--text);
 }
 
 .status-partial,
@@ -1646,6 +1646,11 @@ table {
 .cn-trend-buy {
   border-left-color: var(--ok);
   overflow-x: auto;
+}
+
+.cn-trend-buy:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .cn-trend-buy .cn-trend-table {
@@ -2634,7 +2639,7 @@ tbody tr.active-row {
 .technical-bollinger-card.lower-opportunity .technical-bollinger-header strong {
   background: #f4fbf7;
   border-color: #b9ddc9;
-  color: var(--ok);
+  color: var(--text);
 }
 
 .technical-bollinger-copy {
@@ -3762,6 +3767,10 @@ tbody tr.active-row {
 .pnl-profit { color: var(--danger); font-weight: 800; }
 .pnl-loss { color: var(--success); font-weight: 800; }
 
+tbody tr:hover .pnl-loss {
+  background: var(--surface);
+}
+
 .source-status-row,
 .backtest-form-section,
 .backtest-results,
@@ -3784,7 +3793,7 @@ tbody tr.active-row {
 .badge,
 .trend-report-header dl div,
 .trend-report-metrics span,
-.trend-stage,
+.trend-stage:not(.cn-trend-stage),
 .trend-checklist,
 .trend-discipline,
 th,

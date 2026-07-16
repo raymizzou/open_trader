@@ -17,6 +17,7 @@ const rgb = {
   bg: 'rgb(247, 245, 241)',
   surface: 'rgb(255, 254, 250)',
   text: 'rgb(32, 29, 24)',
+  muted: 'rgb(116, 110, 100)',
   accent: 'rgb(139, 94, 52)',
   line: 'rgb(216, 210, 200)',
   primary: 'rgb(36, 33, 29)',
@@ -142,6 +143,8 @@ test('renders the exact approved warm-ledger contract', async ({ page }) => {
   await expect(page.locator('.current-view-card')).toHaveCSS('background-color', rgb.primary);
   await expectWarmSurface(page, '.header-brand-panel');
   await expectWarmSurface(page, '.holdings-panel');
+  await expect(page.locator('#last-refresh')).toHaveCSS('color', rgb.muted);
+  await expect(page.locator('.research-chat-context .status-ok')).toHaveCSS('color', rgb.text);
 });
 
 test('switches every broker tab and card while preserving US-filtered ledgers', async ({ page }) => {
@@ -204,6 +207,8 @@ test('switches every broker tab and card while preserving US-filtered ledgers', 
   await expect(page.locator('.account-holding-pnl.pnl-profit')).toHaveCSS('color', rgb.danger);
   await page.locator('.broker-summary-card[data-broker="tiger"]').click();
   await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('color', rgb.success);
+  await page.locator('.account-holding-row').hover();
+  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('background-color', rgb.surface);
   await expect(page.getByRole('button', { name: '现金' })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
@@ -230,6 +235,7 @@ test('opens every warm-ledger destination, using real UI paths where available',
   // The display-only dashboard has no reachable research-chat trigger; activate its existing surface directly.
   await page.evaluate(() => (window as any).openResearchChat('US:AAPL:Apple:0'));
   await expectWarmSurface(page, '.research-chat-modal');
+  await expect(page.locator('.research-chat-context .status-ok')).toHaveCSS('color', rgb.text);
   await page.getByRole('button', { name: '关闭' }).click();
   await expect(page.locator('.research-chat-modal')).toBeHidden();
   await page.getByRole('button', { name: '收起' }).click();
@@ -333,6 +339,7 @@ test('aligns the A-share report with the 1600px shell and scrolls only the buy t
   await installLedgerFixture(page);
   await page.goto('/');
   await page.getByRole('tab', { name: /东方财富/ }).click();
+  const holdings = await page.locator('.holdings-panel').boundingBox();
   await page.getByRole('button', { name: '当天趋势报告' }).click();
 
   const geometry = await page.evaluate(() => {
@@ -356,9 +363,20 @@ test('aligns the A-share report with the 1600px shell and scrolls only the buy t
   expect(geometry.shellWidth).toBeCloseTo(1600, 0);
   expect(geometry.reportLeft).toBeCloseTo(geometry.headerLeft, 0);
   expect(geometry.reportRight).toBeCloseTo(geometry.headerRight, 0);
+  expect(geometry.reportLeft).toBeCloseTo(holdings!.x, 0);
+  expect(geometry.reportRight).toBeCloseTo(holdings!.x + holdings!.width, 0);
   expect(geometry.pageFits).toBe(true);
   expect(geometry.overflowX).toBe('auto');
   expect(geometry.stageScrollWidth).toBeGreaterThan(geometry.stageClientWidth);
+  const buyStage = page.locator('.cn-trend-buy');
+  await expect(buyStage).toHaveAttribute('tabindex', '0');
+  await expect(buyStage).toHaveAttribute('aria-label', '正式买入计划，可横向滚动');
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  await expect(buyStage).toBeFocused();
+  await expect(buyStage).toHaveCSS('outline-style', 'solid');
+  await expect(buyStage).toHaveCSS('outline-width', '3px');
+  await expect(page.locator('.cn-trend-price-sources')).toHaveCSS('color', rgb.muted);
 });
 
 test('keeps the A-share report card-based with no page overflow on mobile', async ({ page }) => {
@@ -369,6 +387,10 @@ test('keeps the A-share report card-based with no page overflow on mobile', asyn
   await page.getByRole('button', { name: '当天趋势报告' }).click();
 
   await expect(page.locator('.cn-trend-buy')).toHaveCSS('overflow-x', 'hidden');
+  await expect(page.locator('.cn-trend-buy')).toHaveAttribute('tabindex', '-1');
+  await expect(page.locator('.cn-trend-buy')).toHaveAttribute('aria-label', '正式买入计划');
+  await page.keyboard.press('Tab');
+  await expect(page.locator('.cn-trend-buy')).not.toBeFocused();
   for (const head of await page.locator('.cn-trend-table thead').all()) {
     await expect(head).toBeHidden();
   }

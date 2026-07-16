@@ -234,3 +234,121 @@ Generated evidence digest:
   the same canonical text intentionally appears in reason and meaning; the test
   now asserts an exact count of 2 and both rendered values.
 - Pre-existing untracked `.venv` and `node_modules` symlinks were preserved.
+
+---
+
+# Dashboard Warm-Ledger Final-Review Fix
+
+Date: 2026-07-16 (Asia/Shanghai)
+
+Base HEAD before fixes: `6e291e6684b223ddf546b043cbf58ebf25ddf484`.
+
+## Commit
+
+- Implementation, tests, and this report: recorded by the commit containing this
+  section.
+
+## Fixes
+
+- Corrected all reviewed WCAG AA failures without changing any approved palette
+  token. Normal success text on tinted surfaces now uses `var(--text)`; green
+  remains the semantic border/marker. Hovered loss text keeps the approved green
+  on `var(--surface)` (4.5007:1).
+- Narrowed the soft-surface muted override to
+  `.trend-stage:not(.cn-trend-stage)`, preserving intentional muted secondary text
+  on the main CN report surface, including `.cn-trend-price-sources`.
+- Made the desktop CN buy-table scroller keyboard reachable with an accessible
+  label and visible approved-token focus ring. Mobile card mode renders
+  `tabindex="-1"` and a non-scroll label, so it creates no extra Tab stop.
+- Extended permanent Python Playwright acceptance to cover holdings/header/report
+  edge alignment, secondary and AA-safe status styles, Kelly Lab, standard
+  backtest, decision context, research chat, return paths, and 44px mobile targets
+  inside every opened workspace.
+- Hardened acceptance fakes so unknown selectors/clicks/expressions fail and real
+  navigation, target, geometry, focus, and screenshot paths are recorded.
+- Acceptance now removes only the six expected screenshots before a run, records
+  the run start, requires the Eastmoney report, accepts a valid zero-buy mobile
+  report only with zero buy cards plus `无`, and rejects missing, empty, or stale
+  screenshots after browser checks.
+- Preserved viewport isolation: a wide-desktop failure still runs desktop and
+  mobile; screenshot freshness then reports the missing artifacts from the failed
+  viewport.
+
+## Approved Token Check
+
+The exact approved tokens remain unchanged:
+
+```text
+#F7F5F1 #FFFEFA #F2EEE7 #201D18 #746E64
+#8B5E34 #D8D2C8 #24211D #B42318 #2F855A
+```
+
+Adjusted contrast ratios calculated with WCAG relative luminance:
+
+- `#201D18` on `#E7F4EC`: 14.8353:1
+- `#201D18` on `#F4FBF7`: 15.9864:1
+- `#2F855A` on `#FFFEFA`: 4.5007:1
+- `#746E64` on `#FFFEFA`: 5.0058:1
+
+## TDD RED Evidence
+
+- WCAG and selector-contract RED:
+  `.venv/bin/python -m pytest tests/test_dashboard_web.py -q -k 'muted_text_meets_aa or success_text_meets_aa or cn_trend_secondary'`
+  - `3 failed, 148 deselected in 0.60s`
+  - Failures proved the broad `.trend-stage` override, missing hovered-loss safe
+    background, and missing adjusted foreground contracts.
+- CN scroller accessibility RED:
+  `.venv/bin/python -m pytest tests/test_dashboard_web.py -q -k 'cn_buy_scroller'`
+  - `1 failed, 151 deselected in 0.43s`
+  - The real renderer lacked `tabindex`, `aria-label`, and focus-visible CSS.
+- Acceptance-contract RED:
+  focused screenshot, navigation, geometry, target-size, zero-buy, unavailable
+  report, and visual tests
+  - `13 failed, 1 passed, 130 deselected in 0.31s`
+  - Expected missing functions/contracts included screenshot naming/freshness,
+    workspace navigation, 44px enforcement, holdings geometry, zero-buy behavior,
+    and unavailable Eastmoney rejection. One initial test-harness setup error
+    (`tmp_path.mkdir()` on an existing fixture directory) was corrected to
+    `exist_ok=True` before GREEN work continued.
+
+## GREEN Verification
+
+- Required focused Python tests:
+  `.venv/bin/python -m pytest tests/test_dashboard_web.py tests/test_dashboard_acceptance.py -q`
+  - `296 passed in 16.83s`
+- Required real Chromium E2E:
+  `npm run test:e2e -- tests/e2e/dashboard-warm-ledger.spec.ts --project=chromium`
+  - `6 passed (2.4s)`
+  - Covers computed AA-safe status/hover styles, real tool destinations, desktop
+    keyboard focus and accessible label, mobile no-extra-tab-stop behavior, exact
+    geometry, and mobile layout.
+- Required full Python suite, run once after focused checks passed:
+  `.venv/bin/python -m pytest -q`
+  - `2178 passed in 28.31s`
+- `git diff --check`
+  - exit `0`
+
+## Self-Review
+
+- Reviewed every production caller touched by the acceptance flow; no new product
+  control, API, dependency, or test entrypoint was added.
+- Screenshot cleanup is allow-listed by the exact six names and cannot remove
+  unrelated files from `/tmp/open_trader_dashboard_acceptance`.
+- Screenshot validation checks exact membership expectations, non-empty size, and
+  nanosecond modification time against the current browser run.
+- Desktop CN geometry checks both header and holdings edges. The hidden holdings
+  panel is exposed only transiently inside the Playwright measurement expression
+  and immediately restored.
+- Non-empty CN reports retain card/overflow checks. Zero-buy reports skip the
+  meaningless desktop overflow requirement and require the mobile empty state.
+- Research chat uses a visible production trigger when available; otherwise it
+  invokes the existing production `openResearchChat` with the selected real
+  holding key and closes through the production button.
+- No source-tree screenshot artifacts were created.
+
+## Remaining Risk / Deferred Gate
+
+- No known code-level correctness issue remains.
+- Per the final-fix brief, `make acceptance` was intentionally **not** run. Live
+  API/data, external report availability, service process state, fresh live logs,
+  and review deployment remain for the parent task's final acceptance gate.

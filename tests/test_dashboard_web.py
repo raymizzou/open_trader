@@ -165,7 +165,9 @@ def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
         )
         for selector in selectors.split(",")
     }
-    assert soft_surface_selectors <= contract_selectors
+    assert soft_surface_selectors - {".trend-stage"} <= contract_selectors
+    assert ".trend-stage" not in contract_selectors
+    assert ".trend-stage:not(.cn-trend-stage)" in contract_selectors
 
     for foreground_selector, surface_selector in (
         (".source-status-row span", ".source-status-row"),
@@ -174,6 +176,60 @@ def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
         block = css.split(f"\n{foreground_selector} {{", 1)[1].split("}", 1)[0]
         assert "color: var(--muted);" in block
         assert surface_selector in contract_selectors
+
+
+def test_dashboard_success_text_meets_aa_on_every_adjusted_surface() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    tokens = dict(re.findall(r"--([\w-]+): (#[0-9a-f]{6});", css))
+
+    def luminance(color: str) -> float:
+        channels = (int(color[index:index + 2], 16) / 255 for index in (1, 3, 5))
+        linear = (
+            value / 12.92
+            if value <= 0.04045
+            else ((value + 0.055) / 1.055) ** 2.4
+            for value in channels
+        )
+        red, green, blue = linear
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    def contrast(foreground: str, background: str) -> float:
+        foreground_luminance = luminance(foreground)
+        background_luminance = luminance(background)
+        return (max(foreground_luminance, background_luminance) + 0.05) / (
+            min(foreground_luminance, background_luminance) + 0.05
+        )
+
+    pairings = (
+        (tokens["text"], "#e7f4ec"),
+        (tokens["text"], "#f4fbf7"),
+        (tokens["success"], tokens["surface"]),
+    )
+    assert all(contrast(foreground, background) >= 4.5 for foreground, background in pairings)
+
+    status = css.split("\n.status-ok {", 1)[1].split("}", 1)[0]
+    opportunity = css.split(
+        ".technical-bollinger-card.lower-opportunity .technical-bollinger-header strong {",
+        1,
+    )[1].split("}", 1)[0]
+    hovered_loss = css.split("\ntbody tr:hover .pnl-loss {", 1)[1].split("}", 1)[0]
+    assert "color: var(--text);" in status
+    assert "color: var(--text);" in opportunity
+    assert "background: var(--surface);" in hovered_loss
+
+
+def test_cn_trend_secondary_text_keeps_muted_tone_on_main_surface() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    contract = re.search(
+        r"([^{}]+) \{\n  --muted: var\(--text\);\n\}", css,
+    )
+    assert contract is not None
+    selectors = {selector.strip() for selector in contract.group(1).split(",")}
+    assert ".cn-trend-stage" not in selectors
+    assert ".trend-stage:not(.cn-trend-stage)" in selectors
+    price_sources = css.split("\n.cn-trend-price-sources {", 1)[1].split("}", 1)[0]
+    assert "color: var(--muted);" in price_sources
 
 
 def test_dashboard_account_tabs_register_roving_keyboard_and_panel_semantics() -> None:
@@ -2839,6 +2895,28 @@ console.log("ok");
 ''')
 
     assert "ok" in output
+
+
+def test_dashboard_cn_buy_scroller_is_keyboard_reachable_only_on_desktop() -> None:
+    output = run_dashboard_js(r'''
+const report={market:"CN",counts:{},sell_actions:[],buy_actions:[],hold_actions:[],audit:{}};
+const desktop=renderTrendReportWorkspace(report);
+if (!desktop.includes('class="trend-stage cn-trend-stage cn-trend-buy" tabindex="0" aria-label="正式买入计划，可横向滚动"')) {
+  throw new Error(desktop);
+}
+window={matchMedia:(query)=>({matches:query==="(max-width: 760px)"})};
+const mobile=renderTrendReportWorkspace(report);
+if (!mobile.includes('class="trend-stage cn-trend-stage cn-trend-buy" tabindex="-1" aria-label="正式买入计划"')) {
+  throw new Error(mobile);
+}
+console.log("ok");
+''')
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    assert "ok" in output
+    focus = css.split("\n.cn-trend-buy:focus-visible {", 1)[1].split("}", 1)[0]
+    assert "outline: 3px solid var(--accent);" in focus
+    assert "outline-offset: 2px;" in focus
 
 
 def test_dashboard_cn_empty_stages_keep_tables_and_price_source_labels() -> None:
