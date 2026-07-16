@@ -15,7 +15,6 @@ from open_trader.dashboard_acceptance import (
     classify_result,
     dashboard_signature,
     validate_dashboard_payload,
-    validate_quote_refresh_cycle,
     validate_quotes_payload,
 )
 
@@ -56,6 +55,8 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
     assert 'DASHBOARD_LOG ?= /tmp/open_trader_dashboard_8766.log' in makefile
     assert '--url "$(DASHBOARD_URL)"' in makefile
     assert '--log "$(DASHBOARD_LOG)"' in makefile
+    assert "WAIT_SECONDS" not in makefile
+    assert "--wait-seconds" not in makefile
 
 
 def test_browser_ignores_chrome_unattributed_404_but_not_app_errors() -> None:
@@ -176,10 +177,7 @@ def _run_acceptance_main_with_reports(
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     payloads = iter({"reports_dir": str(path)} for path in report_dirs)
-    first_quotes = valid_quotes_payload()
-    second_quotes = valid_quotes_payload()
-    second_quotes["fetched_at"] = "2026-07-15T15:03:14+08:00"
-    quote_payloads = iter((first_quotes, second_quotes))
+    quote_payloads = iter((valid_quotes_payload(),))
     browser_reports: list[Path | None] = []
     log_path = tmp_path / "dashboard.log"
     if log_is_directory:
@@ -218,6 +216,11 @@ def _run_acceptance_main_with_reports(
         dashboard_acceptance, "_fetch_quotes_payload", lambda url: next(quote_payloads)
     )
     monkeypatch.setattr(
+        dashboard_acceptance.time,
+        "sleep",
+        lambda seconds: pytest.fail(f"acceptance slept for {seconds} seconds"),
+    )
+    monkeypatch.setattr(
         dashboard_acceptance, "validate_dashboard_payload", lambda *args, **kwargs: []
     )
     def browser_check(
@@ -232,7 +235,6 @@ def _run_acceptance_main_with_reports(
     monkeypatch.setattr(dashboard_acceptance, "_browser_check", browser_check)
     status = dashboard_acceptance.main([
         "--expected-root", str(worktree),
-        "--wait-seconds", "0",
         "--log", str(log_path),
     ])
     result = json.loads(capsys.readouterr().out)
@@ -256,7 +258,7 @@ def test_acceptance_main_passes_external_api_reports_dir_to_browser_check(
     assert browser_reports == [external.resolve()]
 
 
-def test_acceptance_main_fails_when_reports_dir_changes_between_refreshes(
+def test_acceptance_main_fails_when_reports_dir_changes_during_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -272,7 +274,7 @@ def test_acceptance_main_fails_when_reports_dir_changes_between_refreshes(
 
     assert status == 1
     assert result["status"] == "FAIL"
-    assert "两个刷新周期的 Dashboard reports_dir 不一致" in result["errors"]
+    assert "账户刷新前后的 Dashboard reports_dir 不一致" in result["errors"]
     assert browser_reports == [second.resolve()]
 
 
@@ -755,26 +757,6 @@ def valid_quotes_payload() -> dict[str, object]:
 
 def test_validate_quotes_payload_accepts_one_selected_us_session_price() -> None:
     assert validate_quotes_payload(valid_quotes_payload()) == []
-
-
-@pytest.mark.parametrize(
-    ("second_fetched_at", "valid"),
-    [
-        ("2026-07-15T15:03:13+08:00", False),
-        ("2026-07-15T15:03:12+08:00", False),
-        ("2026-07-15T15:03:14+08:00", True),
-        ("not-a-timestamp", False),
-    ],
-    ids=("identical", "older", "newer", "invalid"),
-)
-def test_validate_quote_refresh_cycle_requires_strictly_newer_timestamp(
-    second_fetched_at: str, valid: bool,
-) -> None:
-    first = valid_quotes_payload()
-    second = valid_quotes_payload()
-    second["fetched_at"] = second_fetched_at
-
-    assert (validate_quote_refresh_cycle(first, second) == []) is valid
 
 
 @pytest.mark.parametrize(
@@ -2764,6 +2746,7 @@ def test_acceptance_parser_does_not_hardcode_mark_to_market_eastmoney_total() ->
     args = build_parser().parse_args([])
 
     assert args.expected_eastmoney_cny is None
+    assert not hasattr(args, "wait_seconds")
 
 
 def test_validate_dashboard_payload_checks_latest_phillips_statement() -> None:

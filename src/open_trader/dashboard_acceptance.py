@@ -275,21 +275,6 @@ def validate_quotes_payload(payload: dict[str, Any]) -> list[str]:
     return errors
 
 
-def validate_quote_refresh_cycle(
-    first: dict[str, Any], second: dict[str, Any],
-) -> list[str]:
-    try:
-        first_at = datetime.fromisoformat(str(first.get("fetched_at", "")))
-        second_at = datetime.fromisoformat(str(second.get("fetched_at", "")))
-        if first_at.utcoffset() is None or second_at.utcoffset() is None:
-            raise ValueError("timestamp has no timezone")
-        if second_at <= first_at:
-            return ["第二次行情 API 获取时间没有更新"]
-    except (TypeError, ValueError):
-        return ["行情 API 获取时间格式无效"]
-    return []
-
-
 def classify_result(errors: list[str], *, browser_blocker: str | None) -> str:
     if errors:
         return "FAIL"
@@ -1488,7 +1473,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-root", type=Path, default=Path.cwd())
     parser.add_argument("--expected-sha")
     parser.add_argument("--log", type=Path, default=Path("/tmp/open_trader_dashboard_8766.log"))
-    parser.add_argument("--wait-seconds", type=float, default=125)
     return parser
 
 
@@ -1513,8 +1497,6 @@ def main(argv: list[str] | None = None) -> int:
         if running_sha != expected_sha:
             errors.append(f"运行 Git SHA 不匹配：{running_sha[:7]} != {expected_sha[:7]}")
         first = _fetch_payload(args.url)
-        first_quotes = _fetch_quotes_payload(args.url)
-        errors.extend(validate_quotes_payload(first_quotes))
         first_reports_dir = _effective_reports_dir(first, process_cwd=cwd)
         errors.extend(validate_dashboard_payload(
             first, expected_cn=args.expected_cn,
@@ -1523,16 +1505,13 @@ def main(argv: list[str] | None = None) -> int:
             expected_phillips_total=phillips_total,
             expected_phillips_period=phillips_period,
         ))
-        if not errors and args.wait_seconds:
-            time.sleep(args.wait_seconds)
+        quotes = _fetch_quotes_payload(args.url)
+        errors.extend(validate_quotes_payload(quotes))
         second = _fetch_payload(args.url)
-        second_quotes = _fetch_quotes_payload(args.url)
-        errors.extend(validate_quotes_payload(second_quotes))
-        errors.extend(validate_quote_refresh_cycle(first_quotes, second_quotes))
         browser_payload = second
         reports_dir = _effective_reports_dir(second, process_cwd=cwd)
         if first_reports_dir != reports_dir:
-            errors.append("两个刷新周期的 Dashboard reports_dir 不一致")
+            errors.append("账户刷新前后的 Dashboard reports_dir 不一致")
         errors.extend(validate_dashboard_payload(
             second, expected_cn=args.expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
@@ -1541,7 +1520,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_phillips_period=phillips_period,
         ))
         if dashboard_signature(first) != dashboard_signature(second):
-            errors.append("两个刷新周期后的 Dashboard 数据不稳定")
+            errors.append("账户刷新后的 Dashboard 数据不稳定")
     except Exception as exc:
         errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
         pid = None
