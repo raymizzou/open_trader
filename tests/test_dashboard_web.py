@@ -1279,8 +1279,8 @@ console.log(JSON.stringify({quote,kelly,backtest,trend,decision,input:state.stan
         "100,000", "1,000 基点", "00001234",
     ):
         assert expected in rendered["backtest"]
-    assert "卖出 10,000" in rendered["trend"]
-    assert "买入 2,932" in rendered["trend"]
+    assert "全部卖出 10,000" in rendered["trend"]
+    assert "正式买入 2,932" in rendered["trend"]
     assert "2026-07-16" in rendered["trend"]
     assert rendered["decision"]["目标价"] == ">= 1,234,567.50"
     assert rendered["input"] == "100000"
@@ -1300,8 +1300,8 @@ state.dashboard = {kelly_lab:{available:true,experiment_count:"10000",experiment
 }]}};
 const kelly = renderKellyLabPanel();
 const trend = [
-  renderTrendAction({symbol:"02840",name:"SPDR 金",estimated_shares:"10000",target_amount:"29320000.00",estimated_initial_line:"1234567.50"}, "buy"),
-  renderTrendAction({symbol:"02840",name:"SPDR 金",reason:"trend_intact",active_line:"1234567.50"}, "hold"),
+  renderMarketBuyStage({buy_window:"09:30–10:00",buy_actions:[{symbol:"02840",name:"SPDR 金",estimated_shares:"10000",target_amount:"29320000.00",estimated_initial_line:"1234567.50"}]}),
+  renderMarketSellOrHoldStage("盘中持续 · 已有持仓", [{symbol:"02840",name:"SPDR 金",reason:"trend_intact",active_line:"1234567.50"}], "hold"),
   renderTrendAudit({
     candidates:[{symbol:"02840",name:"SPDR 金",strength:"10000"}],
     excluded:{},industry_concentration:[["科技","10000","2932.00"]],
@@ -1324,8 +1324,8 @@ console.log(JSON.stringify({kelly,trend,grouped,omitted}));
         assert expected in rendered["kelly"]
     assert ">02840 SPDR 金<" in rendered["trend"]
     for expected in (
-        "约 10,000 股", "金额上限 29,320,000.00", "预计保护线 1,234,567.50",
-        "活动保护线 1,234,567.50", "强度 10,000", "科技｜10,000｜2,932.00",
+        "10,000 股", "金额上限", "29,320,000.00", "预计保护线", "1,234,567.50",
+        "活动保护线", "强度 10,000", "科技｜10,000｜2,932.00",
         "API 成本：1,234.50",
     ):
         assert expected in rendered["trend"]
@@ -2919,7 +2919,7 @@ const us = renderTrendReportWorkspace({
 for (const text of ["优先处理 · 卖出触发","需要确认 · 人工复核",
   "美股常规交易时段 · 正式买入计划","盘中持续 · 已有持仓",
   "正式买入 1","全部卖出 0","继续持有 0","人工复核 1",
-  "EA 艺电","207.27","99.8","通讯服务","4%","4941.49","23 股",
+  "EA 艺电","207.27","99.8","通讯服务","4%","4,941.49","23 股",
   "205.46930","BOTZ Global X Robotics ETF","趋势信号不完整",
   "账户不参与项","现金类资产不参与趋势判断","审计详情"]) {
   if (!us.includes(text)) throw new Error(text + "\n" + us);

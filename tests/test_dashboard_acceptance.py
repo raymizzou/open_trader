@@ -617,13 +617,13 @@ def trend_reports() -> dict[str, dict[str, object]]:
     return {
         "futu": {
             "available": True, "broker": "futu", "broker_label": "富途",
-            "market_label": "美股", "report_date": "2026-07-15",
+            "market": "US", "market_label": "美股", "report_date": "2026-07-15",
             "data_date": "2026-07-14", "generated_at": "2026-07-15T11:30:36+08:00",
             "account_status": "已更新", "buy_window": "美股常规交易时段",
-            "sell_actions": [{"symbol": "AAPL", "name": "苹果", "reason": "danger_signal", "active_line": "190"}],
-            "buy_actions": [{"symbol": "VIXY", "name": "波动率ETF", "estimated_shares": "5000", "target_amount": "25142.16", "estimated_initial_line": "18.50"}],
-            "hold_actions": [{"symbol": "SPY", "name": "标普ETF", "reason": "trend_intact", "active_line": "500"}],
-            "review_actions": [{"symbol": "QQQ", "name": "纳指ETF", "reason": "holding_signal_unknown"}],
+            "sell_actions": [{"symbol": "AAPL", "name": "苹果", "close": "200", "strength": "99", "reason": "danger_signal", "active_line": "190"}],
+            "buy_actions": [{"symbol": "VIXY", "name": "波动率ETF", "close": "19", "strength": "98", "industry": "ETF", "target_weight": "0.04", "estimated_shares": "5000", "target_amount": "25142.16", "estimated_initial_line": "18.50"}],
+            "hold_actions": [{"symbol": "SPY", "name": "标普ETF", "close": "510", "strength": "97", "reason": "trend_intact", "active_line": "500"}],
+            "review_actions": [{"symbol": "QQQ", "name": "纳指ETF", "close": None, "strength": None, "reason": "holding_signal_unknown"}],
             "counts": {"sell": 1, "buy": 1, "hold": 1, "review": 1},
             "audit": {
                 "candidates": [{"symbol": "VIXY", "name": "波动率ETF", "strength": "5000"}],
@@ -636,7 +636,7 @@ def trend_reports() -> dict[str, dict[str, object]]:
         },
         "phillips": {
             "available": True, "broker": "phillips", "broker_label": "辉立",
-            "market_label": "港股", "report_date": "2026-07-15",
+            "market": "HK", "market_label": "港股", "report_date": "2026-07-15",
             "data_date": "2026-07-14", "generated_at": "2026-07-15T11:31:00+08:00",
             "account_status": "已更新", "buy_window": "09:30–10:00",
             "sell_actions": [], "buy_actions": [], "hold_actions": [],
@@ -820,14 +820,16 @@ def trend_workspace_text(broker: str) -> str:
         return (
             "辉立｜港股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
             "生成时间 2026-07-15T11:31:00+08:00 账户状态 已更新 "
-            "卖出 0 买入 0 持有 0 人工复核 0 今日执行检查 "
-            "确认全部卖出动作 按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
+            "正式买入 0 全部卖出 0 继续持有 0 人工复核 0 "
+            "优先处理 · 卖出触发 需要确认 · 人工复核 "
+            "09:30–10:00 · 正式买入计划 无 盘中持续 · 已有持仓 审计详情"
         )
     return (
         "富途｜美股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
         "生成时间 2026-07-15T11:30:36+08:00 账户状态 已更新 "
-        "卖出 1 买入 1 持有 1 人工复核 1 今日执行检查 "
-        "确认全部卖出动作 按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
+        "正式买入 1 全部卖出 1 继续持有 1 人工复核 1 "
+        "优先处理 · 卖出触发 需要确认 · 人工复核 "
+        "美股常规交易时段 · 正式买入计划 盘中持续 · 已有持仓 审计详情"
     )
 
 
@@ -844,12 +846,17 @@ def trend_stage_texts(broker: str) -> list[str]:
             "98.7 趋势保持完好 27.8 不是新的温转热或温转沸入场信号",
         ]
     if broker == "phillips":
-        return ["开盘前\n无", "09:30–10:00\n无", "盘中持续\n无", "人工复核\n无"]
+        return [
+            "优先处理 · 卖出触发\n无",
+            "需要确认 · 人工复核\n无",
+            "09:30–10:00 · 正式买入计划\n无",
+            "盘中持续 · 已有持仓\n无",
+        ]
     return [
-        "开盘前\nAAPL 苹果 危险信号触发 活动保护线 190",
-        "美股常规交易时段\nVIXY 波动率ETF 约 5,000 股 金额上限 25,142.16 预计保护线 18.50",
-        "盘中持续\nSPY 标普ETF 趋势保持完好 活动保护线 500",
-        "人工复核\nQQQ 纳指ETF 趋势信号不完整",
+        "优先处理 · 卖出触发\nAAPL 苹果 全部卖出 200 99 危险信号触发 190",
+        "需要确认 · 人工复核\nQQQ 纳指ETF 人工复核 — — 趋势信号不完整 — —",
+        "美股常规交易时段 · 正式买入计划\nVIXY 波动率ETF 正式买入 19 98 ETF 4% 25,142.16 5,000 股 18.50",
+        "盘中持续 · 已有持仓\nSPY 标普ETF 继续持有 510 97 趋势保持完好 500",
     ]
 
 
@@ -1051,21 +1058,25 @@ class TabbedAccountLocator:
         if self.selector == "#return-to-portfolio:visible":
             return int(self.page.trend_broker is not None)
         if self.selector == "#trend-report-workspace:visible [data-close-trend-report]":
-            return int(self.page.trend_broker == "eastmoney")
+            return int(self.page.trend_broker is not None)
         if self.selector == ".workspace-grid:visible":
             return int(self.page.trend_broker is None)
         if self.selector == "#trend-report-workspace:visible .cn-trend-report":
-            return int(self.page.trend_broker == "eastmoney")
+            return int(self.page.trend_broker is not None)
         if self.selector == "#trend-report-workspace:visible .trend-discipline[open]":
-            return 0 if self.page.viewport_size["width"] <= 760 else 2
+            return int(self.page.trend_broker == "eastmoney") * (
+                0 if self.page.viewport_size["width"] <= 760 else 2
+            )
         if self.selector == "#trend-report-workspace:visible .trend-discipline":
-            return 2
+            return 2 if self.page.trend_broker == "eastmoney" else 0
         if self.selector == "#trend-report-workspace:visible .cn-trend-table":
-            return 4
+            return 4 if self.page.trend_broker is not None else 0
         if self.selector == (
             "#trend-report-workspace:visible .cn-trend-buy .cn-trend-card"
         ):
-            return 1
+            report = self.page.reports.get(str(self.page.trend_broker), {})
+            actions = report.get("buy_actions", [])
+            return len(actions) if isinstance(actions, list) else 0
         if self.selector == (
             "#trend-report-workspace:visible .cn-trend-buy .cn-trend-card:visible"
         ):
@@ -1073,7 +1084,14 @@ class TabbedAccountLocator:
             actions = report.get("buy_actions", [])
             return len(actions) if isinstance(actions, list) else 0
         if self.selector == "#trend-report-workspace:visible .cn-trend-card:visible":
-            return 4
+            report = self.page.reports.get(str(self.page.trend_broker), {})
+            return sum(
+                len(actions) if isinstance(actions, list) else 0
+                for actions in (
+                    report.get("sell_actions"), report.get("review_actions"),
+                    report.get("buy_actions"), report.get("hold_actions"),
+                )
+            )
         if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
             return 0
         match = re.fullmatch(
@@ -1189,7 +1207,7 @@ class TabbedAccountLocator:
         if self.selector == '#broker-summary-cards [data-broker="phillips"] strong':
             return "HKD 628,554.06"
         if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
-            return trend_workspace_text("eastmoney")
+            return trend_workspace_text(str(self.page.trend_broker))
         match = re.fullmatch(
             r'#trend-report-workspace:visible \.cn-trend-buy '
             r'\.cn-trend-card:nth\(\d+\) td\[data-label="([^"]+)"\]',
@@ -1818,14 +1836,25 @@ def test_acceptance_formats_grouped_numeric_expectations_without_touching_text()
     for value in ("02840", "2026-07-16", "21.13%", "等待确认"):
         assert dashboard_acceptance._plain(value) == value
 
-    dashboard_acceptance._check_trend_stage(
-        "VIXY 波动率ETF 约 5,000 股 金额上限 25,142.16 预计保护线 1,234.50",
-        [{
-            "symbol": "VIXY", "name": "波动率ETF", "estimated_shares": "5000",
-            "target_amount": "25142.16", "estimated_initial_line": "1234.50",
-        }],
-        kind="buy",
-        broker="futu",
+    dashboard_acceptance._check_action_trend_stages(
+        [
+            "优先处理 · 卖出触发 无",
+            "需要确认 · 人工复核 无",
+            "美股常规交易时段 · 正式买入计划 VIXY 波动率ETF "
+            "正式买入 19 98 ETF 4% 25,142.16 5,000 股 1,234.50",
+            "盘中持续 · 已有持仓 无",
+        ],
+        {
+            "buy_window": "美股常规交易时段",
+            "sell_actions": [], "review_actions": [], "hold_actions": [],
+            "buy_actions": [{
+                "symbol": "VIXY", "name": "波动率ETF", "close": "19",
+                "strength": "98", "industry": "ETF", "target_weight": "0.04",
+                "estimated_shares": "5000", "target_amount": "25142.16",
+                "estimated_initial_line": "1234.50",
+            }],
+        },
+        "futu",
     )
 
 
@@ -2342,8 +2371,15 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             '#trend-report-workspace:visible [data-close-trend-report]',
         ) in clicks
         assert (viewport, '#trend-report-workspace:visible') in selectors
-        assert (viewport, '#trend-report-workspace:visible .cn-trend-report') in selectors
-        assert (viewport, '#trend-report-workspace:visible .cn-trend-stage') in selectors
+        assert selectors.count(
+            (viewport, '#trend-report-workspace:visible .cn-trend-report')
+        ) == 3
+        assert selectors.count(
+            (viewport, '#trend-report-workspace:visible .cn-trend-stage')
+        ) == 3
+        assert selectors.count(
+            (viewport, '#trend-report-workspace:visible .cn-trend-table')
+        ) == 3
         buy_rows = '#trend-report-workspace:visible .cn-trend-buy .cn-trend-card'
         assert (viewport, buy_rows) in selectors
         for label in (
@@ -2363,7 +2399,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, 'a:visible, button:visible') in selectors
         assert (viewport, 'a[href="#account-tiger"]') not in clicks
     assert evaluated == [
-        *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 8),
+        *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 10),
     ]
     assert visual_token_evaluations == ["wide_desktop", "desktop", "mobile"]
     for viewport in ("wide_desktop", "desktop", "mobile"):
@@ -2375,7 +2411,10 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, "#refresh-quotes") in visual_focus_calls
         assert (viewport, "#refresh-quotes") in visual_focus_evaluations
     assert geometry_evaluations == ["wide_desktop"] * 3
-    assert buy_overflow_evaluations == ["wide_desktop", "desktop"]
+    assert buy_overflow_evaluations == [
+        *("wide_desktop" for _ in range(2)),
+        *("desktop" for _ in range(2)),
+    ]
     screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
     assert screenshots == [
         ("wide_desktop", str(screenshot_dir / "wide_desktop-portfolio.png")),
@@ -2432,8 +2471,10 @@ def test_check_account_holdings_visits_every_broker_tab(
     assert projections == ["futu", "phillips", "eastmoney"]
     assert page.focus_checks == [
         "#return-to-portfolio:visible",
+        "#trend-report-workspace:visible .cn-trend-buy",
         '#account-futu:visible .trend-report-entry [data-trend-report]',
         "#return-to-portfolio:visible",
+        "#trend-report-workspace:visible .cn-trend-buy",
         '#account-phillips:visible .trend-report-entry [data-trend-report]',
         "#return-to-portfolio:visible",
         "#trend-report-workspace:visible .cn-trend-buy",

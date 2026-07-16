@@ -2012,7 +2012,7 @@ function renderCnSellOrHoldStage(title, items, kind) {
     ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
     ${renderCnTrendCell("强度", item.strength)}
     ${renderCnTrendCell(headings[5], TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
-    ${renderCnTrendCell("活动保护线", item.active_line)}
+    ${renderCnTrendCell("活动保护线", hasValue(item.active_line) ? formatDisplayNumber(item.active_line) : "—")}
     ${renderCnTrendCell("持仓提示", cnTrendHints(item))}
   </tr>`);
   return renderCnTrendTable(title, kind, headings, rows);
@@ -2045,9 +2045,9 @@ function renderMarketBuyStage(report) {
       ${renderCnTrendCell("强度", item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
       ${renderCnTrendCell("目标仓位", targetWeight, `目标仓位 ${targetWeight}`)}
-      ${renderCnTrendCell("金额上限", item.target_amount)}
-      ${renderCnTrendCell("预计数量", hasValue(item.estimated_shares) ? `${formatPlain(item.estimated_shares)} 股` : "—")}
-      ${renderCnTrendCell("预计保护线", item.estimated_initial_line)}
+      ${renderCnTrendCell("金额上限", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : "—")}
+      ${renderCnTrendCell("预计数量", hasValue(item.estimated_shares) ? `${formatDisplayNumber(item.estimated_shares)} 股` : "—")}
+      ${renderCnTrendCell("预计保护线", hasValue(item.estimated_initial_line) ? formatDisplayNumber(item.estimated_initial_line) : "—")}
     </tr>`;
   });
   return renderCnTrendTable(`${formatPlain(report.buy_window)} · 正式买入计划`, "buy", headings, rows);
@@ -2163,10 +2163,10 @@ function renderCnTrendReportWorkspace(report) {
         <div><dt>账户状态</dt><dd>${escapeHtml(formatPlain(report.account_status))}</dd></div>
       </dl>
       <div class="trend-report-metrics cn-trend-counts">
-        <span>正式买入 ${escapeHtml(formatPlain(counts.buy || 0))}</span>
-        <span>全部卖出 ${escapeHtml(formatPlain(counts.sell || 0))}</span>
-        <span>继续持有 ${escapeHtml(formatPlain(counts.hold || 0))}</span>
-        <span>人工复核 ${escapeHtml(formatPlain(counts.review || 0))}</span>
+        <span>正式买入 ${escapeHtml(formatDisplayNumber(counts.buy || 0))}</span>
+        <span>全部卖出 ${escapeHtml(formatDisplayNumber(counts.sell || 0))}</span>
+        <span>继续持有 ${escapeHtml(formatDisplayNumber(counts.hold || 0))}</span>
+        <span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
       </div>
     </header>
     <div class="cn-trend-actions">
