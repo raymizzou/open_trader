@@ -939,25 +939,38 @@ def _check_account_holdings(
             assert isinstance(markets, list) and [
                 market.get("market") for market in markets if isinstance(market, Mapping)
             ] == ["US", "HK"], "futu 期权关注市场顺序不是 US、HK"
-            for market in markets:
+            rowgroups = workspace.locator(".option-attention-table tbody")
+            assert rowgroups.count() == 2, "futu 期权关注市场分组数量不是 2"
+            for index, market in enumerate(markets):
                 assert isinstance(market, Mapping)
-                assert _plain(market.get("market_label")) in workspace_text, (
-                    "futu 期权关注工作区缺少市场"
+                market_name = _plain(market.get("market"))
+                rowgroup_text = rowgroups.nth(index).inner_text()
+                assert _plain(market.get("market_label")) in rowgroup_text, (
+                    f"futu 期权关注 {market_name} 分组缺少市场"
                 )
-                if market.get("data_status") == "current":
+                data_status = market.get("data_status")
+                assert data_status in {"current", "stale", "unavailable"}, (
+                    f"futu 期权关注 {market_name} 数据状态无效"
+                )
+                if data_status == "current":
                     status_text = "今日已更新"
-                elif market.get("data_status") == "stale":
+                elif data_status == "stale":
                     data_date = str(market.get("data_date") or "").strip()
                     assert data_date, "futu 期权关注过期市场缺少数据日期"
                     status_text = f"数据截至 {data_date}；今日未更新"
                 else:
                     status_text = "暂时不可用"
-                assert status_text in workspace_text, "futu 期权关注工作区缺少市场状态"
+                assert status_text in rowgroup_text, (
+                    f"futu 期权关注 {market_name} 分组缺少市场状态"
+                )
                 items = market.get("items")
                 assert isinstance(items, list), "futu 期权关注项目不是列表"
                 for item in items:
-                    assert isinstance(item, Mapping) and _plain(item.get("symbol")) in workspace_text, (
-                        "futu 期权关注工作区缺少标的"
+                    assert (
+                        isinstance(item, Mapping)
+                        and _plain(item.get("symbol")) in rowgroup_text
+                    ), (
+                        f"futu 期权关注 {market_name} 分组缺少标的"
                     )
             close.click()
             assert page.locator("#trend-report-workspace:visible").count() == 0
