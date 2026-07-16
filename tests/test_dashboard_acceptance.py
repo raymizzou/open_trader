@@ -1037,7 +1037,7 @@ class TabbedAccountLocator:
                 self.page.trend_broker is None and self.page.selected == broker
             )
         match = re.fullmatch(
-            r'#account-(\w+):visible \[data-statement-upload="(\w+)"\]',
+            r'#account-(\w+):visible \[data-statement-upload="(\w+)"\]:visible',
             self.selector,
         )
         if match:
@@ -2541,7 +2541,7 @@ def test_check_statement_upload_enforces_desktop_only_controls(
         Section(), broker, width
     )
 
-    assert checked == [f'[data-statement-upload="{broker}"]']
+    assert checked == [f'[data-statement-upload="{broker}"]:visible']
 
 
 def test_acceptance_rejects_unavailable_eastmoney_report_for_screenshot(

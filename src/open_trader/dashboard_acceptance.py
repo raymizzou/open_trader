@@ -880,7 +880,9 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
 
 
 def _check_statement_upload(section: Any, broker: str, width: int) -> None:
-    count = section.locator(f'[data-statement-upload="{broker}"]').count()
+    count = section.locator(
+        f'[data-statement-upload="{broker}"]:visible'
+    ).count()
     expected = int(width > 760 and broker in {"phillips", "eastmoney"})
     assert count == expected, (
         f"{broker} 结单上传入口数量不是 {expected}（视口宽度 {width}）"
