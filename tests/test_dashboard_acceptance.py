@@ -1316,61 +1316,100 @@ def test_acceptance_formats_grouped_numeric_expectations_without_touching_text()
     )
 
 
+VISUAL_CONTRACT_STYLES = {
+    "body": {
+        "backgroundColor": "rgb(247, 245, 241)",
+        "color": "rgb(32, 29, 24)",
+    },
+    "#refresh-quotes": {
+        "backgroundColor": "rgb(139, 94, 52)",
+        "borderTopColor": "rgb(139, 94, 52)",
+    },
+    ".current-view-card": {
+        "backgroundColor": "rgb(36, 33, 29)",
+        "borderTopColor": "rgb(36, 33, 29)",
+    },
+    **{
+        selector: {
+            "backgroundColor": "rgb(255, 254, 250)",
+            "borderTopColor": "rgb(216, 210, 200)",
+        }
+        for selector in (
+            ".header-brand-panel",
+            ".header-assets-panel",
+            ".header-source-panel",
+            ".holdings-panel",
+            ".kelly-lab-panel",
+            ".trend-report-workspace",
+            ".backtest-workspace",
+            ".symbol-detail-panel",
+            ".research-chat-modal",
+        )
+    },
+}
+
+
 def visual_contract_page(*, accent: str = "#8B5E34") -> object:
-    expected = dict(dashboard_acceptance.WARM_LEDGER_TOKENS)
-    expected["--accent"] = accent
 
     class Locator:
-        def __init__(self, selector: str) -> None:
+        def __init__(self, page: "Page", selector: str) -> None:
+            self.page = page
             self.selector = selector
 
         def count(self) -> int:
-            return 1
+            return int(self.selector in VISUAL_CONTRACT_STYLES)
 
         def focus(self) -> None:
-            pass
+            assert self.selector in VISUAL_CONTRACT_STYLES
+            self.page.focused_selectors.append(self.selector)
 
         def evaluate(self, expression: str) -> dict[str, str]:
+            assert self.selector in VISUAL_CONTRACT_STYLES
+            self.page.evaluated_selectors.append(self.selector)
             if "outlineColor" in expression:
+                assert self.selector == "#refresh-quotes"
                 return {
                     "outlineColor": "rgb(139, 94, 52)",
                     "outlineStyle": "solid", "outlineWidth": "3px",
                 }
-            if self.selector == "body":
-                return {
-                    "backgroundColor": "rgb(247, 245, 241)",
-                    "color": "rgb(32, 29, 24)",
-                }
-            if self.selector == "#refresh-quotes":
-                return {
-                    "backgroundColor": "rgb(139, 94, 52)",
-                    "borderTopColor": "rgb(139, 94, 52)",
-                }
-            if self.selector == ".current-view-card":
-                return {
-                    "backgroundColor": "rgb(36, 33, 29)",
-                    "borderTopColor": "rgb(36, 33, 29)",
-                }
-            return {
-                "backgroundColor": "rgb(255, 254, 250)",
-                "borderTopColor": "rgb(216, 210, 200)",
-            }
+            assert "backgroundColor" in expression
+            return dict(VISUAL_CONTRACT_STYLES[self.selector])
 
     class Page:
+        def __init__(self) -> None:
+            self.expected = dict(dashboard_acceptance.WARM_LEDGER_TOKENS)
+            self.expected["--accent"] = accent
+            self.token_evaluations: list[list[str]] = []
+            self.evaluated_selectors: list[str] = []
+            self.focused_selectors: list[str] = []
+
         def evaluate(
             self, expression: str, names: list[str] | None = None
         ) -> dict[str, str]:
             assert names == list(dashboard_acceptance.WARM_LEDGER_TOKENS)
-            return expected
+            assert "getPropertyValue" in expression
+            self.token_evaluations.append(names)
+            return self.expected
 
         def locator(self, selector: str) -> Locator:
-            return Locator(selector)
+            return Locator(self, selector)
 
     return Page()
 
 
 def test_acceptance_visual_contract_accepts_exact_warm_ledger() -> None:
-    dashboard_acceptance._check_visual_contract(visual_contract_page())
+    page = visual_contract_page()
+
+    dashboard_acceptance._check_visual_contract(page)
+
+    assert page.token_evaluations == [  # type: ignore[attr-defined]
+        list(dashboard_acceptance.WARM_LEDGER_TOKENS)
+    ]
+    assert page.evaluated_selectors == [  # type: ignore[attr-defined]
+        *VISUAL_CONTRACT_STYLES,
+        "#refresh-quotes",
+    ]
+    assert page.focused_selectors == ["#refresh-quotes"]  # type: ignore[attr-defined]
 
 
 def test_acceptance_visual_contract_rejects_palette_drift() -> None:
@@ -1380,13 +1419,36 @@ def test_acceptance_visual_contract_rejects_palette_drift() -> None:
         )
 
 
-def test_acceptance_open_report_layout_requires_aligned_wide_shell_and_table_scroll() -> None:
+def test_visual_contract_fake_rejects_unknown_selector() -> None:
+    page = visual_contract_page()
+    locator = page.locator(".misspelled-surface")  # type: ignore[attr-defined]
+
+    assert locator.count() == 0
+    with pytest.raises(AssertionError):
+        locator.evaluate("getComputedStyle(element).backgroundColor")
+
+
+def open_report_layout_page(
+    *,
+    shell_width: float = 1600,
+    header_left: float = 176,
+    header_right: float = 1744,
+    report_left: float = 176,
+    report_right: float = 1744,
+    client_width: int = 1500,
+    scroll_width: int = 1600,
+    overflow_x: str = "auto",
+) -> tuple[object, object]:
     class Stage:
         def evaluate(self, expression: str) -> dict[str, object]:
+            assert "clientWidth" in expression
+            assert "scrollWidth" in expression
+            assert "overflowX" in expression
+            page.overflow_evaluations.append(expression)
             return {
-                "clientWidth": 1500,
-                "scrollWidth": 1600,
-                "overflowX": "auto",
+                "clientWidth": client_width,
+                "scrollWidth": scroll_width,
+                "overflowX": overflow_x,
             }
 
         def count(self) -> int:
@@ -1400,18 +1462,59 @@ def test_acceptance_open_report_layout_requires_aligned_wide_shell_and_table_scr
     class Page:
         viewport_size = {"width": 1920, "height": 1080}
 
+        def __init__(self) -> None:
+            self.geometry_evaluations: list[str] = []
+            self.overflow_evaluations: list[str] = []
+
         def evaluate(self, expression: str) -> dict[str, float]:
+            for required in (
+                ".dashboard-shell",
+                ".dashboard-header",
+                "#trend-report-workspace",
+                "getBoundingClientRect",
+            ):
+                assert required in expression
+            self.geometry_evaluations.append(expression)
             return {
-                "shellWidth": 1600,
-                "headerLeft": 176,
-                "headerRight": 1744,
-                "reportLeft": 176,
-                "reportRight": 1744,
+                "shellWidth": shell_width,
+                "headerLeft": header_left,
+                "headerRight": header_right,
+                "reportLeft": report_left,
+                "reportRight": report_right,
             }
 
-    dashboard_acceptance._check_open_report_layout(
-        Page(), Workspace(), "eastmoney"
-    )
+    page = Page()
+    return page, Workspace()
+
+
+def test_acceptance_open_report_layout_requires_aligned_wide_shell_and_table_scroll() -> None:
+    page, workspace = open_report_layout_page()
+
+    dashboard_acceptance._check_open_report_layout(page, workspace, "eastmoney")
+
+    assert len(page.geometry_evaluations) == 1  # type: ignore[attr-defined]
+    assert len(page.overflow_evaluations) == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"shell_width": 1598}, "shell"),
+        ({"report_left": 178}, "左边线"),
+        ({"report_right": 1742}, "右边线"),
+        ({"overflow_x": "hidden"}, "内部横向滚动"),
+        ({"scroll_width": 1500}, "可滚动内容"),
+    ],
+)
+def test_acceptance_open_report_layout_rejects_contract_drift(
+    overrides: dict[str, object], message: str,
+) -> None:
+    page, workspace = open_report_layout_page(**overrides)  # type: ignore[arg-type]
+
+    with pytest.raises(AssertionError, match=message):
+        dashboard_acceptance._check_open_report_layout(
+            page, workspace, "eastmoney"
+        )
 
 
 def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
@@ -1425,6 +1528,12 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     evaluated: list[str] = []
     viewport_widths: list[int] = []
     screenshots: list[tuple[str, str]] = []
+    visual_token_evaluations: list[str] = []
+    visual_surface_evaluations: list[tuple[str, str]] = []
+    visual_focus_calls: list[tuple[str, str]] = []
+    visual_focus_evaluations: list[tuple[str, str]] = []
+    geometry_evaluations: list[str] = []
+    buy_overflow_evaluations: list[str] = []
     state = {"fail_wide_desktop_navigation": True}
 
     class Locator(TabbedAccountLocator):
@@ -1433,44 +1542,36 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             super().click()
 
         def focus(self) -> None:
-            pass
+            assert self.selector == "#refresh-quotes"
+            visual_focus_calls.append((self.page.name, self.selector))  # type: ignore[attr-defined]
 
         def evaluate(self, expression: str) -> object:
             if "getComputedStyle" in expression:
                 if "outlineColor" in expression:
+                    assert self.selector == "#refresh-quotes"
+                    visual_focus_evaluations.append(
+                        (self.page.name, self.selector)  # type: ignore[attr-defined]
+                    )
                     return {
                         "outlineColor": "rgb(139, 94, 52)",
                         "outlineStyle": "solid",
                         "outlineWidth": "3px",
                     }
-                if self.selector == "body":
-                    return {
-                        "backgroundColor": "rgb(247, 245, 241)",
-                        "color": "rgb(32, 29, 24)",
-                    }
-                if self.selector == "#refresh-quotes":
-                    return {
-                        "backgroundColor": "rgb(139, 94, 52)",
-                        "borderTopColor": "rgb(139, 94, 52)",
-                        "color": "rgb(255, 255, 255)",
-                    }
-                if self.selector == ".current-view-card":
-                    return {
-                        "backgroundColor": "rgb(36, 33, 29)",
-                        "borderTopColor": "rgb(36, 33, 29)",
-                        "color": "rgb(255, 255, 255)",
-                    }
                 if self.selector.endswith(".cn-trend-buy"):
+                    assert self.selector == (
+                        "#trend-report-workspace:visible .cn-trend-buy"
+                    )
+                    buy_overflow_evaluations.append(self.page.name)  # type: ignore[attr-defined]
                     return {
                         "clientWidth": 1500,
                         "scrollWidth": 1600,
                         "overflowX": "auto",
                     }
-                return {
-                    "backgroundColor": "rgb(255, 254, 250)",
-                    "borderTopColor": "rgb(216, 210, 200)",
-                    "color": "rgb(32, 29, 24)",
-                }
+                assert self.selector in VISUAL_CONTRACT_STYLES, self.selector
+                visual_surface_evaluations.append(
+                    (self.page.name, self.selector)  # type: ignore[attr-defined]
+                )
+                return dict(VISUAL_CONTRACT_STYLES[self.selector])
             return super().evaluate(expression)
 
     class Page(TabbedAccountPage):
@@ -1499,8 +1600,17 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         ) -> object:
             if "getPropertyValue" in expression:
                 assert argument == list(dashboard_acceptance.WARM_LEDGER_TOKENS)
+                visual_token_evaluations.append(self.name)
                 return dict(dashboard_acceptance.WARM_LEDGER_TOKENS)
             if "const shell" in expression:
+                for required in (
+                    ".dashboard-shell",
+                    ".dashboard-header",
+                    "#trend-report-workspace",
+                    "getBoundingClientRect",
+                ):
+                    assert required in expression
+                geometry_evaluations.append(self.name)
                 return {
                     "shellWidth": 1600,
                     "headerLeft": 176,
@@ -1568,6 +1678,12 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     evaluated.clear()
     viewport_widths.clear()
     screenshots.clear()
+    visual_token_evaluations.clear()
+    visual_surface_evaluations.clear()
+    visual_focus_calls.clear()
+    visual_focus_evaluations.clear()
+    geometry_evaluations.clear()
+    buy_overflow_evaluations.clear()
     monkeypatch.setattr(
         dashboard_acceptance,
         "_check_decision_tabs",
@@ -1645,6 +1761,17 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     assert evaluated == [
         *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 8),
     ]
+    assert visual_token_evaluations == ["wide_desktop", "desktop", "mobile"]
+    for viewport in ("wide_desktop", "desktop", "mobile"):
+        assert [
+            selector
+            for name, selector in visual_surface_evaluations
+            if name == viewport
+        ] == list(VISUAL_CONTRACT_STYLES)
+        assert (viewport, "#refresh-quotes") in visual_focus_calls
+        assert (viewport, "#refresh-quotes") in visual_focus_evaluations
+    assert geometry_evaluations == ["wide_desktop"] * 3
+    assert buy_overflow_evaluations == ["wide_desktop", "desktop"]
     screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
     assert screenshots == [
         ("wide_desktop", str(screenshot_dir / "wide_desktop-portfolio.png")),
