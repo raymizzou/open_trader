@@ -919,7 +919,7 @@ def _check_account_holdings(
         trigger = entry.locator("[data-trend-report]")
         if report.get("available") is not True:
             assert trigger.count() == 0, f"{broker} 不可用报告仍可打开"
-            button = entry.locator("button")
+            button = entry.locator('button:has-text("当天趋势报告")')
             assert button.count() == 1 and button.is_disabled(), (
                 f"{broker} 不可用报告入口未禁用"
             )

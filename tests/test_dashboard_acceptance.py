@@ -1099,6 +1099,7 @@ class TabbedAccountLocator:
                 entry,
                 f"{entry} [data-trend-report]",
                 f"{entry} button",
+                f'{entry} button:has-text("当天趋势报告")',
             }:
                 continue
             if (
@@ -1232,7 +1233,8 @@ class TabbedAccountLocator:
 
     def is_disabled(self) -> bool:
         match = re.fullmatch(
-            r"#account-(\w+):visible \.trend-report-entry button", self.selector
+            r'#account-(\w+):visible \.trend-report-entry button(?:\:has-text\("当天趋势报告"\))?',
+            self.selector,
         )
         assert match
         broker = self._require_known_broker(match.group(1))
