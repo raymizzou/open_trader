@@ -593,6 +593,19 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
             "average_cost": "40", "market_value": "500",
         }],
     )
+    write_tiger_snapshot(
+        cfg.data_dir,
+        "2026-07-15",
+        cash_records=[
+            {"record_type": "account_total", "currency": "USD", "account_total": "200000"},
+            {"currency": "USD", "cash_balance": "20000", "available_balance": "20000"},
+        ],
+        position_records=[{
+            "market": "US", "sec_type": "STK", "symbol": "VIXY",
+            "name": "VIX Short ETF", "currency": "USD", "position_qty": "10",
+            "average_cost": "40", "market_value": "500",
+        }],
+    )
 
     class Api:
         ignored_stale_components: tuple[object, ...] = ()
@@ -685,6 +698,7 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
     ) in payload["api_facts"]
     assert payload["estimated_api_cost"] == "0.142"
     assert payload["account"]["fresh"] is False
+    assert payload["account"]["source_date"] == "2026-07-14"
     assert payload["strategy_judgments"]["formal_actions"] == []
     assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "MANUAL_REVIEW"
     assert payload["strategy_judgments"]["holding_decisions"][0]["reason"] == "stale_tiger_account"

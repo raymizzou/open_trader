@@ -348,7 +348,11 @@ def _load_tiger_snapshot(
 
 
 def load_tiger_trend_account(
-    *, data_dir: Path, expected_date: str, managed_symbols: set[str]
+    *,
+    data_dir: Path,
+    expected_date: str,
+    managed_symbols: set[str],
+    snapshot_before: str | None = None,
 ) -> AccountSnapshot:
     runs = data_dir / "runs"
     if not runs.exists():
@@ -358,6 +362,8 @@ def load_tiger_trend_account(
         try:
             date.fromisoformat(run_dir.name)
         except ValueError:
+            continue
+        if snapshot_before is not None and run_dir.name >= snapshot_before:
             continue
         path = run_dir / "tiger_account_snapshot.json"
         if not path.exists():
@@ -377,13 +383,19 @@ def load_tiger_trend_account(
 
 
 def load_trend_account(
-    *, data_dir: Path, market: str, expected_date: str, managed_symbols: set[str]
+    *,
+    data_dir: Path,
+    market: str,
+    expected_date: str,
+    managed_symbols: set[str],
+    snapshot_before: str | None = None,
 ) -> AccountSnapshot:
     if _market(market) == "US":
         return load_tiger_trend_account(
             data_dir=data_dir,
             expected_date=expected_date,
             managed_symbols=managed_symbols,
+            snapshot_before=snapshot_before,
         )
     return load_market_account(
         data_dir=data_dir,
@@ -635,6 +647,9 @@ def _attempt_market_report(
             market=market,
             expected_date=run_date if market == "US" else as_of_date,
             managed_symbols=managed,
+            snapshot_before=(
+                run_date if market == "US" and account_refresh_error is not None else None
+            ),
         )
 
         balance_before = _balance(api.get_account_balance())
@@ -768,11 +783,17 @@ def _attempt_market_report(
             metadata={
                 "market": market,
                 "broker": settings["broker"],
-                "account_currency": "HKD",
-                "price_fx_to_hkd": str(USD_TO_HKD if market == "US" else Decimal("1")),
                 "account_check_required": market == "HK",
                 "run_date": run_date,
                 "process_version": _process_version(config.repo),
+                **(
+                    {
+                        "account_currency": "HKD",
+                        "price_fx_to_hkd": str(USD_TO_HKD),
+                    }
+                    if market == "US"
+                    else {}
+                ),
                 **(
                     {"account_refresh_error": account_refresh_error}
                     if account_refresh_error is not None
