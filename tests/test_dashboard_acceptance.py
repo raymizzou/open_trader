@@ -54,8 +54,10 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
 
     assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
     assert 'DASHBOARD_LOG ?= /tmp/open_trader_dashboard_8766.log' in makefile
+    assert 'EXPECTED_CN ?= 5' in makefile
     assert '--url "$(DASHBOARD_URL)"' in makefile
     assert '--log "$(DASHBOARD_LOG)"' in makefile
+    assert '--expected-cn "$(EXPECTED_CN)"' in makefile
 
 
 def test_browser_ignores_chrome_unattributed_404_but_not_app_errors() -> None:
