@@ -17,8 +17,8 @@ def to_futu_symbol(market: str, symbol: str) -> str:
         if prefix == normalized_market:
             normalized_symbol = remainder
         elif normalized_market == "CN" and prefix in {"SH", "SZ", "BJ"}:
-            if prefix != _cn_exchange(remainder):
-                raise ValueError(f"symbol prefix {prefix} does not match {symbol}")
+            if len(remainder) != 6 or not remainder.isdigit():
+                raise ValueError(f"invalid CN symbol: {symbol}")
             return f"{prefix}.{remainder}"
         elif not (normalized_market == "US" and prefix not in KNOWN_PREFIXES):
             raise ValueError(

@@ -128,6 +128,16 @@ from .trend_review import (
 
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+TREND_REPORT_STEM_RE = re.compile(
+    r"(?P<date>\d{4}-\d{2}-\d{2})(?:-r(?P<revision>\d+))?\Z"
+)
+
+
+def _trend_report_path_order(path: Path) -> tuple[str, int]:
+    match = TREND_REPORT_STEM_RE.fullmatch(path.stem)
+    if match is None:
+        return "", -1
+    return match.group("date"), int(match.group("revision") or 0)
 
 
 def _load_trend_review_report(
@@ -142,7 +152,9 @@ def _load_trend_review_report(
         if market == "CN"
         else market_paths(config.data_dir, config.reports_dir, market).reports
     )
-    for path in sorted(report_dir.glob("*.json"), reverse=True):
+    for path in sorted(
+        report_dir.glob("*.json"), key=_trend_report_path_order, reverse=True
+    ):
         payload = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(payload, dict) and payload.get(date_field) == trading_date:
             return payload

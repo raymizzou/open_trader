@@ -346,6 +346,33 @@ def test_trend_a_share_report_main_dispatches_and_returns_status(
     )
 
 
+def test_trend_review_loader_prefers_latest_numeric_revision(tmp_path: Path) -> None:
+    report_dir = tmp_path / "reports/trend_a_share"
+    report_dir.mkdir(parents=True)
+    for filename, version in (
+        ("2026-07-16.json", "base"),
+        ("2026-07-16-r9.json", "r9"),
+        ("2026-07-16-r10.json", "r10"),
+    ):
+        (report_dir / filename).write_text(
+            json.dumps({"as_of_date": "2026-07-16", "version": version}),
+            encoding="utf-8",
+        )
+    config = SimpleNamespace(
+        reports_dir=tmp_path / "reports",
+        data_dir=tmp_path / "data",
+    )
+
+    report = cli._load_trend_review_report(
+        config,
+        "CN",
+        "2026-07-16",
+        date_field="as_of_date",
+    )
+
+    assert report["version"] == "r10"
+
+
 def test_trend_a_share_report_invalid_private_config_returns_two(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
