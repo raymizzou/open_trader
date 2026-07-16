@@ -532,6 +532,8 @@ def _validate_facts(facts: dict[str, object]) -> None:
     for timeframe in timeframes:
         if not isinstance(timeframe, dict):
             raise ValueError("technical facts timeframe must be an object")
+        if not str(timeframe.get("timeframe") or "").strip():
+            raise ValueError("technical facts timeframe is missing")
         _validate_bollinger_payload(timeframe.get("bollinger"))
 
 

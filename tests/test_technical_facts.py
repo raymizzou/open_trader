@@ -302,6 +302,15 @@ def test_validate_facts_rejects_string_timeframe_entries() -> None:
         _validate_facts(facts)
 
 
+def test_validate_facts_rejects_missing_canonical_timeframe() -> None:
+    facts = valid_bollinger_facts()
+    timeframe = facts["timeframes"][0]  # type: ignore[index]
+    timeframe.pop("timeframe")  # type: ignore[union-attr]
+
+    with pytest.raises(ValueError, match="technical facts timeframe is missing"):
+        _validate_facts(facts)
+
+
 def test_validate_facts_rejects_empty_timeframes() -> None:
     facts = valid_bollinger_facts()
     facts["timeframes"] = []
