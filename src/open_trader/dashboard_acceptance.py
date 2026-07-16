@@ -910,7 +910,13 @@ def _check_account_holdings(
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 趋势报告工作区出现横向滚动"
-        close.click()
+        return_control = (
+            workspace.locator("[data-close-trend-report]")
+            if broker == "eastmoney"
+            else close
+        )
+        assert return_control.count() == 1, f"{broker} 趋势报告缺少可用返回按钮"
+        return_control.click()
         assert page.locator("#trend-report-workspace:visible").count() == 0, (
             f"{broker} 返回后趋势报告工作区仍可见"
         )

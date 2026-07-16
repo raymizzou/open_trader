@@ -821,7 +821,9 @@ class TabbedAccountLocator:
         if self.selector.endswith(".trend-audit summary"):
             self.page.active = self.selector
             return
-        if self.selector == "#return-to-portfolio:visible":
+        if self.selector == "#return-to-portfolio:visible" or self.selector.endswith(
+            "[data-close-trend-report]"
+        ):
             broker = self.page.trend_broker
             self.page.trend_broker = None
             self.page.active = (
@@ -1447,6 +1449,10 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
         ) in clicks
         assert (viewport, '#return-to-portfolio:visible') in clicks
+        assert (
+            viewport,
+            '#trend-report-workspace:visible [data-close-trend-report]',
+        ) in clicks
         assert (viewport, '#trend-report-workspace:visible') in selectors
         assert (viewport, '#trend-report-workspace:visible .cn-trend-report') in selectors
         assert (viewport, '#trend-report-workspace:visible .cn-trend-stage') in selectors
