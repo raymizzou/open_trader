@@ -104,6 +104,39 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
     )
 
 
+def test_dashboard_ignores_zero_quantity_closed_positions(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    rows = []
+    for symbol, quantity, market_value in (
+        ("AAPL", "1", "100"),
+        ("RAM", "0", "0"),
+    ):
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update({
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": symbol,
+            "name": symbol,
+            "currency": "USD",
+            "total_quantity": quantity,
+            "last_price": market_value,
+            "market_value": market_value,
+            "market_value_hkd": market_value,
+            "fx_to_hkd": "1",
+            "brokers": "futu",
+        })
+        rows.append(row)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
+
+    payload = load_dashboard_state(config).to_dict()
+
+    assert [row["symbol"] for row in payload["holdings"]] == ["AAPL"]
+    assert payload["summary"]["holding_count"] == 1
+    assert [row["symbol"] for row in payload["backtest_universe"]["holdings"]] == [
+        "AAPL"
+    ]
+
+
 def serialized_trend_account(
     *, fresh: object = MISSING_FRESH,
 ) -> dict[str, object]:
@@ -998,7 +1031,6 @@ def test_dashboard_preserves_statement_when_complete_weights_are_invalid(
         ("close", "0"),
         ("close", "-1"),
         ("total_quantity", "bad"),
-        ("total_quantity", "0"),
         ("total_quantity", "-1"),
         ("cost_value", ""),
         ("cost_value", "NaN"),

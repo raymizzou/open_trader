@@ -21,6 +21,51 @@
 
 ---
 
+### Task 0: Exclude closed zero-quantity rows from Dashboard holdings
+
+**Files:**
+- Modify: `tests/test_dashboard.py`
+- Modify: `src/open_trader/dashboard.py:1092-1094`
+
+**Interfaces:**
+- Consumes: portfolio CSV `total_quantity` and existing `_optional_decimal` parsing.
+- Produces: `_is_dashboard_holding(row)` returning `False` for non-cash rows with an exact zero quantity while retaining positive, negative, and invalid rows for their existing handling.
+
+- [ ] **Step 1: Add a failing payload-level regression test**
+
+Create one active US row and one closed `RAM` row with `total_quantity="0"`, load the
+Dashboard state, and assert that only the active symbol appears in `holdings`, the summary
+holding count is one, and the backtest holding universe excludes `RAM`.
+
+- [ ] **Step 2: Run the regression test and verify RED**
+
+```bash
+.venv/bin/python -m pytest -q tests/test_dashboard.py::test_dashboard_ignores_zero_quantity_closed_positions
+```
+
+Expected: FAIL because both symbols currently appear in Dashboard holdings.
+
+- [ ] **Step 3: Fix the shared holding predicate**
+
+```python
+def _is_dashboard_holding(row: dict[str, str]) -> bool:
+    quantity = _optional_decimal(row.get("total_quantity", ""))
+    return not _is_cash_like_row(row) and quantity != Decimal("0")
+```
+
+An invalid or missing quantity parses as `None`, so it remains visible for the existing data-check behavior. A negative quantity remains visible as a short position.
+
+- [ ] **Step 4: Run the focused Dashboard tests and commit**
+
+```bash
+.venv/bin/python -m pytest -q tests/test_dashboard.py tests/test_dashboard_quotes.py
+git add src/open_trader/dashboard.py tests/test_dashboard.py \
+  docs/superpowers/plans/2026-07-16-unified-trend-report-presentation.md
+git commit -m "fix: hide closed dashboard positions"
+```
+
+---
+
 ### Task 1: Route every market through the existing action-first renderer
 
 **Files:**

@@ -1090,7 +1090,8 @@ def _market_symbol_key(row: dict[str, str]) -> tuple[str, str] | None:
 
 
 def _is_dashboard_holding(row: dict[str, str]) -> bool:
-    return not _is_cash_like_row(row)
+    quantity = _optional_decimal(row.get("total_quantity", ""))
+    return not _is_cash_like_row(row) and quantity != Decimal("0")
 
 
 def _is_cash_like_row(row: dict[str, str]) -> bool:
