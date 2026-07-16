@@ -1021,6 +1021,19 @@ def _check_account_holdings(
                 )
             width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
             if width <= 760:
+                column_counts = page.evaluate(
+                    r"""() => [...document.querySelectorAll('.option-attention-row')]
+                    .map(row => getComputedStyle(row).gridTemplateColumns
+                        .trim().split(/\s+/)
+                        .filter(column => parseFloat(column) > 0).length)"""
+                )
+                expected_columns = 1 if width <= 460 else 2
+                assert isinstance(column_counts, list) and all(
+                    count == expected_columns for count in column_counts
+                ), (
+                    f"futu 期权关注卡片应为 {expected_columns} 列，实际为 "
+                    f"{column_counts}"
+                )
                 _check_mobile_targets(
                     page,
                     "#return-to-portfolio:visible, "
