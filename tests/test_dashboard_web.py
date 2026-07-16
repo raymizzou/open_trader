@@ -548,6 +548,16 @@ def test_dashboard_server_ignores_client_disconnect_while_writing_json(
         config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
     )
     unhandled_errors: list[BaseException | None] = []
+    handler_completed = threading.Event()
+    original_shutdown_request = server.shutdown_request
+
+    def shutdown_request(request: object) -> None:
+        try:
+            original_shutdown_request(request)  # type: ignore[arg-type]
+        finally:
+            handler_completed.set()
+
+    server.shutdown_request = shutdown_request  # type: ignore[method-assign]
     server.handle_error = (  # type: ignore[method-assign]
         lambda _request, _address: unhandled_errors.append(sys.exc_info()[1])
     )
@@ -568,14 +578,14 @@ def test_dashboard_server_ignores_client_disconnect_while_writing_json(
         )
         client.close()
         release_response.set()
+        assert handler_completed.wait(timeout=5)
+        assert unhandled_errors == []
     finally:
         client.close()
         release_response.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
-
-    assert unhandled_errors == []
 
 
 @pytest.mark.parametrize("body", [b"{bad json", b"[]"])

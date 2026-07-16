@@ -1442,9 +1442,12 @@ def _browser_check(
 
 
 def _log_errors(path: Path) -> list[str]:
-    if not path.exists():
-        return [f"日志不存在：{path}"]
-    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        if not path.exists():
+            return [f"日志不存在：{path}"]
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [f"日志读取失败：{type(exc).__name__}: {exc}"]
     markers = ("Traceback (most recent call last)", "看板数据加载失败")
     return [f"日志包含错误标记：{marker}" for marker in markers if marker in text]
 

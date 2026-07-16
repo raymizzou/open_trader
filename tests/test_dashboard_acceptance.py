@@ -170,6 +170,8 @@ def _run_acceptance_main_with_reports(
     report_dirs: list[Path],
     *,
     browser_log_text: str = "",
+    log_is_directory: bool = False,
+    log_read_error: OSError | None = None,
 ) -> tuple[int, dict[str, object], list[Path | None]]:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -180,7 +182,19 @@ def _run_acceptance_main_with_reports(
     quote_payloads = iter((first_quotes, second_quotes))
     browser_reports: list[Path | None] = []
     log_path = tmp_path / "dashboard.log"
-    log_path.write_text("", encoding="utf-8")
+    if log_is_directory:
+        log_path.mkdir()
+    else:
+        log_path.write_text("", encoding="utf-8")
+    if log_read_error is not None:
+        original_read_text = Path.read_text
+
+        def read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if path == log_path:
+                raise log_read_error
+            return original_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "read_text", read_text)
     monkeypatch.setattr(
         dashboard_acceptance, "_project_data_dir", lambda root: tmp_path / "data"
     )
@@ -281,6 +295,41 @@ def test_acceptance_main_fails_on_traceback_written_during_browser_check(
     assert status == 1
     assert result["status"] == "FAIL"
     assert "日志包含错误标记：Traceback (most recent call last)" in result["errors"]
+
+
+@pytest.mark.parametrize(
+    ("options", "error_type"),
+    [
+        ({"log_is_directory": True}, "IsADirectoryError"),
+        ({"log_read_error": FileNotFoundError("log vanished")}, "FileNotFoundError"),
+    ],
+)
+def test_acceptance_main_reports_log_read_errors_as_json_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    options: dict[str, object],
+    error_type: str,
+) -> None:
+    reports = tmp_path / "shared" / "reports"
+    reports.mkdir(parents=True)
+
+    try:
+        status, result, _ = _run_acceptance_main_with_reports(
+            monkeypatch,
+            capsys,
+            tmp_path,
+            [reports, reports],
+            **options,
+        )
+    except OSError as exc:
+        pytest.fail(f"acceptance main leaked {type(exc).__name__}: {exc}")
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert any(
+        f"日志读取失败：{error_type}" in error for error in result["errors"]
+    )
 
 
 def test_acceptance_rejects_api_projection_that_drops_frozen_action(
