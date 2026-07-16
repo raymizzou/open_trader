@@ -1077,23 +1077,27 @@ def test_previous_attention_rows_use_strict_dates_and_one_time_tiger_baseline(
 
 
 @pytest.mark.parametrize(
-    ("section", "malformed_row"),
+    ("market", "section", "malformed_row", "older_symbol", "newer_symbol"),
     [
-        ("candidates", {}),
-        ("candidates", {"symbol": "  "}),
-        ("holdings", {"symbol": "600001"}),
+        ("US", "candidates", {}, "OLDER", "NEWER"),
+        ("US", "candidates", {"symbol": "  "}, "OLDER", "NEWER"),
+        ("US", "holdings", {"symbol": "600001"}, "OLDER", "NEWER"),
+        ("HK", "holdings", {"symbol": "AAPL"}, "00001", "00002"),
     ],
 )
 def test_previous_attention_rows_skip_newest_report_with_invalid_symbol_row(
     tmp_path: Path,
+    market: str,
     section: str,
     malformed_row: dict[str, object],
+    older_symbol: str,
+    newer_symbol: str,
 ) -> None:
-    paths = market_paths(tmp_path / "data", tmp_path / "reports", "US")
+    paths = market_paths(tmp_path / "data", tmp_path / "reports", market)
     paths.reports.mkdir(parents=True)
     for filename, as_of_date, symbol in (
-        ("2026-07-14.json", "2026-07-14", "OLDER"),
-        ("2026-07-15.json", "2026-07-15", "NEWER"),
+        ("2026-07-14.json", "2026-07-14", older_symbol),
+        ("2026-07-15.json", "2026-07-15", newer_symbol),
     ):
         snapshots: dict[str, object] = {
             "candidates": [_attention_row(symbol)],
@@ -1112,10 +1116,29 @@ def test_previous_attention_rows_skip_newest_report_with_invalid_symbol_row(
         )
 
     rows = market_trend._previous_attention_rows(
-        paths, current_as_of_date="2026-07-16", market="US"
+        paths, current_as_of_date="2026-07-16", market=market
     )
 
-    assert [row["symbol"] for row in rows] == ["OLDER"]
+    assert [row["symbol"] for row in rows] == [older_symbol]
+
+
+def test_current_attention_rows_keep_valid_rows_when_one_symbol_is_invalid() -> None:
+    rows = market_trend._attention_rows(
+        {
+            "candidates": [
+                _attention_row("QQQ", right_side=True, danger=False),
+                _attention_row("600001", right_side=True, danger=False),
+            ]
+        }
+    )
+
+    assert rows is not None
+    assert [
+        item["symbol"]
+        for item in market_trend.build_option_attention(
+            rows, [], {}, "US", "tiger"
+        )
+    ] == ["QQQ"]
 
 
 def test_previous_attention_rows_reject_malformed_tiger_baseline(

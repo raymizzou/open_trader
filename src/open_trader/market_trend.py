@@ -570,9 +570,7 @@ def build_option_attention(
     return attention
 
 
-def _attention_rows(
-    signal_snapshots: object, *, market: str
-) -> list[Mapping[str, object]] | None:
+def _attention_rows(signal_snapshots: object) -> list[Mapping[str, object]] | None:
     if not isinstance(signal_snapshots, Mapping):
         return None
     candidates = signal_snapshots.get("candidates", [])
@@ -585,16 +583,7 @@ def _attention_rows(
         row is None or isinstance(row, Mapping) for row in holdings.values()
     ):
         return None
-    rows = [*candidates, *(row for row in holdings.values() if row is not None)]
-    for row in rows:
-        symbol = row.get("symbol")
-        if not isinstance(symbol, str) or not symbol.strip():
-            return None
-        try:
-            _normalized_symbol(market, symbol)
-        except ValueError:
-            return None
-    return rows
+    return [*candidates, *(row for row in holdings.values() if row is not None)]
 
 
 def _attention_report_rows(
@@ -605,7 +594,14 @@ def _attention_report_rows(
         if not isinstance(payload, Mapping):
             return None
         as_of_date = date.fromisoformat(str(payload.get("as_of_date") or ""))
-        rows = _attention_rows(payload.get("signal_snapshots"), market=market)
+        rows = _attention_rows(payload.get("signal_snapshots"))
+        if rows is None:
+            return None
+        for row in rows:
+            symbol = row.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                return None
+            _normalized_symbol(market, symbol)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return None
     return (as_of_date, rows) if rows is not None else None
@@ -1027,9 +1023,7 @@ def _attempt_market_report(
             metadata={**report.metadata, "delivery_status": "prepared"},
         )
         payload = _report_payload(report)
-        current_attention_rows = (
-            _attention_rows(payload.get("signal_snapshots"), market=market) or []
-        )
+        current_attention_rows = _attention_rows(payload.get("signal_snapshots")) or []
         payload["option_attention"] = build_option_attention(
             current_attention_rows,
             _previous_attention_rows(
