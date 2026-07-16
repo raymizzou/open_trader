@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 from open_trader.a_share_trend import write_protection_state
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.market_trend_watch import (
+    BROKER_LABELS,
     market_session,
     next_market_open,
     watch_market_protection,
@@ -97,62 +99,18 @@ def _write_hk_details(data_dir: Path) -> None:
 def _write_us_details(data_dir: Path) -> None:
     run_dir = data_dir / "runs/2026-07-15"
     run_dir.mkdir(parents=True)
-    with (run_dir / "extracted_positions.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "statement_id",
-                "broker",
-                "market",
-                "asset_class",
-                "symbol",
-                "name",
-                "currency",
-                "quantity",
-                "cost_price",
-                "market_value",
-            ],
-        )
-        writer.writeheader()
-        writer.writerow(
-            {
-                "statement_id": "2026-07-15-futu",
-                "broker": "futu",
-                "market": "US",
-                "asset_class": "stock",
-                "symbol": "NVDA",
-                "name": "NVIDIA",
-                "currency": "USD",
-                "quantity": "10",
-                "cost_price": "140",
-                "market_value": "1500",
-            }
-        )
-    with (run_dir / "extracted_cash.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "statement_id",
-                "broker",
-                "currency",
-                "cash_balance",
-                "available_balance",
-            ],
-        )
-        writer.writeheader()
-        writer.writerow(
-            {
-                "statement_id": "2026-07-15-futu",
-                "broker": "futu",
-                "currency": "USD",
-                "cash_balance": "1000",
-                "available_balance": "1000",
-            }
-        )
+    (run_dir / "tiger_account_snapshot.json").write_text(json.dumps({
+        "accounts": [],
+        "cash_records": [
+            {"record_type": "account_total", "currency": "USD", "account_total": "2500"},
+            {"currency": "USD", "cash_balance": "1000", "available_balance": "1000"},
+        ],
+        "position_records": [{
+            "market": "US", "sec_type": "STK", "symbol": "NVDA", "name": "NVIDIA",
+            "currency": "USD", "position_qty": "10", "average_cost": "140",
+            "market_value": "1500",
+        }],
+    }), encoding="utf-8")
 
 
 def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> None:
@@ -217,7 +175,7 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
 def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _write_us_details(data_dir)
-    state_path = data_dir / "trend_us_futu/protection_state.json"
+    state_path = data_dir / "trend_us_tiger/protection_state.json"
     write_protection_state(
         state_path,
         {
@@ -257,8 +215,8 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
         data_dir=data_dir,
         portfolio_path=tmp_path / "unused.csv",
         state_path=state_path,
-        events_path=data_dir / "trend_us_futu/watch_events.jsonl",
-        report_lock_path=data_dir / "runs/.trend_us_futu_report.lock",
+        events_path=data_dir / "trend_us_tiger/watch_events.jsonl",
+        report_lock_path=data_dir / "runs/.trend_us_tiger_report.lock",
         quote_client=Quote(),
         notifier=CompositeNotifier([NullNotifier(), voice]),
         poll_seconds=5,
@@ -271,3 +229,7 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
     assert result.status == "completed"
     assert voice.messages[0][0] == "美股保护线触发 · NVDA"
     assert voice.messages[0][1].startswith("名称：NVIDIA\n最新价 ")
+
+
+def test_us_watcher_uses_tiger_label() -> None:
+    assert BROKER_LABELS["US"] == "老虎"

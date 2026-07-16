@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -8,11 +9,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from open_trader import market_trend
 from open_trader.a_share_trend import AShareTrendRunResult
 from open_trader.daily_premarket import DailyPremarketConfig
 from open_trader.market_trend import (
+    MARKET_NOTIFICATION_LABELS,
+    MARKET_SETTINGS,
     MarketHoliday,
-    _refresh_futu_account,
     load_market_account,
     market_paths,
     resolve_market_dates,
@@ -81,35 +84,58 @@ def write_details(
             writer.writerows(rows)
 
 
-def test_load_market_account_uses_full_native_account_but_only_managed_positions(
+def write_tiger_snapshot(
+    data_dir: Path,
+    run_date: str,
+    *,
+    cash_records: list[dict[str, object]],
+    position_records: list[dict[str, object]],
+) -> None:
+    path = data_dir / "runs" / run_date / "tiger_account_snapshot.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "accounts": [],
+            "cash_records": cash_records,
+            "position_records": position_records,
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_load_tiger_account_uses_hkd_nav_cash_and_managed_positions(
     tmp_path: Path,
 ) -> None:
-    write_details(
+    write_tiger_snapshot(
         tmp_path / "data",
         "2026-07-15",
-        positions=[
+        cash_records=[
             {
-                "statement_id": "2026-07-15-futu-live", "broker": "futu",
-                "market": "US", "asset_class": "etf", "symbol": "VIXY",
-                "name": "VIX Short", "currency": "USD", "quantity": "10",
-                "cost_price": "40", "market_value": "500",
+                "record_type": "account_total", "currency": "USD",
+                "account_total": "100000",
             },
             {
-                "statement_id": "2026-07-15-futu-live", "broker": "futu",
-                "market": "US", "asset_class": "stock", "symbol": "AAPL",
-                "name": "Apple", "currency": "USD", "quantity": "2",
-                "cost_price": "200", "market_value": "420",
+                "currency": "USD", "cash_balance": "12000",
+                "available_balance": "10000",
+            },
+            {
+                "currency": "HKD", "cash_balance": "20000",
+                "available_balance": "25000",
             },
         ],
-        cash=[{
-            "statement_id": "2026-07-15-futu-live", "broker": "futu",
-            "currency": "USD", "cash_balance": "1000", "available_balance": "800",
+        position_records=[{
+            "market": "US", "sec_type": "STK", "symbol": "VIXY",
+            "name": "VIX Short ETF", "currency": "USD", "position_qty": "10",
+            "average_cost": "40", "market_value": "1000",
+        }, {
+            "market": "US", "sec_type": "STK", "symbol": "AAPL",
+            "name": "Apple", "currency": "USD", "position_qty": "2",
+            "average_cost": "200", "market_value": "420",
         }],
     )
 
-    account = load_market_account(
+    account = market_trend.load_trend_account(
         data_dir=tmp_path / "data",
-        broker="futu",
         market="US",
         expected_date="2026-07-15",
         managed_symbols={"VIXY"},
@@ -117,20 +143,60 @@ def test_load_market_account_uses_full_native_account_but_only_managed_positions
 
     assert account.source_date == "2026-07-15"
     assert account.fresh is True
-    assert account.net_value == Decimal("1920")
-    assert account.available_cash == Decimal("800")
+    assert account.net_value == Decimal("785000")
+    assert account.available_cash == Decimal("98500")
     assert [item.symbol for item in account.positions] == ["VIXY"]
+    assert account.positions[0].market_value == Decimal("7850")
+    assert market_trend.load_trend_account(
+        data_dir=tmp_path / "data",
+        market="US",
+        expected_date="2026-07-16",
+        managed_symbols={"VIXY"},
+    ).fresh is False
 
 
-def test_us_account_refreshes_directly_from_futu_before_reporting(
+def test_load_tiger_account_uses_latest_valid_snapshot_and_clamps_cash(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_tiger_snapshot(
+        data_dir,
+        "2026-07-14",
+        cash_records=[
+            {"record_type": "account_total", "currency": "USD", "account_total": "100"},
+            {"currency": "USD", "cash_balance": "-1000", "available_balance": "-900"},
+            {"currency": "SGD", "cash_balance": "100", "available_balance": "80", "fx_to_hkd": "5.8"},
+        ],
+        position_records=[],
+    )
+    write_tiger_snapshot(
+        data_dir,
+        "2026-07-15",
+        cash_records=[],
+        position_records=[],
+    )
+
+    account = market_trend.load_trend_account(
+        data_dir=data_dir,
+        market="US",
+        expected_date="2026-07-15",
+        managed_symbols=set(),
+    )
+
+    assert account.source_date == "2026-07-14"
+    assert account.fresh is False
+    assert account.available_cash == Decimal("0")
+
+
+def test_us_account_refreshes_directly_from_tiger_before_reporting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = config(tmp_path)
     calls: list[object] = []
 
     class Client:
-        def __init__(self, *, host: str, port: int) -> None:
-            calls.append(("connect", host, port))
+        def __init__(self, *, config: object) -> None:
+            calls.append(("connect", config))
 
         def fetch_snapshot(self) -> object:
             calls.append("fetch")
@@ -142,15 +208,24 @@ def test_us_account_refreshes_directly_from_futu_before_reporting(
     def sync(**kwargs: object) -> None:
         calls.append(("sync", kwargs))
 
-    monkeypatch.setattr("open_trader.market_trend.FutuAccountClient", Client)
-    monkeypatch.setattr("open_trader.market_trend.sync_futu_portfolio", sync)
+    monkeypatch.setattr(
+        "open_trader.market_trend.load_tiger_account_config",
+        lambda **kwargs: calls.append(("config", kwargs)) or "tiger-config",
+    )
+    monkeypatch.setattr("open_trader.market_trend.TigerAccountClient", Client)
+    monkeypatch.setattr("open_trader.market_trend.sync_tiger_portfolio", sync)
 
-    _refresh_futu_account(cfg, "2026-07-15")
+    market_trend._refresh_tiger_account(cfg, "2026-07-15")
 
-    assert calls[:3] == [("connect", "127.0.0.1", 11111), "fetch", "close"]
+    assert calls[:3] == [
+        ("config", {"config_dir": Path("~/.tigeropen/"), "account": None, "sandbox": False}),
+        ("connect", "tiger-config"),
+        "fetch",
+    ]
     assert calls[3][0] == "sync"
     assert calls[3][1]["snapshot"] == "snapshot"
     assert calls[3][1]["update_latest"] is True
+    assert calls[4] == "close"
 
 
 def test_load_phillips_statement_can_be_stale_and_caps_cash_to_known_balance(
@@ -191,8 +266,10 @@ def test_load_phillips_statement_can_be_stale_and_caps_cash_to_known_balance(
 
 
 def test_market_paths_are_completely_separate() -> None:
-    assert market_paths(Path("data"), Path("reports"), "US").root.name == "trend_us_futu"
+    assert market_paths(Path("data"), Path("reports"), "US").root == Path("data/trend_us_tiger")
     assert market_paths(Path("data"), Path("reports"), "HK").root.name == "trend_hk_phillips"
+    assert MARKET_SETTINGS["US"]["broker"] == "tiger"
+    assert MARKET_NOTIFICATION_LABELS["US"][0] == "老虎"
 
 
 def test_resolve_market_dates_uses_same_day_hk_and_prior_day_us() -> None:
@@ -301,13 +378,13 @@ def test_market_report_failure_owns_day_at_noon_deadline(tmp_path: Path) -> None
     assert result.status == "failed"
     assert notifier.messages == [
         (
-            "【富途｜美股趋势报告生成失败｜2026-07-15】",
+            "【老虎｜美股趋势报告生成失败｜2026-07-15】",
             "原因：趋势数据在截止时间前仍未更新\n"
-            "现在做：确认 Trend Animals 与富途账户状态后手动重跑富途报告\n\n"
+            "现在做：确认 Trend Animals 与老虎账户状态后手动重跑老虎报告\n\n"
             "报告未生成，请勿依据旧报告交易。",
         )
     ]
-    ledger = cfg.data_dir / "trend_us_futu/daily_delivery/2026-07-15.json"
+    ledger = cfg.data_dir / "trend_us_tiger/daily_delivery/2026-07-15.json"
     assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
 
 
@@ -499,20 +576,21 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
 
 
-def test_us_report_api_fact_uses_unified_trend_fields(tmp_path: Path) -> None:
+def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
+    tmp_path: Path,
+) -> None:
     cfg = config(tmp_path)
-    write_details(
+    write_tiger_snapshot(
         cfg.data_dir,
-        "2026-07-15",
-        positions=[{
-            "statement_id": "2026-07-15-futu-live", "broker": "futu",
-            "market": "US", "asset_class": "stock", "symbol": "AAPL",
-            "name": "Apple", "currency": "USD", "quantity": "1",
-            "cost_price": "200", "market_value": "210",
-        }],
-        cash=[{
-            "statement_id": "2026-07-15-futu-live", "broker": "futu",
-            "currency": "USD", "cash_balance": "1000", "available_balance": "1000",
+        "2026-07-14",
+        cash_records=[
+            {"record_type": "account_total", "currency": "USD", "account_total": "100000"},
+            {"currency": "USD", "cash_balance": "10000", "available_balance": "10000"},
+        ],
+        position_records=[{
+            "market": "US", "sec_type": "STK", "symbol": "VIXY",
+            "name": "VIX Short ETF", "currency": "USD", "position_qty": "10",
+            "average_cost": "40", "market_value": "500",
         }],
     )
 
@@ -532,7 +610,11 @@ def test_us_report_api_fact_uses_unified_trend_fields(tmp_path: Path) -> None:
             self, *, tm_id: int, expected_date: str
         ) -> list[dict[str, object]]:
             assert (tm_id, expected_date) == (622460, "2026-07-14")
-            return [{"tmId": 1, "tickerSymbol": "VIXY.US", "asOfDate": expected_date}]
+            return [{"tmId": 1, "tickerSymbol": "QQQ.US", "asOfDate": expected_date}]
+
+        def search_exact_symbol(self, symbol: str) -> int:
+            assert symbol == "VIXY"
+            return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
             return [
@@ -545,13 +627,18 @@ def test_us_report_api_fact_uses_unified_trend_fields(tmp_path: Path) -> None:
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
             assert kwargs["fields"] == UNIFIED_TREND_FIELDS
-            return [{
-                "tmId": 1, "tickerName": "VIX Short", "tickerSymbol": "VIXY.US",
-                "asset": "美股", "asOfDate": "2026-07-14", "tradableFlag": True,
-                "industryName": "ETF", "amount1d": "2", "isTrendRightSide": True,
-                "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
-                "stopwinFlagByDangerSignal": False,
-            }]
+            return [
+                {
+                    "tmId": tm_id, "tickerName": name, "tickerSymbol": f"{symbol}.US",
+                    "asset": "美股", "asOfDate": "2026-07-14", "tradableFlag": True,
+                    "industryName": "ETF", "amount1d": "2", "isTrendRightSide": True,
+                    "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
+                    "stopwinFlagByDangerSignal": False,
+                    "stopwinFlagByBoilingTemperature": False,
+                    "stopwinFlagByPopChampagne": False,
+                }
+                for tm_id, symbol, name in ((1, "QQQ", "Invesco QQQ"), (2, "VIXY", "VIX Short"))
+            ]
 
     class Quote:
         def __init__(self, **kwargs: object) -> None:
@@ -577,41 +664,51 @@ def test_us_report_api_fact_uses_unified_trend_fields(tmp_path: Path) -> None:
         def close(self) -> None:
             pass
 
+    notifier = RecordingFeishu()
     result = run_market_trend_report(
         config=cfg,
         market="US",
         run_date="2026-07-15",
-        notifier=NullNotifier(),
+        notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
-        account_refresher=lambda *args: None,
+        account_refresher=lambda *args: (_ for _ in ()).throw(
+            RuntimeError("secret refresh failed")
+        ),
     )
 
     assert result.json_path is not None
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
     assert (
-        f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=1 "
+        f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
         "cache=client-managed"
     ) in payload["api_facts"]
-    assert payload["estimated_api_cost"] == "0.071"
+    assert payload["estimated_api_cost"] == "0.142"
+    assert payload["account"]["fresh"] is False
+    assert payload["strategy_judgments"]["formal_actions"] == []
+    assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "MANUAL_REVIEW"
+    assert payload["strategy_judgments"]["holding_decisions"][0]["reason"] == "stale_tiger_account"
+    assert payload["metadata"]["account_currency"] == "HKD"
+    assert payload["metadata"]["price_fx_to_hkd"] == "7.85"
+    assert payload["metadata"]["account_refresh_error"] == "<redacted> refresh failed"
+    assert "账户状态：账户数据非实时，禁止新增买入；持仓需复核" in notifier.messages[0][1]
 
 
 def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
     tmp_path: Path,
 ) -> None:
     cfg = config(tmp_path)
-    write_details(
+    write_tiger_snapshot(
         cfg.data_dir,
         "2026-07-15",
-        positions=[{
-            "statement_id": "2026-07-15-futu-live", "broker": "futu",
-            "market": "US", "asset_class": "stock", "symbol": "AAPL",
-            "name": "Apple", "currency": "USD", "quantity": "1",
-            "cost_price": "200", "market_value": "210",
-        }],
-        cash=[{
-            "statement_id": "2026-07-15-futu-live", "broker": "futu",
-            "currency": "USD", "cash_balance": "1000", "available_balance": "1000",
+        cash_records=[
+            {"record_type": "account_total", "currency": "USD", "account_total": "1210"},
+            {"currency": "USD", "cash_balance": "1000", "available_balance": "1000"},
+        ],
+        position_records=[{
+            "market": "US", "sec_type": "STK", "symbol": "AAPL",
+            "name": "Apple", "currency": "USD", "position_qty": "1",
+            "average_cost": "200", "market_value": "210",
         }],
     )
     snapshot_calls: list[object] = []

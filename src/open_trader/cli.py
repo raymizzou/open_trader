@@ -479,7 +479,9 @@ def build_parser() -> argparse.ArgumentParser:
     trend_watch.add_argument("--once", action="store_true")
 
     market_trend_report = subparsers.add_parser(
-        "trend-market-report", help="Generate a Futu US or Phillips HK trend plan"
+        "trend-market-report",
+        help="Generate a Tiger US or Phillips HK trend plan",
+        description="Generate a Tiger US or Phillips HK trend plan",
     )
     market_trend_report.add_argument("--market", choices=("US", "HK"), required=True)
     market_trend_report.add_argument("--date", default="today")
@@ -489,7 +491,9 @@ def build_parser() -> argparse.ArgumentParser:
     market_trend_report.add_argument("--revision", action="store_true")
 
     market_trend_watch = subparsers.add_parser(
-        "watch-trend-market", help="Watch Futu US or Phillips HK trend protection lines"
+        "watch-trend-market",
+        help="Watch Tiger US or Phillips HK trend protection lines",
+        description="Watch Tiger US or Phillips HK trend protection lines",
     )
     market_trend_watch.add_argument("--market", choices=("US", "HK"), required=True)
     market_trend_watch.add_argument(

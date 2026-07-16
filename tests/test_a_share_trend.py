@@ -843,6 +843,23 @@ def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
     assert hk_actions[0].estimated_shares == 100
 
 
+def test_us_buy_actions_convert_usd_share_price_to_hkd() -> None:
+    us = replace(candidate("600001", close="100", atr="5"), symbol="VIXY", exchange="US")
+
+    actions = estimate_buy_actions(
+        ranked=[us],
+        net_value=Decimal("785000"),
+        available_cash=Decimal("98500"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="US",
+        price_fx_to_account_currency=Decimal("7.85"),
+    )
+
+    assert actions[0].target_amount == Decimal("31400.00")
+    assert actions[0].estimated_shares == 40
+
+
 def test_hk_four_percent_weight_can_buy_one_board_lot() -> None:
     hk = replace(
         candidate("600002", close="127.6"),

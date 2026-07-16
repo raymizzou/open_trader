@@ -48,22 +48,28 @@ from .daily_premarket import (
     send_notification_with_results,
 )
 from .notifications import Notifier, NullNotifier
-from .futu_account import FutuAccountClient, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
+from .parsers.base import detect_asset_class
+from .tiger_account import (
+    TigerAccountClient,
+    load_tiger_account_config,
+    sync_tiger_portfolio,
+)
 from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MARKET_SETTINGS = {
-    "US": {"broker": "futu", "currency": "USD", "asset": "美股", "deadline": time(12)},
+    "US": {"broker": "tiger", "currency": "HKD", "asset": "美股", "deadline": time(12)},
     "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
 }
 MARKET_NOTIFICATION_LABELS = {
-    "US": ("富途", "美股", "确认 Trend Animals 与富途账户状态后手动重跑富途报告"),
+    "US": ("老虎", "美股", "确认 Trend Animals 与老虎账户状态后手动重跑老虎报告"),
     "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
 }
+USD_TO_HKD = Decimal("7.85")
 SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 
 
@@ -91,7 +97,7 @@ def _market(value: str) -> str:
 
 def market_paths(data_dir: Path, reports_dir: Path, market: str) -> MarketTrendPaths:
     market = _market(market)
-    suffix = "us_futu" if market == "US" else "hk_phillips"
+    suffix = "us_tiger" if market == "US" else "hk_phillips"
     root = data_dir / f"trend_{suffix}"
     return MarketTrendPaths(
         root=root,
@@ -251,6 +257,143 @@ def load_market_account(
     )
 
 
+def _tiger_fx_to_hkd(row: Mapping[str, object]) -> Decimal:
+    currency = str(row.get("currency") or "").strip().upper()
+    if currency == "USD":
+        return USD_TO_HKD
+    if currency == "HKD":
+        return Decimal("1")
+    rate = _decimal(row.get("fx_to_hkd"))
+    if not currency or rate <= 0:
+        raise ValueError("Tiger account snapshot has invalid currency FX")
+    return rate
+
+
+def _load_tiger_snapshot(
+    path: Path, *, source_date: str, expected_date: str, managed_symbols: set[str]
+) -> AccountSnapshot:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("Tiger account snapshot must be an object")
+    cash_rows = payload.get("cash_records")
+    position_rows = payload.get("position_records")
+    if not isinstance(cash_rows, list) or not all(isinstance(row, Mapping) for row in cash_rows):
+        raise ValueError("Tiger account cash records are invalid")
+    if not isinstance(position_rows, list) or not all(
+        isinstance(row, Mapping) for row in position_rows
+    ):
+        raise ValueError("Tiger account position records are invalid")
+
+    totals = [
+        row for row in cash_rows
+        if row.get("record_type") == "account_total"
+        and str(row.get("currency") or "").strip().upper() == "USD"
+    ]
+    if len(totals) != 1:
+        raise ValueError("Tiger account snapshot requires exactly one USD account_total")
+    net_value = _decimal(totals[0].get("account_total")) * USD_TO_HKD
+    available_cash = sum(
+        (
+            min(
+                _decimal(row.get("cash_balance")),
+                _decimal(row.get("available_balance")),
+            ) * _tiger_fx_to_hkd(row)
+            for row in cash_rows
+            if row.get("record_type") != "account_total"
+        ),
+        Decimal("0"),
+    )
+
+    normalized_managed = {_normalized_symbol("US", symbol) for symbol in managed_symbols}
+    exceptions: list[str] = []
+    positions: list[AccountPosition] = []
+    for row in position_rows:
+        if str(row.get("market") or "").strip().upper() != "US":
+            continue
+        if str(row.get("sec_type") or "").strip().upper() != "STK":
+            continue
+        quantity = _decimal(row.get("position_qty"))
+        if quantity <= 0:
+            continue
+        symbol = _normalized_symbol("US", str(row.get("symbol") or ""))
+        if symbol not in normalized_managed:
+            continue
+        name = str(row.get("name") or "").strip() or symbol
+        asset_class = str(row.get("asset_class") or "").strip().lower()
+        if not asset_class:
+            asset_class = detect_asset_class(symbol, name).value
+        if asset_class not in {"stock", "etf"}:
+            exceptions.append(
+                f"unsupported managed asset: {symbol} ({asset_class or 'unknown'})"
+            )
+            continue
+        fx = _tiger_fx_to_hkd(row)
+        avg_cost = _optional_decimal(row.get("average_cost"))
+        positions.append(AccountPosition(
+            symbol=symbol,
+            name=name,
+            asset_class=asset_class,
+            quantity=quantity,
+            avg_cost_price=avg_cost * fx if avg_cost is not None else None,
+            market_value=_decimal(row.get("market_value")) * fx,
+        ))
+    return AccountSnapshot(
+        source_date=source_date,
+        fresh=source_date == expected_date,
+        net_value=net_value,
+        available_cash=max(Decimal("0"), available_cash),
+        positions=tuple(sorted(positions, key=lambda item: item.symbol)),
+        exceptions=tuple(exceptions),
+    )
+
+
+def load_tiger_trend_account(
+    *, data_dir: Path, expected_date: str, managed_symbols: set[str]
+) -> AccountSnapshot:
+    runs = data_dir / "runs"
+    if not runs.exists():
+        raise FileNotFoundError("no Tiger account snapshot found")
+    last_error: Exception | None = None
+    for run_dir in sorted((item for item in runs.iterdir() if item.is_dir()), reverse=True):
+        try:
+            date.fromisoformat(run_dir.name)
+        except ValueError:
+            continue
+        path = run_dir / "tiger_account_snapshot.json"
+        if not path.exists():
+            continue
+        try:
+            return _load_tiger_snapshot(
+                path,
+                source_date=run_dir.name,
+                expected_date=expected_date,
+                managed_symbols=managed_symbols,
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+    if last_error is not None:
+        raise ValueError("no valid Tiger account snapshot found") from last_error
+    raise FileNotFoundError("no Tiger account snapshot found")
+
+
+def load_trend_account(
+    *, data_dir: Path, market: str, expected_date: str, managed_symbols: set[str]
+) -> AccountSnapshot:
+    if _market(market) == "US":
+        return load_tiger_trend_account(
+            data_dir=data_dir,
+            expected_date=expected_date,
+            managed_symbols=managed_symbols,
+        )
+    return load_market_account(
+        data_dir=data_dir,
+        broker="phillips",
+        market="HK",
+        expected_date=expected_date,
+        managed_symbols=managed_symbols,
+    )
+
+
 def resolve_market_dates(quote: object, *, market: str, run_date: str) -> tuple[str, str]:
     market = _market(market)
     run_day = date.fromisoformat(run_date)
@@ -302,20 +445,22 @@ def _managed_symbols(
     return {_normalized_symbol(market, value) for value in values if value.strip()}
 
 
-def _refresh_futu_account(config: DailyPremarketConfig, run_date: str) -> None:
-    client = FutuAccountClient(host=config.futu_host, port=config.futu_port)
+def _refresh_tiger_account(config: DailyPremarketConfig, run_date: str) -> None:
+    tiger_config = load_tiger_account_config(
+        config_dir=Path("~/.tigeropen/"), account=None, sandbox=False
+    )
+    client = TigerAccountClient(config=tiger_config)
     try:
-        snapshot = client.fetch_snapshot()
+        sync_tiger_portfolio(
+            snapshot=client.fetch_snapshot(),
+            portfolio_path=config.portfolio,
+            data_dir=config.data_dir,
+            reports_dir=config.reports_dir,
+            run_date=run_date,
+            update_latest=True,
+        )
     finally:
         client.close()
-    sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=config.portfolio,
-        data_dir=config.data_dir,
-        reports_dir=config.reports_dir,
-        run_date=run_date,
-        update_latest=True,
-    )
 
 
 def _market_receipt_path(paths: MarketTrendPaths, artifact_stem: str) -> Path:
@@ -428,7 +573,7 @@ def _attempt_market_report(
     notifier: Notifier,
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
-    account_refresher: Callable[[DailyPremarketConfig, str], None] = _refresh_futu_account,
+    account_refresher: Callable[[DailyPremarketConfig, str], None] = _refresh_tiger_account,
 ) -> AShareTrendRunResult:
     market = _market(market)
     settings = MARKET_SETTINGS[market]
@@ -472,16 +617,21 @@ def _attempt_market_report(
         if not updates_ready(update_rows, market=market, as_of_date=as_of_date):
             return AShareTrendRunResult("waiting", None, None)
 
+        account_refresh_error: str | None = None
         if market == "US":
-            account_refresher(config, run_date)
+            try:
+                account_refresher(config, run_date)
+            except Exception as exc:
+                account_refresh_error = _redact_api_key(
+                    exc, config.trend_animals_api_key
+                )
         prior_state = load_protection_state(paths.state)
         configured = (
             config.trend_us_symbols if market == "US" else config.trend_hk_symbols
         )
         managed = _managed_symbols(prior_state, configured, market)
-        account = load_market_account(
+        account = load_trend_account(
             data_dir=config.data_dir,
-            broker=str(settings["broker"]),
             market=market,
             expected_date=run_date if market == "US" else as_of_date,
             managed_symbols=managed,
@@ -606,7 +756,7 @@ def _attempt_market_report(
             data_sources=(
                 "Trend Animals",
                 f"Futu {market} calendar/QFQ daily K-line",
-                "Futu live account" if market == "US" else "Phillips daily statement",
+                "Tiger live account" if market == "US" else "Phillips daily statement",
             ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost if actual_cost >= 0 else None,
@@ -614,14 +764,35 @@ def _attempt_market_report(
             lot_sizes=lot_sizes,
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
+            price_fx_to_account_currency=(USD_TO_HKD if market == "US" else Decimal("1")),
             metadata={
                 "market": market,
                 "broker": settings["broker"],
+                "account_currency": "HKD",
+                "price_fx_to_hkd": str(USD_TO_HKD if market == "US" else Decimal("1")),
                 "account_check_required": market == "HK",
                 "run_date": run_date,
                 "process_version": _process_version(config.repo),
+                **(
+                    {"account_refresh_error": account_refresh_error}
+                    if account_refresh_error is not None
+                    else {}
+                ),
             },
         )
+        if market == "US" and not account.fresh:
+            report = replace(
+                report,
+                buy_actions=(),
+                holdings=tuple(
+                    replace(
+                        holding,
+                        action="MANUAL_REVIEW",
+                        reason="stale_tiger_account",
+                    )
+                    for holding in report.holdings
+                ),
+            )
         managed.update(item.symbol for item in account.positions)
         managed.update(item.symbol for item in report.buy_actions)
         protection_state = {

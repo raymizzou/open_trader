@@ -37,6 +37,7 @@ DISCLAIMER_TEXT = (
     "本报告是确定性纪律清单，不是订单或成交事实；所有交易由用户人工确认与执行。"
 )
 NON_REALTIME_ACCOUNT_WARNING = "账户数据非实时，执行前核对现金与持仓"
+STALE_TIGER_ACCOUNT_WARNING = "账户数据非实时，禁止新增买入；持仓需复核"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 UNIFIED_TREND_FIELDS = (
     "tmId", "tickerName", "tickerSymbol", "asset", "asOfDate",
@@ -691,6 +692,7 @@ def estimate_buy_actions(
     position_weight: Decimal,
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
+    price_fx_to_account_currency: Decimal = Decimal("1"),
 ) -> list[BuyAction]:
     slots = max(0, 10 - current_position_count)
     if slots == 0:
@@ -719,7 +721,8 @@ def estimate_buy_actions(
             lot_size = (lot_sizes or {}).get(item.symbol, 0)
         else:
             lot_size = 1
-        shares = int(amount / item.close / lot_size) * lot_size if lot_size > 0 else 0
+        share_price = item.close * price_fx_to_account_currency
+        shares = int(amount / share_price / lot_size) * lot_size if lot_size > 0 else 0
         if shares <= 0:
             continue
         actions.append(
@@ -887,6 +890,7 @@ def build_report(
     lot_sizes: Mapping[str, int] | None = None,
     position_weight: Decimal = Decimal("0.04"),
     position_weight_source: str = "fallback_4pct",
+    price_fx_to_account_currency: Decimal = Decimal("1"),
 ) -> TrendReport:
     held_symbols = {position.symbol for position in account.positions}
     candidate_decision = build_candidate_list(
@@ -904,6 +908,7 @@ def build_report(
         position_weight=position_weight,
         market=market,
         lot_sizes=lot_sizes,
+        price_fx_to_account_currency=price_fx_to_account_currency,
     )
     old_positions = _state_positions(prior_state)
     holdings: list[HoldingDecision] = []
@@ -1144,6 +1149,7 @@ REASON_LABELS = {
     "left_trend_right_side": "右侧趋势已结束",
     "holding_signal_unknown": "趋势信号不完整",
     "holding_kline_unavailable": "持仓日线数据不可用",
+    "stale_tiger_account": "老虎账户数据非实时，禁止新增买入；持仓需复核",
     "trend_intact": "趋势保持完好",
     "temperature_changed_to_flat": "趋势温度转平",
     "a_share_only": "仅限 A 股股票",
@@ -1341,7 +1347,13 @@ def render_trend_feishu_text(
         if _trend_action_needs_review(item) and item not in reviews:
             reviews.append(item)
     title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
-    status = "已更新" if fresh else NON_REALTIME_ACCOUNT_WARNING
+    status = (
+        "已更新"
+        if fresh
+        else STALE_TIGER_ACCOUNT_WARNING
+        if metadata.get("broker") == "tiger"
+        else NON_REALTIME_ACCOUNT_WARNING
+    )
     summary = (
         f"今日动作：卖出 {len(sells)}｜买入 {len(buys)}｜持有 {len(holds)}｜复核 {len(reviews)}"
         if sells or buys
@@ -1387,10 +1399,16 @@ def render_trend_failure_text(
 def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
     market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(market, market)
-    currency = {"CN": "元", "US": "美元", "HK": "港元"}.get(market, "")
+    account_currency = str(report.metadata.get("account_currency") or "")
+    currency = (
+        {"CNY": "元", "USD": "美元", "HKD": "港元"}.get(account_currency)
+        or {"CN": "元", "US": "美元", "HK": "港元"}.get(market, "")
+    )
     freshness = (
         "已更新"
         if report.account.fresh is True
+        else STALE_TIGER_ACCOUNT_WARNING
+        if report.metadata.get("broker") == "tiger"
         else NON_REALTIME_ACCOUNT_WARNING
     )
     sells = [item for item in report.holdings if item.action == "SELL_ALL"]

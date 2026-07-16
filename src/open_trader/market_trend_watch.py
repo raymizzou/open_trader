@@ -15,7 +15,7 @@ from .a_share_trend_watch import (
     watch_a_share_protection,
 )
 from .futu_quote import FutuQuoteClient, FutuQuoteError
-from .market_trend import MARKET_SETTINGS, _market, load_market_account
+from .market_trend import _market, load_trend_account
 from .notifications import Notifier
 
 
@@ -24,7 +24,7 @@ MARKET_TIMEZONES = {
     "US": ZoneInfo("America/New_York"),
 }
 MARKET_LABELS = {"HK": "港股", "US": "美股"}
-BROKER_LABELS = {"HK": "辉立", "US": "富途"}
+BROKER_LABELS = {"HK": "辉立", "US": "老虎"}
 
 
 def market_session(now: datetime, market: str) -> str:
@@ -138,9 +138,8 @@ def watch_market_protection(
         break
 
     active_lines = _load_active_lines(state_path)
-    load_market_account(
+    load_trend_account(
         data_dir=data_dir,
-        broker=str(MARKET_SETTINGS[market]["broker"]),
         market=market,
         expected_date=opening.date().isoformat(),
         managed_symbols=set(active_lines),
@@ -153,9 +152,8 @@ def watch_market_protection(
         path: Path, *, expected_date: str, timezone: ZoneInfo
     ):
         del path, timezone
-        return load_market_account(
+        return load_trend_account(
             data_dir=data_dir,
-            broker=str(MARKET_SETTINGS[market]["broker"]),
             market=market,
             expected_date=expected_date,
             managed_symbols=set(_load_active_lines(state_path)),

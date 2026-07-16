@@ -487,6 +487,16 @@ def test_trend_market_parsers_have_safe_defaults() -> None:
     assert watch.once is False
 
 
+def test_trend_market_help_names_tiger_us(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["trend-market-report", "--help"])
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "Tiger US or Phillips HK" in help_text
+    assert "Futu US" not in help_text
+
+
 def test_trend_market_report_dispatches_generic_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
