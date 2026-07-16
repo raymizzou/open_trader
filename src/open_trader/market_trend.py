@@ -21,6 +21,7 @@ from .a_share_trend import (
     _balance,
     _billing_field,
     _billing_price,
+    _component_api_facts,
     _final_pair_matches,
     _holding_snapshot,
     _is_systemic_futu_error,
@@ -596,7 +597,7 @@ def _attempt_market_report(
             watch_events=load_watch_events(paths.events),
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
-                f"getComponentTicker rows={len(component_rows)} cache=client-managed",
+                *_component_api_facts(api, len(component_rows)),
                 f"getTickerSnapshot fields={','.join(HOLDING_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
             ),
             data_sources=(

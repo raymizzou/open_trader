@@ -1886,6 +1886,7 @@ def test_markdown_translates_exclusion_and_api_facts_without_paths() -> None:
         api_facts=(
             "getUpdateStatus rows=6",
             "getComponentTicker rows=39 cache=client-managed",
+            "忽略旧成分 1 条：NUVL（2026-07-14）",
             "getTickerSnapshot fields=tmId,tickerName rows=44 cache=client-managed",
         ),
         data_sources=(
@@ -1901,6 +1902,7 @@ def test_markdown_translates_exclusion_and_api_facts_without_paths() -> None:
     assert "缺少 ATR 数据" in markdown
     assert "数据更新状态：已检查 6 条" in markdown
     assert "候选池成分：39 条" in markdown
+    assert "忽略旧成分 1 条：NUVL（2026-07-14）" in markdown
     assert "趋势快照：44 条" in markdown
     assert "getUpdateStatus" not in markdown
     assert "cache=client-managed" not in markdown
@@ -2447,6 +2449,10 @@ class RecordingFeishu(FeishuWebhookNotifier):
 
 
 class ReadyApi:
+    ignored_stale_components = (
+        {"tickerSymbol": "NUVL", "asOfDate": "2026-07-14"},
+    )
+
     def __init__(
         self,
         calls: list[str],
@@ -2563,6 +2569,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
         ([700001], A_SHARE_INDUSTRY_FIELDS),
     ]
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     audit = payload["signal_snapshots"]["candidates"]
     assert audit[0]["industry_tm_id"] == 700001
     assert audit[0]["industry_temperature"] == "热"

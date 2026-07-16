@@ -1091,7 +1091,20 @@ def _reason_label(value: str) -> str:
     return REASON_LABELS.get(value, f"未知原因（{value}）")
 
 
+def _component_api_facts(api: object, row_count: int) -> tuple[str, ...]:
+    facts = [f"getComponentTicker rows={row_count} cache=client-managed"]
+    ignored = tuple(getattr(api, "ignored_stale_components", ()))
+    if ignored:
+        details = "、".join(
+            f"{row['tickerSymbol']}（{row['asOfDate']}）" for row in ignored
+        )
+        facts.append(f"忽略旧成分 {len(ignored)} 条：{details}")
+    return tuple(facts)
+
+
 def _api_fact_label(value: str) -> str:
+    if value.startswith("忽略旧成分 "):
+        return value
     if value.startswith("getUpdateStatus rows="):
         return f"数据更新状态：已检查 {value.rsplit('=', 1)[-1]} 条"
     if value.startswith("getComponentTicker rows="):
@@ -2412,7 +2425,7 @@ def _attempt_report(
             ),
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
-                f"getComponentTicker rows={len(component_rows)} cache=client-managed",
+                *_component_api_facts(api, len(component_rows)),
                 f"getTickerSnapshot fields={','.join(fields)} rows={len(snapshot_rows)} cache=client-managed",
                 f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
             ),
