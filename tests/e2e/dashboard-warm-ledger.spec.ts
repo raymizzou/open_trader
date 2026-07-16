@@ -398,6 +398,33 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
 
+test('keeps Futu option cards two-column and inside the 760px viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 760, height: 1000 });
+  await installLedgerFixture(page);
+  await page.goto('/');
+  await page.getByRole('tab', { name: /富途/ }).click();
+  await page.getByRole('button', { name: '期权关注', exact: true }).click();
+
+  await expectMobileTargetsAtLeast44(page, 'body', '#return-to-portfolio:visible, #trend-report-workspace button:visible');
+  const geometry = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('.option-attention-row')];
+    const elements = [
+      ...document.querySelectorAll('.option-attention-workspace, .option-attention-table, .option-attention-market, .option-attention-row'),
+    ];
+    return {
+      columns: rows.map((row) => getComputedStyle(row).gridTemplateColumns.split(' ').length),
+      pageFits: document.documentElement.scrollWidth <= window.innerWidth,
+      elementsFit: elements.every((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.left >= -1 && rect.right <= window.innerWidth + 1;
+      }),
+    };
+  });
+  expect(geometry.columns.length).toBeGreaterThan(0);
+  expect(geometry.columns.every((count) => count === 2)).toBe(true);
+  expect(geometry).toMatchObject({ pageFits: true, elementsFit: true });
+});
+
 test('aligns the A-share report with the 1600px shell and scrolls only the buy table', async ({ page }) => {
   await page.setViewportSize({ width: 1920, height: 1080 });
   await installLedgerFixture(page);

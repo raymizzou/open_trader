@@ -60,11 +60,19 @@ WARM_LEDGER_TOKENS = {
     "--success": "#2F855A",
 }
 ACCEPTANCE_SCREENSHOT_DIR = Path("/tmp/open_trader_dashboard_acceptance")
+ACCEPTANCE_BROWSER_VIEWPORTS = (
+    ("wide_desktop", {"width": 1920, "height": 1080}),
+    ("desktop", {"width": 1440, "height": 1000}),
+    ("tablet", {"width": 760, "height": 1000}),
+    ("mobile", {"width": 375, "height": 844}),
+)
 ACCEPTANCE_SCREENSHOT_NAMES = (
     "wide_desktop-portfolio.png",
     "1920-trend-report.png",
     "desktop-portfolio.png",
     "1440-trend-report.png",
+    "tablet-portfolio.png",
+    "760-trend-report.png",
     "mobile-portfolio.png",
     "375-trend-report.png",
 )
@@ -922,8 +930,8 @@ def _check_account_holdings(
             assert page.locator("#trend-report-workspace:visible").count() == 0, (
                 f"{broker} 不可用报告错误打开工作区"
             )
-            if broker == "eastmoney" and screenshot_dir is not None:
-                raise AssertionError("eastmoney 趋势报告不可用，无法生成验收截图")
+            if broker in {"futu", "eastmoney"} and screenshot_dir is not None:
+                raise AssertionError(f"{broker} 趋势报告不可用，无法生成验收截图")
             continue
         assert trigger.count() == 1, f"{broker} 可用报告缺少入口"
         if reports_dir is not None and broker in TREND_REPORT_BROKERS:
@@ -1458,11 +1466,7 @@ def _browser_check(
             except AssertionError as exc:
                 browser.close()
                 return [str(exc)], None
-            for name, viewport in (
-                ("wide_desktop", {"width": 1920, "height": 1080}),
-                ("desktop", {"width": 1440, "height": 1000}),
-                ("mobile", {"width": 375, "height": 844}),
-            ):
+            for name, viewport in ACCEPTANCE_BROWSER_VIEWPORTS:
                 page = None
                 try:
                     page = browser.new_page(viewport=viewport)

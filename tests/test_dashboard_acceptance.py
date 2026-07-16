@@ -83,6 +83,25 @@ def test_acceptance_screenshot_cleanup_removes_only_exact_expected_names(
     assert (tmp_path / "keep-me.png").read_bytes() == b"old"
 
 
+def test_acceptance_browser_viewport_and_screenshot_matrix_is_exact() -> None:
+    assert dashboard_acceptance.ACCEPTANCE_BROWSER_VIEWPORTS == (
+        ("wide_desktop", {"width": 1920, "height": 1080}),
+        ("desktop", {"width": 1440, "height": 1000}),
+        ("tablet", {"width": 760, "height": 1000}),
+        ("mobile", {"width": 375, "height": 844}),
+    )
+    assert dashboard_acceptance.ACCEPTANCE_SCREENSHOT_NAMES == (
+        "wide_desktop-portfolio.png",
+        "1920-trend-report.png",
+        "desktop-portfolio.png",
+        "1440-trend-report.png",
+        "tablet-portfolio.png",
+        "760-trend-report.png",
+        "mobile-portfolio.png",
+        "375-trend-report.png",
+    )
+
+
 def test_acceptance_screenshot_validation_requires_current_nonempty_exact_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2389,7 +2408,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         pages = 0
 
         def new_page(self, **kwargs: object) -> Page:
-            names = ("wide_desktop", "desktop", "mobile")
+            names = ("wide_desktop", "desktop", "tablet", "mobile")
             name = names[self.pages]
             self.pages += 1
             viewport = kwargs["viewport"]
@@ -2428,8 +2447,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         "验收截图缺失：1920-trend-report.png",
     ]
     assert blocker is None
-    assert visited == ["wide_desktop", "desktop", "mobile"]
-    assert viewport_widths == [1920, 1440, 375]
+    assert visited == ["wide_desktop", "desktop", "tablet", "mobile"]
+    assert viewport_widths == [1920, 1440, 760, 375]
 
     state["fail_wide_desktop_navigation"] = False
     visited.clear()
@@ -2457,10 +2476,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     assert errors == [
         "wide_desktop：AssertionError: decision failed",
         "desktop：AssertionError: decision failed",
+        "tablet：AssertionError: decision failed",
         "mobile：AssertionError: decision failed",
     ]
     assert blocker is None
-    for viewport in ("wide_desktop", "desktop", "mobile"):
+    for viewport in ("wide_desktop", "desktop", "tablet", "mobile"):
         assert (viewport, '#broker-summary-cards [data-broker="phillips"]') in selectors
         assert (viewport, '[data-market="CN"]') in selectors
         assert (viewport, '[data-market="CN"]') in clicks
@@ -2518,18 +2538,22 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, 'body') in selectors
         assert (viewport, 'a:visible, button:visible') in selectors
         assert (viewport, 'a[href="#account-tiger"]') not in clicks
-    assert (
-        "mobile",
-        "#trend-report-workspace:visible .option-attention-workspace, "
-        "#trend-report-workspace:visible .option-attention-table, "
-        "#trend-report-workspace:visible .option-attention-market, "
-        "#trend-report-workspace:visible .option-attention-row",
-    ) in selectors
+    for viewport in ("tablet", "mobile"):
+        assert (
+            viewport,
+            "#trend-report-workspace:visible .option-attention-workspace, "
+            "#trend-report-workspace:visible .option-attention-table, "
+            "#trend-report-workspace:visible .option-attention-market, "
+            "#trend-report-workspace:visible .option-attention-row",
+        ) in selectors
     assert evaluated == [
-        *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 9),
+        *(["wide_desktop"] * 7), *(["desktop"] * 7),
+        *(["tablet"] * 9), *(["mobile"] * 9),
     ]
-    assert visual_token_evaluations == ["wide_desktop", "desktop", "mobile"]
-    for viewport in ("wide_desktop", "desktop", "mobile"):
+    assert visual_token_evaluations == [
+        "wide_desktop", "desktop", "tablet", "mobile",
+    ]
+    for viewport in ("wide_desktop", "desktop", "tablet", "mobile"):
         assert [
             selector
             for name, selector in visual_surface_evaluations
@@ -2545,6 +2569,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         ("wide_desktop", str(screenshot_dir / "1920-trend-report.png")),
         ("desktop", str(screenshot_dir / "desktop-portfolio.png")),
         ("desktop", str(screenshot_dir / "1440-trend-report.png")),
+        ("tablet", str(screenshot_dir / "tablet-portfolio.png")),
+        ("tablet", str(screenshot_dir / "760-trend-report.png")),
         ("mobile", str(screenshot_dir / "mobile-portfolio.png")),
         ("mobile", str(screenshot_dir / "375-trend-report.png")),
     ]
@@ -2869,6 +2895,31 @@ def test_acceptance_rejects_unavailable_eastmoney_report_for_screenshot(
         dashboard_acceptance._check_account_holdings(
             page, payload, screenshot_dir=tmp_path
         )
+
+
+def test_acceptance_rejects_unavailable_futu_report_for_screenshot(
+    tmp_path: Path,
+) -> None:
+    payload = valid_payload()
+    report = payload["trend_reports"]["futu"]  # type: ignore[index]
+    report.update(available=False, status_text="今日报告不可用")
+    page = tabbed_account_page(payload)
+
+    with pytest.raises(AssertionError, match="futu.*不可用.*截图"):
+        dashboard_acceptance._check_account_holdings(
+            page, payload, screenshot_dir=tmp_path
+        )
+
+
+def test_acceptance_keeps_unavailable_futu_disabled_outside_screenshot_gate() -> None:
+    payload = valid_payload()
+    report = payload["trend_reports"]["futu"]  # type: ignore[index]
+    report.update(available=False, status_text="今日报告不可用")
+    page = tabbed_account_page(payload)
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert page.disabled_reports == {"futu"}
 
 
 def test_select_account_tab_rejects_multiple_visible_sections() -> None:
