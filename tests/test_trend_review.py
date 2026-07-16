@@ -260,10 +260,15 @@ class FakeTrendSimClient:
         *,
         nav: str = "100000",
         positions: list[dict[str, object]] | None = None,
+        fail_orders: int = 0,
+        accepted_before_failure: bool = False,
     ) -> None:
         self.nav = nav
         self.positions = positions or []
         self.requests: list[dict[str, object]] = []
+        self.orders: list[dict[str, object]] = []
+        self.fail_orders = fail_orders
+        self.accepted_before_failure = accepted_before_failure
 
     def account_snapshot(self) -> dict[str, object]:
         return {
@@ -274,15 +279,28 @@ class FakeTrendSimClient:
 
     def place_order(self, request: dict[str, object]) -> dict[str, object]:
         self.requests.append(request)
+        if self.fail_orders:
+            self.fail_orders -= 1
+            if self.accepted_before_failure:
+                self.orders.append(dict(request))
+            raise RuntimeError("place order failed")
+        self.orders.append(dict(request))
         return {
             "futu_order_id": f"SIM-{len(self.requests)}",
             "status": "submitted",
         }
 
+    def list_orders(self) -> dict[str, object]:
+        return {"orders": self.orders}
+
 
 def cn_buy_report(*, weight: str = "0.04") -> dict[str, object]:
     return {
-        "account": {"net_value": "735164.41"},
+        "account": {
+            "net_value": "735164.41",
+            "fresh": True,
+            "source_date": "2026-07-17",
+        },
         "strategy_snapshot": {
             "strategy_id": "trend_animals_warm_to_hot/CN/v1",
             "strategy_version": "v1",
@@ -334,6 +352,52 @@ def test_open_uses_sim_nav_current_price_and_frozen_lot(tmp_path: Path) -> None:
     assert len(client.requests) == 1
 
 
+def test_open_retries_intent_when_failed_order_is_absent_at_broker(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(fail_orders=1)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "prices": {"600001": Decimal("10")},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "now": "2026-07-17T09:31:00+08:00",
+    }
+
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_open(**arguments)
+    result = trend_review.execute_trend_review_open(**arguments)
+
+    assert result["status"] == "submitted"
+    assert result["submitted_count"] == 1
+    assert len(client.requests) == 2
+
+
+def test_open_reconciles_accepted_order_after_response_failure(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(fail_orders=1, accepted_before_failure=True)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "prices": {"600001": Decimal("10")},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "now": "2026-07-17T09:31:00+08:00",
+    }
+
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_open(**arguments)
+    result = trend_review.execute_trend_review_open(**arguments)
+
+    assert result["status"] == "unchanged"
+    assert len(client.requests) == 1
+    assert list(tmp_path.glob("trend_review/ledgers/CN/open/*/*-result.json"))
+
+
 def test_first_open_requires_empty_dedicated_simulate_account(
     tmp_path: Path,
 ) -> None:
@@ -378,6 +442,36 @@ def test_close_uses_authoritative_simulate_account_nav(tmp_path: Path) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["discipline_equity_after_fees"] == "101000.00"
     assert payload["actual_equity"] == "735164.41"
+
+
+@pytest.mark.parametrize(
+    "account",
+    [
+        {"net_value": "735164.41", "fresh": False, "source_date": "2026-07-17"},
+        {"net_value": "735164.41", "fresh": True, "source_date": "2026-07-16"},
+    ],
+)
+def test_close_records_stale_or_misaligned_actual_equity_as_missing(
+    tmp_path: Path, account: dict[str, object],
+) -> None:
+    report = cn_buy_report()
+    report["account"] = account
+    path = trend_review.capture_trend_review_close(
+        data_dir=tmp_path,
+        market="CN",
+        trading_date="2026-07-17",
+        report=report,
+        simulate_snapshot={"acc_id": 101, "net_value": "101000", "positions": []},
+        orders=[],
+        benchmark={
+            "date": "2026-07-17",
+            "close": "6123.45",
+            "source_id": "CSI_ALL_SHARE_PRICE",
+            "futu_symbol": "SH.000985",
+        },
+    )
+
+    assert "actual_equity" not in json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_close_rejects_report_without_strategy_snapshot(tmp_path: Path) -> None:
@@ -456,6 +550,32 @@ def test_stop_sells_full_simulate_position_once(tmp_path: Path) -> None:
     ]
     assert first["submitted_count"] == 1
     assert repeated["submitted_count"] == 0
+
+
+def test_stop_retries_intent_when_failed_order_is_absent_at_broker(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "300"}],
+        fail_orders=1,
+    )
+    arguments = {
+        "data_dir": tmp_path,
+        "market": "CN",
+        "symbol": "600001",
+        "trading_date": "2026-07-17",
+        "event_id": "event-1",
+        "client": client,
+        "now": "2026-07-17T10:15:00+08:00",
+    }
+
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_stop(**arguments)
+    result = trend_review.execute_trend_review_stop(**arguments)
+
+    assert result["status"] == "submitted"
+    assert result["submitted_count"] == 1
+    assert len(client.requests) == 2
 
 
 def write_review_history(
@@ -548,6 +668,22 @@ def test_projection_closes_non_overlapping_batch_at_thirtieth_trade(
         "value": "0",
         "reason": None,
     }
+
+
+def test_projection_batch_starts_at_earliest_selected_entry(tmp_path: Path) -> None:
+    write_review_history(tmp_path, completed_trades=30, days=40)
+    daily = tmp_path / "trend_review/daily/CN"
+    first_path, _, third_path = sorted(daily.glob("*.json"))[:3]
+    first = json.loads(first_path.read_text(encoding="utf-8"))
+    delayed_sell = first["orders"].pop()
+    first_path.write_text(json.dumps(first), encoding="utf-8")
+    third = json.loads(third_path.read_text(encoding="utf-8"))
+    third["orders"].append(delayed_sell)
+    third_path.write_text(json.dumps(third), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["batch"]["start_date"] == "2026-05-01"
 
 
 def test_projection_marks_missing_actual_curve_as_data_insufficient(

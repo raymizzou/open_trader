@@ -298,7 +298,6 @@ def test_trend_a_share_report_main_dispatches_and_returns_status(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured: dict[str, object] = {}
-    review_calls: list[tuple[object, str, str]] = []
     config = SimpleNamespace(
         timezone="Asia/Shanghai",
         trend_animals_api_key="secret",
@@ -318,12 +317,9 @@ def test_trend_a_share_report_main_dispatches_and_returns_status(
     monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
     monkeypatch.setattr(cli, "run_a_share_trend_report", fake_runner)
     monkeypatch.setattr(
-        cli, "require_trend_review_config", lambda loaded, market: 101
-    )
-    monkeypatch.setattr(
         cli,
         "run_trend_review_close",
-        lambda loaded, market, date: review_calls.append((loaded, market, date)),
+        lambda *args: (_ for _ in ()).throw(RuntimeError("review failed")),
     )
 
     result = cli.main([
@@ -339,24 +335,39 @@ def test_trend_a_share_report_main_dispatches_and_returns_status(
         "notifier": "notifier",
     }
     assert json.loads(capsys.readouterr().out)["status"] == status
-    assert review_calls == (
-        [(config, "CN", "2026-07-14")]
-        if status in {"generated", "existing"}
-        else []
-    )
 
 
 def test_trend_review_loader_prefers_latest_numeric_revision(tmp_path: Path) -> None:
     report_dir = tmp_path / "reports/trend_a_share"
     report_dir.mkdir(parents=True)
+    valid = {
+        "schema_version": 1,
+        "execution_date": "2026-07-16",
+        "as_of_date": "2026-07-16",
+        "generated_at": "2026-07-16T18:00:00+08:00",
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [], "holding_decisions": [], "top10_candidates": [],
+        },
+    }
     for filename, version in (
         ("2026-07-16.json", "base"),
         ("2026-07-16-r9.json", "r9"),
         ("2026-07-16-r10.json", "r10"),
     ):
         (report_dir / filename).write_text(
-            json.dumps({"as_of_date": "2026-07-16", "version": version}),
+            json.dumps({**valid, "version": version}),
             encoding="utf-8",
+        )
+    invalid_reports = [
+        {**valid, "schema_version": 2},
+        {**valid, "metadata": {"market": "US", "broker": "tiger"}},
+        {**valid, "as_of_date": "2026-07-17"},
+        {**valid, "strategy_judgments": {**valid["strategy_judgments"], "formal_actions": [{"action": "WAIT", "symbol": "600001"}]}},
+    ]
+    for revision, payload in enumerate(invalid_reports, 11):
+        (report_dir / f"2026-07-16-r{revision}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
         )
     config = SimpleNamespace(
         reports_dir=tmp_path / "reports",
@@ -487,9 +498,6 @@ def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
     monkeypatch.setattr(cli, "FutuQuoteClient", lambda **kwargs: quote)
     monkeypatch.setattr(cli, "RunLock", RecordingLock)
     monkeypatch.setattr(cli, "watch_a_share_protection", fake_watcher)
-    monkeypatch.setattr(
-        cli, "require_trend_review_config", lambda loaded, market: 101
-    )
     monkeypatch.setattr(cli, "run_trend_review_open", lambda *args: None)
     monkeypatch.setattr(cli, "run_trend_review_stop", lambda *args: None, raising=False)
 
@@ -518,8 +526,8 @@ def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
     assert captured["poll_seconds"] == 2.5
     assert captured["reconnect_seconds"] == 30.0
     assert captured["once"] is True
-    assert callable(captured["on_session_open"])
-    assert callable(captured["on_protection_trigger"])
+    assert captured["on_session_open"] is None
+    assert captured["on_protection_trigger"] is None
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
 
 
@@ -640,10 +648,10 @@ def test_trend_market_report_dispatches_generic_runner(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured: dict[str, object] = {}
-    review_calls: list[tuple[object, str, str]] = []
     config = SimpleNamespace(
         timezone="Asia/Shanghai", trend_animals_api_key="secret",
         trend_animals_us_tm_ids=(622460,), trend_animals_hk_tm_ids=(622494,),
+        trend_review_us_simulate_acc_id=0,
     )
     monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
     monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
@@ -663,12 +671,9 @@ def test_trend_market_report_dispatches_generic_runner(
 
     monkeypatch.setattr(cli, "run_market_trend_report", runner)
     monkeypatch.setattr(
-        cli, "require_trend_review_config", lambda loaded, market: 102
-    )
-    monkeypatch.setattr(
         cli,
         "run_trend_review_close",
-        lambda loaded, market, date: review_calls.append((loaded, market, date)),
+        lambda *args: (_ for _ in ()).throw(RuntimeError("review failed")),
     )
 
     assert cli.main([
@@ -680,7 +685,6 @@ def test_trend_market_report_dispatches_generic_runner(
         "revision": True, "notifier": "notifier",
     }
     assert json.loads(capsys.readouterr().out)["status"] == "generated"
-    assert review_calls == [(config, "US", "2026-07-14")]
 
 
 def test_watch_trend_market_uses_separate_market_paths(
@@ -692,6 +696,7 @@ def test_watch_trend_market_uses_separate_market_paths(
     config = SimpleNamespace(
         data_dir=tmp_path / "data", reports_dir=tmp_path / "reports",
         portfolio=tmp_path / "portfolio.csv", futu_host="127.0.0.1", futu_port=11111,
+        trend_review_hk_simulate_acc_id=0,
     )
 
     class Lock:
@@ -716,9 +721,6 @@ def test_watch_trend_market_uses_separate_market_paths(
     monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
     monkeypatch.setattr(cli, "RunLock", Lock)
     monkeypatch.setattr(cli, "watch_market_protection", watcher)
-    monkeypatch.setattr(
-        cli, "require_trend_review_config", lambda loaded, market: 103
-    )
     monkeypatch.setattr(cli, "run_trend_review_open", lambda *args: None)
     monkeypatch.setattr(cli, "run_trend_review_stop", lambda *args: None, raising=False)
 
@@ -734,8 +736,8 @@ def test_watch_trend_market_uses_separate_market_paths(
     assert captured["market"] == "HK"
     assert captured["quote_client"] is None
     assert callable(captured["quote_client_factory"])
-    assert callable(captured["on_session_open"])
-    assert callable(captured["on_protection_trigger"])
+    assert captured["on_session_open"] is None
+    assert captured["on_protection_trigger"] is None
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
 
 

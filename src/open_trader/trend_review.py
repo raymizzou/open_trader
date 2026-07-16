@@ -301,6 +301,43 @@ def _ensure_experiment_account(
         )
 
 
+def _reconcile_intent(
+    intent_path: Path, client: object
+) -> tuple[dict[str, object], bool]:
+    payload = json.loads(intent_path.read_text(encoding="utf-8"))
+    request = payload.get("request") if isinstance(payload, Mapping) else None
+    if not isinstance(request, dict):
+        raise ValueError("trend review intent request is invalid")
+    result_path = intent_path.with_name(
+        intent_path.name.replace("-intent", "-result")
+    )
+    if result_path.exists():
+        return request, True
+    listed = client.list_orders()
+    orders = listed.get("orders") if isinstance(listed, Mapping) else None
+    if not isinstance(orders, list):
+        raise ValueError("simulate broker orders are unavailable")
+    remark = str(request.get("remark") or "")
+    matched = next(
+        (
+            order for order in orders
+            if isinstance(order, Mapping)
+            and remark
+            and str(order.get("remark") or "") == remark
+        ),
+        None,
+    )
+    if matched is None:
+        return request, False
+    _write_immutable(
+        result_path,
+        _canonical_json_bytes(
+            {"request": request, "response": matched, "reconciled": True}
+        ),
+    )
+    return request, True
+
+
 def execute_trend_review_open(
     *,
     data_dir: Path,
@@ -356,44 +393,47 @@ def execute_trend_review_open(
         if not isinstance(action, Mapping) or action.get("action") != "BUY":
             continue
         symbol = str(action.get("symbol") or "").strip()
-        price = _required_decimal(prices.get(symbol), f"price for {symbol}")
-        weight = _required_decimal(action.get("target_weight"), "target weight")
-        lot_size = int(action.get("lot_size") or 0)
-        if not symbol or price <= 0 or weight <= 0 or lot_size <= 0:
-            raise ValueError("trend review buy action is invalid")
-        quantity = int(
-            (nav * weight / price / Decimal(lot_size)).to_integral_value(
-                rounding=ROUND_DOWN
-            )
-        ) * lot_size
-        if quantity <= 0:
-            continue
-        request = {
-            "market": market,
-            "futu_code": to_futu_symbol(market, symbol),
-            "side": "buy",
-            "order_type": "MARKET",
-            "price": "0",
-            "qty": str(quantity),
-            "remark": f"trend-review:{market}:{execution_date}:{index}",
-        }
         stem = f"{report_sha}-{index}"
         intent_path = root / f"{stem}-intent.json"
         if intent_path.exists():
-            continue
-        _write_immutable(
-            intent_path,
-            _canonical_json_bytes(
-                {
-                    "market": market,
-                    "date": execution_date,
-                    "report_sha256": report_sha,
-                    "action_index": index,
-                    "request": request,
-                    "created_at": now,
-                }
-            ),
-        )
+            request, reconciled = _reconcile_intent(intent_path, client)
+            if reconciled:
+                continue
+        else:
+            price = _required_decimal(prices.get(symbol), f"price for {symbol}")
+            weight = _required_decimal(action.get("target_weight"), "target weight")
+            lot_size = int(action.get("lot_size") or 0)
+            if not symbol or price <= 0 or weight <= 0 or lot_size <= 0:
+                raise ValueError("trend review buy action is invalid")
+            quantity = int(
+                (nav * weight / price / Decimal(lot_size)).to_integral_value(
+                    rounding=ROUND_DOWN
+                )
+            ) * lot_size
+            if quantity <= 0:
+                continue
+            request = {
+                "market": market,
+                "futu_code": to_futu_symbol(market, symbol),
+                "side": "buy",
+                "order_type": "MARKET",
+                "price": "0",
+                "qty": str(quantity),
+                "remark": f"trend-review:{market}:{execution_date}:{index}",
+            }
+            _write_immutable(
+                intent_path,
+                _canonical_json_bytes(
+                    {
+                        "market": market,
+                        "date": execution_date,
+                        "report_sha256": report_sha,
+                        "action_index": index,
+                        "request": request,
+                        "created_at": now,
+                    }
+                ),
+            )
         response = client.place_order(request)
         result_path = root / f"{stem}-result.json"
         _write_immutable(
@@ -433,11 +473,28 @@ def execute_trend_review_stop(
     root = data_dir / "trend_review" / "ledgers" / market / "stops"
     intent_path = root / f"{hashlib.sha256(event_id.encode()).hexdigest()}-intent.json"
     if intent_path.exists():
+        request, reconciled = _reconcile_intent(intent_path, client)
+        if reconciled:
+            return {
+                "status": "unchanged",
+                "market": market,
+                "date": trading_date,
+                "submitted_count": 0,
+            }
+        response = client.place_order(request)
+        result_path = intent_path.with_name(
+            intent_path.name.replace("-intent", "-result")
+        )
+        _write_immutable(
+            result_path,
+            _canonical_json_bytes({"request": request, "response": response}),
+        )
         return {
-            "status": "unchanged",
+            "status": "submitted",
             "market": market,
             "date": trading_date,
-            "submitted_count": 0,
+            "submitted_count": 1,
+            "artifact_path": str(result_path),
         }
     snapshot = client.account_snapshot()
     if not isinstance(snapshot, Mapping):
@@ -530,20 +587,22 @@ def capture_trend_review_close(
         or not strategy_snapshot.get("parameter_rows")
     ):
         raise ValueError("trend report strategy snapshot is unavailable")
-    actual_equity = _required_decimal(account.get("net_value"), "actual net value")
     payload = {
         "schema_version": "open_trader.trend_review.daily.v1",
         "market": market,
         "date": trading_date,
         "simulate_acc_id": simulate_snapshot.get("acc_id"),
         "discipline_equity_after_fees": str(discipline_equity),
-        "actual_equity": str(actual_equity),
         "benchmark": dict(benchmark),
         "strategy_snapshot": dict(strategy_snapshot),
         "report_sha256": _report_hash(report),
         "orders": orders,
         "positions": simulate_snapshot.get("positions"),
     }
+    if account.get("fresh") is True and account.get("source_date") == trading_date:
+        payload["actual_equity"] = str(
+            _required_decimal(account.get("net_value"), "actual net value")
+        )
     path = (
         data_dir
         / "trend_review"
@@ -861,7 +920,7 @@ def build_trend_review_projection(
     else:
         batch_number = completed_batches
         selected_trades = trades[(batch_number - 1) * 30 : batch_number * 30]
-        start_date = str(selected_trades[0]["entry_date"])
+        start_date = min(str(trade["entry_date"]) for trade in selected_trades)
         end_date = str(selected_trades[-1]["exit_date"])
         selected_facts = [
             fact for fact in facts if start_date <= str(fact["date"]) <= end_date

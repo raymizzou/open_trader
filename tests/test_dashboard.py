@@ -684,6 +684,35 @@ def test_dashboard_hk_friday_report_is_current_then_stale_over_weekend(
     assert friday["report_date"] == "2026-07-20"
     assert friday["option_attention"] == current_attention
     assert saturday["data_status"] == "stale"
+
+
+def test_dashboard_legacy_hk_friday_report_uses_generated_date_for_freshness(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_hk_phillips/2026-07-20.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "execution_date": "2026-07-20",
+        "as_of_date": "2026-07-17",
+        "generated_at": "2026-07-17T18:00:00+08:00",
+        "account": serialized_trend_account(fresh=False),
+        "metadata": {"market": "HK", "broker": "phillips"},
+        "strategy_judgments": {
+            "formal_actions": [], "holding_decisions": [], "top10_candidates": [],
+        },
+        "option_attention": [],
+    }), encoding="utf-8")
+
+    friday = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 17)
+    )["phillips"]
+    saturday = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 18)
+    )["phillips"]
+
+    assert friday["data_status"] == "current"
+    assert saturday["data_status"] == "stale"
     assert saturday["report_date"] == "2026-07-20"
     assert saturday["status_text"] == "数据截至 2026-07-17；今日未更新"
 

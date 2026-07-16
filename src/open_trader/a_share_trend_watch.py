@@ -211,7 +211,13 @@ def watch_a_share_protection(
 
             if not session_open_called:
                 if on_session_open is not None:
-                    on_session_open(trading_date)
+                    exception_count += _run_review_callback(
+                        on_session_open,
+                        trading_date,
+                        events_path=events_path,
+                        trading_date=trading_date,
+                        now=now,
+                    )
                 session_open_called = True
 
             try:
@@ -289,7 +295,13 @@ def watch_a_share_protection(
                 if symbol not in positions:
                     continue
                 if on_protection_trigger is not None:
-                    on_protection_trigger(event)
+                    exception_count += _run_review_callback(
+                        on_protection_trigger,
+                        event,
+                        events_path=events_path,
+                        trading_date=trading_date,
+                        now=now,
+                    )
                 _deliver_trigger_notification(
                     events_path=events_path,
                     notifier=notifier,
@@ -428,7 +440,13 @@ def watch_a_share_protection(
                     alerted.add(symbol)
                     trigger_count += 1
                     if on_protection_trigger is not None:
-                        on_protection_trigger(event)
+                        exception_count += _run_review_callback(
+                            on_protection_trigger,
+                            event,
+                            events_path=events_path,
+                            trading_date=trading_date,
+                            now=now,
+                        )
                     _deliver_trigger_notification(
                         events_path=events_path,
                         notifier=notifier,
@@ -458,6 +476,32 @@ def watch_a_share_protection(
     finally:
         if client is not None:
             _close(client)
+
+
+def _run_review_callback(
+    callback: Callable[[object], None],
+    value: object,
+    *,
+    events_path: Path,
+    trading_date: str,
+    now: datetime,
+) -> int:
+    try:
+        callback(value)
+        return 0
+    except Exception as exc:
+        event = value if isinstance(value, Mapping) else {}
+        append_watch_event(
+            events_path,
+            symbol=str(event.get("symbol") or ""),
+            trading_date=trading_date,
+            event_type="trend_review_callback_failed",
+            occurred_at=now.isoformat(timespec="seconds"),
+            last_price=_optional_decimal(event.get("last_price")),
+            active_line=_optional_decimal(event.get("active_line")),
+            reason=str(exc),
+        )
+        return 1
 
 
 def _deliver_trigger_notification(

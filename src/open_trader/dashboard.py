@@ -649,7 +649,7 @@ def _valid_trend_report_payload(
     metadata = payload.get("metadata")
     source_run_date = metadata.get("run_date") if isinstance(metadata, dict) else None
     if source_run_date is None:
-        freshness_date = execution_date
+        freshness_date = generated_at.astimezone(SHANGHAI).date()
     else:
         try:
             freshness_date = date.fromisoformat(source_run_date)

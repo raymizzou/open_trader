@@ -17,6 +17,8 @@ from open_trader.market_trend_watch import (
 )
 from open_trader.notifications import (
     CompositeNotifier,
+    FeishuWebhookNotifier,
+    MacOSNotifier,
     NullNotifier,
     XiaoaiSSHNotifier,
 )
@@ -31,6 +33,19 @@ class RecordingXiaoaiNotifier(XiaoaiSSHNotifier):
 
     def notify(self, title: str, message: str) -> None:
         self.messages.append((title, message))
+
+
+class RecordingFeishuNotifier(FeishuWebhookNotifier):
+    def __init__(self) -> None:
+        pass
+
+    def notify(self, title: str, message: str) -> None:
+        pass
+
+
+class RecordingMacOSNotifier(MacOSNotifier):
+    def notify(self, title: str, message: str) -> None:
+        pass
 
 
 def test_hk_regular_sessions_exclude_lunch_and_auction() -> None:
@@ -176,6 +191,108 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
             "名称：腾讯\n最新价 10 <= 活动保护线 11\n建议动作：全部卖出（人工执行）",
         )
     ]
+
+
+def test_review_callback_failure_is_recorded_without_blocking_protection_notice(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_hk_details(data_dir)
+    state_path = data_dir / "trend_hk_phillips/protection_state.json"
+    events_path = data_dir / "trend_hk_phillips/watch_events.jsonl"
+    write_protection_state(state_path, {
+        "schema_version": 1,
+        "positions": {"00700": {"active_line": "11"}},
+    })
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            return {"HK.00700": QuoteSnapshot("HK.00700", Decimal("10"))}
+
+        def close(self) -> None:
+            pass
+
+    def fail_review(event: object) -> None:
+        raise RuntimeError("simulate order failed")
+
+    result = watch_market_protection(
+        market="HK",
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=state_path,
+        events_path=events_path,
+        report_lock_path=None,
+        quote_client=Quote(),
+        notifier=CompositeNotifier([
+            RecordingFeishuNotifier(), RecordingMacOSNotifier(),
+        ]),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: datetime(2026, 7, 16, 10, 0, tzinfo=SHANGHAI),
+        sleep_fn=lambda seconds: None,
+        on_protection_trigger=fail_review,
+    )
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert result.status == "completed"
+    assert result.exception_count == 1
+    assert [event["event_type"] for event in events] == [
+        "protection_triggered",
+        "trend_review_callback_failed",
+        "protection_triggered_notification_delivered_feishu",
+        "protection_triggered_notification_delivered_macos",
+    ]
+    assert events[1]["reason"] == "simulate order failed"
+
+
+def test_session_review_callback_failure_does_not_stop_watcher(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_hk_details(data_dir)
+    state_path = data_dir / "trend_hk_phillips/protection_state.json"
+    events_path = data_dir / "trend_hk_phillips/watch_events.jsonl"
+    write_protection_state(state_path, {
+        "schema_version": 1,
+        "positions": {"00700": {"active_line": "11"}},
+    })
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            return {"HK.00700": QuoteSnapshot("HK.00700", Decimal("12"))}
+
+        def close(self) -> None:
+            pass
+
+    result = watch_market_protection(
+        market="HK",
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=state_path,
+        events_path=events_path,
+        report_lock_path=None,
+        quote_client=Quote(),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: datetime(2026, 7, 16, 10, 0, tzinfo=SHANGHAI),
+        sleep_fn=lambda seconds: None,
+        on_session_open=lambda trading_date: (_ for _ in ()).throw(
+            RuntimeError("review open failed")
+        ),
+    )
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert result.status == "completed"
+    assert result.exception_count == 1
+    assert events[0]["event_type"] == "trend_review_callback_failed"
+    assert events[0]["reason"] == "review open failed"
 
 
 def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None:

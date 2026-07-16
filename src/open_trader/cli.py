@@ -139,17 +139,6 @@ def _trend_report_path_order(path: Path) -> tuple[str, int]:
     return match.group("date"), int(match.group("revision") or 0)
 
 
-def _trend_review_date_from_report(result: object, fallback: str) -> str:
-    path = getattr(result, "json_path", None)
-    if path is None:
-        return fallback
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    as_of_date = payload.get("as_of_date") if isinstance(payload, dict) else None
-    if not isinstance(as_of_date, str) or DATE_RE.fullmatch(as_of_date) is None:
-        raise ValueError("trend report is missing a valid as_of_date")
-    return as_of_date
-
-
 def _load_trend_review_report(
     config: object,
     market: str,
@@ -165,12 +154,83 @@ def _load_trend_review_report(
     for path in sorted(
         report_dir.glob("*.json"), key=_trend_report_path_order, reverse=True
     ):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict) and payload.get(date_field) == trading_date:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if _valid_trend_review_report(
+            payload,
+            path=path,
+            market=market,
+            trading_date=trading_date,
+            date_field=date_field,
+        ):
             return payload
     raise FileNotFoundError(
         f"no {market} trend report with {date_field}={trading_date}"
     )
+
+
+def _valid_trend_review_report(
+    payload: object,
+    *,
+    path: Path,
+    market: str,
+    trading_date: str,
+    date_field: str,
+) -> bool:
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return False
+    try:
+        execution_date = date.fromisoformat(payload["execution_date"])
+        as_of_date = date.fromisoformat(payload["as_of_date"])
+        generated_at = datetime.fromisoformat(payload["generated_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    metadata = payload.get("metadata")
+    judgments = payload.get("strategy_judgments")
+    actions = (
+        judgments.get("formal_actions") if isinstance(judgments, dict) else None
+    )
+    match = TREND_REPORT_STEM_RE.fullmatch(path.stem)
+    expected_broker = {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market]
+    if not (
+        generated_at.tzinfo is not None
+        and generated_at.utcoffset() is not None
+        and execution_date.isoformat() == payload["execution_date"]
+        and as_of_date.isoformat() == payload["as_of_date"]
+        and generated_at.isoformat() == payload["generated_at"]
+        and as_of_date <= execution_date
+        and payload.get(date_field) == trading_date
+        and match is not None
+        and match.group("date") == execution_date.isoformat()
+        and isinstance(metadata, dict)
+        and str(metadata.get("market") or "").upper() == market
+        and str(metadata.get("broker") or "").lower() == expected_broker
+        and isinstance(actions, list)
+        and all(
+            isinstance(judgments.get(key), list)
+            for key in ("holding_decisions", "top10_candidates")
+        )
+    ):
+        return False
+    for action in actions:
+        if (
+            not isinstance(action, dict)
+            or action.get("action") not in {"BUY", "SELL_ALL"}
+            or not str(action.get("symbol") or "").strip()
+        ):
+            return False
+        if action["action"] == "BUY":
+            try:
+                if (
+                    Decimal(str(action.get("target_weight"))) <= 0
+                    or int(action.get("lot_size") or 0) <= 0
+                ):
+                    return False
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+    return True
 
 
 def run_trend_review_open(
@@ -1536,7 +1596,6 @@ def main(argv: list[str] | None = None) -> int:
                 missing.append(f"TREND_ANIMALS_WARM_TO_HOT_{args.market}_TM_IDS")
             if missing:
                 raise ValueError(f"missing config value(s): {', '.join(missing)}")
-            require_trend_review_config(config, args.market)
             run_date = (
                 datetime.now(ZoneInfo(config.timezone)).date().isoformat()
                 if args.date == "today"
@@ -1559,12 +1618,6 @@ def main(argv: list[str] | None = None) -> int:
                 revision=args.revision,
                 notifier=notifier,
             )
-            if result.status in {"generated", "existing"}:
-                run_trend_review_close(
-                    config,
-                    args.market,
-                    _trend_review_date_from_report(result, run_date),
-                )
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -1578,7 +1631,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "watch-trend-market":
         try:
             config = load_env_config(args.config, dry_run=False)
-            require_trend_review_config(config, args.market)
             notifier = build_notifier(config)
             paths = market_paths(config.data_dir, config.reports_dir, args.market)
         except (FileNotFoundError, ValueError) as exc:
@@ -1603,12 +1655,8 @@ def main(argv: list[str] | None = None) -> int:
                     poll_seconds=args.poll_seconds,
                     reconnect_seconds=args.reconnect_seconds,
                     once=args.once,
-                    on_session_open=lambda trading_date: run_trend_review_open(
-                        config, args.market, trading_date
-                    ),
-                    on_protection_trigger=lambda event: run_trend_review_stop(
-                        config, args.market, event
-                    ),
+                    on_session_open=None,
+                    on_protection_trigger=None,
                 )
         except (FileNotFoundError, FutuQuoteError, RuntimeError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
@@ -1635,7 +1683,6 @@ def main(argv: list[str] | None = None) -> int:
                 missing.append("TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID")
             if missing:
                 raise ValueError(f"missing config value(s): {', '.join(missing)}")
-            require_trend_review_config(config, "CN")
             run_date = (
                 datetime.now(ZoneInfo(config.timezone)).date().isoformat()
                 if args.date == "today"
@@ -1657,8 +1704,6 @@ def main(argv: list[str] | None = None) -> int:
                 revision=args.revision,
                 notifier=notifier,
             )
-            if result.status in {"generated", "existing"}:
-                run_trend_review_close(config, "CN", run_date)
         except (
             FileNotFoundError,
             ValueError,
@@ -1681,7 +1726,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "watch-trend-a-share":
         try:
             config = load_env_config(args.config, dry_run=False)
-            require_trend_review_config(config, "CN")
             notifier = build_notifier(config)
         except (FileNotFoundError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
@@ -1705,12 +1749,8 @@ def main(argv: list[str] | None = None) -> int:
                     poll_seconds=args.poll_seconds,
                     reconnect_seconds=args.reconnect_seconds,
                     once=args.once,
-                    on_session_open=lambda trading_date: run_trend_review_open(
-                        config, "CN", trading_date
-                    ),
-                    on_protection_trigger=lambda event: run_trend_review_stop(
-                        config, "CN", event
-                    ),
+                    on_session_open=None,
+                    on_protection_trigger=None,
                 )
         except (FileNotFoundError, FutuQuoteError, RuntimeError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
