@@ -462,14 +462,20 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
         trigger.first.click()
     else:
         page.evaluate("detailKey => openResearchChat(detailKey)", detail_key)
-    assert page.locator(".research-chat-modal:visible").count() == 1, (
-        "投研讨论弹窗未显示"
-    )
-    if mobile:
-        _check_mobile_targets(
-            page, ".research-chat-modal button:visible, .research-chat-modal input:visible"
+    try:
+        assert page.locator(".research-chat-modal:visible").count() == 1, (
+            "投研讨论弹窗未显示"
         )
-    page.locator("#research-chat-close:visible").click()
+        if mobile:
+            _check_mobile_targets(
+                page,
+                ".research-chat-modal button:visible, "
+                ".research-chat-modal input:visible",
+            )
+    finally:
+        close = page.locator("#research-chat-close:visible")
+        if close.count():
+            close.click()
     assert page.locator(".research-chat-modal:visible").count() == 0, (
         "投研讨论弹窗关闭失败"
     )
@@ -1508,7 +1514,6 @@ def main(argv: list[str] | None = None) -> int:
         ))
         if dashboard_signature(first) != dashboard_signature(second):
             errors.append("两个刷新周期后的 Dashboard 数据不稳定")
-        errors.extend(_log_errors(args.log))
     except Exception as exc:
         errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
         pid = None
@@ -1519,6 +1524,7 @@ def main(argv: list[str] | None = None) -> int:
         reports_dir,
     )
     errors.extend(browser_errors)
+    errors.extend(_log_errors(args.log))
     status = classify_result(errors, browser_blocker=blocker)
     result = {"status": status, "pid": pid, "errors": errors, "blocker": blocker}
     print(json.dumps(result, ensure_ascii=False))

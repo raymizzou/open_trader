@@ -4,7 +4,10 @@ import http.client
 import json
 import re
 import shutil
+import socket
+import struct
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -521,6 +524,58 @@ def test_standard_backtest_http_routes_expose_options_and_map_validation_to_400(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_dashboard_server_ignores_client_disconnect_while_writing_json(
+    tmp_path, monkeypatch
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    request_started = threading.Event()
+    release_response = threading.Event()
+
+    def delayed_options(_config: object) -> dict[str, str]:
+        request_started.set()
+        assert release_response.wait(timeout=5)
+        return {"padding": "x" * (5 * 1024 * 1024)}
+
+    monkeypatch.setattr(
+        dashboard_web, "build_standard_backtest_options_payload", delayed_options
+    )
+    server = dashboard_web.create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    unhandled_errors: list[BaseException | None] = []
+    server.handle_error = (  # type: ignore[method-assign]
+        lambda _request, _address: unhandled_errors.append(sys.exc_info()[1])
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    client = socket.create_connection((host, port), timeout=5)
+    try:
+        client.sendall(
+            b"GET /api/backtests/options HTTP/1.1\r\n"
+            b"Host: dashboard\r\nConnection: close\r\n\r\n"
+        )
+        assert request_started.wait(timeout=5)
+        client.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_LINGER,
+            struct.pack("ii", 1, 0),
+        )
+        client.close()
+        release_response.set()
+    finally:
+        client.close()
+        release_response.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert unhandled_errors == []
 
 
 @pytest.mark.parametrize("body", [b"{bad json", b"[]"])

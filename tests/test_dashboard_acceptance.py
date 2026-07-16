@@ -168,6 +168,8 @@ def _run_acceptance_main_with_reports(
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
     report_dirs: list[Path],
+    *,
+    browser_log_text: str = "",
 ) -> tuple[int, dict[str, object], list[Path | None]]:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -177,6 +179,8 @@ def _run_acceptance_main_with_reports(
     second_quotes["fetched_at"] = "2026-07-15T15:03:14+08:00"
     quote_payloads = iter((first_quotes, second_quotes))
     browser_reports: list[Path | None] = []
+    log_path = tmp_path / "dashboard.log"
+    log_path.write_text("", encoding="utf-8")
     monkeypatch.setattr(
         dashboard_acceptance, "_project_data_dir", lambda root: tmp_path / "data"
     )
@@ -202,20 +206,20 @@ def _run_acceptance_main_with_reports(
     monkeypatch.setattr(
         dashboard_acceptance, "validate_dashboard_payload", lambda *args, **kwargs: []
     )
-    monkeypatch.setattr(dashboard_acceptance, "_log_errors", lambda path: [])
-
     def browser_check(
         url: str, expected_cn: int, payload: dict[str, object],
         reports_dir: Path | None = None,
     ) -> tuple[list[str], None]:
         browser_reports.append(reports_dir)
+        if browser_log_text:
+            log_path.write_text(browser_log_text, encoding="utf-8")
         return [], None
 
     monkeypatch.setattr(dashboard_acceptance, "_browser_check", browser_check)
     status = dashboard_acceptance.main([
         "--expected-root", str(worktree),
         "--wait-seconds", "0",
-        "--log", str(tmp_path / "dashboard.log"),
+        "--log", str(log_path),
     ])
     result = json.loads(capsys.readouterr().out)
     return status, result, browser_reports
@@ -256,6 +260,27 @@ def test_acceptance_main_fails_when_reports_dir_changes_between_refreshes(
     assert result["status"] == "FAIL"
     assert "两个刷新周期的 Dashboard reports_dir 不一致" in result["errors"]
     assert browser_reports == [second.resolve()]
+
+
+def test_acceptance_main_fails_on_traceback_written_during_browser_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "shared" / "reports"
+    reports.mkdir(parents=True)
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [reports, reports],
+        browser_log_text="Traceback (most recent call last):\nBrokenPipeError",
+    )
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert "日志包含错误标记：Traceback (most recent call last)" in result["errors"]
 
 
 def test_acceptance_rejects_api_projection_that_drops_frozen_action(
@@ -1515,6 +1540,30 @@ def test_acceptance_rejects_undersized_mobile_target(selector: str) -> None:
 
     with pytest.raises(AssertionError, match="太小.*44px"):
         dashboard_acceptance._check_mobile_targets(page, selector)
+
+
+def test_tool_workspaces_closes_research_modal_when_target_check_fails() -> None:
+    class Locator(TabbedAccountLocator):
+        def evaluate_all(self, expression: str) -> list[dict[str, float]]:
+            if self.selector == (
+                ".research-chat-modal button:visible, "
+                ".research-chat-modal input:visible"
+            ):
+                return [{"height": 38, "label": "输入讨论消息"}]
+            return super().evaluate_all(expression)
+
+    class Page(TabbedAccountPage):
+        viewport_size = {"width": 375, "height": 844}
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(self, selector)
+
+    page = Page(valid_payload())
+
+    with pytest.raises(AssertionError, match="输入讨论消息.*44px"):
+        dashboard_acceptance._check_tool_workspaces(page, "US:AAPL:Apple:0")
+
+    assert page.research_open is False
 
 
 def test_tabbed_acceptance_fake_rejects_unknown_selectors_and_expressions() -> None:

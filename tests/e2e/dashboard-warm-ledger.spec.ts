@@ -266,7 +266,7 @@ test('opens every warm-ledger destination, using real UI paths where available',
 });
 
 test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 375, height: 844 });
   await installLedgerFixture(page);
   await page.goto('/');
 
@@ -354,6 +354,10 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
     panel?.insertAdjacentHTML('beforeend', (window as any).renderLanguageToggle());
   });
   await expectMobileTargetsAtLeast44(page, '.symbol-detail-panel.inline-symbol-detail', '.decision-tab:visible, [data-back-to-holdings]:visible, .language-toggle button:visible');
+  await page.evaluate(() => (window as any).openResearchChat('US:AAPL:Apple:0'));
+  await expect(page.locator('.research-chat-modal')).toBeVisible();
+  await expectMobileTargetsAtLeast44(page, '.research-chat-modal', 'button:visible, input:visible');
+  await page.getByRole('button', { name: '关闭' }).click();
   await page.getByRole('button', { name: '收起' }).click();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });

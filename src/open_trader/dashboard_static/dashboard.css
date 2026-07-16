@@ -4132,7 +4132,8 @@ table {
   .backtest-form input,
   .backtest-form select,
   .decision-tab,
-  .language-toggle button {
+  .language-toggle button,
+  .research-chat-input-row input {
     min-height: 44px;
   }
 
