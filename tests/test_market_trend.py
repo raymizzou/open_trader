@@ -344,6 +344,10 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     api_instances = 0
 
     class Api:
+        ignored_stale_components = (
+            {"tickerSymbol": "NUVL", "asOfDate": "2026-07-14"},
+        )
+
         def __init__(self, **kwargs: object) -> None:
             nonlocal api_instances
             api_instances += 1
@@ -454,6 +458,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert "禁止买入" not in message
     assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
+    assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     actions = payload["strategy_judgments"]["formal_actions"]
     assert actions[0]["action"] == "BUY"
     assert actions[0]["symbol"] == "02800"

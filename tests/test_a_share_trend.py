@@ -1886,6 +1886,7 @@ def test_markdown_translates_exclusion_and_api_facts_without_paths() -> None:
         api_facts=(
             "getUpdateStatus rows=6",
             "getComponentTicker rows=39 cache=client-managed",
+            "忽略旧成分 1 条：NUVL（2026-07-14）",
             "getTickerSnapshot fields=tmId,tickerName rows=44 cache=client-managed",
         ),
         data_sources=(
@@ -1901,6 +1902,7 @@ def test_markdown_translates_exclusion_and_api_facts_without_paths() -> None:
     assert "缺少 ATR 数据" in markdown
     assert "数据更新状态：已检查 6 条" in markdown
     assert "候选池成分：39 条" in markdown
+    assert "忽略旧成分 1 条：NUVL（2026-07-14）" in markdown
     assert "趋势快照：44 条" in markdown
     assert "getUpdateStatus" not in markdown
     assert "cache=client-managed" not in markdown
@@ -2459,6 +2461,7 @@ class ReadyApi:
         missing_industry_ids: set[int] | None = None,
         industry_error: Exception | None = None,
         industry_ids: dict[int, int] | None = None,
+        ignored_stale_components: tuple[dict[str, str], ...] = (),
     ) -> None:
         self.calls = calls
         self.ready = ready
@@ -2469,6 +2472,7 @@ class ReadyApi:
         self.missing_industry_ids = missing_industry_ids or set()
         self.industry_error = industry_error
         self.industry_ids = industry_ids or {}
+        self.ignored_stale_components = ignored_stale_components
         self.snapshot_requests: list[tuple[list[int], tuple[str, ...]]] = []
         self.balance_calls = 0
 
@@ -2550,7 +2554,12 @@ class ReadyApi:
 
 def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) -> None:
     calls: list[str] = []
-    api = ReadyApi(calls)
+    api = ReadyApi(
+        calls,
+        ignored_stale_components=(
+            {"tickerSymbol": "NUVL", "asOfDate": "2026-07-14"},
+        ),
+    )
     result = run_a_share_trend_report(
         config=trend_config(tmp_path),
         run_date="2026-07-14",
@@ -2563,6 +2572,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
         ([700001], A_SHARE_INDUSTRY_FIELDS),
     ]
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     audit = payload["signal_snapshots"]["candidates"]
     assert audit[0]["industry_tm_id"] == 700001
     assert audit[0]["industry_temperature"] == "热"

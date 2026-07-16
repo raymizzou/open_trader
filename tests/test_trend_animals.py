@@ -78,6 +78,106 @@ def test_paid_response_cache_uses_date_endpoint_and_sorted_params(
     )
 
 
+def test_components_ignore_older_rows_and_do_not_cache_mixed_response(
+    tmp_path: Path,
+) -> None:
+    client = TrendAnimalsClient(
+        api_key="secret-value",
+        cache_dir=tmp_path,
+        transport=FakeTransport(
+            {
+                "getComponentTicker": success(
+                    [
+                        {
+                            "tmId": 1,
+                            "tickerSymbol": "NVDA",
+                            "asOfDate": "2026-07-15",
+                        },
+                        {
+                            "tmId": 2,
+                            "tickerSymbol": "NUVL",
+                            "asOfDate": "2026-07-14",
+                        },
+                    ]
+                )
+            }
+        ),
+    )
+
+    rows = client.get_components(tm_id=622460, expected_date="2026-07-15")
+
+    assert rows == [
+        {"tmId": 1, "tickerSymbol": "NVDA", "asOfDate": "2026-07-15"}
+    ]
+    assert client.ignored_stale_components == (
+        {"tickerSymbol": "NUVL", "asOfDate": "2026-07-14"},
+    )
+    assert not list((tmp_path / "responses").glob("*.json"))
+
+
+@pytest.mark.parametrize("as_of_date", ["not-a-date", "20260714"])
+def test_components_reject_matching_noncanonical_dates_without_caching(
+    as_of_date: str, tmp_path: Path
+) -> None:
+    client = TrendAnimalsClient(
+        api_key="secret-value",
+        cache_dir=tmp_path,
+        transport=FakeTransport(
+            {
+                "getComponentTicker": success(
+                    [
+                        {
+                            "tmId": 1,
+                            "tickerSymbol": "NVDA",
+                            "asOfDate": as_of_date,
+                        }
+                    ]
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(TrendAnimalsError, match="returned data for"):
+        client.get_components(tm_id=622460, expected_date=as_of_date)
+
+    assert not list((tmp_path / "responses").glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        (
+            [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "2026-07-14"}],
+            "no current-date rows",
+        ),
+        (
+            [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "2026-07-16"}],
+            "returned data for",
+        ),
+        (
+            [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "not-a-date"}],
+            "returned data for",
+        ),
+        (
+            [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "20260714"}],
+            "returned data for",
+        ),
+        ([{"tmId": 2, "tickerSymbol": "NUVL"}], "returned data for"),
+    ],
+)
+def test_components_reject_unusable_date_sets(
+    rows: list[dict[str, object]], message: str, tmp_path: Path
+) -> None:
+    client = TrendAnimalsClient(
+        api_key="secret-value",
+        cache_dir=tmp_path,
+        transport=FakeTransport({"getComponentTicker": success(rows)}),
+    )
+
+    with pytest.raises(TrendAnimalsError, match=message):
+        client.get_components(tm_id=622460, expected_date="2026-07-15")
+
+
 def test_snapshot_cache_normalizes_id_and_field_order(tmp_path: Path) -> None:
     rows = [{"tmId": 7, "tickerSymbol": "600025.SH", "asOfDate": "2026-07-14"}]
     first_transport = FakeTransport({"getTickerSnapshot": success(rows)})
@@ -505,6 +605,25 @@ def test_expected_date_is_redacted_if_it_matches_secret(tmp_path: Path) -> None:
         client.get_components(tm_id=622466, expected_date="2026-07-14")
 
     assert "2026-07-14" not in str(exc_info.value)
+
+
+def test_invalid_expected_date_does_not_echo_secret(tmp_path: Path) -> None:
+    client = TrendAnimalsClient(
+        api_key="secret-value",
+        cache_dir=tmp_path,
+        transport=FakeTransport(
+            {
+                "getComponentTicker": success(
+                    [{"tmId": 1, "asOfDate": "2026-07-13"}]
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(TrendAnimalsError) as exc_info:
+        client.get_components(tm_id=622466, expected_date="secret-value")
+
+    assert "secret-value" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
