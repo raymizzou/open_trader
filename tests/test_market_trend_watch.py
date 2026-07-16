@@ -237,7 +237,7 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
     assert voice.messages[0][1].startswith("名称：NVIDIA\n最新价 ")
 
 
-def test_first_run_us_watcher_loads_tiger_holdings_without_protection_seed(
+def test_us_watcher_ignores_unmanaged_tiger_holdings_without_protection_seed(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
@@ -270,15 +270,8 @@ def test_first_run_us_watcher_loads_tiger_holdings_without_protection_seed(
         sleep_fn=lambda seconds: None,
     )
 
-    assert result.watched_symbol_count == 1
-    assert result.exception_count == 1
-    events = [
-        json.loads(line)
-        for line in result.events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert [(event["symbol"], event["event_type"]) for event in events] == [
-        ("NVDA", "protection_line_missing")
-    ]
+    assert result.watched_symbol_count == 0
+    assert result.exception_count == 0
 
 
 def test_us_watcher_uses_tiger_label() -> None:

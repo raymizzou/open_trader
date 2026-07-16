@@ -330,7 +330,9 @@ def _load_tiger_snapshot(
         Decimal("0"),
     )
 
+    normalized_managed = {_normalized_symbol("US", symbol) for symbol in managed_symbols}
     exceptions: list[str] = []
+    position_count = 0
     positions: list[AccountPosition] = []
     for row in position_rows:
         if str(row.get("market") or "").strip().upper() != "US":
@@ -346,9 +348,13 @@ def _load_tiger_snapshot(
         if not asset_class:
             asset_class = detect_asset_class(symbol, name).value
         if asset_class not in {"stock", "etf"}:
-            exceptions.append(
-                f"unsupported managed asset: {symbol} ({asset_class or 'unknown'})"
-            )
+            if symbol in normalized_managed:
+                exceptions.append(
+                    f"unsupported managed asset: {symbol} ({asset_class or 'unknown'})"
+                )
+            continue
+        position_count += 1
+        if symbol not in normalized_managed:
             continue
         fx = _tiger_fx_to_hkd(row)
         avg_cost = _optional_decimal(row.get("average_cost"))
@@ -367,7 +373,7 @@ def _load_tiger_snapshot(
         available_cash=max(Decimal("0"), available_cash),
         positions=tuple(sorted(positions, key=lambda item: item.symbol)),
         exceptions=tuple(exceptions),
-        position_count=len(positions),
+        position_count=position_count,
     )
 
 
