@@ -1985,12 +1985,12 @@ function renderTrendReviewWorkspace(review) {
   return `<main class="trend-review">
     <header class="trend-review-header">
       <div><p>${escapeHtml(`${formatPlain(review.broker_label)}｜${formatPlain(review.market_label)}`)}</p>
-      <h1>${escapeHtml(formatPlain(snapshot.strategy_name))}</h1>
-      <span>版本 ${escapeHtml(formatPlain(snapshot.strategy_version))}</span></div>
+      <h1>${escapeHtml(`${formatPlain(review.market_label)}趋势复盘`)}</h1>
+      <span>${escapeHtml(formatPlain(snapshot.strategy_name))}｜版本 ${escapeHtml(formatPlain(snapshot.strategy_version))}</span></div>
       <button type="button" data-close-trend-report>返回持仓看板</button>
     </header>
     <section class="trend-review-parameters"><h2>当前策略参数</h2>
-      <div class="trend-review-parameter-list">${rows.map((row) => `<div><span>${escapeHtml(formatPlain(row.group))}</span><strong>${escapeHtml(formatPlain(row.name))}</strong><p>${escapeHtml(formatPlain(row.value))}</p></div>`).join("")}</div>
+      <div class="trend-review-parameter-list trend-review-parameter-table">${rows.map((row) => `<div><span>${escapeHtml(formatPlain(row.group))}</span><strong>${escapeHtml(formatPlain(row.name))}</strong><p>${escapeHtml(formatPlain(row.value))}</p></div>`).join("")}</div>
     </section>
     <div class="trend-review-charts">
       ${renderTrendReviewChart(review,"收益与回撤",[["period_net_return","期间净收益率",true],["market_excess_return","相对市场超额收益",true],["max_drawdown","最大回撤",true]])}

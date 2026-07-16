@@ -2907,7 +2907,7 @@ for (const [broker,label] of [["futu","美股复盘"],["phillips","港股复盘"
 }
 if (renderAccountSection(group("tiger")).includes("复盘")) throw new Error("tiger review");
 const html=renderTrendReviewWorkspace(state.dashboard.trend_reviews.eastmoney);
-for (const text of ["东方财富｜A股","A股短线右侧趋势","版本 v1","当前策略参数",
+for (const text of ["东方财富｜A股","A股趋势复盘","A股短线右侧趋势","版本 v1","当前策略参数",
   "仓位执行","持仓上限","10 笔","退出保护","初始保护线","成交均价减 2.0 倍 ATR14",
   "收益与回撤","期间净收益率","相对市场超额收益","最大回撤",
   "风险调整收益","卡玛比率","夏普比率","纪律模拟","实际执行","市场基准",

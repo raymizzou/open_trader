@@ -872,6 +872,7 @@ def _check_account_holdings(
     assert page.locator("#cash-detail-panel").count() == 0, "页面仍包含现金明细挂载点"
 
     reports = payload.get("trend_reports") or {}
+    reviews = payload.get("trend_reviews") or {}
     profiles = {
         "futu": ("富途", "短线", "美股趋势交易"),
         "tiger": ("老虎", "长线", "SMA200 组合策略"),
@@ -1078,6 +1079,82 @@ def _check_account_holdings(
         assert trigger.evaluate("element => element === document.activeElement"), (
             f"{broker} 返回后焦点未恢复到报告入口"
         )
+        review = reviews.get(broker) if isinstance(reviews, Mapping) else None
+        assert isinstance(review, Mapping), f"API 缺少 {broker} 趋势复盘状态"
+        _check_trend_review(page, section, broker, review)
+
+
+def _check_trend_review(
+    page: Any, section: Any, broker: str, review: Mapping[str, Any]
+) -> None:
+    assert review.get("available") is True, f"{broker} 趋势复盘不可用"
+    labels = {"futu": "美股复盘", "phillips": "港股复盘", "eastmoney": "A股复盘"}
+    assert labels[broker] in section.inner_text(), f"{broker} 账户区块缺少 {labels[broker]}"
+    trigger = section.locator(f'[data-trend-review="{broker}"]')
+    assert trigger.count() == 1, f"{broker} 趋势复盘入口数量不是 1"
+    trigger.click()
+    workspace = page.locator("#trend-report-workspace:visible")
+    assert workspace.count() == 1, f"{broker} 趋势复盘工作区未显示"
+    text = workspace.inner_text()
+    market_label = _plain(review.get("market_label"))
+    snapshot = review.get("strategy_snapshot")
+    assert isinstance(snapshot, Mapping), f"{broker} 趋势复盘缺少策略快照"
+    for required in (
+        f"{market_label}趋势复盘",
+        _plain(review.get("broker_label")),
+        _plain(snapshot.get("strategy_name")),
+        f"版本 {_plain(snapshot.get('strategy_version'))}",
+        "当前策略参数",
+        "收益与回撤",
+        "风险调整收益",
+        "纪律模拟",
+        "实际执行",
+        "市场基准",
+    ):
+        assert required in text, f"{broker} 趋势复盘缺少 {required}"
+    parameters = snapshot.get("parameter_rows")
+    assert isinstance(parameters, list) and parameters, f"{broker} 策略参数为空"
+    parameter_rows = workspace.locator(
+        ".trend-review-parameter-table > div"
+    ).all_inner_texts()
+    assert len(parameter_rows) == len(parameters), f"{broker} 策略参数没有完整展示"
+    for rendered, row in zip(parameter_rows, parameters, strict=True):
+        assert isinstance(row, Mapping), f"{broker} 策略参数格式无效"
+        for key in ("group", "name", "value"):
+            assert _plain(row.get(key)) in rendered, f"{broker} 策略参数缺少 {key}"
+    assert workspace.locator(".trend-review-chart").count() == 2, (
+        f"{broker} 趋势复盘图表数量不是 2"
+    )
+    assert workspace.locator(".trend-review-chart figcaption").all_inner_texts() == [
+        "收益与回撤", "风险调整收益",
+    ], f"{broker} 趋势复盘图表顺序不正确"
+    metric_labels = workspace.locator(".trend-review-metric h3").all_inner_texts()
+    assert metric_labels == [
+        "期间净收益率", "相对市场超额收益", "最大回撤", "卡玛比率", "夏普比率",
+    ], f"{broker} 趋势复盘指标不完整或顺序错误"
+    for forbidden in (
+        "复盘结论", "Connected", "创建回测", "导出参数", "Alpha", "Beta",
+        "Sortino", "胜率", "盈亏比",
+    ):
+        assert forbidden not in text, f"{broker} 趋势复盘包含未要求内容 {forbidden}"
+    if (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760:
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        ), f"{broker} 趋势复盘在 375px 产生横向滚动"
+        _check_mobile_targets(
+            page,
+            "#return-to-portfolio:visible, "
+            "#trend-report-workspace:visible button:visible",
+        )
+    close = workspace.locator("[data-close-trend-report]")
+    assert close.count() == 1, f"{broker} 趋势复盘缺少返回按钮"
+    close.click()
+    assert page.locator("#trend-report-workspace:visible").count() == 0, (
+        f"{broker} 返回后趋势复盘工作区仍可见"
+    )
+    assert trigger.evaluate("element => element === document.activeElement"), (
+        f"{broker} 返回后焦点未恢复到复盘入口"
+    )
 
 
 def _select_account_tab(page: Any, broker: str) -> Any:

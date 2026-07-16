@@ -695,6 +695,48 @@ def trend_reports() -> dict[str, dict[str, object]]:
     }
 
 
+def trend_reviews() -> dict[str, dict[str, object]]:
+    reviews: dict[str, dict[str, object]] = {}
+    for broker, market, market_label, broker_label in (
+        ("futu", "US", "美股", "富途"),
+        ("phillips", "HK", "港股", "辉立"),
+        ("eastmoney", "CN", "A股", "东方财富"),
+    ):
+        reviews[broker] = {
+            "available": True,
+            "broker": broker,
+            "broker_label": broker_label,
+            "market": market,
+            "market_label": market_label,
+            "strategy_snapshot": {
+                "strategy_id": f"trend/{market}/v1",
+                "strategy_name": f"{market_label}短线右侧趋势",
+                "strategy_version": "v1",
+                "process_version": "abc1234",
+                "parameters": {"position_limit": 10},
+                "parameter_rows": [
+                    {"group": "仓位执行", "name": "持仓上限", "value": "10 笔"},
+                    {"group": "退出保护", "name": "初始保护线", "value": "成交均价减 2.0 倍 ATR14"},
+                ],
+            },
+            "metrics": {
+                key: {
+                    series: {"value": value, "reason": None}
+                    for series, value in (
+                        ("discipline", "12.6"),
+                        ("actual", "9.4"),
+                        ("benchmark", "7.8"),
+                    )
+                }
+                for key in (
+                    "period_net_return", "market_excess_return",
+                    "max_drawdown", "calmar", "sharpe",
+                )
+            },
+        }
+    return reviews
+
+
 def valid_payload() -> dict[str, object]:
     cn = [
         {
@@ -731,6 +773,7 @@ def valid_payload() -> dict[str, object]:
             {"market": "CN", "symbol": row["symbol"]} for row in cn
         ]},
         "trend_reports": trend_reports(),
+        "trend_reviews": trend_reviews(),
         "tiger_long_term_strategy": {
             "status": "shadow",
             "members": [{"symbol": "QQQ"}],
@@ -738,6 +781,18 @@ def valid_payload() -> dict[str, object]:
             "order_requests": [],
         },
     }
+
+
+def test_acceptance_checks_exact_trend_review_content() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    section = dashboard_acceptance._select_account_tab(page, "futu")
+
+    dashboard_acceptance._check_trend_review(
+        page, section, "futu", payload["trend_reviews"]["futu"]
+    )
+
+    assert page.opened_reviews == ["futu"]
 
 
 def valid_quotes_payload() -> dict[str, object]:
@@ -812,6 +867,19 @@ def trend_workspace_text(broker: str) -> str:
     )
 
 
+def trend_review_workspace_text(broker: str) -> str:
+    review = trend_reviews()[broker]
+    snapshot = review["strategy_snapshot"]
+    return (
+        f"{review['broker_label']}｜{review['market_label']} "
+        f"{review['market_label']}趋势复盘 {snapshot['strategy_name']}｜版本 v1 "
+        "当前策略参数 仓位执行 持仓上限 10 笔 "
+        "退出保护 初始保护线 成交均价减 2.0 倍 ATR14 "
+        "收益与回撤 期间净收益率 相对市场超额收益 最大回撤 "
+        "风险调整收益 卡玛比率 夏普比率 纪律模拟 实际执行 市场基准"
+    )
+
+
 def trend_stage_texts(broker: str) -> list[str]:
     if broker == "eastmoney":
         return [
@@ -869,7 +937,7 @@ ACCOUNT_SECTION_TEXTS = {
     "futu": (
         "富途 短线 · 美股趋势交易 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
         "来源 Futu 时间 2026-07-15 当天趋势报告 报告日期 2026-07-15 "
-        "数据截至 2026-07-14"
+        "数据截至 2026-07-14 美股复盘"
     ),
     "tiger": (
         "老虎 长线 · SMA200 组合策略 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
@@ -879,12 +947,12 @@ ACCOUNT_SECTION_TEXTS = {
     "phillips": (
         "辉立 短线 · 港股趋势交易 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
         "来源 月结单 时间 2026-07 当天趋势报告 报告日期 2026-07-15 "
-        "数据截至 2026-07-14"
+        "数据截至 2026-07-14 港股复盘"
     ),
     "eastmoney": (
         "东方财富 偏短线 · 趋势交易 持仓资产 HKD 0 现金 HKD 20 持仓 0 "
         "来源 东方财富 时间 2026-07-15 当天趋势报告 报告日期 2026-07-15 "
-        "数据截至 2026-07-14 "
+        "数据截至 2026-07-14 A股复盘 "
         "当前筛选下没有持仓"
     ),
 }
@@ -928,6 +996,18 @@ class TabbedAccountLocator:
             self.page.active = "#return-to-portfolio:visible"
             self.page._record_visible_sections()
             return
+        match = re.fullmatch(
+            r'#account-(\w+):visible \[data-trend-review="\w+"\]',
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            self.page.trend_broker = broker
+            self.page.trend_kind = "review"
+            self.page.opened_reviews.append(broker)
+            self.page.active = "#return-to-portfolio:visible"
+            self.page._record_visible_sections()
+            return
         if self.selector == "#trend-report-workspace:visible .trend-audit summary":
             self.page.active = self.selector
             return
@@ -950,8 +1030,11 @@ class TabbedAccountLocator:
             broker = self.page.trend_broker
             self.page.trend_broker = None
             self.page.active = (
-                f"#account-{broker}:visible .trend-report-entry [data-trend-report]"
+                f'#account-{broker}:visible [data-trend-review="{broker}"]'
+                if self.page.trend_kind == "review"
+                else f"#account-{broker}:visible .trend-report-entry [data-trend-report]"
             )
+            self.page.trend_kind = ""
             self.page._record_visible_sections()
             return
         raise AssertionError(f"unknown click selector: {self.selector}")
@@ -972,6 +1055,7 @@ class TabbedAccountLocator:
             ".research-chat-modal button:visible, .research-chat-modal input:visible",
             "#return-to-portfolio:visible, #trend-report-workspace:visible button:visible, "
             "#trend-report-workspace:visible summary:visible",
+            "#return-to-portfolio:visible, #trend-report-workspace:visible button:visible",
         }
         if self.selector in target_selectors:
             return 1
@@ -1026,12 +1110,34 @@ class TabbedAccountLocator:
             if self.selector == f"{entry} [data-trend-report]":
                 return int(bool(self.page.reports[broker]["available"]))
             return 1
+        match = re.fullmatch(
+            r'#account-(\w+):visible \[data-trend-review="(\w+)"\]',
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            return int(
+                broker == match.group(2)
+                and self.page.selected == broker
+                and self.page.trend_broker is None
+                and bool(self.page.reviews[broker]["available"])
+            )
         if self.selector == "#trend-report-workspace:visible":
             return int(self.page.trend_broker is not None)
         if self.selector == "#return-to-portfolio:visible":
             return int(self.page.trend_broker is not None)
         if self.selector == "#trend-report-workspace:visible [data-close-trend-report]":
-            return int(self.page.trend_broker == "eastmoney")
+            return int(
+                self.page.trend_broker == "eastmoney"
+                or self.page.trend_kind == "review"
+            )
+        if self.selector == "#trend-report-workspace:visible .trend-review-chart":
+            return 2 if self.page.trend_kind == "review" else 0
+        if self.selector == "#trend-report-workspace:visible .trend-review-parameter-table > div":
+            review = self.page.reviews.get(str(self.page.trend_broker), {})
+            snapshot = review.get("strategy_snapshot", {})
+            rows = snapshot.get("parameter_rows", []) if isinstance(snapshot, dict) else []
+            return len(rows) if self.page.trend_kind == "review" else 0
         if self.selector == ".workspace-grid:visible":
             return int(self.page.trend_broker is None)
         if self.selector == "#trend-report-workspace:visible .cn-trend-report":
@@ -1145,6 +1251,8 @@ class TabbedAccountLocator:
         if match and match.group(1) in self.page.tab_order:
             return self.page.entry_texts[match.group(1)]
         if self.selector == "#trend-report-workspace:visible":
+            if self.page.trend_kind == "review":
+                return trend_review_workspace_text(str(self.page.trend_broker))
             return trend_workspace_text(str(self.page.trend_broker))
         if self.selector == "#trend-report-workspace:visible .trend-audit":
             return trend_audit_text(str(self.page.trend_broker))
@@ -1194,6 +1302,13 @@ class TabbedAccountLocator:
         if self.selector == "a:visible, button:visible":
             return ["刷新账户与行情", "策略回测"]
         broker = str(self.page.trend_broker)
+        if self.selector == "#trend-report-workspace:visible .trend-review-parameter-table > div":
+            rows = self.page.reviews[broker]["strategy_snapshot"]["parameter_rows"]
+            return [f"{row['group']} {row['name']} {row['value']}" for row in rows]
+        if self.selector == "#trend-report-workspace:visible .trend-review-chart figcaption":
+            return ["收益与回撤", "风险调整收益"]
+        if self.selector == "#trend-report-workspace:visible .trend-review-metric h3":
+            return ["期间净收益率", "相对市场超额收益", "最大回撤", "卡玛比率", "夏普比率"]
         if self.selector == "#trend-report-workspace:visible .cn-trend-stage":
             return trend_stage_texts(broker)
         if self.selector == "#trend-report-workspace:visible .trend-stage":
@@ -1287,6 +1402,7 @@ class TabbedAccountPage:
         cn_rows: dict[str, int] | None = None,
     ) -> None:
         self.reports = (payload or valid_payload())["trend_reports"]  # type: ignore[assignment,index]
+        self.reviews = (payload or valid_payload())["trend_reviews"]  # type: ignore[assignment,index]
         self.section_texts = dict(ACCOUNT_SECTION_TEXTS)
         self.entry_texts = {
             broker: (
@@ -1306,8 +1422,10 @@ class TabbedAccountPage:
         self.visible_account_sections = 1
         self.max_visible_account_sections = 1
         self.trend_broker: str | None = None
+        self.trend_kind = ""
         self.active: str | None = None
         self.opened_reports: list[str] = []
+        self.opened_reviews: list[str] = []
         self.disabled_reports: set[str] = set()
         self.focus_checks: list[str] = []
         self.target_checks: list[str] = []
@@ -2332,6 +2450,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             viewport,
             '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
         ) in clicks
+        for broker in ("futu", "phillips", "eastmoney"):
+            assert (
+                viewport,
+                f'#account-{broker}:visible [data-trend-review="{broker}"]',
+            ) in clicks
         assert (viewport, '#return-to-portfolio:visible') in clicks
         assert (
             viewport,
@@ -2359,7 +2482,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, 'a:visible, button:visible') in selectors
         assert (viewport, 'a[href="#account-tiger"]') not in clicks
     assert evaluated == [
-        *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 8),
+        *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 11),
     ]
     assert visual_token_evaluations == ["wide_desktop", "desktop", "mobile"]
     for viewport in ("wide_desktop", "desktop", "mobile"):
@@ -2424,16 +2547,20 @@ def test_check_account_holdings_visits_every_broker_tab(
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.max_visible_account_sections == 1
     assert page.opened_reports == ["futu", "phillips", "eastmoney"]
+    assert page.opened_reviews == ["futu", "phillips", "eastmoney"]
     assert page.disabled_reports == set()
     assert projections == ["futu", "phillips", "eastmoney"]
     assert page.focus_checks == [
         "#return-to-portfolio:visible",
         '#account-futu:visible .trend-report-entry [data-trend-report]',
+        '#account-futu:visible [data-trend-review="futu"]',
         "#return-to-portfolio:visible",
         '#account-phillips:visible .trend-report-entry [data-trend-report]',
+        '#account-phillips:visible [data-trend-review="phillips"]',
         "#return-to-portfolio:visible",
         "#trend-report-workspace:visible .cn-trend-buy",
         '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
+        '#account-eastmoney:visible [data-trend-review="eastmoney"]',
     ]
 
 
