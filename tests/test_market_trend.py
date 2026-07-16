@@ -27,6 +27,7 @@ from open_trader.notifications import (
     NotificationError,
     NullNotifier,
 )
+from open_trader.tiger_account import TigerAccountError
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
 
@@ -576,8 +577,28 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
 
 
+@pytest.mark.parametrize(
+    ("refresh_error", "expected_refresh_error"),
+    [
+        (
+            TigerAccountError(
+                "Tiger refresh failed token=TIGER-TOKEN account=123456789",
+                error_type="account_query_failed",
+            ),
+            "account_query_failed",
+        ),
+        (
+            RuntimeError(
+                "Tiger refresh failed token=TIGER-TOKEN account=123456789"
+            ),
+            "Tiger account refresh failed",
+        ),
+    ],
+)
 def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
     tmp_path: Path,
+    refresh_error: Exception,
+    expected_refresh_error: str,
 ) -> None:
     cfg = config(tmp_path)
     write_tiger_snapshot(
@@ -686,11 +707,12 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
         api_factory=Api,
         quote_factory=Quote,
         account_refresher=lambda *args: (_ for _ in ()).throw(
-            RuntimeError("secret refresh failed")
+            refresh_error
         ),
     )
 
     assert result.json_path is not None
+    assert result.report_path is not None
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
     assert (
         f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
@@ -704,8 +726,20 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
     assert payload["strategy_judgments"]["holding_decisions"][0]["reason"] == "stale_tiger_account"
     assert payload["metadata"]["account_currency"] == "HKD"
     assert payload["metadata"]["price_fx_to_hkd"] == "7.85"
-    assert payload["metadata"]["account_refresh_error"] == "<redacted> refresh failed"
+    assert payload["metadata"]["account_refresh_error"] == expected_refresh_error
     assert "账户状态：账户数据非实时，禁止新增买入；持仓需复核" in notifier.messages[0][1]
+    output = "\n".join(
+        (
+            result.json_path.read_text(encoding="utf-8"),
+            result.report_path.read_text(encoding="utf-8"),
+            market_paths(cfg.data_dir, cfg.reports_dir, "US").log.read_text(
+                encoding="utf-8"
+            ),
+            *(f"{title}\n{message}" for title, message in notifier.messages),
+        )
+    )
+    assert "TIGER-TOKEN" not in output
+    assert "123456789" not in output
 
 
 def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(

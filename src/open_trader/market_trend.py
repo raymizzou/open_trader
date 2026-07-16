@@ -53,6 +53,7 @@ from .futu_symbols import to_futu_symbol
 from .parsers.base import detect_asset_class
 from .tiger_account import (
     TigerAccountClient,
+    TigerAccountError,
     load_tiger_account_config,
     sync_tiger_portfolio,
 )
@@ -70,6 +71,17 @@ MARKET_NOTIFICATION_LABELS = {
     "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
 }
 USD_TO_HKD = Decimal("7.85")
+TIGER_REFRESH_ERROR_TYPES = {
+    "account_query_failed",
+    "asset_query_failed",
+    "blocking_data_error",
+    "config_invalid",
+    "config_missing",
+    "mixed_tiger_broker_row",
+    "no_matching_accounts",
+    "position_query_failed",
+    "tigeropen_missing",
+}
 SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 
 
@@ -633,10 +645,14 @@ def _attempt_market_report(
         if market == "US":
             try:
                 account_refresher(config, run_date)
-            except Exception as exc:
-                account_refresh_error = _redact_api_key(
-                    exc, config.trend_animals_api_key
+            except TigerAccountError as exc:
+                account_refresh_error = (
+                    exc.error_type
+                    if exc.error_type in TIGER_REFRESH_ERROR_TYPES
+                    else "tiger_account_error"
                 )
+            except Exception:
+                account_refresh_error = "Tiger account refresh failed"
         prior_state = load_protection_state(paths.state)
         configured = (
             config.trend_us_symbols if market == "US" else config.trend_hk_symbols
