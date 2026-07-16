@@ -533,3 +533,28 @@ def test_phillips_statement_parser_joins_pdf_pages_and_sets_page_count(
     assert [(cash.currency, cash.cash_balance) for cash in result.cash_balances] == [
         ("HKD", Decimal("8000.00"))
     ]
+
+
+def test_phillips_statement_parser_extracts_issue_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        phillips_parser.pdfplumber,
+        "open",
+        fake_pdf_open_for(["日期 Issue Date : 10/07/26"]),
+    )
+
+    assert PhillipsStatementParser().statement_date(Path("fake.pdf")) == "2026-07-10"
+
+
+def test_phillips_statement_parser_rejects_missing_issue_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        phillips_parser.pdfplumber,
+        "open",
+        fake_pdf_open_for(["Combined Daily Statement"]),
+    )
+
+    with pytest.raises(ValueError, match="Issue Date"):
+        PhillipsStatementParser().statement_date(Path("fake.pdf"))

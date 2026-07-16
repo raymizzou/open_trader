@@ -132,3 +132,60 @@ def test_encrypted_parser_wraps_errors_without_password(
     assert "sanitized-secret" not in "".join(
         traceback.format_exception(exc_info.value)
     )
+
+
+def test_encrypted_parser_extracts_print_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def extract_text(self) -> str:
+            return "东方财富证券\n打印日期：2026-07-12"
+
+    class FakePdf:
+        pages = [FakePage()]
+
+        def __enter__(self) -> FakePdf:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "open_trader.parsers.eastmoney.pdfplumber.open",
+        lambda path, *, password: FakePdf(),
+    )
+
+    assert (
+        EastmoneyStatementParser(password="sanitized-secret").statement_date(
+            Path("sanitized.pdf")
+        )
+        == "2026-07-12"
+    )
+
+
+def test_encrypted_parser_rejects_missing_print_date_without_password(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def extract_text(self) -> str:
+            return "东方财富证券"
+
+    class FakePdf:
+        pages = [FakePage()]
+
+        def __enter__(self) -> FakePdf:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "open_trader.parsers.eastmoney.pdfplumber.open",
+        lambda path, *, password: FakePdf(),
+    )
+    password = "sanitized-secret"
+
+    with pytest.raises(ValueError, match="打印日期") as exc_info:
+        EastmoneyStatementParser(password=password).statement_date(Path("sanitized.pdf"))
+
+    assert password not in str(exc_info.value)
