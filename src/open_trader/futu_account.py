@@ -55,6 +55,10 @@ FUTU_CASH_CURRENCY_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("CAD", "ca_cash", "ca_avl_withdrawal_cash"),
     ("MYR", "my_cash", "my_avl_withdrawal_cash"),
 )
+FUTU_NET_CASH_POWER_FIELDS = {
+    currency: f"{currency.lower()}_net_cash_power"
+    for currency, _, _ in FUTU_CASH_CURRENCY_FIELDS
+}
 FUTU_UNMAPPED_ASSETS_SYMBOL = "FUTU_UNMAPPED_ASSETS"
 
 
@@ -351,7 +355,9 @@ def _per_currency_cash_balances_from_record(
     cash_balances: list[CashBalance] = []
     for currency, cash_key, available_key in FUTU_CASH_CURRENCY_FIELDS:
         cash_value = _optional_decimal(record, (cash_key,))
-        available_balance = _optional_decimal(record, (available_key,))
+        available_balance = _optional_decimal(
+            record, (FUTU_NET_CASH_POWER_FIELDS[currency], available_key)
+        )
         if cash_value is None and available_balance is None:
             continue
         if (cash_value or Decimal("0")) == 0 and (

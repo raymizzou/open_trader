@@ -275,6 +275,11 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
                     fresh=directory != "trend_hk_phillips"
                 ),
                 "source_date": account_source_date,
+                "exceptions": (
+                    ["趋势判断不支持当前持仓：AAPL260717C200000（option）"]
+                    if directory == "trend_us_futu"
+                    else []
+                ),
             },
             "strategy_judgments": {
                 "formal_actions": [
@@ -340,6 +345,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
         "data_sources": ["Trend Animals", "Futu US daily K-line"],
         "estimated_api_cost": "1.20",
         "actual_api_cost": "1.00",
+        "account_exceptions": ["趋势判断不支持当前持仓：AAPL260717C200000（option）"],
         "artifact": "2026-07-15-b.json",
     }
     assert reports["phillips"]["buy_window"] == "09:30–10:00"

@@ -2805,7 +2805,7 @@ const report=(broker,brokerLabel,marketLabel)=>({
   hold_actions:[{symbol:"HOLDX",name:"持有标的",reason:"trend_intact",active_line:"80"}],
   review_actions:[{symbol:"REVIEWX",name:"复核标的",reason:"holding_signal_unknown"}],
   counts:{sell:1,buy:1,hold:1,review:1},
-  audit:{candidates:[{symbol:"CANDX",name:"候选标的",strength:"95"}],excluded:{EXCLUDED:["already_held"]},industry_concentration:[["科技",1,"0.25"]],data_sources:["Trend Animals"],actual_api_cost:"1.00"},
+  audit:{candidates:[{symbol:"CANDX",name:"候选标的",strength:"95"}],excluded:{EXCLUDED:["already_held"]},account_exceptions:["现金类资产不参与趋势判断：FUTU_UNMAPPED_ASSETS（cash）"],industry_concentration:[["科技",1,"0.25"]],data_sources:["Trend Animals"],actual_api_cost:"1.00"},
 });
 state.dashboard={trend_reports:{
   futu:report("futu","富途","美股"),
@@ -2828,6 +2828,7 @@ const workspace=elements["trend-report-workspace"].innerHTML;
 const order=["开盘前","美股常规交易时段","盘中持续","人工复核"].map((text)=>workspace.indexOf(`<h2>${text}</h2>`));
 if(order.some((index)=>index<0)||!order.every((index,i)=>i===0||order[i-1]<index))throw new Error(workspace);
 for(const symbol of ["SELLX","BUYX","HOLDX","REVIEWX"]){if(!workspace.includes(symbol))throw new Error(workspace);}
+if(!workspace.includes("账户不参与项")||!workspace.includes("现金类资产不参与趋势判断：FUTU_UNMAPPED_ASSETS（cash）"))throw new Error(workspace);
 if(!workspace.includes("账户数据非实时，执行前核对现金与持仓"))throw new Error(workspace);
 if(!workspace.includes('<details class="trend-audit"><summary>审计详情</summary>')||workspace.includes('<details class="trend-audit" open'))throw new Error(workspace);
 for(const text of ["确认全部卖出动作","按顺序考虑允许买入项","盘中观察活动保护线","完成人工复核"]){if(!workspace.includes(text))throw new Error(workspace);}

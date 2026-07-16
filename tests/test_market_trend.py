@@ -81,7 +81,7 @@ def write_details(
             writer.writerows(rows)
 
 
-def test_load_market_account_uses_full_native_account_but_only_managed_positions(
+def test_load_futu_market_account_uses_all_current_supported_positions_and_cash_power(
     tmp_path: Path,
 ) -> None:
     write_details(
@@ -100,10 +100,22 @@ def test_load_market_account_uses_full_native_account_but_only_managed_positions
                 "name": "Apple", "currency": "USD", "quantity": "2",
                 "cost_price": "200", "market_value": "420",
             },
+            {
+                "statement_id": "2026-07-15-futu-live", "broker": "futu",
+                "market": "US", "asset_class": "option", "symbol": "AAPL260717C200000",
+                "name": "AAPL Call", "currency": "USD", "quantity": "-1",
+                "cost_price": "50", "market_value": "-50",
+            },
+            {
+                "statement_id": "2026-07-15-futu-live", "broker": "futu",
+                "market": "CASH", "asset_class": "cash", "symbol": "FUTU_UNMAPPED_ASSETS",
+                "name": "富途未明细账户资产", "currency": "HKD", "quantity": "1",
+                "cost_price": "7850", "market_value": "7850",
+            },
         ],
         cash=[{
             "statement_id": "2026-07-15-futu-live", "broker": "futu",
-            "currency": "USD", "cash_balance": "1000", "available_balance": "800",
+            "currency": "USD", "cash_balance": "0", "available_balance": "50000",
         }],
     )
 
@@ -117,9 +129,13 @@ def test_load_market_account_uses_full_native_account_but_only_managed_positions
 
     assert account.source_date == "2026-07-15"
     assert account.fresh is True
-    assert account.net_value == Decimal("1920")
-    assert account.available_cash == Decimal("800")
-    assert [item.symbol for item in account.positions] == ["VIXY"]
+    assert account.net_value == Decimal("1870")
+    assert account.available_cash == Decimal("50000")
+    assert [item.symbol for item in account.positions] == ["AAPL", "VIXY"]
+    assert account.exceptions == (
+        "趋势判断不支持当前持仓：AAPL260717C200000（option）",
+        "现金类资产不参与趋势判断：FUTU_UNMAPPED_ASSETS（cash）",
+    )
 
 
 def test_us_account_refreshes_directly_from_futu_before_reporting(

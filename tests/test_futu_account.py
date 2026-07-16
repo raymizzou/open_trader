@@ -351,6 +351,37 @@ def test_map_snapshot_expands_futu_accinfo_per_currency_cash() -> None:
     assert cash_by_currency["USD"].available_balance == Decimal("1400.50")
 
 
+def test_map_snapshot_uses_per_currency_net_cash_power_for_buying_power() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "HKD",
+                "cash": "58.8",
+                "hk_cash": "58.8",
+                "hk_avl_withdrawal_cash": "0",
+                "hkd_net_cash_power": "455581.60",
+                "us_cash": "0",
+                "us_avl_withdrawal_cash": "0",
+                "usd_net_cash_power": "50564.72",
+            }
+        ],
+        position_records=[],
+    )
+
+    _, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-07-16",
+    )
+
+    assert blocking_errors == []
+    cash_by_currency = {cash.currency: cash for cash in cash_balances}
+    assert cash_by_currency["HKD"].cash_balance == Decimal("58.8")
+    assert cash_by_currency["HKD"].available_balance == Decimal("455581.60")
+    assert cash_by_currency["USD"].cash_balance == Decimal("0")
+    assert cash_by_currency["USD"].available_balance == Decimal("50564.72")
+
+
 def test_map_snapshot_preserves_simple_fake_cash_record_compatibility() -> None:
     snapshot = client_snapshot_from_records(
         cash_records=[

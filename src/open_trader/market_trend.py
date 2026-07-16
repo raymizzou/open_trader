@@ -49,9 +49,10 @@ from .daily_premarket import (
 )
 from .notifications import Notifier, NullNotifier
 from .futu_account import FutuAccountClient, sync_futu_portfolio
+from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
-from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
+from .trend_animals import TrendAnimalsClient, TrendAnimalsError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 
 
@@ -204,21 +205,35 @@ def load_market_account(
             symbol = _normalized_symbol(market, row.get("symbol", ""))
         except ValueError:
             continue
-        if symbol not in normalized_managed or _decimal(row.get("quantity", "0"), default=Decimal("0")) <= 0:
+        quantity = _decimal(row.get("quantity", "0"), default=Decimal("0"))
+        if market != "US" and symbol not in normalized_managed:
             continue
         asset_class = row.get("asset_class", "").strip().lower()
         if asset_class not in {"stock", "etf"}:
-            exceptions.append(f"unsupported managed asset: {symbol} ({asset_class or 'unknown'})")
+            exceptions.append(
+                f"趋势判断不支持当前持仓：{symbol}（{asset_class or 'unknown'}）"
+            )
+            continue
+        if quantity <= 0:
+            exceptions.append(f"趋势判断不支持非多头持仓：{symbol}")
             continue
         positions.append(
             AccountPosition(
                 symbol=symbol,
                 name=row.get("name", "").strip() or symbol,
                 asset_class=asset_class,
-                quantity=_decimal(row.get("quantity")),
+                quantity=quantity,
                 avg_cost_price=_optional_decimal(row.get("cost_price")),
                 market_value=_decimal(row.get("market_value")),
             )
+        )
+    if market == "US":
+        exceptions.extend(
+            f"现金类资产不参与趋势判断：{row.get('symbol', '').strip()}（{row.get('asset_class', '').strip().lower() or 'unknown'}）"
+            for row in position_rows
+            if row.get("market", "").strip().upper() == "CASH"
+            or row.get("asset_class", "").strip().lower()
+            in {"cash", "money_market_fund"}
         )
     position_value = sum(
         (_decimal(row.get("market_value"), default=Decimal("0")) for row in market_rows),
@@ -230,7 +245,12 @@ def load_market_account(
     )
     available_cash = sum(
         (
-            min(
+            _decimal(
+                row.get("available_balance"),
+                default=_decimal(row.get("cash_balance"), default=Decimal("0")),
+            )
+            if broker == "futu"
+            else min(
                 _decimal(row.get("cash_balance"), default=Decimal("0")),
                 _decimal(
                     row.get("available_balance"),
@@ -241,10 +261,31 @@ def load_market_account(
         ),
         Decimal("0"),
     )
+    net_value = position_value + cash_balance
+    if broker == "futu" and market == "US":
+        fx = StaticMonthEndFxProvider(expected_date[:7], DEFAULT_RATES_TO_HKD)
+        target_rate = fx.get_rate_to_hkd(currency).rate
+        net_value = sum(
+            (
+                _decimal(row.get("market_value"), default=Decimal("0"))
+                * fx.get_rate_to_hkd(row.get("currency", currency)).rate
+                / target_rate
+                for row in position_rows
+            ),
+            Decimal("0"),
+        ) + sum(
+            (
+                _decimal(row.get("cash_balance"), default=Decimal("0"))
+                * fx.get_rate_to_hkd(row.get("currency", currency)).rate
+                / target_rate
+                for row in cash_rows
+            ),
+            Decimal("0"),
+        )
     return AccountSnapshot(
         source_date=source_date,
         fresh=source_date == expected_date,
-        net_value=position_value + cash_balance,
+        net_value=net_value,
         available_cash=max(Decimal("0"), available_cash),
         positions=tuple(sorted(positions, key=lambda item: item.symbol)),
         exceptions=tuple(exceptions),
@@ -506,7 +547,7 @@ def _attempt_market_report(
         for position in account.positions:
             try:
                 holding_ids[position.symbol] = api.search_exact_symbol(position.symbol)
-            except TrendAnimalsLookupError:
+            except TrendAnimalsError:
                 continue
         requested_ids = sorted(component_ids | set(holding_ids.values()))
         billing = {

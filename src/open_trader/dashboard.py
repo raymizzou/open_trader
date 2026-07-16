@@ -496,6 +496,7 @@ def _load_broker_trend_report(
         "audit": {
             "candidates": audit_candidates,
             "excluded": payload.get("excluded", {}),
+            "account_exceptions": account.get("exceptions", []),
             "industry_concentration": payload.get("industry_concentration", []),
             "data_sources": payload.get("data_sources", []),
             "estimated_api_cost": payload.get("estimated_api_cost"),

@@ -1945,6 +1945,7 @@ function renderTrendAudit(audit) {
     ? audit.candidates.filter((item) => item && typeof item === "object" && !Array.isArray(item))
     : [];
   const excluded = audit.excluded && typeof audit.excluded === "object" && !Array.isArray(audit.excluded) ? audit.excluded : {};
+  const accountExceptions = Array.isArray(audit.account_exceptions) ? audit.account_exceptions : [];
   const industries = Array.isArray(audit.industry_concentration)
     ? audit.industry_concentration.filter(Array.isArray)
     : [];
@@ -1955,6 +1956,9 @@ function renderTrendAudit(audit) {
       : "<li>无</li>"}</ol></section>
     <section><h3>排除项</h3><ul>${Object.entries(excluded).length
       ? Object.entries(excluded).map(([symbol, reasons]) => `<li>${escapeHtml(formatPlain(symbol))}｜${escapeHtml((Array.isArray(reasons) ? reasons : []).map((reason) => TREND_REASON_LABELS[reason] || "未知原因").join("、"))}</li>`).join("")
+      : "<li>无</li>"}</ul></section>
+    <section><h3>账户不参与项</h3><ul>${accountExceptions.length
+      ? accountExceptions.map((item) => `<li>${escapeHtml(formatPlain(item))}</li>`).join("")
       : "<li>无</li>"}</ul></section>
     <section><h3>行业集中度</h3><ul>${industries.length
       ? industries.map((item) => `<li>${escapeHtml(item.map((value, index) => index ? formatDisplayNumber(value) : formatPlain(value)).join("｜"))}</li>`).join("")
