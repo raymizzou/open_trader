@@ -1707,6 +1707,76 @@ table {
   font-size: 12px;
 }
 
+.option-attention-workspace {
+  display: grid;
+  gap: 16px;
+}
+
+.option-attention-header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.option-attention-header h1 {
+  margin: 0;
+}
+
+.option-attention-header button {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  color: var(--accent-strong);
+  cursor: pointer;
+  font-weight: 700;
+  min-height: 38px;
+  padding: 0 12px;
+}
+
+.option-attention-table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+}
+
+.option-attention-table th,
+.option-attention-table td {
+  overflow-wrap: anywhere;
+  padding: 9px 7px;
+  vertical-align: top;
+}
+
+.option-attention-table th {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.option-attention-market th {
+  background: var(--surface-soft);
+  border-block: 1px solid var(--line);
+  color: var(--text);
+  font-size: 14px;
+  text-align: left;
+}
+
+.option-attention-market th {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.option-attention-market th span:last-child {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.option-attention-changed {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 4px;
+  font-weight: 700;
+  padding: 1px 3px;
+}
+
 .trend-discipline {
   background: var(--surface-soft);
   border: 1px solid var(--line);
@@ -3861,7 +3931,8 @@ tbody tr.active-row,
 .action-card-metrics div,
 .action-card,
 .backtest-metric-card,
-.cn-trend-card td:nth-child(-n + 2) {
+.cn-trend-card td:nth-child(-n + 2),
+.option-attention-market th {
   --muted: var(--text);
 }
 
@@ -3982,11 +4053,66 @@ table {
   .trend-report-body { grid-template-columns: minmax(0, 1fr); }
   .trend-checklist { position: static; order: 2; }
   .trend-report-entry button,
-  .trend-report-header button { min-height: 44px; }
+  .trend-report-header button,
+  .option-attention-header button { min-height: 44px; }
 
   .trend-report-workspace,
-  .cn-trend-report {
+  .cn-trend-report,
+  .option-attention-workspace {
     overflow-x: hidden;
+  }
+
+  .option-attention-header {
+    align-items: stretch;
+    display: grid;
+    gap: 10px;
+  }
+
+  .option-attention-table {
+    display: block;
+    max-width: 100%;
+  }
+
+  .option-attention-table thead {
+    display: none;
+  }
+
+  .option-attention-table tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .option-attention-market,
+  .option-attention-market th {
+    display: block;
+  }
+
+  .option-attention-market th {
+    box-sizing: border-box;
+    width: 100%;
+  }
+
+  .option-attention-row {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: hidden;
+  }
+
+  .option-attention-row td {
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+    padding: 10px;
+  }
+
+  .option-attention-row td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 12px;
+    font-weight: 700;
   }
 
   .cn-trend-counts {
@@ -4338,5 +4464,11 @@ table {
   .t-signal-detail-grid,
   .t-signal-gate-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 460px) {
+  .option-attention-row {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

@@ -48,9 +48,9 @@ const ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT = 11;
 const WORKSPACE_VIEWS = new Set(["portfolio", "kelly_lab", "standard_backtest", "trend_report"]);
 
 const ACCOUNT_STRATEGY_PROFILES = {
-  futu: {horizon: "短线", strategy: "美股趋势交易"},
-  tiger: {horizon: "长线", strategy: "SMA200 组合策略"},
-  phillips: {horizon: "短线", strategy: "港股趋势交易"},
+  futu: {horizon: "期权增强", strategy: "跨市场期权关注"},
+  tiger: {horizon: "趋势", strategy: "美股趋势交易"},
+  phillips: {horizon: "趋势", strategy: "港股趋势交易"},
   eastmoney: {horizon: "偏短线", strategy: "趋势交易"},
 };
 
@@ -129,21 +129,6 @@ const REASON_LABELS = {
   "No plan trigger is active.": "暂无触发中的交易计划。",
   "Futu did not return a quote.": "Futu 未返回行情。",
   "missing quote": "缺失行情。",
-};
-
-const TIGER_GATE_LABELS = {
-  sharpe_undefined: "夏普比率无法计算",
-  sharpe_below_floor: "夏普比率低于门槛",
-  benchmark_sharpe_undefined: "基准夏普比率无法计算",
-  sharpe_below_benchmark: "夏普比率低于基准",
-  calmar_undefined: "卡玛比率无法计算",
-  calmar_below_floor: "卡玛比率低于门槛",
-  benchmark_calmar_undefined: "基准卡玛比率无法计算",
-  calmar_below_benchmark: "卡玛比率低于基准",
-  return_below_cash: "年化收益不高于现金",
-  drawdown_above_benchmark: "最大回撤高于基准",
-  provenance_incomplete: "数据来源不完整",
-  calibration_required: "需要校准",
 };
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -1898,16 +1883,18 @@ const TREND_REASON_LABELS = {
 };
 
 function renderTrendReportEntry(broker) {
-  if (!["futu", "phillips", "eastmoney"].includes(broker)) return "";
+  if (!ACCOUNT_BROKERS.includes(broker)) return "";
   const report = state.dashboard?.trend_reports?.[broker] || {};
+  const label = broker === "futu" ? "期权关注" : "当天趋势报告";
   if (!report.available) {
     return `<div class="trend-report-entry trend-report-entry-empty">
-      <button type="button" disabled>当天趋势报告</button>
+      <button type="button" disabled>${label}</button>
       <span>${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</span>
     </div>`;
   }
   return `<div class="trend-report-entry">
-    <button type="button" data-trend-report="${escapeHtml(broker)}">当天趋势报告</button>
+    <button type="button" data-trend-report="${escapeHtml(broker)}">${label}</button>
+    <span>${escapeHtml(formatPlain(report.status_text || "今日已更新"))}</span>
     <span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span>
     <span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>
   </div>`;
@@ -2198,40 +2185,79 @@ function renderCnTrendReportWorkspace(report) {
   </main>`;
 }
 
-function renderTrendReportWorkspace(report) {
-  return String(report && report.market || "").toUpperCase() === "CN"
-    ? renderCnTrendReportWorkspace(report || {})
-    : renderDefaultTrendReportWorkspace(report || {});
+const OPTION_ATTENTION_COLUMNS = [
+  {label: "标的", content: (item) => [item.symbol, item.name].map(optionAttentionValue).map(escapeHtml).join(" ")},
+  {label: "分类", content: (item) => escapeHtml(optionAttentionValue(item.category))},
+  {label: "右侧状态", content: (item) => renderOptionAttentionTransition(item.right_side)},
+  {label: "趋势温度", content: (item) => renderOptionAttentionTransition(item.temperature)},
+  {label: "趋势节气", content: (item) => renderOptionAttentionTransition(item.phase)},
+  {label: "本地 / 全球强度", content: (item) => [item.local_strength, item.global_strength].map(optionAttentionValue).map(escapeHtml).join(" / ")},
+  {label: "上周 / 上月", content: (item) => `${[item.strength_prev_week, item.strength_prev_month].map(optionAttentionValue).map(escapeHtml).join(" / ")}<br>${renderOptionAttentionTransition(item.strength_change)}`},
+  {label: "右侧天数 / 累计涨幅", content: (item) => [item.days, item.gain_since_entry].map(optionAttentionValue).map(escapeHtml).join(" / ")},
+  {label: "危险 / 沸腾 / 开香槟", content: (item) => [item.danger, item.boiling, item.champagne].map(renderOptionAttentionTransition).join(" / ")},
+  {label: "来源动作", content: (item) => [optionAttentionValue(item.source_broker), optionAttentionAction(item.source_action)].map(escapeHtml).join(" / ")},
+];
+
+function optionAttentionValue(value) {
+  if (value === null || value === undefined || typeof value === "string" && !value.trim()) {
+    return "未提供";
+  }
+  if (typeof value === "boolean") return value ? "是" : "否";
+  return formatPlain(value);
 }
 
-function renderAccountStrategy(group) {
-  if (group.broker !== "tiger") {
-    return "";
+function renderOptionAttentionTransition(transition) {
+  const value = transition && typeof transition === "object" && !Array.isArray(transition)
+    ? transition
+    : {};
+  const text = `${optionAttentionValue(value.previous)} → ${optionAttentionValue(value.current)}`;
+  const changed = value.changed === true ? ' class="option-attention-changed"' : "";
+  return `<span${changed}>${escapeHtml(text)}</span>`;
+}
+
+function optionAttentionAction(action) {
+  if (action === "BUY") return "允许买入";
+  if (action === "SELL_ALL") return "卖出复核";
+  if (action === "HOLD") return "继续持有";
+  return "观察";
+}
+
+function optionAttentionMarketStatus(market) {
+  if (hasValue(market.status_text)) return optionAttentionValue(market.status_text);
+  if (market.data_status === "current") return "今日已更新";
+  if (market.data_status === "stale") {
+    return `数据截至 ${optionAttentionValue(market.data_date)}；今日未更新`;
   }
-  const strategy = state.dashboard?.tiger_long_term_strategy || {};
-  if (strategy.available === false || !strategy.validation && !strategy.strategy) {
-    return `<div class="account-strategy-summary"><strong>${escapeHtml(group.profile.strategy)}</strong><span>${escapeHtml(strategy.error || "影子验证产物暂不可用")}</span></div>`;
-  }
-  const validation = strategy.validation || {};
-  const values = validation.strategy || strategy.strategy || {};
-  const gate = validation.gate || strategy.gate || {};
-  const reasons = Array.isArray(gate.reasons) && gate.reasons.length
-    ? gate.reasons.map((reason) => TIGER_GATE_LABELS[reason] || "其他门槛未满足")
-    : ["无"];
-  const annualizedReturn = formatSignedPnl(decisionPlanPercent(values.annualized_return_pct));
-  const maxDrawdown = drawdownPercent(values.max_drawdown_pct);
-  const annualizedTone = pnlClass(annualizedReturn);
-  const drawdownTone = pnlClass(maxDrawdown);
-  return `<div class="account-strategy-summary">
-    <div class="tiger-panel-heading"><div><strong>SMA200 策略</strong><span>影子验证 · 仅供人工复核</span></div><span>${escapeHtml(strategy.run_date || "-")}</span></div>
-    <div class="tiger-rule-strip"><span>单标的上限 10%</span><span>风险组上限 30%</span><span>门槛：${reasons.map(escapeHtml).join(" · ")}</span></div>
-    <article class="tiger-metric-card"><dl>
-      <div><dt>年化收益</dt><dd${annualizedTone ? ` class="${annualizedTone}"` : ""}>${escapeHtml(annualizedReturn)}</dd></div>
-      <div><dt>最大回撤</dt><dd${drawdownTone ? ` class="${drawdownTone}"` : ""}>${escapeHtml(maxDrawdown)}</dd></div>
-      <div><dt>夏普比率</dt><dd>${escapeHtml(decisionPlanRatio(values.sharpe_ratio))}</dd></div>
-      <div><dt>卡玛比率</dt><dd>${escapeHtml(decisionPlanRatio(values.calmar_ratio))}</dd></div>
-    </dl></article>
-  </div>`;
+  return "暂时不可用";
+}
+
+function renderOptionAttentionRow(item) {
+  return `<tr class="option-attention-row">${OPTION_ATTENTION_COLUMNS.map(({label, content}) => `<td data-label="${escapeHtml(label)}">${content(item)}</td>`).join("")}</tr>`;
+}
+
+function renderOptionAttentionWorkspace(report) {
+  const order = {US: 0, HK: 1};
+  const markets = (Array.isArray(report.attention_markets) ? report.attention_markets : [])
+    .filter((market) => market && typeof market === "object" && !Array.isArray(market))
+    .sort((left, right) => (order[String(left.market).toUpperCase()] ?? 2) - (order[String(right.market).toUpperCase()] ?? 2));
+  const rows = markets.map((market) => {
+    const items = Array.isArray(market.items)
+      ? market.items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+      : [];
+    return `<tr class="option-attention-market"><th colspan="${OPTION_ATTENTION_COLUMNS.length}" scope="rowgroup"><span>${escapeHtml(optionAttentionValue(market.market_label))}</span><span>${escapeHtml(optionAttentionMarketStatus(market))}</span></th></tr>${items.map(renderOptionAttentionRow).join("")}`;
+  }).join("");
+  return `<main class="option-attention-workspace">
+    <header class="option-attention-header"><h1>期权关注</h1><button type="button" data-close-trend-report>返回持仓看板</button></header>
+    <table class="option-attention-table"><thead><tr>${OPTION_ATTENTION_COLUMNS.map(({label}) => `<th scope="col">${escapeHtml(label)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
+  </main>`;
+}
+
+function renderTrendReportWorkspace(report) {
+  return String(report && report.broker || "").toLowerCase() === "futu"
+    ? renderOptionAttentionWorkspace(report || {})
+    : String(report && report.market || "").toUpperCase() === "CN"
+    ? renderCnTrendReportWorkspace(report || {})
+    : renderDefaultTrendReportWorkspace(report || {});
 }
 
 function renderHeaderSummary() {
@@ -2396,7 +2422,6 @@ function renderAccountSection(group) {
       </div>
       ${renderTrendReportEntry(group.broker)}
     </header>
-    ${renderAccountStrategy(group)}
     ${rows.length ? renderAccountTable(rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
   </section>`;
 }
