@@ -3217,6 +3217,20 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_futu_attention_entry_omits_aggregate_report_dates() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard={trend_reports:{futu:{
+  available:true,status_text:"期权关注",report_date:"-",data_date:"-",
+}}};
+const entry=renderTrendReportEntry("futu");
+if(!entry.includes("期权关注"))throw new Error(entry);
+if(entry.includes("报告日期")||entry.includes("数据截至"))throw new Error(entry);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_trend_report_escapes_report_strings() -> None:
     output = run_dashboard_js(r'''
 const attack='<img src=x onerror=alert(1)>';

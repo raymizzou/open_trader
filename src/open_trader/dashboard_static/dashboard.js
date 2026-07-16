@@ -1892,11 +1892,13 @@ function renderTrendReportEntry(broker) {
       <span>${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</span>
     </div>`;
   }
+  const dates = broker === "futu" ? "" : `
+    <span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span>
+    <span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>`;
   return `<div class="trend-report-entry">
     <button type="button" data-trend-report="${escapeHtml(broker)}">${label}</button>
     <span>${escapeHtml(formatPlain(report.status_text || "今日已更新"))}</span>
-    <span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span>
-    <span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>
+    ${dates}
   </div>`;
 }
 
