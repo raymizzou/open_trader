@@ -2855,17 +2855,17 @@ const cn = renderTrendReportWorkspace({
   buy_window:"09:30–10:00",counts:{sell:1,buy:1,hold:1,review:2},
   sell_actions:[{symbol:"601398",name:"工商银行",close:"7.2",
     temperature_prev:"温",temperature_curr:"温",strength:"91.3",
-    reason:"left_trend_right_side",active_line:"7.0",
+    reason:"left_trend_right_side",active_line:"5.457142857142857142857142857",
     entry_hints:["强度 91.3，低于入场线 95"]}],
   buy_actions:[{symbol:"688046",name:"药康生物",filter_price:"29.14",
     close:"28.81",temperature_prev:"温",temperature_curr:"热",phase:"立夏",
     strength:"99.9",industry:"医疗服务",industry_temperature:"热",
     market_cap:"110",amount:"6",target_weight:"0.04",
     target_amount:"27061.98",estimated_shares:900,
-    estimated_initial_line:"24.55"}],
+    estimated_initial_line:"24.54571428571428571428571429"}],
   hold_actions:[{symbol:"600900",name:"长江电力",close:"28.0",
     temperature_prev:"热",temperature_curr:"热",strength:"98.7",
-    reason:"trend_intact",active_line:"27.8",
+    reason:"trend_intact",active_line:"27.52714285714285714285714286",
     entry_hints:["不是新的温转热或温转沸入场信号"]}],
   review_actions:[
     {symbol:"600036",name:"招商银行",close:"45.2",temperature_prev:"热",
@@ -2896,6 +2896,12 @@ if (!cn.includes('class="cn-trend-report"') ||
     !cn.includes('class="cn-trend-table"') ||
     !cn.includes('class="cn-trend-card"')) throw new Error(cn);
 if ((cn.match(/<details class="trend-discipline" open>/g) || []).length !== 2) throw new Error(cn);
+for (const price of ["5.46", "24.55", "27.53"]) {
+  if (!cn.includes(`>${price}</td>`)) throw new Error(cn);
+}
+for (const raw of ["5.457142857142857142857142857", "24.54571428571428571428571429", "27.52714285714285714285714286"]) {
+  if (cn.includes(raw)) throw new Error(cn);
+}
 const actionContent = cn.split('<details class="trend-audit"', 1)[0];
 if (actionContent.includes("AUDIT-ONLY") || !cn.includes("AUDIT-ONLY")) throw new Error(cn);
 

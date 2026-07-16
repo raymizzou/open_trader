@@ -2015,6 +2015,13 @@ function cnTrendHints(item) {
     : "数据不可用";
 }
 
+function formatCnTrendPrice(value) {
+  const number = numericValue(value);
+  return number === null
+    ? formatPlain(value)
+    : number.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
 function renderCnTrendTable(title, kind, headings, rows, note = "") {
   const desktopScroller = kind === "buy" && !isCnTrendMobile();
   const scrollerAttributes = kind === "buy"
@@ -2061,7 +2068,7 @@ function renderCnSellOrHoldStage(title, items, kind) {
     ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
     ${renderCnTrendCell("强度", item.strength)}
     ${renderCnTrendCell(headings[5], TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
-    ${renderCnTrendCell("活动保护线", item.active_line)}
+    ${renderCnTrendCell("活动保护线", formatCnTrendPrice(item.active_line))}
     ${renderCnTrendCell("持仓提示", cnTrendHints(item))}
   </tr>`);
   return renderCnTrendTable(title, kind, headings, rows);
@@ -2090,7 +2097,7 @@ function renderCnBuyStage(report) {
       ${renderCnTrendCell("目标仓位", targetWeight, `目标仓位 ${targetWeight}`)}
       ${renderCnTrendCell("目标金额", item.target_amount)}
       ${renderCnTrendCell("预计数量", `${formatPlain(item.estimated_shares)} 股`)}
-      ${renderCnTrendCell("预计保护线", item.estimated_initial_line)}
+      ${renderCnTrendCell("预计保护线", formatCnTrendPrice(item.estimated_initial_line))}
     </tr>`;
   });
   return renderCnTrendTable(
