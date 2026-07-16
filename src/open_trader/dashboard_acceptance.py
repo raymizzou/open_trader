@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 from pathlib import Path
 import re
@@ -524,6 +524,26 @@ def _display_number(value: Any) -> str:
     return f"{sign}{grouped}{fraction or ''}"
 
 
+def _display_price(value: Any) -> str:
+    raw = _plain(value).strip()
+    try:
+        number = Decimal(raw)
+    except InvalidOperation:
+        return raw
+    if not number.is_finite():
+        return raw
+    rounded = number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP).normalize()
+    return _display_number(format(rounded, "f"))
+
+
+def _check_displayed_protection_prices(values: list[str]) -> None:
+    assert values, "A 股趋势报告缺少保护线价格"
+    assert all(
+        re.fullmatch(r"(?:-|[+-]?\d+(?:,\d{3})*(?:\.\d{1,2})?)", value.strip())
+        for value in values
+    ), "A 股趋势报告保护线超过两位小数"
+
+
 def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
     action = item.get("action")
     reason = item.get("reason")
@@ -727,7 +747,7 @@ def _check_action_trend_stages(
                     item.get("industry_temperature"), item.get("market_cap"),
                     item.get("amount"), f"{format(weight.normalize(), 'f')}%",
                     item.get("target_amount"), f"{_plain(item.get('estimated_shares'))} 股",
-                    item.get("estimated_initial_line"),
+                    _display_price(item.get("estimated_initial_line")),
                 )
             elif key == "buy_actions":
                 weight = Decimal(str(item.get("target_weight", "NaN"))) * 100
@@ -759,7 +779,7 @@ def _check_action_trend_stages(
                     TREND_REASON_LABELS.get(
                         str(item.get("reason", "")), "未知动作或原因，需人工确认"
                     ),
-                    item.get("active_line"),
+                    _display_price(item.get("active_line")),
                     *(
                         item.get("entry_hints")
                         if isinstance(item.get("entry_hints"), list)
@@ -1013,6 +1033,11 @@ def _check_account_holdings(
                     f"eastmoney 趋势报告工作区缺少 {required}"
                 )
             _check_cn_buy_rows(workspace, report)
+            _check_displayed_protection_prices(
+                workspace.locator(
+                    'td[data-label="活动保护线"], td[data-label="预计保护线"]'
+                ).all_inner_texts()
+            )
             disciplines = workspace.locator(".trend-discipline")
             assert disciplines.count() == 2, "eastmoney 趋势报告纪律卡数量不是 2"
             assert workspace.locator(".trend-discipline summary").all_inner_texts() == [

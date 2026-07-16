@@ -1241,6 +1241,11 @@ class TabbedAccountLocator:
             return [str(report[key]) for key in (
                 "report_date", "data_date", "generated_at", "account_status",
             )]
+        if self.selector == (
+            '#trend-report-workspace:visible td[data-label="活动保护线"], '
+            'td[data-label="预计保护线"]'
+        ):
+            return ["7", "42", "1,450", "24.55", "27.8"]
         if self.selector == "#trend-report-workspace:visible .trend-audit section":
             return trend_audit_sections(broker)
         if self.selector == "#trend-report-workspace:visible .trend-discipline summary":
@@ -1856,6 +1861,17 @@ def test_acceptance_formats_grouped_numeric_expectations_without_touching_text()
         },
         "futu",
     )
+
+
+def test_acceptance_requires_cn_protection_prices_with_at_most_two_decimals() -> None:
+    assert dashboard_acceptance._display_price(
+        "5.457142857142857142857142857"
+    ) == "5.46"
+    dashboard_acceptance._check_displayed_protection_prices(["5.46", "24.55", "27.53"])
+    with pytest.raises(AssertionError, match="超过两位小数"):
+        dashboard_acceptance._check_displayed_protection_prices(
+            ["5.457142857142857142857142857"]
+        )
 
 
 VISUAL_CONTRACT_STYLES = {
