@@ -2956,6 +2956,7 @@ def test_dashboard_trend_report_mobile_layout_css() -> None:
     assert "overflow-x: hidden;" in mobile
     assert ".trend-discipline summary" in mobile
     assert "min-height: 44px;" in mobile
+    assert ".research-chat-input-row input {\n    min-height: 44px;\n  }" in mobile
 
 
 def test_dashboard_trend_report_defensively_handles_malformed_arrays() -> None:

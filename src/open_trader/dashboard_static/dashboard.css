@@ -4232,6 +4232,10 @@ table {
     grid-template-columns: 1fr;
   }
 
+  .research-chat-input-row input {
+    min-height: 44px;
+  }
+
   .decision-dashboard,
   .decision-plan-overview,
   .decision-plan-fallback-banner,
