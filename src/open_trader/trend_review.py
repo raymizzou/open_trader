@@ -320,13 +320,11 @@ def _reconcile_intent(
     orders = listed.get("orders") if isinstance(listed, Mapping) else None
     if not isinstance(orders, list):
         raise ValueError("simulate broker orders are unavailable")
-    remark = str(request.get("remark") or "")
     matched = next(
         (
             order for order in orders
             if isinstance(order, Mapping)
-            and remark
-            and str(order.get("remark") or "") == remark
+            and _order_matches_request(order, request)
         ),
         None,
     )
@@ -339,6 +337,40 @@ def _reconcile_intent(
         ),
     )
     return request, True
+
+
+def _order_matches_request(
+    order: Mapping[str, object], request: Mapping[str, object]
+) -> bool:
+    order_side = str(order.get("trd_side", order.get("side", ""))).strip()
+    request_side = str(request.get("side") or "").strip()
+    try:
+        quantity_matches = _required_decimal(
+            order.get("qty"), "broker order quantity"
+        ) == _required_decimal(request.get("qty"), "request quantity")
+    except ValueError:
+        return False
+    return bool(request.get("remark")) and all(
+        (
+            str(order.get("remark") or "") == str(request["remark"]),
+            str(order.get("code", order.get("futu_code", ""))).strip().upper()
+            == str(request.get("futu_code") or "").strip().upper(),
+            order_side.rsplit(".", 1)[-1].upper()
+            == request_side.rsplit(".", 1)[-1].upper(),
+            quantity_matches,
+        )
+    )
+
+
+def _open_order_remark(
+    market: str, execution_date: str, report_sha: str, action_index: int
+) -> str:
+    remark = (
+        f"trend-review:{market}:{execution_date}:{report_sha[:24]}:{action_index}"
+    )
+    if len(remark.encode("utf-8")) > 64:
+        raise ValueError("trend review order remark exceeds Futu's 64-byte limit")
+    return remark
 
 
 def execute_trend_review_open(
@@ -422,7 +454,9 @@ def execute_trend_review_open(
                 "order_type": "MARKET",
                 "price": "0",
                 "qty": str(quantity),
-                "remark": f"trend-review:{market}:{execution_date}:{index}",
+                "remark": _open_order_remark(
+                    market, execution_date, report_sha, index
+                ),
             }
             _write_immutable(
                 intent_path,

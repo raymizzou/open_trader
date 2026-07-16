@@ -294,7 +294,9 @@ class FakeTrendSimClient:
         return {"orders": self.orders}
 
 
-def cn_buy_report(*, weight: str = "0.04") -> dict[str, object]:
+def cn_buy_report(
+    *, weight: str = "0.04", symbol: str = "600001"
+) -> dict[str, object]:
     return {
         "account": {
             "net_value": "735164.41",
@@ -314,7 +316,7 @@ def cn_buy_report(*, weight: str = "0.04") -> dict[str, object]:
             "formal_actions": [
                 {
                     "action": "BUY",
-                    "symbol": "600001",
+                    "symbol": symbol,
                     "target_weight": weight,
                     "lot_size": 100,
                 }
@@ -391,11 +393,55 @@ def test_open_reconciles_accepted_order_after_response_failure(
 
     with pytest.raises(RuntimeError, match="place order failed"):
         trend_review.execute_trend_review_open(**arguments)
+    client.orders[0] = {
+        "remark": client.orders[0]["remark"],
+        "code": " sh.600001 ",
+        "trd_side": "BUY",
+        "qty": "400.0",
+    }
     result = trend_review.execute_trend_review_open(**arguments)
 
     assert result["status"] == "unchanged"
     assert len(client.requests) == 1
     assert list(tmp_path.glob("trend_review/ledgers/CN/open/*/*-result.json"))
+
+
+def test_newer_revision_cannot_reconcile_to_older_response_failure(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(fail_orders=1, accepted_before_failure=True)
+    first = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(symbol="600001"),
+        "client": client,
+        "prices": {"600001": Decimal("10")},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "now": "2026-07-17T09:31:00+08:00",
+    }
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_open(**first)
+
+    client.fail_orders = 1
+    client.accepted_before_failure = False
+    revised = {
+        **first,
+        "report": cn_buy_report(symbol="600002"),
+        "prices": {"600002": Decimal("20")},
+    }
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_open(**revised)
+    result = trend_review.execute_trend_review_open(**revised)
+
+    assert result["submitted_count"] == 1
+    assert len(client.requests) == 3
+    assert client.requests[0]["remark"] != client.requests[1]["remark"]
+    assert client.requests[-1] | {
+        "futu_code": "SH.600002",
+        "side": "buy",
+        "qty": "200",
+    } == client.requests[-1]
+    assert len(client.requests[-1]["remark"].encode("utf-8")) <= 64
 
 
 def test_first_open_requires_empty_dedicated_simulate_account(
