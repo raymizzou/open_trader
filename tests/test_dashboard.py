@@ -65,6 +65,7 @@ CASH_FIELDNAMES = [
     "notes",
 ]
 MISSING_FRESH = object()
+MISSING_ATTENTION = object()
 
 
 def test_dashboard_excludes_zero_quantity_closed_positions(tmp_path: Path) -> None:
@@ -170,6 +171,33 @@ def serialized_trend_position() -> dict[str, object]:
         "quantity": "10",
         "avg_cost_price": None,
         "market_value": "500",
+    }
+
+
+def option_attention(
+    symbol: str, *, market: str = "US", source_broker: str = "老虎"
+) -> dict[str, object]:
+    unchanged = {"previous": False, "current": False, "changed": False}
+    return {
+        "market": market,
+        "symbol": symbol,
+        "name": symbol,
+        "category": "watch",
+        "right_side": unchanged,
+        "temperature": {"previous": "温", "current": "热", "changed": True},
+        "phase": {"previous": "谷雨", "current": "立夏", "changed": True},
+        "local_strength": "95",
+        "global_strength": "90",
+        "strength_prev_week": "91",
+        "strength_prev_month": "89",
+        "strength_change": {"previous": "→", "current": "↑", "changed": True},
+        "days": 1,
+        "gain_since_entry": "0.02",
+        "danger": unchanged,
+        "boiling": unchanged,
+        "champagne": unchanged,
+        "source_broker": source_broker,
+        "source_action": "WATCH",
     }
 
 
@@ -286,9 +314,9 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     )
     for directory, account_source_date, data_sources in [
         (
-            "trend_us_futu",
+            "trend_us_tiger",
             "2026-07-14",
-            ["Trend Animals", "Futu US daily K-line"],
+            ["Trend Animals", "Tiger US daily K-line"],
         ),
         (
             "trend_hk_phillips",
@@ -302,7 +330,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
         ),
     ]:
         market, broker = {
-            "trend_us_futu": ("US", "futu"),
+            "trend_us_tiger": ("US", "tiger"),
             "trend_hk_phillips": ("HK", "phillips"),
             "trend_a_share": ("CN", "eastmoney"),
         }[directory]
@@ -335,6 +363,17 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
             "data_sources": data_sources,
             "estimated_api_cost": "1.20",
             "actual_api_cost": "1.00",
+            "option_attention": (
+                []
+                if market == "CN"
+                else [
+                    option_attention(
+                        "VIXY",
+                        market=market,
+                        source_broker="老虎" if market == "US" else "辉立",
+                    )
+                ]
+            ),
             "metadata": {
                 "market": market,
                 "broker": broker,
@@ -342,7 +381,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
             },
         }
         path.write_text(json.dumps(payload), encoding="utf-8")
-        if directory == "trend_us_futu":
+        if directory == "trend_us_tiger":
             for filename, generated_at, symbol in (
                 ("2026-07-15-a.json", "2026-07-15T11:30:36+08:00", "WRONG-A"),
                 ("2026-07-15-z.json", "2026-07-15T10:00:00+08:00", "WRONG-Z"),
@@ -351,13 +390,13 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
                 revision["generated_at"] = generated_at
                 revision["strategy_judgments"]["formal_actions"][0]["symbol"] = symbol
                 (path.parent / filename).write_text(json.dumps(revision), encoding="utf-8")
-    events = config.data_dir / "trend_us_futu/watch_events.jsonl"
+    events = config.data_dir / "trend_us_tiger/watch_events.jsonl"
     events.parent.mkdir(parents=True)
     events.write_text(json.dumps({
         "event_type": "protection_triggered", "symbol": "AAPL",
         "occurred_at": "2026-07-15T22:00:00+08:00", "active_line": "190",
     }) + "\n", encoding="utf-8")
-    log = config.data_dir / "trend_us_futu/run.log"
+    log = config.data_dir / "trend_us_tiger/run.log"
     log.write_text(json.dumps({
         "event": "failed", "run_date": "2026-07-15",
     }) + "\n", encoding="utf-8")
@@ -365,22 +404,23 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     state = load_dashboard_state(config).to_dict()
     reports = state["trend_reports"]
 
-    assert set(reports) == {"futu", "phillips", "eastmoney"}
+    assert set(reports) == {"tiger", "phillips", "eastmoney", "futu"}
     assert "trend_market_summaries" not in state
-    assert reports["futu"]["report_date"] == "2026-07-15"
-    assert reports["futu"]["data_date"] == "2026-07-14"
-    assert reports["futu"]["generated_at"] == "2026-07-15T11:30:36+08:00"
-    assert reports["futu"]["sell_actions"][0]["symbol"] == "AAPL"
-    assert reports["futu"]["counts"] == {"sell": 1, "buy": 1, "hold": 1, "review": 0}
-    assert reports["futu"]["run_status"] == "failed"
-    assert reports["futu"]["recent_protection_alert"] == (
+    assert reports["tiger"]["report_date"] == "2026-07-15"
+    assert reports["tiger"]["data_date"] == "2026-07-14"
+    assert reports["tiger"]["data_status"] == "current"
+    assert reports["tiger"]["generated_at"] == "2026-07-15T11:30:36+08:00"
+    assert reports["tiger"]["sell_actions"][0]["symbol"] == "AAPL"
+    assert reports["tiger"]["counts"] == {"sell": 1, "buy": 1, "hold": 1, "review": 0}
+    assert reports["tiger"]["run_status"] == "failed"
+    assert reports["tiger"]["recent_protection_alert"] == (
         "AAPL · 2026-07-15T22:00:00+08:00 · 保护线 190"
     )
-    assert reports["futu"]["audit"] == {
+    assert reports["tiger"]["audit"] == {
         "candidates": [{"symbol": "VIXY", "strength": "95"}],
         "excluded": {"QQQ": ["already_held"]},
         "industry_concentration": [["科技", 1, "0.25"]],
-        "data_sources": ["Trend Animals", "Futu US daily K-line"],
+        "data_sources": ["Trend Animals", "Tiger US daily K-line"],
         "estimated_api_cost": "1.20",
         "actual_api_cost": "1.00",
         "artifact": "2026-07-15-b.json",
@@ -411,7 +451,7 @@ def test_dashboard_projects_complete_cn_candidate_audit_only_for_eastmoney(
     ]
     for directory, market, broker in (
         ("trend_a_share", "CN", "eastmoney"),
-        ("trend_us_futu", "US", "futu"),
+        ("trend_us_tiger", "US", "tiger"),
     ):
         path = config.reports_dir / directory / "2026-07-15.json"
         path.parent.mkdir(parents=True)
@@ -427,6 +467,7 @@ def test_dashboard_projects_complete_cn_candidate_audit_only_for_eastmoney(
                 "top10_candidates": top_ten,
             },
             "signal_snapshots": {"candidates": complete},
+            "option_attention": [],
         }), encoding="utf-8")
 
     reports = dashboard_module._load_trend_reports(
@@ -436,7 +477,7 @@ def test_dashboard_projects_complete_cn_candidate_audit_only_for_eastmoney(
     assert [item["symbol"] for item in reports["eastmoney"]["audit"]["candidates"]] == [
         "688046", "600000",
     ]
-    assert reports["futu"]["audit"]["candidates"] == top_ten
+    assert reports["tiger"]["audit"]["candidates"] == top_ten
 
 
 def test_dashboard_rejects_malformed_signal_candidate_audit_when_present(
@@ -457,6 +498,7 @@ def test_dashboard_rejects_malformed_signal_candidate_audit_when_present(
             "top10_candidates": [],
         },
         "signal_snapshots": {"candidates": [None]},
+        "option_attention": [],
     }), encoding="utf-8")
 
     report = dashboard_module._load_trend_reports(
@@ -464,36 +506,205 @@ def test_dashboard_rejects_malformed_signal_candidate_audit_when_present(
     )["eastmoney"]
 
     assert report["available"] is False
-    assert report["status_text"] == "今日趋势报告无效"
+    assert report["data_status"] == "unavailable"
+    assert report["status_text"] == "暂时不可用"
 
 
-def test_dashboard_trend_report_does_not_fall_back_to_stale_report(
+def test_dashboard_trend_report_falls_back_to_latest_valid_stale_report(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_futu" / "2026-07-14.json"
+    path = config.reports_dir / "trend_us_tiger" / "2026-07-14.json"
     path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({
+    stale_attention = [option_attention("STALE-OPTION")]
+    stale_payload = {
         "execution_date": "2026-07-14",
+        "as_of_date": "2026-07-14",
         "generated_at": "2026-07-14T18:00:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "US", "broker": "tiger"},
         "strategy_judgments": {
-            "formal_actions": [{"action": "BUY", "symbol": "STALE-BUY"}],
-            "holding_decisions": [
+            "formal_actions": [
+                {"action": "BUY", "symbol": "STALE-BUY"},
                 {"action": "SELL_ALL", "reason": "danger_signal", "symbol": "STALE-SELL"},
             ],
+            "holding_decisions": [],
+            "top10_candidates": [],
         },
+        "option_attention": stale_attention,
+    }
+    path.write_text(json.dumps(stale_payload), encoding="utf-8")
+    malformed_newest = json.loads(json.dumps(stale_payload))
+    malformed_newest["execution_date"] = "2026-07-15"
+    malformed_newest["generated_at"] = "2026-07-15T18:00:00+08:00"
+    malformed_newest["option_attention"][0]["headline"] = "unknown field"
+    (path.parent / "2026-07-15.json").write_text(
+        json.dumps(malformed_newest), encoding="utf-8"
+    )
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["tiger"]
+
+    assert report["available"] is True
+    assert report["data_status"] == "stale"
+    assert report["status_text"] == "数据截至 2026-07-14；今日未更新"
+    assert report["option_attention"] == stale_attention
+    assert report["sell_actions"][0]["symbol"] == "STALE-SELL"
+    assert report["buy_actions"][0]["symbol"] == "STALE-BUY"
+
+
+def test_dashboard_trend_report_returns_unavailable_without_a_valid_report(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{malformed", encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["tiger"]
+
+    assert report["available"] is False
+    assert report["data_status"] == "unavailable"
+    assert report["status_text"] == "暂时不可用"
+
+
+def test_dashboard_trend_report_switches_from_stale_to_later_current_report(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir.mkdir(parents=True)
+    base = {
+        "as_of_date": "2026-07-14",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+    }
+    (reports_dir / "2026-07-14.json").write_text(json.dumps({
+        **base,
+        "execution_date": "2026-07-14",
+        "generated_at": "2026-07-14T18:00:00+08:00",
+        "option_attention": [option_attention("STALE")],
+    }), encoding="utf-8")
+    current_attention = [option_attention("CURRENT")]
+    (reports_dir / "2026-07-15.json").write_text(json.dumps({
+        **base,
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-15",
+        "generated_at": "2026-07-15T18:00:00+08:00",
+        "option_attention": current_attention,
     }), encoding="utf-8")
 
     report = dashboard_module._load_trend_reports(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
+    )["tiger"]
+
+    assert report["data_status"] == "current"
+    assert report["report_date"] == "2026-07-15"
+    assert report["option_attention"] == current_attention
+
+
+def test_dashboard_projects_futu_attention_from_tiger_us_and_phillips_hk(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    stale_us = [option_attention("QQQ")]
+    current_hk = [
+        option_attention("00700", market="HK", source_broker="辉立")
+    ]
+    for directory, market, broker, execution_date, attention in (
+        ("trend_us_tiger", "US", "tiger", "2026-07-14", stale_us),
+        ("trend_hk_phillips", "HK", "phillips", "2026-07-15", current_hk),
+    ):
+        path = config.reports_dir / directory / f"{execution_date}.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "execution_date": execution_date,
+            "as_of_date": execution_date,
+            "generated_at": f"{execution_date}T18:00:00+08:00",
+            "account": serialized_trend_account(fresh=True),
+            "metadata": {"market": market, "broker": broker},
+            "strategy_judgments": {
+                "formal_actions": [],
+                "holding_decisions": [],
+                "top10_candidates": [],
+            },
+            "option_attention": attention,
+        }), encoding="utf-8")
+
+    reports = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )
+
+    assert reports["futu"] == {
+        "available": True,
+        "broker": "futu",
+        "broker_label": "富途",
+        "market": "US_HK",
+        "market_label": "美股 / 港股",
+        "status_text": "期权关注",
+        "attention_markets": [
+            {
+                "market": "US",
+                "market_label": "美股",
+                "data_status": "stale",
+                "data_date": "2026-07-14",
+                "items": stale_us,
+            },
+            {
+                "market": "HK",
+                "market_label": "港股",
+                "data_status": "current",
+                "data_date": "2026-07-15",
+                "items": current_hk,
+            },
+        ],
+    }
+
+
+def test_dashboard_futu_projection_keeps_both_unavailable_market_rows(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+
+    futu = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
     )["futu"]
 
-    assert report["available"] is False
-    assert report["status_text"] == "今日暂无趋势报告"
-    assert "sell_actions" not in report
-    assert "buy_actions" not in report
+    assert futu["available"] is False
+    assert futu["attention_markets"] == [
+        {
+            "market": "US",
+            "market_label": "美股",
+            "data_status": "unavailable",
+            "data_date": "",
+            "items": [],
+        },
+        {
+            "market": "HK",
+            "market_label": "港股",
+            "data_status": "unavailable",
+            "data_date": "",
+            "items": [],
+        },
+    ]
 
 
 def test_dashboard_trend_report_today_uses_shanghai_date_at_utc_boundary() -> None:
@@ -510,31 +721,34 @@ def test_dashboard_trend_report_today_uses_shanghai_date_at_utc_boundary() -> No
         ("holding_decisions", {}),
         ("top10_candidates", {}),
         ("account", []),
+        ("execution_date", "not-a-date"),
         ("as_of_date", ""),
         ("as_of_date", 20260714),
         ("generated_at", ""),
         ("generated_at", 20260715113036),
+        ("option_attention", [None]),
     ],
 )
-def test_dashboard_trend_report_rejects_selected_invalid_structure_without_fallback(
+def test_dashboard_trend_report_skips_invalid_newest_candidate(
     tmp_path: Path,
     field: str,
     invalid_value: object,
 ) -> None:
     config = dashboard_config(tmp_path)
-    reports_dir = config.reports_dir / "trend_us_futu"
+    reports_dir = config.reports_dir / "trend_us_tiger"
     reports_dir.mkdir(parents=True)
     valid_payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "US", "broker": "futu"},
+        "metadata": {"market": "US", "broker": "tiger"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VALID-BUT-OLDER"}],
             "holding_decisions": [],
             "top10_candidates": [],
         },
+        "option_attention": [option_attention("VALID-BUT-OLDER")],
     }
     invalid_payload = json.loads(json.dumps(valid_payload))
     if field in {"formal_actions", "holding_decisions", "top10_candidates"}:
@@ -544,22 +758,20 @@ def test_dashboard_trend_report_rejects_selected_invalid_structure_without_fallb
     (reports_dir / "2026-07-15-b.json").write_text(
         json.dumps(invalid_payload), encoding="utf-8"
     )
-    if field != "generated_at":
-        valid_payload["generated_at"] = "2026-07-15T10:00:00+08:00"
-        (reports_dir / "2026-07-15-a.json").write_text(
-            json.dumps(valid_payload), encoding="utf-8"
-        )
+    valid_payload["generated_at"] = "2026-07-15T10:00:00+08:00"
+    (reports_dir / "2026-07-15-a.json").write_text(
+        json.dumps(valid_payload), encoding="utf-8"
+    )
 
     report = dashboard_module._load_trend_reports(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["futu"]
+    )["tiger"]
 
-    assert report["available"] is False
-    assert "sell_actions" not in report
-    assert "buy_actions" not in report
-    assert "review_actions" not in report
+    assert report["available"] is True
+    assert report["data_status"] == "current"
+    assert report["buy_actions"][0]["symbol"] == "VALID-BUT-OLDER"
 
 
 def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
@@ -585,6 +797,7 @@ def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
             "holding_decisions": [unknown_reason],
             "top10_candidates": [],
         },
+        "option_attention": [],
     }), encoding="utf-8")
 
     report = dashboard_module._load_trend_reports(
@@ -604,7 +817,7 @@ def test_dashboard_trend_report_rejects_misrouted_broker_metadata(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
+    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({
         "execution_date": "2026-07-15",
@@ -620,16 +833,18 @@ def test_dashboard_trend_report_rejects_misrouted_broker_metadata(
         "industry_concentration": [],
         "excluded": {},
         "data_sources": [],
+        "option_attention": [],
     }), encoding="utf-8")
 
     report = dashboard_module._load_trend_reports(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["futu"]
+    )["tiger"]
 
     assert report["available"] is False
-    assert report["status_text"] == "今日趋势报告无效"
+    assert report["data_status"] == "unavailable"
+    assert report["status_text"] == "暂时不可用"
 
 
 @pytest.mark.parametrize(
@@ -656,6 +871,7 @@ def test_dashboard_trend_report_keeps_buy_for_non_realtime_account(
         "excluded": {},
         "industry_concentration": [],
         "data_sources": [],
+        "option_attention": [],
     }), encoding="utf-8")
 
     report = dashboard_module._load_trend_reports(
@@ -726,13 +942,13 @@ def test_dashboard_trend_report_rejects_missing_or_malformed_account(
     tmp_path: Path, account: object,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
+    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "metadata": {"market": "US", "broker": "futu"},
+        "metadata": {"market": "US", "broker": "tiger"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VIXY"}],
             "holding_decisions": [],
@@ -741,6 +957,7 @@ def test_dashboard_trend_report_rejects_missing_or_malformed_account(
         "excluded": {},
         "industry_concentration": [],
         "data_sources": [],
+        "option_attention": [],
     }
     if account is not None:
         payload["account"] = account
@@ -750,10 +967,10 @@ def test_dashboard_trend_report_rejects_missing_or_malformed_account(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["futu"]
+    )["tiger"]
 
     assert report["available"] is False
-    assert report["status_text"] == "今日趋势报告无效"
+    assert report["status_text"] == "暂时不可用"
     assert "buy_actions" not in report
 
 
@@ -773,14 +990,14 @@ def test_dashboard_trend_report_rejects_malformed_nested_audit_collections(
     tmp_path: Path, field: str, value: object,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
+    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "account": serialized_trend_account(),
-        "metadata": {"market": "US", "broker": "futu"},
+        "metadata": {"market": "US", "broker": "tiger"},
         "strategy_judgments": {
             "formal_actions": [],
             "holding_decisions": [],
@@ -790,6 +1007,7 @@ def test_dashboard_trend_report_rejects_malformed_nested_audit_collections(
         "industry_concentration": [],
         "data_sources": [],
         "api_facts": [],
+        "option_attention": [],
     }
     if field in payload["strategy_judgments"]:
         payload["strategy_judgments"][field] = value
@@ -801,10 +1019,85 @@ def test_dashboard_trend_report_rejects_malformed_nested_audit_collections(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["futu"]
+    )["tiger"]
 
     assert report["available"] is False
-    assert report["status_text"] == "今日趋势报告无效"
+    assert report["status_text"] == "暂时不可用"
+
+
+@pytest.mark.parametrize(
+    "attention",
+    [
+        MISSING_ATTENTION,
+        None,
+        {},
+        [None],
+        [
+            {
+                key: value
+                for key, value in option_attention("QQQ").items()
+                if key != "symbol"
+            }
+        ],
+        [{**option_attention("QQQ"), "headline": "arbitrary markup"}],
+        [{**option_attention("QQQ"), "category": []}],
+        [{**option_attention("QQQ"), "name": {}}],
+        [{**option_attention("QQQ"), "local_strength": []}],
+        [{**option_attention("QQQ"), "days": {}}],
+        [{**option_attention("QQQ"), "gain_since_entry": []}],
+        [{**option_attention("QQQ"), "days": float("nan")}],
+        [{**option_attention("QQQ"), "danger": {"current": True}}],
+        [{
+            **option_attention("QQQ"),
+            "right_side": {
+                "previous": [], "current": False, "changed": True,
+            },
+        }],
+        [{
+            **option_attention("QQQ"),
+            "temperature": {
+                "previous": "温", "current": {}, "changed": True,
+            },
+        }],
+        [{
+            **option_attention("QQQ"),
+            "phase": {
+                "previous": "谷雨", "current": "立夏", "changed": "yes",
+            },
+        }],
+    ],
+)
+def test_dashboard_trend_report_rejects_malformed_option_attention(
+    tmp_path: Path, attention: object,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-15",
+        "generated_at": "2026-07-15T18:00:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+    }
+    if attention is not MISSING_ATTENTION:
+        payload["option_attention"] = attention
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["tiger"]
+
+    assert report["available"] is False
+    assert report["data_status"] == "unavailable"
+    assert report["status_text"] == "暂时不可用"
 
 
 def dashboard_decision_plan(run_date: str) -> dict[str, object]:

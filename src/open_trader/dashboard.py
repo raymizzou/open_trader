@@ -94,9 +94,39 @@ DETAIL_FX_TO_HKD = {
     "CNY": Decimal("1.08"),
 }
 TREND_REPORT_SOURCES = {
-    "futu": ("US", "美股", "富途", "trend_us_futu", "美股常规交易时段"),
+    "tiger": ("US", "美股", "老虎", "trend_us_tiger", "美股常规交易时段"),
     "phillips": ("HK", "港股", "辉立", "trend_hk_phillips", "09:30–10:00"),
     "eastmoney": ("CN", "A股", "东方财富", "trend_a_share", "09:30–10:00"),
+}
+OPTION_ATTENTION_KEYS = {
+    "market",
+    "symbol",
+    "name",
+    "category",
+    "right_side",
+    "temperature",
+    "phase",
+    "local_strength",
+    "global_strength",
+    "strength_prev_week",
+    "strength_prev_month",
+    "strength_change",
+    "days",
+    "gain_since_entry",
+    "danger",
+    "boiling",
+    "champagne",
+    "source_broker",
+    "source_action",
+}
+OPTION_ATTENTION_TRANSITIONS = {
+    "right_side",
+    "temperature",
+    "phase",
+    "strength_change",
+    "danger",
+    "boiling",
+    "champagne",
 }
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -297,7 +327,7 @@ def _load_trend_reports(
     data_dir: Path, reports_dir: Path, *, today: date | None = None
 ) -> dict[str, dict[str, Any]]:
     report_date = (today or _shanghai_date()).isoformat()
-    return {
+    reports = {
         broker: _load_broker_trend_report(
             data_dir=data_dir,
             reports_dir=reports_dir / directory,
@@ -311,27 +341,73 @@ def _load_trend_reports(
         for broker, (market, market_label, broker_label, directory, buy_window)
         in TREND_REPORT_SOURCES.items()
     }
+    reports["futu"] = _project_futu_attention(
+        reports["tiger"], reports["phillips"]
+    )
+    return reports
+
+
+def _project_futu_attention(
+    tiger: dict[str, Any], phillips: dict[str, Any]
+) -> dict[str, Any]:
+    def project(source: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "market": source["market"],
+            "market_label": source["market_label"],
+            "data_status": source["data_status"],
+            "data_date": source.get("data_date", ""),
+            "items": source.get("option_attention", [])
+            if source["available"]
+            else [],
+        }
+
+    return {
+        "available": tiger["available"] or phillips["available"],
+        "broker": "futu",
+        "broker_label": "富途",
+        "market": "US_HK",
+        "market_label": "美股 / 港股",
+        "status_text": "期权关注",
+        "attention_markets": [project(tiger), project(phillips)],
+    }
 
 
 def _shanghai_date(now: datetime | None = None) -> date:
     return (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI).date()
 
 
-def _same_day_report_payload(
-    reports_dir: Path, report_date: str
+def _latest_valid_report_payload(
+    reports_dir: Path, report_date: str, *, market: str, broker: str
 ) -> tuple[Path, dict[str, Any]] | None:
-    matches: list[tuple[str, str, Path, dict[str, Any]]] = []
+    matches: list[tuple[date, str, str, Path, dict[str, Any]]] = []
+    today = date.fromisoformat(report_date)
     for path in reports_dir.glob("*.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
-        if not isinstance(payload, dict) or payload.get("execution_date") != report_date:
+        if not isinstance(payload, dict):
             continue
-        matches.append((str(payload.get("generated_at") or ""), path.name, path, payload))
+        try:
+            execution_date = date.fromisoformat(payload["execution_date"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if execution_date > today or not _valid_trend_report_payload(
+            payload, market=market, broker=broker
+        ):
+            continue
+        matches.append(
+            (
+                execution_date,
+                str(payload["generated_at"]),
+                path.name,
+                path,
+                payload,
+            )
+        )
     if not matches:
         return None
-    _, _, path, payload = max(matches, key=lambda item: (item[0], item[1]))
+    _, _, _, path, payload = max(matches, key=lambda item: item[:3])
     return path, payload
 
 
@@ -392,6 +468,76 @@ def _valid_trend_collections(
     )
 
 
+def _valid_option_attention(payload: dict[str, Any], *, market: str) -> bool:
+    attention = payload.get("option_attention")
+    if not isinstance(attention, list):
+        return False
+
+    def scalar(value: object) -> bool:
+        return (
+            value is None
+            or isinstance(value, (str, bool, int))
+            or isinstance(value, float) and Decimal(str(value)).is_finite()
+        )
+
+    for item in attention:
+        if not isinstance(item, dict) or set(item) != OPTION_ATTENTION_KEYS:
+            return False
+        if any(
+            not scalar(item[key])
+            for key in OPTION_ATTENTION_KEYS - OPTION_ATTENTION_TRANSITIONS
+        ):
+            return False
+        if (
+            item["market"] != market
+            or not isinstance(item["symbol"], str)
+            or not item["symbol"].strip()
+            or not isinstance(item["category"], str)
+            or item["category"] not in {"risk", "strengthened", "watch"}
+            or not isinstance(item["source_broker"], str)
+            or not item["source_broker"].strip()
+            or not isinstance(item["source_action"], str)
+            or not item["source_action"].strip()
+        ):
+            return False
+        for key in OPTION_ATTENTION_TRANSITIONS:
+            transition = item[key]
+            if (
+                not isinstance(transition, dict)
+                or set(transition) != {"previous", "current", "changed"}
+                or not isinstance(transition["changed"], bool)
+                or not scalar(transition["previous"])
+                or not scalar(transition["current"])
+            ):
+                return False
+    return True
+
+
+def _valid_trend_report_payload(
+    payload: dict[str, Any], *, market: str, broker: str
+) -> bool:
+    judgments = payload.get("strategy_judgments")
+    account = payload.get("account")
+    metadata = payload.get("metadata")
+    return (
+        isinstance(judgments, dict)
+        and all(
+            isinstance(judgments.get(key), list)
+            for key in ("formal_actions", "holding_decisions", "top10_candidates")
+        )
+        and valid_serialized_account(account)
+        and isinstance(payload.get("as_of_date"), str)
+        and bool(payload["as_of_date"].strip())
+        and isinstance(payload.get("generated_at"), str)
+        and bool(payload["generated_at"].strip())
+        and isinstance(metadata, dict)
+        and str(metadata.get("market") or "").upper() == market
+        and str(metadata.get("broker") or "").lower() == broker
+        and _valid_trend_collections(payload, judgments)
+        and _valid_option_attention(payload, market=market)
+    )
+
+
 def _load_broker_trend_report(
     *,
     data_dir: Path,
@@ -405,35 +551,22 @@ def _load_broker_trend_report(
 ) -> dict[str, Any]:
     unavailable = {
         "available": False,
+        "data_status": "unavailable",
         "broker": broker,
         "broker_label": broker_label,
         "market": market,
         "market_label": market_label,
+        "status_text": "暂时不可用",
     }
-    selected = _same_day_report_payload(reports_dir, report_date)
+    selected = _latest_valid_report_payload(
+        reports_dir, report_date, market=market, broker=broker
+    )
     if selected is None:
-        return {**unavailable, "status_text": "今日暂无趋势报告"}
+        return unavailable
     path, payload = selected
-    judgments = payload.get("strategy_judgments")
-    account = payload.get("account")
-    metadata = payload.get("metadata")
-    if (
-        not isinstance(judgments, dict)
-        or any(
-            not isinstance(judgments.get(key), list)
-            for key in ("formal_actions", "holding_decisions", "top10_candidates")
-        )
-        or not valid_serialized_account(account)
-        or not isinstance(payload.get("as_of_date"), str)
-        or not payload["as_of_date"].strip()
-        or not isinstance(payload.get("generated_at"), str)
-        or not payload["generated_at"].strip()
-        or not isinstance(metadata, dict)
-        or str(metadata.get("market") or "").upper() != market
-        or str(metadata.get("broker") or "").lower() != broker
-        or not _valid_trend_collections(payload, judgments)
-    ):
-        return {**unavailable, "status_text": "今日趋势报告无效"}
+    judgments = payload["strategy_judgments"]
+    account = payload["account"]
+    metadata = payload["metadata"]
     formal = judgments["formal_actions"]
     holdings = judgments["holding_decisions"]
     account_fresh = account.get("fresh") is True
@@ -464,15 +597,22 @@ def _load_broker_trend_report(
     audit_candidates = judgments["top10_candidates"]
     if market == "CN" and isinstance(signal_snapshots, dict):
         audit_candidates = signal_snapshots.get("candidates", audit_candidates)
+    current = payload["execution_date"] == report_date
+    data_date = str(payload["as_of_date"])
     return {
         "available": True,
+        "data_status": "current" if current else "stale",
         "broker": broker,
         "broker_label": broker_label,
         "market": market,
         "market_label": market_label,
         "report_date": str(payload.get("execution_date") or ""),
-        "data_date": str(payload.get("as_of_date") or ""),
+        "data_date": data_date,
         "generated_at": str(payload.get("generated_at") or ""),
+        "status_text": (
+            "今日已更新" if current else f"数据截至 {data_date}；今日未更新"
+        ),
+        "option_attention": payload.get("option_attention", []),
         "account_source_date": str(account.get("source_date") or ""),
         "account_fresh": account_fresh,
         "account_status": "已更新" if account_fresh else NON_REALTIME_ACCOUNT_WARNING,
