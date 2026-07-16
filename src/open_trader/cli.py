@@ -140,6 +140,17 @@ def _trend_report_path_order(path: Path) -> tuple[str, int]:
     return match.group("date"), int(match.group("revision") or 0)
 
 
+def _trend_review_date_from_report(result: object, fallback: str) -> str:
+    path = getattr(result, "json_path", None)
+    if path is None:
+        return fallback
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    as_of_date = payload.get("as_of_date") if isinstance(payload, dict) else None
+    if not isinstance(as_of_date, str) or DATE_RE.fullmatch(as_of_date) is None:
+        raise ValueError("trend report is missing a valid as_of_date")
+    return as_of_date
+
+
 def _load_trend_review_report(
     config: object,
     market: str,
@@ -1565,7 +1576,11 @@ def main(argv: list[str] | None = None) -> int:
                 notifier=notifier,
             )
             if result.status in {"generated", "existing"}:
-                run_trend_review_close(config, args.market, run_date)
+                run_trend_review_close(
+                    config,
+                    args.market,
+                    _trend_review_date_from_report(result, run_date),
+                )
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)
             return 1

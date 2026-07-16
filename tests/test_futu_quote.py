@@ -565,6 +565,19 @@ def test_futu_quote_client_preserves_explicit_cn_exchange_for_daily_kline(
     assert client.context.requested_history["symbol"] == symbol
 
 
+def test_futu_quote_client_preserves_explicit_hk_index_for_daily_kline() -> None:
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=FakeOpenQuoteContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    client.get_daily_kline("HK.800701", start="2026-07-01", end="2026-07-14")
+
+    assert client.context.requested_history["symbol"] == "HK.800701"
+
+
 def test_futu_quote_client_normalizes_beijing_daily_kline() -> None:
     client = FutuQuoteClient(
         host="127.0.0.1",

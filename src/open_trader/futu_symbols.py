@@ -15,6 +15,12 @@ def to_futu_symbol(market: str, symbol: str) -> str:
     if "." in normalized_symbol:
         prefix, remainder = normalized_symbol.split(".", 1)
         if prefix == normalized_market:
+            if (
+                normalized_market == "HK"
+                and len(remainder) == 6
+                and remainder.isdigit()
+            ):
+                return f"HK.{remainder}"
             normalized_symbol = remainder
         elif normalized_market == "CN" and prefix in {"SH", "SZ", "BJ"}:
             if len(remainder) != 6 or not remainder.isdigit():

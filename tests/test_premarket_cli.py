@@ -638,11 +638,17 @@ def test_trend_market_report_dispatches_generic_runner(
     monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
     monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
 
+    report_json = tmp_path / "us.json"
+    report_json.write_text(
+        json.dumps({"as_of_date": "2026-07-14"}),
+        encoding="utf-8",
+    )
+
     def runner(**kwargs: object) -> object:
         captured.update(kwargs)
         return SimpleNamespace(
             status="generated", report_path=tmp_path / "us.md",
-            json_path=tmp_path / "us.json",
+            json_path=report_json,
         )
 
     monkeypatch.setattr(cli, "run_market_trend_report", runner)
@@ -664,7 +670,7 @@ def test_trend_market_report_dispatches_generic_runner(
         "revision": True, "notifier": "notifier",
     }
     assert json.loads(capsys.readouterr().out)["status"] == "generated"
-    assert review_calls == [(config, "US", "2026-07-15")]
+    assert review_calls == [(config, "US", "2026-07-14")]
 
 
 def test_watch_trend_market_uses_separate_market_paths(
