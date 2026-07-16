@@ -1301,6 +1301,50 @@ def _append_feishu_action_sections(
         )
 
 
+ATTENTION_FEISHU_FIELDS = (
+    ("right_side", "右侧"),
+    ("temperature", "温度"),
+    ("phase", "节气"),
+    ("strength_change", "周强度"),
+    ("danger", "危险"),
+    ("boiling", "沸腾"),
+    ("champagne", "开香槟"),
+)
+
+
+def _attention_value(value: object) -> str:
+    if value is True:
+        return "是"
+    if value is False:
+        return "否"
+    if value is None:
+        return "未提供"
+    return str(value)
+
+
+def _append_feishu_attention(
+    lines: list[str], attention: object, *, market: str
+) -> None:
+    if market not in {"US", "HK"} or not isinstance(attention, list):
+        return
+    items = [item for item in attention if isinstance(item, Mapping)]
+    if not items:
+        return
+    lines.extend(["", "期权关注"])
+    for index, item in enumerate(items, 1):
+        fields = []
+        for key, label in ATTENTION_FEISHU_FIELDS:
+            transition = item.get(key)
+            if not isinstance(transition, Mapping) or transition.get("changed") is not True:
+                continue
+            fields.append(
+                f"{label} {_attention_value(transition.get('previous'))}"
+                f"→{_attention_value(transition.get('current'))}"
+            )
+        suffix = f"｜{'｜'.join(fields)}" if fields else ""
+        lines.append(f"{index}. {item.get('symbol') or '-'}{suffix}")
+
+
 def render_trend_feishu_text(
     payload: Mapping[str, object], *, broker_label: str, market_label: str
 ) -> tuple[str, str]:
@@ -1365,6 +1409,7 @@ def render_trend_feishu_text(
         summary,
     ]
     _append_feishu_action_sections(lines, sells, buys, reviews, market=market)
+    _append_feishu_attention(lines, payload.get("option_attention"), market=market)
     lines.extend(["", "请人工确认，不自动下单。"])
     return title, "\n".join(lines)
 

@@ -1731,6 +1731,89 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     )
 
 
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_trend_feishu_text_appends_raw_option_attention(market: str) -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": serialized_account(fresh=True),
+        "metadata": {"market": market},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [],
+        },
+        "option_attention": [
+            {
+                "symbol": "QQQ",
+                "right_side": {
+                    "previous": False,
+                    "current": True,
+                    "changed": True,
+                },
+                "temperature": {
+                    "previous": "温",
+                    "current": "热",
+                    "changed": True,
+                },
+                "phase": {
+                    "previous": "谷雨",
+                    "current": "立夏",
+                    "changed": True,
+                },
+                "strength_change": {
+                    "previous": None,
+                    "current": None,
+                    "changed": False,
+                },
+                "danger": {
+                    "previous": False,
+                    "current": False,
+                    "changed": False,
+                },
+                "boiling": {
+                    "previous": False,
+                    "current": False,
+                    "changed": False,
+                },
+                "champagne": {
+                    "previous": False,
+                    "current": False,
+                    "changed": False,
+                },
+            }
+        ],
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="老虎" if market == "US" else "辉立", market_label=market
+    )
+
+    assert message.count("期权关注") == 1
+    assert "1. QQQ｜右侧 否→是｜温度 温→热｜节气 谷雨→立夏" in message
+    assert "危险" not in message
+
+
+def test_trend_feishu_text_never_appends_option_attention_to_cn() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": serialized_account(fresh=True),
+        "metadata": {"market": "CN"},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [],
+        },
+        "option_attention": [{"symbol": "600001"}],
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+
+    assert "期权关注" not in message
+    assert "600001" not in message
+
+
 def test_trend_feishu_text_moves_unknown_hold_reason_to_review() -> None:
     payload = {
         "execution_date": "2026-07-15",

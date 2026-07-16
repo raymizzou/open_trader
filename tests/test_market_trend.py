@@ -549,6 +549,11 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert "禁止买入" not in message
     assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
+    assert [item["symbol"] for item in payload["option_attention"]] == [
+        "00700",
+        "02800",
+    ]
+    assert "\n期权关注\n" in message
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert (
         f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
@@ -856,3 +861,197 @@ def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) 
 
     assert result.status == "existing"
     assert recovered.messages == [("frozen title", "frozen body")]
+
+
+def _attention_row(symbol: str, **overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "symbol": symbol,
+        "name": symbol,
+        "right_side": False,
+        "temperature_curr": "温",
+        "phase_curr": "谷雨",
+        "strength": "90",
+        "global_strength": "85",
+        "strength_prev_week": "88",
+        "strength_prev_month": "80",
+        "strength_change": "→",
+        "days": 0,
+        "gain_since_entry": "0",
+        "danger": False,
+        "boiling": False,
+        "champagne": False,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_build_option_attention_emits_only_raw_trend_transitions() -> None:
+    previous = [
+        _attention_row("QQQ"),
+        _attention_row("DRAM"),
+        _attention_row("MSFT"),
+    ]
+    current = [
+        _attention_row(
+            "QQQ",
+            right_side=True,
+            temperature_curr="热",
+            phase_curr="立夏",
+            strength_change="↑↑",
+            days=1,
+            gain_since_entry="0.048",
+        ),
+        _attention_row("DRAM", danger=True),
+        _attention_row("MSFT"),
+    ]
+
+    attention = market_trend.build_option_attention(
+        current, previous, {"QQQ": "BUY"}, "US", "tiger"
+    )
+
+    assert [item["symbol"] for item in attention] == ["DRAM", "QQQ"]
+    assert list(attention[0]) == [
+        "market",
+        "symbol",
+        "name",
+        "category",
+        "right_side",
+        "temperature",
+        "phase",
+        "local_strength",
+        "global_strength",
+        "strength_prev_week",
+        "strength_prev_month",
+        "strength_change",
+        "days",
+        "gain_since_entry",
+        "danger",
+        "boiling",
+        "champagne",
+        "source_broker",
+        "source_action",
+    ]
+    assert attention[0]["category"] == "risk"
+    assert attention[0]["danger"] == {
+        "previous": False,
+        "current": True,
+        "changed": True,
+    }
+    assert attention[1]["category"] == "strengthened"
+    assert attention[1]["right_side"] == {
+        "previous": False,
+        "current": True,
+        "changed": True,
+    }
+    assert attention[1]["days"] == 1
+    assert attention[1]["gain_since_entry"] == "0.048"
+    assert attention[1]["source_action"] == "BUY"
+    assert "headline" not in attention[1]
+    assert "summary" not in attention[1]
+    assert market_trend.build_option_attention(
+        current, current, {"MSFT": "SELL_ALL"}, "US", "tiger"
+    ) == []
+
+
+def test_build_option_attention_preserves_missing_values_and_holding_precedence() -> None:
+    candidate = _attention_row("700.HK", name="候选腾讯", danger=False)
+    holding = _attention_row(
+        "00700",
+        name=None,
+        right_side=True,
+        temperature_curr=None,
+        phase_curr=None,
+        strength=None,
+        global_strength=None,
+        strength_prev_week=None,
+        strength_prev_month=None,
+        strength_change=None,
+        days=None,
+        gain_since_entry=None,
+        danger=True,
+        boiling=None,
+        champagne=None,
+    )
+    previous = [_attention_row("00700", right_side=True)]
+
+    attention = market_trend.build_option_attention(
+        [candidate, holding], previous, {"00700": "HOLD"}, "HK", "phillips"
+    )
+
+    assert len(attention) == 1
+    assert attention[0]["symbol"] == "00700"
+    assert attention[0]["name"] is None
+    assert attention[0]["danger"]["current"] is True
+    assert attention[0]["temperature"]["current"] is None
+    assert attention[0]["strength_change"]["current"] is None
+    assert attention[0]["global_strength"] is None
+
+    first_entries = market_trend.build_option_attention(
+        [
+            _attention_row("RIGHT", right_side=True, danger=False, boiling=None),
+            _attention_row("LEFT", right_side=False, danger=False),
+            _attention_row("RISK", right_side=True, danger=True),
+        ],
+        [],
+        {},
+        "US",
+        "tiger",
+    )
+    assert [item["symbol"] for item in first_entries] == ["RIGHT"]
+    assert first_entries[0]["boiling"] == {
+        "previous": None,
+        "current": None,
+        "changed": False,
+    }
+
+
+def test_previous_attention_rows_use_strict_dates_and_one_time_tiger_baseline(
+    tmp_path: Path,
+) -> None:
+    paths = market_paths(tmp_path / "data", tmp_path / "reports", "US")
+    paths.root.mkdir(parents=True)
+    baseline = {
+        "as_of_date": "2026-07-15",
+        "signal_snapshots": {"candidates": [_attention_row("BASE")]},
+    }
+    (paths.root / "attention_baseline.json").write_text(
+        json.dumps(baseline), encoding="utf-8"
+    )
+
+    assert [
+        row["symbol"]
+        for row in market_trend._previous_attention_rows(
+            paths, current_as_of_date="2026-07-16", market="US"
+        )
+    ] == ["BASE"]
+
+    paths.reports.mkdir(parents=True)
+    for filename, as_of_date, symbol in (
+        ("2026-07-14.json", "2026-07-14", "OLDER"),
+        ("2026-07-15.json", "2026-07-15", "PRIOR"),
+        ("2026-07-16.json", "2026-07-16", "SAME"),
+        ("2026-07-16-r1.json", "2026-07-16", "REVISION"),
+    ):
+        (paths.reports / filename).write_text(
+            json.dumps(
+                {
+                    "as_of_date": as_of_date,
+                    "signal_snapshots": {
+                        "candidates": [_attention_row(symbol)],
+                        "holdings": {},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    rows = market_trend._previous_attention_rows(
+        paths, current_as_of_date="2026-07-16", market="US"
+    )
+    assert [row["symbol"] for row in rows] == ["PRIOR"]
+
+    (paths.reports / "2026-07-14.json").unlink()
+    (paths.reports / "2026-07-15.json").unlink()
+    assert market_trend._previous_attention_rows(
+        paths, current_as_of_date="2026-07-16", market="US"
+    ) == []

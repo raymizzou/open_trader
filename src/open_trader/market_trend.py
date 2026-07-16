@@ -83,6 +83,17 @@ TIGER_REFRESH_ERROR_TYPES = {
     "tigeropen_missing",
 }
 SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
+ATTENTION_CHANGE_FIELDS = (
+    "right_side",
+    "temperature_curr",
+    "phase_curr",
+    "danger",
+    "boiling",
+    "champagne",
+    "strength_change",
+)
+ATTENTION_RISK_FIELDS = ("danger", "boiling", "champagne")
+ATTENTION_TEMPERATURES = ("凉", "平", "温", "热", "沸")
 
 
 class MarketHoliday(RuntimeError):
@@ -469,6 +480,162 @@ def _managed_symbols(
     return {_normalized_symbol(market, value) for value in values if value.strip()}
 
 
+def build_option_attention(
+    current_rows: Sequence[Mapping[str, object]],
+    previous_rows: Sequence[Mapping[str, object]],
+    actions: Mapping[str, str],
+    market: str,
+    broker_label: str,
+) -> list[dict[str, object]]:
+    market = _market(market)
+
+    def merged(rows: Sequence[Mapping[str, object]]) -> dict[str, Mapping[str, object]]:
+        result: dict[str, Mapping[str, object]] = {}
+        for row in rows:
+            symbol = row.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                continue
+            try:
+                result[_normalized_symbol(market, symbol)] = row
+            except ValueError:
+                continue
+        return result
+
+    current_by_symbol = merged(current_rows)
+    previous_by_symbol = merged(previous_rows)
+    attention: list[dict[str, object]] = []
+    for normalized in sorted(current_by_symbol):
+        current = current_by_symbol[normalized]
+        previous = previous_by_symbol.get(normalized)
+        if previous is None:
+            if current.get("right_side") is not True or current.get("danger") is not False:
+                continue
+        elif not any(
+            previous.get(field) != current.get(field)
+            for field in ATTENTION_CHANGE_FIELDS
+        ):
+            continue
+
+        def transition(field: str) -> dict[str, object]:
+            previous_value = previous.get(field) if previous is not None else None
+            current_value = current.get(field)
+            return {
+                "previous": previous_value,
+                "current": current_value,
+                "changed": previous_value != current_value,
+            }
+
+        risk = any(
+            current.get(field) is True
+            and (previous is None or previous.get(field) is not True)
+            for field in ATTENTION_RISK_FIELDS
+        )
+        old_temperature = previous.get("temperature_curr") if previous else None
+        new_temperature = current.get("temperature_curr")
+        temperature_rose = (
+            old_temperature in ATTENTION_TEMPERATURES
+            and new_temperature in ATTENTION_TEMPERATURES
+            and ATTENTION_TEMPERATURES.index(new_temperature)
+            > ATTENTION_TEMPERATURES.index(old_temperature)
+        )
+        strengthened = (
+            current.get("right_side") is True
+            and (previous is None or previous.get("right_side") is not True)
+        ) or temperature_rose
+        symbol = str(current["symbol"])
+        attention.append(
+            {
+                "market": market,
+                "symbol": symbol,
+                "name": current.get("name"),
+                "category": "risk" if risk else "strengthened" if strengthened else "watch",
+                "right_side": transition("right_side"),
+                "temperature": transition("temperature_curr"),
+                "phase": transition("phase_curr"),
+                "local_strength": current.get("strength"),
+                "global_strength": current.get("global_strength"),
+                "strength_prev_week": current.get("strength_prev_week"),
+                "strength_prev_month": current.get("strength_prev_month"),
+                "strength_change": transition("strength_change"),
+                "days": current.get("days"),
+                "gain_since_entry": current.get("gain_since_entry"),
+                "danger": transition("danger"),
+                "boiling": transition("boiling"),
+                "champagne": transition("champagne"),
+                "source_broker": broker_label,
+                "source_action": actions.get(symbol, "WATCH"),
+            }
+        )
+    return attention
+
+
+def _attention_rows(signal_snapshots: object) -> list[Mapping[str, object]] | None:
+    if not isinstance(signal_snapshots, Mapping):
+        return None
+    candidates = signal_snapshots.get("candidates", [])
+    holdings = signal_snapshots.get("holdings", {})
+    if not isinstance(candidates, list) or not all(
+        isinstance(row, Mapping) for row in candidates
+    ):
+        return None
+    if not isinstance(holdings, Mapping) or not all(
+        row is None or isinstance(row, Mapping) for row in holdings.values()
+    ):
+        return None
+    return [*candidates, *(row for row in holdings.values() if row is not None)]
+
+
+def _attention_report_rows(path: Path) -> tuple[date, list[Mapping[str, object]]] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            return None
+        as_of_date = date.fromisoformat(str(payload.get("as_of_date") or ""))
+        rows = _attention_rows(payload.get("signal_snapshots"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    return (as_of_date, rows) if rows is not None else None
+
+
+def _previous_attention_rows(
+    paths: MarketTrendPaths, *, current_as_of_date: str, market: str
+) -> list[Mapping[str, object]]:
+    current_date = date.fromisoformat(current_as_of_date)
+    valid_reports: list[tuple[date, str, list[Mapping[str, object]]]] = []
+    if paths.reports.exists():
+        for path in paths.reports.glob("*.json"):
+            loaded = _attention_report_rows(path)
+            if loaded is not None:
+                valid_reports.append((loaded[0], path.name, loaded[1]))
+    predecessors = [item for item in valid_reports if item[0] < current_date]
+    if predecessors:
+        return max(predecessors, key=lambda item: (item[0], item[1]))[2]
+    if _market(market) == "US" and not valid_reports:
+        baseline = _attention_report_rows(paths.root / "attention_baseline.json")
+        if baseline is not None and baseline[0] < current_date:
+            return baseline[1]
+    return []
+
+
+def _attention_actions(payload: Mapping[str, object]) -> dict[str, str]:
+    judgments = payload.get("strategy_judgments")
+    if not isinstance(judgments, Mapping):
+        return {}
+    actions: dict[str, str] = {}
+    for key in ("holding_decisions", "formal_actions"):
+        rows = judgments.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            symbol = row.get("symbol")
+            action = row.get("action")
+            if isinstance(symbol, str) and isinstance(action, str):
+                actions[symbol] = action
+    return actions
+
+
 def _refresh_tiger_account(config: DailyPremarketConfig, run_date: str) -> None:
     tiger_config = load_tiger_account_config(
         config_dir=Path("~/.tigeropen/"), account=None, sandbox=False
@@ -842,6 +1009,16 @@ def _attempt_market_report(
             metadata={**report.metadata, "delivery_status": "prepared"},
         )
         payload = _report_payload(report)
+        current_attention_rows = _attention_rows(payload.get("signal_snapshots")) or []
+        payload["option_attention"] = build_option_attention(
+            current_attention_rows,
+            _previous_attention_rows(
+                paths, current_as_of_date=as_of_date, market=market
+            ),
+            _attention_actions(payload),
+            market,
+            str(settings["broker"]),
+        )
         receipt_path = _market_receipt_path(paths, artifact_stem)
         receipt = _write_delivery_receipt(
             receipt_path,
