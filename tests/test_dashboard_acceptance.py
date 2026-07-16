@@ -829,19 +829,21 @@ def trend_workspace_text(
     )
 
 
-def option_attention_market_text(market: dict[str, object]) -> str:
+def option_attention_market_status(market: dict[str, object]) -> str:
     status = market.get("data_status")
     if status == "current":
-        status_text = "今日已更新"
-    elif status == "stale":
-        status_text = f"数据截至 {market.get('data_date')}；今日未更新"
-    else:
-        status_text = "暂时不可用"
+        return "今日已更新"
+    if status == "stale":
+        return f"数据截至 {market.get('data_date')}；今日未更新"
+    return "暂时不可用"
+
+
+def option_attention_market_text(market: dict[str, object]) -> str:
     items = market.get("items", [])
     assert isinstance(items, list)
     return " ".join([
         str(market.get("market_label")),
-        status_text,
+        option_attention_market_status(market),
         *(str(item.get("symbol")) for item in items),
     ])
 
@@ -1063,7 +1065,14 @@ class TabbedAccountLocator:
         if self.selector == (
             "#trend-report-workspace:visible .option-attention-table tbody"
         ):
-            return len(self.page.option_attention_group_texts)
+            return len(self.page.option_attention_header_spans)
+        match = re.fullmatch(
+            r"#trend-report-workspace:visible \.option-attention-table "
+            r"tbody:nth\((\d+)\) \.option-attention-market-content span",
+            self.selector,
+        )
+        if match:
+            return len(self.page.option_attention_header_spans[int(match.group(1))])
         if self.selector == "#return-to-portfolio:visible":
             return int(self.page.trend_broker is not None)
         if self.selector == "#trend-report-workspace:visible [data-close-trend-report]":
@@ -1189,7 +1198,11 @@ class TabbedAccountLocator:
             self.selector,
         )
         if match:
-            return self.page.option_attention_group_texts[int(match.group(1))]
+            index = int(match.group(1))
+            return " ".join([
+                *self.page.option_attention_header_spans[index],
+                *self.page.option_attention_symbol_cells[index],
+            ])
         if self.selector == "#trend-report-workspace:visible .trend-audit":
             return trend_audit_text(str(self.page.trend_broker))
         match = re.fullmatch(
@@ -1235,6 +1248,20 @@ class TabbedAccountLocator:
         raise AssertionError(f"unknown inner_text selector: {self.selector}")
 
     def all_inner_texts(self) -> list[str]:
+        match = re.fullmatch(
+            r"#trend-report-workspace:visible \.option-attention-table "
+            r"tbody:nth\((\d+)\) \.option-attention-market-content span",
+            self.selector,
+        )
+        if match:
+            return self.page.option_attention_header_spans[int(match.group(1))]
+        match = re.fullmatch(
+            r'#trend-report-workspace:visible \.option-attention-table '
+            r'tbody:nth\((\d+)\) \.option-attention-row td\[data-label="标的"\]',
+            self.selector,
+        )
+        if match:
+            return self.page.option_attention_symbol_cells[int(match.group(1))]
         if self.selector == "a:visible, button:visible":
             return ["刷新账户与行情", "策略回测"]
         broker = str(self.page.trend_broker)
@@ -1349,9 +1376,14 @@ class TabbedAccountPage:
             broker: trend_workspace_text(broker, report)
             for broker, report in self.reports.items()
         }
-        self.option_attention_group_texts = [
-            option_attention_market_text(market)
-            for market in self.reports["futu"]["attention_markets"]
+        markets = self.reports["futu"]["attention_markets"]
+        self.option_attention_header_spans = [
+            [str(market.get("market_label")), option_attention_market_status(market)]
+            for market in markets
+        ]
+        self.option_attention_symbol_cells = [
+            [f"{item.get('symbol')} 标的名称" for item in market.get("items", [])]
+            for market in markets
         ]
         self.all_rows = {"futu": 1, "tiger": 1, "phillips": 1, "eastmoney": 0}
         self.cn_rows = cn_rows or {"futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 5}
@@ -2496,6 +2528,35 @@ def test_option_attention_acceptance_checks_current_and_stale_status_text() -> N
     assert "今日已更新" in page.workspace_texts["futu"]
     assert "2026-07-15" not in page.workspace_texts["futu"]
     assert "数据截至 2026-07-14；今日未更新" in page.workspace_texts["futu"]
+    assert page.option_attention_header_spans == [
+        ["美股", "今日已更新"],
+        ["港股", "数据截至 2026-07-14；今日未更新"],
+    ]
+    assert page.option_attention_symbol_cells == [
+        ["VIXY 标的名称"], ["00700 标的名称"],
+    ]
+
+
+@pytest.mark.parametrize("affix", ("错误前缀：", "（错误后缀）"))
+def test_option_attention_acceptance_rejects_status_affixes(affix: str) -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    status = page.option_attention_header_spans[0][1]
+    page.option_attention_header_spans[0][1] = (
+        f"{status}{affix}" if affix.startswith("（") else f"{affix}{status}"
+    )
+
+    with pytest.raises(AssertionError, match="期权关注.*状态"):
+        dashboard_acceptance._check_account_holdings(page, payload)
+
+
+def test_option_attention_acceptance_rejects_extra_header_span() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.option_attention_header_spans[0].append("多余状态")
+
+    with pytest.raises(AssertionError, match="期权关注.*状态"):
+        dashboard_acceptance._check_account_holdings(page, payload)
 
 
 @pytest.mark.parametrize(
@@ -2507,9 +2568,9 @@ def test_option_attention_acceptance_rejects_missing_market_status(
 ) -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
-    page.option_attention_group_texts = [
-        text.replace(missing_status, "状态缺失")
-        for text in page.option_attention_group_texts
+    page.option_attention_header_spans = [
+        [label, status.replace(missing_status, "状态缺失")]
+        for label, status in page.option_attention_header_spans
     ]
 
     with pytest.raises(AssertionError, match="期权关注.*状态"):
@@ -2534,9 +2595,7 @@ def test_option_attention_acceptance_rejects_missing_unavailable_status() -> Non
     unavailable.update(data_status="unavailable")
     unavailable.pop("data_date")
     page = tabbed_account_page(payload)
-    page.option_attention_group_texts[0] = (
-        page.option_attention_group_texts[0].replace("暂时不可用", "状态缺失")
-    )
+    page.option_attention_header_spans[0][1] = "状态缺失"
 
     with pytest.raises(AssertionError, match="期权关注.*状态"):
         dashboard_acceptance._check_account_holdings(page, payload)
@@ -2548,16 +2607,40 @@ def test_option_attention_acceptance_rejects_swapped_market_content(
 ) -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
-    us, hk = page.option_attention_group_texts
     if swapped == "status":
-        current = "今日已更新"
-        stale = "数据截至 2026-07-14；今日未更新"
-        us, hk = us.replace(current, stale), hk.replace(stale, current)
+        page.option_attention_header_spans[0][1], page.option_attention_header_spans[1][1] = (
+            page.option_attention_header_spans[1][1],
+            page.option_attention_header_spans[0][1],
+        )
     else:
-        us, hk = us.replace("VIXY", "00700"), hk.replace("00700", "VIXY")
-    page.option_attention_group_texts = [us, hk]
+        page.option_attention_symbol_cells.reverse()
 
     with pytest.raises(AssertionError, match="futu 期权关注"):
+        dashboard_acceptance._check_account_holdings(page, payload)
+
+
+def test_option_attention_acceptance_rejects_cross_market_duplication() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.option_attention_symbol_cells[0].append("00700 腾讯")
+    page.option_attention_symbol_cells[1].append("VIXY 波动率ETF")
+
+    with pytest.raises(AssertionError, match="标的"):
+        dashboard_acceptance._check_account_holdings(page, payload)
+
+
+@pytest.mark.parametrize("mutation", ("extra", "omission"))
+def test_option_attention_acceptance_rejects_extra_or_missing_symbol(
+    mutation: str,
+) -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    if mutation == "extra":
+        page.option_attention_symbol_cells[0].append("QQQ 纳指ETF")
+    else:
+        page.option_attention_symbol_cells[0].clear()
+
+    with pytest.raises(AssertionError, match="标的"):
         dashboard_acceptance._check_account_holdings(page, payload)
 
 

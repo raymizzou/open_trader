@@ -944,10 +944,7 @@ def _check_account_holdings(
             for index, market in enumerate(markets):
                 assert isinstance(market, Mapping)
                 market_name = _plain(market.get("market"))
-                rowgroup_text = rowgroups.nth(index).inner_text()
-                assert _plain(market.get("market_label")) in rowgroup_text, (
-                    f"futu 期权关注 {market_name} 分组缺少市场"
-                )
+                rowgroup = rowgroups.nth(index)
                 data_status = market.get("data_status")
                 assert data_status in {"current", "stale", "unavailable"}, (
                     f"futu 期权关注 {market_name} 数据状态无效"
@@ -960,18 +957,30 @@ def _check_account_holdings(
                     status_text = f"数据截至 {data_date}；今日未更新"
                 else:
                     status_text = "暂时不可用"
-                assert status_text in rowgroup_text, (
-                    f"futu 期权关注 {market_name} 分组缺少市场状态"
+                header = rowgroup.locator(
+                    ".option-attention-market-content span"
+                )
+                assert header.count() == 2 and header.all_inner_texts() == [
+                    _plain(market.get("market_label")), status_text,
+                ], (
+                    f"futu 期权关注 {market_name} 分组市场或状态不匹配"
                 )
                 items = market.get("items")
                 assert isinstance(items, list), "futu 期权关注项目不是列表"
-                for item in items:
-                    assert (
-                        isinstance(item, Mapping)
-                        and _plain(item.get("symbol")) in rowgroup_text
-                    ), (
-                        f"futu 期权关注 {market_name} 分组缺少标的"
-                    )
+                assert all(isinstance(item, Mapping) for item in items), (
+                    "futu 期权关注项目无效"
+                )
+                expected_symbols = [_plain(item.get("symbol")) for item in items]
+                symbol_texts = rowgroup.locator(
+                    '.option-attention-row td[data-label="标的"]'
+                ).all_inner_texts()
+                actual_symbols = [
+                    text.strip().split(maxsplit=1)[0] if text.strip() else ""
+                    for text in symbol_texts
+                ]
+                assert actual_symbols == expected_symbols, (
+                    f"futu 期权关注 {market_name} 分组标的不匹配"
+                )
             close.click()
             assert page.locator("#trend-report-workspace:visible").count() == 0
             assert trigger.evaluate("element => element === document.activeElement")
