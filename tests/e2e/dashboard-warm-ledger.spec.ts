@@ -1,5 +1,29 @@
 import { expect, test, type Page } from '@playwright/test';
 
+const warmLedger = {
+  bg: '#F7F5F1',
+  surface: '#FFFEFA',
+  soft: '#F2EEE7',
+  text: '#201D18',
+  muted: '#746E64',
+  accent: '#8B5E34',
+  line: '#D8D2C8',
+  primary: '#24211D',
+  danger: '#B42318',
+  success: '#2F855A',
+} as const;
+
+const rgb = {
+  bg: 'rgb(247, 245, 241)',
+  surface: 'rgb(255, 254, 250)',
+  text: 'rgb(32, 29, 24)',
+  accent: 'rgb(139, 94, 52)',
+  line: 'rgb(216, 210, 200)',
+  primary: 'rgb(36, 33, 29)',
+  danger: 'rgb(180, 35, 24)',
+  success: 'rgb(47, 133, 90)',
+} as const;
+
 async function installLedgerFixture(page: Page) {
   await page.route('**/api/dashboard', async (route) => {
     const response = await route.fetch();
@@ -39,8 +63,8 @@ async function installLedgerFixture(page: Page) {
 async function expectWarmSurface(page: Page, selector: string) {
   const surface = page.locator(selector);
   await expect(surface).toBeVisible();
-  await expect(surface).toHaveCSS('background-color', 'rgb(255, 255, 255)');
-  await expect(surface).toHaveCSS('border-top-color', 'rgb(214, 211, 209)');
+  await expect(surface).toHaveCSS('background-color', rgb.surface);
+  await expect(surface).toHaveCSS('border-top-color', rgb.line);
   await expect(surface).toHaveCSS('border-top-width', '1px');
 }
 
@@ -61,6 +85,37 @@ const brokers = [
   { key: 'phillips', label: '辉立', symbol: '02840', portfolio: '628,554.06', holding: '600,000.00', cash: '28,554.06' },
   { key: 'eastmoney', label: '东方财富', symbol: '600519', portfolio: '730,673.51', holding: '700,000.00', cash: '30,673.51' },
 ] as const;
+
+test('renders the exact approved warm-ledger contract', async ({ page }) => {
+  await installLedgerFixture(page);
+  await page.goto('/');
+
+  const tokens = await page.evaluate(() => {
+    const styles = getComputedStyle(document.documentElement);
+    return Object.fromEntries([
+      '--bg', '--surface', '--surface-soft', '--text', '--muted',
+      '--accent', '--line', '--primary', '--danger', '--success',
+    ].map((name) => [name, styles.getPropertyValue(name).trim().toUpperCase()]));
+  });
+  expect(tokens).toEqual({
+    '--bg': warmLedger.bg,
+    '--surface': warmLedger.surface,
+    '--surface-soft': warmLedger.soft,
+    '--text': warmLedger.text,
+    '--muted': warmLedger.muted,
+    '--accent': warmLedger.accent,
+    '--line': warmLedger.line,
+    '--primary': warmLedger.primary,
+    '--danger': warmLedger.danger,
+    '--success': warmLedger.success,
+  });
+  await expect(page.locator('body')).toHaveCSS('background-color', rgb.bg);
+  await expect(page.locator('body')).toHaveCSS('color', rgb.text);
+  await expect(page.locator('#refresh-quotes')).toHaveCSS('background-color', rgb.accent);
+  await expect(page.locator('.current-view-card')).toHaveCSS('background-color', rgb.primary);
+  await expectWarmSurface(page, '.header-brand-panel');
+  await expectWarmSurface(page, '.holdings-panel');
+});
 
 test('switches every broker tab and card while preserving US-filtered ledgers', async ({ page }) => {
   await installLedgerFixture(page);
@@ -119,9 +174,9 @@ test('switches every broker tab and card while preserving US-filtered ledgers', 
   await page.locator('.broker-summary-card[data-broker="futu"]').click();
   await expect(page.locator('.account-holding-quantity')).toContainText('10,000');
   await expect(page.locator('.account-holding-market-value')).toContainText('HKD 16,380,000.00');
-  await expect(page.locator('.account-holding-pnl.pnl-profit')).toHaveCSS('color', 'rgb(185, 28, 28)');
+  await expect(page.locator('.account-holding-pnl.pnl-profit')).toHaveCSS('color', rgb.danger);
   await page.locator('.broker-summary-card[data-broker="tiger"]').click();
-  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('color', 'rgb(21, 128, 61)');
+  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('color', rgb.success);
   await expect(page.getByRole('button', { name: '现金' })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
@@ -179,7 +234,7 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
         inside: tabRect.left >= listRect.left && tabRect.right <= listRect.right,
       };
     });
-    expect(focus.boxShadow).toContain('rgb(161, 98, 7)');
+    expect(focus.boxShadow).toContain(rgb.accent);
     expect(focus.boxShadow).toContain('inset');
     expect(focus.inside).toBe(true);
   }
@@ -217,8 +272,8 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
   await page.getByRole('button', { name: '凯利实验室' }).click();
   await expect(page.locator('.dashboard-shell')).toHaveClass(/tool-workspace-view/);
   await expect(page.locator('.header-assets-panel')).toBeHidden();
-  await expect(page.locator('.kelly-lab-panel')).toHaveCSS('background-color', 'rgb(255, 255, 255)');
-  await expect(page.locator('.kelly-lab-panel')).toHaveCSS('border-top-color', 'rgb(214, 211, 209)');
+  await expect(page.locator('.kelly-lab-panel')).toHaveCSS('background-color', rgb.surface);
+  await expect(page.locator('.kelly-lab-panel')).toHaveCSS('border-top-color', rgb.line);
   await expectMobileTargetsAtLeast44(page, 'body', '#return-to-portfolio:visible, .kelly-lab-panel button:visible');
   await page.getByRole('button', { name: '返回持仓' }).click();
   await expect(page.getByRole('tab', { name: /老虎/ })).toHaveAttribute('aria-selected', 'true');

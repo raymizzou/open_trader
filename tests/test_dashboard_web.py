@@ -58,8 +58,11 @@ def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
     assert "今日结论" not in html
     assert 'id="trade-actions"' not in html
     for token in (
-        "--bg: #fafaf9;", "--surface: #ffffff;", "--text: #1c1917;",
-        "--muted: #78716c;", "--accent: #a16207;", "--line: #d6d3d1;",
+        "--bg: #f7f5f1;", "--surface: #fffefa;",
+        "--surface-soft: #f2eee7;", "--text: #201d18;",
+        "--muted: #746e64;", "--accent: #8b5e34;",
+        "--line: #d8d2c8;", "--primary: #24211d;",
+        "--success: #2f855a;", "--danger: #b42318;",
     ):
         assert token in css
     for broker, color in {
@@ -69,8 +72,8 @@ def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
         assert f'.account-tab[data-broker="{broker}"] {{ --broker-accent: {color}; }}' in css
     assert ".account-tab.active" in css
     assert "border-bottom-color: var(--broker-accent);" in css
-    assert ".pnl-profit { color: #b91c1c;" in css
-    assert ".pnl-loss { color: #15803d;" in css
+    assert ".pnl-profit { color: var(--danger);" in css
+    assert ".pnl-loss { color: var(--success);" in css
     assert ".tool-workspace-view .header-assets-panel" in css
     assert (
         ".backtest-workspace,\n.kelly-lab-panel,\n.trend-report-workspace,\n"
@@ -121,11 +124,11 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     assert ".language-toggle button" in mobile
 
 
-def test_dashboard_muted_text_meets_aa_on_soft_surface() -> None:
+def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
 
-    assert "--muted: #78716c;" in css
-    assert "--surface-soft: #faf8f4;" in css
+    assert "--muted: #746e64;" in css
+    assert "--surface-soft: #f2eee7;" in css
 
 
 def test_dashboard_account_tabs_register_roving_keyboard_and_panel_semantics() -> None:

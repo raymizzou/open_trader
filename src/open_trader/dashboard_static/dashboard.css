@@ -1,15 +1,15 @@
 :root {
   color-scheme: light;
-  --bg: #fafaf9;
-  --surface: #ffffff;
-  --surface-soft: #faf8f4;
-  --text: #1c1917;
-  --muted: #78716c;
-  --accent: #a16207;
-  --line: #d6d3d1;
-  --primary: #1c1917;
-  --success: #15803d;
-  --danger: #b91c1c;
+  --bg: #f7f5f1;
+  --surface: #fffefa;
+  --surface-soft: #f2eee7;
+  --text: #201d18;
+  --muted: #746e64;
+  --accent: #8b5e34;
+  --line: #d8d2c8;
+  --primary: #24211d;
+  --success: #2f855a;
+  --danger: #b42318;
   --shadow: 0 8px 30px rgba(68, 55, 38, 0.06);
   --accent-strong: var(--accent);
   --border: var(--line);
@@ -3747,8 +3747,8 @@ tbody tr.active-row {
 .account-tab.active { color: var(--text); border-bottom-color: var(--broker-accent); }
 .account-tab:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; box-shadow: inset 0 0 0 3px var(--accent); }
 
-.pnl-profit { color: #b91c1c; font-weight: 800; }
-.pnl-loss { color: #15803d; font-weight: 800; }
+.pnl-profit { color: var(--danger); font-weight: 800; }
+.pnl-loss { color: var(--success); font-weight: 800; }
 
 input,
 select,
