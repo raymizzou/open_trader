@@ -256,8 +256,36 @@ def test_market_report_retries_every_ten_minutes_and_stops_after_success(
     assert sleeps == [600.0]
 
 
-def test_market_report_failure_owns_day_at_one_hour_deadline(tmp_path: Path) -> None:
-    now = datetime(2026, 7, 15, 10, 0, tzinfo=SHANGHAI)
+def test_market_report_keeps_retrying_after_old_ten_deadline(
+    tmp_path: Path,
+) -> None:
+    attempts = iter([
+        AShareTrendRunResult("waiting", None, None),
+        AShareTrendRunResult("waiting", None, None),
+        AShareTrendRunResult("generated", Path("report.md"), Path("report.json")),
+    ])
+    times = iter([
+        datetime(2026, 7, 15, 10, 0, tzinfo=SHANGHAI),
+        datetime(2026, 7, 15, 11, 40, tzinfo=SHANGHAI),
+    ])
+    sleeps: list[float] = []
+
+    result = run_market_trend_report(
+        config=config(tmp_path),
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        attempt_fn=lambda **kwargs: next(attempts),
+        now_fn=lambda: next(times),
+        sleep_fn=sleeps.append,
+    )
+
+    assert result.status == "generated"
+    assert sleeps == [600.0, 600.0]
+
+
+def test_market_report_failure_owns_day_at_noon_deadline(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 15, 12, 0, tzinfo=SHANGHAI)
     cfg = config(tmp_path)
     notifier = RecordingFeishu()
     result = run_market_trend_report(

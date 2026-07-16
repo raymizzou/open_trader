@@ -56,7 +56,7 @@ from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MARKET_SETTINGS = {
-    "US": {"broker": "futu", "currency": "USD", "asset": "美股", "deadline": time(10)},
+    "US": {"broker": "futu", "currency": "USD", "asset": "美股", "deadline": time(12)},
     "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
 }
 MARKET_NOTIFICATION_LABELS = {
@@ -789,7 +789,7 @@ def _run_market_trend_retry(
             send_notification_with_results(
                 notifier,
                 f"{market} 趋势计划失败",
-                f"{last_error}；本轮一小时重试窗口已结束。",
+                f"{last_error}；本轮重试窗口已结束。",
                 channels={"macos"},
             )
             return AShareTrendRunResult("failed", None, None)
