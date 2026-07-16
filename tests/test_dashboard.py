@@ -528,6 +528,61 @@ def test_dashboard_trend_report_switches_from_stale_to_later_current_report(
     assert report["option_attention"] == current_attention
 
 
+def test_dashboard_hk_friday_report_is_current_then_stale_over_weekend(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_hk_phillips"
+    reports_dir.mkdir(parents=True)
+    base = {
+        "account": serialized_trend_account(fresh=False),
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+    }
+    (reports_dir / "2026-07-16.json").write_text(json.dumps({
+        **base,
+        "execution_date": "2026-07-17",
+        "as_of_date": "2026-07-16",
+        "generated_at": "2026-07-16T18:00:00+08:00",
+        "metadata": {
+            "market": "HK", "broker": "phillips", "run_date": "2026-07-16",
+        },
+        "option_attention": [
+            option_attention("STALE", market="HK", source_broker="辉立")
+        ],
+    }), encoding="utf-8")
+    current_attention = [
+        option_attention("CURRENT", market="HK", source_broker="辉立")
+    ]
+    (reports_dir / "2026-07-17.json").write_text(json.dumps({
+        **base,
+        "execution_date": "2026-07-20",
+        "as_of_date": "2026-07-17",
+        "generated_at": "2026-07-17T18:00:00+08:00",
+        "metadata": {
+            "market": "HK", "broker": "phillips", "run_date": "2026-07-17",
+        },
+        "option_attention": current_attention,
+    }), encoding="utf-8")
+
+    friday = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 17)
+    )["phillips"]
+    saturday = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 18)
+    )["phillips"]
+
+    assert friday["data_status"] == "current"
+    assert friday["report_date"] == "2026-07-20"
+    assert friday["option_attention"] == current_attention
+    assert saturday["data_status"] == "stale"
+    assert saturday["report_date"] == "2026-07-20"
+    assert saturday["status_text"] == "数据截至 2026-07-17；今日未更新"
+
+
 def test_dashboard_projects_futu_attention_from_tiger_us_and_phillips_hk(
     tmp_path: Path,
 ) -> None:
@@ -763,6 +818,47 @@ def test_dashboard_trend_report_skips_future_candidate(tmp_path: Path) -> None:
     assert report["available"] is True
     assert report["report_date"] == "2026-07-15"
     assert report["data_status"] == "current"
+
+
+@pytest.mark.parametrize("run_date", ["not-a-date", "2026-07-16"])
+def test_dashboard_trend_report_rejects_invalid_source_run_date(
+    tmp_path: Path, run_date: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir.mkdir(parents=True)
+    base = {
+        "account": serialized_trend_account(fresh=True),
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "option_attention": [],
+    }
+    (reports_dir / "2026-07-14.json").write_text(json.dumps({
+        **base,
+        "execution_date": "2026-07-14",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-14T18:00:00+08:00",
+        "metadata": {"market": "US", "broker": "tiger"},
+    }), encoding="utf-8")
+    (reports_dir / "2026-07-15.json").write_text(json.dumps({
+        **base,
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-15",
+        "generated_at": "2026-07-15T18:00:00+08:00",
+        "metadata": {
+            "market": "US", "broker": "tiger", "run_date": run_date,
+        },
+    }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["tiger"]
+
+    assert report["data_status"] == "stale"
+    assert report["report_date"] == "2026-07-14"
 
 
 def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(

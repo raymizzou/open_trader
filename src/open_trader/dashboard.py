@@ -356,9 +356,9 @@ def _shanghai_date(now: datetime | None = None) -> date:
 
 def _latest_valid_report_payload(
     reports_dir: Path, report_date: str, *, market: str, broker: str
-) -> tuple[Path, dict[str, Any], date, date, datetime] | None:
+) -> tuple[Path, dict[str, Any], date, date, date, datetime] | None:
     matches: list[
-        tuple[date, datetime, str, Path, dict[str, Any], date]
+        tuple[date, datetime, date, str, Path, dict[str, Any], date]
     ] = []
     today = date.fromisoformat(report_date)
     for path in reports_dir.glob("*.json"):
@@ -373,13 +373,17 @@ def _latest_valid_report_payload(
         )
         if chronology is None:
             continue
-        execution_date, as_of_date, generated_at = chronology
-        if execution_date > today:
+        execution_date, as_of_date, freshness_date, generated_at = chronology
+        if (
+            freshness_date > today
+            or generated_at.astimezone(SHANGHAI).date() > today
+        ):
             continue
         matches.append(
             (
-                execution_date,
+                freshness_date,
                 generated_at,
+                execution_date,
                 path.name,
                 path,
                 payload,
@@ -388,10 +392,10 @@ def _latest_valid_report_payload(
         )
     if not matches:
         return None
-    execution_date, generated_at, _, path, payload, as_of_date = max(
-        matches, key=lambda item: item[:3]
+    freshness_date, generated_at, execution_date, _, path, payload, as_of_date = max(
+        matches, key=lambda item: item[:4]
     )
-    return path, payload, execution_date, as_of_date, generated_at
+    return path, payload, execution_date, as_of_date, freshness_date, generated_at
 
 
 def _trend_action_needs_review(item: dict[str, Any]) -> bool:
@@ -502,7 +506,7 @@ def _valid_option_attention(payload: dict[str, Any], *, market: str) -> bool:
 
 def _valid_trend_report_payload(
     payload: dict[str, Any], *, market: str, broker: str
-) -> tuple[date, date, datetime] | None:
+) -> tuple[date, date, date, datetime] | None:
     try:
         execution_date = date.fromisoformat(payload["execution_date"])
         as_of_date = date.fromisoformat(payload["as_of_date"])
@@ -520,6 +524,16 @@ def _valid_trend_report_payload(
     judgments = payload.get("strategy_judgments")
     account = payload.get("account")
     metadata = payload.get("metadata")
+    source_run_date = metadata.get("run_date") if isinstance(metadata, dict) else None
+    if source_run_date is None:
+        freshness_date = execution_date
+    else:
+        try:
+            freshness_date = date.fromisoformat(source_run_date)
+        except (TypeError, ValueError):
+            return None
+        if freshness_date.isoformat() != source_run_date:
+            return None
     if not (
         isinstance(judgments, dict)
         and all(
@@ -532,9 +546,10 @@ def _valid_trend_report_payload(
         and str(metadata.get("broker") or "").lower() == broker
         and _valid_trend_collections(payload, judgments)
         and _valid_option_attention(payload, market=market)
+        and as_of_date <= freshness_date <= execution_date
     ):
         return None
-    return execution_date, as_of_date, generated_at
+    return execution_date, as_of_date, freshness_date, generated_at
 
 
 def _load_broker_trend_report(
@@ -562,7 +577,7 @@ def _load_broker_trend_report(
     )
     if selected is None:
         return unavailable
-    path, payload, execution_date, as_of_date, generated_at = selected
+    path, payload, execution_date, as_of_date, freshness_date, generated_at = selected
     judgments = payload["strategy_judgments"]
     account = payload["account"]
     metadata = payload["metadata"]
@@ -596,7 +611,7 @@ def _load_broker_trend_report(
     audit_candidates = judgments["top10_candidates"]
     if market == "CN" and isinstance(signal_snapshots, dict):
         audit_candidates = signal_snapshots.get("candidates", audit_candidates)
-    current = execution_date.isoformat() == report_date
+    current = freshness_date.isoformat() == report_date
     data_date = as_of_date.isoformat()
     return {
         "available": True,

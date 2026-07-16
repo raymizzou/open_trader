@@ -2852,6 +2852,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     ]
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
+    assert payload["metadata"]["run_date"] == "2026-07-14"
     audit = payload["signal_snapshots"]["candidates"]
     assert audit[0]["industry_tm_id"] == 700001
     assert audit[0]["industry_temperature"] == "热"

@@ -213,7 +213,7 @@ class HoldingSnapshot:
     tm_id: int
     symbol: str
     exchange: str
-    name: str
+    name: str | None
     as_of_date: str
     right_side: bool | None
     danger: bool | None
@@ -228,6 +228,7 @@ class HoldingSnapshot:
     temperature_prev: str | None = None
     temperature_curr: str | None = None
     phase: str | None = None
+    days: int | None = None
     gain_since_entry: Decimal | None = None
     phase_prev: str | None = None
     phase_curr: str | None = None
@@ -1022,7 +1023,7 @@ def build_report(
     )
     holding_signals = {
         position.symbol: (
-            _holding_signal(holding_snapshots[position.symbol])
+            _holding_signal(holding_snapshots[position.symbol], market=market)
             if holding_snapshots.get(position.symbol) is not None
             else None
         )
@@ -1099,8 +1100,8 @@ def _paid_expansion_signal(
     }
 
 
-def _holding_signal(item: HoldingSnapshot) -> dict[str, object]:
-    return {
+def _holding_signal(item: HoldingSnapshot, *, market: str) -> dict[str, object]:
+    signal = {
         "tm_id": item.tm_id,
         "symbol": item.symbol,
         "as_of_date": item.as_of_date,
@@ -1119,6 +1120,9 @@ def _holding_signal(item: HoldingSnapshot) -> dict[str, object]:
         "phase": item.phase,
         **_paid_expansion_signal(item),
     }
+    if market.upper() in {"US", "HK"}:
+        signal.update(name=item.name, days=item.days)
+    return signal
 
 
 def _candidate_signal(item: CandidateInput, *, market: str) -> dict[str, object]:
@@ -2367,7 +2371,7 @@ def _holding_snapshot(
         tm_id=_row_tm_id(row),
         symbol=symbol,
         exchange=exchange,
-        name=str(row.get("tickerName") or "").strip(),
+        name=_optional_text(row.get("tickerName")),
         as_of_date=str(row.get("asOfDate") or "").strip(),
         right_side=(
             row.get("isTrendRightSide")
@@ -2406,6 +2410,7 @@ def _holding_snapshot(
             else None
         ),
         phase=_optional_text(row.get("trendPhaseCurr")),
+        days=_optional_int(row.get("daysSinceTrendEntry")),
         **paid_expansion,
     )
 
@@ -2635,6 +2640,7 @@ def _attempt_report(
             metadata={
                 "market": "CN",
                 "broker": "eastmoney",
+                "run_date": run_date,
                 "paid_response_cache": cache_metadata,
             },
         )

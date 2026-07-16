@@ -677,6 +677,10 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         "00700",
         "02800",
     ]
+    assert payload["option_attention"][0]["name"] == "腾讯"
+    assert payload["option_attention"][0]["days"] == 3
+    assert payload["signal_snapshots"]["holdings"]["00700"]["name"] == "腾讯"
+    assert payload["signal_snapshots"]["holdings"]["00700"]["days"] == 3
     assert "\n期权关注\n" in message
     assert payload["option_attention"][0]["source_broker"] == "辉立"
     candidate_snapshot = payload["signal_snapshots"]["candidates"][0]
@@ -1121,6 +1125,7 @@ def test_build_option_attention_preserves_missing_values_and_holding_precedence(
     assert len(attention) == 1
     assert attention[0]["symbol"] == "00700"
     assert attention[0]["name"] is None
+    assert attention[0]["days"] is None
     assert attention[0]["danger"]["current"] is True
     assert attention[0]["temperature"]["current"] is None
     assert attention[0]["strength_change"]["current"] is None
