@@ -234,3 +234,258 @@ Generated evidence digest:
   the same canonical text intentionally appears in reason and meaning; the test
   now asserts an exact count of 2 and both rendered values.
 - Pre-existing untracked `.venv` and `node_modules` symlinks were preserved.
+
+---
+
+# Stale trend component final review fixes — 2026-07-16
+
+## Status
+
+Implemented both final-review findings on `fix/stale-trend-component-filter`:
+
+1. Current and stale component-date classification now requires canonical
+   `YYYY-MM-DD` strings. Matching invalid dates and compact ISO dates cannot be
+   accepted or cached. Invalid, missing, future, and noncanonical stale dates
+   still fail; snapshot responses remain strict; credential values remain
+   redacted.
+2. `ReadyApi` defaults to no ignored stale components. Only
+   `test_report_runner_fetches_unique_industries_in_one_batch` opts into the
+   stale audit row, preserving its exact audit assertion.
+
+## RED
+
+Command:
+
+```text
+.venv/bin/python -m pytest -q tests/test_trend_animals.py::test_components_reject_matching_noncanonical_dates_without_caching tests/test_trend_animals.py::test_components_reject_unusable_date_sets
+```
+
+Exact output (exit 1):
+
+```text
+FF...F.                                                                  [100%]
+=================================== FAILURES ===================================
+_ test_components_reject_matching_noncanonical_dates_without_caching[not-a-date] _
+
+as_of_date = 'not-a-date'
+tmp_path = PosixPath('/private/var/folders/vs/8bcjcg511jx8y9xvxy693cw80000gn/T/pytest-of-ray/pytest-776/test_components_reject_matchin0')
+
+    @pytest.mark.parametrize("as_of_date", ["not-a-date", "20260714"])
+    def test_components_reject_matching_noncanonical_dates_without_caching(
+        as_of_date: str, tmp_path: Path
+    ) -> None:
+        client = TrendAnimalsClient(
+            api_key="secret-value",
+            cache_dir=tmp_path,
+            transport=FakeTransport(
+                {
+                    "getComponentTicker": success(
+                        [
+                            {
+                                "tmId": 1,
+                                "tickerSymbol": "NVDA",
+                                "asOfDate": as_of_date,
+                            }
+                        ]
+                    )
+                }
+            ),
+        )
+
+>       with pytest.raises(TrendAnimalsError, match="returned data for"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE TrendAnimalsError
+
+tests/test_trend_animals.py:140: Failed
+_ test_components_reject_matching_noncanonical_dates_without_caching[20260714] _
+
+as_of_date = '20260714'
+tmp_path = PosixPath('/private/var/folders/vs/8bcjcg511jx8y9xvxy693cw80000gn/T/pytest-of-ray/pytest-776/test_components_reject_matchin1')
+
+    @pytest.mark.parametrize("as_of_date", ["not-a-date", "20260714"])
+    def test_components_reject_matching_noncanonical_dates_without_caching(
+        as_of_date: str, tmp_path: Path
+    ) -> None:
+        client = TrendAnimalsClient(
+            api_key="secret-value",
+            cache_dir=tmp_path,
+            transport=FakeTransport(
+                {
+                    "getComponentTicker": success(
+                        [
+                            {
+                                "tmId": 1,
+                                "tickerSymbol": "NVDA",
+                                "asOfDate": as_of_date,
+                            }
+                        ]
+                    )
+                }
+            ),
+        )
+
+>       with pytest.raises(TrendAnimalsError, match="returned data for"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE TrendAnimalsError
+
+tests/test_trend_animals.py:140: Failed
+______ test_components_reject_unusable_date_sets[rows3-returned data for] ______
+
+rows = [{'tmId': 2, 'tickerSymbol': 'NUVL', 'asOfDate': '20260714'}]
+message = 'returned data for'
+tmp_path = PosixPath('/private/var/folders/vs/8bcjcg511jx8y9xvxy693cw80000gn/T/pytest-of-ray/pytest-776/test_components_reject_unusabl3')
+
+    @pytest.mark.parametrize(
+        ("rows", "message"),
+        [
+            (
+                [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "2026-07-14"}],
+                "no current-date rows",
+            ),
+            (
+                [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "2026-07-16"}],
+                "returned data for",
+            ),
+            (
+                [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "not-a-date"}],
+                "returned data for",
+            ),
+            (
+                [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "20260714"}],
+                "returned data for",
+            ),
+            ([{"tmId": 2, "tickerSymbol": "NUVL"}], "returned data for"),
+        ],
+    )
+    def test_components_reject_unusable_date_sets(
+        rows: list[dict[str, object]], message: str, tmp_path: Path
+    ) -> None:
+        client = TrendAnimalsClient(
+            api_key="secret-value",
+            cache_dir=tmp_path,
+            transport=FakeTransport({"getComponentTicker": success(rows)}),
+        )
+
+>       with pytest.raises(TrendAnimalsError, match=message):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'returned data for'
+E         Actual message: 'getComponentTicker returned no current-date rows'
+
+tests/test_trend_animals.py:177: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_trend_animals.py::test_components_reject_matching_noncanonical_dates_without_caching[not-a-date]
+FAILED tests/test_trend_animals.py::test_components_reject_matching_noncanonical_dates_without_caching[20260714]
+FAILED tests/test_trend_animals.py::test_components_reject_unusable_date_sets[rows3-returned data for]
+3 failed, 4 passed in 0.41s
+```
+
+The failures prove the old equality branch accepted both matching
+noncanonical values, while `date.fromisoformat()` caused a compact stale date
+to be misclassified as a valid older day.
+
+## GREEN
+
+Regression, snapshot-strictness, and redaction command:
+
+```text
+.venv/bin/python -m pytest -q tests/test_trend_animals.py::test_components_reject_matching_noncanonical_dates_without_caching tests/test_trend_animals.py::test_components_reject_unusable_date_sets tests/test_trend_animals.py::test_snapshot_rejects_wrong_data_date_without_caching tests/test_trend_animals.py::test_invalid_expected_date_does_not_echo_secret
+```
+
+Exact output (exit 0):
+
+```text
+.........                                                                [100%]
+9 passed in 0.38s
+```
+
+Required focused Trend Animals command:
+
+```text
+.venv/bin/python -m pytest -q tests/test_trend_animals.py
+```
+
+Exact output (exit 0):
+
+```text
+..............................................                           [100%]
+46 passed in 0.41s
+```
+
+Required targeted A-share command:
+
+```text
+.venv/bin/python -m pytest -q tests/test_a_share_trend.py::test_report_runner_fetches_unique_industries_in_one_batch
+```
+
+Exact output (exit 0):
+
+```text
+.                                                                        [100%]
+1 passed in 0.31s
+```
+
+## Full suite
+
+Command, run once after all code and test changes:
+
+```text
+.venv/bin/python -m pytest -q
+```
+
+Exact output (exit 0):
+
+```text
+........................................................................ [  3%]
+........................................................................ [  6%]
+........................................................................ [  9%]
+........................................................................ [ 13%]
+........................................................................ [ 16%]
+........................................................................ [ 19%]
+........................................................................ [ 23%]
+........................................................................ [ 26%]
+........................................................................ [ 29%]
+........................................................................ [ 33%]
+........................................................................ [ 36%]
+........................................................................ [ 39%]
+........................................................................ [ 43%]
+........................................................................ [ 46%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 56%]
+........................................................................ [ 59%]
+........................................................................ [ 63%]
+........................................................................ [ 66%]
+........................................................................ [ 69%]
+........................................................................ [ 73%]
+........................................................................ [ 76%]
+........................................................................ [ 79%]
+........................................................................ [ 83%]
+........................................................................ [ 86%]
+........................................................................ [ 89%]
+........................................................................ [ 93%]
+........................................................................ [ 96%]
+........................................................................ [ 99%]
+.......                                                                  [100%]
+2167 passed in 29.12s
+```
+
+## Self-review
+
+- Root cause is fixed once in `_cached_rows`; no caller-specific validation or
+  new abstraction was added.
+- Canonicality requires a successful parse and exact `isoformat()` round trip
+  for both expected and actual dates before either current or stale
+  classification.
+- The existing invalid, missing, future, snapshot, cache, and secret-redaction
+  coverage remains green.
+- `ReadyApi` has exactly one explicit `ignored_stale_components=` use, in the
+  targeted audit test.
+- `git diff --check` produced no output and exited 0.
+- No background process or live service is affected by these test/client-only
+  fixes, so restart/log verification is not applicable. This is not a Dashboard
+  task, so the Dashboard acceptance gate is not applicable.
+
+## Concerns
+
+None.

@@ -115,6 +115,34 @@ def test_components_ignore_older_rows_and_do_not_cache_mixed_response(
     assert not list((tmp_path / "responses").glob("*.json"))
 
 
+@pytest.mark.parametrize("as_of_date", ["not-a-date", "20260714"])
+def test_components_reject_matching_noncanonical_dates_without_caching(
+    as_of_date: str, tmp_path: Path
+) -> None:
+    client = TrendAnimalsClient(
+        api_key="secret-value",
+        cache_dir=tmp_path,
+        transport=FakeTransport(
+            {
+                "getComponentTicker": success(
+                    [
+                        {
+                            "tmId": 1,
+                            "tickerSymbol": "NVDA",
+                            "asOfDate": as_of_date,
+                        }
+                    ]
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(TrendAnimalsError, match="returned data for"):
+        client.get_components(tm_id=622460, expected_date=as_of_date)
+
+    assert not list((tmp_path / "responses").glob("*.json"))
+
+
 @pytest.mark.parametrize(
     ("rows", "message"),
     [
@@ -128,6 +156,10 @@ def test_components_ignore_older_rows_and_do_not_cache_mixed_response(
         ),
         (
             [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "not-a-date"}],
+            "returned data for",
+        ),
+        (
+            [{"tmId": 2, "tickerSymbol": "NUVL", "asOfDate": "20260714"}],
             "returned data for",
         ),
         ([{"tmId": 2, "tickerSymbol": "NUVL"}], "returned data for"),

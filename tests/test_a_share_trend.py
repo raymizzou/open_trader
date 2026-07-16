@@ -2449,10 +2449,6 @@ class RecordingFeishu(FeishuWebhookNotifier):
 
 
 class ReadyApi:
-    ignored_stale_components = (
-        {"tickerSymbol": "NUVL", "asOfDate": "2026-07-14"},
-    )
-
     def __init__(
         self,
         calls: list[str],
@@ -2465,6 +2461,7 @@ class ReadyApi:
         missing_industry_ids: set[int] | None = None,
         industry_error: Exception | None = None,
         industry_ids: dict[int, int] | None = None,
+        ignored_stale_components: tuple[dict[str, str], ...] = (),
     ) -> None:
         self.calls = calls
         self.ready = ready
@@ -2475,6 +2472,7 @@ class ReadyApi:
         self.missing_industry_ids = missing_industry_ids or set()
         self.industry_error = industry_error
         self.industry_ids = industry_ids or {}
+        self.ignored_stale_components = ignored_stale_components
         self.snapshot_requests: list[tuple[list[int], tuple[str, ...]]] = []
         self.balance_calls = 0
 
@@ -2556,7 +2554,12 @@ class ReadyApi:
 
 def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) -> None:
     calls: list[str] = []
-    api = ReadyApi(calls)
+    api = ReadyApi(
+        calls,
+        ignored_stale_components=(
+            {"tickerSymbol": "NUVL", "asOfDate": "2026-07-14"},
+        ),
+    )
     result = run_a_share_trend_report(
         config=trend_config(tmp_path),
         run_date="2026-07-14",

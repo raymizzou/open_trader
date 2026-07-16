@@ -235,11 +235,11 @@ class TrendAnimalsClient:
             expected_day = date.fromisoformat(expected_date)
         except ValueError:
             expected_day = None
+        expected_is_canonical = (
+            expected_day is not None and expected_day.isoformat() == expected_date
+        )
         for row in rows:
             actual_date = row.get("asOfDate")
-            if actual_date == expected_date:
-                current_rows.append(row)
-                continue
             try:
                 actual_day = (
                     date.fromisoformat(actual_date)
@@ -248,11 +248,21 @@ class TrendAnimalsClient:
                 )
             except ValueError:
                 actual_day = None
+            actual_is_canonical = (
+                actual_day is not None and actual_day.isoformat() == actual_date
+            )
+            if (
+                expected_is_canonical
+                and actual_is_canonical
+                and actual_date == expected_date
+            ):
+                current_rows.append(row)
+                continue
             symbol = row.get("tickerSymbol")
             if (
                 ignore_older
-                and expected_day is not None
-                and actual_day is not None
+                and expected_is_canonical
+                and actual_is_canonical
                 and actual_day < expected_day
                 and isinstance(symbol, str)
                 and symbol.strip()
