@@ -3,6 +3,14 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-16
+
+- Unified A-share, US, and HK trend reports around the same action-first desktop
+  tables and mobile cards while retaining market-specific facts, excluded closed
+  zero-quantity positions from Dashboard holdings, and expanded real acceptance
+  across all three markets; verified `2199` tests and the Dashboard acceptance
+  gate (`PASS`).
+
 ## 2026-07-15
 
 - Decoupled US/HK/CN trend actions from account snapshot freshness, replaced
