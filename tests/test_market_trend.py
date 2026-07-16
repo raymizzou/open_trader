@@ -108,7 +108,7 @@ def write_tiger_snapshot(
     )
 
 
-def test_load_tiger_account_first_run_loads_all_eligible_us_stock_etf_positions(
+def test_load_tiger_account_separates_managed_positions_from_account_count(
     tmp_path: Path,
 ) -> None:
     write_tiger_snapshot(
@@ -176,27 +176,27 @@ def test_load_tiger_account_first_run_loads_all_eligible_us_stock_etf_positions(
         data_dir=tmp_path / "data",
         market="US",
         expected_date="2026-07-15",
-        managed_symbols=set(),
+        managed_symbols={"AAPL"},
     )
 
     assert account.source_date == "2026-07-15"
     assert account.fresh is True
     assert account.net_value == Decimal("785000")
     assert account.available_cash == Decimal("98500")
+    assert account.position_count == 2
     assert [(item.symbol, item.asset_class) for item in account.positions] == [
         ("AAPL", "stock"),
-        ("QQQ", "etf"),
     ]
     assert account.positions[0].market_value == Decimal("3297.00")
     assert market_trend.load_trend_account(
         data_dir=tmp_path / "data",
         market="US",
         expected_date="2026-07-16",
-        managed_symbols=set(),
+        managed_symbols={"AAPL"},
     ).fresh is False
 
 
-def test_first_run_tiger_holdings_fill_position_cap_and_enter_report_decisions(
+def test_tiger_unmanaged_holdings_fill_position_cap_without_entering_decisions(
     tmp_path: Path,
 ) -> None:
     symbols = [
@@ -229,7 +229,7 @@ def test_first_run_tiger_holdings_fill_position_cap_and_enter_report_decisions(
         data_dir=tmp_path / "data",
         market="US",
         expected_date="2026-07-15",
-        managed_symbols=set(),
+        managed_symbols={"AAPL"},
     )
     candidate = CandidateInput(
         tm_id=1,
@@ -272,12 +272,13 @@ def test_first_run_tiger_holdings_fill_position_cap_and_enter_report_decisions(
         price_fx_to_account_currency=Decimal("7.85"),
     )
 
-    assert len(account.positions) == 10
+    assert account.position_count == 10
+    assert [item.symbol for item in account.positions] == ["AAPL"]
     assert [item.symbol for item in report.candidates] == ["QQQ"]
     assert report.buy_actions == ()
-    assert [item.symbol for item in report.holdings] == symbols
+    assert [item.symbol for item in report.holdings] == ["AAPL"]
     assert {item.action for item in report.holdings} == {"MANUAL_REVIEW"}
-    assert sorted(report.protection_state["positions"]) == symbols
+    assert list(report.protection_state["positions"]) == ["AAPL"]
 
 
 def test_load_tiger_account_uses_latest_valid_snapshot_and_clamps_cash(

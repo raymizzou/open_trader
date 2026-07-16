@@ -90,6 +90,7 @@ class AccountSnapshot:
     available_cash: Decimal
     positions: tuple[AccountPosition, ...]
     exceptions: tuple[str, ...]
+    position_count: int | None = None
 
 
 def _finite_decimal(value: object) -> bool:
@@ -391,6 +392,7 @@ def load_eastmoney_account(
         available_cash=cash,
         positions=positions,
         exceptions=tuple(_account_exceptions(eastmoney)),
+        position_count=len(positions),
     )
 
 
@@ -917,7 +919,11 @@ def build_report(
         ranked=candidate_decision.eligible,
         net_value=account.net_value,
         available_cash=account.available_cash,
-        current_position_count=len(account.positions),
+        current_position_count=(
+            account.position_count
+            if account.position_count is not None
+            else len(account.positions)
+        ),
         position_weight=position_weight,
         market=market,
         lot_sizes=lot_sizes,
