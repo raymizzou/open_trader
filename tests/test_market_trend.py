@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,7 +25,7 @@ from open_trader.notifications import (
     NullNotifier,
 )
 from open_trader.kline_technical_facts import DailyKlineBar
-from open_trader.a_share_trend import HOLDING_FIELDS
+from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -336,6 +336,12 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
             "asset": "港股", "asOfDate": "2026-07-15", "tradableFlag": True,
             "industryName": "科技", "amount1d": "2", "isTrendRightSide": True,
             "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
+            "gainSinceTrendEntry": "0.048", "trendPhasePrev": "谷雨",
+            "trendPhaseCurr": "立夏", "trendStrengthLocalChange": "↑↑",
+            "trendStrengthGlobalCurr": "91.8",
+            "trendStrengthLocalPrevWeek": "86.0",
+            "trendStrengthLocalPrevMonth": "77.4",
+            "tickerLabels": "成交主力;市值龙头",
             "stopwinFlagByDangerSignal": False,
             "stopwinFlagByBoilingTemperature": False,
             "stopwinFlagByPopChampagne": False,
@@ -367,10 +373,14 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
-            return [{"field": field, "priceCost": "0"} for field in HOLDING_FIELDS]
+            return [
+                {"field": field, "priceCost": "0"}
+                for field in UNIFIED_TREND_FIELDS
+            ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
             assert kwargs["tm_ids"] == [1, 2]
+            assert kwargs["fields"] == UNIFIED_TREND_FIELDS
             return [
                 snapshot(1, "02800.HK", "盈富基金"),
                 snapshot(2, "00700.HK", "腾讯"),
@@ -459,6 +469,10 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
+    assert (
+        f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
+        "cache=client-managed"
+    ) in payload["api_facts"]
     actions = payload["strategy_judgments"]["formal_actions"]
     assert actions[0]["action"] == "BUY"
     assert actions[0]["symbol"] == "02800"
@@ -467,7 +481,111 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert payload["account"]["fresh"] is False
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert payload["signal_snapshots"]["holdings"]["00700"] | {
+        "gain_since_entry": "0.048",
+        "phase_prev": "谷雨",
+        "phase_curr": "立夏",
+        "strength_change": "↑↑",
+        "global_strength": "91.8",
+        "strength_prev_week": "86.0",
+        "strength_prev_month": "77.4",
+        "labels": ["成交主力", "市值龙头"],
+        "kline_supplement": None,
+    } == payload["signal_snapshots"]["holdings"]["00700"]
     assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
+
+
+def test_us_report_api_fact_uses_unified_trend_fields(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    write_details(
+        cfg.data_dir,
+        "2026-07-15",
+        positions=[{
+            "statement_id": "2026-07-15-futu-live", "broker": "futu",
+            "market": "US", "asset_class": "stock", "symbol": "AAPL",
+            "name": "Apple", "currency": "USD", "quantity": "1",
+            "cost_price": "200", "market_value": "210",
+        }],
+        cash=[{
+            "statement_id": "2026-07-15-futu-live", "broker": "futu",
+            "currency": "USD", "cash_balance": "1000", "available_balance": "1000",
+        }],
+    )
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [{"asset": "美股", "asOfDate": "2026-07-14"}]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            assert (tm_id, expected_date) == (622460, "2026-07-14")
+            return [{"tmId": 1, "tickerSymbol": "VIXY.US", "asOfDate": expected_date}]
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {"field": field, "priceCost": "0"}
+                for field in UNIFIED_TREND_FIELDS
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            assert kwargs["fields"] == UNIFIED_TREND_FIELDS
+            return [{
+                "tmId": 1, "tickerName": "VIX Short", "tickerSymbol": "VIXY.US",
+                "asset": "美股", "asOfDate": "2026-07-14", "tradableFlag": True,
+                "industryName": "ETF", "amount1d": "2", "isTrendRightSide": True,
+                "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
+                "stopwinFlagByDangerSignal": False,
+            }]
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-14", "2026-07-15"]
+
+        def get_daily_kline(
+            self, *args: object, **kwargs: object
+        ) -> list[DailyKlineBar]:
+            end = datetime(2026, 7, 14)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index))
+                    .date()
+                    .isoformat(),
+                    open=10, high=11, low=9, close=10, volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def close(self) -> None:
+            pass
+
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_refresher=lambda *args: None,
+    )
+
+    assert result.json_path is not None
+    payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
+    assert (
+        f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=1 "
+        "cache=client-managed"
+    ) in payload["api_facts"]
 
 
 def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) -> None:

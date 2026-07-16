@@ -38,33 +38,21 @@ DISCLAIMER_TEXT = (
 )
 NON_REALTIME_ACCOUNT_WARNING = "账户数据非实时，执行前核对现金与持仓"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-CANDIDATE_FIELDS = (
-    "tmId",
-    "tickerName",
-    "tickerSymbol",
-    "asset",
-    "asOfDate",
-    "tradableFlag",
-    "industryName",
-    "amount1d",
-    "isTrendRightSide",
-    "daysSinceTrendEntry",
-    "trendStrengthLocalCurr",
-    "stopwinFlagByDangerSignal",
+UNIFIED_TREND_FIELDS = (
+    "tmId", "tickerName", "tickerSymbol", "asset", "asOfDate",
+    "tradableFlag", "industryTmId", "industryName", "priceIndex",
+    "marketCap", "amount1d", "isTrendRightSide",
+    "trendTemperatureCurr", "trendTemperaturePrev",
+    "daysSinceTrendEntry", "gainSinceTrendEntry",
+    "trendPhasePrev", "trendPhaseCurr", "trendStrengthLocalCurr",
+    "trendStrengthLocalChange", "trendStrengthGlobalCurr",
+    "trendStrengthLocalPrevWeek", "trendStrengthLocalPrevMonth",
+    "stopwinFlagByDangerSignal", "stopwinFlagByBoilingTemperature",
+    "stopwinFlagByPopChampagne", "tickerLabels",
 )
-HOLDING_FIELDS = CANDIDATE_FIELDS + (
-    "stopwinFlagByBoilingTemperature",
-    "stopwinFlagByPopChampagne",
-)
-A_SHARE_DISCIPLINE_FIELDS = (
-    "industryTmId",
-    "priceIndex",
-    "marketCap",
-    "trendTemperatureCurr",
-    "trendTemperaturePrev",
-    "trendPhaseCurr",
-)
-A_SHARE_SNAPSHOT_FIELDS = HOLDING_FIELDS + A_SHARE_DISCIPLINE_FIELDS
+CANDIDATE_FIELDS = UNIFIED_TREND_FIELDS
+HOLDING_FIELDS = UNIFIED_TREND_FIELDS
+A_SHARE_SNAPSHOT_FIELDS = UNIFIED_TREND_FIELDS
 A_SHARE_INDUSTRY_FIELDS = (
     "tmId",
     "asOfDate",
@@ -177,6 +165,15 @@ class CandidateInput:
     temperature_prev: str | None = None
     temperature_curr: str | None = None
     phase: str | None = None
+    gain_since_entry: Decimal | None = None
+    phase_prev: str | None = None
+    phase_curr: str | None = None
+    strength_change: str | None = None
+    global_strength: Decimal | None = None
+    strength_prev_week: Decimal | None = None
+    strength_prev_month: Decimal | None = None
+    labels: tuple[str, ...] = ()
+    kline_supplement: dict[str, bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +224,15 @@ class HoldingSnapshot:
     temperature_prev: str | None = None
     temperature_curr: str | None = None
     phase: str | None = None
+    gain_since_entry: Decimal | None = None
+    phase_prev: str | None = None
+    phase_curr: str | None = None
+    strength_change: str | None = None
+    global_strength: Decimal | None = None
+    strength_prev_week: Decimal | None = None
+    strength_prev_month: Decimal | None = None
+    labels: tuple[str, ...] = ()
+    kline_supplement: dict[str, bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -300,6 +306,17 @@ def _optional_int(value: object) -> int | None:
         return int(str(value).strip())
     except ValueError:
         raise ValueError(f"invalid integer value: {value!r}") from None
+
+
+def _optional_text(value: object) -> str | None:
+    text = value.strip() if isinstance(value, str) else ""
+    return text or None
+
+
+def _ticker_labels(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        return ()
+    return tuple(part.strip() for part in value.split(";") if part.strip())
 
 
 def _account_exceptions(rows: Sequence[Mapping[str, str]]) -> list[str]:
@@ -408,6 +425,70 @@ def _kline_metrics(
     return atr, close, lows
 
 
+def _kline_supplement(
+    bars: Sequence[DailyKlineBar],
+) -> dict[str, bool] | None:
+    if len(bars) < 50:
+        return None
+    try:
+        closes = tuple(_decimal(bar.close) for bar in bars[-50:])
+        low = _decimal(bars[-1].low)
+        prior20_high = max(_decimal(bar.high) for bar in bars[-21:-1])
+        current_volume = _decimal(bars[-1].volume)
+        prior20_volume = tuple(_decimal(bar.volume) for bar in bars[-21:-1])
+    except (TypeError, ValueError):
+        return None
+    sma20 = sum(closes[-20:], Decimal("0")) / Decimal("20")
+    sma50 = sum(closes, Decimal("0")) / Decimal("50")
+    close = closes[-1]
+    average_volume = sum(prior20_volume, Decimal("0")) / Decimal("20")
+    relative_volume = (
+        current_volume / average_volume if average_volume > 0 else Decimal("0")
+    )
+    return {
+        "pullback_to_sma20": sma20 > sma50 and low <= sma20 < close,
+        "breakout_20d_with_volume": (
+            close > prior20_high and relative_volume >= Decimal("1.5")
+        ),
+        "sma50_breakdown": close < sma50,
+    }
+
+
+def _paid_expansion_fields(
+    row: Mapping[str, object], bars: Sequence[DailyKlineBar]
+) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "gain_since_entry": _optional_decimal(row.get("gainSinceTrendEntry")),
+        "phase_prev": _optional_text(row.get("trendPhasePrev")),
+        "phase_curr": _optional_text(row.get("trendPhaseCurr")),
+        "strength_change": _optional_text(row.get("trendStrengthLocalChange")),
+        "global_strength": _optional_decimal(row.get("trendStrengthGlobalCurr")),
+        "strength_prev_week": _optional_decimal(
+            row.get("trendStrengthLocalPrevWeek")
+        ),
+        "strength_prev_month": _optional_decimal(
+            row.get("trendStrengthLocalPrevMonth")
+        ),
+        "labels": _ticker_labels(row.get("tickerLabels")),
+    }
+    paid_expansion_incomplete = any(
+        fields[name] is None
+        for name in (
+            "gain_since_entry",
+            "phase_prev",
+            "phase_curr",
+            "strength_change",
+            "global_strength",
+            "strength_prev_week",
+            "strength_prev_month",
+        )
+    ) or not fields["labels"]
+    fields["kline_supplement"] = (
+        _kline_supplement(bars) if paid_expansion_incomplete else None
+    )
+    return fields
+
+
 def _symbol_parts(value: object, *, market: str = "CN") -> tuple[str, str]:
     if not isinstance(value, str):
         raise ValueError("tickerSymbol must be a string")
@@ -445,6 +526,7 @@ def evaluate_candidate(
     tm_id = row.get("tmId")
     if isinstance(tm_id, bool) or not isinstance(tm_id, int):
         raise ValueError("tmId must be an integer")
+    paid_expansion = _paid_expansion_fields(row, daily_bars)
     return CandidateInput(
         tm_id=tm_id,
         symbol=symbol,
@@ -476,12 +558,8 @@ def evaluate_candidate(
             if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
             else None
         ),
-        phase=(
-            str(row["trendPhaseCurr"]).strip()
-            if isinstance(row.get("trendPhaseCurr"), str)
-            and str(row["trendPhaseCurr"]).strip()
-            else None
-        ),
+        phase=_optional_text(row.get("trendPhaseCurr")),
+        **paid_expansion,
     )
 
 
@@ -983,6 +1061,22 @@ def build_report(
     )
 
 
+def _paid_expansion_signal(
+    item: CandidateInput | HoldingSnapshot,
+) -> dict[str, object]:
+    return {
+        "gain_since_entry": item.gain_since_entry,
+        "phase_prev": item.phase_prev,
+        "phase_curr": item.phase_curr,
+        "strength_change": item.strength_change,
+        "global_strength": item.global_strength,
+        "strength_prev_week": item.strength_prev_week,
+        "strength_prev_month": item.strength_prev_month,
+        "labels": list(item.labels),
+        "kline_supplement": item.kline_supplement,
+    }
+
+
 def _holding_signal(item: HoldingSnapshot) -> dict[str, object]:
     return {
         "tm_id": item.tm_id,
@@ -1001,6 +1095,7 @@ def _holding_signal(item: HoldingSnapshot) -> dict[str, object]:
         "temperature_prev": item.temperature_prev,
         "temperature_curr": item.temperature_curr,
         "phase": item.phase,
+        **_paid_expansion_signal(item),
     }
 
 
@@ -1028,6 +1123,7 @@ def _candidate_signal(item: CandidateInput) -> dict[str, object]:
         "temperature_prev": item.temperature_prev,
         "temperature_curr": item.temperature_curr,
         "phase": item.phase,
+        **_paid_expansion_signal(item),
     }
 
 
@@ -2159,8 +2255,10 @@ def _holding_snapshot(
     *,
     market: str = "CN",
     industry_temperature: str | None = None,
+    bars: Sequence[DailyKlineBar] = (),
 ) -> HoldingSnapshot:
     symbol, exchange = _symbol_parts(row.get("tickerSymbol"), market=market)
+    paid_expansion = _paid_expansion_fields(row, bars)
     return HoldingSnapshot(
         tm_id=_row_tm_id(row),
         symbol=symbol,
@@ -2203,12 +2301,8 @@ def _holding_snapshot(
             if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
             else None
         ),
-        phase=(
-            str(row["trendPhaseCurr"]).strip()
-            if isinstance(row.get("trendPhaseCurr"), str)
-            and str(row["trendPhaseCurr"]).strip()
-            else None
-        ),
+        phase=_optional_text(row.get("trendPhaseCurr")),
+        **paid_expansion,
     )
 
 
@@ -2270,7 +2364,7 @@ def _attempt_report(
                 continue
 
         requested_ids = sorted(component_ids | set(holding_ids.values()))
-        fields = A_SHARE_SNAPSHOT_FIELDS
+        fields = UNIFIED_TREND_FIELDS
         billing_rows = api.get_snapshot_billing()
         billing = {_billing_field(row): row for row in billing_rows}
         requested_fields = tuple(dict.fromkeys(fields + A_SHARE_INDUSTRY_FIELDS))
@@ -2337,7 +2431,7 @@ def _attempt_report(
             position.symbol: None for position in account.positions
         }
         rows_by_tm_id = {_row_tm_id(row): row for row in snapshot_rows}
-        kline_start = (run_day - timedelta(days=60)).isoformat()
+        kline_start = (run_day - timedelta(days=90)).isoformat()
         bars_by_symbol: dict[str, Sequence[DailyKlineBar] | None] = {}
         for tm_id in sorted(component_ids):
             row = rows_by_tm_id.get(tm_id)
@@ -2366,6 +2460,22 @@ def _attempt_report(
             )
         for symbol, tm_id in holding_ids.items():
             row = rows_by_tm_id.get(tm_id)
+            daily_bars = None
+            try:
+                futu_symbol = to_futu_symbol("CN", symbol)
+                if row is not None:
+                    _, exchange = _symbol_parts(row.get("tickerSymbol"))
+                    futu_symbol = f"{exchange}.{symbol}"
+                daily_bars = quote.get_daily_kline(
+                    futu_symbol, start=kline_start, end=run_date
+                )
+            except FutuQuoteError as exc:
+                if _is_systemic_futu_error(exc):
+                    raise
+                daily_bars = None
+            except ValueError:
+                daily_bars = None
+            bars_by_symbol[symbol] = daily_bars
             if row is not None:
                 try:
                     holding_snapshots[symbol] = _holding_snapshot(
@@ -2373,25 +2483,10 @@ def _attempt_report(
                         industry_temperature=industry_temperatures.get(
                             _optional_int(row.get("industryTmId"))
                         ),
+                        bars=tuple(daily_bars or ()),
                     )
                 except ValueError:
                     holding_snapshots[symbol] = None
-            try:
-                returned = holding_snapshots[symbol]
-                futu_symbol = (
-                    f"{returned.exchange}.{symbol}"
-                    if returned is not None
-                    else to_futu_symbol("CN", symbol)
-                )
-                bars_by_symbol[symbol] = quote.get_daily_kline(
-                    futu_symbol, start=kline_start, end=run_date
-                )
-            except FutuQuoteError as exc:
-                if _is_systemic_futu_error(exc):
-                    raise
-                bars_by_symbol[symbol] = None
-            except ValueError:
-                bars_by_symbol[symbol] = None
 
         estimated_cost = sum(
             (_billing_price(billing[field]) for field in fields), Decimal("0")

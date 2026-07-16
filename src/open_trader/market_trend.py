@@ -17,7 +17,7 @@ from .a_share_trend import (
     AShareTrendRunResult,
     AccountPosition,
     AccountSnapshot,
-    HOLDING_FIELDS,
+    UNIFIED_TREND_FIELDS,
     _balance,
     _billing_field,
     _billing_price,
@@ -512,7 +512,7 @@ def _attempt_market_report(
         billing = {
             _billing_field(row): row for row in api.get_snapshot_billing()
         }
-        missing = [field for field in HOLDING_FIELDS if field not in billing]
+        missing = [field for field in UNIFIED_TREND_FIELDS if field not in billing]
         if missing:
             raise ValueError(
                 "getSnapshotColumnBilling missing requested field(s): "
@@ -521,7 +521,7 @@ def _attempt_market_report(
         snapshot_rows = (
             api.get_snapshots(
                 tm_ids=requested_ids,
-                fields=HOLDING_FIELDS,
+                fields=UNIFIED_TREND_FIELDS,
                 expected_date=as_of_date,
             )
             if requested_ids
@@ -535,7 +535,7 @@ def _attempt_market_report(
         balance_after = _balance(api.get_account_balance())
 
         rows_by_id = {_row_tm_id(row): row for row in snapshot_rows}
-        start = (date.fromisoformat(as_of_date) - timedelta(days=60)).isoformat()
+        start = (date.fromisoformat(as_of_date) - timedelta(days=90)).isoformat()
         candidates = []
         bars_by_symbol: dict[str, object] = {}
         for tm_id in sorted(component_ids):
@@ -561,19 +561,23 @@ def _attempt_market_report(
         holding_snapshots = {position.symbol: None for position in account.positions}
         for symbol, tm_id in holding_ids.items():
             row = rows_by_id.get(tm_id)
-            if row is not None:
-                try:
-                    holding_snapshots[symbol] = _holding_snapshot(row, market=market)
-                except ValueError:
-                    pass
+            bars = None
             try:
-                bars_by_symbol[symbol] = quote.get_daily_kline(
+                bars = quote.get_daily_kline(
                     to_futu_symbol(market, symbol), start=start, end=as_of_date
                 )
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
                     raise
-                bars_by_symbol[symbol] = None
+                bars = None
+            bars_by_symbol[symbol] = bars
+            if row is not None:
+                try:
+                    holding_snapshots[symbol] = _holding_snapshot(
+                        row, market=market, bars=tuple(bars or ())
+                    )
+                except ValueError:
+                    pass
 
         lot_sizes: dict[str, int] = {}
         if market == "HK":
@@ -583,7 +587,8 @@ def _attempt_market_report(
                 wire.split(".", 1)[1]: size for wire, size in wire_lots.items()
             }
         estimated_cost = sum(
-            (_billing_price(billing[field]) for field in HOLDING_FIELDS), Decimal("0")
+            (_billing_price(billing[field]) for field in UNIFIED_TREND_FIELDS),
+            Decimal("0"),
         ) * len(requested_ids)
         actual_cost = balance_before - balance_after
         report = build_report(
@@ -598,7 +603,7 @@ def _attempt_market_report(
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
                 *_component_api_facts(api, len(component_rows)),
-                f"getTickerSnapshot fields={','.join(HOLDING_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
             ),
             data_sources=(
                 "Trend Animals",
