@@ -255,6 +255,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             portfolio_rows,
             broker_positions,
             cash_details,
+            _latest_tiger_account_metrics(config.data_dir),
         ),
         source_statuses=_build_source_statuses(
             broker_positions,
@@ -1903,6 +1904,7 @@ def _build_broker_summaries(
     portfolio_rows: list[dict[str, str]],
     broker_positions: list[dict[str, str]],
     cash_details: list[dict[str, str]],
+    tiger_account_metrics: dict[str, str],
 ) -> list[dict[str, Any]]:
     return [
         _build_broker_summary(
@@ -1910,6 +1912,7 @@ def _build_broker_summaries(
             portfolio_rows,
             broker_positions,
             cash_details,
+            tiger_account_metrics if broker == "tiger" else {},
         )
         for broker in BROKERS
     ]
@@ -1920,17 +1923,26 @@ def _build_broker_summary(
     portfolio_rows: list[dict[str, str]],
     broker_positions: list[dict[str, str]],
     cash_details: list[dict[str, str]],
+    account_metrics: dict[str, str],
 ) -> dict[str, Any]:
     detail_positions = [
         row for row in broker_positions if _broker_key(row.get("broker", "")) == broker
     ]
+    holding_positions = [row for row in detail_positions if not _is_cash_like_row(row)]
+    cash_like_positions = [row for row in detail_positions if _is_cash_like_row(row)]
     detail_cash_rows = [
         row for row in cash_details if _broker_key(row.get("broker", "")) == broker
     ]
     detail_available = bool(detail_positions or detail_cash_rows)
     if detail_available:
-        holding_value = _sum_detail_hkd(detail_positions, "market_value")
-        cash_like_value = _sum_detail_hkd(detail_cash_rows, "cash_balance")
+        holding_value = _sum_detail_hkd(holding_positions, "market_value")
+        cash_position_value = _sum_detail_hkd(cash_like_positions, "market_value")
+        cash_balance_value = _sum_detail_hkd(detail_cash_rows, "cash_balance")
+        cash_like_value = (
+            cash_position_value + cash_balance_value
+            if cash_position_value is not None and cash_balance_value is not None
+            else None
+        )
         portfolio_value = (
             holding_value + cash_like_value
             if holding_value is not None and cash_like_value is not None
@@ -1946,7 +1958,7 @@ def _build_broker_summary(
             "portfolio_value_hkd": _money_text(portfolio_value)
             if portfolio_value is not None
             else "",
-            "holding_count": len(detail_positions),
+            "holding_count": len(holding_positions),
         }
     else:
         money = _build_portfolio_fallback_summary(portfolio_rows, broker)
@@ -1956,8 +1968,42 @@ def _build_broker_summary(
         "label": BROKER_LABELS[broker],
         "source_kind": BROKER_SOURCE_KINDS[broker],
         "detail_available": detail_available,
+        **account_metrics,
         **money,
     }
+
+
+def _latest_tiger_account_metrics(data_dir: Path) -> dict[str, str]:
+    runs_dir = data_dir / "runs"
+    if not runs_dir.exists():
+        return {}
+    snapshot_paths = sorted(
+        (
+            path / "tiger_account_snapshot.json"
+            for path in runs_dir.iterdir()
+            if path.is_dir() and DETAIL_DIR_PATTERN.fullmatch(path.name)
+        ),
+        reverse=True,
+    )
+    for path in snapshot_paths:
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        records = payload.get("cash_records") if isinstance(payload, dict) else None
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict) or record.get("record_type") != "account_total":
+                continue
+            available = _optional_decimal(record.get("cash_available_for_trade", ""))
+            fx_to_hkd = _optional_decimal(record.get("fx_to_hkd", ""))
+            if available is None or fx_to_hkd is None or fx_to_hkd <= 0:
+                continue
+            return {"available_to_trade_hkd": _money_text(available * fx_to_hkd)}
+    return {}
 
 
 def _sum_detail_hkd(
@@ -1980,8 +2026,7 @@ def _detail_value_hkd_for_summary(
     if not raw_value:
         return None, True
     value = _optional_decimal(raw_value)
-    currency = row.get("currency", "").strip().upper()
-    fx_rate = DETAIL_FX_TO_HKD.get(currency)
+    fx_rate = _detail_fx_to_hkd(row)
     if value is None or fx_rate is None:
         return None, False
     return value * fx_rate, True
@@ -1989,11 +2034,19 @@ def _detail_value_hkd_for_summary(
 
 def _detail_value_hkd(row: dict[str, str], value_field: str) -> Decimal | None:
     value = _optional_decimal(row.get(value_field, ""))
-    currency = row.get("currency", "").strip().upper()
-    fx_rate = DETAIL_FX_TO_HKD.get(currency)
+    fx_rate = _detail_fx_to_hkd(row)
     if value is None or fx_rate is None:
         return None
     return value * fx_rate
+
+
+def _detail_fx_to_hkd(row: dict[str, str]) -> Decimal | None:
+    raw_rate = row.get("fx_to_hkd", "").strip()
+    if raw_rate:
+        rate = _optional_decimal(raw_rate)
+        return rate if rate is not None and rate > 0 else None
+    currency = row.get("currency", "").strip().upper()
+    return DETAIL_FX_TO_HKD.get(currency)
 
 
 def _build_portfolio_fallback_summary(

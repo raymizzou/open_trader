@@ -2386,6 +2386,9 @@ function renderAccountSection(group) {
       <div class="account-section-meta">
         <span>持仓资产 ${escapeHtml(formatMoney(group.summary.holding_value_hkd, "HKD"))}</span>
         <span>现金 ${escapeHtml(formatMoney(group.summary.cash_like_value_hkd, "HKD"))}</span>
+        ${group.broker === "tiger" && hasValue(group.summary.available_to_trade_hkd)
+          ? `<span>可交易额度 ${escapeHtml(formatMoney(group.summary.available_to_trade_hkd, "HKD"))}</span>`
+          : ""}
         <span>持仓 ${escapeHtml(formatDisplayNumber(group.summary.holding_count))}</span>
         <span>来源 ${escapeHtml(formatPlain(source))}</span>
         <span>时间 ${escapeHtml(formatPlain(sourceTime))}</span>

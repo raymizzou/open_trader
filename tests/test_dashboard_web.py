@@ -1378,6 +1378,24 @@ console.log(JSON.stringify({tabs,section,cards:renderBrokerSummaryCards(),label:
     assert rendered["label"].endswith("10,000 条")
 
 
+def test_dashboard_renders_tiger_trade_available_separately_from_cash() -> None:
+    output = run_dashboard_js(r'''
+const group=(broker,available)=>({
+  broker,rows:[],profile:{horizon:"长期",strategy:"策略"},
+  summary:{broker,portfolio_value_hkd:"715000.00",holding_value_hkd:"263000.00",
+    cash_like_value_hkd:"451097.00",available_to_trade_hkd:available,holding_count:"8"},
+});
+console.log(JSON.stringify({
+  tiger:renderAccountSection(group("tiger","488032.24")),
+  futu:renderAccountSection(group("futu","488032.24")),
+}));
+''')
+    rendered = json.loads(output)
+    assert "现金 HKD 451,097.00" in rendered["tiger"]
+    assert "可交易额度 HKD 488,032.24" in rendered["tiger"]
+    assert "可交易额度" not in rendered["futu"]
+
+
 def test_dashboard_broker_cards_always_render_four_accounts_and_derive_aliases() -> None:
     output = run_dashboard_js(r'''
 state.dashboard={

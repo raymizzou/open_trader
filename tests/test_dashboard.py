@@ -3594,6 +3594,101 @@ def test_load_dashboard_state_builds_broker_summaries_from_detail_rows(
     assert statuses["phillips"]["status"] == "non_realtime"
 
 
+def test_tiger_broker_summary_counts_money_market_fund_as_cash_like(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    run_dir = config.data_dir / "runs" / "2026-07-16"
+    base_position = {
+        "statement_id": "2026-07-16-tiger-live",
+        "broker": "tiger",
+        "account_alias": "tiger_5683",
+        "market": "US",
+        "asset_class": "stock",
+        "symbol": "MSFT",
+        "name": "Microsoft",
+        "currency": "USD",
+        "quantity": "1",
+        "cost_price": "90",
+        "last_price": "100",
+        "market_value": "100",
+        "fx_to_hkd": "7.84",
+        "cost_value": "90",
+        "unrealized_pnl": "10",
+        "confidence": "high",
+        "notes": "",
+    }
+    write_csv(
+        run_dir / "extracted_positions.csv",
+        [*POSITION_FIELDNAMES, "fx_to_hkd"],
+        [
+            base_position,
+            {
+                **base_position,
+                "market": "HK",
+                "asset_class": "fund",
+                "symbol": "ORDINARY_FUND",
+                "name": "环球股票基金",
+                "currency": "HKD",
+                "market_value": "200",
+                "fx_to_hkd": "1",
+            },
+            {
+                **base_position,
+                "market": "HK",
+                "asset_class": "money_market_fund",
+                "symbol": "HK0000951506.HKD",
+                "name": "华泰港元货币市场基金A",
+                "currency": "HKD",
+                "market_value": "1000",
+                "fx_to_hkd": "1",
+            },
+        ],
+    )
+    write_csv(
+        run_dir / "extracted_cash.csv",
+        [*CASH_FIELDNAMES, "fx_to_hkd"],
+        [
+            {
+                "statement_id": "2026-07-16-tiger-live",
+                "broker": "tiger",
+                "account_alias": "tiger_5683",
+                "currency": "USD",
+                "cash_balance": "-10",
+                "fx_to_hkd": "7.84",
+                "available_balance": "-10",
+                "confidence": "high",
+                "notes": "",
+            }
+        ],
+    )
+    (run_dir / "tiger_account_snapshot.json").write_text(
+        json.dumps(
+            {
+                "cash_records": [
+                    {
+                        "record_type": "account_total",
+                        "currency": "USD",
+                        "cash_available_for_trade": "62",
+                        "fx_to_hkd": "7.84",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    summary = next(row for row in state["broker_summaries"] if row["broker"] == "tiger")
+    assert summary["holding_count"] == 2
+    assert summary["holding_value_hkd"] == "984.00"
+    assert summary["cash_like_value_hkd"] == "921.60"
+    assert summary["portfolio_value_hkd"] == "1905.60"
+    assert summary["available_to_trade_hkd"] == "486.08"
+
+
 def test_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
     tmp_path: Path,
 ) -> None:
