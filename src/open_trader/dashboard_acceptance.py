@@ -29,9 +29,9 @@ SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
 SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
 
 ACCOUNT_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
-TREND_REPORT_BROKERS = ("futu", "phillips", "eastmoney")
+TREND_REPORT_BROKERS = ("tiger", "phillips", "eastmoney")
 TREND_REPORT_DIRECTORIES = {
-    "futu": "trend_us_futu",
+    "tiger": "trend_us_tiger",
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }
@@ -233,16 +233,8 @@ def validate_dashboard_payload(
                     "东方财富总资产不匹配："
                     f"{eastmoney_total} != {expected_eastmoney_cny} CNY"
                 )
-    tiger_strategy = payload.get("tiger_long_term_strategy") or {}
-    if tiger_strategy.get("status") != "shadow":
-        errors.append("老虎长线策略不是 shadow 状态")
-    if not tiger_strategy.get("members"):
-        errors.append("老虎长线策略没有组合成员")
-    tiger_gate = tiger_strategy.get("gate") or {}
-    if "calibration_required" not in (tiger_gate.get("reasons") or []):
-        errors.append("老虎长线策略缺少 calibration_required")
-    if tiger_strategy.get("order_requests"):
-        errors.append("老虎长线策略包含下单请求")
+    if "tiger_" + "long_term_strategy" in payload:
+        errors.append("Dashboard API 仍包含已退役策略")
     return errors
 
 
@@ -612,7 +604,7 @@ def _check_trend_artifact_projection(
     assert isinstance(payload, Mapping), f"{broker} 冻结趋势报告不是对象"
     metadata = payload.get("metadata")
     metadata = metadata if isinstance(metadata, Mapping) else {}
-    expected_market = {"futu": "US", "phillips": "HK", "eastmoney": "CN"}[broker]
+    expected_market = {"tiger": "US", "phillips": "HK", "eastmoney": "CN"}[broker]
     assert (
         payload.get("execution_date") == report.get("report_date")
         and payload.get("as_of_date") == report.get("data_date")
@@ -873,9 +865,9 @@ def _check_account_holdings(
 
     reports = payload.get("trend_reports") or {}
     profiles = {
-        "futu": ("富途", "短线", "美股趋势交易"),
-        "tiger": ("老虎", "长线", "SMA200 组合策略"),
-        "phillips": ("辉立", "短线", "港股趋势交易"),
+        "futu": ("富途", "期权增强", "跨市场期权关注"),
+        "tiger": ("老虎", "趋势", "美股趋势交易"),
+        "phillips": ("辉立", "趋势", "港股趋势交易"),
         "eastmoney": ("东方财富", "偏短线", "趋势交易"),
     }
     for broker in ACCOUNT_BROKERS:
@@ -883,13 +875,10 @@ def _check_account_holdings(
         text = section.inner_text()
         for required in (*profiles[broker], "持仓资产", "现金", "持仓", "来源", "时间"):
             assert required in text, f"{broker} 账户区块缺少 {required}"
-        if broker == "tiger":
-            for required in (
-                "SMA200 策略", "影子验证", "年化收益", "最大回撤", "夏普比率", "卡玛比率",
-            ):
-                assert required in text, f"老虎策略摘要缺少 {required}"
         for legacy in ("数据日", "账户源", "最近保护提醒", "策略指标待接入"):
             assert legacy not in text, f"账户持仓视图仍包含旧趋势摘要 {legacy}"
+        for retired in ("SMA200 策略", "SMA200 " + "组合策略", "富途｜美股"):
+            assert retired not in text, f"账户持仓视图仍包含已退役身份 {retired}"
         for forbidden in (
             "tiger-long-term-panel", "calibration_required", "provenance_incomplete",
         ):
@@ -905,12 +894,8 @@ def _check_account_holdings(
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 账户区块出现横向滚动"
-        if broker == "tiger":
-            assert section.locator(".trend-report-entry").count() == 0, (
-                "老虎账户不应包含趋势报告入口"
-            )
-            continue
-        assert "当天趋势报告" in text, f"{broker} 账户区块缺少 当天趋势报告"
+        entry_label = "期权关注" if broker == "futu" else "当天趋势报告"
+        assert entry_label in text, f"{broker} 账户区块缺少 {entry_label}"
         report = reports.get(broker) if isinstance(reports, Mapping) else None
         assert isinstance(report, Mapping), f"API 缺少 {broker} 趋势报告状态"
         entry = section.locator(".trend-report-entry")
@@ -929,13 +914,16 @@ def _check_account_holdings(
                 raise AssertionError("eastmoney 趋势报告不可用，无法生成验收截图")
             continue
         assert trigger.count() == 1, f"{broker} 可用报告缺少入口"
-        if reports_dir is not None:
+        if reports_dir is not None and broker in TREND_REPORT_BROKERS:
             _check_trend_artifact_projection(reports_dir, broker, report)
         entry_text = entry.inner_text()
-        for label, key in (("报告日期", "report_date"), ("数据截至", "data_date")):
-            assert f"{label} {_plain(report.get(key))}" in entry_text, (
-                f"{broker} 入口缺少 {label}"
-            )
+        if broker == "futu":
+            assert "期权关注" in entry_text, "futu 入口缺少期权关注"
+        else:
+            for label, key in (("报告日期", "report_date"), ("数据截至", "data_date")):
+                assert f"{label} {_plain(report.get(key))}" in entry_text, (
+                    f"{broker} 入口缺少 {label}"
+                )
         trigger.click()
         workspace = page.locator("#trend-report-workspace:visible")
         assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
@@ -944,6 +932,29 @@ def _check_account_holdings(
         assert close.evaluate("element => element === document.activeElement"), (
             f"{broker} 趋势报告打开后焦点未进入工作区"
         )
+        if broker == "futu":
+            workspace_text = workspace.inner_text()
+            assert "期权关注" in workspace_text, "futu 期权关注工作区标题缺失"
+            markets = report.get("attention_markets")
+            assert isinstance(markets, list) and [
+                market.get("market") for market in markets if isinstance(market, Mapping)
+            ] == ["US", "HK"], "futu 期权关注市场顺序不是 US、HK"
+            for market in markets:
+                assert isinstance(market, Mapping)
+                for required in (market.get("market_label"), market.get("data_date")):
+                    assert _plain(required) in workspace_text, (
+                        "futu 期权关注工作区缺少市场或数据日期"
+                    )
+                items = market.get("items")
+                assert isinstance(items, list), "futu 期权关注项目不是列表"
+                for item in items:
+                    assert isinstance(item, Mapping) and _plain(item.get("symbol")) in workspace_text, (
+                        "futu 期权关注工作区缺少标的"
+                    )
+            close.click()
+            assert page.locator("#trend-report-workspace:visible").count() == 0
+            assert trigger.evaluate("element => element === document.activeElement")
+            continue
         buy_actions = report.get("buy_actions")
         expected_buy_count = len(buy_actions) if isinstance(buy_actions, list) else 0
         _check_open_report_layout(

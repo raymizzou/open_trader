@@ -26,6 +26,8 @@ OpenD, and writes reports. It does not place orders automatically.
 - Build machine-readable trading plans from the advice summaries.
 - Check trading plans against live Futu OpenD quotes.
 - Generate reviewable trade-action CSV and Markdown reports.
+- Generate the US trend report for Tiger and the HK trend report for Phillips.
+- Show Futu as a read-only US/HK options-attention aggregate in the dashboard.
 - View a local realtime portfolio dashboard with live quote refresh and stale
   data warnings.
 - Run the daily premarket workflow automatically on macOS with `launchd`.
@@ -536,8 +538,9 @@ tail -n 100 logs/daily_premarket/launchd-US.err.log
 ### Deploy HK/US Trend Jobs
 
 The Trend Animals workflows use separate report and protection-watch jobs. HK
-uses Phillips statement positions/cash plus Futu quotes; US refreshes the Futu
-real account directly. Configure the pool lists and explicitly managed current
+uses Phillips statement positions/cash plus Futu quotes; US refreshes the Tiger
+real account directly. The dashboard projects option attention from those US/HK
+reports under Futu. Configure the pool lists and explicitly managed current
 positions in `config/daily_premarket.env`, then install:
 
 ```bash

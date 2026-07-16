@@ -38,7 +38,6 @@ from .tiger_account import (
     load_tiger_account_config,
     sync_tiger_portfolio,
 )
-from .tiger_long_term import generate_tiger_long_term_strategy
 from .decision_facts import (
     index_decision_facts_by_market_symbol,
     load_decision_facts_cache,
@@ -490,7 +489,6 @@ class DailyPremarketRunner:
         futu_facts_generator: Callable[..., FutuSkillFactResult] = generate_futu_skill_facts,
         futu_facts_extractor_factory: Callable[[], object] = FutuSkillFactsExtractor,
         decision_plan_generator: Callable[..., object] = generate_daily_decision_plans,
-        tiger_long_term_generator: Callable[..., object] = generate_tiger_long_term_strategy,
         notifier: Notifier | None = None,
     ) -> None:
         self.config = config
@@ -504,7 +502,6 @@ class DailyPremarketRunner:
         self.futu_facts_generator = futu_facts_generator
         self.futu_facts_extractor_factory = futu_facts_extractor_factory
         self.decision_plan_generator = decision_plan_generator
-        self.tiger_long_term_generator = tiger_long_term_generator
         self.notifier = notifier or NullNotifier()
 
     def run(
@@ -629,34 +626,6 @@ class DailyPremarketRunner:
         if not portfolio_path.exists():
             raise FileNotFoundError(f"portfolio not found: {portfolio_path}")
 
-        tiger_strategy_result: object | None = None
-        tiger_strategy_error = ""
-        if market == "US":
-            tiger_quote_client = None
-            try:
-                tiger_quote_client = self.quote_client_factory(
-                    host=config.futu_host,
-                    port=config.futu_port,
-                )
-                tiger_strategy_result = self.tiger_long_term_generator(
-                    run_date,
-                    config.data_dir,
-                    config.repo / "config" / "tiger_long_term_strategy.json",
-                    tiger_quote_client,
-                    update_latest=not dry_run,
-                )
-                if str(getattr(tiger_strategy_result, "status", "")) != "shadow":
-                    tiger_strategy_error = "Tiger long-term strategy generation failed"
-            except Exception as exc:
-                tiger_strategy_error = str(exc) or exc.__class__.__name__
-                LOGGER.warning("Tiger long-term strategy generation failed", exc_info=True)
-            finally:
-                if tiger_quote_client is not None and hasattr(tiger_quote_client, "close"):
-                    try:
-                        tiger_quote_client.close()
-                    except Exception:
-                        LOGGER.warning("Tiger strategy quote client close failed", exc_info=True)
-
         premarket_result = self.premarket_runner(
             run_date=run_date,
             portfolio_path=portfolio_path,
@@ -719,16 +688,6 @@ class DailyPremarketRunner:
                 "latest_technical_facts": "",
                 "latest_decision_facts": "",
                 "latest_futu_skill_facts": str(futu_skill_facts_latest_path(config.data_dir, market)),
-                "tiger_long_term_status": str(
-                    getattr(tiger_strategy_result, "status", "")
-                ),
-                "tiger_long_term_error": tiger_strategy_error,
-                "tiger_long_term_strategy": str(
-                    getattr(tiger_strategy_result, "run_path", "") or ""
-                ),
-                "latest_tiger_long_term_strategy": str(
-                    getattr(tiger_strategy_result, "latest_path", "") or ""
-                ),
                 "status": str(status_path),
                 "report": str(report_path),
                 "log": str(log_path),
@@ -912,10 +871,6 @@ class DailyPremarketRunner:
             trade_actions=trade_action_counts,
             tradingagents_summary_failed=tradingagents_summary_failed,
             source_failures=source_failures,
-            tiger_long_term_strategy_failed=(
-                bool(tiger_strategy_error)
-                and not str(futu_status.get("error", "")).strip()
-            ),
         )
         status = str(daily_state["status"])
 
@@ -959,16 +914,6 @@ class DailyPremarketRunner:
             "latest_futu_skill_facts": str(latest_futu_skill_facts_path),
             "latest_decision_plans": (
                 str(latest_decision_plans_path) if decision_plans_path else ""
-            ),
-            "tiger_long_term_status": str(
-                getattr(tiger_strategy_result, "status", "")
-            ),
-            "tiger_long_term_error": tiger_strategy_error,
-            "tiger_long_term_strategy": str(
-                getattr(tiger_strategy_result, "run_path", "") or ""
-            ),
-            "latest_tiger_long_term_strategy": str(
-                getattr(tiger_strategy_result, "latest_path", "") or ""
             ),
             "status": str(status_path),
             "report": str(report_path),
@@ -2184,7 +2129,6 @@ def _derive_daily_state(
     already_running: bool = False,
     tradingagents_summary_failed: bool = False,
     source_failures: list[SourceFailure] | None = None,
-    tiger_long_term_strategy_failed: bool = False,
 ) -> dict[str, object]:
     reasons: list[str] = []
     if run_failed:
@@ -2209,9 +2153,6 @@ def _derive_daily_state(
         reasons.append("tradingagents_summary_failed")
     if source_failures:
         reasons.append("source_incomplete")
-    if tiger_long_term_strategy_failed:
-        reasons.append("tiger_long_term_strategy_failed")
-
     if run_failed or source_failures:
         status = "failed"
     elif already_running:

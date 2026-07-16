@@ -71,7 +71,6 @@ from .tradingagents_summary import (
     tradingagents_summary_latest_path,
 )
 from .trading_plan import backtest_plan_side, load_trading_plan_rows
-from .tiger_long_term import load_tiger_long_term_strategy
 
 
 DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
@@ -156,7 +155,6 @@ class DashboardState:
     trade_actions: list[dict[str, str]]
     kelly_lab: dict[str, Any]
     backtest_universe: dict[str, list[dict[str, str]]]
-    tiger_long_term_strategy: dict[str, Any]
     trend_reports: dict[str, dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
@@ -179,7 +177,6 @@ class DashboardState:
             "trade_actions": self.trade_actions,
             "kelly_lab": self.kelly_lab,
             "backtest_universe": self.backtest_universe,
-            "tiger_long_term_strategy": self.tiger_long_term_strategy,
             "trend_reports": self.trend_reports,
         }
 
@@ -298,29 +295,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         trade_actions=trade_actions,
         kelly_lab=kelly_lab,
         backtest_universe=backtest_universe,
-        tiger_long_term_strategy=_load_dashboard_tiger_long_term_strategy(
-            config.data_dir
-        ),
         trend_reports=_load_trend_reports(
             config.data_dir, config.reports_dir
         ),
     )
-
-
-def _load_dashboard_tiger_long_term_strategy(data_dir: Path) -> dict[str, Any]:
-    path = data_dir / "latest" / "US" / "tiger_long_term_strategy.json"
-    if not path.exists():
-        return {
-            "available": False,
-            "error": "Tiger 长线策略产物不存在",
-        }
-    try:
-        return load_tiger_long_term_strategy(path)
-    except ValueError as exc:
-        return {
-            "available": False,
-            "error": f"Tiger 长线策略产物无效：{exc}",
-        }
 
 
 def _load_trend_reports(

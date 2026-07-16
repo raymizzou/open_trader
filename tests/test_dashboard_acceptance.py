@@ -338,14 +338,14 @@ def test_acceptance_rejects_api_projection_that_drops_frozen_action(
     tmp_path: Path,
 ) -> None:
     reports = tmp_path / "reports"
-    artifact = reports / "trend_us_futu" / "2026-07-15.json"
+    artifact = reports / "trend_us_tiger" / "2026-07-15.json"
     artifact.parent.mkdir(parents=True)
     artifact.write_text(json.dumps({
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "US", "broker": "futu"},
+        "metadata": {"market": "US", "broker": "tiger"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VIXY"}],
             "holding_decisions": [],
@@ -357,7 +357,7 @@ def test_acceptance_rejects_api_projection_that_drops_frozen_action(
     }), encoding="utf-8")
     projected = {
         "available": True,
-        "broker": "futu",
+        "broker": "tiger",
         "market": "US",
         "report_date": "2026-07-15",
         "data_date": "2026-07-14",
@@ -378,7 +378,7 @@ def test_acceptance_rejects_api_projection_that_drops_frozen_action(
 
     with pytest.raises(AssertionError, match="冻结报告动作与 API 投影不一致"):
         dashboard_acceptance._check_trend_artifact_projection(
-            reports, "futu", projected
+            reports, "tiger", projected
         )
 
 
@@ -386,7 +386,7 @@ def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
     with pytest.raises(AssertionError, match="产物文件名无效"):
         dashboard_acceptance._check_trend_artifact_projection(
             tmp_path,
-            "futu",
+            "tiger",
             {"available": True, "audit": {"artifact": "../secret.json"}},
         )
 
@@ -490,7 +490,7 @@ def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
     tmp_path: Path, fresh: object,
 ) -> None:
     reports = tmp_path / "reports"
-    artifact = reports / "trend_us_futu" / "2026-07-15.json"
+    artifact = reports / "trend_us_tiger" / "2026-07-15.json"
     artifact.parent.mkdir(parents=True)
     buy = {"action": "BUY", "symbol": "VIXY"}
     artifact.write_text(json.dumps({
@@ -498,7 +498,7 @@ def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "account": serialized_trend_account(fresh=fresh),
-        "metadata": {"market": "US", "broker": "futu"},
+        "metadata": {"market": "US", "broker": "tiger"},
         "strategy_judgments": {
             "formal_actions": [buy],
             "holding_decisions": [],
@@ -527,7 +527,7 @@ def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
     }
 
     dashboard_acceptance._check_trend_artifact_projection(
-        reports, "futu", projected
+        reports, "tiger", projected
     )
 
 
@@ -585,13 +585,13 @@ def test_acceptance_rejects_missing_or_malformed_account(
     tmp_path: Path, account: object,
 ) -> None:
     reports = tmp_path / "reports"
-    artifact = reports / "trend_us_futu" / "2026-07-15.json"
+    artifact = reports / "trend_us_tiger" / "2026-07-15.json"
     artifact.parent.mkdir(parents=True)
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "metadata": {"market": "US", "broker": "futu"},
+        "metadata": {"market": "US", "broker": "tiger"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VIXY"}],
             "holding_decisions": [],
@@ -611,7 +611,7 @@ def test_acceptance_rejects_missing_or_malformed_account(
 
     with pytest.raises(AssertionError, match="账户快照无效"):
         dashboard_acceptance._check_trend_artifact_projection(
-            reports, "futu", projected
+            reports, "tiger", projected
         )
 
 
@@ -619,6 +619,21 @@ def trend_reports() -> dict[str, dict[str, object]]:
     return {
         "futu": {
             "available": True, "broker": "futu", "broker_label": "富途",
+            "market_label": "美股 / 港股", "report_date": "2026-07-15",
+            "data_date": "2026-07-14", "generated_at": "2026-07-15T11:31:00+08:00",
+            "attention_markets": [
+                {
+                    "market": "US", "market_label": "美股", "data_status": "current",
+                    "data_date": "2026-07-14", "items": [{"symbol": "VIXY"}],
+                },
+                {
+                    "market": "HK", "market_label": "港股", "data_status": "current",
+                    "data_date": "2026-07-14", "items": [{"symbol": "00700"}],
+                },
+            ],
+        },
+        "tiger": {
+            "available": True, "broker": "tiger", "broker_label": "老虎",
             "market_label": "美股", "report_date": "2026-07-15",
             "data_date": "2026-07-14", "generated_at": "2026-07-15T11:30:36+08:00",
             "account_status": "已更新", "buy_window": "美股常规交易时段",
@@ -731,12 +746,6 @@ def valid_payload() -> dict[str, object]:
             {"market": "CN", "symbol": row["symbol"]} for row in cn
         ]},
         "trend_reports": trend_reports(),
-        "tiger_long_term_strategy": {
-            "status": "shadow",
-            "members": [{"symbol": "QQQ"}],
-            "gate": {"reasons": ["calibration_required"]},
-            "order_requests": [],
-        },
     }
 
 
@@ -778,14 +787,19 @@ def test_validate_quotes_payload_rejects_incomplete_current_quote(
 
 def trend_account_text() -> str:
     return (
-        "富途短线美股趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14 "
-        "老虎长线SMA200 组合策略夏普比率卡玛比率 "
+        "富途期权增强跨市场期权关注期权关注美股港股 "
+        "老虎趋势美股趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14 "
         "辉立短线港股趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14 "
         "东方财富偏短线趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14"
     )
 
 
 def trend_workspace_text(broker: str) -> str:
+    if broker == "futu":
+        return (
+            "期权关注 美股 数据截至 2026-07-14 当前 VIXY "
+            "港股 数据截至 2026-07-14 当前 00700 返回持仓看板"
+        )
     if broker == "eastmoney":
         return (
             "东方财富｜A股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
@@ -805,7 +819,7 @@ def trend_workspace_text(broker: str) -> str:
             "确认全部卖出动作 按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
         )
     return (
-        "富途｜美股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
+        "老虎｜美股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
         "生成时间 2026-07-15T11:30:36+08:00 账户状态 已更新 "
         "卖出 1 买入 1 持有 1 人工复核 1 今日执行检查 "
         "确认全部卖出动作 按顺序考虑允许买入项 盘中观察活动保护线 完成人工复核"
@@ -867,14 +881,13 @@ def trend_audit_sections(broker: str) -> list[str]:
 
 ACCOUNT_SECTION_TEXTS = {
     "futu": (
-        "富途 短线 · 美股趋势交易 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
-        "来源 Futu 时间 2026-07-15 当天趋势报告 报告日期 2026-07-15 "
-        "数据截至 2026-07-14"
+        "富途 期权增强 · 跨市场期权关注 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
+        "来源 Futu 时间 2026-07-15 期权关注 美股 港股"
     ),
     "tiger": (
-        "老虎 长线 · SMA200 组合策略 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
-        "来源 Tiger 时间 2026-07-15 SMA200 策略 影子验证 · 仅供人工复核 "
-        "年化收益 最大回撤 夏普比率 卡玛比率"
+        "老虎 趋势 · 美股趋势交易 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
+        "来源 Tiger 时间 2026-07-15 当天趋势报告 报告日期 2026-07-15 "
+        "数据截至 2026-07-14"
     ),
     "phillips": (
         "辉立 短线 · 港股趋势交易 持仓资产 HKD 100 现金 HKD 20 持仓 1 "
@@ -1020,7 +1033,6 @@ class TabbedAccountLocator:
             if (
                 self.page.trend_broker is not None
                 or self.page.selected != broker
-                or broker == "tiger"
             ):
                 return 0
             if self.selector == f"{entry} [data-trend-report]":
@@ -1290,10 +1302,14 @@ class TabbedAccountPage:
         self.section_texts = dict(ACCOUNT_SECTION_TEXTS)
         self.entry_texts = {
             broker: (
-                f"当天趋势报告 报告日期 {report.get('report_date', '-')} "
-                f"数据截至 {report.get('data_date', '-')}"
+                (
+                    "期权关注 美股 港股"
+                    if broker == "futu"
+                    else f"当天趋势报告 报告日期 {report.get('report_date', '-')} "
+                    f"数据截至 {report.get('data_date', '-')}"
+                )
                 if report.get("available") is True
-                else f"当天趋势报告 {report.get('status_text', '')}"
+                else f"{'期权关注' if broker == 'futu' else '当天趋势报告'} {report.get('status_text', '')}"
             )
             for broker, report in self.reports.items()
         }
@@ -2387,22 +2403,14 @@ def test_validate_dashboard_payload_accepts_real_contract() -> None:
     assert validate_dashboard_payload(valid_payload(), expected_cn=5) == []
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "expected"),
-    [
-        ("status", "failed", "老虎长线策略不是 shadow 状态"),
-        ("members", [], "老虎长线策略没有组合成员"),
-        ("gate", {"reasons": []}, "老虎长线策略缺少 calibration_required"),
-        ("order_requests", [{"symbol": "QQQ"}], "老虎长线策略包含下单请求"),
-    ],
-)
-def test_validate_dashboard_payload_rejects_invalid_tiger_strategy(
-    field: str, value: object, expected: str,
-) -> None:
+def test_validate_dashboard_payload_rejects_retired_tiger_strategy_payload() -> None:
     payload = valid_payload()
-    payload["tiger_long_term_strategy"][field] = value  # type: ignore[index]
+    payload["tiger_" + "long_term_strategy"] = {"status": "shadow"}
 
-    assert expected in validate_dashboard_payload(payload, expected_cn=5)
+    assert any(
+        "已退役策略" in error
+        for error in validate_dashboard_payload(payload, expected_cn=5)
+    )
 
 
 def test_check_account_holdings_visits_every_broker_tab(
@@ -2423,12 +2431,14 @@ def test_check_account_holdings_visits_every_broker_tab(
 
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.max_visible_account_sections == 1
-    assert page.opened_reports == ["futu", "phillips", "eastmoney"]
+    assert page.opened_reports == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.disabled_reports == set()
-    assert projections == ["futu", "phillips", "eastmoney"]
+    assert projections == ["tiger", "phillips", "eastmoney"]
     assert page.focus_checks == [
         "#return-to-portfolio:visible",
         '#account-futu:visible .trend-report-entry [data-trend-report]',
+        "#return-to-portfolio:visible",
+        '#account-tiger:visible .trend-report-entry [data-trend-report]',
         "#return-to-portfolio:visible",
         '#account-phillips:visible .trend-report-entry [data-trend-report]',
         "#return-to-portfolio:visible",
@@ -2697,7 +2707,10 @@ def test_cn_filter_accepts_grouped_visible_count_for_large_account() -> None:
 
 @pytest.mark.parametrize(
     "missing",
-    ("富途", "老虎", "辉立", "东方财富", "美股趋势交易", "港股趋势交易", "当天趋势报告", "报告日期", "数据截至", "夏普比率", "卡玛比率"),
+        (
+            "富途", "老虎", "辉立", "东方财富", "期权增强", "跨市场期权关注",
+            "美股趋势交易", "港股趋势交易", "期权关注", "当天趋势报告", "报告日期", "数据截至",
+        ),
 )
 def test_check_account_holdings_rejects_missing_profile_or_metric(missing: str) -> None:
     page = tabbed_account_page(valid_payload())

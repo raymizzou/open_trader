@@ -184,7 +184,6 @@ def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
 
     for foreground_selector, surface_selector in (
         (".source-status-row span", ".source-status-row"),
-        (".tiger-member-header", ".tiger-member-header"),
     ):
         block = css.split(f"\n{foreground_selector} {{", 1)[1].split("}", 1)[0]
         assert "color: var(--muted);" in block
@@ -3149,6 +3148,9 @@ const renderedHeadings = [...html.matchAll(/<th scope="col">([^<]+)<\/th>/g)].ma
 if (JSON.stringify(renderedHeadings) !== JSON.stringify(headings)) throw new Error(html);
 const separators = [...html.matchAll(/<th colspan="10" scope="rowgroup"><div class="option-attention-market-content">([\s\S]*?)<\/div><\/th>/g)];
 if (separators.length !== 2 || separators.some((match) => (match[1].match(/<span>/g) || []).length !== 2)) throw new Error(html);
+const rowgroups = [...html.matchAll(/<tbody>([\s\S]*?)<\/tbody>/g)].map((match) => match[1]);
+if (rowgroups.length !== 2 || !rowgroups[0].includes("美股") || !rowgroups[0].includes("QQQ") || rowgroups[0].includes("00700") ||
+    !rowgroups[1].includes("港股") || !rowgroups[1].includes("00700") || rowgroups[1].includes("QQQ")) throw new Error(html);
 for (const row of html.matchAll(/<tr class="option-attention-row">([\s\S]*?)<\/tr>/g)) {
   const labels = [...row[1].matchAll(/data-label="([^"]+)"/g)].map((match) => match[1]);
   if (JSON.stringify(labels) !== JSON.stringify(headings)) throw new Error(row[0]);
@@ -3311,12 +3313,9 @@ def test_dashboard_static_contains_account_holdings_mount() -> None:
     assert 'aria-live="polite"' in html
 
 
-def test_dashboard_uses_new_account_roles_without_tiger_sma200_summary() -> None:
+def test_dashboard_uses_new_account_roles_without_retired_strategy_summary() -> None:
     output = run_dashboard_js(r'''
-state.dashboard={
-  tiger_long_term_strategy:{available:false,error:"产物不存在"},
-  trend_reports:{tiger:{available:false,status_text:"暂时不可用"}},
-};
+state.dashboard={trend_reports:{tiger:{available:false,status_text:"暂时不可用"}}};
 const group={broker:"tiger",profile:ACCOUNT_STRATEGY_PROFILES.tiger,rows:[],summary:{broker:"tiger"}};
 console.log(renderAccountSection(group));
 ''')
@@ -3324,6 +3323,25 @@ console.log(renderAccountSection(group));
     assert "趋势 · 美股趋势交易" in output
     for forbidden in ("SMA200", "影子验证", "夏普比率", "卡玛比率", "产物不存在"):
         assert forbidden not in output
+
+
+def test_dashboard_css_does_not_contain_retired_tiger_strategy_selectors() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    for selector in (
+        "account-strategy-summary",
+        "tiger-long-term-panel",
+        "tiger-panel-heading",
+        "tiger-panel-status",
+        "tiger-rule-strip",
+        "tiger-metric-grid",
+        "tiger-metric-card",
+        "tiger-member-",
+        "tiger-number",
+        "tiger-symbol",
+        "tiger-unavailable",
+    ):
+        assert selector not in css
 
 
 def test_dashboard_js_renders_kelly_lab_panel() -> None:
