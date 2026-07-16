@@ -322,6 +322,7 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
     '.strategy-tools button:visible',
     '#refresh-quotes:visible',
     '.account-holding-actions button:visible',
+    '.trend-report-entry button:visible',
   ].join(','));
 
   await page.getByRole('tab', { name: /老虎/ }).click();

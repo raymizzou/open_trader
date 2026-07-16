@@ -410,3 +410,52 @@ Adjusted contrast ratios calculated with WCAG relative luminance:
 - Per the second-round brief, `make acceptance` was intentionally **not** run.
   Live API/data, background process freshness, logs, and review deployment remain
   for the parent task's final acceptance gate.
+
+---
+
+# Third-Round Important Review Fixes
+
+## Changes
+
+- Added the real `.trend-report-entry button:visible` homepage control to the
+  permanent 375px Python acceptance target set and the fixture-backed mobile
+  Chromium target set. A strict 43.5px negative case proves that this entry must
+  remain at least 44px high.
+- Replaced the trend-entry fake's permissive child-selector regex with an exact
+  set of known entry, trigger, and button selectors for the four known brokers.
+- Removed the fake's arbitrary `strong`, suffix, and substring fallbacks from
+  `inner_text()` and related trend/count paths. Known workspace, audit, holding,
+  session-price, and CN-row selectors are now exact or anchored and broker/label
+  constrained. The review typos `.data-trend-reprot`,
+  `.trend-report-entry .misspelled`, and `.totally-wrong strong` all raise.
+- The exact approved palette remains unchanged.
+
+## TDD RED Evidence
+
+- Mobile entry coverage and strict fake typo rejection:
+  `.venv/bin/python -m pytest tests/test_dashboard_acceptance.py -q -k 'opens_real_tool_workspaces or undersized_mobile_target or tabbed_acceptance_fake_rejects'`
+  - `2 failed, 3 passed, 142 deselected in 0.15s`
+  - The production mobile selector omitted the report entry, and the fake
+    accepted `.data-trend-reprot` as a valid trend-entry child.
+
+## GREEN Verification
+
+- Complete focused Dashboard modules:
+  `.venv/bin/python -m pytest tests/test_dashboard_web.py tests/test_dashboard_acceptance.py -q`
+  - `300 passed in 16.98s`
+- Real Chromium E2E:
+  `npx playwright test tests/e2e/dashboard-warm-ledger.spec.ts --project=chromium`
+  - `6 passed (2.7s)`
+  - The fixture-backed homepage report-entry button passes the 44px target check.
+- Full Python suite:
+  `.venv/bin/python -m pytest -q`
+  - `2182 passed in 28.23s`, exit `0`
+- `git diff --check`
+  - exit `0`
+
+## Remaining Risk / Deferred Gate
+
+- No known code-level correctness issue remains in this fix scope.
+- Per the third-round brief, `make acceptance` was intentionally **not** run.
+  Live API/data, background process freshness, logs, and review deployment remain
+  for the parent task's final acceptance gate.

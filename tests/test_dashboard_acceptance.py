@@ -867,7 +867,7 @@ class TabbedAccountLocator:
             self.page.active = "#return-to-portfolio:visible"
             self.page._record_visible_sections()
             return
-        if self.selector.endswith(".trend-audit summary"):
+        if self.selector == "#trend-report-workspace:visible .trend-audit summary":
             self.page.active = self.selector
             return
         if self.selector == "#open-kelly-lab":
@@ -879,9 +879,10 @@ class TabbedAccountLocator:
         if self.selector == "#research-chat-close:visible":
             self.page.research_open = False
             return
-        if self.selector == "#return-to-portfolio:visible" or self.selector.endswith(
-            "[data-close-trend-report]"
-        ):
+        if self.selector in {
+            "#return-to-portfolio:visible",
+            "#trend-report-workspace:visible [data-close-trend-report]",
+        }:
             if self.page.trend_broker is None:
                 self.page.workspace_view = "portfolio"
                 return
@@ -898,7 +899,8 @@ class TabbedAccountLocator:
         target_selectors = {
             '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
             ".strategy-tools button:visible, #refresh-quotes:visible, "
-            ".broker-summary-card:visible, .account-holding-actions button:visible",
+            ".broker-summary-card:visible, .account-holding-actions button:visible, "
+            ".trend-report-entry button:visible",
             ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
             ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
             ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
@@ -943,19 +945,22 @@ class TabbedAccountLocator:
             return int(
                 self.page.trend_broker is None and self.page.selected == match.group(1)
             )
-        match = re.fullmatch(
-            r"#account-(\w+):visible \.trend-report-entry(?: (.*))?", self.selector
-        )
-        if match:
-            broker, child = match.groups()
-            if self.page.trend_broker is not None or self.page.selected != broker:
+        for broker in self.page.tab_order:
+            entry = f"#account-{broker}:visible .trend-report-entry"
+            if self.selector not in {
+                entry,
+                f"{entry} [data-trend-report]",
+                f"{entry} button",
+            }:
+                continue
+            if (
+                self.page.trend_broker is not None
+                or self.page.selected != broker
+                or broker == "tiger"
+            ):
                 return 0
-            if broker == "tiger":
-                return 0
-            if child == "[data-trend-report]":
+            if self.selector == f"{entry} [data-trend-report]":
                 return int(bool(self.page.reports[broker]["available"]))
-            if child == "button":
-                return 1
             return 1
         if self.selector == "#trend-report-workspace:visible":
             return int(self.page.trend_broker is not None)
@@ -965,39 +970,65 @@ class TabbedAccountLocator:
             return int(self.page.trend_broker == "eastmoney")
         if self.selector == ".workspace-grid:visible":
             return int(self.page.trend_broker is None)
-        if self.selector.endswith(".cn-trend-report"):
+        if self.selector == "#trend-report-workspace:visible .cn-trend-report":
             return int(self.page.trend_broker == "eastmoney")
-        if self.selector.endswith(".trend-discipline[open]"):
+        if self.selector == "#trend-report-workspace:visible .trend-discipline[open]":
             return 0 if self.page.viewport_size["width"] <= 760 else 2
-        if self.selector.endswith(".trend-discipline"):
+        if self.selector == "#trend-report-workspace:visible .trend-discipline":
             return 2
-        if self.selector.endswith(".cn-trend-table"):
+        if self.selector == "#trend-report-workspace:visible .cn-trend-table":
             return 4
-        if self.selector.endswith(".cn-trend-buy .cn-trend-card"):
+        if self.selector == (
+            "#trend-report-workspace:visible .cn-trend-buy .cn-trend-card"
+        ):
             return 1
-        if self.selector.endswith(".cn-trend-buy .cn-trend-card:visible"):
+        if self.selector == (
+            "#trend-report-workspace:visible .cn-trend-buy .cn-trend-card:visible"
+        ):
             report = self.page.reports.get(str(self.page.trend_broker), {})
             actions = report.get("buy_actions", [])
             return len(actions) if isinstance(actions, list) else 0
-        if self.selector.endswith(".cn-trend-card:visible"):
+        if self.selector == "#trend-report-workspace:visible .cn-trend-card:visible":
             return 4
         if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
             return 0
-        if self.selector.endswith(".account-holding-row:visible"):
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.account-holding-row:visible", self.selector
+        )
+        if match and match.group(1) in self.page.tab_order:
             return self.page.visible_rows(self.selector)
-        if self.selector.endswith(".account-empty:visible"):
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.account-empty:visible", self.selector
+        )
+        if match and match.group(1) in self.page.tab_order:
             return int(self.page.visible_rows(self.selector) == 0)
-        if self.selector.endswith(".session-quote"):
+        if re.fullmatch(
+            r'\.account-holding-row:visible:has\('
+            r'\.account-holding-market:has-text\("US"\)\) '
+            r'\.account-holding-price:nth\(\d+\) \.session-quote',
+            self.selector,
+        ):
             return 1
-        if "account-holding-market:has-text(\"US\")" in self.selector:
+        if self.selector == (
+            '.account-holding-row:visible:has('
+            '.account-holding-market:has-text("US")) .account-holding-price'
+        ):
             return int(self.page.selected == "futu" and self.page.market != "CN")
-        if self.selector.endswith((
-            ".trend-audit", ".trend-audit summary", ".trend-audit section",
-            ".trend-report-header dd", ".trend-discipline summary",
-            ".cn-trend-buy", " td[data-label=\"行业\"]",
-            " td[data-label=\"筛选价（Trend Animals）\"]",
-            " td[data-label=\"执行参考价（Futu 前复权）\"]",
-        )):
+        if self.selector in {
+            "#trend-report-workspace:visible .trend-audit",
+            "#trend-report-workspace:visible .trend-audit summary",
+            "#trend-report-workspace:visible .trend-audit section",
+            "#trend-report-workspace:visible .trend-report-header dd",
+            "#trend-report-workspace:visible .trend-discipline summary",
+            "#trend-report-workspace:visible .cn-trend-buy",
+        }:
+            return 1
+        if re.fullmatch(
+            r'#trend-report-workspace:visible \.cn-trend-buy '
+            r'\.cn-trend-card:nth\(\d+\) td\[data-label="'
+            r'(行业|筛选价（Trend Animals）|执行参考价（Futu 前复权）)"\]',
+            self.selector,
+        ):
             return 1
         raise AssertionError(f"unknown count selector: {self.selector}")
 
@@ -1012,7 +1043,7 @@ class TabbedAccountLocator:
         if match:
             assert name == "aria-selected"
             return str(match.group(1) == self.page.selected).lower()
-        if self.selector.endswith(".cn-trend-buy"):
+        if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
             mobile = self.page.viewport_size["width"] <= 760
             return {
                 "tabindex": "-1" if mobile else "0",
@@ -1020,7 +1051,8 @@ class TabbedAccountLocator:
                     "正式买入计划" if mobile else "正式买入计划，可横向滚动"
                 ),
             }[name]
-        assert self.selector.endswith(".trend-audit") and name == "open"
+        assert self.selector == "#trend-report-workspace:visible .trend-audit"
+        assert name == "open"
         return None
 
     def focus(self) -> None:
@@ -1040,58 +1072,81 @@ class TabbedAccountLocator:
         if self.selector == "#account-holdings":
             return self.page.section_texts[self.page.selected]
         match = re.fullmatch(r"#account-(\w+):visible", self.selector)
-        if match:
+        if match and match.group(1) in self.page.tab_order:
             return self.page.section_texts[match.group(1)]
         match = re.fullmatch(
             r"#account-(\w+):visible \.trend-report-entry", self.selector
         )
-        if match:
+        if match and match.group(1) in self.page.tab_order:
             return self.page.entry_texts[match.group(1)]
         if self.selector == "#trend-report-workspace:visible":
             return trend_workspace_text(str(self.page.trend_broker))
-        if self.selector.endswith(".trend-audit"):
+        if self.selector == "#trend-report-workspace:visible .trend-audit":
             return trend_audit_text(str(self.page.trend_broker))
-        if self.selector.endswith(".account-empty:visible"):
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.account-empty:visible", self.selector
+        )
+        if match and match.group(1) in self.page.tab_order:
             return "当前筛选下没有持仓"
         if self.selector == "#visible-count":
             return f"{self.page.visible_rows():,} 条"
         if self.selector == "#last-refresh":
             return "刷新于 2026-07-15 15:03:13 CST"
-        if ".session-quote" in self.selector:
+        if re.fullmatch(
+            r'\.account-holding-row:visible:has\('
+            r'\.account-holding-market:has-text\("US"\)\) '
+            r'\.account-holding-price:nth\(\d+\) \.session-quote:nth\(0\)',
+            self.selector,
+        ):
             return "夜盘 61.50 · 03:03 ET"
         if self.selector == "body":
             return "持仓与策略"
-        if self.selector.endswith(" strong"):
+        if self.selector == '#broker-summary-cards [data-broker="phillips"] strong':
             return "HKD 628,554.06"
-        match = re.search(r'td\[data-label="([^"]+)"\]$', self.selector)
+        if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
+            return trend_workspace_text("eastmoney")
+        match = re.fullmatch(
+            r'#trend-report-workspace:visible \.cn-trend-buy '
+            r'\.cn-trend-card:nth\(\d+\) td\[data-label="([^"]+)"\]',
+            self.selector,
+        )
         if match:
             buy = self.page.reports["eastmoney"]["buy_actions"][0]
-            key = {
+            keys = {
                 "行业": "industry",
                 "筛选价（Trend Animals）": "filter_price",
                 "执行参考价（Futu 前复权）": "close",
-            }[match.group(1)]
+            }
+            if match.group(1) not in keys:
+                raise AssertionError(
+                    f"unknown inner_text selector: {self.selector}"
+                )
+            key = keys[match.group(1)]
             return str(buy[key])
-        raise AssertionError(self.selector)
+        raise AssertionError(f"unknown inner_text selector: {self.selector}")
 
     def all_inner_texts(self) -> list[str]:
         if self.selector == "a:visible, button:visible":
             return ["刷新账户与行情", "策略回测"]
         broker = str(self.page.trend_broker)
-        if self.selector.endswith(".cn-trend-stage"):
+        if self.selector == "#trend-report-workspace:visible .cn-trend-stage":
             return trend_stage_texts(broker)
-        if self.selector.endswith(".trend-stage"):
+        if self.selector == "#trend-report-workspace:visible .trend-stage":
             return trend_stage_texts(broker)
-        if self.selector.endswith(".trend-report-header dd"):
+        if self.selector == "#trend-report-workspace:visible .trend-report-header dd":
             report = self.page.reports[broker]
             return [str(report[key]) for key in (
                 "report_date", "data_date", "generated_at", "account_status",
             )]
-        if self.selector.endswith(".trend-audit section"):
+        if self.selector == "#trend-report-workspace:visible .trend-audit section":
             return trend_audit_sections(broker)
-        if self.selector.endswith(".trend-discipline summary"):
+        if self.selector == "#trend-report-workspace:visible .trend-discipline summary":
             return ["买入纪律", "卖出纪律"]
-        if self.selector.endswith(".account-holding-row:visible td:nth-child(2)"):
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.account-holding-row:visible td:nth-child\(2\)",
+            self.selector,
+        )
+        if match and match.group(1) in self.page.tab_order:
             return ["市场\nCN"] * self.page.visible_rows(self.selector)
         raise AssertionError(f"unknown all_inner_texts selector: {self.selector}")
 
@@ -1109,7 +1164,7 @@ class TabbedAccountLocator:
             "element => ({clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, "
             "overflowX: getComputedStyle(element).overflowX})"
         )
-        if self.selector.endswith(".cn-trend-buy"):
+        if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
             if expression == active_expression:
                 return self.selector == self.page.active
             if expression == focus_expression:
@@ -1337,7 +1392,8 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             target_selectors = {
                 '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
                 ".strategy-tools button:visible, #refresh-quotes:visible, "
-                ".broker-summary-card:visible, .account-holding-actions button:visible",
+                ".broker-summary-card:visible, .account-holding-actions button:visible, "
+                ".trend-report-entry button:visible",
                 ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
                 ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
                 ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
@@ -1416,7 +1472,8 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     assert page.target_checks == [
         "#account-tabs [role=\"tab\"]:visible, #header-market-filters button:visible, "
         ".strategy-tools button:visible, #refresh-quotes:visible, "
-        ".broker-summary-card:visible, .account-holding-actions button:visible",
+        ".broker-summary-card:visible, .account-holding-actions button:visible, "
+        ".trend-report-entry button:visible",
         ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
         ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
         ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
@@ -1433,6 +1490,7 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     (
         ".broker-summary-card:visible",
         ".symbol-detail-panel.inline-symbol-detail:visible .language-toggle button:visible",
+        ".trend-report-entry button:visible",
     ),
 )
 def test_acceptance_rejects_undersized_mobile_target(selector: str) -> None:
@@ -1455,6 +1513,16 @@ def test_tabbed_acceptance_fake_rejects_unknown_selectors_and_expressions() -> N
 
     with pytest.raises(AssertionError, match="unknown count selector"):
         page.locator(".misspelled-control").count()
+    with pytest.raises(AssertionError, match="unknown count selector"):
+        page.locator(
+            "#account-futu:visible .trend-report-entry .data-trend-reprot"
+        ).count()
+    with pytest.raises(AssertionError, match="unknown count selector"):
+        page.locator(
+            "#account-futu:visible .trend-report-entry .misspelled"
+        ).count()
+    with pytest.raises(AssertionError, match="unknown inner_text selector"):
+        page.locator(".totally-wrong strong").inner_text()
     with pytest.raises(AssertionError, match="unknown all_inner_texts selector"):
         page.locator("#visible-count").all_inner_texts()
 

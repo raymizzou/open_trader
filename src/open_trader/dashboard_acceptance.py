@@ -418,7 +418,8 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
             page,
             '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
             ".strategy-tools button:visible, #refresh-quotes:visible, "
-            ".broker-summary-card:visible, .account-holding-actions button:visible",
+            ".broker-summary-card:visible, .account-holding-actions button:visible, "
+            ".trend-report-entry button:visible",
         )
         _check_mobile_targets(
             page,
