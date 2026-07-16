@@ -941,10 +941,18 @@ def _check_account_holdings(
             ] == ["US", "HK"], "futu 期权关注市场顺序不是 US、HK"
             for market in markets:
                 assert isinstance(market, Mapping)
-                for required in (market.get("market_label"), market.get("data_date")):
-                    assert _plain(required) in workspace_text, (
-                        "futu 期权关注工作区缺少市场或数据日期"
-                    )
+                assert _plain(market.get("market_label")) in workspace_text, (
+                    "futu 期权关注工作区缺少市场"
+                )
+                if market.get("data_status") == "current":
+                    status_text = "今日已更新"
+                elif market.get("data_status") == "stale":
+                    data_date = str(market.get("data_date") or "").strip()
+                    assert data_date, "futu 期权关注过期市场缺少数据日期"
+                    status_text = f"数据截至 {data_date}；今日未更新"
+                else:
+                    status_text = "暂时不可用"
+                assert status_text in workspace_text, "futu 期权关注工作区缺少市场状态"
                 items = market.get("items")
                 assert isinstance(items, list), "futu 期权关注项目不是列表"
                 for item in items:

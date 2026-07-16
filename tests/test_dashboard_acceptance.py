@@ -624,10 +624,10 @@ def trend_reports() -> dict[str, dict[str, object]]:
             "attention_markets": [
                 {
                     "market": "US", "market_label": "美股", "data_status": "current",
-                    "data_date": "2026-07-14", "items": [{"symbol": "VIXY"}],
+                    "data_date": "2026-07-15", "items": [{"symbol": "VIXY"}],
                 },
                 {
-                    "market": "HK", "market_label": "港股", "data_status": "current",
+                    "market": "HK", "market_label": "港股", "data_status": "stale",
                     "data_date": "2026-07-14", "items": [{"symbol": "00700"}],
                 },
             ],
@@ -794,12 +794,23 @@ def trend_account_text() -> str:
     )
 
 
-def trend_workspace_text(broker: str) -> str:
+def trend_workspace_text(
+    broker: str, report: dict[str, object] | None = None,
+) -> str:
     if broker == "futu":
-        return (
-            "期权关注 美股 数据截至 2026-07-14 当前 VIXY "
-            "港股 数据截至 2026-07-14 当前 00700 返回持仓看板"
-        )
+        markets = report["attention_markets"] if report else []
+        text = ["期权关注"]
+        for market in markets:  # type: ignore[assignment]
+            status = market.get("data_status")
+            if status == "current":
+                status_text = "今日已更新"
+            elif status == "stale":
+                status_text = f"数据截至 {market.get('data_date')}；今日未更新"
+            else:
+                status_text = "暂时不可用"
+            text.extend((str(market.get("market_label")), status_text))
+            text.extend(str(item.get("symbol")) for item in market.get("items", []))
+        return " ".join(text)
     if broker == "eastmoney":
         return (
             "东方财富｜A股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
@@ -1157,7 +1168,8 @@ class TabbedAccountLocator:
         if match and match.group(1) in self.page.tab_order:
             return self.page.entry_texts[match.group(1)]
         if self.selector == "#trend-report-workspace:visible":
-            return trend_workspace_text(str(self.page.trend_broker))
+            broker = str(self.page.trend_broker)
+            return self.page.workspace_texts[broker]
         if self.selector == "#trend-report-workspace:visible .trend-audit":
             return trend_audit_text(str(self.page.trend_broker))
         match = re.fullmatch(
@@ -1311,6 +1323,10 @@ class TabbedAccountPage:
                 if report.get("available") is True
                 else f"{'期权关注' if broker == 'futu' else '当天趋势报告'} {report.get('status_text', '')}"
             )
+            for broker, report in self.reports.items()
+        }
+        self.workspace_texts = {
+            broker: trend_workspace_text(broker, report)
             for broker, report in self.reports.items()
         }
         self.all_rows = {"futu": 1, "tiger": 1, "phillips": 1, "eastmoney": 0}
@@ -2445,6 +2461,60 @@ def test_check_account_holdings_visits_every_broker_tab(
         "#trend-report-workspace:visible .cn-trend-buy",
         '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
     ]
+
+
+def test_option_attention_acceptance_checks_current_and_stale_status_text() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert "今日已更新" in page.workspace_texts["futu"]
+    assert "2026-07-15" not in page.workspace_texts["futu"]
+    assert "数据截至 2026-07-14；今日未更新" in page.workspace_texts["futu"]
+
+
+@pytest.mark.parametrize(
+    "missing_status",
+    ("今日已更新", "数据截至 2026-07-14；今日未更新"),
+)
+def test_option_attention_acceptance_rejects_missing_market_status(
+    missing_status: str,
+) -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.workspace_texts["futu"] = page.workspace_texts["futu"].replace(
+        missing_status, "状态缺失"
+    )
+
+    with pytest.raises(AssertionError, match="期权关注.*状态"):
+        dashboard_acceptance._check_account_holdings(page, payload)
+
+
+def test_option_attention_acceptance_checks_unavailable_without_data_date() -> None:
+    payload = valid_payload()
+    unavailable = payload["trend_reports"]["futu"]["attention_markets"][0]  # type: ignore[index]
+    unavailable.update(data_status="unavailable")
+    unavailable.pop("data_date")
+    page = tabbed_account_page(payload)
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert "暂时不可用" in page.workspace_texts["futu"]
+
+
+def test_option_attention_acceptance_rejects_missing_unavailable_status() -> None:
+    payload = valid_payload()
+    unavailable = payload["trend_reports"]["futu"]["attention_markets"][0]  # type: ignore[index]
+    unavailable.update(data_status="unavailable")
+    unavailable.pop("data_date")
+    page = tabbed_account_page(payload)
+    page.workspace_texts["futu"] = page.workspace_texts["futu"].replace(
+        "暂时不可用", "状态缺失"
+    )
+
+    with pytest.raises(AssertionError, match="期权关注.*状态"):
+        dashboard_acceptance._check_account_holdings(page, payload)
 
 
 def test_acceptance_rejects_unavailable_eastmoney_report_for_screenshot(
