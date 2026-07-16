@@ -7,8 +7,15 @@ from pathlib import Path
 
 import pytest
 
+from open_trader import market_trend
 import open_trader.trend_review as trend_review
-from open_trader.a_share_trend import trend_strategy_snapshot
+from open_trader.a_share_trend import (
+    AccountSnapshot,
+    CandidateInput,
+    _report_payload,
+    build_report,
+    trend_strategy_snapshot,
+)
 
 
 def frozen_evidence() -> dict[str, object]:
@@ -94,6 +101,7 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
                 "available_cash": "100000",
                 "positions": [],
                 "exceptions": [],
+                "position_count": 0,
             },
             "candidates": [],
             "holding_snapshots": {},
@@ -108,6 +116,7 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
             "lot_sizes": {},
             "position_weight": "0.04",
             "position_weight_source": "fallback_4pct",
+            "price_fx_to_account_currency": "1",
             "candidate_pool_ids": [622466, 697199],
             "generated_at": "2026-07-16T17:00:00+08:00",
             "metadata": {"market": "CN", "broker": "eastmoney"},
@@ -119,6 +128,130 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
     assert rebuilt["process_version"] == "newsha"
     assert rebuilt["strategy_snapshot"]["process_version"] == "newsha"
     assert rebuilt["account"]["net_value"] == "100000"
+
+
+def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
+    tmp_path: Path,
+) -> None:
+    candidates = [
+        CandidateInput(
+            tm_id=index,
+            symbol=symbol,
+            exchange="US",
+            name=symbol,
+            asset="US stock",
+            industry="Technology",
+            as_of_date="2026-07-16",
+            tradable=True,
+            amount=Decimal("2"),
+            right_side=True,
+            days=index,
+            strength=Decimal(str(97 - index)),
+            danger=False,
+            close=Decimal("100"),
+            atr=Decimal("5"),
+            temperature_curr="热",
+            phase_curr="夏至",
+            strength_change="上升",
+            boiling=False,
+            champagne=False,
+        )
+        for index, symbol in enumerate(("AAPL", "MSFT"), start=1)
+    ]
+    account = AccountSnapshot(
+        source_date="2026-07-16",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+        position_count=9,
+    )
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account,
+        candidates=candidates,
+        holding_snapshots={},
+        bars_by_symbol={},
+        generated_at="2026-07-16T17:00:00+08:00",
+        metadata={"market": "US", "broker": "tiger"},
+        market="US",
+        price_fx_to_account_currency=Decimal("7.85"),
+        process_version="oldsha",
+        candidate_pool_ids=(1,),
+    )
+    source = _report_payload(report)
+    current_rows = market_trend._attention_rows(source["signal_snapshots"]) or []
+    previous_rows = [
+        {
+            **row,
+            "right_side": False,
+            "temperature_curr": "温",
+            "strength_change": "下降",
+        }
+        for row in current_rows
+    ]
+    source["option_attention"] = market_trend.build_option_attention(
+        current_rows,
+        previous_rows,
+        market_trend._attention_actions(source),
+        "US",
+        "老虎",
+    )
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path,
+        report=report,
+        candidates=candidates,
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        watch_events=[],
+        query={"component_pool_ids": [1], "snapshot_fields": []},
+        responses={},
+        candidate_pool_ids=(1,),
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("7.85"),
+        previous_attention_rows=previous_rows,
+        option_attention_broker_label="老虎",
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+
+    missing_fx = json.loads(json.dumps(evidence))
+    del missing_fx["rebuild_inputs"]["price_fx_to_account_currency"]
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match="missing original input: price_fx_to_account_currency",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(missing_fx)
+    missing_count = json.loads(json.dumps(evidence))
+    del missing_count["rebuild_inputs"]["account"]["position_count"]
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match="missing original input: account.position_count",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(missing_count)
+
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+
+    source_actions = source["strategy_judgments"]["formal_actions"]
+    rebuilt_actions = rebuilt["strategy_judgments"]["formal_actions"]
+    assert rebuilt["account"]["position_count"] == 9
+    assert len(rebuilt_actions) == len(source_actions) == 1
+    assert rebuilt_actions[0]["estimated_shares"] == source_actions[0]["estimated_shares"] == 5
+    assert rebuilt["option_attention"] == source["option_attention"]
+
+    corrected_path = trend_review.replay_trend_evidence(
+        Path(frozen["path"]),
+        tmp_path,
+        fixed_process_version="fixedsha",
+        rebuild=trend_review.rebuild_trend_report_from_evidence,
+        replayed_at="2026-07-17T09:00:00+08:00",
+    )
+    corrected = json.loads(corrected_path.read_text(encoding="utf-8"))["corrected_report"]
+    assert corrected["process_version"] == "fixedsha"
+    assert corrected["strategy_judgments"]["formal_actions"] == source_actions
+    assert corrected["option_attention"] == source["option_attention"]
 
 
 class FakeTrendSimClient:

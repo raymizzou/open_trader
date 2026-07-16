@@ -2902,6 +2902,9 @@ def _attempt_report(
                 config.trend_animals_etf_tm_id,
             ),
             lot_sizes={},
+            price_fx_to_account_currency=Decimal("1"),
+            previous_attention_rows=(),
+            option_attention_broker_label=None,
         )
         report = replace(
             report,

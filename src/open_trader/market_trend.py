@@ -1031,6 +1031,10 @@ def _attempt_market_report(
             report,
             metadata={**report.metadata, "delivery_status": "prepared"},
         )
+        previous_attention_rows = _previous_attention_rows(
+            paths, current_as_of_date=as_of_date, market=market
+        )
+        option_attention_broker_label = MARKET_NOTIFICATION_LABELS[market][0]
         evidence = freeze_report_evidence(
             data_dir=config.data_dir,
             report=report,
@@ -1050,6 +1054,11 @@ def _attempt_market_report(
             },
             candidate_pool_ids=pool_ids,
             lot_sizes=lot_sizes,
+            price_fx_to_account_currency=(
+                USD_TO_HKD if market == "US" else Decimal("1")
+            ),
+            previous_attention_rows=previous_attention_rows,
+            option_attention_broker_label=option_attention_broker_label,
         )
         report = replace(
             report,
@@ -1062,12 +1071,10 @@ def _attempt_market_report(
         current_attention_rows = _attention_rows(payload.get("signal_snapshots")) or []
         payload["option_attention"] = build_option_attention(
             current_attention_rows,
-            _previous_attention_rows(
-                paths, current_as_of_date=as_of_date, market=market
-            ),
+            previous_attention_rows,
             _attention_actions(payload),
             market,
-            MARKET_NOTIFICATION_LABELS[market][0],
+            option_attention_broker_label,
         )
         receipt_path = _market_receipt_path(paths, artifact_stem)
         receipt = _write_delivery_receipt(

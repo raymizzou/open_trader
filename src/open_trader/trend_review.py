@@ -136,6 +136,9 @@ def freeze_report_evidence(
     responses: Mapping[str, object],
     candidate_pool_ids: object,
     lot_sizes: Mapping[str, int],
+    price_fx_to_account_currency: Decimal,
+    previous_attention_rows: object,
+    option_attention_broker_label: str | None,
 ) -> dict[str, str]:
     metadata = getattr(report, "metadata")
     strategy_snapshot = getattr(report, "strategy_snapshot")
@@ -165,6 +168,11 @@ def freeze_report_evidence(
             "lot_sizes": dict(lot_sizes),
             "position_weight": metadata.get("position_weight"),
             "position_weight_source": metadata.get("position_weight_source"),
+            "price_fx_to_account_currency": price_fx_to_account_currency,
+            "option_attention": {
+                "previous_rows": previous_attention_rows,
+                "broker_label": option_attention_broker_label,
+            },
             "candidate_pool_ids": candidate_pool_ids,
             "generated_at": getattr(report, "generated_at"),
             "metadata": metadata,
@@ -1001,6 +1009,7 @@ def rebuild_trend_report_from_evidence(
         "market",
         "candidate_pool_ids",
         "metadata",
+        "price_fx_to_account_currency",
     }
     missing = sorted(required - inputs.keys())
     if missing:
@@ -1029,6 +1038,10 @@ def rebuild_trend_report_from_evidence(
     account_raw = inputs["account"]
     if not isinstance(account_raw, Mapping):
         raise TrendReplayIncompleteError("missing original input: account")
+    if "position_count" not in account_raw:
+        raise TrendReplayIncompleteError(
+            "missing original input: account.position_count"
+        )
     positions_raw = account_raw.get("positions")
     if not isinstance(positions_raw, list):
         raise TrendReplayIncompleteError("missing original input: account.positions")
@@ -1044,6 +1057,18 @@ def rebuild_trend_report_from_evidence(
         for item in positions_raw
         if isinstance(item, Mapping)
     )
+    position_count_raw = account_raw["position_count"]
+    if (
+        position_count_raw is not None
+        and (
+            isinstance(position_count_raw, bool)
+            or not isinstance(position_count_raw, int)
+            or position_count_raw < 0
+        )
+    ):
+        raise TrendReplayIncompleteError(
+            "invalid original input: account.position_count"
+        )
     account = AccountSnapshot(
         source_date=str(account_raw["source_date"]),
         fresh=account_raw.get("fresh") is True,
@@ -1051,6 +1076,7 @@ def rebuild_trend_report_from_evidence(
         available_cash=Decimal(str(account_raw["available_cash"])),
         positions=positions,
         exceptions=tuple(str(item) for item in account_raw.get("exceptions", [])),
+        position_count=position_count_raw,
     )
 
     decimal_fields = {
@@ -1106,6 +1132,11 @@ def rebuild_trend_report_from_evidence(
         if rows is None or isinstance(rows, list)
     }
     process_version = str(evidence.get("process_version") or "")
+    price_fx = decimal_or_none(inputs["price_fx_to_account_currency"])
+    if price_fx is None or not price_fx.is_finite() or price_fx <= 0:
+        raise TrendReplayIncompleteError(
+            "invalid original input: price_fx_to_account_currency"
+        )
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
         execution_date=str(inputs["execution_date"]),
@@ -1137,8 +1168,47 @@ def rebuild_trend_report_from_evidence(
         position_weight_source=str(
             inputs.get("position_weight_source") or "fallback_4pct"
         ),
+        price_fx_to_account_currency=price_fx,
         process_version=process_version,
         candidate_pool_ids=tuple(int(item) for item in inputs["candidate_pool_ids"]),
         strategy_snapshot=snapshot,
     )
-    return _report_payload(report)
+    payload = _report_payload(report)
+    market = str(inputs["market"]).upper()
+    if market in {"US", "HK"}:
+        attention_input = inputs.get("option_attention")
+        if not isinstance(attention_input, Mapping):
+            raise TrendReplayIncompleteError(
+                "missing original input: option_attention"
+            )
+        previous_rows = attention_input.get("previous_rows")
+        broker_label = attention_input.get("broker_label")
+        if not isinstance(previous_rows, list) or not all(
+            isinstance(row, Mapping) for row in previous_rows
+        ):
+            raise TrendReplayIncompleteError(
+                "missing original input: option_attention.previous_rows"
+            )
+        if not isinstance(broker_label, str) or not broker_label:
+            raise TrendReplayIncompleteError(
+                "missing original input: option_attention.broker_label"
+            )
+        from .market_trend import (
+            _attention_actions,
+            _attention_rows,
+            build_option_attention,
+        )
+
+        current_rows = _attention_rows(payload.get("signal_snapshots"))
+        if current_rows is None:
+            raise TrendReplayIncompleteError(
+                "missing original input: signal_snapshots"
+            )
+        payload["option_attention"] = build_option_attention(
+            current_rows,
+            previous_rows,
+            _attention_actions(payload),
+            market,
+            broker_label,
+        )
+    return payload
