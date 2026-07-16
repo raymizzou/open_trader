@@ -141,6 +141,14 @@ class FakePaginatedContext(FakeOpenQuoteContext):
         }]), next_key
 
 
+class FakeRateLimitedHistoryContext(FakeOpenQuoteContext):
+    def request_history_kline(self, *args: object, **kwargs: object) -> tuple[int, object, object]:
+        self.history_calls = getattr(self, "history_calls", 0) + 1
+        if self.history_calls == 1:
+            return -1, "获取历史K线频率太高，请求失败，每30秒最多60次。", None
+        return super().request_history_kline(*args, **kwargs)
+
+
 def test_futu_quote_error_preserves_diagnostic_metadata() -> None:
     error = FutuQuoteError(
         "网络中断",
@@ -510,6 +518,22 @@ def test_futu_quote_client_reads_all_history_pages() -> None:
 
     assert [bar.date for bar in bars] == ["2026-06-18", "2026-06-19"]
     assert client.context.page_keys == [None, b"page-2"]
+
+
+def test_futu_quote_client_waits_one_window_and_retries_history_rate_limit() -> None:
+    sleeps: list[float] = []
+    client = FutuQuoteClient(
+        host="127.0.0.1", port=11111,
+        context_factory=FakeRateLimitedHistoryContext,
+        connectivity_checker=lambda host, port: True,
+        sleep_fn=sleeps.append,
+    )
+
+    bars = client.get_daily_kline("US.SPY", start="2026-01-01", end="2026-07-13")
+
+    assert len(bars) == 2
+    assert client.context.history_calls == 2
+    assert sleeps == [30.0]
 
 
 def test_futu_quote_client_maps_cn_symbol_for_daily_kline() -> None:

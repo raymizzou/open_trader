@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 import math
+from time import sleep
 from typing import Any
 
 from .futu_watch import QuoteSnapshot
@@ -98,6 +99,7 @@ class FutuQuoteClient:
         port: int,
         context_factory: Callable[..., Any] = _default_context_factory,
         connectivity_checker: Callable[[str, int], bool] = _can_connect_to_opend,
+        sleep_fn: Callable[[float], None] = sleep,
     ) -> None:
         if not connectivity_checker(host, port):
             raise FutuQuoteError(
@@ -124,6 +126,7 @@ class FutuQuoteClient:
             ) from exc
         self.host = host
         self.port = port
+        self._sleep_fn = sleep_fn
 
     def get_snapshots(self, futu_symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
         requested = set(futu_symbols)
@@ -279,6 +282,7 @@ class FutuQuoteClient:
         bars: list[DailyKlineBar] = []
         page_req_key: object = None
         seen_page_keys: set[object] = set()
+        rate_limit_retried = False
         while True:
             response = self.context.request_history_kline(
                 wire_symbol,
@@ -292,6 +296,10 @@ class FutuQuoteClient:
             ret_code, data = response[0], response[1]
             if ret_code != 0:
                 message = str(data)
+                if "获取历史K线频率太高" in message and not rate_limit_retried:
+                    rate_limit_retried = True
+                    self._sleep_fn(30.0)
+                    continue
                 if "网络中断" in message:
                     raise FutuQuoteError(
                         message,
