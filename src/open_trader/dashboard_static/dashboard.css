@@ -1648,7 +1648,7 @@ table {
   overflow-x: auto;
 }
 
-.cn-trend-buy:focus-visible {
+.cn-trend-buy:focus {
   outline: 3px solid var(--accent);
   outline-offset: 2px;
 }

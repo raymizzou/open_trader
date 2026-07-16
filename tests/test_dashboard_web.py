@@ -2914,7 +2914,8 @@ console.log("ok");
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
 
     assert "ok" in output
-    focus = css.split("\n.cn-trend-buy:focus-visible {", 1)[1].split("}", 1)[0]
+    assert "\n.cn-trend-buy:focus {" in css
+    focus = css.split("\n.cn-trend-buy:focus {", 1)[1].split("}", 1)[0]
     assert "outline: 3px solid var(--accent);" in focus
     assert "outline-offset: 2px;" in focus
 
