@@ -924,6 +924,19 @@ ACCOUNT_SECTION_TEXTS = {
     ),
 }
 
+OPTION_ATTENTION_COLUMN_LABELS = [
+    "标的",
+    "分类",
+    "右侧状态",
+    "趋势温度",
+    "趋势节气",
+    "本地 / 全球强度",
+    "上周 / 上月",
+    "右侧天数 / 累计涨幅",
+    "危险 / 沸腾 / 开香槟",
+    "来源动作",
+]
+
 
 class TabbedAccountLocator:
     def __init__(self, page: "TabbedAccountPage", selector: str) -> None:
@@ -1066,6 +1079,11 @@ class TabbedAccountLocator:
             "#trend-report-workspace:visible .option-attention-table tbody"
         ):
             return len(self.page.option_attention_header_spans)
+        if self.selector == (
+            '#trend-report-workspace:visible .option-attention-table '
+            'thead th[scope="col"]'
+        ):
+            return len(self.page.option_attention_column_headers)
         match = re.fullmatch(
             r"#trend-report-workspace:visible \.option-attention-table "
             r"tbody:nth\((\d+)\) \.option-attention-market-content span",
@@ -1073,6 +1091,21 @@ class TabbedAccountLocator:
         )
         if match:
             return len(self.page.option_attention_header_spans[int(match.group(1))])
+        match = re.fullmatch(
+            r"#trend-report-workspace:visible \.option-attention-table "
+            r"tbody:nth\((\d+)\) \.option-attention-row",
+            self.selector,
+        )
+        if match:
+            return len(self.page.option_attention_row_labels[int(match.group(1))])
+        match = re.fullmatch(
+            r"#trend-report-workspace:visible \.option-attention-table "
+            r"tbody:nth\((\d+)\) \.option-attention-row:nth\((\d+)\) td",
+            self.selector,
+        )
+        if match:
+            market_index, row_index = map(int, match.groups())
+            return len(self.page.option_attention_row_labels[market_index][row_index])
         if self.selector == "#return-to-portfolio:visible":
             return int(self.page.trend_broker is not None)
         if self.selector == "#trend-report-workspace:visible [data-close-trend-report]":
@@ -1142,6 +1175,18 @@ class TabbedAccountLocator:
         raise AssertionError(f"unknown count selector: {self.selector}")
 
     def get_attribute(self, name: str) -> str | None:
+        match = re.fullmatch(
+            r"#trend-report-workspace:visible \.option-attention-table "
+            r"tbody:nth\((\d+)\) \.option-attention-row:nth\((\d+)\) "
+            r"td:nth\((\d+)\)",
+            self.selector,
+        )
+        if match:
+            assert name == "data-label"
+            market_index, row_index, cell_index = map(int, match.groups())
+            return self.page.option_attention_row_labels[market_index][row_index][
+                cell_index
+            ]
         match = re.fullmatch(
             r"#account-tabs \[data-broker\]:nth\((\d+)\)", self.selector
         )
@@ -1248,6 +1293,11 @@ class TabbedAccountLocator:
         raise AssertionError(f"unknown inner_text selector: {self.selector}")
 
     def all_inner_texts(self) -> list[str]:
+        if self.selector == (
+            '#trend-report-workspace:visible .option-attention-table '
+            'thead th[scope="col"]'
+        ):
+            return self.page.option_attention_column_headers
         match = re.fullmatch(
             r"#trend-report-workspace:visible \.option-attention-table "
             r"tbody:nth\((\d+)\) \.option-attention-market-content span",
@@ -1342,8 +1392,19 @@ class TabbedAccountLocator:
         )
         if expression == target_expression:
             self.page.target_checks.append(self.selector)
-            return [{"height": 44, "label": self.selector}]
+            height = (
+                43
+                if (
+                    self.selector == self.page.undersized_target_selector
+                    and self.page.trend_broker == "futu"
+                )
+                else 44
+            )
+            return [{"height": height, "label": self.selector}]
         if expression == bounds_expression:
+            self.page.bounds_checks.append(self.selector)
+            if self.selector == self.page.overflow_bounds_selector:
+                return [{"x": 10, "width": 380}]
             return [{"x": 10, "width": 350}]
         raise AssertionError(f"unknown evaluate_all expression: {expression}")
 
@@ -1385,6 +1446,11 @@ class TabbedAccountPage:
             [f"{item.get('symbol')} 标的名称" for item in market.get("items", [])]
             for market in markets
         ]
+        self.option_attention_column_headers = list(OPTION_ATTENTION_COLUMN_LABELS)
+        self.option_attention_row_labels = [
+            [list(OPTION_ATTENTION_COLUMN_LABELS) for _item in market.get("items", [])]
+            for market in markets
+        ]
         self.all_rows = {"futu": 1, "tiger": 1, "phillips": 1, "eastmoney": 0}
         self.cn_rows = cn_rows or {"futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 5}
         self.market = "ALL"
@@ -1399,6 +1465,11 @@ class TabbedAccountPage:
         self.disabled_reports: set[str] = set()
         self.focus_checks: list[str] = []
         self.target_checks: list[str] = []
+        self.bounds_checks: list[str] = []
+        self.undersized_target_selector = ""
+        self.overflow_bounds_selector = ""
+        self.document_overflow_broker = ""
+        self.document_overflow_checks: list[str | None] = []
         self.workspace_view = "portfolio"
         self.research_open = False
         self.script_evaluations: list[tuple[str, object | None]] = []
@@ -1427,7 +1498,8 @@ class TabbedAccountPage:
             self.research_open = True
             return None
         assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
-        return True
+        self.document_overflow_checks.append(self.trend_broker)
+        return self.trend_broker != self.document_overflow_broker
 
     def wait_for_timeout(self, milliseconds: int) -> None:
         assert milliseconds == 500
@@ -2446,8 +2518,15 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, 'body') in selectors
         assert (viewport, 'a:visible, button:visible') in selectors
         assert (viewport, 'a[href="#account-tiger"]') not in clicks
+    assert (
+        "mobile",
+        "#trend-report-workspace:visible .option-attention-workspace, "
+        "#trend-report-workspace:visible .option-attention-table, "
+        "#trend-report-workspace:visible .option-attention-market, "
+        "#trend-report-workspace:visible .option-attention-row",
+    ) in selectors
     assert evaluated == [
-        *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 8),
+        *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 9),
     ]
     assert visual_token_evaluations == ["wide_desktop", "desktop", "mobile"]
     for viewport in ("wide_desktop", "desktop", "mobile"):
@@ -2535,6 +2614,113 @@ def test_option_attention_acceptance_checks_current_and_stale_status_text() -> N
     assert page.option_attention_symbol_cells == [
         ["VIXY 标的名称"], ["00700 标的名称"],
     ]
+    assert page.option_attention_column_headers == OPTION_ATTENTION_COLUMN_LABELS
+    assert page.option_attention_row_labels == [
+        [OPTION_ATTENTION_COLUMN_LABELS],
+        [OPTION_ATTENTION_COLUMN_LABELS],
+    ]
+
+
+def test_option_attention_acceptance_checks_valid_375px_geometry() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert (
+        "#return-to-portfolio:visible, "
+        "#trend-report-workspace:visible button:visible, "
+        "#trend-report-workspace:visible summary:visible"
+    ) in page.target_checks
+    assert (
+        "#trend-report-workspace:visible .option-attention-workspace, "
+        "#trend-report-workspace:visible .option-attention-table, "
+        "#trend-report-workspace:visible .option-attention-market, "
+        "#trend-report-workspace:visible .option-attention-row"
+    ) in page.bounds_checks
+    assert "futu" in page.document_overflow_checks
+
+
+def test_option_attention_acceptance_rejects_undersized_mobile_return() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    page.undersized_target_selector = (
+        "#return-to-portfolio:visible, "
+        "#trend-report-workspace:visible button:visible, "
+        "#trend-report-workspace:visible summary:visible"
+    )
+
+    with pytest.raises(AssertionError, match="高度不足 44px"):
+        dashboard_acceptance._check_account_holdings(page, payload)
+
+
+@pytest.mark.parametrize("overflow", ("document", "workspace"))
+def test_option_attention_acceptance_rejects_mobile_workspace_overflow(
+    overflow: str,
+) -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    if overflow == "document":
+        page.document_overflow_broker = "futu"
+    else:
+        page.overflow_bounds_selector = (
+            "#trend-report-workspace:visible .option-attention-workspace, "
+            "#trend-report-workspace:visible .option-attention-table, "
+            "#trend-report-workspace:visible .option-attention-market, "
+            "#trend-report-workspace:visible .option-attention-row"
+        )
+
+    with pytest.raises(AssertionError, match="横向|超出"):
+        dashboard_acceptance._check_account_holdings(page, payload)
+
+
+def test_option_attention_acceptance_rejects_reordered_column_headings() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.option_attention_column_headers[0:2] = reversed(
+        page.option_attention_column_headers[0:2]
+    )
+
+    with pytest.raises(AssertionError, match="期权关注.*列标题"):
+        dashboard_acceptance._check_account_holdings(page, payload)
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "omission"))
+def test_option_attention_acceptance_rejects_duplicate_or_missing_column_heading(
+    mutation: str,
+) -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    if mutation == "duplicate":
+        page.option_attention_column_headers.insert(
+            1, page.option_attention_column_headers[0]
+        )
+    else:
+        page.option_attention_column_headers.pop()
+
+    with pytest.raises(AssertionError, match="期权关注.*列标题"):
+        dashboard_acceptance._check_account_holdings(page, payload)
+
+
+@pytest.mark.parametrize("mutation", ("changed", "reordered", "omission"))
+def test_option_attention_acceptance_rejects_invalid_row_data_labels(
+    mutation: str,
+) -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    labels = page.option_attention_row_labels[0][0]
+    if mutation == "changed":
+        labels[0] = "错误标签"
+    elif mutation == "reordered":
+        labels[0:2] = reversed(labels[0:2])
+    else:
+        labels.pop()
+
+    with pytest.raises(AssertionError, match="期权关注.*列标签"):
+        dashboard_acceptance._check_account_holdings(page, payload)
 
 
 @pytest.mark.parametrize("affix", ("错误前缀：", "（错误后缀）"))
@@ -2587,6 +2773,19 @@ def test_option_attention_acceptance_checks_unavailable_without_data_date() -> N
     dashboard_acceptance._check_account_holdings(page, payload)
 
     assert "暂时不可用" in page.workspace_texts["futu"]
+
+
+def test_option_attention_acceptance_accepts_empty_unavailable_markets() -> None:
+    payload = valid_payload()
+    markets = payload["trend_reports"]["futu"]["attention_markets"]  # type: ignore[index]
+    for market in markets:
+        market.update(data_status="unavailable", items=[])
+        market.pop("data_date", None)
+    page = tabbed_account_page(payload)
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert page.option_attention_row_labels == [[], []]
 
 
 def test_option_attention_acceptance_rejects_missing_unavailable_status() -> None:

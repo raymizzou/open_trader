@@ -35,6 +35,18 @@ TREND_REPORT_DIRECTORIES = {
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }
+OPTION_ATTENTION_COLUMN_LABELS = (
+    "标的",
+    "分类",
+    "右侧状态",
+    "趋势温度",
+    "趋势节气",
+    "本地 / 全球强度",
+    "上周 / 上月",
+    "右侧天数 / 累计涨幅",
+    "危险 / 沸腾 / 开香槟",
+    "来源动作",
+)
 WARM_LEDGER_TOKENS = {
     "--bg": "#F7F5F1",
     "--surface": "#FFFEFA",
@@ -939,6 +951,14 @@ def _check_account_holdings(
             assert isinstance(markets, list) and [
                 market.get("market") for market in markets if isinstance(market, Mapping)
             ] == ["US", "HK"], "futu 期权关注市场顺序不是 US、HK"
+            column_headings = workspace.locator(
+                '.option-attention-table thead th[scope="col"]'
+            )
+            assert (
+                column_headings.count() == len(OPTION_ATTENTION_COLUMN_LABELS)
+                and tuple(column_headings.all_inner_texts())
+                == OPTION_ATTENTION_COLUMN_LABELS
+            ), "futu 期权关注列标题不匹配"
             rowgroups = workspace.locator(".option-attention-table tbody")
             assert rowgroups.count() == 2, "futu 期权关注市场分组数量不是 2"
             for index, market in enumerate(markets):
@@ -970,6 +990,16 @@ def _check_account_holdings(
                 assert all(isinstance(item, Mapping) for item in items), (
                     "futu 期权关注项目无效"
                 )
+                rows = rowgroup.locator(".option-attention-row")
+                for row_index in range(rows.count()):
+                    cells = rows.nth(row_index).locator("td")
+                    data_labels = tuple(
+                        cells.nth(cell_index).get_attribute("data-label")
+                        for cell_index in range(cells.count())
+                    )
+                    assert data_labels == OPTION_ATTENTION_COLUMN_LABELS, (
+                        f"futu 期权关注 {market_name} 第 {row_index + 1} 行列标签不匹配"
+                    )
                 expected_symbols = [_plain(item.get("symbol")) for item in items]
                 symbol_texts = rowgroup.locator(
                     '.option-attention-row td[data-label="标的"]'
@@ -981,6 +1011,32 @@ def _check_account_holdings(
                 assert actual_symbols == expected_symbols, (
                     f"futu 期权关注 {market_name} 分组标的不匹配"
                 )
+            width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+            if width <= 760:
+                _check_mobile_targets(
+                    page,
+                    "#return-to-portfolio:visible, "
+                    "#trend-report-workspace:visible button:visible, "
+                    "#trend-report-workspace:visible summary:visible",
+                )
+                assert page.evaluate(
+                    "document.documentElement.scrollWidth <= window.innerWidth"
+                ), "futu 期权关注工作区出现横向滚动"
+                boxes = page.locator(
+                    "#trend-report-workspace:visible .option-attention-workspace, "
+                    "#trend-report-workspace:visible .option-attention-table, "
+                    "#trend-report-workspace:visible .option-attention-market, "
+                    "#trend-report-workspace:visible .option-attention-row"
+                ).evaluate_all(
+                    "nodes => nodes.map(node => node.getBoundingClientRect())"
+                    ".map(r => ({x:r.x,width:r.width}))"
+                )
+                assert boxes and all(
+                    box is not None
+                    and box["x"] >= -1
+                    and box["x"] + box["width"] <= width + 1
+                    for box in boxes
+                ), "futu 期权关注工作区元素超出移动端视口"
             close.click()
             assert page.locator("#trend-report-workspace:visible").count() == 0
             assert trigger.evaluate("element => element === document.activeElement")

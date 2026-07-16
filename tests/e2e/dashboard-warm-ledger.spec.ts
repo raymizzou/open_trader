@@ -39,8 +39,9 @@ async function installLedgerFixture(page: Page) {
     fixture.trend_reports = {
       futu: {
         available: true,
+        broker: 'futu',
         broker_label: '富途',
-        market_label: '美股',
+        market_label: '美股 / 港股',
         report_date: '2026-07-16',
         data_date: '2026-07-15',
         generated_at: '2026-07-16 08:00',
@@ -49,6 +50,24 @@ async function installLedgerFixture(page: Page) {
         counts: { sell: 0, buy: 0, hold: 0, review: 0 },
         sell_actions: [], buy_actions: [], hold_actions: [], review_actions: [],
         audit: { candidates: [], excluded: {}, industry_concentration: [], data_sources: ['fixture'] },
+        attention_markets: [
+          {
+            market: 'US', market_label: '美股', data_status: 'current', data_date: '2026-07-16',
+            items: [{
+              symbol: 'VIXY', name: 'VIX Short-Term Futures ETF', category: '波动率',
+              right_side: { previous: false, current: true, changed: true },
+              temperature: { previous: '温', current: '热', changed: true },
+              phase: { previous: '小暑', current: '大暑', changed: true },
+              local_strength: '95', global_strength: '90', strength_prev_week: '91', strength_prev_month: '89',
+              days: 1, gain_since_entry: '0.02',
+              danger: { previous: false, current: false, changed: false },
+              boiling: { previous: false, current: false, changed: false },
+              champagne: { previous: false, current: false, changed: false },
+              source_broker: '老虎', source_action: 'BUY',
+            }],
+          },
+          { market: 'HK', market_label: '港股', data_status: 'stale', data_date: '2026-07-14', items: [] },
+        ],
       },
       eastmoney: {
         available: true,
@@ -242,15 +261,15 @@ test('opens every warm-ledger destination, using real UI paths where available',
 
   await page.getByRole('button', { name: '凯利实验室' }).click();
   await expectWarmSurface(page, '.kelly-lab-panel');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
   await page.getByRole('button', { name: '策略回测' }).click();
   await expectWarmSurface(page, '#standard-backtest-workspace');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
-  await page.getByRole('button', { name: '当天趋势报告' }).click();
+  await page.getByRole('button', { name: '期权关注', exact: true }).click();
   await expectWarmSurface(page, '.trend-report-workspace');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
   await page.locator('.account-holding-actions [data-detail-mode="decision"]').click();
   await expectWarmSurface(page, '.symbol-detail-panel.inline-symbol-detail');
@@ -332,19 +351,36 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
   await expect(page.locator('.kelly-lab-panel')).toHaveCSS('background-color', rgb.surface);
   await expect(page.locator('.kelly-lab-panel')).toHaveCSS('border-top-color', rgb.line);
   await expectMobileTargetsAtLeast44(page, 'body', '#return-to-portfolio:visible, .kelly-lab-panel button:visible');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
   await expect(page.getByRole('tab', { name: /老虎/ })).toHaveAttribute('aria-selected', 'true');
 
   await page.getByRole('button', { name: '策略回测' }).click();
   await expect(page.locator('#standard-backtest-workspace')).toBeVisible();
   await expectMobileTargetsAtLeast44(page, '#standard-backtest-workspace', 'button:visible, input:visible, select:visible');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
   await page.getByRole('tab', { name: /富途/ }).click();
-  await page.getByRole('button', { name: '当天趋势报告' }).click();
+  await page.getByRole('button', { name: '期权关注', exact: true }).click();
   await expect(page.locator('#trend-report-workspace')).toBeVisible();
   await expectMobileTargetsAtLeast44(page, 'body', '#return-to-portfolio:visible, #trend-report-workspace button:visible');
-  await page.getByRole('button', { name: '返回持仓' }).click();
+  await expect(page.locator('.option-attention-table thead th')).toHaveCount(10);
+  await expect(page.locator('.option-attention-table tbody')).toHaveCount(2);
+  const futuGeometry = await page.evaluate(() => {
+    const selectors = [
+      '.option-attention-workspace', '.option-attention-table',
+      '.option-attention-market', '.option-attention-row',
+    ];
+    return {
+      pageFits: document.documentElement.scrollWidth <= window.innerWidth,
+      elementsFit: selectors.flatMap((selector) => [...document.querySelectorAll(selector)])
+        .every((element) => {
+          const rect = element.getBoundingClientRect();
+          return rect.left >= -1 && rect.right <= window.innerWidth + 1;
+        }),
+    };
+  });
+  expect(futuGeometry).toEqual({ pageFits: true, elementsFit: true });
+  await page.getByRole('button', { name: '返回持仓', exact: true }).click();
 
   await page.locator('.account-holding-actions [data-detail-mode="decision"]').click();
   await expect(page.locator('.symbol-detail-panel.inline-symbol-detail')).toBeVisible();
