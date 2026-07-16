@@ -2705,7 +2705,9 @@ def test_option_attention_acceptance_rejects_duplicate_or_missing_column_heading
         dashboard_acceptance._check_account_holdings(page, payload)
 
 
-@pytest.mark.parametrize("mutation", ("changed", "reordered", "omission"))
+@pytest.mark.parametrize(
+    "mutation", ("changed", "reordered", "duplicate", "omission")
+)
 def test_option_attention_acceptance_rejects_invalid_row_data_labels(
     mutation: str,
 ) -> None:
@@ -2716,6 +2718,8 @@ def test_option_attention_acceptance_rejects_invalid_row_data_labels(
         labels[0] = "错误标签"
     elif mutation == "reordered":
         labels[0:2] = reversed(labels[0:2])
+    elif mutation == "duplicate":
+        labels.insert(1, labels[0])
     else:
         labels.pop()
 
