@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+import open_trader.tiger_long_term_backtest as backtest
 
 from open_trader.tiger_long_term_backtest import (
     TigerUsFeeModel,
@@ -17,6 +18,27 @@ from open_trader.tiger_long_term_backtest import (
     run_tiger_long_term_backtest,
 )
 from open_trader.standard_strategies import StrategyBar
+
+
+def test_public_portfolio_metrics_uses_risk_free_excess_returns() -> None:
+    metrics = backtest.portfolio_metrics(
+        [
+            {"date": "2026-07-01", "equity": "100"},
+            {"date": "2026-07-02", "equity": "101"},
+            {"date": "2026-07-03", "equity": "100"},
+        ],
+        {date(2026, 7, 1): Decimal("4")},
+        Decimal("100"),
+    )
+
+    assert set(metrics) == {
+        "total_return_pct",
+        "annualized_return_pct",
+        "max_drawdown_pct",
+        "sharpe_ratio",
+        "calmar_ratio",
+    }
+    assert metrics["sharpe_ratio"] is not None
 
 
 def test_tiger_fee_model_applies_minimums_and_sell_fees() -> None:

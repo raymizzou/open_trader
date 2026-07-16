@@ -34,6 +34,7 @@ class FakeFutuExecutionContext:
         self.host = host
         self.port = port
         self.trd_market = trd_market
+        self.place_calls: list[dict[str, object]] = []
 
     def get_acc_list(self) -> object:
         return (
@@ -52,6 +53,19 @@ class FakeFutuExecutionContext:
 
     def close(self) -> None:
         pass
+
+    def place_order(self, **kwargs: object) -> object:
+        self.place_calls.append(dict(kwargs))
+        return 0, FakeDataFrame([{"order_id": f"SIM-{len(self.place_calls)}"}])
+
+    def accinfo_query(self, **kwargs: object) -> object:
+        return 0, FakeDataFrame([{"total_assets": "100000", "cash": "90000"}])
+
+    def position_list_query(self, **kwargs: object) -> object:
+        return 0, FakeDataFrame([{"code": "SH.600001", "qty": "100"}])
+
+    def order_list_query(self, **kwargs: object) -> object:
+        return 0, FakeDataFrame([{"order_id": "SIM-1", "order_status": "FILLED_ALL"}])
 
 
 class FakeDataFrame:
@@ -300,6 +314,49 @@ def test_futu_simulate_order_execution_client_uses_requested_trd_market() -> Non
 
     assert client.context.trd_market == "US"
     assert client.account == {"acc_id": 12958916, "acc_index": 0}
+
+
+def test_futu_simulate_client_supports_market_order_and_keeps_limit_default() -> None:
+    client = FutuSimulateOrderExecutionClient(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=12958916,
+        trd_market="CN",
+        context_factory=FakeFutuExecutionContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    client.place_order(
+        {
+            "side": "buy",
+            "price": "0",
+            "qty": "100",
+            "futu_code": "SH.600001",
+            "order_type": "MARKET",
+            "remark": "trend:CN:2026-07-17:1",
+        }
+    )
+    client.place_order(
+        {
+            "side": "buy",
+            "price": "10.5",
+            "qty": "100",
+            "futu_code": "SH.600001",
+        }
+    )
+
+    assert client.context.place_calls[0]["order_type"] == "MARKET"
+    assert client.context.place_calls[0]["price"] == 0.0
+    assert client.context.place_calls[1]["order_type"] == "NORMAL"
+    assert client.context.place_calls[1]["price"] == 10.5
+
+    snapshot = client.account_snapshot()
+    assert snapshot["acc_id"] == 12958916
+    assert snapshot["net_value"] == "100000"
+    assert snapshot["positions"] == [{"code": "SH.600001", "qty": "100"}]
+    assert client.list_orders()["orders"] == [
+        {"order_id": "SIM-1", "order_status": "FILLED_ALL"}
+    ]
 
 
 def test_market_routing_order_execution_client_routes_by_request_market() -> None:

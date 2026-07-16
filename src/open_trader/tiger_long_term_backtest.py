@@ -301,7 +301,7 @@ def run_spy_buy_hold_backtest(
         })
         previous_date = bar.date
 
-    metrics = _portfolio_metrics(curve, rates, initial_cash)
+    metrics = portfolio_metrics(curve, rates, initial_cash)
     final_equity = Decimal(curve[-1]["equity"])
     final_invested_weight = quantity * evaluation[-1].close / final_equity
     metrics.update({
@@ -559,7 +559,7 @@ def _simulate_portfolio(
 
     for symbol in symbols:
         contributions[symbol] += quantities[symbol] * latest_close[symbol]
-    metrics = _portfolio_metrics(curve, rates, initial_cash)
+    metrics = portfolio_metrics(curve, rates, initial_cash)
     metrics.update({
         "orders": orders,
         "equity_curve": curve,
@@ -582,7 +582,7 @@ def _simulate_portfolio(
     return metrics
 
 
-def _portfolio_metrics(
+def portfolio_metrics(
     curve: Sequence[Mapping[str, str]],
     rates: Mapping[date, Decimal],
     initial_cash: Decimal,
@@ -661,7 +661,7 @@ def _six_month_segments(
         end = _add_months(evaluation_start, (index + 1) * 6)
         rows = [row for row in curve if start <= date.fromisoformat(row["date"]) < end]
         segment_initial = Decimal(rows[0]["equity"]) if rows else initial_cash
-        metrics = _portfolio_metrics(rows, rates, segment_initial)
+        metrics = portfolio_metrics(rows, rates, segment_initial)
         segments.append({
             "index": index + 1,
             "start": start.isoformat(),
