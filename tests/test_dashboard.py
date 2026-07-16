@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 import open_trader.dashboard as dashboard_module
-import open_trader.a_share_trend as trend_module
 
 from open_trader.advice.models import (
     PREMARKET_ACTION_FIELDNAMES,
@@ -822,6 +821,39 @@ def test_dashboard_trend_report_ranks_revisions_by_generated_instant(
     assert report["buy_actions"][0]["symbol"] == "LATER"
 
 
+def test_dashboard_trend_report_skips_future_candidate(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir.mkdir(parents=True)
+    payload = {
+        "as_of_date": "2026-07-15",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "option_attention": [],
+    }
+    for execution_date in ("2026-07-15", "2026-07-16"):
+        (reports_dir / f"{execution_date}.json").write_text(json.dumps({
+            **payload,
+            "execution_date": execution_date,
+            "generated_at": f"{execution_date}T18:00:00+08:00",
+        }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["tiger"]
+
+    assert report["available"] is True
+    assert report["report_date"] == "2026-07-15"
+    assert report["data_status"] == "current"
+
+
 def test_dashboard_trend_report_routes_unknown_actions_and_reasons_to_review(
     tmp_path: Path,
 ) -> None:
@@ -1094,6 +1126,7 @@ def test_dashboard_trend_report_rejects_malformed_nested_audit_collections(
         [{**option_attention("QQQ"), "days": {}}],
         [{**option_attention("QQQ"), "gain_since_entry": []}],
         [{**option_attention("QQQ"), "days": float("nan")}],
+        [{**option_attention("QQQ"), "gain_since_entry": float("inf")}],
         [{**option_attention("QQQ"), "danger": {"current": True}}],
         [{
             **option_attention("QQQ"),
@@ -1105,6 +1138,12 @@ def test_dashboard_trend_report_rejects_malformed_nested_audit_collections(
             **option_attention("QQQ"),
             "temperature": {
                 "previous": "温", "current": {}, "changed": True,
+            },
+        }],
+        [{
+            **option_attention("QQQ"),
+            "strength_change": {
+                "previous": float("-inf"), "current": 1, "changed": True,
             },
         }],
         [{
@@ -1152,36 +1191,28 @@ def test_dashboard_trend_report_rejects_malformed_option_attention(
     ("attention", "available"),
     [
         (MISSING_ATTENTION, True),
-        ([], True),
+        ([option_attention("600001", market="CN", source_broker="东方财富")], True),
         ([None], False),
-        ([option_attention("600001", market="CN", source_broker="东方财富")], False),
     ],
 )
-def test_dashboard_real_cn_report_only_allows_empty_option_attention(
+def test_dashboard_cn_option_attention_is_optional_but_validated_when_present(
     tmp_path: Path, attention: object, available: bool,
 ) -> None:
     config = dashboard_config(tmp_path)
     path = config.reports_dir / "trend_a_share" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
-    report = trend_module.build_report(
-        as_of_date="2026-07-15",
-        execution_date="2026-07-15",
-        generated_at="2026-07-15T18:00:00+08:00",
-        account=trend_module.AccountSnapshot(
-            source_date="2026-07-15",
-            fresh=True,
-            net_value=Decimal("100000"),
-            available_cash=Decimal("50000"),
-            positions=(),
-            exceptions=(),
-        ),
-        candidates=(),
-        holding_snapshots={},
-        bars_by_symbol={},
-        metadata={"market": "CN", "broker": "eastmoney"},
-    )
-    payload = trend_module._report_payload(report)
-    assert "option_attention" not in payload
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-15",
+        "generated_at": "2026-07-15T18:00:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+    }
     if attention is not MISSING_ATTENTION:
         payload["option_attention"] = attention
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1195,7 +1226,9 @@ def test_dashboard_real_cn_report_only_allows_empty_option_attention(
     assert report["available"] is available
     assert report["data_status"] == ("current" if available else "unavailable")
     if available:
-        assert report["option_attention"] == []
+        assert report["option_attention"] == (
+            [] if attention is MISSING_ATTENTION else attention
+        )
 
 
 def dashboard_decision_plan(run_date: str) -> dict[str, object]:
