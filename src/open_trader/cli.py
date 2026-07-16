@@ -139,6 +139,26 @@ def _trend_report_path_order(path: Path) -> tuple[str, int]:
     return match.group("date"), int(match.group("revision") or 0)
 
 
+def _trend_review_date_from_report(result: object, fallback: str) -> str:
+    path = getattr(result, "json_path", None)
+    if path is None:
+        return fallback
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    as_of_date = payload.get("as_of_date") if isinstance(payload, dict) else None
+    if not isinstance(as_of_date, str) or DATE_RE.fullmatch(as_of_date) is None:
+        raise ValueError("trend report is missing a valid as_of_date")
+    return as_of_date
+
+
+def _run_trend_review_close_best_effort(
+    config: object, market: str, trading_date: str
+) -> None:
+    try:
+        run_trend_review_close(config, market, trading_date)
+    except Exception as exc:
+        print(f"trend review close failed: {exc}", file=sys.stderr)
+
+
 def _load_trend_review_report(
     config: object,
     market: str,
@@ -1621,6 +1641,15 @@ def main(argv: list[str] | None = None) -> int:
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        if result.status in {"generated", "existing"}:
+            try:
+                review_date = _trend_review_date_from_report(result, run_date)
+            except Exception as exc:
+                print(f"trend review close failed: {exc}", file=sys.stderr)
+            else:
+                _run_trend_review_close_best_effort(
+                    config, args.market, review_date
+                )
         print(json.dumps({
             "status": result.status,
             "report_path": str(result.report_path) if result.report_path else None,
@@ -1655,8 +1684,12 @@ def main(argv: list[str] | None = None) -> int:
                     poll_seconds=args.poll_seconds,
                     reconnect_seconds=args.reconnect_seconds,
                     once=args.once,
-                    on_session_open=None,
-                    on_protection_trigger=None,
+                    on_session_open=lambda trading_date: run_trend_review_open(
+                        config, args.market, trading_date
+                    ),
+                    on_protection_trigger=lambda event: run_trend_review_stop(
+                        config, args.market, event
+                    ),
                 )
         except (FileNotFoundError, FutuQuoteError, RuntimeError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
@@ -1711,6 +1744,13 @@ def main(argv: list[str] | None = None) -> int:
         ) as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        if result.status in {"generated", "existing"}:
+            try:
+                review_date = _trend_review_date_from_report(result, run_date)
+            except Exception as exc:
+                print(f"trend review close failed: {exc}", file=sys.stderr)
+            else:
+                _run_trend_review_close_best_effort(config, "CN", review_date)
         print(
             json.dumps(
                 {
@@ -1749,8 +1789,12 @@ def main(argv: list[str] | None = None) -> int:
                     poll_seconds=args.poll_seconds,
                     reconnect_seconds=args.reconnect_seconds,
                     once=args.once,
-                    on_session_open=None,
-                    on_protection_trigger=None,
+                    on_session_open=lambda trading_date: run_trend_review_open(
+                        config, "CN", trading_date
+                    ),
+                    on_protection_trigger=lambda event: run_trend_review_stop(
+                        config, "CN", event
+                    ),
                 )
         except (FileNotFoundError, FutuQuoteError, RuntimeError, ValueError) as exc:
             print(str(exc), file=sys.stderr)

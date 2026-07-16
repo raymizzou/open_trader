@@ -298,6 +298,7 @@ def test_trend_a_share_report_main_dispatches_and_returns_status(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured: dict[str, object] = {}
+    review_calls: list[tuple[object, str, str]] = []
     config = SimpleNamespace(
         timezone="Asia/Shanghai",
         trend_animals_api_key="secret",
@@ -307,10 +308,14 @@ def test_trend_a_share_report_main_dispatches_and_returns_status(
 
     def fake_runner(**kwargs: object) -> object:
         captured.update(kwargs)
+        json_path = tmp_path / "report.json"
+        json_path.write_text(
+            json.dumps({"as_of_date": "2026-07-14"}), encoding="utf-8"
+        )
         return SimpleNamespace(
             status=status,
             report_path=tmp_path / "report.md" if status == "generated" else None,
-            json_path=tmp_path / "report.json" if status == "generated" else None,
+            json_path=json_path if status == "generated" else None,
         )
 
     monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
@@ -319,7 +324,10 @@ def test_trend_a_share_report_main_dispatches_and_returns_status(
     monkeypatch.setattr(
         cli,
         "run_trend_review_close",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("review failed")),
+        lambda *args: (
+            review_calls.append(args),
+            (_ for _ in ()).throw(RuntimeError("review failed")),
+        )[1],
     )
 
     result = cli.main([
@@ -334,7 +342,16 @@ def test_trend_a_share_report_main_dispatches_and_returns_status(
         "revision": True,
         "notifier": "notifier",
     }
-    assert json.loads(capsys.readouterr().out)["status"] == status
+    output = capsys.readouterr()
+    assert json.loads(output.out)["status"] == status
+    assert review_calls == (
+        [(config, "CN", "2026-07-14")]
+        if status in {"generated", "existing"}
+        else []
+    )
+    assert ("trend review close failed: review failed" in output.err) is bool(
+        review_calls
+    )
 
 
 def test_trend_review_loader_prefers_latest_numeric_revision(tmp_path: Path) -> None:
@@ -526,8 +543,8 @@ def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
     assert captured["poll_seconds"] == 2.5
     assert captured["reconnect_seconds"] == 30.0
     assert captured["once"] is True
-    assert captured["on_session_open"] is None
-    assert captured["on_protection_trigger"] is None
+    assert callable(captured["on_session_open"])
+    assert callable(captured["on_protection_trigger"])
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
 
 
@@ -648,6 +665,7 @@ def test_trend_market_report_dispatches_generic_runner(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured: dict[str, object] = {}
+    review_calls: list[tuple[object, str, str]] = []
     config = SimpleNamespace(
         timezone="Asia/Shanghai", trend_animals_api_key="secret",
         trend_animals_us_tm_ids=(622460,), trend_animals_hk_tm_ids=(622494,),
@@ -673,7 +691,10 @@ def test_trend_market_report_dispatches_generic_runner(
     monkeypatch.setattr(
         cli,
         "run_trend_review_close",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("review failed")),
+        lambda *args: (
+            review_calls.append(args),
+            (_ for _ in ()).throw(RuntimeError("review failed")),
+        )[1],
     )
 
     assert cli.main([
@@ -684,7 +705,10 @@ def test_trend_market_report_dispatches_generic_runner(
         "config": config, "market": "US", "run_date": "2026-07-15",
         "revision": True, "notifier": "notifier",
     }
-    assert json.loads(capsys.readouterr().out)["status"] == "generated"
+    output = capsys.readouterr()
+    assert json.loads(output.out)["status"] == "generated"
+    assert review_calls == [(config, "US", "2026-07-14")]
+    assert "trend review close failed: review failed" in output.err
 
 
 def test_watch_trend_market_uses_separate_market_paths(
@@ -736,8 +760,8 @@ def test_watch_trend_market_uses_separate_market_paths(
     assert captured["market"] == "HK"
     assert captured["quote_client"] is None
     assert callable(captured["quote_client_factory"])
-    assert captured["on_session_open"] is None
-    assert captured["on_protection_trigger"] is None
+    assert callable(captured["on_session_open"])
+    assert callable(captured["on_protection_trigger"])
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
 
 
