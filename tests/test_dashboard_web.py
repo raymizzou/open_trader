@@ -317,6 +317,74 @@ console.log(JSON.stringify({loading,error,ready}));
     assert rendered["ready"]["labelledBy"] == "account-tab-futu"
 
 
+def test_dashboard_statement_upload_controls_only_render_for_statement_brokers() -> None:
+    output = run_dashboard_js(r'''
+state.statementUpload={broker:"",busy:false,message:"",error:false};
+console.log(JSON.stringify({
+  futu: renderStatementUpload("futu"),
+  tiger: renderStatementUpload("tiger"),
+  phillips: renderStatementUpload("phillips"),
+  eastmoney: renderStatementUpload("eastmoney"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["futu"] == rendered["tiger"] == ""
+    for broker in ("phillips", "eastmoney"):
+        assert f'data-statement-upload="{broker}"' in rendered[broker]
+        assert f'data-statement-file="{broker}"' in rendered[broker]
+        assert "上传结单" in rendered[broker]
+        assert 'accept=".pdf,application/pdf"' in rendered[broker]
+
+
+def test_dashboard_statement_upload_is_right_aligned_and_desktop_only() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    actions = css.split(".account-section-actions {", 1)[1].split("}", 1)[0]
+    assert "margin-left: auto;" in actions
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+    upload = mobile.split(".statement-upload {", 1)[1].split("}", 1)[0]
+    assert "display: none;" in upload
+
+
+def test_dashboard_statement_upload_posts_pdf_and_reloads_dashboard() -> None:
+    output = run_dashboard_js(r'''
+const calls=[];
+globalThis.fetch=async (url, options) => {
+  calls.push({url, method:options.method, contentType:options.headers["Content-Type"], body:options.body.name});
+  return {ok:true,status:200,json:async()=>({status:"ok",statement_date:"2026-07-10",positions:3})};
+};
+let reloads=0;
+loadDashboard=async()=>{reloads+=1;};
+const payload=await uploadStatement("phillips", {name:"statement.pdf",size:100});
+console.log(JSON.stringify({calls,reloads,payload}));
+''')
+    result = json.loads(output)
+    assert result["calls"] == [
+        {
+            "url": "/api/statements/phillips",
+            "method": "POST",
+            "contentType": "application/pdf",
+            "body": "statement.pdf",
+        }
+    ]
+    assert result["reloads"] == 1
+    assert result["payload"]["positions"] == 3
+
+
+def test_dashboard_statement_upload_rejects_extension_and_size_before_fetch() -> None:
+    output = run_dashboard_js(r'''
+let fetches=0; globalThis.fetch=async()=>{fetches+=1;};
+const messages=[];
+for (const file of [{name:"statement.txt",size:1},{name:"statement.pdf",size:20*1024*1024+1}]) {
+  try { await uploadStatement("phillips", file); } catch (error) { messages.push(error.message); }
+}
+console.log(JSON.stringify({fetches,messages}));
+''')
+    assert json.loads(output) == {
+        "fetches": 0,
+        "messages": ["请选择 PDF 文件", "PDF 不能超过 20 MiB"],
+    }
+
+
 def test_dashboard_renders_validated_and_fallback_decision_plans() -> None:
     node = shutil.which("node")
     if node is None:
