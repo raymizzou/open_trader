@@ -625,7 +625,10 @@ def _latest_broker_details(
             if broker in found:
                 continue
             broker_positions = [
-                row for row in run_positions if _broker_key(row.get("broker", "")) == broker
+                row
+                for row in run_positions
+                if _broker_key(row.get("broker", "")) == broker
+                and not _is_closed_live_position(row, "quantity")
             ]
             broker_cash = [
                 row for row in run_cash if _broker_key(row.get("broker", "")) == broker
@@ -1090,7 +1093,17 @@ def _market_symbol_key(row: dict[str, str]) -> tuple[str, str] | None:
 
 
 def _is_dashboard_holding(row: dict[str, str]) -> bool:
-    return not _is_cash_like_row(row)
+    return not _is_cash_like_row(row) and not _is_closed_live_position(
+        row, "total_quantity"
+    )
+
+
+def _is_closed_live_position(row: dict[str, str], field: str) -> bool:
+    brokers = _broker_list(row.get("brokers", "") or row.get("broker", ""))
+    if len(brokers) != 1 or brokers[0] not in {"futu", "tiger"}:
+        return False
+    raw = row.get(field, "").strip()
+    return bool(raw) and _optional_decimal(raw) == 0
 
 
 def _is_cash_like_row(row: dict[str, str]) -> bool:
@@ -2104,7 +2117,7 @@ def _build_portfolio_fallback_summary(
             return _empty_broker_money()
         if _is_cash_like_row(row):
             cash_like_value += market_value
-        else:
+        elif _is_dashboard_holding(row):
             holding_value += market_value
             holding_count += 1
 

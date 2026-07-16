@@ -29,6 +29,19 @@ def test_preserved_cn_market_stays_cn_during_tiger_sync() -> None:
     assert tiger_account_module._market_from_text("CN") is Market.CN
 
 
+def test_tiger_live_fx_recalculation_keeps_display_weights_at_100_percent() -> None:
+    rows = [
+        base_portfolio_row(symbol=f"TIGER_{index}", market_value_hkd="1")
+        for index in range(3)
+    ]
+
+    recalculated = tiger_account_module._recalculate_combined_portfolio_rows(rows)
+
+    assert sum(
+        Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in recalculated
+    ) == Decimal("100.00")
+
+
 def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:

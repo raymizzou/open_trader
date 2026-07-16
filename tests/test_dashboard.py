@@ -67,6 +67,49 @@ CASH_FIELDNAMES = [
 MISSING_FRESH = object()
 
 
+def test_dashboard_excludes_zero_quantity_closed_positions(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    closed = {field: "" for field in PORTFOLIO_FIELDNAMES}
+    closed.update(
+        {
+            "market": "US",
+            "asset_class": "etf",
+            "symbol": "CLOSED",
+            "currency": "USD",
+            "total_quantity": "0",
+            "market_value": "0",
+            "market_value_hkd": "0",
+            "portfolio_weight_hkd": "0.00%",
+            "brokers": "futu",
+        }
+    )
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [closed])
+    write_csv(
+        config.data_dir / "runs" / "2026-07-16" / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-07-16-futu-live",
+                "broker": "futu",
+                "account_alias": "futu_main",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": "CLOSED",
+                "currency": "USD",
+                "quantity": "0",
+                "market_value": "0",
+            }
+        ],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    assert state["holdings"] == []
+    assert state["broker_positions"] == []
+    futu = next(row for row in state["broker_summaries"] if row["broker"] == "futu")
+    assert futu["holding_count"] == 0
+
+
 def test_futu_signal_detail_marks_explicit_api_unsupported_reason() -> None:
     detail = _futu_skill_signal_detail(
         {

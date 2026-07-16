@@ -12,7 +12,12 @@ from typing import Callable, Iterable
 
 from .csv_io import write_rows
 from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
-from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
+from .portfolio import (
+    PORTFOLIO_FIELDNAMES,
+    build_portfolio_rows,
+    pct,
+    recalculate_portfolio_weights,
+)
 from .models import AssetClass, CashBalance, Market, Position
 from .parsers.base import detect_asset_class
 
@@ -1843,6 +1848,8 @@ def _recalculate_combined_portfolio_rows(
             row["risk_flag"] = "overweight"
         else:
             row["risk_flag"] = "normal"
+    if not has_missing_value and total > 0:
+        recalculate_portfolio_weights(normalized_rows)
     return [
         row
         for row, _ in sorted(
