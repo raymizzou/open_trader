@@ -587,7 +587,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
 
 
 @pytest.mark.parametrize(
-    ("refresh_error", "expected_refresh_error"),
+    ("refresh_error", "expected_refresh_error", "forbidden_values"),
     [
         (
             TigerAccountError(
@@ -595,12 +595,22 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
                 error_type="account_query_failed",
             ),
             "account_query_failed",
+            ("TIGER-TOKEN", "123456789"),
+        ),
+        (
+            TigerAccountError(
+                "Tiger refresh failed token=UNKNOWN-MESSAGE-SECRET",
+                error_type="unknown_type_UNKNOWN-TYPE-SECRET",
+            ),
+            "tiger_account_error",
+            ("UNKNOWN-MESSAGE-SECRET", "unknown_type_UNKNOWN-TYPE-SECRET"),
         ),
         (
             RuntimeError(
                 "Tiger refresh failed token=TIGER-TOKEN account=123456789"
             ),
             "Tiger account refresh failed",
+            ("TIGER-TOKEN", "123456789"),
         ),
     ],
 )
@@ -608,6 +618,7 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
     tmp_path: Path,
     refresh_error: Exception,
     expected_refresh_error: str,
+    forbidden_values: tuple[str, ...],
 ) -> None:
     cfg = config(tmp_path)
     write_tiger_snapshot(
@@ -747,8 +758,8 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
             *(f"{title}\n{message}" for title, message in notifier.messages),
         )
     )
-    assert "TIGER-TOKEN" not in output
-    assert "123456789" not in output
+    for value in forbidden_values:
+        assert value not in output
 
 
 def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(

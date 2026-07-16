@@ -1029,7 +1029,11 @@ def build_report(
         for position in account.positions
     }
     excluded_signals = {
-        symbol: [_candidate_signal(item) for item in candidates if item.symbol == symbol]
+        symbol: [
+            _candidate_signal(item, market=market)
+            for item in candidates
+            if item.symbol == symbol
+        ]
         for symbol in candidate_decision.excluded
     }
     ranks = {
@@ -1038,7 +1042,7 @@ def build_report(
     }
     candidate_signals = [
         {
-            **_candidate_signal(item),
+            **_candidate_signal(item, market=market),
             "eligible": (item.tm_id, item.symbol) in ranks,
             "excluded_reasons": _candidate_reasons(
                 item, held_symbols, as_of_date, market=market
@@ -1117,8 +1121,8 @@ def _holding_signal(item: HoldingSnapshot) -> dict[str, object]:
     }
 
 
-def _candidate_signal(item: CandidateInput) -> dict[str, object]:
-    return {
+def _candidate_signal(item: CandidateInput, *, market: str) -> dict[str, object]:
+    signal = {
         "tm_id": item.tm_id,
         "symbol": item.symbol,
         "exchange": item.exchange,
@@ -1132,8 +1136,6 @@ def _candidate_signal(item: CandidateInput) -> dict[str, object]:
         "days": item.days,
         "strength": item.strength,
         "danger": item.danger,
-        "boiling": item.boiling,
-        "champagne": item.champagne,
         "filter_price": item.filter_price,
         "close": item.close,
         "atr": item.atr,
@@ -1145,6 +1147,9 @@ def _candidate_signal(item: CandidateInput) -> dict[str, object]:
         "phase": item.phase,
         **_paid_expansion_signal(item),
     }
+    if market.upper() in {"US", "HK"}:
+        signal.update(boiling=item.boiling, champagne=item.champagne)
+    return signal
 
 
 def _money(value: Decimal) -> str:
@@ -1643,7 +1648,13 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         else f"{report.execution_date} regular session"
     )
     holding_decisions = [_json_value(asdict(item)) for item in report.holdings]
-    top10_candidates = [_json_value(asdict(item)) for item in report.candidates]
+    top10_candidates = []
+    for item in report.candidates:
+        candidate = asdict(item)
+        if market == "CN":
+            candidate.pop("boiling")
+            candidate.pop("champagne")
+        top10_candidates.append(_json_value(candidate))
     formal_actions = [
         _json_value(asdict(item))
         for item in report.holdings

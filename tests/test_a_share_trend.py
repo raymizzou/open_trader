@@ -2401,7 +2401,9 @@ def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> No
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
         account=account("600009"),
-        candidates=(candidate("600001"),),
+        candidates=(
+            replace(candidate("600001"), boiling=True, champagne=False),
+        ),
         holding_snapshots={"600009": holding("600009", danger=True)},
         bars_by_symbol={"600009": None},
         api_facts=("A股数据日期：2026-07-14",),
@@ -2416,7 +2418,41 @@ def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> No
         ("SELL_ALL", "600009"),
         ("BUY", "600001"),
     ]
+    assert {"boiling", "champagne"}.isdisjoint(
+        payload["signal_snapshots"]["candidates"][0]
+    )
+    assert {"boiling", "champagne"}.isdisjoint(judgments["top10_candidates"][0])
     assert "no_action" not in payload
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_us_hk_frozen_candidates_keep_attention_risk_fields(
+    tmp_path: Path, market: str
+) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(
+            replace(
+                candidate("600001", exchange=market),
+                boiling=True,
+                champagne=False,
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": market},
+        market=market,
+    )
+
+    _, json_path = write_frozen_report(built, tmp_path / market)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert payload["signal_snapshots"]["candidates"][0]["boiling"] is True
+    assert payload["signal_snapshots"]["candidates"][0]["champagne"] is False
+    assert payload["strategy_judgments"]["top10_candidates"][0]["boiling"] is True
+    assert payload["strategy_judgments"]["top10_candidates"][0]["champagne"] is False
 
 
 def test_report_records_generation_time_and_whitelisted_signal_audit(
@@ -2427,9 +2463,7 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         execution_date="2026-07-15",
         generated_at="2026-07-14T17:00:01+08:00",
         account=account("600009"),
-        candidates=(
-            replace(candidate("600001", danger=True), boiling=True, champagne=None),
-        ),
+        candidates=(candidate("600001", danger=True),),
         holding_snapshots={"600009": replace(holding("600009"), boiling=None)},
         bars_by_symbol={"600009": bars()},
         metadata={
@@ -2478,8 +2512,6 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
     }
     excluded = payload["signal_snapshots"]["excluded"]["600001"][0]
     assert excluded["danger"] is True
-    assert excluded["boiling"] is True
-    assert excluded["champagne"] is None
     assert set(excluded) == {
         "tm_id",
         "symbol",
@@ -2494,8 +2526,6 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "days",
         "strength",
         "danger",
-        "boiling",
-        "champagne",
         "filter_price",
         "close",
         "atr",
@@ -2565,8 +2595,6 @@ def test_candidate_audit_includes_all_ranked_and_excluded_pool_facts() -> None:
         "days",
         "strength",
         "danger",
-        "boiling",
-        "champagne",
         "filter_price",
         "close",
         "atr",
