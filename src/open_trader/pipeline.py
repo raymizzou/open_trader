@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import csv
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from os import close
 from pathlib import Path
@@ -16,7 +16,12 @@ from .csv_io import write_rows
 from .fx import StaticMonthEndFxProvider
 from .models import CashBalance, ManifestRecord, Position, WarningRecord
 from .parsers.base import ParseResult, StatementParser, sha256_file
-from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, merge_eastmoney_portfolio_rows
+from .portfolio import (
+    PORTFOLIO_FIELDNAMES,
+    build_portfolio_rows,
+    merge_eastmoney_portfolio_rows,
+    replace_broker_portfolio_rows,
+)
 
 
 MANIFEST_FIELDNAMES = [
@@ -91,11 +96,67 @@ def run_import(
     update_latest: bool = True,
 ) -> ImportResult:
     validate_month(month)
+    return _run_import(
+        month=month,
+        statement_period=month,
+        run_name=month,
+        statement_paths=statement_paths,
+        parsers=parsers,
+        data_dir=data_dir,
+        latest_path=data_dir / "latest" / "portfolio.csv",
+        fx_provider=fx_provider,
+        update_latest=update_latest,
+        replace_latest_broker=None,
+    )
+
+
+def run_uploaded_statement(
+    *,
+    statement_date: str,
+    statement_path: Path,
+    parser: StatementParser,
+    data_dir: Path,
+    portfolio_path: Path,
+    fx_provider: StaticMonthEndFxProvider,
+) -> ImportResult:
+    try:
+        parsed_date = date.fromisoformat(statement_date)
+    except ValueError:
+        raise ValueError(f"invalid statement date: {statement_date}") from None
+    if parsed_date.isoformat() != statement_date:
+        raise ValueError(f"invalid statement date: {statement_date}")
+    return _run_import(
+        month=statement_date[:7],
+        statement_period=statement_date,
+        run_name=statement_date,
+        statement_paths={parser.broker: statement_path},
+        parsers=[parser],
+        data_dir=data_dir,
+        latest_path=portfolio_path,
+        fx_provider=fx_provider,
+        update_latest=True,
+        replace_latest_broker=parser.broker,
+    )
+
+
+def _run_import(
+    *,
+    month: str,
+    statement_period: str,
+    run_name: str,
+    statement_paths: Mapping[str, Path],
+    parsers: Iterable[StatementParser],
+    data_dir: Path,
+    latest_path: Path,
+    fx_provider: StaticMonthEndFxProvider,
+    update_latest: bool,
+    replace_latest_broker: str | None,
+) -> ImportResult:
     parser_list = list(parsers)
     _validate_statement_paths(statement_paths, parser_list)
 
-    run_dir = data_dir / "runs" / month
-    latest_dir = data_dir / "latest"
+    run_dir = data_dir / "runs" / run_name
+    latest_dir = latest_path.parent
 
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
@@ -105,7 +166,7 @@ def run_import(
     for parser in parser_list:
         source_path = statement_paths[parser.broker]
         parsed_at = datetime.now(UTC).isoformat()
-        parse_result = parser.parse(source_path, month)
+        parse_result = parser.parse(source_path, statement_period)
         _validate_parse_result_brokers(parser.broker, parse_result)
 
         positions.extend(parse_result.positions)
@@ -126,9 +187,13 @@ def run_import(
 
     portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
 
-    latest_path = latest_dir / "portfolio.csv"
     eastmoney_mode = {parser.broker for parser in parser_list} == {"eastmoney"}
-    if eastmoney_mode and latest_path.exists():
+    if replace_latest_broker is not None and latest_path.exists():
+        with latest_path.open(newline="", encoding="utf-8") as handle:
+            portfolio_rows = replace_broker_portfolio_rows(
+                list(csv.DictReader(handle)), portfolio_rows, replace_latest_broker
+            )
+    elif eastmoney_mode and latest_path.exists():
         with latest_path.open(newline="", encoding="utf-8") as handle:
             portfolio_rows = merge_eastmoney_portfolio_rows(
                 list(csv.DictReader(handle)), portfolio_rows
@@ -204,7 +269,7 @@ def run_import(
         latest_path=latest_path,
         positions_count=(
             sum(row["asset_class"] != "cash" for row in portfolio_rows)
-            if eastmoney_mode
+            if eastmoney_mode and replace_latest_broker is None
             else len(positions)
         ),
         cash_count=len(cash_balances),

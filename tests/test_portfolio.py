@@ -122,6 +122,41 @@ def test_merge_eastmoney_rows_rejects_missing_non_hkd_fx() -> None:
         )
 
 
+def test_replace_broker_rows_drops_old_target_and_preserves_other_brokers() -> None:
+    rows = portfolio.replace_broker_portfolio_rows(
+        [
+            portfolio_row(symbol="AAPL", brokers="futu"),
+            portfolio_row(symbol="OLD", brokers="phillips"),
+        ],
+        [portfolio_row(symbol="NEW", brokers="phillips")],
+        "phillips",
+    )
+
+    assert {(row["brokers"], row["symbol"]) for row in rows} == {
+        ("futu", "AAPL"),
+        ("phillips", "NEW"),
+    }
+    assert sum(
+        Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in rows
+    ) == Decimal("100.00")
+
+
+def test_replace_broker_rows_rejects_mixed_target_row() -> None:
+    with pytest.raises(ValueError, match="mixes phillips"):
+        portfolio.replace_broker_portfolio_rows(
+            [portfolio_row(brokers="futu;phillips")], [], "phillips"
+        )
+
+
+def test_replace_broker_rows_rejects_wrong_new_broker() -> None:
+    with pytest.raises(ValueError, match="invalid brokers"):
+        portfolio.replace_broker_portfolio_rows(
+            [portfolio_row(brokers="futu")],
+            [portfolio_row(brokers="eastmoney")],
+            "phillips",
+        )
+
+
 def position(
     broker: str,
     symbol: str,

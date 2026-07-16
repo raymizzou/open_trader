@@ -182,6 +182,66 @@ def test_run_import_can_leave_latest_untouched(tmp_path: Path) -> None:
     assert latest.read_text(encoding="utf-8") == "sentinel\n"
 
 
+def test_run_uploaded_statement_uses_full_date_and_replaces_only_target_broker(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    portfolio_path = tmp_path / "custom" / "portfolio.csv"
+    portfolio_path.parent.mkdir(parents=True)
+    existing_rows = []
+    for symbol, broker in (("AAPL", "futu"), ("OLD", "phillips")):
+        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
+        row.update(
+            {
+                "sort_group": "2",
+                "market": "US",
+                "asset_class": "stock",
+                "symbol": symbol,
+                "currency": "USD",
+                "market_value": "100",
+                "cost_value": "80",
+                "fx_to_hkd": "7.8",
+                "brokers": broker,
+                "risk_flag": "normal",
+            }
+        )
+        existing_rows.append(row)
+    with portfolio_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(existing_rows)
+
+    result = pipeline.run_uploaded_statement(
+        statement_date="2026-07-10",
+        statement_path=source,
+        parser=FakeParser(broker="phillips"),
+        data_dir=tmp_path / "data",
+        portfolio_path=portfolio_path,
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-07", {"USD": Decimal("7.8")}, fx_date="2026-07-10"
+        ),
+    )
+
+    assert result.run_dir == tmp_path / "data" / "runs" / "2026-07-10"
+    assert result.latest_path == portfolio_path
+    assert result.positions_count == 1
+    rows = list(csv.DictReader(portfolio_path.open(encoding="utf-8")))
+    assert {(row["brokers"], row["symbol"]) for row in rows} == {
+        ("futu", "AAPL"),
+        ("phillips", "NVDA"),
+        ("phillips", "USD_CASH"),
+    }
+    detail_rows = list(
+        csv.DictReader(
+            (result.run_dir / "extracted_positions.csv").open(encoding="utf-8")
+        )
+    )
+    assert {row["statement_id"] for row in detail_rows} == {
+        "2026-07-10-phillips"
+    }
+
+
 def test_eastmoney_import_counts_all_combined_non_cash_holdings(tmp_path: Path) -> None:
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
