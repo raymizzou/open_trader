@@ -2617,7 +2617,11 @@ class E {
   addEventListener(name,listener){this.listeners[name]=listener;}
   click(target=this){return this.listeners.click&&this.listeners.click({target,preventDefault(){}});}
   focus(){document.activeElement=this;}
-  closest(selector){if(selector==="[data-trend-report]"&&Object.hasOwn(this.dataset,"trendReport"))return this;return null;}
+  closest(selector){
+    if(selector==="[data-trend-report]"&&Object.hasOwn(this.dataset,"trendReport"))return this;
+    if(selector==="[data-close-trend-report]"&&Object.hasOwn(this.dataset,"closeTrendReport"))return this;
+    return null;
+  }
 }
 const nodes={};
 document.getElementById=(id)=>nodes[id]||(nodes[id]=new E());
@@ -2660,7 +2664,8 @@ if(!workspace.includes("账户数据非实时，执行前核对现金与持仓")
 if(!workspace.includes('<details class="trend-audit"><summary>审计详情</summary>')||workspace.includes('<details class="trend-audit" open'))throw new Error(workspace);
 for(const text of ["确认全部卖出动作","按顺序考虑允许买入项","盘中观察活动保护线","完成人工复核"]){if(!workspace.includes(text))throw new Error(workspace);}
 
-elements["return-to-portfolio"].click();
+const close=new E();close.dataset.closeTrendReport="";
+elements["trend-report-workspace"].click(close);
 if(elements["trend-report-workspace"].hidden!==true||!elements["trend-report-workspace"].classList.contains("hidden")||elements["workspace-grid"].classList.contains("hidden")||state.selectedTrendBroker!=="")throw new Error("close state");
 if(document.activeElement!==open)throw new Error("trigger focus");
 

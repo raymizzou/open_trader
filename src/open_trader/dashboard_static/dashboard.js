@@ -291,6 +291,9 @@ function bindEvents() {
   elements["symbol-detail-panel"].addEventListener("click", handleSymbolDetailClick);
   elements["open-kelly-lab"].addEventListener("click", () => setWorkspaceView("kelly_lab"));
   elements["return-to-portfolio"].addEventListener("click", returnToPortfolio);
+  elements["trend-report-workspace"].addEventListener("click", (event) => {
+    if (event.target.closest("[data-close-trend-report]")) returnToPortfolio();
+  });
   elements["open-standard-backtest"].addEventListener("click", openStandardBacktest);
   elements["backtest-symbol-source"].addEventListener("click", handleBacktestChoice);
   elements["backtest-strategy-cards"].addEventListener("click", handleBacktestChoice);
