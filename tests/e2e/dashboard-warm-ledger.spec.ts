@@ -49,6 +49,33 @@ async function installLedgerFixture(page: Page) {
         sell_actions: [], buy_actions: [], hold_actions: [], review_actions: [],
         audit: { candidates: [], excluded: {}, industry_concentration: [], data_sources: ['fixture'] },
       },
+      eastmoney: {
+        available: true,
+        broker_label: '东方财富',
+        market: 'CN',
+        market_label: 'A股',
+        report_date: '2026-07-16',
+        data_date: '2026-07-15',
+        generated_at: '2026-07-16T11:07:21+08:00',
+        account_status: '账户数据非实时，执行前核对现金与持仓',
+        buy_window: '09:30–10:00',
+        counts: { sell: 0, buy: 1, hold: 0, review: 0 },
+        sell_actions: [],
+        review_actions: [],
+        hold_actions: [],
+        buy_actions: [{
+          symbol: '600519', name: '贵州茅台', filter_price: '1501.00',
+          close: '1500.00', temperature_prev: '温', temperature_curr: '热',
+          phase: '小暑', strength: '97.7', industry: '白酒',
+          industry_temperature: '热', market_cap: '19000', amount: '35',
+          target_weight: '0.04', target_amount: '40000',
+          estimated_shares: '26', estimated_initial_line: '1425.00',
+        }],
+        audit: {
+          candidates: [], excluded: {}, industry_concentration: [],
+          data_sources: ['fixture'],
+        },
+      },
     };
     fixture.holdings = [
       { market: 'US', symbol: 'AAPL', name: 'Apple', currency: 'USD', total_quantity: '10000', avg_cost_price: '180.00', market_value_hkd: '16380000.00', unrealized_pnl_pct: '16.67%', brokers: 'futu', broker_details: [{ broker: 'futu', market: 'US', symbol: 'AAPL', name: 'Apple', quantity: '10000', cost_value: '1800000.00', avg_cost_price: '180.00', market_value_hkd: '16380000.00', unrealized_pnl: '300000.00', unrealized_pnl_pct: '16.67%' }] },
@@ -298,5 +325,53 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
   });
   await expectMobileTargetsAtLeast44(page, '.symbol-detail-panel.inline-symbol-detail', '.decision-tab:visible, [data-back-to-holdings]:visible, .language-toggle button:visible');
   await page.getByRole('button', { name: '收起' }).click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('aligns the A-share report with the 1600px shell and scrolls only the buy table', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await installLedgerFixture(page);
+  await page.goto('/');
+  await page.getByRole('tab', { name: /东方财富/ }).click();
+  await page.getByRole('button', { name: '当天趋势报告' }).click();
+
+  const geometry = await page.evaluate(() => {
+    const shell = document.querySelector('.dashboard-shell')!.getBoundingClientRect();
+    const header = document.querySelector('.dashboard-header')!.getBoundingClientRect();
+    const report = document.querySelector('#trend-report-workspace')!.getBoundingClientRect();
+    const stage = document.querySelector('.cn-trend-buy')!;
+    const stageStyle = getComputedStyle(stage);
+    return {
+      shellWidth: shell.width,
+      headerLeft: header.left,
+      headerRight: header.right,
+      reportLeft: report.left,
+      reportRight: report.right,
+      pageFits: document.documentElement.scrollWidth <= window.innerWidth,
+      stageClientWidth: stage.clientWidth,
+      stageScrollWidth: stage.scrollWidth,
+      overflowX: stageStyle.overflowX,
+    };
+  });
+  expect(geometry.shellWidth).toBeCloseTo(1600, 0);
+  expect(geometry.reportLeft).toBeCloseTo(geometry.headerLeft, 0);
+  expect(geometry.reportRight).toBeCloseTo(geometry.headerRight, 0);
+  expect(geometry.pageFits).toBe(true);
+  expect(geometry.overflowX).toBe('auto');
+  expect(geometry.stageScrollWidth).toBeGreaterThan(geometry.stageClientWidth);
+});
+
+test('keeps the A-share report card-based with no page overflow on mobile', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 844 });
+  await installLedgerFixture(page);
+  await page.goto('/');
+  await page.getByRole('tab', { name: /东方财富/ }).click();
+  await page.getByRole('button', { name: '当天趋势报告' }).click();
+
+  await expect(page.locator('.cn-trend-buy')).toHaveCSS('overflow-x', 'hidden');
+  for (const head of await page.locator('.cn-trend-table thead').all()) {
+    await expect(head).toBeHidden();
+  }
+  await expect(page.locator('.cn-trend-buy .cn-trend-card')).toHaveCSS('display', 'grid');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });

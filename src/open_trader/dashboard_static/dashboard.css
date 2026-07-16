@@ -1463,7 +1463,7 @@ table {
   border-radius: 8px;
   box-shadow: var(--shadow);
   margin: 0 auto;
-  max-width: 1180px;
+  max-width: none;
   padding: 22px;
   width: 100%;
 }
@@ -1645,6 +1645,18 @@ table {
 
 .cn-trend-buy {
   border-left-color: var(--ok);
+  overflow-x: auto;
+}
+
+.cn-trend-buy .cn-trend-table {
+  min-width: 1600px;
+  table-layout: auto;
+}
+
+.cn-trend-buy .cn-trend-table th,
+.cn-trend-buy .cn-trend-table td {
+  overflow-wrap: normal;
+  white-space: nowrap;
 }
 
 .cn-trend-table {
@@ -3953,6 +3965,20 @@ table {
 
   .cn-trend-stage {
     padding: 12px;
+  }
+
+  .cn-trend-buy {
+    overflow-x: hidden;
+  }
+
+  .cn-trend-buy .cn-trend-table {
+    min-width: 0;
+  }
+
+  .cn-trend-buy .cn-trend-table th,
+  .cn-trend-buy .cn-trend-table td {
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
 
   .cn-trend-table {

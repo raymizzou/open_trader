@@ -123,6 +123,15 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     assert ".backtest-form select," in mobile
     assert ".decision-tab," in mobile
     assert ".language-toggle button" in mobile
+    assert ".trend-report-workspace" in css
+    report_css = css.split(".trend-report-workspace {", 1)[1].split("}", 1)[0]
+    assert "max-width: none;" in report_css
+    buy_css = css.split(".cn-trend-buy {", 1)[1].split("}", 1)[0]
+    assert "overflow-x: auto;" in buy_css
+    assert ".cn-trend-buy .cn-trend-table" in css
+    assert "min-width: 1600px;" in css
+    assert ".cn-trend-buy {\n    overflow-x: hidden;\n  }" in mobile
+    assert "min-width: 0;" in mobile
 
 
 def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
@@ -2858,7 +2867,7 @@ def test_dashboard_trend_report_mobile_layout_css() -> None:
     assert ".trend-checklist { position: static; order: 2; }" in mobile
     assert ".trend-report-entry button,\n  .trend-report-header button { min-height: 44px; }" in mobile
     assert ".cn-trend-table {" in css
-    table_css = css.split(".cn-trend-table {", 1)[1].split("}", 1)[0]
+    table_css = css.split("\n.cn-trend-table {", 1)[1].split("}", 1)[0]
     assert "table-layout: fixed;" in table_css
     assert "width: 100%;" in table_css
     assert "min-width:" not in table_css
