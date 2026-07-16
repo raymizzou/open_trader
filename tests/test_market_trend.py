@@ -374,7 +374,10 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
             return [
-                {"field": field, "priceCost": "0"}
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
                 for field in UNIFIED_TREND_FIELDS
             ]
 
@@ -481,6 +484,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert payload["account"]["fresh"] is False
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert payload["estimated_api_cost"] == "0.142"
     assert payload["signal_snapshots"]["holdings"]["00700"] | {
         "gain_since_entry": "0.048",
         "phase_prev": "谷雨",
@@ -532,7 +536,10 @@ def test_us_report_api_fact_uses_unified_trend_fields(tmp_path: Path) -> None:
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
             return [
-                {"field": field, "priceCost": "0"}
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
                 for field in UNIFIED_TREND_FIELDS
             ]
 
@@ -586,6 +593,86 @@ def test_us_report_api_fact_uses_unified_trend_fields(tmp_path: Path) -> None:
         f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=1 "
         "cache=client-managed"
     ) in payload["api_facts"]
+    assert payload["estimated_api_cost"] == "0.071"
+
+
+def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    write_details(
+        cfg.data_dir,
+        "2026-07-15",
+        positions=[{
+            "statement_id": "2026-07-15-futu-live", "broker": "futu",
+            "market": "US", "asset_class": "stock", "symbol": "AAPL",
+            "name": "Apple", "currency": "USD", "quantity": "1",
+            "cost_price": "200", "market_value": "210",
+        }],
+        cash=[{
+            "statement_id": "2026-07-15-futu-live", "broker": "futu",
+            "currency": "USD", "cash_balance": "1000", "available_balance": "1000",
+        }],
+    )
+    snapshot_calls: list[object] = []
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [{"asset": "美股", "asOfDate": "2026-07-14"}]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            return [{"tmId": 1, "tickerSymbol": "VIXY.US", "asOfDate": expected_date}]
+
+        def search_exact_symbol(self, symbol: str) -> int:
+            return 2
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.072" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            snapshot_calls.append(kwargs)
+            return []
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-14", "2026-07-15"]
+
+        def close(self) -> None:
+            pass
+
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        now_fn=lambda: datetime(2026, 7, 15, 12, tzinfo=SHANGHAI),
+        sleep_fn=lambda seconds: None,
+        api_factory=Api,
+        quote_factory=Quote,
+        account_refresher=lambda *args: None,
+    )
+
+    assert result.status == "failed"
+    assert snapshot_calls == []
 
 
 def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) -> None:

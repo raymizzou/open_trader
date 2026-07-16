@@ -2596,6 +2596,7 @@ class ReadyApi:
         snapshot_date: str = "2026-07-14",
         holding_error: Exception | None = None,
         invalid_billing: bool = False,
+        catalog_unit_cost: str = "0.071",
         snapshot_ids: list[object] | None = None,
         missing_industry_ids: set[int] | None = None,
         industry_error: Exception | None = None,
@@ -2607,6 +2608,7 @@ class ReadyApi:
         self.snapshot_date = snapshot_date
         self.holding_error = holding_error
         self.invalid_billing = invalid_billing
+        self.catalog_unit_cost = catalog_unit_cost
         self.snapshot_ids = snapshot_ids
         self.missing_industry_ids = missing_industry_ids or set()
         self.industry_error = industry_error
@@ -2641,7 +2643,11 @@ class ReadyApi:
         return [
             {
                 "columnName": field,
-                "priceCost": "bad" if self.invalid_billing else "0.01",
+                "priceCost": (
+                    "bad"
+                    if self.invalid_billing
+                    else self.catalog_unit_cost if field == "tickerName" else "0"
+                ),
             }
             for field in UNIFIED_TREND_FIELDS
         ]
@@ -2717,6 +2723,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
         f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
         "cache=client-managed"
     ) in payload["api_facts"]
+    assert payload["estimated_api_cost"] == "0.142"
 
 
 def test_missing_industry_row_excludes_only_affected_candidate(
@@ -4032,6 +4039,25 @@ def test_report_runner_rejects_invalid_live_billing_price(tmp_path: Path) -> Non
     )
     assert result.status == "failed"
     assert not list((tmp_path / "reports").rglob("*.json"))
+
+
+def test_report_runner_rejects_catalog_cost_drift_before_paid_snapshots(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        api_factory=lambda **kwargs: ReadyApi(
+            calls, catalog_unit_cost="0.072"
+        ),
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        notifier=RecordingMacOS(),
+    )
+
+    assert result.status == "failed"
+    assert "api.snapshots" not in calls
 
 
 def test_report_runner_does_not_invent_zero_cost_when_balance_increases(

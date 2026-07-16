@@ -20,7 +20,6 @@ from .a_share_trend import (
     UNIFIED_TREND_FIELDS,
     _balance,
     _billing_field,
-    _billing_price,
     _component_api_facts,
     _final_pair_matches,
     _holding_snapshot,
@@ -31,6 +30,7 @@ from .a_share_trend import (
     _report_payload,
     _row_tm_id,
     _transition_delivery_receipt,
+    _unified_trend_unit_cost,
     _write_delivery_receipt,
     _freeze_receipt_report,
     build_report,
@@ -518,6 +518,7 @@ def _attempt_market_report(
                 "getSnapshotColumnBilling missing requested field(s): "
                 + ", ".join(missing)
             )
+        unified_unit_cost = _unified_trend_unit_cost(billing)
         snapshot_rows = (
             api.get_snapshots(
                 tm_ids=requested_ids,
@@ -586,10 +587,7 @@ def _attempt_market_report(
             lot_sizes = {
                 wire.split(".", 1)[1]: size for wire, size in wire_lots.items()
             }
-        estimated_cost = sum(
-            (_billing_price(billing[field]) for field in UNIFIED_TREND_FIELDS),
-            Decimal("0"),
-        ) * len(requested_ids)
+        estimated_cost = unified_unit_cost * len(requested_ids)
         actual_cost = balance_before - balance_after
         report = build_report(
             as_of_date=as_of_date,

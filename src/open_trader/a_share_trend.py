@@ -50,6 +50,7 @@ UNIFIED_TREND_FIELDS = (
     "stopwinFlagByDangerSignal", "stopwinFlagByBoilingTemperature",
     "stopwinFlagByPopChampagne", "tickerLabels",
 )
+UNIFIED_TREND_UNIT_COST = Decimal("0.071")
 CANDIDATE_FIELDS = UNIFIED_TREND_FIELDS
 HOLDING_FIELDS = UNIFIED_TREND_FIELDS
 A_SHARE_SNAPSHOT_FIELDS = UNIFIED_TREND_FIELDS
@@ -2232,6 +2233,21 @@ def _billing_price(row: Mapping[str, object]) -> Decimal:
     raise TrendAnimalsError("snapshot billing returned no price")
 
 
+def _unified_trend_unit_cost(
+    billing: Mapping[str, Mapping[str, object]],
+) -> Decimal:
+    cost = sum(
+        (_billing_price(billing[field]) for field in UNIFIED_TREND_FIELDS),
+        Decimal("0"),
+    )
+    if cost != UNIFIED_TREND_UNIT_COST:
+        raise TrendAnimalsError(
+            "unified Trend Animals catalog cost must be "
+            f"{UNIFIED_TREND_UNIT_COST}, got {cost}"
+        )
+    return cost
+
+
 def _is_systemic_futu_error(exc: FutuQuoteError) -> bool:
     return exc.error_type in {
         "opend_unreachable",
@@ -2374,6 +2390,7 @@ def _attempt_report(
                 "getSnapshotColumnBilling missing requested field(s): "
                 + ", ".join(missing_billing)
             )
+        unified_unit_cost = _unified_trend_unit_cost(billing)
         snapshot_rows = (
             api.get_snapshots(
                 tm_ids=requested_ids,
@@ -2488,9 +2505,7 @@ def _attempt_report(
                 except ValueError:
                     holding_snapshots[symbol] = None
 
-        estimated_cost = sum(
-            (_billing_price(billing[field]) for field in fields), Decimal("0")
-        ) * len(requested_ids) + sum(
+        estimated_cost = unified_unit_cost * len(requested_ids) + sum(
             (
                 _billing_price(billing[field])
                 for field in A_SHARE_INDUSTRY_FIELDS
