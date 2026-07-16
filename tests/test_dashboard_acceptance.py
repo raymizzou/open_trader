@@ -1470,7 +1470,7 @@ class TabbedAccountPage:
             [list(OPTION_ATTENTION_COLUMN_LABELS) for _item in market.get("items", [])]
             for market in markets
         ]
-        self.option_attention_grid_template_columns: list[str] | None = None
+        self.option_attention_column_counts: list[int] | None = None
         self.option_attention_grid_checks: list[str | None] = []
         self.all_rows = {"futu": 1, "tiger": 1, "phillips": 1, "eastmoney": 0}
         self.cn_rows = cn_rows or {"futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 5}
@@ -1520,18 +1520,15 @@ class TabbedAccountPage:
             return None
         if "gridTemplateColumns" in expression:
             self.option_attention_grid_checks.append(self.trend_broker)
-            styles = self.option_attention_grid_template_columns
-            if styles is None:
+            counts = self.option_attention_column_counts
+            if counts is None:
                 column_count = 1 if self.viewport_size["width"] <= 460 else 2
-                styles = [
-                    " ".join(["350px"] * column_count)
+                counts = [
+                    column_count
                     for rows in self.option_attention_row_labels
                     for _row in rows
                 ]
-            return [
-                sum(float(column.removesuffix("px")) > 0 for column in style.split())
-                for style in styles
-            ]
+            return counts
         assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
         self.document_overflow_checks.append(self.trend_broker)
         return self.trend_broker != self.document_overflow_broker
@@ -2691,20 +2688,20 @@ def test_option_attention_acceptance_checks_valid_responsive_geometry(
 
 
 @pytest.mark.parametrize(
-    ("width", "grid_template_columns"),
+    ("width", "column_counts"),
     (
-        (760, ["350px 350px", "350px"]),
-        (375, ["350px", "175px 175px"]),
+        (760, [2, 1]),
+        (375, [1, 2]),
     ),
 )
 def test_option_attention_acceptance_rejects_wrong_responsive_column_count(
     width: int,
-    grid_template_columns: list[str],
+    column_counts: list[int],
 ) -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
     page.viewport_size = {"width": width, "height": 844}
-    page.option_attention_grid_template_columns = grid_template_columns
+    page.option_attention_column_counts = column_counts
 
     with pytest.raises(AssertionError, match="期权关注.*列"):
         dashboard_acceptance._check_account_holdings(page, payload)

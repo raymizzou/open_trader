@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from open_trader import market_trend
-from open_trader.a_share_trend import AShareTrendRunResult
+from open_trader.a_share_trend import (
+    AShareTrendRunResult,
+    CandidateInput,
+    build_report,
+)
 from open_trader.daily_premarket import DailyPremarketConfig
 from open_trader.market_trend import (
     MARKET_NOTIFICATION_LABELS,
@@ -104,7 +108,7 @@ def write_tiger_snapshot(
     )
 
 
-def test_load_tiger_account_uses_hkd_nav_cash_and_managed_positions(
+def test_load_tiger_account_first_run_loads_all_eligible_us_stock_etf_positions(
     tmp_path: Path,
 ) -> None:
     write_tiger_snapshot(
@@ -124,36 +128,156 @@ def test_load_tiger_account_uses_hkd_nav_cash_and_managed_positions(
                 "available_balance": "25000",
             },
         ],
-        position_records=[{
-            "market": "US", "sec_type": "STK", "symbol": "VIXY",
-            "name": "VIX Short ETF", "currency": "USD", "position_qty": "10",
-            "average_cost": "40", "market_value": "1000",
-        }, {
-            "market": "US", "sec_type": "STK", "symbol": "AAPL",
-            "name": "Apple", "currency": "USD", "position_qty": "2",
-            "average_cost": "200", "market_value": "420",
-        }],
+        position_records=[
+            {
+                "market": "US", "sec_type": "STK", "symbol": "AAPL",
+                "name": "Apple", "currency": "USD", "position_qty": "2",
+                "average_cost": "200", "market_value": "420",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "QQQ",
+                "name": "Invesco QQQ ETF", "currency": "USD", "position_qty": "3",
+                "average_cost": "500", "market_value": "1600",
+            },
+            {
+                "market": "HK", "sec_type": "STK", "symbol": "00700",
+                "name": "Tencent", "currency": "HKD", "position_qty": "100",
+                "average_cost": "400", "market_value": "50000",
+            },
+            {
+                "market": "US", "sec_type": "OPT", "symbol": "AAPL 260717C00200000",
+                "name": "Apple Call", "currency": "USD", "position_qty": "1",
+                "average_cost": "10", "market_value": "20",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "ZERO",
+                "name": "Zero", "currency": "USD", "position_qty": "0",
+                "average_cost": "1", "market_value": "0",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "CALL",
+                "name": "Synthetic Call Option", "currency": "USD",
+                "position_qty": "1", "average_cost": "1", "market_value": "1",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "BOND",
+                "name": "Treasury Bond", "asset_class": "bond", "currency": "USD",
+                "position_qty": "1", "average_cost": "1", "market_value": "1",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "MMF",
+                "name": "USD Money Market Fund", "currency": "USD",
+                "position_qty": "1", "average_cost": "1", "market_value": "1",
+            },
+        ],
     )
 
     account = market_trend.load_trend_account(
         data_dir=tmp_path / "data",
         market="US",
         expected_date="2026-07-15",
-        managed_symbols={"VIXY"},
+        managed_symbols=set(),
     )
 
     assert account.source_date == "2026-07-15"
     assert account.fresh is True
     assert account.net_value == Decimal("785000")
     assert account.available_cash == Decimal("98500")
-    assert [item.symbol for item in account.positions] == ["VIXY"]
-    assert account.positions[0].market_value == Decimal("7850")
+    assert [(item.symbol, item.asset_class) for item in account.positions] == [
+        ("AAPL", "stock"),
+        ("QQQ", "etf"),
+    ]
+    assert account.positions[0].market_value == Decimal("3297.00")
     assert market_trend.load_trend_account(
         data_dir=tmp_path / "data",
         market="US",
         expected_date="2026-07-16",
-        managed_symbols={"VIXY"},
+        managed_symbols=set(),
     ).fresh is False
+
+
+def test_first_run_tiger_holdings_fill_position_cap_and_enter_report_decisions(
+    tmp_path: Path,
+) -> None:
+    symbols = [
+        "AAPL", "AMZN", "AVGO", "COST", "GOOGL",
+        "META", "MSFT", "NFLX", "NVDA", "TSLA",
+    ]
+    write_tiger_snapshot(
+        tmp_path / "data",
+        "2026-07-15",
+        cash_records=[
+            {
+                "record_type": "account_total", "currency": "USD",
+                "account_total": "100000",
+            },
+            {
+                "currency": "USD", "cash_balance": "10000",
+                "available_balance": "10000",
+            },
+        ],
+        position_records=[
+            {
+                "market": "US", "sec_type": "STK", "symbol": symbol,
+                "name": symbol, "currency": "USD", "position_qty": "1",
+                "average_cost": "100", "market_value": "100",
+            }
+            for symbol in symbols
+        ],
+    )
+    account = market_trend.load_trend_account(
+        data_dir=tmp_path / "data",
+        market="US",
+        expected_date="2026-07-15",
+        managed_symbols=set(),
+    )
+    candidate = CandidateInput(
+        tm_id=1,
+        symbol="QQQ",
+        exchange="US",
+        name="Invesco QQQ ETF",
+        asset="美股",
+        industry="ETF",
+        as_of_date="2026-07-14",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=Decimal("100"),
+        atr=Decimal("5"),
+    )
+    end = datetime(2026, 7, 14)
+    bars = [
+        DailyKlineBar(
+            date=(end - timedelta(days=14 - index)).date().isoformat(),
+            open=100,
+            high=101,
+            low=99,
+            close=100,
+            volume=100,
+        )
+        for index in range(15)
+    ]
+
+    report = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account,
+        candidates=[candidate],
+        holding_snapshots={symbol: None for symbol in symbols},
+        bars_by_symbol={symbol: bars for symbol in symbols},
+        market="US",
+        price_fx_to_account_currency=Decimal("7.85"),
+    )
+
+    assert len(account.positions) == 10
+    assert [item.symbol for item in report.candidates] == ["QQQ"]
+    assert report.buy_actions == ()
+    assert [item.symbol for item in report.holdings] == symbols
+    assert {item.action for item in report.holdings} == {"MANUAL_REVIEW"}
+    assert sorted(report.protection_state["positions"]) == symbols
 
 
 def test_load_tiger_account_uses_latest_valid_snapshot_and_clamps_cash(

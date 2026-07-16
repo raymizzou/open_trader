@@ -328,7 +328,6 @@ def _load_tiger_snapshot(
         Decimal("0"),
     )
 
-    normalized_managed = {_normalized_symbol("US", symbol) for symbol in managed_symbols}
     exceptions: list[str] = []
     positions: list[AccountPosition] = []
     for row in position_rows:
@@ -340,8 +339,6 @@ def _load_tiger_snapshot(
         if quantity <= 0:
             continue
         symbol = _normalized_symbol("US", str(row.get("symbol") or ""))
-        if symbol not in normalized_managed:
-            continue
         name = str(row.get("name") or "").strip() or symbol
         asset_class = str(row.get("asset_class") or "").strip().lower()
         if not asset_class:
