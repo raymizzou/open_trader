@@ -12,7 +12,12 @@ from typing import Callable, Iterable
 
 from .csv_io import write_rows
 from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
-from .portfolio import PORTFOLIO_FIELDNAMES, build_portfolio_rows, pct
+from .portfolio import (
+    PORTFOLIO_FIELDNAMES,
+    build_portfolio_rows,
+    pct,
+    recalculate_portfolio_weights,
+)
 from .models import AssetClass, CashBalance, Market, Position
 from .parsers.base import detect_asset_class
 
@@ -30,6 +35,7 @@ POSITION_DETAIL_FIELDNAMES = [
     "cost_price",
     "last_price",
     "market_value",
+    "fx_to_hkd",
     "cost_value",
     "unrealized_pnl",
     "confidence",
@@ -41,6 +47,7 @@ CASH_DETAIL_FIELDNAMES = [
     "account_alias",
     "currency",
     "cash_balance",
+    "fx_to_hkd",
     "available_balance",
     "confidence",
     "notes",
@@ -130,13 +137,14 @@ def sync_tiger_portfolio(
         snapshot,
         run_date=run_date,
     )
+    tiger_fx_to_hkd = _snapshot_fx_to_hkd(snapshot)
     positions = [
         *positions,
         *_unmapped_total_asset_positions(
             snapshot=snapshot,
             positions=positions,
             cash_balances=cash_balances,
-            fx_provider=fx_provider,
+            fx_to_hkd=tiger_fx_to_hkd,
             run_date=run_date,
         ),
     ]
@@ -177,6 +185,11 @@ def sync_tiger_portfolio(
         )
         if preserved_has_invalid_market_value:
             _mark_all_rows_data_check(merged_rows)
+    merged_rows = _apply_tiger_live_fx(
+        merged_rows,
+        tiger_fx_to_hkd,
+        run_date,
+    )
 
     run_dir = data_dir / "runs" / run_date
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -200,14 +213,27 @@ def sync_tiger_portfolio(
             extracted_positions_path,
             POSITION_DETAIL_FIELDNAMES,
             (
-                _position_to_detail_row(position)
+                _position_to_detail_row(
+                    position,
+                    fx_to_hkd=tiger_fx_to_hkd.get(
+                        (position.account_alias, position.currency.upper())
+                    ),
+                )
                 for position in [*preserved_positions, *positions]
             ),
         )
         write_rows(
             extracted_cash_path,
             CASH_DETAIL_FIELDNAMES,
-            (_cash_to_detail_row(cash) for cash in [*preserved_cash, *cash_balances]),
+            (
+                _cash_to_detail_row(
+                    cash,
+                    fx_to_hkd=tiger_fx_to_hkd.get(
+                        (cash.account_alias, cash.currency.upper())
+                    ),
+                )
+                for cash in [*preserved_cash, *cash_balances]
+            ),
         )
     _write_portfolio_rows_atomic(merged_portfolio_path, merged_rows)
     _write_text_file_atomic(
@@ -607,7 +633,14 @@ class TigerAccountClient:
 
     def _fetch_position_records(self, account: TigerAccount) -> list[dict[str, object]]:
         try:
-            positions = list(self.trade_client.get_positions(account=account.account))
+            positions = [
+                position
+                for sec_type in ("STK", "FUND")
+                for position in self.trade_client.get_positions(
+                    account=account.account,
+                    sec_type=sec_type,
+                )
+            ]
         except Exception as exc:
             raise TigerAccountError(
                 "failed to query Tiger account positions",
@@ -678,51 +711,68 @@ class TigerAccountClient:
         if segment is None:
             return records
 
+        currency_assets = _get_attr(segment, "currency_assets", {})
+        has_currency_assets = isinstance(currency_assets, dict)
+        if not has_currency_assets:
+            currency_assets = {}
         account_total = _first_present_value(
             segment,
             "equity_with_loan",
             "net_liquidation",
         )
         if account_total is not None:
-            records.append(
-                {
-                    "record_type": "account_total",
-                    "account": account.account,
-                    "account_alias": account.account_alias,
-                    "currency": _text(segment, "currency"),
-                    "account_total": account_total,
-                    "segment_category": _text(segment, "category"),
-                    "net_liquidation": _text(segment, "net_liquidation"),
-                    "equity_with_loan": _text(segment, "equity_with_loan"),
-                    "locked_funds": _text(segment, "locked_funds"),
-                    "uncollected": _text(segment, "uncollected"),
-                    "source": account.asset_method,
-                }
+            record = {
+                "record_type": "account_total",
+                "account": account.account,
+                "account_alias": account.account_alias,
+                "currency": _text(segment, "currency"),
+                "account_total": account_total,
+                "segment_category": _text(segment, "category"),
+                "net_liquidation": _text(segment, "net_liquidation"),
+                "equity_with_loan": _text(segment, "equity_with_loan"),
+                "cash_balance": _text(segment, "cash_balance"),
+                "cash_available_for_trade": _text(
+                    segment, "cash_available_for_trade"
+                ),
+                "locked_funds": _text(segment, "locked_funds"),
+                "uncollected": _text(segment, "uncollected"),
+                "source": account.asset_method,
+            }
+            fx_to_hkd = _prime_fx_to_hkd(
+                currency_assets,
+                _text(segment, "currency"),
             )
+            if fx_to_hkd:
+                record["fx_to_hkd"] = fx_to_hkd
+            records.append(record)
 
-        currency_assets = _get_attr(segment, "currency_assets", {})
-        if not isinstance(currency_assets, dict):
+        if not has_currency_assets:
             return records
         for currency_asset in currency_assets.values():
             if not self._has_non_zero_balance(currency_asset):
                 continue
-            records.append(
-                {
-                    "account": account.account,
-                    "account_alias": account.account_alias,
-                    "currency": _text(currency_asset, "currency"),
-                    "cash_balance": _text(currency_asset, "cash_balance"),
-                    "available_balance": _first_present_value(
-                        currency_asset,
-                        "cash_available_for_trade",
-                        "cash_available_for_withdrawal",
-                    ),
-                    "gross_position_value": _text(
-                        currency_asset, "gross_position_value"
-                    ),
-                    "source": account.asset_method,
-                }
+            record = {
+                "account": account.account,
+                "account_alias": account.account_alias,
+                "currency": _text(currency_asset, "currency"),
+                "cash_balance": _text(currency_asset, "cash_balance"),
+                "available_balance": _first_present_value(
+                    currency_asset,
+                    "cash_available_for_trade",
+                    "cash_available_for_withdrawal",
+                ),
+                "gross_position_value": _text(
+                    currency_asset, "gross_position_value"
+                ),
+                "source": account.asset_method,
+            }
+            fx_to_hkd = _prime_fx_to_hkd(
+                currency_assets,
+                _text(currency_asset, "currency"),
             )
+            if fx_to_hkd:
+                record["fx_to_hkd"] = fx_to_hkd
+            records.append(record)
         return records
 
     @staticmethod
@@ -779,6 +829,29 @@ class TigerAccountClient:
                     }
                 )
         return records
+
+
+def _prime_fx_to_hkd(currency_assets: dict[object, object], currency: str) -> str:
+    normalized_currency = currency.strip().upper()
+    if normalized_currency == "HKD":
+        return "1"
+    assets = {
+        _text(asset, "currency").upper(): asset for asset in currency_assets.values()
+    }
+    currency_rate = _positive_decimal_attr(assets.get(normalized_currency), "forex_rate")
+    hkd_rate = _positive_decimal_attr(assets.get("HKD"), "forex_rate")
+    if currency_rate is None or hkd_rate is None:
+        return ""
+    return _decimal_to_str(currency_rate / hkd_rate)
+
+
+def _positive_decimal_attr(record: object, key: str) -> Decimal | None:
+    raw_value = _get_attr(record, key, None)
+    try:
+        value = Decimal(str(raw_value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return value if value.is_finite() and value > 0 else None
 
 
 def map_snapshot_to_portfolio_inputs(
@@ -927,27 +1000,28 @@ def _unmapped_total_asset_positions(
     snapshot: TigerAccountSnapshot,
     positions: list[Position],
     cash_balances: list[CashBalance],
-    fx_provider: StaticMonthEndFxProvider,
+    fx_to_hkd: dict[tuple[str, str], Decimal],
     run_date: str,
 ) -> list[Position]:
     mapped_hkd_by_account: dict[str, Decimal] = {}
     for position in positions:
         if position.market_value is None:
             continue
+        rate = fx_to_hkd.get((position.account_alias, position.currency.upper()))
+        if rate is None:
+            return []
         mapped_hkd_by_account[position.account_alias] = mapped_hkd_by_account.get(
             position.account_alias,
             Decimal("0"),
-        ) + (
-            position.market_value
-            * fx_provider.get_rate_to_hkd(position.currency.upper()).rate
-        )
+        ) + position.market_value * rate
     for cash in cash_balances:
+        rate = fx_to_hkd.get((cash.account_alias, cash.currency.upper()))
+        if rate is None:
+            return []
         mapped_hkd_by_account[cash.account_alias] = mapped_hkd_by_account.get(
             cash.account_alias,
             Decimal("0"),
-        ) + (
-            cash.cash_balance * fx_provider.get_rate_to_hkd(cash.currency.upper()).rate
-        )
+        ) + cash.cash_balance * rate
 
     adjustments: list[Position] = []
     statement_id = f"{run_date}-tiger-live"
@@ -961,9 +1035,12 @@ def _unmapped_total_asset_positions(
         total_currency = _text(record, "currency", "USD").upper()
         if total_currency in {"", "N/A"}:
             total_currency = "USD"
-        total_assets_hkd = (
-            account_total * fx_provider.get_rate_to_hkd(total_currency).rate
+        total_rate = fx_to_hkd.get(
+            (account_alias, total_currency),
         )
+        if total_rate is None:
+            continue
+        total_assets_hkd = account_total * total_rate
         residual_hkd = total_assets_hkd - mapped_hkd_by_account.get(
             account_alias,
             Decimal("0"),
@@ -1076,6 +1153,13 @@ def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
     raw_type = _text(record, "sec_type", "").upper()
     if raw_type in {"STK", "STOCK", "EQUITY", "COMMON_STOCK"}:
         return AssetClass.STOCK
+    if raw_type == "FUND":
+        detected = detect_asset_class(_text(record, "symbol"), _text(record, "name"))
+        return (
+            detected
+            if detected == AssetClass.MONEY_MARKET_FUND
+            else AssetClass.FUND
+        )
     if raw_type in {"ETF", "EXCHANGE_TRADED_FUND"}:
         return AssetClass.ETF
     return AssetClass.UNKNOWN
@@ -1507,7 +1591,55 @@ def _mark_all_rows_data_check(rows: list[dict[str, str]]) -> None:
         row["risk_flag"] = "data_check"
 
 
-def _position_to_detail_row(position: Position) -> dict[str, str]:
+def _snapshot_fx_to_hkd(
+    snapshot: TigerAccountSnapshot,
+) -> dict[tuple[str, str], Decimal]:
+    rates: dict[tuple[str, str], Decimal] = {}
+    for record in snapshot.cash_records:
+        rate = _optional_decimal(record, ("fx_to_hkd",))
+        currency = _text(record, "currency").upper()
+        account_alias = _text(record, "account_alias")
+        if rate is not None and rate > 0 and currency and account_alias:
+            rates[(account_alias, currency)] = rate
+    return rates
+
+
+def _apply_tiger_live_fx(
+    rows: list[dict[str, str]],
+    account_rates: dict[tuple[str, str], Decimal],
+    run_date: str,
+) -> list[dict[str, str]]:
+    rates_by_currency: dict[str, set[Decimal]] = {}
+    for (_, currency), rate in account_rates.items():
+        rates_by_currency.setdefault(currency, set()).add(rate)
+    for row in rows:
+        if _broker_parts(row) != {"tiger"}:
+            continue
+        rates = rates_by_currency.get(row.get("currency", "").strip().upper(), set())
+        if len(rates) != 1:
+            row["risk_flag"] = "data_check"
+            continue
+        market_value = _parse_finite_decimal(row.get("market_value", "").strip())
+        if market_value is None:
+            row["risk_flag"] = "data_check"
+            continue
+        rate = next(iter(rates))
+        cost_value = _parse_finite_decimal(row.get("cost_value", "").strip())
+        row["fx_source"] = "tiger_live"
+        row["fx_date"] = run_date
+        row["fx_to_hkd"] = _decimal_to_str(rate)
+        row["market_value_hkd"] = _decimal_to_str(market_value * rate)
+        row["cost_value_hkd"] = (
+            _decimal_to_str(cost_value * rate) if cost_value is not None else ""
+        )
+    return _recalculate_combined_portfolio_rows(rows)
+
+
+def _position_to_detail_row(
+    position: Position,
+    *,
+    fx_to_hkd: Decimal | None = None,
+) -> dict[str, str]:
     return {
         "statement_id": position.statement_id,
         "broker": position.broker,
@@ -1521,6 +1653,7 @@ def _position_to_detail_row(position: Position) -> dict[str, str]:
         "cost_price": _decimal_to_str(position.cost_price),
         "last_price": _decimal_to_str(position.last_price),
         "market_value": _decimal_to_str(position.market_value),
+        "fx_to_hkd": _decimal_to_str(fx_to_hkd),
         "cost_value": _decimal_to_str(position.cost_value),
         "unrealized_pnl": _decimal_to_str(position.unrealized_pnl),
         "confidence": position.confidence,
@@ -1528,13 +1661,18 @@ def _position_to_detail_row(position: Position) -> dict[str, str]:
     }
 
 
-def _cash_to_detail_row(cash: CashBalance) -> dict[str, str]:
+def _cash_to_detail_row(
+    cash: CashBalance,
+    *,
+    fx_to_hkd: Decimal | None = None,
+) -> dict[str, str]:
     return {
         "statement_id": cash.statement_id,
         "broker": cash.broker,
         "account_alias": cash.account_alias,
         "currency": cash.currency,
         "cash_balance": _decimal_to_str(cash.cash_balance),
+        "fx_to_hkd": _decimal_to_str(fx_to_hkd),
         "available_balance": _decimal_to_str(cash.available_balance),
         "confidence": cash.confidence,
         "notes": cash.notes,
@@ -1710,6 +1848,8 @@ def _recalculate_combined_portfolio_rows(
             row["risk_flag"] = "overweight"
         else:
             row["risk_flag"] = "normal"
+    if not has_missing_value and total > 0:
+        recalculate_portfolio_weights(normalized_rows)
     return [
         row
         for row, _ in sorted(

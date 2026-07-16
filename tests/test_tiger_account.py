@@ -29,6 +29,19 @@ def test_preserved_cn_market_stays_cn_during_tiger_sync() -> None:
     assert tiger_account_module._market_from_text("CN") is Market.CN
 
 
+def test_tiger_live_fx_recalculation_keeps_display_weights_at_100_percent() -> None:
+    rows = [
+        base_portfolio_row(symbol=f"TIGER_{index}", market_value_hkd="1")
+        for index in range(3)
+    ]
+
+    recalculated = tiger_account_module._recalculate_combined_portfolio_rows(rows)
+
+    assert sum(
+        Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in recalculated
+    ) == Decimal("100.00")
+
+
 def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -364,6 +377,37 @@ class FakePrimeAssetsWithUsefulZeroCash:
         }
 
 
+class FakePrimeAssetsWithMetrics:
+    def __init__(self) -> None:
+        self.account = "123456789"
+        self.segments = {
+            "S": FakeSegment(
+                category="S",
+                currency="USD",
+                cash_balance="-3980.76",
+                cash_available_for_trade="62320.21",
+                equity_with_loan="91322.91",
+                net_liquidation="29548.11",
+                currency_assets={
+                    "USD": FakeCurrencyAsset(
+                        currency="USD",
+                        cash_balance="-37207.24",
+                        cash_available_for_trade="-37207.24",
+                        gross_position_value="0",
+                        forex_rate="1",
+                    ),
+                    "HKD": FakeCurrencyAsset(
+                        currency="HKD",
+                        cash_balance="260484.1",
+                        cash_available_for_trade="260484.1",
+                        gross_position_value="0",
+                        forex_rate="0.1275578",
+                    ),
+                },
+            )
+        }
+
+
 class FakePrimeAssetsWithCommodityCash:
     def __init__(self) -> None:
         self.account = "123456789"
@@ -443,6 +487,8 @@ class FakeTradeClient:
 
     def get_positions(self, **kwargs: object) -> list[FakePosition]:
         self.position_calls.append(kwargs)
+        if kwargs.get("sec_type") == "FUND":
+            return []
         return [
             FakePosition(
                 account="123456789",
@@ -460,10 +506,50 @@ class FakeTradeClient:
         return FakePrimeAssets()
 
 
+class FakeStockAndFundTradeClient(FakeTradeClient):
+    def get_positions(self, **kwargs: object) -> list[FakePosition]:
+        self.position_calls.append(kwargs)
+        if kwargs.get("sec_type") == "FUND":
+            return [
+                FakePosition(
+                    account="123456789",
+                    contract=FakeContract(
+                        symbol="HK0000951506.HKD",
+                        sec_type="FUND",
+                        currency="HKD",
+                        market="HK",
+                        name="华泰港元货币市场基金A",
+                    ),
+                    position_qty="437187.6069",
+                    average_cost="1.10",
+                    market_price="1.1032",
+                    market_value="482305.3679",
+                    unrealized_pnl="0",
+                )
+            ]
+        return [
+            FakePosition(
+                account="123456789",
+                contract=FakeContract(symbol="MSFT"),
+                position_qty="2",
+                average_cost="300",
+                market_price="410",
+                market_value="820",
+                unrealized_pnl="220",
+            )
+        ]
+
+
 class FakePrimeAssetUsefulCashTradeClient(FakeTradeClient):
     def get_prime_assets(self, **kwargs: object) -> FakePrimeAssetsWithUsefulZeroCash:
         self.prime_asset_calls.append(kwargs)
         return FakePrimeAssetsWithUsefulZeroCash()
+
+
+class FakePrimeAssetMetricsTradeClient(FakeTradeClient):
+    def get_prime_assets(self, **kwargs: object) -> FakePrimeAssetsWithMetrics:
+        self.prime_asset_calls.append(kwargs)
+        return FakePrimeAssetsWithMetrics()
 
 
 class FakePrimeAssetCommodityCashTradeClient(FakeTradeClient):
@@ -698,8 +784,29 @@ def test_tiger_account_client_fetches_standard_account_snapshot() -> None:
     assert len(snapshot.cash_records) == 1
     assert snapshot.cash_records[0]["currency"] == "USD"
     assert snapshot.cash_records[0]["cash_balance"] == "100.25"
-    assert client.trade_client.position_calls == [{"account": "123456789"}]
+    assert client.trade_client.position_calls == [
+        {"account": "123456789", "sec_type": "STK"},
+        {"account": "123456789", "sec_type": "FUND"},
+    ]
     assert client.trade_client.prime_asset_calls == [{"account": "123456789"}]
+
+
+def test_tiger_account_client_fetches_stock_and_fund_positions() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=FakeStockAndFundTradeClient,
+    )
+
+    snapshot = client.fetch_snapshot()
+
+    assert client.trade_client.position_calls == [
+        {"account": "123456789", "sec_type": "STK"},
+        {"account": "123456789", "sec_type": "FUND"},
+    ]
+    assert [row["symbol"] for row in snapshot.position_records] == [
+        "MSFT",
+        "HK0000951506.HKD",
+    ]
 
 
 def test_tiger_account_client_accepts_open_status_case_insensitively() -> None:
@@ -902,6 +1009,33 @@ def test_tiger_account_client_keeps_zero_cash_row_if_other_balance_is_positive()
             assert record["gross_position_value"] == "100.00"
 
 
+def test_tiger_account_client_captures_prime_cash_metrics_and_live_fx() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=FakePrimeAssetMetricsTradeClient,
+    )
+
+    snapshot = client.fetch_snapshot()
+
+    total = next(
+        row for row in snapshot.cash_records if row.get("record_type") == "account_total"
+    )
+    assert total["cash_balance"] == "-3980.76"
+    assert total["cash_available_for_trade"] == "62320.21"
+    assert Decimal(str(total["fx_to_hkd"])) == (
+        Decimal("1") / Decimal("0.1275578")
+    )
+    cash_by_currency = {
+        str(row["currency"]): row
+        for row in snapshot.cash_records
+        if row.get("record_type") != "account_total"
+    }
+    assert Decimal(str(cash_by_currency["USD"]["fx_to_hkd"])) == (
+        Decimal("1") / Decimal("0.1275578")
+    )
+    assert cash_by_currency["HKD"]["fx_to_hkd"] == "1"
+
+
 def test_tiger_account_client_prime_asset_ignores_commodity_segment_cash() -> None:
     client = TigerAccountClient(
         config=tiger_config(),
@@ -1045,6 +1179,7 @@ def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:
                 "currency": "USD",
                 "cash_balance": "100.25",
                 "available_balance": "88.50",
+                "fx_to_hkd": "7.85",
                 "source": "get_prime_assets",
             }
         ],
@@ -1099,6 +1234,46 @@ def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:
     assert cash.cash_balance == Decimal("100.25")
     assert cash.available_balance == Decimal("88.50")
     assert cash.confidence == "high"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_asset_class"),
+    [
+        ("华泰港元货币市场基金A", AssetClass.MONEY_MARKET_FUND),
+        ("环球股票基金", AssetClass.FUND),
+        ("Global Equity ETF", AssetClass.FUND),
+    ],
+)
+def test_map_snapshot_classifies_tiger_funds(
+    name: str,
+    expected_asset_class: AssetClass,
+) -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "HK0000951506.HKD",
+                "name": name,
+                "sec_type": "FUND",
+                "currency": "HKD",
+                "market": "HK",
+                "position_qty": "437187.6069",
+                "average_cost": "1.10",
+                "market_price": "1.1032",
+                "market_value": "482305.3679",
+                "unrealized_pnl": "0",
+            }
+        ],
+    )
+
+    positions, _, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date="2026-07-16",
+    )
+
+    assert blocking_errors == []
+    assert positions[0].asset_class == expected_asset_class
 
 
 def test_map_snapshot_to_portfolio_inputs_defaults_hk_currency_from_symbol() -> None:
@@ -1655,6 +1830,7 @@ def test_sync_tiger_portfolio_reconciles_prime_account_total_assets(
                 "currency": "USD",
                 "cash_balance": "100.25",
                 "available_balance": "88.50",
+                "fx_to_hkd": "7.85",
                 "source": "get_prime_assets",
             },
             {
@@ -1662,6 +1838,7 @@ def test_sync_tiger_portfolio_reconciles_prime_account_total_assets(
                 "account_alias": "tiger_6789",
                 "currency": "USD",
                 "account_total": "1200",
+                "fx_to_hkd": "7.85",
                 "source": "get_prime_assets",
             },
         ],
@@ -1702,6 +1879,103 @@ def test_sync_tiger_portfolio_reconciles_prime_account_total_assets(
         adjustment["notes"]
         == "Tiger account_total reconciliation for locked funds or fund assets not returned as positions"
     )
+
+
+def test_sync_tiger_portfolio_writes_real_fund_and_live_fx_details(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio_path,
+        [base_portfolio_row(brokers="futu", accounts="main", fx_to_hkd="7.85")],
+    )
+    run_dir = tmp_path / "data/runs/2026-07-16"
+    preserved = futu_hk_unknown_detail_row()
+    write_csv(
+        run_dir / "extracted_positions.csv",
+        tiger_account_module.POSITION_DETAIL_FIELDNAMES,
+        [preserved],
+    )
+    write_csv(
+        run_dir / "extracted_cash.csv",
+        tiger_account_module.CASH_DETAIL_FIELDNAMES,
+        [],
+    )
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "-10",
+                "available_balance": "-10",
+                "fx_to_hkd": "7.84",
+                "source": "get_prime_assets",
+            },
+            {
+                "record_type": "account_total",
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "account_total": "217.5510204081632653061224490",
+                "cash_available_for_trade": "62",
+                "fx_to_hkd": "7.84",
+                "source": "get_prime_assets",
+            },
+        ],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "1",
+                "market_value": "100",
+            },
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "HK0000951506.HKD",
+                "name": "华泰港元货币市场基金A",
+                "sec_type": "FUND",
+                "currency": "HKD",
+                "market": "HK",
+                "position_qty": "900",
+                "market_value": "1000",
+            },
+        ],
+    )
+
+    result = sync_tiger_portfolio(
+        snapshot=snapshot,
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        run_date="2026-07-16",
+        update_latest=False,
+    )
+
+    portfolio_rows_by_symbol = {
+        row["symbol"]: row for row in read_portfolio(result.portfolio_path)
+    }
+    assert portfolio_rows_by_symbol["HK0000951506.HKD"]["asset_class"] == (
+        "money_market_fund"
+    )
+    assert portfolio_rows_by_symbol["MSFT"]["fx_to_hkd"] == "7.84"
+    assert portfolio_rows_by_symbol["MSFT"]["market_value_hkd"] == "784.00"
+    assert portfolio_rows_by_symbol["MSFT"]["fx_source"] == "tiger_live"
+    assert "TIGER_UNMAPPED_ASSETS" not in portfolio_rows_by_symbol
+    with (run_dir / "extracted_positions.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        position_details = list(csv.DictReader(handle))
+    with (run_dir / "extracted_cash.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        cash_details = list(csv.DictReader(handle))
+    tiger_stock = next(row for row in position_details if row["symbol"] == "MSFT")
+    tiger_cash = next(row for row in cash_details if row["broker"] == "tiger")
+    assert tiger_stock["fx_to_hkd"] == "7.84"
+    assert tiger_cash["fx_to_hkd"] == "7.84"
 
 
 def test_sync_tiger_portfolio_masks_numeric_account_values_in_snapshot_artifact(
@@ -2670,7 +2944,15 @@ def test_sync_tiger_portfolio_no_detail_ignores_invalid_stale_tiger_row(
     )
     write_portfolio(portfolio_path, [stale_tiger, preserved])
     snapshot = tiger_snapshot_from_records(
-        cash_records=[],
+        cash_records=[
+            {
+                "account_alias": "tiger_5683",
+                "currency": "USD",
+                "cash_balance": "0",
+                "available_balance": "0",
+                "fx_to_hkd": "7.80",
+            }
+        ],
         position_records=[
             {
                 "account_alias": "tiger_5683",
