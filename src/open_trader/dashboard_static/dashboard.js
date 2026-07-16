@@ -2240,15 +2240,15 @@ function renderOptionAttentionWorkspace(report) {
   const markets = (Array.isArray(report.attention_markets) ? report.attention_markets : [])
     .filter((market) => market && typeof market === "object" && !Array.isArray(market))
     .sort((left, right) => (order[String(left.market).toUpperCase()] ?? 2) - (order[String(right.market).toUpperCase()] ?? 2));
-  const rows = markets.map((market) => {
+  const rowgroups = markets.map((market) => {
     const items = Array.isArray(market.items)
       ? market.items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
       : [];
-    return `<tr class="option-attention-market"><th colspan="${OPTION_ATTENTION_COLUMNS.length}" scope="rowgroup"><div class="option-attention-market-content"><span>${escapeHtml(optionAttentionValue(market.market_label))}</span><span>${escapeHtml(optionAttentionMarketStatus(market))}</span></div></th></tr>${items.map(renderOptionAttentionRow).join("")}`;
+    return `<tbody><tr class="option-attention-market"><th colspan="${OPTION_ATTENTION_COLUMNS.length}" scope="rowgroup"><div class="option-attention-market-content"><span>${escapeHtml(optionAttentionValue(market.market_label))}</span><span>${escapeHtml(optionAttentionMarketStatus(market))}</span></div></th></tr>${items.map(renderOptionAttentionRow).join("")}</tbody>`;
   }).join("");
   return `<main class="option-attention-workspace">
     <header class="option-attention-header"><h1>期权关注</h1><button type="button" data-close-trend-report>返回持仓看板</button></header>
-    <table class="option-attention-table"><thead><tr>${OPTION_ATTENTION_COLUMNS.map(({label}) => `<th scope="col">${escapeHtml(label)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
+    <table class="option-attention-table"><thead><tr>${OPTION_ATTENTION_COLUMNS.map(({label}) => `<th scope="col">${escapeHtml(label)}</th>`).join("")}</tr></thead>${rowgroups}</table>
   </main>`;
 }
 
