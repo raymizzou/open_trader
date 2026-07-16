@@ -22,6 +22,7 @@ from .a_share_trend import (
     _billing_field,
     _component_api_facts,
     _final_pair_matches,
+    _finalize_market_report,
     _holding_snapshot,
     _is_systemic_futu_error,
     _process_version,
@@ -1007,30 +1008,7 @@ def _attempt_market_report(
                 ),
             },
         )
-        if market == "US" and not account.fresh:
-            report = replace(
-                report,
-                buy_actions=(),
-                holdings=tuple(
-                    replace(
-                        holding,
-                        action="MANUAL_REVIEW",
-                        reason="stale_tiger_account",
-                    )
-                    for holding in report.holdings
-                ),
-            )
-        managed.update(item.symbol for item in account.positions)
-        managed.update(item.symbol for item in report.buy_actions)
-        protection_state = {
-            **report.protection_state,
-            "managed_symbols": sorted(managed),
-        }
-        report = replace(report, protection_state=protection_state)
-        report = replace(
-            report,
-            metadata={**report.metadata, "delivery_status": "prepared"},
-        )
+        report = _finalize_market_report(report, managed_symbols=sorted(managed))
         previous_attention_rows = _previous_attention_rows(
             paths, current_as_of_date=as_of_date, market=market
         )

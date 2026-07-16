@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import open_trader.a_share_trend as trend_module
 
-from open_trader import market_trend
+from open_trader import market_trend, trend_review
 from open_trader.a_share_trend import (
     AShareTrendRunResult,
     CandidateInput,
@@ -939,6 +939,22 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
     assert payload["strategy_judgments"]["formal_actions"] == []
     assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "MANUAL_REVIEW"
     assert payload["strategy_judgments"]["holding_decisions"][0]["reason"] == "stale_tiger_account"
+    evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    replayed = trend_review.rebuild_trend_report_from_evidence(evidence)
+    for key in (
+        "account",
+        "strategy_judgments",
+        "protection_state",
+        "signal_snapshots",
+        "strategy_snapshot",
+    ):
+        assert replayed[key] == payload[key]
+    assert replayed["strategy_judgments"]["formal_actions"] == []
+    assert replayed["strategy_judgments"]["holding_decisions"][0] | {
+        "action": "MANUAL_REVIEW",
+        "reason": "stale_tiger_account",
+    } == replayed["strategy_judgments"]["holding_decisions"][0]
     assert payload["metadata"]["account_currency"] == "HKD"
     assert payload["metadata"]["price_fx_to_hkd"] == "7.85"
     assert payload["metadata"]["account_refresh_error"] == expected_refresh_error

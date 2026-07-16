@@ -176,6 +176,9 @@ def freeze_report_evidence(
             "candidate_pool_ids": candidate_pool_ids,
             "generated_at": getattr(report, "generated_at"),
             "metadata": metadata,
+            "managed_symbols": list(
+                getattr(report, "protection_state").get("managed_symbols", [])
+            ),
         },
     }
     return freeze_trend_evidence(data_dir, evidence)
@@ -1086,6 +1089,7 @@ def rebuild_trend_report_from_evidence(
         AccountSnapshot,
         CandidateInput,
         HoldingSnapshot,
+        _finalize_market_report,
         _report_payload,
         build_report,
     )
@@ -1232,8 +1236,19 @@ def rebuild_trend_report_from_evidence(
         candidate_pool_ids=tuple(int(item) for item in inputs["candidate_pool_ids"]),
         strategy_snapshot=snapshot,
     )
-    payload = _report_payload(report)
     market = str(inputs["market"]).upper()
+    if market in {"US", "HK"}:
+        managed_symbols = inputs.get("managed_symbols")
+        if not isinstance(managed_symbols, list) or not all(
+            isinstance(symbol, str) for symbol in managed_symbols
+        ):
+            raise TrendReplayIncompleteError(
+                "missing original input: managed_symbols"
+            )
+        report = _finalize_market_report(
+            report, managed_symbols=managed_symbols
+        )
+    payload = _report_payload(report)
     if market in {"US", "HK"}:
         attention_input = inputs.get("option_attention")
         if not isinstance(attention_input, Mapping):

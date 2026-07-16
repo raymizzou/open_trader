@@ -1265,6 +1265,36 @@ def build_report(
     )
 
 
+def _finalize_market_report(
+    report: TrendReport, *, managed_symbols: Sequence[str]
+) -> TrendReport:
+    market = str(report.metadata.get("market") or "").upper()
+    if market == "US" and not report.account.fresh:
+        report = replace(
+            report,
+            buy_actions=(),
+            holdings=tuple(
+                replace(
+                    holding,
+                    action="MANUAL_REVIEW",
+                    reason="stale_tiger_account",
+                )
+                for holding in report.holdings
+            ),
+        )
+    managed = set(managed_symbols)
+    managed.update(item.symbol for item in report.account.positions)
+    managed.update(item.symbol for item in report.buy_actions)
+    return replace(
+        report,
+        protection_state={
+            **report.protection_state,
+            "managed_symbols": sorted(managed),
+        },
+        metadata={**report.metadata, "delivery_status": "prepared"},
+    )
+
+
 def _paid_expansion_signal(
     item: CandidateInput | HoldingSnapshot,
 ) -> dict[str, object]:
