@@ -7,6 +7,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+import open_trader.a_share_trend as trend_module
 
 from open_trader.a_share_trend import AShareTrendRunResult
 from open_trader.daily_premarket import DailyPremarketConfig
@@ -41,6 +42,75 @@ class RecordingFeishu(FeishuWebhookNotifier):
         self.messages.append((title, message))
         if self.fail:
             raise NotificationError("network down")
+
+
+@pytest.mark.parametrize(
+    ("market", "name", "pool_ids", "buy", "sell", "market_parameters"),
+    [
+        (
+            "US",
+            "美股短线右侧趋势",
+            (622460,),
+            Decimal("0.5"),
+            Decimal("0.5"),
+            {"allowed_exchange": "US", "lot_size": 1, "buy_window": "美股常规交易时段"},
+        ),
+        (
+            "HK",
+            "港股短线右侧趋势",
+            (622494,),
+            Decimal("3"),
+            Decimal("13"),
+            {
+                "allowed_exchange": "HK",
+                "lot_size_source": "Futu 每标的整手",
+                "buy_window": "09:30-10:00",
+            },
+        ),
+    ],
+)
+def test_market_strategy_snapshot_matches_runtime_rules(
+    market: str,
+    name: str,
+    pool_ids: tuple[int, ...],
+    buy: Decimal,
+    sell: Decimal,
+    market_parameters: dict[str, object],
+) -> None:
+    snapshot = trend_module.trend_strategy_snapshot(
+        market, "abc123", buy, sell, pool_ids
+    )
+
+    assert snapshot["strategy_name"] == name
+    assert snapshot["strategy_version"] == "v1"
+    assert snapshot["parameters"] == {
+        "candidate_pool_ids": list(pool_ids),
+        "min_strength_exclusive": "90",
+        "max_right_side_days_exclusive": 10,
+        "min_amount_100m": "1",
+        "requires_right_side": True,
+        "requires_tradable": True,
+        "requires_no_danger": True,
+        "requires_matching_data_date": True,
+        "requires_not_held": True,
+        "requires_atr14": True,
+        "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
+        "candidate_limit": 10,
+        "position_limit": 10,
+        "target_weight": "0.04",
+        **market_parameters,
+        "initial_protection_atr_multiple": "2",
+        "exit_reasons": ["danger", "left_right_side", "protection"],
+        "trailing_low_days": 5,
+        "protection_line_non_decreasing": True,
+        "buy_cost_bps": str(buy),
+        "sell_cost_bps": str(sell),
+    }
+    assert snapshot["parameter_rows"]
+    assert all(
+        set(row) == {"group", "name", "value"}
+        for row in snapshot["parameter_rows"]
+    )
 
 
 def config(tmp_path: Path) -> DailyPremarketConfig:
@@ -468,6 +538,11 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
     assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
+    evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
+    evidence = __import__("json").loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["market"] == "HK"
+    assert evidence["query"]["component_pool_ids"] == [622494]
+    assert evidence["rebuild_inputs"]["lot_sizes"] == {"02800": 100}
 
 
 def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) -> None:

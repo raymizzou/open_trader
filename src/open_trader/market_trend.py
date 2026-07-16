@@ -53,6 +53,7 @@ from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
+from .trend_review import freeze_report_evidence
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -586,6 +587,7 @@ def _attempt_market_report(
             (_billing_price(billing[field]) for field in HOLDING_FIELDS), Decimal("0")
         ) * len(requested_ids)
         actual_cost = balance_before - balance_after
+        watch_events = load_watch_events(paths.events)
         report = build_report(
             as_of_date=as_of_date,
             execution_date=execution_date,
@@ -594,7 +596,7 @@ def _attempt_market_report(
             holding_snapshots=holding_snapshots,
             bars_by_symbol=bars_by_symbol,
             prior_state=prior_state,
-            watch_events=load_watch_events(paths.events),
+            watch_events=watch_events,
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
                 *_component_api_facts(api, len(component_rows)),
@@ -611,6 +613,14 @@ def _attempt_market_report(
             lot_sizes=lot_sizes,
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
+            process_version=_process_version(config.repo),
+            candidate_pool_ids=pool_ids,
+            buy_cost_bps=getattr(
+                config, f"trend_review_{market.lower()}_buy_cost_bps"
+            ),
+            sell_cost_bps=getattr(
+                config, f"trend_review_{market.lower()}_sell_cost_bps"
+            ),
             metadata={
                 "market": market,
                 "broker": settings["broker"],
@@ -629,6 +639,41 @@ def _attempt_market_report(
         report = replace(
             report,
             metadata={**report.metadata, "delivery_status": "prepared"},
+        )
+        buy_cost_bps = getattr(
+            config, f"trend_review_{market.lower()}_buy_cost_bps"
+        )
+        sell_cost_bps = getattr(
+            config, f"trend_review_{market.lower()}_sell_cost_bps"
+        )
+        evidence = freeze_report_evidence(
+            data_dir=config.data_dir,
+            report=report,
+            candidates=candidates,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol=bars_by_symbol,
+            prior_state=prior_state,
+            watch_events=watch_events,
+            query={
+                "component_pool_ids": list(pool_ids),
+                "snapshot_fields": list(HOLDING_FIELDS),
+            },
+            responses={
+                "update_status": update_rows,
+                "components": component_rows,
+                "snapshots": snapshot_rows,
+            },
+            candidate_pool_ids=pool_ids,
+            lot_sizes=lot_sizes,
+            buy_cost_bps=buy_cost_bps,
+            sell_cost_bps=sell_cost_bps,
+        )
+        report = replace(
+            report,
+            replay_evidence={
+                "path": str(Path(evidence["path"]).relative_to(config.data_dir)),
+                "sha256": evidence["sha256"],
+            },
         )
         payload = _report_payload(report)
         receipt_path = _market_receipt_path(paths, artifact_stem)

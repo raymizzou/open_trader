@@ -10,7 +10,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime, time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -113,6 +113,15 @@ class DailyPremarketConfig:
     trend_animals_hk_tm_ids: tuple[int, ...] = ()
     trend_us_symbols: tuple[str, ...] = ()
     trend_hk_symbols: tuple[str, ...] = ()
+    trend_review_cn_simulate_acc_id: int = 0
+    trend_review_us_simulate_acc_id: int = 0
+    trend_review_hk_simulate_acc_id: int = 0
+    trend_review_cn_buy_cost_bps: Decimal | None = None
+    trend_review_cn_sell_cost_bps: Decimal | None = None
+    trend_review_us_buy_cost_bps: Decimal | None = None
+    trend_review_us_sell_cost_bps: Decimal | None = None
+    trend_review_hk_buy_cost_bps: Decimal | None = None
+    trend_review_hk_sell_cost_bps: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +214,22 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
     trend_hk_tm_ids = _positive_tm_ids(
         values.get("TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS", "")
     )
+    review_account_ids = {
+        market: _optional_positive_tm_id(
+            values, f"OPEN_TRADER_TREND_REVIEW_{market}_SIMULATE_ACC_ID"
+        )
+        for market in ("CN", "US", "HK")
+    }
+    populated_review_ids = [value for value in review_account_ids.values() if value]
+    if len(populated_review_ids) != len(set(populated_review_ids)):
+        raise ValueError("trend review simulate account IDs must be distinct")
+    review_costs = {
+        (market, side): _optional_nonnegative_decimal(
+            values, f"OPEN_TRADER_TREND_REVIEW_{market}_{side}_COST_BPS"
+        )
+        for market in ("CN", "US", "HK")
+        for side in ("BUY", "SELL")
+    }
 
     for key, value in values.items():
         os.environ[key] = value
@@ -265,6 +290,15 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         trend_hk_symbols=_symbol_config(
             values.get("OPEN_TRADER_TREND_HK_SYMBOLS", "")
         ),
+        trend_review_cn_simulate_acc_id=review_account_ids["CN"],
+        trend_review_us_simulate_acc_id=review_account_ids["US"],
+        trend_review_hk_simulate_acc_id=review_account_ids["HK"],
+        trend_review_cn_buy_cost_bps=review_costs[("CN", "BUY")],
+        trend_review_cn_sell_cost_bps=review_costs[("CN", "SELL")],
+        trend_review_us_buy_cost_bps=review_costs[("US", "BUY")],
+        trend_review_us_sell_cost_bps=review_costs[("US", "SELL")],
+        trend_review_hk_buy_cost_bps=review_costs[("HK", "BUY")],
+        trend_review_hk_sell_cost_bps=review_costs[("HK", "SELL")],
     )
 
 
@@ -276,6 +310,21 @@ def _optional_positive_tm_id(values: dict[str, str], key: str) -> int:
         raise ValueError(f"{key} must be a positive integer") from None
     if value < 0:
         raise ValueError(f"{key} must be a positive integer")
+    return value
+
+
+def _optional_nonnegative_decimal(
+    values: dict[str, str], key: str
+) -> Decimal | None:
+    raw = values.get(key, "").strip()
+    if not raw:
+        return None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        raise ValueError(f"{key} must be a finite non-negative decimal") from None
+    if not value.is_finite() or value < 0:
+        raise ValueError(f"{key} must be a finite non-negative decimal")
     return value
 
 
