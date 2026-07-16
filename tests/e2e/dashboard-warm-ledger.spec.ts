@@ -1,5 +1,30 @@
 import { expect, test, type Page } from '@playwright/test';
 
+const warmLedger = {
+  bg: '#F7F5F1',
+  surface: '#FFFEFA',
+  soft: '#F2EEE7',
+  text: '#201D18',
+  muted: '#746E64',
+  accent: '#8B5E34',
+  line: '#D8D2C8',
+  primary: '#24211D',
+  danger: '#B42318',
+  success: '#2F855A',
+} as const;
+
+const rgb = {
+  bg: 'rgb(247, 245, 241)',
+  surface: 'rgb(255, 254, 250)',
+  text: 'rgb(32, 29, 24)',
+  muted: 'rgb(116, 110, 100)',
+  accent: 'rgb(139, 94, 52)',
+  line: 'rgb(216, 210, 200)',
+  primary: 'rgb(36, 33, 29)',
+  danger: 'rgb(180, 35, 24)',
+  success: 'rgb(47, 133, 90)',
+} as const;
+
 async function installLedgerFixture(page: Page) {
   await page.route('**/api/dashboard', async (route) => {
     const response = await route.fetch();
@@ -25,6 +50,33 @@ async function installLedgerFixture(page: Page) {
         sell_actions: [], buy_actions: [], hold_actions: [], review_actions: [],
         audit: { candidates: [], excluded: {}, industry_concentration: [], data_sources: ['fixture'] },
       },
+      eastmoney: {
+        available: true,
+        broker_label: '东方财富',
+        market: 'CN',
+        market_label: 'A股',
+        report_date: '2026-07-16',
+        data_date: '2026-07-15',
+        generated_at: '2026-07-16T11:07:21+08:00',
+        account_status: '账户数据非实时，执行前核对现金与持仓',
+        buy_window: '09:30–10:00',
+        counts: { sell: 0, buy: 1, hold: 0, review: 0 },
+        sell_actions: [],
+        review_actions: [],
+        hold_actions: [],
+        buy_actions: [{
+          symbol: '600519', name: '贵州茅台', filter_price: '1501.00',
+          close: '1500.00', temperature_prev: '温', temperature_curr: '热',
+          phase: '小暑', strength: '97.7', industry: '白酒',
+          industry_temperature: '热', market_cap: '19000', amount: '35',
+          target_weight: '0.04', target_amount: '40000',
+          estimated_shares: '26', estimated_initial_line: '1425.00',
+        }],
+        audit: {
+          candidates: [], excluded: {}, industry_concentration: [],
+          data_sources: ['fixture'],
+        },
+      },
     };
     fixture.holdings = [
       { market: 'US', symbol: 'AAPL', name: 'Apple', currency: 'USD', total_quantity: '10000', avg_cost_price: '180.00', market_value_hkd: '16380000.00', unrealized_pnl_pct: '16.67%', brokers: 'futu', broker_details: [{ broker: 'futu', market: 'US', symbol: 'AAPL', name: 'Apple', quantity: '10000', cost_value: '1800000.00', avg_cost_price: '180.00', market_value_hkd: '16380000.00', unrealized_pnl: '300000.00', unrealized_pnl_pct: '16.67%' }] },
@@ -39,9 +91,27 @@ async function installLedgerFixture(page: Page) {
 async function expectWarmSurface(page: Page, selector: string) {
   const surface = page.locator(selector);
   await expect(surface).toBeVisible();
-  await expect(surface).toHaveCSS('background-color', 'rgb(255, 255, 255)');
-  await expect(surface).toHaveCSS('border-top-color', 'rgb(214, 211, 209)');
+  await expect(surface).toHaveCSS('background-color', rgb.surface);
+  await expect(surface).toHaveCSS('border-top-color', rgb.line);
   await expect(surface).toHaveCSS('border-top-width', '1px');
+}
+
+async function expectContrastAtLeast(page: Page, selector: string, minimum: number) {
+  const ratio = await page.locator(selector).evaluate((element) => {
+    const parse = (color: string) => color.match(/[\d.]+/g)!.slice(0, 3).map(Number);
+    const luminance = (color: string) => {
+      const [red, green, blue] = parse(color).map((channel) => {
+        const value = channel / 255;
+        return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    };
+    const styles = getComputedStyle(element);
+    const foreground = luminance(styles.color);
+    const background = luminance(styles.backgroundColor);
+    return (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05);
+  });
+  expect(ratio, `${selector} contrast`).toBeGreaterThanOrEqual(minimum);
 }
 
 async function expectMobileTargetsAtLeast44(page: Page, surface: string, selector: string) {
@@ -61,6 +131,39 @@ const brokers = [
   { key: 'phillips', label: '辉立', symbol: '02840', portfolio: '628,554.06', holding: '600,000.00', cash: '28,554.06' },
   { key: 'eastmoney', label: '东方财富', symbol: '600519', portfolio: '730,673.51', holding: '700,000.00', cash: '30,673.51' },
 ] as const;
+
+test('renders the exact approved warm-ledger contract', async ({ page }) => {
+  await installLedgerFixture(page);
+  await page.goto('/');
+
+  const tokens = await page.evaluate(() => {
+    const styles = getComputedStyle(document.documentElement);
+    return Object.fromEntries([
+      '--bg', '--surface', '--surface-soft', '--text', '--muted',
+      '--accent', '--line', '--primary', '--danger', '--success',
+    ].map((name) => [name, styles.getPropertyValue(name).trim().toUpperCase()]));
+  });
+  expect(tokens).toEqual({
+    '--bg': warmLedger.bg,
+    '--surface': warmLedger.surface,
+    '--surface-soft': warmLedger.soft,
+    '--text': warmLedger.text,
+    '--muted': warmLedger.muted,
+    '--accent': warmLedger.accent,
+    '--line': warmLedger.line,
+    '--primary': warmLedger.primary,
+    '--danger': warmLedger.danger,
+    '--success': warmLedger.success,
+  });
+  await expect(page.locator('body')).toHaveCSS('background-color', rgb.bg);
+  await expect(page.locator('body')).toHaveCSS('color', rgb.text);
+  await expect(page.locator('#refresh-quotes')).toHaveCSS('background-color', rgb.accent);
+  await expect(page.locator('.current-view-card')).toHaveCSS('background-color', rgb.primary);
+  await expectWarmSurface(page, '.header-brand-panel');
+  await expectWarmSurface(page, '.holdings-panel');
+  await expect(page.locator('#last-refresh')).toHaveCSS('color', rgb.muted);
+  await expect(page.locator('.research-chat-context .status-ok')).toHaveCSS('color', rgb.text);
+});
 
 test('switches every broker tab and card while preserving US-filtered ledgers', async ({ page }) => {
   await installLedgerFixture(page);
@@ -119,9 +222,16 @@ test('switches every broker tab and card while preserving US-filtered ledgers', 
   await page.locator('.broker-summary-card[data-broker="futu"]').click();
   await expect(page.locator('.account-holding-quantity')).toContainText('10,000');
   await expect(page.locator('.account-holding-market-value')).toContainText('HKD 16,380,000.00');
-  await expect(page.locator('.account-holding-pnl.pnl-profit')).toHaveCSS('color', 'rgb(185, 28, 28)');
+  await expect(page.locator('.account-holding-pnl.pnl-profit')).toHaveCSS('color', rgb.danger);
   await page.locator('.broker-summary-card[data-broker="tiger"]').click();
-  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('color', 'rgb(21, 128, 61)');
+  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('color', rgb.success);
+  await page.locator('.account-holding-row').hover();
+  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('background-color', rgb.surface);
+  await page.locator('.account-holding-actions [data-detail-mode="decision"]').click();
+  await page.locator('.header-brand-panel').hover();
+  await expect(page.locator('.account-holding-row')).toHaveClass(/active-row/);
+  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('background-color', rgb.surface);
+  await expectContrastAtLeast(page, '.account-holding-pnl.pnl-loss', 4.5);
   await expect(page.getByRole('button', { name: '现金' })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
@@ -148,6 +258,7 @@ test('opens every warm-ledger destination, using real UI paths where available',
   // The display-only dashboard has no reachable research-chat trigger; activate its existing surface directly.
   await page.evaluate(() => (window as any).openResearchChat('US:AAPL:Apple:0'));
   await expectWarmSurface(page, '.research-chat-modal');
+  await expect(page.locator('.research-chat-context .status-ok')).toHaveCSS('color', rgb.text);
   await page.getByRole('button', { name: '关闭' }).click();
   await expect(page.locator('.research-chat-modal')).toBeHidden();
   await page.getByRole('button', { name: '收起' }).click();
@@ -155,7 +266,7 @@ test('opens every warm-ledger destination, using real UI paths where available',
 });
 
 test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 375, height: 844 });
   await installLedgerFixture(page);
   await page.goto('/');
 
@@ -179,7 +290,7 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
         inside: tabRect.left >= listRect.left && tabRect.right <= listRect.right,
       };
     });
-    expect(focus.boxShadow).toContain('rgb(161, 98, 7)');
+    expect(focus.boxShadow).toContain(rgb.accent);
     expect(focus.boxShadow).toContain('inset');
     expect(focus.inside).toBe(true);
   }
@@ -211,14 +322,15 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
     '.strategy-tools button:visible',
     '#refresh-quotes:visible',
     '.account-holding-actions button:visible',
+    '.trend-report-entry button:visible',
   ].join(','));
 
   await page.getByRole('tab', { name: /老虎/ }).click();
   await page.getByRole('button', { name: '凯利实验室' }).click();
   await expect(page.locator('.dashboard-shell')).toHaveClass(/tool-workspace-view/);
   await expect(page.locator('.header-assets-panel')).toBeHidden();
-  await expect(page.locator('.kelly-lab-panel')).toHaveCSS('background-color', 'rgb(255, 255, 255)');
-  await expect(page.locator('.kelly-lab-panel')).toHaveCSS('border-top-color', 'rgb(214, 211, 209)');
+  await expect(page.locator('.kelly-lab-panel')).toHaveCSS('background-color', rgb.surface);
+  await expect(page.locator('.kelly-lab-panel')).toHaveCSS('border-top-color', rgb.line);
   await expectMobileTargetsAtLeast44(page, 'body', '#return-to-portfolio:visible, .kelly-lab-panel button:visible');
   await page.getByRole('button', { name: '返回持仓' }).click();
   await expect(page.getByRole('tab', { name: /老虎/ })).toHaveAttribute('aria-selected', 'true');
@@ -242,6 +354,80 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
     panel?.insertAdjacentHTML('beforeend', (window as any).renderLanguageToggle());
   });
   await expectMobileTargetsAtLeast44(page, '.symbol-detail-panel.inline-symbol-detail', '.decision-tab:visible, [data-back-to-holdings]:visible, .language-toggle button:visible');
+  await page.evaluate(() => (window as any).openResearchChat('US:AAPL:Apple:0'));
+  await expect(page.locator('.research-chat-modal')).toBeVisible();
+  await expectMobileTargetsAtLeast44(page, '.research-chat-modal', 'button:visible, input:visible');
+  await page.getByRole('button', { name: '关闭' }).click();
   await page.getByRole('button', { name: '收起' }).click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('aligns the A-share report with the 1600px shell and scrolls only the buy table', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await installLedgerFixture(page);
+  await page.goto('/');
+  await page.getByRole('tab', { name: /东方财富/ }).click();
+  const holdings = await page.locator('.holdings-panel').boundingBox();
+  await page.getByRole('button', { name: '当天趋势报告' }).click();
+
+  const geometry = await page.evaluate(() => {
+    const shell = document.querySelector('.dashboard-shell')!.getBoundingClientRect();
+    const header = document.querySelector('.dashboard-header')!.getBoundingClientRect();
+    const report = document.querySelector('#trend-report-workspace')!.getBoundingClientRect();
+    const stage = document.querySelector('.cn-trend-buy')!;
+    const stageStyle = getComputedStyle(stage);
+    return {
+      shellWidth: shell.width,
+      headerLeft: header.left,
+      headerRight: header.right,
+      reportLeft: report.left,
+      reportRight: report.right,
+      pageFits: document.documentElement.scrollWidth <= window.innerWidth,
+      stageClientWidth: stage.clientWidth,
+      stageScrollWidth: stage.scrollWidth,
+      overflowX: stageStyle.overflowX,
+    };
+  });
+  expect(geometry.shellWidth).toBeCloseTo(1600, 0);
+  expect(geometry.reportLeft).toBeCloseTo(geometry.headerLeft, 0);
+  expect(geometry.reportRight).toBeCloseTo(geometry.headerRight, 0);
+  expect(geometry.reportLeft).toBeCloseTo(holdings!.x, 0);
+  expect(geometry.reportRight).toBeCloseTo(holdings!.x + holdings!.width, 0);
+  expect(geometry.pageFits).toBe(true);
+  expect(geometry.overflowX).toBe('auto');
+  expect(geometry.stageScrollWidth).toBeGreaterThan(geometry.stageClientWidth);
+  const buyStage = page.locator('.cn-trend-buy');
+  await expect(buyStage).toHaveAttribute('tabindex', '0');
+  await expect(buyStage).toHaveAttribute('aria-label', '正式买入计划，可横向滚动');
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  await expect(buyStage).toBeFocused();
+  await expect(buyStage).toHaveCSS('outline-style', 'solid');
+  await expect(buyStage).toHaveCSS('outline-width', '3px');
+  await expect(page.locator('.cn-trend-price-sources')).toHaveCSS('color', rgb.muted);
+  await page.setViewportSize({ width: 375, height: 844 });
+  await expect(buyStage).toHaveAttribute('tabindex', '-1');
+  await expect(buyStage).toHaveAttribute('aria-label', '正式买入计划');
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await expect(buyStage).toHaveAttribute('tabindex', '0');
+  await expect(buyStage).toHaveAttribute('aria-label', '正式买入计划，可横向滚动');
+});
+
+test('keeps the A-share report card-based with no page overflow on mobile', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 844 });
+  await installLedgerFixture(page);
+  await page.goto('/');
+  await page.getByRole('tab', { name: /东方财富/ }).click();
+  await page.getByRole('button', { name: '当天趋势报告' }).click();
+
+  await expect(page.locator('.cn-trend-buy')).toHaveCSS('overflow-x', 'hidden');
+  await expect(page.locator('.cn-trend-buy')).toHaveAttribute('tabindex', '-1');
+  await expect(page.locator('.cn-trend-buy')).toHaveAttribute('aria-label', '正式买入计划');
+  await page.keyboard.press('Tab');
+  await expect(page.locator('.cn-trend-buy')).not.toBeFocused();
+  for (const head of await page.locator('.cn-trend-table thead').all()) {
+    await expect(head).toBeHidden();
+  }
+  await expect(page.locator('.cn-trend-buy .cn-trend-card')).toHaveCSS('display', 'grid');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });

@@ -1,5 +1,6 @@
 from decimal import Decimal
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -64,6 +65,54 @@ def test_browser_ignores_chrome_unattributed_404_but_not_app_errors() -> None:
     assert _is_actionable_console_error("Uncaught TypeError: failed")
 
 
+def test_acceptance_screenshot_cleanup_removes_only_exact_expected_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        dashboard_acceptance, "ACCEPTANCE_SCREENSHOT_DIR", tmp_path
+    )
+    expected = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_NAMES
+    for name in (*expected, "keep-me.png"):
+        (tmp_path / name).write_bytes(b"old")
+
+    started_at_ns = dashboard_acceptance._prepare_acceptance_screenshots()
+
+    assert isinstance(started_at_ns, int) and started_at_ns > 0
+    assert all(not (tmp_path / name).exists() for name in expected)
+    assert (tmp_path / "keep-me.png").read_bytes() == b"old"
+
+
+def test_acceptance_screenshot_validation_requires_current_nonempty_exact_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        dashboard_acceptance, "ACCEPTANCE_SCREENSHOT_DIR", tmp_path
+    )
+    tmp_path.mkdir(exist_ok=True)
+    started_at_ns = 2_000_000_000
+    for name in dashboard_acceptance.ACCEPTANCE_SCREENSHOT_NAMES:
+        path = tmp_path / name
+        path.write_bytes(b"fresh")
+        os.utime(path, ns=(started_at_ns, started_at_ns))
+
+    assert dashboard_acceptance._validate_acceptance_screenshots(
+        started_at_ns
+    ) == []
+
+    stale = tmp_path / dashboard_acceptance.ACCEPTANCE_SCREENSHOT_NAMES[0]
+    os.utime(stale, ns=(started_at_ns - 1, started_at_ns - 1))
+    empty = tmp_path / dashboard_acceptance.ACCEPTANCE_SCREENSHOT_NAMES[1]
+    empty.write_bytes(b"")
+    missing = tmp_path / dashboard_acceptance.ACCEPTANCE_SCREENSHOT_NAMES[2]
+    missing.unlink()
+
+    errors = dashboard_acceptance._validate_acceptance_screenshots(started_at_ns)
+
+    assert any(stale.name in error and "过期" in error for error in errors)
+    assert any(empty.name in error and "空文件" in error for error in errors)
+    assert any(missing.name in error and "缺失" in error for error in errors)
+
+
 def test_acceptance_uses_absolute_shared_reports_dir_from_payload(
     tmp_path: Path,
 ) -> None:
@@ -119,6 +168,10 @@ def _run_acceptance_main_with_reports(
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
     report_dirs: list[Path],
+    *,
+    browser_log_text: str = "",
+    log_is_directory: bool = False,
+    log_read_error: OSError | None = None,
 ) -> tuple[int, dict[str, object], list[Path | None]]:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -128,6 +181,20 @@ def _run_acceptance_main_with_reports(
     second_quotes["fetched_at"] = "2026-07-15T15:03:14+08:00"
     quote_payloads = iter((first_quotes, second_quotes))
     browser_reports: list[Path | None] = []
+    log_path = tmp_path / "dashboard.log"
+    if log_is_directory:
+        log_path.mkdir()
+    else:
+        log_path.write_text("", encoding="utf-8")
+    if log_read_error is not None:
+        original_read_text = Path.read_text
+
+        def read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if path == log_path:
+                raise log_read_error
+            return original_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "read_text", read_text)
     monkeypatch.setattr(
         dashboard_acceptance, "_project_data_dir", lambda root: tmp_path / "data"
     )
@@ -153,20 +220,20 @@ def _run_acceptance_main_with_reports(
     monkeypatch.setattr(
         dashboard_acceptance, "validate_dashboard_payload", lambda *args, **kwargs: []
     )
-    monkeypatch.setattr(dashboard_acceptance, "_log_errors", lambda path: [])
-
     def browser_check(
         url: str, expected_cn: int, payload: dict[str, object],
         reports_dir: Path | None = None,
     ) -> tuple[list[str], None]:
         browser_reports.append(reports_dir)
+        if browser_log_text:
+            log_path.write_text(browser_log_text, encoding="utf-8")
         return [], None
 
     monkeypatch.setattr(dashboard_acceptance, "_browser_check", browser_check)
     status = dashboard_acceptance.main([
         "--expected-root", str(worktree),
         "--wait-seconds", "0",
-        "--log", str(tmp_path / "dashboard.log"),
+        "--log", str(log_path),
     ])
     result = json.loads(capsys.readouterr().out)
     return status, result, browser_reports
@@ -207,6 +274,62 @@ def test_acceptance_main_fails_when_reports_dir_changes_between_refreshes(
     assert result["status"] == "FAIL"
     assert "两个刷新周期的 Dashboard reports_dir 不一致" in result["errors"]
     assert browser_reports == [second.resolve()]
+
+
+def test_acceptance_main_fails_on_traceback_written_during_browser_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "shared" / "reports"
+    reports.mkdir(parents=True)
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [reports, reports],
+        browser_log_text="Traceback (most recent call last):\nBrokenPipeError",
+    )
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert "日志包含错误标记：Traceback (most recent call last)" in result["errors"]
+
+
+@pytest.mark.parametrize(
+    ("options", "error_type"),
+    [
+        ({"log_is_directory": True}, "IsADirectoryError"),
+        ({"log_read_error": FileNotFoundError("log vanished")}, "FileNotFoundError"),
+    ],
+)
+def test_acceptance_main_reports_log_read_errors_as_json_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    options: dict[str, object],
+    error_type: str,
+) -> None:
+    reports = tmp_path / "shared" / "reports"
+    reports.mkdir(parents=True)
+
+    try:
+        status, result, _ = _run_acceptance_main_with_reports(
+            monkeypatch,
+            capsys,
+            tmp_path,
+            [reports, reports],
+            **options,
+        )
+    except OSError as exc:
+        pytest.fail(f"acceptance main leaked {type(exc).__name__}: {exc}")
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert any(
+        f"日志读取失败：{error_type}" in error for error in result["errors"]
+    )
 
 
 def test_acceptance_rejects_api_projection_that_drops_frozen_action(
@@ -797,10 +920,15 @@ class TabbedAccountLocator:
     def locator(self, selector: str) -> "TabbedAccountLocator":
         return self.page.locator(f"{self.selector} {selector}")
 
+    def _require_known_broker(self, broker: str) -> str:
+        if broker not in self.page.tab_order:
+            raise AssertionError(f"unknown broker: {broker}")
+        return broker
+
     def click(self) -> None:
         match = re.fullmatch(r'#account-tabs \[data-broker="(\w+)"\]', self.selector)
         if match:
-            self.page.selected = match.group(1)
+            self.page.selected = self._require_known_broker(match.group(1))
             self.page.selected_brokers.append(self.page.selected)
             self.page._record_visible_sections()
             return
@@ -812,29 +940,80 @@ class TabbedAccountLocator:
             self.selector,
         )
         if match:
-            broker = match.group(1)
+            broker = self._require_known_broker(match.group(1))
             self.page.trend_broker = broker
             self.page.opened_reports.append(broker)
             self.page.active = "#return-to-portfolio:visible"
             self.page._record_visible_sections()
             return
-        if self.selector.endswith(".trend-audit summary"):
+        if self.selector == "#trend-report-workspace:visible .trend-audit summary":
             self.page.active = self.selector
             return
-        if self.selector == "#return-to-portfolio:visible" or self.selector.endswith(
-            "[data-close-trend-report]"
-        ):
+        if self.selector == "#open-kelly-lab":
+            self.page.workspace_view = "kelly"
+            return
+        if self.selector == "#open-standard-backtest":
+            self.page.workspace_view = "backtest"
+            return
+        if self.selector == "#research-chat-close:visible":
+            self.page.research_open = False
+            return
+        if self.selector in {
+            "#return-to-portfolio:visible",
+            "#trend-report-workspace:visible [data-close-trend-report]",
+        }:
+            if self.page.trend_broker is None:
+                self.page.workspace_view = "portfolio"
+                return
             broker = self.page.trend_broker
             self.page.trend_broker = None
             self.page.active = (
                 f"#account-{broker}:visible .trend-report-entry [data-trend-report]"
             )
             self.page._record_visible_sections()
+            return
+        raise AssertionError(f"unknown click selector: {self.selector}")
 
     def count(self) -> int:
+        target_selectors = {
+            '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
+            ".strategy-tools button:visible, #refresh-quotes:visible, "
+            ".broker-summary-card:visible, .account-holding-actions button:visible, "
+            ".trend-report-entry button:visible",
+            ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
+            ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
+            ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
+            "#return-to-portfolio:visible, .kelly-lab-panel button:visible",
+            "#standard-backtest-workspace button:visible, "
+            "#standard-backtest-workspace input:visible, "
+            "#standard-backtest-workspace select:visible",
+            ".research-chat-modal button:visible, .research-chat-modal input:visible",
+            "#return-to-portfolio:visible, #trend-report-workspace:visible button:visible, "
+            "#trend-report-workspace:visible summary:visible",
+        }
+        if self.selector in target_selectors:
+            return 1
+        if self.selector in VISUAL_CONTRACT_STYLES:
+            return 1
+        if self.selector == "#open-kelly-lab":
+            return 1
+        if self.selector == ".kelly-lab-panel:visible":
+            return int(self.page.workspace_view == "kelly")
+        if self.selector == "#open-standard-backtest":
+            return 1
+        if self.selector == "#standard-backtest-workspace:visible":
+            return int(self.page.workspace_view == "backtest")
+        if self.selector == ".holdings-panel:visible":
+            return int(self.page.workspace_view == "portfolio")
+        if self.selector == "[data-research-chat]:visible":
+            return 0
+        if self.selector in {".research-chat-modal:visible", "#research-chat-close:visible"}:
+            return int(self.page.research_open)
         if self.selector == "#account-tabs [data-broker]":
             return 4
-        if re.fullmatch(r'#account-tabs \[data-broker="\w+"\]', self.selector):
+        match = re.fullmatch(r'#account-tabs \[data-broker="(\w+)"\]', self.selector)
+        if match:
+            self._require_known_broker(match.group(1))
             return 1
         if self.selector in {'[data-market="CASH"]', "#cash-detail-panel"}:
             return 0
@@ -844,52 +1023,96 @@ class TabbedAccountLocator:
             return self.page._record_visible_sections()
         match = re.fullmatch(r"#account-(\w+):visible", self.selector)
         if match:
+            broker = self._require_known_broker(match.group(1))
             return int(
-                self.page.trend_broker is None and self.page.selected == match.group(1)
+                self.page.trend_broker is None and self.page.selected == broker
             )
-        match = re.fullmatch(
-            r"#account-(\w+):visible \.trend-report-entry(?: (.*))?", self.selector
-        )
-        if match:
-            broker, child = match.groups()
-            if self.page.trend_broker is not None or self.page.selected != broker:
+        for broker in self.page.tab_order:
+            entry = f"#account-{broker}:visible .trend-report-entry"
+            if self.selector not in {
+                entry,
+                f"{entry} [data-trend-report]",
+                f"{entry} button",
+            }:
+                continue
+            if (
+                self.page.trend_broker is not None
+                or self.page.selected != broker
+                or broker == "tiger"
+            ):
                 return 0
-            if broker == "tiger":
-                return 0
-            if child == "[data-trend-report]":
+            if self.selector == f"{entry} [data-trend-report]":
                 return int(bool(self.page.reports[broker]["available"]))
-            if child == "button":
-                return 1
             return 1
         if self.selector == "#trend-report-workspace:visible":
             return int(self.page.trend_broker is not None)
         if self.selector == "#return-to-portfolio:visible":
             return int(self.page.trend_broker is not None)
+        if self.selector == "#trend-report-workspace:visible [data-close-trend-report]":
+            return int(self.page.trend_broker == "eastmoney")
         if self.selector == ".workspace-grid:visible":
             return int(self.page.trend_broker is None)
-        if self.selector.endswith(".cn-trend-report"):
+        if self.selector == "#trend-report-workspace:visible .cn-trend-report":
             return int(self.page.trend_broker == "eastmoney")
-        if self.selector.endswith(".trend-discipline[open]"):
+        if self.selector == "#trend-report-workspace:visible .trend-discipline[open]":
             return 0 if self.page.viewport_size["width"] <= 760 else 2
-        if self.selector.endswith(".trend-discipline"):
+        if self.selector == "#trend-report-workspace:visible .trend-discipline":
             return 2
-        if self.selector.endswith(".cn-trend-table"):
+        if self.selector == "#trend-report-workspace:visible .cn-trend-table":
             return 4
-        if self.selector.endswith(".cn-trend-buy .cn-trend-card"):
+        if self.selector == (
+            "#trend-report-workspace:visible .cn-trend-buy .cn-trend-card"
+        ):
             return 1
-        if self.selector.endswith(".cn-trend-card:visible"):
+        if self.selector == (
+            "#trend-report-workspace:visible .cn-trend-buy .cn-trend-card:visible"
+        ):
+            report = self.page.reports.get(str(self.page.trend_broker), {})
+            actions = report.get("buy_actions", [])
+            return len(actions) if isinstance(actions, list) else 0
+        if self.selector == "#trend-report-workspace:visible .cn-trend-card:visible":
             return 4
         if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
             return 0
-        if self.selector.endswith(".account-holding-row:visible"):
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.account-holding-row:visible", self.selector
+        )
+        if match and match.group(1) in self.page.tab_order:
             return self.page.visible_rows(self.selector)
-        if self.selector.endswith(".account-empty:visible"):
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.account-empty:visible", self.selector
+        )
+        if match and match.group(1) in self.page.tab_order:
             return int(self.page.visible_rows(self.selector) == 0)
-        if self.selector.endswith(".session-quote"):
+        if re.fullmatch(
+            r'\.account-holding-row:visible:has\('
+            r'\.account-holding-market:has-text\("US"\)\) '
+            r'\.account-holding-price:nth\(\d+\) \.session-quote',
+            self.selector,
+        ):
             return 1
-        if "account-holding-market:has-text(\"US\")" in self.selector:
+        if self.selector == (
+            '.account-holding-row:visible:has('
+            '.account-holding-market:has-text("US")) .account-holding-price'
+        ):
             return int(self.page.selected == "futu" and self.page.market != "CN")
-        return 1
+        if self.selector in {
+            "#trend-report-workspace:visible .trend-audit",
+            "#trend-report-workspace:visible .trend-audit summary",
+            "#trend-report-workspace:visible .trend-audit section",
+            "#trend-report-workspace:visible .trend-report-header dd",
+            "#trend-report-workspace:visible .trend-discipline summary",
+            "#trend-report-workspace:visible .cn-trend-buy",
+        }:
+            return 1
+        if re.fullmatch(
+            r'#trend-report-workspace:visible \.cn-trend-buy '
+            r'\.cn-trend-card:nth\(\d+\) td\[data-label="'
+            r'(行业|筛选价（Trend Animals）|执行参考价（Futu 前复权）)"\]',
+            self.selector,
+        ):
+            return 1
+        raise AssertionError(f"unknown count selector: {self.selector}")
 
     def get_attribute(self, name: str) -> str | None:
         match = re.fullmatch(
@@ -900,17 +1123,31 @@ class TabbedAccountLocator:
             return self.page.tab_order[int(match.group(1))]
         match = re.fullmatch(r'#account-tabs \[data-broker="(\w+)"\]', self.selector)
         if match:
+            broker = self._require_known_broker(match.group(1))
             assert name == "aria-selected"
-            return str(match.group(1) == self.page.selected).lower()
-        assert self.selector.endswith(".trend-audit") and name == "open"
+            return str(broker == self.page.selected).lower()
+        if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
+            mobile = self.page.viewport_size["width"] <= 760
+            return {
+                "tabindex": "-1" if mobile else "0",
+                "aria-label": (
+                    "正式买入计划" if mobile else "正式买入计划，可横向滚动"
+                ),
+            }[name]
+        assert self.selector == "#trend-report-workspace:visible .trend-audit"
+        assert name == "open"
         return None
+
+    def focus(self) -> None:
+        self.page.active = self.selector
+        self.page.focus_checks.append(self.selector)
 
     def is_disabled(self) -> bool:
         match = re.fullmatch(
             r"#account-(\w+):visible \.trend-report-entry button", self.selector
         )
         assert match
-        broker = match.group(1)
+        broker = self._require_known_broker(match.group(1))
         self.page.disabled_reports.add(broker)
         return not bool(self.page.reports[broker]["available"])
 
@@ -918,66 +1155,121 @@ class TabbedAccountLocator:
         if self.selector == "#account-holdings":
             return self.page.section_texts[self.page.selected]
         match = re.fullmatch(r"#account-(\w+):visible", self.selector)
-        if match:
+        if match and match.group(1) in self.page.tab_order:
             return self.page.section_texts[match.group(1)]
         match = re.fullmatch(
             r"#account-(\w+):visible \.trend-report-entry", self.selector
         )
-        if match:
+        if match and match.group(1) in self.page.tab_order:
             return self.page.entry_texts[match.group(1)]
         if self.selector == "#trend-report-workspace:visible":
             return trend_workspace_text(str(self.page.trend_broker))
-        if self.selector.endswith(".trend-audit"):
+        if self.selector == "#trend-report-workspace:visible .trend-audit":
             return trend_audit_text(str(self.page.trend_broker))
-        if self.selector.endswith(".account-empty:visible"):
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.account-empty:visible", self.selector
+        )
+        if match and match.group(1) in self.page.tab_order:
             return "当前筛选下没有持仓"
         if self.selector == "#visible-count":
             return f"{self.page.visible_rows():,} 条"
         if self.selector == "#last-refresh":
             return "刷新于 2026-07-15 15:03:13 CST"
-        if ".session-quote" in self.selector:
+        if re.fullmatch(
+            r'\.account-holding-row:visible:has\('
+            r'\.account-holding-market:has-text\("US"\)\) '
+            r'\.account-holding-price:nth\(\d+\) \.session-quote:nth\(0\)',
+            self.selector,
+        ):
             return "夜盘 61.50 · 03:03 ET"
         if self.selector == "body":
             return "持仓与策略"
-        if self.selector.endswith(" strong"):
+        if self.selector == '#broker-summary-cards [data-broker="phillips"] strong':
             return "HKD 628,554.06"
-        match = re.search(r'td\[data-label="([^"]+)"\]$', self.selector)
+        if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
+            return trend_workspace_text("eastmoney")
+        match = re.fullmatch(
+            r'#trend-report-workspace:visible \.cn-trend-buy '
+            r'\.cn-trend-card:nth\(\d+\) td\[data-label="([^"]+)"\]',
+            self.selector,
+        )
         if match:
             buy = self.page.reports["eastmoney"]["buy_actions"][0]
-            key = {
+            keys = {
                 "行业": "industry",
                 "筛选价（Trend Animals）": "filter_price",
                 "执行参考价（Futu 前复权）": "close",
-            }[match.group(1)]
+            }
+            if match.group(1) not in keys:
+                raise AssertionError(
+                    f"unknown inner_text selector: {self.selector}"
+                )
+            key = keys[match.group(1)]
             return str(buy[key])
-        raise AssertionError(self.selector)
+        raise AssertionError(f"unknown inner_text selector: {self.selector}")
 
     def all_inner_texts(self) -> list[str]:
         if self.selector == "a:visible, button:visible":
             return ["刷新账户与行情", "策略回测"]
         broker = str(self.page.trend_broker)
-        if self.selector.endswith(".cn-trend-stage"):
+        if self.selector == "#trend-report-workspace:visible .cn-trend-stage":
             return trend_stage_texts(broker)
-        if self.selector.endswith(".trend-stage"):
+        if self.selector == "#trend-report-workspace:visible .trend-stage":
             return trend_stage_texts(broker)
-        if self.selector.endswith(".trend-report-header dd"):
+        if self.selector == "#trend-report-workspace:visible .trend-report-header dd":
             report = self.page.reports[broker]
             return [str(report[key]) for key in (
                 "report_date", "data_date", "generated_at", "account_status",
             )]
-        if self.selector.endswith(".trend-audit section"):
+        if self.selector == (
+            '#trend-report-workspace:visible td[data-label="活动保护线"], '
+            'td[data-label="预计保护线"]'
+        ):
+            return ["7", "42", "1,450", "24.55", "27.8"]
+        if self.selector == "#trend-report-workspace:visible .trend-audit section":
             return trend_audit_sections(broker)
-        if self.selector.endswith(".trend-discipline summary"):
+        if self.selector == "#trend-report-workspace:visible .trend-discipline summary":
             return ["买入纪律", "卖出纪律"]
-        if self.selector.endswith(".account-holding-row:visible td:nth-child(2)"):
+        match = re.fullmatch(
+            r"#account-(\w+):visible \.account-holding-row:visible td:nth-child\(2\)",
+            self.selector,
+        )
+        if match and match.group(1) in self.page.tab_order:
             return ["市场\nCN"] * self.page.visible_rows(self.selector)
-        return []
+        raise AssertionError(f"unknown all_inner_texts selector: {self.selector}")
 
     def nth(self, index: int) -> "TabbedAccountLocator":
         return self.page.locator(f"{self.selector}:nth({index})")
 
-    def evaluate(self, expression: str) -> bool:
-        assert "document.activeElement" in expression
+    def evaluate(self, expression: str) -> bool | dict[str, object]:
+        active_expression = "element => element === document.activeElement"
+        focus_expression = (
+            "element => { const styles = getComputedStyle(element); return {"
+            "outlineColor: styles.outlineColor, outlineStyle: styles.outlineStyle, "
+            "outlineWidth: styles.outlineWidth}; }"
+        )
+        overflow_expression = (
+            "element => ({clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, "
+            "overflowX: getComputedStyle(element).overflowX})"
+        )
+        if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
+            if expression == active_expression:
+                return self.selector == self.page.active
+            if expression == focus_expression:
+                return {
+                    "outlineColor": "rgb(139, 94, 52)",
+                    "outlineStyle": "solid",
+                    "outlineWidth": "3px",
+                }
+            if expression == overflow_expression:
+                return {
+                    "clientWidth": 1500,
+                    "scrollWidth": 1600,
+                    "overflowX": "auto",
+                }
+            raise AssertionError(f"unknown evaluate expression: {expression}")
+        if expression != active_expression:
+            raise AssertionError(f"unknown evaluate expression: {expression}")
         self.page.focus_checks.append(self.selector)
         return self.selector == self.page.active
 
@@ -985,8 +1277,22 @@ class TabbedAccountLocator:
         return {"x": 20, "width": 100}
 
     def evaluate_all(self, expression: str) -> list[dict[str, float]]:
-        assert "getBoundingClientRect" in expression
-        return [{"x": 10, "width": 350}]
+        target_expression = (
+            "nodes => nodes.map(node => ({"
+            "height: node.getBoundingClientRect().height, "
+            "label: node.getAttribute('aria-label') || node.textContent.trim() || node.tagName"
+            "}))"
+        )
+        bounds_expression = (
+            "nodes => nodes.map(node => node.getBoundingClientRect())"
+            ".map(r => ({x:r.x,width:r.width}))"
+        )
+        if expression == target_expression:
+            self.page.target_checks.append(self.selector)
+            return [{"height": 44, "label": self.selector}]
+        if expression == bounds_expression:
+            return [{"x": 10, "width": 350}]
+        raise AssertionError(f"unknown evaluate_all expression: {expression}")
 
 
 class TabbedAccountPage:
@@ -1022,6 +1328,10 @@ class TabbedAccountPage:
         self.opened_reports: list[str] = []
         self.disabled_reports: set[str] = set()
         self.focus_checks: list[str] = []
+        self.target_checks: list[str] = []
+        self.workspace_view = "portfolio"
+        self.research_open = False
+        self.script_evaluations: list[tuple[str, object | None]] = []
 
     def _record_visible_sections(self) -> int:
         visible = self.visible_account_sections if self.trend_broker is None else 0
@@ -1039,7 +1349,13 @@ class TabbedAccountPage:
     def locator(self, selector: str) -> TabbedAccountLocator:
         return TabbedAccountLocator(self, selector)
 
-    def evaluate(self, expression: str) -> bool:
+    def evaluate(
+        self, expression: str, argument: object | None = None,
+    ) -> bool | None:
+        if "openResearchChat" in expression:
+            self.script_evaluations.append((expression, argument))
+            self.research_open = True
+            return None
         assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
         return True
 
@@ -1141,6 +1457,9 @@ def test_validate_dashboard_payload_accepts_explicitly_unsupported_source() -> N
 
 def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
     assert dashboard_acceptance._first_in_scope_holding(valid_payload()) == ("US", "MSFT", "tiger")
+    assert dashboard_acceptance._dashboard_holding_key(
+        valid_payload(), "US", "MSFT"
+    ) == "US:MSFT::5"
 
 
 def test_first_in_scope_holding_rejects_payload_without_current_advice() -> None:
@@ -1149,6 +1468,209 @@ def test_first_in_scope_holding_rejects_payload_without_current_advice() -> None
 
     with pytest.raises(AssertionError, match="advice-backed holding"):
         dashboard_acceptance._first_in_scope_holding(payload)
+
+
+def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> None:
+    class Locator:
+        def __init__(self, page: "Page", selector: str) -> None:
+            self.page = page
+            self.selector = selector
+
+        def count(self) -> int:
+            target_selectors = {
+                '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
+                ".strategy-tools button:visible, #refresh-quotes:visible, "
+                ".broker-summary-card:visible, .account-holding-actions button:visible, "
+                ".trend-report-entry button:visible",
+                ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
+                ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
+                ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
+                "#return-to-portfolio:visible, .kelly-lab-panel button:visible",
+                "#standard-backtest-workspace button:visible, "
+                "#standard-backtest-workspace input:visible, "
+                "#standard-backtest-workspace select:visible",
+                ".research-chat-modal button:visible, .research-chat-modal input:visible",
+            }
+            if self.selector in target_selectors:
+                return 1
+            counts = {
+                "#open-kelly-lab": 1,
+                ".kelly-lab-panel:visible": int(self.page.view == "kelly"),
+                "#return-to-portfolio:visible": int(self.page.view != "portfolio"),
+                "#open-standard-backtest": 1,
+                "#standard-backtest-workspace:visible": int(self.page.view == "backtest"),
+                "[data-research-chat]:visible": 0,
+                ".research-chat-modal:visible": int(self.page.research_open),
+                "#research-chat-close:visible": int(self.page.research_open),
+                ".holdings-panel:visible": int(self.page.view == "portfolio"),
+            }
+            if self.selector not in counts:
+                raise AssertionError(f"unknown count selector: {self.selector}")
+            return counts[self.selector]
+
+        def click(self) -> None:
+            self.page.clicks.append(self.selector)
+            if self.selector == "#open-kelly-lab":
+                self.page.view = "kelly"
+            elif self.selector == "#open-standard-backtest":
+                self.page.view = "backtest"
+            elif self.selector == "#return-to-portfolio:visible":
+                self.page.view = "portfolio"
+            elif self.selector == "#research-chat-close:visible":
+                self.page.research_open = False
+            else:
+                raise AssertionError(f"unknown click selector: {self.selector}")
+
+        def evaluate_all(self, expression: str) -> list[dict[str, object]]:
+            assert "getBoundingClientRect" in expression
+            self.page.target_checks.append(self.selector)
+            return [{"height": 44, "label": self.selector}]
+
+    class Page:
+        viewport_size = {"width": 375, "height": 844}
+
+        def __init__(self) -> None:
+            self.view = "portfolio"
+            self.research_open = False
+            self.clicks: list[str] = []
+            self.evaluations: list[tuple[str, object | None]] = []
+            self.target_checks: list[str] = []
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(self, selector)
+
+        def evaluate(self, expression: str, argument: object | None = None) -> None:
+            assert "openResearchChat" in expression
+            assert argument == "US:MSFT:Microsoft:5"
+            self.evaluations.append((expression, argument))
+            self.research_open = True
+
+    page = Page()
+
+    dashboard_acceptance._check_tool_workspaces(
+        page, "US:MSFT:Microsoft:5"
+    )
+
+    assert page.clicks == [
+        "#open-kelly-lab", "#return-to-portfolio:visible",
+        "#open-standard-backtest", "#return-to-portfolio:visible",
+        "#research-chat-close:visible",
+    ]
+    assert len(page.evaluations) == 1
+    assert page.target_checks == [
+        "#account-tabs [role=\"tab\"]:visible, #header-market-filters button:visible, "
+        ".strategy-tools button:visible, #refresh-quotes:visible, "
+        ".broker-summary-card:visible, .account-holding-actions button:visible, "
+        ".trend-report-entry button:visible",
+        ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
+        ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
+        ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
+        "#return-to-portfolio:visible, .kelly-lab-panel button:visible",
+        "#standard-backtest-workspace button:visible, "
+        "#standard-backtest-workspace input:visible, "
+        "#standard-backtest-workspace select:visible",
+        ".research-chat-modal button:visible, .research-chat-modal input:visible",
+    ]
+
+
+@pytest.mark.parametrize(
+    "selector",
+    (
+        ".broker-summary-card:visible",
+        ".symbol-detail-panel.inline-symbol-detail:visible .language-toggle button:visible",
+        ".trend-report-entry button:visible",
+    ),
+)
+def test_acceptance_rejects_undersized_mobile_target(selector: str) -> None:
+    class Locator:
+        def count(self) -> int:
+            return 1
+
+        def evaluate_all(self, expression: str) -> list[dict[str, object]]:
+            assert "getBoundingClientRect" in expression
+            return [{"height": 43.5, "label": "太小"}]
+
+    page = SimpleNamespace(locator=lambda _selector: Locator())
+
+    with pytest.raises(AssertionError, match="太小.*44px"):
+        dashboard_acceptance._check_mobile_targets(page, selector)
+
+
+def test_tool_workspaces_closes_research_modal_when_target_check_fails() -> None:
+    class Locator(TabbedAccountLocator):
+        def evaluate_all(self, expression: str) -> list[dict[str, float]]:
+            if self.selector == (
+                ".research-chat-modal button:visible, "
+                ".research-chat-modal input:visible"
+            ):
+                return [{"height": 38, "label": "输入讨论消息"}]
+            return super().evaluate_all(expression)
+
+    class Page(TabbedAccountPage):
+        viewport_size = {"width": 375, "height": 844}
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(self, selector)
+
+    page = Page(valid_payload())
+
+    with pytest.raises(AssertionError, match="输入讨论消息.*44px"):
+        dashboard_acceptance._check_tool_workspaces(page, "US:AAPL:Apple:0")
+
+    assert page.research_open is False
+
+
+def test_tabbed_acceptance_fake_rejects_unknown_selectors_and_expressions() -> None:
+    page = tabbed_account_page(valid_payload())
+
+    with pytest.raises(AssertionError, match="unknown count selector"):
+        page.locator(".misspelled-control").count()
+    with pytest.raises(AssertionError, match="unknown count selector"):
+        page.locator(
+            "#account-futu:visible .trend-report-entry .data-trend-reprot"
+        ).count()
+    with pytest.raises(AssertionError, match="unknown count selector"):
+        page.locator(
+            "#account-futu:visible .trend-report-entry .misspelled"
+        ).count()
+    with pytest.raises(AssertionError, match="unknown inner_text selector"):
+        page.locator(".totally-wrong strong").inner_text()
+    with pytest.raises(AssertionError, match="unknown all_inner_texts selector"):
+        page.locator("#visible-count").all_inner_texts()
+
+    page.trend_broker = "eastmoney"
+    buy_stage = page.locator("#trend-report-workspace:visible .cn-trend-buy")
+    with pytest.raises(AssertionError, match="unknown evaluate expression"):
+        buy_stage.evaluate("element => element.clientHeight")
+    with pytest.raises(AssertionError, match="unknown evaluate_all expression"):
+        buy_stage.evaluate_all("nodes => nodes.length")
+
+
+def test_tabbed_acceptance_fake_rejects_unknown_broker_everywhere() -> None:
+    page = tabbed_account_page(valid_payload())
+    original_broker = page.selected
+    unknown_tab = page.locator('#account-tabs [data-broker="futtu"]')
+
+    with pytest.raises(AssertionError, match="unknown broker"):
+        unknown_tab.count()
+    with pytest.raises(AssertionError, match="unknown broker"):
+        unknown_tab.click()
+    assert page.selected == original_broker
+    with pytest.raises(AssertionError, match="unknown broker"):
+        unknown_tab.get_attribute("aria-selected")
+    with pytest.raises(AssertionError, match="unknown broker"):
+        page.locator("#account-futtu:visible").count()
+    with pytest.raises(AssertionError, match="unknown broker"):
+        page.locator(
+            "#account-futtu:visible .trend-report-entry [data-trend-report]"
+        ).click()
+    with pytest.raises(AssertionError, match="unknown broker"):
+        page.locator(
+            "#account-futtu:visible .trend-report-entry button"
+        ).is_disabled()
+    with pytest.raises(AssertionError, match="unknown broker"):
+        dashboard_acceptance._select_account_tab(page, "futtu")
+    assert page.selected == original_broker
 
 
 def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None:
@@ -1310,9 +1832,294 @@ def test_acceptance_formats_grouped_numeric_expectations_without_touching_text()
     )
 
 
-def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
-    monkeypatch: pytest.MonkeyPatch,
+def test_acceptance_requires_cn_protection_prices_with_at_most_two_decimals() -> None:
+    assert dashboard_acceptance._display_price(
+        "5.457142857142857142857142857"
+    ) == "5.46"
+    dashboard_acceptance._check_displayed_protection_prices(["5.46", "24.55", "27.53"])
+    with pytest.raises(AssertionError, match="超过两位小数"):
+        dashboard_acceptance._check_displayed_protection_prices(
+            ["5.457142857142857142857142857"]
+        )
+
+
+VISUAL_CONTRACT_STYLES = {
+    "body": {
+        "backgroundColor": "rgb(247, 245, 241)",
+        "color": "rgb(32, 29, 24)",
+    },
+    "#refresh-quotes": {
+        "backgroundColor": "rgb(139, 94, 52)",
+        "borderTopColor": "rgb(139, 94, 52)",
+    },
+    ".current-view-card": {
+        "backgroundColor": "rgb(36, 33, 29)",
+        "borderTopColor": "rgb(36, 33, 29)",
+    },
+    "#last-refresh": {
+        "color": "rgb(116, 110, 100)",
+    },
+    ".research-chat-context .status-ok": {
+        "backgroundColor": "rgb(231, 244, 236)",
+        "color": "rgb(32, 29, 24)",
+    },
+    **{
+        selector: {
+            "backgroundColor": "rgb(255, 254, 250)",
+            "borderTopColor": "rgb(216, 210, 200)",
+        }
+        for selector in (
+            ".header-brand-panel",
+            ".header-assets-panel",
+            ".header-source-panel",
+            ".holdings-panel",
+            ".kelly-lab-panel",
+            ".trend-report-workspace",
+            ".backtest-workspace",
+            ".symbol-detail-panel",
+            ".research-chat-modal",
+        )
+    },
+}
+
+
+def visual_contract_page(*, accent: str = "#8B5E34") -> object:
+
+    class Locator:
+        def __init__(self, page: "Page", selector: str) -> None:
+            self.page = page
+            self.selector = selector
+
+        def count(self) -> int:
+            return int(self.selector in VISUAL_CONTRACT_STYLES)
+
+        def focus(self) -> None:
+            assert self.selector in VISUAL_CONTRACT_STYLES
+            self.page.focused_selectors.append(self.selector)
+
+        def evaluate(self, expression: str) -> dict[str, str]:
+            assert self.selector in VISUAL_CONTRACT_STYLES
+            self.page.evaluated_selectors.append(self.selector)
+            if "outlineColor" in expression:
+                assert self.selector == "#refresh-quotes"
+                return {
+                    "outlineColor": "rgb(139, 94, 52)",
+                    "outlineStyle": "solid", "outlineWidth": "3px",
+                }
+            assert "backgroundColor" in expression
+            return dict(VISUAL_CONTRACT_STYLES[self.selector])
+
+    class Page:
+        def __init__(self) -> None:
+            self.expected = dict(dashboard_acceptance.WARM_LEDGER_TOKENS)
+            self.expected["--accent"] = accent
+            self.token_evaluations: list[list[str]] = []
+            self.evaluated_selectors: list[str] = []
+            self.focused_selectors: list[str] = []
+
+        def evaluate(
+            self, expression: str, names: list[str] | None = None
+        ) -> dict[str, str]:
+            assert names == list(dashboard_acceptance.WARM_LEDGER_TOKENS)
+            assert "getPropertyValue" in expression
+            self.token_evaluations.append(names)
+            return self.expected
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(self, selector)
+
+    return Page()
+
+
+def test_acceptance_visual_contract_accepts_exact_warm_ledger() -> None:
+    page = visual_contract_page()
+
+    dashboard_acceptance._check_visual_contract(page)
+
+    assert page.token_evaluations == [  # type: ignore[attr-defined]
+        list(dashboard_acceptance.WARM_LEDGER_TOKENS)
+    ]
+    assert page.evaluated_selectors == [  # type: ignore[attr-defined]
+        *VISUAL_CONTRACT_STYLES,
+        "#refresh-quotes",
+    ]
+    assert page.focused_selectors == ["#refresh-quotes"]  # type: ignore[attr-defined]
+
+
+def test_acceptance_visual_contract_rejects_palette_drift() -> None:
+    with pytest.raises(AssertionError, match="--accent"):
+        dashboard_acceptance._check_visual_contract(
+            visual_contract_page(accent="#A16207")
+        )
+
+
+def test_visual_contract_fake_rejects_unknown_selector() -> None:
+    page = visual_contract_page()
+    locator = page.locator(".misspelled-surface")  # type: ignore[attr-defined]
+
+    assert locator.count() == 0
+    with pytest.raises(AssertionError):
+        locator.evaluate("getComputedStyle(element).backgroundColor")
+
+
+def open_report_layout_page(
+    *,
+    shell_width: float = 1600,
+    header_left: float = 176,
+    header_right: float = 1744,
+    report_left: float = 176,
+    report_right: float = 1744,
+    holdings_left: float = 176,
+    holdings_right: float = 1744,
+    client_width: int = 1500,
+    scroll_width: int = 1600,
+    overflow_x: str = "auto",
+) -> tuple[object, object]:
+    class Cards:
+        def count(self) -> int:
+            return 1
+
+    class Stage:
+        def evaluate(self, expression: str) -> dict[str, object]:
+            if "document.activeElement" in expression:
+                return True  # type: ignore[return-value]
+            if "outlineColor" in expression:
+                return {
+                    "outlineColor": "rgb(139, 94, 52)",
+                    "outlineStyle": "solid",
+                    "outlineWidth": "3px",
+                }
+            assert "clientWidth" in expression
+            assert "scrollWidth" in expression
+            assert "overflowX" in expression
+            page.overflow_evaluations.append(expression)
+            return {
+                "clientWidth": client_width,
+                "scrollWidth": scroll_width,
+                "overflowX": overflow_x,
+            }
+
+        def count(self) -> int:
+            return 1
+
+        def locator(self, selector: str) -> Cards:
+            assert selector == ".cn-trend-card:visible"
+            return Cards()
+
+        def get_attribute(self, name: str) -> str:
+            return {
+                "tabindex": "0",
+                "aria-label": "正式买入计划，可横向滚动",
+            }[name]
+
+        def focus(self) -> None:
+            return None
+
+    class Workspace:
+        def locator(self, selector: str) -> Stage:
+            assert selector == ".cn-trend-buy"
+            return Stage()
+
+    class Page:
+        viewport_size = {"width": 1920, "height": 1080}
+
+        def __init__(self) -> None:
+            self.geometry_evaluations: list[str] = []
+            self.overflow_evaluations: list[str] = []
+
+        def evaluate(self, expression: str) -> dict[str, float]:
+            for required in (
+                ".dashboard-shell",
+                ".dashboard-header",
+                ".holdings-panel",
+                "#trend-report-workspace",
+                "getBoundingClientRect",
+            ):
+                assert required in expression
+            self.geometry_evaluations.append(expression)
+            return {
+                "shellWidth": shell_width,
+                "headerLeft": header_left,
+                "headerRight": header_right,
+                "reportLeft": report_left,
+                "reportRight": report_right,
+                "holdingsLeft": holdings_left,
+                "holdingsRight": holdings_right,
+            }
+
+    page = Page()
+    return page, Workspace()
+
+
+def test_acceptance_open_report_layout_requires_aligned_wide_shell_and_table_scroll() -> None:
+    page, workspace = open_report_layout_page()
+
+    dashboard_acceptance._check_open_report_layout(page, workspace, "eastmoney")
+
+    assert len(page.geometry_evaluations) == 1  # type: ignore[attr-defined]
+    assert len(page.overflow_evaluations) == 1  # type: ignore[attr-defined]
+
+
+def test_acceptance_zero_buy_mobile_report_requires_empty_state_without_cards() -> None:
+    class Cards:
+        def count(self) -> int:
+            return 0
+
+    class Stage:
+        def count(self) -> int:
+            return 1
+
+        def locator(self, selector: str) -> Cards:
+            assert selector == ".cn-trend-card:visible"
+            return Cards()
+
+        def inner_text(self) -> str:
+            return "09:30–10:00 · 正式买入计划\n无"
+
+        def get_attribute(self, name: str) -> str:
+            return {"tabindex": "-1", "aria-label": "正式买入计划"}[name]
+
+    class Workspace:
+        def locator(self, selector: str) -> Stage:
+            assert selector == ".cn-trend-buy"
+            return Stage()
+
+    page = SimpleNamespace(viewport_size={"width": 375, "height": 844})
+
+    dashboard_acceptance._check_open_report_layout(
+        page, Workspace(), "eastmoney", expected_buy_count=0
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"shell_width": 1598}, "shell"),
+        ({"report_left": 178}, "左边线"),
+        ({"report_right": 1742}, "右边线"),
+        ({"holdings_left": 178}, "持仓.*左边线"),
+        ({"holdings_right": 1742}, "持仓.*右边线"),
+        ({"overflow_x": "hidden"}, "内部横向滚动"),
+        ({"scroll_width": 1500}, "可滚动内容"),
+    ],
+)
+def test_acceptance_open_report_layout_rejects_contract_drift(
+    overrides: dict[str, object], message: str,
 ) -> None:
+    page, workspace = open_report_layout_page(**overrides)  # type: ignore[arg-type]
+
+    with pytest.raises(AssertionError, match=message):
+        dashboard_acceptance._check_open_report_layout(
+            page, workspace, "eastmoney"
+        )
+
+
+def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        dashboard_acceptance, "ACCEPTANCE_SCREENSHOT_DIR", tmp_path / "screenshots"
+    )
     payload = valid_payload()
     reports = payload["trend_reports"]
     visited: list[str] = []
@@ -1320,12 +2127,60 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     clicks: list[tuple[str, str]] = []
     evaluated: list[str] = []
     viewport_widths: list[int] = []
-    state = {"fail_desktop_navigation": True}
+    screenshots: list[tuple[str, str]] = []
+    visual_token_evaluations: list[str] = []
+    visual_surface_evaluations: list[tuple[str, str]] = []
+    visual_focus_calls: list[tuple[str, str]] = []
+    visual_focus_evaluations: list[tuple[str, str]] = []
+    geometry_evaluations: list[str] = []
+    buy_overflow_evaluations: list[str] = []
+    state = {"fail_wide_desktop_navigation": True}
 
     class Locator(TabbedAccountLocator):
         def click(self) -> None:
             clicks.append((self.page.name, self.selector))  # type: ignore[attr-defined]
             super().click()
+
+        def focus(self) -> None:
+            if self.selector == "#refresh-quotes":
+                visual_focus_calls.append((self.page.name, self.selector))  # type: ignore[attr-defined]
+                return
+            super().focus()
+
+        def evaluate(self, expression: str) -> object:
+            if "getComputedStyle" in expression:
+                if self.selector.endswith(".cn-trend-buy"):
+                    if "outlineColor" in expression:
+                        return {
+                            "outlineColor": "rgb(139, 94, 52)",
+                            "outlineStyle": "solid",
+                            "outlineWidth": "3px",
+                        }
+                    assert self.selector == (
+                        "#trend-report-workspace:visible .cn-trend-buy"
+                    )
+                    buy_overflow_evaluations.append(self.page.name)  # type: ignore[attr-defined]
+                    return {
+                        "clientWidth": 1500,
+                        "scrollWidth": 1600,
+                        "overflowX": "auto",
+                    }
+                if "outlineColor" in expression:
+                    assert self.selector == "#refresh-quotes"
+                    visual_focus_evaluations.append(
+                        (self.page.name, self.selector)  # type: ignore[attr-defined]
+                    )
+                    return {
+                        "outlineColor": "rgb(139, 94, 52)",
+                        "outlineStyle": "solid",
+                        "outlineWidth": "3px",
+                    }
+                assert self.selector in VISUAL_CONTRACT_STYLES, self.selector
+                visual_surface_evaluations.append(
+                    (self.page.name, self.selector)  # type: ignore[attr-defined]
+                )
+                return dict(VISUAL_CONTRACT_STYLES[self.selector])
+            return super().evaluate(expression)
 
     class Page(TabbedAccountPage):
         def __init__(self, name: str, viewport: dict[str, int]) -> None:
@@ -1338,17 +2193,52 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
         def goto(self, *_args: object, **_kwargs: object) -> None:
             visited.append(self.name)
-            if self.name == "desktop" and state["fail_desktop_navigation"]:
+            if (
+                self.name == "wide_desktop"
+                and state["fail_wide_desktop_navigation"]
+            ):
                 raise RuntimeError("navigation failed")
 
         def locator(self, selector: str) -> Locator:
             selectors.append((self.name, selector))
             return Locator(self, selector)
 
-        def evaluate(self, expression: str) -> bool:
+        def evaluate(
+            self, expression: str, argument: object | None = None
+        ) -> object:
+            if "openResearchChat" in expression:
+                return super().evaluate(expression, argument)
+            if "getPropertyValue" in expression:
+                assert argument == list(dashboard_acceptance.WARM_LEDGER_TOKENS)
+                visual_token_evaluations.append(self.name)
+                return dict(dashboard_acceptance.WARM_LEDGER_TOKENS)
+            if "const shell" in expression:
+                for required in (
+                    ".dashboard-shell",
+                    ".dashboard-header",
+                    ".holdings-panel",
+                    "#trend-report-workspace",
+                    "getBoundingClientRect",
+                ):
+                    assert required in expression
+                geometry_evaluations.append(self.name)
+                return {
+                    "shellWidth": 1600,
+                    "headerLeft": 176,
+                    "headerRight": 1744,
+                    "reportLeft": 176,
+                    "reportRight": 1744,
+                    "holdingsLeft": 176,
+                    "holdingsRight": 1744,
+                }
             assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
             evaluated.append(self.name)
             return True
+
+        def screenshot(self, *, path: str, full_page: bool) -> None:
+            assert full_page is True
+            screenshots.append((self.name, path))
+            Path(path).write_bytes(b"screenshot")
 
         def close(self) -> None:
             pass
@@ -1356,13 +2246,13 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     class Browser:
         pages = 0
 
-        def new_page(self, **_kwargs: object) -> Page:
+        def new_page(self, **kwargs: object) -> Page:
+            names = ("wide_desktop", "desktop", "mobile")
+            name = names[self.pages]
             self.pages += 1
-            viewport_widths.append(_kwargs["viewport"]["width"])  # type: ignore[index]
-            return Page(
-                "desktop" if self.pages == 1 else "mobile",
-                _kwargs["viewport"],  # type: ignore[arg-type]
-            )
+            viewport = kwargs["viewport"]
+            viewport_widths.append(viewport["width"])  # type: ignore[index]
+            return Page(name, viewport)  # type: ignore[arg-type]
 
         def close(self) -> None:
             pass
@@ -1390,17 +2280,28 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         "http://dashboard", 5, payload
     )
 
-    assert errors == ["desktop：RuntimeError: navigation failed"]
+    assert errors == [
+        "wide_desktop：RuntimeError: navigation failed",
+        "验收截图缺失：wide_desktop-portfolio.png",
+        "验收截图缺失：1920-trend-report.png",
+    ]
     assert blocker is None
-    assert visited == ["desktop", "mobile"]
-    assert viewport_widths == [1440, 375]
+    assert visited == ["wide_desktop", "desktop", "mobile"]
+    assert viewport_widths == [1920, 1440, 375]
 
-    state["fail_desktop_navigation"] = False
+    state["fail_wide_desktop_navigation"] = False
     visited.clear()
     selectors.clear()
     clicks.clear()
     evaluated.clear()
     viewport_widths.clear()
+    screenshots.clear()
+    visual_token_evaluations.clear()
+    visual_surface_evaluations.clear()
+    visual_focus_calls.clear()
+    visual_focus_evaluations.clear()
+    geometry_evaluations.clear()
+    buy_overflow_evaluations.clear()
     monkeypatch.setattr(
         dashboard_acceptance,
         "_check_decision_tabs",
@@ -1412,11 +2313,12 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     )
 
     assert errors == [
+        "wide_desktop：AssertionError: decision failed",
         "desktop：AssertionError: decision failed",
         "mobile：AssertionError: decision failed",
     ]
     assert blocker is None
-    for viewport in ("desktop", "mobile"):
+    for viewport in ("wide_desktop", "desktop", "mobile"):
         assert (viewport, '#broker-summary-cards [data-broker="phillips"]') in selectors
         assert (viewport, '[data-market="CN"]') in selectors
         assert (viewport, '[data-market="CN"]') in clicks
@@ -1475,7 +2377,27 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, 'a:visible, button:visible') in selectors
         assert (viewport, 'a[href="#account-tiger"]') not in clicks
     assert evaluated == [
-        *(["desktop"] * 7), *(["mobile"] * 8),
+        *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 8),
+    ]
+    assert visual_token_evaluations == ["wide_desktop", "desktop", "mobile"]
+    for viewport in ("wide_desktop", "desktop", "mobile"):
+        assert [
+            selector
+            for name, selector in visual_surface_evaluations
+            if name == viewport
+        ] == list(VISUAL_CONTRACT_STYLES)
+        assert (viewport, "#refresh-quotes") in visual_focus_calls
+        assert (viewport, "#refresh-quotes") in visual_focus_evaluations
+    assert geometry_evaluations == ["wide_desktop"] * 3
+    assert buy_overflow_evaluations == ["wide_desktop", "desktop"]
+    screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
+    assert screenshots == [
+        ("wide_desktop", str(screenshot_dir / "wide_desktop-portfolio.png")),
+        ("wide_desktop", str(screenshot_dir / "1920-trend-report.png")),
+        ("desktop", str(screenshot_dir / "desktop-portfolio.png")),
+        ("desktop", str(screenshot_dir / "1440-trend-report.png")),
+        ("mobile", str(screenshot_dir / "mobile-portfolio.png")),
+        ("mobile", str(screenshot_dir / "375-trend-report.png")),
     ]
 
 
@@ -1528,8 +2450,23 @@ def test_check_account_holdings_visits_every_broker_tab(
         "#return-to-portfolio:visible",
         '#account-phillips:visible .trend-report-entry [data-trend-report]',
         "#return-to-portfolio:visible",
+        "#trend-report-workspace:visible .cn-trend-buy",
         '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
     ]
+
+
+def test_acceptance_rejects_unavailable_eastmoney_report_for_screenshot(
+    tmp_path: Path,
+) -> None:
+    payload = valid_payload()
+    report = payload["trend_reports"]["eastmoney"]  # type: ignore[index]
+    report.update(available=False, status_text="今日报告不可用")
+    page = tabbed_account_page(payload)
+
+    with pytest.raises(AssertionError, match="eastmoney.*不可用.*截图"):
+        dashboard_acceptance._check_account_holdings(
+            page, payload, screenshot_dir=tmp_path
+        )
 
 
 def test_select_account_tab_rejects_multiple_visible_sections() -> None:

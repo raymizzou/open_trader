@@ -230,6 +230,12 @@ function bindElements() {
 }
 
 function bindEvents() {
+  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    window.matchMedia("(max-width: 760px)").addEventListener?.(
+      "change",
+      syncCnTrendBuyAccessibility,
+    );
+  }
   elements["refresh-quotes"].addEventListener("click", refreshQuotes);
   if (elements["kelly-lab-panel"]) {
     elements["kelly-lab-panel"].addEventListener("click", (event) => {
@@ -333,6 +339,7 @@ function openTrendReport(broker) {
   state.selectedTrendBroker = broker;
   elements["trend-report-workspace"].innerHTML = renderTrendReportWorkspace(report);
   setWorkspaceView("trend_report");
+  syncCnTrendBuyAccessibility();
   elements["return-to-portfolio"].focus();
 }
 
@@ -2008,13 +2015,43 @@ function cnTrendHints(item) {
     : "数据不可用";
 }
 
+function formatCnTrendPrice(value) {
+  const number = numericValue(value);
+  return number === null
+    ? formatPlain(value)
+    : number.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
 function renderCnTrendTable(title, kind, headings, rows, note = "") {
-  return `<section class="trend-stage cn-trend-stage cn-trend-${escapeHtml(kind)}">
+  const desktopScroller = kind === "buy" && !isCnTrendMobile();
+  const scrollerAttributes = kind === "buy"
+    ? ` tabindex="${desktopScroller ? "0" : "-1"}" aria-label="${desktopScroller ? "正式买入计划，可横向滚动" : "正式买入计划"}"`
+    : "";
+  return `<section class="trend-stage cn-trend-stage cn-trend-${escapeHtml(kind)}"${scrollerAttributes}>
     <h2>${escapeHtml(title)}</h2>
     ${note ? `<p class="cn-trend-price-sources">${escapeHtml(note)}</p>` : ""}
     <table class="cn-trend-table"><thead><tr>${headings.map((heading) => `<th scope="col">${escapeHtml(heading)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>
     ${rows.length ? "" : "<p>无</p>"}
   </section>`;
+}
+
+function isCnTrendMobile() {
+  return typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia("(max-width: 760px)").matches;
+}
+
+function syncCnTrendBuyAccessibility() {
+  const workspace = elements["trend-report-workspace"];
+  if (!workspace || typeof workspace.querySelector !== "function") return;
+  const scroller = workspace.querySelector(".cn-trend-buy");
+  if (!scroller) return;
+  const mobile = isCnTrendMobile();
+  scroller.tabIndex = mobile ? -1 : 0;
+  scroller.setAttribute(
+    "aria-label",
+    mobile ? "正式买入计划" : "正式买入计划，可横向滚动",
+  );
 }
 
 function renderCnSellOrHoldStage(title, items, kind) {
@@ -2031,7 +2068,7 @@ function renderCnSellOrHoldStage(title, items, kind) {
     ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
     ${renderCnTrendCell("强度", item.strength)}
     ${renderCnTrendCell(headings[5], TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
-    ${renderCnTrendCell("活动保护线", item.active_line)}
+    ${renderCnTrendCell("活动保护线", formatCnTrendPrice(item.active_line))}
     ${renderCnTrendCell("持仓提示", cnTrendHints(item))}
   </tr>`);
   return renderCnTrendTable(title, kind, headings, rows);
@@ -2060,7 +2097,7 @@ function renderCnBuyStage(report) {
       ${renderCnTrendCell("目标仓位", targetWeight, `目标仓位 ${targetWeight}`)}
       ${renderCnTrendCell("目标金额", item.target_amount)}
       ${renderCnTrendCell("预计数量", `${formatPlain(item.estimated_shares)} 股`)}
-      ${renderCnTrendCell("预计保护线", item.estimated_initial_line)}
+      ${renderCnTrendCell("预计保护线", formatCnTrendPrice(item.estimated_initial_line))}
     </tr>`;
   });
   return renderCnTrendTable(

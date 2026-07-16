@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import shutil
+import socket
+import struct
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -23,6 +27,26 @@ from tests.test_dashboard import (
     tiger_long_term_dashboard_payload,
     write_csv,
 )
+
+
+def relative_luminance(color: str) -> float:
+    channels = (int(color[index:index + 2], 16) / 255 for index in (1, 3, 5))
+    linear = (
+        value / 12.92
+        if value <= 0.04045
+        else ((value + 0.055) / 1.055) ** 2.4
+        for value in channels
+    )
+    red, green, blue = linear
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def contrast_ratio(foreground: str, background: str) -> float:
+    foreground_luminance = relative_luminance(foreground)
+    background_luminance = relative_luminance(background)
+    return (max(foreground_luminance, background_luminance) + 0.05) / (
+        min(foreground_luminance, background_luminance) + 0.05
+    )
 
 
 def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
@@ -58,8 +82,11 @@ def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
     assert "今日结论" not in html
     assert 'id="trade-actions"' not in html
     for token in (
-        "--bg: #fafaf9;", "--surface: #ffffff;", "--text: #1c1917;",
-        "--muted: #78716c;", "--accent: #a16207;", "--line: #d6d3d1;",
+        "--bg: #f7f5f1;", "--surface: #fffefa;",
+        "--surface-soft: #f2eee7;", "--text: #201d18;",
+        "--muted: #746e64;", "--accent: #8b5e34;",
+        "--line: #d8d2c8;", "--primary: #24211d;",
+        "--success: #2f855a;", "--danger: #b42318;",
     ):
         assert token in css
     for broker, color in {
@@ -69,8 +96,8 @@ def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
         assert f'.account-tab[data-broker="{broker}"] {{ --broker-accent: {color}; }}' in css
     assert ".account-tab.active" in css
     assert "border-bottom-color: var(--broker-accent);" in css
-    assert ".pnl-profit { color: #b91c1c;" in css
-    assert ".pnl-loss { color: #15803d;" in css
+    assert ".pnl-profit { color: var(--danger);" in css
+    assert ".pnl-loss { color: var(--success);" in css
     assert ".tool-workspace-view .header-assets-panel" in css
     assert (
         ".backtest-workspace,\n.kelly-lab-panel,\n.trend-report-workspace,\n"
@@ -119,13 +146,92 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     assert ".backtest-form select," in mobile
     assert ".decision-tab," in mobile
     assert ".language-toggle button" in mobile
+    assert ".trend-report-workspace" in css
+    report_css = css.split(".trend-report-workspace {", 1)[1].split("}", 1)[0]
+    assert "max-width: none;" in report_css
+    buy_css = css.split(".cn-trend-buy {", 1)[1].split("}", 1)[0]
+    assert "overflow-x: auto;" in buy_css
+    assert ".cn-trend-buy .cn-trend-table" in css
+    assert "min-width: 1600px;" in css
+    assert ".cn-trend-buy {\n    overflow-x: hidden;\n  }" in mobile
+    assert "min-width: 0;" in mobile
 
 
-def test_dashboard_muted_text_meets_aa_on_soft_surface() -> None:
+def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
 
-    assert "--muted: #78716c;" in css
-    assert "--surface-soft: #faf8f4;" in css
+    tokens = dict(re.findall(r"--([\w-]+): (#[0-9a-f]{6});", css))
+
+    assert contrast_ratio(tokens["text"], tokens["surface-soft"]) >= 4.5
+
+    soft_surface_contract = re.search(
+        r"([^{}]+) \{\n  --muted: var\(--text\);\n\}", css,
+    )
+    assert soft_surface_contract is not None
+    contract_selectors = {
+        selector.strip() for selector in soft_surface_contract.group(1).split(",")
+    }
+    soft_surface_selectors = {
+        selector.strip()
+        for selectors in re.findall(
+            r"([^{}]+)\{[^{}]*background: var\(--(?:surface-soft|panel-soft)\);[^{}]*\}",
+            css,
+        )
+        for selector in selectors.split(",")
+    }
+    assert soft_surface_selectors - {".trend-stage"} <= contract_selectors
+    assert ".trend-stage" not in contract_selectors
+    assert ".trend-stage:not(.cn-trend-stage)" in contract_selectors
+
+    for foreground_selector, surface_selector in (
+        (".source-status-row span", ".source-status-row"),
+        (".tiger-member-header", ".tiger-member-header"),
+    ):
+        block = css.split(f"\n{foreground_selector} {{", 1)[1].split("}", 1)[0]
+        assert "color: var(--muted);" in block
+        assert surface_selector in contract_selectors
+
+
+def test_dashboard_success_text_meets_aa_on_every_adjusted_surface() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    tokens = dict(re.findall(r"--([\w-]+): (#[0-9a-f]{6});", css))
+
+    pairings = (
+        (tokens["text"], "#e7f4ec"),
+        (tokens["text"], "#f4fbf7"),
+        (tokens["success"], tokens["surface"]),
+    )
+    assert all(
+        contrast_ratio(foreground, background) >= 4.5
+        for foreground, background in pairings
+    )
+
+    status = css.split("\n.status-ok {", 1)[1].split("}", 1)[0]
+    opportunity = css.split(
+        ".technical-bollinger-card.lower-opportunity .technical-bollinger-header strong {",
+        1,
+    )[1].split("}", 1)[0]
+    safe_loss = css.split("\ntbody tr:hover .pnl-loss,", 1)[1].split("}", 1)[0]
+    assert "color: var(--text);" in status
+    assert "color: var(--text);" in opportunity
+    assert "tbody tr.active-row .pnl-loss" in safe_loss
+    assert "background: var(--surface);" in safe_loss
+    assert contrast_ratio(tokens["success"], tokens["surface-soft"]) < 4.5
+    assert contrast_ratio(tokens["success"], tokens["surface"]) >= 4.5
+
+
+def test_cn_trend_secondary_text_keeps_muted_tone_on_main_surface() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    contract = re.search(
+        r"([^{}]+) \{\n  --muted: var\(--text\);\n\}", css,
+    )
+    assert contract is not None
+    selectors = {selector.strip() for selector in contract.group(1).split(",")}
+    assert ".cn-trend-stage" not in selectors
+    assert ".trend-stage:not(.cn-trend-stage)" in selectors
+    price_sources = css.split("\n.cn-trend-price-sources {", 1)[1].split("}", 1)[0]
+    assert "color: var(--muted);" in price_sources
 
 
 def test_dashboard_account_tabs_register_roving_keyboard_and_panel_semantics() -> None:
@@ -418,6 +524,68 @@ def test_standard_backtest_http_routes_expose_options_and_map_validation_to_400(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_dashboard_server_ignores_client_disconnect_while_writing_json(
+    tmp_path, monkeypatch
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    request_started = threading.Event()
+    release_response = threading.Event()
+
+    def delayed_options(_config: object) -> dict[str, str]:
+        request_started.set()
+        assert release_response.wait(timeout=5)
+        return {"padding": "x" * (5 * 1024 * 1024)}
+
+    monkeypatch.setattr(
+        dashboard_web, "build_standard_backtest_options_payload", delayed_options
+    )
+    server = dashboard_web.create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    unhandled_errors: list[BaseException | None] = []
+    handler_completed = threading.Event()
+    original_shutdown_request = server.shutdown_request
+
+    def shutdown_request(request: object) -> None:
+        try:
+            original_shutdown_request(request)  # type: ignore[arg-type]
+        finally:
+            handler_completed.set()
+
+    server.shutdown_request = shutdown_request  # type: ignore[method-assign]
+    server.handle_error = (  # type: ignore[method-assign]
+        lambda _request, _address: unhandled_errors.append(sys.exc_info()[1])
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    client = socket.create_connection((host, port), timeout=5)
+    try:
+        client.sendall(
+            b"GET /api/backtests/options HTTP/1.1\r\n"
+            b"Host: dashboard\r\nConnection: close\r\n\r\n"
+        )
+        assert request_started.wait(timeout=5)
+        client.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_LINGER,
+            struct.pack("ii", 1, 0),
+        )
+        client.close()
+        release_response.set()
+        assert handler_completed.wait(timeout=5)
+        assert unhandled_errors == []
+    finally:
+        client.close()
+        release_response.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.mark.parametrize("body", [b"{bad json", b"[]"])
@@ -2687,17 +2855,17 @@ const cn = renderTrendReportWorkspace({
   buy_window:"09:30–10:00",counts:{sell:1,buy:1,hold:1,review:2},
   sell_actions:[{symbol:"601398",name:"工商银行",close:"7.2",
     temperature_prev:"温",temperature_curr:"温",strength:"91.3",
-    reason:"left_trend_right_side",active_line:"7.0",
+    reason:"left_trend_right_side",active_line:"5.457142857142857142857142857",
     entry_hints:["强度 91.3，低于入场线 95"]}],
   buy_actions:[{symbol:"688046",name:"药康生物",filter_price:"29.14",
     close:"28.81",temperature_prev:"温",temperature_curr:"热",phase:"立夏",
     strength:"99.9",industry:"医疗服务",industry_temperature:"热",
     market_cap:"110",amount:"6",target_weight:"0.04",
     target_amount:"27061.98",estimated_shares:900,
-    estimated_initial_line:"24.55"}],
+    estimated_initial_line:"24.54571428571428571428571429"}],
   hold_actions:[{symbol:"600900",name:"长江电力",close:"28.0",
     temperature_prev:"热",temperature_curr:"热",strength:"98.7",
-    reason:"trend_intact",active_line:"27.8",
+    reason:"trend_intact",active_line:"27.52714285714285714285714286",
     entry_hints:["不是新的温转热或温转沸入场信号"]}],
   review_actions:[
     {symbol:"600036",name:"招商银行",close:"45.2",temperature_prev:"热",
@@ -2728,6 +2896,12 @@ if (!cn.includes('class="cn-trend-report"') ||
     !cn.includes('class="cn-trend-table"') ||
     !cn.includes('class="cn-trend-card"')) throw new Error(cn);
 if ((cn.match(/<details class="trend-discipline" open>/g) || []).length !== 2) throw new Error(cn);
+for (const price of ["5.46", "24.55", "27.53"]) {
+  if (!cn.includes(`>${price}</td>`)) throw new Error(cn);
+}
+for (const raw of ["5.457142857142857142857142857", "24.54571428571428571428571429", "27.52714285714285714285714286"]) {
+  if (cn.includes(raw)) throw new Error(cn);
+}
 const actionContent = cn.split('<details class="trend-audit"', 1)[0];
 if (actionContent.includes("AUDIT-ONLY") || !cn.includes("AUDIT-ONLY")) throw new Error(cn);
 
@@ -2793,6 +2967,52 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_cn_buy_scroller_is_keyboard_reachable_only_on_desktop() -> None:
+    output = run_dashboard_js(r'''
+const report={market:"CN",counts:{},sell_actions:[],buy_actions:[],hold_actions:[],audit:{}};
+const desktop=renderTrendReportWorkspace(report);
+if (!desktop.includes('class="trend-stage cn-trend-stage cn-trend-buy" tabindex="0" aria-label="正式买入计划，可横向滚动"')) {
+  throw new Error(desktop);
+}
+window={matchMedia:(query)=>({matches:query==="(max-width: 760px)"})};
+const mobile=renderTrendReportWorkspace(report);
+if (!mobile.includes('class="trend-stage cn-trend-stage cn-trend-buy" tabindex="-1" aria-label="正式买入计划"')) {
+  throw new Error(mobile);
+}
+console.log("ok");
+''')
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    assert "ok" in output
+    assert "\n.cn-trend-buy:focus {" in css
+    focus = css.split("\n.cn-trend-buy:focus {", 1)[1].split("}", 1)[0]
+    assert "outline: 3px solid var(--accent);" in focus
+    assert "outline-offset: 2px;" in focus
+
+
+def test_dashboard_cn_buy_scroller_semantics_sync_across_breakpoint_changes() -> None:
+    output = run_dashboard_js(r'''
+const attributes={};
+const stage={tabIndex:99,setAttribute(name,value){attributes[name]=value;}};
+elements["trend-report-workspace"]={querySelector(selector){
+  if (selector !== ".cn-trend-buy") throw new Error("unknown selector " + selector);
+  return stage;
+}};
+window={matchMedia(){return {matches:true};}};
+syncCnTrendBuyAccessibility();
+const mobile={tabIndex:stage.tabIndex,label:attributes["aria-label"]};
+window={matchMedia(){return {matches:false};}};
+syncCnTrendBuyAccessibility();
+const desktop={tabIndex:stage.tabIndex,label:attributes["aria-label"]};
+console.log(JSON.stringify({mobile,desktop}));
+''')
+
+    assert json.loads(output) == {
+        "mobile": {"tabIndex": -1, "label": "正式买入计划"},
+        "desktop": {"tabIndex": 0, "label": "正式买入计划，可横向滚动"},
+    }
+
+
 def test_dashboard_cn_empty_stages_keep_tables_and_price_source_labels() -> None:
     output = run_dashboard_js(r'''
 const html=renderTrendReportWorkspace({
@@ -2819,7 +3039,7 @@ def test_dashboard_trend_report_mobile_layout_css() -> None:
     assert ".trend-checklist { position: static; order: 2; }" in mobile
     assert ".trend-report-entry button,\n  .trend-report-header button { min-height: 44px; }" in mobile
     assert ".cn-trend-table {" in css
-    table_css = css.split(".cn-trend-table {", 1)[1].split("}", 1)[0]
+    table_css = css.split("\n.cn-trend-table {", 1)[1].split("}", 1)[0]
     assert "table-layout: fixed;" in table_css
     assert "width: 100%;" in table_css
     assert "min-width:" not in table_css

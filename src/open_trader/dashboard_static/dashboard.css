@@ -1,15 +1,15 @@
 :root {
   color-scheme: light;
-  --bg: #fafaf9;
-  --surface: #ffffff;
-  --surface-soft: #faf8f4;
-  --text: #1c1917;
-  --muted: #78716c;
-  --accent: #a16207;
-  --line: #d6d3d1;
-  --primary: #1c1917;
-  --success: #15803d;
-  --danger: #b91c1c;
+  --bg: #f7f5f1;
+  --surface: #fffefa;
+  --surface-soft: #f2eee7;
+  --text: #201d18;
+  --muted: #746e64;
+  --accent: #8b5e34;
+  --line: #d8d2c8;
+  --primary: #24211d;
+  --success: #2f855a;
+  --danger: #b42318;
   --shadow: 0 8px 30px rgba(68, 55, 38, 0.06);
   --accent-strong: var(--accent);
   --border: var(--line);
@@ -1299,7 +1299,7 @@ h2 {
 .status-ok {
   background: #e7f4ec;
   border-color: #b8dac6;
-  color: var(--ok);
+  color: var(--text);
 }
 
 .status-partial,
@@ -1463,7 +1463,7 @@ table {
   border-radius: 8px;
   box-shadow: var(--shadow);
   margin: 0 auto;
-  max-width: 1180px;
+  max-width: none;
   padding: 22px;
   width: 100%;
 }
@@ -1645,6 +1645,23 @@ table {
 
 .cn-trend-buy {
   border-left-color: var(--ok);
+  overflow-x: auto;
+}
+
+.cn-trend-buy:focus {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.cn-trend-buy .cn-trend-table {
+  min-width: 1600px;
+  table-layout: auto;
+}
+
+.cn-trend-buy .cn-trend-table th,
+.cn-trend-buy .cn-trend-table td {
+  overflow-wrap: normal;
+  white-space: nowrap;
 }
 
 .cn-trend-table {
@@ -2622,7 +2639,7 @@ tbody tr.active-row {
 .technical-bollinger-card.lower-opportunity .technical-bollinger-header strong {
   background: #f4fbf7;
   border-color: #b9ddc9;
-  color: var(--ok);
+  color: var(--text);
 }
 
 .technical-bollinger-copy {
@@ -3747,8 +3764,86 @@ tbody tr.active-row {
 .account-tab.active { color: var(--text); border-bottom-color: var(--broker-accent); }
 .account-tab:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; box-shadow: inset 0 0 0 3px var(--accent); }
 
-.pnl-profit { color: #b91c1c; font-weight: 800; }
-.pnl-loss { color: #15803d; font-weight: 800; }
+.pnl-profit { color: var(--danger); font-weight: 800; }
+.pnl-loss { color: var(--success); font-weight: 800; }
+
+tbody tr:hover .pnl-loss,
+tbody tr.active-row .pnl-loss {
+  background: var(--surface);
+}
+
+.source-status-row,
+.backtest-form-section,
+.backtest-results,
+.tiger-rule-strip,
+.tiger-metric-card,
+.tiger-member-header,
+.tiger-unavailable,
+.kelly-lab-empty,
+.kelly-strategy-tab,
+.kelly-strategy-capital.unavailable,
+.kelly-capital-metric-grid div,
+.kelly-capital-utilization-bar,
+.kelly-capital-pane,
+.kelly-order-sync,
+.kelly-strategy-rules,
+.kelly-derivation,
+.kelly-symbol-state-card,
+.status-pill,
+.count-pill,
+.badge,
+.trend-report-header dl div,
+.trend-report-metrics span,
+.trend-stage:not(.cn-trend-stage),
+.trend-checklist,
+.trend-discipline,
+th,
+tbody tr:hover,
+tbody tr.active-row,
+.market-section-row td,
+.market-section-us-stock td,
+.market-section-us-option td,
+.market-section-hk-stock td,
+.market-section-hk-option td,
+.market-section-other td,
+.language-toggle,
+.disabled-button,
+.detail-metric,
+.decision-plan-header,
+.decision-plan-overview article,
+.decision-plan-fallback-banner > div,
+.decision-plan-fact,
+.decision-plan-condition-metrics > div,
+.decision-plan-evidence,
+.futu-signal-pill-row span,
+.futu-signal-metrics div,
+.futu-signal-category,
+.technical-bollinger-card.middle-range,
+.technical-bollinger-card.missing,
+.domestic-row,
+.technical-fact-row,
+.decision-fact-row,
+.condition-box,
+.llm-template-field,
+.decision-card,
+.decision-metric-strip article,
+.final-conclusion-list article,
+.decision-block,
+.impact-cell,
+.report-text,
+.dialogue-row,
+.research-conclusion-card,
+.research-chat-header,
+.research-chat-footer,
+.research-chat-context,
+.research-chat-message.assistant,
+.action-summary-grid div,
+.action-card-metrics div,
+.action-card,
+.backtest-metric-card,
+.cn-trend-card td:nth-child(-n + 2) {
+  --muted: var(--text);
+}
 
 input,
 select,
@@ -3880,6 +3975,20 @@ table {
 
   .cn-trend-stage {
     padding: 12px;
+  }
+
+  .cn-trend-buy {
+    overflow-x: hidden;
+  }
+
+  .cn-trend-buy .cn-trend-table {
+    min-width: 0;
+  }
+
+  .cn-trend-buy .cn-trend-table th,
+  .cn-trend-buy .cn-trend-table td {
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
 
   .cn-trend-table {
@@ -4023,7 +4132,8 @@ table {
   .backtest-form input,
   .backtest-form select,
   .decision-tab,
-  .language-toggle button {
+  .language-toggle button,
+  .research-chat-input-row input {
     min-height: 44px;
   }
 
