@@ -1383,7 +1383,11 @@ def test_dashboard_renders_tiger_trade_available_separately_from_cash() -> None:
 const group=(broker,available)=>({
   broker,rows:[],profile:{horizon:"长期",strategy:"策略"},
   summary:{broker,portfolio_value_hkd:"715000.00",holding_value_hkd:"263000.00",
-    cash_like_value_hkd:"451097.00",available_to_trade_hkd:available,holding_count:"8"},
+    cash_like_value_hkd:"451097.00",available_to_trade_hkd:available,holding_count:"8",
+    cash_components:[
+      {label:"USD 现金",value_hkd:"-31208.00"},
+      {label:"华泰港元货币市场基金A",value_hkd:"482305.00"},
+    ]},
 });
 console.log(JSON.stringify({
   tiger:renderAccountSection(group("tiger","488032.24")),
@@ -1393,7 +1397,11 @@ console.log(JSON.stringify({
     rendered = json.loads(output)
     assert "现金 HKD 451,097.00" in rendered["tiger"]
     assert "可交易额度 HKD 488,032.24" in rendered["tiger"]
+    assert "现金构成" in rendered["tiger"]
+    assert "USD 现金" in rendered["tiger"]
+    assert "华泰港元货币市场基金A" in rendered["tiger"]
     assert "可交易额度" not in rendered["futu"]
+    assert "现金构成" not in rendered["futu"]
 
 
 def test_dashboard_broker_cards_always_render_four_accounts_and_derive_aliases() -> None:

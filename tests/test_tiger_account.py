@@ -1166,6 +1166,7 @@ def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:
                 "currency": "USD",
                 "cash_balance": "100.25",
                 "available_balance": "88.50",
+                "fx_to_hkd": "7.85",
                 "source": "get_prime_assets",
             }
         ],
@@ -1227,6 +1228,7 @@ def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:
     [
         ("华泰港元货币市场基金A", AssetClass.MONEY_MARKET_FUND),
         ("环球股票基金", AssetClass.FUND),
+        ("Global Equity ETF", AssetClass.FUND),
     ],
 )
 def test_map_snapshot_classifies_tiger_funds(
@@ -1815,6 +1817,7 @@ def test_sync_tiger_portfolio_reconciles_prime_account_total_assets(
                 "currency": "USD",
                 "cash_balance": "100.25",
                 "available_balance": "88.50",
+                "fx_to_hkd": "7.85",
                 "source": "get_prime_assets",
             },
             {
@@ -1822,6 +1825,7 @@ def test_sync_tiger_portfolio_reconciles_prime_account_total_assets(
                 "account_alias": "tiger_6789",
                 "currency": "USD",
                 "account_total": "1200",
+                "fx_to_hkd": "7.85",
                 "source": "get_prime_assets",
             },
         ],
@@ -1870,7 +1874,7 @@ def test_sync_tiger_portfolio_writes_real_fund_and_live_fx_details(
     portfolio_path = tmp_path / "data/latest/portfolio.csv"
     write_portfolio(
         portfolio_path,
-        [base_portfolio_row(brokers="futu", accounts="main", fx_to_hkd="7.84")],
+        [base_portfolio_row(brokers="futu", accounts="main", fx_to_hkd="7.85")],
     )
     run_dir = tmp_path / "data/runs/2026-07-16"
     preserved = futu_hk_unknown_detail_row()
@@ -1943,6 +1947,9 @@ def test_sync_tiger_portfolio_writes_real_fund_and_live_fx_details(
     assert portfolio_rows_by_symbol["HK0000951506.HKD"]["asset_class"] == (
         "money_market_fund"
     )
+    assert portfolio_rows_by_symbol["MSFT"]["fx_to_hkd"] == "7.84"
+    assert portfolio_rows_by_symbol["MSFT"]["market_value_hkd"] == "784.00"
+    assert portfolio_rows_by_symbol["MSFT"]["fx_source"] == "tiger_live"
     assert "TIGER_UNMAPPED_ASSETS" not in portfolio_rows_by_symbol
     with (run_dir / "extracted_positions.csv").open(
         encoding="utf-8", newline=""
@@ -2924,7 +2931,15 @@ def test_sync_tiger_portfolio_no_detail_ignores_invalid_stale_tiger_row(
     )
     write_portfolio(portfolio_path, [stale_tiger, preserved])
     snapshot = tiger_snapshot_from_records(
-        cash_records=[],
+        cash_records=[
+            {
+                "account_alias": "tiger_5683",
+                "currency": "USD",
+                "cash_balance": "0",
+                "available_balance": "0",
+                "fx_to_hkd": "7.80",
+            }
+        ],
         position_records=[
             {
                 "account_alias": "tiger_5683",

@@ -139,7 +139,7 @@ def sync_tiger_portfolio(
             snapshot=snapshot,
             positions=positions,
             cash_balances=cash_balances,
-            fx_provider=fx_provider,
+            fx_to_hkd=tiger_fx_to_hkd,
             run_date=run_date,
         ),
     ]
@@ -180,6 +180,11 @@ def sync_tiger_portfolio(
         )
         if preserved_has_invalid_market_value:
             _mark_all_rows_data_check(merged_rows)
+    merged_rows = _apply_tiger_live_fx(
+        merged_rows,
+        tiger_fx_to_hkd,
+        run_date,
+    )
 
     run_dir = data_dir / "runs" / run_date
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -990,27 +995,28 @@ def _unmapped_total_asset_positions(
     snapshot: TigerAccountSnapshot,
     positions: list[Position],
     cash_balances: list[CashBalance],
-    fx_provider: StaticMonthEndFxProvider,
+    fx_to_hkd: dict[tuple[str, str], Decimal],
     run_date: str,
 ) -> list[Position]:
     mapped_hkd_by_account: dict[str, Decimal] = {}
     for position in positions:
         if position.market_value is None:
             continue
+        rate = fx_to_hkd.get((position.account_alias, position.currency.upper()))
+        if rate is None:
+            return []
         mapped_hkd_by_account[position.account_alias] = mapped_hkd_by_account.get(
             position.account_alias,
             Decimal("0"),
-        ) + (
-            position.market_value
-            * fx_provider.get_rate_to_hkd(position.currency.upper()).rate
-        )
+        ) + position.market_value * rate
     for cash in cash_balances:
+        rate = fx_to_hkd.get((cash.account_alias, cash.currency.upper()))
+        if rate is None:
+            return []
         mapped_hkd_by_account[cash.account_alias] = mapped_hkd_by_account.get(
             cash.account_alias,
             Decimal("0"),
-        ) + (
-            cash.cash_balance * fx_provider.get_rate_to_hkd(cash.currency.upper()).rate
-        )
+        ) + cash.cash_balance * rate
 
     adjustments: list[Position] = []
     statement_id = f"{run_date}-tiger-live"
@@ -1024,9 +1030,12 @@ def _unmapped_total_asset_positions(
         total_currency = _text(record, "currency", "USD").upper()
         if total_currency in {"", "N/A"}:
             total_currency = "USD"
-        total_assets_hkd = (
-            account_total * fx_provider.get_rate_to_hkd(total_currency).rate
+        total_rate = fx_to_hkd.get(
+            (account_alias, total_currency),
         )
+        if total_rate is None:
+            continue
+        total_assets_hkd = account_total * total_rate
         residual_hkd = total_assets_hkd - mapped_hkd_by_account.get(
             account_alias,
             Decimal("0"),
@@ -1140,7 +1149,12 @@ def _asset_class_from_record(record: dict[str, object]) -> AssetClass:
     if raw_type in {"STK", "STOCK", "EQUITY", "COMMON_STOCK"}:
         return AssetClass.STOCK
     if raw_type == "FUND":
-        return detect_asset_class(_text(record, "symbol"), _text(record, "name"))
+        detected = detect_asset_class(_text(record, "symbol"), _text(record, "name"))
+        return (
+            detected
+            if detected == AssetClass.MONEY_MARKET_FUND
+            else AssetClass.FUND
+        )
     if raw_type in {"ETF", "EXCHANGE_TRADED_FUND"}:
         return AssetClass.ETF
     return AssetClass.UNKNOWN
@@ -1583,6 +1597,37 @@ def _snapshot_fx_to_hkd(
         if rate is not None and rate > 0 and currency and account_alias:
             rates[(account_alias, currency)] = rate
     return rates
+
+
+def _apply_tiger_live_fx(
+    rows: list[dict[str, str]],
+    account_rates: dict[tuple[str, str], Decimal],
+    run_date: str,
+) -> list[dict[str, str]]:
+    rates_by_currency: dict[str, set[Decimal]] = {}
+    for (_, currency), rate in account_rates.items():
+        rates_by_currency.setdefault(currency, set()).add(rate)
+    for row in rows:
+        if _broker_parts(row) != {"tiger"}:
+            continue
+        rates = rates_by_currency.get(row.get("currency", "").strip().upper(), set())
+        if len(rates) != 1:
+            row["risk_flag"] = "data_check"
+            continue
+        market_value = _parse_finite_decimal(row.get("market_value", "").strip())
+        if market_value is None:
+            row["risk_flag"] = "data_check"
+            continue
+        rate = next(iter(rates))
+        cost_value = _parse_finite_decimal(row.get("cost_value", "").strip())
+        row["fx_source"] = "tiger_live"
+        row["fx_date"] = run_date
+        row["fx_to_hkd"] = _decimal_to_str(rate)
+        row["market_value_hkd"] = _decimal_to_str(market_value * rate)
+        row["cost_value_hkd"] = (
+            _decimal_to_str(cost_value * rate) if cost_value is not None else ""
+        )
+    return _recalculate_combined_portfolio_rows(rows)
 
 
 def _position_to_detail_row(

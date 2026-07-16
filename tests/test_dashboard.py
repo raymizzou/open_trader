@@ -3687,6 +3687,10 @@ def test_tiger_broker_summary_counts_money_market_fund_as_cash_like(
     assert summary["cash_like_value_hkd"] == "921.60"
     assert summary["portfolio_value_hkd"] == "1905.60"
     assert summary["available_to_trade_hkd"] == "486.08"
+    assert summary["cash_components"] == [
+        {"label": "USD 现金", "value_hkd": "-78.40"},
+        {"label": "华泰港元货币市场基金A", "value_hkd": "1000.00"},
+    ]
 
 
 def test_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
@@ -3737,6 +3741,35 @@ def test_load_dashboard_state_discovers_cash_only_detail_runs(
     statuses = {row["broker"]: row for row in state["source_statuses"]}
     assert statuses["tiger"]["status"] == "non_realtime"
     assert statuses["tiger"]["display_text"] == "仅月结单明细"
+
+
+def test_tiger_live_detail_without_fx_does_not_guess_cash_value(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_csv(
+        config.data_dir / "runs" / "2026-07-16" / "extracted_cash.csv",
+        CASH_FIELDNAMES,
+        [
+            {
+                "statement_id": "2026-07-16-tiger-live",
+                "broker": "tiger",
+                "account_alias": "tiger_5683",
+                "currency": "USD",
+                "cash_balance": "10",
+                "available_balance": "10",
+                "confidence": "high",
+                "notes": "",
+            }
+        ],
+    )
+
+    state = load_dashboard_state(config).to_dict()
+
+    summary = next(row for row in state["broker_summaries"] if row["broker"] == "tiger")
+    assert summary["cash_like_value_hkd"] == ""
+    assert summary["portfolio_value_hkd"] == ""
 
 
 def test_load_dashboard_state_marks_futu_and_tiger_live_only_from_live_statement_ids(

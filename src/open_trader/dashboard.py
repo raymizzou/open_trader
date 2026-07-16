@@ -1962,6 +1962,25 @@ def _build_broker_summary(
         }
     else:
         money = _build_portfolio_fallback_summary(portfolio_rows, broker)
+    cash_components = (
+        [
+            {
+                "label": f"{row.get('currency', '').strip().upper()} 现金".strip(),
+                "value_hkd": _detail_money_text(row, "cash_balance"),
+            }
+            for row in detail_cash_rows
+        ]
+        + [
+            {
+                "label": row.get("name", "").strip()
+                or row.get("symbol", "").strip(),
+                "value_hkd": _detail_money_text(row, "market_value"),
+            }
+            for row in cash_like_positions
+        ]
+        if broker == "tiger" and detail_available
+        else []
+    )
 
     return {
         "broker": broker,
@@ -1969,6 +1988,7 @@ def _build_broker_summary(
         "source_kind": BROKER_SOURCE_KINDS[broker],
         "detail_available": detail_available,
         **account_metrics,
+        **({"cash_components": cash_components} if cash_components else {}),
         **money,
     }
 
@@ -2019,6 +2039,11 @@ def _sum_detail_hkd(
     return total
 
 
+def _detail_money_text(row: dict[str, str], value_field: str) -> str:
+    value = _detail_value_hkd(row, value_field)
+    return _money_text(value) if value is not None else ""
+
+
 def _detail_value_hkd_for_summary(
     row: dict[str, str], value_field: str
 ) -> tuple[Decimal | None, bool]:
@@ -2045,6 +2070,11 @@ def _detail_fx_to_hkd(row: dict[str, str]) -> Decimal | None:
     if raw_rate:
         rate = _optional_decimal(raw_rate)
         return rate if rate is not None and rate > 0 else None
+    if (
+        _broker_key(row.get("broker", "")) == "tiger"
+        and row.get("statement_id", "").strip().endswith("-tiger-live")
+    ):
+        return None
     currency = row.get("currency", "").strip().upper()
     return DETAIL_FX_TO_HKD.get(currency)
 

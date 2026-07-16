@@ -2392,12 +2392,22 @@ function renderAccountSection(group) {
         <span>持仓 ${escapeHtml(formatDisplayNumber(group.summary.holding_count))}</span>
         <span>来源 ${escapeHtml(formatPlain(source))}</span>
         <span>时间 ${escapeHtml(formatPlain(sourceTime))}</span>
+        ${renderAccountCashDetails(group)}
       </div>
       ${renderTrendReportEntry(group.broker)}
     </header>
     ${renderAccountStrategy(group)}
     ${rows.length ? renderAccountTable(rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
   </section>`;
+}
+
+function renderAccountCashDetails(group) {
+  const components = group.broker === "tiger" && Array.isArray(group.summary.cash_components)
+    ? group.summary.cash_components
+    : [];
+  if (!components.length) return "";
+  const rows = components.map((component) => `<li><span>${escapeHtml(formatPlain(component.label))}</span><strong>${escapeHtml(formatMoney(component.value_hkd, "HKD"))}</strong></li>`).join("");
+  return `<details class="account-cash-details"><summary>现金构成</summary><ul>${rows}</ul></details>`;
 }
 
 function renderAccountTable(rows) {
