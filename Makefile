@@ -10,5 +10,4 @@ acceptance: test
 	PYTHONPATH=src .venv/bin/python -m open_trader.dashboard_acceptance \
 		--url "$(DASHBOARD_URL)" \
 		--log "$(DASHBOARD_LOG)" \
-		--expected-root "$(CURDIR)" \
-		--wait-seconds "$${WAIT_SECONDS:-125}"
+		--expected-root "$(CURDIR)"

@@ -28,7 +28,7 @@ only as the final gate before asking the user to review or accept a completed
 Dashboard task, unless the user explicitly requests it earlier. Its result is
 the only review-readiness status:
 
-- `PASS`: automated tests, real API/data, two refresh cycles, process version,
+- `PASS`: automated tests, real API/data, one live account/quote refresh, process version,
   logs, and desktop/mobile browser flows all passed.
 - `FAIL`: a page, data, process, log, or test check failed.
 - `BLOCKED`: the required browser or external environment is unavailable.
