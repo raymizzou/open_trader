@@ -2244,7 +2244,7 @@ function renderOptionAttentionWorkspace(report) {
     const items = Array.isArray(market.items)
       ? market.items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
       : [];
-    return `<tr class="option-attention-market"><th colspan="${OPTION_ATTENTION_COLUMNS.length}" scope="rowgroup"><span>${escapeHtml(optionAttentionValue(market.market_label))}</span><span>${escapeHtml(optionAttentionMarketStatus(market))}</span></th></tr>${items.map(renderOptionAttentionRow).join("")}`;
+    return `<tr class="option-attention-market"><th colspan="${OPTION_ATTENTION_COLUMNS.length}" scope="rowgroup"><div class="option-attention-market-content"><span>${escapeHtml(optionAttentionValue(market.market_label))}</span><span>${escapeHtml(optionAttentionMarketStatus(market))}</span></div></th></tr>${items.map(renderOptionAttentionRow).join("")}`;
   }).join("");
   return `<main class="option-attention-workspace">
     <header class="option-attention-header"><h1>期权关注</h1><button type="button" data-close-trend-report>返回持仓看板</button></header>

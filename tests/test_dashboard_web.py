@@ -3147,6 +3147,8 @@ const headings = [
 ];
 const renderedHeadings = [...html.matchAll(/<th scope="col">([^<]+)<\/th>/g)].map((match) => match[1]);
 if (JSON.stringify(renderedHeadings) !== JSON.stringify(headings)) throw new Error(html);
+const separators = [...html.matchAll(/<th colspan="10" scope="rowgroup"><div class="option-attention-market-content">([\s\S]*?)<\/div><\/th>/g)];
+if (separators.length !== 2 || separators.some((match) => (match[1].match(/<span>/g) || []).length !== 2)) throw new Error(html);
 for (const row of html.matchAll(/<tr class="option-attention-row">([\s\S]*?)<\/tr>/g)) {
   const labels = [...row[1].matchAll(/data-label="([^"]+)"/g)].map((match) => match[1]);
   if (JSON.stringify(labels) !== JSON.stringify(headings)) throw new Error(row[0]);
@@ -3169,8 +3171,19 @@ console.log("ok");
 
 def test_dashboard_option_attention_uses_native_responsive_grid() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    desktop = css.split("@media (max-width: 760px) {", 1)[0]
     mobile = css.split("@media (max-width: 760px) {", 1)[1]
 
+    separator_cell_rules = re.findall(
+        r"\.option-attention-market th \{([^}]*)\}", desktop,
+    )
+    assert separator_cell_rules
+    assert all("display:" not in rule for rule in separator_cell_rules)
+    separator_content = desktop.split(
+        ".option-attention-market-content {", 1,
+    )[1].split("}", 1)[0]
+    assert "display: flex;" in separator_content
+    assert "justify-content: space-between;" in separator_content
     assert ".option-attention-table thead" in mobile
     assert ".option-attention-row" in mobile
     assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in mobile

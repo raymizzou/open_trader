@@ -1759,7 +1759,7 @@ table {
   text-align: left;
 }
 
-.option-attention-market th {
+.option-attention-market-content {
   display: flex;
   gap: 10px;
   justify-content: space-between;
