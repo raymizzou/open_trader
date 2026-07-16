@@ -1913,33 +1913,6 @@ function renderTrendReportEntry(broker) {
   </div>`;
 }
 
-function renderTrendAction(item, kind) {
-  const identity = [item.symbol, item.name].filter(Boolean).map(formatPlain).join(" ");
-  const reason = TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认";
-  const fields = [identity];
-  if (kind === "buy") {
-    fields.push(`约 ${formatDisplayNumber(item.estimated_shares)} 股`);
-    fields.push(`金额上限 ${formatDisplayNumber(item.target_amount)}`);
-    fields.push(`预计保护线 ${formatDisplayNumber(item.estimated_initial_line)}`);
-  } else {
-    fields.push(reason);
-    if (item.active_line !== null && item.active_line !== undefined && item.active_line !== "") {
-      fields.push(`活动保护线 ${formatDisplayNumber(item.active_line)}`);
-    }
-  }
-  return `<li>${fields.map(escapeHtml).join("<span>｜</span>")}</li>`;
-}
-
-function renderTrendStage(title, items, kind) {
-  const rows = Array.isArray(items)
-    ? items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
-    : [];
-  return `<section class="trend-stage">
-    <h2>${escapeHtml(title)}</h2>
-    ${rows.length ? `<ol>${rows.map((item) => renderTrendAction(item, kind)).join("")}</ol>` : "<p>无</p>"}
-  </section>`;
-}
-
 function renderTrendAudit(audit) {
   const candidates = Array.isArray(audit.candidates)
     ? audit.candidates.filter((item) => item && typeof item === "object" && !Array.isArray(item))
@@ -1968,33 +1941,6 @@ function renderTrendAudit(audit) {
   </details>`;
 }
 
-function renderDefaultTrendReportWorkspace(report) {
-  const counts = report.counts || {};
-  const audit = report.audit || {};
-  return `<header class="trend-report-header">
-      <div><p>${escapeHtml(`${report.broker_label}｜${report.market_label}`)}</p><h1>当天趋势报告</h1></div>
-      <dl>
-        <div><dt>报告日期</dt><dd>${escapeHtml(formatPlain(report.report_date))}</dd></div>
-        <div><dt>数据截至</dt><dd>${escapeHtml(formatPlain(report.data_date))}</dd></div>
-        <div><dt>生成时间</dt><dd>${escapeHtml(formatPlain(report.generated_at))}</dd></div>
-        <div><dt>账户状态</dt><dd>${escapeHtml(formatPlain(report.account_status))}</dd></div>
-      </dl>
-      <div class="trend-report-metrics"><span>卖出 ${escapeHtml(formatDisplayNumber(counts.sell || 0))}</span><span>买入 ${escapeHtml(formatDisplayNumber(counts.buy || 0))}</span><span>持有 ${escapeHtml(formatDisplayNumber(counts.hold || 0))}</span><span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span></div>
-    </header>
-    <div class="trend-report-body">
-      <main class="trend-timeline">
-        ${renderTrendStage("开盘前", report.sell_actions || [], "sell")}
-        ${renderTrendStage(report.buy_window, report.buy_actions || [], "buy")}
-        ${renderTrendStage("盘中持续", report.hold_actions || [], "hold")}
-        ${renderTrendStage("人工复核", report.review_actions || [], "review")}
-        ${renderTrendAudit(audit)}
-      </main>
-      <aside class="trend-checklist"><h2>今日执行检查</h2><ol>
-        <li>确认全部卖出动作</li><li>按顺序考虑允许买入项</li><li>盘中观察活动保护线</li><li>完成人工复核</li>
-      </ol></aside>
-    </div>`;
-}
-
 function cnTrendRows(items) {
   return Array.isArray(items)
     ? items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
@@ -2002,7 +1948,8 @@ function cnTrendRows(items) {
 }
 
 function renderCnTrendCell(label, value, ariaLabel = "") {
-  return `<td data-label="${escapeHtml(label)}"${ariaLabel ? ` aria-label="${escapeHtml(ariaLabel)}"` : ""}>${escapeHtml(formatPlain(value))}</td>`;
+  const display = hasValue(value) ? formatPlain(value) : "—";
+  return `<td data-label="${escapeHtml(label)}"${ariaLabel ? ` aria-label="${escapeHtml(ariaLabel)}"` : ""}>${escapeHtml(display)}</td>`;
 }
 
 function cnTrendIdentity(item) {
@@ -2069,6 +2016,41 @@ function renderCnSellOrHoldStage(title, items, kind) {
     ${renderCnTrendCell("持仓提示", cnTrendHints(item))}
   </tr>`);
   return renderCnTrendTable(title, kind, headings, rows);
+}
+
+function renderMarketSellOrHoldStage(title, items, kind) {
+  const action = { sell: "全部卖出", review: "人工复核" }[kind] || "继续持有";
+  const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
+  const headings = ["标的", "动作", "执行参考价", "强度", reasonHeading, "活动保护线", "持仓提示"];
+  const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
+    ${renderCnTrendCell("标的", cnTrendIdentity(item))}
+    ${renderCnTrendCell("动作", action)}
+    ${renderCnTrendCell("执行参考价", item.close)}
+    ${renderCnTrendCell("强度", item.strength)}
+    ${renderCnTrendCell(reasonHeading, TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
+    ${renderCnTrendCell("活动保护线", item.active_line)}
+    ${renderCnTrendCell("持仓提示", Array.isArray(item.entry_hints) && item.entry_hints.length ? item.entry_hints.map(formatPlain).join("；") : "—")}
+  </tr>`);
+  return renderCnTrendTable(title, kind, headings, rows);
+}
+
+function renderMarketBuyStage(report) {
+  const headings = ["标的", "动作", "执行参考价", "强度", "行业", "目标仓位", "金额上限", "预计数量", "预计保护线"];
+  const rows = cnTrendRows(report.buy_actions).map((item) => {
+    const targetWeight = decimalAsPercent(item.target_weight, "—");
+    return `<tr class="cn-trend-card">
+      ${renderCnTrendCell("标的", cnTrendIdentity(item))}
+      ${renderCnTrendCell("动作", "正式买入")}
+      ${renderCnTrendCell("执行参考价", item.close)}
+      ${renderCnTrendCell("强度", item.strength)}
+      ${renderCnTrendCell("行业", item.industry)}
+      ${renderCnTrendCell("目标仓位", targetWeight, `目标仓位 ${targetWeight}`)}
+      ${renderCnTrendCell("金额上限", item.target_amount)}
+      ${renderCnTrendCell("预计数量", hasValue(item.estimated_shares) ? `${formatPlain(item.estimated_shares)} 股` : "—")}
+      ${renderCnTrendCell("预计保护线", item.estimated_initial_line)}
+    </tr>`;
+  });
+  return renderCnTrendTable(`${formatPlain(report.buy_window)} · 正式买入计划`, "buy", headings, rows);
 }
 
 function renderCnBuyStage(report) {
@@ -2167,6 +2149,9 @@ function renderCnTrendAudit(audit) {
 function renderCnTrendReportWorkspace(report) {
   const counts = report.counts || {};
   const audit = report.audit || {};
+  const isCn = String(report.market || "").toUpperCase() === "CN";
+  const sellOrHold = isCn ? renderCnSellOrHoldStage : renderMarketSellOrHoldStage;
+  const buyStage = isCn ? renderCnBuyStage(report) : renderMarketBuyStage(report);
   return `<main class="cn-trend-report">
     <header class="trend-report-header">
       <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1></div>
@@ -2185,20 +2170,18 @@ function renderCnTrendReportWorkspace(report) {
       </div>
     </header>
     <div class="cn-trend-actions">
-      ${renderCnSellOrHoldStage("优先处理 · 卖出触发", report.sell_actions, "sell")}
-      ${renderCnSellOrHoldStage("需要确认 · 人工复核", report.review_actions, "review")}
-      ${renderCnBuyStage(report)}
-      ${renderCnSellOrHoldStage("盘中持续 · 已有持仓", report.hold_actions, "hold")}
+      ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
+      ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}
+      ${buyStage}
+      ${sellOrHold("盘中持续 · 已有持仓", report.hold_actions, "hold")}
     </div>
-    ${renderCnTrendDisciplines()}
-    ${renderCnTrendAudit(audit)}
+    ${isCn ? renderCnTrendDisciplines() : ""}
+    ${isCn ? renderCnTrendAudit(audit) : renderTrendAudit(audit)}
   </main>`;
 }
 
 function renderTrendReportWorkspace(report) {
-  return String(report && report.market || "").toUpperCase() === "CN"
-    ? renderCnTrendReportWorkspace(report || {})
-    : renderDefaultTrendReportWorkspace(report || {});
+  return renderCnTrendReportWorkspace(report || {});
 }
 
 function renderAccountStrategy(group) {

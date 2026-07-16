@@ -2825,13 +2825,17 @@ elements["account-holdings"].click(open);
 if(!elements["workspace-grid"].classList.contains("hidden")||elements["trend-report-workspace"].hidden||elements["trend-report-workspace"].classList.contains("hidden"))throw new Error("workspace state");
 if(document.activeElement!==elements["return-to-portfolio"])throw new Error("workspace focus");
 const workspace=elements["trend-report-workspace"].innerHTML;
-const order=["开盘前","美股常规交易时段","盘中持续","人工复核"].map((text)=>workspace.indexOf(`<h2>${text}</h2>`));
+const order=["优先处理 · 卖出触发","需要确认 · 人工复核",
+  "美股常规交易时段 · 正式买入计划","盘中持续 · 已有持仓"]
+  .map((text)=>workspace.indexOf(`<h2>${text}</h2>`));
 if(order.some((index)=>index<0)||!order.every((index,i)=>i===0||order[i-1]<index))throw new Error(workspace);
 for(const symbol of ["SELLX","BUYX","HOLDX","REVIEWX"]){if(!workspace.includes(symbol))throw new Error(workspace);}
+for(const count of ["正式买入 1","全部卖出 1","继续持有 1","人工复核 1"]){if(!workspace.includes(count))throw new Error(workspace);}
+if((workspace.match(/class="cn-trend-table"/g)||[]).length!==4)throw new Error(workspace);
 if(!workspace.includes("账户不参与项")||!workspace.includes("现金类资产不参与趋势判断：FUTU_UNMAPPED_ASSETS（cash）"))throw new Error(workspace);
 if(!workspace.includes("账户数据非实时，执行前核对现金与持仓"))throw new Error(workspace);
 if(!workspace.includes('<details class="trend-audit"><summary>审计详情</summary>')||workspace.includes('<details class="trend-audit" open'))throw new Error(workspace);
-for(const text of ["确认全部卖出动作","按顺序考虑允许买入项","盘中观察活动保护线","完成人工复核"]){if(!workspace.includes(text))throw new Error(workspace);}
+if(workspace.includes("今日执行检查"))throw new Error(workspace);
 
 const close=new E();close.dataset.closeTrendReport="";
 elements["trend-report-workspace"].click(close);
@@ -2847,7 +2851,7 @@ console.log("ok");
     assert "ok" in output
 
 
-def test_dashboard_renders_action_first_cn_trend_report_only_for_cn() -> None:
+def test_dashboard_renders_action_first_trend_report_for_every_market() -> None:
     output = run_dashboard_js(r'''
 const cn = renderTrendReportWorkspace({
   available:true,market:"CN",broker:"eastmoney",broker_label:"东方财富",
@@ -2900,12 +2904,36 @@ if ((cn.match(/<details class="trend-discipline" open>/g) || []).length !== 2) t
 const actionContent = cn.split('<details class="trend-audit"', 1)[0];
 if (actionContent.includes("AUDIT-ONLY") || !cn.includes("AUDIT-ONLY")) throw new Error(cn);
 
-const us = renderTrendReportWorkspace({market:"US",broker_label:"富途",
-  market_label:"美股",counts:{},sell_actions:[],buy_actions:[],
-  hold_actions:[],review_actions:[],audit:{}});
-if (us.includes('class="cn-trend-report"') || !us.includes("今日执行检查")) {
-  throw new Error(us);
+const us = renderTrendReportWorkspace({
+  market:"US",broker_label:"富途",market_label:"美股",
+  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
+  account_status:"已更新",buy_window:"美股常规交易时段",
+  counts:{sell:0,buy:1,hold:0,review:1},sell_actions:[],hold_actions:[],
+  buy_actions:[{symbol:"EA",name:"艺电",close:"207.27",strength:"99.8",
+    industry:"通讯服务",target_weight:"0.04",target_amount:"4941.49",
+    estimated_shares:23,estimated_initial_line:"205.46930"}],
+  review_actions:[{symbol:"BOTZ",name:"Global X Robotics ETF",
+    reason:"holding_signal_unknown",close:null,strength:null,active_line:null}],
+  audit:{account_exceptions:["现金类资产不参与趋势判断"]},
+});
+for (const text of ["优先处理 · 卖出触发","需要确认 · 人工复核",
+  "美股常规交易时段 · 正式买入计划","盘中持续 · 已有持仓",
+  "正式买入 1","全部卖出 0","继续持有 0","人工复核 1",
+  "EA 艺电","207.27","99.8","通讯服务","4%","4941.49","23 股",
+  "205.46930","BOTZ Global X Robotics ETF","趋势信号不完整",
+  "账户不参与项","现金类资产不参与趋势判断","审计详情"]) {
+  if (!us.includes(text)) throw new Error(text + "\n" + us);
 }
+const usOrder=["优先处理 · 卖出触发","需要确认 · 人工复核",
+  "美股常规交易时段 · 正式买入计划","盘中持续 · 已有持仓"]
+  .map((text)=>us.indexOf(`<h2>${text}</h2>`));
+if (usOrder.some((index)=>index<0) ||
+    !usOrder.every((index,i)=>i===0||usOrder[i-1]<index)) throw new Error(us);
+if (!us.includes('class="cn-trend-report"') ||
+    (us.match(/class="cn-trend-table"/g) || []).length !== 4 ||
+    !us.includes('class="cn-trend-card"') ||
+    us.includes("今日执行检查") || us.includes("筛选价（Trend Animals）") ||
+    us.includes('class="trend-discipline"')) throw new Error(us);
 console.log("ok");
 ''')
 
