@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import shutil
 import subprocess
 import threading
@@ -127,8 +128,43 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
 def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
 
-    assert "--muted: #746e64;" in css
-    assert "--surface-soft: #f2eee7;" in css
+    tokens = dict(re.findall(r"--([\w-]+): (#[0-9a-f]{6});", css))
+
+    def luminance(color: str) -> float:
+        channels = (int(color[index:index + 2], 16) / 255 for index in (1, 3, 5))
+        linear = (value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4 for value in channels)
+        red, green, blue = linear
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    foreground = luminance(tokens["text"])
+    background = luminance(tokens["surface-soft"])
+    ratio = (max(foreground, background) + 0.05) / (min(foreground, background) + 0.05)
+    assert ratio >= 4.5
+
+    soft_surface_contract = re.search(
+        r"([^{}]+) \{\n  --muted: var\(--text\);\n\}", css,
+    )
+    assert soft_surface_contract is not None
+    contract_selectors = {
+        selector.strip() for selector in soft_surface_contract.group(1).split(",")
+    }
+    soft_surface_selectors = {
+        selector.strip()
+        for selectors in re.findall(
+            r"([^{}]+)\{[^{}]*background: var\(--(?:surface-soft|panel-soft)\);[^{}]*\}",
+            css,
+        )
+        for selector in selectors.split(",")
+    }
+    assert soft_surface_selectors <= contract_selectors
+
+    for foreground_selector, surface_selector in (
+        (".source-status-row span", ".source-status-row"),
+        (".tiger-member-header", ".tiger-member-header"),
+    ):
+        block = css.split(f"\n{foreground_selector} {{", 1)[1].split("}", 1)[0]
+        assert "color: var(--muted);" in block
+        assert surface_selector in contract_selectors
 
 
 def test_dashboard_account_tabs_register_roving_keyboard_and_panel_semantics() -> None:
