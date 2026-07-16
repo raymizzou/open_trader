@@ -3594,6 +3594,30 @@ def test_load_dashboard_state_builds_broker_summaries_from_detail_rows(
     assert statuses["phillips"]["status"] == "non_realtime"
 
 
+def test_broker_summary_counts_cash_classified_positions_as_cash() -> None:
+    futu = dashboard_module._build_broker_summary(
+        "futu",
+        [],
+        [{
+            "broker": "futu",
+            "market": "CASH",
+            "asset_class": "cash",
+            "currency": "HKD",
+            "market_value": "900",
+        }],
+        [{
+            "broker": "futu",
+            "currency": "HKD",
+            "cash_balance": "100",
+        }],
+    )
+
+    assert futu["holding_value_hkd"] == "0.00"
+    assert futu["cash_like_value_hkd"] == "1000.00"
+    assert futu["portfolio_value_hkd"] == "1000.00"
+    assert futu["holding_count"] == 0
+
+
 def test_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
     tmp_path: Path,
 ) -> None:
