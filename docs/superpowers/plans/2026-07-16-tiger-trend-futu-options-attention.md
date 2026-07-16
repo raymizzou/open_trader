@@ -644,13 +644,26 @@ git commit -m "refactor: retire Tiger SMA200 strategy"
 **Files:**
 - Runtime migration: `data/trend_us_futu/`, `reports/trend_us_futu/`, `data/latest/US/tiger_long_term_strategy.json`, dated Tiger long-term artifacts
 - Runtime outputs: `data/trend_us_tiger/`, `reports/trend_us_tiger/`, HK/CN report revisions, logs
+- Runtime checkout: `/Users/ray/projects/open_trader` fast-forwarded to the same candidate SHA
 - No source edits after the accepted commit
 
 **Interfaces:**
 - Consumes: all code from Tasks 1-6 and the 2026-07-15 Futu report as one-time diff baseline.
 - Produces: live Tiger US report/watcher, updated HK/CN unified fields, accepted Dashboard process, and review URL.
 
-- [ ] **Step 1: Run focused and full automated verification**
+- [ ] **Step 1: Integrate the branch that owns the live checkout**
+
+Merge the current live-checkout branch into this feature branch before selecting
+the candidate. Resolve conflicts by preserving both the Dashboard acceptance
+changes and this feature; the merge must make the live checkout an ancestor of
+the candidate so it can be fast-forwarded exactly:
+
+```bash
+git merge --no-edit docs/dashboard-acceptance-single-refresh-plan
+git merge-base --is-ancestor docs/dashboard-acceptance-single-refresh-plan HEAD
+```
+
+- [ ] **Step 2: Run focused and full automated verification**
 
 Run:
 
@@ -661,18 +674,19 @@ make test
 
 Expected: both commands PASS. Do not run `make acceptance` yet.
 
-- [ ] **Step 2: Commit the confirmed spec/plan and record the candidate SHA**
+- [ ] **Step 3: Record the candidate SHA and fast-forward the live checkout**
 
 ```bash
-git add docs/superpowers/specs/2026-07-16-tiger-trend-futu-options-attention-design.md docs/superpowers/plans/2026-07-16-tiger-trend-futu-options-attention.md
-git commit -m "docs: define Tiger trend and Futu attention rollout"
 git status --short
-git rev-parse HEAD
+candidate_sha="$(git rev-parse HEAD)"
+git -C /Users/ray/projects/open_trader merge --ff-only "$candidate_sha"
+test "$(git -C /Users/ray/projects/open_trader rev-parse HEAD)" = "$candidate_sha"
 ```
 
-Expected: only pre-existing unrelated user files may remain untracked/modified; record the printed SHA as the candidate SHA.
+Expected: only pre-existing unrelated user files may remain untracked/modified;
+the actual checkout and feature worktree resolve to the same candidate SHA.
 
-- [ ] **Step 3: Stop old in-memory jobs and run the real report workflows**
+- [ ] **Step 4: Stop old in-memory jobs and run the real report workflows**
 
 Inspect before changing processes:
 
@@ -694,10 +708,27 @@ one-time read-only baseline:
 
 ```bash
 mkdir -p data/trend_us_tiger
-baseline="$(find reports/trend_us_futu -maxdepth 1 -type f -name '2026-07-15*.json' -print | sort | tail -n 1)"
-test -n "$baseline"
+baseline=""
+best_revision=-1
+for candidate in reports/trend_us_futu/2026-07-15.json(N) reports/trend_us_futu/2026-07-15-r*.json(N); do
+  stem="${candidate:t:r}"
+  revision=0
+  [[ "$stem" == *-r* ]] && revision="${stem##*-r}"
+  [[ "$revision" == <-> ]] || continue
+  if (( revision > best_revision )); then
+    baseline="$candidate"
+    best_revision="$revision"
+  fi
+done
+test -f "$baseline"
+test "$best_revision" -eq 4
 cp "$baseline" data/trend_us_tiger/attention_baseline.json
+PYTHONPATH=src .venv/bin/python -c 'from pathlib import Path; from open_trader.market_trend import _previous_attention_rows, market_paths; paths=market_paths(Path("data"), Path("reports"), "US"); rows=_previous_attention_rows(paths, current_as_of_date="2026-07-16", market="US"); symbols=sorted({str(row["symbol"]) for row in rows}); assert symbols; print("baseline symbols:", ",".join(symbols))'
 ```
+
+The direct loader proof must print non-empty baseline symbols before any legacy
+path is removed. Keep the baseline until the first Tiger report has been
+validated.
 
 Then run current data directly:
 
@@ -709,7 +740,7 @@ PYTHONPATH=src .venv/bin/python -m open_trader trend-a-share-report --date today
 
 Expected: US reports under `reports/trend_us_tiger`; HK/CN revisions contain all unified snapshot keys; notification ledgers still contain one semantic daily message per source market.
 
-- [ ] **Step 4: Remove retired runtime artifacts only after the new US report exists**
+- [ ] **Step 5: Remove retired runtime artifacts only after the new US report exists**
 
 First prove the replacement exists and the 2026-07-15 baseline was consumed:
 
@@ -729,7 +760,7 @@ find data/runs -path '*/US/tiger_long_term_strategy.json' -delete
 
 Expected: the old paths no longer exist; `data/trend_us_tiger` protection state and logs remain.
 
-- [ ] **Step 5: Start the candidate Dashboard and inspect fresh process evidence**
+- [ ] **Step 6: Start the candidate Dashboard and inspect fresh process evidence**
 
 ```bash
 screen -S open_trader_dashboard_8766 -X quit 2>/dev/null || true
@@ -743,7 +774,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/
 
 Expected: a new PID/start time, repository working directory in the command, fresh logs, and HTTP `200`.
 
-- [ ] **Step 6: Run the final Dashboard acceptance gate once**
+- [ ] **Step 7: Run the final Dashboard acceptance gate once**
 
 ```bash
 make acceptance
@@ -751,7 +782,7 @@ make acceptance
 
 Expected: final line/result `PASS`. On `FAIL`, fix the cause, rerun focused/direct checks, and repeat this step. On `BLOCKED`, stop and report the external blocker; do not substitute curl, fixtures, mocks, or screenshots.
 
-- [ ] **Step 7: Redeploy the exact accepted SHA and provide the review URL**
+- [ ] **Step 8: Redeploy the exact accepted SHA and provide the review URL**
 
 ```bash
 accepted_sha="$(git rev-parse HEAD)"
