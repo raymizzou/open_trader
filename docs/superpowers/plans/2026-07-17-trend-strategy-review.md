@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 为东方财富 A 股、富途美股和辉立港股建立按 30 笔完整纪律模拟交易分批的复盘，展示当前策略完整参数，以及纪律模拟、实际执行和市场基准的期间净收益率、相对市场超额收益、最大回撤、卡玛比率和夏普比率。
+**Goal:** 为东方财富 A 股、老虎美股和辉立港股建立按 30 笔完整纪律模拟交易分批的复盘，展示当前策略完整参数，以及纪律模拟、实际执行和市场基准的期间净收益率、相对市场超额收益、最大回撤、卡玛比率和夏普比率。
 
 **Architecture:** 现有趋势报告继续是动作和策略规则的唯一事实源，在冻结 JSON 中新增完整 `strategy_snapshot` 和可重放证据引用。新增一个 `trend_review.py` 负责 Futu 模拟账户动作、日终快照、不可变批次、纠正回放和五项指标；现有 watcher 在开盘和保护线触发点调用它，Dashboard 只读取 `data/latest/trend_review_cn.json`、`trend_review_us.json`、`trend_review_hk.json`。前端复用现有趋势报告工作区，以原生 HTML/CSS 绘制两组条形图，不增加依赖或第二套页面框架。
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 只实现批准的三个市场：东方财富 A 股、富途美股、辉立港股；老虎不显示复盘入口。
+- 只实现批准的三个市场：东方财富 A 股、老虎美股、辉立港股；富途期权关注不显示复盘入口。
 - 入口只放在对应账户头部 `当天趋势报告` 旁，文字固定为 `A 股复盘`、`美股复盘`、`港股复盘`。
 - A 股只对比中证全指前复权收盘价，美股只对比 SPY 前复权收盘价，港股只对比恒生综合指数前复权收盘价；不同市场不得合并。
 - 每个市场使用独立 Futu 模拟账户，并以全现金、零持仓开始；账户中不得混入其他实验。
@@ -743,20 +743,20 @@ git commit -m "feat: automate trend review collection"
 
 **Interfaces:**
 - Consumes: `data/latest/trend_review_cn.json`, `trend_review_us.json`, `trend_review_hk.json`.
-- Produces: `DashboardState.trend_reviews: dict[str, dict[str, Any]]` keyed by `eastmoney|futu|phillips`.
+- Produces: `DashboardState.trend_reviews: dict[str, dict[str, Any]]` keyed by `eastmoney|tiger|phillips`.
 
 - [ ] **Step 1: Write failing projection tests**
 
 ```python
 def test_dashboard_loads_only_matching_market_review(tmp_path: Path) -> None:
     write_review(tmp_path, "CN", broker="eastmoney")
-    write_review(tmp_path, "US", broker="futu")
+    write_review(tmp_path, "US", broker="tiger")
     write_review(tmp_path, "HK", broker="phillips")
     state = load_dashboard_state(config(tmp_path)).to_dict()
     assert state["trend_reviews"]["eastmoney"]["market"] == "CN"
-    assert state["trend_reviews"]["futu"]["market"] == "US"
+    assert state["trend_reviews"]["tiger"]["market"] == "US"
     assert state["trend_reviews"]["phillips"]["market"] == "HK"
-    assert "tiger" not in state["trend_reviews"]
+    assert "futu" not in state["trend_reviews"]
 
 
 def test_dashboard_rejects_review_with_extra_metric(tmp_path: Path) -> None:
@@ -783,7 +783,7 @@ Use fixed configuration beside `TREND_REPORT_SOURCES`:
 
 ```python
 TREND_REVIEW_SOURCES = {
-    "futu": ("US", "美股", "trend_review_us.json"),
+    "tiger": ("US", "美股", "trend_review_us.json"),
     "phillips": ("HK", "港股", "trend_review_hk.json"),
     "eastmoney": ("CN", "A股", "trend_review_cn.json"),
 }
@@ -830,7 +830,7 @@ Add a JS harness test that renders all four accounts and asserts:
 
 ```javascript
 for (const [broker, label] of [
-  ["eastmoney", "A 股复盘"], ["futu", "美股复盘"], ["phillips", "港股复盘"],
+  ["eastmoney", "A 股复盘"], ["tiger", "美股复盘"], ["phillips", "港股复盘"],
 ]) {
   const account = renderAccountSection(group(broker));
   if (!account.includes(`data-trend-review="${broker}"`) || !account.includes(label)) {
@@ -935,7 +935,7 @@ Extend the acceptance fake page to verify:
 
 ```python
 for broker, label in (
-    ("eastmoney", "A 股复盘"), ("futu", "美股复盘"), ("phillips", "港股复盘")
+    ("eastmoney", "A 股复盘"), ("tiger", "美股复盘"), ("phillips", "港股复盘")
 ):
     page.locator(f'#account-{broker}:visible [data-trend-review="{broker}"]').click()
     assert page.locator("#trend-report-workspace:visible").contains_text(label.replace("复盘", "趋势复盘"))
