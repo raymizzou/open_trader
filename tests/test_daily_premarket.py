@@ -74,6 +74,9 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS=622494",
                 "OPEN_TRADER_TREND_US_SYMBOLS=AAPL, VIXY",
                 "OPEN_TRADER_TREND_HK_SYMBOLS=00700, 02800",
+                "OPEN_TRADER_TREND_REVIEW_CN_SIMULATE_ACC_ID=101",
+                "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID=102",
+                "OPEN_TRADER_TREND_REVIEW_HK_SIMULATE_ACC_ID=103",
                 "DEEPSEEK_API_KEY=secret",
             ]
         ),
@@ -107,6 +110,9 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.trend_animals_hk_tm_ids == (622494,)
     assert config.trend_us_symbols == ("AAPL", "VIXY")
     assert config.trend_hk_symbols == ("00700", "02800")
+    assert config.trend_review_cn_simulate_acc_id == 101
+    assert config.trend_review_us_simulate_acc_id == 102
+    assert config.trend_review_hk_simulate_acc_id == 103
 
 
 def test_shared_env_loader_accepts_other_positive_a_share_pool_ids(
@@ -1360,6 +1366,20 @@ def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
         logs_dir=tmp_path / "logs",
         portfolio=tmp_path / "data/latest/portfolio.csv",
     )
+
+
+def test_require_trend_review_config_returns_selected_market_values(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _daily_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
+    )
+
+    assert daily_premarket.require_trend_review_config(config, "CN") == 101
+    assert daily_premarket.require_trend_review_config(config, "US") == 102
 
 
 def _daily_runner(

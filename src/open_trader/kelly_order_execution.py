@@ -73,12 +73,15 @@ class FutuSimulateOrderExecutionClient:
     def place_order(self, request: dict[str, Any]) -> dict[str, Any]:
         side = str(request["side"]).strip().lower()
         trd_side = _futu_trade_side(side)
+        order_type = str(request.get("order_type") or "NORMAL").strip().upper()
+        if order_type not in {"NORMAL", "MARKET"}:
+            raise ValueError("order_type must be NORMAL or MARKET")
         ret_code, data = self.context.place_order(
-            price=float(request["price"]),
+            price=0.0 if order_type == "MARKET" else float(request["price"]),
             qty=float(request["qty"]),
             code=request["futu_code"],
             trd_side=trd_side,
-            order_type="NORMAL",
+            order_type=order_type,
             trd_env=TRD_ENV_SIMULATE,
             acc_id=self.account["acc_id"],
             acc_index=self.account["acc_index"],
@@ -95,6 +98,38 @@ class FutuSimulateOrderExecutionClient:
             "status": "submitted",
             "raw": raw,
         }
+
+    def account_snapshot(self) -> dict[str, Any]:
+        account_rows = self._query("accinfo_query")
+        positions = self._query("position_list_query")
+        raw = account_rows[0] if account_rows else {}
+        return {
+            "acc_id": self.account["acc_id"],
+            "net_value": _first_text(
+                raw, ("total_assets", "total_asset", "net_assets", "net_asset")
+            ),
+            "cash": _first_text(raw, ("cash", "cash_balance", "available_funds")),
+            "positions": positions,
+            "raw": raw,
+        }
+
+    def list_orders(self) -> dict[str, Any]:
+        return {
+            "acc_id": self.account["acc_id"],
+            "orders": self._query("order_list_query"),
+        }
+
+    def _query(self, method_name: str) -> list[dict[str, Any]]:
+        ret_code, data = getattr(self.context, method_name)(
+            trd_env=TRD_ENV_SIMULATE,
+            acc_id=self.account["acc_id"],
+            acc_index=self.account["acc_index"],
+        )
+        if ret_code != 0:
+            raise FutuOrderExecutionError(
+                str(data), error_type=f"{method_name}_failed"
+            )
+        return [dict(item) for item in _records(data)]
 
     def close(self) -> None:
         self.context.close()

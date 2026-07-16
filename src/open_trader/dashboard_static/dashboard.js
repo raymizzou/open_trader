@@ -13,6 +13,7 @@ const state = {
   selectedHoldingDetail: "decision",
   selectedDecisionTab: "final",
   selectedTrendBroker: "",
+  selectedTrendKind: "",
   decisionDeepLinkRestored: false,
   detailLanguage: "zh",
   refreshActive: false,
@@ -249,6 +250,11 @@ function bindEvents() {
   elements["account-tabs"].addEventListener("keydown", handleBrokerTabKeydown);
   elements["broker-summary-cards"].addEventListener("click", handleBrokerSelection);
   elements["account-holdings"].addEventListener("click", (event) => {
+    const trendReview = event.target.closest("[data-trend-review]");
+    if (trendReview) {
+      openTrendReview(trendReview.dataset.trendReview || "");
+      return;
+    }
     const trendReport = event.target.closest("[data-trend-report]");
     if (trendReport) {
       openTrendReport(trendReport.dataset.trendReport || "");
@@ -322,20 +328,34 @@ function openTrendReport(broker) {
   const report = state.dashboard?.trend_reports?.[broker];
   if (!report?.available) return;
   state.selectedTrendBroker = broker;
+  state.selectedTrendKind = "report";
   elements["trend-report-workspace"].innerHTML = renderTrendReportWorkspace(report);
   setWorkspaceView("trend_report");
   syncCnTrendBuyAccessibility();
   elements["return-to-portfolio"].focus();
 }
 
+function openTrendReview(broker) {
+  const review = state.dashboard?.trend_reviews?.[broker];
+  if (!review?.available) return;
+  state.selectedTrendBroker = broker;
+  state.selectedTrendKind = "review";
+  elements["trend-report-workspace"].innerHTML = renderTrendReviewWorkspace(review);
+  setWorkspaceView("trend_report");
+  elements["return-to-portfolio"].focus();
+}
+
 function returnToPortfolio() {
   const trendBroker = state.selectedTrendBroker;
+  const trendKind = state.selectedTrendKind;
   if (state.workspaceView === "standard_backtest") syncStandardBacktestInputs();
   state.selectedTrendBroker = "";
+  state.selectedTrendKind = "";
   setWorkspaceView("portfolio");
   renderAccountHoldings();
   if (trendBroker) {
-    document.querySelector(`#account-${trendBroker} [data-trend-report]`)?.focus();
+    const attribute = trendKind === "review" ? "data-trend-review" : "data-trend-report";
+    document.querySelector(`#account-${trendBroker} [${attribute}]`)?.focus();
   }
 }
 
@@ -1886,20 +1906,85 @@ function renderTrendReportEntry(broker) {
   if (!ACCOUNT_BROKERS.includes(broker)) return "";
   const report = state.dashboard?.trend_reports?.[broker] || {};
   const label = broker === "futu" ? "期权关注" : "当天趋势报告";
-  if (!report.available) {
-    return `<div class="trend-report-entry trend-report-entry-empty">
-      <button type="button" disabled>${label}</button>
-      <span>${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</span>
-    </div>`;
-  }
-  const dates = broker === "futu" ? "" : `
-    <span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span>
-    <span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>`;
-  return `<div class="trend-report-entry">
-    <button type="button" data-trend-report="${escapeHtml(broker)}">${label}</button>
-    <span>${escapeHtml(formatPlain(report.status_text || "今日已更新"))}</span>
-    ${dates}
+  const reviews = state.dashboard?.trend_reviews;
+  const review = reviews?.[broker];
+  const reviewLabel = `${formatPlain(review?.market_label || report.market_label || {futu:"美股",phillips:"港股",eastmoney:"A股"}[broker])}复盘`.replaceAll(" ", "");
+  const reportButton = report.available
+    ? `<button type="button" data-trend-report="${escapeHtml(broker)}">${label}</button>`
+    : `<button type="button" disabled>${label}</button>`;
+  const reviewButton = !review ? "" : review.available
+    ? `<button type="button" data-trend-review="${escapeHtml(broker)}">${escapeHtml(reviewLabel)}</button>`
+    : `<button type="button" disabled>${escapeHtml(reviewLabel)}</button>`;
+  const details = report.available
+    ? broker === "futu"
+      ? `<span>${escapeHtml(formatPlain(report.status_text || "期权关注"))}</span>`
+      : `<span>${escapeHtml(formatPlain(report.status_text || "今日已更新"))}</span><span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span><span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>`
+    : `<span>${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</span>`;
+  const reviewStatus = review && !review.available
+    ? `<span>${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</span>`
+    : "";
+  return `<div class="trend-report-entry${report.available ? "" : " trend-report-entry-empty"}">
+    <div class="trend-entry-buttons">${reportButton}${reviewButton}</div>
+    <div class="trend-entry-details">${details}${reviewStatus}</div>
   </div>`;
+}
+
+const TREND_REVIEW_SERIES = [
+  {key:"discipline", label:"纪律模拟", className:"discipline"},
+  {key:"actual", label:"实际执行", className:"actual"},
+  {key:"benchmark", label:"市场基准", className:"benchmark"},
+];
+
+function formatTrendReviewValue(cell, percent) {
+  const value = numericValue(cell?.value);
+  if (value === null) return formatPlain(cell?.reason || "数据不足");
+  const formatted = value.toLocaleString("zh-CN", {maximumFractionDigits:2});
+  return percent ? `${formatted}%` : formatted;
+}
+
+function renderTrendReviewMetric(review, key, label, percent) {
+  const values = TREND_REVIEW_SERIES.map((series) => numericValue(review.metrics?.[key]?.[series.key]?.value));
+  const maximum = Math.max(...values.filter((value) => value !== null).map(Math.abs), 0);
+  const rows = TREND_REVIEW_SERIES.map((series, index) => {
+    const cell = review.metrics?.[key]?.[series.key] || {};
+    const value = values[index];
+    const width = value === null || maximum === 0 ? 0 : Math.round(Math.abs(value) / maximum * 50);
+    const direction = value !== null && value < 0 ? " negative" : " positive";
+    const unavailable = value === null ? " unavailable" : "";
+    return `<div class="trend-review-series${unavailable}">
+      <span>${escapeHtml(series.label)}</span>
+      <span class="trend-review-track" aria-hidden="true"><i class="trend-review-bar ${series.className}${direction}" style="--trend-review-width:${width}%"></i></span>
+      <strong>${escapeHtml(formatTrendReviewValue(cell, percent))}</strong>
+    </div>`;
+  }).join("");
+  return `<section class="trend-review-metric"><h3>${escapeHtml(label)}</h3>${rows}</section>`;
+}
+
+function renderTrendReviewChart(review, title, definitions) {
+  return `<figure class="trend-review-chart"><figcaption>${escapeHtml(title)}</figcaption>
+    <div class="trend-review-legend">${TREND_REVIEW_SERIES.map((series) => `<span class="${series.className}">${escapeHtml(series.label)}</span>`).join("")}</div>
+    ${definitions.map(([key,label,percent]) => renderTrendReviewMetric(review,key,label,percent)).join("")}
+  </figure>`;
+}
+
+function renderTrendReviewWorkspace(review) {
+  const snapshot = review.strategy_snapshot || {};
+  const rows = Array.isArray(snapshot.parameter_rows) ? snapshot.parameter_rows : [];
+  return `<main class="trend-review">
+    <header class="trend-review-header">
+      <div><p>${escapeHtml(`${formatPlain(review.broker_label)}｜${formatPlain(review.market_label)}`)}</p>
+      <h1>${escapeHtml(`${formatPlain(review.market_label)}趋势复盘`)}</h1>
+      <span>${escapeHtml(formatPlain(snapshot.strategy_name))}｜版本 ${escapeHtml(formatPlain(snapshot.strategy_version))}</span></div>
+      <button type="button" data-close-trend-report>返回持仓看板</button>
+    </header>
+    <section class="trend-review-parameters"><h2>当前策略参数</h2>
+      <div class="trend-review-parameter-list trend-review-parameter-table">${rows.map((row) => `<div><span>${escapeHtml(formatPlain(row.group))}</span><strong>${escapeHtml(formatPlain(row.name))}</strong><p>${escapeHtml(formatPlain(row.value))}</p></div>`).join("")}</div>
+    </section>
+    <div class="trend-review-charts">
+      ${renderTrendReviewChart(review,"收益与回撤",[["period_net_return","期间净收益率",true],["market_excess_return","相对市场超额收益",true],["max_drawdown","最大回撤",true]])}
+      ${renderTrendReviewChart(review,"风险调整收益",[["calmar","卡玛比率",false],["sharpe","夏普比率",false]])}
+    </div>
+  </main>`;
 }
 
 function renderTrendAction(item, kind) {

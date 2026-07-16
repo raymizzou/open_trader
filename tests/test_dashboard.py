@@ -175,6 +175,111 @@ def serialized_trend_position() -> dict[str, object]:
     }
 
 
+def trend_review_projection(market: str, broker: str) -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.trend_review.projection.v1",
+        "available": True,
+        "market": market,
+        "market_label": {"CN": "A 股", "US": "美股", "HK": "港股"}[market],
+        "broker": broker,
+        "strategy_snapshot": {
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/v1",
+            "strategy_name": f"{market} 短线右侧趋势",
+            "strategy_version": "v1",
+            "process_version": "abc1234",
+            "parameters": {"position_limit": 10},
+            "parameter_rows": [
+                {"group": "仓位执行", "name": "持仓上限", "value": "10 笔"},
+                {"group": "退出保护", "name": "初始保护线", "value": "成交均价减 2.0 倍 ATR14"},
+            ],
+        },
+        "batch": {
+            "batch_number": 1,
+            "completed_trade_count": 30,
+            "start_date": "2026-01-01",
+            "end_date": "2026-07-17",
+        },
+        "batch_path": "batch.json",
+        "metrics": {
+            key: {
+                series: {"value": value, "reason": None}
+                for series, value in {
+                    "discipline": "12.6",
+                    "actual": "9.4",
+                    "benchmark": "7.8",
+                }.items()
+            }
+            for key in (
+                "period_net_return",
+                "market_excess_return",
+                "max_drawdown",
+                "calmar",
+                "sharpe",
+            )
+        },
+    }
+
+
+def test_dashboard_loads_only_strict_market_matched_trend_reviews(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
+    latest = config.data_dir / "latest"
+    latest.mkdir(parents=True, exist_ok=True)
+    for market, broker in (("CN", "eastmoney"), ("US", "tiger"), ("HK", "phillips")):
+        (latest / f"trend_review_{market.lower()}.json").write_text(
+            json.dumps(trend_review_projection(market, broker)), encoding="utf-8"
+        )
+
+    reviews = load_dashboard_state(config).to_dict()["trend_reviews"]
+
+    assert set(reviews) == {"eastmoney", "tiger", "phillips"}
+    assert reviews["eastmoney"]["market"] == "CN"
+    assert reviews["tiger"]["strategy_snapshot"]["strategy_version"] == "v1"
+    assert reviews["phillips"]["metrics"]["calmar"]["actual"]["value"] == "9.4"
+    assert "batch" not in reviews["tiger"]
+    assert "batch_path" not in reviews["tiger"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "broker"),
+    [
+        (lambda payload: payload.update(market="HK"), "tiger"),
+        (lambda payload: payload["metrics"].pop("sharpe"), "tiger"),
+        (
+            lambda payload: payload["metrics"]["calmar"]["actual"].update(
+                value="NaN"
+            ),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["strategy_snapshot"].update(parameter_rows=[]),
+            "tiger",
+        ),
+    ],
+)
+def test_dashboard_rejects_invalid_trend_review_projection(
+    tmp_path: Path, mutation: object, broker: str
+) -> None:
+    payload = trend_review_projection("US", "tiger")
+    mutation(payload)  # type: ignore[operator]
+    path = tmp_path / "data/latest/trend_review_us.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reviews = dashboard_module._load_trend_reviews(tmp_path / "data")
+
+    assert reviews[broker] == {
+        "available": False,
+        "broker": "tiger",
+        "broker_label": "老虎",
+        "market": "US",
+        "market_label": "美股",
+        "status_text": "复盘数据无效",
+    }
+
+
 def option_attention(
     symbol: str, *, market: str = "US", source_broker: str = "老虎"
 ) -> dict[str, object]:

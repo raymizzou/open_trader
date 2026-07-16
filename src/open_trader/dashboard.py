@@ -127,6 +127,19 @@ OPTION_ATTENTION_TRANSITIONS = {
     "boiling",
     "champagne",
 }
+TREND_REVIEW_SOURCES = {
+    "tiger": ("US", "美股", "老虎"),
+    "phillips": ("HK", "港股", "辉立"),
+    "eastmoney": ("CN", "A股", "东方财富"),
+}
+TREND_REVIEW_METRICS = {
+    "period_net_return",
+    "market_excess_return",
+    "max_drawdown",
+    "calmar",
+    "sharpe",
+}
+TREND_REVIEW_SERIES = {"discipline", "actual", "benchmark"}
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -156,6 +169,7 @@ class DashboardState:
     kelly_lab: dict[str, Any]
     backtest_universe: dict[str, list[dict[str, str]]]
     trend_reports: dict[str, dict[str, Any]]
+    trend_reviews: dict[str, dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,6 +192,7 @@ class DashboardState:
             "kelly_lab": self.kelly_lab,
             "backtest_universe": self.backtest_universe,
             "trend_reports": self.trend_reports,
+            "trend_reviews": self.trend_reviews,
         }
 
 
@@ -298,7 +313,115 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         trend_reports=_load_trend_reports(
             config.data_dir, config.reports_dir
         ),
+        trend_reviews=_load_trend_reviews(config.data_dir),
     )
+
+
+def _trend_review_unavailable(
+    broker: str, market: str, market_label: str, broker_label: str, status: str
+) -> dict[str, Any]:
+    return {
+        "available": False,
+        "broker": broker,
+        "broker_label": broker_label,
+        "market": market,
+        "market_label": market_label,
+        "status_text": status,
+    }
+
+
+def _valid_trend_review_metric_cell(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"value", "reason"}:
+        return False
+    metric_value = value["value"]
+    reason = value["reason"]
+    if metric_value is None:
+        return isinstance(reason, str) and bool(reason.strip())
+    try:
+        finite = Decimal(str(metric_value)).is_finite()
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return finite and reason is None
+
+
+def _valid_trend_review_projection(
+    payload: object, *, broker: str, market: str
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    snapshot = payload.get("strategy_snapshot")
+    metrics = payload.get("metrics")
+    if (
+        payload.get("schema_version") != "open_trader.trend_review.projection.v1"
+        or payload.get("available") is not True
+        or payload.get("broker") != broker
+        or payload.get("market") != market
+        or not isinstance(snapshot, dict)
+        or not isinstance(metrics, dict)
+        or set(metrics) != TREND_REVIEW_METRICS
+    ):
+        return False
+    for key in (
+        "strategy_id",
+        "strategy_name",
+        "strategy_version",
+        "process_version",
+    ):
+        if not isinstance(snapshot.get(key), str) or not snapshot[key].strip():
+            return False
+    if not isinstance(snapshot.get("parameters"), dict):
+        return False
+    rows = snapshot.get("parameter_rows")
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or any(
+            not isinstance(row, dict)
+            or set(row) != {"group", "name", "value"}
+            or any(not isinstance(row[key], str) or not row[key].strip() for key in row)
+            for row in rows
+        )
+    ):
+        return False
+    return all(
+        isinstance(metrics[key], dict)
+        and set(metrics[key]) == TREND_REVIEW_SERIES
+        and all(
+            _valid_trend_review_metric_cell(metrics[key][series])
+            for series in TREND_REVIEW_SERIES
+        )
+        for key in TREND_REVIEW_METRICS
+    )
+
+
+def _load_trend_reviews(data_dir: Path) -> dict[str, dict[str, Any]]:
+    reviews: dict[str, dict[str, Any]] = {}
+    for broker, (market, market_label, broker_label) in TREND_REVIEW_SOURCES.items():
+        unavailable = _trend_review_unavailable(
+            broker, market, market_label, broker_label, "暂无复盘数据"
+        )
+        path = data_dir / "latest" / f"trend_review_{market.lower()}.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            reviews[broker] = unavailable
+            continue
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            reviews[broker] = {**unavailable, "status_text": "复盘数据无效"}
+            continue
+        if not _valid_trend_review_projection(payload, broker=broker, market=market):
+            reviews[broker] = {**unavailable, "status_text": "复盘数据无效"}
+            continue
+        reviews[broker] = {
+            "available": True,
+            "broker": broker,
+            "broker_label": broker_label,
+            "market": market,
+            "market_label": market_label,
+            "strategy_snapshot": payload["strategy_snapshot"],
+            "metrics": payload["metrics"],
+        }
+    return reviews
 
 
 def _load_trend_reports(

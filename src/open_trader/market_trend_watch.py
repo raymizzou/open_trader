@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 import time as time_module
@@ -81,6 +81,8 @@ def watch_market_protection(
     quote_client_factory: Callable[[], object] | None = None,
     now_fn: Callable[[], datetime] = datetime.now,
     sleep_fn: Callable[[float], None] = time_module.sleep,
+    on_session_open: Callable[[str], None] | None = None,
+    on_protection_trigger: Callable[[Mapping[str, object]], None] | None = None,
 ) -> AShareWatchResult:
     market = _market(market)
     timezone = MARKET_TIMEZONES[market]
@@ -178,4 +180,6 @@ def watch_market_protection(
         session_timezone=timezone,
         session_fn=lambda value: market_session(value, market),
         account_loader=account_loader,
+        on_session_open=on_session_open,
+        on_protection_trigger=on_protection_trigger,
     )

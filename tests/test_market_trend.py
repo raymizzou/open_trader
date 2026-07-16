@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+import open_trader.a_share_trend as trend_module
 
 from open_trader import market_trend
 from open_trader.a_share_trend import (
@@ -49,6 +50,65 @@ class RecordingFeishu(FeishuWebhookNotifier):
         self.messages.append((title, message))
         if self.fail:
             raise NotificationError("network down")
+
+
+@pytest.mark.parametrize(
+    ("market", "name", "pool_ids", "market_parameters"),
+    [
+        (
+            "US",
+            "美股短线右侧趋势",
+            (622460,),
+            {"allowed_exchange": "US", "lot_size": 1, "buy_window": "美股常规交易时段"},
+        ),
+        (
+            "HK",
+            "港股短线右侧趋势",
+            (622494,),
+            {
+                "allowed_exchange": "HK",
+                "lot_size_source": "Futu 每标的整手",
+                "buy_window": "09:30-10:00",
+            },
+        ),
+    ],
+)
+def test_market_strategy_snapshot_matches_runtime_rules(
+    market: str,
+    name: str,
+    pool_ids: tuple[int, ...],
+    market_parameters: dict[str, object],
+) -> None:
+    snapshot = trend_module.trend_strategy_snapshot(market, "abc123", pool_ids)
+
+    assert snapshot["strategy_name"] == name
+    assert snapshot["strategy_version"] == "v1"
+    assert snapshot["parameters"] == {
+        "candidate_pool_ids": list(pool_ids),
+        "min_strength_exclusive": "90",
+        "max_right_side_days_exclusive": 10,
+        "min_amount_100m": "1",
+        "requires_right_side": True,
+        "requires_tradable": True,
+        "requires_no_danger": True,
+        "requires_matching_data_date": True,
+        "requires_not_held": True,
+        "requires_atr14": True,
+        "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
+        "candidate_limit": 10,
+        "position_limit": 10,
+        "target_weight": "0.04",
+        **market_parameters,
+        "initial_protection_atr_multiple": "2",
+        "exit_reasons": ["danger", "left_right_side", "protection"],
+        "trailing_low_days": 5,
+        "protection_line_non_decreasing": True,
+    }
+    assert snapshot["parameter_rows"]
+    assert all(
+        set(row) == {"group", "name", "value"}
+        for row in snapshot["parameter_rows"]
+    )
 
 
 def config(tmp_path: Path) -> DailyPremarketConfig:
@@ -108,7 +168,7 @@ def write_tiger_snapshot(
     )
 
 
-def test_load_tiger_account_separates_managed_positions_from_account_count(
+def test_load_tiger_account_first_run_loads_all_eligible_us_stock_etf_positions(
     tmp_path: Path,
 ) -> None:
     write_tiger_snapshot(
@@ -176,27 +236,27 @@ def test_load_tiger_account_separates_managed_positions_from_account_count(
         data_dir=tmp_path / "data",
         market="US",
         expected_date="2026-07-15",
-        managed_symbols={"AAPL"},
+        managed_symbols=set(),
     )
 
     assert account.source_date == "2026-07-15"
     assert account.fresh is True
     assert account.net_value == Decimal("785000")
     assert account.available_cash == Decimal("98500")
-    assert account.position_count == 2
     assert [(item.symbol, item.asset_class) for item in account.positions] == [
         ("AAPL", "stock"),
+        ("QQQ", "etf"),
     ]
     assert account.positions[0].market_value == Decimal("3297.00")
     assert market_trend.load_trend_account(
         data_dir=tmp_path / "data",
         market="US",
         expected_date="2026-07-16",
-        managed_symbols={"AAPL"},
+        managed_symbols=set(),
     ).fresh is False
 
 
-def test_tiger_unmanaged_holdings_fill_position_cap_without_entering_decisions(
+def test_first_run_tiger_holdings_fill_position_cap_and_enter_report_decisions(
     tmp_path: Path,
 ) -> None:
     symbols = [
@@ -229,7 +289,7 @@ def test_tiger_unmanaged_holdings_fill_position_cap_without_entering_decisions(
         data_dir=tmp_path / "data",
         market="US",
         expected_date="2026-07-15",
-        managed_symbols={"AAPL"},
+        managed_symbols=set(),
     )
     candidate = CandidateInput(
         tm_id=1,
@@ -272,13 +332,13 @@ def test_tiger_unmanaged_holdings_fill_position_cap_without_entering_decisions(
         price_fx_to_account_currency=Decimal("7.85"),
     )
 
+    assert len(account.positions) == 10
     assert account.position_count == 10
-    assert [item.symbol for item in account.positions] == ["AAPL"]
     assert [item.symbol for item in report.candidates] == ["QQQ"]
     assert report.buy_actions == ()
-    assert [item.symbol for item in report.holdings] == ["AAPL"]
+    assert [item.symbol for item in report.holdings] == symbols
     assert {item.action for item in report.holdings} == {"MANUAL_REVIEW"}
-    assert list(report.protection_state["positions"]) == ["AAPL"]
+    assert sorted(report.protection_state["positions"]) == symbols
 
 
 def test_load_tiger_account_uses_latest_valid_snapshot_and_clamps_cash(
@@ -713,6 +773,11 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         "kline_supplement": None,
     } == payload["signal_snapshots"]["holdings"]["00700"]
     assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
+    evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
+    evidence = __import__("json").loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["market"] == "HK"
+    assert evidence["query"]["component_pool_ids"] == [622494]
+    assert evidence["rebuild_inputs"]["lot_sizes"] == {"02800": 100}
 
 
 @pytest.mark.parametrize(

@@ -10,7 +10,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime, time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -112,6 +112,9 @@ class DailyPremarketConfig:
     trend_animals_hk_tm_ids: tuple[int, ...] = ()
     trend_us_symbols: tuple[str, ...] = ()
     trend_hk_symbols: tuple[str, ...] = ()
+    trend_review_cn_simulate_acc_id: int = 0
+    trend_review_us_simulate_acc_id: int = 0
+    trend_review_hk_simulate_acc_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -204,7 +207,15 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
     trend_hk_tm_ids = _positive_tm_ids(
         values.get("TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS", "")
     )
-
+    review_account_ids = {
+        market: _optional_positive_tm_id(
+            values, f"OPEN_TRADER_TREND_REVIEW_{market}_SIMULATE_ACC_ID"
+        )
+        for market in ("CN", "US", "HK")
+    }
+    populated_review_ids = [value for value in review_account_ids.values() if value]
+    if len(populated_review_ids) != len(set(populated_review_ids)):
+        raise ValueError("trend review simulate account IDs must be distinct")
     for key, value in values.items():
         os.environ[key] = value
 
@@ -264,6 +275,9 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         trend_hk_symbols=_symbol_config(
             values.get("OPEN_TRADER_TREND_HK_SYMBOLS", "")
         ),
+        trend_review_cn_simulate_acc_id=review_account_ids["CN"],
+        trend_review_us_simulate_acc_id=review_account_ids["US"],
+        trend_review_hk_simulate_acc_id=review_account_ids["HK"],
     )
 
 
@@ -276,6 +290,26 @@ def _optional_positive_tm_id(values: dict[str, str], key: str) -> int:
     if value < 0:
         raise ValueError(f"{key} must be a positive integer")
     return value
+
+
+def require_trend_review_config(
+    config: DailyPremarketConfig, market: str
+) -> int:
+    market = market.upper()
+    if market not in {"CN", "US", "HK"}:
+        raise ValueError(f"unsupported trend review market: {market}")
+    account_ids = [
+        config.trend_review_cn_simulate_acc_id,
+        config.trend_review_us_simulate_acc_id,
+        config.trend_review_hk_simulate_acc_id,
+    ]
+    populated = [value for value in account_ids if value > 0]
+    if len(populated) != len(set(populated)):
+        raise ValueError("trend review simulate account IDs must be distinct")
+    account_id = getattr(config, f"trend_review_{market.lower()}_simulate_acc_id")
+    if account_id <= 0:
+        raise ValueError(f"{market} trend review config is incomplete")
+    return account_id
 
 
 def _positive_tm_ids(value: str) -> tuple[int, ...]:

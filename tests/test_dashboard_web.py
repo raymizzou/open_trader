@@ -2888,6 +2888,59 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_trend_review_is_compact_exact_and_account_scoped() -> None:
+    output = run_dashboard_js(r'''
+const review=(broker,brokerLabel,market,marketLabel)=>({
+  available:true,broker,broker_label:brokerLabel,market,market_label:marketLabel,
+  strategy_snapshot:{strategy_id:`trend/${market}/v1`,strategy_name:`${marketLabel}短线右侧趋势`,
+    strategy_version:"v1",process_version:"abc1234",parameters:{position_limit:10},
+    parameter_rows:[
+      {group:"仓位执行",name:"持仓上限",value:"10 笔"},
+      {group:"退出保护",name:"初始保护线",value:"成交均价减 2.0 倍 ATR14"},
+    ]},
+  metrics:{
+    period_net_return:{discipline:{value:"12.6",reason:null},actual:{value:"9.4",reason:null},benchmark:{value:"7.8",reason:null}},
+    market_excess_return:{discipline:{value:"4.8",reason:null},actual:{value:"1.6",reason:null},benchmark:{value:"0",reason:null}},
+    max_drawdown:{discipline:{value:"-8.9",reason:null},actual:{value:"-10.2",reason:null},benchmark:{value:"-12.2",reason:null}},
+    calmar:{discipline:{value:"1.42",reason:null},actual:{value:"0.92",reason:null},benchmark:{value:"0.64",reason:null}},
+    sharpe:{discipline:{value:"1.07",reason:null},actual:{value:null,reason:"实际执行日终净值缺失"},benchmark:{value:"0.58",reason:null}},
+  },
+});
+state.dashboard={trend_reports:{
+  futu:{available:true,report_date:"2026-07-17",data_date:"2026-07-16"},
+  tiger:{available:true,report_date:"2026-07-17",data_date:"2026-07-16"},
+  phillips:{available:true,report_date:"2026-07-17",data_date:"2026-07-16"},
+  eastmoney:{available:true,report_date:"2026-07-17",data_date:"2026-07-16"},
+},trend_reviews:{
+  tiger:review("tiger","老虎","US","美股"),
+  phillips:review("phillips","辉立","HK","港股"),
+  eastmoney:review("eastmoney","东方财富","CN","A股"),
+}};
+const group=(broker)=>({broker,profile:ACCOUNT_STRATEGY_PROFILES[broker],rows:[],summary:{broker,display_name:broker,portfolio_value_hkd:"1000",holding_value_hkd:"700",cash_like_value_hkd:"300",holding_count:"1"}});
+for (const [broker,label] of [["tiger","美股复盘"],["phillips","港股复盘"],["eastmoney","A股复盘"]]) {
+  const account=renderAccountSection(group(broker));
+  if (!account.includes(`data-trend-review="${broker}"`) || !account.includes(label)) throw new Error(account);
+  if (account.indexOf("当天趋势报告") > account.indexOf(label)) throw new Error("entry order");
+}
+if (renderAccountSection(group("futu")).includes("复盘")) throw new Error("futu review");
+const html=renderTrendReviewWorkspace(state.dashboard.trend_reviews.eastmoney);
+for (const text of ["东方财富｜A股","A股趋势复盘","A股短线右侧趋势","版本 v1","当前策略参数",
+  "仓位执行","持仓上限","10 笔","退出保护","初始保护线","成交均价减 2.0 倍 ATR14",
+  "收益与回撤","期间净收益率","相对市场超额收益","最大回撤",
+  "风险调整收益","卡玛比率","夏普比率","纪律模拟","实际执行","市场基准",
+  "12.6%","1.42","实际执行日终净值缺失"]) {
+  if (!html.includes(text)) throw new Error(text+"\n"+html);
+}
+if ((html.match(/class="trend-review-chart"/g)||[]).length!==2) throw new Error(html);
+for (const forbidden of ["复盘结论","Connected","创建回测","导出参数","Alpha","Beta","Sortino","胜率","盈亏比"]) {
+  if (html.includes(forbidden)) throw new Error(forbidden+"\n"+html);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_renders_action_first_cn_trend_report_only_for_cn() -> None:
     output = run_dashboard_js(r'''
 const cn = renderTrendReportWorkspace({

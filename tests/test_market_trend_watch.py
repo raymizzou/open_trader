@@ -145,6 +145,8 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
 
     now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
     voice = RecordingXiaoaiNotifier()
+    opens: list[str] = []
+    stops: list[object] = []
     result = watch_market_protection(
         market="HK",
         data_dir=data_dir,
@@ -159,11 +161,15 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
         once=True,
         now_fn=lambda: now,
         sleep_fn=lambda seconds: None,
+        on_session_open=opens.append,
+        on_protection_trigger=stops.append,
     )
 
     assert result.status == "completed"
     assert result.watched_symbol_count == 1
     assert result.trigger_count == 1
+    assert opens == ["2026-07-16"]
+    assert len(stops) == 1
     assert voice.messages == [
         (
             "港股保护线触发 · 00700",
@@ -231,7 +237,7 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
     assert voice.messages[0][1].startswith("名称：NVIDIA\n最新价 ")
 
 
-def test_us_watcher_ignores_unmanaged_tiger_holdings_without_protection_seed(
+def test_first_run_us_watcher_loads_tiger_holdings_without_protection_seed(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
@@ -264,8 +270,15 @@ def test_us_watcher_ignores_unmanaged_tiger_holdings_without_protection_seed(
         sleep_fn=lambda seconds: None,
     )
 
-    assert result.watched_symbol_count == 0
-    assert result.exception_count == 0
+    assert result.watched_symbol_count == 1
+    assert result.exception_count == 1
+    events = [
+        json.loads(line)
+        for line in result.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(event["symbol"], event["event_type"]) for event in events] == [
+        ("NVDA", "protection_line_missing")
+    ]
 
 
 def test_us_watcher_uses_tiger_label() -> None:

@@ -256,6 +256,95 @@ def portfolio_row(**overrides: str) -> dict[str, str]:
     return row
 
 
+def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None:
+    snapshot = trend_module.trend_strategy_snapshot(
+        "CN",
+        "abc123",
+        (622466, 697199),
+    )
+
+    assert {
+        key: snapshot[key]
+        for key in (
+            "strategy_id",
+            "strategy_name",
+            "strategy_version",
+            "market",
+            "effective_from",
+            "process_version",
+        )
+    } == {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v1",
+        "strategy_name": "A 股短线右侧趋势",
+        "strategy_version": "v1",
+        "market": "CN",
+        "effective_from": "2026-07-14",
+        "process_version": "abc123",
+    }
+    assert snapshot["parameters"] == {
+        "candidate_pool_ids": [622466, 697199],
+        "allowed_exchanges": ["SH", "SZ"],
+        "excluded_name_markers": ["ST", "退"],
+        "temperature_transition": {"from": ["温"], "to": ["热", "沸"]},
+        "max_filter_price": "200",
+        "min_strength": "95",
+        "allowed_industry_temperatures": ["热", "沸"],
+        "allowed_phases": ["谷雨", "立夏", "夏至"],
+        "min_market_cap_100m": "100",
+        "min_amount_100m": "2",
+        "requires_right_side": True,
+        "requires_tradable": True,
+        "requires_no_danger": True,
+        "requires_matching_data_date": True,
+        "requires_not_held": True,
+        "requires_right_side_days": True,
+        "requires_atr14": True,
+        "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
+        "candidate_limit": 10,
+        "position_limit": 10,
+        "target_weight": {"热": "0.04", "沸": "0.02"},
+        "lot_size": 100,
+        "buy_window": "09:30-10:00",
+        "initial_protection_atr_multiple": "2",
+        "exit_reasons": [
+            "danger",
+            "left_right_side",
+            "temperature_to_flat",
+            "protection",
+        ],
+        "trailing_low_days": 5,
+        "protection_line_non_decreasing": True,
+    }
+    assert snapshot["parameter_rows"][0] == {
+        "group": "候选来源",
+        "name": "趋势动物组合",
+        "value": "温转热（A 股）、温转热（ETF 基金个股）",
+    }
+    assert all(
+        set(row) == {"group", "name", "value"}
+        for row in snapshot["parameter_rows"]
+    )
+
+    built = report(candidates=(candidate("600001"),))
+    assert built.buy_actions[0].lot_size == 100
+    assert trend_module._report_payload(built)["strategy_snapshot"] == (
+        built.strategy_snapshot
+    )
+
+
+def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
+    built = report(candidates=(candidate("600001"),))
+    parameters = dict(built.strategy_snapshot["parameters"])
+    parameters["target_weight"] = {"热": "0.02", "沸": "0.02"}
+    broken = replace(
+        built,
+        strategy_snapshot={**built.strategy_snapshot, "parameters": parameters},
+    )
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module.validate_report_strategy_snapshot(broken)
+
+
 def test_candidates_filter_then_sort_deterministically() -> None:
     rows = [
         candidate("600004", strength="95", days=2, amount="3"),
@@ -2861,6 +2950,11 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
         "cache=client-managed"
     ) in payload["api_facts"]
     assert payload["estimated_api_cost"] == "0.142"
+    evidence_path = trend_config(tmp_path).data_dir / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["query"]["component_pool_ids"] == [622466, 697199]
+    assert evidence["responses"]["snapshots"]
+    assert evidence["rebuild_inputs"]["candidates"]
 
 
 def test_missing_industry_row_excludes_only_affected_candidate(

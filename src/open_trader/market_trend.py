@@ -59,6 +59,7 @@ from .tiger_account import (
 )
 from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
+from .trend_review import freeze_report_evidence
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -329,9 +330,7 @@ def _load_tiger_snapshot(
         Decimal("0"),
     )
 
-    normalized_managed = {_normalized_symbol("US", symbol) for symbol in managed_symbols}
     exceptions: list[str] = []
-    position_count = 0
     positions: list[AccountPosition] = []
     for row in position_rows:
         if str(row.get("market") or "").strip().upper() != "US":
@@ -347,13 +346,9 @@ def _load_tiger_snapshot(
         if not asset_class:
             asset_class = detect_asset_class(symbol, name).value
         if asset_class not in {"stock", "etf"}:
-            if symbol in normalized_managed:
-                exceptions.append(
-                    f"unsupported managed asset: {symbol} ({asset_class or 'unknown'})"
-                )
-            continue
-        position_count += 1
-        if symbol not in normalized_managed:
+            exceptions.append(
+                f"unsupported managed asset: {symbol} ({asset_class or 'unknown'})"
+            )
             continue
         fx = _tiger_fx_to_hkd(row)
         avg_cost = _optional_decimal(row.get("average_cost"))
@@ -372,7 +367,7 @@ def _load_tiger_snapshot(
         available_cash=max(Decimal("0"), available_cash),
         positions=tuple(sorted(positions, key=lambda item: item.symbol)),
         exceptions=tuple(exceptions),
-        position_count=position_count,
+        position_count=len(positions),
     )
 
 
@@ -956,6 +951,7 @@ def _attempt_market_report(
             }
         estimated_cost = unified_unit_cost * len(requested_ids)
         actual_cost = balance_before - balance_after
+        watch_events = load_watch_events(paths.events)
         report = build_report(
             as_of_date=as_of_date,
             execution_date=execution_date,
@@ -964,7 +960,7 @@ def _attempt_market_report(
             holding_snapshots=holding_snapshots,
             bars_by_symbol=bars_by_symbol,
             prior_state=prior_state,
-            watch_events=load_watch_events(paths.events),
+            watch_events=watch_events,
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
                 *_component_api_facts(api, len(component_rows)),
@@ -982,6 +978,8 @@ def _attempt_market_report(
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
             price_fx_to_account_currency=(USD_TO_HKD if market == "US" else Decimal("1")),
+            process_version=_process_version(config.repo),
+            candidate_pool_ids=pool_ids,
             metadata={
                 "market": market,
                 "broker": settings["broker"],
@@ -1026,6 +1024,33 @@ def _attempt_market_report(
         report = replace(
             report,
             metadata={**report.metadata, "delivery_status": "prepared"},
+        )
+        evidence = freeze_report_evidence(
+            data_dir=config.data_dir,
+            report=report,
+            candidates=candidates,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol=bars_by_symbol,
+            prior_state=prior_state,
+            watch_events=watch_events,
+            query={
+                "component_pool_ids": list(pool_ids),
+                "snapshot_fields": list(UNIFIED_TREND_FIELDS),
+            },
+            responses={
+                "update_status": update_rows,
+                "components": component_rows,
+                "snapshots": snapshot_rows,
+            },
+            candidate_pool_ids=pool_ids,
+            lot_sizes=lot_sizes,
+        )
+        report = replace(
+            report,
+            replay_evidence={
+                "path": str(Path(evidence["path"]).relative_to(config.data_dir)),
+                "sha256": evidence["sha256"],
+            },
         )
         payload = _report_payload(report)
         current_attention_rows = _attention_rows(payload.get("signal_snapshots")) or []
