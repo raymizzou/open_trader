@@ -570,7 +570,9 @@ def build_option_attention(
     return attention
 
 
-def _attention_rows(signal_snapshots: object) -> list[Mapping[str, object]] | None:
+def _attention_rows(
+    signal_snapshots: object, *, market: str
+) -> list[Mapping[str, object]] | None:
     if not isinstance(signal_snapshots, Mapping):
         return None
     candidates = signal_snapshots.get("candidates", [])
@@ -583,16 +585,27 @@ def _attention_rows(signal_snapshots: object) -> list[Mapping[str, object]] | No
         row is None or isinstance(row, Mapping) for row in holdings.values()
     ):
         return None
-    return [*candidates, *(row for row in holdings.values() if row is not None)]
+    rows = [*candidates, *(row for row in holdings.values() if row is not None)]
+    for row in rows:
+        symbol = row.get("symbol")
+        if not isinstance(symbol, str) or not symbol.strip():
+            return None
+        try:
+            _normalized_symbol(market, symbol)
+        except ValueError:
+            return None
+    return rows
 
 
-def _attention_report_rows(path: Path) -> tuple[date, list[Mapping[str, object]]] | None:
+def _attention_report_rows(
+    path: Path, *, market: str
+) -> tuple[date, list[Mapping[str, object]]] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, Mapping):
             return None
         as_of_date = date.fromisoformat(str(payload.get("as_of_date") or ""))
-        rows = _attention_rows(payload.get("signal_snapshots"))
+        rows = _attention_rows(payload.get("signal_snapshots"), market=market)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return None
     return (as_of_date, rows) if rows is not None else None
@@ -605,7 +618,7 @@ def _previous_attention_rows(
     valid_reports: list[tuple[date, int, str, list[Mapping[str, object]]]] = []
     report_files = list(paths.reports.glob("*.json")) if paths.reports.exists() else []
     for path in report_files:
-        loaded = _attention_report_rows(path)
+        loaded = _attention_report_rows(path, market=market)
         if loaded is not None:
             match = REPORT_REVISION.search(path.name)
             revision = int(match.group(1)) if match else 0
@@ -614,7 +627,9 @@ def _previous_attention_rows(
     if predecessors:
         return max(predecessors, key=lambda item: (item[0], item[1], item[2]))[3]
     if _market(market) == "US" and not report_files:
-        baseline = _attention_report_rows(paths.root / "attention_baseline.json")
+        baseline = _attention_report_rows(
+            paths.root / "attention_baseline.json", market=market
+        )
         if baseline is not None and baseline[0] < current_date:
             return baseline[1]
     return []
@@ -1012,7 +1027,9 @@ def _attempt_market_report(
             metadata={**report.metadata, "delivery_status": "prepared"},
         )
         payload = _report_payload(report)
-        current_attention_rows = _attention_rows(payload.get("signal_snapshots")) or []
+        current_attention_rows = (
+            _attention_rows(payload.get("signal_snapshots"), market=market) or []
+        )
         payload["option_attention"] = build_option_attention(
             current_attention_rows,
             _previous_attention_rows(

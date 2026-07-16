@@ -1074,3 +1074,68 @@ def test_previous_attention_rows_use_strict_dates_and_one_time_tiger_baseline(
     assert market_trend._previous_attention_rows(
         paths, current_as_of_date="2026-07-16", market="US"
     ) == []
+
+
+@pytest.mark.parametrize(
+    ("section", "malformed_row"),
+    [
+        ("candidates", {}),
+        ("candidates", {"symbol": "  "}),
+        ("holdings", {"symbol": "600001"}),
+    ],
+)
+def test_previous_attention_rows_skip_newest_report_with_invalid_symbol_row(
+    tmp_path: Path,
+    section: str,
+    malformed_row: dict[str, object],
+) -> None:
+    paths = market_paths(tmp_path / "data", tmp_path / "reports", "US")
+    paths.reports.mkdir(parents=True)
+    for filename, as_of_date, symbol in (
+        ("2026-07-14.json", "2026-07-14", "OLDER"),
+        ("2026-07-15.json", "2026-07-15", "NEWER"),
+    ):
+        snapshots: dict[str, object] = {
+            "candidates": [_attention_row(symbol)],
+            "holdings": {},
+        }
+        if filename == "2026-07-15.json":
+            if section == "candidates":
+                snapshots[section] = [*snapshots[section], malformed_row]
+            else:
+                snapshots[section] = {"malformed": malformed_row}
+        (paths.reports / filename).write_text(
+            json.dumps(
+                {"as_of_date": as_of_date, "signal_snapshots": snapshots}
+            ),
+            encoding="utf-8",
+        )
+
+    rows = market_trend._previous_attention_rows(
+        paths, current_as_of_date="2026-07-16", market="US"
+    )
+
+    assert [row["symbol"] for row in rows] == ["OLDER"]
+
+
+def test_previous_attention_rows_reject_malformed_tiger_baseline(
+    tmp_path: Path,
+) -> None:
+    paths = market_paths(tmp_path / "data", tmp_path / "reports", "US")
+    paths.root.mkdir(parents=True)
+    (paths.root / "attention_baseline.json").write_text(
+        json.dumps(
+            {
+                "as_of_date": "2026-07-15",
+                "signal_snapshots": {
+                    "candidates": [_attention_row("VALID")],
+                    "holdings": {"malformed": {"symbol": "600001"}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert market_trend._previous_attention_rows(
+        paths, current_as_of_date="2026-07-16", market="US"
+    ) == []
