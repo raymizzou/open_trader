@@ -976,7 +976,13 @@ class TabbedAccountLocator:
     def nth(self, index: int) -> "TabbedAccountLocator":
         return self.page.locator(f"{self.selector}:nth({index})")
 
-    def evaluate(self, expression: str) -> bool:
+    def evaluate(self, expression: str) -> bool | dict[str, object]:
+        if self.selector.endswith(".cn-trend-buy"):
+            return {
+                "clientWidth": 1500,
+                "scrollWidth": 1600,
+                "overflowX": "auto",
+            }
         assert "document.activeElement" in expression
         self.page.focus_checks.append(self.selector)
         return self.selector == self.page.active
@@ -1310,6 +1316,104 @@ def test_acceptance_formats_grouped_numeric_expectations_without_touching_text()
     )
 
 
+def visual_contract_page(*, accent: str = "#8B5E34") -> object:
+    expected = dict(dashboard_acceptance.WARM_LEDGER_TOKENS)
+    expected["--accent"] = accent
+
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        def count(self) -> int:
+            return 1
+
+        def focus(self) -> None:
+            pass
+
+        def evaluate(self, expression: str) -> dict[str, str]:
+            if "outlineColor" in expression:
+                return {
+                    "outlineColor": "rgb(139, 94, 52)",
+                    "outlineStyle": "solid", "outlineWidth": "3px",
+                }
+            if self.selector == "body":
+                return {
+                    "backgroundColor": "rgb(247, 245, 241)",
+                    "color": "rgb(32, 29, 24)",
+                }
+            if self.selector == "#refresh-quotes":
+                return {
+                    "backgroundColor": "rgb(139, 94, 52)",
+                    "borderTopColor": "rgb(139, 94, 52)",
+                }
+            if self.selector == ".current-view-card":
+                return {
+                    "backgroundColor": "rgb(36, 33, 29)",
+                    "borderTopColor": "rgb(36, 33, 29)",
+                }
+            return {
+                "backgroundColor": "rgb(255, 254, 250)",
+                "borderTopColor": "rgb(216, 210, 200)",
+            }
+
+    class Page:
+        def evaluate(
+            self, expression: str, names: list[str] | None = None
+        ) -> dict[str, str]:
+            assert names == list(dashboard_acceptance.WARM_LEDGER_TOKENS)
+            return expected
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+    return Page()
+
+
+def test_acceptance_visual_contract_accepts_exact_warm_ledger() -> None:
+    dashboard_acceptance._check_visual_contract(visual_contract_page())
+
+
+def test_acceptance_visual_contract_rejects_palette_drift() -> None:
+    with pytest.raises(AssertionError, match="--accent"):
+        dashboard_acceptance._check_visual_contract(
+            visual_contract_page(accent="#A16207")
+        )
+
+
+def test_acceptance_open_report_layout_requires_aligned_wide_shell_and_table_scroll() -> None:
+    class Stage:
+        def evaluate(self, expression: str) -> dict[str, object]:
+            return {
+                "clientWidth": 1500,
+                "scrollWidth": 1600,
+                "overflowX": "auto",
+            }
+
+        def count(self) -> int:
+            return 1
+
+    class Workspace:
+        def locator(self, selector: str) -> Stage:
+            assert selector == ".cn-trend-buy"
+            return Stage()
+
+    class Page:
+        viewport_size = {"width": 1920, "height": 1080}
+
+        def evaluate(self, expression: str) -> dict[str, float]:
+            return {
+                "shellWidth": 1600,
+                "headerLeft": 176,
+                "headerRight": 1744,
+                "reportLeft": 176,
+                "reportRight": 1744,
+            }
+
+    dashboard_acceptance._check_open_report_layout(
+        Page(), Workspace(), "eastmoney"
+    )
+
+
 def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1320,12 +1424,54 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     clicks: list[tuple[str, str]] = []
     evaluated: list[str] = []
     viewport_widths: list[int] = []
-    state = {"fail_desktop_navigation": True}
+    screenshots: list[tuple[str, str]] = []
+    state = {"fail_wide_desktop_navigation": True}
 
     class Locator(TabbedAccountLocator):
         def click(self) -> None:
             clicks.append((self.page.name, self.selector))  # type: ignore[attr-defined]
             super().click()
+
+        def focus(self) -> None:
+            pass
+
+        def evaluate(self, expression: str) -> object:
+            if "getComputedStyle" in expression:
+                if "outlineColor" in expression:
+                    return {
+                        "outlineColor": "rgb(139, 94, 52)",
+                        "outlineStyle": "solid",
+                        "outlineWidth": "3px",
+                    }
+                if self.selector == "body":
+                    return {
+                        "backgroundColor": "rgb(247, 245, 241)",
+                        "color": "rgb(32, 29, 24)",
+                    }
+                if self.selector == "#refresh-quotes":
+                    return {
+                        "backgroundColor": "rgb(139, 94, 52)",
+                        "borderTopColor": "rgb(139, 94, 52)",
+                        "color": "rgb(255, 255, 255)",
+                    }
+                if self.selector == ".current-view-card":
+                    return {
+                        "backgroundColor": "rgb(36, 33, 29)",
+                        "borderTopColor": "rgb(36, 33, 29)",
+                        "color": "rgb(255, 255, 255)",
+                    }
+                if self.selector.endswith(".cn-trend-buy"):
+                    return {
+                        "clientWidth": 1500,
+                        "scrollWidth": 1600,
+                        "overflowX": "auto",
+                    }
+                return {
+                    "backgroundColor": "rgb(255, 254, 250)",
+                    "borderTopColor": "rgb(216, 210, 200)",
+                    "color": "rgb(32, 29, 24)",
+                }
+            return super().evaluate(expression)
 
     class Page(TabbedAccountPage):
         def __init__(self, name: str, viewport: dict[str, int]) -> None:
@@ -1338,17 +1484,37 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
         def goto(self, *_args: object, **_kwargs: object) -> None:
             visited.append(self.name)
-            if self.name == "desktop" and state["fail_desktop_navigation"]:
+            if (
+                self.name == "wide_desktop"
+                and state["fail_wide_desktop_navigation"]
+            ):
                 raise RuntimeError("navigation failed")
 
         def locator(self, selector: str) -> Locator:
             selectors.append((self.name, selector))
             return Locator(self, selector)
 
-        def evaluate(self, expression: str) -> bool:
+        def evaluate(
+            self, expression: str, argument: object | None = None
+        ) -> object:
+            if "getPropertyValue" in expression:
+                assert argument == list(dashboard_acceptance.WARM_LEDGER_TOKENS)
+                return dict(dashboard_acceptance.WARM_LEDGER_TOKENS)
+            if "const shell" in expression:
+                return {
+                    "shellWidth": 1600,
+                    "headerLeft": 176,
+                    "headerRight": 1744,
+                    "reportLeft": 176,
+                    "reportRight": 1744,
+                }
             assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
             evaluated.append(self.name)
             return True
+
+        def screenshot(self, *, path: str, full_page: bool) -> None:
+            assert full_page is True
+            screenshots.append((self.name, path))
 
         def close(self) -> None:
             pass
@@ -1356,13 +1522,13 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     class Browser:
         pages = 0
 
-        def new_page(self, **_kwargs: object) -> Page:
+        def new_page(self, **kwargs: object) -> Page:
+            names = ("wide_desktop", "desktop", "mobile")
+            name = names[self.pages]
             self.pages += 1
-            viewport_widths.append(_kwargs["viewport"]["width"])  # type: ignore[index]
-            return Page(
-                "desktop" if self.pages == 1 else "mobile",
-                _kwargs["viewport"],  # type: ignore[arg-type]
-            )
+            viewport = kwargs["viewport"]
+            viewport_widths.append(viewport["width"])  # type: ignore[index]
+            return Page(name, viewport)  # type: ignore[arg-type]
 
         def close(self) -> None:
             pass
@@ -1390,17 +1556,18 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         "http://dashboard", 5, payload
     )
 
-    assert errors == ["desktop：RuntimeError: navigation failed"]
+    assert errors == ["wide_desktop：RuntimeError: navigation failed"]
     assert blocker is None
-    assert visited == ["desktop", "mobile"]
-    assert viewport_widths == [1440, 375]
+    assert visited == ["wide_desktop", "desktop", "mobile"]
+    assert viewport_widths == [1920, 1440, 375]
 
-    state["fail_desktop_navigation"] = False
+    state["fail_wide_desktop_navigation"] = False
     visited.clear()
     selectors.clear()
     clicks.clear()
     evaluated.clear()
     viewport_widths.clear()
+    screenshots.clear()
     monkeypatch.setattr(
         dashboard_acceptance,
         "_check_decision_tabs",
@@ -1412,11 +1579,12 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     )
 
     assert errors == [
+        "wide_desktop：AssertionError: decision failed",
         "desktop：AssertionError: decision failed",
         "mobile：AssertionError: decision failed",
     ]
     assert blocker is None
-    for viewport in ("desktop", "mobile"):
+    for viewport in ("wide_desktop", "desktop", "mobile"):
         assert (viewport, '#broker-summary-cards [data-broker="phillips"]') in selectors
         assert (viewport, '[data-market="CN"]') in selectors
         assert (viewport, '[data-market="CN"]') in clicks
@@ -1475,7 +1643,16 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, 'a:visible, button:visible') in selectors
         assert (viewport, 'a[href="#account-tiger"]') not in clicks
     assert evaluated == [
-        *(["desktop"] * 7), *(["mobile"] * 8),
+        *(["wide_desktop"] * 7), *(["desktop"] * 7), *(["mobile"] * 8),
+    ]
+    screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
+    assert screenshots == [
+        ("wide_desktop", str(screenshot_dir / "wide_desktop-portfolio.png")),
+        ("wide_desktop", str(screenshot_dir / "1920-trend-report.png")),
+        ("desktop", str(screenshot_dir / "desktop-portfolio.png")),
+        ("desktop", str(screenshot_dir / "1440-trend-report.png")),
+        ("mobile", str(screenshot_dir / "mobile-portfolio.png")),
+        ("mobile", str(screenshot_dir / "375-trend-report.png")),
     ]
 
 

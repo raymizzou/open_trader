@@ -35,6 +35,19 @@ TREND_REPORT_DIRECTORIES = {
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }
+WARM_LEDGER_TOKENS = {
+    "--bg": "#F7F5F1",
+    "--surface": "#FFFEFA",
+    "--surface-soft": "#F2EEE7",
+    "--text": "#201D18",
+    "--muted": "#746E64",
+    "--accent": "#8B5E34",
+    "--line": "#D8D2C8",
+    "--primary": "#24211D",
+    "--danger": "#B42318",
+    "--success": "#2F855A",
+}
+ACCEPTANCE_SCREENSHOT_DIR = Path("/tmp/open_trader_dashboard_acceptance")
 TREND_REASON_LABELS = {
     "protection_line_already_triggered": "活动保护线已触发",
     "danger_signal": "危险信号触发",
@@ -734,7 +747,11 @@ def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> No
 
 
 def _check_account_holdings(
-    page: Any, payload: dict[str, Any], *, reports_dir: Path | None = None
+    page: Any,
+    payload: dict[str, Any],
+    *,
+    reports_dir: Path | None = None,
+    screenshot_dir: Path | None = None,
 ) -> None:
     tabs = page.locator("#account-tabs [data-broker]")
     assert tabs.count() == 4, "券商账户 Tab 数量不是 4"
@@ -811,6 +828,13 @@ def _check_account_holdings(
         trigger.click()
         workspace = page.locator("#trend-report-workspace:visible")
         assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
+        _check_open_report_layout(page, workspace, broker)
+        if broker == "eastmoney" and screenshot_dir is not None:
+            width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+            page.screenshot(
+                path=str(screenshot_dir / f"{width}-trend-report.png"),
+                full_page=True,
+            )
         close = page.locator("#return-to-portfolio:visible")
         assert close.count() == 1, f"{broker} 趋势报告工作区缺少共享返回按钮"
         assert close.evaluate("element => element === document.activeElement"), (
@@ -963,6 +987,105 @@ def _check_session_prices(page: Any) -> None:
             )
 
 
+def _check_visual_contract(page: Any) -> None:
+    names = list(WARM_LEDGER_TOKENS)
+    actual = page.evaluate(
+        "names => { const styles = getComputedStyle(document.documentElement); "
+        "return Object.fromEntries(names.map(name => "
+        "[name, styles.getPropertyValue(name).trim().toUpperCase()])); }",
+        names,
+    )
+    assert actual == WARM_LEDGER_TOKENS, f"Dashboard A 色板漂移：{actual}"
+
+    expected = {
+        "body": {
+            "backgroundColor": "rgb(247, 245, 241)",
+            "color": "rgb(32, 29, 24)",
+        },
+        "#refresh-quotes": {
+            "backgroundColor": "rgb(139, 94, 52)",
+            "borderTopColor": "rgb(139, 94, 52)",
+        },
+        ".current-view-card": {
+            "backgroundColor": "rgb(36, 33, 29)",
+            "borderTopColor": "rgb(36, 33, 29)",
+        },
+    }
+    surface = {
+        "backgroundColor": "rgb(255, 254, 250)",
+        "borderTopColor": "rgb(216, 210, 200)",
+    }
+    for selector in (
+        ".header-brand-panel", ".header-assets-panel", ".header-source-panel",
+        ".holdings-panel", ".kelly-lab-panel", ".trend-report-workspace",
+        ".backtest-workspace", ".symbol-detail-panel", ".research-chat-modal",
+    ):
+        expected[selector] = surface
+    expression = (
+        "element => { const styles = getComputedStyle(element); return {"
+        "backgroundColor: styles.backgroundColor, "
+        "borderTopColor: styles.borderTopColor, color: styles.color}; }"
+    )
+    for selector, required in expected.items():
+        locator = page.locator(selector)
+        assert locator.count() == 1, f"A 色板验收缺少表面 {selector}"
+        actual_style = locator.evaluate(expression)
+        assert all(
+            actual_style.get(key) == value for key, value in required.items()
+        ), f"{selector} 未使用 A 色板：{actual_style}"
+
+    focus_target = page.locator("#refresh-quotes")
+    focus_target.focus()
+    focus = focus_target.evaluate(
+        "element => { const styles = getComputedStyle(element); return {"
+        "outlineColor: styles.outlineColor, outlineStyle: styles.outlineStyle, "
+        "outlineWidth: styles.outlineWidth}; }"
+    )
+    assert focus == {
+        "outlineColor": "rgb(139, 94, 52)",
+        "outlineStyle": "solid", "outlineWidth": "3px",
+    }, f"主操作焦点未使用 A 色板：{focus}"
+
+
+def _check_open_report_layout(page: Any, workspace: Any, broker: str) -> None:
+    viewport = getattr(page, "viewport_size", None) or {}
+    width = viewport.get("width", 0)
+    if width >= 1920:
+        geometry = page.evaluate("""() => {
+          const shell = document.querySelector('.dashboard-shell').getBoundingClientRect();
+          const header = document.querySelector('.dashboard-header').getBoundingClientRect();
+          const report = document.querySelector('#trend-report-workspace').getBoundingClientRect();
+          return {shellWidth: shell.width, headerLeft: header.left, headerRight: header.right,
+                  reportLeft: report.left, reportRight: report.right};
+        }""")
+        assert abs(geometry["shellWidth"] - 1600) <= 1, (
+            "1920px 下 Dashboard shell 不是 1600px"
+        )
+        assert abs(geometry["headerLeft"] - geometry["reportLeft"]) <= 1, (
+            "趋势报告左边线未与 Header 对齐"
+        )
+        assert abs(geometry["headerRight"] - geometry["reportRight"]) <= 1, (
+            "趋势报告右边线未与 Header 对齐"
+        )
+
+    if broker != "eastmoney":
+        return
+    buy_stage = workspace.locator(".cn-trend-buy")
+    assert buy_stage.count() == 1, "A 股趋势报告缺少正式买入区"
+    if width <= 760:
+        cards = buy_stage.locator(".cn-trend-card:visible")
+        assert cards.count() >= 1, "A 股趋势报告手机端缺少卡片"
+        return
+    overflow = buy_stage.evaluate(
+        "element => ({clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, "
+        "overflowX: getComputedStyle(element).overflowX})"
+    )
+    assert overflow["overflowX"] == "auto", "A 股正式买入区未启用内部横向滚动"
+    assert overflow["scrollWidth"] > overflow["clientWidth"], (
+        "A 股正式买入宽表没有可滚动内容"
+    )
+
+
 def _check_page_safety(page: Any) -> None:
     assert page.locator("#tiger-long-term-panel").count() == 0, "页面仍包含独立老虎长线面板"
     assert page.locator("#trade-actions").count() == 0, "页面仍包含交易动作面板"
@@ -1025,12 +1148,14 @@ def _browser_check(
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome", headless=True)
+            ACCEPTANCE_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
             try:
                 market, symbol, decision_broker = _first_in_scope_holding(payload)
             except AssertionError as exc:
                 browser.close()
                 return [str(exc)], None
             for name, viewport in (
+                ("wide_desktop", {"width": 1920, "height": 1080}),
                 ("desktop", {"width": 1440, "height": 1000}),
                 ("mobile", {"width": 375, "height": 844}),
             ):
@@ -1050,6 +1175,13 @@ def _browser_check(
                         f"HTTP {response.status} {response.url}"
                     ) if response.status >= 400 else None)
                     page.goto(url, wait_until="networkidle")
+                    _check_visual_contract(page)
+                    page.screenshot(
+                        path=str(
+                            ACCEPTANCE_SCREENSHOT_DIR / f"{name}-portfolio.png"
+                        ),
+                        full_page=True,
+                    )
                     if "看板数据加载失败" in page.locator("body").inner_text():
                         errors.append(f"{name}：页面显示看板数据加载失败")
                     try:
@@ -1062,7 +1194,10 @@ def _browser_check(
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
                         _check_account_holdings(
-                            page, payload, reports_dir=reports_dir
+                            page,
+                            payload,
+                            reports_dir=reports_dir,
+                            screenshot_dir=ACCEPTANCE_SCREENSHOT_DIR,
                         )
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
