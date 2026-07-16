@@ -355,6 +355,16 @@ def _valid_trend_collections(
         for key in ("formal_actions", "holding_decisions", "top10_candidates")
     ):
         return False
+    snapshots = payload.get("signal_snapshots")
+    if snapshots is not None and (
+        not isinstance(snapshots, dict)
+        or "candidates" in snapshots
+        and (
+            not isinstance(snapshots["candidates"], list)
+            or not all(isinstance(item, dict) for item in snapshots["candidates"])
+        )
+    ):
+        return False
     excluded = payload.get("excluded", {})
     if not isinstance(excluded, dict) or any(
         not isinstance(symbol, str)
@@ -449,6 +459,10 @@ def _load_broker_trend_report(
         if _trend_action_needs_review(item) and item not in review_actions:
             review_actions.append(item)
     directory = reports_dir.name
+    signal_snapshots = payload.get("signal_snapshots", {})
+    audit_candidates = judgments["top10_candidates"]
+    if market == "CN" and isinstance(signal_snapshots, dict):
+        audit_candidates = signal_snapshots.get("candidates", audit_candidates)
     return {
         "available": True,
         "broker": broker,
@@ -480,7 +494,7 @@ def _load_broker_trend_report(
             data_dir / directory / "watch_events.jsonl"
         ),
         "audit": {
-            "candidates": judgments.get("top10_candidates", []),
+            "candidates": audit_candidates,
             "excluded": payload.get("excluded", {}),
             "industry_concentration": payload.get("industry_concentration", []),
             "data_sources": payload.get("data_sources", []),

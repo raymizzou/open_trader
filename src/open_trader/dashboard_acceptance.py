@@ -42,6 +42,24 @@ TREND_REASON_LABELS = {
     "holding_signal_unknown": "趋势信号不完整",
     "holding_kline_unavailable": "持仓日线数据不可用",
     "trend_intact": "趋势保持完好",
+    "temperature_changed_to_flat": "趋势温度转平",
+    "a_share_only": "仅限 A 股股票",
+    "temperature_missing": "个股趋势温度缺失",
+    "temperature_transition_not_entry": "不是温转热或温转沸",
+    "filter_price_missing": "筛选价缺失",
+    "filter_price_above_200": "筛选价高于 200 元",
+    "strength_missing": "趋势强度缺失",
+    "strength_below_95": "趋势强度低于 95",
+    "industry_id_missing": "行业 ID 缺失",
+    "industry_temperature_missing": "行业温度缺失",
+    "industry_temperature_not_hot": "行业温度未达到热或沸",
+    "phase_missing": "趋势节气缺失",
+    "phase_after_summer_solstice": "趋势节气晚于夏至",
+    "market_cap_missing": "市值缺失",
+    "market_cap_below_100": "市值低于 100 亿元",
+    "amount_missing": "日成交额缺失",
+    "amount_below_2": "日成交额不足 2 亿元",
+    "right_side_days_missing": "右侧天数缺失",
     "right_side_not_true": "尚未进入右侧趋势",
     "strength_not_above_90": "趋势强度未超过 90",
     "right_side_days_not_below_10": "进入右侧趋势已满 10 天",
@@ -502,6 +520,16 @@ def _check_trend_artifact_projection(
         if item.get("action") == "BUY"
         and not _trend_action_needs_review(item)
     ]
+    if broker == "eastmoney":
+        for item in buys:
+            for key, label in (
+                ("industry", "行业"),
+                ("filter_price", "筛选价（Trend Animals）"),
+                ("close", "执行参考价（Futu 前复权）"),
+            ):
+                assert item.get(key) is not None and str(item[key]).strip() not in {
+                    "", "-",
+                }, f"A 股正式买入缺少 {label}"
     holds = [
         item for item in holdings
         if item.get("action") == "HOLD" and not _trend_action_needs_review(item)
@@ -525,7 +553,11 @@ def _check_trend_artifact_projection(
         "hold": len(holds),
         "review": len(reviews),
     }, f"{broker} 冻结报告计数与 API 投影不一致"
-    assert audit.get("candidates") == judgments.get("top10_candidates", []), (
+    signal_snapshots = payload.get("signal_snapshots")
+    expected_candidates = judgments.get("top10_candidates", [])
+    if broker == "eastmoney" and isinstance(signal_snapshots, Mapping):
+        expected_candidates = signal_snapshots.get("candidates", expected_candidates)
+    assert audit.get("candidates") == expected_candidates, (
         f"{broker} 冻结报告候选榜与 API 投影不一致"
     )
     for key, default in (
@@ -567,6 +599,85 @@ def _check_trend_stage(
         if item.get("active_line") not in (None, ""):
             assert f"活动保护线 {_display_number(item['active_line'])}" in text, (
                 f"{broker} 的 {kind} 动作缺少活动保护线"
+            )
+
+
+def _check_cn_trend_stages(
+    stage_texts: list[str], report: Mapping[str, Any]
+) -> None:
+    expected = (
+        ("优先处理 · 卖出触发", "sell_actions", "全部卖出"),
+        ("需要确认 · 人工复核", "review_actions", "人工复核"),
+        (
+            f"{_plain(report.get('buy_window'))} · 正式买入计划",
+            "buy_actions",
+            "正式买入",
+        ),
+        ("盘中持续 · 已有持仓", "hold_actions", "继续持有"),
+    )
+    assert len(stage_texts) == len(expected), "eastmoney 趋势报告阶段数量不正确"
+    for text, (title, key, action) in zip(stage_texts, expected, strict=True):
+        assert title in text, f"eastmoney 趋势报告缺少阶段 {title}"
+        rows = report.get(key) if isinstance(report.get(key), list) else []
+        if not rows:
+            assert "无" in text, f"eastmoney 的 {title} 空阶段未显示 无"
+            continue
+        for item in rows:
+            assert isinstance(item, Mapping), f"eastmoney 的 {title} 动作格式无效"
+            assert action in text, f"eastmoney 的 {title} 缺少动作 {action}"
+            for value in (item.get("symbol"), item.get("name")):
+                if value:
+                    assert str(value) in text, f"eastmoney 的 {title} 缺少 {value}"
+            if key == "buy_actions":
+                weight = Decimal(str(item.get("target_weight", "NaN"))) * 100
+                facts = (
+                    item.get("filter_price"), item.get("close"),
+                    f"{_plain(item.get('temperature_prev'))} → {_plain(item.get('temperature_curr'))}",
+                    item.get("phase"), item.get("strength"), item.get("industry"),
+                    item.get("industry_temperature"), item.get("market_cap"),
+                    item.get("amount"), f"{format(weight.normalize(), 'f')}%",
+                    item.get("target_amount"), f"{_plain(item.get('estimated_shares'))} 股",
+                    item.get("estimated_initial_line"),
+                )
+            else:
+                facts = (
+                    item.get("close"),
+                    f"{_plain(item.get('temperature_prev'))} → {_plain(item.get('temperature_curr'))}",
+                    item.get("strength"),
+                    TREND_REASON_LABELS.get(
+                        str(item.get("reason", "")), "未知动作或原因，需人工确认"
+                    ),
+                    item.get("active_line"),
+                    *(
+                        item.get("entry_hints")
+                        if isinstance(item.get("entry_hints"), list)
+                        else ["数据不可用"]
+                    ),
+                )
+            for fact in facts:
+                assert _plain(fact) in text, (
+                    f"eastmoney 的 {title} 缺少事实 {_plain(fact)}"
+                )
+
+
+def _check_cn_buy_rows(workspace: Any, report: Mapping[str, Any]) -> None:
+    items = report.get("buy_actions")
+    items = items if isinstance(items, list) else []
+    rows = workspace.locator(".cn-trend-buy .cn-trend-card")
+    assert rows.count() == len(items), "eastmoney 正式买入行数与 API 不一致"
+    for index, item in enumerate(items):
+        assert isinstance(item, Mapping), "eastmoney 正式买入动作格式无效"
+        row = rows.nth(index)
+        for label, key in (
+            ("行业", "industry"),
+            ("筛选价（Trend Animals）", "filter_price"),
+            ("执行参考价（Futu 前复权）", "close"),
+        ):
+            expected = _plain(item.get(key))
+            assert expected != "-", f"eastmoney 正式买入缺少 {label}"
+            cell = row.locator(f'td[data-label="{label}"]')
+            assert cell.count() == 1 and cell.inner_text().strip() == expected, (
+                f"eastmoney 正式买入行 {index + 1} 的 {label} 与 API 不一致"
             )
 
 
@@ -708,12 +819,16 @@ def _check_account_holdings(
         workspace_text = workspace.inner_text()
         identity = f"{_plain(report.get('broker_label'))}｜{_plain(report.get('market_label'))}"
         assert identity in workspace_text, f"{broker} 趋势报告身份不匹配"
-        for required in (
-            "报告日期", "数据截至", "生成时间", "账户状态", "今日执行检查",
-            "确认全部卖出动作", "按顺序考虑允许买入项", "盘中观察活动保护线",
-            "完成人工复核",
-        ):
+        for required in ("报告日期", "数据截至", "生成时间", "账户状态"):
             assert required in workspace_text, f"{broker} 趋势报告工作区缺少 {required}"
+        if broker != "eastmoney":
+            for required in (
+                "今日执行检查", "确认全部卖出动作", "按顺序考虑允许买入项",
+                "盘中观察活动保护线", "完成人工复核",
+            ):
+                assert required in workspace_text, (
+                    f"{broker} 趋势报告工作区缺少 {required}"
+                )
         header_values = workspace.locator(".trend-report-header dd").all_inner_texts()
         assert header_values == [
             _plain(report.get(key)) for key in (
@@ -721,24 +836,75 @@ def _check_account_holdings(
             )
         ], f"{broker} 趋势报告头部内容与 API 不一致"
         counts = report.get("counts") if isinstance(report.get("counts"), Mapping) else {}
-        for label, key in (("卖出", "sell"), ("买入", "buy"), ("持有", "hold"), ("人工复核", "review")):
+        count_labels = (
+            (("全部卖出", "sell"), ("正式买入", "buy"), ("继续持有", "hold"), ("人工复核", "review"))
+            if broker == "eastmoney"
+            else (("卖出", "sell"), ("买入", "buy"), ("持有", "hold"), ("人工复核", "review"))
+        )
+        for label, key in count_labels:
             assert f"{label} {_display_number(counts.get(key) or 0)}" in workspace_text, (
                 f"{broker} 趋势报告缺少 {label}计数"
             )
-        stage_texts = workspace.locator(".trend-stage").all_inner_texts()
-        expected_titles = [
-            "开盘前", _plain(report.get("buy_window")), "盘中持续", "人工复核",
-        ]
-        assert len(stage_texts) == 4 and all(
-            title in stage_texts[index] for index, title in enumerate(expected_titles)
-        ), f"{broker} 趋势报告阶段顺序不正确"
-        for stage_text, key, kind in zip(
-            stage_texts,
-            ("sell_actions", "buy_actions", "hold_actions", "review_actions"),
-            ("sell", "buy", "hold", "review"),
-            strict=True,
-        ):
-            _check_trend_stage(stage_text, report.get(key), kind=kind, broker=broker)
+        if broker == "eastmoney":
+            for required in (
+                "优先处理 · 卖出触发", "09:30–10:00 · 正式买入计划",
+                "需要确认 · 人工复核", "盘中持续 · 已有持仓", "筛选价（Trend Animals）",
+                "执行参考价（Futu 前复权）", "买入纪律", "卖出纪律",
+                "全部卖出", "正式买入", "继续持有",
+            ):
+                assert required in workspace_text, (
+                    f"eastmoney 趋势报告工作区缺少 {required}"
+                )
+            assert workspace.locator(".cn-trend-report").count() == 1, (
+                "eastmoney 趋势报告未使用 A 股动作优先结构"
+            )
+            stage_texts = workspace.locator(".cn-trend-stage").all_inner_texts()
+            _check_cn_trend_stages(stage_texts, report)
+            _check_cn_buy_rows(workspace, report)
+            assert workspace.locator(".cn-trend-table").count() == 4, (
+                "eastmoney 趋势报告动作表数量与 API 不一致"
+            )
+            disciplines = workspace.locator(".trend-discipline")
+            assert disciplines.count() == 2, "eastmoney 趋势报告纪律卡数量不是 2"
+            assert workspace.locator(".trend-discipline summary").all_inner_texts() == [
+                "买入纪律", "卖出纪律",
+            ], "eastmoney 趋势报告纪律顺序不正确"
+            viewport = getattr(page, "viewport_size", None)
+            expected_open = (
+                0 if viewport and viewport.get("width", 0) <= 760 else 2
+            )
+            assert workspace.locator(".trend-discipline[open]").count() == expected_open, (
+                "eastmoney 趋势报告纪律默认展开状态不正确"
+            )
+            if viewport and viewport.get("width", 0) <= 760:
+                assert page.evaluate(
+                    "document.documentElement.scrollWidth <= window.innerWidth"
+                ), "A 股趋势报告在 375px 产生横向滚动"
+                cards = workspace.locator(".cn-trend-card:visible")
+                assert cards.count() >= 1, "A 股趋势报告在 375px 没有可见动作卡"
+                assert all(
+                    box is not None and box["x"] + box["width"] <= 376
+                    for box in cards.evaluate_all(
+                        "nodes => nodes.map(node => node.getBoundingClientRect()).map(r => ({x:r.x,width:r.width}))"
+                    )
+                ), "A 股趋势报告动作卡超出 375px 视口"
+        else:
+            stage_texts = workspace.locator(".trend-stage").all_inner_texts()
+            expected_titles = [
+                "开盘前", _plain(report.get("buy_window")), "盘中持续", "人工复核",
+            ]
+            assert len(stage_texts) == 4 and all(
+                title in stage_texts[index] for index, title in enumerate(expected_titles)
+            ), f"{broker} 趋势报告阶段顺序不正确"
+            for stage_text, key, kind in zip(
+                stage_texts,
+                ("sell_actions", "buy_actions", "hold_actions", "review_actions"),
+                ("sell", "buy", "hold", "review"),
+                strict=True,
+            ):
+                _check_trend_stage(
+                    stage_text, report.get(key), kind=kind, broker=broker
+                )
         audit = workspace.locator(".trend-audit")
         _check_trend_audit(audit, report, broker)
         assert page.evaluate(
@@ -860,7 +1026,7 @@ def _browser_check(
                 return [str(exc)], None
             for name, viewport in (
                 ("desktop", {"width": 1440, "height": 1000}),
-                ("mobile", {"width": 390, "height": 844}),
+                ("mobile", {"width": 375, "height": 844}),
             ):
                 page = None
                 try:

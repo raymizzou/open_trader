@@ -354,7 +354,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         def get_daily_kline(self, *args: object, **kwargs: object) -> list[DailyKlineBar]:
             return [
                 DailyKlineBar(
-                    date=f"2026-06-{index + 1:02d}", open=10, high=11,
+                    date=f"2026-07-{index + 1:02d}", open=10, high=11,
                     low=9, close=10, volume=100,
                 )
                 for index in range(15)

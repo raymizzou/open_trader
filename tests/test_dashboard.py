@@ -350,6 +350,80 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     assert reports["eastmoney"]["audit"]["data_sources"] == ["Trend Animals"]
 
 
+def test_dashboard_projects_complete_cn_candidate_audit_only_for_eastmoney(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
+    top_ten = [{"symbol": "688046", "strength": "99.9"}]
+    complete = [
+        {
+            "symbol": "688046", "eligible": True, "rank": 1,
+            "excluded_reasons": [], "filter_price": "29.14",
+        },
+        {
+            "symbol": "600000", "eligible": False, "rank": None,
+            "excluded_reasons": ["strength_below_95"], "filter_price": "9.8",
+        },
+    ]
+    for directory, market, broker in (
+        ("trend_a_share", "CN", "eastmoney"),
+        ("trend_us_futu", "US", "futu"),
+    ):
+        path = config.reports_dir / directory / "2026-07-15.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "execution_date": "2026-07-15",
+            "as_of_date": "2026-07-14",
+            "generated_at": "2026-07-15T20:00:00+08:00",
+            "account": serialized_trend_account(fresh=True),
+            "metadata": {"market": market, "broker": broker},
+            "strategy_judgments": {
+                "formal_actions": [],
+                "holding_decisions": [],
+                "top10_candidates": top_ten,
+            },
+            "signal_snapshots": {"candidates": complete},
+        }), encoding="utf-8")
+
+    reports = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )
+
+    assert [item["symbol"] for item in reports["eastmoney"]["audit"]["candidates"]] == [
+        "688046", "600000",
+    ]
+    assert reports["futu"]["audit"]["candidates"] == top_ten
+
+
+def test_dashboard_rejects_malformed_signal_candidate_audit_when_present(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share" / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T20:00:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "signal_snapshots": {"candidates": [None]},
+    }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is False
+    assert report["status_text"] == "今日趋势报告无效"
+
+
 def test_dashboard_trend_report_does_not_fall_back_to_stale_report(
     tmp_path: Path,
 ) -> None:

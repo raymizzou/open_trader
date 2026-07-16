@@ -304,6 +304,45 @@ def test_quote_service_degrades_when_any_us_market_state_is_missing(
     assert "市场状态不可用" in result.diagnostic["message"]
 
 
+def test_quote_service_reuses_last_good_us_sessions_when_market_state_refresh_fails(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    first_client = FakeQuoteClient(
+        {
+            "US.MSFT": session_snapshot(last="500"),
+            "US.AAPL": session_snapshot(last="160"),
+        },
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
+    )
+    service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
+    first_result = service.refresh().to_dict()
+    state_error = FutuQuoteError(
+        "state failed", error_type="market_state_failed", snapshot_ok=True
+    )
+    second_client = FakeQuoteClient(
+        {
+            "US.MSFT": session_snapshot(last="510.25"),
+            "US.AAPL": session_snapshot(last="165"),
+        },
+        state_error=state_error,
+    )
+    service.client_factory = lambda: second_client
+
+    result = service.refresh().to_dict()
+
+    assert result["status"] == "partial"
+    assert result["stale"] is True
+    assert result["us_session_status"] == "active"
+    assert result["last_success_at"] == first_result["last_success_at"]
+    assert result["quotes"]["US.MSFT"] == {
+        **first_result["quotes"]["US.MSFT"],
+        "stale": True,
+    }
+    assert "上一笔有效分时段行情" in result["diagnostic"]["message"]
+
+
 def test_quote_service_returns_ok_and_never_writes_portfolio(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_portfolio(config.portfolio_path)

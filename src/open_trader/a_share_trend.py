@@ -56,6 +56,25 @@ HOLDING_FIELDS = CANDIDATE_FIELDS + (
     "stopwinFlagByBoilingTemperature",
     "stopwinFlagByPopChampagne",
 )
+A_SHARE_DISCIPLINE_FIELDS = (
+    "industryTmId",
+    "priceIndex",
+    "marketCap",
+    "trendTemperatureCurr",
+    "trendTemperaturePrev",
+    "trendPhaseCurr",
+)
+A_SHARE_SNAPSHOT_FIELDS = HOLDING_FIELDS + A_SHARE_DISCIPLINE_FIELDS
+A_SHARE_INDUSTRY_FIELDS = (
+    "tmId",
+    "asOfDate",
+    "trendTemperatureCurr",
+)
+ALLOWED_ENTRY_PHASES = {"谷雨", "立夏", "夏至"}
+HOT_TEMPERATURES = {"热", "沸"}
+KNOWN_TEMPERATURES = {"凉", "平", "温", "热", "沸"}
+
+
 @dataclass(frozen=True)
 class AShareTrendRunResult:
     status: str
@@ -151,6 +170,13 @@ class CandidateInput:
     close: Decimal | None
     atr: Decimal | None
     pools: tuple[str, ...] = ()
+    industry_tm_id: int | None = None
+    industry_temperature: str | None = None
+    filter_price: Decimal | None = None
+    market_cap: Decimal | None = None
+    temperature_prev: str | None = None
+    temperature_curr: str | None = None
+    phase: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,9 +189,21 @@ class CandidateDecision:
 class BuyAction:
     symbol: str
     name: str
+    industry: str
+    target_weight: Decimal
     target_amount: Decimal
     estimated_shares: int
+    filter_price: Decimal | None
     close: Decimal
+    market_cap: Decimal | None
+    industry_tm_id: int | None
+    industry_temperature: str | None
+    temperature_prev: str | None
+    temperature_curr: str | None
+    phase: str | None
+    strength: Decimal | None
+    amount: Decimal | None
+    atr: Decimal
     estimated_initial_line: Decimal
 
 
@@ -181,6 +219,14 @@ class HoldingSnapshot:
     boiling: bool | None
     champagne: bool | None
     industry: str = ""
+    industry_tm_id: int | None = None
+    industry_temperature: str | None = None
+    filter_price: Decimal | None = None
+    market_cap: Decimal | None = None
+    strength: Decimal | None = None
+    temperature_prev: str | None = None
+    temperature_curr: str | None = None
+    phase: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +240,11 @@ class HoldingDecision:
     active_line: Decimal | None
     atr: Decimal | None
     historical: bool
+    close: Decimal | None = None
+    temperature_prev: str | None = None
+    temperature_curr: str | None = None
+    strength: Decimal | None = None
+    entry_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -337,9 +388,12 @@ def atr14(bars: Sequence[DailyKlineBar]) -> Decimal | None:
 
 
 def _kline_metrics(
-    bars: Sequence[DailyKlineBar], *, before: str | None = None
+    bars: Sequence[DailyKlineBar],
+    *,
+    before: str | None = None,
+    expected_date: str | None = None,
 ) -> tuple[Decimal | None, Decimal | None, tuple[Decimal, ...]]:
-    if not bars:
+    if not bars or expected_date is not None and bars[-1].date != expected_date:
         return None, None, ()
     try:
         atr = atr14(bars)
@@ -380,10 +434,14 @@ def evaluate_candidate(
     *,
     pools: Sequence[str] = (),
     market: str = "CN",
+    industry_temperature: str | None = None,
 ) -> CandidateInput:
     symbol, exchange = _symbol_parts(row.get("tickerSymbol"), market=market)
     daily_bars = tuple(bars or ())
-    atr, close, _ = _kline_metrics(daily_bars)
+    as_of_date = str(row.get("asOfDate") or "").strip()
+    atr, close, _ = _kline_metrics(
+        daily_bars, expected_date=as_of_date or None
+    )
     tm_id = row.get("tmId")
     if isinstance(tm_id, bool) or not isinstance(tm_id, int):
         raise ValueError("tmId must be an integer")
@@ -404,6 +462,26 @@ def evaluate_candidate(
         close=close,
         atr=atr,
         pools=tuple(sorted(set(pools))),
+        industry_tm_id=_optional_int(row.get("industryTmId")),
+        industry_temperature=industry_temperature,
+        filter_price=_optional_decimal(row.get("priceIndex")),
+        market_cap=_optional_decimal(row.get("marketCap")),
+        temperature_prev=(
+            str(row["trendTemperaturePrev"])
+            if row.get("trendTemperaturePrev") in KNOWN_TEMPERATURES
+            else None
+        ),
+        temperature_curr=(
+            str(row["trendTemperatureCurr"])
+            if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
+            else None
+        ),
+        phase=(
+            str(row["trendPhaseCurr"]).strip()
+            if isinstance(row.get("trendPhaseCurr"), str)
+            and str(row["trendPhaseCurr"]).strip()
+            else None
+        ),
     )
 
 
@@ -420,24 +498,58 @@ def _candidate_reasons(
     market: str = "CN",
 ) -> list[str]:
     reasons: list[str] = []
+    if market == "CN":
+        if item.asset != "A股":
+            reasons.append("a_share_only")
+        if item.temperature_prev is None or item.temperature_curr is None:
+            reasons.append("temperature_missing")
+        elif item.temperature_prev != "温" or item.temperature_curr not in HOT_TEMPERATURES:
+            reasons.append("temperature_transition_not_entry")
+        if item.filter_price is None:
+            reasons.append("filter_price_missing")
+        elif item.filter_price > 200:
+            reasons.append("filter_price_above_200")
+        if item.strength is None:
+            reasons.append("strength_missing")
+        elif item.strength < 95:
+            reasons.append("strength_below_95")
+        if item.industry_tm_id is None:
+            reasons.append("industry_id_missing")
+        if item.industry_temperature is None:
+            reasons.append("industry_temperature_missing")
+        elif item.industry_temperature not in HOT_TEMPERATURES:
+            reasons.append("industry_temperature_not_hot")
+        if item.phase is None:
+            reasons.append("phase_missing")
+        elif item.phase not in ALLOWED_ENTRY_PHASES:
+            reasons.append("phase_after_summer_solstice")
+        if item.market_cap is None:
+            reasons.append("market_cap_missing")
+        elif item.market_cap < 100:
+            reasons.append("market_cap_below_100")
+        if item.amount is None:
+            reasons.append("amount_missing")
+        elif item.amount < 2:
+            reasons.append("amount_below_2")
+        if item.days is None:
+            reasons.append("right_side_days_missing")
+    else:
+        if item.strength is None or item.strength <= 90:
+            reasons.append("strength_not_above_90")
+        if item.days is None or item.days >= 10:
+            reasons.append("right_side_days_not_below_10")
+        if item.amount is None or item.amount < 1:
+            reasons.append("amount_below_1")
     if item.right_side is not True:
         reasons.append("right_side_not_true")
-    if item.strength is None or item.strength <= 90:
-        reasons.append("strength_not_above_90")
-    if item.days is None or item.days >= 10:
-        reasons.append("right_side_days_not_below_10")
     if item.tradable is not True:
         reasons.append("not_tradable")
-    if item.amount is None or item.amount < 1:
-        reasons.append("amount_below_1")
     if item.danger is not False:
         reasons.append("danger_signal" if item.danger else "danger_unknown")
     if not item.name:
         reasons.append("name_missing")
     if not item.asset:
         reasons.append("asset_missing")
-    elif market == "CN" and item.asset not in {"A股", "ETF基金"}:
-        reasons.append("unsupported_asset")
     if item.symbol in held_symbols:
         reasons.append("already_held")
     if market == "CN" and (item.exchange == "BJ" or _excluded_name(item.name)):
@@ -504,7 +616,6 @@ def estimate_buy_actions(
     slots = max(0, 10 - current_position_count)
     if slots == 0:
         return []
-    target = (net_value * position_weight).quantize(Decimal("0.01"))
     remaining_cash = available_cash
     actions: list[BuyAction] = []
     for item in ranked:
@@ -512,6 +623,16 @@ def estimate_buy_actions(
             break
         if item.close is None or item.close <= 0 or item.atr is None:
             continue
+        weight = (
+            {"热": Decimal("0.04"), "沸": Decimal("0.02")}.get(
+                item.temperature_curr
+            )
+            if market == "CN"
+            else position_weight
+        )
+        if weight is None:
+            continue
+        target = (net_value * weight).quantize(Decimal("0.01"))
         amount = min(target, remaining_cash)
         if market == "CN":
             lot_size = 100
@@ -526,9 +647,21 @@ def estimate_buy_actions(
             BuyAction(
                 symbol=item.symbol,
                 name=item.name,
+                industry=item.industry,
+                target_weight=weight,
                 target_amount=amount,
                 estimated_shares=shares,
+                filter_price=item.filter_price,
                 close=item.close,
+                market_cap=item.market_cap,
+                industry_tm_id=item.industry_tm_id,
+                industry_temperature=item.industry_temperature,
+                temperature_prev=item.temperature_prev,
+                temperature_curr=item.temperature_curr,
+                phase=item.phase,
+                strength=item.strength,
+                amount=item.amount,
+                atr=item.atr,
                 estimated_initial_line=item.close - Decimal("2") * item.atr,
             )
         )
@@ -565,6 +698,7 @@ def _holding_action(
     symbol: str,
     snapshot: HoldingSnapshot | None,
     triggered: set[str],
+    market: str = "CN",
 ) -> tuple[str, str]:
     if symbol in triggered:
         return "SELL_ALL", "protection_line_already_triggered"
@@ -572,6 +706,13 @@ def _holding_action(
         return "SELL_ALL", "danger_signal"
     if snapshot is not None and snapshot.right_side is False:
         return "SELL_ALL", "left_trend_right_side"
+    if (
+        market == "CN"
+        and snapshot is not None
+        and snapshot.temperature_prev in {"温", "热", "沸"}
+        and snapshot.temperature_curr == "平"
+    ):
+        return "SELL_ALL", "temperature_changed_to_flat"
     if snapshot is None or any(
         signal is None
         for signal in (
@@ -580,9 +721,47 @@ def _holding_action(
             snapshot.boiling,
             snapshot.champagne,
         )
+    ) or (
+        market == "CN"
+        and (
+            snapshot.temperature_prev not in KNOWN_TEMPERATURES
+            or snapshot.temperature_curr not in KNOWN_TEMPERATURES
+        )
     ):
         return "MANUAL_REVIEW", "holding_signal_unknown"
     return "HOLD", "trend_intact"
+
+
+def _holding_entry_hints(snapshot: HoldingSnapshot | None) -> tuple[str, ...]:
+    if snapshot is None:
+        return ("数据不可用",)
+    hints: list[str] = []
+    if snapshot.filter_price is None:
+        hints.append("筛选价数据不可用")
+    elif snapshot.filter_price > 200:
+        hints.append(f"筛选价 {snapshot.filter_price}，高于入场上限 200")
+    if snapshot.strength is None:
+        hints.append("强度数据不可用")
+    elif snapshot.strength < 95:
+        hints.append(f"强度 {snapshot.strength}，低于入场线 95")
+    if snapshot.industry_temperature is None:
+        hints.append("行业温度数据不可用")
+    elif snapshot.industry_temperature not in HOT_TEMPERATURES:
+        hints.append(f"行业温度为{snapshot.industry_temperature}，未达到热或沸")
+    if snapshot.phase is None:
+        hints.append("节气数据不可用")
+    elif snapshot.phase not in ALLOWED_ENTRY_PHASES:
+        hints.append(f"节气已到{snapshot.phase}")
+    if snapshot.market_cap is None:
+        hints.append("市值数据不可用")
+    elif snapshot.market_cap < 100:
+        hints.append(f"市值 {snapshot.market_cap} 亿元，低于入场线 100")
+    if (
+        snapshot.temperature_prev != "温"
+        or snapshot.temperature_curr not in HOT_TEMPERATURES
+    ):
+        hints.append("不是新的温转热或温转沸入场信号")
+    return tuple(hints)
 
 
 def _protection_was_triggered(
@@ -639,7 +818,7 @@ def build_report(
     )
     displayed_candidates = candidate_decision.eligible[:10]
     buy_actions = estimate_buy_actions(
-        ranked=displayed_candidates,
+        ranked=candidate_decision.eligible,
         net_value=account.net_value,
         available_cash=account.available_cash,
         current_position_count=len(account.positions),
@@ -669,7 +848,7 @@ def build_report(
             else set()
         )
         action, reason = _holding_action(
-            symbol=symbol, snapshot=snapshot, triggered=triggered
+            symbol=symbol, snapshot=snapshot, triggered=triggered, market=market
         )
         initial_line = _state_decimal(old_state, "initial_line")
         active_line = _state_decimal(old_state, "active_line")
@@ -684,7 +863,10 @@ def build_report(
             tracking_active = True
         historical = not old_state
         daily_bars = tuple(bars_by_symbol.get(symbol) or ())
-        current_atr, close, lows = _kline_metrics(daily_bars, before=as_of_date)
+        current_atr, close, lows = _kline_metrics(
+            daily_bars, before=as_of_date, expected_date=as_of_date
+        )
+        stale_kline = bool(daily_bars) and daily_bars[-1].date != as_of_date
         if active_line is None and current_atr is not None and close is not None:
             initial_line = active_line = close - Decimal("2") * current_atr
         if active_line is not None and tracking_active and action == "HOLD":
@@ -694,7 +876,7 @@ def build_report(
                 champagne=False,
                 prior_five_lows=lows,
             )
-        if active_line is None and action == "HOLD":
+        if (active_line is None or stale_kline) and action == "HOLD":
             action, reason = "MANUAL_REVIEW", "holding_kline_unavailable"
         effective_atr = current_atr if current_atr is not None else old_atr
         industry = snapshot.industry if snapshot else ""
@@ -711,6 +893,13 @@ def build_report(
                 initial_line=initial_line,
                 active_line=active_line,
                 atr=effective_atr,
+                close=close,
+                temperature_prev=snapshot.temperature_prev if snapshot else None,
+                temperature_curr=snapshot.temperature_curr if snapshot else None,
+                strength=snapshot.strength if snapshot else None,
+                entry_hints=(
+                    _holding_entry_hints(snapshot) if market == "CN" else ()
+                ),
                 historical=historical,
             )
         )
@@ -803,6 +992,15 @@ def _holding_signal(item: HoldingSnapshot) -> dict[str, object]:
         "danger": item.danger,
         "boiling": item.boiling,
         "champagne": item.champagne,
+        "industry": item.industry,
+        "industry_tm_id": item.industry_tm_id,
+        "industry_temperature": item.industry_temperature,
+        "filter_price": item.filter_price,
+        "market_cap": item.market_cap,
+        "strength": item.strength,
+        "temperature_prev": item.temperature_prev,
+        "temperature_curr": item.temperature_curr,
+        "phase": item.phase,
     }
 
 
@@ -821,6 +1019,15 @@ def _candidate_signal(item: CandidateInput) -> dict[str, object]:
         "days": item.days,
         "strength": item.strength,
         "danger": item.danger,
+        "filter_price": item.filter_price,
+        "close": item.close,
+        "atr": item.atr,
+        "market_cap": item.market_cap,
+        "industry_tm_id": item.industry_tm_id,
+        "industry_temperature": item.industry_temperature,
+        "temperature_prev": item.temperature_prev,
+        "temperature_curr": item.temperature_curr,
+        "phase": item.phase,
     }
 
 
@@ -841,6 +1048,24 @@ REASON_LABELS = {
     "holding_signal_unknown": "趋势信号不完整",
     "holding_kline_unavailable": "持仓日线数据不可用",
     "trend_intact": "趋势保持完好",
+    "temperature_changed_to_flat": "趋势温度转平",
+    "a_share_only": "仅限 A 股股票",
+    "temperature_missing": "个股趋势温度缺失",
+    "temperature_transition_not_entry": "不是温转热或温转沸",
+    "filter_price_missing": "筛选价缺失",
+    "filter_price_above_200": "筛选价高于 200 元",
+    "strength_missing": "趋势强度缺失",
+    "strength_below_95": "趋势强度低于 95",
+    "industry_id_missing": "行业 ID 缺失",
+    "industry_temperature_missing": "行业温度缺失",
+    "industry_temperature_not_hot": "行业温度未达到热或沸",
+    "phase_missing": "趋势节气缺失",
+    "phase_after_summer_solstice": "趋势节气晚于夏至",
+    "market_cap_missing": "市值缺失",
+    "market_cap_below_100": "市值低于 100 亿元",
+    "amount_missing": "日成交额缺失",
+    "amount_below_2": "日成交额不足 2 亿元",
+    "right_side_days_missing": "右侧天数缺失",
     "right_side_not_true": "尚未进入右侧趋势",
     "strength_not_above_90": "趋势强度未超过 90",
     "right_side_days_not_below_10": "进入右侧趋势已满 10 天",
@@ -1091,13 +1316,27 @@ def render_markdown(report: TrendReport) -> str:
     lines.extend(["", f"## {buy_window}：按顺序考虑买入", ""])
     if report.buy_actions:
         for index, item in enumerate(report.buy_actions, 1):
-            lines.append(
-                f"- {index}. {item.symbol} {item.name}｜约 {item.estimated_shares} 股｜"
-                f"金额上限 {_money(item.target_amount)} {currency}｜"
-                f"预计保护线 {_money(item.estimated_initial_line)}"
-            )
+            if market == "CN":
+                lines.append(
+                    f"- {index}. {item.symbol} {item.name}｜"
+                    f"筛选价 {_money(item.filter_price)} 元（Trend Animals）｜"  # type: ignore[arg-type]
+                    f"执行参考价 {_money(item.close)} 元（富途前复权日线）｜"
+                    f"温度 {item.temperature_prev or '未知'}→{item.temperature_curr or '未知'}｜"
+                    f"节气 {item.phase or '未知'}｜强度 {item.strength}｜"
+                    f"行业温度 {item.industry_temperature or '未知'}｜"
+                    f"市值 {item.market_cap} 亿元｜成交额 {item.amount} 亿元｜"
+                    f"目标仓位 {_money(item.target_weight * Decimal('100'))}%｜"
+                    f"金额上限 {_money(item.target_amount)} 元｜约 {item.estimated_shares} 股｜"
+                    f"预计保护线 {_money(item.estimated_initial_line)}"
+                )
+            else:
+                lines.append(
+                    f"- {index}. {item.symbol} {item.name}｜约 {item.estimated_shares} 股｜"
+                    f"金额上限 {_money(item.target_amount)} {currency}｜"
+                    f"预计保护线 {_money(item.estimated_initial_line)}"
+                )
         if market == "CN":
-            quantity_rule = "按东方财富实时价格向下取整为 100 股整数倍"
+            quantity_rule = "按富途数据日前复权日线收盘价向下取整为 100 股整数倍"
         elif market == "HK":
             quantity_rule = "按富途 lot size 向下取整为整手"
         else:
@@ -1116,6 +1355,15 @@ def render_markdown(report: TrendReport) -> str:
         )
         if item.active_line is not None:
             line += f"｜活动保护线 {_money(item.active_line)}"
+        if market == "CN":
+            line += (
+                f"｜执行参考价 "
+                f"{_money(item.close) + ' 元（富途前复权日线）' if item.close is not None else '不可用'}"
+                f"｜温度 {item.temperature_prev or '未知'}→{item.temperature_curr or '未知'}"
+                f"｜强度 {item.strength if item.strength is not None else '不可用'}"
+            )
+            if item.entry_hints:
+                line += f"｜持仓提示 {'；'.join(item.entry_hints)}"
         lines.append(line)
     if not holds and not reviews and not others:
         lines.append("- 无。")
@@ -1129,6 +1377,15 @@ def render_markdown(report: TrendReport) -> str:
             lines.append(
                 f"- {index}. {item.symbol} {item.name}｜强度 {item.strength}｜"
                 f"右侧 {item.days} 天｜成交额 {item.amount} 亿元｜"
+                + (
+                    f"筛选价 {item.filter_price} 元｜执行参考价 {item.close} 元｜"
+                    f"温度 {item.temperature_prev or '未知'}→{item.temperature_curr or '未知'}｜"
+                    f"节气 {item.phase or '未知'}｜行业 ID {item.industry_tm_id}｜"
+                    f"行业温度 {item.industry_temperature or '未知'}｜市值 {item.market_cap} 亿元｜"
+                    if market == "CN"
+                    else ""
+                )
+                +
                 f"行业 {item.industry or '未知'}（已占 {industry_count} 个席位，"
                 f"当前仓位 {_money(industry_weight)}%）"
             )
@@ -1885,7 +2142,10 @@ def _balance(row: Mapping[str, object]) -> Decimal:
 
 
 def _holding_snapshot(
-    row: Mapping[str, object], *, market: str = "CN"
+    row: Mapping[str, object],
+    *,
+    market: str = "CN",
+    industry_temperature: str | None = None,
 ) -> HoldingSnapshot:
     symbol, exchange = _symbol_parts(row.get("tickerSymbol"), market=market)
     return HoldingSnapshot(
@@ -1915,6 +2175,27 @@ def _holding_snapshot(
             else None
         ),
         industry=str(row.get("industryName") or "").strip(),
+        industry_tm_id=_optional_int(row.get("industryTmId")),
+        industry_temperature=industry_temperature,
+        filter_price=_optional_decimal(row.get("priceIndex")),
+        market_cap=_optional_decimal(row.get("marketCap")),
+        strength=_optional_decimal(row.get("trendStrengthLocalCurr")),
+        temperature_prev=(
+            str(row["trendTemperaturePrev"])
+            if row.get("trendTemperaturePrev") in KNOWN_TEMPERATURES
+            else None
+        ),
+        temperature_curr=(
+            str(row["trendTemperatureCurr"])
+            if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
+            else None
+        ),
+        phase=(
+            str(row["trendPhaseCurr"]).strip()
+            if isinstance(row.get("trendPhaseCurr"), str)
+            and str(row["trendPhaseCurr"]).strip()
+            else None
+        ),
     )
 
 
@@ -1976,10 +2257,11 @@ def _attempt_report(
                 continue
 
         requested_ids = sorted(component_ids | set(holding_ids.values()))
-        fields = HOLDING_FIELDS if holding_ids else CANDIDATE_FIELDS
+        fields = A_SHARE_SNAPSHOT_FIELDS
         billing_rows = api.get_snapshot_billing()
         billing = {_billing_field(row): row for row in billing_rows}
-        missing_billing = [field for field in fields if field not in billing]
+        requested_fields = tuple(dict.fromkeys(fields + A_SHARE_INDUSTRY_FIELDS))
+        missing_billing = [field for field in requested_fields if field not in billing]
         if missing_billing:
             raise TrendAnimalsError(
                 "getSnapshotColumnBilling missing requested field(s): "
@@ -2001,6 +2283,40 @@ def _attempt_report(
             raise TrendAnimalsError("getTickerSnapshot returned mismatched tmIds")
         if any(row.get("asOfDate") != run_date for row in snapshot_rows):
             raise TrendAnimalsError("getTickerSnapshot returned a stale data date")
+        industry_ids = sorted(
+            {
+                value
+                for row in snapshot_rows
+                if isinstance((value := row.get("industryTmId")), int)
+                and not isinstance(value, bool)
+                and value > 0
+            }
+        )
+        industry_rows = (
+            api.get_snapshots(
+                tm_ids=industry_ids,
+                fields=A_SHARE_INDUSTRY_FIELDS,
+                expected_date=run_date,
+            )
+            if industry_ids
+            else []
+        )
+        returned_industry_ids = [_row_tm_id(row) for row in industry_rows]
+        if (
+            len(returned_industry_ids) != len(set(returned_industry_ids))
+            or any(tm_id not in industry_ids for tm_id in returned_industry_ids)
+        ):
+            raise TrendAnimalsError("industry snapshot returned mismatched tmIds")
+        if any(row.get("asOfDate") != run_date for row in industry_rows):
+            raise TrendAnimalsError("industry snapshot returned a stale data date")
+        industry_temperatures = {
+            _row_tm_id(row): (
+                str(row["trendTemperatureCurr"])
+                if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
+                else None
+            )
+            for row in industry_rows
+        }
         balance_after = _balance(api.get_account_balance())
 
         candidates: list[CandidateInput] = []
@@ -2030,13 +2346,21 @@ def _attempt_report(
                     row,
                     daily_bars,
                     pools=component_pools[tm_id],
+                    industry_temperature=industry_temperatures.get(
+                        _optional_int(row.get("industryTmId"))
+                    ),
                 )
             )
         for symbol, tm_id in holding_ids.items():
             row = rows_by_tm_id.get(tm_id)
             if row is not None:
                 try:
-                    holding_snapshots[symbol] = _holding_snapshot(row)
+                    holding_snapshots[symbol] = _holding_snapshot(
+                        row,
+                        industry_temperature=industry_temperatures.get(
+                            _optional_int(row.get("industryTmId"))
+                        ),
+                    )
                 except ValueError:
                     holding_snapshots[symbol] = None
             try:
@@ -2058,7 +2382,13 @@ def _attempt_report(
 
         estimated_cost = sum(
             (_billing_price(billing[field]) for field in fields), Decimal("0")
-        ) * len(requested_ids)
+        ) * len(requested_ids) + sum(
+            (
+                _billing_price(billing[field])
+                for field in A_SHARE_INDUSTRY_FIELDS
+            ),
+            Decimal("0"),
+        ) * len(industry_ids)
         balance_delta = balance_before - balance_after
         actual_cost = balance_delta if balance_delta >= 0 else None
         cache_events = tuple(getattr(api, "paid_cache_events", ()))
@@ -2084,6 +2414,7 @@ def _attempt_report(
                 f"getUpdateStatus rows={len(update_rows)}",
                 f"getComponentTicker rows={len(component_rows)} cache=client-managed",
                 f"getTickerSnapshot fields={','.join(fields)} rows={len(snapshot_rows)} cache=client-managed",
+                f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
             ),
             data_sources=("Trend Animals", "Futu CN calendar/QFQ daily K-line", str(config.portfolio)),
             estimated_api_cost=estimated_cost,

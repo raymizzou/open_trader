@@ -141,6 +141,19 @@ class DashboardQuoteService:
             )
             for futu_symbol in requested_symbols
         }
+        reused_us_quotes = (
+            _last_good_us_quotes(self.last_quotes, us_symbols)
+            if state_error is not None
+            else {}
+        )
+        if reused_us_quotes:
+            quotes.update(reused_us_quotes)
+            market_states.update(
+                {
+                    symbol: str(quote["market_state"])
+                    for symbol, quote in reused_us_quotes.items()
+                }
+            )
         missing_count = sum(
             1 for quote in quotes.values() if quote["status"] == "missing_quote"
         )
@@ -154,7 +167,7 @@ class DashboardQuoteService:
         )
         status = "partial" if missing_count or fallback_count or state_error else "ok"
         diagnostic = _partial_diagnostic(
-            missing_count, fallback_count, state_error
+            missing_count, fallback_count, state_error, bool(reused_us_quotes)
         )
         cacheable = missing_count == 0 and state_error is None
         if cacheable:
@@ -171,12 +184,14 @@ class DashboardQuoteService:
             missing_count=missing_count,
             fetched_at=fetched_at,
             last_success_at=self.last_success_at,
-            stale=False,
+            stale=bool(reused_us_quotes),
             quotes=quotes,
             diagnostic=diagnostic,
             fallback_count=fallback_count,
             us_session_status=_us_session_status(
-                us_symbols, market_states, state_error
+                us_symbols,
+                market_states,
+                None if reused_us_quotes else state_error,
             ),
         )
 
@@ -305,10 +320,28 @@ def _mark_stale(
     return stale_quotes
 
 
+def _last_good_us_quotes(
+    last_quotes: dict[str, dict[str, Any]], us_symbols: list[str]
+) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for symbol in us_symbols:
+        quote = last_quotes.get(symbol)
+        if (
+            not quote
+            or quote.get("status") != "ok"
+            or not quote.get("price_session")
+            or not quote.get("market_state")
+        ):
+            return {}
+        rows[symbol] = {**quote, "stale": True}
+    return rows
+
+
 def _partial_diagnostic(
     missing_count: int,
     fallback_count: int,
     state_error: FutuQuoteError | None,
+    reused_us_quotes: bool = False,
 ) -> dict[str, Any]:
     messages: list[str] = []
     if missing_count:
@@ -316,7 +349,11 @@ def _partial_diagnostic(
     if fallback_count:
         messages.append(f"{fallback_count} 个标的当前时段无报价，已使用上一有效价。")
     if state_error is not None:
-        messages.append("美股市场状态不可用，已使用盘中价。")
+        messages.append(
+            "美股市场状态不可用，已使用上一笔有效分时段行情。"
+            if reused_us_quotes
+            else "美股市场状态不可用，已使用盘中价。"
+        )
     if not messages:
         return {}
     error_type = (

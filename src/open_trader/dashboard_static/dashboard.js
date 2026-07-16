@@ -1853,6 +1853,24 @@ const TREND_REASON_LABELS = {
   holding_signal_unknown: "趋势信号不完整",
   holding_kline_unavailable: "持仓日线数据不可用",
   trend_intact: "趋势保持完好",
+  temperature_changed_to_flat: "趋势温度转平",
+  a_share_only: "仅限 A 股股票",
+  temperature_missing: "个股趋势温度缺失",
+  temperature_transition_not_entry: "不是温转热或温转沸",
+  filter_price_missing: "筛选价缺失",
+  filter_price_above_200: "筛选价高于 200 元",
+  strength_missing: "趋势强度缺失",
+  strength_below_95: "趋势强度低于 95",
+  industry_id_missing: "行业 ID 缺失",
+  industry_temperature_missing: "行业温度缺失",
+  industry_temperature_not_hot: "行业温度未达到热或沸",
+  phase_missing: "趋势节气缺失",
+  phase_after_summer_solstice: "趋势节气晚于夏至",
+  market_cap_missing: "市值缺失",
+  market_cap_below_100: "市值低于 100 亿元",
+  amount_missing: "日成交额缺失",
+  amount_below_2: "日成交额不足 2 亿元",
+  right_side_days_missing: "右侧天数缺失",
   right_side_not_true: "尚未进入右侧趋势",
   strength_not_above_90: "趋势强度未超过 90",
   right_side_days_not_below_10: "进入右侧趋势已满 10 天",
@@ -1936,7 +1954,7 @@ function renderTrendAudit(audit) {
   </details>`;
 }
 
-function renderTrendReportWorkspace(report) {
+function renderDefaultTrendReportWorkspace(report) {
   const counts = report.counts || {};
   const audit = report.audit || {};
   return `<header class="trend-report-header">
@@ -1961,6 +1979,189 @@ function renderTrendReportWorkspace(report) {
         <li>确认全部卖出动作</li><li>按顺序考虑允许买入项</li><li>盘中观察活动保护线</li><li>完成人工复核</li>
       </ol></aside>
     </div>`;
+}
+
+function cnTrendRows(items) {
+  return Array.isArray(items)
+    ? items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    : [];
+}
+
+function renderCnTrendCell(label, value, ariaLabel = "") {
+  return `<td data-label="${escapeHtml(label)}"${ariaLabel ? ` aria-label="${escapeHtml(ariaLabel)}"` : ""}>${escapeHtml(formatPlain(value))}</td>`;
+}
+
+function cnTrendIdentity(item) {
+  return [item.symbol, item.name].filter(hasValue).map(formatPlain).join(" ") || "-";
+}
+
+function cnTrendTemperature(item) {
+  return `${formatPlain(item.temperature_prev)} → ${formatPlain(item.temperature_curr)}`;
+}
+
+function cnTrendHints(item) {
+  return Array.isArray(item.entry_hints) && item.entry_hints.length
+    ? item.entry_hints.map(formatPlain).join("；")
+    : "数据不可用";
+}
+
+function renderCnTrendTable(title, kind, headings, rows, note = "") {
+  return `<section class="trend-stage cn-trend-stage cn-trend-${escapeHtml(kind)}">
+    <h2>${escapeHtml(title)}</h2>
+    ${note ? `<p class="cn-trend-price-sources">${escapeHtml(note)}</p>` : ""}
+    <table class="cn-trend-table"><thead><tr>${headings.map((heading) => `<th scope="col">${escapeHtml(heading)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>
+    ${rows.length ? "" : "<p>无</p>"}
+  </section>`;
+}
+
+function renderCnSellOrHoldStage(title, items, kind) {
+  const action = { sell: "全部卖出", review: "人工复核" }[kind] || "继续持有";
+  const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
+  const headings = [
+    "标的", "动作", "执行参考价（Futu 前复权）", "温度变化", "强度",
+    reasonHeading, "活动保护线", "持仓提示",
+  ];
+  const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
+    ${renderCnTrendCell("标的", cnTrendIdentity(item))}
+    ${renderCnTrendCell("动作", action)}
+    ${renderCnTrendCell("执行参考价（Futu 前复权）", item.close)}
+    ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
+    ${renderCnTrendCell("强度", item.strength)}
+    ${renderCnTrendCell(headings[5], TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
+    ${renderCnTrendCell("活动保护线", item.active_line)}
+    ${renderCnTrendCell("持仓提示", cnTrendHints(item))}
+  </tr>`);
+  return renderCnTrendTable(title, kind, headings, rows);
+}
+
+function renderCnBuyStage(report) {
+  const headings = [
+    "标的", "动作", "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
+    "温度变化", "节气", "强度", "行业", "行业温度", "市值（亿元）",
+    "日成交额（亿元）", "目标仓位", "目标金额", "预计数量", "预计保护线",
+  ];
+  const rows = cnTrendRows(report.buy_actions).map((item) => {
+    const targetWeight = decimalAsPercent(item.target_weight, "-");
+    return `<tr class="cn-trend-card">
+      ${renderCnTrendCell("标的", cnTrendIdentity(item))}
+      ${renderCnTrendCell("动作", "正式买入")}
+      ${renderCnTrendCell("筛选价（Trend Animals）", item.filter_price)}
+      ${renderCnTrendCell("执行参考价（Futu 前复权）", item.close)}
+      ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
+      ${renderCnTrendCell("节气", item.phase)}
+      ${renderCnTrendCell("强度", item.strength)}
+      ${renderCnTrendCell("行业", item.industry)}
+      ${renderCnTrendCell("行业温度", item.industry_temperature)}
+      ${renderCnTrendCell("市值（亿元）", item.market_cap)}
+      ${renderCnTrendCell("日成交额（亿元）", item.amount)}
+      ${renderCnTrendCell("目标仓位", targetWeight, `目标仓位 ${targetWeight}`)}
+      ${renderCnTrendCell("目标金额", item.target_amount)}
+      ${renderCnTrendCell("预计数量", `${formatPlain(item.estimated_shares)} 股`)}
+      ${renderCnTrendCell("预计保护线", item.estimated_initial_line)}
+    </tr>`;
+  });
+  return renderCnTrendTable(
+    `${formatPlain(report.buy_window)} · 正式买入计划`, "buy", headings, rows,
+    "价格口径：筛选价（Trend Animals）｜执行参考价（Futu 前复权）",
+  );
+}
+
+function renderCnTrendDisciplines() {
+  const desktopOpen = typeof window === "undefined"
+    || typeof window.matchMedia !== "function"
+    || !window.matchMedia("(max-width: 760px)").matches;
+  const open = desktopOpen ? " open" : "";
+  return `<section class="cn-trend-disciplines">
+    <details class="trend-discipline"${open}><summary>买入纪律</summary><ol>
+      <li>仅限 A 股股票，排除基金、北交所、ST 与退市标的</li>
+      <li>个股必须由温转热或温转沸；热目标仓位 4%，沸目标仓位 2%</li>
+      <li>筛选价不高于 200 元，强度不低于 95</li>
+      <li>行业温度为热或沸，节气不晚于夏至</li>
+      <li>市值不低于 100 亿元，日成交额不低于 2 亿元</li>
+      <li>当前可交易、未持有、处于右侧、无危险信号，执行价与 ATR 可用</li>
+      <li>正式计划还须通过现金与最多 10 个持仓席位约束</li>
+    </ol></details>
+    <details class="trend-discipline"${open}><summary>卖出纪律</summary><ol>
+      <li>活动保护线触发时全部卖出</li>
+      <li>危险信号触发时全部卖出</li>
+      <li>离开右侧趋势时全部卖出</li>
+      <li>温、热或沸转为平时全部卖出</li>
+      <li>沸腾或开香槟只上移保护线，不减仓</li>
+    </ol></details>
+  </section>`;
+}
+
+function renderCnTrendAudit(audit) {
+  const candidates = cnTrendRows(audit.candidates);
+  const excluded = audit.excluded && typeof audit.excluded === "object" && !Array.isArray(audit.excluded) ? audit.excluded : {};
+  const industries = Array.isArray(audit.industry_concentration) ? audit.industry_concentration.filter(Array.isArray) : [];
+  const dataSources = Array.isArray(audit.data_sources) ? audit.data_sources : [];
+  const candidateRows = candidates.map((item) => {
+    const reasons = Array.isArray(item.excluded_reasons)
+      ? item.excluded_reasons.map((reason) => TREND_REASON_LABELS[reason] || "未知原因")
+      : [];
+    const result = item.eligible === true ? "通过策略纪律" : item.eligible === false ? "已排除" : "未知";
+    return `<li>${escapeHtml([
+      cnTrendIdentity(item), `最终排名 ${formatPlain(item.rank)}`, `结论 ${result}`,
+      `排除原因 ${reasons.join("、") || "无"}`,
+      `筛选价（Trend Animals） ${formatPlain(item.filter_price)}`,
+      `执行参考价（Futu 前复权） ${formatPlain(item.close)}`,
+      `温度 ${cnTrendTemperature(item)}`, `节气 ${formatPlain(item.phase)}`,
+      `强度 ${formatPlain(item.strength)}`, `行业 ${formatPlain(item.industry)}`,
+      `行业 ID ${formatPlain(item.industry_tm_id)}`,
+      `行业温度 ${formatPlain(item.industry_temperature)}`,
+      `市值 ${formatPlain(item.market_cap)}`, `日成交额 ${formatPlain(item.amount)}`,
+      `ATR14 ${formatPlain(item.atr)}`, `危险信号 ${formatPlain(item.danger)}`,
+    ].join("｜"))}</li>`;
+  }).join("");
+  return `<details class="trend-audit"><summary>审计详情</summary>
+    <section><h3>完整候选审计</h3><ol>${candidateRows || "<li>无</li>"}</ol></section>
+    <section><h3>排除项</h3><ul>${Object.entries(excluded).length
+      ? Object.entries(excluded).map(([symbol, reasons]) => `<li>${escapeHtml(formatPlain(symbol))}｜${escapeHtml((Array.isArray(reasons) ? reasons : []).map((reason) => TREND_REASON_LABELS[reason] || "未知原因").join("、"))}</li>`).join("")
+      : "<li>无</li>"}</ul></section>
+    <section><h3>行业集中度</h3><ul>${industries.length
+      ? industries.map((item) => `<li>${escapeHtml(item.map(formatPlain).join("｜"))}</li>`).join("")
+      : "<li>无</li>"}</ul></section>
+    <p>数据来源：${escapeHtml(dataSources.map(formatPlain).join("、") || "无")}</p>
+    <p>API 成本：${escapeHtml(formatPlain(audit.actual_api_cost ?? audit.estimated_api_cost ?? "未知"))}</p>
+  </details>`;
+}
+
+function renderCnTrendReportWorkspace(report) {
+  const counts = report.counts || {};
+  const audit = report.audit || {};
+  return `<main class="cn-trend-report">
+    <header class="trend-report-header">
+      <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1></div>
+      <button type="button" data-close-trend-report>返回持仓看板</button>
+      <dl>
+        <div><dt>报告日期</dt><dd>${escapeHtml(formatPlain(report.report_date))}</dd></div>
+        <div><dt>数据截至</dt><dd>${escapeHtml(formatPlain(report.data_date))}</dd></div>
+        <div><dt>生成时间</dt><dd>${escapeHtml(formatPlain(report.generated_at))}</dd></div>
+        <div><dt>账户状态</dt><dd>${escapeHtml(formatPlain(report.account_status))}</dd></div>
+      </dl>
+      <div class="trend-report-metrics cn-trend-counts">
+        <span>正式买入 ${escapeHtml(formatPlain(counts.buy || 0))}</span>
+        <span>全部卖出 ${escapeHtml(formatPlain(counts.sell || 0))}</span>
+        <span>继续持有 ${escapeHtml(formatPlain(counts.hold || 0))}</span>
+        <span>人工复核 ${escapeHtml(formatPlain(counts.review || 0))}</span>
+      </div>
+    </header>
+    <div class="cn-trend-actions">
+      ${renderCnSellOrHoldStage("优先处理 · 卖出触发", report.sell_actions, "sell")}
+      ${renderCnSellOrHoldStage("需要确认 · 人工复核", report.review_actions, "review")}
+      ${renderCnBuyStage(report)}
+      ${renderCnSellOrHoldStage("盘中持续 · 已有持仓", report.hold_actions, "hold")}
+    </div>
+    ${renderCnTrendDisciplines()}
+    ${renderCnTrendAudit(audit)}
+  </main>`;
+}
+
+function renderTrendReportWorkspace(report) {
+  return String(report && report.market || "").toUpperCase() === "CN"
+    ? renderCnTrendReportWorkspace(report || {})
+    : renderDefaultTrendReportWorkspace(report || {});
 }
 
 function renderAccountStrategy(group) {

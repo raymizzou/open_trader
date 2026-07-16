@@ -2673,6 +2673,137 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_renders_action_first_cn_trend_report_only_for_cn() -> None:
+    output = run_dashboard_js(r'''
+const cn = renderTrendReportWorkspace({
+  available:true,market:"CN",broker:"eastmoney",broker_label:"东方财富",
+  market_label:"A股",report_date:"2026-07-16",data_date:"2026-07-15",
+  generated_at:"2026-07-15T20:00:00+08:00",account_status:"已更新",
+  buy_window:"09:30–10:00",counts:{sell:1,buy:1,hold:1,review:2},
+  sell_actions:[{symbol:"601398",name:"工商银行",close:"7.2",
+    temperature_prev:"温",temperature_curr:"温",strength:"91.3",
+    reason:"left_trend_right_side",active_line:"7.0",
+    entry_hints:["强度 91.3，低于入场线 95"]}],
+  buy_actions:[{symbol:"688046",name:"药康生物",filter_price:"29.14",
+    close:"28.81",temperature_prev:"温",temperature_curr:"热",phase:"立夏",
+    strength:"99.9",industry:"医疗服务",industry_temperature:"热",
+    market_cap:"110",amount:"6",target_weight:"0.04",
+    target_amount:"27061.98",estimated_shares:900,
+    estimated_initial_line:"24.55"}],
+  hold_actions:[{symbol:"600900",name:"长江电力",close:"28.0",
+    temperature_prev:"热",temperature_curr:"热",strength:"98.7",
+    reason:"trend_intact",active_line:"27.8",
+    entry_hints:["不是新的温转热或温转沸入场信号"]}],
+  review_actions:[
+    {symbol:"600036",name:"招商银行",close:"45.2",temperature_prev:"热",
+     temperature_curr:"热",strength:"97",reason:"holding_kline_unavailable",
+     active_line:"42.0",entry_hints:["筛选价数据不可用"]},
+    {symbol:"600519",name:"贵州茅台",close:"1498",temperature_prev:"热",
+     temperature_curr:"-",strength:"98",reason:"holding_signal_unknown",
+     active_line:"1450",entry_hints:["行业温度数据不可用"]},
+  ],audit:{candidates:[
+    {symbol:"AUDIT-ONLY",name:"仅审计",eligible:false,rank:null,
+     excluded_reasons:["strength_below_95"],filter_price:"9.8",close:"9.7",
+     temperature_prev:"温",temperature_curr:"温",phase:"立夏",strength:"94",
+     industry:"银行",industry_temperature:"热",market_cap:"120",amount:"3",atr:"0.4",danger:false},
+  ],excluded:{"AUDIT-ONLY":["strength_below_95"]},industry_concentration:[],
+    data_sources:["Trend Animals","Futu CN calendar/QFQ daily K-line"]},
+});
+for (const text of ["优先处理 · 卖出触发","09:30–10:00 · 正式买入计划",
+  "需要确认 · 人工复核","盘中持续 · 已有持仓","筛选价（Trend Animals）","执行参考价（Futu 前复权）",
+  "温 → 热","目标仓位 4%","全部卖出","正式买入","继续持有",
+  "人工复核","600036","600519","日线数据不可用","筛选价数据不可用",
+  "趋势信号不完整","行业温度数据不可用","买入纪律","卖出纪律","审计详情"]) {
+  if (!cn.includes(text)) throw new Error(text + "\n" + cn);
+}
+const stageOrder=["优先处理 · 卖出触发","需要确认 · 人工复核",
+  "09:30–10:00 · 正式买入计划","盘中持续 · 已有持仓"].map((text)=>cn.indexOf(`<h2>${text}</h2>`));
+if(stageOrder.some((index)=>index<0)||!stageOrder.every((index,i)=>i===0||stageOrder[i-1]<index))throw new Error(cn);
+if (!cn.includes('class="cn-trend-report"') ||
+    !cn.includes('class="cn-trend-table"') ||
+    !cn.includes('class="cn-trend-card"')) throw new Error(cn);
+if ((cn.match(/<details class="trend-discipline" open>/g) || []).length !== 2) throw new Error(cn);
+const actionContent = cn.split('<details class="trend-audit"', 1)[0];
+if (actionContent.includes("AUDIT-ONLY") || !cn.includes("AUDIT-ONLY")) throw new Error(cn);
+
+const us = renderTrendReportWorkspace({market:"US",broker_label:"富途",
+  market_label:"美股",counts:{},sell_actions:[],buy_actions:[],
+  hold_actions:[],review_actions:[],audit:{}});
+if (us.includes('class="cn-trend-report"') || !us.includes("今日执行检查")) {
+  throw new Error(us);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_cn_trend_report_escapes_every_rendered_fact() -> None:
+    output = run_dashboard_js(r'''
+const attack='<img src=x onerror=alert(1)>';
+const html=renderTrendReportWorkspace({
+  market:"CN",broker_label:attack,market_label:attack,report_date:attack,
+  data_date:attack,generated_at:attack,account_status:attack,buy_window:attack,
+  counts:{sell:attack},sell_actions:[{symbol:attack,name:attack,close:attack,
+    temperature_prev:attack,temperature_curr:attack,strength:attack,
+    reason:"unknown",active_line:attack,entry_hints:[attack]}],
+  buy_actions:[{symbol:attack,name:attack,filter_price:attack,close:attack,
+    temperature_prev:attack,temperature_curr:attack,phase:attack,strength:attack,
+    industry:attack,industry_temperature:attack,market_cap:attack,amount:attack,
+    target_weight:attack,target_amount:attack,estimated_shares:attack,
+    estimated_initial_line:attack}],
+  hold_actions:[],review_actions:[{symbol:attack,name:attack,close:attack,
+    temperature_prev:attack,temperature_curr:attack,strength:attack,
+    reason:"holding_kline_unavailable",active_line:attack,entry_hints:[attack]}],
+  audit:{candidates:[{symbol:attack,name:attack,
+    excluded_reasons:[attack],filter_price:attack,close:attack}],excluded:{[attack]:[attack]},
+    industry_concentration:[[attack]],data_sources:[attack],actual_api_cost:attack},
+});
+if (html.includes(attack) || !html.includes("&lt;img") ||
+    !html.includes('class="cn-trend-report"') ||
+    !html.includes("筛选价（Trend Animals）") ||
+    !html.includes("执行参考价（Futu 前复权）")) throw new Error(html);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_cn_disciplines_default_closed_only_on_mobile() -> None:
+    output = run_dashboard_js(r'''
+const report={market:"CN",counts:{},sell_actions:[],buy_actions:[],hold_actions:[],audit:{}};
+const deterministic=renderTrendReportWorkspace(report);
+if ((deterministic.match(/<details class="trend-discipline" open>/g) || []).length !== 2) {
+  throw new Error(deterministic);
+}
+window={matchMedia:(query)=>({matches:query==="(max-width: 760px)"})};
+const mobile=renderTrendReportWorkspace(report);
+if (mobile.includes('<details class="trend-discipline" open>') ||
+    (mobile.match(/<details class="trend-discipline">/g) || []).length !== 2) {
+  throw new Error(mobile);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_cn_empty_stages_keep_tables_and_price_source_labels() -> None:
+    output = run_dashboard_js(r'''
+const html=renderTrendReportWorkspace({
+  market:"CN",buy_window:"09:30–10:00",counts:{},sell_actions:[],buy_actions:[],
+  hold_actions:[],audit:{},
+});
+if ((html.match(/class="cn-trend-table"/g) || []).length !== 4 ||
+    !html.includes("筛选价（Trend Animals）") ||
+    !html.includes("执行参考价（Futu 前复权）") ||
+    (html.match(/<p>无<\/p>/g) || []).length !== 4) throw new Error(html);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_trend_report_mobile_layout_css() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     mobile = css.split("@media (max-width: 760px) {", 1)[1]
@@ -2682,6 +2813,17 @@ def test_dashboard_trend_report_mobile_layout_css() -> None:
     assert ".trend-report-body { grid-template-columns: minmax(0, 1fr); }" in mobile
     assert ".trend-checklist { position: static; order: 2; }" in mobile
     assert ".trend-report-entry button,\n  .trend-report-header button { min-height: 44px; }" in mobile
+    assert ".cn-trend-table {" in css
+    table_css = css.split(".cn-trend-table {", 1)[1].split("}", 1)[0]
+    assert "table-layout: fixed;" in table_css
+    assert "width: 100%;" in table_css
+    assert "min-width:" not in table_css
+    assert ".cn-trend-table thead" in mobile
+    assert ".cn-trend-card" in mobile
+    assert "content: attr(data-label);" in mobile
+    assert "overflow-x: hidden;" in mobile
+    assert ".trend-discipline summary" in mobile
+    assert "min-height: 44px;" in mobile
 
 
 def test_dashboard_trend_report_defensively_handles_malformed_arrays() -> None:

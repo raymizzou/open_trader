@@ -266,6 +266,98 @@ def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
         )
 
 
+def test_acceptance_checks_complete_cn_signal_candidate_projection(
+    tmp_path: Path,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_a_share" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    complete = [
+        {"symbol": "688046", "eligible": True, "rank": 1},
+        {
+            "symbol": "600000", "eligible": False, "rank": None,
+            "excluded_reasons": ["strength_below_95"],
+        },
+    ]
+    review = {
+        "action": "MANUAL_REVIEW", "symbol": "600036", "name": "招商银行",
+        "reason": "holding_kline_unavailable",
+    }
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T20:00:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [review],
+            "top10_candidates": [complete[0]],
+        },
+        "signal_snapshots": {"candidates": complete},
+    }), encoding="utf-8")
+    projected = {
+        "report_date": "2026-07-15",
+        "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T20:00:00+08:00",
+        "sell_actions": [], "buy_actions": [], "hold_actions": [],
+        "review_actions": [review],
+        "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 1},
+        "audit": {
+            "artifact": artifact.name, "candidates": complete, "excluded": {},
+            "industry_concentration": [], "data_sources": [],
+        },
+    }
+
+    dashboard_acceptance._check_trend_artifact_projection(
+        reports, "eastmoney", projected
+    )
+
+
+@pytest.mark.parametrize("field", ["industry", "filter_price", "close"])
+@pytest.mark.parametrize("value", [None, "", "-"])
+def test_acceptance_rejects_missing_cn_buy_fact(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_a_share" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    buy = {
+        "action": "BUY", "symbol": "688046", "name": "药康生物",
+        "industry": "医疗服务", "filter_price": "29.14", "close": "28.81",
+    }
+    buy[field] = value
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T20:00:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [buy], "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "signal_snapshots": {"candidates": []},
+        "excluded": {}, "industry_concentration": [], "data_sources": [],
+    }), encoding="utf-8")
+    projected = {
+        "report_date": "2026-07-15", "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T20:00:00+08:00",
+        "sell_actions": [], "buy_actions": [buy], "hold_actions": [],
+        "review_actions": [],
+        "counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
+        "audit": {
+            "artifact": artifact.name, "candidates": [], "excluded": {},
+            "industry_concentration": [], "data_sources": [],
+        },
+    }
+
+    with pytest.raises(AssertionError, match="A 股正式买入缺少"):
+        dashboard_acceptance._check_trend_artifact_projection(
+            reports, "eastmoney", projected
+        )
+
+
 @pytest.mark.parametrize(
     "fresh", [False, MISSING_FRESH, None, "yes"]
 )
@@ -432,8 +524,48 @@ def trend_reports() -> dict[str, dict[str, object]]:
             },
         },
         "eastmoney": {
-            "available": False, "broker": "eastmoney", "broker_label": "东方财富",
-            "market_label": "A股", "status_text": "今日暂无趋势报告",
+            "available": True, "broker": "eastmoney", "broker_label": "东方财富",
+            "market": "CN", "market_label": "A股", "report_date": "2026-07-15",
+            "data_date": "2026-07-14", "generated_at": "2026-07-15T20:00:00+08:00",
+            "account_status": "已更新", "buy_window": "09:30–10:00",
+            "sell_actions": [{
+                "symbol": "601398", "name": "工商银行", "close": "7.2",
+                "temperature_prev": "温", "temperature_curr": "温",
+                "strength": "91.3", "reason": "left_trend_right_side",
+                "active_line": "7.0", "entry_hints": ["强度 91.3，低于入场线 95"],
+            }],
+            "buy_actions": [{
+                "symbol": "688046", "name": "药康生物", "filter_price": "29.14",
+                "close": "28.81", "temperature_prev": "温", "temperature_curr": "热",
+                "phase": "立夏", "strength": "99.9", "industry": "医疗服务",
+                "industry_temperature": "热", "market_cap": "110", "amount": "6",
+                "target_weight": "0.04", "target_amount": "27061.98",
+                "estimated_shares": 900, "estimated_initial_line": "24.55",
+            }],
+            "hold_actions": [{
+                "symbol": "600900", "name": "长江电力", "close": "28.0",
+                "temperature_prev": "热", "temperature_curr": "热",
+                "strength": "98.7", "reason": "trend_intact", "active_line": "27.8",
+                "entry_hints": ["不是新的温转热或温转沸入场信号"],
+            }],
+            "review_actions": [{
+                "symbol": "600036", "name": "招商银行", "close": "45.2",
+                "temperature_prev": "热", "temperature_curr": "热",
+                "strength": "97", "reason": "holding_kline_unavailable",
+                "active_line": "42.0", "entry_hints": ["筛选价数据不可用"],
+            }],
+            "counts": {"sell": 1, "buy": 1, "hold": 1, "review": 1},
+            "audit": {
+                "candidates": [{
+                    "symbol": "600000", "name": "浦发银行", "strength": "94",
+                    "eligible": False, "rank": None,
+                    "excluded_reasons": ["strength_below_95"],
+                }],
+                "excluded": {"600000": ["strength_below_95"]},
+                "industry_concentration": [],
+                "data_sources": ["Trend Animals", "Futu CN calendar/QFQ daily K-line"],
+                "actual_api_cost": "2.00",
+            },
         },
     }
 
@@ -544,11 +676,22 @@ def trend_account_text() -> str:
         "富途短线美股趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14 "
         "老虎长线SMA200 组合策略夏普比率卡玛比率 "
         "辉立短线港股趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14 "
-        "东方财富偏短线趋势交易当天趋势报告今日暂无趋势报告"
+        "东方财富偏短线趋势交易当天趋势报告报告日期2026-07-15数据截至2026-07-14"
     )
 
 
 def trend_workspace_text(broker: str) -> str:
+    if broker == "eastmoney":
+        return (
+            "东方财富｜A股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
+            "生成时间 2026-07-15T20:00:00+08:00 账户状态 已更新 "
+            "正式买入 1 全部卖出 1 继续持有 1 人工复核 1 "
+            "优先处理 · 卖出触发 需要确认 · 人工复核 "
+            "09:30–10:00 · 正式买入计划 "
+            "盘中持续 · 已有持仓 筛选价（Trend Animals） "
+            "执行参考价（Futu 前复权） 全部卖出 正式买入 继续持有 "
+            "人工复核 买入纪律 卖出纪律 审计详情"
+        )
     if broker == "phillips":
         return (
             "辉立｜港股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
@@ -565,6 +708,17 @@ def trend_workspace_text(broker: str) -> str:
 
 
 def trend_stage_texts(broker: str) -> list[str]:
+    if broker == "eastmoney":
+        return [
+            "优先处理 · 卖出触发\n601398 工商银行 全部卖出 7.2 温 → 温 "
+            "91.3 右侧趋势已结束 7.0 强度 91.3，低于入场线 95",
+            "需要确认 · 人工复核\n600036 招商银行 人工复核 45.2 热 → 热 "
+            "97 持仓日线数据不可用 42.0 筛选价数据不可用",
+            "09:30–10:00 · 正式买入计划\n688046 药康生物 正式买入 29.14 "
+            "28.81 温 → 热 立夏 99.9 医疗服务 热 110 6 4% 27061.98 900 股 24.55",
+            "盘中持续 · 已有持仓\n600900 长江电力 继续持有 28.0 热 → 热 "
+            "98.7 趋势保持完好 27.8 不是新的温转热或温转沸入场信号",
+        ]
     if broker == "phillips":
         return ["开盘前\n无", "09:30–10:00\n无", "盘中持续\n无", "人工复核\n无"]
     return [
@@ -576,6 +730,12 @@ def trend_stage_texts(broker: str) -> list[str]:
 
 
 def trend_audit_text(broker: str) -> str:
+    if broker == "eastmoney":
+        return (
+            "审计详情 完整候选审计 600000 浦发银行 强度 94 "
+            "排除项 600000 趋势强度低于 95 行业集中度 无 "
+            "数据来源：Trend Animals、Futu CN calendar/QFQ daily K-line API 成本：2.00"
+        )
     if broker == "phillips":
         return "审计详情 候选榜 无 排除项 无 行业集中度 无 数据来源：Trend Animals API 成本：1.20"
     return (
@@ -585,6 +745,12 @@ def trend_audit_text(broker: str) -> str:
 
 
 def trend_audit_sections(broker: str) -> list[str]:
+    if broker == "eastmoney":
+        return [
+            "完整候选审计 600000 浦发银行 强度 94",
+            "排除项 600000 趋势强度低于 95",
+            "行业集中度 无",
+        ]
     if broker == "phillips":
         return ["候选榜 无", "排除项 无", "行业集中度 无"]
     return [
@@ -612,7 +778,8 @@ ACCOUNT_SECTION_TEXTS = {
     ),
     "eastmoney": (
         "东方财富 偏短线 · 趋势交易 持仓资产 HKD 0 现金 HKD 20 持仓 0 "
-        "来源 东方财富 时间 2026-07-15 当天趋势报告 今日暂无趋势报告 "
+        "来源 东方财富 时间 2026-07-15 当天趋势报告 报告日期 2026-07-15 "
+        "数据截至 2026-07-14 "
         "当前筛选下没有持仓"
     ),
 }
@@ -698,6 +865,18 @@ class TabbedAccountLocator:
             return int(self.page.trend_broker is not None)
         if self.selector == ".workspace-grid:visible":
             return int(self.page.trend_broker is None)
+        if self.selector.endswith(".cn-trend-report"):
+            return int(self.page.trend_broker == "eastmoney")
+        if self.selector.endswith(".trend-discipline[open]"):
+            return 0 if self.page.viewport_size["width"] <= 760 else 2
+        if self.selector.endswith(".trend-discipline"):
+            return 2
+        if self.selector.endswith(".cn-trend-table"):
+            return 4
+        if self.selector.endswith(".cn-trend-buy .cn-trend-card"):
+            return 1
+        if self.selector.endswith(".cn-trend-card:visible"):
+            return 4
         if self.selector in {"#tiger-long-term-panel", "#trade-actions"}:
             return 0
         if self.selector.endswith(".account-holding-row:visible"):
@@ -760,12 +939,23 @@ class TabbedAccountLocator:
             return "持仓与策略"
         if self.selector.endswith(" strong"):
             return "HKD 628,554.06"
+        match = re.search(r'td\[data-label="([^"]+)"\]$', self.selector)
+        if match:
+            buy = self.page.reports["eastmoney"]["buy_actions"][0]
+            key = {
+                "行业": "industry",
+                "筛选价（Trend Animals）": "filter_price",
+                "执行参考价（Futu 前复权）": "close",
+            }[match.group(1)]
+            return str(buy[key])
         raise AssertionError(self.selector)
 
     def all_inner_texts(self) -> list[str]:
         if self.selector == "a:visible, button:visible":
             return ["刷新账户与行情", "策略回测"]
         broker = str(self.page.trend_broker)
+        if self.selector.endswith(".cn-trend-stage"):
+            return trend_stage_texts(broker)
         if self.selector.endswith(".trend-stage"):
             return trend_stage_texts(broker)
         if self.selector.endswith(".trend-report-header dd"):
@@ -775,6 +965,8 @@ class TabbedAccountLocator:
             )]
         if self.selector.endswith(".trend-audit section"):
             return trend_audit_sections(broker)
+        if self.selector.endswith(".trend-discipline summary"):
+            return ["买入纪律", "卖出纪律"]
         if self.selector.endswith(".account-holding-row:visible td:nth-child(2)"):
             return ["市场\nCN"] * self.page.visible_rows(self.selector)
         return []
@@ -789,6 +981,10 @@ class TabbedAccountLocator:
 
     def bounding_box(self) -> dict[str, float]:
         return {"x": 20, "width": 100}
+
+    def evaluate_all(self, expression: str) -> list[dict[str, float]]:
+        assert "getBoundingClientRect" in expression
+        return [{"x": 10, "width": 350}]
 
 
 class TabbedAccountPage:
@@ -1121,6 +1317,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     selectors: list[tuple[str, str]] = []
     clicks: list[tuple[str, str]] = []
     evaluated: list[str] = []
+    viewport_widths: list[int] = []
     state = {"fail_desktop_navigation": True}
 
     class Locator(TabbedAccountLocator):
@@ -1159,6 +1356,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
         def new_page(self, **_kwargs: object) -> Page:
             self.pages += 1
+            viewport_widths.append(_kwargs["viewport"]["width"])  # type: ignore[index]
             return Page(
                 "desktop" if self.pages == 1 else "mobile",
                 _kwargs["viewport"],  # type: ignore[arg-type]
@@ -1193,12 +1391,14 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     assert errors == ["desktop：RuntimeError: navigation failed"]
     assert blocker is None
     assert visited == ["desktop", "mobile"]
+    assert viewport_widths == [1440, 375]
 
     state["fail_desktop_navigation"] = False
     visited.clear()
     selectors.clear()
     clicks.clear()
     evaluated.clear()
+    viewport_widths.clear()
     monkeypatch.setattr(
         dashboard_acceptance,
         "_check_decision_tabs",
@@ -1242,8 +1442,24 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             viewport,
             '#account-phillips:visible .trend-report-entry [data-trend-report]',
         ) in clicks
+        assert (
+            viewport,
+            '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
+        ) in clicks
         assert (viewport, '#return-to-portfolio:visible') in clicks
         assert (viewport, '#trend-report-workspace:visible') in selectors
+        assert (viewport, '#trend-report-workspace:visible .cn-trend-report') in selectors
+        assert (viewport, '#trend-report-workspace:visible .cn-trend-stage') in selectors
+        buy_rows = '#trend-report-workspace:visible .cn-trend-buy .cn-trend-card'
+        assert (viewport, buy_rows) in selectors
+        for label in (
+            "行业", "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
+        ):
+            assert (
+                viewport,
+                f'{buy_rows}:nth(0) td[data-label="{label}"]',
+            ) in selectors
+        assert (viewport, '#trend-report-workspace:visible .trend-discipline') in selectors
         assert (viewport, '.workspace-grid:visible') in selectors
         assert (viewport, '.account-section:visible') in selectors
         assert (viewport, '#account-tiger:visible') in selectors
@@ -1253,7 +1469,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, 'a:visible, button:visible') in selectors
         assert (viewport, 'a[href="#account-tiger"]') not in clicks
     assert evaluated == [
-        *(["desktop"] * 6), *(["mobile"] * 6),
+        *(["desktop"] * 7), *(["mobile"] * 8),
     ]
 
 
@@ -1297,14 +1513,16 @@ def test_check_account_holdings_visits_every_broker_tab(
 
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.max_visible_account_sections == 1
-    assert page.opened_reports == ["futu", "phillips"]
-    assert page.disabled_reports == {"eastmoney"}
-    assert projections == ["futu", "phillips"]
+    assert page.opened_reports == ["futu", "phillips", "eastmoney"]
+    assert page.disabled_reports == set()
+    assert projections == ["futu", "phillips", "eastmoney"]
     assert page.focus_checks == [
         "#return-to-portfolio:visible",
         '#account-futu:visible .trend-report-entry [data-trend-report]',
         "#return-to-portfolio:visible",
         '#account-phillips:visible .trend-report-entry [data-trend-report]',
+        "#return-to-portfolio:visible",
+        '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
     ]
 
 
