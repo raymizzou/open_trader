@@ -846,10 +846,15 @@ class TabbedAccountLocator:
     def locator(self, selector: str) -> "TabbedAccountLocator":
         return self.page.locator(f"{self.selector} {selector}")
 
+    def _require_known_broker(self, broker: str) -> str:
+        if broker not in self.page.tab_order:
+            raise AssertionError(f"unknown broker: {broker}")
+        return broker
+
     def click(self) -> None:
         match = re.fullmatch(r'#account-tabs \[data-broker="(\w+)"\]', self.selector)
         if match:
-            self.page.selected = match.group(1)
+            self.page.selected = self._require_known_broker(match.group(1))
             self.page.selected_brokers.append(self.page.selected)
             self.page._record_visible_sections()
             return
@@ -861,7 +866,7 @@ class TabbedAccountLocator:
             self.selector,
         )
         if match:
-            broker = match.group(1)
+            broker = self._require_known_broker(match.group(1))
             self.page.trend_broker = broker
             self.page.opened_reports.append(broker)
             self.page.active = "#return-to-portfolio:visible"
@@ -932,7 +937,9 @@ class TabbedAccountLocator:
             return int(self.page.research_open)
         if self.selector == "#account-tabs [data-broker]":
             return 4
-        if re.fullmatch(r'#account-tabs \[data-broker="\w+"\]', self.selector):
+        match = re.fullmatch(r'#account-tabs \[data-broker="(\w+)"\]', self.selector)
+        if match:
+            self._require_known_broker(match.group(1))
             return 1
         if self.selector in {'[data-market="CASH"]', "#cash-detail-panel"}:
             return 0
@@ -942,8 +949,9 @@ class TabbedAccountLocator:
             return self.page._record_visible_sections()
         match = re.fullmatch(r"#account-(\w+):visible", self.selector)
         if match:
+            broker = self._require_known_broker(match.group(1))
             return int(
-                self.page.trend_broker is None and self.page.selected == match.group(1)
+                self.page.trend_broker is None and self.page.selected == broker
             )
         for broker in self.page.tab_order:
             entry = f"#account-{broker}:visible .trend-report-entry"
@@ -1041,8 +1049,9 @@ class TabbedAccountLocator:
             return self.page.tab_order[int(match.group(1))]
         match = re.fullmatch(r'#account-tabs \[data-broker="(\w+)"\]', self.selector)
         if match:
+            broker = self._require_known_broker(match.group(1))
             assert name == "aria-selected"
-            return str(match.group(1) == self.page.selected).lower()
+            return str(broker == self.page.selected).lower()
         if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
             mobile = self.page.viewport_size["width"] <= 760
             return {
@@ -1064,7 +1073,7 @@ class TabbedAccountLocator:
             r"#account-(\w+):visible \.trend-report-entry button", self.selector
         )
         assert match
-        broker = match.group(1)
+        broker = self._require_known_broker(match.group(1))
         self.page.disabled_reports.add(broker)
         return not bool(self.page.reports[broker]["available"])
 
@@ -1532,6 +1541,33 @@ def test_tabbed_acceptance_fake_rejects_unknown_selectors_and_expressions() -> N
         buy_stage.evaluate("element => element.clientHeight")
     with pytest.raises(AssertionError, match="unknown evaluate_all expression"):
         buy_stage.evaluate_all("nodes => nodes.length")
+
+
+def test_tabbed_acceptance_fake_rejects_unknown_broker_everywhere() -> None:
+    page = tabbed_account_page(valid_payload())
+    original_broker = page.selected
+    unknown_tab = page.locator('#account-tabs [data-broker="futtu"]')
+
+    with pytest.raises(AssertionError, match="unknown broker"):
+        unknown_tab.count()
+    with pytest.raises(AssertionError, match="unknown broker"):
+        unknown_tab.click()
+    assert page.selected == original_broker
+    with pytest.raises(AssertionError, match="unknown broker"):
+        unknown_tab.get_attribute("aria-selected")
+    with pytest.raises(AssertionError, match="unknown broker"):
+        page.locator("#account-futtu:visible").count()
+    with pytest.raises(AssertionError, match="unknown broker"):
+        page.locator(
+            "#account-futtu:visible .trend-report-entry [data-trend-report]"
+        ).click()
+    with pytest.raises(AssertionError, match="unknown broker"):
+        page.locator(
+            "#account-futtu:visible .trend-report-entry button"
+        ).is_disabled()
+    with pytest.raises(AssertionError, match="unknown broker"):
+        dashboard_acceptance._select_account_tab(page, "futtu")
+    assert page.selected == original_broker
 
 
 def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None:

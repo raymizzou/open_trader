@@ -459,3 +459,45 @@ Adjusted contrast ratios calculated with WCAG relative luminance:
 - Per the third-round brief, `make acceptance` was intentionally **not** run.
   Live API/data, background process freshness, logs, and review deployment remain
   for the parent task's final acceptance gate.
+
+---
+
+# Fourth-Round Strict Broker Fake Fix
+
+## Changes
+
+- Added one test-fake broker guard backed by the production-defined four-broker
+  fixture order and applied it before every relevant tab/account mutation or
+  lookup: tab `count`, `click`, `get_attribute`, account-section `count`, trend
+  entry `click`, and disabled-entry inspection.
+- Added direct negative coverage proving `futtu` fails in each path,
+  `_select_account_tab(page, "futtu")` raises, and the selected broker remains
+  unchanged after rejected clicks.
+- This is a test-only patch; no product, palette, or E2E code changed.
+
+## TDD RED Evidence
+
+- Unknown broker fail-fast test:
+  `.venv/bin/python -m pytest tests/test_dashboard_acceptance.py -q -k 'rejects_unknown_broker_everywhere'`
+  - `1 failed, 147 deselected in 0.11s`
+  - The unknown tab `count()` incorrectly returned `1` instead of raising.
+
+## GREEN Verification
+
+- Focused permanent Dashboard acceptance:
+  `.venv/bin/python -m pytest tests/test_dashboard_acceptance.py -q`
+  - `148 passed in 0.46s`
+- Full Python suite:
+  `.venv/bin/python -m pytest -q`
+  - `2183 passed in 32.67s`, exit `0`
+- Chromium E2E was not repeated because this patch changes only the Python test
+  fake and its negative tests; the prior unchanged E2E result remains `6 passed`.
+- `git diff --check`
+  - exit `0`
+
+## Remaining Risk / Deferred Gate
+
+- No known code-level correctness issue remains in this test-fake scope.
+- Per the fourth-round brief, `make acceptance` was intentionally **not** run.
+  Live API/data, background process freshness, logs, and review deployment remain
+  for the parent task's final acceptance gate.
