@@ -26,6 +26,26 @@ from tests.test_dashboard import (
 )
 
 
+def relative_luminance(color: str) -> float:
+    channels = (int(color[index:index + 2], 16) / 255 for index in (1, 3, 5))
+    linear = (
+        value / 12.92
+        if value <= 0.04045
+        else ((value + 0.055) / 1.055) ** 2.4
+        for value in channels
+    )
+    red, green, blue = linear
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def contrast_ratio(foreground: str, background: str) -> float:
+    foreground_luminance = relative_luminance(foreground)
+    background_luminance = relative_luminance(background)
+    return (max(foreground_luminance, background_luminance) + 0.05) / (
+        min(foreground_luminance, background_luminance) + 0.05
+    )
+
+
 def test_dashboard_static_keeps_existing_columns_and_adds_cn() -> None:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
@@ -139,16 +159,7 @@ def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
 
     tokens = dict(re.findall(r"--([\w-]+): (#[0-9a-f]{6});", css))
 
-    def luminance(color: str) -> float:
-        channels = (int(color[index:index + 2], 16) / 255 for index in (1, 3, 5))
-        linear = (value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4 for value in channels)
-        red, green, blue = linear
-        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
-
-    foreground = luminance(tokens["text"])
-    background = luminance(tokens["surface-soft"])
-    ratio = (max(foreground, background) + 0.05) / (min(foreground, background) + 0.05)
-    assert ratio >= 4.5
+    assert contrast_ratio(tokens["text"], tokens["surface-soft"]) >= 4.5
 
     soft_surface_contract = re.search(
         r"([^{}]+) \{\n  --muted: var\(--text\);\n\}", css,
@@ -182,40 +193,28 @@ def test_dashboard_success_text_meets_aa_on_every_adjusted_surface() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     tokens = dict(re.findall(r"--([\w-]+): (#[0-9a-f]{6});", css))
 
-    def luminance(color: str) -> float:
-        channels = (int(color[index:index + 2], 16) / 255 for index in (1, 3, 5))
-        linear = (
-            value / 12.92
-            if value <= 0.04045
-            else ((value + 0.055) / 1.055) ** 2.4
-            for value in channels
-        )
-        red, green, blue = linear
-        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
-
-    def contrast(foreground: str, background: str) -> float:
-        foreground_luminance = luminance(foreground)
-        background_luminance = luminance(background)
-        return (max(foreground_luminance, background_luminance) + 0.05) / (
-            min(foreground_luminance, background_luminance) + 0.05
-        )
-
     pairings = (
         (tokens["text"], "#e7f4ec"),
         (tokens["text"], "#f4fbf7"),
         (tokens["success"], tokens["surface"]),
     )
-    assert all(contrast(foreground, background) >= 4.5 for foreground, background in pairings)
+    assert all(
+        contrast_ratio(foreground, background) >= 4.5
+        for foreground, background in pairings
+    )
 
     status = css.split("\n.status-ok {", 1)[1].split("}", 1)[0]
     opportunity = css.split(
         ".technical-bollinger-card.lower-opportunity .technical-bollinger-header strong {",
         1,
     )[1].split("}", 1)[0]
-    hovered_loss = css.split("\ntbody tr:hover .pnl-loss {", 1)[1].split("}", 1)[0]
+    safe_loss = css.split("\ntbody tr:hover .pnl-loss,", 1)[1].split("}", 1)[0]
     assert "color: var(--text);" in status
     assert "color: var(--text);" in opportunity
-    assert "background: var(--surface);" in hovered_loss
+    assert "tbody tr.active-row .pnl-loss" in safe_loss
+    assert "background: var(--surface);" in safe_loss
+    assert contrast_ratio(tokens["success"], tokens["surface-soft"]) < 4.5
+    assert contrast_ratio(tokens["success"], tokens["surface"]) >= 4.5
 
 
 def test_cn_trend_secondary_text_keeps_muted_tone_on_main_surface() -> None:
@@ -2918,6 +2917,29 @@ console.log("ok");
     focus = css.split("\n.cn-trend-buy:focus {", 1)[1].split("}", 1)[0]
     assert "outline: 3px solid var(--accent);" in focus
     assert "outline-offset: 2px;" in focus
+
+
+def test_dashboard_cn_buy_scroller_semantics_sync_across_breakpoint_changes() -> None:
+    output = run_dashboard_js(r'''
+const attributes={};
+const stage={tabIndex:99,setAttribute(name,value){attributes[name]=value;}};
+elements["trend-report-workspace"]={querySelector(selector){
+  if (selector !== ".cn-trend-buy") throw new Error("unknown selector " + selector);
+  return stage;
+}};
+window={matchMedia(){return {matches:true};}};
+syncCnTrendBuyAccessibility();
+const mobile={tabIndex:stage.tabIndex,label:attributes["aria-label"]};
+window={matchMedia(){return {matches:false};}};
+syncCnTrendBuyAccessibility();
+const desktop={tabIndex:stage.tabIndex,label:attributes["aria-label"]};
+console.log(JSON.stringify({mobile,desktop}));
+''')
+
+    assert json.loads(output) == {
+        "mobile": {"tabIndex": -1, "label": "正式买入计划"},
+        "desktop": {"tabIndex": 0, "label": "正式买入计划，可横向滚动"},
+    }
 
 
 def test_dashboard_cn_empty_stages_keep_tables_and_price_source_labels() -> None:

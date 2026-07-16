@@ -898,9 +898,10 @@ class TabbedAccountLocator:
         target_selectors = {
             '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
             ".strategy-tools button:visible, #refresh-quotes:visible, "
-            ".account-holding-actions button:visible",
-            ".symbol-detail-panel.inline-symbol-detail:visible .decision-tab:visible, "
-            ".symbol-detail-panel.inline-symbol-detail:visible [data-back-to-holdings]:visible",
+            ".broker-summary-card:visible, .account-holding-actions button:visible",
+            ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
+            ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
+            ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
             "#return-to-portfolio:visible, .kelly-lab-panel button:visible",
             "#standard-backtest-workspace button:visible, "
             "#standard-backtest-workspace input:visible, "
@@ -1092,27 +1093,40 @@ class TabbedAccountLocator:
             return ["买入纪律", "卖出纪律"]
         if self.selector.endswith(".account-holding-row:visible td:nth-child(2)"):
             return ["市场\nCN"] * self.page.visible_rows(self.selector)
-        return []
+        raise AssertionError(f"unknown all_inner_texts selector: {self.selector}")
 
     def nth(self, index: int) -> "TabbedAccountLocator":
         return self.page.locator(f"{self.selector}:nth({index})")
 
     def evaluate(self, expression: str) -> bool | dict[str, object]:
+        active_expression = "element => element === document.activeElement"
+        focus_expression = (
+            "element => { const styles = getComputedStyle(element); return {"
+            "outlineColor: styles.outlineColor, outlineStyle: styles.outlineStyle, "
+            "outlineWidth: styles.outlineWidth}; }"
+        )
+        overflow_expression = (
+            "element => ({clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, "
+            "overflowX: getComputedStyle(element).overflowX})"
+        )
         if self.selector.endswith(".cn-trend-buy"):
-            if "document.activeElement" in expression:
+            if expression == active_expression:
                 return self.selector == self.page.active
-            if "outlineColor" in expression:
+            if expression == focus_expression:
                 return {
                     "outlineColor": "rgb(139, 94, 52)",
                     "outlineStyle": "solid",
                     "outlineWidth": "3px",
                 }
-            return {
-                "clientWidth": 1500,
-                "scrollWidth": 1600,
-                "overflowX": "auto",
-            }
-        assert "document.activeElement" in expression
+            if expression == overflow_expression:
+                return {
+                    "clientWidth": 1500,
+                    "scrollWidth": 1600,
+                    "overflowX": "auto",
+                }
+            raise AssertionError(f"unknown evaluate expression: {expression}")
+        if expression != active_expression:
+            raise AssertionError(f"unknown evaluate expression: {expression}")
         self.page.focus_checks.append(self.selector)
         return self.selector == self.page.active
 
@@ -1120,11 +1134,22 @@ class TabbedAccountLocator:
         return {"x": 20, "width": 100}
 
     def evaluate_all(self, expression: str) -> list[dict[str, float]]:
-        assert "getBoundingClientRect" in expression
-        if "height:" in expression:
+        target_expression = (
+            "nodes => nodes.map(node => ({"
+            "height: node.getBoundingClientRect().height, "
+            "label: node.getAttribute('aria-label') || node.textContent.trim() || node.tagName"
+            "}))"
+        )
+        bounds_expression = (
+            "nodes => nodes.map(node => node.getBoundingClientRect())"
+            ".map(r => ({x:r.x,width:r.width}))"
+        )
+        if expression == target_expression:
             self.page.target_checks.append(self.selector)
             return [{"height": 44, "label": self.selector}]
-        return [{"x": 10, "width": 350}]
+        if expression == bounds_expression:
+            return [{"x": 10, "width": 350}]
+        raise AssertionError(f"unknown evaluate_all expression: {expression}")
 
 
 class TabbedAccountPage:
@@ -1312,9 +1337,10 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             target_selectors = {
                 '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
                 ".strategy-tools button:visible, #refresh-quotes:visible, "
-                ".account-holding-actions button:visible",
-                ".symbol-detail-panel.inline-symbol-detail:visible .decision-tab:visible, "
-                ".symbol-detail-panel.inline-symbol-detail:visible [data-back-to-holdings]:visible",
+                ".broker-summary-card:visible, .account-holding-actions button:visible",
+                ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
+                ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
+                ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
                 "#return-to-portfolio:visible, .kelly-lab-panel button:visible",
                 "#standard-backtest-workspace button:visible, "
                 "#standard-backtest-workspace input:visible, "
@@ -1390,9 +1416,10 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     assert page.target_checks == [
         "#account-tabs [role=\"tab\"]:visible, #header-market-filters button:visible, "
         ".strategy-tools button:visible, #refresh-quotes:visible, "
-        ".account-holding-actions button:visible",
-        ".symbol-detail-panel.inline-symbol-detail:visible .decision-tab:visible, "
-        ".symbol-detail-panel.inline-symbol-detail:visible [data-back-to-holdings]:visible",
+        ".broker-summary-card:visible, .account-holding-actions button:visible",
+        ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
+        ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
+        ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
         "#return-to-portfolio:visible, .kelly-lab-panel button:visible",
         "#standard-backtest-workspace button:visible, "
         "#standard-backtest-workspace input:visible, "
@@ -1401,7 +1428,14 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     ]
 
 
-def test_acceptance_rejects_undersized_mobile_target() -> None:
+@pytest.mark.parametrize(
+    "selector",
+    (
+        ".broker-summary-card:visible",
+        ".symbol-detail-panel.inline-symbol-detail:visible .language-toggle button:visible",
+    ),
+)
+def test_acceptance_rejects_undersized_mobile_target(selector: str) -> None:
     class Locator:
         def count(self) -> int:
             return 1
@@ -1410,10 +1444,26 @@ def test_acceptance_rejects_undersized_mobile_target() -> None:
             assert "getBoundingClientRect" in expression
             return [{"height": 43.5, "label": "太小"}]
 
-    page = SimpleNamespace(locator=lambda selector: Locator())
+    page = SimpleNamespace(locator=lambda _selector: Locator())
 
     with pytest.raises(AssertionError, match="太小.*44px"):
-        dashboard_acceptance._check_mobile_targets(page, "button:visible")
+        dashboard_acceptance._check_mobile_targets(page, selector)
+
+
+def test_tabbed_acceptance_fake_rejects_unknown_selectors_and_expressions() -> None:
+    page = tabbed_account_page(valid_payload())
+
+    with pytest.raises(AssertionError, match="unknown count selector"):
+        page.locator(".misspelled-control").count()
+    with pytest.raises(AssertionError, match="unknown all_inner_texts selector"):
+        page.locator("#visible-count").all_inner_texts()
+
+    page.trend_broker = "eastmoney"
+    buy_stage = page.locator("#trend-report-workspace:visible .cn-trend-buy")
+    with pytest.raises(AssertionError, match="unknown evaluate expression"):
+        buy_stage.evaluate("element => element.clientHeight")
+    with pytest.raises(AssertionError, match="unknown evaluate_all expression"):
+        buy_stage.evaluate_all("nodes => nodes.length")
 
 
 def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None:

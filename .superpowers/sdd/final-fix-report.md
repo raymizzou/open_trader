@@ -352,3 +352,61 @@ Adjusted contrast ratios calculated with WCAG relative luminance:
 - Per the final-fix brief, `make acceptance` was intentionally **not** run. Live
   API/data, external report availability, service process state, fresh live logs,
   and review deployment remain for the parent task's final acceptance gate.
+
+---
+
+# Second-Round Final Review Fixes
+
+## Changes
+
+- Kept loss text on the approved `#2F855A` token and added the AA-safe
+  `var(--surface)` background whenever a holding row is selected as well as when
+  it is hovered. The computed pairing is at least 4.5:1; the unsafe green on the
+  selected row's soft background is explicitly covered by a Python contrast test.
+- Expanded 375px acceptance coverage to include every visible broker summary card
+  and every visible button, input, and select in the open decision workspace,
+  including the language toggle. Strict negative tests prove a 43.5px control is
+  rejected.
+- Added a live media-query change handler for the A-share buy scroller. It now
+  resynchronizes `tabindex` and `aria-label` after resize/orientation changes:
+  desktop is keyboard-scrollable, while mobile has no extra Tab stop.
+- Made the tabbed acceptance fake reject unknown `all_inner_texts`, `evaluate`,
+  and `evaluate_all` calls instead of returning plausible empty or overflow data.
+- Consolidated the duplicated WCAG luminance calculation in
+  `tests/test_dashboard_web.py` into shared helpers.
+
+## TDD RED Evidence
+
+- Active-row contrast and dynamic scroller semantics:
+  `.venv/bin/python -m pytest tests/test_dashboard_web.py -q -k 'success_text_meets_aa or cn_buy_scroller_semantics_sync'`
+  - `2 failed, 151 deselected in 0.38s`
+  - The failures showed the selected-row loss background was missing and the
+    breakpoint synchronization helper did not exist.
+- Mobile workspace coverage and strict fake behavior:
+  `.venv/bin/python -m pytest tests/test_dashboard_acceptance.py -q -k 'opens_real_tool_workspaces or undersized_mobile_target or tabbed_acceptance_fake_rejects'`
+  - `2 failed, 2 passed, 142 deselected in 0.15s`
+  - The failures showed the production target selectors omitted the new surfaces
+    and the fake still returned an empty list for an unknown selector.
+
+## GREEN Verification
+
+- Complete focused Dashboard modules:
+  `.venv/bin/python -m pytest tests/test_dashboard_web.py tests/test_dashboard_acceptance.py -q`
+  - `299 passed in 17.44s`
+- Real Chromium E2E:
+  `npx playwright test tests/e2e/dashboard-warm-ledger.spec.ts --project=chromium`
+  - `6 passed (2.6s)`
+  - Includes computed active-row loss contrast and live 1920px → 375px → 1920px
+    scroller semantic synchronization.
+- Full Python suite, rerun with an explicit retained summary:
+  `zsh -o pipefail -c '.venv/bin/python -m pytest -q | tail -5'`
+  - `2181 passed in 28.59s`, exit `0`
+- `git diff --check`
+  - exit `0`
+
+## Remaining Risk / Deferred Gate
+
+- No known code-level correctness issue remains in this fix scope.
+- Per the second-round brief, `make acceptance` was intentionally **not** run.
+  Live API/data, background process freshness, logs, and review deployment remain
+  for the parent task's final acceptance gate.

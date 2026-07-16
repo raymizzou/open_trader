@@ -418,12 +418,13 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
             page,
             '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
             ".strategy-tools button:visible, #refresh-quotes:visible, "
-            ".account-holding-actions button:visible",
+            ".broker-summary-card:visible, .account-holding-actions button:visible",
         )
         _check_mobile_targets(
             page,
-            ".symbol-detail-panel.inline-symbol-detail:visible .decision-tab:visible, "
-            ".symbol-detail-panel.inline-symbol-detail:visible [data-back-to-holdings]:visible",
+            ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
+            ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
+            ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
         )
 
     page.locator("#open-kelly-lab").click()

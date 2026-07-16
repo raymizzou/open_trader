@@ -3767,7 +3767,8 @@ tbody tr.active-row {
 .pnl-profit { color: var(--danger); font-weight: 800; }
 .pnl-loss { color: var(--success); font-weight: 800; }
 
-tbody tr:hover .pnl-loss {
+tbody tr:hover .pnl-loss,
+tbody tr.active-row .pnl-loss {
   background: var(--surface);
 }
 

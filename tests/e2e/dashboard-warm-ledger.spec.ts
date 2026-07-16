@@ -96,6 +96,24 @@ async function expectWarmSurface(page: Page, selector: string) {
   await expect(surface).toHaveCSS('border-top-width', '1px');
 }
 
+async function expectContrastAtLeast(page: Page, selector: string, minimum: number) {
+  const ratio = await page.locator(selector).evaluate((element) => {
+    const parse = (color: string) => color.match(/[\d.]+/g)!.slice(0, 3).map(Number);
+    const luminance = (color: string) => {
+      const [red, green, blue] = parse(color).map((channel) => {
+        const value = channel / 255;
+        return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    };
+    const styles = getComputedStyle(element);
+    const foreground = luminance(styles.color);
+    const background = luminance(styles.backgroundColor);
+    return (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05);
+  });
+  expect(ratio, `${selector} contrast`).toBeGreaterThanOrEqual(minimum);
+}
+
 async function expectMobileTargetsAtLeast44(page: Page, surface: string, selector: string) {
   const targets = page.locator(surface).locator(selector);
   expect(await targets.count(), `${surface} should expose ${selector}`).toBeGreaterThan(0);
@@ -209,6 +227,11 @@ test('switches every broker tab and card while preserving US-filtered ledgers', 
   await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('color', rgb.success);
   await page.locator('.account-holding-row').hover();
   await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('background-color', rgb.surface);
+  await page.locator('.account-holding-actions [data-detail-mode="decision"]').click();
+  await page.locator('.header-brand-panel').hover();
+  await expect(page.locator('.account-holding-row')).toHaveClass(/active-row/);
+  await expect(page.locator('.account-holding-pnl.pnl-loss')).toHaveCSS('background-color', rgb.surface);
+  await expectContrastAtLeast(page, '.account-holding-pnl.pnl-loss', 4.5);
   await expect(page.getByRole('button', { name: '现金' })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
@@ -377,6 +400,12 @@ test('aligns the A-share report with the 1600px shell and scrolls only the buy t
   await expect(buyStage).toHaveCSS('outline-style', 'solid');
   await expect(buyStage).toHaveCSS('outline-width', '3px');
   await expect(page.locator('.cn-trend-price-sources')).toHaveCSS('color', rgb.muted);
+  await page.setViewportSize({ width: 375, height: 844 });
+  await expect(buyStage).toHaveAttribute('tabindex', '-1');
+  await expect(buyStage).toHaveAttribute('aria-label', '正式买入计划');
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await expect(buyStage).toHaveAttribute('tabindex', '0');
+  await expect(buyStage).toHaveAttribute('aria-label', '正式买入计划，可横向滚动');
 });
 
 test('keeps the A-share report card-based with no page overflow on mobile', async ({ page }) => {

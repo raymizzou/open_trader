@@ -230,6 +230,12 @@ function bindElements() {
 }
 
 function bindEvents() {
+  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    window.matchMedia("(max-width: 760px)").addEventListener?.(
+      "change",
+      syncCnTrendBuyAccessibility,
+    );
+  }
   elements["refresh-quotes"].addEventListener("click", refreshQuotes);
   if (elements["kelly-lab-panel"]) {
     elements["kelly-lab-panel"].addEventListener("click", (event) => {
@@ -333,6 +339,7 @@ function openTrendReport(broker) {
   state.selectedTrendBroker = broker;
   elements["trend-report-workspace"].innerHTML = renderTrendReportWorkspace(report);
   setWorkspaceView("trend_report");
+  syncCnTrendBuyAccessibility();
   elements["return-to-portfolio"].focus();
 }
 
@@ -2009,11 +2016,7 @@ function cnTrendHints(item) {
 }
 
 function renderCnTrendTable(title, kind, headings, rows, note = "") {
-  const desktopScroller = kind === "buy" && (
-    typeof window === "undefined"
-    || typeof window.matchMedia !== "function"
-    || !window.matchMedia("(max-width: 760px)").matches
-  );
+  const desktopScroller = kind === "buy" && !isCnTrendMobile();
   const scrollerAttributes = kind === "buy"
     ? ` tabindex="${desktopScroller ? "0" : "-1"}" aria-label="${desktopScroller ? "正式买入计划，可横向滚动" : "正式买入计划"}"`
     : "";
@@ -2023,6 +2026,25 @@ function renderCnTrendTable(title, kind, headings, rows, note = "") {
     <table class="cn-trend-table"><thead><tr>${headings.map((heading) => `<th scope="col">${escapeHtml(heading)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>
     ${rows.length ? "" : "<p>无</p>"}
   </section>`;
+}
+
+function isCnTrendMobile() {
+  return typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia("(max-width: 760px)").matches;
+}
+
+function syncCnTrendBuyAccessibility() {
+  const workspace = elements["trend-report-workspace"];
+  if (!workspace || typeof workspace.querySelector !== "function") return;
+  const scroller = workspace.querySelector(".cn-trend-buy");
+  if (!scroller) return;
+  const mobile = isCnTrendMobile();
+  scroller.tabIndex = mobile ? -1 : 0;
+  scroller.setAttribute(
+    "aria-label",
+    mobile ? "正式买入计划" : "正式买入计划，可横向滚动",
+  );
 }
 
 function renderCnSellOrHoldStage(title, items, kind) {
