@@ -680,7 +680,11 @@ def test_futu_anomaly_client_uses_native_sdk_when_skill_script_is_missing(
     class FakeContext:
         def get_financial_unusual(self, symbol: str, time_range: int) -> tuple[int, object]:
             calls.append(("capital", symbol, time_range))
-            return 0, {"err_code": 1, "content": "资金面异动无异常"}
+            return 0, {
+                "err_code": 1,
+                "time_range": "近7个自然日",
+                "content": "资金面异动无异常",
+            }
 
         def close(self) -> None:
             calls.append(("close", "", 0))
@@ -692,7 +696,13 @@ def test_futu_anomaly_client_uses_native_sdk_when_skill_script_is_missing(
 
     payload = client.run("capital", market="US", symbol="DRAM", window_days=7)
 
-    assert payload == {"data": {"err_code": 1, "content": "资金面异动无异常"}}
+    assert payload == {
+        "data": {
+            "err_code": 1,
+            "time_range": "近7个自然日",
+            "content": "资金面异动无异常",
+        }
+    }
     assert calls == [("capital", "US.DRAM", 7), ("close", "", 0)]
 
 
@@ -724,6 +734,9 @@ def test_futu_anomaly_client_reports_native_sdk_unsupported_reason(tmp_path: Pat
         {},
         {"err_code": 0},
         {"err_code": 0, "content": ""},
+        {"err_code": 0, "content": "MACD 金叉"},
+        {"err_code": 0, "time_range": "", "content": "MACD 金叉"},
+        {"err_code": 0, "time_range": 7, "content": "MACD 金叉"},
     ],
 )
 def test_futu_anomaly_client_rejects_native_sdk_payload_without_required_content(

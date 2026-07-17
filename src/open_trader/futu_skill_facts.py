@@ -679,6 +679,7 @@ class FutuAnomalyScriptClient:
         if (
             not isinstance(data, dict)
             or not isinstance(data.get("err_code"), int)
+            or not _optional_text(data.get("time_range"))
             or not _optional_text(data.get("content"))
         ):
             raise RuntimeError(f"{module} native anomaly response is invalid")
