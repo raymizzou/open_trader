@@ -805,6 +805,156 @@ def test_trend_review_close_skips_stale_actual_equity(
     assert (tmp_path / "trend_review/facts/benchmark/HK/2026-07-17.json").exists()
 
 
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {},
+        {
+            "strategy_id": "trend/CN/v1",
+            "strategy_version": "v1",
+            "process_version": "test",
+            "parameters": [],
+            "parameter_rows": [{"name": "test"}],
+        },
+        {
+            "strategy_id": "trend/CN/v1",
+            "strategy_version": "v1",
+            "process_version": "test",
+            "parameters": {},
+            "parameter_rows": [],
+        },
+    ],
+)
+def test_trend_review_close_rejects_malformed_snapshot_before_any_fact(
+    snapshot: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("CN", "2026-07-17")
+    report["strategy_snapshot"] = snapshot
+    _stub_close_clients(monkeypatch, report=report)
+
+    with pytest.raises(ValueError, match="strategy snapshot is unavailable"):
+        cli.run_trend_review_close(
+            _trend_review_close_config(tmp_path), "CN", "2026-07-17"
+        )
+
+    assert not (tmp_path / "trend_review/facts").exists()
+
+
+def test_trend_review_close_rejects_fresh_missing_nav_before_any_fact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("CN", "2026-07-17")
+    del report["account"]["net_value"]
+    _stub_close_clients(monkeypatch, report=report)
+
+    with pytest.raises(ValueError, match="actual net value"):
+        cli.run_trend_review_close(
+            _trend_review_close_config(tmp_path), "CN", "2026-07-17"
+        )
+
+    assert not (tmp_path / "trend_review/facts").exists()
+
+
+def test_trend_review_close_benchmark_failure_still_freezes_other_streams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("CN", "2026-07-17")
+    _stub_close_clients(monkeypatch, report=report)
+    monkeypatch.setattr(
+        cli,
+        "benchmark_fact",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("benchmark unavailable")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_trend_review_projection",
+        lambda data_dir, market: {"sample_counts": {}},
+    )
+
+    with pytest.raises(RuntimeError, match="benchmark unavailable"):
+        cli.run_trend_review_close(
+            _trend_review_close_config(tmp_path), "CN", "2026-07-17"
+        )
+
+    assert (
+        tmp_path / "trend_review/facts/actual_equity/CN/2026-07-17.json"
+    ).exists()
+    assert (
+        tmp_path / "trend_review/facts/discipline/CN/2026-07-17.json"
+    ).exists()
+    assert not (tmp_path / "trend_review/facts/benchmark/CN/2026-07-17.json").exists()
+
+
+def test_trend_review_close_simulate_failure_still_freezes_available_streams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("CN", "2026-07-17")
+    _stub_close_clients(monkeypatch, report=report)
+    closed: list[bool] = []
+
+    class FailingSimulate:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def account_snapshot(self) -> dict[str, object]:
+            raise RuntimeError("simulate unavailable")
+
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(cli, "FutuSimulateOrderExecutionClient", FailingSimulate)
+    monkeypatch.setattr(
+        cli,
+        "build_trend_review_projection",
+        lambda data_dir, market: {"sample_counts": {}},
+    )
+
+    with pytest.raises(RuntimeError, match="simulate unavailable"):
+        cli.run_trend_review_close(
+            _trend_review_close_config(tmp_path), "CN", "2026-07-17"
+        )
+
+    assert closed == [True]
+    assert (
+        tmp_path / "trend_review/facts/actual_equity/CN/2026-07-17.json"
+    ).exists()
+    assert (tmp_path / "trend_review/facts/benchmark/CN/2026-07-17.json").exists()
+    assert not (
+        tmp_path / "trend_review/facts/discipline/CN/2026-07-17.json"
+    ).exists()
+
+
+def test_trend_review_close_simulate_config_failure_is_stream_local(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("CN", "2026-07-17")
+    _stub_close_clients(monkeypatch, report=report)
+    config = _trend_review_close_config(tmp_path)
+    config.trend_review_cn_simulate_acc_id = 0
+    monkeypatch.setattr(
+        cli,
+        "build_trend_review_projection",
+        lambda data_dir, market: {"sample_counts": {}},
+    )
+
+    with pytest.raises(RuntimeError, match="trend review config is incomplete"):
+        cli.run_trend_review_close(config, "CN", "2026-07-17")
+
+    assert (
+        tmp_path / "trend_review/facts/actual_equity/CN/2026-07-17.json"
+    ).exists()
+    assert (tmp_path / "trend_review/facts/benchmark/CN/2026-07-17.json").exists()
+    assert not (
+        tmp_path / "trend_review/facts/discipline/CN/2026-07-17.json"
+    ).exists()
+
+
 def test_tiger_close_freezes_empty_completeness_before_projection_and_closes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

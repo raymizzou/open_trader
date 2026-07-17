@@ -304,6 +304,7 @@ def cn_buy_report(
             "net_value": "735164.41",
             "fresh": True,
             "source_date": "2026-07-17",
+            "positions": [],
         },
         "strategy_snapshot": {
             "strategy_id": "trend_animals_warm_to_hot/CN/v1",
@@ -787,6 +788,70 @@ def test_actual_fill_identity_is_idempotent_only_for_identical_payload(
             ],
             "2026-07-16",
         )
+
+
+def test_actual_fill_batch_preflights_all_collisions_before_writing(
+    tmp_path: Path,
+) -> None:
+    existing = actual_fill("existing", "600001", "BUY", "100", "2026-07-16")
+    trend_review.freeze_actual_fill_batch(
+        tmp_path, {"market": "CN"}, [existing], "2026-07-16"
+    )
+    before = {
+        path: path.read_bytes()
+        for path in (tmp_path / "trend_review/facts").rglob("*.json")
+    }
+
+    with pytest.raises(FileExistsError, match="immutable artifact collision"):
+        trend_review.freeze_actual_fill_batch(
+            tmp_path,
+            {"market": "CN"},
+            [
+                actual_fill("new", "600002", "BUY", "100", "2026-07-16"),
+                actual_fill(
+                    "existing",
+                    "600001",
+                    "BUY",
+                    "100",
+                    "2026-07-16",
+                    price="11",
+                ),
+            ],
+            "2026-07-16",
+        )
+
+    assert {
+        path: path.read_bytes()
+        for path in (tmp_path / "trend_review/facts").rglob("*.json")
+    } == before
+
+
+def test_actual_fill_batch_write_failure_removes_new_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_fdopen = trend_review.os.fdopen
+    calls = 0
+
+    def fail_second_write(descriptor: int, mode: str):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            trend_review.os.close(descriptor)
+            raise OSError("simulated immutable write failure")
+        return real_fdopen(descriptor, mode)
+
+    monkeypatch.setattr(trend_review.os, "fdopen", fail_second_write)
+
+    with pytest.raises(OSError, match="simulated immutable write failure"):
+        trend_review.freeze_actual_fill_batch(
+            tmp_path,
+            {"market": "CN"},
+            [actual_fill("new", "600002", "BUY", "100", "2026-07-16")],
+            "2026-07-16",
+        )
+
+    assert list((tmp_path / "trend_review/facts").rglob("*.json")) == []
 
 
 def write_review_history(

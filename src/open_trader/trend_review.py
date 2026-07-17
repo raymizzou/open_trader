@@ -91,19 +91,56 @@ def _canonical_json_bytes(payload: Mapping[str, object]) -> bytes:
     ).encode()
 
 
-def _write_immutable(path: Path, body: bytes) -> Path:
+def _create_immutable(path: Path, body: bytes) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         if path.read_bytes() != body:
             raise FileExistsError(f"immutable artifact collision: {path}") from None
-        return path
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(body)
-        handle.flush()
-        os.fsync(handle.fileno())
+        return False
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def _write_immutable(path: Path, body: bytes) -> Path:
+    _create_immutable(path, body)
     return path
+
+
+def _write_immutable_batch(artifacts: Sequence[tuple[Path, bytes]]) -> None:
+    prepared: dict[Path, bytes] = {}
+    for path, body in artifacts:
+        previous = prepared.get(path)
+        if previous is not None and previous != body:
+            raise FileExistsError(f"immutable artifact collision: {path}")
+        prepared[path] = body
+    for path, body in prepared.items():
+        if path.exists() and path.read_bytes() != body:
+            raise FileExistsError(f"immutable artifact collision: {path}")
+
+    created: list[Path] = []
+    try:
+        for path, body in prepared.items():
+            if _create_immutable(path, body):
+                created.append(path)
+    except Exception:
+        for path in reversed(created):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def _market(value: object) -> str:
@@ -208,6 +245,12 @@ def freeze_actual_fill_batch(
     fills: Sequence[TradeFill],
     complete_through: str,
 ) -> list[Path]:
+    try:
+        complete_date = date.fromisoformat(complete_through)
+    except ValueError:
+        raise ValueError("actual fill complete_through must be an ISO date") from None
+    if complete_date.isoformat() != complete_through:
+        raise ValueError("actual fill complete_through must be an ISO date")
     raw_market = source_metadata.get("market")
     if raw_market is None and fills:
         raw_market = fills[0].market
@@ -220,28 +263,56 @@ def freeze_actual_fill_batch(
     market = _market(raw_market)
     paths: list[Path] = []
     identities: list[tuple[str, str, str]] = []
+    artifacts: list[tuple[Path, bytes]] = []
     for fill in fills:
+        if not isinstance(fill, TradeFill):
+            raise ValueError("actual fill must be a TradeFill")
         if _market(fill.market) != market:
             raise ValueError("actual fill market does not match source metadata")
         payload = {
             "schema_version": "open_trader.trend_review.fill.v1",
             **asdict(fill),
         }
+        if any(
+            not str(payload.get(field) or "").strip()
+            for field in (
+                "source_id",
+                "broker",
+                "account_alias",
+                "symbol",
+                "currency",
+                "executed_at",
+            )
+        ):
+            raise ValueError("actual fill has missing required fields")
+        if payload["side"] not in {"BUY", "SELL"}:
+            raise ValueError("actual fill side must be BUY or SELL")
+        if _required_decimal(payload["quantity"], "fill quantity") <= 0:
+            raise ValueError("fill quantity must be positive")
+        if _required_decimal(payload["price"], "fill price") <= 0:
+            raise ValueError("fill price must be positive")
+        if payload["fees"] is not None:
+            _required_decimal(payload["fees"], "fill fees")
+        try:
+            execution_date = date.fromisoformat(str(payload["executed_at"])[:10])
+        except ValueError:
+            raise ValueError("actual fill executed_at must start with an ISO date") from None
+        if execution_date > complete_date:
+            raise ValueError("actual fill is later than complete_through")
         identity = _actual_fill_identity(payload)
         digest = hashlib.sha256(
             _canonical_json_bytes({"identity": identity})
         ).hexdigest()
-        paths.append(
-            _write_immutable(
-                data_dir
-                / "trend_review"
-                / "facts"
-                / "actual_fills"
-                / market
-                / f"{digest}.json",
-                _canonical_json_bytes(payload),
-            )
+        path = (
+            data_dir
+            / "trend_review"
+            / "facts"
+            / "actual_fills"
+            / market
+            / f"{digest}.json"
         )
+        paths.append(path)
+        artifacts.append((path, _canonical_json_bytes(payload)))
         identities.append(identity)
     completeness = {
         "schema_version": "open_trader.trend_review.fill_completeness.v1",
@@ -251,15 +322,18 @@ def freeze_actual_fill_batch(
         "fill_identities": sorted(identities),
     }
     digest = hashlib.sha256(_canonical_json_bytes(completeness)).hexdigest()
-    _write_immutable(
-        data_dir
-        / "trend_review"
-        / "facts"
-        / "actual_fill_completeness"
-        / market
-        / f"{digest}.json",
-        _canonical_json_bytes(completeness),
+    artifacts.append(
+        (
+            data_dir
+            / "trend_review"
+            / "facts"
+            / "actual_fill_completeness"
+            / market
+            / f"{digest}.json",
+            _canonical_json_bytes(completeness),
+        )
     )
+    _write_immutable_batch(artifacts)
     return paths
 
 
@@ -761,6 +835,9 @@ def capture_trend_review_close(
     benchmark: Mapping[str, object],
 ) -> Path:
     market = _market(market)
+    account, strategy_snapshot = validate_trend_review_close_report(
+        report, trading_date
+    )
     net_value = _required_decimal(
         simulate_snapshot.get("net_value"), "simulate net value"
     )
@@ -768,19 +845,6 @@ def capture_trend_review_close(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
     _validate_benchmark(benchmark, market=market, trading_date=trading_date)
-    account = report.get("account")
-    if not isinstance(account, Mapping):
-        raise ValueError("trend report account is unavailable")
-    strategy_snapshot = report.get("strategy_snapshot")
-    if (
-        not isinstance(strategy_snapshot, Mapping)
-        or not strategy_snapshot.get("strategy_id")
-        or not strategy_snapshot.get("strategy_version")
-        or not strategy_snapshot.get("process_version")
-        or not isinstance(strategy_snapshot.get("parameters"), Mapping)
-        or not strategy_snapshot.get("parameter_rows")
-    ):
-        raise ValueError("trend report strategy snapshot is unavailable")
     payload = {
         "schema_version": "open_trader.trend_review.daily.v1",
         "market": market,
@@ -805,6 +869,34 @@ def capture_trend_review_close(
         / f"{trading_date}.json"
     )
     return _write_immutable(path, _canonical_json_bytes(payload))
+
+
+def validate_trend_review_close_report(
+    report: Mapping[str, object], trading_date: str
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    account = report.get("account")
+    if not isinstance(account, Mapping):
+        raise ValueError("trend report account is unavailable")
+    strategy_snapshot = report.get("strategy_snapshot")
+    if (
+        not isinstance(strategy_snapshot, Mapping)
+        or any(
+            not str(strategy_snapshot.get(field) or "").strip()
+            for field in ("strategy_id", "strategy_version", "process_version")
+        )
+        or not isinstance(strategy_snapshot.get("parameters"), Mapping)
+        or not isinstance(strategy_snapshot.get("parameter_rows"), list)
+        or not strategy_snapshot["parameter_rows"]
+    ):
+        raise ValueError("trend report strategy snapshot is unavailable")
+    if account.get("fresh") is True and account.get("source_date") == trading_date:
+        _required_decimal(account.get("net_value"), "actual net value")
+        positions = account.get("positions")
+        if not isinstance(positions, list) or any(
+            not isinstance(position, Mapping) for position in positions
+        ):
+            raise ValueError("trend report account positions are unavailable")
+    return account, strategy_snapshot
 
 
 def _validate_benchmark(

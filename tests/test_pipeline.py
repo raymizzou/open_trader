@@ -375,6 +375,66 @@ def test_monthly_import_does_not_guess_fill_completeness_date(tmp_path: Path) ->
     assert not (data_dir / "trend_review/facts").exists()
 
 
+def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"first statement")
+    data_dir = tmp_path / "data"
+    portfolio_path = tmp_path / "current/portfolio.csv"
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": FakeParser(
+            broker="eastmoney",
+            position_currency="CNY",
+            cash_currency="CNY",
+            symbol="600001",
+        ),
+        "data_dir": data_dir,
+        "portfolio_path": portfolio_path,
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08")}
+        ),
+    }
+    first = pipeline.run_uploaded_statement(**arguments)
+
+    def tree_bytes(root: Path) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    original_run = tree_bytes(first.run_dir)
+    original_portfolio = portfolio_path.read_bytes()
+    original_facts = tree_bytes(data_dir / "trend_review/facts")
+    source.write_bytes(b"second statement")
+    arguments["parser"] = FakeParser(
+        broker="eastmoney",
+        position_currency="CNY",
+        cash_currency="CNY",
+        symbol="600002",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "freeze_actual_fill_batch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("simulated fact writer failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="simulated fact writer failure"):
+        pipeline.run_uploaded_statement(**arguments)
+
+    assert tree_bytes(first.run_dir) == original_run
+    assert portfolio_path.read_bytes() == original_portfolio
+    assert tree_bytes(data_dir / "trend_review/facts") == original_facts
+    assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
+    assert list(portfolio_path.parent.glob(".portfolio.csv.*.backup")) == []
+
+
 def test_uploaded_statements_for_two_brokers_share_monthly_run(
     tmp_path: Path,
 ) -> None:

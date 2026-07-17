@@ -127,6 +127,7 @@ from .trend_review import (
     freeze_discipline_fact,
     rebuild_trend_report_from_evidence,
     replay_trend_evidence,
+    validate_trend_review_close_report,
 )
 
 
@@ -313,43 +314,21 @@ def run_trend_review_open(
 def run_trend_review_close(
     config: object, market: str, trading_date: str
 ) -> dict[str, object]:
-    account_id = require_trend_review_config(config, market)
     report = _load_trend_review_report(
         config, market, trading_date, date_field="as_of_date"
     )
-    quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-    client = None
-    try:
-        benchmark = benchmark_fact(quote, market, trading_date)
-        client = FutuSimulateOrderExecutionClient(
-            host=config.futu_host,
-            port=config.futu_port,
-            simulate_acc_id=account_id,
-            trd_market=market,
+    account, strategy_snapshot = validate_trend_review_close_report(
+        report, trading_date
+    )
+    errors: list[tuple[str, Exception]] = []
+    actual_equity_path = None
+    if account.get("fresh") is True and account.get("source_date") == trading_date:
+        opening_positions = (
+            account["positions"]
+            if trading_date == TREND_V1_EFFECTIVE_FROM[market]
+            else []
         )
-        snapshot = client.account_snapshot()
-        orders = client.list_orders()["orders"]
-        strategy_snapshot = report.get("strategy_snapshot")
-        account = report.get("account")
-        if not isinstance(strategy_snapshot, dict):
-            raise ValueError("trend report strategy snapshot is unavailable")
-        if not isinstance(account, dict):
-            raise ValueError("trend report account is unavailable")
-        discipline_path = freeze_discipline_fact(
-            config.data_dir,
-            market,
-            trading_date,
-            snapshot["net_value"],
-            orders,
-            strategy_snapshot,
-        )
-        actual_equity_path = None
-        if account.get("fresh") is True and account.get("source_date") == trading_date:
-            opening_positions = []
-            if trading_date == TREND_V1_EFFECTIVE_FROM[market]:
-                opening_positions = account.get("positions")
-                if not isinstance(opening_positions, list):
-                    raise ValueError("trend report account positions are unavailable")
+        try:
             actual_equity_path = freeze_actual_equity_fact(
                 config.data_dir,
                 market,
@@ -358,13 +337,54 @@ def run_trend_review_close(
                 opening_positions,
                 strategy_snapshot,
             )
+        except Exception as exc:
+            errors.append(("actual equity", exc))
+
+    benchmark_path = None
+    quote = None
+    try:
+        quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+        benchmark = benchmark_fact(quote, market, trading_date)
         benchmark_path = freeze_benchmark_fact(
             config.data_dir, market, trading_date, benchmark
         )
+    except Exception as exc:
+        errors.append(("benchmark", exc))
     finally:
-        quote.close()
+        if quote is not None:
+            try:
+                quote.close()
+            except Exception as exc:
+                errors.append(("benchmark client close", exc))
+
+    discipline_path = None
+    client = None
+    try:
+        account_id = require_trend_review_config(config, market)
+        client = FutuSimulateOrderExecutionClient(
+            host=config.futu_host,
+            port=config.futu_port,
+            simulate_acc_id=account_id,
+            trd_market=market,
+        )
+        snapshot = client.account_snapshot()
+        orders = client.list_orders()["orders"]
+        discipline_path = freeze_discipline_fact(
+            config.data_dir,
+            market,
+            trading_date,
+            snapshot["net_value"],
+            orders,
+            strategy_snapshot,
+        )
+    except Exception as exc:
+        errors.append(("discipline", exc))
+    finally:
         if client is not None:
-            client.close()
+            try:
+                client.close()
+            except Exception as exc:
+                errors.append(("discipline client close", exc))
 
     actual_fill_paths: list[Path] = []
     if market == "US":
@@ -382,10 +402,25 @@ def run_trend_review_close(
                 ),
                 trading_date,
             )
+        except Exception as exc:
+            errors.append(("actual fills", exc))
         finally:
             if tiger_client is not None:
-                tiger_client.close()
-    projection = build_trend_review_projection(config.data_dir, market)
+                try:
+                    tiger_client.close()
+                except Exception as exc:
+                    errors.append(("actual fill client close", exc))
+    projection = None
+    try:
+        projection = build_trend_review_projection(config.data_dir, market)
+    except Exception as exc:
+        errors.append(("projection", exc))
+    if errors:
+        details = "; ".join(f"{stream}: {exc}" for stream, exc in errors)
+        raise RuntimeError(f"trend review close failed: {details}") from errors[0][1]
+    assert discipline_path is not None
+    assert benchmark_path is not None
+    assert projection is not None
     artifact_paths = {
         "discipline": str(discipline_path),
         "actual_equity": (

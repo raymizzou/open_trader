@@ -319,6 +319,15 @@ def _run_import(
             run_dir.rename(backup_run_dir)
         temp_run_dir.rename(run_dir)
         temp_run_promoted = True
+        if actual_fill_complete_through is not None:
+            for broker, source_sha256, batch_fills in uploaded_fill_batches:
+                if broker in {"eastmoney", "phillips"}:
+                    freeze_actual_fill_batch(
+                        data_dir,
+                        {"broker": broker, "source_sha256": source_sha256},
+                        batch_fills,
+                        actual_fill_complete_through,
+                    )
         if backup_run_dir is not None and backup_run_dir.exists():
             rmtree(backup_run_dir)
         if backup_latest_path is not None and backup_latest_path.exists():
@@ -337,16 +346,6 @@ def _run_import(
         raise
 
     portfolio_path = run_dir / "portfolio.csv"
-
-    if actual_fill_complete_through is not None:
-        for broker, source_sha256, batch_fills in uploaded_fill_batches:
-            if broker in {"eastmoney", "phillips"}:
-                freeze_actual_fill_batch(
-                    data_dir,
-                    {"broker": broker, "source_sha256": source_sha256},
-                    batch_fills,
-                    actual_fill_complete_through,
-                )
 
     return ImportResult(
         run_dir=run_dir,
