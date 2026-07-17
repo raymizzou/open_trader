@@ -1,4 +1,5 @@
 from decimal import Decimal
+import inspect
 import json
 import os
 from pathlib import Path
@@ -53,7 +54,7 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
 
     assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
     assert 'DASHBOARD_LOG ?= /tmp/open_trader_dashboard_8766.log' in makefile
-    assert 'EXPECTED_CN ?= 5' in makefile
+    assert 'EXPECTED_CN ?= 4' in makefile
     assert '--url "$(DASHBOARD_URL)"' in makefile
     assert '--log "$(DASHBOARD_LOG)"' in makefile
     assert '--expected-cn "$(EXPECTED_CN)"' in makefile
@@ -102,6 +103,13 @@ def test_acceptance_browser_viewport_and_screenshot_matrix_is_exact() -> None:
         "mobile-portfolio.png",
         "375-trend-report.png",
     )
+
+
+def test_tablet_trend_cards_use_the_actual_viewport_width() -> None:
+    source = inspect.getsource(dashboard_acceptance._check_account_holdings)
+
+    assert 'box["x"] + box["width"] <= width + 1' in source
+    assert 'box["x"] + box["width"] <= 376' not in source
 
 
 def test_acceptance_screenshot_validation_requires_current_nonempty_exact_set(

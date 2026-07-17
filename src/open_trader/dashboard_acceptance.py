@@ -1173,11 +1173,11 @@ def _check_account_holdings(
             ), f"{broker} 趋势报告在 375px 产生横向滚动"
             cards = workspace.locator(".cn-trend-card:visible")
             assert all(
-                box is not None and box["x"] + box["width"] <= 376
+                box is not None and box["x"] + box["width"] <= width + 1
                 for box in cards.evaluate_all(
                     "nodes => nodes.map(node => node.getBoundingClientRect()).map(r => ({x:r.x,width:r.width}))"
                 )
-            ), f"{broker} 趋势报告动作卡超出 375px 视口"
+            ), f"{broker} 趋势报告动作卡超出 {width}px 视口"
         audit = workspace.locator(".trend-audit")
         _check_trend_audit(audit, report, broker)
         assert page.evaluate(

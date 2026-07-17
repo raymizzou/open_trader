@@ -130,10 +130,8 @@ def _eligible_portfolio_symbols(portfolio_path: Path, market: str) -> list[str]:
         for row in csv.DictReader(handle):
             if str(row.get("market") or "").strip().upper() != market:
                 continue
-            if str(row.get("ai_eligible") or "").strip().lower() != "true":
-                continue
             asset_class = str(row.get("asset_class") or "").strip().lower()
-            if asset_class not in {"stock", "etf"}:
+            if asset_class not in {"stock", "etf", "fund"}:
                 continue
             symbol = (
                 str(row.get("analysis_symbol") or row.get("symbol") or "")
