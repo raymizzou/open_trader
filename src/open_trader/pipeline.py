@@ -211,11 +211,7 @@ def _run_import(
         fills.extend(parse_result.fills)
         uploaded_positions.extend(parse_result.positions)
         uploaded_cash.extend(parse_result.cash_balances)
-        if not any(
-            warning.code == "invalid_execution_row"
-            and warning.broker.strip().lower() == parser.broker.strip().lower()
-            for warning in parse_result.warnings
-        ):
+        if parse_result.fills_complete:
             uploaded_fill_batches.append(
                 (parser.broker, source_sha256, list(parse_result.fills))
             )

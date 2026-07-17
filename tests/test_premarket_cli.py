@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import open_trader.cli as cli
+from open_trader.a_share_trend import trend_strategy_snapshot
 from open_trader.advice.premarket import PremarketResult
 from open_trader.cli import build_parser
 from open_trader.daily_premarket import DailyPremarketConfig, NotificationAttempt
@@ -656,18 +657,7 @@ def _trend_review_close_report(
             "net_value": "123456.78",
             "positions": [{"symbol": "600000", "quantity": "100"}],
         },
-        "strategy_snapshot": {
-            "strategy_id": f"trend_animals_warm_to_hot/{market}/v1",
-            "strategy_name": "trend",
-            "strategy_version": "v1",
-            "market": market,
-            "effective_from": cli.TREND_V1_EFFECTIVE_FROM[market],
-            "process_version": "test",
-            "parameters": {},
-            "parameter_rows": [
-                {"group": "rules", "name": "test", "value": "1"}
-            ],
-        },
+        "strategy_snapshot": trend_strategy_snapshot(market, "test", ()),
     }
 
 

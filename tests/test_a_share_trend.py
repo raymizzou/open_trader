@@ -389,6 +389,65 @@ def test_report_rejects_snapshot_that_changes_shared_execution_rules(
         trend_module.validate_report_strategy_snapshot(broken)
 
 
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("min_strength", "94"),
+        ("candidate_limit", 9),
+        ("position_limit", 9),
+        ("allowed_phases", ["谷雨"]),
+    ],
+)
+def test_build_report_rejects_any_injected_snapshot_parameter_drift(
+    parameter: str, value: object,
+) -> None:
+    canonical = trend_module.trend_strategy_snapshot("CN", "sha", ())
+    changed = {
+        **canonical,
+        "parameters": {**canonical["parameters"], parameter: value},
+    }
+
+    with pytest.raises(ValueError, match="strategy snapshot"):
+        build_report(
+            as_of_date="2026-07-16",
+            execution_date="2026-07-17",
+            account=account(),
+            candidates=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            market="CN",
+            process_version="sha",
+            candidate_pool_ids=(),
+            strategy_snapshot=changed,
+        )
+
+
+def test_build_report_upgrades_exact_repository_legacy_snapshot() -> None:
+    legacy = json.loads(
+        Path("data/trend_review/daily/CN/2026-07-16.json").read_text(
+            encoding="utf-8"
+        )
+    )["strategy_snapshot"]
+    pools = tuple(legacy["parameters"]["candidate_pool_ids"])
+
+    built = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="CN",
+        process_version=legacy["process_version"],
+        candidate_pool_ids=pools,
+        strategy_snapshot=legacy,
+    )
+
+    assert built.strategy_snapshot == trend_module.trend_strategy_snapshot(
+        "CN", legacy["process_version"], pools
+    )
+
+
 def test_candidates_filter_then_sort_deterministically() -> None:
     rows = [
         candidate("600004", strength="95", days=2, amount="3"),

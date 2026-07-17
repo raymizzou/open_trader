@@ -23,6 +23,7 @@ class ParseResult:
     positions: list[Position] = field(default_factory=list)
     cash_balances: list[CashBalance] = field(default_factory=list)
     fills: list[TradeFill] = field(default_factory=list)
+    fills_complete: bool = False
     warnings: list[WarningRecord] = field(default_factory=list)
     page_count: int = 0
 

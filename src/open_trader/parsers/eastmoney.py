@@ -88,11 +88,13 @@ def parse_eastmoney_page(
     fills: list[TradeFill] = []
     warnings: list[WarningRecord] = []
     occurrences: dict[tuple[str, ...], int] = {}
-    for execution_table in (
+    execution_tables = tuple(
         candidate
         for candidate in tables
         if candidate and _normalize_row(candidate[0]) == EXECUTION_HEADER
-    ):
+    )
+    fills_complete = bool(execution_tables)
+    for execution_table in execution_tables:
         for row in execution_table[1:]:
             values = _normalize_row(row)
             occurrence = occurrences.get(values, 0)
@@ -101,6 +103,7 @@ def parse_eastmoney_page(
             if fill is not None:
                 fills.append(fill)
             elif _is_execution_candidate(row):
+                fills_complete = False
                 warnings.append(
                     WarningRecord(
                         statement_id=statement_id,
@@ -129,6 +132,7 @@ def parse_eastmoney_page(
             )
         ],
         fills=fills,
+        fills_complete=fills_complete,
         warnings=warnings,
     )
 
@@ -179,12 +183,7 @@ def _parse_fill(
 def _is_execution_candidate(row: list[str | None]) -> bool:
     values = [_normalize_cell(cell) for cell in row]
     category = values[1] if len(values) > 1 else ""
-    security_fields = [
-        values[index] if len(values) > index else "" for index in (2, 4, 5)
-    ]
-    return category in {"证券买入", "证券卖出"} or (
-        (not category or category.startswith("证券")) and any(security_fields)
-    )
+    return category in {"证券买入", "证券卖出"}
 
 
 def _execution_date(value: str) -> str | None:

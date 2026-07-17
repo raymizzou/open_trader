@@ -41,6 +41,7 @@ class FakeParser:
         position_broker: str | None = None,
         cash_broker: str | None = None,
         warning_broker: str | None = None,
+        fills_complete: bool = False,
     ) -> None:
         self.broker = broker
         self.result_broker = result_broker or broker
@@ -51,6 +52,7 @@ class FakeParser:
         self.position_broker = position_broker or self.result_broker
         self.cash_broker = cash_broker or self.result_broker
         self.warning_broker = warning_broker or self.result_broker
+        self.fills_complete = fills_complete
 
     def parse(self, path: Path, month: str) -> ParseResult:
         return ParseResult(
@@ -88,6 +90,7 @@ class FakeParser:
                     notes="",
                 )
             ],
+            fills_complete=self.fills_complete,
             warnings=[
                 WarningRecord(
                     statement_id=f"{month}-{self.result_broker}",
@@ -137,6 +140,7 @@ class FillParser(FakeParser):
                     source_sequence=7,
                 )
             ],
+            fills_complete=True,
             warnings=result.warnings,
             page_count=result.page_count,
         )
@@ -175,6 +179,7 @@ class BrokerFillParser(FakeParser):
                     executed_at="2026-05-10",
                 )
             ],
+            fills_complete=True,
             warnings=result.warnings,
             page_count=result.page_count,
         )
@@ -189,6 +194,7 @@ class InvalidExecutionBrokerFillParser(BrokerFillParser):
             positions=result.positions,
             cash_balances=result.cash_balances,
             fills=result.fills,
+            fills_complete=False,
             warnings=[
                 WarningRecord(
                     statement_id=result.statement_id,
@@ -263,6 +269,28 @@ def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
         "code": "fake_warning",
         "message": "fake warning",
     }
+
+
+def test_uploaded_statement_without_fill_completeness_keeps_audit_artifacts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    result = pipeline.run_uploaded_statement(
+        statement_date="2026-05-10",
+        statement_path=source,
+        parser=FakeParser(
+            broker="eastmoney", position_currency="CNY", cash_currency="CNY",
+            fills_complete=False,
+        ),
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "current/portfolio.csv",
+        fx_provider=StaticMonthEndFxProvider("2026-05", {"CNY": Decimal("1.08")}),
+    )
+
+    assert result.positions_count == 1
+    assert (result.run_dir / "manifest.csv").exists()
+    assert not (tmp_path / "data/trend_review/facts/actual_fill_completeness").exists()
 
 
 def test_uploaded_statement_persists_each_fill_once(tmp_path: Path) -> None:
@@ -394,6 +422,7 @@ def test_uploaded_empty_statement_freezes_completeness_only_after_success(
             broker="eastmoney",
             position_currency="CNY",
             cash_currency="CNY",
+            fills_complete=True,
         ),
         "data_dir": data_dir,
         "portfolio_path": tmp_path / "current/portfolio.csv",
@@ -460,6 +489,7 @@ def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
             position_currency="CNY",
             cash_currency="CNY",
             symbol="600001",
+            fills_complete=True,
         ),
         "data_dir": data_dir,
         "portfolio_path": portfolio_path,
@@ -485,6 +515,7 @@ def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
         position_currency="CNY",
         cash_currency="CNY",
         symbol="600002",
+        fills_complete=True,
     )
     monkeypatch.setattr(
         pipeline,
@@ -520,6 +551,7 @@ def test_uploaded_statement_commits_before_backup_cleanup(
             position_currency="CNY",
             cash_currency="CNY",
             symbol="600001",
+            fills_complete=True,
         ),
         "data_dir": data_dir,
         "portfolio_path": portfolio_path,
@@ -534,6 +566,7 @@ def test_uploaded_statement_commits_before_backup_cleanup(
         position_currency="CNY",
         cash_currency="CNY",
         symbol="600002",
+        fills_complete=True,
     )
     real_rmtree = pipeline.rmtree
 

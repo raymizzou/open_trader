@@ -8,7 +8,7 @@ import os
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -280,6 +280,7 @@ def freeze_actual_fill_batch(
     paths: list[Path] = []
     identities: list[tuple[str, str, str]] = []
     artifacts: list[tuple[Path, bytes]] = []
+    fill_order: list[dict[str, object]] = []
     for fill in fills:
         if not isinstance(fill, TradeFill):
             raise ValueError("actual fill must be a TradeFill")
@@ -316,6 +317,7 @@ def freeze_actual_fill_batch(
             or source_sequence < 0
         ):
             raise ValueError("actual fill source_sequence must be a non-negative integer")
+        payload.pop("source_sequence")
         executed_at = str(payload["executed_at"])
         try:
             execution_date = (
@@ -344,6 +346,12 @@ def freeze_actual_fill_batch(
         paths.append(path)
         artifacts.append((path, _canonical_json_bytes(payload)))
         identities.append(identity)
+        fill_order.append(
+            {
+                "identity": list(identity),
+                "source_sequence": source_sequence,
+            }
+        )
     completeness = {
         "schema_version": "open_trader.trend_review.fill_completeness.v1",
         "market": market,
@@ -352,6 +360,7 @@ def freeze_actual_fill_batch(
         "coverage_end": complete_through,
         "source_metadata": dict(source_metadata),
         "fill_identities": sorted(identities),
+        "fill_order": fill_order,
     }
     digest = hashlib.sha256(_canonical_json_bytes(completeness)).hexdigest()
     artifacts.append(
@@ -865,7 +874,9 @@ def validate_trend_review_close_report(
         raise ValueError("trend report account is unavailable")
     strategy_snapshot = report.get("strategy_snapshot")
     try:
-        _validated_strategy_snapshot(strategy_snapshot, market)
+        strategy_snapshot = normalize_trend_strategy_snapshot(
+            strategy_snapshot, market
+        )
     except ValueError:
         raise ValueError("trend report strategy snapshot is unavailable")
     if account.get("fresh") is True and account.get("source_date") == trading_date:
@@ -878,49 +889,74 @@ def validate_trend_review_close_report(
     return account, strategy_snapshot
 
 
+def normalize_trend_strategy_snapshot(
+    snapshot: object,
+    market: str,
+    *,
+    expected_snapshot: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    market = _market(market)
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("strategy snapshot is unavailable")
+    if expected_snapshot is None:
+        parameters = snapshot.get("parameters")
+        pools = (
+            parameters.get("candidate_pool_ids")
+            if isinstance(parameters, Mapping)
+            else None
+        )
+        process_version = snapshot.get("process_version")
+        if (
+            not isinstance(pools, list)
+            or any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in pools
+            )
+            or not isinstance(process_version, str)
+        ):
+            raise ValueError("strategy snapshot is unavailable")
+        from .a_share_trend import trend_strategy_snapshot
+
+        expected_snapshot = trend_strategy_snapshot(
+            market, process_version, pools
+        )
+    expected = copy.deepcopy(dict(expected_snapshot))
+    if _canonical_json_bytes(dict(snapshot)) == _canonical_json_bytes(expected):
+        return expected
+
+    legacy = copy.deepcopy(expected)
+    legacy["effective_from"] = "2026-07-14"
+    legacy_parameters = legacy.get("parameters")
+    if not isinstance(legacy_parameters, dict):
+        raise ValueError("strategy snapshot is unavailable")
+    legacy_parameters.pop("use_available_cash", None)
+    legacy_parameters.pop("trailing_activation_signals", None)
+    old_buy_quantity = {
+        "CN": "按 100 股整数倍向下取整",
+        "US": "按 1 股整数倍向下取整",
+        "HK": "按 Futu 返回的每标的整手股数向下取整",
+    }[market]
+    rows = legacy.get("parameter_rows")
+    if not isinstance(rows, list):
+        raise ValueError("strategy snapshot is unavailable")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("strategy snapshot is unavailable")
+        if row.get("name") == "买入数量":
+            row["value"] = old_buy_quantity
+        elif row.get("name") == "过热跟踪":
+            row["value"] = "此前 5 个完整交易日最低价；保护线只升不降"
+    if _canonical_json_bytes(dict(snapshot)) != _canonical_json_bytes(legacy):
+        raise ValueError(
+            "strategy snapshot does not match current or known legacy rules"
+        )
+    return expected
+
+
 def _validated_strategy_snapshot(
     snapshot: object, market: str
 ) -> Mapping[str, object]:
-    if not isinstance(snapshot, Mapping):
-        raise ValueError("strategy snapshot is unavailable")
-    required_text = (
-        "strategy_id",
-        "strategy_name",
-        "strategy_version",
-        "market",
-        "effective_from",
-        "process_version",
-    )
-    if any(
-        not isinstance(snapshot.get(field), str)
-        or not str(snapshot[field]).strip()
-        for field in required_text
-    ):
-        raise ValueError("strategy snapshot is unavailable")
-    if (
-        snapshot["strategy_version"] != "v1"
-        or snapshot["strategy_id"] != f"trend_animals_warm_to_hot/{market}/v1"
-        or snapshot["market"] != market
-        or snapshot["effective_from"] != TREND_V1_EFFECTIVE_FROM[market]
-        or not isinstance(snapshot.get("parameters"), Mapping)
-    ):
-        raise ValueError("strategy snapshot is unavailable")
-    rows = snapshot.get("parameter_rows")
-    if (
-        not isinstance(rows, list)
-        or not rows
-        or any(
-            not isinstance(row, Mapping)
-            or set(row) != {"group", "name", "value"}
-            or any(
-                not isinstance(row[key], str) or not row[key].strip()
-                for key in ("group", "name", "value")
-            )
-            for row in rows
-        )
-    ):
-        raise ValueError("strategy snapshot is unavailable")
-    return snapshot
+    return normalize_trend_strategy_snapshot(snapshot, market)
 
 
 def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
@@ -1014,6 +1050,7 @@ def _load_actual_fills(
             raise ValueError(f"invalid trend review actual fill fact: {path}")
         fills.append(payload)
     coverage: list[tuple[str, str]] = []
+    source_sequences: dict[tuple[str, str, str], int | None] = {}
     completeness_root = (
         data_dir
         / "trend_review"
@@ -1048,6 +1085,31 @@ def _load_actual_fills(
         ):
             raise ValueError(f"invalid trend review fill completeness fact: {path}")
         coverage.append((coverage_start, coverage_end))
+        raw_order = payload.get("fill_order", [])
+        if not isinstance(raw_order, list):
+            raise ValueError(f"invalid trend review fill completeness fact: {path}")
+        for item in raw_order:
+            if (
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("identity"), list)
+                or len(item["identity"]) != 3
+            ):
+                raise ValueError(f"invalid trend review fill completeness fact: {path}")
+            identity = tuple(str(value) for value in item["identity"])
+            sequence = item.get("source_sequence")
+            if sequence is not None and (
+                not isinstance(sequence, int)
+                or isinstance(sequence, bool)
+                or sequence < 0
+            ):
+                raise ValueError(f"invalid trend review fill completeness fact: {path}")
+            if identity in source_sequences and source_sequences[identity] != sequence:
+                raise ValueError(f"conflicting actual fill source order: {identity}")
+            source_sequences[identity] = sequence
+    for fill in fills:
+        identity = _actual_fill_identity(fill)
+        if identity in source_sequences and source_sequences[identity] is not None:
+            fill["source_sequence"] = source_sequences[identity]
     return fills, coverage
 
 
@@ -1092,15 +1154,26 @@ def _completed_cycles(
             for value in sequences
         ) or len(set(sequences)) != len(sequences):
             raise ValueError("ambiguous actual fill order")
+
+    def sort_key(row: Mapping[str, object]) -> tuple[float, int, str]:
+        text = str(row["executed_at"])
+        moment = (
+            datetime.fromisoformat(f"{text}T00:00:00+00:00")
+            if len(text) == 10
+            else datetime.fromisoformat(text.replace("Z", "+00:00"))
+        )
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        sequence = row.get("source_sequence")
+        return (
+            moment.timestamp(),
+            sequence if isinstance(sequence, int) else 0,
+            str(row["source_id"]),
+        )
+
     for fill in sorted(
         unique_fills,
-        key=lambda row: (
-            str(row["executed_at"]),
-            row.get("source_sequence")
-            if isinstance(row.get("source_sequence"), int)
-            else 0,
-            str(row["source_id"]),
-        ),
+        key=sort_key,
     ):
         symbol = str(fill["symbol"])
         quantity = _required_decimal(fill["quantity"], "fill quantity")
@@ -1461,25 +1534,40 @@ def build_trend_review_projection(
     if not discipline_by_date and not actual_by_date and not benchmark_by_date:
         raise ValueError(f"no trend review facts for {market}")
 
-    def is_v1(fact: Mapping[str, object]) -> bool:
+    def has_valid_v1_snapshot(
+        fact: Mapping[str, object],
+    ) -> Mapping[str, object] | None:
         snapshot = fact.get("strategy_snapshot")
         if not isinstance(snapshot, Mapping) or snapshot.get("strategy_version") != "v1":
-            return False
+            return None
         try:
-            _validated_strategy_snapshot(snapshot, market)
+            return _validated_strategy_snapshot(snapshot, market)
         except ValueError:
-            return False
-        return True
+            return None
 
     discipline_facts = [
-        discipline_by_date[trading_date]
+        {
+            **discipline_by_date[trading_date],
+            "strategy_snapshot": normalized,
+        }
         for trading_date in sorted(discipline_by_date)
-        if is_v1(discipline_by_date[trading_date])
+        if (
+            normalized := has_valid_v1_snapshot(
+                discipline_by_date[trading_date]
+            )
+        )
+        is not None
     ]
     actual_facts = [
-        actual_by_date[trading_date]
+        {
+            **actual_by_date[trading_date],
+            "strategy_snapshot": normalized,
+        }
         for trading_date in sorted(actual_by_date)
-        if is_v1(actual_by_date[trading_date])
+        if (
+            normalized := has_valid_v1_snapshot(actual_by_date[trading_date])
+        )
+        is not None
     ]
     strategy_identities = {
         _strategy_identity(
@@ -1517,20 +1605,12 @@ def build_trend_review_projection(
         and effective_from <= str(fact["date"]) <= common_cutoff
     ]
 
-    def has_complete_snapshot(fact: Mapping[str, object]) -> bool:
-        try:
-            _validated_strategy_snapshot(fact.get("strategy_snapshot"), market)
-        except ValueError:
-            return False
-        return True
-
     snapshot_facts = sorted(
         (
             fact
             for fact in (*discipline_facts, *actual_facts)
             if effective_from <= str(fact["date"])
             and (common_cutoff is None or str(fact["date"]) <= common_cutoff)
-            and has_complete_snapshot(fact)
         ),
         key=lambda fact: str(fact["date"]),
     )
@@ -1815,6 +1895,10 @@ def rebuild_trend_report_from_evidence(
         if rows is None or isinstance(rows, list)
     }
     process_version = str(evidence.get("process_version") or "")
+    replay_snapshot = {
+        **normalize_trend_strategy_snapshot(snapshot, str(inputs["market"])),
+        "process_version": process_version,
+    }
     price_fx = decimal_or_none(inputs["price_fx_to_account_currency"])
     if price_fx is None or not price_fx.is_finite() or price_fx <= 0:
         raise TrendReplayIncompleteError(
@@ -1854,7 +1938,7 @@ def rebuild_trend_report_from_evidence(
         price_fx_to_account_currency=price_fx,
         process_version=process_version,
         candidate_pool_ids=tuple(int(item) for item in inputs["candidate_pool_ids"]),
-        strategy_snapshot=snapshot,
+        strategy_snapshot=replay_snapshot,
     )
     market = str(inputs["market"]).upper()
     if market in {"US", "HK"}:

@@ -30,7 +30,11 @@ from .trend_animals import (
     TrendAnimalsLookupError,
 )
 from .trend_delivery import deliver_daily_trend_text
-from .trend_review import TREND_V1_EFFECTIVE_FROM, freeze_report_evidence
+from .trend_review import (
+    TREND_V1_EFFECTIVE_FROM,
+    freeze_report_evidence,
+    normalize_trend_strategy_snapshot,
+)
 
 
 NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
@@ -1077,6 +1081,21 @@ def build_report(
     candidate_pool_ids: Sequence[int] = (),
     strategy_snapshot: Mapping[str, object] | None = None,
 ) -> TrendReport:
+    resolved_process_version = process_version or str(
+        (metadata or {}).get("process_version") or ""
+    )
+    canonical_strategy_snapshot = trend_strategy_snapshot(
+        market, resolved_process_version, candidate_pool_ids
+    )
+    resolved_strategy_snapshot = (
+        normalize_trend_strategy_snapshot(
+            strategy_snapshot,
+            market,
+            expected_snapshot=canonical_strategy_snapshot,
+        )
+        if strategy_snapshot is not None
+        else canonical_strategy_snapshot
+    )
     held_symbols = {position.symbol for position in account.positions}
     candidate_decision = build_candidate_list(
         candidates,
@@ -1259,20 +1278,7 @@ def build_report(
             "position_weight": str(position_weight),
             "position_weight_source": position_weight_source,
         },
-        strategy_snapshot=(
-            {
-                **dict(strategy_snapshot),
-                "process_version": process_version
-                or str((metadata or {}).get("process_version") or ""),
-            }
-            if strategy_snapshot is not None
-            else trend_strategy_snapshot(
-                market,
-                process_version
-                or str((metadata or {}).get("process_version") or ""),
-                candidate_pool_ids,
-            )
-        ),
+        strategy_snapshot=resolved_strategy_snapshot,
         replay_evidence=None,
     )
 
@@ -1873,6 +1879,22 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     if not isinstance(parameters, Mapping):
         raise ValueError("strategy snapshot does not match report actions")
     market = str(report.metadata.get("market") or "CN").upper()
+    pool_ids = parameters.get("candidate_pool_ids")
+    if not isinstance(pool_ids, list) or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in pool_ids
+    ):
+        raise ValueError("strategy snapshot does not match report actions")
+    expected_snapshot = trend_strategy_snapshot(
+        market, str(snapshot.get("process_version") or ""), pool_ids
+    )
+    try:
+        normalize_trend_strategy_snapshot(
+            snapshot,
+            market,
+            expected_snapshot=expected_snapshot,
+        )
+    except ValueError:
+        raise ValueError("strategy snapshot does not match report actions") from None
     expected_window = "美股常规交易时段" if market == "US" else "09:30-10:00"
     if parameters.get("buy_window") != expected_window:
         raise ValueError("strategy snapshot does not match report actions")

@@ -549,18 +549,96 @@ def test_stop_retries_intent_when_failed_order_is_absent_at_broker(
 
 
 def strategy_snapshot(market: str = "CN", version: str = "v1") -> dict[str, object]:
-    return {
-        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
-        "strategy_name": "trend",
-        "strategy_version": version,
-        "market": market,
-        "effective_from": trend_review.TREND_V1_EFFECTIVE_FROM[market],
-        "process_version": "test-sha",
-        "parameter_rows": [
-            {"group": "rules", "name": "position limit", "value": "10"}
-        ],
-        "parameters": {},
-    }
+    snapshot = trend_strategy_snapshot(market, "test-sha", ())
+    if version != "v1":
+        snapshot = {
+            **snapshot,
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+            "strategy_version": version,
+        }
+    return snapshot
+
+
+@pytest.mark.parametrize(
+    ("market", "trading_date"),
+    [("CN", "2026-07-16"), ("HK", "2026-07-16"), ("US", "2026-07-16")],
+)
+def test_repository_legacy_snapshots_adapt_without_rewrite(
+    market: str, trading_date: str,
+) -> None:
+    path = Path(f"data/trend_review/daily/{market}/{trading_date}.json")
+    original = path.read_bytes()
+    snapshot = json.loads(original)["strategy_snapshot"]
+
+    normalized = trend_review.normalize_trend_strategy_snapshot(
+        snapshot, market
+    )
+
+    assert path.read_bytes() == original
+    assert normalized == trend_strategy_snapshot(
+        market,
+        snapshot["process_version"],
+        tuple(snapshot["parameters"]["candidate_pool_ids"]),
+    )
+
+
+def test_separate_fact_legacy_snapshot_adapts_without_rewrite(
+    tmp_path: Path,
+) -> None:
+    legacy = json.loads(
+        Path("data/trend_review/daily/CN/2026-07-16.json").read_text(
+            encoding="utf-8"
+        )
+    )["strategy_snapshot"]
+    discipline_path = trend_review.freeze_discipline_fact(
+        tmp_path, "CN", "2026-07-16", "100000", [], legacy
+    )
+    trend_review.freeze_actual_equity_fact(
+        tmp_path, "CN", "2026-07-16", "100000", [], legacy
+    )
+    trend_review.freeze_benchmark_fact(
+        tmp_path,
+        "CN",
+        "2026-07-16",
+        {
+            "date": "2026-07-16",
+            "close": "1000",
+            "source_id": "CSI_ALL_SHARE_PRICE",
+            "futu_symbol": "SH.000985",
+        },
+    )
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [],
+        "2026-07-16",
+        coverage_start="2026-07-16",
+    )
+    rates = tmp_path / "rates/DGS3MO.csv"
+    rates.parent.mkdir()
+    rates.write_text("DATE,DGS3MO\n2026-07-16,4.25\n", encoding="utf-8")
+    original = discipline_path.read_bytes()
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert discipline_path.read_bytes() == original
+    assert projection["strategy_snapshot"] == trend_strategy_snapshot(
+        "CN",
+        legacy["process_version"],
+        tuple(legacy["parameters"]["candidate_pool_ids"]),
+    )
+
+
+def test_legacy_snapshot_adapter_rejects_unapproved_parameter_drift() -> None:
+    snapshot = json.loads(
+        Path("data/trend_review/daily/CN/2026-07-16.json").read_text(
+            encoding="utf-8"
+        )
+    )["strategy_snapshot"]
+    snapshot["parameters"]["position_limit"] = 9
+
+    with pytest.raises(ValueError, match="known legacy rules"):
+        trend_review.normalize_trend_strategy_snapshot(snapshot, "CN")
 
 
 def actual_fill(
@@ -783,7 +861,92 @@ def test_actual_fill_completeness_freezes_explicit_coverage_interval(
     fill_path = next(
         (tmp_path / "trend_review/facts/actual_fills/CN").glob("*.json")
     )
-    assert json.loads(fill_path.read_text(encoding="utf-8"))["source_sequence"] == 4
+    assert "source_sequence" not in json.loads(fill_path.read_text(encoding="utf-8"))
+    loaded, _ = trend_review._load_actual_fills(tmp_path, "CN")
+    assert loaded[0]["source_sequence"] == 4
+
+
+@pytest.mark.parametrize("source_sequence", [3, None])
+def test_reimport_keeps_legacy_fill_body_and_recovers_batch_order(
+    source_sequence: int | None, tmp_path: Path,
+) -> None:
+    fill = actual_fill(
+        "legacy-fill", "600001", "BUY", "100", "2026-07-16",
+        source_sequence=source_sequence,
+    )
+    payload = {
+        "schema_version": "open_trader.trend_review.fill.v1",
+        **asdict(fill),
+    }
+    payload.pop("source_sequence")
+    identity = trend_review._actual_fill_identity(payload)
+    digest = trend_review.hashlib.sha256(
+        trend_review._canonical_json_bytes({"identity": identity})
+    ).hexdigest()
+    path = (
+        tmp_path / "trend_review/facts/actual_fills/CN" / f"{digest}.json"
+    )
+    path.parent.mkdir(parents=True)
+    original = trend_review._canonical_json_bytes(payload)
+    path.write_bytes(original)
+
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"market": "CN"},
+        [fill],
+        "2026-07-16",
+        coverage_start="2026-07-16",
+    )
+
+    assert path.read_bytes() == original
+    loaded, _ = trend_review._load_actual_fills(tmp_path, "CN")
+    assert loaded[0].get("source_sequence") == source_sequence
+
+
+def test_tiger_reimport_keeps_legacy_fill_body_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    fill = TradeFill(
+        source_id="tiger-fill",
+        source_order_id="order-1",
+        broker="tiger",
+        account_alias="tiger_main",
+        market=Market.US,
+        symbol="AAPL",
+        currency="USD",
+        side="BUY",
+        quantity=Decimal("1"),
+        price=Decimal("200"),
+        fees=None,
+        executed_at="2026-07-16T09:30:00-04:00",
+        source_sequence=None,
+    )
+    payload = {
+        "schema_version": "open_trader.trend_review.fill.v1",
+        **asdict(fill),
+    }
+    payload.pop("source_sequence")
+    identity = trend_review._actual_fill_identity(payload)
+    digest = trend_review.hashlib.sha256(
+        trend_review._canonical_json_bytes({"identity": identity})
+    ).hexdigest()
+    path = tmp_path / "trend_review/facts/actual_fills/US" / f"{digest}.json"
+    path.parent.mkdir(parents=True)
+    original = trend_review._canonical_json_bytes(payload)
+    path.write_bytes(original)
+
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "tiger"},
+        [fill],
+        "2026-07-16",
+        coverage_start="2026-07-16",
+    )
+
+    assert path.read_bytes() == original
+    loaded, _ = trend_review._load_actual_fills(tmp_path, "US")
+    assert len(loaded) == 1
+    assert trend_review._canonical_json_bytes(loaded[0]) == original
 
 
 def test_actual_fill_batch_rejects_non_iso_execution_timestamp(
@@ -1050,6 +1213,25 @@ def test_completed_cycles_use_precise_timestamps_without_source_sequence() -> No
     assert len(cycles) == 1
 
 
+def test_completed_cycles_sort_precise_timestamps_by_instant_not_offset_text() -> None:
+    fills = [
+        asdict(
+            actual_fill(
+                "sell", "600001", "SELL", "100",
+                "2026-07-16T08:00:00+00:00",
+            )
+        ),
+        asdict(
+            actual_fill(
+                "buy", "600001", "BUY", "100",
+                "2026-07-16T09:00:00+02:00",
+            )
+        ),
+    ]
+
+    assert len(trend_review._completed_cycles(fills)) == 1
+
+
 @pytest.mark.parametrize("sequences", [(None, None), (0, 0)])
 def test_completed_cycles_rejects_ambiguous_date_only_fill_order(
     sequences: tuple[int | None, int | None],
@@ -1058,6 +1240,41 @@ def test_completed_cycles_rejects_ambiguous_date_only_fill_order(
         asdict(actual_fill("buy", "600001", "BUY", "100", "2026-07-16", source_sequence=sequences[0])),
         asdict(actual_fill("sell", "600001", "SELL", "100", "2026-07-16", source_sequence=sequences[1])),
     ]
+
+    with pytest.raises(ValueError, match="ambiguous actual fill order"):
+        trend_review._completed_cycles(fills)
+
+
+def test_legacy_completeness_without_fill_order_fails_closed_for_same_day_fills(
+    tmp_path: Path,
+) -> None:
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [
+            actual_fill(
+                "buy", "600001", "BUY", "100", "2026-07-16",
+                source_sequence=1,
+            ),
+            actual_fill(
+                "sell", "600001", "SELL", "100", "2026-07-16",
+                source_sequence=2,
+            ),
+        ],
+        "2026-07-16",
+        coverage_start="2026-07-16",
+    )
+    completeness_path = next(
+        (
+            tmp_path
+            / "trend_review/facts/actual_fill_completeness/CN"
+        ).glob("*.json")
+    )
+    legacy = json.loads(completeness_path.read_text(encoding="utf-8"))
+    legacy.pop("fill_order")
+    completeness_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    fills, _ = trend_review._load_actual_fills(tmp_path, "CN")
 
     with pytest.raises(ValueError, match="ambiguous actual fill order"):
         trend_review._completed_cycles(fills)
@@ -1119,7 +1336,9 @@ def test_projection_without_cutoff_keeps_latest_complete_discipline_snapshot(
         "trend_animals_warm_to_hot/CN/v1"
     )
     assert projection["strategy_snapshot"]["process_version"] == "latest-sha"
-    assert projection["strategy_snapshot"]["parameters"] == {}
+    assert projection["strategy_snapshot"] == trend_strategy_snapshot(
+        "CN", "latest-sha", ()
+    )
     assert projection["strategy_snapshot"]["parameter_rows"]
 
 
@@ -1361,7 +1580,7 @@ def test_projection_excludes_v1_facts_with_wrong_strategy_id(
     }
 
 
-def test_projection_rejects_mixed_parameters_within_one_strategy_version(
+def test_projection_excludes_noncanonical_parameters_within_one_strategy_version(
     tmp_path: Path,
 ) -> None:
     write_separate_review_facts(tmp_path, discipline_count=0, actual_count=0)
@@ -1370,8 +1589,11 @@ def test_projection_rejects_mixed_parameters_within_one_strategy_version(
     fact["strategy_snapshot"]["parameters"] = {"position_limit": 99}
     path.write_text(json.dumps(fact), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="strategy snapshot identity changed"):
-        trend_review.build_trend_review_projection(tmp_path, "CN")
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["strategy_snapshot"] == trend_strategy_snapshot(
+        "CN", "test-sha", ()
+    )
 
 
 def test_projection_allows_process_version_change_without_parameter_change(
@@ -1446,7 +1668,9 @@ def test_projection_snapshot_ignores_facts_after_common_cutoff(
 
     assert projection["common_cutoff"] == "2026-07-17"
     assert projection["strategy_snapshot"]["process_version"] == "test-sha"
-    assert projection["strategy_snapshot"]["parameters"] == {}
+    assert projection["strategy_snapshot"] == trend_strategy_snapshot(
+        "CN", "test-sha", ()
+    )
     assert projection["strategy_snapshot"]["strategy_version"] == "v1"
 
 

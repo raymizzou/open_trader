@@ -234,13 +234,29 @@ def test_phillips_statement_extracts_actual_trade_fills() -> None:
     assert result.fills[0].executed_at == "2026-07-10"
     assert result.fills[0].source_id
     assert result.fills[0].source_order_id == "REF00001"
+    assert result.fills_complete is True
+
+
+def test_phillips_without_transaction_section_does_not_claim_fill_completeness() -> None:
+    result = parse_phillips_text("Securities Portfolio\n", "2026-07")
+
+    assert result.fills_complete is False
+
+
+def test_phillips_non_trade_equity_activity_does_not_block_completeness() -> None:
+    result = parse_phillips_text(
+        "Transaction Details\n10/07/26 Equity REF Dividend 000700 Tencent 10.00\n",
+        "2026-07",
+    )
+
+    assert result.fills_complete is True
+    assert result.warnings == []
 
 
 @pytest.mark.parametrize(
     "line",
     [
         "10/07/26 14/07/26 Equity Sold 000700 Tencent 100 380.00 38,000.00 37,900.00",
-        "10/07/26 14/07/26 Equity REF00001 000700 Tencent 100 380.00 38,000.00 37,900.00",
         "10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent 380.00 38,000.00 37,900.00",
         "10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent 100 missing 38,000.00 37,900.00",
     ],
@@ -254,6 +270,17 @@ def test_phillips_statement_warns_for_incomplete_execution_row(line: str) -> Non
     assert [warning.code for warning in result.warnings] == [
         "invalid_execution_row"
     ]
+
+
+def test_phillips_row_without_explicit_trade_side_is_nonblocking() -> None:
+    result = parse_phillips_text(
+        "Transaction Details\n"
+        "10/07/26 14/07/26 Equity REF00001 Dividend 000700 Tencent 100.00\n",
+        "2026-07",
+    )
+
+    assert result.fills_complete is True
+    assert result.warnings == []
 
 
 def test_phillips_statement_warns_when_execution_date_is_missing() -> None:

@@ -60,6 +60,8 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
     in_positions = False
     in_cash = False
     in_account_details = False
+    transaction_section_seen = False
+    fills_complete = False
 
     for raw_line in text.splitlines():
         line = _normalize_line(raw_line)
@@ -68,6 +70,8 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
 
         if "Transaction Details" in line or "TTrraannssaaccttiioonn DDeettaaiillss" in line:
             in_transactions = True
+            transaction_section_seen = True
+            fills_complete = True
             continue
 
         if in_transactions:
@@ -98,6 +102,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
                 fills.append(fill)
                 continue
             if _is_transaction_candidate(line):
+                fills_complete = False
                 warnings.append(
                     WarningRecord(
                         statement_id=statement_id,
@@ -167,6 +172,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         positions=positions,
         cash_balances=[base_cash] if base_cash is not None else cash_balances,
         fills=fills,
+        fills_complete=transaction_section_seen and fills_complete,
         warnings=warnings,
     )
 
@@ -216,7 +222,11 @@ def _parse_transaction_line(
 
 
 def _is_transaction_candidate(line: str) -> bool:
-    return re.search(r"(?:^|\s)Equity(?:\s|$)", line, re.IGNORECASE) is not None
+    return (
+        re.search(r"(?:^|\s)Equity(?:\s|$)", line, re.IGNORECASE) is not None
+        and re.search(r"(?:^|\s)(?:Bought|Sold)(?:\s|$)", line, re.IGNORECASE)
+        is not None
+    )
 
 
 def _is_hk_execution_symbol(symbol: str) -> bool:
