@@ -308,6 +308,23 @@ def test_phillips_any_nonempty_unparsed_transaction_activity_is_incomplete(
     ]
 
 
+def test_phillips_repeated_transaction_heading_does_not_restore_completeness() -> None:
+    result = parse_phillips_text(
+        "Transaction Details\n"
+        "BROKEN TRANSACTION ACTIVITY\n"
+        "Transaction Details\n"
+        "10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent "
+        "100 380.00 38,000.00 37,900.00\n",
+        "2026-07",
+    )
+
+    assert len(result.fills) == 1
+    assert result.fills_complete is False
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
 def test_phillips_cash_section_ends_transaction_validation() -> None:
     result = parse_phillips_text(
         "Transaction Details\n"

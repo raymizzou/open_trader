@@ -69,8 +69,9 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
 
         if "Transaction Details" in line or "TTrraannssaaccttiioonn DDeettaaiillss" in line:
             in_transactions = True
+            if not transaction_section_seen:
+                fills_complete = True
             transaction_section_seen = True
-            fills_complete = True
             continue
 
         if _is_account_details_start(line):
