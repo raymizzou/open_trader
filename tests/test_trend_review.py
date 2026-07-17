@@ -783,7 +783,88 @@ def test_actual_fill_completeness_freezes_explicit_coverage_interval(
     fill_path = next(
         (tmp_path / "trend_review/facts/actual_fills/CN").glob("*.json")
     )
-    assert json.loads(fill_path.read_text(encoding="utf-8"))["source_sequence"] == 4
+    assert "source_sequence" not in json.loads(fill_path.read_text(encoding="utf-8"))
+    loaded, _ = trend_review._load_actual_fills(tmp_path, "CN")
+    assert loaded[0]["source_sequence"] == 4
+
+
+@pytest.mark.parametrize("source_sequence", [3, None])
+def test_reimport_keeps_legacy_fill_body_and_recovers_batch_order(
+    source_sequence: int | None, tmp_path: Path,
+) -> None:
+    fill = actual_fill(
+        "legacy-fill", "600001", "BUY", "100", "2026-07-16",
+        source_sequence=source_sequence,
+    )
+    payload = {
+        "schema_version": "open_trader.trend_review.fill.v1",
+        **asdict(fill),
+    }
+    payload.pop("source_sequence")
+    identity = trend_review._actual_fill_identity(payload)
+    digest = trend_review.hashlib.sha256(
+        trend_review._canonical_json_bytes({"identity": identity})
+    ).hexdigest()
+    path = tmp_path / "trend_review/facts/actual_fills/CN" / f"{digest}.json"
+    path.parent.mkdir(parents=True)
+    original = trend_review._canonical_json_bytes(payload)
+    path.write_bytes(original)
+
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"market": "CN"},
+        [fill],
+        "2026-07-16",
+        coverage_start="2026-07-16",
+    )
+
+    assert path.read_bytes() == original
+    loaded, _ = trend_review._load_actual_fills(tmp_path, "CN")
+    assert loaded[0].get("source_sequence") == source_sequence
+
+
+def test_tiger_reimport_keeps_legacy_fill_body_byte_for_byte(tmp_path: Path) -> None:
+    fill = TradeFill(
+        source_id="tiger-fill",
+        source_order_id="order-1",
+        broker="tiger",
+        account_alias="tiger_main",
+        market=Market.US,
+        symbol="AAPL",
+        currency="USD",
+        side="BUY",
+        quantity=Decimal("1"),
+        price=Decimal("200"),
+        fees=None,
+        executed_at="2026-07-16T09:30:00-04:00",
+        source_sequence=None,
+    )
+    payload = {
+        "schema_version": "open_trader.trend_review.fill.v1",
+        **asdict(fill),
+    }
+    payload.pop("source_sequence")
+    identity = trend_review._actual_fill_identity(payload)
+    digest = trend_review.hashlib.sha256(
+        trend_review._canonical_json_bytes({"identity": identity})
+    ).hexdigest()
+    path = tmp_path / "trend_review/facts/actual_fills/US" / f"{digest}.json"
+    path.parent.mkdir(parents=True)
+    original = trend_review._canonical_json_bytes(payload)
+    path.write_bytes(original)
+
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "tiger"},
+        [fill],
+        "2026-07-16",
+        coverage_start="2026-07-16",
+    )
+
+    assert path.read_bytes() == original
+    loaded, _ = trend_review._load_actual_fills(tmp_path, "US")
+    assert len(loaded) == 1
+    assert trend_review._canonical_json_bytes(loaded[0]) == original
 
 
 def test_actual_fill_batch_rejects_non_iso_execution_timestamp(
@@ -1048,6 +1129,25 @@ def test_completed_cycles_use_precise_timestamps_without_source_sequence() -> No
     cycles = trend_review._completed_cycles(fills)
 
     assert len(cycles) == 1
+
+
+def test_completed_cycles_sort_precise_timestamps_by_instant_not_offset_text() -> None:
+    fills = [
+        asdict(
+            actual_fill(
+                "sell", "600001", "SELL", "100",
+                "2026-07-16T08:00:00+00:00",
+            )
+        ),
+        asdict(
+            actual_fill(
+                "buy", "600001", "BUY", "100",
+                "2026-07-16T09:00:00+02:00",
+            )
+        ),
+    ]
+
+    assert len(trend_review._completed_cycles(fills)) == 1
 
 
 @pytest.mark.parametrize("sequences", [(None, None), (0, 0)])

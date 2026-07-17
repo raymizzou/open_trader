@@ -81,9 +81,36 @@ def test_eastmoney_statement_extracts_actual_trade_fills() -> None:
     assert result.fills[0].fees == Decimal("6.20")
     assert result.fills[0].executed_at == "2026-07-10"
     assert result.fills[0].source_id
+    assert result.fills_complete is True
 
 
-@pytest.mark.parametrize("missing_index", [0, 1, 2, 4, 5])
+def test_eastmoney_without_execution_header_does_not_claim_fill_completeness() -> None:
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS],
+        "2026-07",
+    )
+
+    assert result.fills == []
+    assert result.fills_complete is False
+
+
+def test_eastmoney_non_trade_security_activity_does_not_block_completeness() -> None:
+    header = [
+        "发生日期", "买卖类别", "证券代码", "证券名称", "成交数量",
+        "成交价格", "总发生金额", "手续费", "印花税", "过户费", "资金余额",
+    ]
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, [header, ["20260710", "证券红利", "600900", "股票", "", "", "10", "", "", "", ""]]],
+        "2026-07",
+    )
+
+    assert result.fills_complete is True
+    assert result.warnings == []
+
+
+@pytest.mark.parametrize("missing_index", [0, 2, 4, 5])
 def test_eastmoney_statement_warns_for_incomplete_execution_row(
     missing_index: int,
 ) -> None:
@@ -108,6 +135,21 @@ def test_eastmoney_statement_warns_for_incomplete_execution_row(
     assert [warning.code for warning in result.warnings] == [
         "invalid_execution_row"
     ]
+
+
+def test_eastmoney_row_without_explicit_trade_side_is_nonblocking() -> None:
+    header = [
+        "发生日期", "买卖类别", "证券代码", "证券名称", "成交数量",
+        "成交价格", "总发生金额", "手续费", "印花税", "过户费", "资金余额",
+    ]
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, [header, ["20260710", "", "600900", "股票", "100", "10", "", "", "", "", ""]]],
+        "2026-07",
+    )
+
+    assert result.fills_complete is True
+    assert result.warnings == []
 
 
 def test_eastmoney_fill_fees_require_all_fee_columns() -> None:

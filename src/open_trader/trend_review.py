@@ -8,7 +8,7 @@ import os
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -280,6 +280,7 @@ def freeze_actual_fill_batch(
     paths: list[Path] = []
     identities: list[tuple[str, str, str]] = []
     artifacts: list[tuple[Path, bytes]] = []
+    fill_order: list[dict[str, object]] = []
     for fill in fills:
         if not isinstance(fill, TradeFill):
             raise ValueError("actual fill must be a TradeFill")
@@ -316,6 +317,7 @@ def freeze_actual_fill_batch(
             or source_sequence < 0
         ):
             raise ValueError("actual fill source_sequence must be a non-negative integer")
+        payload.pop("source_sequence")
         executed_at = str(payload["executed_at"])
         try:
             execution_date = (
@@ -344,6 +346,12 @@ def freeze_actual_fill_batch(
         paths.append(path)
         artifacts.append((path, _canonical_json_bytes(payload)))
         identities.append(identity)
+        fill_order.append(
+            {
+                "identity": list(identity),
+                "source_sequence": source_sequence,
+            }
+        )
     completeness = {
         "schema_version": "open_trader.trend_review.fill_completeness.v1",
         "market": market,
@@ -352,6 +360,7 @@ def freeze_actual_fill_batch(
         "coverage_end": complete_through,
         "source_metadata": dict(source_metadata),
         "fill_identities": sorted(identities),
+        "fill_order": fill_order,
     }
     digest = hashlib.sha256(_canonical_json_bytes(completeness)).hexdigest()
     artifacts.append(
@@ -1014,6 +1023,7 @@ def _load_actual_fills(
             raise ValueError(f"invalid trend review actual fill fact: {path}")
         fills.append(payload)
     coverage: list[tuple[str, str]] = []
+    source_sequences: dict[tuple[str, str, str], int | None] = {}
     completeness_root = (
         data_dir
         / "trend_review"
@@ -1048,6 +1058,31 @@ def _load_actual_fills(
         ):
             raise ValueError(f"invalid trend review fill completeness fact: {path}")
         coverage.append((coverage_start, coverage_end))
+        raw_order = payload.get("fill_order", [])
+        if not isinstance(raw_order, list):
+            raise ValueError(f"invalid trend review fill completeness fact: {path}")
+        for item in raw_order:
+            if (
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("identity"), list)
+                or len(item["identity"]) != 3
+            ):
+                raise ValueError(f"invalid trend review fill completeness fact: {path}")
+            identity = tuple(str(value) for value in item["identity"])
+            sequence = item.get("source_sequence")
+            if sequence is not None and (
+                not isinstance(sequence, int)
+                or isinstance(sequence, bool)
+                or sequence < 0
+            ):
+                raise ValueError(f"invalid trend review fill completeness fact: {path}")
+            if identity in source_sequences and source_sequences[identity] != sequence:
+                raise ValueError(f"conflicting actual fill source order: {identity}")
+            source_sequences[identity] = sequence
+    for fill in fills:
+        identity = _actual_fill_identity(fill)
+        if identity in source_sequences and source_sequences[identity] is not None:
+            fill["source_sequence"] = source_sequences[identity]
     return fills, coverage
 
 
@@ -1092,16 +1127,23 @@ def _completed_cycles(
             for value in sequences
         ) or len(set(sequences)) != len(sequences):
             raise ValueError("ambiguous actual fill order")
-    for fill in sorted(
-        unique_fills,
-        key=lambda row: (
-            str(row["executed_at"]),
-            row.get("source_sequence")
-            if isinstance(row.get("source_sequence"), int)
-            else 0,
+    def sort_key(row: Mapping[str, object]) -> tuple[float, int, str]:
+        text = str(row["executed_at"])
+        moment = (
+            datetime.fromisoformat(f"{text}T00:00:00+00:00")
+            if len(text) == 10
+            else datetime.fromisoformat(text.replace("Z", "+00:00"))
+        )
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        sequence = row.get("source_sequence")
+        return (
+            moment.timestamp(),
+            sequence if isinstance(sequence, int) else 0,
             str(row["source_id"]),
-        ),
-    ):
+        )
+
+    for fill in sorted(unique_fills, key=sort_key):
         symbol = str(fill["symbol"])
         quantity = _required_decimal(fill["quantity"], "fill quantity")
         if quantity <= 0:
