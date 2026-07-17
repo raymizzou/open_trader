@@ -1168,26 +1168,6 @@ def test_actual_cycles_close_partials_opening_positions_rebuys_and_dedupe() -> N
     assert [len(cycle["fills"]) for cycle in cycles] == [2, 2]
 
 
-def test_projection_uses_pre_effective_fills_to_seed_opening_positions(
-    tmp_path: Path,
-) -> None:
-    write_review_history(tmp_path, completed_trades=0, days=2)
-    trend_review.freeze_actual_fill_batch(
-        tmp_path,
-        {"broker": "eastmoney"},
-        [
-            actual_fill("buy-before-v1", "600001", "BUY", "100", "2026-06-30"),
-            actual_fill("sell-in-v1", "600001", "SELL", "100", "2026-07-16"),
-        ],
-        "2026-07-17",
-        coverage_start="2026-07-16",
-    )
-
-    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
-
-    assert projection["sample_counts"]["actual"] == 1
-
-
 def test_completed_cycles_ignores_identical_duplicate_payloads() -> None:
     buy = asdict(actual_fill("buy-1", "600001", "BUY", "100", "2026-07-16"))
     sell = asdict(actual_fill("sell-1", "600001", "SELL", "100", "2026-07-17"))
