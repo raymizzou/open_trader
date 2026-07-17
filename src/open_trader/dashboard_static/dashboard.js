@@ -1993,6 +1993,12 @@ function formatTrendReviewSampleCount(review, key, label) {
   return count >= required ? `${label} ${count} 笔` : `${label} ${count} / ${required}，数据不足`;
 }
 
+function formatTrendReviewStrategyVersion(value) {
+  const version = formatPlain(value);
+  const match = /^v(.+)$/i.exec(version);
+  return match ? `第 ${match[1]} 版` : version;
+}
+
 function renderTrendReviewWorkspace(review) {
   const snapshot = review.strategy_snapshot || {};
   const rows = Array.isArray(snapshot.parameter_rows) ? snapshot.parameter_rows : [];
@@ -2000,7 +2006,7 @@ function renderTrendReviewWorkspace(review) {
     <header class="trend-review-header">
       <div><p>${escapeHtml(`${formatPlain(review.broker_label)}｜${formatPlain(review.market_label)}`)}</p>
       <h1>${escapeHtml(`${formatPlain(review.market_label)}趋势复盘`)}</h1>
-      <span>${escapeHtml(formatPlain(snapshot.strategy_name))}｜版本 ${escapeHtml(formatPlain(snapshot.strategy_version))}</span></div>
+      <span>${escapeHtml(formatPlain(snapshot.strategy_name))}｜${escapeHtml(formatTrendReviewStrategyVersion(snapshot.strategy_version))}</span></div>
       <div class="trend-review-header-side">
         <button type="button" data-close-trend-report>返回持仓看板</button>
         <span>${escapeHtml(formatTrendReviewSampleCount(review,"discipline","纪律模拟"))}</span>

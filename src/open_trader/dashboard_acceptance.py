@@ -524,6 +524,12 @@ def _plain(value: Any) -> str:
     return "-" if value is None or str(value).strip() == "" else str(value)
 
 
+def _trend_review_strategy_version(value: Any) -> str:
+    version = _plain(value)
+    match = re.fullmatch(r"v(.+)", version, flags=re.IGNORECASE)
+    return f"第 {match.group(1)} 版" if match else version
+
+
 def _display_number(value: Any) -> str:
     raw = _plain(value).strip()
     match = re.fullmatch(r"([+-]?)(\d+)(\.\d+)?", raw)
@@ -1551,8 +1557,8 @@ def _check_trend_review(
     header_left_items = [
         f"{_plain(review.get('broker_label'))}｜{market_label}",
         f"{market_label}趋势复盘",
-        f"{_plain(snapshot.get('strategy_name'))}｜版本 "
-        f"{_plain(snapshot.get('strategy_version'))}",
+        f"{_plain(snapshot.get('strategy_name'))}｜"
+        f"{_trend_review_strategy_version(snapshot.get('strategy_version'))}",
     ]
     rendered_header_left = workspace.locator(
         ".trend-review-header > div:first-child > *"
@@ -1573,7 +1579,7 @@ def _check_trend_review(
         f"{market_label}趋势复盘",
         _plain(review.get("broker_label")),
         _plain(snapshot.get("strategy_name")),
-        f"版本 {_plain(snapshot.get('strategy_version'))}",
+        _trend_review_strategy_version(snapshot.get("strategy_version")),
         "当前策略参数",
         *header_items,
         *(title for _series, _label, title in TREND_REVIEW_COMPARISONS),

@@ -891,7 +891,7 @@ def test_acceptance_rejects_trend_review_header_left_order_drift() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
     page.review_header_left_texts = [
-        "美股趋势复盘", "老虎｜美股", "美股短线右侧趋势｜版本 v1",
+        "美股趋势复盘", "老虎｜美股", "美股短线右侧趋势｜第 1 版",
     ]
     section = dashboard_acceptance._select_account_tab(page, "tiger")
 
@@ -911,7 +911,7 @@ def test_acceptance_rejects_arbitrary_english_trend_review_chrome(
         page.review_metric_reason = "Ready"
     else:
         page.review_header_left_texts = [
-            "老虎｜美股 Ready", "美股趋势复盘", "美股短线右侧趋势｜版本 v1",
+            "老虎｜美股 Ready", "美股趋势复盘", "美股短线右侧趋势｜第 1 版",
         ]
     section = dashboard_acceptance._select_account_tab(page, "tiger")
 
@@ -1163,7 +1163,7 @@ def trend_review_workspace_text(broker: str) -> str:
     snapshot = review["strategy_snapshot"]
     return (
         f"{review['broker_label']}｜{review['market_label']} "
-        f"{review['market_label']}趋势复盘 {snapshot['strategy_name']}｜版本 v1 "
+        f"{review['market_label']}趋势复盘 {snapshot['strategy_name']}｜第 1 版 "
         "返回持仓看板 纪律模拟 31 笔 实际执行 29 / 30，数据不足 "
         "共同截止日 2026-07-17 "
         "当前策略参数 仓位执行 持仓上限 10 笔 "
@@ -1748,7 +1748,7 @@ class TabbedAccountLocator:
             return [
                 f"{review['broker_label']}｜{review['market_label']}",
                 f"{review['market_label']}趋势复盘",
-                f"{snapshot['strategy_name']}｜版本 {snapshot['strategy_version']}",
+                f"{snapshot['strategy_name']}｜第 1 版",
             ]
         if self.selector == "#trend-report-workspace:visible .trend-review-header-side > *":
             return [
