@@ -113,10 +113,28 @@ class FutuSimulateOrderExecutionClient:
             "raw": raw,
         }
 
-    def list_orders(self) -> dict[str, Any]:
+    def list_orders(
+        self,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, object] = {
+            "trd_env": TRD_ENV_SIMULATE,
+            "acc_id": self.account["acc_id"],
+            "acc_index": self.account["acc_index"],
+        }
+        if start is not None or end is not None:
+            kwargs["start"] = start
+            kwargs["end"] = end
+        ret_code, data = self.context.history_order_list_query(**kwargs)
+        if ret_code != 0:
+            raise FutuOrderExecutionError(
+                str(data), error_type="history_order_list_query_failed"
+            )
         return {
             "acc_id": self.account["acc_id"],
-            "orders": self._query("order_list_query"),
+            "orders": [dict(item) for item in _records(data)],
         }
 
     def _query(self, method_name: str) -> list[dict[str, Any]]:
