@@ -328,6 +328,40 @@ Equity XHKG 003433 CSOP UST20 610 10/07/26 0 66.5600 0.00 0.0000 0.00
     ]
 
 
+def test_phillips_execution_skips_name_shared_by_multiple_hk_symbols() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+10/07/26 14/07/26 Equity REF00001 Sold Shared Name 1 10.00 10.00 9.00
+Securities Portfolio
+Equity XHKG 003433 Shared Name 1 10/07/26 1 10.00 10.00 0.50 5.00
+Equity XHKG 000200 Shared Name 1 10/07/26 1 10.00 10.00 0.50 5.00
+""",
+        "2026-07",
+    )
+
+    assert result.fills == []
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
+def test_phillips_execution_skips_name_shared_by_hk_and_us_symbols() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+10/07/26 14/07/26 Equity REF00001 Sold Shared Name 1 10.00 10.00 9.00
+Securities Portfolio
+Equity XNAS AAPL Shared Name 1 10/07/26 1 10.00 10.00 0.50 5.00
+Equity XHKG 000200 Shared Name 1 10/07/26 1 10.00 10.00 0.50 5.00
+""",
+        "2026-07",
+    )
+
+    assert result.fills == []
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
 def test_parse_phillips_text_extracts_equity_rows_and_account_cash() -> None:
     result = parse_phillips_text(
         """戶口資料 Account Details

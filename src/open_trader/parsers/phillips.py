@@ -172,7 +172,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
 def _parse_transaction_line(
     line: str,
     occurrence: int,
-    position_products: dict[str, tuple[Market, str]],
+    position_products: dict[str, set[tuple[Market, str]]],
 ) -> TradeFill | None:
     match = TRANSACTION_LINE.fullmatch(line)
     if match is None:
@@ -222,34 +222,38 @@ def _is_hk_execution_symbol(symbol: str) -> bool:
 def _position_products_by_name(
     text: str,
     statement_id: str,
-) -> dict[str, tuple[Market, str]]:
-    return {
-        _normalize_line(position.name).upper(): (position.market, position.symbol)
-        for raw_line in text.splitlines()
-        if (position := _parse_position_line(_normalize_line(raw_line), statement_id))
-        is not None
-        and position.name
-    }
+) -> dict[str, set[tuple[Market, str]]]:
+    products: dict[str, set[tuple[Market, str]]] = {}
+    for raw_line in text.splitlines():
+        position = _parse_position_line(_normalize_line(raw_line), statement_id)
+        if position is not None and position.name:
+            products.setdefault(_normalize_line(position.name).upper(), set()).add(
+                (position.market, position.symbol)
+            )
+    return products
 
 
 def _resolve_execution_symbol(
     description: str,
-    position_products: dict[str, tuple[Market, str]],
+    position_products: dict[str, set[tuple[Market, str]]],
 ) -> str | None:
     normalized = _normalize_line(description).upper()
     first = normalized.split()[0] if normalized else ""
     if _is_hk_execution_symbol(first):
         return _normalize_phillips_symbol(first, Market.HK).zfill(5)
-    product = position_products.get(normalized)
-    return product[1] if product is not None and product[0] is Market.HK else None
+    products = position_products.get(normalized, set())
+    if len(products) != 1:
+        return None
+    market, symbol = next(iter(products))
+    return symbol if market is Market.HK else None
 
 
 def _looks_like_us_execution(
     description: str,
-    position_products: dict[str, tuple[Market, str]],
+    position_products: dict[str, set[tuple[Market, str]]],
 ) -> bool:
-    product = position_products.get(_normalize_line(description).upper())
-    return product is not None and product[0] is Market.US
+    products = position_products.get(_normalize_line(description).upper(), set())
+    return len(products) == 1 and next(iter(products))[0] is Market.US
 
 
 def _parse_position_line(line: str, statement_id: str) -> Position | None:
