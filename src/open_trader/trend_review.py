@@ -1425,9 +1425,47 @@ def build_trend_review_projection(
         if common_cutoff is not None
         and effective_from <= str(fact["date"]) <= common_cutoff
     ]
+
+    def has_complete_snapshot(fact: Mapping[str, object]) -> bool:
+        candidate = fact.get("strategy_snapshot")
+        if not isinstance(candidate, Mapping):
+            return False
+        rows = candidate.get("parameter_rows")
+        return (
+            candidate.get("strategy_version") == "v1"
+            and all(
+                isinstance(candidate.get(key), str) and bool(candidate[key].strip())
+                for key in (
+                    "strategy_id",
+                    "strategy_name",
+                    "strategy_version",
+                    "process_version",
+                )
+            )
+            and isinstance(candidate.get("parameters"), Mapping)
+            and isinstance(rows, list)
+            and bool(rows)
+            and all(
+                isinstance(row, Mapping)
+                and set(row) == {"group", "name", "value"}
+                and all(
+                    isinstance(row[key], str) and bool(row[key].strip())
+                    for key in row
+                )
+                for row in rows
+            )
+        )
+
+    snapshot_facts = [
+        fact
+        for fact in discipline_facts
+        if effective_from <= str(fact["date"])
+        and (common_cutoff is None or str(fact["date"]) <= common_cutoff)
+        and has_complete_snapshot(fact)
+    ]
     snapshot = (
-        dict(interval_discipline[-1]["strategy_snapshot"])
-        if interval_discipline
+        dict(snapshot_facts[-1]["strategy_snapshot"])
+        if snapshot_facts
         else {}
     )
     snapshot["effective_from"] = effective_from

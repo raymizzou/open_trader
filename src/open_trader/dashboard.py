@@ -395,32 +395,31 @@ def _valid_trend_review_projection(
         or set(metrics) != TREND_REVIEW_METRICS
     ):
         return False
-    if common_cutoff is not None:
-        for key in (
-            "strategy_id",
-            "strategy_name",
-            "strategy_version",
-            "process_version",
-        ):
-            if not isinstance(snapshot.get(key), str) or not snapshot[key].strip():
-                return False
-        if not isinstance(snapshot.get("parameters"), dict):
+    for key in (
+        "strategy_id",
+        "strategy_name",
+        "strategy_version",
+        "process_version",
+    ):
+        if not isinstance(snapshot.get(key), str) or not snapshot[key].strip():
             return False
-        rows = snapshot.get("parameter_rows")
-        if (
-            not isinstance(rows, list)
-            or not rows
+    if not isinstance(snapshot.get("parameters"), dict):
+        return False
+    rows = snapshot.get("parameter_rows")
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or any(
+            not isinstance(row, dict)
+            or set(row) != {"group", "name", "value"}
             or any(
-                not isinstance(row, dict)
-                or set(row) != {"group", "name", "value"}
-                or any(
-                    not isinstance(row[key], str) or not row[key].strip()
-                    for key in row
-                )
-                for row in rows
+                not isinstance(row[key], str) or not row[key].strip()
+                for key in row
             )
-        ):
-            return False
+            for row in rows
+        )
+    ):
+        return False
     return all(
         isinstance(metrics[key], dict)
         and set(metrics[key]) == TREND_REVIEW_SERIES

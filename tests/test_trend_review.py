@@ -635,7 +635,9 @@ def strategy_snapshot(market: str = "CN", version: str = "v1") -> dict[str, obje
         "market": market,
         "effective_from": "2026-07-14",
         "process_version": "test-sha",
-        "parameter_rows": [],
+        "parameter_rows": [
+            {"group": "rules", "name": "position limit", "value": "10"}
+        ],
         "parameters": {},
     }
 
@@ -1052,6 +1054,30 @@ def test_missing_actual_fill_source_stops_common_cutoff(tmp_path: Path) -> None:
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
     assert projection["common_cutoff"] is None
+
+
+def test_projection_without_cutoff_keeps_latest_complete_discipline_snapshot(
+    tmp_path: Path,
+) -> None:
+    write_review_history(tmp_path, completed_trades=0, days=2)
+    latest_path = tmp_path / "trend_review/daily/CN/2026-07-17.json"
+    latest = json.loads(latest_path.read_text(encoding="utf-8"))
+    latest["strategy_snapshot"] = {
+        **latest["strategy_snapshot"],
+        "process_version": "latest-sha",
+        "parameters": {"position_limit": 12},
+    }
+    latest_path.write_text(json.dumps(latest), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["common_cutoff"] is None
+    assert projection["strategy_snapshot"]["strategy_id"] == (
+        "trend_animals_warm_to_hot/CN/v1"
+    )
+    assert projection["strategy_snapshot"]["process_version"] == "latest-sha"
+    assert projection["strategy_snapshot"]["parameters"] == {"position_limit": 12}
+    assert projection["strategy_snapshot"]["parameter_rows"]
 
 
 def test_us_projection_belongs_to_tiger_trend_account(tmp_path: Path) -> None:

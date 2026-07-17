@@ -320,7 +320,6 @@ def test_dashboard_keeps_null_common_cutoff_available(tmp_path: Path) -> None:
     payload = trend_review_projection("US", "tiger")
     payload["common_cutoff"] = None
     payload["interval"] = {"start": "2026-07-17", "end": None}
-    payload["strategy_snapshot"] = {"effective_from": "2026-07-17"}
     path = tmp_path / "data/latest/trend_review_us.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -335,6 +334,26 @@ def test_dashboard_keeps_null_common_cutoff_available(tmp_path: Path) -> None:
     }
     assert review["common_cutoff"] is None
     assert review["interval"] == {"start": "2026-07-17", "end": None}
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [{}, {"effective_from": "2026-07-17"}],
+)
+def test_dashboard_rejects_incomplete_snapshot_without_common_cutoff(
+    tmp_path: Path, snapshot: dict[str, object]
+) -> None:
+    payload = trend_review_projection("US", "tiger")
+    payload["common_cutoff"] = None
+    payload["interval"] = {"start": "2026-07-17", "end": None}
+    payload["strategy_snapshot"] = snapshot
+    path = tmp_path / "data/latest/trend_review_us.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+
+    assert review["available"] is False
 
 
 @pytest.mark.parametrize(
