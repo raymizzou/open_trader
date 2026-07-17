@@ -317,6 +317,7 @@ def freeze_actual_fill_batch(
             or source_sequence < 0
         ):
             raise ValueError("actual fill source_sequence must be a non-negative integer")
+        sequence_bearing_body = _canonical_json_bytes(payload)
         payload.pop("source_sequence")
         executed_at = str(payload["executed_at"])
         try:
@@ -344,7 +345,10 @@ def freeze_actual_fill_batch(
             / f"{digest}.json"
         )
         paths.append(path)
-        artifacts.append((path, _canonical_json_bytes(payload)))
+        body = _canonical_json_bytes(payload)
+        if path.exists() and path.read_bytes() == sequence_bearing_body:
+            body = sequence_bearing_body
+        artifacts.append((path, body))
         identities.append(identity)
         fill_order.append(
             {

@@ -823,6 +823,39 @@ def test_reimport_keeps_legacy_fill_body_and_recovers_batch_order(
     assert loaded[0].get("source_sequence") == source_sequence
 
 
+def test_reimport_keeps_sequence_bearing_fill_body_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    fill = actual_fill(
+        "existing-fill", "600001", "BUY", "100", "2026-07-16",
+        source_sequence=4,
+    )
+    payload = {
+        "schema_version": "open_trader.trend_review.fill.v1",
+        **asdict(fill),
+    }
+    identity = trend_review._actual_fill_identity(payload)
+    digest = trend_review.hashlib.sha256(
+        trend_review._canonical_json_bytes({"identity": identity})
+    ).hexdigest()
+    path = tmp_path / "trend_review/facts/actual_fills/CN" / f"{digest}.json"
+    path.parent.mkdir(parents=True)
+    original = trend_review._canonical_json_bytes(payload)
+    path.write_bytes(original)
+
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"market": "CN"},
+        [fill],
+        "2026-07-16",
+        coverage_start="2026-07-16",
+    )
+
+    assert path.read_bytes() == original
+    loaded, _ = trend_review._load_actual_fills(tmp_path, "CN")
+    assert loaded[0]["source_sequence"] == 4
+
+
 def test_tiger_reimport_keeps_legacy_fill_body_byte_for_byte(tmp_path: Path) -> None:
     fill = TradeFill(
         source_id="tiger-fill",
