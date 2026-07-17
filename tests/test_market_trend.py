@@ -97,6 +97,8 @@ def test_market_strategy_snapshot_matches_runtime_rules(
         "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
         "candidate_limit": 10,
         "position_limit": 10,
+        "use_available_cash": True,
+        "trailing_activation_signals": ["boiling", "champagne"],
         "target_weight": "0.04",
         **market_parameters,
         "initial_protection_atr_multiple": "2",
@@ -108,6 +110,11 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     assert all(
         set(row) == {"group", "name", "value"}
         for row in snapshot["parameter_rows"]
+    )
+    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
+    assert rows["买入数量"].startswith("使用已有现金，")
+    assert rows["过热跟踪"] == (
+        "沸腾或开香槟触发后，取原保护线与此前5个完整交易日最低价较高者，只升不降"
     )
 
 

@@ -302,6 +302,8 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
         "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
         "candidate_limit": 10,
         "position_limit": 10,
+        "use_available_cash": True,
+        "trailing_activation_signals": ["boiling", "champagne"],
         "target_weight": {"热": "0.04", "沸": "0.02"},
         "lot_size": 100,
         "buy_window": "09:30-10:00",
@@ -324,6 +326,11 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
         set(row) == {"group", "name", "value"}
         for row in snapshot["parameter_rows"]
     )
+    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
+    assert {
+        "买入数量": "使用已有现金，按100股整数倍向下取整",
+        "过热跟踪": "沸腾或开香槟触发后，取原保护线与此前5个完整交易日最低价较高者，只升不降",
+    }.items() <= rows.items()
 
     built = report(candidates=(candidate("600001"),))
     assert built.buy_actions[0].lot_size == 100
@@ -353,7 +360,32 @@ def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
         strategy_snapshot={**built.strategy_snapshot, "parameters": parameters},
     )
 
-    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+    with pytest.raises(
+        ValueError, match="strategy snapshot does not match report actions"
+    ):
+        trend_module.validate_report_strategy_snapshot(broken)
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("use_available_cash", False),
+        ("trailing_activation_signals", ["boiling"]),
+    ],
+)
+def test_report_rejects_snapshot_that_changes_shared_execution_rules(
+    parameter: str, value: object
+) -> None:
+    built = report(candidates=(candidate("600001"),))
+    parameters = {**built.strategy_snapshot["parameters"], parameter: value}
+    broken = replace(
+        built,
+        strategy_snapshot={**built.strategy_snapshot, "parameters": parameters},
+    )
+
+    with pytest.raises(
+        ValueError, match="strategy snapshot does not match report actions"
+    ):
         trend_module.validate_report_strategy_snapshot(broken)
 
 
