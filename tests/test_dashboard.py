@@ -227,8 +227,11 @@ def serialized_trend_position() -> dict[str, object]:
 
 
 def trend_review_projection(market: str, broker: str) -> dict[str, object]:
+    effective_from = {"CN": "2026-07-16", "US": "2026-07-17", "HK": "2026-07-17"}[
+        market
+    ]
     return {
-        "schema_version": "open_trader.trend_review.projection.v1",
+        "schema_version": "open_trader.trend_review.projection.v2",
         "available": True,
         "market": market,
         "market_label": {"CN": "A 股", "US": "美股", "HK": "港股"}[market],
@@ -238,6 +241,7 @@ def trend_review_projection(market: str, broker: str) -> dict[str, object]:
             "strategy_name": f"{market} 短线右侧趋势",
             "strategy_version": "v1",
             "process_version": "abc1234",
+            "effective_from": effective_from,
             "parameters": {"position_limit": 10},
             "parameter_rows": [
                 {"group": "仓位执行", "name": "持仓上限", "value": "10 笔"},
@@ -251,6 +255,11 @@ def trend_review_projection(market: str, broker: str) -> dict[str, object]:
             "end_date": "2026-07-17",
         },
         "batch_path": "batch.json",
+        "source_path": "/private/trend-review-source.json",
+        "source_artifacts": ["private-fill-batch.json"],
+        "sample_counts": {"discipline": 31, "actual": 29, "required": 30},
+        "common_cutoff": "2026-07-17",
+        "interval": {"start": effective_from, "end": "2026-07-17"},
         "metrics": {
             key: {
                 series: {"value": value, "reason": None}
@@ -288,14 +297,50 @@ def test_dashboard_loads_only_strict_market_matched_trend_reviews(
     assert set(reviews) == {"eastmoney", "tiger", "phillips"}
     assert reviews["eastmoney"]["market"] == "CN"
     assert reviews["tiger"]["strategy_snapshot"]["strategy_version"] == "v1"
+    assert reviews["eastmoney"]["sample_counts"] == {
+        "discipline": 31,
+        "actual": 29,
+        "required": 30,
+    }
+    assert reviews["eastmoney"]["common_cutoff"] == "2026-07-17"
+    assert reviews["eastmoney"]["interval"] == {
+        "start": "2026-07-16",
+        "end": "2026-07-17",
+    }
     assert reviews["phillips"]["metrics"]["calmar"]["actual"]["value"] == "9.4"
-    assert "batch" not in reviews["tiger"]
-    assert "batch_path" not in reviews["tiger"]
+    assert not {
+        "batch",
+        "batch_path",
+        "source_path",
+        "source_artifacts",
+    } & reviews["tiger"].keys()
+
+
+def test_dashboard_keeps_null_common_cutoff_available(tmp_path: Path) -> None:
+    payload = trend_review_projection("US", "tiger")
+    payload["common_cutoff"] = None
+    payload["interval"] = {"start": "2026-07-17", "end": None}
+    payload["strategy_snapshot"] = {"effective_from": "2026-07-17"}
+    path = tmp_path / "data/latest/trend_review_us.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+
+    assert review["available"] is True
+    assert review["sample_counts"] == {
+        "discipline": 31,
+        "actual": 29,
+        "required": 30,
+    }
+    assert review["common_cutoff"] is None
+    assert review["interval"] == {"start": "2026-07-17", "end": None}
 
 
 @pytest.mark.parametrize(
     ("mutation", "broker"),
     [
+        (lambda payload: payload.update(schema_version="v1"), "tiger"),
         (lambda payload: payload.update(market="HK"), "tiger"),
         (lambda payload: payload["metrics"].pop("sharpe"), "tiger"),
         (
@@ -306,6 +351,36 @@ def test_dashboard_loads_only_strict_market_matched_trend_reviews(
         ),
         (
             lambda payload: payload["strategy_snapshot"].update(parameter_rows=[]),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_counts"].update(discipline=True),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_counts"].update(actual=-1),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_counts"].update(required=29),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_counts"].update(internal=1),
+            "tiger",
+        ),
+        (lambda payload: payload.update(common_cutoff="2026/07/17"), "tiger"),
+        (lambda payload: payload.update(common_cutoff="2026-02-30"), "tiger"),
+        (
+            lambda payload: payload["interval"].update(start="2026-07-16"),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["interval"].update(end="2026-07-18"),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["interval"].update(source="internal"),
             "tiger",
         ),
     ],

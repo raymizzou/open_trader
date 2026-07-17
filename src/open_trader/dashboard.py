@@ -140,6 +140,7 @@ TREND_REVIEW_METRICS = {
     "sharpe",
 }
 TREND_REVIEW_SERIES = {"discipline", "actual", "benchmark"}
+ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -344,45 +345,82 @@ def _valid_trend_review_metric_cell(value: object) -> bool:
     return finite and reason is None
 
 
+def _valid_iso_date(value: object) -> bool:
+    if not isinstance(value, str) or not ISO_DATE.fullmatch(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _valid_trend_review_projection(
     payload: object, *, broker: str, market: str
 ) -> bool:
     if not isinstance(payload, dict):
         return False
     snapshot = payload.get("strategy_snapshot")
+    sample_counts = payload.get("sample_counts")
+    common_cutoff = payload.get("common_cutoff")
+    interval = payload.get("interval")
     metrics = payload.get("metrics")
     if (
-        payload.get("schema_version") != "open_trader.trend_review.projection.v1"
+        payload.get("schema_version") != "open_trader.trend_review.projection.v2"
         or payload.get("available") is not True
         or payload.get("broker") != broker
         or payload.get("market") != market
         or not isinstance(snapshot, dict)
+        or not isinstance(sample_counts, dict)
+        or set(sample_counts) != {"discipline", "actual", "required"}
+        or any(
+            type(sample_counts[key]) is not int or sample_counts[key] < 0
+            for key in ("discipline", "actual")
+        )
+        or type(sample_counts["required"]) is not int
+        or sample_counts["required"] != 30
+        or not isinstance(interval, dict)
+        or set(interval) != {"start", "end"}
+        or not _valid_iso_date(interval["start"])
+        or snapshot.get("effective_from") != interval["start"]
+        or interval["end"] != common_cutoff
+        or (
+            common_cutoff is not None
+            and (
+                not _valid_iso_date(common_cutoff)
+                or common_cutoff < interval["start"]
+            )
+        )
         or not isinstance(metrics, dict)
         or set(metrics) != TREND_REVIEW_METRICS
     ):
         return False
-    for key in (
-        "strategy_id",
-        "strategy_name",
-        "strategy_version",
-        "process_version",
-    ):
-        if not isinstance(snapshot.get(key), str) or not snapshot[key].strip():
+    if common_cutoff is not None:
+        for key in (
+            "strategy_id",
+            "strategy_name",
+            "strategy_version",
+            "process_version",
+        ):
+            if not isinstance(snapshot.get(key), str) or not snapshot[key].strip():
+                return False
+        if not isinstance(snapshot.get("parameters"), dict):
             return False
-    if not isinstance(snapshot.get("parameters"), dict):
-        return False
-    rows = snapshot.get("parameter_rows")
-    if (
-        not isinstance(rows, list)
-        or not rows
-        or any(
-            not isinstance(row, dict)
-            or set(row) != {"group", "name", "value"}
-            or any(not isinstance(row[key], str) or not row[key].strip() for key in row)
-            for row in rows
-        )
-    ):
-        return False
+        rows = snapshot.get("parameter_rows")
+        if (
+            not isinstance(rows, list)
+            or not rows
+            or any(
+                not isinstance(row, dict)
+                or set(row) != {"group", "name", "value"}
+                or any(
+                    not isinstance(row[key], str) or not row[key].strip()
+                    for key in row
+                )
+                for row in rows
+            )
+        ):
+            return False
     return all(
         isinstance(metrics[key], dict)
         and set(metrics[key]) == TREND_REVIEW_SERIES
@@ -419,6 +457,9 @@ def _load_trend_reviews(data_dir: Path) -> dict[str, dict[str, Any]]:
             "market": market,
             "market_label": market_label,
             "strategy_snapshot": payload["strategy_snapshot"],
+            "sample_counts": payload["sample_counts"],
+            "common_cutoff": payload["common_cutoff"],
+            "interval": payload["interval"],
             "metrics": payload["metrics"],
         }
     return reviews
