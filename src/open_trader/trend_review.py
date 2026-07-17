@@ -194,6 +194,14 @@ def freeze_benchmark_fact(
     )
 
 
+def _actual_fill_identity(fill: Mapping[str, object]) -> tuple[str, str, str]:
+    return (
+        str(fill["broker"]),
+        str(fill["account_alias"]),
+        str(fill["source_id"]),
+    )
+
+
 def freeze_actual_fill_batch(
     data_dir: Path,
     source_metadata: Mapping[str, object],
@@ -211,12 +219,18 @@ def freeze_actual_fill_batch(
         }.get(str(source_metadata.get("broker") or "").lower())
     market = _market(raw_market)
     paths: list[Path] = []
-    identities: list[str] = []
+    identities: list[tuple[str, str, str]] = []
     for fill in fills:
         if _market(fill.market) != market:
             raise ValueError("actual fill market does not match source metadata")
-        identity = f"{fill.broker}:{fill.account_alias}:{fill.source_id}"
-        digest = hashlib.sha256(f"{fill.broker}:{fill.source_id}".encode()).hexdigest()
+        payload = {
+            "schema_version": "open_trader.trend_review.fill.v1",
+            **asdict(fill),
+        }
+        identity = _actual_fill_identity(payload)
+        digest = hashlib.sha256(
+            _canonical_json_bytes({"identity": identity})
+        ).hexdigest()
         paths.append(
             _write_immutable(
                 data_dir
@@ -225,12 +239,7 @@ def freeze_actual_fill_batch(
                 / "actual_fills"
                 / market
                 / f"{digest}.json",
-                _canonical_json_bytes(
-                    {
-                        "schema_version": "open_trader.trend_review.fill.v1",
-                        **asdict(fill),
-                    }
-                ),
+                _canonical_json_bytes(payload),
             )
         )
         identities.append(identity)
@@ -917,11 +926,7 @@ def _completed_cycles(
     for fill in sorted(
         fills, key=lambda row: (str(row["executed_at"]), str(row["source_id"]))
     ):
-        identity = (
-            str(fill["broker"]),
-            str(fill["account_alias"]),
-            str(fill["source_id"]),
-        )
+        identity = _actual_fill_identity(fill)
         if identity in seen:
             continue
         seen.add(identity)
@@ -1291,14 +1296,6 @@ def build_trend_review_projection(
         for trading_date in sorted(actual_by_date)
         if is_v1(actual_by_date[trading_date])
     ]
-    snapshots = [
-        fact["strategy_snapshot"]
-        for fact in [*discipline_facts, *actual_facts]
-        if isinstance(fact.get("strategy_snapshot"), Mapping)
-    ]
-    snapshot = dict(snapshots[-1]) if snapshots else {}
-    snapshot["effective_from"] = effective_from
-
     fills, actual_complete_through = _load_actual_fills(data_dir, market)
     equity_cutoff = _common_cutoff(
         effective_from,
@@ -1325,6 +1322,14 @@ def build_trend_review_projection(
         if common_cutoff is not None
         and effective_from <= str(fact["date"]) <= common_cutoff
     ]
+    if any(not is_v1(fact) for fact in interval_discipline):
+        raise ValueError("discipline fact strategy version does not match projection")
+    snapshot = (
+        dict(interval_discipline[-1]["strategy_snapshot"])
+        if interval_discipline
+        else {}
+    )
+    snapshot["effective_from"] = effective_from
     discipline_cycles = _completed_trades(interval_discipline)
     interval_actual = {
         str(fact["date"]): fact
@@ -1339,14 +1344,9 @@ def build_trend_review_projection(
         and effective_from <= str(fill["executed_at"])[:10] <= common_cutoff
         and str(fill["executed_at"])[:10] in interval_actual
     ]
-    opening_fact = next(
-        (
-            fact
-            for fact in interval_actual.values()
-            if fact.get("new_fact") is True
-        ),
-        None,
-    )
+    opening_fact = interval_actual.get(effective_from)
+    if opening_fact is not None and opening_fact.get("new_fact") is not True:
+        opening_fact = None
     opening_positions = (
         [
             {**position, "opened_at": position.get("opened_at", opening_fact["date"])}

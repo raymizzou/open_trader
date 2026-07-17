@@ -645,18 +645,21 @@ def actual_fill(
     side: str,
     quantity: str,
     executed_at: str,
+    *,
+    account_alias: str = "eastmoney_main",
+    price: str = "10",
 ) -> TradeFill:
     return TradeFill(
         source_id=source_id,
         source_order_id=None,
         broker="eastmoney",
-        account_alias="eastmoney_main",
+        account_alias=account_alias,
         market=Market.CN,
         symbol=symbol,
         currency="CNY",
         side=side,
         quantity=Decimal(quantity),
-        price=Decimal("10"),
+        price=Decimal(price),
         fees=Decimal("0"),
         executed_at=executed_at,
     )
@@ -667,6 +670,7 @@ def write_separate_review_facts(
     *,
     discipline_count: int,
     actual_count: int,
+    complete_through: str | None = None,
 ) -> None:
     snapshot = strategy_snapshot()
     start = date(2026, 7, 16)
@@ -731,11 +735,58 @@ def write_separate_review_facts(
         root,
         {"market": "CN", "source": "test"},
         fills,
-        (start + timedelta(days=39)).isoformat(),
+        complete_through or (start + timedelta(days=39)).isoformat(),
     )
     rates = root / "rates/DGS3MO.csv"
     rates.parent.mkdir(parents=True)
     rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
+
+
+def test_actual_fill_identity_includes_account_alias(tmp_path: Path) -> None:
+    paths = trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"market": "CN", "source": "test"},
+        [
+            actual_fill(
+                "shared-id", "600001", "BUY", "100", "2026-07-16",
+                account_alias="account-a",
+            ),
+            actual_fill(
+                "shared-id", "600001", "BUY", "100", "2026-07-16",
+                account_alias="account-b",
+            ),
+        ],
+        "2026-07-16",
+    )
+
+    assert len(set(paths)) == 2
+    assert all(path.exists() for path in paths)
+
+
+def test_actual_fill_identity_is_idempotent_only_for_identical_payload(
+    tmp_path: Path,
+) -> None:
+    fill = actual_fill("fill-1", "600001", "BUY", "100", "2026-07-16")
+    first = trend_review.freeze_actual_fill_batch(
+        tmp_path, {"market": "CN"}, [fill], "2026-07-16"
+    )
+    second = trend_review.freeze_actual_fill_batch(
+        tmp_path, {"market": "CN"}, [fill], "2026-07-16"
+    )
+
+    assert second == first
+    with pytest.raises(FileExistsError, match="immutable artifact collision"):
+        trend_review.freeze_actual_fill_batch(
+            tmp_path,
+            {"market": "CN"},
+            [
+                actual_fill(
+                    "fill-1", "600001", "BUY", "100", "2026-07-16",
+                    price="11",
+                )
+            ],
+            "2026-07-16",
+        )
 
 
 def write_review_history(
@@ -964,3 +1015,52 @@ def test_projection_does_not_mix_strategy_versions(tmp_path: Path) -> None:
     assert projection["strategy_snapshot"]["strategy_version"] == "v1"
     assert projection["strategy_snapshot"]["effective_from"] == "2026-07-16"
     assert projection["sample_counts"]["discipline"] == 30
+
+
+def test_projection_snapshot_ignores_facts_after_common_cutoff(
+    tmp_path: Path,
+) -> None:
+    write_separate_review_facts(
+        tmp_path,
+        discipline_count=0,
+        actual_count=0,
+        complete_through="2026-07-17",
+    )
+    for stream in ("discipline", "actual_equity"):
+        path = tmp_path / f"trend_review/facts/{stream}/CN/2026-08-24.json"
+        fact = json.loads(path.read_text(encoding="utf-8"))
+        fact["strategy_snapshot"] = {
+            **fact["strategy_snapshot"],
+            "process_version": "future-sha",
+            "parameters": {"future": True},
+        }
+        path.write_text(json.dumps(fact), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["common_cutoff"] == "2026-07-17"
+    assert projection["strategy_snapshot"]["process_version"] == "test-sha"
+    assert projection["strategy_snapshot"]["parameters"] == {}
+    assert projection["strategy_snapshot"]["strategy_version"] == "v1"
+
+
+def test_late_opening_fact_never_backfills_an_earlier_sell(tmp_path: Path) -> None:
+    write_review_history(tmp_path, completed_trades=0, days=2)
+    snapshot = strategy_snapshot()
+    trend_review.freeze_actual_equity_fact(
+        tmp_path,
+        "CN",
+        "2026-07-17",
+        "100000",
+        [{"symbol": "600001", "quantity": "100", "opened_at": "2026-07-17"}],
+        snapshot,
+    )
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [actual_fill("sell-1", "600001", "SELL", "100", "2026-07-16")],
+        "2026-07-17",
+    )
+
+    with pytest.raises(ValueError, match="sell fill exceeds actual position"):
+        trend_review.build_trend_review_projection(tmp_path, "CN")
