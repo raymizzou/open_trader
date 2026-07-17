@@ -88,8 +88,13 @@ def futu_module_available(
 def futu_module_unsupported(module: object) -> bool:
     return bool(
         isinstance(module, dict)
-        and module.get("status") == "error"
-        and str(module.get("summary") or "").startswith("富途接口不支持")
+        and (
+            module.get("status") == "not_applicable"
+            or (
+                module.get("status") == "error"
+                and str(module.get("summary") or "").startswith("富途接口不支持")
+            )
+        )
     )
 
 

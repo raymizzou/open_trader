@@ -94,10 +94,18 @@ def test_evaluate_required_sources_accepts_complete_current_records() -> None:
 def test_evaluate_required_sources_accepts_explicit_futu_unsupported_module() -> None:
     records = _records()
     records["futu_records"][("US", "MSFT")]["technical_anomaly"] = {
-        "status": "error",
+        "status": "not_applicable",
         "summary": "富途接口不支持技术异动：US.MSFT",
     }
 
+    assert evaluate_required_sources(
+        advice_rows=[
+            {"run_date": RUN_DATE, "market": "US", "symbol": "MSFT", "raw_decision": RAW_DECISION}
+        ],
+        **records,
+    ) == []
+
+    records["futu_records"][("US", "MSFT")]["technical_anomaly"]["status"] = "error"
     assert evaluate_required_sources(
         advice_rows=[
             {"run_date": RUN_DATE, "market": "US", "symbol": "MSFT", "raw_decision": RAW_DECISION}
