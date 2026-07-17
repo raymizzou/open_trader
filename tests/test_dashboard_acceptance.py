@@ -921,6 +921,15 @@ def test_acceptance_rejects_arbitrary_english_trend_review_chrome(
         )
 
 
+def test_acceptance_allows_approved_spaced_a_share_label_and_version() -> None:
+    dashboard_acceptance._assert_no_trend_review_latin(
+        ["A 股短线右侧趋势｜版本 v1"],
+        "eastmoney",
+        "header 左侧",
+        allow_version=True,
+    )
+
+
 def test_acceptance_allows_raw_parameter_facts_with_english_abbreviations() -> None:
     payload = valid_payload()
     review = payload["trend_reviews"]["tiger"]

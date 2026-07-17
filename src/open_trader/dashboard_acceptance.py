@@ -1505,7 +1505,7 @@ def _assert_no_trend_review_latin(
 ) -> None:
     for text in texts:
         inspected = re.sub(r"v\d+", "", text) if allow_version else text
-        inspected = inspected.replace("A股", "")
+        inspected = inspected.replace("A 股", "").replace("A股", "")
         if allow_atr:
             inspected = inspected.replace("ATR14", "")
         assert re.search(r"[A-Za-z]", inspected) is None, (
