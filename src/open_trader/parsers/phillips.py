@@ -45,6 +45,13 @@ TRANSACTION_LINE = re.compile(
     rf"(?P<amount>{NUMERIC})",
     re.IGNORECASE,
 )
+TRANSACTION_SHAPE = re.compile(
+    rf"^\d{{2}}/\d{{2}}/\d{{2}}\s+\d{{2}}/\d{{2}}/\d{{2}}\s+"
+    rf"Equity\s+[A-Z0-9@#*.-]+\s+.+?\s+{NUMERIC}\s+{NUMERIC}\s+"
+    rf"{NUMERIC}\s+{NUMERIC}$",
+    re.IGNORECASE,
+)
+NON_TRADE_TRANSACTION_ACTIVITIES = {"DIVIDEND"}
 
 
 def parse_phillips_text(text: str, month: str) -> ParseResult:
@@ -56,6 +63,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
     fills: list[TradeFill] = []
     warnings: list[WarningRecord] = []
     occurrences: dict[str, int] = {}
+    sequence_by_group: dict[tuple[str, str], int] = {}
     in_transactions = False
     in_positions = False
     in_cash = False
@@ -96,9 +104,13 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
                     )
                     continue
                 fill = _parse_transaction_line(
-                    line, occurrence, len(fills), position_products
+                    line, occurrence, 0, position_products
                 )
             if fill is not None:
+                group = (fill.symbol, fill.executed_at)
+                source_sequence = sequence_by_group.get(group, 0)
+                sequence_by_group[group] = source_sequence + 1
+                fill = replace(fill, source_sequence=source_sequence)
                 fills.append(fill)
                 continue
             if _is_transaction_candidate(line):
@@ -222,11 +234,18 @@ def _parse_transaction_line(
 
 
 def _is_transaction_candidate(line: str) -> bool:
+    tokens = line.split()
+    if (
+        len(tokens) > 4
+        and tokens[2].upper() == "EQUITY"
+        and tokens[4].upper() in NON_TRADE_TRANSACTION_ACTIVITIES
+    ):
+        return False
     return (
         re.search(r"(?:^|\s)Equity(?:\s|$)", line, re.IGNORECASE) is not None
         and re.search(r"(?:^|\s)(?:Bought|Sold)(?:\s|$)", line, re.IGNORECASE)
         is not None
-    )
+    ) or TRANSACTION_SHAPE.fullmatch(line) is not None
 
 
 def _is_hk_execution_symbol(symbol: str) -> bool:

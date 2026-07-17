@@ -8,6 +8,7 @@ import pytest
 
 from open_trader.models import AssetClass, Market
 from open_trader.parsers.eastmoney import (
+    EXECUTION_HEADER,
     EastmoneyStatementParser,
     parse_eastmoney_page,
 )
@@ -95,14 +96,17 @@ def test_eastmoney_without_execution_header_does_not_claim_fill_completeness() -
     assert result.fills_complete is False
 
 
-def test_eastmoney_non_trade_security_activity_does_not_block_completeness() -> None:
+@pytest.mark.parametrize("activity", ["证券红利", "证券转入", "证券转出"])
+def test_eastmoney_non_trade_security_activity_does_not_block_completeness(
+    activity: str,
+) -> None:
     header = [
         "发生日期", "买卖类别", "证券代码", "证券名称", "成交数量",
         "成交价格", "总发生金额", "手续费", "印花税", "过户费", "资金余额",
     ]
     result = parse_eastmoney_page(
         "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
-        [POSITIONS, [header, ["20260710", "证券红利", "600900", "股票", "", "", "10", "", "", "", ""]]],
+        [POSITIONS, [header, ["20260710", activity, "600900", "股票", "100", "10", "10", "", "", "", ""]]],
         "2026-07",
     )
 
@@ -137,19 +141,24 @@ def test_eastmoney_statement_warns_for_incomplete_execution_row(
     ]
 
 
-def test_eastmoney_row_without_explicit_trade_side_is_nonblocking() -> None:
+@pytest.mark.parametrize("activity", ["", "证券未知"])
+def test_eastmoney_trade_shaped_row_without_known_side_is_incomplete(
+    activity: str,
+) -> None:
     header = [
         "发生日期", "买卖类别", "证券代码", "证券名称", "成交数量",
         "成交价格", "总发生金额", "手续费", "印花税", "过户费", "资金余额",
     ]
     result = parse_eastmoney_page(
         "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
-        [POSITIONS, [header, ["20260710", "", "600900", "股票", "100", "10", "", "", "", "", ""]]],
+        [POSITIONS, [header, ["20260710", activity, "600900", "股票", "100", "10", "", "", "", "", ""]]],
         "2026-07",
     )
 
-    assert result.fills_complete is True
-    assert result.warnings == []
+    assert result.fills_complete is False
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
 
 
 def test_eastmoney_fill_fees_require_all_fee_columns() -> None:
@@ -201,6 +210,44 @@ def test_eastmoney_identical_execution_rows_get_stable_distinct_ids() -> None:
         fill.source_id for fill in repeated.fills
     ]
     assert [fill.source_sequence for fill in first.fills] == [0, 1]
+
+
+def test_eastmoney_source_sequence_is_local_to_symbol_and_execution_date() -> None:
+    header = list(EXECUTION_HEADER)
+    target_one = [
+        "20260710", "证券买入", "600900", "目标", "100", "10", "", "0", "0", "0", "",
+    ]
+    target_two = [
+        "20260710", "证券卖出", "600900", "目标", "100", "11", "", "0", "0", "0", "",
+    ]
+    other_day = [
+        "20260709", "证券买入", "600900", "目标", "100", "9", "", "0", "0", "0", "",
+    ]
+    other_symbol = [
+        "20260710", "证券买入", "600901", "其他", "100", "8", "", "0", "0", "0", "",
+    ]
+
+    first = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, [header, other_day, target_one, other_symbol, target_two]],
+        "2026-07",
+    )
+    reordered = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, [header, other_symbol, target_one, target_two, other_day]],
+        "2026-07",
+    )
+
+    assert [
+        fill.source_sequence
+        for fill in first.fills
+        if fill.symbol == "600900" and fill.executed_at == "2026-07-10"
+    ] == [0, 1]
+    assert [
+        fill.source_sequence
+        for fill in reordered.fills
+        if fill.symbol == "600900" and fill.executed_at == "2026-07-10"
+    ] == [0, 1]
 
 
 def test_parse_eastmoney_cash_when_currency_balances_share_lines() -> None:

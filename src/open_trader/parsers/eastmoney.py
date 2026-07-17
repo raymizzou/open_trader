@@ -49,6 +49,7 @@ EXECUTION_HEADER = (
     "资金余额",
 )
 SUPPORTED_MARKETS = {"沪市A股", "深市A股"}
+NON_TRADE_EXECUTION_CATEGORIES = {"证券红利", "证券转入", "证券转出"}
 MONEY = r"[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)"
 PRINT_DATE = re.compile(r"打印日期\s*[:：]\s*(\d{4}-\d{2}-\d{2})")
 
@@ -88,6 +89,7 @@ def parse_eastmoney_page(
     fills: list[TradeFill] = []
     warnings: list[WarningRecord] = []
     occurrences: dict[tuple[str, ...], int] = {}
+    sequence_by_group: dict[tuple[str, str], int] = {}
     execution_tables = tuple(
         candidate
         for candidate in tables
@@ -99,8 +101,12 @@ def parse_eastmoney_page(
             values = _normalize_row(row)
             occurrence = occurrences.get(values, 0)
             occurrences[values] = occurrence + 1
-            fill = _parse_fill(row, occurrence, len(fills))
+            fill = _parse_fill(row, occurrence, 0)
             if fill is not None:
+                group = (fill.symbol, fill.executed_at)
+                source_sequence = sequence_by_group.get(group, 0)
+                sequence_by_group[group] = source_sequence + 1
+                fill = replace(fill, source_sequence=source_sequence)
                 fills.append(fill)
             elif _is_execution_candidate(row):
                 fills_complete = False
@@ -183,7 +189,19 @@ def _parse_fill(
 def _is_execution_candidate(row: list[str | None]) -> bool:
     values = [_normalize_cell(cell) for cell in row]
     category = values[1] if len(values) > 1 else ""
-    return category in {"证券买入", "证券卖出"}
+    if category in NON_TRADE_EXECUTION_CATEGORIES:
+        return False
+    if category in {"证券买入", "证券卖出"}:
+        return True
+    return (
+        len(values) == len(EXECUTION_HEADER)
+        and _execution_date(values[0]) is not None
+        and re.fullmatch(r"\d{6}", values[2]) is not None
+        and (quantity := parse_decimal(values[4])) is not None
+        and quantity > 0
+        and (price := parse_decimal(values[5])) is not None
+        and price > 0
+    )
 
 
 def _execution_date(value: str) -> str | None:

@@ -272,15 +272,18 @@ def test_phillips_statement_warns_for_incomplete_execution_row(line: str) -> Non
     ]
 
 
-def test_phillips_row_without_explicit_trade_side_is_nonblocking() -> None:
+def test_phillips_trade_shaped_row_without_known_side_is_incomplete() -> None:
     result = parse_phillips_text(
         "Transaction Details\n"
-        "10/07/26 14/07/26 Equity REF00001 Dividend 000700 Tencent 100.00\n",
+        "10/07/26 14/07/26 Equity REF00001 Pending 000700 Tencent "
+        "100 380.00 38,000.00 37,900.00\n",
         "2026-07",
     )
 
-    assert result.fills_complete is True
-    assert result.warnings == []
+    assert result.fills_complete is False
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
 
 
 def test_phillips_statement_warns_when_execution_date_is_missing() -> None:
@@ -326,6 +329,47 @@ def test_phillips_identical_execution_rows_get_stable_distinct_ids() -> None:
         fill.source_id for fill in repeated.fills
     ]
     assert [fill.source_sequence for fill in first.fills] == [0, 1]
+
+
+def test_phillips_source_sequence_is_local_to_symbol_and_execution_date() -> None:
+    target_one = (
+        "10/07/26 14/07/26 Equity REF00001 Bought 000700 Tencent "
+        "100 380.00 38,000.00 37,900.00"
+    )
+    target_two = (
+        "10/07/26 14/07/26 Equity REF00002 Sold 000700 Tencent "
+        "100 381.00 38,100.00 38,000.00"
+    )
+    other_day = (
+        "09/07/26 13/07/26 Equity REF00003 Bought 000700 Tencent "
+        "100 379.00 37,900.00 37,800.00"
+    )
+    other_symbol = (
+        "10/07/26 14/07/26 Equity REF00004 Bought 000522 Other "
+        "100 3.00 300.00 299.00"
+    )
+
+    first = parse_phillips_text(
+        "Transaction Details\n"
+        + "\n".join((other_day, target_one, other_symbol, target_two)),
+        "2026-07",
+    )
+    reordered = parse_phillips_text(
+        "Transaction Details\n"
+        + "\n".join((other_symbol, target_one, target_two, other_day)),
+        "2026-07",
+    )
+
+    assert [
+        fill.source_sequence
+        for fill in first.fills
+        if fill.symbol == "00700" and fill.executed_at == "2026-07-10"
+    ] == [0, 1]
+    assert [
+        fill.source_sequence
+        for fill in reordered.fills
+        if fill.symbol == "00700" and fill.executed_at == "2026-07-10"
+    ] == [0, 1]
 
 
 def test_phillips_execution_accepts_numeric_code_without_inline_name() -> None:

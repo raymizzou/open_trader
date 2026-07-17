@@ -620,6 +620,53 @@ class SymbolRequiredTransactions(PagedTransactions):
         return [self._transaction("9001-1", 9001)]
 
 
+class EmptyScopedTransactions(SymbolRequiredTransactions):
+    def get_transactions(self, **kwargs: object) -> object:
+        self.transaction_calls.append(kwargs)
+        if "order_id" not in kwargs:
+            raise RuntimeError("biz param error(field 'symbol' cannot be empty)")
+        return []
+
+
+class HundredFilledOrders(SymbolRequiredTransactions):
+    def get_filled_orders(self, **kwargs: object) -> list[object]:
+        self.filled_order_calls.append(kwargs)
+        return [type("Order", (), {"id": index})() for index in range(100)]
+
+
+class PagedScopedTransactions(SymbolRequiredTransactions):
+    def get_transactions(self, **kwargs: object) -> object:
+        self.transaction_calls.append(kwargs)
+        if "order_id" not in kwargs:
+            raise RuntimeError("biz param error(field 'symbol' cannot be empty)")
+        if kwargs.get("page_token") is None:
+            return [
+                self._transaction(f"9001-{index}", 9001)
+                for index in range(100)
+            ]
+        return type(
+            "TransactionsResponse",
+            (),
+            {
+                "result": [self._transaction("9001-100", 9001)],
+                "next_page_token": None,
+            },
+        )()
+
+
+class IncompletePagedScopedTransactions(PagedScopedTransactions):
+    def get_transactions(self, **kwargs: object) -> object:
+        if "order_id" not in kwargs:
+            return super().get_transactions(**kwargs)
+        self.transaction_calls.append(kwargs)
+        if kwargs.get("page_token") is None:
+            return [
+                self._transaction(f"9001-{index}", 9001)
+                for index in range(100)
+            ]
+        return None
+
+
 class FakeStockAndFundTradeClient(FakeTradeClient):
     def get_positions(self, **kwargs: object) -> list[FakePosition]:
         self.position_calls.append(kwargs)
@@ -960,13 +1007,102 @@ def test_tiger_fetch_transactions_falls_back_to_filled_orders_when_symbol_is_req
         {
             "account": "123456789",
             "start_time": "2026-07-17 00:00:00",
-            "end_time": "2026-07-17 23:59:59",
+            "end_time": "2026-07-18 00:00:00",
+            "limit": 100,
         }
     ]
     assert client.trade_client.transaction_calls[-1] == {
         "account": "123456789",
         "order_id": 9001,
+        "limit": 100,
+        "page_token": None,
     }
+
+
+def test_tiger_fallback_rejects_filled_order_without_transactions() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=EmptyScopedTransactions,
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        client.fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert exc_info.value.error_type == "transaction_query_failed"
+
+
+def test_tiger_fallback_rejects_daily_filled_order_limit() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=HundredFilledOrders,
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        client.fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert exc_info.value.error_type == "transaction_query_failed"
+
+
+def test_tiger_fallback_paginates_all_transactions_for_each_order() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=PagedScopedTransactions,
+    )
+
+    fills = client.fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert len(fills) == 101
+    assert len({fill.source_id for fill in fills}) == 101
+    assert client.trade_client.transaction_calls[-2:] == [
+        {
+            "account": "123456789",
+            "order_id": 9001,
+            "limit": 100,
+            "page_token": None,
+        },
+        {
+            "account": "123456789",
+            "order_id": 9001,
+            "limit": 100,
+            "page_token": "",
+        },
+    ]
+
+
+def test_tiger_fallback_rejects_unprovable_order_transaction_continuation() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=IncompletePagedScopedTransactions,
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        client.fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert exc_info.value.error_type == "transaction_query_failed"
+
+
+def test_tiger_fallback_queries_filled_orders_one_calendar_day_at_a_time() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=SymbolRequiredTransactions,
+    )
+
+    client.fetch_actual_fills("2026-07-17", "2026-07-18")
+
+    assert client.trade_client.filled_order_calls == [
+        {
+            "account": "123456789",
+            "start_time": "2026-07-17 00:00:00",
+            "end_time": "2026-07-18 00:00:00",
+            "limit": 100,
+        },
+        {
+            "account": "123456789",
+            "start_time": "2026-07-18 00:00:00",
+            "end_time": "2026-07-19 00:00:00",
+            "limit": 100,
+        },
+    ]
 
 
 def test_tiger_multiple_fills_do_not_guess_order_fee_allocation() -> None:

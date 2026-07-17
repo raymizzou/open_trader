@@ -953,12 +953,6 @@ def normalize_trend_strategy_snapshot(
     return expected
 
 
-def _validated_strategy_snapshot(
-    snapshot: object, market: str
-) -> Mapping[str, object]:
-    return normalize_trend_strategy_snapshot(snapshot, market)
-
-
 def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
     return _canonical_json_bytes(
         {
@@ -1534,14 +1528,14 @@ def build_trend_review_projection(
     if not discipline_by_date and not actual_by_date and not benchmark_by_date:
         raise ValueError(f"no trend review facts for {market}")
 
-    def has_valid_v1_snapshot(
+    def normalize_v1_snapshot_or_none(
         fact: Mapping[str, object],
     ) -> Mapping[str, object] | None:
         snapshot = fact.get("strategy_snapshot")
         if not isinstance(snapshot, Mapping) or snapshot.get("strategy_version") != "v1":
             return None
         try:
-            return _validated_strategy_snapshot(snapshot, market)
+            return normalize_trend_strategy_snapshot(snapshot, market)
         except ValueError:
             return None
 
@@ -1552,7 +1546,7 @@ def build_trend_review_projection(
         }
         for trading_date in sorted(discipline_by_date)
         if (
-            normalized := has_valid_v1_snapshot(
+            normalized := normalize_v1_snapshot_or_none(
                 discipline_by_date[trading_date]
             )
         )
@@ -1565,14 +1559,14 @@ def build_trend_review_projection(
         }
         for trading_date in sorted(actual_by_date)
         if (
-            normalized := has_valid_v1_snapshot(actual_by_date[trading_date])
+            normalized := normalize_v1_snapshot_or_none(
+                actual_by_date[trading_date]
+            )
         )
         is not None
     ]
     strategy_identities = {
-        _strategy_identity(
-            _validated_strategy_snapshot(fact.get("strategy_snapshot"), market)
-        )
+        _strategy_identity(fact["strategy_snapshot"])
         for fact in (*discipline_facts, *actual_facts)
         if str(fact["date"]) >= effective_from
     }

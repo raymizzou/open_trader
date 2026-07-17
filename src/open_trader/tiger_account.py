@@ -4,7 +4,7 @@ import csv
 import inspect
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import json
 from decimal import Decimal, InvalidOperation
 import uuid
@@ -734,25 +734,80 @@ class TigerAccountClient:
                         error_type="transaction_query_failed",
                     ) from exc
                 try:
-                    orders = self.trade_client.get_filled_orders(
-                        account=self.config.account,
-                        start_time=f"{start_date} 00:00:00",
-                        end_time=f"{end_date} 23:59:59",
-                    ) or []
-                    for order in orders:
-                        order_id = _get_attr(
-                            order, "id", _get_attr(order, "order_id")
-                        )
-                        if order_id is None:
-                            raise ValueError("Tiger filled order is missing id")
-                        scoped = self.trade_client.get_transactions(
+                    current_day = date.fromisoformat(start_date)
+                    final_day = date.fromisoformat(end_date)
+                    while current_day <= final_day:
+                        next_day = current_day + timedelta(days=1)
+                        response = self.trade_client.get_filled_orders(
                             account=self.config.account,
-                            order_id=order_id,
+                            start_time=f"{current_day.isoformat()} 00:00:00",
+                            end_time=f"{next_day.isoformat()} 00:00:00",
+                            limit=100,
                         )
-                        if isinstance(scoped, list):
-                            transactions.extend(scoped)
-                        elif scoped is not None:
-                            transactions.extend(list(_get_attr(scoped, "result", [])))
+                        if response is None:
+                            raise ValueError("Tiger filled orders are unavailable")
+                        orders = (
+                            list(response)
+                            if isinstance(response, list)
+                            else list(_get_attr(response, "result", []))
+                        )
+                        if len(orders) >= 100:
+                            raise ValueError("Tiger filled orders may be truncated")
+                        for order in orders:
+                            order_id = _get_attr(
+                                order, "id", _get_attr(order, "order_id")
+                            )
+                            if order_id is None:
+                                raise ValueError("Tiger filled order is missing id")
+                            scoped_transactions: list[object] = []
+                            scoped_page_token: str | None = None
+                            while True:
+                                scoped = self.trade_client.get_transactions(
+                                    account=self.config.account,
+                                    order_id=order_id,
+                                    limit=100,
+                                    page_token=scoped_page_token,
+                                )
+                                if scoped is None:
+                                    raise ValueError(
+                                        "Tiger order transactions are unavailable"
+                                    )
+                                if isinstance(scoped, list):
+                                    page = list(scoped)
+                                    if not page:
+                                        raise ValueError(
+                                            "Tiger order transactions are empty"
+                                        )
+                                    scoped_transactions.extend(page)
+                                    if len(page) < 100:
+                                        break
+                                    if scoped_page_token is not None:
+                                        raise ValueError(
+                                            "Tiger order transaction pagination is incomplete"
+                                        )
+                                    scoped_page_token = ""
+                                    continue
+                                page = list(_get_attr(scoped, "result", []))
+                                if not page:
+                                    raise ValueError(
+                                        "Tiger order transactions are empty"
+                                    )
+                                scoped_transactions.extend(page)
+                                next_token = _get_attr(
+                                    scoped,
+                                    "next_page_token",
+                                    _get_attr(scoped, "page_token", None),
+                                )
+                                if next_token:
+                                    scoped_page_token = str(next_token)
+                                    continue
+                                if len(page) >= 100:
+                                    raise ValueError(
+                                        "Tiger order transaction pagination is incomplete"
+                                    )
+                                break
+                            transactions.extend(scoped_transactions)
+                        current_day = next_day
                 except Exception as fallback_exc:
                     raise TigerAccountError(
                         "failed to query Tiger transactions",
