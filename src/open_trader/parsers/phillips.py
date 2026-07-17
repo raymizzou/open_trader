@@ -45,15 +45,6 @@ TRANSACTION_LINE = re.compile(
     rf"(?P<amount>{NUMERIC})",
     re.IGNORECASE,
 )
-TRANSACTION_SHAPE = re.compile(
-    rf"^\d{{2}}/\d{{2}}/\d{{2}}\s+\d{{2}}/\d{{2}}/\d{{2}}\s+"
-    rf"Equity\s+[A-Z0-9@#*.-]+\s+.+?\s+{NUMERIC}\s+{NUMERIC}\s+"
-    rf"{NUMERIC}\s+{NUMERIC}$",
-    re.IGNORECASE,
-)
-NON_TRADE_TRANSACTION_ACTIVITIES = {"DIVIDEND"}
-
-
 def parse_phillips_text(text: str, month: str) -> ParseResult:
     statement_id = f"{month}-{BROKER}"
     position_products = _position_products_by_name(text, statement_id)
@@ -82,66 +73,12 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
             fills_complete = True
             continue
 
-        if in_transactions:
-            if not _is_transaction_candidate(line):
-                fill = None
-            else:
-                occurrence = occurrences.get(line, 0)
-                occurrences[line] = occurrence + 1
-                match = TRANSACTION_LINE.fullmatch(line)
-                if match is not None and _looks_like_us_execution(
-                    match.group("description"), position_products
-                ):
-                    warnings.append(
-                        WarningRecord(
-                            statement_id=statement_id,
-                            broker=BROKER,
-                            page=None,
-                            severity="warning",
-                            code="unsupported_execution_market",
-                            message="辉立成交行不是香港市场成交",
-                        )
-                    )
-                    continue
-                fill = _parse_transaction_line(
-                    line, occurrence, 0, position_products
-                )
-            if fill is not None:
-                group = (fill.symbol, fill.executed_at)
-                source_sequence = sequence_by_group.get(group, 0)
-                sequence_by_group[group] = source_sequence + 1
-                fill = replace(fill, source_sequence=source_sequence)
-                fills.append(fill)
-                continue
-            if _is_transaction_candidate(line):
-                fills_complete = False
-                warnings.append(
-                    WarningRecord(
-                        statement_id=statement_id,
-                        broker=BROKER,
-                        page=None,
-                        severity="warning",
-                        code="invalid_execution_row",
-                        message="辉立成交行缺少成交标识、方向、数量、价格或日期",
-                    )
-                )
-                continue
-
         if _is_account_details_start(line):
             in_transactions = False
             in_account_details = True
             in_positions = False
             in_cash = False
             continue
-
-        if in_account_details:
-            account_cash = _parse_account_cash_line(line, statement_id)
-            if account_cash is not None:
-                if "HKD(Base)" in account_cash.notes:
-                    base_cash = account_cash
-                elif base_cash is None:
-                    _upsert_cash_balance(cash_balances, account_cash)
-                continue
 
         if (
             line == "Securities Portfolio"
@@ -160,10 +97,61 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         if line.startswith(("產品 市場", "Product Market")):
             continue
         if line == "Cash Balance":
+            in_transactions = False
             in_positions = False
             in_account_details = False
             in_cash = True
             continue
+
+        if in_transactions:
+            if _is_ignored_transaction_line(line):
+                continue
+            occurrence = occurrences.get(line, 0)
+            occurrences[line] = occurrence + 1
+            match = TRANSACTION_LINE.fullmatch(line)
+            if match is not None and _looks_like_us_execution(
+                match.group("description"), position_products
+            ):
+                warnings.append(
+                    WarningRecord(
+                        statement_id=statement_id,
+                        broker=BROKER,
+                        page=None,
+                        severity="warning",
+                        code="unsupported_execution_market",
+                        message="辉立成交行不是香港市场成交",
+                    )
+                )
+                continue
+            fill = _parse_transaction_line(line, occurrence, position_products)
+            if fill is not None:
+                group = (fill.symbol, fill.executed_at)
+                source_sequence = sequence_by_group.get(group, 0)
+                sequence_by_group[group] = source_sequence + 1
+                fill = replace(fill, source_sequence=source_sequence)
+                fills.append(fill)
+                continue
+            fills_complete = False
+            warnings.append(
+                WarningRecord(
+                    statement_id=statement_id,
+                    broker=BROKER,
+                    page=None,
+                    severity="warning",
+                    code="invalid_execution_row",
+                    message="辉立成交行缺少成交标识、方向、数量、价格或日期",
+                )
+            )
+            continue
+
+        if in_account_details:
+            account_cash = _parse_account_cash_line(line, statement_id)
+            if account_cash is not None:
+                if "HKD(Base)" in account_cash.notes:
+                    base_cash = account_cash
+                elif base_cash is None:
+                    _upsert_cash_balance(cash_balances, account_cash)
+                continue
 
         if in_positions:
             position = _parse_position_line(line, statement_id)
@@ -192,7 +180,6 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
 def _parse_transaction_line(
     line: str,
     occurrence: int,
-    source_sequence: int,
     position_products: dict[str, set[tuple[Market, str]]],
 ) -> TradeFill | None:
     match = TRANSACTION_LINE.fullmatch(line)
@@ -229,23 +216,28 @@ def _parse_transaction_line(
         price=price,
         fees=None,
         executed_at=executed_at,
-        source_sequence=source_sequence,
     )
 
 
-def _is_transaction_candidate(line: str) -> bool:
-    tokens = line.split()
-    if (
-        len(tokens) > 4
-        and tokens[2].upper() == "EQUITY"
-        and tokens[4].upper() in NON_TRADE_TRANSACTION_ACTIVITIES
+def _is_ignored_transaction_line(line: str) -> bool:
+    upper = line.upper()
+    if all(
+        heading in upper
+        for heading in ("DATE", "PRODUCT", "REFERENCE", "QUANTITY", "PRICE")
     ):
-        return False
+        return True
+    if re.search(
+        r"(?:^|\s)Equity\s+\S+\s+Dividend(?:\s|$)",
+        line,
+        re.IGNORECASE,
+    ):
+        return True
     return (
-        re.search(r"(?:^|\s)Equity(?:\s|$)", line, re.IGNORECASE) is not None
-        and re.search(r"(?:^|\s)(?:Bought|Sold)(?:\s|$)", line, re.IGNORECASE)
+        re.fullmatch(r"Page\s+\d+\s+(?:of|/)\s*\d+", line, re.IGNORECASE)
         is not None
-    ) or TRANSACTION_SHAPE.fullmatch(line) is not None
+        or re.fullmatch(r"第\s*\d+\s*[頁页](?:\s*共\s*\d+\s*[頁页])?", line)
+        is not None
+    )
 
 
 def _is_hk_execution_symbol(symbol: str) -> bool:

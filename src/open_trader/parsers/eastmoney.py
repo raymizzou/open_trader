@@ -99,16 +99,20 @@ def parse_eastmoney_page(
     for execution_table in execution_tables:
         for row in execution_table[1:]:
             values = _normalize_row(row)
+            category = values[1] if len(values) > 1 else ""
             occurrence = occurrences.get(values, 0)
             occurrences[values] = occurrence + 1
-            fill = _parse_fill(row, occurrence, 0)
+            fill = _parse_fill(row, occurrence)
             if fill is not None:
                 group = (fill.symbol, fill.executed_at)
                 source_sequence = sequence_by_group.get(group, 0)
                 sequence_by_group[group] = source_sequence + 1
                 fill = replace(fill, source_sequence=source_sequence)
                 fills.append(fill)
-            elif _is_execution_candidate(row):
+            elif (
+                any(values)
+                and category not in NON_TRADE_EXECUTION_CATEGORIES
+            ):
                 fills_complete = False
                 warnings.append(
                     WarningRecord(
@@ -143,9 +147,7 @@ def parse_eastmoney_page(
     )
 
 
-def _parse_fill(
-    row: list[str | None], occurrence: int, source_sequence: int
-) -> TradeFill | None:
+def _parse_fill(row: list[str | None], occurrence: int) -> TradeFill | None:
     if len(row) != len(EXECUTION_HEADER):
         return None
     values = [_normalize_cell(cell) for cell in row]
@@ -182,25 +184,6 @@ def _parse_fill(
         price=price,
         fees=fees,
         executed_at=executed_at,
-        source_sequence=source_sequence,
-    )
-
-
-def _is_execution_candidate(row: list[str | None]) -> bool:
-    values = [_normalize_cell(cell) for cell in row]
-    category = values[1] if len(values) > 1 else ""
-    if category in NON_TRADE_EXECUTION_CATEGORIES:
-        return False
-    if category in {"证券买入", "证券卖出"}:
-        return True
-    return (
-        len(values) == len(EXECUTION_HEADER)
-        and _execution_date(values[0]) is not None
-        and re.fullmatch(r"\d{6}", values[2]) is not None
-        and (quantity := parse_decimal(values[4])) is not None
-        and quantity > 0
-        and (price := parse_decimal(values[5])) is not None
-        and price > 0
     )
 
 

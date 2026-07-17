@@ -286,6 +286,41 @@ def test_phillips_trade_shaped_row_without_known_side_is_incomplete() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent",
+        "10/07/26 14/07/26 Equity REF00001 000700 Tencent",
+        "BROKEN TRANSACTION ACTIVITY",
+    ],
+)
+def test_phillips_any_nonempty_unparsed_transaction_activity_is_incomplete(
+    line: str,
+) -> None:
+    result = parse_phillips_text(
+        f"Transaction Details\n{line}\n",
+        "2026-07",
+    )
+
+    assert result.fills_complete is False
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
+def test_phillips_cash_section_ends_transaction_validation() -> None:
+    result = parse_phillips_text(
+        "Transaction Details\n"
+        "Cash Balance\n"
+        "HKD 100.00\n",
+        "2026-07",
+    )
+
+    assert result.fills_complete is True
+    assert result.warnings == []
+    assert result.cash_balances[0].cash_balance == Decimal("100.00")
+
+
 def test_phillips_statement_warns_when_execution_date_is_missing() -> None:
     result = parse_phillips_text(
         """Transaction Details

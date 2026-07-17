@@ -161,6 +161,40 @@ def test_eastmoney_trade_shaped_row_without_known_side_is_incomplete(
     ]
 
 
+@pytest.mark.parametrize(
+    "row",
+    [
+        ["20260710", "证券买入", "600900", "股票", "", "", "", "", "", "", ""],
+        ["20260710", "", "600900", "股票", "", "", "", "", "", "", ""],
+        ["", "证券未知", "", "", "", "", "", "", "", "", ""],
+    ],
+)
+def test_eastmoney_any_nonempty_unparsed_execution_row_is_incomplete(
+    row: list[str],
+) -> None:
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, [list(EXECUTION_HEADER), row]],
+        "2026-07",
+    )
+
+    assert result.fills_complete is False
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
+def test_eastmoney_empty_execution_row_does_not_block_completeness() -> None:
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, [list(EXECUTION_HEADER), [""] * len(EXECUTION_HEADER)]],
+        "2026-07",
+    )
+
+    assert result.fills_complete is True
+    assert result.warnings == []
+
+
 def test_eastmoney_fill_fees_require_all_fee_columns() -> None:
     executions = [
         list(
