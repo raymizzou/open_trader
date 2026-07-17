@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -798,6 +798,112 @@ def test_actual_fill_identity_is_idempotent_only_for_identical_payload(
             ],
             "2026-07-16",
         )
+
+
+def test_actual_fill_reimport_preserves_legacy_embedded_sequence(
+    tmp_path: Path,
+) -> None:
+    fill = actual_fill(
+        "fill-1",
+        "600001",
+        "BUY",
+        "100",
+        "2026-07-16",
+        source_sequence=7,
+    )
+    [path] = trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [fill],
+        "2026-07-16",
+        coverage_start="2026-07-01",
+    )
+    legacy = json.loads(path.read_text(encoding="utf-8"))
+    legacy["source_sequence"] = 99
+    path.write_text(
+        json.dumps(legacy, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    original = path.read_bytes()
+
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [fill],
+        "2026-07-16",
+        coverage_start="2026-06-16",
+    )
+
+    assert path.read_bytes() == original
+    _, coverage = trend_review._load_actual_fills(tmp_path, "CN")
+    assert ("2026-06-16", "2026-07-16") in coverage
+
+
+def test_singleton_fill_ignores_obsolete_sequence_conflicts(tmp_path: Path) -> None:
+    first = actual_fill(
+        "fill-1",
+        "600001",
+        "BUY",
+        "100",
+        "2026-07-16",
+        source_sequence=4,
+    )
+    second = replace(first, source_sequence=0)
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [first],
+        "2026-07-16",
+        coverage_start="2026-07-01",
+    )
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [second],
+        "2026-07-16",
+        coverage_start="2026-06-16",
+    )
+
+    fills, _ = trend_review._load_actual_fills(tmp_path, "CN")
+
+    assert len(fills) == 1
+
+
+def test_same_day_fill_order_conflict_still_fails_closed(tmp_path: Path) -> None:
+    buy = actual_fill(
+        "buy",
+        "600001",
+        "BUY",
+        "100",
+        "2026-07-16",
+        source_sequence=0,
+    )
+    sell = actual_fill(
+        "sell",
+        "600001",
+        "SELL",
+        "100",
+        "2026-07-16",
+        source_sequence=1,
+    )
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [buy, sell],
+        "2026-07-16",
+        coverage_start="2026-07-01",
+    )
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [replace(buy, source_sequence=1), replace(sell, source_sequence=0)],
+        "2026-07-16",
+        coverage_start="2026-06-16",
+    )
+
+    with pytest.raises(ValueError, match="conflicting actual fill source order"):
+        trend_review._load_actual_fills(tmp_path, "CN")
 
 
 def test_actual_fill_batch_preflights_all_collisions_before_writing(

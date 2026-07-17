@@ -244,6 +244,29 @@ def _actual_fill_identity(fill: Mapping[str, object]) -> tuple[str, str, str]:
     )
 
 
+def _compatible_actual_fill_body(
+    path: Path, payload: Mapping[str, object]
+) -> bytes:
+    body = _canonical_json_bytes(payload)
+    if not path.exists():
+        return body
+    existing_body = path.read_bytes()
+    try:
+        existing = json.loads(existing_body)
+    except (UnicodeError, json.JSONDecodeError):
+        return body
+    if not isinstance(existing, dict) or "source_sequence" not in existing:
+        return body
+    source_sequence = existing.pop("source_sequence")
+    if (
+        not isinstance(source_sequence, int)
+        or isinstance(source_sequence, bool)
+        or source_sequence < 0
+    ):
+        return body
+    return existing_body if _canonical_json_bytes(existing) == body else body
+
+
 def freeze_actual_fill_batch(
     data_dir: Path,
     source_metadata: Mapping[str, object],
@@ -344,7 +367,7 @@ def freeze_actual_fill_batch(
             / f"{digest}.json"
         )
         paths.append(path)
-        artifacts.append((path, _canonical_json_bytes(payload)))
+        artifacts.append((path, _compatible_actual_fill_body(path, payload)))
         identities.append(identity)
         fill_order.append(
             {
@@ -1044,7 +1067,7 @@ def _load_actual_fills(
             raise ValueError(f"invalid trend review actual fill fact: {path}")
         fills.append(payload)
     coverage: list[tuple[str, str]] = []
-    source_sequences: dict[tuple[str, str, str], int | None] = {}
+    source_sequences: dict[tuple[str, str, str], set[int | None]] = {}
     completeness_root = (
         data_dir
         / "trend_review"
@@ -1097,13 +1120,29 @@ def _load_actual_fills(
                 or sequence < 0
             ):
                 raise ValueError(f"invalid trend review fill completeness fact: {path}")
-            if identity in source_sequences and source_sequences[identity] != sequence:
-                raise ValueError(f"conflicting actual fill source order: {identity}")
-            source_sequences[identity] = sequence
+            source_sequences.setdefault(identity, set()).add(sequence)
+    date_only_groups: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    for fill in fills:
+        executed_at = str(fill.get("executed_at") or "")
+        if len(executed_at) == 10:
+            date_only_groups.setdefault(
+                (str(fill.get("symbol") or ""), executed_at), []
+            ).append(_actual_fill_identity(fill))
+    ordered_identities = {
+        identity
+        for identities in date_only_groups.values()
+        if len(identities) > 1
+        for identity in identities
+    }
     for fill in fills:
         identity = _actual_fill_identity(fill)
-        if identity in source_sequences and source_sequences[identity] is not None:
-            fill["source_sequence"] = source_sequences[identity]
+        sequences = source_sequences.get(identity, set())
+        if len(sequences) > 1 and identity in ordered_identities:
+            raise ValueError(f"conflicting actual fill source order: {identity}")
+        if len(sequences) == 1:
+            sequence = next(iter(sequences))
+            if sequence is not None:
+                fill["source_sequence"] = sequence
     return fills, coverage
 
 
