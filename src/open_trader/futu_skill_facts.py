@@ -676,6 +676,12 @@ class FutuAnomalyScriptClient:
         if isinstance(data, dict) and data.get("err_code") == -12301:
             label = {"technical": "技术", "capital": "资金", "derivatives": "衍生品"}[module]
             raise FutuAnomalyUnsupportedError(f"富途接口不支持{label}异动：{stock_symbol}")
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("err_code"), int)
+            or not _optional_text(data.get("content"))
+        ):
+            raise RuntimeError(f"{module} native anomaly response is invalid")
         return {"data": data}
 
     def _script_path(self, module: str) -> Path:

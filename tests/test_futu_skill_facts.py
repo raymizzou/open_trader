@@ -717,6 +717,43 @@ def test_futu_anomaly_client_reports_native_sdk_unsupported_reason(tmp_path: Pat
         client.run("technical", market="US", symbol="BOTZ", window_days=7)
 
 
+@pytest.mark.parametrize(
+    "data",
+    [
+        [],
+        {},
+        {"err_code": 0},
+        {"err_code": 0, "content": ""},
+    ],
+)
+def test_futu_anomaly_client_rejects_native_sdk_payload_without_required_content(
+    tmp_path: Path,
+    data: object,
+) -> None:
+    class FakeContext:
+        def get_technical_unusual(
+            self,
+            symbol: str,
+            time_range: int,
+        ) -> tuple[int, object]:
+            del symbol, time_range
+            return 0, data
+
+        def close(self) -> None:
+            pass
+
+    client = FutuAnomalyScriptClient(
+        skill_root=tmp_path / "skills",
+        context_factory=lambda **_kwargs: FakeContext(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="technical native anomaly response is invalid",
+    ):
+        client.run("technical", market="US", symbol="BOTZ", window_days=7)
+
+
 def test_generate_futu_skill_facts_marks_native_unsupported_as_not_applicable(
     tmp_path: Path,
 ) -> None:
