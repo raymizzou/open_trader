@@ -278,7 +278,7 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
         "strategy_name": "A 股短线右侧趋势",
         "strategy_version": "v1",
         "market": "CN",
-        "effective_from": "2026-07-14",
+        "effective_from": "2026-07-16",
         "process_version": "abc123",
     }
     assert snapshot["parameters"] == {
@@ -330,6 +330,18 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
     assert trend_module._report_payload(built)["strategy_snapshot"] == (
         built.strategy_snapshot
     )
+
+
+@pytest.mark.parametrize(
+    ("market", "effective_from"),
+    [("CN", "2026-07-16"), ("US", "2026-07-17"), ("HK", "2026-07-17")],
+)
+def test_trend_v1_effective_dates_are_market_specific(
+    market: str, effective_from: str
+) -> None:
+    assert trend_module.trend_strategy_snapshot(
+        market, "abc123", (622466,)
+    )["effective_from"] == effective_from
 
 
 def test_report_rejects_strategy_snapshot_action_mismatch() -> None:

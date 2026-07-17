@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -16,6 +17,7 @@ from open_trader.a_share_trend import (
     build_report,
     trend_strategy_snapshot,
 )
+from open_trader.models import Market, TradeFill
 
 
 def frozen_evidence() -> dict[str, object]:
@@ -624,28 +626,55 @@ def test_stop_retries_intent_when_failed_order_is_absent_at_broker(
     assert len(client.requests) == 2
 
 
-def write_review_history(
-    root: Path,
-    *,
-    completed_trades: int,
-    days: int,
-    missing_actual_index: int | None = None,
-) -> None:
-    daily = root / "trend_review/daily/CN"
-    daily.mkdir(parents=True)
-    start = date(2026, 5, 1)
-    snapshot = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v1",
-        "strategy_name": "A 股短线右侧趋势",
-        "strategy_version": "v1",
-        "market": "CN",
+def strategy_snapshot(market: str = "CN", version: str = "v1") -> dict[str, object]:
+    return {
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_name": "trend",
+        "strategy_version": version,
+        "market": market,
+        "effective_from": "2026-07-14",
+        "process_version": "test-sha",
         "parameter_rows": [],
         "parameters": {},
     }
-    for index in range(days):
+
+
+def actual_fill(
+    source_id: str,
+    symbol: str,
+    side: str,
+    quantity: str,
+    executed_at: str,
+) -> TradeFill:
+    return TradeFill(
+        source_id=source_id,
+        source_order_id=None,
+        broker="eastmoney",
+        account_alias="eastmoney_main",
+        market=Market.CN,
+        symbol=symbol,
+        currency="CNY",
+        side=side,
+        quantity=Decimal(quantity),
+        price=Decimal("10"),
+        fees=Decimal("0"),
+        executed_at=executed_at,
+    )
+
+
+def write_separate_review_facts(
+    root: Path,
+    *,
+    discipline_count: int,
+    actual_count: int,
+) -> None:
+    snapshot = strategy_snapshot()
+    start = date(2026, 7, 16)
+    fills: list[TradeFill] = []
+    for index in range(40):
         trading_date = (start + timedelta(days=index)).isoformat()
         orders: list[dict[str, object]] = []
-        if index < completed_trades:
+        if index < discipline_count:
             symbol = f"{600000 + index:06d}"
             orders = [
                 {
@@ -663,7 +692,72 @@ def write_review_history(
                     "notional": "1010",
                 },
             ]
-        payload: dict[str, object] = {
+        trend_review.freeze_discipline_fact(
+            root,
+            "CN",
+            trading_date,
+            str(100000 + index * 100 - (200 if index % 2 else 0)),
+            orders,
+            snapshot,
+        )
+        trend_review.freeze_actual_equity_fact(
+            root,
+            "CN",
+            trading_date,
+            str(100000 + index * 80 - (160 if index % 2 else 0)),
+            [],
+            snapshot,
+        )
+        trend_review.freeze_benchmark_fact(
+            root,
+            "CN",
+            trading_date,
+            {
+                "date": trading_date,
+                "close": str(1000 + index),
+                "source_id": "CSI_ALL_SHARE_PRICE",
+                "futu_symbol": "SH.000985",
+            },
+        )
+        if index < actual_count:
+            symbol = f"{700000 + index:06d}"
+            fills.extend(
+                [
+                    actual_fill(f"buy-{index}", symbol, "BUY", "100", trading_date),
+                    actual_fill(f"sell-{index}", symbol, "SELL", "100", trading_date),
+                ]
+            )
+    trend_review.freeze_actual_fill_batch(
+        root,
+        {"market": "CN", "source": "test"},
+        fills,
+        (start + timedelta(days=39)).isoformat(),
+    )
+    rates = root / "rates/DGS3MO.csv"
+    rates.parent.mkdir(parents=True)
+    rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
+
+
+def write_review_history(
+    root: Path,
+    *,
+    completed_trades: int,
+    days: int,
+) -> None:
+    daily = root / "trend_review/daily/CN"
+    daily.mkdir(parents=True)
+    start = date(2026, 7, 16)
+    snapshot = strategy_snapshot()
+    for index in range(days):
+        trading_date = (start + timedelta(days=index)).isoformat()
+        orders: list[dict[str, object]] = []
+        if index < completed_trades:
+            symbol = f"{600000 + index:06d}"
+            orders = [
+                {"side": "BUY", "status": "FILLED", "symbol": symbol, "qty": "100"},
+                {"side": "SELL", "status": "FILLED", "symbol": symbol, "qty": "100"},
+            ]
+        payload = {
             "schema_version": "open_trader.trend_review.daily.v1",
             "market": "CN",
             "date": trading_date,
@@ -679,26 +773,47 @@ def write_review_history(
                 "futu_symbol": "SH.000985",
             },
         }
-        if index == missing_actual_index:
-            payload.pop("actual_equity")
         (daily / f"{trading_date}.json").write_text(
             json.dumps(payload), encoding="utf-8"
         )
     rates = root / "rates/DGS3MO.csv"
     rates.parent.mkdir(parents=True)
-    rates.write_text("DATE,DGS3MO\n2026-04-30,4.0\n", encoding="utf-8")
+    rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
 
 
-def test_projection_closes_non_overlapping_batch_at_thirtieth_trade(
+@pytest.mark.parametrize(
+    ("discipline_count", "actual_count", "discipline_ready", "actual_ready"),
+    [(29, 30, False, True), (30, 29, True, False), (31, 31, True, True)],
+)
+def test_projection_unlocks_series_independently_and_never_batches(
     tmp_path: Path,
+    discipline_count: int,
+    actual_count: int,
+    discipline_ready: bool,
+    actual_ready: bool,
 ) -> None:
-    write_review_history(tmp_path, completed_trades=31, days=45)
+    write_separate_review_facts(
+        tmp_path,
+        discipline_count=discipline_count,
+        actual_count=actual_count,
+    )
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["batch"]["completed_trade_count"] == 30
-    assert projection["batch"]["batch_number"] == 1
-    assert Path(projection["batch_path"]).exists()
+    assert projection["sample_counts"] == {
+        "discipline": discipline_count,
+        "actual": actual_count,
+        "required": 30,
+    }
+    assert (
+        projection["metrics"]["calmar"]["discipline"]["value"] is not None
+    ) is discipline_ready
+    assert (
+        projection["metrics"]["calmar"]["actual"]["value"] is not None
+    ) is actual_ready
+    assert "batch" not in projection
+    assert "batch_path" not in projection
+    assert not (tmp_path / "trend_review/batches").exists()
     assert set(projection["metrics"]) == {
         "period_net_return",
         "market_excess_return",
@@ -716,48 +831,51 @@ def test_projection_closes_non_overlapping_batch_at_thirtieth_trade(
     }
 
 
-def test_projection_batch_starts_at_earliest_selected_entry(tmp_path: Path) -> None:
+def test_actual_cycles_close_partials_opening_positions_rebuys_and_dedupe() -> None:
+    fills = [
+        asdict(actual_fill("partial-1", "600001", "SELL", "40", "2026-07-16")),
+        asdict(actual_fill("partial-1", "600001", "SELL", "40", "2026-07-16")),
+        asdict(actual_fill("partial-2", "600001", "SELL", "60", "2026-07-17")),
+        asdict(actual_fill("rebuy", "600001", "BUY", "10", "2026-07-18")),
+        asdict(actual_fill("reclose", "600001", "SELL", "10", "2026-07-19")),
+    ]
+
+    cycles = trend_review._completed_cycles(
+        fills,
+        [{"symbol": "600001", "opened_at": "2026-07-01", "quantity": "100"}],
+    )
+
+    assert [(cycle["entry_date"], cycle["exit_date"]) for cycle in cycles] == [
+        ("2026-07-01", "2026-07-17"),
+        ("2026-07-18", "2026-07-19"),
+    ]
+    assert [len(cycle["fills"]) for cycle in cycles] == [2, 2]
+
+
+def test_old_daily_actual_equity_never_fabricates_actual_samples(tmp_path: Path) -> None:
     write_review_history(tmp_path, completed_trades=30, days=40)
-    daily = tmp_path / "trend_review/daily/CN"
-    first_path, _, third_path = sorted(daily.glob("*.json"))[:3]
-    first = json.loads(first_path.read_text(encoding="utf-8"))
-    delayed_sell = first["orders"].pop()
-    first_path.write_text(json.dumps(first), encoding="utf-8")
-    third = json.loads(third_path.read_text(encoding="utf-8"))
-    third["orders"].append(delayed_sell)
-    third_path.write_text(json.dumps(third), encoding="utf-8")
-
-    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
-
-    assert projection["batch"]["start_date"] == "2026-05-01"
-
-
-def test_projection_marks_missing_actual_curve_as_data_insufficient(
-    tmp_path: Path,
-) -> None:
-    write_review_history(
+    trend_review.freeze_actual_fill_batch(
         tmp_path,
-        completed_trades=30,
-        days=40,
-        missing_actual_index=10,
+        {"broker": "eastmoney"},
+        [],
+        "2026-08-24",
     )
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["metrics"]["sharpe"]["actual"] == {
-        "value": None,
-        "reason": "实际执行日终净值缺失",
+    assert projection["sample_counts"] == {
+        "discipline": 30,
+        "actual": 0,
+        "required": 30,
     }
 
 
-def test_projection_waits_for_thirty_trades(tmp_path: Path) -> None:
-    write_review_history(tmp_path, completed_trades=29, days=40)
+def test_missing_actual_fill_source_stops_common_cutoff(tmp_path: Path) -> None:
+    write_review_history(tmp_path, completed_trades=30, days=40)
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["batch"]["completed_trade_count"] == 29
-    assert projection["batch_path"] is None
-    assert projection["metrics"]["calmar"]["discipline"]["value"] is None
+    assert projection["common_cutoff"] is None
 
 
 def test_us_projection_belongs_to_tiger_trend_account(tmp_path: Path) -> None:
@@ -806,32 +924,43 @@ def test_projection_rejects_wrong_benchmark_identity(tmp_path: Path) -> None:
         trend_review.build_trend_review_projection(tmp_path, "CN")
 
 
-def test_projection_counts_partial_exit_once_and_keeps_entry_version(
+def test_common_cutoff_respects_equity_continuity_and_fill_completeness(
     tmp_path: Path,
 ) -> None:
-    write_review_history(tmp_path, completed_trades=29, days=40)
-    daily = tmp_path / "trend_review/daily/CN"
-    entry_path = sorted(daily.glob("*.json"))[29]
-    exit_path = sorted(daily.glob("*.json"))[30]
-    entry = json.loads(entry_path.read_text(encoding="utf-8"))
-    entry["orders"] = [
-        {"side": "BUY", "status": "FILLED", "symbol": "700000", "qty": "100"},
-        {"side": "SELL", "status": "FILLED", "symbol": "700000", "qty": "40"},
-    ]
-    entry_path.write_text(json.dumps(entry), encoding="utf-8")
-    exit_fact = json.loads(exit_path.read_text(encoding="utf-8"))
-    exit_fact["strategy_snapshot"] = {
-        **exit_fact["strategy_snapshot"],
-        "strategy_version": "v2",
-    }
-    exit_fact["orders"] = [
-        {"side": "SELL", "status": "FILLED", "symbol": "700000", "qty": "60"}
-    ]
-    exit_path.write_text(json.dumps(exit_fact), encoding="utf-8")
+    write_separate_review_facts(tmp_path, discipline_count=0, actual_count=0)
+    missing = (
+        tmp_path
+        / "trend_review/facts/actual_equity/CN/2026-07-18.json"
+    )
+    missing.unlink()
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
-    batch = json.loads(Path(projection["batch_path"]).read_text(encoding="utf-8"))
-    final_trade = batch["completed_trades"][-1]
 
-    assert final_trade["quantity"] == "100"
-    assert final_trade["strategy_snapshot"]["strategy_version"] == "v1"
+    assert projection["common_cutoff"] == "2026-07-17"
+    assert projection["interval"] == {
+        "start": "2026-07-16",
+        "end": "2026-07-17",
+    }
+
+
+def test_common_cutoff_uses_available_benchmark_calendar() -> None:
+    assert trend_review._common_cutoff(
+        "2026-07-16",
+        {"2026-07-16", "2026-07-17", "2026-07-20"},
+        {"2026-07-16", "2026-07-17"},
+        {"2026-07-16", "2026-07-17", "2026-07-20"},
+    ) == "2026-07-17"
+
+
+def test_projection_does_not_mix_strategy_versions(tmp_path: Path) -> None:
+    write_separate_review_facts(tmp_path, discipline_count=31, actual_count=31)
+    path = tmp_path / "trend_review/facts/discipline/CN/2026-08-15.json"
+    fact = json.loads(path.read_text(encoding="utf-8"))
+    fact["strategy_snapshot"] = strategy_snapshot(version="v2")
+    path.write_text(json.dumps(fact), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["strategy_snapshot"]["strategy_version"] == "v1"
+    assert projection["strategy_snapshot"]["effective_from"] == "2026-07-16"
+    assert projection["sample_counts"]["discipline"] == 30

@@ -30,7 +30,7 @@ from .trend_animals import (
     TrendAnimalsLookupError,
 )
 from .trend_delivery import deliver_daily_trend_text
-from .trend_review import freeze_report_evidence
+from .trend_review import TREND_V1_EFFECTIVE_FROM, freeze_report_evidence
 
 
 NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
@@ -206,7 +206,7 @@ def trend_strategy_snapshot(
         "strategy_name": name,
         "strategy_version": "v1",
         "market": market,
-        "effective_from": "2026-07-14",
+        "effective_from": TREND_V1_EFFECTIVE_FROM[market],
         "process_version": process_version,
         "parameters": parameters,
         "parameter_rows": [

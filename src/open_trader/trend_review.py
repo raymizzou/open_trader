@@ -13,6 +13,8 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .models import TradeFill
+
 
 EVIDENCE_SCHEMA_VERSION = "open_trader.trend_review.evidence.v1"
 REPLAY_SCHEMA_VERSION = "open_trader.trend_review.replay.v1"
@@ -26,6 +28,11 @@ BENCHMARK_FUTU_SYMBOLS = {
     "CN": "SH.000985",
     "US": "US.SPY",
     "HK": "HK.800701",
+}
+TREND_V1_EFFECTIVE_FROM = {
+    "CN": "2026-07-16",
+    "US": "2026-07-17",
+    "HK": "2026-07-17",
 }
 
 
@@ -104,6 +111,147 @@ def _market(value: object) -> str:
     if market not in {"CN", "US", "HK"}:
         raise ValueError(f"unsupported trend review market: {value}")
     return market
+
+
+def _fact_path(
+    data_dir: Path, stream: str, market: str, trading_date: str
+) -> Path:
+    return (
+        data_dir
+        / "trend_review"
+        / "facts"
+        / stream
+        / market
+        / f"{trading_date}.json"
+    )
+
+
+def freeze_discipline_fact(
+    data_dir: Path,
+    market: str,
+    trading_date: str,
+    equity: object,
+    orders: Sequence[Mapping[str, object]],
+    strategy_snapshot: Mapping[str, object],
+) -> Path:
+    market = _market(market)
+    payload = {
+        "schema_version": "open_trader.trend_review.discipline.v1",
+        "market": market,
+        "date": trading_date,
+        "equity_after_fees": str(_required_decimal(equity, "discipline equity")),
+        "orders": [dict(order) for order in orders],
+        "strategy_snapshot": dict(strategy_snapshot),
+    }
+    return _write_immutable(
+        _fact_path(data_dir, "discipline", market, trading_date),
+        _canonical_json_bytes(payload),
+    )
+
+
+def freeze_actual_equity_fact(
+    data_dir: Path,
+    market: str,
+    trading_date: str,
+    equity: object,
+    opening_positions: Sequence[Mapping[str, object]],
+    strategy_snapshot: Mapping[str, object],
+) -> Path:
+    market = _market(market)
+    payload = {
+        "schema_version": "open_trader.trend_review.actual_equity.v1",
+        "market": market,
+        "date": trading_date,
+        "equity": str(_required_decimal(equity, "actual equity")),
+        "opening_positions": [dict(position) for position in opening_positions],
+        "strategy_snapshot": dict(strategy_snapshot),
+    }
+    return _write_immutable(
+        _fact_path(data_dir, "actual_equity", market, trading_date),
+        _canonical_json_bytes(payload),
+    )
+
+
+def freeze_benchmark_fact(
+    data_dir: Path,
+    market: str,
+    trading_date: str,
+    benchmark: Mapping[str, object],
+) -> Path:
+    market = _market(market)
+    validated = _validate_benchmark(
+        benchmark, market=market, trading_date=trading_date
+    )
+    payload = {
+        "schema_version": "open_trader.trend_review.benchmark.v1",
+        "market": market,
+        "date": trading_date,
+        "benchmark": dict(validated),
+    }
+    return _write_immutable(
+        _fact_path(data_dir, "benchmark", market, trading_date),
+        _canonical_json_bytes(payload),
+    )
+
+
+def freeze_actual_fill_batch(
+    data_dir: Path,
+    source_metadata: Mapping[str, object],
+    fills: Sequence[TradeFill],
+    complete_through: str,
+) -> list[Path]:
+    raw_market = source_metadata.get("market")
+    if raw_market is None and fills:
+        raw_market = fills[0].market
+    if raw_market is None:
+        raw_market = {
+            "eastmoney": "CN",
+            "tiger": "US",
+            "phillips": "HK",
+        }.get(str(source_metadata.get("broker") or "").lower())
+    market = _market(raw_market)
+    paths: list[Path] = []
+    identities: list[str] = []
+    for fill in fills:
+        if _market(fill.market) != market:
+            raise ValueError("actual fill market does not match source metadata")
+        identity = f"{fill.broker}:{fill.account_alias}:{fill.source_id}"
+        digest = hashlib.sha256(f"{fill.broker}:{fill.source_id}".encode()).hexdigest()
+        paths.append(
+            _write_immutable(
+                data_dir
+                / "trend_review"
+                / "facts"
+                / "actual_fills"
+                / market
+                / f"{digest}.json",
+                _canonical_json_bytes(
+                    {
+                        "schema_version": "open_trader.trend_review.fill.v1",
+                        **asdict(fill),
+                    }
+                ),
+            )
+        )
+        identities.append(identity)
+    completeness = {
+        "schema_version": "open_trader.trend_review.fill_completeness.v1",
+        "market": market,
+        "complete_through": complete_through,
+        "source_metadata": dict(source_metadata),
+        "fill_identities": sorted(identities),
+    }
+    digest = hashlib.sha256(_canonical_json_bytes(completeness)).hexdigest()
+    _write_immutable(
+        data_dir
+        / "trend_review"
+        / "facts"
+        / "actual_fill_completeness"
+        / market
+        / f"{digest}.json",
+        _canonical_json_bytes(completeness),
+    )
+    return paths
 
 
 def freeze_trend_evidence(
@@ -687,6 +835,148 @@ def _load_daily_facts(data_dir: Path, market: str) -> list[dict[str, object]]:
     return facts
 
 
+def _load_dated_fact_stream(
+    data_dir: Path,
+    stream: str,
+    market: str,
+    schema_version: str,
+) -> list[dict[str, object]]:
+    root = data_dir / "trend_review" / "facts" / stream / market
+    facts: list[dict[str, object]] = []
+    for path in sorted(root.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != schema_version
+            or payload.get("market") != market
+            or payload.get("date") != path.stem
+        ):
+            raise ValueError(f"invalid trend review {stream} fact: {path}")
+        facts.append(payload)
+    return facts
+
+
+def _load_actual_fills(
+    data_dir: Path, market: str
+) -> tuple[list[dict[str, object]], str | None]:
+    fills: list[dict[str, object]] = []
+    root = data_dir / "trend_review" / "facts" / "actual_fills" / market
+    for path in sorted(root.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version")
+            != "open_trader.trend_review.fill.v1"
+            or payload.get("market") != market
+        ):
+            raise ValueError(f"invalid trend review actual fill fact: {path}")
+        fills.append(payload)
+    completeness: list[str] = []
+    completeness_root = (
+        data_dir
+        / "trend_review"
+        / "facts"
+        / "actual_fill_completeness"
+        / market
+    )
+    for path in sorted(completeness_root.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version")
+            != "open_trader.trend_review.fill_completeness.v1"
+            or payload.get("market") != market
+        ):
+            raise ValueError(f"invalid trend review fill completeness fact: {path}")
+        complete_through = str(payload.get("complete_through") or "")
+        try:
+            date.fromisoformat(complete_through)
+        except ValueError:
+            raise ValueError(
+                f"invalid trend review fill completeness fact: {path}"
+            ) from None
+        completeness.append(complete_through)
+    return fills, max(completeness, default=None)
+
+
+def _completed_cycles(
+    fills: Sequence[Mapping[str, object]],
+    opening_positions: Sequence[Mapping[str, object]] = (),
+) -> list[dict[str, object]]:
+    positions = {
+        str(row["symbol"]): {
+            "symbol": str(row["symbol"]),
+            "entry_date": str(row["opened_at"])[:10],
+            "quantity": _required_decimal(row["quantity"], "opening quantity"),
+            "fills": [],
+        }
+        for row in opening_positions
+    }
+    completed: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for fill in sorted(
+        fills, key=lambda row: (str(row["executed_at"]), str(row["source_id"]))
+    ):
+        identity = (
+            str(fill["broker"]),
+            str(fill["account_alias"]),
+            str(fill["source_id"]),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        symbol = str(fill["symbol"])
+        quantity = _required_decimal(fill["quantity"], "fill quantity")
+        if quantity <= 0:
+            raise ValueError("fill quantity must be positive")
+        current = positions.get(symbol)
+        if fill["side"] == "BUY":
+            if current is None:
+                current = {
+                    "symbol": symbol,
+                    "entry_date": str(fill["executed_at"])[:10],
+                    "quantity": Decimal("0"),
+                    "fills": [],
+                }
+                positions[symbol] = current
+            current["quantity"] = (
+                _required_decimal(current["quantity"], "open quantity") + quantity
+            )
+        elif fill["side"] == "SELL":
+            if current is None or _required_decimal(
+                current["quantity"], "open quantity"
+            ) < quantity:
+                raise ValueError("sell fill exceeds actual position")
+            current["quantity"] = (
+                _required_decimal(current["quantity"], "open quantity") - quantity
+            )
+        else:
+            raise ValueError("actual fill side must be BUY or SELL")
+        current["fills"].append(dict(fill))
+        if current["quantity"] == 0:
+            completed.append(
+                {**current, "exit_date": str(fill["executed_at"])[:10]}
+            )
+            del positions[symbol]
+    return completed
+
+
+def _common_cutoff(
+    effective_from: str,
+    discipline_dates: set[str],
+    actual_dates: set[str],
+    benchmark_dates: set[str],
+) -> str | None:
+    cutoff: str | None = None
+    for trading_date in sorted(
+        day for day in benchmark_dates if day >= effective_from
+    ):
+        if trading_date not in discipline_dates or trading_date not in actual_dates:
+            break
+        cutoff = trading_date
+    return cutoff
+
+
 def _completed_trades(facts: list[dict[str, object]]) -> list[dict[str, object]]:
     open_by_symbol: dict[str, dict[str, object]] = {}
     completed: list[dict[str, object]] = []
@@ -927,157 +1217,244 @@ def build_trend_review_projection(
     data_dir: Path, market: str
 ) -> dict[str, object]:
     market = _market(market)
-    facts = _load_daily_facts(data_dir, market)
-    trades = _completed_trades(facts)
+    effective_from = TREND_V1_EFFECTIVE_FROM[market]
+    daily_root = data_dir / "trend_review" / "daily" / market
+    legacy = _load_daily_facts(data_dir, market) if any(daily_root.glob("*.json")) else []
+    discipline_by_date = {str(fact["date"]): fact for fact in legacy}
+    actual_by_date = {
+        str(fact["date"]): {
+            "date": fact["date"],
+            "actual_equity": fact["actual_equity"],
+            "strategy_snapshot": fact.get("strategy_snapshot"),
+            "opening_positions": [],
+            "new_fact": False,
+        }
+        for fact in legacy
+        if "actual_equity" in fact
+    }
+    benchmark_by_date = {
+        str(fact["date"]): dict(fact["benchmark"])
+        for fact in legacy
+    }
+    for fact in _load_dated_fact_stream(
+        data_dir,
+        "discipline",
+        market,
+        "open_trader.trend_review.discipline.v1",
+    ):
+        discipline_by_date[str(fact["date"])] = {
+            "date": fact["date"],
+            "discipline_equity_after_fees": fact["equity_after_fees"],
+            "orders": fact["orders"],
+            "strategy_snapshot": fact.get("strategy_snapshot"),
+        }
+    for fact in _load_dated_fact_stream(
+        data_dir,
+        "actual_equity",
+        market,
+        "open_trader.trend_review.actual_equity.v1",
+    ):
+        actual_by_date[str(fact["date"])] = {
+            "date": fact["date"],
+            "actual_equity": fact["equity"],
+            "strategy_snapshot": fact.get("strategy_snapshot"),
+            "opening_positions": fact.get("opening_positions", []),
+            "new_fact": True,
+        }
+    for fact in _load_dated_fact_stream(
+        data_dir,
+        "benchmark",
+        market,
+        "open_trader.trend_review.benchmark.v1",
+    ):
+        benchmark = _validate_benchmark(
+            fact.get("benchmark"), market=market, trading_date=str(fact["date"])
+        )
+        benchmark_by_date[str(fact["date"])] = dict(benchmark)
+    if not discipline_by_date and not actual_by_date and not benchmark_by_date:
+        raise ValueError(f"no trend review facts for {market}")
+
+    def is_v1(fact: Mapping[str, object]) -> bool:
+        snapshot = fact.get("strategy_snapshot")
+        return (
+            isinstance(snapshot, Mapping)
+            and snapshot.get("strategy_version") == "v1"
+        )
+
+    discipline_facts = [
+        discipline_by_date[trading_date]
+        for trading_date in sorted(discipline_by_date)
+        if is_v1(discipline_by_date[trading_date])
+    ]
+    actual_facts = [
+        actual_by_date[trading_date]
+        for trading_date in sorted(actual_by_date)
+        if is_v1(actual_by_date[trading_date])
+    ]
+    snapshots = [
+        fact["strategy_snapshot"]
+        for fact in [*discipline_facts, *actual_facts]
+        if isinstance(fact.get("strategy_snapshot"), Mapping)
+    ]
+    snapshot = dict(snapshots[-1]) if snapshots else {}
+    snapshot["effective_from"] = effective_from
+
+    fills, actual_complete_through = _load_actual_fills(data_dir, market)
+    equity_cutoff = _common_cutoff(
+        effective_from,
+        {str(fact["date"]) for fact in discipline_facts},
+        {str(fact["date"]) for fact in actual_facts},
+        set(benchmark_by_date),
+    )
+    common_cutoff = (
+        max(
+            (
+                trading_date
+                for trading_date in benchmark_by_date
+                if effective_from <= trading_date <= equity_cutoff
+                and trading_date <= actual_complete_through
+            ),
+            default=None,
+        )
+        if equity_cutoff is not None and actual_complete_through is not None
+        else None
+    )
+    interval_discipline = [
+        fact
+        for fact in discipline_facts
+        if common_cutoff is not None
+        and effective_from <= str(fact["date"]) <= common_cutoff
+    ]
+    discipline_cycles = _completed_trades(interval_discipline)
+    interval_actual = {
+        str(fact["date"]): fact
+        for fact in actual_facts
+        if common_cutoff is not None
+        and effective_from <= str(fact["date"]) <= common_cutoff
+    }
+    interval_fills = [
+        fill
+        for fill in fills
+        if common_cutoff is not None
+        and effective_from <= str(fill["executed_at"])[:10] <= common_cutoff
+        and str(fill["executed_at"])[:10] in interval_actual
+    ]
+    opening_fact = next(
+        (
+            fact
+            for fact in interval_actual.values()
+            if fact.get("new_fact") is True
+        ),
+        None,
+    )
+    opening_positions = (
+        [
+            {**position, "opened_at": position.get("opened_at", opening_fact["date"])}
+            for position in opening_fact.get("opening_positions", [])
+            if isinstance(position, Mapping)
+        ]
+        if opening_fact is not None
+        else []
+    )
+    if not isinstance(opening_positions, list):
+        raise ValueError("actual opening positions must be a list")
+    actual_cycles = _completed_cycles(interval_fills, opening_positions)
+
     rates_path = data_dir / "rates" / "DGS3MO.csv"
     rates = _load_dgs3mo_csv(rates_path)
-    completed_batches = len(trades) // 30
-    if completed_batches == 0:
-        reason = "尚未完成 30 笔纪律模拟交易"
-        metrics = {
-            key: {
-                series: _metric(None, reason)
-                for series in ("discipline", "actual", "benchmark")
-            }
-            for key in (
-                "period_net_return",
-                "market_excess_return",
-                "max_drawdown",
-                "calmar",
-                "sharpe",
-            )
-        }
-        batch = {
-            "batch_number": 1,
-            "completed_trade_count": len(trades),
-            "start_date": trades[0]["entry_date"] if trades else facts[0]["date"],
-            "end_date": None,
-        }
-        batch_path: Path | None = None
-    else:
-        batch_number = completed_batches
-        selected_trades = trades[(batch_number - 1) * 30 : batch_number * 30]
-        start_date = min(str(trade["entry_date"]) for trade in selected_trades)
-        end_date = str(selected_trades[-1]["exit_date"])
-        selected_facts = [
-            fact for fact in facts if start_date <= str(fact["date"]) <= end_date
-        ]
-        discipline_curve = _normalized_curve(
-            selected_facts, "discipline_equity_after_fees"
-        )
-        actual_curve = _normalized_curve(selected_facts, "actual_equity")
-        benchmark_facts = [
+    curve_dates = [
+        trading_date
+        for trading_date in sorted(benchmark_by_date)
+        if common_cutoff is not None
+        and effective_from <= trading_date <= common_cutoff
+    ]
+    discipline_curve = _normalized_curve(
+        [discipline_by_date[trading_date] for trading_date in curve_dates],
+        "discipline_equity_after_fees",
+    ) if curve_dates else None
+    actual_curve = _normalized_curve(
+        [actual_by_date[trading_date] for trading_date in curve_dates],
+        "actual_equity",
+    ) if curve_dates else None
+    benchmark_curve = _normalized_curve(
+        [
             {
-                "date": fact["date"],
-                "benchmark_equity": fact["benchmark"]["close"],
+                "date": trading_date,
+                "benchmark_equity": benchmark_by_date[trading_date]["close"],
             }
-            for fact in selected_facts
-        ]
-        benchmark_curve = _normalized_curve(
-            benchmark_facts, "benchmark_equity"
-        )
-        discipline_metrics = _curve_metrics(
-            discipline_curve, rates, missing_reason="纪律模拟日终净值缺失"
-        )
-        actual_metrics = _curve_metrics(
-            actual_curve, rates, missing_reason="实际执行日终净值缺失"
-        )
-        benchmark_metrics = _curve_metrics(
-            benchmark_curve, rates, missing_reason="市场基准缺失"
-        )
+            for trading_date in curve_dates
+        ],
+        "benchmark_equity",
+    ) if curve_dates else None
+    discipline_metrics = _curve_metrics(
+        discipline_curve, rates, missing_reason="纪律模拟日终净值缺失"
+    )
+    actual_metrics = _curve_metrics(
+        actual_curve, rates, missing_reason="实际执行日终净值缺失"
+    )
+    benchmark_metrics = _curve_metrics(
+        benchmark_curve, rates, missing_reason="市场基准缺失"
+    )
 
-        def values(metric_name: str) -> dict[str, dict[str, object]]:
-            return {
-                "discipline": discipline_metrics[metric_name],
-                "actual": actual_metrics[metric_name],
-                "benchmark": benchmark_metrics[metric_name],
-            }
+    def values(metric_name: str) -> dict[str, dict[str, object]]:
+        return {
+            "discipline": discipline_metrics[metric_name],
+            "actual": actual_metrics[metric_name],
+            "benchmark": benchmark_metrics[metric_name],
+        }
 
-        def excess(
-            item: dict[str, object], benchmark_item: dict[str, object]
-        ) -> dict[str, object]:
-            if item["value"] is None:
-                return item
-            if benchmark_item["value"] is None:
-                return benchmark_item
-            return _metric(
-                str(
-                    _required_decimal(item["value"], "return")
-                    - _required_decimal(benchmark_item["value"], "benchmark return")
-                )
+    def excess(
+        item: dict[str, object], benchmark_item: dict[str, object]
+    ) -> dict[str, object]:
+        if item["value"] is None:
+            return item
+        if benchmark_item["value"] is None:
+            return benchmark_item
+        return _metric(
+            str(
+                _required_decimal(item["value"], "return")
+                - _required_decimal(benchmark_item["value"], "benchmark return")
             )
-
-        metrics = {
-            "period_net_return": values("total_return_pct"),
-            "market_excess_return": {
-                "discipline": excess(
-                    discipline_metrics["total_return_pct"],
-                    benchmark_metrics["total_return_pct"],
-                ),
-                "actual": excess(
-                    actual_metrics["total_return_pct"],
-                    benchmark_metrics["total_return_pct"],
-                ),
-                "benchmark": _metric("0"),
-            },
-            "max_drawdown": values("max_drawdown_pct"),
-            "calmar": values("calmar_ratio"),
-            "sharpe": values("sharpe_ratio"),
-        }
-        batch = {
-            "batch_number": batch_number,
-            "completed_trade_count": 30,
-            "start_date": start_date,
-            "end_date": end_date,
-        }
-        batch_path = (
-            data_dir
-            / "trend_review"
-            / "batches"
-            / market
-            / f"{batch_number:04d}.json"
         )
-        batch_payload = {
-            "schema_version": "open_trader.trend_review.batch.v1",
-            "market": market,
-            "batch": batch,
-            "strategy_snapshot": selected_facts[-1].get("strategy_snapshot"),
-            "curves": {
-                "discipline": discipline_curve,
-                "actual": actual_curve,
-                "benchmark": benchmark_curve,
-            },
-            "metrics": metrics,
-            "completed_trades": selected_trades,
-            "benchmark_source_id": BENCHMARK_SOURCE_IDS[market],
-            "benchmark_sha256": hashlib.sha256(
-                _canonical_json_bytes({
-                    "benchmarks": [fact["benchmark"] for fact in selected_facts]
-                })
-            ).hexdigest(),
-            "rates_sha256": hashlib.sha256(rates_path.read_bytes()).hexdigest(),
-            "generated_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
-            "process_version": (
-                selected_facts[-1].get("strategy_snapshot") or {}
-            ).get("process_version"),
-        }
-        if batch_path.exists():
-            existing = json.loads(batch_path.read_text(encoding="utf-8"))
-            metrics = existing["metrics"]
-            batch = existing["batch"]
-        else:
-            _write_immutable(batch_path, _canonical_json_bytes(batch_payload))
 
-    latest_snapshot = facts[-1].get("strategy_snapshot")
+    metrics = {
+        "period_net_return": values("total_return_pct"),
+        "market_excess_return": {
+            "discipline": excess(
+                discipline_metrics["total_return_pct"],
+                benchmark_metrics["total_return_pct"],
+            ),
+            "actual": excess(
+                actual_metrics["total_return_pct"],
+                benchmark_metrics["total_return_pct"],
+            ),
+            "benchmark": _metric("0") if benchmark_curve else _metric(None, "市场基准缺失"),
+        },
+        "max_drawdown": values("max_drawdown_pct"),
+        "calmar": values("calmar_ratio"),
+        "sharpe": values("sharpe_ratio"),
+    }
+    sample_counts = {
+        "discipline": len(discipline_cycles),
+        "actual": len(actual_cycles),
+        "required": 30,
+    }
+    for series in ("discipline", "actual"):
+        count = sample_counts[series]
+        if count < 30:
+            for metric in metrics.values():
+                metric[series] = _metric(None, f"{count} / 30，数据不足")
+
     projection = {
-        "schema_version": "open_trader.trend_review.projection.v1",
+        "schema_version": "open_trader.trend_review.projection.v2",
         "available": True,
         "market": market,
         "market_label": {"CN": "A 股", "US": "美股", "HK": "港股"}[market],
         "broker": {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market],
-        "strategy_snapshot": latest_snapshot,
-        "batch": batch,
-        "batch_path": None if batch_path is None else str(batch_path),
+        "strategy_snapshot": snapshot,
+        "sample_counts": sample_counts,
+        "common_cutoff": common_cutoff,
+        "interval": {"start": effective_from, "end": common_cutoff},
         "metrics": metrics,
     }
     _write_json_atomic(
