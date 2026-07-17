@@ -415,7 +415,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
                 "source_date": account_source_date,
                 "exceptions": (
                     ["趋势判断不支持当前持仓：AAPL260717C200000（option）"]
-                    if directory == "trend_us_futu"
+                    if directory == "trend_us_tiger"
                     else []
                 ),
             },
