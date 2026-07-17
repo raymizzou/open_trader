@@ -15,6 +15,7 @@ from open_trader.futu_skill_facts import (
     DERIVATIVES_ANOMALY_CATEGORY_LABELS_US,
     FUTU_SKILL_FACTS_SCHEMA_VERSION,
     FutuAnomalyScriptClient,
+    FutuAnomalyUnsupportedError,
     FutuNewsSentimentExtractor,
     FutuSkillFactsExtractor,
     FutuSkillNewsSentimentExtractor,
@@ -709,8 +710,71 @@ def test_futu_anomaly_client_reports_native_sdk_unsupported_reason(tmp_path: Pat
         context_factory=lambda **_kwargs: FakeContext(),
     )
 
-    with pytest.raises(RuntimeError, match="富途接口不支持技术异动：US.BOTZ"):
+    with pytest.raises(
+        FutuAnomalyUnsupportedError,
+        match="富途接口不支持技术异动：US.BOTZ",
+    ):
         client.run("technical", market="US", symbol="BOTZ", window_days=7)
+
+
+def test_generate_futu_skill_facts_marks_native_unsupported_as_not_applicable(
+    tmp_path: Path,
+) -> None:
+    class UnsupportedTechnicalExtractor(FakeExtractor):
+        def extract_technical_anomaly(
+            self,
+            *,
+            market: str,
+            symbol: str,
+            name: str,
+            run_date: str,
+            window_days: int,
+        ) -> dict[str, object]:
+            del market, name, run_date, window_days
+            raise FutuAnomalyUnsupportedError(f"富途接口不支持技术异动：US.{symbol}")
+
+    portfolio = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(
+        portfolio,
+        [
+            {
+                "market": "US",
+                "symbol": "BOTZ",
+                "name": "Global X Robotics & AI ETF",
+                "asset_class": "stock",
+            }
+        ],
+    )
+
+    result = generate_futu_skill_facts(
+        portfolio_path=portfolio,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        extractor=UnsupportedTechnicalExtractor(),
+        update_latest=False,
+    )
+
+    record = load_futu_skill_facts_cache(result.run_path)["records"][0]
+    assert result.failed == 0
+    assert record["error"] == ""
+    assert record["technical_anomaly"] == {
+        "status": "not_applicable",
+        "signal": "neutral",
+        "confidence": "low",
+        "suggested_constraint": "",
+        "window_days": 7,
+        "summary": "富途接口不支持技术异动：US.BOTZ",
+        "categories": [
+            {
+                "name": "技术异动",
+                "state": "not_applicable",
+                "direction": "",
+                "detail": "富途接口不支持技术异动：US.BOTZ",
+                "evidence_date": "",
+            }
+        ],
+    }
 
 
 def test_futu_anomaly_script_client_extracts_json_from_sdk_logs(
