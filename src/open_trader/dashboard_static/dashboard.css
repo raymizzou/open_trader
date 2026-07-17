@@ -360,7 +360,6 @@ select:focus-visible {
 .summary-card,
 .filter-panel,
 .kelly-lab-panel,
-.tiger-long-term-panel,
 .holdings-panel,
 .info-panel {
   background: var(--surface);
@@ -508,8 +507,7 @@ select:focus-visible {
   grid-template-columns: minmax(0, 1fr);
 }
 
-.workspace-grid.kelly-lab-view .holdings-panel,
-.workspace-grid.kelly-lab-view .tiger-long-term-panel {
+.workspace-grid.kelly-lab-view .holdings-panel {
   display: none;
 }
 
@@ -523,162 +521,6 @@ select:focus-visible {
   gap: 10px;
   min-width: 0;
   padding: 12px 14px;
-}
-
-.tiger-long-term-panel {
-  display: grid;
-  gap: 12px;
-  min-width: 0;
-  padding: 14px;
-}
-
-.tiger-panel-heading {
-  align-items: flex-start;
-  display: flex;
-  gap: 16px;
-  justify-content: space-between;
-}
-
-.tiger-panel-heading h2,
-.tiger-metric-card h3 {
-  margin: 0;
-}
-
-.tiger-panel-heading p {
-  color: var(--muted);
-  margin: 5px 0 0;
-}
-
-.tiger-panel-status {
-  align-items: flex-end;
-  color: var(--muted);
-  display: grid;
-  flex: 0 0 auto;
-  font-size: 12px;
-  gap: 5px;
-  justify-items: end;
-}
-
-.tiger-rule-strip {
-  align-items: center;
-  background: var(--surface-soft);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px 14px;
-  padding: 9px 11px;
-}
-
-.tiger-rule-strip span {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.tiger-rule-strip .tiger-gate-reasons {
-  color: var(--text);
-  margin-left: auto;
-  overflow-wrap: anywhere;
-}
-
-.tiger-metric-grid {
-  display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.tiger-metric-card {
-  background: var(--surface-soft);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  min-width: 0;
-  padding: 11px;
-}
-
-.tiger-metric-card h3 {
-  font-size: 14px;
-}
-
-.tiger-metric-card dl {
-  display: grid;
-  gap: 6px 12px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin: 10px 0 0;
-}
-
-.tiger-metric-card dl div {
-  min-width: 0;
-}
-
-.tiger-metric-card dt {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.tiger-metric-card dd {
-  font-size: 14px;
-  font-weight: 800;
-  margin: 2px 0 0;
-}
-
-.tiger-member-table {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  min-width: 0;
-  overflow: hidden;
-}
-
-.tiger-member-header,
-.tiger-member-row {
-  display: grid;
-  gap: 8px;
-  grid-template-columns: .65fr 1.1fr .65fr .75fr .75fr .65fr 1fr 1fr;
-  min-width: 0;
-  padding: 9px 11px;
-}
-
-.tiger-member-header {
-  background: var(--surface-soft);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 800;
-}
-
-.tiger-member-row + .tiger-member-row {
-  border-top: 1px solid var(--line);
-}
-
-.tiger-member-cell,
-.tiger-member-header span {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.tiger-member-cell {
-  align-items: center;
-  display: flex;
-  font-size: 12px;
-}
-
-.tiger-number {
-  font-variant-numeric: tabular-nums;
-}
-
-.tiger-symbol {
-  font-weight: 800;
-}
-
-.tiger-mobile-label {
-  display: none;
-}
-
-.tiger-unavailable {
-  background: var(--surface-soft);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  color: var(--muted);
-  padding: 14px;
 }
 
 .kelly-lab-heading {
@@ -1408,8 +1250,7 @@ table {
 .broker-summary-card[data-broker="eastmoney"],
 #account-eastmoney { --broker-accent: #dc2626; }
 
-.account-section-header,
-.account-strategy-summary {
+.account-section-header {
   background: var(--surface);
 }
 
@@ -1463,11 +1304,6 @@ table {
   color: var(--danger);
 }
 
-.account-strategy-summary {
-  border-top: 1px solid var(--line);
-  padding: 12px;
-}
-
 .trend-report-entry {
   display: flex;
   flex-wrap: wrap;
@@ -1475,8 +1311,20 @@ table {
   max-width: 240px;
 }
 
+.trend-entry-buttons,
+.trend-entry-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.trend-entry-details {
+  gap: 4px 10px;
+}
+
 .trend-report-entry button,
-.trend-report-header button {
+.trend-report-header button,
+.trend-review-header button {
   background: var(--surface);
   border: 1px solid var(--accent);
   border-radius: 7px;
@@ -1486,6 +1334,165 @@ table {
   min-height: 38px;
   padding: 0 12px;
 }
+
+.trend-review {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+}
+
+.trend-review-header {
+  align-items: start;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding-bottom: 18px;
+}
+
+.trend-review-header h1,
+.trend-review-header p,
+.trend-review-parameters h2,
+.trend-review-parameter-list p,
+.trend-review-chart,
+.trend-review-metric h3 {
+  margin: 0;
+}
+
+.trend-review-header p,
+.trend-review-header span,
+.trend-review-parameter-list span {
+  color: var(--muted);
+}
+
+.trend-review-header h1 {
+  font-size: 24px;
+  margin: 4px 0;
+}
+
+.trend-review-parameters {
+  display: grid;
+  gap: 10px;
+}
+
+.trend-review-parameters h2,
+.trend-review-chart figcaption {
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.trend-review-parameter-list {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.trend-review-parameter-list > div {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 120px 160px minmax(0, 1fr);
+  padding: 10px 12px;
+}
+
+.trend-review-parameter-list > div + div {
+  border-top: 1px solid var(--line);
+}
+
+.trend-review-charts {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.trend-review-chart {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 16px;
+}
+
+.trend-review-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.trend-review-legend span::before {
+  background: currentColor;
+  border-radius: 2px;
+  content: "";
+  display: inline-block;
+  height: 8px;
+  margin-right: 6px;
+  width: 16px;
+}
+
+.trend-review-legend .discipline { color: var(--accent); }
+.trend-review-legend .actual { color: var(--primary); }
+.trend-review-legend .benchmark { color: var(--muted); }
+
+.trend-review-metric {
+  display: grid;
+  gap: 7px;
+}
+
+.trend-review-metric + .trend-review-metric {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.trend-review-metric h3 {
+  font-size: 14px;
+}
+
+.trend-review-series {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 64px minmax(80px, 1fr) minmax(56px, auto);
+  min-width: 0;
+}
+
+.trend-review-series strong {
+  text-align: right;
+}
+
+.trend-review-series.unavailable strong {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.trend-review-track {
+  background: var(--line);
+  border-radius: 3px;
+  height: 10px;
+  position: relative;
+}
+
+.trend-review-track::after {
+  background: var(--line);
+  content: "";
+  inset: 0 auto 0 50%;
+  position: absolute;
+  width: 1px;
+}
+
+.trend-review-bar {
+  background: currentColor;
+  height: 100%;
+  position: absolute;
+  width: var(--trend-review-width);
+}
+
+.trend-review-bar.positive { left: 50%; }
+.trend-review-bar.negative { right: 50%; }
+.trend-review-bar.discipline { color: var(--accent); }
+.trend-review-bar.actual { color: var(--primary); }
+.trend-review-bar.benchmark { color: var(--muted); }
 
 .trend-report-entry span {
   color: var(--muted);
@@ -1726,6 +1733,76 @@ table {
 .cn-trend-table th {
   color: var(--muted);
   font-size: 12px;
+}
+
+.option-attention-workspace {
+  display: grid;
+  gap: 16px;
+}
+
+.option-attention-header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.option-attention-header h1 {
+  margin: 0;
+}
+
+.option-attention-header button {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  color: var(--accent-strong);
+  cursor: pointer;
+  font-weight: 700;
+  min-height: 38px;
+  padding: 0 12px;
+}
+
+.option-attention-table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+}
+
+.option-attention-table th,
+.option-attention-table td {
+  overflow-wrap: anywhere;
+  padding: 9px 7px;
+  vertical-align: top;
+}
+
+.option-attention-table th {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.option-attention-market th {
+  background: var(--surface-soft);
+  border-block: 1px solid var(--line);
+  color: var(--text);
+  font-size: 14px;
+  text-align: left;
+}
+
+.option-attention-market-content {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.option-attention-market th span:last-child {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.option-attention-changed {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 4px;
+  font-weight: 700;
+  padding: 1px 3px;
 }
 
 .trend-discipline {
@@ -3816,10 +3893,6 @@ tbody tr.active-row .pnl-loss {
 .source-status-row,
 .backtest-form-section,
 .backtest-results,
-.tiger-rule-strip,
-.tiger-metric-card,
-.tiger-member-header,
-.tiger-unavailable,
 .kelly-lab-empty,
 .kelly-strategy-tab,
 .kelly-strategy-capital.unavailable,
@@ -3882,7 +3955,8 @@ tbody tr.active-row,
 .action-card-metrics div,
 .action-card,
 .backtest-metric-card,
-.cn-trend-card td:nth-child(-n + 2) {
+.cn-trend-card td:nth-child(-n + 2),
+.option-attention-market th {
   --muted: var(--text);
 }
 
@@ -3960,9 +4034,6 @@ table {
     grid-template-columns: 1fr;
   }
 
-  .tiger-metric-grid {
-    grid-template-columns: 1fr;
-  }
 }
 
 @media (max-width: 760px) {
@@ -4000,14 +4071,84 @@ table {
     justify-self: stretch;
   }
 
+  .trend-review-header,
+  .trend-review-parameter-list > div,
+  .trend-review-charts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-review-header button {
+    justify-self: stretch;
+    min-height: 44px;
+  }
+
+  .trend-review-parameter-list > div {
+    gap: 4px;
+  }
+
   .trend-report-body { grid-template-columns: minmax(0, 1fr); }
   .trend-checklist { position: static; order: 2; }
   .trend-report-entry button,
-  .trend-report-header button { min-height: 44px; }
+  .trend-report-header button,
+  .option-attention-header button { min-height: 44px; }
 
   .trend-report-workspace,
-  .cn-trend-report {
+  .cn-trend-report,
+  .option-attention-workspace {
     overflow-x: hidden;
+  }
+
+  .option-attention-header {
+    align-items: stretch;
+    display: grid;
+    gap: 10px;
+  }
+
+  .option-attention-table {
+    display: block;
+    max-width: 100%;
+  }
+
+  .option-attention-table thead {
+    display: none;
+  }
+
+  .option-attention-table tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .option-attention-market,
+  .option-attention-market th {
+    display: block;
+  }
+
+  .option-attention-market th {
+    box-sizing: border-box;
+    width: 100%;
+  }
+
+  .option-attention-row {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: hidden;
+  }
+
+  .option-attention-row td {
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+    padding: 10px;
+  }
+
+  .option-attention-row td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 12px;
+    font-weight: 700;
   }
 
   .cn-trend-counts {
@@ -4227,45 +4368,6 @@ table {
     grid-template-columns: 1fr;
   }
 
-  .tiger-panel-heading,
-  .tiger-rule-strip {
-    align-items: stretch;
-    display: grid;
-    grid-template-columns: 1fr;
-  }
-
-  .tiger-panel-status {
-    justify-items: start;
-  }
-
-  .tiger-rule-strip .tiger-gate-reasons {
-    margin-left: 0;
-  }
-
-  .tiger-member-header {
-    display: none;
-  }
-
-  .tiger-member-row {
-    gap: 7px;
-    grid-template-columns: 1fr;
-    padding: 11px;
-  }
-
-  .tiger-member-cell {
-    align-items: start;
-    display: grid;
-    gap: 8px;
-    grid-template-columns: 88px minmax(0, 1fr);
-  }
-
-  .tiger-mobile-label {
-    color: var(--muted);
-    display: inline;
-    font-size: 11px;
-    font-weight: 800;
-  }
-
   .action-card-metrics,
   .action-summary-grid,
   .decision-band,
@@ -4363,5 +4465,11 @@ table {
   .t-signal-detail-grid,
   .t-signal-gate-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 460px) {
+  .option-attention-row {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

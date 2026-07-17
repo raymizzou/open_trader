@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -9,12 +10,15 @@ from zoneinfo import ZoneInfo
 from open_trader.a_share_trend import write_protection_state
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.market_trend_watch import (
+    BROKER_LABELS,
     market_session,
     next_market_open,
     watch_market_protection,
 )
 from open_trader.notifications import (
     CompositeNotifier,
+    FeishuWebhookNotifier,
+    MacOSNotifier,
     NullNotifier,
     XiaoaiSSHNotifier,
 )
@@ -29,6 +33,19 @@ class RecordingXiaoaiNotifier(XiaoaiSSHNotifier):
 
     def notify(self, title: str, message: str) -> None:
         self.messages.append((title, message))
+
+
+class RecordingFeishuNotifier(FeishuWebhookNotifier):
+    def __init__(self) -> None:
+        pass
+
+    def notify(self, title: str, message: str) -> None:
+        pass
+
+
+class RecordingMacOSNotifier(MacOSNotifier):
+    def notify(self, title: str, message: str) -> None:
+        pass
 
 
 def test_hk_regular_sessions_exclude_lunch_and_auction() -> None:
@@ -97,62 +114,18 @@ def _write_hk_details(data_dir: Path) -> None:
 def _write_us_details(data_dir: Path) -> None:
     run_dir = data_dir / "runs/2026-07-15"
     run_dir.mkdir(parents=True)
-    with (run_dir / "extracted_positions.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "statement_id",
-                "broker",
-                "market",
-                "asset_class",
-                "symbol",
-                "name",
-                "currency",
-                "quantity",
-                "cost_price",
-                "market_value",
-            ],
-        )
-        writer.writeheader()
-        writer.writerow(
-            {
-                "statement_id": "2026-07-15-futu",
-                "broker": "futu",
-                "market": "US",
-                "asset_class": "stock",
-                "symbol": "NVDA",
-                "name": "NVIDIA",
-                "currency": "USD",
-                "quantity": "10",
-                "cost_price": "140",
-                "market_value": "1500",
-            }
-        )
-    with (run_dir / "extracted_cash.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "statement_id",
-                "broker",
-                "currency",
-                "cash_balance",
-                "available_balance",
-            ],
-        )
-        writer.writeheader()
-        writer.writerow(
-            {
-                "statement_id": "2026-07-15-futu",
-                "broker": "futu",
-                "currency": "USD",
-                "cash_balance": "1000",
-                "available_balance": "1000",
-            }
-        )
+    (run_dir / "tiger_account_snapshot.json").write_text(json.dumps({
+        "accounts": [],
+        "cash_records": [
+            {"record_type": "account_total", "currency": "USD", "account_total": "2500"},
+            {"currency": "USD", "cash_balance": "1000", "available_balance": "1000"},
+        ],
+        "position_records": [{
+            "market": "US", "sec_type": "STK", "symbol": "NVDA", "name": "NVIDIA",
+            "currency": "USD", "position_qty": "10", "average_cost": "140",
+            "market_value": "1500",
+        }],
+    }), encoding="utf-8")
 
 
 def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> None:
@@ -187,6 +160,8 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
 
     now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
     voice = RecordingXiaoaiNotifier()
+    opens: list[str] = []
+    stops: list[object] = []
     result = watch_market_protection(
         market="HK",
         data_dir=data_dir,
@@ -201,11 +176,15 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
         once=True,
         now_fn=lambda: now,
         sleep_fn=lambda seconds: None,
+        on_session_open=opens.append,
+        on_protection_trigger=stops.append,
     )
 
     assert result.status == "completed"
     assert result.watched_symbol_count == 1
     assert result.trigger_count == 1
+    assert opens == ["2026-07-16"]
+    assert len(stops) == 1
     assert voice.messages == [
         (
             "港股保护线触发 · 00700",
@@ -214,10 +193,112 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
     ]
 
 
+def test_review_callback_failure_is_recorded_without_blocking_protection_notice(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_hk_details(data_dir)
+    state_path = data_dir / "trend_hk_phillips/protection_state.json"
+    events_path = data_dir / "trend_hk_phillips/watch_events.jsonl"
+    write_protection_state(state_path, {
+        "schema_version": 1,
+        "positions": {"00700": {"active_line": "11"}},
+    })
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            return {"HK.00700": QuoteSnapshot("HK.00700", Decimal("10"))}
+
+        def close(self) -> None:
+            pass
+
+    def fail_review(event: object) -> None:
+        raise RuntimeError("simulate order failed")
+
+    result = watch_market_protection(
+        market="HK",
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=state_path,
+        events_path=events_path,
+        report_lock_path=None,
+        quote_client=Quote(),
+        notifier=CompositeNotifier([
+            RecordingFeishuNotifier(), RecordingMacOSNotifier(),
+        ]),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: datetime(2026, 7, 16, 10, 0, tzinfo=SHANGHAI),
+        sleep_fn=lambda seconds: None,
+        on_protection_trigger=fail_review,
+    )
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert result.status == "completed"
+    assert result.exception_count == 1
+    assert [event["event_type"] for event in events] == [
+        "protection_triggered",
+        "trend_review_callback_failed",
+        "protection_triggered_notification_delivered_feishu",
+        "protection_triggered_notification_delivered_macos",
+    ]
+    assert events[1]["reason"] == "simulate order failed"
+
+
+def test_session_review_callback_failure_does_not_stop_watcher(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_hk_details(data_dir)
+    state_path = data_dir / "trend_hk_phillips/protection_state.json"
+    events_path = data_dir / "trend_hk_phillips/watch_events.jsonl"
+    write_protection_state(state_path, {
+        "schema_version": 1,
+        "positions": {"00700": {"active_line": "11"}},
+    })
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            return {"HK.00700": QuoteSnapshot("HK.00700", Decimal("12"))}
+
+        def close(self) -> None:
+            pass
+
+    result = watch_market_protection(
+        market="HK",
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=state_path,
+        events_path=events_path,
+        report_lock_path=None,
+        quote_client=Quote(),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: datetime(2026, 7, 16, 10, 0, tzinfo=SHANGHAI),
+        sleep_fn=lambda seconds: None,
+        on_session_open=lambda trading_date: (_ for _ in ()).throw(
+            RuntimeError("review open failed")
+        ),
+    )
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert result.status == "completed"
+    assert result.exception_count == 1
+    assert events[0]["event_type"] == "trend_review_callback_failed"
+    assert events[0]["reason"] == "review open failed"
+
+
 def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _write_us_details(data_dir)
-    state_path = data_dir / "trend_us_futu/protection_state.json"
+    state_path = data_dir / "trend_us_tiger/protection_state.json"
     write_protection_state(
         state_path,
         {
@@ -257,8 +338,8 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
         data_dir=data_dir,
         portfolio_path=tmp_path / "unused.csv",
         state_path=state_path,
-        events_path=data_dir / "trend_us_futu/watch_events.jsonl",
-        report_lock_path=data_dir / "runs/.trend_us_futu_report.lock",
+        events_path=data_dir / "trend_us_tiger/watch_events.jsonl",
+        report_lock_path=data_dir / "runs/.trend_us_tiger_report.lock",
         quote_client=Quote(),
         notifier=CompositeNotifier([NullNotifier(), voice]),
         poll_seconds=5,
@@ -271,3 +352,44 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
     assert result.status == "completed"
     assert voice.messages[0][0] == "美股保护线触发 · NVDA"
     assert voice.messages[0][1].startswith("名称：NVIDIA\n最新价 ")
+
+
+def test_us_watcher_ignores_unmanaged_tiger_holdings_without_protection_seed(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_us_details(data_dir)
+    state_path = data_dir / "trend_us_tiger/protection_state.json"
+
+    class Quote:
+        host = "127.0.0.1"
+        port = 11111
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-15"]
+
+        def close(self) -> None:
+            pass
+
+    result = watch_market_protection(
+        market="US",
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=state_path,
+        events_path=data_dir / "trend_us_tiger/watch_events.jsonl",
+        report_lock_path=data_dir / "runs/.trend_us_tiger_report.lock",
+        quote_client=Quote(),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: datetime(2026, 7, 15, 22, 0, tzinfo=SHANGHAI),
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert result.watched_symbol_count == 0
+    assert result.exception_count == 0
+
+
+def test_us_watcher_uses_tiger_label() -> None:
+    assert BROKER_LABELS["US"] == "老虎"

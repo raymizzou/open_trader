@@ -18,6 +18,7 @@ import open_trader.trend_delivery as trend_delivery_module
 from open_trader.a_share_trend import (
     A_SHARE_INDUSTRY_FIELDS,
     A_SHARE_SNAPSHOT_FIELDS,
+    UNIFIED_TREND_FIELDS,
     AShareTrendRunResult,
     AccountPosition,
     AccountSnapshot,
@@ -49,6 +50,24 @@ from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MISSING_FRESH = object()
+
+
+def test_unified_trend_fields_match_the_paid_catalog_selection() -> None:
+    from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
+
+    assert UNIFIED_TREND_FIELDS == (
+        "tmId", "tickerName", "tickerSymbol", "asset", "asOfDate",
+        "tradableFlag", "industryTmId", "industryName", "priceIndex",
+        "marketCap", "amount1d", "isTrendRightSide",
+        "trendTemperatureCurr", "trendTemperaturePrev",
+        "daysSinceTrendEntry", "gainSinceTrendEntry",
+        "trendPhasePrev", "trendPhaseCurr", "trendStrengthLocalCurr",
+        "trendStrengthLocalChange", "trendStrengthGlobalCurr",
+        "trendStrengthLocalPrevWeek", "trendStrengthLocalPrevMonth",
+        "stopwinFlagByDangerSignal",
+        "stopwinFlagByBoilingTemperature",
+        "stopwinFlagByPopChampagne", "tickerLabels",
+    )
 
 
 def candidate(
@@ -237,6 +256,95 @@ def portfolio_row(**overrides: str) -> dict[str, str]:
     return row
 
 
+def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None:
+    snapshot = trend_module.trend_strategy_snapshot(
+        "CN",
+        "abc123",
+        (622466, 697199),
+    )
+
+    assert {
+        key: snapshot[key]
+        for key in (
+            "strategy_id",
+            "strategy_name",
+            "strategy_version",
+            "market",
+            "effective_from",
+            "process_version",
+        )
+    } == {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v1",
+        "strategy_name": "A 股短线右侧趋势",
+        "strategy_version": "v1",
+        "market": "CN",
+        "effective_from": "2026-07-14",
+        "process_version": "abc123",
+    }
+    assert snapshot["parameters"] == {
+        "candidate_pool_ids": [622466, 697199],
+        "allowed_exchanges": ["SH", "SZ"],
+        "excluded_name_markers": ["ST", "退"],
+        "temperature_transition": {"from": ["温"], "to": ["热", "沸"]},
+        "max_filter_price": "200",
+        "min_strength": "95",
+        "allowed_industry_temperatures": ["热", "沸"],
+        "allowed_phases": ["谷雨", "立夏", "夏至"],
+        "min_market_cap_100m": "100",
+        "min_amount_100m": "2",
+        "requires_right_side": True,
+        "requires_tradable": True,
+        "requires_no_danger": True,
+        "requires_matching_data_date": True,
+        "requires_not_held": True,
+        "requires_right_side_days": True,
+        "requires_atr14": True,
+        "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
+        "candidate_limit": 10,
+        "position_limit": 10,
+        "target_weight": {"热": "0.04", "沸": "0.02"},
+        "lot_size": 100,
+        "buy_window": "09:30-10:00",
+        "initial_protection_atr_multiple": "2",
+        "exit_reasons": [
+            "danger",
+            "left_right_side",
+            "temperature_to_flat",
+            "protection",
+        ],
+        "trailing_low_days": 5,
+        "protection_line_non_decreasing": True,
+    }
+    assert snapshot["parameter_rows"][0] == {
+        "group": "候选来源",
+        "name": "趋势动物组合",
+        "value": "温转热（A 股）、温转热（ETF 基金个股）",
+    }
+    assert all(
+        set(row) == {"group", "name", "value"}
+        for row in snapshot["parameter_rows"]
+    )
+
+    built = report(candidates=(candidate("600001"),))
+    assert built.buy_actions[0].lot_size == 100
+    assert trend_module._report_payload(built)["strategy_snapshot"] == (
+        built.strategy_snapshot
+    )
+
+
+def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
+    built = report(candidates=(candidate("600001"),))
+    parameters = dict(built.strategy_snapshot["parameters"])
+    parameters["target_weight"] = {"热": "0.02", "沸": "0.02"}
+    broken = replace(
+        built,
+        strategy_snapshot={**built.strategy_snapshot, "parameters": parameters},
+    )
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module.validate_report_strategy_snapshot(broken)
+
+
 def test_candidates_filter_then_sort_deterministically() -> None:
     rows = [
         candidate("600004", strength="95", days=2, amount="3"),
@@ -384,6 +492,99 @@ def test_candidate_normalizes_returned_exchange_without_inference() -> None:
         bars(),
     )
     assert (item.symbol, item.exchange) == ("600000", "SZ")
+
+
+def test_candidate_serializes_paid_expansion_fields_and_kline_fallback(
+    tmp_path: Path,
+) -> None:
+    row = {
+        "tmId": 600001,
+        "tickerSymbol": "600001.SH",
+        "tickerName": "示例",
+        "asset": "A股",
+        "industryName": "工业",
+        "asOfDate": "2026-07-14",
+        "tradableFlag": True,
+        "amount1d": "2",
+        "isTrendRightSide": True,
+        "daysSinceTrendEntry": 3,
+        "trendStrengthLocalCurr": "96",
+        "stopwinFlagByDangerSignal": False,
+        "industryTmId": 700001,
+        "priceIndex": "10",
+        "marketCap": "100",
+        "trendTemperaturePrev": "温",
+        "trendTemperatureCurr": "热",
+        "gainSinceTrendEntry": "0.048",
+        "trendPhasePrev": " 谷雨 ",
+        "trendPhaseCurr": " 立夏 ",
+        "trendStrengthLocalChange": " ↑↑ ",
+        "trendStrengthGlobalCurr": "91.8",
+        "trendStrengthLocalPrevWeek": "86.0",
+        "trendStrengthLocalPrevMonth": "77.4",
+        "tickerLabels": "成交主力; 市值龙头",
+        "stopwinFlagByBoilingTemperature": False,
+        "stopwinFlagByPopChampagne": False,
+    }
+    assert set(row) == set(UNIFIED_TREND_FIELDS)
+    supplement_bars = bars(50)
+    supplement_bars[30:49] = [
+        replace(bar, close=12, high=12) for bar in supplement_bars[30:49]
+    ]
+    supplement_bars[-1] = replace(
+        supplement_bars[-1], close=13, high=14, low=11, volume=200
+    )
+    complete = evaluate_candidate(row, supplement_bars, industry_temperature="热")
+    missing = evaluate_candidate(
+        {key: value for key, value in row.items() if key != "trendStrengthGlobalCurr"},
+        supplement_bars,
+        industry_temperature="热",
+    )
+
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(complete,),
+        holding_snapshots={},
+        bars_by_symbol={},
+    )
+    _, json_path = write_frozen_report(built, tmp_path)
+    signal = json.loads(json_path.read_text(encoding="utf-8"))["signal_snapshots"][
+        "candidates"
+    ][0]
+
+    assert signal | {
+        "gain_since_entry": "0.048",
+        "phase_prev": "谷雨",
+        "phase_curr": "立夏",
+        "strength_change": "↑↑",
+        "global_strength": "91.8",
+        "strength_prev_week": "86.0",
+        "strength_prev_month": "77.4",
+        "labels": ["成交主力", "市值龙头"],
+    } == signal
+    assert missing.kline_supplement == {
+        "pullback_to_sma20": True,
+        "breakout_20d_with_volume": True,
+        "sma50_breakdown": False,
+    }
+    assert complete.kline_supplement is None
+    assert build_candidate_list([missing], held_symbols=set()).eligible == (missing,)
+    missing_built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(missing,),
+        holding_snapshots={},
+        bars_by_symbol={},
+    )
+    assert [item.symbol for item in missing_built.buy_actions] == [
+        item.symbol for item in built.buy_actions
+    ]
+    assert missing_built.signal_snapshots["candidates"][0]["source"] == (
+        built.signal_snapshots["candidates"][0]["source"]
+    ) == "Trend Animals"
 
 
 @pytest.mark.parametrize(
@@ -729,6 +930,23 @@ def test_market_buy_actions_use_whole_us_shares_and_hk_lot_sizes() -> None:
 
     assert us_actions[0].estimated_shares == 8
     assert hk_actions[0].estimated_shares == 100
+
+
+def test_us_buy_actions_convert_usd_share_price_to_hkd() -> None:
+    us = replace(candidate("600001", close="100", atr="5"), symbol="VIXY", exchange="US")
+
+    actions = estimate_buy_actions(
+        ranked=[us],
+        net_value=Decimal("785000"),
+        available_cash=Decimal("98500"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="US",
+        price_fx_to_account_currency=Decimal("7.85"),
+    )
+
+    assert actions[0].target_amount == Decimal("31400.00")
+    assert actions[0].estimated_shares == 40
 
 
 def test_hk_four_percent_weight_can_buy_one_board_lot() -> None:
@@ -1602,6 +1820,89 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     )
 
 
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_trend_feishu_text_appends_raw_option_attention(market: str) -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": serialized_account(fresh=True),
+        "metadata": {"market": market},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [],
+        },
+        "option_attention": [
+            {
+                "symbol": "QQQ",
+                "right_side": {
+                    "previous": False,
+                    "current": True,
+                    "changed": True,
+                },
+                "temperature": {
+                    "previous": "温",
+                    "current": "热",
+                    "changed": True,
+                },
+                "phase": {
+                    "previous": "谷雨",
+                    "current": "立夏",
+                    "changed": True,
+                },
+                "strength_change": {
+                    "previous": None,
+                    "current": None,
+                    "changed": False,
+                },
+                "danger": {
+                    "previous": False,
+                    "current": False,
+                    "changed": False,
+                },
+                "boiling": {
+                    "previous": False,
+                    "current": False,
+                    "changed": False,
+                },
+                "champagne": {
+                    "previous": False,
+                    "current": False,
+                    "changed": False,
+                },
+            }
+        ],
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="老虎" if market == "US" else "辉立", market_label=market
+    )
+
+    assert message.count("期权关注") == 1
+    assert "1. QQQ｜右侧 否→是｜温度 温→热｜节气 谷雨→立夏" in message
+    assert "危险" not in message
+
+
+def test_trend_feishu_text_never_appends_option_attention_to_cn() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": serialized_account(fresh=True),
+        "metadata": {"market": "CN"},
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [],
+        },
+        "option_attention": [{"symbol": "600001"}],
+    }
+
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+
+    assert "期权关注" not in message
+    assert "600001" not in message
+
+
 def test_trend_feishu_text_moves_unknown_hold_reason_to_review() -> None:
     payload = {
         "execution_date": "2026-07-15",
@@ -2189,7 +2490,9 @@ def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> No
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
         account=account("600009"),
-        candidates=(candidate("600001"),),
+        candidates=(
+            replace(candidate("600001"), boiling=True, champagne=False),
+        ),
         holding_snapshots={"600009": holding("600009", danger=True)},
         bars_by_symbol={"600009": None},
         api_facts=("A股数据日期：2026-07-14",),
@@ -2204,7 +2507,41 @@ def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> No
         ("SELL_ALL", "600009"),
         ("BUY", "600001"),
     ]
+    assert {"boiling", "champagne"}.isdisjoint(
+        payload["signal_snapshots"]["candidates"][0]
+    )
+    assert {"boiling", "champagne"}.isdisjoint(judgments["top10_candidates"][0])
     assert "no_action" not in payload
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_us_hk_frozen_candidates_keep_attention_risk_fields(
+    tmp_path: Path, market: str
+) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(
+            replace(
+                candidate("600001", exchange=market),
+                boiling=True,
+                champagne=False,
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": market},
+        market=market,
+    )
+
+    _, json_path = write_frozen_report(built, tmp_path / market)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert payload["signal_snapshots"]["candidates"][0]["boiling"] is True
+    assert payload["signal_snapshots"]["candidates"][0]["champagne"] is False
+    assert payload["strategy_judgments"]["top10_candidates"][0]["boiling"] is True
+    assert payload["strategy_judgments"]["top10_candidates"][0]["champagne"] is False
 
 
 def test_report_records_generation_time_and_whitelisted_signal_audit(
@@ -2252,6 +2589,15 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "temperature_prev": "温",
         "temperature_curr": "热",
         "phase": "立夏",
+        "gain_since_entry": None,
+        "phase_prev": None,
+        "phase_curr": None,
+        "strength_change": None,
+        "global_strength": None,
+        "strength_prev_week": None,
+        "strength_prev_month": None,
+        "labels": [],
+        "kline_supplement": None,
     }
     excluded = payload["signal_snapshots"]["excluded"]["600001"][0]
     assert excluded["danger"] is True
@@ -2278,6 +2624,15 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "temperature_prev",
         "temperature_curr",
         "phase",
+        "gain_since_entry",
+        "phase_prev",
+        "phase_curr",
+        "strength_change",
+        "global_strength",
+        "strength_prev_week",
+        "strength_prev_month",
+        "labels",
+        "kline_supplement",
     }
     markdown = markdown_path.read_text(encoding="utf-8")
     assert "2026-07-14T17:00:01+08:00" in markdown
@@ -2338,6 +2693,15 @@ def test_candidate_audit_includes_all_ranked_and_excluded_pool_facts() -> None:
         "temperature_prev",
         "temperature_curr",
         "phase",
+        "gain_since_entry",
+        "phase_prev",
+        "phase_curr",
+        "strength_change",
+        "global_strength",
+        "strength_prev_week",
+        "strength_prev_month",
+        "labels",
+        "kline_supplement",
         "eligible",
         "excluded_reasons",
         "rank",
@@ -2457,6 +2821,7 @@ class ReadyApi:
         snapshot_date: str = "2026-07-14",
         holding_error: Exception | None = None,
         invalid_billing: bool = False,
+        catalog_unit_cost: str = "0.071",
         snapshot_ids: list[object] | None = None,
         missing_industry_ids: set[int] | None = None,
         industry_error: Exception | None = None,
@@ -2468,6 +2833,7 @@ class ReadyApi:
         self.snapshot_date = snapshot_date
         self.holding_error = holding_error
         self.invalid_billing = invalid_billing
+        self.catalog_unit_cost = catalog_unit_cost
         self.snapshot_ids = snapshot_ids
         self.missing_industry_ids = missing_industry_ids or set()
         self.industry_error = industry_error
@@ -2499,15 +2865,17 @@ class ReadyApi:
 
     def get_snapshot_billing(self) -> list[dict[str, object]]:
         self.calls.append("api.billing")
-        return [{"columnName": field, "priceCost": "bad" if self.invalid_billing else "0.01"} for field in {
-            "tmId", "tickerName", "tickerSymbol", "asset", "asOfDate",
-            "tradableFlag", "industryName", "amount1d", "isTrendRightSide",
-            "daysSinceTrendEntry", "trendStrengthLocalCurr",
-            "stopwinFlagByDangerSignal", "stopwinFlagByBoilingTemperature",
-            "stopwinFlagByPopChampagne",
-            "industryTmId", "priceIndex", "marketCap",
-            "trendTemperatureCurr", "trendTemperaturePrev", "trendPhaseCurr",
-        }]
+        return [
+            {
+                "columnName": field,
+                "priceCost": (
+                    "bad"
+                    if self.invalid_billing
+                    else self.catalog_unit_cost if field == "tickerName" else "0"
+                ),
+            }
+            for field in UNIFIED_TREND_FIELDS
+        ]
 
     def get_snapshots(self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str) -> list[dict[str, object]]:
         self.calls.append("api.snapshots")
@@ -2573,9 +2941,20 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     ]
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
+    assert payload["metadata"]["run_date"] == "2026-07-14"
     audit = payload["signal_snapshots"]["candidates"]
     assert audit[0]["industry_tm_id"] == 700001
     assert audit[0]["industry_temperature"] == "热"
+    assert (
+        f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
+        "cache=client-managed"
+    ) in payload["api_facts"]
+    assert payload["estimated_api_cost"] == "0.142"
+    evidence_path = trend_config(tmp_path).data_dir / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["query"]["component_pool_ids"] == [622466, 697199]
+    assert evidence["responses"]["snapshots"]
+    assert evidence["rebuild_inputs"]["candidates"]
 
 
 def test_missing_industry_row_excludes_only_affected_candidate(
@@ -3891,6 +4270,25 @@ def test_report_runner_rejects_invalid_live_billing_price(tmp_path: Path) -> Non
     )
     assert result.status == "failed"
     assert not list((tmp_path / "reports").rglob("*.json"))
+
+
+def test_report_runner_rejects_catalog_cost_drift_before_paid_snapshots(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        api_factory=lambda **kwargs: ReadyApi(
+            calls, catalog_unit_cost="0.072"
+        ),
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        notifier=RecordingMacOS(),
+    )
+
+    assert result.status == "failed"
+    assert "api.snapshots" not in calls
 
 
 def test_report_runner_does_not_invent_zero_cost_when_balance_increases(

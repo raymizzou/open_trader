@@ -13,6 +13,7 @@ const state = {
   selectedHoldingDetail: "decision",
   selectedDecisionTab: "final",
   selectedTrendBroker: "",
+  selectedTrendKind: "",
   decisionDeepLinkRestored: false,
   detailLanguage: "zh",
   refreshActive: false,
@@ -49,9 +50,9 @@ const ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT = 11;
 const WORKSPACE_VIEWS = new Set(["portfolio", "kelly_lab", "standard_backtest", "trend_report"]);
 
 const ACCOUNT_STRATEGY_PROFILES = {
-  futu: {horizon: "短线", strategy: "美股趋势交易"},
-  tiger: {horizon: "长线", strategy: "SMA200 组合策略"},
-  phillips: {horizon: "短线", strategy: "港股趋势交易"},
+  futu: {horizon: "期权增强", strategy: "跨市场期权关注"},
+  tiger: {horizon: "趋势", strategy: "美股趋势交易"},
+  phillips: {horizon: "趋势", strategy: "港股趋势交易"},
   eastmoney: {horizon: "偏短线", strategy: "趋势交易"},
 };
 
@@ -130,21 +131,6 @@ const REASON_LABELS = {
   "No plan trigger is active.": "暂无触发中的交易计划。",
   "Futu did not return a quote.": "Futu 未返回行情。",
   "missing quote": "缺失行情。",
-};
-
-const TIGER_GATE_LABELS = {
-  sharpe_undefined: "夏普比率无法计算",
-  sharpe_below_floor: "夏普比率低于门槛",
-  benchmark_sharpe_undefined: "基准夏普比率无法计算",
-  sharpe_below_benchmark: "夏普比率低于基准",
-  calmar_undefined: "卡玛比率无法计算",
-  calmar_below_floor: "卡玛比率低于门槛",
-  benchmark_calmar_undefined: "基准卡玛比率无法计算",
-  calmar_below_benchmark: "卡玛比率低于基准",
-  return_below_cash: "年化收益不高于现金",
-  drawdown_above_benchmark: "最大回撤高于基准",
-  provenance_incomplete: "数据来源不完整",
-  calibration_required: "需要校准",
 };
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -273,6 +259,11 @@ function bindEvents() {
       )?.click();
       return;
     }
+    const trendReview = event.target.closest("[data-trend-review]");
+    if (trendReview) {
+      openTrendReview(trendReview.dataset.trendReview || "");
+      return;
+    }
     const trendReport = event.target.closest("[data-trend-report]");
     if (trendReport) {
       openTrendReport(trendReport.dataset.trendReport || "");
@@ -347,20 +338,34 @@ function openTrendReport(broker) {
   const report = state.dashboard?.trend_reports?.[broker];
   if (!report?.available) return;
   state.selectedTrendBroker = broker;
+  state.selectedTrendKind = "report";
   elements["trend-report-workspace"].innerHTML = renderTrendReportWorkspace(report);
   setWorkspaceView("trend_report");
   syncCnTrendBuyAccessibility();
   elements["return-to-portfolio"].focus();
 }
 
+function openTrendReview(broker) {
+  const review = state.dashboard?.trend_reviews?.[broker];
+  if (!review?.available) return;
+  state.selectedTrendBroker = broker;
+  state.selectedTrendKind = "review";
+  elements["trend-report-workspace"].innerHTML = renderTrendReviewWorkspace(review);
+  setWorkspaceView("trend_report");
+  elements["return-to-portfolio"].focus();
+}
+
 function returnToPortfolio() {
   const trendBroker = state.selectedTrendBroker;
+  const trendKind = state.selectedTrendKind;
   if (state.workspaceView === "standard_backtest") syncStandardBacktestInputs();
   state.selectedTrendBroker = "";
+  state.selectedTrendKind = "";
   setWorkspaceView("portfolio");
   renderAccountHoldings();
   if (trendBroker) {
-    document.querySelector(`#account-${trendBroker} [data-trend-report]`)?.focus();
+    const attribute = trendKind === "review" ? "data-trend-review" : "data-trend-report";
+    document.querySelector(`#account-${trendBroker} [${attribute}]`)?.focus();
   }
 }
 
@@ -1908,19 +1913,115 @@ const TREND_REASON_LABELS = {
 };
 
 function renderTrendReportEntry(broker) {
-  if (!["futu", "phillips", "eastmoney"].includes(broker)) return "";
+  if (!ACCOUNT_BROKERS.includes(broker)) return "";
   const report = state.dashboard?.trend_reports?.[broker] || {};
-  if (!report.available) {
-    return `<div class="trend-report-entry trend-report-entry-empty">
-      <button type="button" disabled>当天趋势报告</button>
-      <span>${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</span>
-    </div>`;
-  }
-  return `<div class="trend-report-entry">
-    <button type="button" data-trend-report="${escapeHtml(broker)}">当天趋势报告</button>
-    <span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span>
-    <span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>
+  const label = broker === "futu" ? "期权关注" : "当天趋势报告";
+  const reviews = state.dashboard?.trend_reviews;
+  const review = reviews?.[broker];
+  const reviewLabel = `${formatPlain(review?.market_label || report.market_label || {futu:"美股",phillips:"港股",eastmoney:"A股"}[broker])}复盘`.replaceAll(" ", "");
+  const reportButton = report.available
+    ? `<button type="button" data-trend-report="${escapeHtml(broker)}">${label}</button>`
+    : `<button type="button" disabled>${label}</button>`;
+  const reviewButton = !review ? "" : review.available
+    ? `<button type="button" data-trend-review="${escapeHtml(broker)}">${escapeHtml(reviewLabel)}</button>`
+    : `<button type="button" disabled>${escapeHtml(reviewLabel)}</button>`;
+  const details = report.available
+    ? broker === "futu"
+      ? `<span>${escapeHtml(formatPlain(report.status_text || "期权关注"))}</span>`
+      : `<span>${escapeHtml(formatPlain(report.status_text || "今日已更新"))}</span><span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span><span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>`
+    : `<span>${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</span>`;
+  const reviewStatus = review && !review.available
+    ? `<span>${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</span>`
+    : "";
+  return `<div class="trend-report-entry${report.available ? "" : " trend-report-entry-empty"}">
+    <div class="trend-entry-buttons">${reportButton}${reviewButton}</div>
+    <div class="trend-entry-details">${details}${reviewStatus}</div>
   </div>`;
+}
+
+const TREND_REVIEW_SERIES = [
+  {key:"discipline", label:"纪律模拟", className:"discipline"},
+  {key:"actual", label:"实际执行", className:"actual"},
+  {key:"benchmark", label:"市场基准", className:"benchmark"},
+];
+
+function formatTrendReviewValue(cell, percent) {
+  const value = numericValue(cell?.value);
+  if (value === null) return formatPlain(cell?.reason || "数据不足");
+  const formatted = value.toLocaleString("zh-CN", {maximumFractionDigits:2});
+  return percent ? `${formatted}%` : formatted;
+}
+
+function renderTrendReviewMetric(review, key, label, percent) {
+  const values = TREND_REVIEW_SERIES.map((series) => numericValue(review.metrics?.[key]?.[series.key]?.value));
+  const maximum = Math.max(...values.filter((value) => value !== null).map(Math.abs), 0);
+  const rows = TREND_REVIEW_SERIES.map((series, index) => {
+    const cell = review.metrics?.[key]?.[series.key] || {};
+    const value = values[index];
+    const width = value === null || maximum === 0 ? 0 : Math.round(Math.abs(value) / maximum * 50);
+    const direction = value !== null && value < 0 ? " negative" : " positive";
+    const unavailable = value === null ? " unavailable" : "";
+    return `<div class="trend-review-series${unavailable}">
+      <span>${escapeHtml(series.label)}</span>
+      <span class="trend-review-track" aria-hidden="true"><i class="trend-review-bar ${series.className}${direction}" style="--trend-review-width:${width}%"></i></span>
+      <strong>${escapeHtml(formatTrendReviewValue(cell, percent))}</strong>
+    </div>`;
+  }).join("");
+  return `<section class="trend-review-metric"><h3>${escapeHtml(label)}</h3>${rows}</section>`;
+}
+
+function renderTrendReviewChart(review, title, definitions) {
+  return `<figure class="trend-review-chart"><figcaption>${escapeHtml(title)}</figcaption>
+    <div class="trend-review-legend">${TREND_REVIEW_SERIES.map((series) => `<span class="${series.className}">${escapeHtml(series.label)}</span>`).join("")}</div>
+    ${definitions.map(([key,label,percent]) => renderTrendReviewMetric(review,key,label,percent)).join("")}
+  </figure>`;
+}
+
+function renderTrendReviewWorkspace(review) {
+  const snapshot = review.strategy_snapshot || {};
+  const rows = Array.isArray(snapshot.parameter_rows) ? snapshot.parameter_rows : [];
+  return `<main class="trend-review">
+    <header class="trend-review-header">
+      <div><p>${escapeHtml(`${formatPlain(review.broker_label)}｜${formatPlain(review.market_label)}`)}</p>
+      <h1>${escapeHtml(`${formatPlain(review.market_label)}趋势复盘`)}</h1>
+      <span>${escapeHtml(formatPlain(snapshot.strategy_name))}｜版本 ${escapeHtml(formatPlain(snapshot.strategy_version))}</span></div>
+      <button type="button" data-close-trend-report>返回持仓看板</button>
+    </header>
+    <section class="trend-review-parameters"><h2>当前策略参数</h2>
+      <div class="trend-review-parameter-list trend-review-parameter-table">${rows.map((row) => `<div><span>${escapeHtml(formatPlain(row.group))}</span><strong>${escapeHtml(formatPlain(row.name))}</strong><p>${escapeHtml(formatPlain(row.value))}</p></div>`).join("")}</div>
+    </section>
+    <div class="trend-review-charts">
+      ${renderTrendReviewChart(review,"收益与回撤",[["period_net_return","期间净收益率",true],["market_excess_return","相对市场超额收益",true],["max_drawdown","最大回撤",true]])}
+      ${renderTrendReviewChart(review,"风险调整收益",[["calmar","卡玛比率",false],["sharpe","夏普比率",false]])}
+    </div>
+  </main>`;
+}
+
+function renderTrendAction(item, kind) {
+  const identity = [item.symbol, item.name].filter(Boolean).map(formatPlain).join(" ");
+  const reason = TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认";
+  const fields = [identity];
+  if (kind === "buy") {
+    fields.push(`约 ${formatDisplayNumber(item.estimated_shares)} 股`);
+    fields.push(`金额上限 ${formatDisplayNumber(item.target_amount)}`);
+    fields.push(`预计保护线 ${formatDisplayNumber(item.estimated_initial_line)}`);
+  } else {
+    fields.push(reason);
+    if (item.active_line !== null && item.active_line !== undefined && item.active_line !== "") {
+      fields.push(`活动保护线 ${formatDisplayNumber(item.active_line)}`);
+    }
+  }
+  return `<li>${fields.map(escapeHtml).join("<span>｜</span>")}</li>`;
+}
+
+function renderTrendStage(title, items, kind) {
+  const rows = Array.isArray(items)
+    ? items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    : [];
+  return `<section class="trend-stage">
+    <h2>${escapeHtml(title)}</h2>
+    ${rows.length ? `<ol>${rows.map((item) => renderTrendAction(item, kind)).join("")}</ol>` : "<p>无</p>"}
+  </section>`;
 }
 
 function renderTrendAudit(audit) {
@@ -2197,38 +2298,77 @@ function renderCnTrendReportWorkspace(report) {
   </main>`;
 }
 
-function renderTrendReportWorkspace(report) {
-  return renderCnTrendReportWorkspace(report || {});
+const OPTION_ATTENTION_COLUMNS = [
+  {label: "标的", content: (item) => [item.symbol, item.name].map(optionAttentionValue).map(escapeHtml).join(" ")},
+  {label: "分类", content: (item) => escapeHtml(optionAttentionValue(item.category))},
+  {label: "右侧状态", content: (item) => renderOptionAttentionTransition(item.right_side)},
+  {label: "趋势温度", content: (item) => renderOptionAttentionTransition(item.temperature)},
+  {label: "趋势节气", content: (item) => renderOptionAttentionTransition(item.phase)},
+  {label: "本地 / 全球强度", content: (item) => [item.local_strength, item.global_strength].map(optionAttentionValue).map(escapeHtml).join(" / ")},
+  {label: "上周 / 上月", content: (item) => `${[item.strength_prev_week, item.strength_prev_month].map(optionAttentionValue).map(escapeHtml).join(" / ")}<br>${renderOptionAttentionTransition(item.strength_change)}`},
+  {label: "右侧天数 / 累计涨幅", content: (item) => [item.days, item.gain_since_entry].map(optionAttentionValue).map(escapeHtml).join(" / ")},
+  {label: "危险 / 沸腾 / 开香槟", content: (item) => [item.danger, item.boiling, item.champagne].map(renderOptionAttentionTransition).join(" / ")},
+  {label: "来源动作", content: (item) => [optionAttentionValue(item.source_broker), optionAttentionAction(item.source_action)].map(escapeHtml).join(" / ")},
+];
+
+function optionAttentionValue(value) {
+  if (value === null || value === undefined || typeof value === "string" && !value.trim()) {
+    return "未提供";
+  }
+  if (typeof value === "boolean") return value ? "是" : "否";
+  return formatPlain(value);
 }
 
-function renderAccountStrategy(group) {
-  if (group.broker !== "tiger") {
-    return "";
+function renderOptionAttentionTransition(transition) {
+  const value = transition && typeof transition === "object" && !Array.isArray(transition)
+    ? transition
+    : {};
+  const text = `${optionAttentionValue(value.previous)} → ${optionAttentionValue(value.current)}`;
+  const changed = value.changed === true ? ' class="option-attention-changed"' : "";
+  return `<span${changed}>${escapeHtml(text)}</span>`;
+}
+
+function optionAttentionAction(action) {
+  if (action === "BUY") return "允许买入";
+  if (action === "SELL_ALL") return "卖出复核";
+  if (action === "HOLD") return "继续持有";
+  return "观察";
+}
+
+function optionAttentionMarketStatus(market) {
+  if (hasValue(market.status_text)) return optionAttentionValue(market.status_text);
+  if (market.data_status === "current") return "今日已更新";
+  if (market.data_status === "stale") {
+    return `数据截至 ${optionAttentionValue(market.data_date)}；今日未更新`;
   }
-  const strategy = state.dashboard?.tiger_long_term_strategy || {};
-  if (strategy.available === false || !strategy.validation && !strategy.strategy) {
-    return `<div class="account-strategy-summary"><strong>${escapeHtml(group.profile.strategy)}</strong><span>${escapeHtml(strategy.error || "影子验证产物暂不可用")}</span></div>`;
-  }
-  const validation = strategy.validation || {};
-  const values = validation.strategy || strategy.strategy || {};
-  const gate = validation.gate || strategy.gate || {};
-  const reasons = Array.isArray(gate.reasons) && gate.reasons.length
-    ? gate.reasons.map((reason) => TIGER_GATE_LABELS[reason] || "其他门槛未满足")
-    : ["无"];
-  const annualizedReturn = formatSignedPnl(decisionPlanPercent(values.annualized_return_pct));
-  const maxDrawdown = drawdownPercent(values.max_drawdown_pct);
-  const annualizedTone = pnlClass(annualizedReturn);
-  const drawdownTone = pnlClass(maxDrawdown);
-  return `<div class="account-strategy-summary">
-    <div class="tiger-panel-heading"><div><strong>SMA200 策略</strong><span>影子验证 · 仅供人工复核</span></div><span>${escapeHtml(strategy.run_date || "-")}</span></div>
-    <div class="tiger-rule-strip"><span>单标的上限 10%</span><span>风险组上限 30%</span><span>门槛：${reasons.map(escapeHtml).join(" · ")}</span></div>
-    <article class="tiger-metric-card"><dl>
-      <div><dt>年化收益</dt><dd${annualizedTone ? ` class="${annualizedTone}"` : ""}>${escapeHtml(annualizedReturn)}</dd></div>
-      <div><dt>最大回撤</dt><dd${drawdownTone ? ` class="${drawdownTone}"` : ""}>${escapeHtml(maxDrawdown)}</dd></div>
-      <div><dt>夏普比率</dt><dd>${escapeHtml(decisionPlanRatio(values.sharpe_ratio))}</dd></div>
-      <div><dt>卡玛比率</dt><dd>${escapeHtml(decisionPlanRatio(values.calmar_ratio))}</dd></div>
-    </dl></article>
-  </div>`;
+  return "暂时不可用";
+}
+
+function renderOptionAttentionRow(item) {
+  return `<tr class="option-attention-row">${OPTION_ATTENTION_COLUMNS.map(({label, content}) => `<td data-label="${escapeHtml(label)}">${content(item)}</td>`).join("")}</tr>`;
+}
+
+function renderOptionAttentionWorkspace(report) {
+  const order = {US: 0, HK: 1};
+  const markets = (Array.isArray(report.attention_markets) ? report.attention_markets : [])
+    .filter((market) => market && typeof market === "object" && !Array.isArray(market))
+    .sort((left, right) => (order[String(left.market).toUpperCase()] ?? 2) - (order[String(right.market).toUpperCase()] ?? 2));
+  const rowgroups = markets.map((market) => {
+    const items = Array.isArray(market.items)
+      ? market.items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+      : [];
+    return `<tbody><tr class="option-attention-market"><th colspan="${OPTION_ATTENTION_COLUMNS.length}" scope="rowgroup"><div class="option-attention-market-content"><span>${escapeHtml(optionAttentionValue(market.market_label))}</span><span>${escapeHtml(optionAttentionMarketStatus(market))}</span></div></th></tr>${items.map(renderOptionAttentionRow).join("")}</tbody>`;
+  }).join("");
+  return `<main class="option-attention-workspace">
+    <header class="option-attention-header"><h1>期权关注</h1><button type="button" data-close-trend-report>返回持仓看板</button></header>
+    <table class="option-attention-table"><thead><tr>${OPTION_ATTENTION_COLUMNS.map(({label}) => `<th scope="col">${escapeHtml(label)}</th>`).join("")}</tr></thead>${rowgroups}</table>
+  </main>`;
+}
+
+function renderTrendReportWorkspace(report) {
+  return String(report && report.broker || "").toLowerCase() === "futu"
+    ? renderOptionAttentionWorkspace(report || {})
+    : renderCnTrendReportWorkspace(report || {});
 }
 
 function renderHeaderSummary() {
@@ -2396,7 +2536,6 @@ function renderAccountSection(group) {
         ${renderStatementUpload(group.broker)}
       </div>
     </header>
-    ${renderAccountStrategy(group)}
     ${rows.length ? renderAccountTable(rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
   </section>`;
 }
@@ -3357,7 +3496,7 @@ function futuAnomalySignalsPlugin(holding) {
 function futuSignalModuleView(module, key, title) {
   const value = module && typeof module === "object" ? module : {};
   const status = hasValue(value.status) ? String(value.status) : "missing";
-  const signal = value.available === true && !["missing", "error", "stale"].includes(status) && hasValue(value.signal)
+  const signal = value.available === true && !["missing", "error", "stale", "stale_run_date"].includes(status) && hasValue(value.signal)
     ? String(value.signal)
     : status;
   return {
@@ -3381,6 +3520,16 @@ function deriveFutuSignalOverall(modules) {
     : constraints.includes("review")
       ? "review"
       : "";
+  if (signals.includes("error") || signals.includes("missing") || signals.includes("stale") || signals.includes("stale_run_date")) {
+    return {
+      tone: "warn",
+      label: "需复核",
+      signal: signals.includes("error") ? "error" : (signals.includes("stale_run_date") ? "stale_run_date" : (signals.includes("stale") ? "stale" : "missing")),
+      constraint: constraint || "review",
+      headline: "市场信号数据不可用，不能视为中性。",
+      detail: "缺失、错误或过期模块会保留数据质量状态，不会自动改写成交易方向。",
+    };
+  }
   if (signals.includes("risk_up") || signals.includes("mixed")) {
     return {
       tone: constraint ? "warn" : "ok",
@@ -3409,16 +3558,6 @@ function deriveFutuSignalOverall(modules) {
       constraint,
       headline: "市场信号支持当前交易方向。",
       detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
-    };
-  }
-  if (signals.includes("error") || signals.includes("missing") || signals.includes("stale")) {
-    return {
-      tone: "warn",
-      label: "需复核",
-      signal: signals.includes("error") ? "error" : (signals.includes("stale") ? "stale" : "missing"),
-      constraint: constraint || "review",
-      headline: "市场信号数据不可用，不能视为中性。",
-      detail: "缺失、错误或过期模块会保留数据质量状态，不会自动改写成交易方向。",
     };
   }
   return {
@@ -3491,6 +3630,7 @@ function translateFutuSignalValue(value) {
     missing: "缺失",
     error: "错误",
     stale: "已过期",
+    stale_run_date: "已过期",
     anomaly: "异常",
     none: "无异常",
     not_applicable: "不适用",
@@ -3507,7 +3647,7 @@ function translateFutuSignalValue(value) {
 function futuSignalStatusTone(status) {
   if (status === "ok") return "ok";
   if (status === "partial") return "warn";
-  if (status === "stale") return "stale";
+  if (status === "stale" || status === "stale_run_date") return "stale";
   if (status === "error") return "failed";
   return "muted";
 }

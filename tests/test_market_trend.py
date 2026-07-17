@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+import open_trader.a_share_trend as trend_module
 
-from open_trader.a_share_trend import AShareTrendRunResult
+from open_trader import market_trend, trend_review
+from open_trader.a_share_trend import (
+    AShareTrendRunResult,
+    CandidateInput,
+    build_report,
+)
 from open_trader.daily_premarket import DailyPremarketConfig
 from open_trader.market_trend import (
+    MARKET_NOTIFICATION_LABELS,
+    MARKET_SETTINGS,
     MarketHoliday,
-    _refresh_futu_account,
     load_market_account,
     market_paths,
     resolve_market_dates,
@@ -24,8 +32,9 @@ from open_trader.notifications import (
     NotificationError,
     NullNotifier,
 )
+from open_trader.tiger_account import TigerAccountError
 from open_trader.kline_technical_facts import DailyKlineBar
-from open_trader.a_share_trend import HOLDING_FIELDS
+from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -41,6 +50,65 @@ class RecordingFeishu(FeishuWebhookNotifier):
         self.messages.append((title, message))
         if self.fail:
             raise NotificationError("network down")
+
+
+@pytest.mark.parametrize(
+    ("market", "name", "pool_ids", "market_parameters"),
+    [
+        (
+            "US",
+            "美股短线右侧趋势",
+            (622460,),
+            {"allowed_exchange": "US", "lot_size": 1, "buy_window": "美股常规交易时段"},
+        ),
+        (
+            "HK",
+            "港股短线右侧趋势",
+            (622494,),
+            {
+                "allowed_exchange": "HK",
+                "lot_size_source": "Futu 每标的整手",
+                "buy_window": "09:30-10:00",
+            },
+        ),
+    ],
+)
+def test_market_strategy_snapshot_matches_runtime_rules(
+    market: str,
+    name: str,
+    pool_ids: tuple[int, ...],
+    market_parameters: dict[str, object],
+) -> None:
+    snapshot = trend_module.trend_strategy_snapshot(market, "abc123", pool_ids)
+
+    assert snapshot["strategy_name"] == name
+    assert snapshot["strategy_version"] == "v1"
+    assert snapshot["parameters"] == {
+        "candidate_pool_ids": list(pool_ids),
+        "min_strength_exclusive": "90",
+        "max_right_side_days_exclusive": 10,
+        "min_amount_100m": "1",
+        "requires_right_side": True,
+        "requires_tradable": True,
+        "requires_no_danger": True,
+        "requires_matching_data_date": True,
+        "requires_not_held": True,
+        "requires_atr14": True,
+        "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
+        "candidate_limit": 10,
+        "position_limit": 10,
+        "target_weight": "0.04",
+        **market_parameters,
+        "initial_protection_atr_multiple": "2",
+        "exit_reasons": ["danger", "left_right_side", "protection"],
+        "trailing_low_days": 5,
+        "protection_line_non_decreasing": True,
+    }
+    assert snapshot["parameter_rows"]
+    assert all(
+        set(row) == {"group", "name", "value"}
+        for row in snapshot["parameter_rows"]
+    )
 
 
 def config(tmp_path: Path) -> DailyPremarketConfig:
@@ -81,72 +149,241 @@ def write_details(
             writer.writerows(rows)
 
 
-def test_load_futu_market_account_uses_all_current_supported_positions_and_cash_power(
-    tmp_path: Path,
+def write_tiger_snapshot(
+    data_dir: Path,
+    run_date: str,
+    *,
+    cash_records: list[dict[str, object]],
+    position_records: list[dict[str, object]],
 ) -> None:
-    write_details(
-        tmp_path / "data",
-        "2026-07-15",
-        positions=[
-            {
-                "statement_id": "2026-07-15-futu-live", "broker": "futu",
-                "market": "US", "asset_class": "etf", "symbol": "VIXY",
-                "name": "VIX Short", "currency": "USD", "quantity": "10",
-                "cost_price": "40", "market_value": "500",
-            },
-            {
-                "statement_id": "2026-07-15-futu-live", "broker": "futu",
-                "market": "US", "asset_class": "stock", "symbol": "AAPL",
-                "name": "Apple", "currency": "USD", "quantity": "2",
-                "cost_price": "200", "market_value": "420",
-            },
-            {
-                "statement_id": "2026-07-15-futu-live", "broker": "futu",
-                "market": "US", "asset_class": "option", "symbol": "AAPL260717C200000",
-                "name": "AAPL Call", "currency": "USD", "quantity": "-1",
-                "cost_price": "50", "market_value": "-50",
-            },
-            {
-                "statement_id": "2026-07-15-futu-live", "broker": "futu",
-                "market": "CASH", "asset_class": "cash", "symbol": "FUTU_UNMAPPED_ASSETS",
-                "name": "富途未明细账户资产", "currency": "HKD", "quantity": "1",
-                "cost_price": "7850", "market_value": "7850",
-            },
-        ],
-        cash=[{
-            "statement_id": "2026-07-15-futu-live", "broker": "futu",
-            "currency": "USD", "cash_balance": "0", "available_balance": "50000",
-        }],
+    path = data_dir / "runs" / run_date / "tiger_account_snapshot.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "accounts": [],
+            "cash_records": cash_records,
+            "position_records": position_records,
+        }),
+        encoding="utf-8",
     )
 
-    account = load_market_account(
+
+def test_load_tiger_account_separates_managed_positions_from_account_count(
+    tmp_path: Path,
+) -> None:
+    write_tiger_snapshot(
+        tmp_path / "data",
+        "2026-07-15",
+        cash_records=[
+            {
+                "record_type": "account_total", "currency": "USD",
+                "account_total": "100000",
+            },
+            {
+                "currency": "USD", "cash_balance": "12000",
+                "available_balance": "10000",
+            },
+            {
+                "currency": "HKD", "cash_balance": "20000",
+                "available_balance": "25000",
+            },
+        ],
+        position_records=[
+            {
+                "market": "US", "sec_type": "STK", "symbol": "AAPL",
+                "name": "Apple", "currency": "USD", "position_qty": "2",
+                "average_cost": "200", "market_value": "420",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "QQQ",
+                "name": "Invesco QQQ ETF", "currency": "USD", "position_qty": "3",
+                "average_cost": "500", "market_value": "1600",
+            },
+            {
+                "market": "HK", "sec_type": "STK", "symbol": "00700",
+                "name": "Tencent", "currency": "HKD", "position_qty": "100",
+                "average_cost": "400", "market_value": "50000",
+            },
+            {
+                "market": "US", "sec_type": "OPT", "symbol": "AAPL 260717C00200000",
+                "name": "Apple Call", "currency": "USD", "position_qty": "1",
+                "average_cost": "10", "market_value": "20",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "ZERO",
+                "name": "Zero", "currency": "USD", "position_qty": "0",
+                "average_cost": "1", "market_value": "0",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "CALL",
+                "name": "Synthetic Call Option", "currency": "USD",
+                "position_qty": "1", "average_cost": "1", "market_value": "1",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "BOND",
+                "name": "Treasury Bond", "asset_class": "bond", "currency": "USD",
+                "position_qty": "1", "average_cost": "1", "market_value": "1",
+            },
+            {
+                "market": "US", "sec_type": "STK", "symbol": "MMF",
+                "name": "USD Money Market Fund", "currency": "USD",
+                "position_qty": "1", "average_cost": "1", "market_value": "1",
+            },
+        ],
+    )
+
+    account = market_trend.load_trend_account(
         data_dir=tmp_path / "data",
-        broker="futu",
         market="US",
         expected_date="2026-07-15",
-        managed_symbols={"VIXY"},
+        managed_symbols={"AAPL"},
     )
 
     assert account.source_date == "2026-07-15"
     assert account.fresh is True
-    assert account.net_value == Decimal("1870")
-    assert account.available_cash == Decimal("50000")
-    assert [item.symbol for item in account.positions] == ["AAPL", "VIXY"]
-    assert account.exceptions == (
-        "趋势判断不支持当前持仓：AAPL260717C200000（option）",
-        "现金类资产不参与趋势判断：FUTU_UNMAPPED_ASSETS（cash）",
+    assert account.net_value == Decimal("785000")
+    assert account.available_cash == Decimal("98500")
+    assert account.position_count == 2
+    assert [(item.symbol, item.asset_class) for item in account.positions] == [
+        ("AAPL", "stock"),
+    ]
+    assert account.exceptions == ()
+    assert account.positions[0].market_value == Decimal("3297.00")
+    assert market_trend.load_trend_account(
+        data_dir=tmp_path / "data",
+        market="US",
+        expected_date="2026-07-16",
+        managed_symbols={"AAPL"},
+    ).fresh is False
+
+
+def test_tiger_unmanaged_holdings_fill_position_cap_without_entering_decisions(
+    tmp_path: Path,
+) -> None:
+    symbols = [
+        "AAPL", "AMZN", "AVGO", "COST", "GOOGL",
+        "META", "MSFT", "NFLX", "NVDA", "TSLA",
+    ]
+    write_tiger_snapshot(
+        tmp_path / "data",
+        "2026-07-15",
+        cash_records=[
+            {
+                "record_type": "account_total", "currency": "USD",
+                "account_total": "100000",
+            },
+            {
+                "currency": "USD", "cash_balance": "10000",
+                "available_balance": "10000",
+            },
+        ],
+        position_records=[
+            {
+                "market": "US", "sec_type": "STK", "symbol": symbol,
+                "name": symbol, "currency": "USD", "position_qty": "1",
+                "average_cost": "100", "market_value": "100",
+            }
+            for symbol in symbols
+        ],
+    )
+    account = market_trend.load_trend_account(
+        data_dir=tmp_path / "data",
+        market="US",
+        expected_date="2026-07-15",
+        managed_symbols={"AAPL"},
+    )
+    candidate = CandidateInput(
+        tm_id=1,
+        symbol="QQQ",
+        exchange="US",
+        name="Invesco QQQ ETF",
+        asset="美股",
+        industry="ETF",
+        as_of_date="2026-07-14",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=Decimal("100"),
+        atr=Decimal("5"),
+    )
+    end = datetime(2026, 7, 14)
+    bars = [
+        DailyKlineBar(
+            date=(end - timedelta(days=14 - index)).date().isoformat(),
+            open=100,
+            high=101,
+            low=99,
+            close=100,
+            volume=100,
+        )
+        for index in range(15)
+    ]
+
+    report = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account,
+        candidates=[candidate],
+        holding_snapshots={symbol: None for symbol in symbols},
+        bars_by_symbol={symbol: bars for symbol in symbols},
+        market="US",
+        price_fx_to_account_currency=Decimal("7.85"),
     )
 
+    assert account.position_count == 10
+    assert [item.symbol for item in account.positions] == ["AAPL"]
+    assert [item.symbol for item in report.candidates] == ["QQQ"]
+    assert report.buy_actions == ()
+    assert [item.symbol for item in report.holdings] == ["AAPL"]
+    assert {item.action for item in report.holdings} == {"MANUAL_REVIEW"}
+    assert list(report.protection_state["positions"]) == ["AAPL"]
 
-def test_us_account_refreshes_directly_from_futu_before_reporting(
+
+def test_load_tiger_account_uses_latest_valid_snapshot_and_clamps_cash(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_tiger_snapshot(
+        data_dir,
+        "2026-07-14",
+        cash_records=[
+            {"record_type": "account_total", "currency": "USD", "account_total": "100"},
+            {"currency": "USD", "cash_balance": "-1000", "available_balance": "-900"},
+            {"currency": "SGD", "cash_balance": "100", "available_balance": "80", "fx_to_hkd": "5.8"},
+        ],
+        position_records=[],
+    )
+    write_tiger_snapshot(
+        data_dir,
+        "2026-07-15",
+        cash_records=[],
+        position_records=[],
+    )
+
+    account = market_trend.load_trend_account(
+        data_dir=data_dir,
+        market="US",
+        expected_date="2026-07-15",
+        managed_symbols=set(),
+    )
+
+    assert account.source_date == "2026-07-14"
+    assert account.fresh is False
+    assert account.available_cash == Decimal("0")
+
+
+def test_us_account_refreshes_directly_from_tiger_before_reporting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = config(tmp_path)
     calls: list[object] = []
 
     class Client:
-        def __init__(self, *, host: str, port: int) -> None:
-            calls.append(("connect", host, port))
+        def __init__(self, *, config: object) -> None:
+            calls.append(("connect", config))
 
         def fetch_snapshot(self) -> object:
             calls.append("fetch")
@@ -158,15 +395,24 @@ def test_us_account_refreshes_directly_from_futu_before_reporting(
     def sync(**kwargs: object) -> None:
         calls.append(("sync", kwargs))
 
-    monkeypatch.setattr("open_trader.market_trend.FutuAccountClient", Client)
-    monkeypatch.setattr("open_trader.market_trend.sync_futu_portfolio", sync)
+    monkeypatch.setattr(
+        "open_trader.market_trend.load_tiger_account_config",
+        lambda **kwargs: calls.append(("config", kwargs)) or "tiger-config",
+    )
+    monkeypatch.setattr("open_trader.market_trend.TigerAccountClient", Client)
+    monkeypatch.setattr("open_trader.market_trend.sync_tiger_portfolio", sync)
 
-    _refresh_futu_account(cfg, "2026-07-15")
+    market_trend._refresh_tiger_account(cfg, "2026-07-15")
 
-    assert calls[:3] == [("connect", "127.0.0.1", 11111), "fetch", "close"]
+    assert calls[:3] == [
+        ("config", {"config_dir": Path("~/.tigeropen/"), "account": None, "sandbox": False}),
+        ("connect", "tiger-config"),
+        "fetch",
+    ]
     assert calls[3][0] == "sync"
     assert calls[3][1]["snapshot"] == "snapshot"
     assert calls[3][1]["update_latest"] is True
+    assert calls[4] == "close"
 
 
 def test_load_phillips_statement_can_be_stale_and_caps_cash_to_known_balance(
@@ -207,8 +453,10 @@ def test_load_phillips_statement_can_be_stale_and_caps_cash_to_known_balance(
 
 
 def test_market_paths_are_completely_separate() -> None:
-    assert market_paths(Path("data"), Path("reports"), "US").root.name == "trend_us_futu"
+    assert market_paths(Path("data"), Path("reports"), "US").root == Path("data/trend_us_tiger")
     assert market_paths(Path("data"), Path("reports"), "HK").root.name == "trend_hk_phillips"
+    assert MARKET_SETTINGS["US"]["broker"] == "tiger"
+    assert MARKET_NOTIFICATION_LABELS["US"][0] == "老虎"
 
 
 def test_resolve_market_dates_uses_same_day_hk_and_prior_day_us() -> None:
@@ -317,13 +565,13 @@ def test_market_report_failure_owns_day_at_noon_deadline(tmp_path: Path) -> None
     assert result.status == "failed"
     assert notifier.messages == [
         (
-            "【富途｜美股趋势报告生成失败｜2026-07-15】",
+            "【老虎｜美股趋势报告生成失败｜2026-07-15】",
             "原因：趋势数据在截止时间前仍未更新\n"
-            "现在做：确认 Trend Animals 与富途账户状态后手动重跑富途报告\n\n"
+            "现在做：确认 Trend Animals 与老虎账户状态后手动重跑老虎报告\n\n"
             "报告未生成，请勿依据旧报告交易。",
         )
     ]
-    ledger = cfg.data_dir / "trend_us_futu/daily_delivery/2026-07-15.json"
+    ledger = cfg.data_dir / "trend_us_tiger/daily_delivery/2026-07-15.json"
     assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
 
 
@@ -352,6 +600,12 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
             "asset": "港股", "asOfDate": "2026-07-15", "tradableFlag": True,
             "industryName": "科技", "amount1d": "2", "isTrendRightSide": True,
             "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
+            "gainSinceTrendEntry": "0.048", "trendPhasePrev": "谷雨",
+            "trendPhaseCurr": "立夏", "trendStrengthLocalChange": "↑↑",
+            "trendStrengthGlobalCurr": "91.8",
+            "trendStrengthLocalPrevWeek": "86.0",
+            "trendStrengthLocalPrevMonth": "77.4",
+            "tickerLabels": "成交主力;市值龙头",
             "stopwinFlagByDangerSignal": False,
             "stopwinFlagByBoilingTemperature": False,
             "stopwinFlagByPopChampagne": False,
@@ -383,10 +637,17 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
-            return [{"field": field, "priceCost": "0"} for field in HOLDING_FIELDS]
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS
+            ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
             assert kwargs["tm_ids"] == [1, 2]
+            assert kwargs["fields"] == UNIFIED_TREND_FIELDS
             return [
                 snapshot(1, "02800.HK", "盈富基金"),
                 snapshot(2, "00700.HK", "腾讯"),
@@ -474,7 +735,24 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert "禁止买入" not in message
     assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
+    assert [item["symbol"] for item in payload["option_attention"]] == [
+        "00700",
+        "02800",
+    ]
+    assert payload["option_attention"][0]["name"] == "腾讯"
+    assert payload["option_attention"][0]["days"] == 3
+    assert payload["signal_snapshots"]["holdings"]["00700"]["name"] == "腾讯"
+    assert payload["signal_snapshots"]["holdings"]["00700"]["days"] == 3
+    assert "\n期权关注\n" in message
+    assert payload["option_attention"][0]["source_broker"] == "辉立"
+    candidate_snapshot = payload["signal_snapshots"]["candidates"][0]
+    assert candidate_snapshot["boiling"] is False
+    assert candidate_snapshot["champagne"] is False
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
+    assert (
+        f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
+        "cache=client-managed"
+    ) in payload["api_facts"]
     actions = payload["strategy_judgments"]["formal_actions"]
     assert actions[0]["action"] == "BUY"
     assert actions[0]["symbol"] == "02800"
@@ -483,7 +761,294 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert payload["account"]["fresh"] is False
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert payload["estimated_api_cost"] == "0.142"
+    assert payload["signal_snapshots"]["holdings"]["00700"] | {
+        "gain_since_entry": "0.048",
+        "phase_prev": "谷雨",
+        "phase_curr": "立夏",
+        "strength_change": "↑↑",
+        "global_strength": "91.8",
+        "strength_prev_week": "86.0",
+        "strength_prev_month": "77.4",
+        "labels": ["成交主力", "市值龙头"],
+        "kline_supplement": None,
+    } == payload["signal_snapshots"]["holdings"]["00700"]
     assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
+    evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
+    evidence = __import__("json").loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["market"] == "HK"
+    assert evidence["query"]["component_pool_ids"] == [622494]
+    assert evidence["rebuild_inputs"]["lot_sizes"] == {"02800": 100}
+
+
+@pytest.mark.parametrize(
+    ("refresh_error", "expected_refresh_error", "forbidden_values"),
+    [
+        (
+            TigerAccountError(
+                "Tiger refresh failed token=TIGER-TOKEN account=123456789",
+                error_type="account_query_failed",
+            ),
+            "account_query_failed",
+            ("TIGER-TOKEN", "123456789"),
+        ),
+        (
+            TigerAccountError(
+                "Tiger refresh failed token=UNKNOWN-MESSAGE-SECRET",
+                error_type="unknown_type_UNKNOWN-TYPE-SECRET",
+            ),
+            "tiger_account_error",
+            ("UNKNOWN-MESSAGE-SECRET", "unknown_type_UNKNOWN-TYPE-SECRET"),
+        ),
+        (
+            RuntimeError(
+                "Tiger refresh failed token=TIGER-TOKEN account=123456789"
+            ),
+            "Tiger account refresh failed",
+            ("TIGER-TOKEN", "123456789"),
+        ),
+    ],
+)
+def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
+    tmp_path: Path,
+    refresh_error: Exception,
+    expected_refresh_error: str,
+    forbidden_values: tuple[str, ...],
+) -> None:
+    cfg = config(tmp_path)
+    write_tiger_snapshot(
+        cfg.data_dir,
+        "2026-07-14",
+        cash_records=[
+            {"record_type": "account_total", "currency": "USD", "account_total": "100000"},
+            {"currency": "USD", "cash_balance": "10000", "available_balance": "10000"},
+        ],
+        position_records=[{
+            "market": "US", "sec_type": "STK", "symbol": "VIXY",
+            "name": "VIX Short ETF", "currency": "USD", "position_qty": "10",
+            "average_cost": "40", "market_value": "500",
+        }],
+    )
+    write_tiger_snapshot(
+        cfg.data_dir,
+        "2026-07-15",
+        cash_records=[
+            {"record_type": "account_total", "currency": "USD", "account_total": "200000"},
+            {"currency": "USD", "cash_balance": "20000", "available_balance": "20000"},
+        ],
+        position_records=[{
+            "market": "US", "sec_type": "STK", "symbol": "VIXY",
+            "name": "VIX Short ETF", "currency": "USD", "position_qty": "10",
+            "average_cost": "40", "market_value": "500",
+        }],
+    )
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [{"asset": "美股", "asOfDate": "2026-07-14"}]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            assert (tm_id, expected_date) == (622460, "2026-07-14")
+            return [{"tmId": 1, "tickerSymbol": "QQQ.US", "asOfDate": expected_date}]
+
+        def search_exact_symbol(self, symbol: str) -> int:
+            assert symbol == "VIXY"
+            return 2
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            assert kwargs["fields"] == UNIFIED_TREND_FIELDS
+            return [
+                {
+                    "tmId": tm_id, "tickerName": name, "tickerSymbol": f"{symbol}.US",
+                    "asset": "美股", "asOfDate": "2026-07-14", "tradableFlag": True,
+                    "industryName": "ETF", "amount1d": "2", "isTrendRightSide": True,
+                    "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
+                    "stopwinFlagByDangerSignal": False,
+                    "stopwinFlagByBoilingTemperature": False,
+                    "stopwinFlagByPopChampagne": False,
+                }
+                for tm_id, symbol, name in ((1, "QQQ", "Invesco QQQ"), (2, "VIXY", "VIX Short"))
+            ]
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-14", "2026-07-15"]
+
+        def get_daily_kline(
+            self, *args: object, **kwargs: object
+        ) -> list[DailyKlineBar]:
+            end = datetime(2026, 7, 14)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index))
+                    .date()
+                    .isoformat(),
+                    open=10, high=11, low=9, close=10, volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def close(self) -> None:
+            pass
+
+    notifier = RecordingFeishu()
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=notifier,
+        api_factory=Api,
+        quote_factory=Quote,
+        account_refresher=lambda *args: (_ for _ in ()).throw(
+            refresh_error
+        ),
+    )
+
+    assert result.json_path is not None
+    assert result.report_path is not None
+    payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
+    assert (
+        f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
+        "cache=client-managed"
+    ) in payload["api_facts"]
+    assert payload["estimated_api_cost"] == "0.142"
+    assert payload["account"]["fresh"] is False
+    assert payload["account"]["source_date"] == "2026-07-14"
+    assert payload["strategy_judgments"]["formal_actions"] == []
+    assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "MANUAL_REVIEW"
+    assert payload["strategy_judgments"]["holding_decisions"][0]["reason"] == "stale_tiger_account"
+    evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    replayed = trend_review.rebuild_trend_report_from_evidence(evidence)
+    for key in (
+        "account",
+        "strategy_judgments",
+        "protection_state",
+        "signal_snapshots",
+        "strategy_snapshot",
+    ):
+        assert replayed[key] == payload[key]
+    assert replayed["strategy_judgments"]["formal_actions"] == []
+    assert replayed["strategy_judgments"]["holding_decisions"][0] | {
+        "action": "MANUAL_REVIEW",
+        "reason": "stale_tiger_account",
+    } == replayed["strategy_judgments"]["holding_decisions"][0]
+    assert payload["metadata"]["account_currency"] == "HKD"
+    assert payload["metadata"]["price_fx_to_hkd"] == "7.85"
+    assert payload["metadata"]["account_refresh_error"] == expected_refresh_error
+    assert "账户状态：账户数据非实时，禁止新增买入；持仓需复核" in notifier.messages[0][1]
+    output = "\n".join(
+        (
+            result.json_path.read_text(encoding="utf-8"),
+            result.report_path.read_text(encoding="utf-8"),
+            market_paths(cfg.data_dir, cfg.reports_dir, "US").log.read_text(
+                encoding="utf-8"
+            ),
+            *(f"{title}\n{message}" for title, message in notifier.messages),
+        )
+    )
+    for value in forbidden_values:
+        assert value not in output
+
+
+def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    write_tiger_snapshot(
+        cfg.data_dir,
+        "2026-07-15",
+        cash_records=[
+            {"record_type": "account_total", "currency": "USD", "account_total": "1210"},
+            {"currency": "USD", "cash_balance": "1000", "available_balance": "1000"},
+        ],
+        position_records=[{
+            "market": "US", "sec_type": "STK", "symbol": "AAPL",
+            "name": "Apple", "currency": "USD", "position_qty": "1",
+            "average_cost": "200", "market_value": "210",
+        }],
+    )
+    snapshot_calls: list[object] = []
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [{"asset": "美股", "asOfDate": "2026-07-14"}]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            return [{"tmId": 1, "tickerSymbol": "VIXY.US", "asOfDate": expected_date}]
+
+        def search_exact_symbol(self, symbol: str) -> int:
+            return 2
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.072" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            snapshot_calls.append(kwargs)
+            return []
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-14", "2026-07-15"]
+
+        def close(self) -> None:
+            pass
+
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        now_fn=lambda: datetime(2026, 7, 15, 12, tzinfo=SHANGHAI),
+        sleep_fn=lambda seconds: None,
+        api_factory=Api,
+        quote_factory=Quote,
+        account_refresher=lambda *args: None,
+    )
+
+    assert result.status == "failed"
+    assert snapshot_calls == []
 
 
 def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) -> None:
@@ -522,3 +1087,290 @@ def test_existing_report_retries_frozen_failure_without_refetch(tmp_path: Path) 
 
     assert result.status == "existing"
     assert recovered.messages == [("frozen title", "frozen body")]
+
+
+def _attention_row(symbol: str, **overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "symbol": symbol,
+        "name": symbol,
+        "right_side": False,
+        "temperature_curr": "温",
+        "phase_curr": "谷雨",
+        "strength": "90",
+        "global_strength": "85",
+        "strength_prev_week": "88",
+        "strength_prev_month": "80",
+        "strength_change": "→",
+        "days": 0,
+        "gain_since_entry": "0",
+        "danger": False,
+        "boiling": False,
+        "champagne": False,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_build_option_attention_emits_only_raw_trend_transitions() -> None:
+    previous = [
+        _attention_row("QQQ"),
+        _attention_row("DRAM"),
+        _attention_row("MSFT"),
+    ]
+    current = [
+        _attention_row(
+            "QQQ",
+            right_side=True,
+            temperature_curr="热",
+            phase_curr="立夏",
+            strength_change="↑↑",
+            days=1,
+            gain_since_entry="0.048",
+        ),
+        _attention_row("DRAM", danger=True),
+        _attention_row("MSFT"),
+    ]
+
+    attention = market_trend.build_option_attention(
+        current, previous, {"QQQ": "BUY"}, "US", "tiger"
+    )
+
+    assert [item["symbol"] for item in attention] == ["DRAM", "QQQ"]
+    assert list(attention[0]) == [
+        "market",
+        "symbol",
+        "name",
+        "category",
+        "right_side",
+        "temperature",
+        "phase",
+        "local_strength",
+        "global_strength",
+        "strength_prev_week",
+        "strength_prev_month",
+        "strength_change",
+        "days",
+        "gain_since_entry",
+        "danger",
+        "boiling",
+        "champagne",
+        "source_broker",
+        "source_action",
+    ]
+    assert attention[0]["category"] == "risk"
+    assert attention[0]["danger"] == {
+        "previous": False,
+        "current": True,
+        "changed": True,
+    }
+    assert attention[1]["category"] == "strengthened"
+    assert attention[1]["right_side"] == {
+        "previous": False,
+        "current": True,
+        "changed": True,
+    }
+    assert attention[1]["days"] == 1
+    assert attention[1]["gain_since_entry"] == "0.048"
+    assert attention[1]["source_action"] == "BUY"
+    assert "headline" not in attention[1]
+    assert "summary" not in attention[1]
+    protection_only = [{**row, "active_line": "200"} for row in current]
+    assert market_trend.build_option_attention(
+        protection_only, current, {"MSFT": "SELL_ALL"}, "US", "tiger"
+    ) == []
+
+
+def test_build_option_attention_preserves_missing_values_and_holding_precedence() -> None:
+    candidate = _attention_row("700.HK", name="候选腾讯", danger=False)
+    holding = _attention_row(
+        "00700",
+        name=None,
+        right_side=True,
+        temperature_curr=None,
+        phase_curr=None,
+        strength=None,
+        global_strength=None,
+        strength_prev_week=None,
+        strength_prev_month=None,
+        strength_change=None,
+        days=None,
+        gain_since_entry=None,
+        danger=True,
+        boiling=None,
+        champagne=None,
+    )
+    previous = [_attention_row("00700", right_side=True)]
+
+    attention = market_trend.build_option_attention(
+        [candidate, holding], previous, {"00700": "HOLD"}, "HK", "phillips"
+    )
+
+    assert len(attention) == 1
+    assert attention[0]["symbol"] == "00700"
+    assert attention[0]["name"] is None
+    assert attention[0]["days"] is None
+    assert attention[0]["danger"]["current"] is True
+    assert attention[0]["temperature"]["current"] is None
+    assert attention[0]["strength_change"]["current"] is None
+    assert attention[0]["global_strength"] is None
+
+    first_entries = market_trend.build_option_attention(
+        [
+            _attention_row("RIGHT", right_side=True, danger=False, boiling=None),
+            _attention_row("LEFT", right_side=False, danger=False),
+            _attention_row("RISK", right_side=True, danger=True),
+        ],
+        [],
+        {},
+        "US",
+        "tiger",
+    )
+    assert [item["symbol"] for item in first_entries] == ["RIGHT"]
+    assert first_entries[0]["boiling"] == {
+        "previous": None,
+        "current": None,
+        "changed": False,
+    }
+
+
+def test_previous_attention_rows_use_strict_dates_and_one_time_tiger_baseline(
+    tmp_path: Path,
+) -> None:
+    paths = market_paths(tmp_path / "data", tmp_path / "reports", "US")
+    paths.root.mkdir(parents=True)
+    baseline = {
+        "as_of_date": "2026-07-15",
+        "signal_snapshots": {"candidates": [_attention_row("BASE")]},
+    }
+    (paths.root / "attention_baseline.json").write_text(
+        json.dumps(baseline), encoding="utf-8"
+    )
+
+    assert [
+        row["symbol"]
+        for row in market_trend._previous_attention_rows(
+            paths, current_as_of_date="2026-07-16", market="US"
+        )
+    ] == ["BASE"]
+
+    paths.reports.mkdir(parents=True)
+    for filename, as_of_date, symbol in (
+        ("2026-07-14.json", "2026-07-14", "OLDER"),
+        ("2026-07-15.json", "2026-07-15", "PRIOR"),
+        ("2026-07-15-r2.json", "2026-07-15", "REVISION2"),
+        ("2026-07-15-r10.json", "2026-07-15", "REVISION10"),
+        ("2026-07-16.json", "2026-07-16", "SAME"),
+        ("2026-07-16-r1.json", "2026-07-16", "REVISION"),
+    ):
+        (paths.reports / filename).write_text(
+            json.dumps(
+                {
+                    "as_of_date": as_of_date,
+                    "signal_snapshots": {
+                        "candidates": [_attention_row(symbol)],
+                        "holdings": {},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    rows = market_trend._previous_attention_rows(
+        paths, current_as_of_date="2026-07-16", market="US"
+    )
+    assert [row["symbol"] for row in rows] == ["REVISION10"]
+
+    for path in paths.reports.glob("*.json"):
+        path.unlink()
+    (paths.reports / "malformed.json").write_text("{", encoding="utf-8")
+    assert market_trend._previous_attention_rows(
+        paths, current_as_of_date="2026-07-16", market="US"
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("market", "section", "malformed_row", "older_symbol", "newer_symbol"),
+    [
+        ("US", "candidates", {}, "OLDER", "NEWER"),
+        ("US", "candidates", {"symbol": "  "}, "OLDER", "NEWER"),
+        ("US", "holdings", {"symbol": "600001"}, "OLDER", "NEWER"),
+        ("HK", "holdings", {"symbol": "AAPL"}, "00001", "00002"),
+    ],
+)
+def test_previous_attention_rows_skip_newest_report_with_invalid_symbol_row(
+    tmp_path: Path,
+    market: str,
+    section: str,
+    malformed_row: dict[str, object],
+    older_symbol: str,
+    newer_symbol: str,
+) -> None:
+    paths = market_paths(tmp_path / "data", tmp_path / "reports", market)
+    paths.reports.mkdir(parents=True)
+    for filename, as_of_date, symbol in (
+        ("2026-07-14.json", "2026-07-14", older_symbol),
+        ("2026-07-15.json", "2026-07-15", newer_symbol),
+    ):
+        snapshots: dict[str, object] = {
+            "candidates": [_attention_row(symbol)],
+            "holdings": {},
+        }
+        if filename == "2026-07-15.json":
+            if section == "candidates":
+                snapshots[section] = [*snapshots[section], malformed_row]
+            else:
+                snapshots[section] = {"malformed": malformed_row}
+        (paths.reports / filename).write_text(
+            json.dumps(
+                {"as_of_date": as_of_date, "signal_snapshots": snapshots}
+            ),
+            encoding="utf-8",
+        )
+
+    rows = market_trend._previous_attention_rows(
+        paths, current_as_of_date="2026-07-16", market=market
+    )
+
+    assert [row["symbol"] for row in rows] == [older_symbol]
+
+
+def test_current_attention_rows_keep_valid_rows_when_one_symbol_is_invalid() -> None:
+    rows = market_trend._attention_rows(
+        {
+            "candidates": [
+                _attention_row("QQQ", right_side=True, danger=False),
+                _attention_row("600001", right_side=True, danger=False),
+            ]
+        }
+    )
+
+    assert rows is not None
+    assert [
+        item["symbol"]
+        for item in market_trend.build_option_attention(
+            rows, [], {}, "US", "tiger"
+        )
+    ] == ["QQQ"]
+
+
+def test_previous_attention_rows_reject_malformed_tiger_baseline(
+    tmp_path: Path,
+) -> None:
+    paths = market_paths(tmp_path / "data", tmp_path / "reports", "US")
+    paths.root.mkdir(parents=True)
+    (paths.root / "attention_baseline.json").write_text(
+        json.dumps(
+            {
+                "as_of_date": "2026-07-15",
+                "signal_snapshots": {
+                    "candidates": [_attention_row("VALID")],
+                    "holdings": {"malformed": {"symbol": "600001"}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert market_trend._previous_attention_rows(
+        paths, current_as_of_date="2026-07-16", market="US"
+    ) == []

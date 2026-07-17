@@ -29,12 +29,24 @@ SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
 SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
 
 ACCOUNT_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
-TREND_REPORT_BROKERS = ("futu", "phillips", "eastmoney")
+TREND_REPORT_BROKERS = ("tiger", "phillips", "eastmoney")
 TREND_REPORT_DIRECTORIES = {
-    "futu": "trend_us_futu",
+    "tiger": "trend_us_tiger",
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }
+OPTION_ATTENTION_COLUMN_LABELS = (
+    "标的",
+    "分类",
+    "右侧状态",
+    "趋势温度",
+    "趋势节气",
+    "本地 / 全球强度",
+    "上周 / 上月",
+    "右侧天数 / 累计涨幅",
+    "危险 / 沸腾 / 开香槟",
+    "来源动作",
+)
 WARM_LEDGER_TOKENS = {
     "--bg": "#F7F5F1",
     "--surface": "#FFFEFA",
@@ -48,11 +60,19 @@ WARM_LEDGER_TOKENS = {
     "--success": "#2F855A",
 }
 ACCEPTANCE_SCREENSHOT_DIR = Path("/tmp/open_trader_dashboard_acceptance")
+ACCEPTANCE_BROWSER_VIEWPORTS = (
+    ("wide_desktop", {"width": 1920, "height": 1080}),
+    ("desktop", {"width": 1440, "height": 1000}),
+    ("tablet", {"width": 760, "height": 1000}),
+    ("mobile", {"width": 375, "height": 844}),
+)
 ACCEPTANCE_SCREENSHOT_NAMES = (
     "wide_desktop-portfolio.png",
     "1920-trend-report.png",
     "desktop-portfolio.png",
     "1440-trend-report.png",
+    "tablet-portfolio.png",
+    "760-trend-report.png",
     "mobile-portfolio.png",
     "375-trend-report.png",
 )
@@ -233,16 +253,8 @@ def validate_dashboard_payload(
                     "东方财富总资产不匹配："
                     f"{eastmoney_total} != {expected_eastmoney_cny} CNY"
                 )
-    tiger_strategy = payload.get("tiger_long_term_strategy") or {}
-    if tiger_strategy.get("status") != "shadow":
-        errors.append("老虎长线策略不是 shadow 状态")
-    if not tiger_strategy.get("members"):
-        errors.append("老虎长线策略没有组合成员")
-    tiger_gate = tiger_strategy.get("gate") or {}
-    if "calibration_required" not in (tiger_gate.get("reasons") or []):
-        errors.append("老虎长线策略缺少 calibration_required")
-    if tiger_strategy.get("order_requests"):
-        errors.append("老虎长线策略包含下单请求")
+    if "tiger_" + "long_term_strategy" in payload:
+        errors.append("Dashboard API 仍包含已退役策略")
     return errors
 
 
@@ -612,7 +624,7 @@ def _check_trend_artifact_projection(
     assert isinstance(payload, Mapping), f"{broker} 冻结趋势报告不是对象"
     metadata = payload.get("metadata")
     metadata = metadata if isinstance(metadata, Mapping) else {}
-    expected_market = {"futu": "US", "phillips": "HK", "eastmoney": "CN"}[broker]
+    expected_market = {"tiger": "US", "phillips": "HK", "eastmoney": "CN"}[broker]
     assert (
         payload.get("execution_date") == report.get("report_date")
         and payload.get("as_of_date") == report.get("data_date")
@@ -891,10 +903,11 @@ def _check_account_holdings(
     assert page.locator("#cash-detail-panel").count() == 0, "页面仍包含现金明细挂载点"
 
     reports = payload.get("trend_reports") or {}
+    reviews = payload.get("trend_reviews") or {}
     profiles = {
-        "futu": ("富途", "短线", "美股趋势交易"),
-        "tiger": ("老虎", "长线", "SMA200 组合策略"),
-        "phillips": ("辉立", "短线", "港股趋势交易"),
+        "futu": ("富途", "期权增强", "跨市场期权关注"),
+        "tiger": ("老虎", "趋势", "美股趋势交易"),
+        "phillips": ("辉立", "趋势", "港股趋势交易"),
         "eastmoney": ("东方财富", "偏短线", "趋势交易"),
     }
     for broker in ACCOUNT_BROKERS:
@@ -904,13 +917,10 @@ def _check_account_holdings(
         text = section.inner_text()
         for required in (*profiles[broker], "持仓资产", "现金", "持仓", "来源", "时间"):
             assert required in text, f"{broker} 账户区块缺少 {required}"
-        if broker == "tiger":
-            for required in (
-                "SMA200 策略", "影子验证", "年化收益", "最大回撤", "夏普比率", "卡玛比率",
-            ):
-                assert required in text, f"老虎策略摘要缺少 {required}"
         for legacy in ("数据日", "账户源", "最近保护提醒", "策略指标待接入"):
             assert legacy not in text, f"账户持仓视图仍包含旧趋势摘要 {legacy}"
+        for retired in ("SMA200 策略", "SMA200 " + "组合策略", "富途｜美股"):
+            assert retired not in text, f"账户持仓视图仍包含已退役身份 {retired}"
         for forbidden in (
             "tiger-long-term-panel", "calibration_required", "provenance_incomplete",
         ):
@@ -926,12 +936,8 @@ def _check_account_holdings(
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 账户区块出现横向滚动"
-        if broker == "tiger":
-            assert section.locator(".trend-report-entry").count() == 0, (
-                "老虎账户不应包含趋势报告入口"
-            )
-            continue
-        assert "当天趋势报告" in text, f"{broker} 账户区块缺少 当天趋势报告"
+        entry_label = "期权关注" if broker == "futu" else "当天趋势报告"
+        assert entry_label in text, f"{broker} 账户区块缺少 {entry_label}"
         report = reports.get(broker) if isinstance(reports, Mapping) else None
         assert isinstance(report, Mapping), f"API 缺少 {broker} 趋势报告状态"
         entry = section.locator(".trend-report-entry")
@@ -939,24 +945,27 @@ def _check_account_holdings(
         trigger = entry.locator("[data-trend-report]")
         if report.get("available") is not True:
             assert trigger.count() == 0, f"{broker} 不可用报告仍可打开"
-            button = entry.locator("button")
+            button = entry.locator(f'button:has-text("{entry_label}")')
             assert button.count() == 1 and button.is_disabled(), (
                 f"{broker} 不可用报告入口未禁用"
             )
             assert page.locator("#trend-report-workspace:visible").count() == 0, (
                 f"{broker} 不可用报告错误打开工作区"
             )
-            if broker == "eastmoney" and screenshot_dir is not None:
-                raise AssertionError("eastmoney 趋势报告不可用，无法生成验收截图")
+            if broker in {"futu", "eastmoney"} and screenshot_dir is not None:
+                raise AssertionError(f"{broker} 趋势报告不可用，无法生成验收截图")
             continue
         assert trigger.count() == 1, f"{broker} 可用报告缺少入口"
-        if reports_dir is not None:
+        if reports_dir is not None and broker in TREND_REPORT_BROKERS:
             _check_trend_artifact_projection(reports_dir, broker, report)
         entry_text = entry.inner_text()
-        for label, key in (("报告日期", "report_date"), ("数据截至", "data_date")):
-            assert f"{label} {_plain(report.get(key))}" in entry_text, (
-                f"{broker} 入口缺少 {label}"
-            )
+        if broker == "futu":
+            assert "期权关注" in entry_text, "futu 入口缺少期权关注"
+        else:
+            for label, key in (("报告日期", "report_date"), ("数据截至", "data_date")):
+                assert f"{label} {_plain(report.get(key))}" in entry_text, (
+                    f"{broker} 入口缺少 {label}"
+                )
         trigger.click()
         workspace = page.locator("#trend-report-workspace:visible")
         assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
@@ -965,6 +974,116 @@ def _check_account_holdings(
         assert close.evaluate("element => element === document.activeElement"), (
             f"{broker} 趋势报告打开后焦点未进入工作区"
         )
+        if broker == "futu":
+            workspace_text = workspace.inner_text()
+            assert "期权关注" in workspace_text, "futu 期权关注工作区标题缺失"
+            markets = report.get("attention_markets")
+            assert isinstance(markets, list) and [
+                market.get("market") for market in markets if isinstance(market, Mapping)
+            ] == ["US", "HK"], "futu 期权关注市场顺序不是 US、HK"
+            column_headings = workspace.locator(
+                '.option-attention-table thead th[scope="col"]'
+            )
+            assert (
+                column_headings.count() == len(OPTION_ATTENTION_COLUMN_LABELS)
+                and tuple(column_headings.all_inner_texts())
+                == OPTION_ATTENTION_COLUMN_LABELS
+            ), "futu 期权关注列标题不匹配"
+            rowgroups = workspace.locator(".option-attention-table tbody")
+            assert rowgroups.count() == 2, "futu 期权关注市场分组数量不是 2"
+            for index, market in enumerate(markets):
+                assert isinstance(market, Mapping)
+                market_name = _plain(market.get("market"))
+                rowgroup = rowgroups.nth(index)
+                data_status = market.get("data_status")
+                assert data_status in {"current", "stale", "unavailable"}, (
+                    f"futu 期权关注 {market_name} 数据状态无效"
+                )
+                if data_status == "current":
+                    status_text = "今日已更新"
+                elif data_status == "stale":
+                    data_date = str(market.get("data_date") or "").strip()
+                    assert data_date, "futu 期权关注过期市场缺少数据日期"
+                    status_text = f"数据截至 {data_date}；今日未更新"
+                else:
+                    status_text = "暂时不可用"
+                header = rowgroup.locator(
+                    ".option-attention-market-content span"
+                )
+                assert header.count() == 2 and header.all_inner_texts() == [
+                    _plain(market.get("market_label")), status_text,
+                ], (
+                    f"futu 期权关注 {market_name} 分组市场或状态不匹配"
+                )
+                items = market.get("items")
+                assert isinstance(items, list), "futu 期权关注项目不是列表"
+                assert all(isinstance(item, Mapping) for item in items), (
+                    "futu 期权关注项目无效"
+                )
+                rows = rowgroup.locator(".option-attention-row")
+                for row_index in range(rows.count()):
+                    cells = rows.nth(row_index).locator("td")
+                    data_labels = tuple(
+                        cells.nth(cell_index).get_attribute("data-label")
+                        for cell_index in range(cells.count())
+                    )
+                    assert data_labels == OPTION_ATTENTION_COLUMN_LABELS, (
+                        f"futu 期权关注 {market_name} 第 {row_index + 1} 行列标签不匹配"
+                    )
+                expected_symbols = [_plain(item.get("symbol")) for item in items]
+                symbol_texts = rowgroup.locator(
+                    '.option-attention-row td[data-label="标的"]'
+                ).all_inner_texts()
+                actual_symbols = [
+                    text.strip().split(maxsplit=1)[0] if text.strip() else ""
+                    for text in symbol_texts
+                ]
+                assert actual_symbols == expected_symbols, (
+                    f"futu 期权关注 {market_name} 分组标的不匹配"
+                )
+            width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+            if width <= 760:
+                column_counts = page.evaluate(
+                    r"""() => [...document.querySelectorAll('.option-attention-row')]
+                    .map(row => getComputedStyle(row).gridTemplateColumns
+                        .trim().split(/\s+/)
+                        .filter(column => parseFloat(column) > 0).length)"""
+                )
+                expected_columns = 1 if width <= 460 else 2
+                assert isinstance(column_counts, list) and all(
+                    count == expected_columns for count in column_counts
+                ), (
+                    f"futu 期权关注卡片应为 {expected_columns} 列，实际为 "
+                    f"{column_counts}"
+                )
+                _check_mobile_targets(
+                    page,
+                    "#return-to-portfolio:visible, "
+                    "#trend-report-workspace:visible button:visible, "
+                    "#trend-report-workspace:visible summary:visible",
+                )
+                assert page.evaluate(
+                    "document.documentElement.scrollWidth <= window.innerWidth"
+                ), "futu 期权关注工作区出现横向滚动"
+                boxes = page.locator(
+                    "#trend-report-workspace:visible .option-attention-workspace, "
+                    "#trend-report-workspace:visible .option-attention-table, "
+                    "#trend-report-workspace:visible .option-attention-market, "
+                    "#trend-report-workspace:visible .option-attention-row"
+                ).evaluate_all(
+                    "nodes => nodes.map(node => node.getBoundingClientRect())"
+                    ".map(r => ({x:r.x,width:r.width}))"
+                )
+                assert boxes and all(
+                    box is not None
+                    and box["x"] >= -1
+                    and box["x"] + box["width"] <= width + 1
+                    for box in boxes
+                ), "futu 期权关注工作区元素超出移动端视口"
+            close.click()
+            assert page.locator("#trend-report-workspace:visible").count() == 0
+            assert trigger.evaluate("element => element === document.activeElement")
+            continue
         buy_actions = report.get("buy_actions")
         expected_buy_count = len(buy_actions) if isinstance(buy_actions, list) else 0
         _check_open_report_layout(
@@ -1076,6 +1195,82 @@ def _check_account_holdings(
         assert trigger.evaluate("element => element === document.activeElement"), (
             f"{broker} 返回后焦点未恢复到报告入口"
         )
+        review = reviews.get(broker) if isinstance(reviews, Mapping) else None
+        assert isinstance(review, Mapping), f"API 缺少 {broker} 趋势复盘状态"
+        _check_trend_review(page, section, broker, review)
+
+
+def _check_trend_review(
+    page: Any, section: Any, broker: str, review: Mapping[str, Any]
+) -> None:
+    assert review.get("available") is True, f"{broker} 趋势复盘不可用"
+    labels = {"tiger": "美股复盘", "phillips": "港股复盘", "eastmoney": "A股复盘"}
+    assert labels[broker] in section.inner_text(), f"{broker} 账户区块缺少 {labels[broker]}"
+    trigger = section.locator(f'[data-trend-review="{broker}"]')
+    assert trigger.count() == 1, f"{broker} 趋势复盘入口数量不是 1"
+    trigger.click()
+    workspace = page.locator("#trend-report-workspace:visible")
+    assert workspace.count() == 1, f"{broker} 趋势复盘工作区未显示"
+    text = workspace.inner_text()
+    market_label = _plain(review.get("market_label"))
+    snapshot = review.get("strategy_snapshot")
+    assert isinstance(snapshot, Mapping), f"{broker} 趋势复盘缺少策略快照"
+    for required in (
+        f"{market_label}趋势复盘",
+        _plain(review.get("broker_label")),
+        _plain(snapshot.get("strategy_name")),
+        f"版本 {_plain(snapshot.get('strategy_version'))}",
+        "当前策略参数",
+        "收益与回撤",
+        "风险调整收益",
+        "纪律模拟",
+        "实际执行",
+        "市场基准",
+    ):
+        assert required in text, f"{broker} 趋势复盘缺少 {required}"
+    parameters = snapshot.get("parameter_rows")
+    assert isinstance(parameters, list) and parameters, f"{broker} 策略参数为空"
+    parameter_rows = workspace.locator(
+        ".trend-review-parameter-table > div"
+    ).all_inner_texts()
+    assert len(parameter_rows) == len(parameters), f"{broker} 策略参数没有完整展示"
+    for rendered, row in zip(parameter_rows, parameters, strict=True):
+        assert isinstance(row, Mapping), f"{broker} 策略参数格式无效"
+        for key in ("group", "name", "value"):
+            assert _plain(row.get(key)) in rendered, f"{broker} 策略参数缺少 {key}"
+    assert workspace.locator(".trend-review-chart").count() == 2, (
+        f"{broker} 趋势复盘图表数量不是 2"
+    )
+    assert workspace.locator(".trend-review-chart figcaption").all_inner_texts() == [
+        "收益与回撤", "风险调整收益",
+    ], f"{broker} 趋势复盘图表顺序不正确"
+    metric_labels = workspace.locator(".trend-review-metric h3").all_inner_texts()
+    assert metric_labels == [
+        "期间净收益率", "相对市场超额收益", "最大回撤", "卡玛比率", "夏普比率",
+    ], f"{broker} 趋势复盘指标不完整或顺序错误"
+    for forbidden in (
+        "复盘结论", "Connected", "创建回测", "导出参数", "Alpha", "Beta",
+        "Sortino", "胜率", "盈亏比",
+    ):
+        assert forbidden not in text, f"{broker} 趋势复盘包含未要求内容 {forbidden}"
+    if (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760:
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        ), f"{broker} 趋势复盘在 375px 产生横向滚动"
+        _check_mobile_targets(
+            page,
+            "#return-to-portfolio:visible, "
+            "#trend-report-workspace:visible button:visible",
+        )
+    close = workspace.locator("[data-close-trend-report]")
+    assert close.count() == 1, f"{broker} 趋势复盘缺少返回按钮"
+    close.click()
+    assert page.locator("#trend-report-workspace:visible").count() == 0, (
+        f"{broker} 返回后趋势复盘工作区仍可见"
+    )
+    assert trigger.evaluate("element => element === document.activeElement"), (
+        f"{broker} 返回后焦点未恢复到复盘入口"
+    )
 
 
 def _select_account_tab(page: Any, broker: str) -> Any:
@@ -1357,11 +1552,7 @@ def _browser_check(
             except AssertionError as exc:
                 browser.close()
                 return [str(exc)], None
-            for name, viewport in (
-                ("wide_desktop", {"width": 1920, "height": 1080}),
-                ("desktop", {"width": 1440, "height": 1000}),
-                ("mobile", {"width": 375, "height": 844}),
-            ):
+            for name, viewport in ACCEPTANCE_BROWSER_VIEWPORTS:
                 page = None
                 try:
                     page = browser.new_page(viewport=viewport)

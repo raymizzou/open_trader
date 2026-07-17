@@ -88,8 +88,13 @@ def futu_module_available(
 def futu_module_unsupported(module: object) -> bool:
     return bool(
         isinstance(module, dict)
-        and module.get("status") == "error"
-        and str(module.get("summary") or "").startswith("富途接口不支持")
+        and (
+            module.get("status") == "not_applicable"
+            or (
+                module.get("status") == "error"
+                and str(module.get("summary") or "").startswith("富途接口不支持")
+            )
+        )
     )
 
 
@@ -160,22 +165,29 @@ def _futu_checks(
     run_date: str,
 ) -> tuple[tuple[str, object, bool], ...]:
     current = bool(record and record.get("run_date") == run_date)
-    return tuple(
+    news_sentiment = _module(record, "news_sentiment")
+    return (
         (
-            f"futu_skill_facts.{name}",
-            _module(record, name),
-            current
-            and (
-                futu_module_available(_module(record, name))
-                or futu_module_unsupported(_module(record, name))
-            ),
-        )
-        for name in (
-            "news_sentiment",
-            "technical_anomaly",
-            "capital_anomaly",
-            "derivatives_anomaly",
-        )
+            "futu_skill_facts.news_sentiment",
+            news_sentiment,
+            current and futu_module_available(news_sentiment),
+        ),
+        *(
+            (
+                f"futu_skill_facts.{name}",
+                _module(record, name),
+                current
+                and (
+                    futu_module_available(_module(record, name))
+                    or futu_module_unsupported(_module(record, name))
+                ),
+            )
+            for name in (
+                "technical_anomaly",
+                "capital_anomaly",
+                "derivatives_anomaly",
+            )
+        ),
     )
 
 

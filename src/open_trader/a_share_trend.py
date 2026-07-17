@@ -30,6 +30,7 @@ from .trend_animals import (
     TrendAnimalsLookupError,
 )
 from .trend_delivery import deliver_daily_trend_text
+from .trend_review import freeze_report_evidence
 
 
 NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
@@ -37,42 +38,182 @@ DISCLAIMER_TEXT = (
     "本报告是确定性纪律清单，不是订单或成交事实；所有交易由用户人工确认与执行。"
 )
 NON_REALTIME_ACCOUNT_WARNING = "账户数据非实时，执行前核对现金与持仓"
+STALE_TIGER_ACCOUNT_WARNING = "账户数据非实时，禁止新增买入；持仓需复核"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-CANDIDATE_FIELDS = (
-    "tmId",
-    "tickerName",
-    "tickerSymbol",
-    "asset",
-    "asOfDate",
-    "tradableFlag",
-    "industryName",
-    "amount1d",
-    "isTrendRightSide",
-    "daysSinceTrendEntry",
-    "trendStrengthLocalCurr",
-    "stopwinFlagByDangerSignal",
+UNIFIED_TREND_FIELDS = (
+    "tmId", "tickerName", "tickerSymbol", "asset", "asOfDate",
+    "tradableFlag", "industryTmId", "industryName", "priceIndex",
+    "marketCap", "amount1d", "isTrendRightSide",
+    "trendTemperatureCurr", "trendTemperaturePrev",
+    "daysSinceTrendEntry", "gainSinceTrendEntry",
+    "trendPhasePrev", "trendPhaseCurr", "trendStrengthLocalCurr",
+    "trendStrengthLocalChange", "trendStrengthGlobalCurr",
+    "trendStrengthLocalPrevWeek", "trendStrengthLocalPrevMonth",
+    "stopwinFlagByDangerSignal", "stopwinFlagByBoilingTemperature",
+    "stopwinFlagByPopChampagne", "tickerLabels",
 )
-HOLDING_FIELDS = CANDIDATE_FIELDS + (
-    "stopwinFlagByBoilingTemperature",
-    "stopwinFlagByPopChampagne",
-)
-A_SHARE_DISCIPLINE_FIELDS = (
-    "industryTmId",
-    "priceIndex",
-    "marketCap",
-    "trendTemperatureCurr",
-    "trendTemperaturePrev",
-    "trendPhaseCurr",
-)
-A_SHARE_SNAPSHOT_FIELDS = HOLDING_FIELDS + A_SHARE_DISCIPLINE_FIELDS
+UNIFIED_TREND_UNIT_COST = Decimal("0.071")
+CANDIDATE_FIELDS = UNIFIED_TREND_FIELDS
+HOLDING_FIELDS = UNIFIED_TREND_FIELDS
+A_SHARE_SNAPSHOT_FIELDS = UNIFIED_TREND_FIELDS
 A_SHARE_INDUSTRY_FIELDS = (
     "tmId",
     "asOfDate",
     "trendTemperatureCurr",
 )
+CN_MAX_FILTER_PRICE = Decimal("200")
+CN_MIN_STRENGTH = Decimal("95")
+CN_MIN_MARKET_CAP_100M = Decimal("100")
+CN_MIN_AMOUNT_100M = Decimal("2")
+MARKET_MIN_STRENGTH_EXCLUSIVE = Decimal("90")
+MARKET_MAX_RIGHT_SIDE_DAYS_EXCLUSIVE = 10
+MARKET_MIN_AMOUNT_100M = Decimal("1")
+POSITION_LIMIT = 10
+CANDIDATE_LIMIT = 10
+CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
+DEFAULT_TARGET_WEIGHT = Decimal("0.04")
+INITIAL_PROTECTION_ATR_MULTIPLE = Decimal("2")
+TRAILING_LOW_DAYS = 5
 ALLOWED_ENTRY_PHASES = {"谷雨", "立夏", "夏至"}
 HOT_TEMPERATURES = {"热", "沸"}
 KNOWN_TEMPERATURES = {"凉", "平", "温", "热", "沸"}
+
+
+def trend_strategy_snapshot(
+    market: str,
+    process_version: str,
+    candidate_pool_ids: Sequence[int],
+) -> dict[str, object]:
+    market = market.upper()
+    if market not in {"CN", "US", "HK"}:
+        raise ValueError(f"unsupported trend review market: {market}")
+
+    common = {
+        "candidate_pool_ids": list(candidate_pool_ids),
+        "requires_right_side": True,
+        "requires_tradable": True,
+        "requires_no_danger": True,
+        "requires_matching_data_date": True,
+        "requires_not_held": True,
+        "requires_atr14": True,
+        "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
+        "candidate_limit": CANDIDATE_LIMIT,
+        "position_limit": POSITION_LIMIT,
+    }
+    if market == "CN":
+        parameters: dict[str, object] = {
+            **common,
+            "allowed_exchanges": ["SH", "SZ"],
+            "excluded_name_markers": ["ST", "退"],
+            "temperature_transition": {"from": ["温"], "to": ["热", "沸"]},
+            "max_filter_price": str(CN_MAX_FILTER_PRICE),
+            "min_strength": str(CN_MIN_STRENGTH),
+            "allowed_industry_temperatures": ["热", "沸"],
+            "allowed_phases": ["谷雨", "立夏", "夏至"],
+            "min_market_cap_100m": str(CN_MIN_MARKET_CAP_100M),
+            "min_amount_100m": str(CN_MIN_AMOUNT_100M),
+            "requires_right_side_days": True,
+            "target_weight": {key: str(value) for key, value in CN_TARGET_WEIGHTS.items()},
+            "lot_size": 100,
+            "buy_window": "09:30-10:00",
+            "initial_protection_atr_multiple": str(INITIAL_PROTECTION_ATR_MULTIPLE),
+            "exit_reasons": [
+                "danger",
+                "left_right_side",
+                "temperature_to_flat",
+                "protection",
+            ],
+            "trailing_low_days": TRAILING_LOW_DAYS,
+            "protection_line_non_decreasing": True,
+        }
+        name = "A 股短线右侧趋势"
+        rows = [
+            ("候选来源", "趋势动物组合", "温转热（A 股）、温转热（ETF 基金个股）"),
+            ("入场过滤", "交易市场", "沪深 A 股；排除北交所、ST、*ST 和退市标记"),
+            ("入场过滤", "趋势温度", "前一状态为温；当前状态为热或沸"),
+            ("入场过滤", "筛选价格", "不高于 200 元"),
+            ("入场过滤", "趋势强度", "不低于 95"),
+            ("入场过滤", "行业温度", "热或沸"),
+            ("入场过滤", "趋势节气", "谷雨、立夏或夏至"),
+            ("入场过滤", "总市值", "不低于 100 亿元"),
+            ("入场过滤", "单日成交额", "不低于 2 亿元"),
+            ("入场过滤", "趋势右侧", "必须明确为是"),
+            ("入场过滤", "可交易状态", "必须明确为可交易"),
+            ("入场过滤", "危险信号", "必须明确未触发"),
+            ("入场过滤", "其他要求", "数据日期一致、非当前持仓、右侧天数存在、ATR14 可计算"),
+            ("候选排序", "排序顺序", "趋势强度降序、右侧天数升序、成交额降序、股票代码升序"),
+            ("候选排序", "候选数量", "展示前 10；按剩余持仓席位产生买入动作"),
+            ("仓位执行", "持仓上限", "10 笔"),
+            ("仓位执行", "热状态仓位", "账户净值的 4%"),
+            ("仓位执行", "沸状态仓位", "账户净值的 2%"),
+            ("仓位执行", "买入数量", "按 100 股整数倍向下取整"),
+            ("仓位执行", "买入窗口", "下一交易日 09:30–10:00"),
+            ("退出保护", "初始保护线", "成交均价减 2.0 倍 ATR14"),
+            ("退出保护", "退出条件", "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"),
+            ("退出保护", "过热跟踪", "此前 5 个完整交易日最低价；保护线只升不降"),
+        ]
+    else:
+        parameters = {
+            **common,
+            "min_strength_exclusive": str(MARKET_MIN_STRENGTH_EXCLUSIVE),
+            "max_right_side_days_exclusive": MARKET_MAX_RIGHT_SIDE_DAYS_EXCLUSIVE,
+            "min_amount_100m": str(MARKET_MIN_AMOUNT_100M),
+            "target_weight": str(DEFAULT_TARGET_WEIGHT),
+            "allowed_exchange": market,
+            **(
+                {"lot_size": 1, "buy_window": "美股常规交易时段"}
+                if market == "US"
+                else {
+                    "lot_size_source": "Futu 每标的整手",
+                    "buy_window": "09:30-10:00",
+                }
+            ),
+            "initial_protection_atr_multiple": str(INITIAL_PROTECTION_ATR_MULTIPLE),
+            "exit_reasons": ["danger", "left_right_side", "protection"],
+            "trailing_low_days": TRAILING_LOW_DAYS,
+            "protection_line_non_decreasing": True,
+        }
+        market_label = "美股" if market == "US" else "港股"
+        name = f"{market_label}短线右侧趋势"
+        rows = [
+            ("候选来源", "趋势动物组合", "、".join(str(item) for item in candidate_pool_ids)),
+            ("入场过滤", "交易市场", market_label),
+            ("入场过滤", "趋势强度", "高于 90"),
+            ("入场过滤", "右侧天数", "少于 10 天"),
+            ("入场过滤", "单日成交额", "不低于 1 亿元"),
+            ("入场过滤", "其他要求", "趋势右侧、可交易、无危险信号、日期一致、非当前持仓、ATR14 可计算"),
+            ("候选排序", "排序顺序", "趋势强度降序、右侧天数升序、成交额降序、股票代码升序"),
+            ("候选排序", "候选数量", "展示前 10；按剩余持仓席位产生买入动作"),
+            ("仓位执行", "持仓上限", "10 笔"),
+            ("仓位执行", "目标仓位", "账户净值的 4%"),
+            (
+                "仓位执行",
+                "买入数量",
+                "按 1 股整数倍向下取整" if market == "US" else "按 Futu 返回的每标的整手股数向下取整",
+            ),
+            (
+                "仓位执行",
+                "买入窗口",
+                "美股常规交易时段" if market == "US" else "下一交易日 09:30–10:00",
+            ),
+            ("退出保护", "初始保护线", "成交均价减 2.0 倍 ATR14"),
+            ("退出保护", "退出条件", "危险信号、离开趋势右侧或触发保护线时全部卖出"),
+            ("退出保护", "过热跟踪", "此前 5 个完整交易日最低价；保护线只升不降"),
+        ]
+
+    return {
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/v1",
+        "strategy_name": name,
+        "strategy_version": "v1",
+        "market": market,
+        "effective_from": "2026-07-14",
+        "process_version": process_version,
+        "parameters": parameters,
+        "parameter_rows": [
+            {"group": group, "name": label, "value": value}
+            for group, label, value in rows
+        ],
+    }
 
 
 @dataclass(frozen=True)
@@ -100,6 +241,7 @@ class AccountSnapshot:
     available_cash: Decimal
     positions: tuple[AccountPosition, ...]
     exceptions: tuple[str, ...]
+    position_count: int | None = None
 
 
 def _finite_decimal(value: object) -> bool:
@@ -177,6 +319,17 @@ class CandidateInput:
     temperature_prev: str | None = None
     temperature_curr: str | None = None
     phase: str | None = None
+    gain_since_entry: Decimal | None = None
+    phase_prev: str | None = None
+    phase_curr: str | None = None
+    strength_change: str | None = None
+    global_strength: Decimal | None = None
+    strength_prev_week: Decimal | None = None
+    strength_prev_month: Decimal | None = None
+    labels: tuple[str, ...] = ()
+    kline_supplement: dict[str, bool] | None = None
+    boiling: object = None
+    champagne: object = None
 
 
 @dataclass(frozen=True)
@@ -193,6 +346,7 @@ class BuyAction:
     target_weight: Decimal
     target_amount: Decimal
     estimated_shares: int
+    lot_size: int
     filter_price: Decimal | None
     close: Decimal
     market_cap: Decimal | None
@@ -212,7 +366,7 @@ class HoldingSnapshot:
     tm_id: int
     symbol: str
     exchange: str
-    name: str
+    name: str | None
     as_of_date: str
     right_side: bool | None
     danger: bool | None
@@ -227,6 +381,16 @@ class HoldingSnapshot:
     temperature_prev: str | None = None
     temperature_curr: str | None = None
     phase: str | None = None
+    days: int | None = None
+    gain_since_entry: Decimal | None = None
+    phase_prev: str | None = None
+    phase_curr: str | None = None
+    strength_change: str | None = None
+    global_strength: Decimal | None = None
+    strength_prev_week: Decimal | None = None
+    strength_prev_month: Decimal | None = None
+    labels: tuple[str, ...] = ()
+    kline_supplement: dict[str, bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +430,8 @@ class TrendReport:
     protection_state: dict[str, object]
     signal_snapshots: dict[str, object]
     metadata: dict[str, object]
+    strategy_snapshot: dict[str, object]
+    replay_evidence: dict[str, str] | None = None
 
 
 def _broker_set(value: str) -> set[str]:
@@ -300,6 +466,17 @@ def _optional_int(value: object) -> int | None:
         return int(str(value).strip())
     except ValueError:
         raise ValueError(f"invalid integer value: {value!r}") from None
+
+
+def _optional_text(value: object) -> str | None:
+    text = value.strip() if isinstance(value, str) else ""
+    return text or None
+
+
+def _ticker_labels(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        return ()
+    return tuple(part.strip() for part in value.split(";") if part.strip())
 
 
 def _account_exceptions(rows: Sequence[Mapping[str, str]]) -> list[str]:
@@ -369,6 +546,7 @@ def load_eastmoney_account(
         available_cash=cash,
         positions=positions,
         exceptions=tuple(_account_exceptions(eastmoney)),
+        position_count=len(positions),
     )
 
 
@@ -408,6 +586,70 @@ def _kline_metrics(
     return atr, close, lows
 
 
+def _kline_supplement(
+    bars: Sequence[DailyKlineBar],
+) -> dict[str, bool] | None:
+    if len(bars) < 50:
+        return None
+    try:
+        closes = tuple(_decimal(bar.close) for bar in bars[-50:])
+        low = _decimal(bars[-1].low)
+        prior20_high = max(_decimal(bar.high) for bar in bars[-21:-1])
+        current_volume = _decimal(bars[-1].volume)
+        prior20_volume = tuple(_decimal(bar.volume) for bar in bars[-21:-1])
+    except (TypeError, ValueError):
+        return None
+    sma20 = sum(closes[-20:], Decimal("0")) / Decimal("20")
+    sma50 = sum(closes, Decimal("0")) / Decimal("50")
+    close = closes[-1]
+    average_volume = sum(prior20_volume, Decimal("0")) / Decimal("20")
+    relative_volume = (
+        current_volume / average_volume if average_volume > 0 else Decimal("0")
+    )
+    return {
+        "pullback_to_sma20": sma20 > sma50 and low <= sma20 < close,
+        "breakout_20d_with_volume": (
+            close > prior20_high and relative_volume >= Decimal("1.5")
+        ),
+        "sma50_breakdown": close < sma50,
+    }
+
+
+def _paid_expansion_fields(
+    row: Mapping[str, object], bars: Sequence[DailyKlineBar]
+) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "gain_since_entry": _optional_decimal(row.get("gainSinceTrendEntry")),
+        "phase_prev": _optional_text(row.get("trendPhasePrev")),
+        "phase_curr": _optional_text(row.get("trendPhaseCurr")),
+        "strength_change": _optional_text(row.get("trendStrengthLocalChange")),
+        "global_strength": _optional_decimal(row.get("trendStrengthGlobalCurr")),
+        "strength_prev_week": _optional_decimal(
+            row.get("trendStrengthLocalPrevWeek")
+        ),
+        "strength_prev_month": _optional_decimal(
+            row.get("trendStrengthLocalPrevMonth")
+        ),
+        "labels": _ticker_labels(row.get("tickerLabels")),
+    }
+    paid_expansion_incomplete = any(
+        fields[name] is None
+        for name in (
+            "gain_since_entry",
+            "phase_prev",
+            "phase_curr",
+            "strength_change",
+            "global_strength",
+            "strength_prev_week",
+            "strength_prev_month",
+        )
+    ) or not fields["labels"]
+    fields["kline_supplement"] = (
+        _kline_supplement(bars) if paid_expansion_incomplete else None
+    )
+    return fields
+
+
 def _symbol_parts(value: object, *, market: str = "CN") -> tuple[str, str]:
     if not isinstance(value, str):
         raise ValueError("tickerSymbol must be a string")
@@ -445,6 +687,7 @@ def evaluate_candidate(
     tm_id = row.get("tmId")
     if isinstance(tm_id, bool) or not isinstance(tm_id, int):
         raise ValueError("tmId must be an integer")
+    paid_expansion = _paid_expansion_fields(row, daily_bars)
     return CandidateInput(
         tm_id=tm_id,
         symbol=symbol,
@@ -476,12 +719,18 @@ def evaluate_candidate(
             if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
             else None
         ),
-        phase=(
-            str(row["trendPhaseCurr"]).strip()
-            if isinstance(row.get("trendPhaseCurr"), str)
-            and str(row["trendPhaseCurr"]).strip()
+        phase=_optional_text(row.get("trendPhaseCurr")),
+        boiling=(
+            row.get("stopwinFlagByBoilingTemperature")
+            if isinstance(row.get("stopwinFlagByBoilingTemperature"), bool)
             else None
         ),
+        champagne=(
+            row.get("stopwinFlagByPopChampagne")
+            if isinstance(row.get("stopwinFlagByPopChampagne"), bool)
+            else None
+        ),
+        **paid_expansion,
     )
 
 
@@ -507,11 +756,11 @@ def _candidate_reasons(
             reasons.append("temperature_transition_not_entry")
         if item.filter_price is None:
             reasons.append("filter_price_missing")
-        elif item.filter_price > 200:
+        elif item.filter_price > CN_MAX_FILTER_PRICE:
             reasons.append("filter_price_above_200")
         if item.strength is None:
             reasons.append("strength_missing")
-        elif item.strength < 95:
+        elif item.strength < CN_MIN_STRENGTH:
             reasons.append("strength_below_95")
         if item.industry_tm_id is None:
             reasons.append("industry_id_missing")
@@ -525,20 +774,20 @@ def _candidate_reasons(
             reasons.append("phase_after_summer_solstice")
         if item.market_cap is None:
             reasons.append("market_cap_missing")
-        elif item.market_cap < 100:
+        elif item.market_cap < CN_MIN_MARKET_CAP_100M:
             reasons.append("market_cap_below_100")
         if item.amount is None:
             reasons.append("amount_missing")
-        elif item.amount < 2:
+        elif item.amount < CN_MIN_AMOUNT_100M:
             reasons.append("amount_below_2")
         if item.days is None:
             reasons.append("right_side_days_missing")
     else:
-        if item.strength is None or item.strength <= 90:
+        if item.strength is None or item.strength <= MARKET_MIN_STRENGTH_EXCLUSIVE:
             reasons.append("strength_not_above_90")
-        if item.days is None or item.days >= 10:
+        if item.days is None or item.days >= MARKET_MAX_RIGHT_SIDE_DAYS_EXCLUSIVE:
             reasons.append("right_side_days_not_below_10")
-        if item.amount is None or item.amount < 1:
+        if item.amount is None or item.amount < MARKET_MIN_AMOUNT_100M:
             reasons.append("amount_below_1")
     if item.right_side is not True:
         reasons.append("right_side_not_true")
@@ -612,8 +861,9 @@ def estimate_buy_actions(
     position_weight: Decimal,
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
+    price_fx_to_account_currency: Decimal = Decimal("1"),
 ) -> list[BuyAction]:
-    slots = max(0, 10 - current_position_count)
+    slots = max(0, POSITION_LIMIT - current_position_count)
     if slots == 0:
         return []
     remaining_cash = available_cash
@@ -624,9 +874,7 @@ def estimate_buy_actions(
         if item.close is None or item.close <= 0 or item.atr is None:
             continue
         weight = (
-            {"热": Decimal("0.04"), "沸": Decimal("0.02")}.get(
-                item.temperature_curr
-            )
+            CN_TARGET_WEIGHTS.get(item.temperature_curr)
             if market == "CN"
             else position_weight
         )
@@ -640,7 +888,8 @@ def estimate_buy_actions(
             lot_size = (lot_sizes or {}).get(item.symbol, 0)
         else:
             lot_size = 1
-        shares = int(amount / item.close / lot_size) * lot_size if lot_size > 0 else 0
+        share_price = item.close * price_fx_to_account_currency
+        shares = int(amount / share_price / lot_size) * lot_size if lot_size > 0 else 0
         if shares <= 0:
             continue
         actions.append(
@@ -651,6 +900,7 @@ def estimate_buy_actions(
                 target_weight=weight,
                 target_amount=amount,
                 estimated_shares=shares,
+                lot_size=lot_size,
                 filter_price=item.filter_price,
                 close=item.close,
                 market_cap=item.market_cap,
@@ -662,7 +912,9 @@ def estimate_buy_actions(
                 strength=item.strength,
                 amount=item.amount,
                 atr=item.atr,
-                estimated_initial_line=item.close - Decimal("2") * item.atr,
+                estimated_initial_line=(
+                    item.close - INITIAL_PROTECTION_ATR_MULTIPLE * item.atr
+                ),
             )
         )
         remaining_cash -= amount
@@ -677,7 +929,7 @@ def update_protection_line(
     champagne: bool,
     prior_five_lows: Sequence[Decimal],
 ) -> Decimal:
-    if not (boiling or champagne) or len(prior_five_lows) != 5:
+    if not (boiling or champagne) or len(prior_five_lows) != TRAILING_LOW_DAYS:
         return old_line
     return max(old_line, min(prior_five_lows))
 
@@ -806,8 +1058,12 @@ def build_report(
     metadata: Mapping[str, object] | None = None,
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
-    position_weight: Decimal = Decimal("0.04"),
+    position_weight: Decimal = DEFAULT_TARGET_WEIGHT,
     position_weight_source: str = "fallback_4pct",
+    price_fx_to_account_currency: Decimal = Decimal("1"),
+    process_version: str = "",
+    candidate_pool_ids: Sequence[int] = (),
+    strategy_snapshot: Mapping[str, object] | None = None,
 ) -> TrendReport:
     held_symbols = {position.symbol for position in account.positions}
     candidate_decision = build_candidate_list(
@@ -816,15 +1072,20 @@ def build_report(
         expected_date=as_of_date,
         market=market,
     )
-    displayed_candidates = candidate_decision.eligible[:10]
+    displayed_candidates = candidate_decision.eligible[:CANDIDATE_LIMIT]
     buy_actions = estimate_buy_actions(
         ranked=candidate_decision.eligible,
         net_value=account.net_value,
         available_cash=account.available_cash,
-        current_position_count=len(account.positions),
+        current_position_count=(
+            account.position_count
+            if account.position_count is not None
+            else len(account.positions)
+        ),
         position_weight=position_weight,
         market=market,
         lot_sizes=lot_sizes,
+        price_fx_to_account_currency=price_fx_to_account_currency,
     )
     old_positions = _state_positions(prior_state)
     holdings: list[HoldingDecision] = []
@@ -868,7 +1129,9 @@ def build_report(
         )
         stale_kline = bool(daily_bars) and daily_bars[-1].date != as_of_date
         if active_line is None and current_atr is not None and close is not None:
-            initial_line = active_line = close - Decimal("2") * current_atr
+            initial_line = active_line = (
+                close - INITIAL_PROTECTION_ATR_MULTIPLE * current_atr
+            )
         if active_line is not None and tracking_active and action == "HOLD":
             active_line = update_protection_line(
                 old_line=active_line,
@@ -926,14 +1189,18 @@ def build_report(
     )
     holding_signals = {
         position.symbol: (
-            _holding_signal(holding_snapshots[position.symbol])
+            _holding_signal(holding_snapshots[position.symbol], market=market)
             if holding_snapshots.get(position.symbol) is not None
             else None
         )
         for position in account.positions
     }
     excluded_signals = {
-        symbol: [_candidate_signal(item) for item in candidates if item.symbol == symbol]
+        symbol: [
+            _candidate_signal(item, market=market)
+            for item in candidates
+            if item.symbol == symbol
+        ]
         for symbol in candidate_decision.excluded
     }
     ranks = {
@@ -942,7 +1209,7 @@ def build_report(
     }
     candidate_signals = [
         {
-            **_candidate_signal(item),
+            **_candidate_signal(item, market=market),
             "eligible": (item.tm_id, item.symbol) in ranks,
             "excluded_reasons": _candidate_reasons(
                 item, held_symbols, as_of_date, market=market
@@ -980,11 +1247,72 @@ def build_report(
             "position_weight": str(position_weight),
             "position_weight_source": position_weight_source,
         },
+        strategy_snapshot=(
+            {
+                **dict(strategy_snapshot),
+                "process_version": process_version
+                or str((metadata or {}).get("process_version") or ""),
+            }
+            if strategy_snapshot is not None
+            else trend_strategy_snapshot(
+                market,
+                process_version
+                or str((metadata or {}).get("process_version") or ""),
+                candidate_pool_ids,
+            )
+        ),
+        replay_evidence=None,
     )
 
 
-def _holding_signal(item: HoldingSnapshot) -> dict[str, object]:
+def _finalize_market_report(
+    report: TrendReport, *, managed_symbols: Sequence[str]
+) -> TrendReport:
+    market = str(report.metadata.get("market") or "").upper()
+    if market == "US" and not report.account.fresh:
+        report = replace(
+            report,
+            buy_actions=(),
+            holdings=tuple(
+                replace(
+                    holding,
+                    action="MANUAL_REVIEW",
+                    reason="stale_tiger_account",
+                )
+                for holding in report.holdings
+            ),
+        )
+    managed = set(managed_symbols)
+    managed.update(item.symbol for item in report.account.positions)
+    managed.update(item.symbol for item in report.buy_actions)
+    return replace(
+        report,
+        protection_state={
+            **report.protection_state,
+            "managed_symbols": sorted(managed),
+        },
+        metadata={**report.metadata, "delivery_status": "prepared"},
+    )
+
+
+def _paid_expansion_signal(
+    item: CandidateInput | HoldingSnapshot,
+) -> dict[str, object]:
     return {
+        "gain_since_entry": item.gain_since_entry,
+        "phase_prev": item.phase_prev,
+        "phase_curr": item.phase_curr,
+        "strength_change": item.strength_change,
+        "global_strength": item.global_strength,
+        "strength_prev_week": item.strength_prev_week,
+        "strength_prev_month": item.strength_prev_month,
+        "labels": list(item.labels),
+        "kline_supplement": item.kline_supplement,
+    }
+
+
+def _holding_signal(item: HoldingSnapshot, *, market: str) -> dict[str, object]:
+    signal = {
         "tm_id": item.tm_id,
         "symbol": item.symbol,
         "as_of_date": item.as_of_date,
@@ -1001,11 +1329,15 @@ def _holding_signal(item: HoldingSnapshot) -> dict[str, object]:
         "temperature_prev": item.temperature_prev,
         "temperature_curr": item.temperature_curr,
         "phase": item.phase,
+        **_paid_expansion_signal(item),
     }
+    if market.upper() in {"US", "HK"}:
+        signal.update(name=item.name, days=item.days)
+    return signal
 
 
-def _candidate_signal(item: CandidateInput) -> dict[str, object]:
-    return {
+def _candidate_signal(item: CandidateInput, *, market: str) -> dict[str, object]:
+    signal = {
         "tm_id": item.tm_id,
         "symbol": item.symbol,
         "exchange": item.exchange,
@@ -1028,7 +1360,11 @@ def _candidate_signal(item: CandidateInput) -> dict[str, object]:
         "temperature_prev": item.temperature_prev,
         "temperature_curr": item.temperature_curr,
         "phase": item.phase,
+        **_paid_expansion_signal(item),
     }
+    if market.upper() in {"US", "HK"}:
+        signal.update(boiling=item.boiling, champagne=item.champagne)
+    return signal
 
 
 def _money(value: Decimal) -> str:
@@ -1047,6 +1383,7 @@ REASON_LABELS = {
     "left_trend_right_side": "右侧趋势已结束",
     "holding_signal_unknown": "趋势信号不完整",
     "holding_kline_unavailable": "持仓日线数据不可用",
+    "stale_tiger_account": "老虎账户数据非实时，禁止新增买入；持仓需复核",
     "trend_intact": "趋势保持完好",
     "temperature_changed_to_flat": "趋势温度转平",
     "a_share_only": "仅限 A 股股票",
@@ -1198,6 +1535,50 @@ def _append_feishu_action_sections(
         )
 
 
+ATTENTION_FEISHU_FIELDS = (
+    ("right_side", "右侧"),
+    ("temperature", "温度"),
+    ("phase", "节气"),
+    ("strength_change", "周强度"),
+    ("danger", "危险"),
+    ("boiling", "沸腾"),
+    ("champagne", "开香槟"),
+)
+
+
+def _attention_value(value: object) -> str:
+    if value is True:
+        return "是"
+    if value is False:
+        return "否"
+    if value is None:
+        return "未提供"
+    return str(value)
+
+
+def _append_feishu_attention(
+    lines: list[str], attention: object, *, market: str
+) -> None:
+    if market not in {"US", "HK"} or not isinstance(attention, list):
+        return
+    items = [item for item in attention if isinstance(item, Mapping)]
+    if not items:
+        return
+    lines.extend(["", "期权关注"])
+    for index, item in enumerate(items, 1):
+        fields = []
+        for key, label in ATTENTION_FEISHU_FIELDS:
+            transition = item.get(key)
+            if not isinstance(transition, Mapping) or transition.get("changed") is not True:
+                continue
+            fields.append(
+                f"{label} {_attention_value(transition.get('previous'))}"
+                f"→{_attention_value(transition.get('current'))}"
+            )
+        suffix = f"｜{'｜'.join(fields)}" if fields else ""
+        lines.append(f"{index}. {item.get('symbol') or '-'}{suffix}")
+
+
 def render_trend_feishu_text(
     payload: Mapping[str, object], *, broker_label: str, market_label: str
 ) -> tuple[str, str]:
@@ -1244,7 +1625,13 @@ def render_trend_feishu_text(
         if _trend_action_needs_review(item) and item not in reviews:
             reviews.append(item)
     title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
-    status = "已更新" if fresh else NON_REALTIME_ACCOUNT_WARNING
+    status = (
+        "已更新"
+        if fresh
+        else STALE_TIGER_ACCOUNT_WARNING
+        if metadata.get("broker") == "tiger"
+        else NON_REALTIME_ACCOUNT_WARNING
+    )
     summary = (
         f"今日动作：卖出 {len(sells)}｜买入 {len(buys)}｜持有 {len(holds)}｜复核 {len(reviews)}"
         if sells or buys
@@ -1256,6 +1643,7 @@ def render_trend_feishu_text(
         summary,
     ]
     _append_feishu_action_sections(lines, sells, buys, reviews, market=market)
+    _append_feishu_attention(lines, payload.get("option_attention"), market=market)
     lines.extend(["", "请人工确认，不自动下单。"])
     return title, "\n".join(lines)
 
@@ -1290,10 +1678,16 @@ def render_trend_failure_text(
 def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
     market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(market, market)
-    currency = {"CN": "元", "US": "美元", "HK": "港元"}.get(market, "")
+    account_currency = str(report.metadata.get("account_currency") or "")
+    currency = (
+        {"CNY": "元", "USD": "美元", "HKD": "港元"}.get(account_currency)
+        or {"CN": "元", "US": "美元", "HK": "港元"}.get(market, "")
+    )
     freshness = (
         "已更新"
         if report.account.fresh is True
+        else STALE_TIGER_ACCOUNT_WARNING
+        if report.metadata.get("broker") == "tiger"
         else NON_REALTIME_ACCOUNT_WARNING
     )
     sells = [item for item in report.holdings if item.action == "SELL_ALL"]
@@ -1461,15 +1855,53 @@ def _json_value(value: object) -> object:
     return value
 
 
+def validate_report_strategy_snapshot(report: TrendReport) -> None:
+    snapshot = report.strategy_snapshot
+    parameters = snapshot.get("parameters")
+    if not isinstance(parameters, Mapping):
+        raise ValueError("strategy snapshot does not match report actions")
+    market = str(report.metadata.get("market") or "CN").upper()
+    expected_window = "美股常规交易时段" if market == "US" else "09:30-10:00"
+    if parameters.get("buy_window") != expected_window:
+        raise ValueError("strategy snapshot does not match report actions")
+    try:
+        protection_multiple = Decimal(str(parameters["initial_protection_atr_multiple"]))
+    except (InvalidOperation, KeyError, ValueError):
+        raise ValueError("strategy snapshot does not match report actions") from None
+    for action in report.buy_actions:
+        target = parameters.get("target_weight")
+        expected_weight = (
+            target.get(action.temperature_curr)
+            if isinstance(target, Mapping)
+            else target
+        )
+        expected_lot = parameters.get("lot_size")
+        if (
+            str(action.target_weight) != str(expected_weight)
+            or (expected_lot is not None and action.lot_size != expected_lot)
+            or action.lot_size <= 0
+            or action.estimated_initial_line
+            != action.close - protection_multiple * action.atr
+        ):
+            raise ValueError("strategy snapshot does not match report actions")
+
+
 def _report_payload(report: TrendReport) -> dict[str, object]:
+    validate_report_strategy_snapshot(report)
     market = str(report.metadata.get("market") or "CN").upper()
     buy_window = (
         f"{report.execution_date} 09:30–10:00"
-        if market == "CN"
+        if market in {"CN", "HK"}
         else f"{report.execution_date} regular session"
     )
     holding_decisions = [_json_value(asdict(item)) for item in report.holdings]
-    top10_candidates = [_json_value(asdict(item)) for item in report.candidates]
+    top10_candidates = []
+    for item in report.candidates:
+        candidate = asdict(item)
+        if market == "CN":
+            candidate.pop("boiling")
+            candidate.pop("champagne")
+        top10_candidates.append(_json_value(candidate))
     formal_actions = [
         _json_value(asdict(item))
         for item in report.holdings
@@ -1503,8 +1935,11 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "protection_state": report.protection_state,
         "signal_snapshots": _json_value(report.signal_snapshots),
         "metadata": _json_value(report.metadata),
+        "strategy_snapshot": _json_value(report.strategy_snapshot),
         "disclaimer": DISCLAIMER_TEXT,
     }
+    if report.replay_evidence is not None:
+        payload["replay_evidence"] = dict(report.replay_evidence)
     for key in ("delivery_status", "process_version"):
         value = report.metadata.get(key)
         if isinstance(value, str) and value:
@@ -2136,6 +2571,21 @@ def _billing_price(row: Mapping[str, object]) -> Decimal:
     raise TrendAnimalsError("snapshot billing returned no price")
 
 
+def _unified_trend_unit_cost(
+    billing: Mapping[str, Mapping[str, object]],
+) -> Decimal:
+    cost = sum(
+        (_billing_price(billing[field]) for field in UNIFIED_TREND_FIELDS),
+        Decimal("0"),
+    )
+    if cost != UNIFIED_TREND_UNIT_COST:
+        raise TrendAnimalsError(
+            "unified Trend Animals catalog cost must be "
+            f"{UNIFIED_TREND_UNIT_COST}, got {cost}"
+        )
+    return cost
+
+
 def _is_systemic_futu_error(exc: FutuQuoteError) -> bool:
     return exc.error_type in {
         "opend_unreachable",
@@ -2159,13 +2609,15 @@ def _holding_snapshot(
     *,
     market: str = "CN",
     industry_temperature: str | None = None,
+    bars: Sequence[DailyKlineBar] = (),
 ) -> HoldingSnapshot:
     symbol, exchange = _symbol_parts(row.get("tickerSymbol"), market=market)
+    paid_expansion = _paid_expansion_fields(row, bars)
     return HoldingSnapshot(
         tm_id=_row_tm_id(row),
         symbol=symbol,
         exchange=exchange,
-        name=str(row.get("tickerName") or "").strip(),
+        name=_optional_text(row.get("tickerName")),
         as_of_date=str(row.get("asOfDate") or "").strip(),
         right_side=(
             row.get("isTrendRightSide")
@@ -2203,12 +2655,9 @@ def _holding_snapshot(
             if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
             else None
         ),
-        phase=(
-            str(row["trendPhaseCurr"]).strip()
-            if isinstance(row.get("trendPhaseCurr"), str)
-            and str(row["trendPhaseCurr"]).strip()
-            else None
-        ),
+        phase=_optional_text(row.get("trendPhaseCurr")),
+        days=_optional_int(row.get("daysSinceTrendEntry")),
+        **paid_expansion,
     )
 
 
@@ -2270,7 +2719,7 @@ def _attempt_report(
                 continue
 
         requested_ids = sorted(component_ids | set(holding_ids.values()))
-        fields = A_SHARE_SNAPSHOT_FIELDS
+        fields = UNIFIED_TREND_FIELDS
         billing_rows = api.get_snapshot_billing()
         billing = {_billing_field(row): row for row in billing_rows}
         requested_fields = tuple(dict.fromkeys(fields + A_SHARE_INDUSTRY_FIELDS))
@@ -2280,6 +2729,7 @@ def _attempt_report(
                 "getSnapshotColumnBilling missing requested field(s): "
                 + ", ".join(missing_billing)
             )
+        unified_unit_cost = _unified_trend_unit_cost(billing)
         snapshot_rows = (
             api.get_snapshots(
                 tm_ids=requested_ids,
@@ -2337,7 +2787,7 @@ def _attempt_report(
             position.symbol: None for position in account.positions
         }
         rows_by_tm_id = {_row_tm_id(row): row for row in snapshot_rows}
-        kline_start = (run_day - timedelta(days=60)).isoformat()
+        kline_start = (run_day - timedelta(days=90)).isoformat()
         bars_by_symbol: dict[str, Sequence[DailyKlineBar] | None] = {}
         for tm_id in sorted(component_ids):
             row = rows_by_tm_id.get(tm_id)
@@ -2366,6 +2816,22 @@ def _attempt_report(
             )
         for symbol, tm_id in holding_ids.items():
             row = rows_by_tm_id.get(tm_id)
+            daily_bars = None
+            try:
+                futu_symbol = to_futu_symbol("CN", symbol)
+                if row is not None:
+                    _, exchange = _symbol_parts(row.get("tickerSymbol"))
+                    futu_symbol = f"{exchange}.{symbol}"
+                daily_bars = quote.get_daily_kline(
+                    futu_symbol, start=kline_start, end=run_date
+                )
+            except FutuQuoteError as exc:
+                if _is_systemic_futu_error(exc):
+                    raise
+                daily_bars = None
+            except ValueError:
+                daily_bars = None
+            bars_by_symbol[symbol] = daily_bars
             if row is not None:
                 try:
                     holding_snapshots[symbol] = _holding_snapshot(
@@ -2373,29 +2839,12 @@ def _attempt_report(
                         industry_temperature=industry_temperatures.get(
                             _optional_int(row.get("industryTmId"))
                         ),
+                        bars=tuple(daily_bars or ()),
                     )
                 except ValueError:
                     holding_snapshots[symbol] = None
-            try:
-                returned = holding_snapshots[symbol]
-                futu_symbol = (
-                    f"{returned.exchange}.{symbol}"
-                    if returned is not None
-                    else to_futu_symbol("CN", symbol)
-                )
-                bars_by_symbol[symbol] = quote.get_daily_kline(
-                    futu_symbol, start=kline_start, end=run_date
-                )
-            except FutuQuoteError as exc:
-                if _is_systemic_futu_error(exc):
-                    raise
-                bars_by_symbol[symbol] = None
-            except ValueError:
-                bars_by_symbol[symbol] = None
 
-        estimated_cost = sum(
-            (_billing_price(billing[field]) for field in fields), Decimal("0")
-        ) * len(requested_ids) + sum(
+        estimated_cost = unified_unit_cost * len(requested_ids) + sum(
             (
                 _billing_price(billing[field])
                 for field in A_SHARE_INDUSTRY_FIELDS
@@ -2410,6 +2859,12 @@ def _attempt_report(
             "misses": sum(event.get("cache") == "miss" for event in cache_events),
             "events": [dict(event) for event in cache_events],
         }
+        prior_state = load_protection_state(
+            config.data_dir / "trend_a_share/protection_state.json"
+        )
+        watch_events = load_watch_events(
+            config.data_dir / "trend_a_share/watch_events.jsonl"
+        )
         report = build_report(
             as_of_date=run_date,
             execution_date=execution_date,
@@ -2417,12 +2872,8 @@ def _attempt_report(
             candidates=candidates,
             holding_snapshots=holding_snapshots,
             bars_by_symbol=bars_by_symbol,
-            prior_state=load_protection_state(
-                config.data_dir / "trend_a_share/protection_state.json"
-            ),
-            watch_events=load_watch_events(
-                config.data_dir / "trend_a_share/watch_events.jsonl"
-            ),
+            prior_state=prior_state,
+            watch_events=watch_events,
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
                 *_component_api_facts(api, len(component_rows)),
@@ -2434,9 +2885,15 @@ def _attempt_report(
             actual_api_cost=actual_cost,
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
+            process_version=process_version,
+            candidate_pool_ids=(
+                config.trend_animals_a_share_tm_id,
+                config.trend_animals_etf_tm_id,
+            ),
             metadata={
                 "market": "CN",
                 "broker": "eastmoney",
+                "run_date": run_date,
                 "paid_response_cache": cache_metadata,
             },
         )
@@ -2446,6 +2903,44 @@ def _attempt_report(
                 **report.metadata,
                 "delivery_status": "prepared",
                 "process_version": process_version,
+            },
+        )
+        evidence = freeze_report_evidence(
+            data_dir=config.data_dir,
+            report=report,
+            candidates=candidates,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol=bars_by_symbol,
+            prior_state=prior_state,
+            watch_events=watch_events,
+            query={
+                "component_pool_ids": [
+                    config.trend_animals_a_share_tm_id,
+                    config.trend_animals_etf_tm_id,
+                ],
+                "snapshot_fields": list(fields),
+                "industry_fields": list(A_SHARE_INDUSTRY_FIELDS),
+            },
+            responses={
+                "update_status": update_rows,
+                "components": component_rows,
+                "snapshots": snapshot_rows,
+                "industries": industry_rows,
+            },
+            candidate_pool_ids=(
+                config.trend_animals_a_share_tm_id,
+                config.trend_animals_etf_tm_id,
+            ),
+            lot_sizes={},
+            price_fx_to_account_currency=Decimal("1"),
+            previous_attention_rows=(),
+            option_attention_broker_label=None,
+        )
+        report = replace(
+            report,
+            replay_evidence={
+                "path": str(Path(evidence["path"]).relative_to(config.data_dir)),
+                "sha256": evidence["sha256"],
             },
         )
         receipt_path = _receipt_path(config.data_dir, artifact_stem)

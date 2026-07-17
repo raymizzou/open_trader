@@ -17,12 +17,12 @@ from .a_share_trend import (
     AShareTrendRunResult,
     AccountPosition,
     AccountSnapshot,
-    HOLDING_FIELDS,
+    UNIFIED_TREND_FIELDS,
     _balance,
     _billing_field,
-    _billing_price,
     _component_api_facts,
     _final_pair_matches,
+    _finalize_market_report,
     _holding_snapshot,
     _is_systemic_futu_error,
     _process_version,
@@ -31,6 +31,7 @@ from .a_share_trend import (
     _report_payload,
     _row_tm_id,
     _transition_delivery_receipt,
+    _unified_trend_unit_cost,
     _write_delivery_receipt,
     _freeze_receipt_report,
     build_report,
@@ -48,24 +49,54 @@ from .daily_premarket import (
     send_notification_with_results,
 )
 from .notifications import Notifier, NullNotifier
-from .futu_account import FutuAccountClient, sync_futu_portfolio
-from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
-from .trend_animals import TrendAnimalsClient, TrendAnimalsError
+from .parsers.base import detect_asset_class
+from .tiger_account import (
+    TigerAccountClient,
+    TigerAccountError,
+    load_tiger_account_config,
+    sync_tiger_portfolio,
+)
+from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
+from .trend_review import freeze_report_evidence
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MARKET_SETTINGS = {
-    "US": {"broker": "futu", "currency": "USD", "asset": "美股", "deadline": time(12)},
+    "US": {"broker": "tiger", "currency": "HKD", "asset": "美股", "deadline": time(12)},
     "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
 }
 MARKET_NOTIFICATION_LABELS = {
-    "US": ("富途", "美股", "确认 Trend Animals 与富途账户状态后手动重跑富途报告"),
+    "US": ("老虎", "美股", "确认 Trend Animals 与老虎账户状态后手动重跑老虎报告"),
     "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
 }
+USD_TO_HKD = Decimal("7.85")
+TIGER_REFRESH_ERROR_TYPES = {
+    "account_query_failed",
+    "asset_query_failed",
+    "blocking_data_error",
+    "config_invalid",
+    "config_missing",
+    "mixed_tiger_broker_row",
+    "no_matching_accounts",
+    "position_query_failed",
+    "tigeropen_missing",
+}
 SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
+ATTENTION_CHANGE_FIELDS = (
+    "right_side",
+    "temperature_curr",
+    "phase_curr",
+    "danger",
+    "boiling",
+    "champagne",
+    "strength_change",
+)
+ATTENTION_RISK_FIELDS = ("danger", "boiling", "champagne")
+ATTENTION_TEMPERATURES = ("凉", "平", "温", "热", "沸")
+REPORT_REVISION = re.compile(r"-r(\d+)\.json$")
 
 
 class MarketHoliday(RuntimeError):
@@ -92,7 +123,7 @@ def _market(value: str) -> str:
 
 def market_paths(data_dir: Path, reports_dir: Path, market: str) -> MarketTrendPaths:
     market = _market(market)
-    suffix = "us_futu" if market == "US" else "hk_phillips"
+    suffix = "us_tiger" if market == "US" else "hk_phillips"
     root = data_dir / f"trend_{suffix}"
     return MarketTrendPaths(
         root=root,
@@ -289,6 +320,160 @@ def load_market_account(
         available_cash=max(Decimal("0"), available_cash),
         positions=tuple(sorted(positions, key=lambda item: item.symbol)),
         exceptions=tuple(exceptions),
+        position_count=len(positions),
+    )
+
+
+def _tiger_fx_to_hkd(row: Mapping[str, object]) -> Decimal:
+    currency = str(row.get("currency") or "").strip().upper()
+    if currency == "USD":
+        return USD_TO_HKD
+    if currency == "HKD":
+        return Decimal("1")
+    rate = _decimal(row.get("fx_to_hkd"))
+    if not currency or rate <= 0:
+        raise ValueError("Tiger account snapshot has invalid currency FX")
+    return rate
+
+
+def _load_tiger_snapshot(
+    path: Path, *, source_date: str, expected_date: str, managed_symbols: set[str]
+) -> AccountSnapshot:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("Tiger account snapshot must be an object")
+    cash_rows = payload.get("cash_records")
+    position_rows = payload.get("position_records")
+    if not isinstance(cash_rows, list) or not all(isinstance(row, Mapping) for row in cash_rows):
+        raise ValueError("Tiger account cash records are invalid")
+    if not isinstance(position_rows, list) or not all(
+        isinstance(row, Mapping) for row in position_rows
+    ):
+        raise ValueError("Tiger account position records are invalid")
+
+    totals = [
+        row for row in cash_rows
+        if row.get("record_type") == "account_total"
+        and str(row.get("currency") or "").strip().upper() == "USD"
+    ]
+    if len(totals) != 1:
+        raise ValueError("Tiger account snapshot requires exactly one USD account_total")
+    net_value = _decimal(totals[0].get("account_total")) * USD_TO_HKD
+    available_cash = sum(
+        (
+            min(
+                _decimal(row.get("cash_balance")),
+                _decimal(row.get("available_balance")),
+            ) * _tiger_fx_to_hkd(row)
+            for row in cash_rows
+            if row.get("record_type") != "account_total"
+        ),
+        Decimal("0"),
+    )
+
+    normalized_managed = {_normalized_symbol("US", symbol) for symbol in managed_symbols}
+    exceptions: list[str] = []
+    position_count = 0
+    positions: list[AccountPosition] = []
+    for row in position_rows:
+        if str(row.get("market") or "").strip().upper() != "US":
+            continue
+        if str(row.get("sec_type") or "").strip().upper() != "STK":
+            continue
+        quantity = _decimal(row.get("position_qty"))
+        if quantity <= 0:
+            continue
+        symbol = _normalized_symbol("US", str(row.get("symbol") or ""))
+        name = str(row.get("name") or "").strip() or symbol
+        asset_class = str(row.get("asset_class") or "").strip().lower()
+        if not asset_class:
+            asset_class = detect_asset_class(symbol, name).value
+        if asset_class not in {"stock", "etf"}:
+            if symbol in normalized_managed:
+                exceptions.append(
+                    f"unsupported managed asset: {symbol} ({asset_class or 'unknown'})"
+                )
+            continue
+        position_count += 1
+        if symbol not in normalized_managed:
+            continue
+        fx = _tiger_fx_to_hkd(row)
+        avg_cost = _optional_decimal(row.get("average_cost"))
+        positions.append(AccountPosition(
+            symbol=symbol,
+            name=name,
+            asset_class=asset_class,
+            quantity=quantity,
+            avg_cost_price=avg_cost * fx if avg_cost is not None else None,
+            market_value=_decimal(row.get("market_value")) * fx,
+        ))
+    return AccountSnapshot(
+        source_date=source_date,
+        fresh=source_date == expected_date,
+        net_value=net_value,
+        available_cash=max(Decimal("0"), available_cash),
+        positions=tuple(sorted(positions, key=lambda item: item.symbol)),
+        exceptions=tuple(exceptions),
+        position_count=position_count,
+    )
+
+
+def load_tiger_trend_account(
+    *,
+    data_dir: Path,
+    expected_date: str,
+    managed_symbols: set[str],
+    snapshot_before: str | None = None,
+) -> AccountSnapshot:
+    runs = data_dir / "runs"
+    if not runs.exists():
+        raise FileNotFoundError("no Tiger account snapshot found")
+    last_error: Exception | None = None
+    for run_dir in sorted((item for item in runs.iterdir() if item.is_dir()), reverse=True):
+        try:
+            date.fromisoformat(run_dir.name)
+        except ValueError:
+            continue
+        if snapshot_before is not None and run_dir.name >= snapshot_before:
+            continue
+        path = run_dir / "tiger_account_snapshot.json"
+        if not path.exists():
+            continue
+        try:
+            return _load_tiger_snapshot(
+                path,
+                source_date=run_dir.name,
+                expected_date=expected_date,
+                managed_symbols=managed_symbols,
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+    if last_error is not None:
+        raise ValueError("no valid Tiger account snapshot found") from last_error
+    raise FileNotFoundError("no Tiger account snapshot found")
+
+
+def load_trend_account(
+    *,
+    data_dir: Path,
+    market: str,
+    expected_date: str,
+    managed_symbols: set[str],
+    snapshot_before: str | None = None,
+) -> AccountSnapshot:
+    if _market(market) == "US":
+        return load_tiger_trend_account(
+            data_dir=data_dir,
+            expected_date=expected_date,
+            managed_symbols=managed_symbols,
+            snapshot_before=snapshot_before,
+        )
+    return load_market_account(
+        data_dir=data_dir,
+        broker="phillips",
+        market="HK",
+        expected_date=expected_date,
+        managed_symbols=managed_symbols,
     )
 
 
@@ -343,20 +528,191 @@ def _managed_symbols(
     return {_normalized_symbol(market, value) for value in values if value.strip()}
 
 
-def _refresh_futu_account(config: DailyPremarketConfig, run_date: str) -> None:
-    client = FutuAccountClient(host=config.futu_host, port=config.futu_port)
+def build_option_attention(
+    current_rows: Sequence[Mapping[str, object]],
+    previous_rows: Sequence[Mapping[str, object]],
+    actions: Mapping[str, str],
+    market: str,
+    broker_label: str,
+) -> list[dict[str, object]]:
+    market = _market(market)
+
+    def merged(rows: Sequence[Mapping[str, object]]) -> dict[str, Mapping[str, object]]:
+        result: dict[str, Mapping[str, object]] = {}
+        for row in rows:
+            symbol = row.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                continue
+            try:
+                result[_normalized_symbol(market, symbol)] = row
+            except ValueError:
+                continue
+        return result
+
+    current_by_symbol = merged(current_rows)
+    previous_by_symbol = merged(previous_rows)
+    attention: list[dict[str, object]] = []
+    for normalized in sorted(current_by_symbol):
+        current = current_by_symbol[normalized]
+        previous = previous_by_symbol.get(normalized)
+        if previous is None:
+            if current.get("right_side") is not True or current.get("danger") is not False:
+                continue
+        elif not any(
+            previous.get(field) != current.get(field)
+            for field in ATTENTION_CHANGE_FIELDS
+        ):
+            continue
+
+        def transition(field: str) -> dict[str, object]:
+            previous_value = previous.get(field) if previous is not None else None
+            current_value = current.get(field)
+            return {
+                "previous": previous_value,
+                "current": current_value,
+                "changed": previous_value != current_value,
+            }
+
+        risk = any(
+            current.get(field) is True
+            and (previous is None or previous.get(field) is not True)
+            for field in ATTENTION_RISK_FIELDS
+        )
+        old_temperature = previous.get("temperature_curr") if previous else None
+        new_temperature = current.get("temperature_curr")
+        temperature_rose = (
+            old_temperature in ATTENTION_TEMPERATURES
+            and new_temperature in ATTENTION_TEMPERATURES
+            and ATTENTION_TEMPERATURES.index(new_temperature)
+            > ATTENTION_TEMPERATURES.index(old_temperature)
+        )
+        strengthened = (
+            current.get("right_side") is True
+            and (previous is None or previous.get("right_side") is not True)
+        ) or temperature_rose
+        symbol = str(current["symbol"])
+        attention.append(
+            {
+                "market": market,
+                "symbol": symbol,
+                "name": current.get("name"),
+                "category": "risk" if risk else "strengthened" if strengthened else "watch",
+                "right_side": transition("right_side"),
+                "temperature": transition("temperature_curr"),
+                "phase": transition("phase_curr"),
+                "local_strength": current.get("strength"),
+                "global_strength": current.get("global_strength"),
+                "strength_prev_week": current.get("strength_prev_week"),
+                "strength_prev_month": current.get("strength_prev_month"),
+                "strength_change": transition("strength_change"),
+                "days": current.get("days"),
+                "gain_since_entry": current.get("gain_since_entry"),
+                "danger": transition("danger"),
+                "boiling": transition("boiling"),
+                "champagne": transition("champagne"),
+                "source_broker": broker_label,
+                "source_action": actions.get(symbol, "WATCH"),
+            }
+        )
+    return attention
+
+
+def _attention_rows(signal_snapshots: object) -> list[Mapping[str, object]] | None:
+    if not isinstance(signal_snapshots, Mapping):
+        return None
+    candidates = signal_snapshots.get("candidates", [])
+    holdings = signal_snapshots.get("holdings", {})
+    if not isinstance(candidates, list) or not all(
+        isinstance(row, Mapping) for row in candidates
+    ):
+        return None
+    if not isinstance(holdings, Mapping) or not all(
+        row is None or isinstance(row, Mapping) for row in holdings.values()
+    ):
+        return None
+    return [*candidates, *(row for row in holdings.values() if row is not None)]
+
+
+def _attention_report_rows(
+    path: Path, *, market: str
+) -> tuple[date, list[Mapping[str, object]]] | None:
     try:
-        snapshot = client.fetch_snapshot()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            return None
+        as_of_date = date.fromisoformat(str(payload.get("as_of_date") or ""))
+        rows = _attention_rows(payload.get("signal_snapshots"))
+        if rows is None:
+            return None
+        for row in rows:
+            symbol = row.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                return None
+            _normalized_symbol(market, symbol)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    return (as_of_date, rows) if rows is not None else None
+
+
+def _previous_attention_rows(
+    paths: MarketTrendPaths, *, current_as_of_date: str, market: str
+) -> list[Mapping[str, object]]:
+    current_date = date.fromisoformat(current_as_of_date)
+    valid_reports: list[tuple[date, int, str, list[Mapping[str, object]]]] = []
+    report_files = list(paths.reports.glob("*.json")) if paths.reports.exists() else []
+    for path in report_files:
+        loaded = _attention_report_rows(path, market=market)
+        if loaded is not None:
+            match = REPORT_REVISION.search(path.name)
+            revision = int(match.group(1)) if match else 0
+            valid_reports.append((loaded[0], revision, path.name, loaded[1]))
+    predecessors = [item for item in valid_reports if item[0] < current_date]
+    if predecessors:
+        return max(predecessors, key=lambda item: (item[0], item[1], item[2]))[3]
+    if _market(market) == "US" and not report_files:
+        baseline = _attention_report_rows(
+            paths.root / "attention_baseline.json", market=market
+        )
+        if baseline is not None and baseline[0] < current_date:
+            return baseline[1]
+    return []
+
+
+def _attention_actions(payload: Mapping[str, object]) -> dict[str, str]:
+    judgments = payload.get("strategy_judgments")
+    if not isinstance(judgments, Mapping):
+        return {}
+    actions: dict[str, str] = {}
+    for key in ("holding_decisions", "formal_actions"):
+        rows = judgments.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            symbol = row.get("symbol")
+            action = row.get("action")
+            if isinstance(symbol, str) and isinstance(action, str):
+                actions[symbol] = action
+    return actions
+
+
+def _refresh_tiger_account(config: DailyPremarketConfig, run_date: str) -> None:
+    tiger_config = load_tiger_account_config(
+        config_dir=Path("~/.tigeropen/"), account=None, sandbox=False
+    )
+    client = TigerAccountClient(config=tiger_config)
+    try:
+        sync_tiger_portfolio(
+            snapshot=client.fetch_snapshot(),
+            portfolio_path=config.portfolio,
+            data_dir=config.data_dir,
+            reports_dir=config.reports_dir,
+            run_date=run_date,
+            update_latest=True,
+        )
     finally:
         client.close()
-    sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=config.portfolio,
-        data_dir=config.data_dir,
-        reports_dir=config.reports_dir,
-        run_date=run_date,
-        update_latest=True,
-    )
 
 
 def _market_receipt_path(paths: MarketTrendPaths, artifact_stem: str) -> Path:
@@ -469,7 +825,7 @@ def _attempt_market_report(
     notifier: Notifier,
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
-    account_refresher: Callable[[DailyPremarketConfig, str], None] = _refresh_futu_account,
+    account_refresher: Callable[[DailyPremarketConfig, str], None] = _refresh_tiger_account,
 ) -> AShareTrendRunResult:
     market = _market(market)
     settings = MARKET_SETTINGS[market]
@@ -513,19 +869,31 @@ def _attempt_market_report(
         if not updates_ready(update_rows, market=market, as_of_date=as_of_date):
             return AShareTrendRunResult("waiting", None, None)
 
+        account_refresh_error: str | None = None
         if market == "US":
-            account_refresher(config, run_date)
+            try:
+                account_refresher(config, run_date)
+            except TigerAccountError as exc:
+                account_refresh_error = (
+                    exc.error_type
+                    if exc.error_type in TIGER_REFRESH_ERROR_TYPES
+                    else "tiger_account_error"
+                )
+            except Exception:
+                account_refresh_error = "Tiger account refresh failed"
         prior_state = load_protection_state(paths.state)
         configured = (
             config.trend_us_symbols if market == "US" else config.trend_hk_symbols
         )
         managed = _managed_symbols(prior_state, configured, market)
-        account = load_market_account(
+        account = load_trend_account(
             data_dir=config.data_dir,
-            broker=str(settings["broker"]),
             market=market,
             expected_date=run_date if market == "US" else as_of_date,
             managed_symbols=managed,
+            snapshot_before=(
+                run_date if market == "US" and account_refresh_error is not None else None
+            ),
         )
 
         balance_before = _balance(api.get_account_balance())
@@ -553,16 +921,17 @@ def _attempt_market_report(
         billing = {
             _billing_field(row): row for row in api.get_snapshot_billing()
         }
-        missing = [field for field in HOLDING_FIELDS if field not in billing]
+        missing = [field for field in UNIFIED_TREND_FIELDS if field not in billing]
         if missing:
             raise ValueError(
                 "getSnapshotColumnBilling missing requested field(s): "
                 + ", ".join(missing)
             )
+        unified_unit_cost = _unified_trend_unit_cost(billing)
         snapshot_rows = (
             api.get_snapshots(
                 tm_ids=requested_ids,
-                fields=HOLDING_FIELDS,
+                fields=UNIFIED_TREND_FIELDS,
                 expected_date=as_of_date,
             )
             if requested_ids
@@ -576,7 +945,7 @@ def _attempt_market_report(
         balance_after = _balance(api.get_account_balance())
 
         rows_by_id = {_row_tm_id(row): row for row in snapshot_rows}
-        start = (date.fromisoformat(as_of_date) - timedelta(days=60)).isoformat()
+        start = (date.fromisoformat(as_of_date) - timedelta(days=90)).isoformat()
         candidates = []
         bars_by_symbol: dict[str, object] = {}
         for tm_id in sorted(component_ids):
@@ -602,19 +971,23 @@ def _attempt_market_report(
         holding_snapshots = {position.symbol: None for position in account.positions}
         for symbol, tm_id in holding_ids.items():
             row = rows_by_id.get(tm_id)
-            if row is not None:
-                try:
-                    holding_snapshots[symbol] = _holding_snapshot(row, market=market)
-                except ValueError:
-                    pass
+            bars = None
             try:
-                bars_by_symbol[symbol] = quote.get_daily_kline(
+                bars = quote.get_daily_kline(
                     to_futu_symbol(market, symbol), start=start, end=as_of_date
                 )
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
                     raise
-                bars_by_symbol[symbol] = None
+                bars = None
+            bars_by_symbol[symbol] = bars
+            if row is not None:
+                try:
+                    holding_snapshots[symbol] = _holding_snapshot(
+                        row, market=market, bars=tuple(bars or ())
+                    )
+                except ValueError:
+                    pass
 
         lot_sizes: dict[str, int] = {}
         if market == "HK":
@@ -623,10 +996,9 @@ def _attempt_market_report(
             lot_sizes = {
                 wire.split(".", 1)[1]: size for wire, size in wire_lots.items()
             }
-        estimated_cost = sum(
-            (_billing_price(billing[field]) for field in HOLDING_FIELDS), Decimal("0")
-        ) * len(requested_ids)
+        estimated_cost = unified_unit_cost * len(requested_ids)
         actual_cost = balance_before - balance_after
+        watch_events = load_watch_events(paths.events)
         report = build_report(
             as_of_date=as_of_date,
             execution_date=execution_date,
@@ -635,16 +1007,16 @@ def _attempt_market_report(
             holding_snapshots=holding_snapshots,
             bars_by_symbol=bars_by_symbol,
             prior_state=prior_state,
-            watch_events=load_watch_events(paths.events),
+            watch_events=watch_events,
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
                 *_component_api_facts(api, len(component_rows)),
-                f"getTickerSnapshot fields={','.join(HOLDING_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
             ),
             data_sources=(
                 "Trend Animals",
                 f"Futu {market} calendar/QFQ daily K-line",
-                "Futu live account" if market == "US" else "Phillips daily statement",
+                "Tiger live account" if market == "US" else "Phillips daily statement",
             ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost if actual_cost >= 0 else None,
@@ -652,26 +1024,76 @@ def _attempt_market_report(
             lot_sizes=lot_sizes,
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
+            price_fx_to_account_currency=(USD_TO_HKD if market == "US" else Decimal("1")),
+            process_version=_process_version(config.repo),
+            candidate_pool_ids=pool_ids,
             metadata={
                 "market": market,
                 "broker": settings["broker"],
                 "account_check_required": market == "HK",
                 "run_date": run_date,
                 "process_version": _process_version(config.repo),
+                **(
+                    {
+                        "account_currency": "HKD",
+                        "price_fx_to_hkd": str(USD_TO_HKD),
+                    }
+                    if market == "US"
+                    else {}
+                ),
+                **(
+                    {"account_refresh_error": account_refresh_error}
+                    if account_refresh_error is not None
+                    else {}
+                ),
             },
         )
-        managed.update(item.symbol for item in account.positions)
-        managed.update(item.symbol for item in report.buy_actions)
-        protection_state = {
-            **report.protection_state,
-            "managed_symbols": sorted(managed),
-        }
-        report = replace(report, protection_state=protection_state)
+        report = _finalize_market_report(report, managed_symbols=sorted(managed))
+        previous_attention_rows = _previous_attention_rows(
+            paths, current_as_of_date=as_of_date, market=market
+        )
+        option_attention_broker_label = MARKET_NOTIFICATION_LABELS[market][0]
+        evidence = freeze_report_evidence(
+            data_dir=config.data_dir,
+            report=report,
+            candidates=candidates,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol=bars_by_symbol,
+            prior_state=prior_state,
+            watch_events=watch_events,
+            query={
+                "component_pool_ids": list(pool_ids),
+                "snapshot_fields": list(UNIFIED_TREND_FIELDS),
+            },
+            responses={
+                "update_status": update_rows,
+                "components": component_rows,
+                "snapshots": snapshot_rows,
+            },
+            candidate_pool_ids=pool_ids,
+            lot_sizes=lot_sizes,
+            price_fx_to_account_currency=(
+                USD_TO_HKD if market == "US" else Decimal("1")
+            ),
+            previous_attention_rows=previous_attention_rows,
+            option_attention_broker_label=option_attention_broker_label,
+        )
         report = replace(
             report,
-            metadata={**report.metadata, "delivery_status": "prepared"},
+            replay_evidence={
+                "path": str(Path(evidence["path"]).relative_to(config.data_dir)),
+                "sha256": evidence["sha256"],
+            },
         )
         payload = _report_payload(report)
+        current_attention_rows = _attention_rows(payload.get("signal_snapshots")) or []
+        payload["option_attention"] = build_option_attention(
+            current_attention_rows,
+            previous_attention_rows,
+            _attention_actions(payload),
+            market,
+            option_attention_broker_label,
+        )
         receipt_path = _market_receipt_path(paths, artifact_stem)
         receipt = _write_delivery_receipt(
             receipt_path,

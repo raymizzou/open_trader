@@ -59,7 +59,7 @@ def append_watch_event(
     active_line: Decimal | None,
     market: str = "",
     reason: str = "",
-) -> None:
+) -> dict[str, object]:
     path.parent.mkdir(parents=True, exist_ok=True)
     event = {
         "event_id": uuid4().hex,
@@ -76,6 +76,7 @@ def append_watch_event(
         event["reason"] = reason
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    return event
 
 
 def watch_a_share_protection(
@@ -98,6 +99,8 @@ def watch_a_share_protection(
     session_timezone: ZoneInfo = SHANGHAI,
     session_fn: Callable[[datetime], str] = cn_session,
     account_loader: Callable[..., AccountSnapshot] = load_eastmoney_account,
+    on_session_open: Callable[[str], None] | None = None,
+    on_protection_trigger: Callable[[Mapping[str, object]], None] | None = None,
 ) -> AShareWatchResult:
     client = quote_client
     if quote_client_factory is None and client is not None:
@@ -121,6 +124,7 @@ def watch_a_share_protection(
 
     trigger_count = exception_count = unknown_quote_count = 0
     calendar_checked = False
+    session_open_called = False
     interrupted = False
     now = first_now
     try:
@@ -205,6 +209,17 @@ def watch_a_share_protection(
                 now = now_fn()
                 continue
 
+            if not session_open_called:
+                if on_session_open is not None:
+                    exception_count += _run_review_callback(
+                        on_session_open,
+                        trading_date,
+                        events_path=events_path,
+                        trading_date=trading_date,
+                        now=now,
+                    )
+                session_open_called = True
+
             try:
                 with (
                     RunLock(report_lock_path)
@@ -279,6 +294,14 @@ def watch_a_share_protection(
             for symbol, event in sorted(trigger_events.items()):
                 if symbol not in positions:
                     continue
+                if on_protection_trigger is not None:
+                    exception_count += _run_review_callback(
+                        on_protection_trigger,
+                        event,
+                        events_path=events_path,
+                        trading_date=trading_date,
+                        now=now,
+                    )
                 _deliver_trigger_notification(
                     events_path=events_path,
                     notifier=notifier,
@@ -405,7 +428,7 @@ def watch_a_share_protection(
                 if snapshot.last_price > active_line:
                     continue
                 if symbol not in alerted:
-                    append_watch_event(
+                    event = append_watch_event(
                         events_path,
                         symbol=symbol,
                         trading_date=trading_date,
@@ -416,6 +439,14 @@ def watch_a_share_protection(
                     )
                     alerted.add(symbol)
                     trigger_count += 1
+                    if on_protection_trigger is not None:
+                        exception_count += _run_review_callback(
+                            on_protection_trigger,
+                            event,
+                            events_path=events_path,
+                            trading_date=trading_date,
+                            now=now,
+                        )
                     _deliver_trigger_notification(
                         events_path=events_path,
                         notifier=notifier,
@@ -445,6 +476,32 @@ def watch_a_share_protection(
     finally:
         if client is not None:
             _close(client)
+
+
+def _run_review_callback(
+    callback: Callable[[object], None],
+    value: object,
+    *,
+    events_path: Path,
+    trading_date: str,
+    now: datetime,
+) -> int:
+    try:
+        callback(value)
+        return 0
+    except Exception as exc:
+        event = value if isinstance(value, Mapping) else {}
+        append_watch_event(
+            events_path,
+            symbol=str(event.get("symbol") or ""),
+            trading_date=trading_date,
+            event_type="trend_review_callback_failed",
+            occurred_at=now.isoformat(timespec="seconds"),
+            last_price=_optional_decimal(event.get("last_price")),
+            active_line=_optional_decimal(event.get("active_line")),
+            reason=str(exc),
+        )
+        return 1
 
 
 def _deliver_trigger_notification(

@@ -29,7 +29,8 @@ FUTU_SKILL_FACTS_SCHEMA_VERSION = "open_trader.futu_skill_facts.v1"
 FUTU_STOCK_FEED_CACHE_FILENAME = "futu_stock_feed_cache.json"
 FUTU_STOCK_FEED_CACHE_DAYS = 7
 FUTU_STOCK_FEED_SIZE = 50
-VALID_MODULE_STATUSES = {"ok", "partial", "missing", "error", "stale"}
+VALID_MODULE_STATUSES = {"ok", "partial", "missing", "error", "stale", "not_applicable"}
+VALID_NEWS_SENTIMENT_STATUSES = VALID_MODULE_STATUSES - {"not_applicable"}
 VALID_SIGNALS = {"supportive", "opposing", "neutral", "risk_up", "mixed"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_CONSTRAINTS = {"", "review", "reduce_only", "wait_for_event", "no_add"}
@@ -180,6 +181,10 @@ class FutuSkillSource:
     market: str
     symbol: str
     name: str
+
+
+class FutuAnomalyUnsupportedError(RuntimeError):
+    pass
 
 
 class FutuSkillNewsSentimentExtractor(Protocol):
@@ -671,7 +676,21 @@ class FutuAnomalyScriptClient:
             raise RuntimeError(str(data))
         if isinstance(data, dict) and data.get("err_code") == -12301:
             label = {"technical": "技术", "capital": "资金", "derivatives": "衍生品"}[module]
-            raise RuntimeError(f"富途接口不支持{label}异动：{stock_symbol}")
+            raise FutuAnomalyUnsupportedError(f"富途接口不支持{label}异动：{stock_symbol}")
+        err_code = data.get("err_code") if isinstance(data, dict) else None
+        valid = bool(
+            type(err_code) is int
+            and _optional_text(data.get("time_range"))
+            and (
+                err_code == 0
+                and _optional_text(data.get("content"))
+                or err_code == 1
+                and _optional_text(data.get("retMsg"))
+                and isinstance(data.get("content"), str)
+            )
+        )
+        if not valid:
+            raise RuntimeError(f"{module} native anomaly response is invalid")
         return {"data": data}
 
     def _script_path(self, module: str) -> Path:
@@ -1085,6 +1104,12 @@ def _build_record(
             ),
             "technical_anomaly",
         )
+    except FutuAnomalyUnsupportedError as exc:
+        technical_anomaly = _unsupported_signal_module(
+            "technical_anomaly",
+            window_days,
+            str(exc) or exc.__class__.__name__,
+        )
     except Exception as exc:
         reason = str(exc) or exc.__class__.__name__
         technical_anomaly = _error_signal_module(
@@ -1104,6 +1129,12 @@ def _build_record(
             ),
             "capital_anomaly",
         )
+    except FutuAnomalyUnsupportedError as exc:
+        capital_anomaly = _unsupported_signal_module(
+            "capital_anomaly",
+            window_days,
+            str(exc) or exc.__class__.__name__,
+        )
     except Exception as exc:
         reason = str(exc) or exc.__class__.__name__
         capital_anomaly = _error_signal_module(
@@ -1122,6 +1153,12 @@ def _build_record(
                 window_days=window_days,
             ),
             "derivatives_anomaly",
+        )
+    except FutuAnomalyUnsupportedError as exc:
+        derivatives_anomaly = _unsupported_signal_module(
+            "derivatives_anomaly",
+            window_days,
+            str(exc) or exc.__class__.__name__,
         )
     except Exception as exc:
         reason = str(exc) or exc.__class__.__name__
@@ -1147,7 +1184,7 @@ def _normalize_news_sentiment_module(module: object) -> dict[str, Any]:
     if not isinstance(module, dict):
         raise ValueError("news_sentiment module is invalid")
     normalized = {
-        "status": _required_enum(module, "status", VALID_MODULE_STATUSES, "news_sentiment"),
+        "status": _required_enum(module, "status", VALID_NEWS_SENTIMENT_STATUSES, "news_sentiment"),
         "signal": _required_enum(module, "signal", VALID_SIGNALS, "news_sentiment"),
         "confidence": _required_enum(module, "confidence", VALID_CONFIDENCES, "news_sentiment"),
         "freshness": _normalize_freshness(module.get("freshness")),
@@ -1170,7 +1207,7 @@ def _normalize_news_sentiment_module(module: object) -> dict[str, Any]:
 def _validate_news_sentiment_module(module: object) -> None:
     if not isinstance(module, dict):
         raise ValueError("news_sentiment module is invalid")
-    _validate_enum(module, "status", VALID_MODULE_STATUSES, "news_sentiment")
+    _validate_enum(module, "status", VALID_NEWS_SENTIMENT_STATUSES, "news_sentiment")
     _validate_enum(module, "signal", VALID_SIGNALS, "news_sentiment")
     _validate_enum(module, "confidence", VALID_CONFIDENCES, "news_sentiment")
     _validate_enum(module, "suggested_constraint", VALID_CONSTRAINTS, "news_sentiment")
@@ -2092,6 +2129,30 @@ def _error_signal_module(module_name: str, window_days: int, reason: str) -> dic
             {
                 "name": _default_error_category_name(module_name),
                 "state": "error",
+                "direction": "",
+                "detail": reason,
+                "evidence_date": "",
+            }
+        ],
+    }
+
+
+def _unsupported_signal_module(
+    module_name: str,
+    window_days: int,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "status": "not_applicable",
+        "signal": "neutral",
+        "confidence": "low",
+        "suggested_constraint": "",
+        "window_days": _validate_window_days(window_days),
+        "summary": reason,
+        "categories": [
+            {
+                "name": _default_error_category_name(module_name),
+                "state": "not_applicable",
                 "direction": "",
                 "detail": reason,
                 "evidence_date": "",
