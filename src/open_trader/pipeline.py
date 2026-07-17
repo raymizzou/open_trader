@@ -197,7 +197,9 @@ def _run_import(
         )
     uploaded_positions: list[Position] = []
     uploaded_cash: list[CashBalance] = []
-    uploaded_fill_batches: list[tuple[str, str, list[TradeFill]]] = []
+    uploaded_fill_batches: list[
+        tuple[str, str, list[TradeFill], str | None]
+    ] = []
 
     for parser in parser_list:
         source_path = statement_paths[parser.broker]
@@ -213,7 +215,12 @@ def _run_import(
         uploaded_cash.extend(parse_result.cash_balances)
         if parse_result.fills_complete:
             uploaded_fill_batches.append(
-                (parser.broker, source_sha256, list(parse_result.fills))
+                (
+                    parser.broker,
+                    source_sha256,
+                    list(parse_result.fills),
+                    parse_result.fills_coverage_start,
+                )
             )
         warnings.extend(parse_result.warnings)
         manifest.append(
@@ -322,7 +329,12 @@ def _run_import(
         temp_run_dir.rename(run_dir)
         temp_run_promoted = True
         if actual_fill_complete_through is not None:
-            for broker, source_sha256, batch_fills in uploaded_fill_batches:
+            for (
+                broker,
+                source_sha256,
+                batch_fills,
+                fills_coverage_start,
+            ) in uploaded_fill_batches:
                 if broker in {"eastmoney", "phillips"}:
                     freeze_actual_fill_batch(
                         data_dir,
@@ -334,9 +346,12 @@ def _run_import(
                         batch_fills,
                         actual_fill_complete_through,
                         coverage_start=(
-                            f"{actual_fill_complete_through[:7]}-01"
-                            if broker == "eastmoney"
-                            else actual_fill_complete_through
+                            fills_coverage_start
+                            or (
+                                f"{actual_fill_complete_through[:7]}-01"
+                                if broker == "eastmoney"
+                                else actual_fill_complete_through
+                            )
                         ),
                     )
         if actual_fill_complete_through is None:

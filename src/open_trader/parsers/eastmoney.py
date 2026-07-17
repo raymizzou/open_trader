@@ -49,9 +49,22 @@ EXECUTION_HEADER = (
     "资金余额",
 )
 SUPPORTED_MARKETS = {"沪市A股", "深市A股"}
-NON_TRADE_EXECUTION_CATEGORIES = {"证券红利", "证券转入", "证券转出"}
+NON_TRADE_EXECUTION_CATEGORIES = {
+    "证券红利",
+    "证券转入",
+    "证券转出",
+    "红利入账",
+    "天天宝申购",
+    "天天宝赎回",
+    "银行转证券",
+    "证券转银行",
+    "利息归本",
+}
 MONEY = r"[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)"
 PRINT_DATE = re.compile(r"打印日期\s*[:：]\s*(\d{4}-\d{2}-\d{2})")
+QUERY_INTERVAL = re.compile(
+    r"查询区间\s*[:：]\s*(\d{4}/\d{2}/\d{2})\s*-\s*(\d{4}/\d{2}/\d{2})"
+)
 
 
 def parse_eastmoney_page(
@@ -143,6 +156,7 @@ def parse_eastmoney_page(
         ],
         fills=fills,
         fills_complete=fills_complete,
+        fills_coverage_start=_fill_coverage_start(first_page_text),
         warnings=warnings,
     )
 
@@ -194,6 +208,20 @@ def _execution_date(value: str) -> str | None:
         ).isoformat()
     except ValueError:
         return None
+
+
+def _fill_coverage_start(text: str) -> str | None:
+    match = QUERY_INTERVAL.search(text)
+    if match is None:
+        return None
+    try:
+        start = date.fromisoformat(match.group(1).replace("/", "-"))
+        end = date.fromisoformat(match.group(2).replace("/", "-"))
+    except ValueError:
+        raise ValueError("东方财富对账单包含无效查询区间") from None
+    if start > end:
+        raise ValueError("东方财富对账单包含无效查询区间")
+    return start.isoformat()
 
 
 def _parse_position(row: list[str | None], statement_id: str) -> Position | None:

@@ -83,6 +83,18 @@ def test_eastmoney_statement_extracts_actual_trade_fills() -> None:
     assert result.fills[0].executed_at == "2026-07-10"
     assert result.fills[0].source_id
     assert result.fills_complete is True
+    assert result.fills_coverage_start is None
+
+
+def test_eastmoney_extracts_declared_fill_coverage_start() -> None:
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00\n"
+        "查询区间：2026/06/16-2026/07/16",
+        [POSITIONS, [list(EXECUTION_HEADER)]],
+        "2026-07",
+    )
+
+    assert result.fills_coverage_start == "2026-06-16"
 
 
 def test_eastmoney_without_execution_header_does_not_claim_fill_completeness() -> None:
@@ -96,7 +108,20 @@ def test_eastmoney_without_execution_header_does_not_claim_fill_completeness() -
     assert result.fills_complete is False
 
 
-@pytest.mark.parametrize("activity", ["证券红利", "证券转入", "证券转出"])
+@pytest.mark.parametrize(
+    "activity",
+    [
+        "证券红利",
+        "证券转入",
+        "证券转出",
+        "红利入账",
+        "天天宝申购",
+        "天天宝赎回",
+        "银行转证券",
+        "证券转银行",
+        "利息归本",
+    ],
+)
 def test_eastmoney_non_trade_security_activity_does_not_block_completeness(
     activity: str,
 ) -> None:

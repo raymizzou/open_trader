@@ -147,7 +147,13 @@ class FillParser(FakeParser):
 
 
 class BrokerFillParser(FakeParser):
-    def __init__(self, broker: str, market: Market) -> None:
+    def __init__(
+        self,
+        broker: str,
+        market: Market,
+        *,
+        fills_coverage_start: str | None = None,
+    ) -> None:
         currency = "CNY" if market is Market.CN else "HKD"
         super().__init__(
             broker=broker,
@@ -155,6 +161,7 @@ class BrokerFillParser(FakeParser):
             cash_currency=currency,
         )
         self.market = market
+        self.fills_coverage_start = fills_coverage_start
 
     def parse(self, path: Path, month: str) -> ParseResult:
         result = super().parse(path, month)
@@ -180,6 +187,7 @@ class BrokerFillParser(FakeParser):
                 )
             ],
             fills_complete=True,
+            fills_coverage_start=self.fills_coverage_start,
             warnings=result.warnings,
             page_count=result.page_count,
         )
@@ -371,6 +379,34 @@ def test_uploaded_statement_freezes_broker_fills_in_its_market_idempotently(
         "2026-05-01" if broker == "eastmoney" else "2026-05-10"
     )
     assert completeness_payload["coverage_end"] == "2026-05-10"
+
+
+def test_uploaded_statement_uses_declared_fill_coverage_start(tmp_path: Path) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+
+    pipeline.run_uploaded_statement(
+        statement_date="2026-07-16",
+        statement_path=source,
+        parser=BrokerFillParser(
+            "eastmoney",
+            Market.CN,
+            fills_coverage_start="2026-06-16",
+        ),
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "current/portfolio.csv",
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-07", {"CNY": Decimal("1.08")}
+        ),
+    )
+
+    completeness = next(
+        (data_dir / "trend_review/facts/actual_fill_completeness/CN").glob("*.json")
+    )
+    payload = json.loads(completeness.read_text(encoding="utf-8"))
+    assert payload["coverage_start"] == "2026-06-16"
+    assert payload["coverage_end"] == "2026-07-16"
 
 
 @pytest.mark.parametrize(
