@@ -1366,8 +1366,17 @@ table {
 }
 
 .trend-review-header > div:first-child,
-.trend-review-header-side,
-.trend-review-parameter-list p {
+.trend-review-header-side {
+  min-width: 0;
+}
+
+.trend-review-header > div:first-child > *,
+.trend-review-header-side > *,
+.trend-review-parameter-list > div > *,
+.trend-review-comparison figcaption,
+.trend-review-metric h3,
+.trend-review-series > span:first-child,
+.trend-review-series strong {
   min-width: 0;
   overflow-wrap: anywhere;
 }
@@ -4097,7 +4106,6 @@ table {
   .trend-report-header button,
   .option-attention-header button { min-height: 44px; }
 
-  .trend-report-workspace,
   .cn-trend-report,
   .option-attention-workspace {
     overflow-x: hidden;

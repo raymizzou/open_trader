@@ -190,6 +190,20 @@ def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
         assert surface_selector in contract_selectors
 
 
+def test_trend_review_workspace_does_not_hide_horizontal_overflow() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    hidden_overflow_selectors = {
+        selector.strip()
+        for selectors in re.findall(
+            r"([^{}]+)\{[^{}]*overflow-x:\s*hidden;[^{}]*\}", css
+        )
+        for selector in selectors.split(",")
+    }
+
+    assert ".trend-report-workspace" not in hidden_overflow_selectors
+
+
 def test_dashboard_success_text_meets_aa_on_every_adjusted_surface() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     tokens = dict(re.findall(r"--([\w-]+): (#[0-9a-f]{6});", css))
