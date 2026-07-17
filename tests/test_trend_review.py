@@ -798,6 +798,20 @@ def test_actual_fill_batch_rejects_non_iso_execution_timestamp(
         )
 
 
+@pytest.mark.parametrize("coverage_start", ["not-a-date", "2026-07-17"])
+def test_actual_fill_batch_rejects_invalid_coverage_start(
+    coverage_start: str, tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="coverage_start"):
+        trend_review.freeze_actual_fill_batch(
+            tmp_path,
+            {"market": "CN"},
+            [],
+            "2026-07-16",
+            coverage_start=coverage_start,
+        )
+
+
 def test_actual_fill_batch_write_failure_removes_new_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -956,6 +970,18 @@ def test_projection_unlocks_series_independently_and_never_batches(
         "value": "0",
         "reason": None,
     }
+    for series, ready in (
+        ("discipline", discipline_ready),
+        ("actual", actual_ready),
+    ):
+        if ready:
+            assert Decimal(
+                projection["metrics"]["market_excess_return"][series]["value"]
+            ) == Decimal(
+                projection["metrics"]["period_net_return"][series]["value"]
+            ) - Decimal(
+                projection["metrics"]["period_net_return"]["benchmark"]["value"]
+            )
 
 
 def test_actual_cycles_close_partials_opening_positions_rebuys_and_dedupe() -> None:
@@ -1001,6 +1027,27 @@ def test_completed_cycles_uses_authoritative_source_sequence_for_date_only_fills
 
     assert len(cycles) == 1
     assert [fill["side"] for fill in cycles[0]["fills"]] == ["BUY", "SELL"]
+
+
+def test_completed_cycles_use_precise_timestamps_without_source_sequence() -> None:
+    fills = [
+        asdict(
+            actual_fill(
+                "sell", "600001", "SELL", "100",
+                "2026-07-16T10:01:00+00:00",
+            )
+        ),
+        asdict(
+            actual_fill(
+                "buy", "600001", "BUY", "100",
+                "2026-07-16T10:00:00+00:00",
+            )
+        ),
+    ]
+
+    cycles = trend_review._completed_cycles(fills)
+
+    assert len(cycles) == 1
 
 
 @pytest.mark.parametrize("sequences", [(None, None), (0, 0)])
