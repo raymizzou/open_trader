@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import subprocess
+import sys
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,19 @@ from open_trader.advice.premarket import PremarketResult
 from open_trader.cli import build_parser
 from open_trader.daily_premarket import DailyPremarketConfig, NotificationAttempt
 from open_trader.notifications import CompositeNotifier
+
+
+def test_cli_module_invocation_runs_main() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "open_trader.cli", "--help"],
+        cwd=Path(__file__).parents[1],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "usage: open-trader" in result.stdout
 
 
 @pytest.mark.parametrize("value", [None, "", "   ", " , , "])
@@ -617,6 +632,255 @@ def test_trend_review_parsers_keep_markets_separate() -> None:
     assert opened.config == closed.config == replayed.config == Path(
         "config/daily_premarket.env"
     )
+
+
+def _trend_review_close_config(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        data_dir=tmp_path,
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
+    )
+
+
+def _trend_review_close_report(
+    market: str, trading_date: str, *, fresh: bool = True
+) -> dict[str, object]:
+    return {
+        "account": {
+            "fresh": fresh,
+            "source_date": trading_date,
+            "net_value": "123456.78",
+            "positions": [{"symbol": "600000", "quantity": "100"}],
+        },
+        "strategy_snapshot": {
+            "strategy_id": f"trend/{market}/v1",
+            "strategy_version": "v1",
+            "process_version": "test",
+            "parameters": {},
+            "parameter_rows": [{"name": "test"}],
+        },
+    }
+
+
+def _stub_close_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    report: dict[str, object],
+) -> None:
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Simulate:
+        def __init__(self, **kwargs: object) -> None:
+            self.closed = False
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {"acc_id": 101, "net_value": "100000", "positions": []}
+
+        def list_orders(self) -> dict[str, object]:
+            return {"orders": []}
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(cli, "_load_trend_review_report", lambda *args, **kwargs: report)
+    monkeypatch.setattr(cli, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(cli, "FutuSimulateOrderExecutionClient", Simulate)
+    monkeypatch.setattr(
+        cli,
+        "benchmark_fact",
+        lambda quote, market, trading_date: {
+            "date": trading_date,
+            "close": "1000",
+            "source_id": {
+                "CN": "CSI_ALL_SHARE_PRICE",
+                "US": "SPY_QFQ",
+                "HK": "HSCI_PRICE",
+            }[market],
+            "futu_symbol": {"CN": "SH.000985", "US": "US.SPY", "HK": "HK.800701"}[market],
+        },
+    )
+
+
+def test_trend_review_close_writes_separate_facts_despite_legacy_daily(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("CN", "2026-07-17")
+    _stub_close_clients(monkeypatch, report=report)
+    legacy = tmp_path / "trend_review/daily/CN/2026-07-17.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy daily fact\n")
+    monkeypatch.setattr(
+        cli,
+        "build_trend_review_projection",
+        lambda data_dir, market: {
+            "sample_counts": {"discipline": 0, "actual": 0, "required": 30}
+        },
+    )
+
+    first = cli.run_trend_review_close(
+        _trend_review_close_config(tmp_path), "CN", "2026-07-17"
+    )
+    facts = {
+        stream: tmp_path / f"trend_review/facts/{stream}/CN/2026-07-17.json"
+        for stream in ("discipline", "actual_equity", "benchmark")
+    }
+    first_bytes = {stream: path.read_bytes() for stream, path in facts.items()}
+
+    second = cli.run_trend_review_close(
+        _trend_review_close_config(tmp_path), "CN", "2026-07-17"
+    )
+
+    assert all(path.exists() for path in facts.values())
+    assert {stream: path.read_bytes() for stream, path in facts.items()} == first_bytes
+    assert legacy.read_bytes() == b"legacy daily fact\n"
+    assert first["artifact_paths"] == second["artifact_paths"]
+    actual = json.loads(facts["actual_equity"].read_text(encoding="utf-8"))
+    assert actual["opening_positions"] == []
+    assert first["sample_counts"] == {
+        "discipline": 0,
+        "actual": 0,
+        "required": 30,
+    }
+
+
+def test_effective_date_actual_equity_uses_frozen_report_positions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("CN", "2026-07-16")
+    _stub_close_clients(monkeypatch, report=report)
+    legacy = tmp_path / "trend_review/daily/CN/2026-07-16.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy daily fact\n")
+    monkeypatch.setattr(
+        cli,
+        "build_trend_review_projection",
+        lambda data_dir, market: {"sample_counts": {}},
+    )
+
+    cli.run_trend_review_close(
+        _trend_review_close_config(tmp_path), "CN", "2026-07-16"
+    )
+
+    actual_path = (
+        tmp_path / "trend_review/facts/actual_equity/CN/2026-07-16.json"
+    )
+    actual = json.loads(actual_path.read_text(encoding="utf-8"))
+    assert actual["opening_positions"] == report["account"]["positions"]
+    assert legacy.read_bytes() == b"legacy daily fact\n"
+
+
+def test_trend_review_close_skips_stale_actual_equity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("HK", "2026-07-17", fresh=False)
+    _stub_close_clients(monkeypatch, report=report)
+    monkeypatch.setattr(
+        cli,
+        "build_trend_review_projection",
+        lambda data_dir, market: {"sample_counts": {}},
+    )
+
+    cli.run_trend_review_close(
+        _trend_review_close_config(tmp_path), "HK", "2026-07-17"
+    )
+
+    assert not (
+        tmp_path / "trend_review/facts/actual_equity/HK/2026-07-17.json"
+    ).exists()
+    assert (
+        tmp_path / "trend_review/facts/discipline/HK/2026-07-17.json"
+    ).exists()
+    assert (tmp_path / "trend_review/facts/benchmark/HK/2026-07-17.json").exists()
+
+
+def test_tiger_close_freezes_empty_completeness_before_projection_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("US", "2026-07-17")
+    _stub_close_clients(monkeypatch, report=report)
+    events: list[str] = []
+
+    class Tiger:
+        def __init__(self, *, config: object) -> None:
+            events.append("created")
+
+        def fetch_actual_fills(self, start_date: str, end_date: str) -> list[object]:
+            assert (start_date, end_date) == ("2026-07-17", "2026-07-17")
+            events.append("fetched")
+            return []
+
+        def close(self) -> None:
+            events.append("closed")
+
+    monkeypatch.setattr(cli, "load_tiger_account_config", lambda **kwargs: "tiger-config")
+    monkeypatch.setattr(cli, "TigerAccountClient", Tiger)
+
+    def project(data_dir: Path, market: str) -> dict[str, object]:
+        assert list(
+            (data_dir / "trend_review/facts/actual_fill_completeness/US").glob("*.json")
+        )
+        events.append("projected")
+        return {"sample_counts": {"discipline": 0, "actual": 0, "required": 30}}
+
+    monkeypatch.setattr(cli, "build_trend_review_projection", project)
+
+    cli.run_trend_review_close(
+        _trend_review_close_config(tmp_path), "US", "2026-07-17"
+    )
+
+    assert events == ["created", "fetched", "closed", "projected"]
+
+
+def test_tiger_fill_failure_keeps_other_facts_and_closes_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trend_review_close_report("US", "2026-07-17")
+    _stub_close_clients(monkeypatch, report=report)
+    closed: list[bool] = []
+
+    class Tiger:
+        def __init__(self, *, config: object) -> None:
+            pass
+
+        def fetch_actual_fills(self, start_date: str, end_date: str) -> list[object]:
+            raise RuntimeError("Tiger transactions unavailable")
+
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(cli, "load_tiger_account_config", lambda **kwargs: "tiger-config")
+    monkeypatch.setattr(cli, "TigerAccountClient", Tiger)
+
+    with pytest.raises(RuntimeError, match="Tiger transactions unavailable"):
+        cli.run_trend_review_close(
+            _trend_review_close_config(tmp_path), "US", "2026-07-17"
+        )
+
+    assert closed == [True]
+    assert (
+        tmp_path / "trend_review/facts/discipline/US/2026-07-17.json"
+    ).exists()
+    assert (
+        tmp_path / "trend_review/facts/actual_equity/US/2026-07-17.json"
+    ).exists()
+    assert (tmp_path / "trend_review/facts/benchmark/US/2026-07-17.json").exists()
+    assert not (
+        tmp_path / "trend_review/facts/actual_fill_completeness/US"
+    ).exists()
 
 
 @pytest.mark.parametrize("command", ["open", "close"])

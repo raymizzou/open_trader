@@ -30,6 +30,7 @@ from .portfolio import (
     merge_eastmoney_portfolio_rows,
     replace_broker_portfolio_rows,
 )
+from .trend_review import freeze_actual_fill_batch
 
 
 MANIFEST_FIELDNAMES = [
@@ -130,6 +131,7 @@ def run_import(
         fx_provider=fx_provider,
         update_latest=update_latest,
         replace_latest_broker=None,
+        actual_fill_complete_through=None,
     )
 
 
@@ -159,6 +161,7 @@ def run_uploaded_statement(
         fx_provider=fx_provider,
         update_latest=True,
         replace_latest_broker=parser.broker,
+        actual_fill_complete_through=statement_date,
     )
 
 
@@ -174,6 +177,7 @@ def _run_import(
     fx_provider: StaticMonthEndFxProvider,
     update_latest: bool,
     replace_latest_broker: str | None,
+    actual_fill_complete_through: str | None,
 ) -> ImportResult:
     parser_list = list(parsers)
     _validate_statement_paths(statement_paths, parser_list)
@@ -192,25 +196,30 @@ def _run_import(
         )
     uploaded_positions: list[Position] = []
     uploaded_cash: list[CashBalance] = []
+    uploaded_fill_batches: list[tuple[str, str, list[TradeFill]]] = []
 
     for parser in parser_list:
         source_path = statement_paths[parser.broker]
         parsed_at = datetime.now(UTC).isoformat()
         parse_result = parser.parse(source_path, statement_period)
         _validate_parse_result_brokers(parser.broker, parse_result)
+        source_sha256 = sha256_file(source_path)
 
         positions.extend(parse_result.positions)
         cash_balances.extend(parse_result.cash_balances)
         fills.extend(parse_result.fills)
         uploaded_positions.extend(parse_result.positions)
         uploaded_cash.extend(parse_result.cash_balances)
+        uploaded_fill_batches.append(
+            (parser.broker, source_sha256, list(parse_result.fills))
+        )
         warnings.extend(parse_result.warnings)
         manifest.append(
             ManifestRecord(
                 month=month,
                 broker=parse_result.broker,
                 source_file=str(source_path),
-                source_sha256=sha256_file(source_path),
+                source_sha256=source_sha256,
                 parsed_at=parsed_at,
                 page_count=parse_result.page_count,
                 parser_version=parser.parser_version,
@@ -328,6 +337,16 @@ def _run_import(
         raise
 
     portfolio_path = run_dir / "portfolio.csv"
+
+    if actual_fill_complete_through is not None:
+        for broker, source_sha256, batch_fills in uploaded_fill_batches:
+            if broker in {"eastmoney", "phillips"}:
+                freeze_actual_fill_batch(
+                    data_dir,
+                    {"broker": broker, "source_sha256": source_sha256},
+                    batch_fills,
+                    actual_fill_complete_through,
+                )
 
     return ImportResult(
         run_dir=run_dir,

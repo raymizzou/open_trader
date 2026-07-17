@@ -140,6 +140,44 @@ class FillParser(FakeParser):
         )
 
 
+class BrokerFillParser(FakeParser):
+    def __init__(self, broker: str, market: Market) -> None:
+        currency = "CNY" if market is Market.CN else "HKD"
+        super().__init__(
+            broker=broker,
+            position_currency=currency,
+            cash_currency=currency,
+        )
+        self.market = market
+
+    def parse(self, path: Path, month: str) -> ParseResult:
+        result = super().parse(path, month)
+        return ParseResult(
+            statement_id=result.statement_id,
+            broker=result.broker,
+            positions=result.positions,
+            cash_balances=result.cash_balances,
+            fills=[
+                TradeFill(
+                    source_id=f"{self.broker}-fill-1",
+                    source_order_id=None,
+                    broker=self.broker,
+                    account_alias="main",
+                    market=self.market,
+                    symbol="600000" if self.market is Market.CN else "00700",
+                    currency="CNY" if self.market is Market.CN else "HKD",
+                    side="BUY",
+                    quantity=Decimal("100"),
+                    price=Decimal("10"),
+                    fees=Decimal("1"),
+                    executed_at="2026-05-10",
+                )
+            ],
+            warnings=result.warnings,
+            page_count=result.page_count,
+        )
+
+
 def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
@@ -225,6 +263,116 @@ def test_uploaded_statement_persists_each_fill_once(tmp_path: Path) -> None:
         csv.DictReader((repeated.run_dir / "extracted_fills.csv").open())
     )
     assert [row["source_id"] for row in repeated_rows] == ["fill-1"]
+
+
+@pytest.mark.parametrize(
+    ("broker", "market"),
+    [("eastmoney", Market.CN), ("phillips", Market.HK)],
+)
+def test_uploaded_statement_freezes_broker_fills_in_its_market_idempotently(
+    broker: str,
+    market: Market,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / f"{broker}.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": BrokerFillParser(broker, market),
+        "data_dir": data_dir,
+        "portfolio_path": tmp_path / "current/portfolio.csv",
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08"), "HKD": Decimal("1")}
+        ),
+    }
+
+    pipeline.run_uploaded_statement(**arguments)
+    fill_paths = list(
+        (data_dir / f"trend_review/facts/actual_fills/{market.value}").glob("*.json")
+    )
+    assert len(fill_paths) == 1
+    first_bytes = fill_paths[0].read_bytes()
+    assert not list(
+        (data_dir / "trend_review/facts/actual_fills").glob(
+            f"{'HK' if market is Market.CN else 'CN'}/*.json"
+        )
+    )
+
+    pipeline.run_uploaded_statement(**arguments)
+
+    assert fill_paths[0].read_bytes() == first_bytes
+    completeness = list(
+        (
+            data_dir
+            / f"trend_review/facts/actual_fill_completeness/{market.value}"
+        ).glob("*.json")
+    )
+    assert len(completeness) == 1
+
+
+def test_uploaded_empty_statement_freezes_completeness_only_after_success(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": FakeParser(
+            broker="eastmoney",
+            position_currency="CNY",
+            cash_currency="CNY",
+        ),
+        "data_dir": data_dir,
+        "portfolio_path": tmp_path / "current/portfolio.csv",
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08")}
+        ),
+    }
+
+    pipeline.run_uploaded_statement(**arguments)
+
+    completeness = list(
+        (data_dir / "trend_review/facts/actual_fill_completeness/CN").glob("*.json")
+    )
+    assert len(completeness) == 1
+
+    failed_dir = tmp_path / "failed-data"
+    with pytest.raises(KeyError, match="SGD"):
+        pipeline.run_uploaded_statement(
+            **{
+                **arguments,
+                "data_dir": failed_dir,
+                "portfolio_path": tmp_path / "failed/portfolio.csv",
+                "parser": FakeParser(
+                    broker="eastmoney",
+                    position_currency="SGD",
+                    cash_currency="CNY",
+                ),
+            }
+        )
+    assert not (failed_dir / "trend_review/facts").exists()
+
+
+def test_monthly_import_does_not_guess_fill_completeness_date(tmp_path: Path) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+
+    run_import(
+        month="2026-05",
+        statement_paths={"eastmoney": source},
+        parsers=[BrokerFillParser("eastmoney", Market.CN)],
+        data_dir=data_dir,
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08")}
+        ),
+    )
+
+    assert not (data_dir / "trend_review/facts").exists()
 
 
 def test_uploaded_statements_for_two_brokers_share_monthly_run(

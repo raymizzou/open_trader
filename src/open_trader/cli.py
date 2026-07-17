@@ -116,11 +116,15 @@ from .trading_plan import (
 )
 from .watchlist import build_watchlist
 from .trend_review import (
+    TREND_V1_EFFECTIVE_FROM,
     benchmark_fact,
     build_trend_review_projection,
-    capture_trend_review_close,
     execute_trend_review_open,
     execute_trend_review_stop,
+    freeze_actual_equity_fact,
+    freeze_actual_fill_batch,
+    freeze_benchmark_fact,
+    freeze_discipline_fact,
     rebuild_trend_report_from_evidence,
     replay_trend_evidence,
 )
@@ -310,17 +314,6 @@ def run_trend_review_close(
     config: object, market: str, trading_date: str
 ) -> dict[str, object]:
     account_id = require_trend_review_config(config, market)
-    existing_path = (
-        config.data_dir / "trend_review" / "daily" / market / f"{trading_date}.json"
-    )
-    if existing_path.exists():
-        build_trend_review_projection(config.data_dir, market)
-        return {
-            "status": "existing",
-            "market": market,
-            "date": trading_date,
-            "artifact_path": str(existing_path),
-        }
     report = _load_trend_review_report(
         config, market, trading_date, date_field="as_of_date"
     )
@@ -336,25 +329,78 @@ def run_trend_review_close(
         )
         snapshot = client.account_snapshot()
         orders = client.list_orders()["orders"]
-        path = capture_trend_review_close(
-            data_dir=config.data_dir,
-            market=market,
-            trading_date=trading_date,
-            report=report,
-            simulate_snapshot=snapshot,
-            orders=orders,
-            benchmark=benchmark,
+        strategy_snapshot = report.get("strategy_snapshot")
+        account = report.get("account")
+        if not isinstance(strategy_snapshot, dict):
+            raise ValueError("trend report strategy snapshot is unavailable")
+        if not isinstance(account, dict):
+            raise ValueError("trend report account is unavailable")
+        discipline_path = freeze_discipline_fact(
+            config.data_dir,
+            market,
+            trading_date,
+            snapshot["net_value"],
+            orders,
+            strategy_snapshot,
         )
-        build_trend_review_projection(config.data_dir, market)
+        actual_equity_path = None
+        if account.get("fresh") is True and account.get("source_date") == trading_date:
+            opening_positions = []
+            if trading_date == TREND_V1_EFFECTIVE_FROM[market]:
+                opening_positions = account.get("positions")
+                if not isinstance(opening_positions, list):
+                    raise ValueError("trend report account positions are unavailable")
+            actual_equity_path = freeze_actual_equity_fact(
+                config.data_dir,
+                market,
+                trading_date,
+                account["net_value"],
+                opening_positions,
+                strategy_snapshot,
+            )
+        benchmark_path = freeze_benchmark_fact(
+            config.data_dir, market, trading_date, benchmark
+        )
     finally:
         quote.close()
         if client is not None:
             client.close()
+
+    actual_fill_paths: list[Path] = []
+    if market == "US":
+        tiger_client = None
+        try:
+            tiger_config = load_tiger_account_config(
+                config_dir=Path("~/.tigeropen/"), account=None, sandbox=False
+            )
+            tiger_client = TigerAccountClient(config=tiger_config)
+            actual_fill_paths = freeze_actual_fill_batch(
+                config.data_dir,
+                {"broker": "tiger", "account_alias": "tiger_main"},
+                tiger_client.fetch_actual_fills(
+                    TREND_V1_EFFECTIVE_FROM[market], trading_date
+                ),
+                trading_date,
+            )
+        finally:
+            if tiger_client is not None:
+                tiger_client.close()
+    projection = build_trend_review_projection(config.data_dir, market)
+    artifact_paths = {
+        "discipline": str(discipline_path),
+        "actual_equity": (
+            str(actual_equity_path) if actual_equity_path is not None else None
+        ),
+        "benchmark": str(benchmark_path),
+        "actual_fills": [str(path) for path in actual_fill_paths],
+    }
     return {
         "status": "captured",
         "market": market,
         "date": trading_date,
-        "artifact_path": str(path),
+        "artifact_path": str(discipline_path),
+        "artifact_paths": artifact_paths,
+        "sample_counts": projection["sample_counts"],
     }
 
 
@@ -2667,3 +2713,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.error(f"unknown command: {args.command}")
     return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
