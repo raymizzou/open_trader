@@ -17,6 +17,11 @@ from zoneinfo import ZoneInfo
 EVIDENCE_SCHEMA_VERSION = "open_trader.trend_review.evidence.v1"
 REPLAY_SCHEMA_VERSION = "open_trader.trend_review.replay.v1"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+MARKET_TIMEZONES = {
+    "CN": SHANGHAI,
+    "HK": ZoneInfo("Asia/Hong_Kong"),
+    "US": ZoneInfo("America/New_York"),
+}
 BENCHMARK_SOURCE_IDS = {
     "CN": "CSI_ALL_SHARE_PRICE",
     "US": "SPY_QFQ",
@@ -363,11 +368,9 @@ def _order_matches_request(
 
 
 def _open_order_remark(
-    market: str, execution_date: str, report_sha: str, action_index: int
+    market: str, execution_date: str, action_key: str
 ) -> str:
-    remark = (
-        f"trend-review:{market}:{execution_date}:{report_sha[:24]}:{action_index}"
-    )
+    remark = f"trend-review:{market}:{execution_date}:{action_key[:24]}"
     if len(remark.encode("utf-8")) > 64:
         raise ValueError("trend review order remark exceeds Futu's 64-byte limit")
     return remark
@@ -385,7 +388,7 @@ def execute_trend_review_open(
 ) -> dict[str, object]:
     market = _market(market)
     current = datetime.fromisoformat(now)
-    if current.date().isoformat() != execution_date:
+    if current.astimezone(MARKET_TIMEZONES[market]).date().isoformat() != execution_date:
         raise ValueError("execution date does not match current time")
     if market in {"CN", "HK"} and not (
         current.time().replace(tzinfo=None)
@@ -428,7 +431,11 @@ def execute_trend_review_open(
         if not isinstance(action, Mapping) or action.get("action") != "BUY":
             continue
         symbol = str(action.get("symbol") or "").strip()
-        stem = f"{report_sha}-{index}"
+        futu_code = to_futu_symbol(market, symbol)
+        action_key = hashlib.sha256(
+            f"{market}:{execution_date}:{futu_code}:BUY".encode("utf-8")
+        ).hexdigest()
+        stem = action_key
         intent_path = root / f"{stem}-intent.json"
         if intent_path.exists():
             request, reconciled = _reconcile_intent(intent_path, client)
@@ -449,14 +456,12 @@ def execute_trend_review_open(
                 continue
             request = {
                 "market": market,
-                "futu_code": to_futu_symbol(market, symbol),
+                "futu_code": futu_code,
                 "side": "buy",
                 "order_type": "MARKET",
                 "price": "0",
                 "qty": str(quantity),
-                "remark": _open_order_remark(
-                    market, execution_date, report_sha, index
-                ),
+                "remark": _open_order_remark(market, execution_date, action_key),
             }
             _write_immutable(
                 intent_path,

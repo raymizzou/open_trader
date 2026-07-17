@@ -290,7 +290,7 @@ class FakeTrendSimClient:
             "status": "submitted",
         }
 
-    def list_orders(self) -> dict[str, object]:
+    def list_orders(self, **kwargs: object) -> dict[str, object]:
         return {"orders": self.orders}
 
 
@@ -350,6 +350,57 @@ def test_open_uses_sim_nav_current_price_and_frozen_lot(tmp_path: Path) -> None:
     assert client.requests[0]["qty"] == "400"
     assert client.requests[0]["order_type"] == "MARKET"
     assert result["submitted_count"] == 1
+    assert repeated["submitted_count"] == 0
+    assert len(client.requests) == 1
+
+
+def test_us_open_uses_us_market_date_after_shanghai_midnight(tmp_path: Path) -> None:
+    client = FakeTrendSimClient()
+    report = cn_buy_report(symbol="NDAQ")
+    report["strategy_judgments"]["formal_actions"][0]["lot_size"] = 1
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        prices={"NDAQ": Decimal("94.25")},
+        market="US",
+        execution_date="2026-07-17",
+        now="2026-07-18T00:30:00+08:00",
+    )
+
+    assert result["submitted_count"] == 1
+    assert client.requests[0]["futu_code"] == "US.NDAQ"
+
+
+def test_report_revision_does_not_duplicate_existing_symbol_intent(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    first_report = cn_buy_report(symbol="600001")
+    revised_report = cn_buy_report(symbol="600001")
+    revised_report["process_version"] = "new-process"
+
+    first = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=first_report,
+        client=client,
+        prices={"600001": Decimal("10")},
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+    )
+    repeated = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=revised_report,
+        client=client,
+        prices={"600001": Decimal("9")},
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:32:00+08:00",
+    )
+
+    assert first["submitted_count"] == 1
     assert repeated["submitted_count"] == 0
     assert len(client.requests) == 1
 
