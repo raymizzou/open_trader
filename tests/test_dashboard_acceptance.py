@@ -3693,6 +3693,24 @@ def test_acceptance_rejects_unavailable_review_when_daily_report_is_unavailable(
         dashboard_acceptance._check_account_holdings(page, payload)
 
 
+@pytest.mark.parametrize("broker", ("tiger", "phillips"))
+def test_acceptance_validates_available_review_when_daily_report_is_unavailable(
+    broker: str,
+) -> None:
+    payload = valid_payload()
+    payload["trend_reports"][broker].update(  # type: ignore[index]
+        available=False, status_text="今日报告不可用"
+    )
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert broker in page.opened_reviews
+    assert broker in page.review_style_checks
+    assert broker in page.review_geometry_checks
+
+
 def test_select_account_tab_rejects_multiple_visible_sections() -> None:
     page = tabbed_account_page(valid_payload())
     page.visible_account_sections = 2
