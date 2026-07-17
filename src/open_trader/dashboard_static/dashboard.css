@@ -1354,7 +1354,7 @@ table {
 .trend-review-header p,
 .trend-review-parameters h2,
 .trend-review-parameter-list p,
-.trend-review-chart,
+.trend-review-comparison,
 .trend-review-metric h3 {
   margin: 0;
 }
@@ -1363,6 +1363,19 @@ table {
 .trend-review-header span,
 .trend-review-parameter-list span {
   color: var(--muted);
+}
+
+.trend-review-header > div:first-child,
+.trend-review-header-side,
+.trend-review-parameter-list p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.trend-review-header-side {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
 }
 
 .trend-review-header h1 {
@@ -1376,7 +1389,7 @@ table {
 }
 
 .trend-review-parameters h2,
-.trend-review-chart figcaption {
+.trend-review-comparison figcaption {
   font-size: 17px;
   font-weight: 700;
 }
@@ -1398,40 +1411,23 @@ table {
   border-top: 1px solid var(--line);
 }
 
-.trend-review-charts {
+.trend-review-comparisons {
   display: grid;
   gap: 12px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.trend-review-chart {
+.trend-review-comparison {
+  background: var(--surface-soft);
   border: 1px solid var(--line);
   border-radius: 8px;
+  box-shadow: none;
   display: grid;
   gap: 14px;
+  margin: 0;
   min-width: 0;
   padding: 16px;
 }
-
-.trend-review-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-}
-
-.trend-review-legend span::before {
-  background: currentColor;
-  border-radius: 2px;
-  content: "";
-  display: inline-block;
-  height: 8px;
-  margin-right: 6px;
-  width: 16px;
-}
-
-.trend-review-legend .discipline { color: var(--accent); }
-.trend-review-legend .actual { color: var(--primary); }
-.trend-review-legend .benchmark { color: var(--muted); }
 
 .trend-review-metric {
   display: grid;
@@ -1458,6 +1454,10 @@ table {
 .trend-review-series strong {
   text-align: right;
 }
+
+.trend-review-series[data-series="discipline"] > span:first-child { color: var(--accent); }
+.trend-review-series[data-series="actual"] > span:first-child { color: var(--accent); }
+.trend-review-series[data-series="benchmark"] > span:first-child { color: var(--primary); }
 
 .trend-review-series.unavailable strong {
   color: var(--muted);
@@ -1491,8 +1491,8 @@ table {
 .trend-review-bar.positive { left: 50%; }
 .trend-review-bar.negative { right: 50%; }
 .trend-review-bar.discipline { color: var(--accent); }
-.trend-review-bar.actual { color: var(--primary); }
-.trend-review-bar.benchmark { color: var(--muted); }
+.trend-review-bar.actual { color: var(--accent); }
+.trend-review-bar.benchmark { color: var(--primary); }
 
 .trend-report-entry span {
   color: var(--muted);
@@ -3956,7 +3956,8 @@ tbody tr.active-row,
 .action-card,
 .backtest-metric-card,
 .cn-trend-card td:nth-child(-n + 2),
-.option-attention-market th {
+.option-attention-market th,
+.trend-review-comparison {
   --muted: var(--text);
 }
 
@@ -4073,13 +4074,17 @@ table {
 
   .trend-review-header,
   .trend-review-parameter-list > div,
-  .trend-review-charts {
+  .trend-review-comparisons {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .trend-review-header button {
-    justify-self: stretch;
+  .trend-review-header-side {
+    justify-items: stretch;
+  }
+
+  .trend-review-header-side button {
     min-height: 44px;
+    width: 100%;
   }
 
   .trend-review-parameter-list > div {

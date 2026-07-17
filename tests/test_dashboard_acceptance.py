@@ -98,10 +98,12 @@ def test_acceptance_browser_viewport_and_screenshot_matrix_is_exact() -> None:
         "1920-trend-report.png",
         "desktop-portfolio.png",
         "1440-trend-report.png",
+        "1440-trend-review.png",
         "tablet-portfolio.png",
         "760-trend-report.png",
         "mobile-portfolio.png",
         "375-trend-report.png",
+        "375-trend-review.png",
     )
 
 
@@ -753,6 +755,8 @@ def trend_reviews() -> dict[str, dict[str, object]]:
             "broker_label": broker_label,
             "market": market,
             "market_label": market_label,
+            "sample_counts": {"discipline": 31, "actual": 29, "required": 30},
+            "common_cutoff": "2026-07-17",
             "strategy_snapshot": {
                 "strategy_id": f"trend/{market}/v1",
                 "strategy_name": f"{market_label}短线右侧趋势",
@@ -773,10 +777,8 @@ def trend_reviews() -> dict[str, dict[str, object]]:
                         ("benchmark", "7.8"),
                     )
                 }
-                for key in (
-                    "period_net_return", "market_excess_return",
-                    "max_drawdown", "calmar", "sharpe",
-                )
+                for key, _label, _percent
+                in dashboard_acceptance.TREND_REVIEW_METRIC_SPECS
             },
         }
     return reviews
@@ -832,6 +834,71 @@ def test_acceptance_checks_exact_trend_review_content() -> None:
     )
 
     assert page.opened_reviews == ["tiger"]
+    assert page.review_benchmark_checks == ["discipline", "actual"]
+    assert page.review_style_checks == ["tiger"]
+    assert page.review_geometry_checks == ["tiger"]
+
+
+def test_acceptance_rejects_trend_review_benchmark_drift() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_benchmark_values["actual"][0] = "8.0%"
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="市场基准"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_trend_review_panel_style_drift() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_panel_radius = "12px"
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="圆角"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_trend_review_label_style_drift() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_label_border_width = "1px"
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="series"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_375_trend_review_overflow() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    page.review_document_width = 376
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="375"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_375_trend_review_clipped_long_text() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    page.review_long_text_scroll_width = 324
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="长文本"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
 
 
 def valid_quotes_payload() -> dict[str, object]:
@@ -941,10 +1008,13 @@ def trend_review_workspace_text(broker: str) -> str:
     return (
         f"{review['broker_label']}｜{review['market_label']} "
         f"{review['market_label']}趋势复盘 {snapshot['strategy_name']}｜版本 v1 "
+        "返回持仓看板 纪律模拟 31 笔 实际执行 29 / 30，数据不足 "
+        "共同截止日 2026-07-17 "
         "当前策略参数 仓位执行 持仓上限 10 笔 "
         "退出保护 初始保护线 成交均价减 2.0 倍 ATR14 "
-        "收益与回撤 期间净收益率 相对市场超额收益 最大回撤 "
-        "风险调整收益 卡玛比率 夏普比率 纪律模拟 实际执行 市场基准"
+        "纪律模拟与市场 期间净收益率 相对市场超额收益 最大回撤 卡玛比率 夏普比率 "
+        "实际执行与市场 期间净收益率 相对市场超额收益 最大回撤 卡玛比率 夏普比率 "
+        "纪律模拟 实际执行 同期市场"
     )
 
 
@@ -1258,8 +1328,29 @@ class TabbedAccountLocator:
             return int(self.page.trend_broker is not None)
         if self.selector == "#trend-report-workspace:visible [data-close-trend-report]":
             return int(self.page.trend_broker is not None)
-        if self.selector == "#trend-report-workspace:visible .trend-review-chart":
+        if self.selector == "#trend-report-workspace:visible .trend-review-header-side":
+            return int(self.page.trend_kind == "review")
+        if self.selector == "#trend-report-workspace:visible .trend-review-header-side > *":
+            return 4 if self.page.trend_kind == "review" else 0
+        if self.selector == "#trend-report-workspace:visible .trend-review-comparison":
             return 2 if self.page.trend_kind == "review" else 0
+        match = re.fullmatch(
+            r'#trend-report-workspace:visible \.trend-review-comparison'
+            r'\[data-series="(discipline|actual)"\](.*)',
+            self.selector,
+        )
+        if match and self.page.trend_kind == "review":
+            suffix = match.group(2)
+            if suffix == "":
+                return 1
+            if suffix == " .trend-review-metric":
+                return 5
+            if suffix == " .trend-review-series":
+                return 10
+            if re.fullmatch(r" \.trend-review-metric:nth\(\d+\) \.trend-review-series", suffix):
+                return 2
+        if self.selector == "#trend-report-workspace:visible .trend-review-chart":
+            return 0
         if self.selector == "#trend-report-workspace:visible .trend-review-parameter-table > div":
             review = self.page.reviews.get(str(self.page.trend_broker), {})
             snapshot = review.get("strategy_snapshot", {})
@@ -1488,10 +1579,31 @@ class TabbedAccountLocator:
         if self.selector == "#trend-report-workspace:visible .trend-review-parameter-table > div":
             rows = self.page.reviews[broker]["strategy_snapshot"]["parameter_rows"]
             return [f"{row['group']} {row['name']} {row['value']}" for row in rows]
-        if self.selector == "#trend-report-workspace:visible .trend-review-chart figcaption":
-            return ["收益与回撤", "风险调整收益"]
-        if self.selector == "#trend-report-workspace:visible .trend-review-metric h3":
-            return ["期间净收益率", "相对市场超额收益", "最大回撤", "卡玛比率", "夏普比率"]
+        if self.selector == "#trend-report-workspace:visible .trend-review-header-side > *":
+            return [
+                "返回持仓看板", "纪律模拟 31 笔",
+                "实际执行 29 / 30，数据不足", "共同截止日 2026-07-17",
+            ]
+        if self.selector == "#trend-report-workspace:visible .trend-review-comparison figcaption":
+            return ["纪律模拟与市场", "实际执行与市场"]
+        match = re.fullmatch(
+            r'#trend-report-workspace:visible \.trend-review-comparison'
+            r'\[data-series="(discipline|actual)"\] (.*)',
+            self.selector,
+        )
+        if match:
+            series, suffix = match.groups()
+            metrics = [
+                spec[1] for spec in dashboard_acceptance.TREND_REVIEW_METRIC_SPECS
+            ]
+            if suffix == ".trend-review-metric h3":
+                return metrics
+            if suffix == ".trend-review-series > span:first-child":
+                label = "纪律模拟" if series == "discipline" else "实际执行"
+                return [item for _metric in metrics for item in (label, "同期市场")]
+            if suffix == '.trend-review-series[data-series="benchmark"] strong':
+                self.page.review_benchmark_checks.append(series)
+                return self.page.review_benchmark_values[series]
         if self.selector == "#trend-report-workspace:visible .cn-trend-stage":
             return trend_stage_texts(broker)
         if self.selector == "#trend-report-workspace:visible .trend-stage":
@@ -1652,6 +1764,17 @@ class TabbedAccountPage:
         self.overflow_bounds_selector = ""
         self.document_overflow_broker = ""
         self.document_overflow_checks: list[str | None] = []
+        self.review_style_checks: list[str | None] = []
+        self.review_geometry_checks: list[str | None] = []
+        self.review_benchmark_checks: list[str] = []
+        self.review_benchmark_values = {
+            "discipline": ["7.8%", "7.8%", "7.8%", "7.8", "7.8"],
+            "actual": ["7.8%", "7.8%", "7.8%", "7.8", "7.8"],
+        }
+        self.review_panel_radius = "8px"
+        self.review_label_border_width = "0px"
+        self.review_long_text_scroll_width = 323
+        self.review_document_width: int | None = None
         self.workspace_view = "portfolio"
         self.research_open = False
         self.script_evaluations: list[tuple[str, object | None]] = []
@@ -1674,7 +1797,7 @@ class TabbedAccountPage:
 
     def evaluate(
         self, expression: str, argument: object | None = None,
-    ) -> bool | list[int] | None:
+    ) -> bool | list[int] | dict[str, object] | int | None:
         if "openResearchChat" in expression:
             self.script_evaluations.append((expression, argument))
             self.research_open = True
@@ -1690,6 +1813,105 @@ class TabbedAccountPage:
                     for _row in rows
                 ]
             return counts
+        if "trend-review-style-contract" in expression:
+            self.review_style_checks.append(self.trend_broker)
+            tokens = {
+                "bg": "rgb(247, 245, 241)",
+                "surface": "rgb(255, 254, 250)",
+                "surfaceSoft": "rgb(242, 238, 231)",
+                "text": "rgb(32, 29, 24)",
+                "muted": "rgb(116, 110, 100)",
+                "accent": "rgb(139, 94, 52)",
+                "line": "rgb(216, 210, 200)",
+                "primary": "rgb(36, 33, 29)",
+                "shadow": "rgba(68, 55, 38, 0.06) 0px 8px 30px 0px",
+            }
+            panel = {
+                "backgroundColor": tokens["surfaceSoft"],
+                "borderColor": tokens["line"],
+                "borderWidth": "1px",
+                "color": tokens["text"],
+                "borderRadius": self.review_panel_radius, "boxShadow": "none",
+                "backgroundImage": "none",
+            }
+            return {
+                "tokens": tokens,
+                "workspace": {
+                    "backgroundColor": tokens["surface"],
+                    "borderColor": tokens["line"],
+                    "borderWidth": "1px",
+                    "color": tokens["text"],
+                    "borderRadius": "8px", "boxShadow": tokens["shadow"],
+                    "backgroundImage": "none",
+                },
+                "panels": [panel, panel],
+                "side": {
+                    "backgroundColor": "rgba(0, 0, 0, 0)",
+                    "borderWidth": "0px", "boxShadow": "none",
+                    "backgroundImage": "none",
+                },
+                "button": {
+                    "backgroundColor": tokens["surface"],
+                    "borderColor": tokens["accent"],
+                    "borderWidth": "1px",
+                    "color": tokens["accent"],
+                    "borderRadius": "7px", "boxShadow": "none",
+                    "backgroundImage": "none",
+                },
+                "labels": [
+                    *([{
+                        "text": "纪律模拟", "backgroundColor": "rgba(0, 0, 0, 0)",
+                        "borderColor": tokens["accent"], "borderWidth": self.review_label_border_width,
+                        "color": tokens["accent"], "borderRadius": "0px",
+                        "boxShadow": "none", "backgroundImage": "none",
+                    }, {
+                        "text": "同期市场", "backgroundColor": "rgba(0, 0, 0, 0)",
+                        "borderColor": tokens["primary"], "borderWidth": "0px",
+                        "color": tokens["primary"], "borderRadius": "0px",
+                        "boxShadow": "none", "backgroundImage": "none",
+                    }] * 5),
+                    *([{
+                        "text": "实际执行", "backgroundColor": "rgba(0, 0, 0, 0)",
+                        "borderColor": tokens["accent"], "borderWidth": "0px",
+                        "color": tokens["accent"], "borderRadius": "0px",
+                        "boxShadow": "none", "backgroundImage": "none",
+                    }, {
+                        "text": "同期市场", "backgroundColor": "rgba(0, 0, 0, 0)",
+                        "borderColor": tokens["primary"], "borderWidth": "0px",
+                        "color": tokens["primary"], "borderRadius": "0px",
+                        "boxShadow": "none", "backgroundImage": "none",
+                    }] * 5),
+                ],
+            }
+        if "trend-review-geometry-contract" in expression:
+            self.review_geometry_checks.append(self.trend_broker)
+            mobile = self.viewport_size["width"] == 375
+            narrow = self.viewport_size["width"] <= 760
+            panel_width = self.viewport_size["width"] - 28 if narrow else 680
+            return {
+                "documentWidth": self.review_document_width or self.viewport_size["width"],
+                "side": {"x": 14, "y": 120, "width": 347, "height": 176},
+                "sideItems": [
+                    {"x": 14, "y": 120, "width": 347, "height": 44},
+                    {"x": 14, "y": 172, "width": 347, "height": 20},
+                    {"x": 14, "y": 200, "width": 347, "height": 20},
+                    {"x": 14, "y": 228, "width": 347, "height": 20},
+                ],
+                "button": {"x": 14, "y": 120, "width": 347, "height": 44},
+                "parameterCells": [
+                    {"x": 26, "y": 340, "width": 323, "height": 20},
+                    {"x": 26, "y": 364 if mobile else 340, "width": 323, "height": 20},
+                    {"x": 26, "y": 388 if mobile else 340, "width": 323, "height": 40},
+                ],
+                "panels": [
+                    {"x": 14, "y": 460, "width": panel_width, "height": 600},
+                    {"x": 14 if narrow else 706, "y": 1072 if narrow else 460, "width": panel_width, "height": 600},
+                ],
+                "longTexts": [
+                    {"clientWidth": 323, "scrollWidth": self.review_long_text_scroll_width},
+                    {"clientWidth": 323, "scrollWidth": 323},
+                ],
+            }
         assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
         self.document_overflow_checks.append(self.trend_broker)
         return self.trend_broker != self.document_overflow_broker
@@ -2552,6 +2774,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def evaluate(
             self, expression: str, argument: object | None = None
         ) -> object:
+            if (
+                "trend-review-style-contract" in expression
+                or "trend-review-geometry-contract" in expression
+            ):
+                return super().evaluate(expression, argument)
             if "openResearchChat" in expression:
                 return super().evaluate(expression, argument)
             if "gridTemplateColumns" in expression:
@@ -2771,10 +2998,12 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         ("wide_desktop", str(screenshot_dir / "1920-trend-report.png")),
         ("desktop", str(screenshot_dir / "desktop-portfolio.png")),
         ("desktop", str(screenshot_dir / "1440-trend-report.png")),
+        ("desktop", str(screenshot_dir / "1440-trend-review.png")),
         ("tablet", str(screenshot_dir / "tablet-portfolio.png")),
         ("tablet", str(screenshot_dir / "760-trend-report.png")),
         ("mobile", str(screenshot_dir / "mobile-portfolio.png")),
         ("mobile", str(screenshot_dir / "375-trend-report.png")),
+        ("mobile", str(screenshot_dir / "375-trend-review.png")),
     ]
 
 

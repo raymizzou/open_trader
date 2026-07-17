@@ -1939,10 +1939,17 @@ function renderTrendReportEntry(broker) {
   </div>`;
 }
 
-const TREND_REVIEW_SERIES = [
-  {key:"discipline", label:"纪律模拟", className:"discipline"},
-  {key:"actual", label:"实际执行", className:"actual"},
-  {key:"benchmark", label:"市场基准", className:"benchmark"},
+const TREND_REVIEW_METRICS = [
+  {key:"period_net_return", label:"期间净收益率", percent:true},
+  {key:"market_excess_return", label:"相对市场超额收益", percent:true},
+  {key:"max_drawdown", label:"最大回撤", percent:true},
+  {key:"calmar", label:"卡玛比率", percent:false},
+  {key:"sharpe", label:"夏普比率", percent:false},
+];
+
+const TREND_REVIEW_COMPARISONS = [
+  {key:"discipline", title:"纪律模拟与市场", label:"纪律模拟"},
+  {key:"actual", title:"实际执行与市场", label:"实际执行"},
 ];
 
 function formatTrendReviewValue(cell, percent) {
@@ -1952,29 +1959,38 @@ function formatTrendReviewValue(cell, percent) {
   return percent ? `${formatted}%` : formatted;
 }
 
-function renderTrendReviewMetric(review, key, label, percent) {
-  const values = TREND_REVIEW_SERIES.map((series) => numericValue(review.metrics?.[key]?.[series.key]?.value));
+function renderTrendReviewMetric(review, metric, seriesDefinitions) {
+  const values = seriesDefinitions.map((series) => numericValue(review.metrics?.[metric.key]?.[series.key]?.value));
   const maximum = Math.max(...values.filter((value) => value !== null).map(Math.abs), 0);
-  const rows = TREND_REVIEW_SERIES.map((series, index) => {
-    const cell = review.metrics?.[key]?.[series.key] || {};
+  const rows = seriesDefinitions.map((series, index) => {
+    const cell = review.metrics?.[metric.key]?.[series.key] || {};
     const value = values[index];
     const width = value === null || maximum === 0 ? 0 : Math.round(Math.abs(value) / maximum * 50);
     const direction = value !== null && value < 0 ? " negative" : " positive";
     const unavailable = value === null ? " unavailable" : "";
-    return `<div class="trend-review-series${unavailable}">
+    return `<div class="trend-review-series${unavailable}" data-series="${series.key}">
       <span>${escapeHtml(series.label)}</span>
-      <span class="trend-review-track" aria-hidden="true"><i class="trend-review-bar ${series.className}${direction}" style="--trend-review-width:${width}%"></i></span>
-      <strong>${escapeHtml(formatTrendReviewValue(cell, percent))}</strong>
+      <span class="trend-review-track" aria-hidden="true"><i class="trend-review-bar ${series.key}${direction}" style="--trend-review-width:${width}%"></i></span>
+      <strong>${escapeHtml(formatTrendReviewValue(cell, metric.percent))}</strong>
     </div>`;
   }).join("");
-  return `<section class="trend-review-metric"><h3>${escapeHtml(label)}</h3>${rows}</section>`;
+  return `<section class="trend-review-metric"><h3>${escapeHtml(metric.label)}</h3>${rows}</section>`;
 }
 
-function renderTrendReviewChart(review, title, definitions) {
-  return `<figure class="trend-review-chart"><figcaption>${escapeHtml(title)}</figcaption>
-    <div class="trend-review-legend">${TREND_REVIEW_SERIES.map((series) => `<span class="${series.className}">${escapeHtml(series.label)}</span>`).join("")}</div>
-    ${definitions.map(([key,label,percent]) => renderTrendReviewMetric(review,key,label,percent)).join("")}
+function renderTrendReviewComparison(review, comparison) {
+  const seriesDefinitions = [
+    {key:comparison.key, label:comparison.label},
+    {key:"benchmark", label:"同期市场"},
+  ];
+  return `<figure class="trend-review-comparison" data-series="${comparison.key}"><figcaption>${escapeHtml(comparison.title)}</figcaption>
+    ${TREND_REVIEW_METRICS.map((metric) => renderTrendReviewMetric(review, metric, seriesDefinitions)).join("")}
   </figure>`;
+}
+
+function formatTrendReviewSampleCount(review, key, label) {
+  const count = Number.isInteger(review.sample_counts?.[key]) ? review.sample_counts[key] : 0;
+  const required = Number.isInteger(review.sample_counts?.required) ? review.sample_counts.required : 30;
+  return count >= required ? `${label} ${count} 笔` : `${label} ${count} / ${required}，数据不足`;
 }
 
 function renderTrendReviewWorkspace(review) {
@@ -1985,14 +2001,18 @@ function renderTrendReviewWorkspace(review) {
       <div><p>${escapeHtml(`${formatPlain(review.broker_label)}｜${formatPlain(review.market_label)}`)}</p>
       <h1>${escapeHtml(`${formatPlain(review.market_label)}趋势复盘`)}</h1>
       <span>${escapeHtml(formatPlain(snapshot.strategy_name))}｜版本 ${escapeHtml(formatPlain(snapshot.strategy_version))}</span></div>
-      <button type="button" data-close-trend-report>返回持仓看板</button>
+      <div class="trend-review-header-side">
+        <button type="button" data-close-trend-report>返回持仓看板</button>
+        <span>${escapeHtml(formatTrendReviewSampleCount(review,"discipline","纪律模拟"))}</span>
+        <span>${escapeHtml(formatTrendReviewSampleCount(review,"actual","实际执行"))}</span>
+        <span>共同截止日 ${escapeHtml(review.common_cutoff ? formatPlain(review.common_cutoff) : "暂无")}</span>
+      </div>
     </header>
     <section class="trend-review-parameters"><h2>当前策略参数</h2>
       <div class="trend-review-parameter-list trend-review-parameter-table">${rows.map((row) => `<div><span>${escapeHtml(formatPlain(row.group))}</span><strong>${escapeHtml(formatPlain(row.name))}</strong><p>${escapeHtml(formatPlain(row.value))}</p></div>`).join("")}</div>
     </section>
-    <div class="trend-review-charts">
-      ${renderTrendReviewChart(review,"收益与回撤",[["period_net_return","期间净收益率",true],["market_excess_return","相对市场超额收益",true],["max_drawdown","最大回撤",true]])}
-      ${renderTrendReviewChart(review,"风险调整收益",[["calmar","卡玛比率",false],["sharpe","夏普比率",false]])}
+    <div class="trend-review-comparisons">
+      ${TREND_REVIEW_COMPARISONS.map((comparison) => renderTrendReviewComparison(review, comparison)).join("")}
     </div>
   </main>`;
 }
