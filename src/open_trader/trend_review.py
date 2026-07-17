@@ -922,14 +922,21 @@ def _completed_cycles(
         for row in opening_positions
     }
     completed: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for fill in sorted(
-        fills, key=lambda row: (str(row["executed_at"]), str(row["source_id"]))
-    ):
+    seen: dict[tuple[str, str, str], bytes] = {}
+    unique_fills: list[Mapping[str, object]] = []
+    for fill in fills:
         identity = _actual_fill_identity(fill)
-        if identity in seen:
-            continue
-        seen.add(identity)
+        payload = _canonical_json_bytes(dict(fill))
+        existing = seen.get(identity)
+        if existing is None:
+            seen[identity] = payload
+            unique_fills.append(fill)
+        elif existing != payload:
+            raise ValueError(f"conflicting actual fill identity: {identity}")
+    for fill in sorted(
+        unique_fills,
+        key=lambda row: (str(row["executed_at"]), str(row["source_id"])),
+    ):
         symbol = str(fill["symbol"])
         quantity = _required_decimal(fill["quantity"], "fill quantity")
         if quantity <= 0:
@@ -1322,8 +1329,6 @@ def build_trend_review_projection(
         if common_cutoff is not None
         and effective_from <= str(fact["date"]) <= common_cutoff
     ]
-    if any(not is_v1(fact) for fact in interval_discipline):
-        raise ValueError("discipline fact strategy version does not match projection")
     snapshot = (
         dict(interval_discipline[-1]["strategy_snapshot"])
         if interval_discipline

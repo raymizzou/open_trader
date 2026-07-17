@@ -903,6 +903,27 @@ def test_actual_cycles_close_partials_opening_positions_rebuys_and_dedupe() -> N
     assert [len(cycle["fills"]) for cycle in cycles] == [2, 2]
 
 
+def test_completed_cycles_ignores_identical_duplicate_payloads() -> None:
+    buy = asdict(actual_fill("buy-1", "600001", "BUY", "100", "2026-07-16"))
+    sell = asdict(actual_fill("sell-1", "600001", "SELL", "100", "2026-07-17"))
+
+    cycles = trend_review._completed_cycles([buy, dict(buy), sell])
+
+    assert len(cycles) == 1
+    assert len(cycles[0]["fills"]) == 2
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_completed_cycles_rejects_conflicting_payloads_for_one_identity(
+    reverse: bool,
+) -> None:
+    buy = asdict(actual_fill("fill-1", "600001", "BUY", "100", "2026-07-16"))
+    sell = asdict(actual_fill("fill-1", "600001", "SELL", "100", "2026-07-16"))
+
+    with pytest.raises(ValueError, match="conflicting actual fill identity"):
+        trend_review._completed_cycles([sell, buy] if reverse else [buy, sell])
+
+
 def test_old_daily_actual_equity_never_fabricates_actual_samples(tmp_path: Path) -> None:
     write_review_history(tmp_path, completed_trades=30, days=40)
     trend_review.freeze_actual_fill_batch(
