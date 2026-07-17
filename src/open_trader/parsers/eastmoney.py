@@ -8,8 +8,20 @@ import re
 
 import pdfplumber
 
-from open_trader.models import AssetClass, CashBalance, Market, Position
-from open_trader.parsers.base import ParseResult, StatementParser, parse_decimal
+from open_trader.models import (
+    AssetClass,
+    CashBalance,
+    Market,
+    Position,
+    TradeFill,
+    WarningRecord,
+)
+from open_trader.parsers.base import (
+    ParseResult,
+    StatementParser,
+    parse_decimal,
+    source_id_for_fill,
+)
 
 
 BROKER = "eastmoney"
@@ -22,6 +34,19 @@ POSITION_HEADER = (
     "市价",
     "成本价",
     "证券市值",
+)
+EXECUTION_HEADER = (
+    "发生日期",
+    "买卖类别",
+    "证券代码",
+    "证券名称",
+    "成交数量",
+    "成交价格",
+    "总发生金额",
+    "手续费",
+    "印花税",
+    "过户费",
+    "资金余额",
 )
 SUPPORTED_MARKETS = {"沪市A股", "深市A股"}
 MONEY = r"[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)"
@@ -60,6 +85,29 @@ def parse_eastmoney_page(
     if cash_balance is None or cash_balance < 0 or available_balance is None:
         raise ValueError("东方财富对账单缺少人民币资金汇总")
 
+    fills: list[TradeFill] = []
+    warnings: list[WarningRecord] = []
+    for execution_table in (
+        candidate
+        for candidate in tables
+        if candidate and _normalize_row(candidate[0]) == EXECUTION_HEADER
+    ):
+        for row in execution_table[1:]:
+            fill = _parse_fill(row)
+            if fill is not None:
+                fills.append(fill)
+            elif len(row) > 1 and _normalize_cell(row[1]) in {"证券买入", "证券卖出"}:
+                warnings.append(
+                    WarningRecord(
+                        statement_id=statement_id,
+                        broker=BROKER,
+                        page=None,
+                        severity="warning",
+                        code="invalid_execution_row",
+                        message="东方财富成交行缺少成交标识、方向、数量、价格或日期",
+                    )
+                )
+
     return ParseResult(
         statement_id=statement_id,
         broker=BROKER,
@@ -76,7 +124,58 @@ def parse_eastmoney_page(
                 notes="cash derived from statement total assets less securities value",
             )
         ],
+        fills=fills,
+        warnings=warnings,
     )
+
+
+def _parse_fill(row: list[str | None]) -> TradeFill | None:
+    if len(row) != len(EXECUTION_HEADER):
+        return None
+    values = [_normalize_cell(cell) for cell in row]
+    executed_at = _execution_date(values[0])
+    side = {"证券买入": "BUY", "证券卖出": "SELL"}.get(values[1])
+    quantity = parse_decimal(values[4])
+    price = parse_decimal(values[5])
+    if (
+        executed_at is None
+        or side is None
+        or re.fullmatch(r"\d{6}", values[2]) is None
+        or quantity is None
+        or quantity <= 0
+        or price is None
+        or price <= 0
+    ):
+        return None
+    fee_parts = [parse_decimal(value) for value in values[7:10]]
+    fees = (
+        sum((fee or Decimal("0") for fee in fee_parts), Decimal("0"))
+        if any(fee is not None for fee in fee_parts)
+        else None
+    )
+    return TradeFill(
+        source_id=source_id_for_fill(BROKER, values),
+        source_order_id=None,
+        broker=BROKER,
+        account_alias=ACCOUNT_ALIAS,
+        market=Market.CN,
+        symbol=values[2],
+        currency="CNY",
+        side=side,
+        quantity=quantity,
+        price=price,
+        fees=fees,
+        executed_at=executed_at,
+    )
+
+
+def _execution_date(value: str) -> str | None:
+    try:
+        return date.fromisoformat(
+            f"{value[:4]}-{value[4:6]}-{value[6:]}" if re.fullmatch(r"\d{8}", value) else value
+        ).isoformat()
+    except ValueError:
+        return None
 
 
 def _parse_position(row: list[str | None], statement_id: str) -> Position | None:
@@ -176,9 +275,12 @@ class EastmoneyStatementParser(StatementParser):
                 if not pdf.pages:
                     raise _EmptyStatementError
                 page_count = len(pdf.pages)
-                page = pdf.pages[0]
-                first_page_text = page.extract_text() or ""
-                tables = page.extract_tables()
+                first_page_text = pdf.pages[0].extract_text() or ""
+                tables = [
+                    table
+                    for page in pdf.pages
+                    for table in page.extract_tables()
+                ]
         except _EmptyStatementError:
             raise ValueError("东方财富对账单没有页面") from None
         except Exception:

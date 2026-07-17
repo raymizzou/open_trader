@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from open_trader.models import AssetClass, CashBalance, Market, Position
+from open_trader.models import AssetClass, CashBalance, Market, Position, TradeFill
 from open_trader.parsers.base import ParseResult
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 
@@ -98,6 +98,36 @@ class FakeEastmoneyParser:
         )
 
 
+class FakeFillOnlyParser:
+    broker = "phillips"
+    parser_version = "test-1"
+
+    def statement_date(self, path: Path) -> str:
+        return "2026-07-10"
+
+    def parse(self, path: Path, period: str) -> ParseResult:
+        return ParseResult(
+            statement_id=f"{period}-phillips",
+            broker="phillips",
+            fills=[
+                TradeFill(
+                    source_id="fill-1",
+                    source_order_id=None,
+                    broker="phillips",
+                    account_alias="phillips_main",
+                    market=Market.HK,
+                    symbol="00700",
+                    currency="HKD",
+                    side="SELL",
+                    quantity=Decimal("1"),
+                    price=Decimal("500"),
+                    fees=None,
+                    executed_at="2026-07-10",
+                )
+            ],
+        )
+
+
 def write_existing_portfolio(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {field: "" for field in PORTFOLIO_FIELDNAMES}
@@ -154,6 +184,26 @@ def test_import_pdf_archives_and_replaces_only_target_broker(
     assert {row["brokers"] for row in rows} == {"futu", "phillips"}
 
 
+def test_import_pdf_accepts_fill_only_statement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statement_import = importlib.import_module("open_trader.statement_import")
+    monkeypatch.setattr(
+        statement_import, "PhillipsStatementParser", FakeFillOnlyParser
+    )
+    monkeypatch.setattr(statement_import, "run_uploaded_statement", lambda **kwargs: None)
+    service = statement_import.StatementImportService(
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "portfolio.csv",
+        eastmoney_password="secret",
+    )
+
+    result = service.import_pdf("phillips", PDF_BYTES)
+
+    assert result["fills"] == 1
+
+
 def test_import_pdf_rejects_older_statement_and_preserves_current_data(
     tmp_path: Path,
     monkeypatch,
@@ -200,6 +250,24 @@ def test_latest_statement_period_uses_newest_statement_id_across_runs(
             writer = csv.DictWriter(handle, fieldnames=["statement_id", "broker"])
             writer.writeheader()
             writer.writerow({"statement_id": statement_id, "broker": "phillips"})
+    service = statement_import.StatementImportService(
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "portfolio.csv",
+        eastmoney_password="secret",
+    )
+
+    assert service._latest_statement_period("phillips") == "2026-07-15"
+
+
+def test_latest_statement_period_uses_fill_execution_date(tmp_path: Path) -> None:
+    statement_import = importlib.import_module("open_trader.statement_import")
+    data_dir = tmp_path / "data"
+    path = data_dir / "runs/2026-07/extracted_fills.csv"
+    path.parent.mkdir(parents=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["broker", "executed_at"])
+        writer.writeheader()
+        writer.writerow({"broker": "phillips", "executed_at": "2026-07-15"})
     service = statement_import.StatementImportService(
         data_dir=data_dir,
         portfolio_path=tmp_path / "portfolio.csv",

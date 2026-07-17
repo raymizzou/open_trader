@@ -42,8 +42,8 @@ class StatementImportService:
             uploaded.write_bytes(body)
             statement_date = parser.statement_date(uploaded)  # type: ignore[attr-defined]
             parsed = parser.parse(uploaded, statement_date)
-            if not parsed.positions and not parsed.cash_balances:
-                raise ValueError(f"{broker} 结单没有可导入的持仓或现金")
+            if not parsed.positions and not parsed.cash_balances and not parsed.fills:
+                raise ValueError(f"{broker} 结单没有可导入的持仓、现金或成交")
             current_period = self._latest_statement_period(broker)
             if current_period and statement_date[: len(current_period)] < current_period:
                 raise ValueError(
@@ -69,7 +69,7 @@ class StatementImportService:
                 raise
             if backup is not None:
                 backup.unlink(missing_ok=True)
-        return {
+        result = {
             "status": "ok",
             "broker": broker,
             "statement_date": statement_date,
@@ -77,6 +77,9 @@ class StatementImportService:
             "cash": len(parsed.cash_balances),
             "warnings": len(parsed.warnings),
         }
+        if parsed.fills:
+            result["fills"] = len(parsed.fills)
+        return result
 
     def _parser(self, broker: str) -> StatementParser:
         if broker == "phillips":
@@ -99,7 +102,11 @@ class StatementImportService:
         for run_dir in sorted(runs_dir.iterdir(), reverse=True):
             if not run_dir.is_dir():
                 continue
-            for filename in ("extracted_positions.csv", "extracted_cash.csv"):
+            for filename in (
+                "extracted_positions.csv",
+                "extracted_cash.csv",
+                "extracted_fills.csv",
+            ):
                 path = run_dir / filename
                 if not path.exists():
                     continue
@@ -107,7 +114,12 @@ class StatementImportService:
                     for row in csv.DictReader(handle):
                         if row.get("broker", "").strip().lower() != broker:
                             continue
-                        match = STATEMENT_PERIOD.match(row.get("statement_id", ""))
+                        value = (
+                            row.get("executed_at", "")[:10]
+                            if filename == "extracted_fills.csv"
+                            else row.get("statement_id", "")
+                        )
+                        match = STATEMENT_PERIOD.match(f"{value}-")
                         if match is not None:
                             periods.append(match.group(1))
         return max(periods) if periods else ""

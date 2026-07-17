@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 import re
 
 import pdfplumber
 
-from open_trader.models import AssetClass, CashBalance, Market, Position
+from open_trader.models import (
+    AssetClass,
+    CashBalance,
+    Market,
+    Position,
+    TradeFill,
+    WarningRecord,
+)
 from open_trader.parsers.base import (
     ParseResult,
     StatementParser,
     detect_asset_class,
     detect_market,
     parse_decimal,
+    source_id_for_fill,
 )
 
 
@@ -25,6 +33,17 @@ ISSUE_DATE = re.compile(
     r"(?:日期\s*)?Issue Date\s*[:：]\s*(\d{2})/(\d{2})/(\d{2})",
     re.IGNORECASE,
 )
+TRANSACTION_LINE = re.compile(
+    rf"(?P<trade_date>\d{{2}}/\d{{2}}/\d{{2}})\s+"
+    rf"(?P<settlement_date>\d{{2}}/\d{{2}}/\d{{2}})\s+"
+    r"Equity\s+(?P<symbol>[A-Z0-9.-]+)\s+"
+    r"(?P<side>Bought|Sold)\s+.+?\s+"
+    rf"(?P<quantity>{NUMERIC})\s+"
+    rf"(?P<price>{NUMERIC})\s+"
+    rf"(?P<turnover>{NUMERIC})\s+"
+    rf"(?P<amount>{NUMERIC})",
+    re.IGNORECASE,
+)
 
 
 def parse_phillips_text(text: str, month: str) -> ParseResult:
@@ -32,6 +51,9 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
     base_cash: CashBalance | None = None
+    fills: list[TradeFill] = []
+    warnings: list[WarningRecord] = []
+    in_transactions = False
     in_positions = False
     in_cash = False
     in_account_details = False
@@ -40,6 +62,28 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         line = _normalize_line(raw_line)
         if not line:
             continue
+
+        if "Transaction Details" in line or "TTrraannssaaccttiioonn DDeettaaiillss" in line:
+            in_transactions = True
+            continue
+
+        if in_transactions:
+            fill = _parse_transaction_line(line)
+            if fill is not None:
+                fills.append(fill)
+                continue
+            if re.match(r"\d{2}/\d{2}/\d{2}\s+\d{2}/\d{2}/\d{2}\s+Equity\b", line):
+                warnings.append(
+                    WarningRecord(
+                        statement_id=statement_id,
+                        broker=BROKER,
+                        page=None,
+                        severity="warning",
+                        code="invalid_execution_row",
+                        message="辉立成交行缺少成交标识、方向、数量、价格或日期",
+                    )
+                )
+                continue
 
         if _is_account_details_start(line):
             in_account_details = True
@@ -95,6 +139,40 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         broker=BROKER,
         positions=positions,
         cash_balances=[base_cash] if base_cash is not None else cash_balances,
+        fills=fills,
+        warnings=warnings,
+    )
+
+
+def _parse_transaction_line(line: str) -> TradeFill | None:
+    match = TRANSACTION_LINE.fullmatch(line)
+    if match is None:
+        return None
+    quantity = parse_decimal(match.group("quantity"))
+    price = parse_decimal(match.group("price"))
+    try:
+        executed_at = datetime.strptime(match.group("trade_date"), "%d/%m/%y").date().isoformat()
+    except ValueError:
+        executed_at = None
+    symbol = match.group("symbol").upper()
+    side = "BUY" if match.group("side").upper() == "BOUGHT" else "SELL"
+    if quantity is None or quantity <= 0 or price is None or price <= 0 or executed_at is None:
+        return None
+    market = Market.HK if re.fullmatch(r"\d{6}", symbol) else Market.US
+    symbol = _normalize_phillips_symbol(symbol, market)
+    return TradeFill(
+        source_id=source_id_for_fill(BROKER, [line]),
+        source_order_id=None,
+        broker=BROKER,
+        account_alias=ACCOUNT_ALIAS,
+        market=market,
+        symbol=symbol,
+        currency=_currency_for_market(market),
+        side=side,
+        quantity=quantity,
+        price=price,
+        fees=None,
+        executed_at=executed_at,
     )
 
 

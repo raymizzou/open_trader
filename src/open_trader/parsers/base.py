@@ -6,7 +6,14 @@ from hashlib import sha256
 from pathlib import Path
 import re
 
-from open_trader.models import AssetClass, CashBalance, Market, Position, WarningRecord
+from open_trader.models import (
+    AssetClass,
+    CashBalance,
+    Market,
+    Position,
+    TradeFill,
+    WarningRecord,
+)
 
 
 @dataclass(frozen=True)
@@ -15,6 +22,7 @@ class ParseResult:
     broker: str
     positions: list[Position] = field(default_factory=list)
     cash_balances: list[CashBalance] = field(default_factory=list)
+    fills: list[TradeFill] = field(default_factory=list)
     warnings: list[WarningRecord] = field(default_factory=list)
     page_count: int = 0
 
@@ -33,6 +41,10 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def source_id_for_fill(broker: str, values: list[str]) -> str:
+    return sha256("\x1f".join([broker, *values]).encode("utf-8")).hexdigest()
 
 
 def parse_decimal(value: str | None) -> Decimal | None:

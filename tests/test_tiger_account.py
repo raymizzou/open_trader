@@ -506,6 +506,94 @@ class FakeTradeClient:
         return FakePrimeAssets()
 
 
+class PagedTransactions(FakeTradeClient):
+    def __init__(self, client_config: object) -> None:
+        super().__init__(client_config)
+        self.transaction_calls: list[dict[str, object]] = []
+        self.order_calls: list[dict[str, object]] = []
+
+    @staticmethod
+    def _transaction(source_id: str, order_id: int) -> object:
+        return type(
+            "Transaction",
+            (),
+            {
+                "id": source_id,
+                "order_id": order_id,
+                "action": "BUY",
+                "filled_quantity": "1",
+                "filled_price": "123.45",
+                "transacted_at": 1784246400000,
+                "contract": FakeContract(
+                    symbol="MSFT", currency="USD", market="US"
+                ),
+            },
+        )()
+
+    def get_transactions(self, **kwargs: object) -> object:
+        self.transaction_calls.append(kwargs)
+        if kwargs["page_token"] is None:
+            return type(
+                "TransactionsResponse",
+                (),
+                {
+                    "result": [self._transaction("9001-1", 9001)],
+                    "next_page_token": "next",
+                },
+            )()
+        return type(
+            "TransactionsResponse",
+            (),
+            {
+                "result": [self._transaction("9002-1", 9002)],
+                "next_page_token": None,
+            },
+        )()
+
+    def get_order(self, **kwargs: object) -> object:
+        self.order_calls.append(kwargs)
+        return type("Order", (), {"commission": "1.25", "charges": []})()
+
+
+class ListTransactions(PagedTransactions):
+    def get_transactions(self, **kwargs: object) -> object:
+        self.transaction_calls.append(kwargs)
+        return [self._transaction("9001-1", 9001)]
+
+
+class MultipleFillsOneOrder(ListTransactions):
+    def get_transactions(self, **kwargs: object) -> object:
+        self.transaction_calls.append(kwargs)
+        return [
+            self._transaction("9001-1", 9001),
+            self._transaction("9001-2", 9001),
+        ]
+
+
+class SdkPagedTransactions(PagedTransactions):
+    def _page(self) -> list[object]:
+        return [self._transaction(f"{index}-1", index) for index in range(100)]
+
+    def get_transactions(self, **kwargs: object) -> object:
+        self.transaction_calls.append(kwargs)
+        if kwargs["page_token"] is None:
+            return self._page()
+        if kwargs["page_token"] == "":
+            return type(
+                "TransactionsResponse",
+                (),
+                {"result": self._page(), "next_page_token": "next"},
+            )()
+        return type(
+            "TransactionsResponse",
+            (),
+            {
+                "result": [self._transaction("100-1", 100)],
+                "next_page_token": None,
+            },
+        )()
+
+
 class FakeStockAndFundTradeClient(FakeTradeClient):
     def get_positions(self, **kwargs: object) -> list[FakePosition]:
         self.position_calls.append(kwargs)
@@ -789,6 +877,79 @@ def test_tiger_account_client_fetches_standard_account_snapshot() -> None:
         {"account": "123456789", "sec_type": "FUND"},
     ]
     assert client.trade_client.prime_asset_calls == [{"account": "123456789"}]
+
+
+def test_tiger_fetch_transactions_paginates_and_normalizes() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=PagedTransactions,
+    )
+
+    fills = client.fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert [fill.source_id for fill in fills] == ["9001-1", "9002-1"]
+    assert all(fill.market is Market.US for fill in fills)
+    assert all(fill.fees == Decimal("1.25") for fill in fills)
+    assert client.trade_client.transaction_calls == [
+        {
+            "account": "123456789",
+            "since_date": "20260717",
+            "to_date": "20260717",
+            "limit": 100,
+            "page_token": None,
+        },
+        {
+            "account": "123456789",
+            "since_date": "20260717",
+            "to_date": "20260717",
+            "limit": 100,
+            "page_token": "next",
+        },
+    ]
+    assert client.trade_client.order_calls == [
+        {"order_id": 9001, "show_charges": True},
+        {"order_id": 9002, "show_charges": True},
+    ]
+
+
+def test_tiger_fetch_transactions_accepts_sdk_list_response() -> None:
+    fills = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=ListTransactions,
+    ).fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert [fill.source_id for fill in fills] == ["9001-1"]
+
+
+def test_tiger_multiple_fills_do_not_guess_order_fee_allocation() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=MultipleFillsOneOrder,
+    )
+
+    fills = client.fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert [fill.fees for fill in fills] == [None, None]
+    assert client.trade_client.order_calls == [
+        {"order_id": 9001, "show_charges": True}
+    ]
+
+
+def test_tiger_sdk_list_response_at_limit_continues_with_response_pagination() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=SdkPagedTransactions,
+    )
+
+    fills = client.fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert len(fills) == 101
+    assert len({fill.source_id for fill in fills}) == 101
+    assert [call["page_token"] for call in client.trade_client.transaction_calls] == [
+        None,
+        "",
+        "next",
+    ]
 
 
 def test_tiger_account_client_fetches_stock_and_fund_positions() -> None:

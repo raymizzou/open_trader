@@ -217,6 +217,37 @@ def test_parse_phillips_text_extracts_hk_and_us_positions() -> None:
     assert us.currency == "USD"
 
 
+def test_phillips_statement_extracts_actual_trade_fills() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+日期Date 產品 Product 參考 Reference 類別 Type 摘要 Description 數量 Quantity 單價 Price 成交金額 Consideration 金額 Amount
+10/07/26 14/07/26 Equity 000700 Sold Tencent 100 380.0000 38,000.00 37,900.00
+""",
+        "2026-07",
+    )
+
+    assert [(fill.market.value, fill.symbol, fill.side) for fill in result.fills] == [
+        ("HK", "00700", "SELL"),
+    ]
+    assert result.fills[0].quantity == Decimal("100")
+    assert result.fills[0].price == Decimal("380.0000")
+    assert result.fills[0].executed_at == "2026-07-10"
+    assert result.fills[0].source_id
+
+
+def test_phillips_statement_warns_for_incomplete_execution_row() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+10/07/26 14/07/26 Equity 000700 Sold Tencent 100 missing 38,000.00 37,900.00
+""",
+        "2026-07",
+    )
+
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
 def test_parse_phillips_text_extracts_equity_rows_and_account_cash() -> None:
     result = parse_phillips_text(
         """戶口資料 Account Details

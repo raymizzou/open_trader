@@ -11,7 +11,14 @@ import open_trader.cli as cli
 import open_trader.pipeline as pipeline
 from open_trader.cli import build_parser
 from open_trader.fx import StaticMonthEndFxProvider
-from open_trader.models import AssetClass, CashBalance, Market, Position, WarningRecord
+from open_trader.models import (
+    AssetClass,
+    CashBalance,
+    Market,
+    Position,
+    TradeFill,
+    WarningRecord,
+)
 from open_trader.parsers.base import ParseResult
 from open_trader.pipeline import ImportResult, run_import
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
@@ -27,6 +34,8 @@ class FakeParser:
         broker: str = "fake",
         result_broker: str | None = None,
         position_currency: str = "USD",
+        symbol: str = "NVDA",
+        cash_currency: str = "USD",
         warning_page: int | None = 1,
         position_broker: str | None = None,
         cash_broker: str | None = None,
@@ -35,6 +44,8 @@ class FakeParser:
         self.broker = broker
         self.result_broker = result_broker or broker
         self.position_currency = position_currency
+        self.symbol = symbol
+        self.cash_currency = cash_currency
         self.warning_page = warning_page
         self.position_broker = position_broker or self.result_broker
         self.cash_broker = cash_broker or self.result_broker
@@ -51,8 +62,8 @@ class FakeParser:
                     account_alias="main",
                     market=Market.US,
                     asset_class=AssetClass.STOCK,
-                    symbol="NVDA",
-                    name="NVIDIA Corp",
+                    symbol=self.symbol,
+                    name=self.symbol,
                     currency=self.position_currency,
                     quantity=Decimal("2"),
                     cost_price=Decimal("100"),
@@ -69,7 +80,7 @@ class FakeParser:
                     statement_id=f"{month}-{self.result_broker}",
                     broker=self.cash_broker,
                     account_alias="main",
-                    currency="USD",
+                    currency=self.cash_currency,
                     cash_balance=Decimal("50"),
                     available_balance=Decimal("45"),
                     confidence="high",
@@ -98,6 +109,35 @@ class SpyParser(FakeParser):
     def parse(self, path: Path, month: str) -> ParseResult:
         self.parse_called = True
         return super().parse(path, month)
+
+
+class FillParser(FakeParser):
+    def parse(self, path: Path, month: str) -> ParseResult:
+        result = super().parse(path, month)
+        return ParseResult(
+            statement_id=result.statement_id,
+            broker=result.broker,
+            positions=result.positions,
+            cash_balances=result.cash_balances,
+            fills=[
+                TradeFill(
+                    source_id="fill-1",
+                    source_order_id=None,
+                    broker="fake",
+                    account_alias="main",
+                    market=Market.US,
+                    symbol="NVDA",
+                    currency="USD",
+                    side="BUY",
+                    quantity=Decimal("2"),
+                    price=Decimal("100"),
+                    fees=Decimal("1"),
+                    executed_at="2026-05-10",
+                )
+            ],
+            warnings=result.warnings,
+            page_count=result.page_count,
+        )
 
 
 def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
@@ -160,6 +200,64 @@ def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
         "code": "fake_warning",
         "message": "fake warning",
     }
+
+
+def test_uploaded_statement_persists_each_fill_once(tmp_path: Path) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": FillParser(),
+        "data_dir": tmp_path / "data",
+        "portfolio_path": tmp_path / "current" / "portfolio.csv",
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"USD": Decimal("7.8")}
+        ),
+    }
+
+    result = pipeline.run_uploaded_statement(**arguments)
+    rows = list(csv.DictReader((result.run_dir / "extracted_fills.csv").open()))
+    assert [row["source_id"] for row in rows] == ["fill-1"]
+
+    repeated = pipeline.run_uploaded_statement(**arguments)
+    repeated_rows = list(
+        csv.DictReader((repeated.run_dir / "extracted_fills.csv").open())
+    )
+    assert [row["source_id"] for row in repeated_rows] == ["fill-1"]
+
+
+def test_uploaded_statements_for_two_brokers_share_monthly_run(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    portfolio_path = tmp_path / "current/portfolio.csv"
+    fx_provider = StaticMonthEndFxProvider(
+        "2026-05", {"USD": Decimal("7.8"), "CNY": Decimal("1.08")}
+    )
+
+    for broker, currency, symbol in (
+        ("eastmoney", "CNY", "600900"),
+        ("phillips", "USD", "NVDA"),
+    ):
+        pipeline.run_uploaded_statement(
+            statement_date="2026-05-10",
+            statement_path=source,
+            parser=FakeParser(
+                broker=broker,
+                position_currency=currency,
+                symbol=symbol,
+                cash_currency=currency,
+            ),
+            data_dir=data_dir,
+            portfolio_path=portfolio_path,
+            fx_provider=fx_provider,
+        )
+
+    rows = list(csv.DictReader(portfolio_path.open(encoding="utf-8")))
+    assert {row["brokers"] for row in rows} == {"eastmoney", "phillips"}
 
 
 def test_run_import_can_leave_latest_untouched(tmp_path: Path) -> None:

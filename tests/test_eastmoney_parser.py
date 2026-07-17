@@ -19,7 +19,7 @@ POSITIONS = [
 ]
 
 
-def test_parse_eastmoney_first_page_only() -> None:
+def test_parse_eastmoney_summary_positions_and_cash() -> None:
     result = parse_eastmoney_page(
         "总资产(RMB)： 462939.55\n资金余额(RMB)： 10000.00\n资金可用(RMB)： 405219.55",
         [POSITIONS, [["发生日期", "买卖类别", "证券代码"]]],
@@ -35,6 +35,77 @@ def test_parse_eastmoney_first_page_only() -> None:
     assert result.positions[0].unrealized_pnl == Decimal("4374.000")
     assert result.cash_balances[0].cash_balance == Decimal("405219.55")
     assert result.cash_balances[0].available_balance == Decimal("405219.55")
+
+
+def test_eastmoney_statement_extracts_actual_trade_fills() -> None:
+    executions = [
+        [
+            "发生日期",
+            "买卖类别",
+            "证券代码",
+            "证券名称",
+            "成交数量",
+            "成交价格",
+            "总发生金额",
+            "手续费",
+            "印花税",
+            "过户费",
+            "资金余额",
+        ],
+        [
+            "20260710",
+            "证券买入",
+            "600900",
+            "脱敏股票",
+            "2000",
+            "28.50",
+            "-57006.20",
+            "5.00",
+            "0.00",
+            "1.20",
+            "100000.00",
+        ],
+    ]
+
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, executions],
+        "2026-07",
+    )
+
+    assert [
+        (fill.market.value, fill.symbol, fill.side, fill.quantity)
+        for fill in result.fills
+    ] == [("CN", "600900", "BUY", Decimal("2000"))]
+    assert result.fills[0].price == Decimal("28.50")
+    assert result.fills[0].fees == Decimal("6.20")
+    assert result.fills[0].executed_at == "2026-07-10"
+    assert result.fills[0].source_id
+
+
+def test_eastmoney_statement_warns_for_incomplete_execution_row() -> None:
+    executions = [
+        list(
+            (
+                "发生日期", "买卖类别", "证券代码", "证券名称", "成交数量",
+                "成交价格", "总发生金额", "手续费", "印花税", "过户费", "资金余额",
+            )
+        ),
+        [
+            "20260710", "证券买入", "600900", "脱敏股票", "", "28.50",
+            "", "", "", "", "",
+        ],
+    ]
+
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, executions],
+        "2026-07",
+    )
+
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
 
 
 def test_parse_eastmoney_cash_when_currency_balances_share_lines() -> None:
@@ -86,22 +157,36 @@ def test_parser_rejects_invalid_summary_rows_and_cash() -> None:
         parse_eastmoney_page("资金余额(RMB)： 1", [POSITIONS], "2026-07")
 
 
-def test_encrypted_parser_reads_only_first_page_and_hides_password(
+def test_encrypted_parser_reads_trade_tables_from_all_pages_and_hides_password(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakePage:
+    class FirstPage:
         def extract_text(self) -> str:
             return "总资产(RMB)： 57722\n资金余额(RMB)： 1\n资金可用(RMB)： 2"
 
         def extract_tables(self) -> list[list[list[str]]]:
             return [POSITIONS]
 
-    class UnreadablePage:
+    class SecondPage:
         def extract_text(self) -> str:
-            raise AssertionError("second page must not be read")
+            return ""
+
+        def extract_tables(self) -> list[list[list[str]]]:
+            return [
+                [
+                    [
+                        "发生日期", "买卖类别", "证券代码", "证券名称", "成交数量",
+                        "成交价格", "总发生金额", "手续费", "印花税", "过户费", "资金余额",
+                    ],
+                    [
+                        "20260710", "证券卖出", "600900", "脱敏股票", "2000", "28.50",
+                        "56990.00", "5.00", "4.00", "1.00", "100000.00",
+                    ],
+                ]
+            ]
 
     class FakePdf:
-        pages = [FakePage(), UnreadablePage()]
+        pages = [FirstPage(), SecondPage()]
 
         def __enter__(self) -> FakePdf:
             return self
@@ -125,6 +210,9 @@ def test_encrypted_parser_reads_only_first_page_and_hides_password(
         "password": "sanitized-secret",
     }
     assert result.page_count == 2
+    assert [(fill.symbol, fill.side) for fill in result.fills] == [
+        ("600900", "SELL")
+    ]
     assert "sanitized-secret" not in repr(result)
 
 
