@@ -4650,7 +4650,7 @@ console.log(html.slice(start, end));
     assert "<strong>中性</strong>" not in output
 
 
-def test_dashboard_futu_anomaly_stale_run_date_is_expired_and_blocking() -> None:
+def test_dashboard_futu_anomaly_stale_run_date_blocks_supportive_overall() -> None:
     output = run_dashboard_js(
         """
 const holding = {
@@ -4670,10 +4670,10 @@ const holding = {
     capital_anomaly: {
       available: true,
       status: "ok",
-      signal: "neutral",
+      signal: "supportive",
       confidence: "low",
       suggested_constraint: "",
-      summary: "窗口内无异常。",
+      summary: "资金信号支持当前方向。",
       categories: []
     },
     derivatives_anomaly: {
@@ -4693,6 +4693,7 @@ console.log(futuAnomalySignalsPlugin(holding));
 
     assert "已过期" in output
     assert "status-stale" in output
+    assert "status-warn" in output
     assert "需复核" in output
     assert "市场信号数据不可用" in output
     assert "窗口内未发现明显异动" not in output

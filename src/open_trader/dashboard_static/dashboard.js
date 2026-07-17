@@ -3426,6 +3426,16 @@ function deriveFutuSignalOverall(modules) {
     : constraints.includes("review")
       ? "review"
       : "";
+  if (signals.includes("error") || signals.includes("missing") || signals.includes("stale") || signals.includes("stale_run_date")) {
+    return {
+      tone: "warn",
+      label: "需复核",
+      signal: signals.includes("error") ? "error" : (signals.includes("stale_run_date") ? "stale_run_date" : (signals.includes("stale") ? "stale" : "missing")),
+      constraint: constraint || "review",
+      headline: "市场信号数据不可用，不能视为中性。",
+      detail: "缺失、错误或过期模块会保留数据质量状态，不会自动改写成交易方向。",
+    };
+  }
   if (signals.includes("risk_up") || signals.includes("mixed")) {
     return {
       tone: constraint ? "warn" : "ok",
@@ -3454,16 +3464,6 @@ function deriveFutuSignalOverall(modules) {
       constraint,
       headline: "市场信号支持当前交易方向。",
       detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
-    };
-  }
-  if (signals.includes("error") || signals.includes("missing") || signals.includes("stale") || signals.includes("stale_run_date")) {
-    return {
-      tone: "warn",
-      label: "需复核",
-      signal: signals.includes("error") ? "error" : (signals.includes("stale_run_date") ? "stale_run_date" : (signals.includes("stale") ? "stale" : "missing")),
-      constraint: constraint || "review",
-      headline: "市场信号数据不可用，不能视为中性。",
-      detail: "缺失、错误或过期模块会保留数据质量状态，不会自动改写成交易方向。",
     };
   }
   return {
