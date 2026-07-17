@@ -469,85 +469,6 @@ def test_first_open_requires_empty_dedicated_simulate_account(
         )
 
 
-def test_close_uses_authoritative_simulate_account_nav(tmp_path: Path) -> None:
-    path = trend_review.capture_trend_review_close(
-        data_dir=tmp_path,
-        market="CN",
-        trading_date="2026-07-17",
-        report=cn_buy_report(),
-        simulate_snapshot={"acc_id": 101, "net_value": "101000", "positions": []},
-        orders=[
-            {"side": "BUY", "status": "FILLED", "notional": "4000"},
-            {"side": "SELL", "status": "FILLED", "notional": "4200"},
-        ],
-        benchmark={
-            "date": "2026-07-17",
-            "close": "6123.45",
-            "source_id": "CSI_ALL_SHARE_PRICE",
-            "futu_symbol": "SH.000985",
-        },
-    )
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["discipline_equity_after_fees"] == "101000.00"
-    assert payload["actual_equity"] == "735164.41"
-
-
-@pytest.mark.parametrize(
-    "account",
-    [
-        {"net_value": "735164.41", "fresh": False, "source_date": "2026-07-17"},
-        {"net_value": "735164.41", "fresh": True, "source_date": "2026-07-16"},
-    ],
-)
-def test_close_records_stale_or_misaligned_actual_equity_as_missing(
-    tmp_path: Path, account: dict[str, object],
-) -> None:
-    report = cn_buy_report()
-    report["account"] = account
-    path = trend_review.capture_trend_review_close(
-        data_dir=tmp_path,
-        market="CN",
-        trading_date="2026-07-17",
-        report=report,
-        simulate_snapshot={"acc_id": 101, "net_value": "101000", "positions": []},
-        orders=[],
-        benchmark={
-            "date": "2026-07-17",
-            "close": "6123.45",
-            "source_id": "CSI_ALL_SHARE_PRICE",
-            "futu_symbol": "SH.000985",
-        },
-    )
-
-    assert "actual_equity" not in json.loads(path.read_text(encoding="utf-8"))
-
-
-def test_close_rejects_report_without_strategy_snapshot(tmp_path: Path) -> None:
-    report = cn_buy_report()
-    report.pop("strategy_snapshot")
-
-    with pytest.raises(ValueError, match="strategy snapshot is unavailable"):
-        trend_review.capture_trend_review_close(
-            data_dir=tmp_path,
-            market="CN",
-            trading_date="2026-07-17",
-            report=report,
-            simulate_snapshot={
-                "acc_id": 101,
-                "net_value": "101000",
-                "positions": [],
-            },
-            orders=[],
-            benchmark={
-                "date": "2026-07-17",
-                "close": "6123.45",
-                "source_id": "CSI_ALL_SHARE_PRICE",
-                "futu_symbol": "SH.000985",
-            },
-        )
-
-
 def test_benchmark_fact_uses_exact_market_qfq_close() -> None:
     class Quote:
         def get_daily_kline(self, symbol: str, *, start: str, end: str) -> list[object]:
@@ -633,7 +554,7 @@ def strategy_snapshot(market: str = "CN", version: str = "v1") -> dict[str, obje
         "strategy_name": "trend",
         "strategy_version": version,
         "market": market,
-        "effective_from": "2026-07-14",
+        "effective_from": trend_review.TREND_V1_EFFECTIVE_FROM[market],
         "process_version": "test-sha",
         "parameter_rows": [
             {"group": "rules", "name": "position limit", "value": "10"}
@@ -651,6 +572,7 @@ def actual_fill(
     *,
     account_alias: str = "eastmoney_main",
     price: str = "10",
+    source_sequence: int | None = None,
 ) -> TradeFill:
     return TradeFill(
         source_id=source_id,
@@ -665,6 +587,7 @@ def actual_fill(
         price=Decimal(price),
         fees=Decimal("0"),
         executed_at=executed_at,
+        source_sequence=source_sequence,
     )
 
 
@@ -730,8 +653,14 @@ def write_separate_review_facts(
             symbol = f"{700000 + index:06d}"
             fills.extend(
                 [
-                    actual_fill(f"buy-{index}", symbol, "BUY", "100", trading_date),
-                    actual_fill(f"sell-{index}", symbol, "SELL", "100", trading_date),
+                    actual_fill(
+                        f"buy-{index}", symbol, "BUY", "100", trading_date,
+                        source_sequence=index * 2,
+                    ),
+                    actual_fill(
+                        f"sell-{index}", symbol, "SELL", "100", trading_date,
+                        source_sequence=index * 2 + 1,
+                    ),
                 ]
             )
     trend_review.freeze_actual_fill_batch(
@@ -739,6 +668,7 @@ def write_separate_review_facts(
         {"market": "CN", "source": "test"},
         fills,
         complete_through or (start + timedelta(days=39)).isoformat(),
+        coverage_start=start.isoformat(),
     )
     rates = root / "rates/DGS3MO.csv"
     rates.parent.mkdir(parents=True)
@@ -826,6 +756,46 @@ def test_actual_fill_batch_preflights_all_collisions_before_writing(
         path: path.read_bytes()
         for path in (tmp_path / "trend_review/facts").rglob("*.json")
     } == before
+
+
+def test_actual_fill_completeness_freezes_explicit_coverage_interval(
+    tmp_path: Path,
+) -> None:
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        [
+            actual_fill(
+                "fill", "600001", "BUY", "100", "2026-07-16",
+                source_sequence=4,
+            )
+        ],
+        "2026-07-17",
+        coverage_start="2026-07-01",
+    )
+
+    path = next(
+        (tmp_path / "trend_review/facts/actual_fill_completeness/CN").glob("*.json")
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["coverage_start"] == "2026-07-01"
+    assert payload["coverage_end"] == "2026-07-17"
+    fill_path = next(
+        (tmp_path / "trend_review/facts/actual_fills/CN").glob("*.json")
+    )
+    assert json.loads(fill_path.read_text(encoding="utf-8"))["source_sequence"] == 4
+
+
+def test_actual_fill_batch_rejects_non_iso_execution_timestamp(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="ISO date or timestamp"):
+        trend_review.freeze_actual_fill_batch(
+            tmp_path,
+            {"market": "CN"},
+            [actual_fill("fill", "600001", "BUY", "100", "2026-07-16 garbage")],
+            "2026-07-16",
+        )
 
 
 def test_actual_fill_batch_write_failure_removes_new_files(
@@ -1019,6 +989,33 @@ def test_completed_cycles_ignores_identical_duplicate_payloads() -> None:
     assert len(cycles[0]["fills"]) == 2
 
 
+def test_completed_cycles_uses_authoritative_source_sequence_for_date_only_fills() -> None:
+    buy = asdict(
+        actual_fill("z-buy", "600001", "BUY", "100", "2026-07-16", source_sequence=0)
+    )
+    sell = asdict(
+        actual_fill("a-sell", "600001", "SELL", "100", "2026-07-16", source_sequence=1)
+    )
+
+    cycles = trend_review._completed_cycles([sell, buy])
+
+    assert len(cycles) == 1
+    assert [fill["side"] for fill in cycles[0]["fills"]] == ["BUY", "SELL"]
+
+
+@pytest.mark.parametrize("sequences", [(None, None), (0, 0)])
+def test_completed_cycles_rejects_ambiguous_date_only_fill_order(
+    sequences: tuple[int | None, int | None],
+) -> None:
+    fills = [
+        asdict(actual_fill("buy", "600001", "BUY", "100", "2026-07-16", source_sequence=sequences[0])),
+        asdict(actual_fill("sell", "600001", "SELL", "100", "2026-07-16", source_sequence=sequences[1])),
+    ]
+
+    with pytest.raises(ValueError, match="ambiguous actual fill order"):
+        trend_review._completed_cycles(fills)
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_completed_cycles_rejects_conflicting_payloads_for_one_identity(
     reverse: bool,
@@ -1030,7 +1027,7 @@ def test_completed_cycles_rejects_conflicting_payloads_for_one_identity(
         trend_review._completed_cycles([sell, buy] if reverse else [buy, sell])
 
 
-def test_old_daily_actual_equity_never_fabricates_actual_samples(tmp_path: Path) -> None:
+def test_legacy_single_date_completeness_never_fabricates_samples(tmp_path: Path) -> None:
     write_review_history(tmp_path, completed_trades=30, days=40)
     trend_review.freeze_actual_fill_batch(
         tmp_path,
@@ -1042,7 +1039,7 @@ def test_old_daily_actual_equity_never_fabricates_actual_samples(tmp_path: Path)
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
     assert projection["sample_counts"] == {
-        "discipline": 30,
+        "discipline": 0,
         "actual": 0,
         "required": 30,
     }
@@ -1065,7 +1062,6 @@ def test_projection_without_cutoff_keeps_latest_complete_discipline_snapshot(
     latest["strategy_snapshot"] = {
         **latest["strategy_snapshot"],
         "process_version": "latest-sha",
-        "parameters": {"position_limit": 12},
     }
     latest_path.write_text(json.dumps(latest), encoding="utf-8")
 
@@ -1076,7 +1072,7 @@ def test_projection_without_cutoff_keeps_latest_complete_discipline_snapshot(
         "trend_animals_warm_to_hot/CN/v1"
     )
     assert projection["strategy_snapshot"]["process_version"] == "latest-sha"
-    assert projection["strategy_snapshot"]["parameters"] == {"position_limit": 12}
+    assert projection["strategy_snapshot"]["parameters"] == {}
     assert projection["strategy_snapshot"]["parameter_rows"]
 
 
@@ -1094,7 +1090,11 @@ def test_us_projection_belongs_to_tiger_trend_account(tmp_path: Path) -> None:
             "strategy_name": "美股短线右侧趋势",
             "strategy_version": "v1",
             "market": "US",
-            "parameter_rows": [],
+            "effective_from": "2026-07-17",
+            "process_version": "test-sha",
+            "parameter_rows": [
+                {"group": "rules", "name": "limit", "value": "10"}
+            ],
             "parameters": {},
         },
         "report_sha256": "report-us",
@@ -1145,6 +1145,52 @@ def test_common_cutoff_respects_equity_continuity_and_fill_completeness(
     }
 
 
+def test_common_cutoff_stops_before_gap_between_fill_coverage_intervals(
+    tmp_path: Path,
+) -> None:
+    write_separate_review_facts(tmp_path, discipline_count=0, actual_count=0)
+    completeness_root = (
+        tmp_path / "trend_review/facts/actual_fill_completeness/CN"
+    )
+    for path in completeness_root.glob("*.json"):
+        path.unlink()
+    trend_review.freeze_actual_fill_batch(
+        tmp_path, {"market": "CN"}, [], "2026-07-16", coverage_start="2026-07-16"
+    )
+    trend_review.freeze_actual_fill_batch(
+        tmp_path, {"market": "CN"}, [], "2026-07-18", coverage_start="2026-07-18"
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["common_cutoff"] == "2026-07-16"
+
+
+def test_legacy_complete_through_without_start_only_covers_that_date(
+    tmp_path: Path,
+) -> None:
+    write_separate_review_facts(tmp_path, discipline_count=0, actual_count=0)
+    completeness_root = (
+        tmp_path / "trend_review/facts/actual_fill_completeness/CN"
+    )
+    for path in completeness_root.glob("*.json"):
+        path.unlink()
+    payload = {
+        "schema_version": "open_trader.trend_review.fill_completeness.v1",
+        "market": "CN",
+        "complete_through": "2026-07-17",
+        "source_metadata": {},
+        "fill_identities": [],
+    }
+    completeness_root.joinpath("legacy.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["common_cutoff"] is None
+
+
 def test_common_cutoff_uses_available_benchmark_calendar() -> None:
     assert trend_review._common_cutoff(
         "2026-07-16",
@@ -1152,6 +1198,83 @@ def test_common_cutoff_uses_available_benchmark_calendar() -> None:
         {"2026-07-16", "2026-07-17"},
         {"2026-07-16", "2026-07-17", "2026-07-20"},
     ) == "2026-07-17"
+
+
+def test_common_cutoff_requires_benchmark_on_effective_date() -> None:
+    assert trend_review._common_cutoff(
+        "2026-07-16",
+        {"2026-07-16", "2026-07-17"},
+        {"2026-07-16", "2026-07-17"},
+        {"2026-07-17"},
+    ) is None
+
+
+def test_portfolio_metrics_use_return_drawdown_calmar_and_sharpe_formulas() -> None:
+    metrics = trend_review._portfolio_metrics(
+        [
+            {"date": "2025-01-01", "equity": "100"},
+            {"date": "2025-07-02", "equity": "120"},
+            {"date": "2026-01-01", "equity": "110"},
+        ],
+        {date(2025, 1, 1): Decimal("0")},
+        Decimal("100"),
+    )
+
+    assert Decimal(metrics["total_return_pct"]) == Decimal("10")
+    assert Decimal(metrics["max_drawdown_pct"]) == Decimal(100) / Decimal(12)
+    assert Decimal(metrics["calmar_ratio"]) == Decimal("1.2")
+    expected_sharpe = (
+        (Decimal("0.2") - Decimal(1) / Decimal(12)) / Decimal(2)
+    ) / (
+        (
+            (
+                Decimal("0.2")
+                - (Decimal("0.2") - Decimal(1) / Decimal(12)) / Decimal(2)
+            ) ** 2
+            + (
+                -Decimal(1) / Decimal(12)
+                - (Decimal("0.2") - Decimal(1) / Decimal(12)) / Decimal(2)
+            ) ** 2
+        )
+        / Decimal(2)
+    ).sqrt() * Decimal(252).sqrt()
+    assert abs(Decimal(metrics["sharpe_ratio"]) - expected_sharpe) < Decimal("1e-24")
+
+
+def test_metric_boundaries_return_none_for_zero_risk_or_too_few_returns() -> None:
+    rates = {date(2026, 1, 1): Decimal("0")}
+    one_point = trend_review._portfolio_metrics(
+        [{"date": "2026-01-01", "equity": "100"}], rates, Decimal("100")
+    )
+    flat = trend_review._portfolio_metrics(
+        [
+            {"date": "2026-01-01", "equity": "100"},
+            {"date": "2026-01-02", "equity": "100"},
+            {"date": "2026-01-03", "equity": "100"},
+        ],
+        rates,
+        Decimal("100"),
+    )
+
+    assert one_point["sharpe_ratio"] is None
+    assert one_point["calmar_ratio"] is None
+    assert flat["sharpe_ratio"] is None
+    assert flat["calmar_ratio"] is None
+
+
+@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity")])
+def test_metric_formulas_reject_non_finite_values(value: Decimal) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        trend_review._annualized_sharpe([Decimal("0.1"), value])
+    with pytest.raises(ValueError, match="finite"):
+        trend_review._portfolio_metrics(
+            [
+                {"date": "2026-01-01", "equity": "100"},
+                {"date": "2026-01-02", "equity": str(value)},
+            ],
+            {date(2026, 1, 1): Decimal("0")},
+            Decimal("100"),
+        )
 
 
 def test_projection_does_not_mix_strategy_versions(tmp_path: Path) -> None:
@@ -1166,6 +1289,92 @@ def test_projection_does_not_mix_strategy_versions(tmp_path: Path) -> None:
     assert projection["strategy_snapshot"]["strategy_version"] == "v1"
     assert projection["strategy_snapshot"]["effective_from"] == "2026-07-16"
     assert projection["sample_counts"]["discipline"] == 30
+
+
+@pytest.mark.parametrize("stream", ["discipline", "actual_equity"])
+def test_projection_excludes_v1_facts_with_wrong_strategy_id(
+    stream: str,
+    tmp_path: Path,
+) -> None:
+    write_separate_review_facts(tmp_path, discipline_count=31, actual_count=31)
+    path = tmp_path / f"trend_review/facts/{stream}/CN/2026-08-15.json"
+    fact = json.loads(path.read_text(encoding="utf-8"))
+    fact["strategy_snapshot"] = {
+        **fact["strategy_snapshot"],
+        "strategy_id": "trend_animals_warm_to_hot/US/v1",
+    }
+    path.write_text(json.dumps(fact), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["sample_counts"] == {
+        "discipline": 30,
+        "actual": 30,
+        "required": 30,
+    }
+
+
+def test_projection_rejects_mixed_parameters_within_one_strategy_version(
+    tmp_path: Path,
+) -> None:
+    write_separate_review_facts(tmp_path, discipline_count=0, actual_count=0)
+    path = tmp_path / "trend_review/facts/discipline/CN/2026-07-17.json"
+    fact = json.loads(path.read_text(encoding="utf-8"))
+    fact["strategy_snapshot"]["parameters"] = {"position_limit": 99}
+    path.write_text(json.dumps(fact), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strategy snapshot identity changed"):
+        trend_review.build_trend_review_projection(tmp_path, "CN")
+
+
+def test_projection_allows_process_version_change_without_parameter_change(
+    tmp_path: Path,
+) -> None:
+    write_separate_review_facts(tmp_path, discipline_count=0, actual_count=0)
+    for stream in ("discipline", "actual_equity"):
+        path = tmp_path / f"trend_review/facts/{stream}/CN/2026-08-24.json"
+        fact = json.loads(path.read_text(encoding="utf-8"))
+        fact["strategy_snapshot"]["process_version"] = "new-code-sha"
+        path.write_text(json.dumps(fact), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["strategy_snapshot"]["process_version"] == "new-code-sha"
+
+
+def test_projection_can_show_latest_snapshot_from_actual_stream(
+    tmp_path: Path,
+) -> None:
+    write_separate_review_facts(tmp_path, discipline_count=0, actual_count=0)
+    for path in (
+        tmp_path / "trend_review/facts/actual_fill_completeness/CN"
+    ).glob("*.json"):
+        path.unlink()
+    path = tmp_path / "trend_review/facts/actual_equity/CN/2026-08-24.json"
+    fact = json.loads(path.read_text(encoding="utf-8"))
+    fact["strategy_snapshot"]["process_version"] = "actual-latest-sha"
+    path.write_text(json.dumps(fact), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["common_cutoff"] is None
+    assert projection["strategy_snapshot"]["process_version"] == "actual-latest-sha"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("market", "US"), ("effective_from", "2026-07-15")],
+)
+def test_close_report_rejects_wrong_strategy_market_or_effective_date(
+    field: str, value: str,
+) -> None:
+    report = cn_buy_report()
+    report["strategy_snapshot"][field] = value
+
+    with pytest.raises(ValueError, match="strategy snapshot is unavailable"):
+        trend_review.validate_trend_review_close_report(
+            report, "2026-07-17", "CN"
+        )
 
 
 def test_projection_snapshot_ignores_facts_after_common_cutoff(
@@ -1183,7 +1392,6 @@ def test_projection_snapshot_ignores_facts_after_common_cutoff(
         fact["strategy_snapshot"] = {
             **fact["strategy_snapshot"],
             "process_version": "future-sha",
-            "parameters": {"future": True},
         }
         path.write_text(json.dumps(fact), encoding="utf-8")
 
@@ -1211,6 +1419,7 @@ def test_late_opening_fact_never_backfills_an_earlier_sell(tmp_path: Path) -> No
         {"broker": "eastmoney"},
         [actual_fill("sell-1", "600001", "SELL", "100", "2026-07-16")],
         "2026-07-17",
+        coverage_start="2026-07-16",
     )
 
     with pytest.raises(ValueError, match="sell fill exceeds actual position"):

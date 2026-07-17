@@ -158,6 +158,7 @@ def test_eastmoney_identical_execution_rows_get_stable_distinct_ids() -> None:
     assert [fill.source_id for fill in first.fills] == [
         fill.source_id for fill in repeated.fills
     ]
+    assert [fill.source_sequence for fill in first.fills] == [0, 1]
 
 
 def test_parse_eastmoney_cash_when_currency_balances_share_lines() -> None:

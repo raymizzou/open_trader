@@ -298,6 +298,7 @@ def test_phillips_identical_execution_rows_get_stable_distinct_ids() -> None:
     assert [fill.source_id for fill in first.fills] == [
         fill.source_id for fill in repeated.fills
     ]
+    assert [fill.source_sequence for fill in first.fills] == [0, 1]
 
 
 def test_phillips_execution_accepts_numeric_code_without_inline_name() -> None:

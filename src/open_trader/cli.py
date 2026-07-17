@@ -318,7 +318,7 @@ def run_trend_review_close(
         config, market, trading_date, date_field="as_of_date"
     )
     account, strategy_snapshot = validate_trend_review_close_report(
-        report, trading_date
+        report, trading_date, market
     )
     errors: list[tuple[str, Exception]] = []
     actual_equity_path = None
@@ -401,6 +401,7 @@ def run_trend_review_close(
                     TREND_V1_EFFECTIVE_FROM[market], trading_date
                 ),
                 trading_date,
+                coverage_start=TREND_V1_EFFECTIVE_FROM[market],
             )
         except Exception as exc:
             errors.append(("actual fills", exc))

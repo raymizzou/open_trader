@@ -328,8 +328,8 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
     )
     rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
     assert {
-        "买入数量": "使用已有现金，按100股整数倍向下取整",
-        "过热跟踪": "沸腾或开香槟触发后，取原保护线与此前5个完整交易日最低价较高者，只升不降",
+        "买入数量": "使用已有现金，按 100 股整数倍向下取整",
+        "过热跟踪": "沸腾或开香槟触发后，活动保护线取原值与此前 5 个完整交易日最低价的较高者，只升不降",
     }.items() <= rows.items()
 
     built = report(candidates=(candidate("600001"),))

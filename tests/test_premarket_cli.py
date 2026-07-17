@@ -657,11 +657,16 @@ def _trend_review_close_report(
             "positions": [{"symbol": "600000", "quantity": "100"}],
         },
         "strategy_snapshot": {
-            "strategy_id": f"trend/{market}/v1",
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/v1",
+            "strategy_name": "trend",
             "strategy_version": "v1",
+            "market": market,
+            "effective_from": cli.TREND_V1_EFFECTIVE_FROM[market],
             "process_version": "test",
             "parameters": {},
-            "parameter_rows": [{"name": "test"}],
+            "parameter_rows": [
+                {"group": "rules", "name": "test", "value": "1"}
+            ],
         },
     }
 
@@ -979,9 +984,13 @@ def test_tiger_close_freezes_empty_completeness_before_projection_and_closes(
     monkeypatch.setattr(cli, "TigerAccountClient", Tiger)
 
     def project(data_dir: Path, market: str) -> dict[str, object]:
-        assert list(
+        paths = list(
             (data_dir / "trend_review/facts/actual_fill_completeness/US").glob("*.json")
         )
+        assert paths
+        completeness = json.loads(paths[0].read_text(encoding="utf-8"))
+        assert completeness["coverage_start"] == "2026-07-17"
+        assert completeness["coverage_end"] == "2026-07-17"
         events.append("projected")
         return {"sample_counts": {"discipline": 0, "actual": 0, "required": 30}}
 

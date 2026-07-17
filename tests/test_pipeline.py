@@ -134,6 +134,7 @@ class FillParser(FakeParser):
                     price=Decimal("100"),
                     fees=Decimal("1"),
                     executed_at="2026-05-10",
+                    source_sequence=7,
                 )
             ],
             warnings=result.warnings,
@@ -175,6 +176,29 @@ class BrokerFillParser(FakeParser):
                 )
             ],
             warnings=result.warnings,
+            page_count=result.page_count,
+        )
+
+
+class InvalidExecutionBrokerFillParser(BrokerFillParser):
+    def parse(self, path: Path, month: str) -> ParseResult:
+        result = super().parse(path, month)
+        return ParseResult(
+            statement_id=result.statement_id,
+            broker=result.broker,
+            positions=result.positions,
+            cash_balances=result.cash_balances,
+            fills=result.fills,
+            warnings=[
+                WarningRecord(
+                    statement_id=result.statement_id,
+                    broker=self.broker,
+                    page=1,
+                    severity="warning",
+                    code="invalid_execution_row",
+                    message="invalid execution row",
+                )
+            ],
             page_count=result.page_count,
         )
 
@@ -258,12 +282,14 @@ def test_uploaded_statement_persists_each_fill_once(tmp_path: Path) -> None:
     result = pipeline.run_uploaded_statement(**arguments)
     rows = list(csv.DictReader((result.run_dir / "extracted_fills.csv").open()))
     assert [row["source_id"] for row in rows] == ["fill-1"]
+    assert rows[0]["source_sequence"] == "7"
 
     repeated = pipeline.run_uploaded_statement(**arguments)
     repeated_rows = list(
         csv.DictReader((repeated.run_dir / "extracted_fills.csv").open())
     )
     assert [row["source_id"] for row in repeated_rows] == ["fill-1"]
+    assert repeated_rows[0]["source_sequence"] == "7"
 
 
 @pytest.mark.parametrize(
@@ -313,6 +339,46 @@ def test_uploaded_statement_freezes_broker_fills_in_its_market_idempotently(
     assert len(completeness) == 1
     completeness_payload = json.loads(completeness[0].read_text(encoding="utf-8"))
     assert completeness_payload["source_metadata"]["market"] == market.value
+    assert completeness_payload["coverage_start"] == (
+        "2026-05-01" if broker == "eastmoney" else "2026-05-10"
+    )
+    assert completeness_payload["coverage_end"] == "2026-05-10"
+
+
+@pytest.mark.parametrize(
+    ("broker", "market"),
+    [("eastmoney", Market.CN), ("phillips", Market.HK)],
+)
+def test_uploaded_statement_with_invalid_execution_row_does_not_advance_fill_facts(
+    broker: str,
+    market: Market,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / f"{broker}.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+
+    result = pipeline.run_uploaded_statement(
+        statement_date="2026-05-10",
+        statement_path=source,
+        parser=InvalidExecutionBrokerFillParser(broker, market),
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "current/portfolio.csv",
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08"), "HKD": Decimal("1")}
+        ),
+    )
+
+    assert not (data_dir / "trend_review/facts/actual_fills" / market.value).exists()
+    assert not (
+        data_dir / "trend_review/facts/actual_fill_completeness" / market.value
+    ).exists()
+    assert list(csv.DictReader((result.run_dir / "extracted_fills.csv").open()))
+    warnings = list(
+        csv.DictReader((result.run_dir / "parse_warnings.csv").open())
+    )
+    assert [warning["code"] for warning in warnings] == ["invalid_execution_row"]
+    assert result.positions_count == 1
 
 
 def test_uploaded_empty_statement_freezes_completeness_only_after_success(

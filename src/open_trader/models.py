@@ -89,6 +89,7 @@ class TradeFill:
     price: Decimal
     fees: Decimal | None
     executed_at: str
+    source_sequence: int | None = None
 
 
 @dataclass(frozen=True)

@@ -91,7 +91,9 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
                         )
                     )
                     continue
-                fill = _parse_transaction_line(line, occurrence, position_products)
+                fill = _parse_transaction_line(
+                    line, occurrence, len(fills), position_products
+                )
             if fill is not None:
                 fills.append(fill)
                 continue
@@ -172,6 +174,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
 def _parse_transaction_line(
     line: str,
     occurrence: int,
+    source_sequence: int,
     position_products: dict[str, set[tuple[Market, str]]],
 ) -> TradeFill | None:
     match = TRANSACTION_LINE.fullmatch(line)
@@ -208,6 +211,7 @@ def _parse_transaction_line(
         price=price,
         fees=None,
         executed_at=executed_at,
+        source_sequence=source_sequence,
     )
 
 

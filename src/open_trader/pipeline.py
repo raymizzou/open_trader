@@ -87,6 +87,7 @@ FILL_FIELDNAMES = [
     "fees",
     "currency",
     "executed_at",
+    "source_sequence",
 ]
 
 WARNING_FIELDNAMES = [
@@ -210,9 +211,14 @@ def _run_import(
         fills.extend(parse_result.fills)
         uploaded_positions.extend(parse_result.positions)
         uploaded_cash.extend(parse_result.cash_balances)
-        uploaded_fill_batches.append(
-            (parser.broker, source_sha256, list(parse_result.fills))
-        )
+        if not any(
+            warning.code == "invalid_execution_row"
+            and warning.broker.strip().lower() == parser.broker.strip().lower()
+            for warning in parse_result.warnings
+        ):
+            uploaded_fill_batches.append(
+                (parser.broker, source_sha256, list(parse_result.fills))
+            )
         warnings.extend(parse_result.warnings)
         manifest.append(
             ManifestRecord(
@@ -331,6 +337,11 @@ def _run_import(
                         },
                         batch_fills,
                         actual_fill_complete_through,
+                        coverage_start=(
+                            f"{actual_fill_complete_through[:7]}-01"
+                            if broker == "eastmoney"
+                            else actual_fill_complete_through
+                        ),
                     )
         if actual_fill_complete_through is None:
             if backup_run_dir is not None and backup_run_dir.exists():
@@ -508,6 +519,11 @@ def _fill_from_row(row: dict[str, str]) -> TradeFill:
         price=Decimal(row["price"]),
         fees=_optional_decimal(row.get("fees", "")),
         executed_at=row.get("executed_at", ""),
+        source_sequence=(
+            int(row["source_sequence"])
+            if row.get("source_sequence", "").strip()
+            else None
+        ),
     )
 
 
@@ -753,6 +769,9 @@ def _fill_to_row(fill: TradeFill) -> dict[str, str]:
         "fees": _decimal_to_str(fill.fees),
         "currency": fill.currency,
         "executed_at": fill.executed_at,
+        "source_sequence": (
+            "" if fill.source_sequence is None else str(fill.source_sequence)
+        ),
     }
 
 

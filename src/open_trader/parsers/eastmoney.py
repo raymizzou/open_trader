@@ -97,7 +97,7 @@ def parse_eastmoney_page(
             values = _normalize_row(row)
             occurrence = occurrences.get(values, 0)
             occurrences[values] = occurrence + 1
-            fill = _parse_fill(row, occurrence)
+            fill = _parse_fill(row, occurrence, len(fills))
             if fill is not None:
                 fills.append(fill)
             elif _is_execution_candidate(row):
@@ -133,7 +133,9 @@ def parse_eastmoney_page(
     )
 
 
-def _parse_fill(row: list[str | None], occurrence: int) -> TradeFill | None:
+def _parse_fill(
+    row: list[str | None], occurrence: int, source_sequence: int
+) -> TradeFill | None:
     if len(row) != len(EXECUTION_HEADER):
         return None
     values = [_normalize_cell(cell) for cell in row]
@@ -170,6 +172,7 @@ def _parse_fill(row: list[str | None], occurrence: int) -> TradeFill | None:
         price=price,
         fees=fees,
         executed_at=executed_at,
+        source_sequence=source_sequence,
     )
 
 

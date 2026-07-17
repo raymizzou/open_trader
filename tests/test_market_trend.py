@@ -114,7 +114,7 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
     assert rows["买入数量"].startswith("使用已有现金，")
     assert rows["过热跟踪"] == (
-        "沸腾或开香槟触发后，取原保护线与此前5个完整交易日最低价较高者，只升不降"
+        "沸腾或开香槟触发后，活动保护线取原值与此前 5 个完整交易日最低价的较高者，只升不降"
     )
 
 

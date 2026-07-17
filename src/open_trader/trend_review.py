@@ -9,7 +9,7 @@ from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -249,6 +249,8 @@ def freeze_actual_fill_batch(
     source_metadata: Mapping[str, object],
     fills: Sequence[TradeFill],
     complete_through: str,
+    *,
+    coverage_start: str | None = None,
 ) -> list[Path]:
     try:
         complete_date = date.fromisoformat(complete_through)
@@ -256,6 +258,16 @@ def freeze_actual_fill_batch(
         raise ValueError("actual fill complete_through must be an ISO date") from None
     if complete_date.isoformat() != complete_through:
         raise ValueError("actual fill complete_through must be an ISO date")
+    coverage_start = coverage_start or complete_through
+    try:
+        coverage_start_date = date.fromisoformat(coverage_start)
+    except ValueError:
+        raise ValueError("actual fill coverage_start must be an ISO date") from None
+    if (
+        coverage_start_date.isoformat() != coverage_start
+        or coverage_start_date > complete_date
+    ):
+        raise ValueError("actual fill coverage_start must not follow complete_through")
     broker = str(source_metadata.get("broker") or "").lower()
     broker_market = ACTUAL_FILL_MARKETS_BY_BROKER.get(broker)
     explicit_market = source_metadata.get("market")
@@ -297,10 +309,24 @@ def freeze_actual_fill_batch(
             raise ValueError("fill price must be positive")
         if payload["fees"] is not None:
             _required_decimal(payload["fees"], "fill fees")
+        source_sequence = payload.get("source_sequence")
+        if source_sequence is not None and (
+            not isinstance(source_sequence, int)
+            or isinstance(source_sequence, bool)
+            or source_sequence < 0
+        ):
+            raise ValueError("actual fill source_sequence must be a non-negative integer")
+        executed_at = str(payload["executed_at"])
         try:
-            execution_date = date.fromisoformat(str(payload["executed_at"])[:10])
+            execution_date = (
+                date.fromisoformat(executed_at)
+                if len(executed_at) == 10
+                else datetime.fromisoformat(executed_at.replace("Z", "+00:00")).date()
+            )
         except ValueError:
-            raise ValueError("actual fill executed_at must start with an ISO date") from None
+            raise ValueError(
+                "actual fill executed_at must be an ISO date or timestamp"
+            ) from None
         if execution_date > complete_date:
             raise ValueError("actual fill is later than complete_through")
         identity = _actual_fill_identity(payload)
@@ -322,6 +348,8 @@ def freeze_actual_fill_batch(
         "schema_version": "open_trader.trend_review.fill_completeness.v1",
         "market": market,
         "complete_through": complete_through,
+        "coverage_start": coverage_start,
+        "coverage_end": complete_through,
         "source_metadata": dict(source_metadata),
         "fill_identities": sorted(identities),
     }
@@ -828,70 +856,17 @@ def execute_trend_review_stop(
     }
 
 
-def capture_trend_review_close(
-    *,
-    data_dir: Path,
-    market: str,
-    trading_date: str,
-    report: Mapping[str, object],
-    simulate_snapshot: Mapping[str, object],
-    orders: list[Mapping[str, object]],
-    benchmark: Mapping[str, object],
-) -> Path:
-    market = _market(market)
-    account, strategy_snapshot = validate_trend_review_close_report(
-        report, trading_date
-    )
-    net_value = _required_decimal(
-        simulate_snapshot.get("net_value"), "simulate net value"
-    )
-    discipline_equity = net_value.quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-    _validate_benchmark(benchmark, market=market, trading_date=trading_date)
-    payload = {
-        "schema_version": "open_trader.trend_review.daily.v1",
-        "market": market,
-        "date": trading_date,
-        "simulate_acc_id": simulate_snapshot.get("acc_id"),
-        "discipline_equity_after_fees": str(discipline_equity),
-        "benchmark": dict(benchmark),
-        "strategy_snapshot": dict(strategy_snapshot),
-        "report_sha256": _report_hash(report),
-        "orders": orders,
-        "positions": simulate_snapshot.get("positions"),
-    }
-    if account.get("fresh") is True and account.get("source_date") == trading_date:
-        payload["actual_equity"] = str(
-            _required_decimal(account.get("net_value"), "actual net value")
-        )
-    path = (
-        data_dir
-        / "trend_review"
-        / "daily"
-        / market
-        / f"{trading_date}.json"
-    )
-    return _write_immutable(path, _canonical_json_bytes(payload))
-
-
 def validate_trend_review_close_report(
-    report: Mapping[str, object], trading_date: str
+    report: Mapping[str, object], trading_date: str, market: str
 ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    market = _market(market)
     account = report.get("account")
     if not isinstance(account, Mapping):
         raise ValueError("trend report account is unavailable")
     strategy_snapshot = report.get("strategy_snapshot")
-    if (
-        not isinstance(strategy_snapshot, Mapping)
-        or any(
-            not str(strategy_snapshot.get(field) or "").strip()
-            for field in ("strategy_id", "strategy_version", "process_version")
-        )
-        or not isinstance(strategy_snapshot.get("parameters"), Mapping)
-        or not isinstance(strategy_snapshot.get("parameter_rows"), list)
-        or not strategy_snapshot["parameter_rows"]
-    ):
+    try:
+        _validated_strategy_snapshot(strategy_snapshot, market)
+    except ValueError:
         raise ValueError("trend report strategy snapshot is unavailable")
     if account.get("fresh") is True and account.get("source_date") == trading_date:
         _required_decimal(account.get("net_value"), "actual net value")
@@ -901,6 +876,68 @@ def validate_trend_review_close_report(
         ):
             raise ValueError("trend report account positions are unavailable")
     return account, strategy_snapshot
+
+
+def _validated_strategy_snapshot(
+    snapshot: object, market: str
+) -> Mapping[str, object]:
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("strategy snapshot is unavailable")
+    required_text = (
+        "strategy_id",
+        "strategy_name",
+        "strategy_version",
+        "market",
+        "effective_from",
+        "process_version",
+    )
+    if any(
+        not isinstance(snapshot.get(field), str)
+        or not str(snapshot[field]).strip()
+        for field in required_text
+    ):
+        raise ValueError("strategy snapshot is unavailable")
+    if (
+        snapshot["strategy_version"] != "v1"
+        or snapshot["strategy_id"] != f"trend_animals_warm_to_hot/{market}/v1"
+        or snapshot["market"] != market
+        or snapshot["effective_from"] != TREND_V1_EFFECTIVE_FROM[market]
+        or not isinstance(snapshot.get("parameters"), Mapping)
+    ):
+        raise ValueError("strategy snapshot is unavailable")
+    rows = snapshot.get("parameter_rows")
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or any(
+            not isinstance(row, Mapping)
+            or set(row) != {"group", "name", "value"}
+            or any(
+                not isinstance(row[key], str) or not row[key].strip()
+                for key in ("group", "name", "value")
+            )
+            for row in rows
+        )
+    ):
+        raise ValueError("strategy snapshot is unavailable")
+    return snapshot
+
+
+def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
+    return _canonical_json_bytes(
+        {
+            key: snapshot[key]
+            for key in (
+                "strategy_id",
+                "strategy_name",
+                "strategy_version",
+                "market",
+                "effective_from",
+                "parameters",
+                "parameter_rows",
+            )
+        }
+    )
 
 
 def _validate_benchmark(
@@ -963,7 +1000,7 @@ def _load_dated_fact_stream(
 
 def _load_actual_fills(
     data_dir: Path, market: str
-) -> tuple[list[dict[str, object]], str | None]:
+) -> tuple[list[dict[str, object]], list[tuple[str, str]]]:
     fills: list[dict[str, object]] = []
     root = data_dir / "trend_review" / "facts" / "actual_fills" / market
     for path in sorted(root.glob("*.json")):
@@ -976,7 +1013,7 @@ def _load_actual_fills(
         ):
             raise ValueError(f"invalid trend review actual fill fact: {path}")
         fills.append(payload)
-    completeness: list[str] = []
+    coverage: list[tuple[str, str]] = []
     completeness_root = (
         data_dir
         / "trend_review"
@@ -993,15 +1030,25 @@ def _load_actual_fills(
             or payload.get("market") != market
         ):
             raise ValueError(f"invalid trend review fill completeness fact: {path}")
-        complete_through = str(payload.get("complete_through") or "")
+        coverage_end = str(
+            payload.get("coverage_end") or payload.get("complete_through") or ""
+        )
+        coverage_start = str(payload.get("coverage_start") or coverage_end)
         try:
-            date.fromisoformat(complete_through)
+            start_date = date.fromisoformat(coverage_start)
+            end_date = date.fromisoformat(coverage_end)
         except ValueError:
             raise ValueError(
                 f"invalid trend review fill completeness fact: {path}"
             ) from None
-        completeness.append(complete_through)
-    return fills, max(completeness, default=None)
+        if (
+            start_date.isoformat() != coverage_start
+            or end_date.isoformat() != coverage_end
+            or start_date > end_date
+        ):
+            raise ValueError(f"invalid trend review fill completeness fact: {path}")
+        coverage.append((coverage_start, coverage_end))
+    return fills, coverage
 
 
 def _completed_cycles(
@@ -1029,9 +1076,31 @@ def _completed_cycles(
             unique_fills.append(fill)
         elif existing != payload:
             raise ValueError(f"conflicting actual fill identity: {identity}")
+    date_only_groups: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    for fill in unique_fills:
+        executed_at = str(fill["executed_at"])
+        if len(executed_at) == 10:
+            date_only_groups.setdefault(
+                (str(fill["symbol"]), executed_at), []
+            ).append(fill)
+    for grouped in date_only_groups.values():
+        if len(grouped) < 2:
+            continue
+        sequences = [fill.get("source_sequence") for fill in grouped]
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in sequences
+        ) or len(set(sequences)) != len(sequences):
+            raise ValueError("ambiguous actual fill order")
     for fill in sorted(
         unique_fills,
-        key=lambda row: (str(row["executed_at"]), str(row["source_id"])),
+        key=lambda row: (
+            str(row["executed_at"]),
+            row.get("source_sequence")
+            if isinstance(row.get("source_sequence"), int)
+            else 0,
+            str(row["source_id"]),
+        ),
     ):
         symbol = str(fill["symbol"])
         quantity = _required_decimal(fill["quantity"], "fill quantity")
@@ -1075,6 +1144,8 @@ def _common_cutoff(
     actual_dates: set[str],
     benchmark_dates: set[str],
 ) -> str | None:
+    if effective_from not in benchmark_dates:
+        return None
     cutoff: str | None = None
     for trading_date in sorted(
         day for day in benchmark_dates if day >= effective_from
@@ -1221,6 +1292,8 @@ def _rate_on_or_before(
 
 
 def _annualized_sharpe(excess_returns: Sequence[Decimal]) -> Decimal | None:
+    if any(not value.is_finite() for value in excess_returns):
+        raise ValueError("Sharpe returns must be finite")
     if len(excess_returns) < 2:
         return None
     mean = sum(excess_returns, Decimal("0")) / Decimal(len(excess_returns))
@@ -1244,7 +1317,13 @@ def _portfolio_metrics(
             "sharpe_ratio": None,
             "calmar_ratio": None,
         }
-    equities = [Decimal(row["equity"]) for row in curve]
+    if not initial_cash.is_finite() or initial_cash <= 0:
+        raise ValueError("initial cash must be finite and positive")
+    equities = [
+        _required_decimal(row["equity"], "portfolio equity") for row in curve
+    ]
+    if any(equity < 0 for equity in equities):
+        raise ValueError("portfolio equity must be non-negative")
     dates = [date.fromisoformat(row["date"]) for row in curve]
     total_return = (equities[-1] / initial_cash - Decimal("1")) * Decimal("100")
     elapsed_days = max(1, (dates[-1] - dates[0]).days)
@@ -1384,10 +1463,13 @@ def build_trend_review_projection(
 
     def is_v1(fact: Mapping[str, object]) -> bool:
         snapshot = fact.get("strategy_snapshot")
-        return (
-            isinstance(snapshot, Mapping)
-            and snapshot.get("strategy_version") == "v1"
-        )
+        if not isinstance(snapshot, Mapping) or snapshot.get("strategy_version") != "v1":
+            return False
+        try:
+            _validated_strategy_snapshot(snapshot, market)
+        except ValueError:
+            return False
+        return True
 
     discipline_facts = [
         discipline_by_date[trading_date]
@@ -1399,26 +1481,35 @@ def build_trend_review_projection(
         for trading_date in sorted(actual_by_date)
         if is_v1(actual_by_date[trading_date])
     ]
-    fills, actual_complete_through = _load_actual_fills(data_dir, market)
+    strategy_identities = {
+        _strategy_identity(
+            _validated_strategy_snapshot(fact.get("strategy_snapshot"), market)
+        )
+        for fact in (*discipline_facts, *actual_facts)
+        if str(fact["date"]) >= effective_from
+    }
+    if len(strategy_identities) > 1:
+        raise ValueError("strategy snapshot identity changed within version interval")
+    fills, actual_fill_coverage = _load_actual_fills(data_dir, market)
     equity_cutoff = _common_cutoff(
         effective_from,
         {str(fact["date"]) for fact in discipline_facts},
         {str(fact["date"]) for fact in actual_facts},
         set(benchmark_by_date),
     )
-    common_cutoff = (
-        max(
-            (
-                trading_date
-                for trading_date in benchmark_by_date
-                if effective_from <= trading_date <= equity_cutoff
-                and trading_date <= actual_complete_through
-            ),
-            default=None,
-        )
-        if equity_cutoff is not None and actual_complete_through is not None
-        else None
-    )
+    common_cutoff = None
+    if equity_cutoff is not None:
+        for trading_date in sorted(
+            day
+            for day in benchmark_by_date
+            if effective_from <= day <= equity_cutoff
+        ):
+            if not any(
+                start <= trading_date <= end
+                for start, end in actual_fill_coverage
+            ):
+                break
+            common_cutoff = trading_date
     interval_discipline = [
         fact
         for fact in discipline_facts
@@ -1427,48 +1518,27 @@ def build_trend_review_projection(
     ]
 
     def has_complete_snapshot(fact: Mapping[str, object]) -> bool:
-        candidate = fact.get("strategy_snapshot")
-        if not isinstance(candidate, Mapping):
+        try:
+            _validated_strategy_snapshot(fact.get("strategy_snapshot"), market)
+        except ValueError:
             return False
-        rows = candidate.get("parameter_rows")
-        return (
-            candidate.get("strategy_version") == "v1"
-            and all(
-                isinstance(candidate.get(key), str) and bool(candidate[key].strip())
-                for key in (
-                    "strategy_id",
-                    "strategy_name",
-                    "strategy_version",
-                    "process_version",
-                )
-            )
-            and isinstance(candidate.get("parameters"), Mapping)
-            and isinstance(rows, list)
-            and bool(rows)
-            and all(
-                isinstance(row, Mapping)
-                and set(row) == {"group", "name", "value"}
-                and all(
-                    isinstance(row[key], str) and bool(row[key].strip())
-                    for key in row
-                )
-                for row in rows
-            )
-        )
+        return True
 
-    snapshot_facts = [
-        fact
-        for fact in discipline_facts
-        if effective_from <= str(fact["date"])
-        and (common_cutoff is None or str(fact["date"]) <= common_cutoff)
-        and has_complete_snapshot(fact)
-    ]
+    snapshot_facts = sorted(
+        (
+            fact
+            for fact in (*discipline_facts, *actual_facts)
+            if effective_from <= str(fact["date"])
+            and (common_cutoff is None or str(fact["date"]) <= common_cutoff)
+            and has_complete_snapshot(fact)
+        ),
+        key=lambda fact: str(fact["date"]),
+    )
     snapshot = (
         dict(snapshot_facts[-1]["strategy_snapshot"])
         if snapshot_facts
         else {}
     )
-    snapshot["effective_from"] = effective_from
     discipline_cycles = _completed_trades(interval_discipline)
     interval_actual = {
         str(fact["date"]): fact
