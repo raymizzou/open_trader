@@ -167,6 +167,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
             else:
                 in_cash = False
 
+    coverage_date = _issue_date(text)
     return ParseResult(
         statement_id=statement_id,
         broker=BROKER,
@@ -174,6 +175,8 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         cash_balances=[base_cash] if base_cash is not None else cash_balances,
         fills=fills,
         fills_complete=transaction_section_seen and fills_complete,
+        fills_coverage_start=coverage_date,
+        fills_coverage_end=coverage_date,
         warnings=warnings,
     )
 
@@ -472,20 +475,27 @@ def _normalize_line(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip()
 
 
+def _issue_date(text: str) -> str | None:
+    match = ISSUE_DATE.search(text)
+    if match is None:
+        return None
+    day, month, year = match.groups()
+    try:
+        return date(2000 + int(year), int(month), int(day)).isoformat()
+    except ValueError:
+        raise ValueError("辉立结单包含无效 Issue Date") from None
+
+
 class PhillipsStatementParser(StatementParser):
     broker = BROKER
 
     def statement_date(self, path: Path) -> str:
         with pdfplumber.open(path) as pdf:
             text = pdf.pages[0].extract_text() if pdf.pages else ""
-        match = ISSUE_DATE.search(text or "")
-        if match is None:
+        statement_date = _issue_date(text or "")
+        if statement_date is None:
             raise ValueError("辉立结单缺少 Issue Date")
-        day, month, year = match.groups()
-        try:
-            return date(2000 + int(year), int(month), int(day)).isoformat()
-        except ValueError:
-            raise ValueError("辉立结单包含无效 Issue Date") from None
+        return statement_date
 
     def parse(self, path: Path, month: str) -> ParseResult:
         with pdfplumber.open(path) as pdf:

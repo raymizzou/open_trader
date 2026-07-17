@@ -42,6 +42,8 @@ class FakeParser:
         cash_broker: str | None = None,
         warning_broker: str | None = None,
         fills_complete: bool = False,
+        fills_coverage_start: str | None = None,
+        fills_coverage_end: str | None = None,
     ) -> None:
         self.broker = broker
         self.result_broker = result_broker or broker
@@ -53,6 +55,8 @@ class FakeParser:
         self.cash_broker = cash_broker or self.result_broker
         self.warning_broker = warning_broker or self.result_broker
         self.fills_complete = fills_complete
+        self.fills_coverage_start = fills_coverage_start
+        self.fills_coverage_end = fills_coverage_end
 
     def parse(self, path: Path, month: str) -> ParseResult:
         return ParseResult(
@@ -91,6 +95,8 @@ class FakeParser:
                 )
             ],
             fills_complete=self.fills_complete,
+            fills_coverage_start=self.fills_coverage_start,
+            fills_coverage_end=self.fills_coverage_end,
             warnings=[
                 WarningRecord(
                     statement_id=f"{month}-{self.result_broker}",
@@ -153,6 +159,7 @@ class BrokerFillParser(FakeParser):
         market: Market,
         *,
         fills_coverage_start: str | None = None,
+        fills_coverage_end: str | None = None,
     ) -> None:
         currency = "CNY" if market is Market.CN else "HKD"
         super().__init__(
@@ -162,6 +169,7 @@ class BrokerFillParser(FakeParser):
         )
         self.market = market
         self.fills_coverage_start = fills_coverage_start
+        self.fills_coverage_end = fills_coverage_end
 
     def parse(self, path: Path, month: str) -> ParseResult:
         result = super().parse(path, month)
@@ -188,6 +196,7 @@ class BrokerFillParser(FakeParser):
             ],
             fills_complete=True,
             fills_coverage_start=self.fills_coverage_start,
+            fills_coverage_end=self.fills_coverage_end,
             warnings=result.warnings,
             page_count=result.page_count,
         )
@@ -343,7 +352,14 @@ def test_uploaded_statement_freezes_broker_fills_in_its_market_idempotently(
     arguments = {
         "statement_date": "2026-05-10",
         "statement_path": source,
-        "parser": BrokerFillParser(broker, market),
+        "parser": BrokerFillParser(
+            broker,
+            market,
+            fills_coverage_start=(
+                "2026-05-01" if broker == "eastmoney" else "2026-05-10"
+            ),
+            fills_coverage_end="2026-05-10",
+        ),
         "data_dir": data_dir,
         "portfolio_path": tmp_path / "current/portfolio.csv",
         "fx_provider": StaticMonthEndFxProvider(
@@ -393,6 +409,7 @@ def test_uploaded_statement_uses_declared_fill_coverage_start(tmp_path: Path) ->
             "eastmoney",
             Market.CN,
             fills_coverage_start="2026-06-16",
+            fills_coverage_end="2026-07-15",
         ),
         data_dir=data_dir,
         portfolio_path=tmp_path / "current/portfolio.csv",
@@ -406,7 +423,30 @@ def test_uploaded_statement_uses_declared_fill_coverage_start(tmp_path: Path) ->
     )
     payload = json.loads(completeness.read_text(encoding="utf-8"))
     assert payload["coverage_start"] == "2026-06-16"
-    assert payload["coverage_end"] == "2026-07-16"
+    assert payload["coverage_end"] == "2026-07-15"
+
+
+def test_uploaded_statement_without_declared_coverage_does_not_advance_facts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+
+    pipeline.run_uploaded_statement(
+        statement_date="2026-07-16",
+        statement_path=source,
+        parser=BrokerFillParser("eastmoney", Market.CN),
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "current/portfolio.csv",
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-07", {"CNY": Decimal("1.08")}
+        ),
+    )
+
+    assert not (
+        data_dir / "trend_review/facts/actual_fill_completeness"
+    ).exists()
 
 
 @pytest.mark.parametrize(
@@ -459,6 +499,8 @@ def test_uploaded_empty_statement_freezes_completeness_only_after_success(
             position_currency="CNY",
             cash_currency="CNY",
             fills_complete=True,
+            fills_coverage_start="2026-05-01",
+            fills_coverage_end="2026-05-10",
         ),
         "data_dir": data_dir,
         "portfolio_path": tmp_path / "current/portfolio.csv",
@@ -526,6 +568,8 @@ def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
             cash_currency="CNY",
             symbol="600001",
             fills_complete=True,
+            fills_coverage_start="2026-05-01",
+            fills_coverage_end="2026-05-10",
         ),
         "data_dir": data_dir,
         "portfolio_path": portfolio_path,
@@ -552,6 +596,8 @@ def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
         cash_currency="CNY",
         symbol="600002",
         fills_complete=True,
+        fills_coverage_start="2026-05-01",
+        fills_coverage_end="2026-05-10",
     )
     monkeypatch.setattr(
         pipeline,
@@ -588,6 +634,8 @@ def test_uploaded_statement_commits_before_backup_cleanup(
             cash_currency="CNY",
             symbol="600001",
             fills_complete=True,
+            fills_coverage_start="2026-05-01",
+            fills_coverage_end="2026-05-10",
         ),
         "data_dir": data_dir,
         "portfolio_path": portfolio_path,
@@ -603,6 +651,8 @@ def test_uploaded_statement_commits_before_backup_cleanup(
         cash_currency="CNY",
         symbol="600002",
         fills_complete=True,
+        fills_coverage_start="2026-05-01",
+        fills_coverage_end="2026-05-10",
     )
     real_rmtree = pipeline.rmtree
 

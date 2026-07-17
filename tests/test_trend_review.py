@@ -800,7 +800,9 @@ def test_actual_fill_identity_is_idempotent_only_for_identical_payload(
         )
 
 
+@pytest.mark.parametrize("legacy_sequence", [99, None])
 def test_actual_fill_reimport_preserves_legacy_embedded_sequence(
+    legacy_sequence: int | None,
     tmp_path: Path,
 ) -> None:
     fill = actual_fill(
@@ -819,7 +821,7 @@ def test_actual_fill_reimport_preserves_legacy_embedded_sequence(
         coverage_start="2026-07-01",
     )
     legacy = json.loads(path.read_text(encoding="utf-8"))
-    legacy["source_sequence"] = 99
+    legacy["source_sequence"] = legacy_sequence
     path.write_text(
         json.dumps(legacy, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n",

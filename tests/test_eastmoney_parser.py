@@ -84,6 +84,7 @@ def test_eastmoney_statement_extracts_actual_trade_fills() -> None:
     assert result.fills[0].source_id
     assert result.fills_complete is True
     assert result.fills_coverage_start is None
+    assert result.fills_coverage_end is None
 
 
 def test_eastmoney_extracts_declared_fill_coverage_start() -> None:
@@ -95,6 +96,7 @@ def test_eastmoney_extracts_declared_fill_coverage_start() -> None:
     )
 
     assert result.fills_coverage_start == "2026-06-16"
+    assert result.fills_coverage_end == "2026-07-16"
 
 
 def test_eastmoney_without_execution_header_does_not_claim_fill_completeness() -> None:

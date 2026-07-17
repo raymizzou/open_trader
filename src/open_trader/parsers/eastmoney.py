@@ -138,6 +138,9 @@ def parse_eastmoney_page(
                     )
                 )
 
+    fills_coverage_start, fills_coverage_end = _fill_coverage_interval(
+        first_page_text
+    )
     return ParseResult(
         statement_id=statement_id,
         broker=BROKER,
@@ -156,7 +159,8 @@ def parse_eastmoney_page(
         ],
         fills=fills,
         fills_complete=fills_complete,
-        fills_coverage_start=_fill_coverage_start(first_page_text),
+        fills_coverage_start=fills_coverage_start,
+        fills_coverage_end=fills_coverage_end,
         warnings=warnings,
     )
 
@@ -210,10 +214,10 @@ def _execution_date(value: str) -> str | None:
         return None
 
 
-def _fill_coverage_start(text: str) -> str | None:
+def _fill_coverage_interval(text: str) -> tuple[str | None, str | None]:
     match = QUERY_INTERVAL.search(text)
     if match is None:
-        return None
+        return None, None
     try:
         start = date.fromisoformat(match.group(1).replace("/", "-"))
         end = date.fromisoformat(match.group(2).replace("/", "-"))
@@ -221,7 +225,7 @@ def _fill_coverage_start(text: str) -> str | None:
         raise ValueError("东方财富对账单包含无效查询区间") from None
     if start > end:
         raise ValueError("东方财富对账单包含无效查询区间")
-    return start.isoformat()
+    return start.isoformat(), end.isoformat()
 
 
 def _parse_position(row: list[str | None], statement_id: str) -> Position | None:

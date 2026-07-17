@@ -219,7 +219,8 @@ def test_parse_phillips_text_extracts_hk_and_us_positions() -> None:
 
 def test_phillips_statement_extracts_actual_trade_fills() -> None:
     result = parse_phillips_text(
-        """Transaction Details
+        """Issue Date : 10/07/26
+Transaction Details
 日期Date 產品 Product 參考 Reference 類別 Type 摘要 Description 數量 Quantity 單價 Price 成交金額 Consideration 金額 Amount
 10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent 100 380.0000 38,000.00 37,900.00
 """,
@@ -235,6 +236,8 @@ def test_phillips_statement_extracts_actual_trade_fills() -> None:
     assert result.fills[0].source_id
     assert result.fills[0].source_order_id == "REF00001"
     assert result.fills_complete is True
+    assert result.fills_coverage_start == "2026-07-10"
+    assert result.fills_coverage_end == "2026-07-10"
 
 
 def test_phillips_without_transaction_section_does_not_claim_fill_completeness() -> None:

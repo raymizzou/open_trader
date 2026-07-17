@@ -198,7 +198,7 @@ def _run_import(
     uploaded_positions: list[Position] = []
     uploaded_cash: list[CashBalance] = []
     uploaded_fill_batches: list[
-        tuple[str, str, list[TradeFill], str | None]
+        tuple[str, str, list[TradeFill], str, str]
     ] = []
 
     for parser in parser_list:
@@ -213,13 +213,22 @@ def _run_import(
         fills.extend(parse_result.fills)
         uploaded_positions.extend(parse_result.positions)
         uploaded_cash.extend(parse_result.cash_balances)
-        if parse_result.fills_complete:
+        if (
+            parse_result.fills_complete
+            and parse_result.fills_coverage_start is not None
+            and parse_result.fills_coverage_end is not None
+            and (
+                actual_fill_complete_through is None
+                or parse_result.fills_coverage_end <= actual_fill_complete_through
+            )
+        ):
             uploaded_fill_batches.append(
                 (
                     parser.broker,
                     source_sha256,
                     list(parse_result.fills),
                     parse_result.fills_coverage_start,
+                    parse_result.fills_coverage_end,
                 )
             )
         warnings.extend(parse_result.warnings)
@@ -334,6 +343,7 @@ def _run_import(
                 source_sha256,
                 batch_fills,
                 fills_coverage_start,
+                fills_coverage_end,
             ) in uploaded_fill_batches:
                 if broker in {"eastmoney", "phillips"}:
                     freeze_actual_fill_batch(
@@ -344,15 +354,8 @@ def _run_import(
                             "source_sha256": source_sha256,
                         },
                         batch_fills,
-                        actual_fill_complete_through,
-                        coverage_start=(
-                            fills_coverage_start
-                            or (
-                                f"{actual_fill_complete_through[:7]}-01"
-                                if broker == "eastmoney"
-                                else actual_fill_complete_through
-                            )
-                        ),
+                        fills_coverage_end,
+                        coverage_start=fills_coverage_start,
                     )
         if actual_fill_complete_through is None:
             if backup_run_dir is not None and backup_run_dir.exists():

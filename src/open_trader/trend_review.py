@@ -258,7 +258,7 @@ def _compatible_actual_fill_body(
     if not isinstance(existing, dict) or "source_sequence" not in existing:
         return body
     source_sequence = existing.pop("source_sequence")
-    if (
+    if source_sequence is not None and (
         not isinstance(source_sequence, int)
         or isinstance(source_sequence, bool)
         or source_sequence < 0
