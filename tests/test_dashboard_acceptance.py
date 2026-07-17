@@ -3678,15 +3678,18 @@ def test_acceptance_keeps_unavailable_futu_disabled_outside_screenshot_gate() ->
     assert page.disabled_reports == {"futu"}
 
 
-def test_acceptance_rejects_unavailable_review_when_daily_report_is_unavailable() -> None:
+@pytest.mark.parametrize("broker", ("tiger", "phillips"))
+def test_acceptance_rejects_unavailable_review_when_daily_report_is_unavailable(
+    broker: str,
+) -> None:
     payload = valid_payload()
-    payload["trend_reports"]["tiger"].update(  # type: ignore[index]
+    payload["trend_reports"][broker].update(  # type: ignore[index]
         available=False, status_text="今日报告不可用"
     )
-    payload["trend_reviews"]["tiger"]["available"] = False  # type: ignore[index]
+    payload["trend_reviews"][broker]["available"] = False  # type: ignore[index]
     page = tabbed_account_page(payload)
 
-    with pytest.raises(AssertionError, match="tiger 趋势复盘不可用"):
+    with pytest.raises(AssertionError, match=f"{broker} 趋势复盘不可用"):
         dashboard_acceptance._check_account_holdings(page, payload)
 
 
