@@ -260,6 +260,48 @@ def test_uploaded_statements_for_two_brokers_share_monthly_run(
     assert {row["brokers"] for row in rows} == {"eastmoney", "phillips"}
 
 
+def test_uploaded_statement_accepts_old_run_without_fills_file(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    portfolio_path = tmp_path / "current/portfolio.csv"
+    fx_provider = StaticMonthEndFxProvider(
+        "2026-05", {"USD": Decimal("7.8"), "CNY": Decimal("1.08")}
+    )
+    first = pipeline.run_uploaded_statement(
+        statement_date="2026-05-10",
+        statement_path=source,
+        parser=FakeParser(
+            broker="eastmoney",
+            position_currency="CNY",
+            cash_currency="CNY",
+            symbol="600900",
+        ),
+        data_dir=data_dir,
+        portfolio_path=portfolio_path,
+        fx_provider=fx_provider,
+    )
+    (first.run_dir / "extracted_fills.csv").unlink()
+
+    second = pipeline.run_uploaded_statement(
+        statement_date="2026-05-10",
+        statement_path=source,
+        parser=FillParser(),
+        data_dir=data_dir,
+        portfolio_path=portfolio_path,
+        fx_provider=fx_provider,
+    )
+
+    fills = list(csv.DictReader((second.run_dir / "extracted_fills.csv").open()))
+    positions = list(
+        csv.DictReader((second.run_dir / "extracted_positions.csv").open())
+    )
+    assert [row["source_id"] for row in fills] == ["fill-1"]
+    assert {row["broker"] for row in positions} == {"eastmoney", "fake"}
+
+
 def test_run_import_can_leave_latest_untouched(tmp_path: Path) -> None:
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")

@@ -487,11 +487,7 @@ def _tiger_trade_fill(
         or executed_at is None
     ):
         raise ValueError("invalid Tiger fill")
-    market = _market_from_text(_text(contract, "market"))
-    if market is Market.OTHER:
-        market = {"USD": Market.US, "HKD": Market.HK, "CNY": Market.CN}.get(
-            currency, Market.OTHER
-        )
+    market = _tiger_transaction_market(transaction)
     return TradeFill(
         source_id=source_id,
         source_order_id=source_order_id,
@@ -505,6 +501,16 @@ def _tiger_trade_fill(
         price=price,
         fees=fees,
         executed_at=executed_at,
+    )
+
+
+def _tiger_transaction_market(transaction: object) -> Market:
+    contract = _get_attr(transaction, "contract", None)
+    market = _market_from_text(_text(contract, "market"))
+    if market is not Market.OTHER:
+        return market
+    return {"USD": Market.US, "HKD": Market.HK, "CNY": Market.CN}.get(
+        _text(contract, "currency").upper(), Market.OTHER
     )
 
 
@@ -746,6 +752,11 @@ class TigerAccountClient:
         transactions = list(
             {_text(transaction, "id"): transaction for transaction in transactions}.values()
         )
+        transactions = [
+            transaction
+            for transaction in transactions
+            if _tiger_transaction_market(transaction) is Market.US
+        ]
         counts_by_order: dict[str, int] = {}
         for transaction in transactions:
             order_id = _text(transaction, "order_id")

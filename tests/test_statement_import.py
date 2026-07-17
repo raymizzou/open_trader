@@ -184,7 +184,7 @@ def test_import_pdf_archives_and_replaces_only_target_broker(
     assert {row["brokers"] for row in rows} == {"futu", "phillips"}
 
 
-def test_import_pdf_accepts_fill_only_statement(
+def test_import_pdf_rejects_fill_only_statement_and_preserves_portfolio(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -192,16 +192,20 @@ def test_import_pdf_accepts_fill_only_statement(
     monkeypatch.setattr(
         statement_import, "PhillipsStatementParser", FakeFillOnlyParser
     )
-    monkeypatch.setattr(statement_import, "run_uploaded_statement", lambda **kwargs: None)
+    portfolio_path = tmp_path / "portfolio.csv"
+    write_existing_portfolio(portfolio_path)
+    before = portfolio_path.read_bytes()
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=tmp_path / "portfolio.csv",
+        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
 
-    result = service.import_pdf("phillips", PDF_BYTES)
+    with pytest.raises(ValueError, match="没有可导入的持仓或现金"):
+        service.import_pdf("phillips", PDF_BYTES)
 
-    assert result["fills"] == 1
+    assert portfolio_path.read_bytes() == before
+    assert not (tmp_path / "data/statements").exists()
 
 
 def test_import_pdf_rejects_older_statement_and_preserves_current_data(
@@ -259,7 +263,7 @@ def test_latest_statement_period_uses_newest_statement_id_across_runs(
     assert service._latest_statement_period("phillips") == "2026-07-15"
 
 
-def test_latest_statement_period_uses_fill_execution_date(tmp_path: Path) -> None:
+def test_latest_statement_period_ignores_fill_execution_date(tmp_path: Path) -> None:
     statement_import = importlib.import_module("open_trader.statement_import")
     data_dir = tmp_path / "data"
     path = data_dir / "runs/2026-07/extracted_fills.csv"
@@ -268,13 +272,20 @@ def test_latest_statement_period_uses_fill_execution_date(tmp_path: Path) -> Non
         writer = csv.DictWriter(handle, fieldnames=["broker", "executed_at"])
         writer.writeheader()
         writer.writerow({"broker": "phillips", "executed_at": "2026-07-15"})
+    positions = data_dir / "runs/2026-07/extracted_positions.csv"
+    with positions.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["broker", "statement_id"])
+        writer.writeheader()
+        writer.writerow(
+            {"broker": "phillips", "statement_id": "2026-07-10-phillips"}
+        )
     service = statement_import.StatementImportService(
         data_dir=data_dir,
         portfolio_path=tmp_path / "portfolio.csv",
         eastmoney_password="secret",
     )
 
-    assert service._latest_statement_period("phillips") == "2026-07-15"
+    assert service._latest_statement_period("phillips") == "2026-07-10"
 
 
 def test_import_pdf_restores_archive_when_pipeline_fails(

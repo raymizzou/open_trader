@@ -83,7 +83,10 @@ def test_eastmoney_statement_extracts_actual_trade_fills() -> None:
     assert result.fills[0].source_id
 
 
-def test_eastmoney_statement_warns_for_incomplete_execution_row() -> None:
+@pytest.mark.parametrize("missing_index", [0, 1, 2, 4, 5])
+def test_eastmoney_statement_warns_for_incomplete_execution_row(
+    missing_index: int,
+) -> None:
     executions = [
         list(
             (
@@ -91,11 +94,10 @@ def test_eastmoney_statement_warns_for_incomplete_execution_row() -> None:
                 "成交价格", "总发生金额", "手续费", "印花税", "过户费", "资金余额",
             )
         ),
-        [
-            "20260710", "证券买入", "600900", "脱敏股票", "", "28.50",
-            "", "", "", "", "",
-        ],
+        ["20260710", "证券买入", "600900", "脱敏股票", "2000", "28.50",
+         "", "0", "0", "0", ""],
     ]
+    executions[1][missing_index] = ""
 
     result = parse_eastmoney_page(
         "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
@@ -105,6 +107,56 @@ def test_eastmoney_statement_warns_for_incomplete_execution_row() -> None:
 
     assert [warning.code for warning in result.warnings] == [
         "invalid_execution_row"
+    ]
+
+
+def test_eastmoney_fill_fees_require_all_fee_columns() -> None:
+    executions = [
+        list(
+            (
+                "发生日期", "买卖类别", "证券代码", "证券名称", "成交数量",
+                "成交价格", "总发生金额", "手续费", "印花税", "过户费", "资金余额",
+            )
+        ),
+        [
+            "20260710", "证券买入", "600900", "脱敏股票", "2000", "28.50",
+            "", "5.00", "", "1.20", "",
+        ],
+    ]
+
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, executions],
+        "2026-07",
+    )
+
+    assert result.fills[0].fees is None
+
+
+def test_eastmoney_identical_execution_rows_get_stable_distinct_ids() -> None:
+    header = [
+        "发生日期", "买卖类别", "证券代码", "证券名称", "成交数量",
+        "成交价格", "总发生金额", "手续费", "印花税", "过户费", "资金余额",
+    ]
+    row = [
+        "20260710", "证券买入", "600900", "脱敏股票", "2000", "28.50",
+        "", "5.00", "0", "1.20", "",
+    ]
+
+    first = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, [header, row, row]],
+        "2026-07",
+    )
+    repeated = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, [header, row, row]],
+        "2026-07",
+    )
+
+    assert len({fill.source_id for fill in first.fills}) == 2
+    assert [fill.source_id for fill in first.fills] == [
+        fill.source_id for fill in repeated.fills
     ]
 
 

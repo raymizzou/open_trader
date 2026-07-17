@@ -594,6 +594,16 @@ class SdkPagedTransactions(PagedTransactions):
         )()
 
 
+class HkTransactions(ListTransactions):
+    @staticmethod
+    def _transaction(source_id: str, order_id: int) -> object:
+        transaction = PagedTransactions._transaction(source_id, order_id)
+        transaction.contract = FakeContract(
+            symbol="00700", currency="HKD", market="HK"
+        )
+        return transaction
+
+
 class FakeStockAndFundTradeClient(FakeTradeClient):
     def get_positions(self, **kwargs: object) -> list[FakePosition]:
         self.position_calls.append(kwargs)
@@ -950,6 +960,18 @@ def test_tiger_sdk_list_response_at_limit_continues_with_response_pagination() -
         "",
         "next",
     ]
+
+
+def test_tiger_actual_fills_ignore_non_us_transactions() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=HkTransactions,
+    )
+
+    fills = client.fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert fills == []
+    assert client.trade_client.order_calls == []
 
 
 def test_tiger_account_client_fetches_stock_and_fund_positions() -> None:

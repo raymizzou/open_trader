@@ -42,8 +42,8 @@ class StatementImportService:
             uploaded.write_bytes(body)
             statement_date = parser.statement_date(uploaded)  # type: ignore[attr-defined]
             parsed = parser.parse(uploaded, statement_date)
-            if not parsed.positions and not parsed.cash_balances and not parsed.fills:
-                raise ValueError(f"{broker} 结单没有可导入的持仓、现金或成交")
+            if not parsed.positions and not parsed.cash_balances:
+                raise ValueError(f"{broker} 结单没有可导入的持仓或现金")
             current_period = self._latest_statement_period(broker)
             if current_period and statement_date[: len(current_period)] < current_period:
                 raise ValueError(
@@ -102,11 +102,7 @@ class StatementImportService:
         for run_dir in sorted(runs_dir.iterdir(), reverse=True):
             if not run_dir.is_dir():
                 continue
-            for filename in (
-                "extracted_positions.csv",
-                "extracted_cash.csv",
-                "extracted_fills.csv",
-            ):
+            for filename in ("extracted_positions.csv", "extracted_cash.csv"):
                 path = run_dir / filename
                 if not path.exists():
                     continue
@@ -114,11 +110,7 @@ class StatementImportService:
                     for row in csv.DictReader(handle):
                         if row.get("broker", "").strip().lower() != broker:
                             continue
-                        value = (
-                            row.get("executed_at", "")[:10]
-                            if filename == "extracted_fills.csv"
-                            else row.get("statement_id", "")
-                        )
+                        value = row.get("statement_id", "")
                         match = STATEMENT_PERIOD.match(f"{value}-")
                         if match is not None:
                             periods.append(match.group(1))

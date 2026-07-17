@@ -87,16 +87,20 @@ def parse_eastmoney_page(
 
     fills: list[TradeFill] = []
     warnings: list[WarningRecord] = []
+    occurrences: dict[tuple[str, ...], int] = {}
     for execution_table in (
         candidate
         for candidate in tables
         if candidate and _normalize_row(candidate[0]) == EXECUTION_HEADER
     ):
         for row in execution_table[1:]:
-            fill = _parse_fill(row)
+            values = _normalize_row(row)
+            occurrence = occurrences.get(values, 0)
+            occurrences[values] = occurrence + 1
+            fill = _parse_fill(row, occurrence)
             if fill is not None:
                 fills.append(fill)
-            elif len(row) > 1 and _normalize_cell(row[1]) in {"证券买入", "证券卖出"}:
+            elif _is_execution_candidate(row):
                 warnings.append(
                     WarningRecord(
                         statement_id=statement_id,
@@ -129,7 +133,7 @@ def parse_eastmoney_page(
     )
 
 
-def _parse_fill(row: list[str | None]) -> TradeFill | None:
+def _parse_fill(row: list[str | None], occurrence: int) -> TradeFill | None:
     if len(row) != len(EXECUTION_HEADER):
         return None
     values = [_normalize_cell(cell) for cell in row]
@@ -149,12 +153,12 @@ def _parse_fill(row: list[str | None]) -> TradeFill | None:
         return None
     fee_parts = [parse_decimal(value) for value in values[7:10]]
     fees = (
-        sum((fee or Decimal("0") for fee in fee_parts), Decimal("0"))
-        if any(fee is not None for fee in fee_parts)
+        sum(fee_parts, Decimal("0"))
+        if all(fee is not None for fee in fee_parts)
         else None
     )
     return TradeFill(
-        source_id=source_id_for_fill(BROKER, values),
+        source_id=source_id_for_fill(BROKER, [*values, str(occurrence)]),
         source_order_id=None,
         broker=BROKER,
         account_alias=ACCOUNT_ALIAS,
@@ -166,6 +170,17 @@ def _parse_fill(row: list[str | None]) -> TradeFill | None:
         price=price,
         fees=fees,
         executed_at=executed_at,
+    )
+
+
+def _is_execution_candidate(row: list[str | None]) -> bool:
+    values = [_normalize_cell(cell) for cell in row]
+    category = values[1] if len(values) > 1 else ""
+    security_fields = [
+        values[index] if len(values) > index else "" for index in (2, 4, 5)
+    ]
+    return category in {"证券买入", "证券卖出"} or (
+        (not category or category.startswith("证券")) and any(security_fields)
     )
 
 

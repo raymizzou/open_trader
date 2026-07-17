@@ -36,8 +36,9 @@ ISSUE_DATE = re.compile(
 TRANSACTION_LINE = re.compile(
     rf"(?P<trade_date>\d{{2}}/\d{{2}}/\d{{2}})\s+"
     rf"(?P<settlement_date>\d{{2}}/\d{{2}}/\d{{2}})\s+"
-    r"Equity\s+(?P<symbol>[A-Z0-9.-]+)\s+"
-    r"(?P<side>Bought|Sold)\s+.+?\s+"
+    r"Equity\s+(?P<reference>[A-Z0-9@#*.-]+)\s+"
+    r"(?P<side>Bought|Sold)\s+"
+    r"(?P<description>.+?)\s+"
     rf"(?P<quantity>{NUMERIC})\s+"
     rf"(?P<price>{NUMERIC})\s+"
     rf"(?P<turnover>{NUMERIC})\s+"
@@ -48,11 +49,13 @@ TRANSACTION_LINE = re.compile(
 
 def parse_phillips_text(text: str, month: str) -> ParseResult:
     statement_id = f"{month}-{BROKER}"
+    position_products = _position_products_by_name(text, statement_id)
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
     base_cash: CashBalance | None = None
     fills: list[TradeFill] = []
     warnings: list[WarningRecord] = []
+    occurrences: dict[str, int] = {}
     in_transactions = False
     in_positions = False
     in_cash = False
@@ -68,11 +71,31 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
             continue
 
         if in_transactions:
-            fill = _parse_transaction_line(line)
+            if not _is_transaction_candidate(line):
+                fill = None
+            else:
+                occurrence = occurrences.get(line, 0)
+                occurrences[line] = occurrence + 1
+                match = TRANSACTION_LINE.fullmatch(line)
+                if match is not None and _looks_like_us_execution(
+                    match.group("description"), position_products
+                ):
+                    warnings.append(
+                        WarningRecord(
+                            statement_id=statement_id,
+                            broker=BROKER,
+                            page=None,
+                            severity="warning",
+                            code="unsupported_execution_market",
+                            message="辉立成交行不是香港市场成交",
+                        )
+                    )
+                    continue
+                fill = _parse_transaction_line(line, occurrence, position_products)
             if fill is not None:
                 fills.append(fill)
                 continue
-            if re.match(r"\d{2}/\d{2}/\d{2}\s+\d{2}/\d{2}/\d{2}\s+Equity\b", line):
+            if _is_transaction_candidate(line):
                 warnings.append(
                     WarningRecord(
                         statement_id=statement_id,
@@ -86,6 +109,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
                 continue
 
         if _is_account_details_start(line):
+            in_transactions = False
             in_account_details = True
             in_positions = False
             in_cash = False
@@ -109,6 +133,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
             or "SSeeccuurriittiieess PPoorrttffoolliioo" in line
             or "股股票票投投資資組組合合" in line
         ):
+            in_transactions = False
             in_positions = True
             in_account_details = False
             in_cash = False
@@ -144,7 +169,11 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
     )
 
 
-def _parse_transaction_line(line: str) -> TradeFill | None:
+def _parse_transaction_line(
+    line: str,
+    occurrence: int,
+    position_products: dict[str, tuple[Market, str]],
+) -> TradeFill | None:
     match = TRANSACTION_LINE.fullmatch(line)
     if match is None:
         return None
@@ -154,15 +183,21 @@ def _parse_transaction_line(line: str) -> TradeFill | None:
         executed_at = datetime.strptime(match.group("trade_date"), "%d/%m/%y").date().isoformat()
     except ValueError:
         executed_at = None
-    symbol = match.group("symbol").upper()
+    symbol = _resolve_execution_symbol(match.group("description"), position_products)
     side = "BUY" if match.group("side").upper() == "BOUGHT" else "SELL"
-    if quantity is None or quantity <= 0 or price is None or price <= 0 or executed_at is None:
+    if (
+        symbol is None
+        or quantity is None
+        or quantity <= 0
+        or price is None
+        or price <= 0
+        or executed_at is None
+    ):
         return None
-    market = Market.HK if re.fullmatch(r"\d{6}", symbol) else Market.US
-    symbol = _normalize_phillips_symbol(symbol, market)
+    market = Market.HK
     return TradeFill(
-        source_id=source_id_for_fill(BROKER, [line]),
-        source_order_id=None,
+        source_id=source_id_for_fill(BROKER, [line, str(occurrence)]),
+        source_order_id=match.group("reference"),
         broker=BROKER,
         account_alias=ACCOUNT_ALIAS,
         market=market,
@@ -174,6 +209,47 @@ def _parse_transaction_line(line: str) -> TradeFill | None:
         fees=None,
         executed_at=executed_at,
     )
+
+
+def _is_transaction_candidate(line: str) -> bool:
+    return re.search(r"(?:^|\s)Equity(?:\s|$)", line, re.IGNORECASE) is not None
+
+
+def _is_hk_execution_symbol(symbol: str) -> bool:
+    return re.fullmatch(r"0?\d{1,5}", symbol) is not None
+
+
+def _position_products_by_name(
+    text: str,
+    statement_id: str,
+) -> dict[str, tuple[Market, str]]:
+    return {
+        _normalize_line(position.name).upper(): (position.market, position.symbol)
+        for raw_line in text.splitlines()
+        if (position := _parse_position_line(_normalize_line(raw_line), statement_id))
+        is not None
+        and position.name
+    }
+
+
+def _resolve_execution_symbol(
+    description: str,
+    position_products: dict[str, tuple[Market, str]],
+) -> str | None:
+    normalized = _normalize_line(description).upper()
+    first = normalized.split()[0] if normalized else ""
+    if _is_hk_execution_symbol(first):
+        return _normalize_phillips_symbol(first, Market.HK).zfill(5)
+    product = position_products.get(normalized)
+    return product[1] if product is not None and product[0] is Market.HK else None
+
+
+def _looks_like_us_execution(
+    description: str,
+    position_products: dict[str, tuple[Market, str]],
+) -> bool:
+    product = position_products.get(_normalize_line(description).upper())
+    return product is not None and product[0] is Market.US
 
 
 def _parse_position_line(line: str, statement_id: str) -> Position | None:
