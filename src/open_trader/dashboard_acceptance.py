@@ -1674,17 +1674,6 @@ def _check_trend_review(
         ".trend-review-series strong"
     ).all_inner_texts()
     assert len(metric_values) == 20, f"{broker} 趋势复盘指标值数量不是 20"
-    visible_chrome = [
-        *rendered_header_left,
-        *header_items,
-        "当前策略参数",
-        *parameter_groups,
-        *parameter_names,
-        *comparison_titles,
-        *metric_labels,
-        *series_labels,
-        *metric_values,
-    ]
     _assert_no_trend_review_latin(
         [*header_items, "当前策略参数", *comparison_titles, *metric_labels,
          *series_labels, *metric_values],
@@ -1695,9 +1684,7 @@ def _check_trend_review(
         "复盘结论", "运行状态", "回测", "导出", "缺陷", "Connected",
         "Backtest", "Sharpe", "Calmar", "Alpha", "Beta", "Sortino",
     ):
-        assert all(forbidden not in item for item in visible_chrome), (
-            f"{broker} 趋势复盘包含未要求内容 {forbidden}"
-        )
+        assert forbidden not in text, f"{broker} 趋势复盘包含未要求内容 {forbidden}"
     _check_trend_review_visual_contract(page, broker)
     _check_trend_review_geometry(page, broker, parameter_count=len(parameters))
     width = (getattr(page, "viewport_size", None) or {}).get("width", 0)

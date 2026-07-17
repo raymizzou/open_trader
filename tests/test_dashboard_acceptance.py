@@ -925,12 +925,28 @@ def test_acceptance_allows_raw_parameter_facts_with_english_abbreviations() -> N
     payload = valid_payload()
     review = payload["trend_reviews"]["tiger"]
     review["strategy_snapshot"]["parameter_rows"][0]["value"] = (  # type: ignore[index]
-        "ETF / ST / ATR14 原始参数事实"
+        "ETF / ST / ATR14 / trend/US/v1 原始参数事实"
     )
     page = tabbed_account_page(payload)
     section = dashboard_acceptance._select_account_tab(page, "tiger")
 
     dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
+@pytest.mark.parametrize("forbidden", ("Backtest", "Alpha", "复盘结论"))
+def test_acceptance_rejects_forbidden_text_inside_raw_parameter_values(
+    forbidden: str,
+) -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    review["strategy_snapshot"]["parameter_rows"][0]["value"] = (  # type: ignore[index]
+        f"原始参数事实 {forbidden}"
+    )
+    page = tabbed_account_page(payload)
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match=forbidden):
+        dashboard_acceptance._check_trend_review(page, section, "tiger", review)
 
 
 def test_acceptance_rejects_english_parameter_group_or_name() -> None:
@@ -1031,6 +1047,13 @@ def test_trend_review_acceptance_fake_rejects_broken_selector_or_api() -> None:
     with pytest.raises(AssertionError):
         page.evaluate(geometry_expression.replace(
             "getBoundingClientRect", "getBrokenRect", 1
+        ))
+    page.trend_broker = "tiger"
+    with pytest.raises(AssertionError):
+        page.evaluate(geometry_expression.replace(
+            "documentWidth: document.documentElement.scrollWidth",
+            "documentWidth: 375",
+            1,
         ))
 
 
@@ -1628,7 +1651,12 @@ class TabbedAccountLocator:
             return self.page.entry_texts[match.group(1)]
         if self.selector == "#trend-report-workspace:visible":
             if self.page.trend_kind == "review":
-                return trend_review_workspace_text(str(self.page.trend_broker))
+                broker = str(self.page.trend_broker)
+                rows = self.page.reviews[broker]["strategy_snapshot"]["parameter_rows"]
+                return " ".join([
+                    trend_review_workspace_text(broker),
+                    *(str(row["value"]) for row in rows),
+                ])
             broker = str(self.page.trend_broker)
             return self.page.workspace_texts[broker]
         match = re.fullmatch(
@@ -2068,6 +2096,7 @@ class TabbedAccountPage:
         if "trend-review-geometry-contract" in expression:
             required = (
                 'document.querySelector("#trend-report-workspace")',
+                "documentWidth: document.documentElement.scrollWidth",
                 ".trend-review-header > div:first-child > *",
                 ".trend-review-header-side > *",
                 ".trend-review-parameter-list > div > *",
