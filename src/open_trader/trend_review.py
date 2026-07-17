@@ -1641,7 +1641,24 @@ def build_trend_review_projection(
     )
     if not isinstance(opening_positions, list):
         raise ValueError("actual opening positions must be a list")
-    actual_cycles = _completed_cycles(interval_fills, opening_positions)
+    if opening_fact is None:
+        replay_fills = [
+            fill
+            for fill in fills
+            if common_cutoff is not None
+            and str(fill["executed_at"])[:10] <= common_cutoff
+            and (
+                str(fill["executed_at"])[:10] < effective_from
+                or str(fill["executed_at"])[:10] in interval_actual
+            )
+        ]
+        actual_cycles = [
+            cycle
+            for cycle in _completed_cycles(replay_fills)
+            if str(cycle["exit_date"]) >= effective_from
+        ]
+    else:
+        actual_cycles = _completed_cycles(interval_fills, opening_positions)
 
     rates_path = data_dir / "rates" / "DGS3MO.csv"
     rates = _load_dgs3mo_csv(rates_path)
