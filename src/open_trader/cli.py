@@ -223,7 +223,7 @@ def _valid_trend_review_report(
         and as_of_date <= execution_date
         and payload.get(date_field) == trading_date
         and match is not None
-        and match.group("date") == execution_date.isoformat()
+        and match.group("date") == as_of_date.isoformat()
         and isinstance(metadata, dict)
         and str(metadata.get("market") or "").upper() == market
         and str(metadata.get("broker") or "").lower() == expected_broker

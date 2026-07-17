@@ -401,6 +401,34 @@ def test_trend_review_loader_prefers_latest_numeric_revision(tmp_path: Path) -> 
     assert report["version"] == "r10"
 
 
+def test_trend_review_loader_accepts_report_named_for_as_of_date(
+    tmp_path: Path,
+) -> None:
+    report_dir = tmp_path / "reports/trend_us_tiger"
+    report_dir.mkdir(parents=True)
+    report = {
+        "schema_version": 1,
+        "execution_date": "2026-07-17",
+        "as_of_date": "2026-07-16",
+        "generated_at": "2026-07-17T09:00:00+08:00",
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_judgments": {
+            "formal_actions": [], "holding_decisions": [], "top10_candidates": [],
+        },
+    }
+    (report_dir / "2026-07-16.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+    config = SimpleNamespace(
+        reports_dir=tmp_path / "reports",
+        data_dir=tmp_path / "data",
+    )
+
+    assert cli._load_trend_review_report(
+        config, "US", "2026-07-16", date_field="as_of_date"
+    ) == report
+
+
 def test_trend_a_share_report_invalid_private_config_returns_two(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
