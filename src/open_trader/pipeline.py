@@ -30,7 +30,7 @@ from .portfolio import (
     merge_eastmoney_portfolio_rows,
     replace_broker_portfolio_rows,
 )
-from .trend_review import freeze_actual_fill_batch
+from .trend_review import ACTUAL_FILL_MARKETS_BY_BROKER, freeze_actual_fill_batch
 
 
 MANIFEST_FIELDNAMES = [
@@ -324,14 +324,19 @@ def _run_import(
                 if broker in {"eastmoney", "phillips"}:
                     freeze_actual_fill_batch(
                         data_dir,
-                        {"broker": broker, "source_sha256": source_sha256},
+                        {
+                            "broker": broker,
+                            "market": ACTUAL_FILL_MARKETS_BY_BROKER[broker],
+                            "source_sha256": source_sha256,
+                        },
                         batch_fills,
                         actual_fill_complete_through,
                     )
-        if backup_run_dir is not None and backup_run_dir.exists():
-            rmtree(backup_run_dir)
-        if backup_latest_path is not None and backup_latest_path.exists():
-            _best_effort_unlink(backup_latest_path)
+        if actual_fill_complete_through is None:
+            if backup_run_dir is not None and backup_run_dir.exists():
+                rmtree(backup_run_dir)
+            if backup_latest_path is not None and backup_latest_path.exists():
+                _best_effort_unlink(backup_latest_path)
     except Exception:
         _rollback_failed_promotion(
             run_dir=run_dir,
@@ -344,6 +349,12 @@ def _run_import(
             latest_replaced=latest_replaced,
         )
         raise
+
+    if actual_fill_complete_through is not None:
+        if backup_run_dir is not None and backup_run_dir.exists():
+            _best_effort_rmtree(backup_run_dir)
+        if backup_latest_path is not None and backup_latest_path.exists():
+            _best_effort_unlink(backup_latest_path)
 
     portfolio_path = run_dir / "portfolio.csv"
 

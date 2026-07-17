@@ -34,6 +34,11 @@ TREND_V1_EFFECTIVE_FROM = {
     "US": "2026-07-17",
     "HK": "2026-07-17",
 }
+ACTUAL_FILL_MARKETS_BY_BROKER = {
+    "eastmoney": "CN",
+    "phillips": "HK",
+    "tiger": "US",
+}
 
 
 class TrendReplayIncompleteError(ValueError):
@@ -251,16 +256,15 @@ def freeze_actual_fill_batch(
         raise ValueError("actual fill complete_through must be an ISO date") from None
     if complete_date.isoformat() != complete_through:
         raise ValueError("actual fill complete_through must be an ISO date")
-    raw_market = source_metadata.get("market")
+    broker = str(source_metadata.get("broker") or "").lower()
+    broker_market = ACTUAL_FILL_MARKETS_BY_BROKER.get(broker)
+    explicit_market = source_metadata.get("market")
+    raw_market = explicit_market if explicit_market is not None else broker_market
     if raw_market is None and fills:
         raw_market = fills[0].market
-    if raw_market is None:
-        raw_market = {
-            "eastmoney": "CN",
-            "tiger": "US",
-            "phillips": "HK",
-        }.get(str(source_metadata.get("broker") or "").lower())
     market = _market(raw_market)
+    if broker_market is not None and market != broker_market:
+        raise ValueError("actual fill source metadata market does not match broker")
     paths: list[Path] = []
     identities: list[tuple[str, str, str]] = []
     artifacts: list[tuple[Path, bytes]] = []

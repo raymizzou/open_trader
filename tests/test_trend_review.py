@@ -854,6 +854,45 @@ def test_actual_fill_batch_write_failure_removes_new_files(
     assert list((tmp_path / "trend_review/facts").rglob("*.json")) == []
 
 
+@pytest.mark.parametrize(
+    ("broker", "market", "currency"),
+    [
+        ("eastmoney", Market.HK, "HKD"),
+        ("phillips", Market.CN, "CNY"),
+    ],
+)
+def test_actual_fill_batch_rejects_market_outside_broker_authority(
+    broker: str,
+    market: Market,
+    currency: str,
+    tmp_path: Path,
+) -> None:
+    fill = TradeFill(
+        source_id="wrong-market",
+        source_order_id=None,
+        broker=broker,
+        account_alias=f"{broker}_main",
+        market=market,
+        symbol="00700" if market is Market.HK else "600001",
+        currency=currency,
+        side="BUY",
+        quantity=Decimal("100"),
+        price=Decimal("10"),
+        fees=Decimal("0"),
+        executed_at="2026-07-16",
+    )
+
+    with pytest.raises(ValueError, match="market does not match source metadata"):
+        trend_review.freeze_actual_fill_batch(
+            tmp_path,
+            {"broker": broker},
+            [fill],
+            "2026-07-16",
+        )
+
+    assert not (tmp_path / "trend_review/facts").exists()
+
+
 def write_review_history(
     root: Path,
     *,

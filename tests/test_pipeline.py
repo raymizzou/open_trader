@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -310,6 +311,8 @@ def test_uploaded_statement_freezes_broker_fills_in_its_market_idempotently(
         ).glob("*.json")
     )
     assert len(completeness) == 1
+    completeness_payload = json.loads(completeness[0].read_text(encoding="utf-8"))
+    assert completeness_payload["source_metadata"]["market"] == market.value
 
 
 def test_uploaded_empty_statement_freezes_completeness_only_after_success(
@@ -433,6 +436,68 @@ def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
     assert tree_bytes(data_dir / "trend_review/facts") == original_facts
     assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
     assert list(portfolio_path.parent.glob(".portfolio.csv.*.backup")) == []
+
+
+def test_uploaded_statement_commits_before_backup_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"first statement")
+    data_dir = tmp_path / "data"
+    portfolio_path = tmp_path / "current/portfolio.csv"
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": FakeParser(
+            broker="eastmoney",
+            position_currency="CNY",
+            cash_currency="CNY",
+            symbol="600001",
+        ),
+        "data_dir": data_dir,
+        "portfolio_path": portfolio_path,
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08")}
+        ),
+    }
+    pipeline.run_uploaded_statement(**arguments)
+    source.write_bytes(b"second statement")
+    arguments["parser"] = FakeParser(
+        broker="eastmoney",
+        position_currency="CNY",
+        cash_currency="CNY",
+        symbol="600002",
+    )
+    real_rmtree = pipeline.rmtree
+
+    def fail_backup_cleanup(path: Path) -> None:
+        if path.suffix == ".backup":
+            raise OSError("simulated backup cleanup failure")
+        real_rmtree(path)
+
+    monkeypatch.setattr(pipeline, "rmtree", fail_backup_cleanup)
+
+    result = pipeline.run_uploaded_statement(**arguments)
+
+    expected_sha = pipeline.sha256_file(source)
+    manifest = list(
+        csv.DictReader((result.run_dir / "manifest.csv").open(encoding="utf-8"))
+    )
+    assert manifest[0]["source_sha256"] == expected_sha
+    assert "600002" in result.portfolio_path.read_text(encoding="utf-8")
+    assert "600002" in portfolio_path.read_text(encoding="utf-8")
+    completeness = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            data_dir / "trend_review/facts/actual_fill_completeness/CN"
+        ).glob("*.json")
+    ]
+    assert any(
+        fact["source_metadata"]["source_sha256"] == expected_sha
+        for fact in completeness
+    )
+    assert len(list((data_dir / "runs").glob(".2026-05*.backup"))) == 1
 
 
 def test_uploaded_statements_for_two_brokers_share_monthly_run(
