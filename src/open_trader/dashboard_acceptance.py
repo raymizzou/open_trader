@@ -30,6 +30,7 @@ SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
 
 ACCOUNT_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 TREND_REPORT_BROKERS = ("tiger", "phillips", "eastmoney")
+TREND_REVIEW_BROKERS = TREND_REPORT_BROKERS
 TREND_REPORT_DIRECTORIES = {
     "tiger": "trend_us_tiger",
     "phillips": "trend_hk_phillips",
@@ -965,6 +966,10 @@ def _check_account_holdings(
             assert page.locator("#trend-report-workspace:visible").count() == 0, (
                 f"{broker} 不可用报告错误打开工作区"
             )
+            if broker in TREND_REVIEW_BROKERS:
+                review = reviews.get(broker) if isinstance(reviews, Mapping) else None
+                assert isinstance(review, Mapping), f"API 缺少 {broker} 趋势复盘状态"
+                _check_trend_review(page, section, broker, review)
             if broker in {"futu", "eastmoney"} and screenshot_dir is not None:
                 raise AssertionError(f"{broker} 趋势报告不可用，无法生成验收截图")
             continue

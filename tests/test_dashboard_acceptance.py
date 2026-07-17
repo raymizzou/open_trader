@@ -3678,6 +3678,18 @@ def test_acceptance_keeps_unavailable_futu_disabled_outside_screenshot_gate() ->
     assert page.disabled_reports == {"futu"}
 
 
+def test_acceptance_rejects_unavailable_review_when_daily_report_is_unavailable() -> None:
+    payload = valid_payload()
+    payload["trend_reports"]["tiger"].update(  # type: ignore[index]
+        available=False, status_text="今日报告不可用"
+    )
+    payload["trend_reviews"]["tiger"]["available"] = False  # type: ignore[index]
+    page = tabbed_account_page(payload)
+
+    with pytest.raises(AssertionError, match="tiger 趋势复盘不可用"):
+        dashboard_acceptance._check_account_holdings(page, payload)
+
+
 def test_select_account_tab_rejects_multiple_visible_sections() -> None:
     page = tabbed_account_page(valid_payload())
     page.visible_account_sections = 2
