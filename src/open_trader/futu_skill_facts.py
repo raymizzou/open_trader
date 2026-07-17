@@ -30,6 +30,7 @@ FUTU_STOCK_FEED_CACHE_FILENAME = "futu_stock_feed_cache.json"
 FUTU_STOCK_FEED_CACHE_DAYS = 7
 FUTU_STOCK_FEED_SIZE = 50
 VALID_MODULE_STATUSES = {"ok", "partial", "missing", "error", "stale", "not_applicable"}
+VALID_NEWS_SENTIMENT_STATUSES = VALID_MODULE_STATUSES - {"not_applicable"}
 VALID_SIGNALS = {"supportive", "opposing", "neutral", "risk_up", "mixed"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_CONSTRAINTS = {"", "review", "reduce_only", "wait_for_event", "no_add"}
@@ -676,12 +677,19 @@ class FutuAnomalyScriptClient:
         if isinstance(data, dict) and data.get("err_code") == -12301:
             label = {"technical": "技术", "capital": "资金", "derivatives": "衍生品"}[module]
             raise FutuAnomalyUnsupportedError(f"富途接口不支持{label}异动：{stock_symbol}")
-        if (
-            not isinstance(data, dict)
-            or not isinstance(data.get("err_code"), int)
-            or not _optional_text(data.get("time_range"))
-            or not _optional_text(data.get("content"))
-        ):
+        err_code = data.get("err_code") if isinstance(data, dict) else None
+        valid = bool(
+            type(err_code) is int
+            and _optional_text(data.get("time_range"))
+            and (
+                err_code == 0
+                and _optional_text(data.get("content"))
+                or err_code == 1
+                and _optional_text(data.get("retMsg"))
+                and isinstance(data.get("content"), str)
+            )
+        )
+        if not valid:
             raise RuntimeError(f"{module} native anomaly response is invalid")
         return {"data": data}
 
@@ -1176,7 +1184,7 @@ def _normalize_news_sentiment_module(module: object) -> dict[str, Any]:
     if not isinstance(module, dict):
         raise ValueError("news_sentiment module is invalid")
     normalized = {
-        "status": _required_enum(module, "status", VALID_MODULE_STATUSES, "news_sentiment"),
+        "status": _required_enum(module, "status", VALID_NEWS_SENTIMENT_STATUSES, "news_sentiment"),
         "signal": _required_enum(module, "signal", VALID_SIGNALS, "news_sentiment"),
         "confidence": _required_enum(module, "confidence", VALID_CONFIDENCES, "news_sentiment"),
         "freshness": _normalize_freshness(module.get("freshness")),
@@ -1199,7 +1207,7 @@ def _normalize_news_sentiment_module(module: object) -> dict[str, Any]:
 def _validate_news_sentiment_module(module: object) -> None:
     if not isinstance(module, dict):
         raise ValueError("news_sentiment module is invalid")
-    _validate_enum(module, "status", VALID_MODULE_STATUSES, "news_sentiment")
+    _validate_enum(module, "status", VALID_NEWS_SENTIMENT_STATUSES, "news_sentiment")
     _validate_enum(module, "signal", VALID_SIGNALS, "news_sentiment")
     _validate_enum(module, "confidence", VALID_CONFIDENCES, "news_sentiment")
     _validate_enum(module, "suggested_constraint", VALID_CONSTRAINTS, "news_sentiment")

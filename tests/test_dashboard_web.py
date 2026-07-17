@@ -4650,6 +4650,54 @@ console.log(html.slice(start, end));
     assert "<strong>中性</strong>" not in output
 
 
+def test_dashboard_futu_anomaly_stale_run_date_is_expired_and_blocking() -> None:
+    output = run_dashboard_js(
+        """
+const holding = {
+  market: "US",
+  symbol: "NVDA",
+  decision_facts: {},
+  futu_skill_facts: {
+    technical_anomaly: {
+      available: false,
+      status: "stale_run_date",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "Futu facts run date does not match latest advice",
+      categories: []
+    },
+    capital_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "窗口内无异常。",
+      categories: []
+    },
+    derivatives_anomaly: {
+      available: true,
+      status: "ok",
+      signal: "neutral",
+      confidence: "low",
+      suggested_constraint: "",
+      summary: "窗口内无异常。",
+      categories: []
+    }
+  }
+};
+console.log(futuAnomalySignalsPlugin(holding));
+"""
+    )
+
+    assert "已过期" in output
+    assert "status-stale" in output
+    assert "需复核" in output
+    assert "市场信号数据不可用" in output
+    assert "窗口内未发现明显异动" not in output
+
+
 def test_dashboard_futu_anomaly_unknown_enums_render_safe_chinese_fallback() -> None:
     output = run_dashboard_js(
         """

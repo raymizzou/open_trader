@@ -2023,7 +2023,11 @@ def _futu_skill_signal_detail(
     return {
         "available": available,
         "unsupported": unsupported and not stale_run_date,
-        "status": "stale_run_date" if stale_run_date else status or "missing",
+        "status": (
+            "stale_run_date"
+            if stale_run_date
+            else "not_applicable" if unsupported else status or "missing"
+        ),
         "error": "Futu facts run date does not match latest advice" if stale_run_date else "",
         "signal": signal,
         "confidence": confidence,

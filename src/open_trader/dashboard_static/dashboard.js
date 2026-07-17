@@ -3402,7 +3402,7 @@ function futuAnomalySignalsPlugin(holding) {
 function futuSignalModuleView(module, key, title) {
   const value = module && typeof module === "object" ? module : {};
   const status = hasValue(value.status) ? String(value.status) : "missing";
-  const signal = value.available === true && !["missing", "error", "stale"].includes(status) && hasValue(value.signal)
+  const signal = value.available === true && !["missing", "error", "stale", "stale_run_date"].includes(status) && hasValue(value.signal)
     ? String(value.signal)
     : status;
   return {
@@ -3456,11 +3456,11 @@ function deriveFutuSignalOverall(modules) {
       detail: "统一结论只来自三个模块的结构化字段；不会展示自由发挥的长段落。",
     };
   }
-  if (signals.includes("error") || signals.includes("missing") || signals.includes("stale")) {
+  if (signals.includes("error") || signals.includes("missing") || signals.includes("stale") || signals.includes("stale_run_date")) {
     return {
       tone: "warn",
       label: "需复核",
-      signal: signals.includes("error") ? "error" : (signals.includes("stale") ? "stale" : "missing"),
+      signal: signals.includes("error") ? "error" : (signals.includes("stale_run_date") ? "stale_run_date" : (signals.includes("stale") ? "stale" : "missing")),
       constraint: constraint || "review",
       headline: "市场信号数据不可用，不能视为中性。",
       detail: "缺失、错误或过期模块会保留数据质量状态，不会自动改写成交易方向。",
@@ -3536,6 +3536,7 @@ function translateFutuSignalValue(value) {
     missing: "缺失",
     error: "错误",
     stale: "已过期",
+    stale_run_date: "已过期",
     anomaly: "异常",
     none: "无异常",
     not_applicable: "不适用",
@@ -3552,7 +3553,7 @@ function translateFutuSignalValue(value) {
 function futuSignalStatusTone(status) {
   if (status === "ok") return "ok";
   if (status === "partial") return "warn";
-  if (status === "stale") return "stale";
+  if (status === "stale" || status === "stale_run_date") return "stale";
   if (status === "error") return "failed";
   return "muted";
 }

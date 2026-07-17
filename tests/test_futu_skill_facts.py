@@ -682,8 +682,9 @@ def test_futu_anomaly_client_uses_native_sdk_when_skill_script_is_missing(
             calls.append(("capital", symbol, time_range))
             return 0, {
                 "err_code": 1,
+                "retMsg": "资金面异动无异常",
                 "time_range": "近7个自然日",
-                "content": "资金面异动无异常",
+                "content": "",
             }
 
         def close(self) -> None:
@@ -699,11 +700,27 @@ def test_futu_anomaly_client_uses_native_sdk_when_skill_script_is_missing(
     assert payload == {
         "data": {
             "err_code": 1,
+            "retMsg": "资金面异动无异常",
             "time_range": "近7个自然日",
-            "content": "资金面异动无异常",
+            "content": "",
         }
     }
     assert calls == [("capital", "US.DRAM", 7), ("close", "", 0)]
+
+    module = FutuSkillFactsExtractor(
+        news_extractor=FakeExtractor(),
+        anomaly_client=client,
+    ).extract_capital_anomaly(
+        market="US",
+        symbol="DRAM",
+        name="DRAM ETF",
+        run_date="2026-07-17",
+        window_days=7,
+    )
+
+    assert module["status"] == "ok"
+    assert module["signal"] == "neutral"
+    assert {category["state"] for category in module["categories"]} == {"none"}
 
 
 def test_futu_anomaly_client_reports_native_sdk_unsupported_reason(tmp_path: Path) -> None:
@@ -737,6 +754,11 @@ def test_futu_anomaly_client_reports_native_sdk_unsupported_reason(tmp_path: Pat
         {"err_code": 0, "content": "MACD 金叉"},
         {"err_code": 0, "time_range": "", "content": "MACD 金叉"},
         {"err_code": 0, "time_range": 7, "content": "MACD 金叉"},
+        {"err_code": 1, "retMsg": "资金面异动无异常", "time_range": "近7个自然日"},
+        {"err_code": 1, "retMsg": "", "time_range": "近7个自然日", "content": ""},
+        {"err_code": 2, "retMsg": "未知状态", "time_range": "近7个自然日", "content": ""},
+        {"err_code": "1", "retMsg": "资金面异动无异常", "time_range": "近7个自然日", "content": ""},
+        {"err_code": True, "retMsg": "资金面异动无异常", "time_range": "近7个自然日", "content": ""},
     ],
 )
 def test_futu_anomaly_client_rejects_native_sdk_payload_without_required_content(
@@ -1593,6 +1615,14 @@ def test_index_futu_skill_facts_by_market_symbol() -> None:
 def test_validate_futu_skill_fact_record_rejects_invalid_module_status() -> None:
     record = valid_record()
     record["news_sentiment"]["status"] = "unknown"
+
+    with pytest.raises(ValueError, match="news_sentiment status is invalid"):
+        validate_futu_skill_fact_record(record)
+
+
+def test_validate_futu_skill_fact_record_rejects_not_applicable_news_sentiment() -> None:
+    record = valid_record()
+    record["news_sentiment"]["status"] = "not_applicable"
 
     with pytest.raises(ValueError, match="news_sentiment status is invalid"):
         validate_futu_skill_fact_record(record)

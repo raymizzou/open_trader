@@ -114,6 +114,24 @@ def test_evaluate_required_sources_accepts_explicit_futu_unsupported_module() ->
     ) == []
 
 
+@pytest.mark.parametrize("status", ["not_applicable", "error"])
+def test_evaluate_required_sources_rejects_unsupported_news_sentiment(status: str) -> None:
+    records = _records()
+    records["futu_records"][("US", "MSFT")]["news_sentiment"] = {
+        "status": status,
+        "summary": "富途接口不支持新闻舆情：US.MSFT",
+    }
+
+    failures = evaluate_required_sources(
+        advice_rows=[
+            {"run_date": RUN_DATE, "market": "US", "symbol": "MSFT", "raw_decision": RAW_DECISION}
+        ],
+        **records,
+    )
+
+    assert [failure.source for failure in failures] == ["futu_skill_facts.news_sentiment"]
+
+
 @pytest.mark.parametrize(
     ("source", "mutate", "expected_error"),
     [

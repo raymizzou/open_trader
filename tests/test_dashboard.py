@@ -127,6 +127,7 @@ def test_futu_signal_detail_marks_explicit_api_unsupported_reason() -> None:
 
     assert detail["available"] is False
     assert detail["unsupported"] is True
+    assert detail["status"] == "not_applicable"
     assert detail["summary"] == "富途接口不支持技术异动：US.BOTZ"
 
 
