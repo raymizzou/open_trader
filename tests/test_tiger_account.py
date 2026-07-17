@@ -604,6 +604,22 @@ class HkTransactions(ListTransactions):
         return transaction
 
 
+class SymbolRequiredTransactions(PagedTransactions):
+    def __init__(self, client_config: object) -> None:
+        super().__init__(client_config)
+        self.filled_order_calls: list[dict[str, object]] = []
+
+    def get_filled_orders(self, **kwargs: object) -> list[object]:
+        self.filled_order_calls.append(kwargs)
+        return [type("Order", (), {"id": 9001})()]
+
+    def get_transactions(self, **kwargs: object) -> object:
+        self.transaction_calls.append(kwargs)
+        if "order_id" not in kwargs:
+            raise RuntimeError("biz param error(field 'symbol' cannot be empty)")
+        return [self._transaction("9001-1", 9001)]
+
+
 class FakeStockAndFundTradeClient(FakeTradeClient):
     def get_positions(self, **kwargs: object) -> list[FakePosition]:
         self.position_calls.append(kwargs)
@@ -929,6 +945,28 @@ def test_tiger_fetch_transactions_accepts_sdk_list_response() -> None:
     ).fetch_actual_fills("2026-07-17", "2026-07-17")
 
     assert [fill.source_id for fill in fills] == ["9001-1"]
+
+
+def test_tiger_fetch_transactions_falls_back_to_filled_orders_when_symbol_is_required() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=SymbolRequiredTransactions,
+    )
+
+    fills = client.fetch_actual_fills("2026-07-17", "2026-07-17")
+
+    assert [fill.source_id for fill in fills] == ["9001-1"]
+    assert client.trade_client.filled_order_calls == [
+        {
+            "account": "123456789",
+            "start_time": "2026-07-17 00:00:00",
+            "end_time": "2026-07-17 23:59:59",
+        }
+    ]
+    assert client.trade_client.transaction_calls[-1] == {
+        "account": "123456789",
+        "order_id": 9001,
+    }
 
 
 def test_tiger_multiple_fills_do_not_guess_order_fee_allocation() -> None:

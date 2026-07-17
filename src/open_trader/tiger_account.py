@@ -727,10 +727,38 @@ class TigerAccountClient:
                     page_token=page_token,
                 )
             except Exception as exc:
-                raise TigerAccountError(
-                    "failed to query Tiger transactions",
-                    error_type="transaction_query_failed",
-                ) from exc
+                message = str(exc).lower()
+                if "symbol" not in message or "empty" not in message:
+                    raise TigerAccountError(
+                        "failed to query Tiger transactions",
+                        error_type="transaction_query_failed",
+                    ) from exc
+                try:
+                    orders = self.trade_client.get_filled_orders(
+                        account=self.config.account,
+                        start_time=f"{start_date} 00:00:00",
+                        end_time=f"{end_date} 23:59:59",
+                    ) or []
+                    for order in orders:
+                        order_id = _get_attr(
+                            order, "id", _get_attr(order, "order_id")
+                        )
+                        if order_id is None:
+                            raise ValueError("Tiger filled order is missing id")
+                        scoped = self.trade_client.get_transactions(
+                            account=self.config.account,
+                            order_id=order_id,
+                        )
+                        if isinstance(scoped, list):
+                            transactions.extend(scoped)
+                        elif scoped is not None:
+                            transactions.extend(list(_get_attr(scoped, "result", [])))
+                except Exception as fallback_exc:
+                    raise TigerAccountError(
+                        "failed to query Tiger transactions",
+                        error_type="transaction_query_failed",
+                    ) from fallback_exc
+                break
             if response is None:
                 break
             if isinstance(response, list):
