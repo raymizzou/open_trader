@@ -325,6 +325,12 @@ def cn_buy_report(
     }
 
 
+def report_with_actions(actions: list[dict[str, object]]) -> dict[str, object]:
+    report = cn_buy_report()
+    report["strategy_judgments"] = {"formal_actions": actions}
+    return report
+
+
 def test_open_uses_sim_nav_current_price_and_frozen_lot(tmp_path: Path) -> None:
     client = FakeTrendSimClient()
 
@@ -373,6 +379,38 @@ def test_us_open_uses_us_market_date_after_shanghai_midnight(tmp_path: Path) -> 
     assert client.requests[0]["futu_code"] == "US.NDAQ"
 
 
+def test_us_open_does_not_carry_market_order_after_close(tmp_path: Path) -> None:
+    client = FakeTrendSimClient()
+    report = cn_buy_report(symbol="NDAQ")
+    report["strategy_judgments"]["formal_actions"][0]["lot_size"] = 1
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        prices={"NDAQ": Decimal("94.25")},
+        market="US",
+        execution_date="2026-07-17",
+        now="2026-07-17T19:54:00-04:00",
+    )
+
+    assert result["status"] == "missed_window"
+    assert result["submitted_count"] == 0
+    assert client.requests == []
+    events = list(
+        tmp_path.glob("trend_review/ledgers/US/actions/2026-07-17/*/*.json")
+    )
+    assert len(events) == 1
+    assert json.loads(events[0].read_text(encoding="utf-8")) | {
+        "market": "US",
+        "date": "2026-07-17",
+        "symbol": "NDAQ",
+        "side": "buy",
+        "status": "missed",
+        "reason": "buy_window_closed",
+    } == json.loads(events[0].read_text(encoding="utf-8"))
+
+
 def test_report_revision_does_not_duplicate_existing_symbol_intent(
     tmp_path: Path,
 ) -> None:
@@ -402,6 +440,144 @@ def test_report_revision_does_not_duplicate_existing_symbol_intent(
 
     assert first["submitted_count"] == 1
     assert repeated["submitted_count"] == 0
+    assert len(client.requests) == 1
+
+
+def test_formal_sell_all_submits_full_position_market_order(tmp_path: Path) -> None:
+    client = FakeTrendSimClient()
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        prices={"600001": Decimal("10")},
+        market="CN",
+        execution_date="2026-07-16",
+        now="2026-07-16T09:31:00+08:00",
+    )
+    client.positions = [{"code": "SH.600001", "qty": "300"}]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report_with_actions(
+            [{"action": "SELL_ALL", "symbol": "600001"}]
+        ),
+        client=client,
+        prices={},
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T10:30:00+08:00",
+    )
+
+    assert result["submitted_count"] == 1
+    assert client.requests[-1] | {
+        "side": "sell",
+        "order_type": "MARKET",
+        "qty": "300",
+        "futu_code": "SH.600001",
+    } == client.requests[-1]
+
+
+def test_formal_sell_all_suppresses_conflicting_buy(tmp_path: Path) -> None:
+    client = FakeTrendSimClient()
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        prices={"600001": Decimal("10")},
+        market="CN",
+        execution_date="2026-07-16",
+        now="2026-07-16T09:31:00+08:00",
+    )
+    client.requests.clear()
+    client.orders.clear()
+    client.positions = [{"code": "SH.600001", "qty": "300"}]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report_with_actions(
+            [
+                {
+                    "action": "BUY",
+                    "symbol": "600001",
+                    "target_weight": "0.04",
+                    "lot_size": 100,
+                },
+                {"action": "SELL_ALL", "symbol": "600001"},
+            ]
+        ),
+        client=client,
+        prices={"600001": Decimal("10")},
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+    )
+
+    assert result["submitted_count"] == 1
+    assert [request["side"] for request in client.requests] == ["sell"]
+
+
+def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "prices": {"600001": Decimal("10")},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "now": "2026-07-17T09:31:00+08:00",
+    }
+    trend_review.execute_trend_review_open(**arguments)
+    remark = client.requests[0]["remark"]
+    client.orders = [
+        {
+            "order_id": "SIM-1",
+            "remark": remark,
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "400",
+            "dealt_qty": "200",
+            "order_status": "CANCELLED_PART",
+        }
+    ]
+
+    result = trend_review.execute_trend_review_open(**arguments)
+
+    assert result["submitted_count"] == 1
+    assert client.requests[-1]["qty"] == "200"
+    assert client.requests[-1]["remark"] == remark
+
+
+def test_active_partial_buy_waits_instead_of_duplicate_submission(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "prices": {"600001": Decimal("10")},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "now": "2026-07-17T09:31:00+08:00",
+    }
+    trend_review.execute_trend_review_open(**arguments)
+    request = client.requests[0]
+    client.orders = [
+        {
+            "order_id": "SIM-1",
+            "remark": request["remark"],
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "400",
+            "dealt_qty": "200",
+            "order_status": "FILLED_PART",
+        }
+    ]
+
+    result = trend_review.execute_trend_review_open(**arguments)
+
+    assert result["submitted_count"] == 0
     assert len(client.requests) == 1
 
 
