@@ -2009,15 +2009,20 @@ def _futu_skill_signal_detail(
     status = str(module.get("status") or "").strip()
     signal = str(module.get("signal") or "").strip()
     confidence = str(module.get("confidence") or "").strip()
+    advice_run_date = str((advice_row or {}).get("run_date") or "")
     available = futu_module_available(
         module,
         run_date,
-        str((advice_row or {}).get("run_date") or ""),
+        advice_run_date,
     )
-    stale_run_date = futu_module_available(module) and not available
+    unsupported = futu_module_unsupported(module)
+    stale_run_date = (
+        futu_module_available(module) and not available
+        or unsupported and run_date != advice_run_date
+    )
     return {
         "available": available,
-        "unsupported": futu_module_unsupported(module),
+        "unsupported": unsupported and not stale_run_date,
         "status": "stale_run_date" if stale_run_date else status or "missing",
         "error": "Futu facts run date does not match latest advice" if stale_run_date else "",
         "signal": signal,

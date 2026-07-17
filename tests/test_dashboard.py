@@ -130,6 +130,23 @@ def test_futu_signal_detail_marks_explicit_api_unsupported_reason() -> None:
     assert detail["summary"] == "富途接口不支持技术异动：US.BOTZ"
 
 
+def test_futu_signal_detail_marks_stale_api_unsupported_reason_blocking() -> None:
+    detail = _futu_skill_signal_detail(
+        {
+            "status": "not_applicable",
+            "summary": "富途接口不支持技术异动：US.BOTZ",
+            "categories": [],
+        },
+        "2026-07-12",
+        {"run_date": "2026-07-13"},
+    )
+
+    assert detail["available"] is False
+    assert detail["unsupported"] is False
+    assert detail["status"] == "stale_run_date"
+    assert detail["error"] == "Futu facts run date does not match latest advice"
+
+
 def write_csv(path: Path, fieldnames: list[str] | tuple[str, ...], rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
