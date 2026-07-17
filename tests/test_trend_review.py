@@ -1738,6 +1738,33 @@ def test_projection_can_show_latest_snapshot_from_actual_stream(
     assert projection["strategy_snapshot"]["process_version"] == "actual-latest-sha"
 
 
+def test_projection_shows_current_strategy_before_first_effective_sample(
+    tmp_path: Path,
+) -> None:
+    snapshot = strategy_snapshot("US")
+    trend_review.freeze_discipline_fact(
+        tmp_path,
+        "US",
+        "2026-07-16",
+        "100000",
+        [],
+        snapshot,
+    )
+    rates = tmp_path / "rates/DGS3MO.csv"
+    rates.parent.mkdir(parents=True)
+    rates.write_text("DATE,DGS3MO\n2026-07-16,4.25\n", encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    assert projection["common_cutoff"] is None
+    assert projection["sample_counts"] == {
+        "discipline": 0,
+        "actual": 0,
+        "required": 30,
+    }
+    assert projection["strategy_snapshot"] == snapshot
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("market", "US"), ("effective_from", "2026-07-15")],

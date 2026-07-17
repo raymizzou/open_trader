@@ -1650,7 +1650,21 @@ def build_trend_review_projection(
     snapshot = (
         dict(snapshot_facts[-1]["strategy_snapshot"])
         if snapshot_facts
-        else {}
+        else next(
+            (
+                dict(fact["strategy_snapshot"])
+                for fact in sorted(
+                    (
+                        fact
+                        for fact in (*discipline_facts, *actual_facts)
+                        if str(fact["date"]) < effective_from
+                    ),
+                    key=lambda fact: str(fact["date"]),
+                    reverse=True,
+                )
+            ),
+            {},
+        )
     )
     discipline_cycles = _completed_trades(interval_discipline)
     interval_actual = {
