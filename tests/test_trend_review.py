@@ -1256,6 +1256,40 @@ def test_projection_without_cutoff_keeps_latest_complete_discipline_snapshot(
     assert projection["strategy_snapshot"]["parameter_rows"]
 
 
+def test_projection_uses_frozen_report_snapshot_before_first_effective_fact(
+    tmp_path: Path,
+) -> None:
+    snapshot = trend_strategy_snapshot("US", "current-sha", (1,))
+    trend_review.freeze_trend_evidence(
+        tmp_path,
+        {
+            "market": "US",
+            "report_id": "2026-07-16",
+            "strategy_snapshot": snapshot,
+            "process_version": "current-sha",
+            "rebuild_inputs": {"generated_at": "2026-07-17T20:00:00+08:00"},
+        },
+    )
+    rates = tmp_path / "rates/DGS3MO.csv"
+    rates.parent.mkdir(parents=True)
+    rates.write_text("DATE,DGS3MO\n2026-07-16,4.0\n", encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    assert projection["strategy_snapshot"] == snapshot
+    assert projection["sample_counts"] == {
+        "discipline": 0,
+        "actual": 0,
+        "required": 30,
+    }
+    assert projection["common_cutoff"] is None
+    assert all(
+        cell["value"] is None
+        for metric in projection["metrics"].values()
+        for cell in metric.values()
+    )
+
+
 def test_us_projection_belongs_to_tiger_trend_account(tmp_path: Path) -> None:
     daily = tmp_path / "trend_review/daily/US"
     daily.mkdir(parents=True)

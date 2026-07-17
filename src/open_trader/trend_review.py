@@ -1446,6 +1446,34 @@ def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
         temp.unlink(missing_ok=True)
 
 
+def _latest_frozen_strategy_snapshot(
+    data_dir: Path, market: str
+) -> dict[str, object] | None:
+    candidates: list[tuple[str, str, str, dict[str, object]]] = []
+    root = data_dir / "trend_review" / "evidence" / market
+    for path in sorted(root.glob("*.json")):
+        evidence = _load_valid_evidence(path)
+        if _market(evidence.get("market")) != market:
+            raise ValueError(f"trend review evidence market mismatch: {path}")
+        try:
+            snapshot = _validated_strategy_snapshot(
+                evidence.get("strategy_snapshot"), market
+            )
+            report_id = date.fromisoformat(str(evidence.get("report_id"))).isoformat()
+        except ValueError:
+            continue
+        rebuild_inputs = evidence.get("rebuild_inputs")
+        generated_at = (
+            str(rebuild_inputs.get("generated_at") or "")
+            if isinstance(rebuild_inputs, Mapping)
+            else ""
+        )
+        candidates.append((report_id, generated_at, path.name, dict(snapshot)))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[:3])[3]
+
+
 def build_trend_review_projection(
     data_dir: Path, market: str
 ) -> dict[str, object]:
@@ -1504,7 +1532,13 @@ def build_trend_review_projection(
             fact.get("benchmark"), market=market, trading_date=str(fact["date"])
         )
         benchmark_by_date[str(fact["date"])] = dict(benchmark)
-    if not discipline_by_date and not actual_by_date and not benchmark_by_date:
+    evidence_snapshot = _latest_frozen_strategy_snapshot(data_dir, market)
+    if (
+        not discipline_by_date
+        and not actual_by_date
+        and not benchmark_by_date
+        and evidence_snapshot is None
+    ):
         raise ValueError(f"no trend review facts for {market}")
 
     def is_v1(fact: Mapping[str, object]) -> bool:
@@ -1583,7 +1617,7 @@ def build_trend_review_projection(
     snapshot = (
         dict(snapshot_facts[-1]["strategy_snapshot"])
         if snapshot_facts
-        else {}
+        else evidence_snapshot or {}
     )
     discipline_cycles = _completed_trades(interval_discipline)
     interval_actual = {
