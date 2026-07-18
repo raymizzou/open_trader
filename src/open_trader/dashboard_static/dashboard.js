@@ -50,7 +50,6 @@ const state = {
 
 const elements = {};
 
-const ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT = 11;
 const WORKSPACE_VIEWS = new Set(["portfolio", "kelly_lab", "standard_backtest", "trend_report"]);
 
 const ACCOUNT_STRATEGY_PROFILES = {
@@ -2551,9 +2550,10 @@ async function setAccountView(broker, view) {
   state.selectedHoldingDetail = "decision";
   state.selectedDecisionTab = "final";
   syncDecisionDeepLink();
-  renderAccountViewPanelOnly(broker);
   if (view === "simulate" && !Object.hasOwn(state.trendSimulatePositions, broker)) {
     await loadTrendSimulatePositions(broker);
+  } else {
+    renderAccountViewPanelOnly(broker);
   }
 }
 
@@ -2613,23 +2613,28 @@ async function openTrendReportHistory(broker) {
   try {
     const response = await fetch(`/api/trend-reports/${encodeURIComponent(broker)}/history`, {cache: "no-store"});
     if (!response.ok) throw new Error(`report history ${response.status}`);
+    const rows = await response.json();
+    const history = state.trendReportHistories[broker] || {};
     state.trendReportHistories[broker] = {
-      open: true,
+      ...history,
       loading: false,
-      rows: await response.json(),
-      scrollY,
+      rows,
+      error: "",
     };
   } catch (error) {
+    const history = state.trendReportHistories[broker] || {};
     state.trendReportHistories[broker] = {
-      open: true,
+      ...history,
       loading: false,
       rows: [],
       error: error instanceof Error ? error.message : String(error),
-      scrollY,
     };
   }
-  renderAccountViewPanelOnly(broker);
-  if (state.brokerFilter === broker) restoreAccountScroll(scrollY);
+  const history = state.trendReportHistories[broker];
+  if (state.brokerFilter === broker && state.accountViews[broker] === "report" && history.open) {
+    renderAccountViewPanelOnly(broker);
+    restoreAccountScroll(history.scrollY);
+  }
 }
 
 async function loadHistoricalTrendReport(broker, artifact) {
@@ -2967,7 +2972,7 @@ function renderAccountHoldingRow(row, {simulated = false} = {}) {
     <td class="number-cell account-holding-pnl${pnlTone ? ` ${pnlTone}` : ""}"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatSignedPnl(display.unrealized_pnl_pct))}</td>
   </tr>`;
   if (!isSelected) return cells;
-  return `${cells}<tr class="decision-detail-row"><td colspan="${ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT}"><div class="symbol-detail-panel inline-symbol-detail">${selectedDetail === "t_signal"
+  return `${cells}<tr class="decision-detail-row"><td colspan="${ACCOUNT_HOLDING_COLUMNS.length}"><div class="symbol-detail-panel inline-symbol-detail">${selectedDetail === "t_signal"
     ? renderTSignalDetail(holding)
     : renderSymbolDetail(holding, row.index)}</div></td></tr>`;
 }

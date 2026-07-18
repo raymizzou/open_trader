@@ -1555,7 +1555,6 @@ table {
   cursor: not-allowed;
 }
 
-.trend-report-header .trend-history-button,
 .trend-history-button,
 .report-attribution-link {
   background: transparent;
@@ -1971,11 +1970,6 @@ table {
   border-collapse: collapse;
   table-layout: fixed;
   width: 100%;
-}
-
-.account-holdings-table-wrap {
-  max-width: 100%;
-  overflow-x: auto;
 }
 
 .account-mobile-label {
