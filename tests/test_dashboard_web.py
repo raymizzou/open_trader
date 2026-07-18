@@ -3286,6 +3286,138 @@ console.log(JSON.stringify(results));
         assert entry["scrolls"] == []
 
 
+def test_dashboard_exact_report_completion_does_not_render_in_inactive_account_view() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",counts:{},audit:{}}},
+  trend_reviews:{tiger:{available:true,market_label:"美股",strategy_snapshot:{parameter_rows:[]},metrics:{}}}};
+state.brokerFilter="tiger";
+state.trendSimulatePositions.tiger={available:true,positions:[]};
+const scrolls=[];
+globalThis.window={scrollY:333,scrollTo(_x,y){scrolls.push(y);},location:{search:""}};
+let resolveExact;
+globalThis.fetch=()=>new Promise((resolve)=>{resolveExact=resolve;});
+const renderPanel=renderAccountViewPanelOnly;
+let panelRenders=0;
+renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
+const results=[];
+for(const [view,ok] of [["real",true],["simulate",false],["review",true]]){
+  state.accountViews.tiger="report";
+  state.trendReportHistories.tiger={open:true,scrollY:100};
+  delete state.trendHistoricalReports.tiger;
+  const request=loadHistoricalTrendReport("tiger",`${view}.json`);
+  await setAccountView("tiger",view);
+  panelRenders=0;
+  scrolls.length=0;
+  resolveExact({ok,status:500,json:async()=>({available:true,artifact:`${view}.json`})});
+  await request;
+  results.push({view:state.accountViews.tiger,exact:state.trendHistoricalReports.tiger,panelRenders,scrolls:[...scrolls]});
+}
+console.log(JSON.stringify(results));
+''')
+    rendered = json.loads(output)
+    assert [entry["view"] for entry in rendered] == ["real", "simulate", "review"]
+    assert rendered[0]["exact"]["report"]["artifact"] == "real.json"
+    assert rendered[1]["exact"]["error"] == "historical report 500"
+    assert rendered[2]["exact"]["report"]["artifact"] == "review.json"
+    for entry in rendered:
+        assert entry["panelRenders"] == 0
+        assert entry["scrolls"] == []
+
+
+def test_dashboard_direct_exact_report_refreshes_scroll_and_ignores_stale_artifact() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",counts:{},audit:{}}},trend_reviews:{}};
+state.brokerFilter="tiger";
+state.accountViews.tiger="simulate";
+state.trendReportHistories.tiger={open:false,rows:[],scrollY:12};
+const scrolls=[];
+globalThis.window={scrollY:444,scrollTo(_x,y){scrolls.push(y);},location:{search:""}};
+const pending={};
+globalThis.fetch=(url)=>new Promise((resolve)=>{pending[url]=resolve;});
+const renderPanel=renderAccountViewPanelOnly;
+let panelRenders=0;
+renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
+const firstRequest=loadHistoricalTrendReport("tiger","first.json");
+const firstScroll=state.trendReportHistories.tiger.scrollY;
+window.scrollY=555;
+const secondRequest=loadHistoricalTrendReport("tiger","second.json");
+const secondScroll=state.trendReportHistories.tiger.scrollY;
+panelRenders=0;
+scrolls.length=0;
+pending["/api/trend-reports/tiger/history/first.json"]({ok:true,json:async()=>({artifact:"first.json"})});
+await firstRequest;
+const afterFirst={exact:{...state.trendHistoricalReports.tiger},panelRenders,scrolls:[...scrolls]};
+panelRenders=0;
+scrolls.length=0;
+pending["/api/trend-reports/tiger/history/second.json"]({ok:true,json:async()=>({artifact:"second.json"})});
+await secondRequest;
+console.log(JSON.stringify({firstScroll,secondScroll,history:state.trendReportHistories.tiger,afterFirst,
+  exact:state.trendHistoricalReports.tiger,panelRenders,scrolls}));
+''')
+    rendered = json.loads(output)
+    assert rendered["firstScroll"] == 444
+    assert rendered["secondScroll"] == 555
+    assert rendered["history"]["open"] is True
+    assert rendered["afterFirst"] == {
+        "exact": {"artifact": "second.json", "loading": True},
+        "panelRenders": 0,
+        "scrolls": [],
+    }
+    assert rendered["exact"]["artifact"] == "second.json"
+    assert rendered["exact"]["report"]["artifact"] == "second.json"
+    assert rendered["panelRenders"] == 1
+    assert rendered["scrolls"] == [555]
+
+
+def test_dashboard_simulate_completion_does_not_render_after_view_switch() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",counts:{},audit:{}}},
+  trend_reviews:{tiger:{available:true,market_label:"美股",strategy_snapshot:{parameter_rows:[]},metrics:{}}}};
+state.brokerFilter="tiger";
+globalThis.window={location:{search:""}};
+let resolveSimulate;
+globalThis.fetch=()=>new Promise((resolve)=>{resolveSimulate=resolve;});
+const renderPanel=renderAccountViewPanelOnly;
+let panelRenders=0;
+renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
+const results=[];
+for(const [view,ok] of [["real",true],["review",false]]){
+  state.accountViews.tiger="real";
+  delete state.trendSimulatePositions.tiger;
+  const request=setAccountView("tiger","simulate");
+  await setAccountView("tiger",view);
+  panelRenders=0;
+  resolveSimulate({ok,status:500,json:async()=>({available:true,positions:[{symbol:"AAPL"}]})});
+  await request;
+  results.push({view:state.accountViews.tiger,payload:state.trendSimulatePositions.tiger,panelRenders});
+}
+console.log(JSON.stringify(results));
+''')
+    rendered = json.loads(output)
+    assert rendered[0] == {
+        "view": "real",
+        "payload": {"available": True, "positions": [{"symbol": "AAPL"}]},
+        "panelRenders": 0,
+    }
+    assert rendered[1]["view"] == "review"
+    assert rendered[1]["payload"]["available"] is False
+    assert rendered[1]["payload"]["positions"] == []
+    assert rendered[1]["payload"]["error"] == "simulate positions 500"
+    assert rendered[1]["panelRenders"] == 0
+
+
 def test_dashboard_inactive_account_requests_do_not_render_or_restore_scroll() -> None:
     output = run_dashboard_js(r'''
 const panel={innerHTML:"",setAttribute(){}};

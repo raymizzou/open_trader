@@ -2585,7 +2585,9 @@ async function loadTrendSimulatePositions(broker) {
       error: error instanceof Error ? error.message : String(error),
     };
   }
-  renderAccountViewPanelOnly(broker);
+  if (state.brokerFilter === broker && state.accountViews[broker] === "simulate") {
+    renderAccountViewPanelOnly(broker);
+  }
 }
 
 function accountScrollY() {
@@ -2639,25 +2641,35 @@ async function openTrendReportHistory(broker) {
 
 async function loadHistoricalTrendReport(broker, artifact) {
   if (!TREND_ACCOUNT_BROKERS.includes(broker) || !artifact) return;
-  if (!Object.hasOwn(state.trendReportHistories, broker)) {
-    state.trendReportHistories[broker] = {open: false, scrollY: accountScrollY()};
-  }
-  const history = state.trendReportHistories[broker];
+  state.trendReportHistories[broker] = {
+    ...(state.trendReportHistories[broker] || {}),
+    open: true,
+    scrollY: accountScrollY(),
+  };
   state.accountViews[broker] = "report";
   state.trendHistoricalReports[broker] = {artifact, loading: true};
   renderAccountViewPanelOnly(broker);
   try {
     const response = await fetch(`/api/trend-reports/${encodeURIComponent(broker)}/history/${encodeURIComponent(artifact)}`, {cache: "no-store"});
     if (!response.ok) throw new Error(`historical report ${response.status}`);
-    state.trendHistoricalReports[broker] = {artifact, report: await response.json()};
+    const report = await response.json();
+    if (state.trendHistoricalReports[broker]?.artifact !== artifact) return;
+    state.trendHistoricalReports[broker] = {artifact, report};
   } catch (error) {
+    if (state.trendHistoricalReports[broker]?.artifact !== artifact) return;
     state.trendHistoricalReports[broker] = {
       artifact,
       error: error instanceof Error ? error.message : String(error),
     };
   }
-  renderAccountViewPanelOnly(broker);
-  if (state.brokerFilter === broker) restoreAccountScroll(history.scrollY);
+  const history = state.trendReportHistories[broker] || {};
+  if (state.brokerFilter === broker
+      && state.accountViews[broker] === "report"
+      && history.open
+      && state.trendHistoricalReports[broker]?.artifact === artifact) {
+    renderAccountViewPanelOnly(broker);
+    restoreAccountScroll(history.scrollY);
+  }
 }
 
 function showCurrentTrendReport(broker) {
