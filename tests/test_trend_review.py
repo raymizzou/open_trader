@@ -526,6 +526,111 @@ def test_formal_sell_all_suppresses_conflicting_buy(tmp_path: Path) -> None:
     assert [request["side"] for request in client.requests] == ["sell"]
 
 
+def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zero(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        prices={"600001": Decimal("10")},
+        market="CN",
+        execution_date="2026-07-16",
+        now="2026-07-16T09:31:00+08:00",
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(symbol="600003"),
+        client=client,
+        prices={"600003": Decimal("10")},
+        market="CN",
+        execution_date="2026-07-16",
+        now="2026-07-16T09:32:00+08:00",
+    )
+    client.requests.clear()
+    client.orders.clear()
+    client.positions = [{"code": "SH.600001", "qty": "300"}]
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+        },
+        {"action": "SELL_ALL", "symbol": "600001"},
+        {"action": "SELL_ALL", "symbol": "600003"},
+    ])
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "prices": {"600002": Decimal("10")},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+    }
+
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T10:30:00+08:00"
+    )
+    remark = client.requests[0]["remark"]
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": remark,
+        "code": "SH.600001",
+        "trd_side": "SELL",
+        "qty": "300",
+        "dealt_qty": "200",
+        "order_status": "CANCELLED_PART",
+    }]
+    client.positions = [
+        {"code": "SH.600001", "qty": "100"},
+        {"code": "SH.600003", "qty": "75"},
+    ]
+
+    day_two = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+
+    assert day_two["submitted_count"] == 1
+    assert [request["side"] for request in client.requests] == ["sell", "sell"]
+    assert client.requests[-1]["qty"] == "100"
+    client.orders = [
+        client.orders[0],
+        {
+            "order_id": "SIM-2",
+            "remark": remark,
+            "code": "SH.600001",
+            "trd_side": "SELL",
+            "qty": "100",
+            "dealt_qty": "50",
+            "order_status": "CANCELLED_PART",
+        },
+    ]
+    client.positions = [
+        {"code": "SH.600001", "qty": "50"},
+        {"code": "SH.600003", "qty": "75"},
+    ]
+
+    day_three = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-21T09:31:00+08:00"
+    )
+
+    assert day_three["submitted_count"] == 1
+    assert client.requests[-1]["qty"] == "50"
+    client.positions = [{"code": "SH.600003", "qty": "75"}]
+    request_count = len(client.requests)
+
+    confirmed_zero = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-22T09:31:00+08:00"
+    )
+
+    assert confirmed_zero["submitted_count"] == 0
+    assert len(client.requests) == request_count
+    assert all(request["futu_code"] != "SH.600002" for request in client.requests)
+    assert all(request["futu_code"] != "SH.600003" for request in client.requests)
+
+
 def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:
     client = FakeTrendSimClient()
     arguments = {

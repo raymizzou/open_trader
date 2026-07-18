@@ -71,7 +71,7 @@ def _write_action_event(
     side: str = "buy",
     status: str = "filled",
     report_sha256: str | None = "",
-    strategy_version: str = "v1",
+    strategy_version: str | None = "v1",
     filled_qty: str = "1",
     execution_date: str = "2026-07-20",
     recorded_at: str = "2026-07-20T10:00:00-04:00",
@@ -94,13 +94,14 @@ def _write_action_event(
     payload = {
         "market": market,
         "date": execution_date,
-        "strategy_version": strategy_version,
         "symbol": symbol,
         "side": side,
         "status": status,
         "filled_qty": filled_qty,
         "recorded_at": recorded_at,
     }
+    if strategy_version is not None:
+        payload["strategy_version"] = strategy_version
     if report_sha256 is not None:
         payload["report_sha256"] = report_sha256
     path.write_text(
@@ -382,6 +383,24 @@ def test_simulated_positions_fail_closed_after_unattributable_positive_buy(
         tmp_path,
         report_sha256=unattributable_hash,
         recorded_at="2026-07-20T10:01:00-04:00",
+    )
+
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+
+    assert payload["positions"][0]["attribution_status"] == "unlinked"
+    assert payload["positions"][0]["report"] is None
+
+
+@pytest.mark.parametrize("strategy_version", [None, "v2"])
+def test_simulated_positions_never_link_report_by_hash_without_matching_version(
+    tmp_path: Path, strategy_version: str | None,
+) -> None:
+    report = _frozen_report(version="v1")
+    _write_report(tmp_path, broker="tiger", artifact="report.json", payload=report)
+    _write_action_event(
+        tmp_path,
+        report_sha256=_report_hash(report),
+        strategy_version=strategy_version,
     )
 
     payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")

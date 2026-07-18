@@ -3657,6 +3657,51 @@ def simulate_api_payload(
     }
 
 
+def write_current_attribution(
+    root: Path,
+    *,
+    artifact: str = "old.json",
+    version: str = "v1",
+    recorded_at: str = "2026-07-20T10:00:00-04:00",
+) -> dict[str, str]:
+    from open_trader.trend_review import _report_hash
+
+    payload = {
+        "execution_date": "2026-07-17",
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_snapshot": {"strategy_version": version},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": "NDAQ"}],
+        },
+    }
+    report_sha256 = _report_hash(payload)
+    report_path = root / "reports" / "trend_us_tiger" / artifact
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    event_path = (
+        root / "data/trend_review/ledgers/US/actions/2026-07-17/action"
+        / f"{artifact}.json"
+    )
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    event_path.write_text(json.dumps({
+        "date": "2026-07-17",
+        "market": "US",
+        "symbol": "NDAQ",
+        "side": "buy",
+        "status": "filled",
+        "filled_qty": "13",
+        "recorded_at": recorded_at,
+        "report_sha256": report_sha256,
+        "strategy_version": version,
+    }), encoding="utf-8")
+    return {
+        "artifact": artifact,
+        "execution_date": "2026-07-17",
+        "strategy_version": version,
+        "report_sha256": report_sha256,
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("symbol", "AAPL"), ("quantity", "12"), ("cost_price", "94.26")],
@@ -3668,7 +3713,11 @@ def test_acceptance_rejects_simulated_api_facts_that_differ_from_direct_futu(
 
     with pytest.raises(AssertionError, match="模拟盘持仓.*不匹配"):
         dashboard_acceptance._validate_simulated_positions(
-            "tiger", simulate_snapshot(), payload, tmp_path
+            "tiger",
+            simulate_snapshot(),
+            payload,
+            tmp_path / "data",
+            tmp_path / "reports",
         )
 
 
@@ -3677,7 +3726,8 @@ def test_acceptance_accepts_zero_simulated_positions(tmp_path: Path) -> None:
         "tiger",
         {"positions": []},
         {**simulate_api_payload(), "positions": []},
-        tmp_path,
+        tmp_path / "data",
+        tmp_path / "reports",
     )
 
 
@@ -3694,7 +3744,8 @@ def test_acceptance_classifies_unavailable_configured_futu_account_as_blocked(
         "http://dashboard.test",
         {"futu_host": "127.0.0.1", "futu_port": 11111},
         {"tiger": 1, "phillips": 2, "eastmoney": 3},
-        tmp_path,
+        tmp_path / "data",
+        tmp_path / "reports",
     )
 
     assert payloads == {}
@@ -3736,7 +3787,8 @@ def test_acceptance_treats_dashboard_simulate_fallback_as_fail_when_futu_works(
         "http://dashboard.test",
         {"futu_host": "127.0.0.1", "futu_port": 11111},
         {"tiger": 1, "phillips": 2, "eastmoney": 3},
-        tmp_path,
+        tmp_path / "data",
+        tmp_path / "reports",
     )
 
     assert blocker is None
@@ -3748,8 +3800,48 @@ def test_acceptance_accepts_explicitly_unlinked_legacy_simulated_position(
     tmp_path: Path,
 ) -> None:
     dashboard_acceptance._validate_simulated_positions(
-        "tiger", simulate_snapshot(), simulate_api_payload(), tmp_path
+        "tiger",
+        simulate_snapshot(),
+        simulate_api_payload(),
+        tmp_path / "data",
+        tmp_path / "reports",
     )
+
+
+def test_acceptance_rejects_traceable_position_declared_unlinked(
+    tmp_path: Path,
+) -> None:
+    write_current_attribution(tmp_path)
+
+    with pytest.raises(AssertionError, match="报告归因"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            simulate_api_payload(),
+            tmp_path / "data",
+            tmp_path / "reports",
+        )
+
+
+def test_acceptance_rejects_hidden_current_attribution_conflict(
+    tmp_path: Path,
+) -> None:
+    write_current_attribution(tmp_path, artifact="v1.json", version="v1")
+    write_current_attribution(
+        tmp_path,
+        artifact="v2.json",
+        version="v2",
+        recorded_at="2026-07-20T10:01:00-04:00",
+    )
+
+    with pytest.raises(AssertionError, match="报告归因冲突"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            simulate_api_payload(),
+            tmp_path / "data",
+            tmp_path / "reports",
+        )
 
 
 def test_acceptance_rejects_hidden_unlinked_simulated_position(tmp_path: Path) -> None:
@@ -3758,7 +3850,8 @@ def test_acceptance_rejects_hidden_unlinked_simulated_position(tmp_path: Path) -
             "tiger",
             simulate_snapshot(),
             {**simulate_api_payload(), "positions": []},
-            tmp_path,
+            tmp_path / "data",
+            tmp_path / "reports",
         )
 
 
@@ -3773,7 +3866,11 @@ def test_acceptance_rejects_unavailable_simulated_api_with_substitute_rows(
 
     with pytest.raises(AssertionError, match="不可用.*替代持仓"):
         dashboard_acceptance._validate_simulated_positions(
-            "tiger", simulate_snapshot(), payload, tmp_path
+            "tiger",
+            simulate_snapshot(),
+            payload,
+            tmp_path / "data",
+            tmp_path / "reports",
         )
 
 
@@ -3781,22 +3878,7 @@ def test_acceptance_rejects_unavailable_simulated_api_with_substitute_rows(
 def test_acceptance_rejects_linked_simulated_position_with_wrong_report_identity(
     tmp_path: Path, wrong_field: str,
 ) -> None:
-    from open_trader.trend_review import _report_hash
-
-    report_payload = {
-        "execution_date": "2026-07-17",
-        "metadata": {"market": "US", "broker": "tiger"},
-        "strategy_snapshot": {"strategy_version": "v1"},
-    }
-    artifact = tmp_path / "trend_us_tiger" / "old.json"
-    artifact.parent.mkdir(parents=True)
-    artifact.write_text(json.dumps(report_payload), encoding="utf-8")
-    report = {
-        "artifact": "old.json",
-        "execution_date": "2026-07-17",
-        "strategy_version": "v1",
-        "report_sha256": _report_hash(report_payload),
-    }
+    report = write_current_attribution(tmp_path)
     report[wrong_field] = "0" * 64 if wrong_field == "report_sha256" else "v2"
 
     with pytest.raises(AssertionError, match="报告身份"):
@@ -3804,7 +3886,8 @@ def test_acceptance_rejects_linked_simulated_position_with_wrong_report_identity
             "tiger",
             simulate_snapshot(),
             simulate_api_payload(attribution_status="linked", report=report),
-            tmp_path,
+            tmp_path / "data",
+            tmp_path / "reports",
         )
 
 
@@ -4124,7 +4207,8 @@ def test_acceptance_local_missing_futu_configuration_is_fail(tmp_path: Path) -> 
         "http://dashboard.test",
         {"futu_host": "", "futu_port": 0},
         {"tiger": 0, "phillips": 0, "eastmoney": 0},
-        tmp_path,
+        tmp_path / "data",
+        tmp_path / "reports",
     )
 
     assert payloads == {}

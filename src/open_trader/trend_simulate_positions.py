@@ -222,10 +222,10 @@ def _position_attributions(
     broker: str,
     market: str,
 ) -> dict[str, dict[str, Any]]:
-    reports = _reports_by_hash(
+    reports = _reports_by_identity(
         reports_dir / _REPORT_DIRECTORIES[broker], broker=broker, market=market
     )
-    active: dict[str, set[str | None]] = {}
+    active: dict[str, set[tuple[str, str] | None]] = {}
     for _, _, _, event in _action_events(data_dir, market):
         symbol = str(event["symbol"]).strip().upper()
         side = str(event.get("side") or "").strip().lower()
@@ -237,28 +237,32 @@ def _position_attributions(
             continue
         filled, _ = _required_decimal(event.get("filled_qty"), "filled quantity")
         report_sha256 = str(event.get("report_sha256") or "").strip().lower()
+        strategy_version = str(event.get("strategy_version") or "").strip()
         if filled > 0:
             active.setdefault(symbol, set()).add(
-                report_sha256 if _is_sha256(report_sha256) else None
+                (report_sha256, strategy_version)
+                if _is_sha256(report_sha256) and strategy_version
+                else None
             )
 
     attributions: dict[str, dict[str, Any]] = {}
-    for symbol, report_hashes in active.items():
-        valid_hashes = report_hashes - {None}
-        if len(valid_hashes) > 1:
+    for symbol, report_identities in active.items():
+        valid_identities = {
+            identity for identity in report_identities if identity in reports
+        }
+        if len(valid_identities) > 1:
             attributions[symbol] = {
                 "attribution_status": "conflict",
                 "report": None,
             }
             continue
-        if None in report_hashes:
+        if report_identities - valid_identities:
             attributions[symbol] = {
                 "attribution_status": "unlinked",
                 "report": None,
             }
             continue
-        report_hash = next(iter(valid_hashes))
-        report = reports.get(report_hash)
+        report = reports.get(next(iter(valid_identities))) if valid_identities else None
         attributions[symbol] = (
             {"attribution_status": "linked", "report": report}
             if report is not None
@@ -267,10 +271,10 @@ def _position_attributions(
     return attributions
 
 
-def _reports_by_hash(
+def _reports_by_identity(
     reports_dir: Path, *, broker: str, market: str
-) -> dict[str, dict[str, str]]:
-    reports: dict[str, dict[str, str]] = {}
+) -> dict[tuple[str, str], dict[str, str]]:
+    reports: dict[tuple[str, str], dict[str, str]] = {}
     for path in sorted(reports_dir.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -299,7 +303,7 @@ def _reports_by_hash(
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             continue
         reports.setdefault(
-            digest,
+            (digest, strategy_version),
             {
                 "artifact": path.name,
                 "execution_date": execution_date,
@@ -308,6 +312,17 @@ def _reports_by_hash(
             },
         )
     return reports
+
+
+def _reports_by_hash(
+    reports_dir: Path, *, broker: str, market: str
+) -> dict[str, dict[str, str]]:
+    return {
+        report_hash: report
+        for (report_hash, _strategy_version), report in _reports_by_identity(
+            reports_dir, broker=broker, market=market
+        ).items()
+    }
 
 
 def _action_events(

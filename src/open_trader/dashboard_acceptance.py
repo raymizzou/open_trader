@@ -430,10 +430,60 @@ def _api_simulate_facts(
     return tuple(sorted(facts))
 
 
+def _current_simulate_attributions(
+    data_dir: Path, reports_dir: Path, *, broker: str, market: str,
+) -> dict[str, tuple[str, dict[str, str] | None]]:
+    reports = {
+        (report_hash, report["strategy_version"]): report
+        for report_hash, report in _reports_by_hash(
+            reports_dir / TREND_REPORT_DIRECTORIES[broker],
+            broker=broker,
+            market=market,
+        ).items()
+    }
+
+    active: dict[str, set[tuple[str, str] | None]] = {}
+    for _event_date, _recorded_at, _path, event in _action_events(data_dir, market):
+        symbol = str(event.get("symbol") or "").strip().upper()
+        side = str(event.get("side") or "").strip().lower()
+        status = str(event.get("status") or "").strip().lower()
+        if not symbol:
+            continue
+        if side == "sell" and status == "filled":
+            active.pop(symbol, None)
+            continue
+        if side != "buy" or status not in {"partially_filled", "filled"}:
+            continue
+        if _position_decimal(event.get("filled_qty"), "账本成交数量") <= 0:
+            continue
+        report_sha256 = str(event.get("report_sha256") or "").strip().lower()
+        strategy_version = str(event.get("strategy_version") or "").strip()
+        identity = (
+            (report_sha256, strategy_version)
+            if len(report_sha256) == 64
+            and all(character in "0123456789abcdef" for character in report_sha256)
+            and strategy_version
+            else None
+        )
+        active.setdefault(symbol, set()).add(identity)
+
+    result: dict[str, tuple[str, dict[str, str] | None]] = {}
+    for symbol, identities in active.items():
+        valid = {identity for identity in identities if identity in reports}
+        if len(valid) > 1:
+            result[symbol] = ("conflict", None)
+        elif identities - valid or not valid:
+            result[symbol] = ("unlinked", None)
+        else:
+            result[symbol] = ("linked", reports[next(iter(valid))])
+    return result
+
+
 def _validate_simulated_positions(
     broker: str,
     direct_snapshot: Mapping[str, Any],
     payload: Mapping[str, Any],
+    data_dir: Path,
     reports_dir: Path,
 ) -> None:
     market = TREND_SIMULATE_MARKETS[broker]
@@ -449,17 +499,22 @@ def _validate_simulated_positions(
         direct_snapshot, market
     ), f"{broker} 模拟盘持仓与 Futu 不匹配"
 
-    reports = _reports_by_hash(
-        reports_dir / TREND_REPORT_DIRECTORIES[broker],
-        broker=broker,
-        market=market,
+    expected_attributions = _current_simulate_attributions(
+        data_dir, reports_dir, broker=broker, market=market
     )
     assert isinstance(positions, list)
     for position in positions:
         assert isinstance(position, Mapping)
+        symbol = str(position.get("symbol") or "").strip().upper()
+        expected_status, expected_report = expected_attributions.get(
+            symbol, ("unlinked", None)
+        )
+        assert expected_status != "conflict", (
+            f"{broker} {symbol} 模拟盘报告归因冲突"
+        )
         status = position.get("attribution_status")
-        assert status in {"linked", "unlinked"}, (
-            f"{broker} {position.get('symbol', '')} 模拟盘报告归因无效"
+        assert status == expected_status, (
+            f"{broker} {symbol} 模拟盘报告归因不匹配"
         )
         if status == "unlinked":
             assert position.get("report") is None, (
@@ -468,9 +523,8 @@ def _validate_simulated_positions(
             continue
         report = position.get("report")
         assert isinstance(report, Mapping), f"{broker} 已关联持仓缺少报告身份"
-        expected = reports.get(str(report.get("report_sha256") or ""))
-        assert expected is not None and all(
-            report.get(key) == expected[key]
+        assert expected_report is not None and all(
+            report.get(key) == expected_report[key]
             for key in (
                 "artifact", "execution_date", "strategy_version", "report_sha256"
             )
@@ -481,6 +535,7 @@ def _check_simulated_accounts(
     url: str,
     dashboard_payload: Mapping[str, Any],
     account_ids: Mapping[str, int],
+    data_dir: Path,
     reports_dir: Path,
 ) -> tuple[dict[str, dict[str, Any]], list[str], str | None]:
     host = dashboard_payload.get("futu_host")
@@ -514,7 +569,9 @@ def _check_simulated_accounts(
         try:
             payload = _fetch_json_path(url, f"/api/trend-simulate-positions/{broker}")
             assert isinstance(payload, dict), f"{broker} 模拟盘 API 不是对象"
-            _validate_simulated_positions(broker, snapshot, payload, reports_dir)
+            _validate_simulated_positions(
+                broker, snapshot, payload, data_dir, reports_dir
+            )
         except Exception as exc:
             errors.append(f"{broker} 模拟盘检查失败：{type(exc).__name__}: {exc}")
             continue
@@ -2473,7 +2530,11 @@ def main(argv: list[str] | None = None) -> int:
                 simulate_errors,
                 external_blocker,
             ) = _check_simulated_accounts(
-                args.url, first, account_ids, first_reports_dir
+                args.url,
+                first,
+                account_ids,
+                _project_data_dir(args.expected_root),
+                first_reports_dir,
             )
             errors.extend(simulate_errors)
         history_expectations, history_errors = _check_history_endpoints(

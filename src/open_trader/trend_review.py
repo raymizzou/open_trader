@@ -434,8 +434,8 @@ def execute_trend_review_open(
     market = _market(market)
     current = datetime.fromisoformat(now)
     local_current = current.astimezone(MARKET_TIMEZONES[market])
-    if local_current.date().isoformat() != execution_date:
-        raise ValueError("execution date does not match current time")
+    execution_day = date.fromisoformat(execution_date)
+    same_day = local_current.date() == execution_day
     buy_window_end = "16:00" if market == "US" else "10:00"
     local_time = local_current.time().replace(tzinfo=None)
     buy_window_open = (
@@ -518,6 +518,36 @@ def execute_trend_review_open(
                 "utf-8"
             )
         ).hexdigest()
+        stem = action_key
+        intent_path = root / f"{stem}-intent.json"
+        sell_position = next(
+            (
+                item
+                for item in _positive_positions(snapshot)
+                if str(item.get("code") or item.get("futu_code") or "")
+                .strip()
+                .upper()
+                == futu_code.upper()
+            ),
+            None,
+        ) if action_name == "SELL_ALL" else None
+        sell_quantity = (
+            int(
+                _required_decimal(
+                    sell_position.get("qty", sell_position.get("quantity")),
+                    "position qty",
+                )
+            )
+            if sell_position is not None
+            else 0
+        )
+        if not same_day and not (
+            local_current.date() > execution_day
+            and action_name == "SELL_ALL"
+            and intent_path.exists()
+            and sell_quantity > 0
+        ):
+            continue
         if action_name == "BUY" and (symbol in sell_symbols or not buy_window_open):
             if symbol not in sell_symbols:
                 _write_action_event(
@@ -551,8 +581,6 @@ def execute_trend_review_open(
             continue
         if action_name == "SELL_ALL" and not market_open:
             continue
-        stem = action_key
-        intent_path = root / f"{stem}-intent.json"
         if intent_path.exists():
             intent_paths = [intent_path, *sorted(root.glob(f"{stem}-attempt-*-intent.json"))]
             pending_intent = next(
@@ -575,7 +603,9 @@ def execute_trend_review_open(
                 request = base.get("request") if isinstance(base, Mapping) else None
                 if not isinstance(request, dict):
                     raise ValueError("trend review intent request is invalid")
-                listed = client.list_orders(start=execution_date, end=execution_date)
+                listed = client.list_orders(
+                    start=execution_date, end=local_current.date().isoformat()
+                )
                 orders = listed.get("orders") if isinstance(listed, Mapping) else None
                 if not isinstance(orders, list):
                     raise ValueError("simulate broker orders are unavailable")
@@ -597,6 +627,8 @@ def execute_trend_review_open(
                 remaining = target_quantity - sum(
                     dealt_by_order.values(), start=Decimal("0")
                 )
+                if action_name == "SELL_ALL":
+                    remaining = Decimal(sell_quantity)
                 filled = target_quantity - remaining
                 order_ids = [
                     str(order.get("order_id"))
@@ -712,23 +744,7 @@ def execute_trend_review_open(
                     )
                 ) * lot_size
             else:
-                position = next(
-                    (
-                        item
-                        for item in _positive_positions(snapshot)
-                        if str(item.get("code") or item.get("futu_code") or "")
-                        .strip()
-                        .upper()
-                        == futu_code.upper()
-                    ),
-                    None,
-                )
-                quantity = int(
-                    _required_decimal(
-                        position.get("qty", position.get("quantity")),
-                        "position qty",
-                    )
-                ) if position is not None else 0
+                quantity = sell_quantity
             if quantity <= 0:
                 continue
             request = {

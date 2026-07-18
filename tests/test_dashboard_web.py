@@ -3537,7 +3537,7 @@ window.fetch=async (input)=>{{
   }});
   const payload=url==="/api/dashboard"?dashboardPayload
     :url==="/api/quotes"?{{status:"ok",quotes:{{}},account_sync:{{status:"skipped"}}}}
-    :url==="/api/trend-reports/tiger/history"?[{{available:true,artifact:"2026-07-16.json",execution_date:"2026-07-17",strategy_version:"v1"}}]
+    :url==="/api/trend-reports/tiger/history"?[{{available:true,artifact:"2026-07-16.json",execution_date:"2026-07-17",data_date:"2026-07-16",generated_at:"2026-07-18T09:30:00+08:00",strategy_version:"v1",execution_counts:{{sell:1,buy:2,hold:3,review:4}}}}]
     :url.endsWith("/2026-07-16.json")?{{...dashboardPayload.trend_reports.tiger,artifact:"2026-07-16.json",report_sha256:"{'a' * 64}",strategy_version:"v1",report_date:"2026-07-20",buy_actions:[{{symbol:"AAPL",execution:{{status:"missed"}}}}]}}
     :{{available:false}};
   return {{ok:true,status:200,json:async()=>structuredClone(payload)}};
@@ -3763,7 +3763,16 @@ window.fetch=async (input)=>{{
         cash_details = section.locator(".account-cash-details")
         cash_details.evaluate("node => { node.open = true; node.dataset.historyStable = 'yes'; }")
         section.locator("[data-report-history]").click()
-        section.locator('[data-history-artifact="2026-07-16.json"]').wait_for()
+        history_row = section.locator('[data-history-artifact="2026-07-16.json"]')
+        history_row.wait_for()
+        for text in (
+            "数据截至 2026-07-16",
+            "生成时间 2026-07-18T09:30:00+08:00",
+            "策略版本 v1",
+            "执行摘要 卖出 1 · 买入 2 · 持有 3 · 复核 4",
+        ):
+            assert history_row.get_by_text(text, exact=True).count() == 1
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         assert page.evaluate(
             "window.__requests.filter(url => url === '/api/trend-reports/tiger/history').length",
         ) == 1

@@ -1613,11 +1613,21 @@ table {
 }
 
 .trend-history-list button {
+  align-items: flex-start;
   cursor: pointer;
+  flex-direction: column;
 }
 
 .trend-history-list button span {
   color: var(--muted);
+}
+
+.trend-history-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .trend-report-workspace {

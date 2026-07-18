@@ -2876,7 +2876,7 @@ function renderTrendReportHistory(broker, history) {
       ? `<p class="missing-text">${escapeHtml(history.error)}</p>`
       : rows.length
         ? `<ul class="trend-history-list">${rows.map((row) => row.available
-          ? `<li><button type="button" data-history-broker="${escapeHtml(broker)}" data-history-artifact="${escapeHtml(row.artifact)}"><strong>报告 ${escapeHtml(formatPlain(row.execution_date))} · ${escapeHtml(formatPlain(row.strategy_version))}</strong><span>${escapeHtml(row.artifact)}</span></button></li>`
+          ? `<li><button type="button" data-history-broker="${escapeHtml(broker)}" data-history-artifact="${escapeHtml(row.artifact)}"><strong>报告 ${escapeHtml(formatPlain(row.execution_date))} · ${escapeHtml(formatPlain(row.strategy_version))}</strong><span class="trend-history-meta"><span>${escapeHtml(row.artifact)}</span><span>数据截至 ${escapeHtml(formatPlain(row.data_date))}</span><span>生成时间 ${escapeHtml(formatPlain(row.generated_at))}</span><span>策略版本 ${escapeHtml(formatPlain(row.strategy_version))}</span><span>执行摘要 卖出 ${escapeHtml(formatPlain(row.execution_counts?.sell))} · 买入 ${escapeHtml(formatPlain(row.execution_counts?.buy))} · 持有 ${escapeHtml(formatPlain(row.execution_counts?.hold))} · 复核 ${escapeHtml(formatPlain(row.execution_counts?.review))}</span></span></button></li>`
           : `<li><span class="missing-text">${escapeHtml(formatPlain(row.artifact))} · ${escapeHtml(formatPlain(row.status_text))}</span></li>`).join("")}</ul>`
         : '<p class="account-empty">暂无历史报告</p>';
   return `<section class="trend-history-panel"><header><h1>历史报告</h1><button class="trend-history-button" type="button" data-current-trend-report="${escapeHtml(broker)}">返回当前报告</button></header>${content}</section>`;
