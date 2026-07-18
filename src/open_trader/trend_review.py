@@ -541,6 +541,50 @@ def execute_trend_review_open(
             if sell_position is not None
             else 0
         )
+        if action_name == "SELL_ALL" and intent_path.exists():
+            action_events_root = (
+                data_dir
+                / "trend_review"
+                / "ledgers"
+                / market
+                / "actions"
+                / execution_date
+                / action_key
+            )
+            position_zero_complete = any(
+                json.loads(path.read_text(encoding="utf-8")).get("reason")
+                == "position_zero_confirmed"
+                for path in action_events_root.glob("*.json")
+            )
+            if position_zero_complete:
+                continue
+            if sell_quantity <= 0:
+                intent = json.loads(intent_path.read_text(encoding="utf-8"))
+                request = intent.get("request") if isinstance(intent, Mapping) else None
+                if not isinstance(request, Mapping):
+                    raise ValueError("trend review intent request is invalid")
+                target_qty = str(request.get("qty") or "")
+                _write_action_event(
+                    data_dir=data_dir,
+                    market=market,
+                    execution_date=execution_date,
+                    action_key=action_key,
+                    payload={
+                        "market": market,
+                        "date": execution_date,
+                        "strategy_version": strategy_version,
+                        "report_sha256": report_sha,
+                        "symbol": symbol,
+                        "futu_code": futu_code,
+                        "side": side,
+                        "status": "filled",
+                        "filled_qty": target_qty,
+                        "target_qty": target_qty,
+                        "reason": "position_zero_confirmed",
+                    },
+                    recorded_at=now,
+                )
+                continue
         if not same_day and not (
             local_current.date() > execution_day
             and action_name == "SELL_ALL"

@@ -603,32 +603,57 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
             "code": "SH.600001",
             "trd_side": "SELL",
             "qty": "100",
-            "dealt_qty": "50",
-            "order_status": "CANCELLED_PART",
+            "dealt_qty": "100",
+            "order_status": "FILLED",
         },
     ]
-    client.positions = [
-        {"code": "SH.600001", "qty": "50"},
-        {"code": "SH.600003", "qty": "75"},
-    ]
-
-    day_three = trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-21T09:31:00+08:00"
-    )
-
-    assert day_three["submitted_count"] == 1
-    assert client.requests[-1]["qty"] == "50"
     client.positions = [{"code": "SH.600003", "qty": "75"}]
     request_count = len(client.requests)
 
     confirmed_zero = trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-22T09:31:00+08:00"
+        **arguments, now="2026-07-21T09:31:00+08:00"
     )
 
     assert confirmed_zero["submitted_count"] == 0
     assert len(client.requests) == request_count
     assert all(request["futu_code"] != "SH.600002" for request in client.requests)
     assert all(request["futu_code"] != "SH.600003" for request in client.requests)
+    terminal_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+        if "position_zero_confirmed" in path.read_text(encoding="utf-8")
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0] | {
+        "symbol": "600001",
+        "side": "sell",
+        "status": "filled",
+        "reason": "position_zero_confirmed",
+    } == terminal_events[0]
+
+    client.positions = [
+        {"code": "SH.600001", "qty": "25"},
+        {"code": "SH.600003", "qty": "75"},
+    ]
+
+    reacquired = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-22T09:31:00+08:00"
+    )
+    repeated = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-23T09:31:00+08:00"
+    )
+
+    assert reacquired["submitted_count"] == 0
+    assert repeated["submitted_count"] == 0
+    assert len(client.requests) == request_count
+    assert sum(
+        "position_zero_confirmed" in path.read_text(encoding="utf-8")
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+    ) == 1
 
 
 def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:
