@@ -542,7 +542,20 @@ def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
         "data_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "sell_actions": [],
-        "buy_actions": [buy],
+        "buy_actions": [
+            {
+                **buy,
+                "execution": {
+                    "status": "missed",
+                    "filled_qty": "",
+                    "target_qty": "",
+                    "avg_fill_price": "",
+                    "order_ids": [],
+                    "updated_at": "2026-07-15T16:00:00-04:00",
+                    "reason": "buy_window_closed",
+                },
+            }
+        ],
         "hold_actions": [],
         "review_actions": [],
         "counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},

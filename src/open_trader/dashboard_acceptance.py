@@ -679,7 +679,17 @@ def _check_trend_artifact_projection(
         "review_actions": reviews,
     }
     assert all(
-        report.get(key) == value for key, value in expected_actions.items()
+        isinstance(projected := report.get(key), list)
+        and all(isinstance(item, Mapping) for item in projected)
+        and [
+            {
+                field: field_value
+                for field, field_value in item.items()
+                if field != "execution"
+            }
+            for item in projected
+        ] == value
+        for key, value in expected_actions.items()
     ), f"{broker} 冻结报告动作与 API 投影不一致"
     assert report.get("counts") == {
         "sell": len(sells),
