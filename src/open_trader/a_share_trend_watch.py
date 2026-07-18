@@ -124,22 +124,11 @@ def watch_a_share_protection(
 
     trigger_count = exception_count = unknown_quote_count = 0
     calendar_checked = False
-    session_open_called = False
     interrupted = False
     now = first_now
     try:
         while True:
             session = session_fn(now)
-            if session == "closed":
-                return _result(
-                    "closed",
-                    positions,
-                    trigger_count,
-                    exception_count,
-                    unknown_quote_count,
-                    events_path,
-                )
-
             if client is None:
                 if quote_client_factory is None:
                     raise RuntimeError("quote client factory is required after interruption")
@@ -194,6 +183,33 @@ def watch_a_share_protection(
                         events_path,
                     )
 
+            if on_session_open is not None:
+                exception_count += _run_review_callback(
+                    on_session_open,
+                    trading_date,
+                    events_path=events_path,
+                    trading_date=trading_date,
+                    now=now,
+                    notifier=notifier,
+                )
+                _notify_trend_review_deadline(
+                    data_dir=events_path.parents[1],
+                    market=market,
+                    trading_date=trading_date,
+                    now=now,
+                    events_path=events_path,
+                    notifier=notifier,
+                )
+
+            if session == "closed":
+                return _result(
+                    "closed",
+                    positions,
+                    trigger_count,
+                    exception_count,
+                    unknown_quote_count,
+                    events_path,
+                )
             if session == "before":
                 opening = now.astimezone(session_timezone).replace(
                     hour=9, minute=30, second=0, microsecond=0
@@ -208,17 +224,6 @@ def watch_a_share_protection(
                 sleep_fn((afternoon - now.astimezone(session_timezone)).total_seconds())
                 now = now_fn()
                 continue
-
-            if not session_open_called:
-                if on_session_open is not None:
-                    exception_count += _run_review_callback(
-                        on_session_open,
-                        trading_date,
-                        events_path=events_path,
-                        trading_date=trading_date,
-                        now=now,
-                    )
-                session_open_called = True
 
             try:
                 with (
@@ -301,6 +306,7 @@ def watch_a_share_protection(
                         events_path=events_path,
                         trading_date=trading_date,
                         now=now,
+                        notifier=notifier,
                     )
                 _deliver_trigger_notification(
                     events_path=events_path,
@@ -446,6 +452,7 @@ def watch_a_share_protection(
                             events_path=events_path,
                             trading_date=trading_date,
                             now=now,
+                            notifier=notifier,
                         )
                     _deliver_trigger_notification(
                         events_path=events_path,
@@ -478,6 +485,74 @@ def watch_a_share_protection(
             _close(client)
 
 
+def _notify_trend_review_deadline(
+    *,
+    data_dir: Path,
+    market: str,
+    trading_date: str,
+    now: datetime,
+    events_path: Path,
+    notifier: Notifier,
+) -> None:
+    deadline = time(15, 30) if market == "US" else time(10)
+    timezone = ZoneInfo("America/New_York") if market == "US" else SHANGHAI
+    if now.astimezone(timezone).time().replace(tzinfo=None) < deadline:
+        return
+    prior = load_watch_events(events_path)
+    notified = {
+        str(event.get("symbol") or "")
+        for event in prior
+        if event.get("event_type") == "trend_review_deadline_notified"
+        and event.get("trading_date") == trading_date
+    }
+    labels = {
+        "pending": "待执行",
+        "submitted": "已提交",
+        "partially_filled": "部分成交",
+        "failed": "失败",
+        "blocked": "受阻",
+        "missed": "错过",
+        "incomplete": "未完成",
+    }
+    root = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+        / trading_date
+    )
+    for action_dir in root.glob("*"):
+        paths = sorted(action_dir.glob("*.json"))
+        if not paths:
+            continue
+        try:
+            event = json.loads(paths[-1].read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        symbol = str(event.get("symbol") or "")
+        status = str(event.get("status") or "")
+        if not symbol or symbol in notified or status == "filled":
+            continue
+        attempts = send_notification_with_results(
+            notifier,
+            f"趋势模拟执行未完成 · {trading_date}",
+            f"{symbol} · {labels.get(status, '状态未知')}",
+        )
+        if any(attempt.success for attempt in attempts):
+            append_watch_event(
+                events_path,
+                symbol=symbol,
+                trading_date=trading_date,
+                event_type="trend_review_deadline_notified",
+                occurred_at=now.isoformat(timespec="seconds"),
+                last_price=None,
+                active_line=None,
+                market=market,
+                reason=status,
+            )
+
+
 def _run_review_callback(
     callback: Callable[[object], None],
     value: object,
@@ -485,6 +560,7 @@ def _run_review_callback(
     events_path: Path,
     trading_date: str,
     now: datetime,
+    notifier: Notifier,
 ) -> int:
     try:
         callback(value)
@@ -501,6 +577,30 @@ def _run_review_callback(
             active_line=_optional_decimal(event.get("active_line")),
             reason=str(exc),
         )
+        prior_events = load_watch_events(events_path)
+        already_notified = any(
+            event.get("event_type") == "trend_review_callback_failure_notified"
+            and event.get("trading_date") == trading_date
+            and event.get("reason") == str(exc)
+            for event in prior_events
+        )
+        if not already_notified:
+            attempts = send_notification_with_results(
+                notifier,
+                f"趋势模拟执行失败 · {trading_date}",
+                str(exc),
+            )
+            if any(attempt.success for attempt in attempts):
+                append_watch_event(
+                    events_path,
+                    symbol=str(event.get("symbol") or ""),
+                    trading_date=trading_date,
+                    event_type="trend_review_callback_failure_notified",
+                    occurred_at=now.isoformat(timespec="seconds"),
+                    last_price=_optional_decimal(event.get("last_price")),
+                    active_line=_optional_decimal(event.get("active_line")),
+                    reason=str(exc),
+                )
         return 1
 
 

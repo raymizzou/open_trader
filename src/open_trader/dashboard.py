@@ -344,6 +344,16 @@ def _valid_trend_review_metric_cell(value: object) -> bool:
     return finite and reason is None
 
 
+def _valid_iso_date(value: object) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _valid_trend_review_projection(
     payload: object, *, broker: str, market: str
 ) -> bool:
@@ -351,8 +361,12 @@ def _valid_trend_review_projection(
         return False
     snapshot = payload.get("strategy_snapshot")
     metrics = payload.get("metrics")
+    schema_version = payload.get("schema_version")
     if (
-        payload.get("schema_version") != "open_trader.trend_review.projection.v1"
+        schema_version not in {
+            "open_trader.trend_review.projection.v1",
+            "open_trader.trend_review.projection.v2",
+        }
         or payload.get("available") is not True
         or payload.get("broker") != broker
         or payload.get("market") != market
@@ -361,6 +375,33 @@ def _valid_trend_review_projection(
         or set(metrics) != TREND_REVIEW_METRICS
     ):
         return False
+    if schema_version == "open_trader.trend_review.projection.v2":
+        sample_counts = payload.get("sample_counts")
+        common_cutoff = payload.get("common_cutoff")
+        interval = payload.get("interval")
+        if (
+            not isinstance(sample_counts, dict)
+            or set(sample_counts) != {"discipline", "actual", "required"}
+            or any(
+                type(sample_counts[key]) is not int or sample_counts[key] < 0
+                for key in ("discipline", "actual")
+            )
+            or type(sample_counts["required"]) is not int
+            or sample_counts["required"] != 30
+            or not isinstance(interval, dict)
+            or set(interval) != {"start", "end"}
+            or not _valid_iso_date(interval["start"])
+            or snapshot.get("effective_from") != interval["start"]
+            or interval["end"] != common_cutoff
+            or (
+                common_cutoff is not None
+                and (
+                    not _valid_iso_date(common_cutoff)
+                    or common_cutoff < interval["start"]
+                )
+            )
+        ):
+            return False
     for key in (
         "strategy_id",
         "strategy_name",
@@ -706,6 +747,23 @@ def _load_broker_trend_report(
     metadata = payload["metadata"]
     formal = judgments["formal_actions"]
     holdings = judgments["holding_decisions"]
+    executions = _trend_action_executions(
+        data_dir, market=market, execution_date=execution_date.isoformat()
+    )
+    formal = [
+        {
+            **item,
+            **(
+                {"execution": executions[key]}
+                if (key := (
+                    str(item.get("symbol") or "").strip(),
+                    {"BUY": "buy", "SELL_ALL": "sell"}.get(item.get("action"), ""),
+                )) in executions
+                else {}
+            ),
+        }
+        for item in formal
+    ]
     account_fresh = account.get("fresh") is True
     sell_actions = [
         item
@@ -782,6 +840,44 @@ def _load_broker_trend_report(
             "artifact": path.name,
         },
     }
+
+
+def _trend_action_executions(
+    data_dir: Path, *, market: str, execution_date: str
+) -> dict[tuple[str, str], dict[str, Any]]:
+    executions: dict[tuple[str, str], dict[str, Any]] = {}
+    root = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+        / execution_date
+    )
+    for path in sorted(root.glob("*/*.json")):
+        try:
+            event = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        symbol = str(event.get("symbol") or "").strip()
+        side = str(event.get("side") or "").strip().lower()
+        status = str(event.get("status") or "").strip()
+        if not symbol or side not in {"buy", "sell"} or not status:
+            continue
+        executions[(symbol, side)] = {
+            "status": status,
+            "filled_qty": str(event.get("filled_qty") or ""),
+            "target_qty": str(event.get("target_qty") or ""),
+            "avg_fill_price": str(event.get("avg_fill_price") or ""),
+            "order_ids": event.get("order_ids")
+            if isinstance(event.get("order_ids"), list)
+            else [],
+            "updated_at": str(event.get("recorded_at") or ""),
+            "reason": str(event.get("reason") or ""),
+        }
+    return executions
 
 
 def _recent_trend_protection_alert(path: Path) -> str:

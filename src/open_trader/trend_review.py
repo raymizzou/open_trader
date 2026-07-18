@@ -17,6 +17,11 @@ from zoneinfo import ZoneInfo
 EVIDENCE_SCHEMA_VERSION = "open_trader.trend_review.evidence.v1"
 REPLAY_SCHEMA_VERSION = "open_trader.trend_review.replay.v1"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+MARKET_TIMEZONES = {
+    "CN": SHANGHAI,
+    "HK": ZoneInfo("Asia/Hong_Kong"),
+    "US": ZoneInfo("America/New_York"),
+}
 BENCHMARK_SOURCE_IDS = {
     "CN": "CSI_ALL_SHARE_PRICE",
     "US": "SPY_QFQ",
@@ -362,15 +367,58 @@ def _order_matches_request(
     )
 
 
-def _open_order_remark(
-    market: str, execution_date: str, report_sha: str, action_index: int
-) -> str:
-    remark = (
-        f"trend-review:{market}:{execution_date}:{report_sha[:24]}:{action_index}"
+def _order_has_action_identity(
+    order: Mapping[str, object], request: Mapping[str, object]
+) -> bool:
+    return all(
+        (
+            bool(request.get("remark")),
+            str(order.get("remark") or "") == str(request.get("remark") or ""),
+            str(order.get("code", order.get("futu_code", ""))).strip().upper()
+            == str(request.get("futu_code") or "").strip().upper(),
+            str(order.get("trd_side", order.get("side", "")))
+            .strip()
+            .rsplit(".", 1)[-1]
+            .upper()
+            == str(request.get("side") or "").strip().rsplit(".", 1)[-1].upper(),
+        )
     )
+
+
+def _open_order_remark(
+    market: str, execution_date: str, action_key: str
+) -> str:
+    remark = f"trend-review:{market}:{execution_date}:{action_key[:24]}"
     if len(remark.encode("utf-8")) > 64:
         raise ValueError("trend review order remark exceeds Futu's 64-byte limit")
     return remark
+
+
+def _write_action_event(
+    *,
+    data_dir: Path,
+    market: str,
+    execution_date: str,
+    action_key: str,
+    payload: Mapping[str, object],
+    recorded_at: str,
+) -> Path:
+    event = {**payload, "recorded_at": recorded_at}
+    body = _canonical_json_bytes(event)
+    filename = (
+        f"{recorded_at.replace(':', '-')}-{hashlib.sha256(body).hexdigest()[:12]}.json"
+    )
+    return _write_immutable(
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+        / execution_date
+        / action_key
+        / filename,
+        body,
+    )
 
 
 def execute_trend_review_open(
@@ -385,20 +433,39 @@ def execute_trend_review_open(
 ) -> dict[str, object]:
     market = _market(market)
     current = datetime.fromisoformat(now)
-    if current.date().isoformat() != execution_date:
+    local_current = current.astimezone(MARKET_TIMEZONES[market])
+    if local_current.date().isoformat() != execution_date:
         raise ValueError("execution date does not match current time")
-    if market in {"CN", "HK"} and not (
-        current.time().replace(tzinfo=None)
-        >= datetime.strptime("09:30", "%H:%M").time()
-        and current.time().replace(tzinfo=None)
-        <= datetime.strptime("10:00", "%H:%M").time()
-    ):
-        return {
-            "status": "missed_window",
-            "market": market,
-            "date": execution_date,
-            "submitted_count": 0,
-        }
+    buy_window_end = "16:00" if market == "US" else "10:00"
+    local_time = local_current.time().replace(tzinfo=None)
+    buy_window_open = (
+        datetime.strptime("09:30", "%H:%M").time()
+        <= local_time
+        <= datetime.strptime(buy_window_end, "%H:%M").time()
+    )
+    market_open = {
+        "CN": (
+            datetime.strptime("09:30", "%H:%M").time()
+            <= local_time
+            <= datetime.strptime("11:30", "%H:%M").time()
+        ) or (
+            datetime.strptime("13:00", "%H:%M").time()
+            <= local_time
+            <= datetime.strptime("15:00", "%H:%M").time()
+        ),
+        "HK": (
+            datetime.strptime("09:30", "%H:%M").time()
+            <= local_time
+            <= datetime.strptime("12:00", "%H:%M").time()
+        ) or (
+            datetime.strptime("13:00", "%H:%M").time()
+            <= local_time
+            <= datetime.strptime("16:00", "%H:%M").time()
+        ),
+        "US": datetime.strptime("09:30", "%H:%M").time()
+        <= local_time
+        <= datetime.strptime("16:00", "%H:%M").time(),
+    }[market]
     snapshot = client.account_snapshot()
     if not isinstance(snapshot, Mapping):
         raise TrendReviewAccountStateError("simulate account snapshot is invalid")
@@ -414,8 +481,21 @@ def execute_trend_review_open(
     from .futu_symbols import to_futu_symbol
 
     report_sha = _report_hash(report)
+    strategy_snapshot = report.get("strategy_snapshot")
+    strategy_version = (
+        str(strategy_snapshot.get("strategy_version") or "")
+        if isinstance(strategy_snapshot, Mapping)
+        else ""
+    )
+    if not strategy_version:
+        raise ValueError("trend report strategy version is unavailable")
     submitted = 0
     artifacts: list[str] = []
+    sell_symbols = {
+        str(action.get("symbol") or "").strip()
+        for action in actions
+        if isinstance(action, Mapping) and action.get("action") == "SELL_ALL"
+    }
     root = (
         data_dir
         / "trend_review"
@@ -425,38 +505,240 @@ def execute_trend_review_open(
         / execution_date
     )
     for index, action in enumerate(actions):
-        if not isinstance(action, Mapping) or action.get("action") != "BUY":
+        if not isinstance(action, Mapping):
             continue
+        action_name = str(action.get("action") or "")
         symbol = str(action.get("symbol") or "").strip()
-        stem = f"{report_sha}-{index}"
+        if action_name not in {"BUY", "SELL_ALL"}:
+            continue
+        futu_code = to_futu_symbol(market, symbol)
+        side = "buy" if action_name == "BUY" else "sell"
+        action_key = hashlib.sha256(
+            f"{market}:{execution_date}:{strategy_version}:{futu_code}:{side}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        if action_name == "BUY" and (symbol in sell_symbols or not buy_window_open):
+            if symbol not in sell_symbols:
+                _write_action_event(
+                    data_dir=data_dir,
+                    market=market,
+                    execution_date=execution_date,
+                    action_key=action_key,
+                    payload={
+                        "market": market,
+                        "date": execution_date,
+                        "strategy_version": strategy_version,
+                        "report_sha256": report_sha,
+                        "symbol": symbol,
+                        "futu_code": futu_code,
+                        "side": side,
+                        "status": (
+                            "pending"
+                            if local_time
+                            < datetime.strptime("09:30", "%H:%M").time()
+                            else "missed"
+                        ),
+                        "reason": (
+                            "buy_window_not_open"
+                            if local_time
+                            < datetime.strptime("09:30", "%H:%M").time()
+                            else "buy_window_closed"
+                        ),
+                    },
+                    recorded_at=now,
+                )
+            continue
+        if action_name == "SELL_ALL" and not market_open:
+            continue
+        stem = action_key
         intent_path = root / f"{stem}-intent.json"
         if intent_path.exists():
-            request, reconciled = _reconcile_intent(intent_path, client)
-            if reconciled:
-                continue
-        else:
-            price = _required_decimal(prices.get(symbol), f"price for {symbol}")
-            weight = _required_decimal(action.get("target_weight"), "target weight")
-            lot_size = int(action.get("lot_size") or 0)
-            if not symbol or price <= 0 or weight <= 0 or lot_size <= 0:
-                raise ValueError("trend review buy action is invalid")
-            quantity = int(
-                (nav * weight / price / Decimal(lot_size)).to_integral_value(
-                    rounding=ROUND_DOWN
+            intent_paths = [intent_path, *sorted(root.glob(f"{stem}-attempt-*-intent.json"))]
+            pending_intent = next(
+                (
+                    path
+                    for path in intent_paths
+                    if not path.with_name(
+                        path.name.replace("-intent", "-result")
+                    ).exists()
+                ),
+                None,
+            )
+            if pending_intent is not None:
+                request, reconciled = _reconcile_intent(pending_intent, client)
+                if reconciled:
+                    continue
+                intent_path = pending_intent
+            else:
+                base = json.loads(intent_path.read_text(encoding="utf-8"))
+                request = base.get("request") if isinstance(base, Mapping) else None
+                if not isinstance(request, dict):
+                    raise ValueError("trend review intent request is invalid")
+                listed = client.list_orders(start=execution_date, end=execution_date)
+                orders = listed.get("orders") if isinstance(listed, Mapping) else None
+                if not isinstance(orders, list):
+                    raise ValueError("simulate broker orders are unavailable")
+                matched = [
+                    order
+                    for order in orders
+                    if isinstance(order, Mapping)
+                    and _order_has_action_identity(order, request)
+                ]
+                if not matched:
+                    continue
+                target_quantity = _required_decimal(request.get("qty"), "target quantity")
+                dealt_by_order = {
+                    str(order.get("order_id") or index): _required_decimal(
+                        order.get("dealt_qty", "0"), "broker dealt quantity"
+                    )
+                    for index, order in enumerate(matched)
+                }
+                remaining = target_quantity - sum(
+                    dealt_by_order.values(), start=Decimal("0")
                 )
-            ) * lot_size
+                filled = target_quantity - remaining
+                order_ids = [
+                    str(order.get("order_id"))
+                    for order in matched
+                    if order.get("order_id") not in {None, ""}
+                ]
+                weighted_prices = [
+                    (
+                        _required_decimal(order.get("dealt_qty"), "broker dealt quantity"),
+                        _required_decimal(
+                            order.get("dealt_avg_price"), "broker average fill price"
+                        ),
+                    )
+                    for order in matched
+                    if _required_decimal(
+                        order.get("dealt_qty", "0"), "broker dealt quantity"
+                    ) > 0
+                    and order.get("dealt_avg_price") not in {None, ""}
+                ]
+                average_price = (
+                    sum(
+                        (quantity * price for quantity, price in weighted_prices),
+                        start=Decimal("0"),
+                    )
+                    / sum(
+                        (quantity for quantity, _ in weighted_prices),
+                        start=Decimal("0"),
+                    )
+                    if weighted_prices
+                    else None
+                )
+                if any(
+                    order.get("order_id")
+                    or order.get("order_status")
+                    or order.get("dealt_qty")
+                    for order in matched
+                ):
+                    _write_action_event(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        payload={
+                            "market": market,
+                            "date": execution_date,
+                            "strategy_version": strategy_version,
+                            "report_sha256": report_sha,
+                            "symbol": symbol,
+                            "futu_code": futu_code,
+                            "side": side,
+                            "status": (
+                                "filled"
+                                if remaining <= 0
+                                else "partially_filled"
+                                if filled > 0
+                                else "submitted"
+                            ),
+                            "filled_qty": format(filled, "f"),
+                            "target_qty": format(target_quantity, "f"),
+                            "avg_fill_price": (
+                                format(average_price, "f")
+                                if average_price is not None
+                                else ""
+                            ),
+                            "order_ids": order_ids,
+                        },
+                        recorded_at=now,
+                    )
+                if remaining <= 0:
+                    continue
+                active_statuses = {
+                    "",
+                    "SUBMITTING",
+                    "SUBMITTED",
+                    "WAITING_SUBMIT",
+                    "FILLED_PART",
+                }
+                if any(
+                    str(order.get("order_status") or order.get("status") or "")
+                    .strip()
+                    .upper()
+                    in active_statuses
+                    for order in matched
+                ):
+                    continue
+                request = {**request, "qty": format(remaining, "f")}
+                attempt = len(intent_paths) + 1
+                intent_path = root / f"{stem}-attempt-{attempt}-intent.json"
+                _write_immutable(
+                    intent_path,
+                    _canonical_json_bytes(
+                        {
+                            "market": market,
+                            "date": execution_date,
+                            "report_sha256": report_sha,
+                            "action_index": index,
+                            "attempt": attempt,
+                            "request": request,
+                            "created_at": now,
+                        }
+                    ),
+                )
+        else:
+            if action_name == "BUY":
+                price = _required_decimal(prices.get(symbol), f"price for {symbol}")
+                weight = _required_decimal(action.get("target_weight"), "target weight")
+                lot_size = int(action.get("lot_size") or 0)
+                if not symbol or price <= 0 or weight <= 0 or lot_size <= 0:
+                    raise ValueError("trend review buy action is invalid")
+                quantity = int(
+                    (nav * weight / price / Decimal(lot_size)).to_integral_value(
+                        rounding=ROUND_DOWN
+                    )
+                ) * lot_size
+            else:
+                position = next(
+                    (
+                        item
+                        for item in _positive_positions(snapshot)
+                        if str(item.get("code") or item.get("futu_code") or "")
+                        .strip()
+                        .upper()
+                        == futu_code.upper()
+                    ),
+                    None,
+                )
+                quantity = int(
+                    _required_decimal(
+                        position.get("qty", position.get("quantity")),
+                        "position qty",
+                    )
+                ) if position is not None else 0
             if quantity <= 0:
                 continue
             request = {
                 "market": market,
-                "futu_code": to_futu_symbol(market, symbol),
-                "side": "buy",
+                "futu_code": futu_code,
+                "side": side,
                 "order_type": "MARKET",
                 "price": "0",
                 "qty": str(quantity),
-                "remark": _open_order_remark(
-                    market, execution_date, report_sha, index
-                ),
+                "remark": _open_order_remark(market, execution_date, action_key),
             }
             _write_immutable(
                 intent_path,
@@ -471,8 +753,35 @@ def execute_trend_review_open(
                     }
                 ),
             )
-        response = client.place_order(request)
-        result_path = root / f"{stem}-result.json"
+        base_intent = json.loads((root / f"{stem}-intent.json").read_text(encoding="utf-8"))
+        base_request = base_intent.get("request") if isinstance(base_intent, Mapping) else {}
+        target_qty = str(base_request.get("qty") or request.get("qty") or "")
+        try:
+            response = client.place_order(request)
+        except Exception as exc:
+            _write_action_event(
+                data_dir=data_dir,
+                market=market,
+                execution_date=execution_date,
+                action_key=action_key,
+                payload={
+                    "market": market,
+                    "date": execution_date,
+                    "strategy_version": strategy_version,
+                    "report_sha256": report_sha,
+                    "symbol": symbol,
+                    "futu_code": futu_code,
+                    "side": side,
+                    "status": "failed",
+                    "target_qty": target_qty,
+                    "reason": str(exc),
+                },
+                recorded_at=now,
+            )
+            raise
+        result_path = intent_path.with_name(
+            intent_path.name.replace("-intent", "-result")
+        )
         _write_immutable(
             result_path,
             _canonical_json_bytes(
@@ -485,10 +794,36 @@ def execute_trend_review_open(
                 }
             ),
         )
+        order_id = str(response.get("futu_order_id") or "")
+        _write_action_event(
+            data_dir=data_dir,
+            market=market,
+            execution_date=execution_date,
+            action_key=action_key,
+            payload={
+                "market": market,
+                "date": execution_date,
+                "strategy_version": strategy_version,
+                "report_sha256": report_sha,
+                "symbol": symbol,
+                "futu_code": futu_code,
+                "side": side,
+                "status": "submitted",
+                "target_qty": target_qty,
+                "order_ids": [order_id] if order_id else [],
+            },
+            recorded_at=now,
+        )
         artifacts.append(str(result_path))
         submitted += 1
     return {
-        "status": "submitted" if submitted else "unchanged",
+        "status": (
+            "submitted"
+            if submitted
+            else "unchanged"
+            if buy_window_open or market_open
+            else "missed_window"
+        ),
         "market": market,
         "date": execution_date,
         "submitted_count": submitted,

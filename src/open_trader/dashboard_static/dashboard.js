@@ -2077,6 +2077,27 @@ function cnTrendHints(item) {
     : "数据不可用";
 }
 
+function renderTrendExecutionRow(item, columnCount) {
+  const execution = item.execution && typeof item.execution === "object" ? item.execution : {};
+  const status = String(execution.status || "pending");
+  const statusLabel = {
+    pending: "待执行", submitted: "已提交", partially_filled: "部分成交",
+    filled: "全部成交", failed: "失败", blocked: "受阻", missed: "错过",
+    incomplete: "未完成", early_revision_executed: "早期版本已执行",
+  }[status] || "待执行";
+  const details = [statusLabel];
+  if (hasValue(execution.filled_qty) || hasValue(execution.target_qty)) {
+    details.push(`成交 ${formatPlain(execution.filled_qty)} / ${formatPlain(execution.target_qty)}`);
+  }
+  if (hasValue(execution.avg_fill_price)) details.push(`均价 ${formatPlain(execution.avg_fill_price)}`);
+  if (Array.isArray(execution.order_ids) && execution.order_ids.length) {
+    details.push(`订单 ${execution.order_ids.map(formatPlain).join("、")}`);
+  }
+  if (hasValue(execution.updated_at)) details.push(formatPlain(execution.updated_at));
+  if (hasValue(execution.reason)) details.push(`原因 ${formatPlain(execution.reason)}`);
+  return `<tr class="cn-trend-execution"><td colspan="${columnCount}">${details.map((detail) => `<span>${escapeHtml(detail)}</span>`).join("")}</td></tr>`;
+}
+
 function formatCnTrendPrice(value) {
   const number = numericValue(value);
   return number === null
@@ -2132,7 +2153,7 @@ function renderCnSellOrHoldStage(title, items, kind) {
     ${renderCnTrendCell(headings[5], TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
     ${renderCnTrendCell("活动保护线", formatCnTrendPrice(item.active_line))}
     ${renderCnTrendCell("持仓提示", cnTrendHints(item))}
-  </tr>`);
+  </tr>${kind === "sell" ? renderTrendExecutionRow(item, headings.length) : ""}`);
   return renderCnTrendTable(title, kind, headings, rows);
 }
 
@@ -2148,7 +2169,7 @@ function renderMarketSellOrHoldStage(title, items, kind) {
     ${renderCnTrendCell(reasonHeading, TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
     ${renderCnTrendCell("活动保护线", item.active_line)}
     ${renderCnTrendCell("持仓提示", Array.isArray(item.entry_hints) && item.entry_hints.length ? item.entry_hints.map(formatPlain).join("；") : "—")}
-  </tr>`);
+  </tr>${kind === "sell" ? renderTrendExecutionRow(item, headings.length) : ""}`);
   return renderCnTrendTable(title, kind, headings, rows);
 }
 
@@ -2166,7 +2187,7 @@ function renderMarketBuyStage(report) {
       ${renderCnTrendCell("金额上限", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : "—")}
       ${renderCnTrendCell("预计数量", hasValue(item.estimated_shares) ? `${formatDisplayNumber(item.estimated_shares)} 股` : "—")}
       ${renderCnTrendCell("预计保护线", hasValue(item.estimated_initial_line) ? formatDisplayNumber(item.estimated_initial_line) : "—")}
-    </tr>`;
+    </tr>${renderTrendExecutionRow(item, headings.length)}`;
   });
   return renderCnTrendTable(`${formatPlain(report.buy_window)} · 正式买入计划`, "buy", headings, rows);
 }
@@ -2195,7 +2216,7 @@ function renderCnBuyStage(report) {
       ${renderCnTrendCell("目标金额", item.target_amount)}
       ${renderCnTrendCell("预计数量", `${formatPlain(item.estimated_shares)} 股`)}
       ${renderCnTrendCell("预计保护线", formatCnTrendPrice(item.estimated_initial_line))}
-    </tr>`;
+    </tr>${renderTrendExecutionRow(item, headings.length)}`;
   });
   return renderCnTrendTable(
     `${formatPlain(report.buy_window)} · 正式买入计划`, "buy", headings, rows,

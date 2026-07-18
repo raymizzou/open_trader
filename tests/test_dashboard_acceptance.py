@@ -542,7 +542,20 @@ def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
         "data_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "sell_actions": [],
-        "buy_actions": [buy],
+        "buy_actions": [
+            {
+                **buy,
+                "execution": {
+                    "status": "missed",
+                    "filled_qty": "",
+                    "target_qty": "",
+                    "avg_fill_price": "",
+                    "order_ids": [],
+                    "updated_at": "2026-07-15T16:00:00-04:00",
+                    "reason": "buy_window_closed",
+                },
+            }
+        ],
         "hold_actions": [],
         "review_actions": [],
         "counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
@@ -1277,6 +1290,15 @@ class TabbedAccountLocator:
             return 2 if self.page.trend_broker == "eastmoney" else 0
         if self.selector == "#trend-report-workspace:visible .cn-trend-table":
             return 4 if self.page.trend_broker is not None else 0
+        if self.selector in {
+            "#trend-report-workspace:visible .cn-trend-execution",
+            "#trend-report-workspace:visible .cn-trend-execution span:first-child",
+        }:
+            report = self.page.reports.get(str(self.page.trend_broker), {})
+            return sum(
+                len(actions) if isinstance(actions, list) else 0
+                for actions in (report.get("sell_actions"), report.get("buy_actions"))
+            )
         if self.selector == (
             "#trend-report-workspace:visible .cn-trend-buy .cn-trend-card"
         ):
@@ -1510,6 +1532,29 @@ class TabbedAccountLocator:
             return trend_audit_sections(broker)
         if self.selector == "#trend-report-workspace:visible .trend-discipline summary":
             return ["买入纪律", "卖出纪律"]
+        if self.selector == (
+            "#trend-report-workspace:visible .cn-trend-execution span:first-child"
+        ):
+            report = self.page.reports[broker]
+            actions = [
+                *report.get("sell_actions", []),
+                *report.get("buy_actions", []),
+            ]
+            labels = {
+                "pending": "待执行",
+                "submitted": "已提交",
+                "partially_filled": "部分成交",
+                "filled": "全部成交",
+                "failed": "失败",
+                "blocked": "受阻",
+                "missed": "错过",
+                "incomplete": "未完成",
+                "early_revision_executed": "早期版本已执行",
+            }
+            return [
+                labels.get((action.get("execution") or {}).get("status"), "待执行")
+                for action in actions
+            ]
         match = re.fullmatch(
             r"#account-(\w+):visible \.account-holding-row:visible td:nth-child\(2\)",
             self.selector,

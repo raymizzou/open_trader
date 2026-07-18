@@ -1735,6 +1735,24 @@ table {
   font-size: 12px;
 }
 
+.cn-trend-execution td,
+.cn-trend-buy .cn-trend-execution td {
+  background: var(--surface-soft);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.cn-trend-execution span:first-child {
+  color: var(--text);
+  font-weight: 700;
+}
+
 .option-attention-workspace {
   display: grid;
   gap: 16px;
@@ -3956,6 +3974,8 @@ tbody tr.active-row,
 .action-card,
 .backtest-metric-card,
 .cn-trend-card td:nth-child(-n + 2),
+.cn-trend-execution td,
+.cn-trend-buy .cn-trend-execution td,
 .option-attention-market th {
   --muted: var(--text);
 }
@@ -4211,6 +4231,18 @@ table {
 
   .cn-trend-card td:nth-child(-n + 2) {
     background: var(--surface-soft);
+  }
+
+  .cn-trend-execution {
+    display: block;
+    margin-top: -12px;
+  }
+
+  .cn-trend-execution td {
+    box-sizing: border-box;
+    display: flex;
+    padding: 10px;
+    width: 100%;
   }
 
   .trend-discipline summary,

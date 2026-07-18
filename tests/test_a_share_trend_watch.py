@@ -11,6 +11,7 @@ import pytest
 
 from open_trader.a_share_trend_watch import (
     _deliver_trigger_notification,
+    _notify_trend_review_deadline,
     append_watch_event,
     watch_a_share_protection,
 )
@@ -256,6 +257,107 @@ def test_watcher_calls_review_open_and_stop_hooks_once(tmp_path: Path) -> None:
     assert len(stops) == 1
     assert stops[0]["event_type"] == "protection_triggered"
     assert stops[0]["event_id"]
+
+
+def test_watcher_retries_review_callback_on_next_poll(tmp_path: Path) -> None:
+    attempts: list[str] = []
+
+    def review(trading_date: str) -> None:
+        attempts.append(trading_date)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary review failure")
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path, active_line="20"),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=SequenceQuote(
+            [
+                {"SH.600900": Decimal("27.30")},
+                {"SH.600900": Decimal("27.20")},
+            ]
+        ),
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        now_fn=SequenceClock(
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:05+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
+        ),
+        sleep_fn=lambda seconds: None,
+        on_session_open=review,
+    )
+
+    assert result.status == "closed"
+    assert attempts == ["2026-07-15", "2026-07-15", "2026-07-15"]
+
+
+def test_closed_trading_day_runs_compensation_before_exit(tmp_path: Path) -> None:
+    opens: list[str] = []
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=SequenceQuote([], trading_days=["2026-07-15"]),
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        now_fn=SequenceClock(["2026-07-15T15:01:00+08:00"]),
+        sleep_fn=lambda seconds: None,
+        on_session_open=opens.append,
+    )
+
+    assert result.status == "closed"
+    assert opens == ["2026-07-15"]
+
+
+def test_trend_review_deadline_notification_is_sent_once(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    action = (
+        data_dir
+        / "trend_review/ledgers/CN/actions/2026-07-15/key"
+        / "2026-07-15T09-31-00+08-00.json"
+    )
+    action.parent.mkdir(parents=True)
+    action.write_text(
+        json.dumps(
+            {
+                "symbol": "600900",
+                "status": "submitted",
+                "recorded_at": "2026-07-15T09:31:00+08:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    events = data_dir / "trend_a_share/watch_events.jsonl"
+    notifier = RecordingNotifier()
+
+    _notify_trend_review_deadline(
+        data_dir=data_dir,
+        market="CN",
+        trading_date="2026-07-15",
+        now=datetime.fromisoformat("2026-07-15T09:59:00+08:00"),
+        events_path=events,
+        notifier=notifier,
+    )
+    for _ in range(2):
+        _notify_trend_review_deadline(
+            data_dir=data_dir,
+            market="CN",
+            trading_date="2026-07-15",
+            now=datetime.fromisoformat("2026-07-15T10:00:00+08:00"),
+            events_path=events,
+            notifier=notifier,
+        )
+
+    assert notifier.messages == [
+        ("趋势模拟执行未完成 · 2026-07-15", "600900 · 已提交")
+    ]
+    assert read_events(events)[0]["event_type"] == "trend_review_deadline_notified"
 
 
 def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:

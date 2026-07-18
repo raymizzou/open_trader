@@ -271,6 +271,21 @@ def trend_review_projection(market: str, broker: str) -> dict[str, object]:
     }
 
 
+def trend_review_projection_v2(market: str, broker: str) -> dict[str, object]:
+    payload = trend_review_projection(market, broker)
+    effective_from = {"CN": "2026-07-16", "US": "2026-07-17", "HK": "2026-07-17"}[
+        market
+    ]
+    payload.update({
+        "schema_version": "open_trader.trend_review.projection.v2",
+        "sample_counts": {"discipline": 31, "actual": 29, "required": 30},
+        "common_cutoff": "2026-07-17",
+        "interval": {"start": effective_from, "end": "2026-07-17"},
+    })
+    payload["strategy_snapshot"]["effective_from"] = effective_from  # type: ignore[index]
+    return payload
+
+
 def test_dashboard_loads_only_strict_market_matched_trend_reviews(
     tmp_path: Path,
 ) -> None:
@@ -291,6 +306,19 @@ def test_dashboard_loads_only_strict_market_matched_trend_reviews(
     assert reviews["phillips"]["metrics"]["calmar"]["actual"]["value"] == "9.4"
     assert "batch" not in reviews["tiger"]
     assert "batch_path" not in reviews["tiger"]
+
+
+def test_dashboard_accepts_strict_v2_trend_review_projection(tmp_path: Path) -> None:
+    path = tmp_path / "data/latest/trend_review_us.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(trend_review_projection_v2("US", "tiger")), encoding="utf-8"
+    )
+
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+
+    assert review["available"] is True
+    assert review["metrics"]["calmar"]["actual"]["value"] == "9.4"
 
 
 @pytest.mark.parametrize(
@@ -472,6 +500,30 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     log.write_text(json.dumps({
         "event": "failed", "run_date": "2026-07-15",
     }) + "\n", encoding="utf-8")
+    execution = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-15/action-key"
+        / "2026-07-15T10-00-00-04-00-event.json"
+    )
+    execution.parent.mkdir(parents=True)
+    execution.write_text(
+        json.dumps(
+            {
+                "market": "US",
+                "date": "2026-07-15",
+                "symbol": "VIXY",
+                "side": "buy",
+                "status": "partially_filled",
+                "filled_qty": "20",
+                "target_qty": "40",
+                "avg_fill_price": "50.25",
+                "order_ids": ["SIM-1"],
+                "recorded_at": "2026-07-15T10:00:00-04:00",
+                "reason": "",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     state = load_dashboard_state(config).to_dict()
     reports = state["trend_reports"]
@@ -483,6 +535,15 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     assert reports["tiger"]["data_status"] == "current"
     assert reports["tiger"]["generated_at"] == "2026-07-15T11:30:36+08:00"
     assert reports["tiger"]["sell_actions"][0]["symbol"] == "AAPL"
+    assert reports["tiger"]["buy_actions"][0]["execution"] == {
+        "status": "partially_filled",
+        "filled_qty": "20",
+        "target_qty": "40",
+        "avg_fill_price": "50.25",
+        "order_ids": ["SIM-1"],
+        "updated_at": "2026-07-15T10:00:00-04:00",
+        "reason": "",
+    }
     assert reports["tiger"]["counts"] == {"sell": 1, "buy": 1, "hold": 1, "review": 0}
     assert reports["tiger"]["run_status"] == "failed"
     assert reports["tiger"]["recent_protection_alert"] == (

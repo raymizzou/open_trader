@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from open_trader.kelly_order_execution import (
+    FutuOrderExecutionError,
     FutuSimulateOrderExecutionClient,
     MarketRoutingOrderExecutionClient,
     execute_kelly_orders_from_risk_checks,
@@ -35,6 +36,7 @@ class FakeFutuExecutionContext:
         self.port = port
         self.trd_market = trd_market
         self.place_calls: list[dict[str, object]] = []
+        self.history_order_calls: list[dict[str, object]] = []
 
     def get_acc_list(self) -> object:
         return (
@@ -66,6 +68,20 @@ class FakeFutuExecutionContext:
 
     def order_list_query(self, **kwargs: object) -> object:
         return 0, FakeDataFrame([{"order_id": "SIM-1", "order_status": "FILLED_ALL"}])
+
+    def history_order_list_query(self, **kwargs: object) -> object:
+        self.history_order_calls.append(dict(kwargs))
+        return 0, FakeDataFrame(
+            [
+                {
+                    "order_id": "SIM-HISTORY-1",
+                    "order_status": "FILLED_ALL",
+                    "qty": "100",
+                    "dealt_qty": "100",
+                    "dealt_avg_price": "20.74",
+                }
+            ]
+        )
 
 
 class FakeDataFrame:
@@ -354,9 +370,47 @@ def test_futu_simulate_client_supports_market_order_and_keeps_limit_default() ->
     assert snapshot["acc_id"] == 12958916
     assert snapshot["net_value"] == "100000"
     assert snapshot["positions"] == [{"code": "SH.600001", "qty": "100"}]
-    assert client.list_orders()["orders"] == [
-        {"order_id": "SIM-1", "order_status": "FILLED_ALL"}
+    assert client.list_orders(start="2026-07-17", end="2026-07-17")["orders"] == [
+        {
+            "order_id": "SIM-HISTORY-1",
+            "order_status": "FILLED_ALL",
+            "qty": "100",
+            "dealt_qty": "100",
+            "dealt_avg_price": "20.74",
+        }
     ]
+    assert client.context.history_order_calls == [
+        {
+            "start": "2026-07-17",
+            "end": "2026-07-17",
+            "trd_env": "SIMULATE",
+            "acc_id": 12958916,
+            "acc_index": 0,
+        }
+    ]
+
+
+def test_futu_simulate_client_reports_history_order_query_failure() -> None:
+    class FailedHistoryContext(FakeFutuExecutionContext):
+        def history_order_list_query(self, **kwargs: object) -> object:
+            return -1, "history unavailable"
+
+    client = FutuSimulateOrderExecutionClient(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=12958916,
+        trd_market="CN",
+        context_factory=FailedHistoryContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    try:
+        client.list_orders(start="2026-07-17", end="2026-07-17")
+    except FutuOrderExecutionError as exc:
+        assert exc.error_type == "history_order_list_query_failed"
+        assert str(exc) == "history unavailable"
+    else:
+        raise AssertionError("expected FutuOrderExecutionError")
 
 
 def test_market_routing_order_execution_client_routes_by_request_market() -> None:

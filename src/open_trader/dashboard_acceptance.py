@@ -679,7 +679,17 @@ def _check_trend_artifact_projection(
         "review_actions": reviews,
     }
     assert all(
-        report.get(key) == value for key, value in expected_actions.items()
+        isinstance(projected := report.get(key), list)
+        and all(isinstance(item, Mapping) for item in projected)
+        and [
+            {
+                field: field_value
+                for field, field_value in item.items()
+                if field != "execution"
+            }
+            for item in projected
+        ] == value
+        for key, value in expected_actions.items()
     ), f"{broker} 冻结报告动作与 API 投影不一致"
     assert report.get("counts") == {
         "sell": len(sells),
@@ -1140,6 +1150,22 @@ def _check_account_holdings(
         assert workspace.locator(".cn-trend-table").count() == 4, (
             f"{broker} 趋势报告动作表数量与 API 不一致"
         )
+        sell_actions = report.get("sell_actions")
+        expected_execution_rows = expected_buy_count + (
+            len(sell_actions) if isinstance(sell_actions, list) else 0
+        )
+        execution_rows = workspace.locator(".cn-trend-execution")
+        assert execution_rows.count() == expected_execution_rows, (
+            f"{broker} 执行状态行数量不是 {expected_execution_rows}"
+        )
+        valid_statuses = {
+            "待执行", "已提交", "部分成交", "全部成交", "失败",
+            "受阻", "错过", "未完成", "早期版本已执行",
+        }
+        assert all(
+            status in valid_statuses
+            for status in execution_rows.locator("span:first-child").all_inner_texts()
+        ), f"{broker} 执行状态包含未知文案"
         if broker == "eastmoney":
             for required in (
                 "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
