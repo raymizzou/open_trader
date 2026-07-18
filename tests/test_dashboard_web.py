@@ -3586,9 +3586,23 @@ window.fetch=async (input)=>{{
         assert page.evaluate("document.activeElement.dataset.accountView") == "simulate"
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         section.locator(".report-attribution-link").click()
-        section.locator("[data-current-trend-report]").wait_for()
+        return_current = section.locator("[data-current-trend-report]")
+        return_current.wait_for()
+        assert return_current.evaluate(
+            """node => {
+              const style = getComputedStyle(node);
+              return {border: style.borderTopWidth, background: style.backgroundColor, fontWeight: style.fontWeight};
+            }""",
+        ) == {"border": "0px", "background": "rgba(0, 0, 0, 0)", "fontWeight": "400"}
         assert "错过" in section.inner_text()
-        section.locator("[data-current-trend-report]").click()
+        return_current.click()
+        history_button = section.locator("[data-report-history]")
+        assert history_button.evaluate(
+            """node => {
+              const style = getComputedStyle(node);
+              return {border: style.borderTopWidth, background: style.backgroundColor, fontWeight: style.fontWeight};
+            }""",
+        ) == {"border": "0px", "background": "rgba(0, 0, 0, 0)", "fontWeight": "400"}
         cash_details = section.locator(".account-cash-details")
         cash_details.evaluate("node => { node.open = true; node.dataset.historyStable = 'yes'; }")
         section.locator("[data-report-history]").click()

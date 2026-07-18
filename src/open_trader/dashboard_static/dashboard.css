@@ -1555,6 +1555,7 @@ table {
   cursor: not-allowed;
 }
 
+.trend-report-header .trend-history-button,
 .trend-history-button,
 .report-attribution-link {
   background: transparent;
@@ -1562,6 +1563,7 @@ table {
   border-radius: 0;
   color: var(--muted);
   cursor: pointer;
+  font-weight: 400;
   min-height: 44px;
   padding: 0 8px;
   text-decoration: underline;
