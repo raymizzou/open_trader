@@ -292,7 +292,27 @@ def test_watcher_retries_review_callback_on_next_poll(tmp_path: Path) -> None:
     )
 
     assert result.status == "closed"
-    assert attempts == ["2026-07-15", "2026-07-15"]
+    assert attempts == ["2026-07-15", "2026-07-15", "2026-07-15"]
+
+
+def test_closed_trading_day_runs_compensation_before_exit(tmp_path: Path) -> None:
+    opens: list[str] = []
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=SequenceQuote([], trading_days=["2026-07-15"]),
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        now_fn=SequenceClock(["2026-07-15T15:01:00+08:00"]),
+        sleep_fn=lambda seconds: None,
+        on_session_open=opens.append,
+    )
+
+    assert result.status == "closed"
+    assert opens == ["2026-07-15"]
 
 
 def test_trend_review_deadline_notification_is_sent_once(tmp_path: Path) -> None:

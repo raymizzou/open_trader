@@ -7,6 +7,8 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from open_trader.a_share_trend import write_protection_state
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.market_trend_watch import (
@@ -15,6 +17,7 @@ from open_trader.market_trend_watch import (
     next_market_open,
     watch_market_protection,
 )
+import open_trader.market_trend_watch as market_watch_module
 from open_trader.notifications import (
     CompositeNotifier,
     FeishuWebhookNotifier,
@@ -64,6 +67,44 @@ def test_us_regular_session_is_new_york_dst_aware() -> None:
     assert market_session(summer, "US") == "open"
     assert market_session(winter, "US") == "open"
     assert market_session(datetime(2026, 7, 17, 4, 1, tzinfo=SHANGHAI), "US") == "closed"
+
+
+def test_closed_us_watcher_compensates_before_waiting_for_next_open(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    opens: list[str] = []
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-17", "2026-07-20"]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(market_watch_module, "load_trend_account", lambda **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="stop before long wait"):
+        watch_market_protection(
+            market="US",
+            data_dir=tmp_path / "data",
+            portfolio_path=tmp_path / "unused.csv",
+            state_path=tmp_path / "state.json",
+            events_path=tmp_path / "events.jsonl",
+            report_lock_path=tmp_path / "report.lock",
+            quote_client=Quote(),
+            notifier=NullNotifier(),
+            poll_seconds=5,
+            reconnect_seconds=60,
+            now_fn=lambda: datetime(
+                2026, 7, 17, 19, 0, tzinfo=ZoneInfo("America/New_York")
+            ),
+            sleep_fn=lambda seconds: (_ for _ in ()).throw(
+                RuntimeError("stop before long wait")
+            ),
+            on_session_open=opens.append,
+        )
+
+    assert opens == ["2026-07-17"]
 
 
 def test_next_market_open_waits_from_early_report_until_next_session() -> None:

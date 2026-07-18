@@ -129,16 +129,6 @@ def watch_a_share_protection(
     try:
         while True:
             session = session_fn(now)
-            if session == "closed":
-                return _result(
-                    "closed",
-                    positions,
-                    trigger_count,
-                    exception_count,
-                    unknown_quote_count,
-                    events_path,
-                )
-
             if client is None:
                 if quote_client_factory is None:
                     raise RuntimeError("quote client factory is required after interruption")
@@ -193,21 +183,6 @@ def watch_a_share_protection(
                         events_path,
                     )
 
-            if session == "before":
-                opening = now.astimezone(session_timezone).replace(
-                    hour=9, minute=30, second=0, microsecond=0
-                )
-                sleep_fn((opening - now.astimezone(session_timezone)).total_seconds())
-                now = now_fn()
-                continue
-            if session == "lunch":
-                afternoon = now.astimezone(session_timezone).replace(
-                    hour=13, minute=0, second=0, microsecond=0
-                )
-                sleep_fn((afternoon - now.astimezone(session_timezone)).total_seconds())
-                now = now_fn()
-                continue
-
             if on_session_open is not None:
                 exception_count += _run_review_callback(
                     on_session_open,
@@ -225,6 +200,30 @@ def watch_a_share_protection(
                     events_path=events_path,
                     notifier=notifier,
                 )
+
+            if session == "closed":
+                return _result(
+                    "closed",
+                    positions,
+                    trigger_count,
+                    exception_count,
+                    unknown_quote_count,
+                    events_path,
+                )
+            if session == "before":
+                opening = now.astimezone(session_timezone).replace(
+                    hour=9, minute=30, second=0, microsecond=0
+                )
+                sleep_fn((opening - now.astimezone(session_timezone)).total_seconds())
+                now = now_fn()
+                continue
+            if session == "lunch":
+                afternoon = now.astimezone(session_timezone).replace(
+                    hour=13, minute=0, second=0, microsecond=0
+                )
+                sleep_fn((afternoon - now.astimezone(session_timezone)).total_seconds())
+                now = now_fn()
+                continue
 
             try:
                 with (

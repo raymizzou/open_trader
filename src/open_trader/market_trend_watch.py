@@ -12,6 +12,8 @@ from .a_share_trend_watch import (
     _load_active_lines,
     _record_interruption,
     _record_recovery,
+    _run_review_callback,
+    _notify_trend_review_deadline,
     watch_a_share_protection,
 )
 from .futu_quote import FutuQuoteClient, FutuQuoteError
@@ -111,6 +113,30 @@ def watch_market_protection(
                 now = now_fn()
                 continue
         try:
+            local_date = now.astimezone(timezone).date().isoformat()
+            if market_session(now, market) == "closed":
+                current_days = client.get_trading_days(
+                    market=market,
+                    start=local_date,
+                    end=local_date,
+                )
+                if local_date in current_days and on_session_open is not None:
+                    _run_review_callback(
+                        on_session_open,
+                        local_date,
+                        events_path=events_path,
+                        trading_date=local_date,
+                        now=now,
+                        notifier=notifier,
+                    )
+                    _notify_trend_review_deadline(
+                        data_dir=data_dir,
+                        market=market,
+                        trading_date=local_date,
+                        now=now,
+                        events_path=events_path,
+                        notifier=notifier,
+                    )
             opening = next_market_open(client, market=market, now=now)
         except FutuQuoteError as exc:
             if not interrupted:
