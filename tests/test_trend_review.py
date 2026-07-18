@@ -370,6 +370,31 @@ def test_open_uses_sim_nav_current_price_and_frozen_lot(tmp_path: Path) -> None:
     } == json.loads(events[-1].read_text(encoding="utf-8"))
 
 
+def test_completed_buy_with_empty_broker_history_never_resubmits(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "prices": {"600001": Decimal("10")},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:31:00+08:00"
+    )
+    client.orders.clear()
+
+    result = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:32:00+08:00"
+    )
+
+    assert result["submitted_count"] == 0
+    assert len(client.requests) == 1
+
+
 def test_us_open_uses_us_market_date_after_shanghai_midnight(tmp_path: Path) -> None:
     client = FakeTrendSimClient()
     report = cn_buy_report(symbol="NDAQ")
@@ -736,6 +761,75 @@ def test_position_zero_terminal_uses_actual_broker_fill_facts(
             "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
         )
     ) == 1
+
+
+def test_positive_sell_recovery_uses_broker_fills_and_live_retry_quantity(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        prices={"600001": Decimal("10")},
+        market="CN",
+        execution_date="2026-07-16",
+        now="2026-07-16T09:31:00+08:00",
+    )
+    client.requests.clear()
+    client.orders.clear()
+    client.positions = [{"code": "SH.600001", "qty": "100"}]
+    report = report_with_actions([{"action": "SELL_ALL", "symbol": "600001"}])
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "prices": {},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T10:30:00+08:00"
+    )
+    action_glob = "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+    event_count = len(list(tmp_path.glob(action_glob)))
+    client.orders.clear()
+    client.positions = [{"code": "SH.600001", "qty": "50"}]
+
+    unmatched = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+
+    assert unmatched["submitted_count"] == 0
+    assert len(client.requests) == 1
+    assert len(list(tmp_path.glob(action_glob))) == event_count
+
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": client.requests[0]["remark"],
+        "code": "SH.600001",
+        "trd_side": "SELL",
+        "qty": "100",
+        "dealt_qty": "20",
+        "dealt_avg_price": "10",
+        "order_status": "CANCELLED_PART",
+    }]
+    recovered = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+    latest = json.loads(
+        sorted(tmp_path.glob(action_glob))[-1].read_text(encoding="utf-8")
+    )
+
+    assert recovered["submitted_count"] == 1
+    assert client.requests[-1]["qty"] == "50"
+    assert latest | {
+        "status": "partially_filled",
+        "filled_qty": "20",
+        "target_qty": "100",
+        "avg_fill_price": "10",
+        "order_ids": ["SIM-1"],
+    } == latest
 
 
 def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:

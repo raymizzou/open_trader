@@ -633,7 +633,8 @@ def execute_trend_review_open(
                     if isinstance(order, Mapping)
                     and _order_has_action_identity(order, request)
                 ]
-                if not matched and sell_quantity > 0:
+                position_zero = action_name == "SELL_ALL" and sell_quantity <= 0
+                if not matched and not position_zero:
                     continue
                 target_quantity = _required_decimal(request.get("qty"), "target quantity")
                 dealt_by_order = {
@@ -647,12 +648,10 @@ def execute_trend_review_open(
                 )
                 remaining = target_quantity - broker_filled
                 filled = broker_filled
-                position_zero = action_name == "SELL_ALL" and sell_quantity <= 0
                 if position_zero:
                     remaining = Decimal("0")
                 elif action_name == "SELL_ALL":
                     remaining = Decimal(sell_quantity)
-                    filled = target_quantity - remaining
                 order_ids = [
                     str(order.get("order_id"))
                     for order in matched

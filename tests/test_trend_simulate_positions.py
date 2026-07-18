@@ -360,11 +360,17 @@ def test_simulated_positions_replay_sell_then_new_partial_buy(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    ("reason", "expected_status"),
-    [("position_zero_confirmed", "unlinked"), (None, "linked")],
+    ("status", "reason", "expected_status"),
+    [
+        ("incomplete", "position_zero_confirmed", "unlinked"),
+        ("incomplete", None, "linked"),
+        ("failed", "position_zero_confirmed", "linked"),
+        ("submitted", "position_zero_confirmed", "linked"),
+        ("missed", "position_zero_confirmed", "linked"),
+    ],
 )
 def test_simulated_positions_clear_only_terminal_incomplete_sell(
-    tmp_path: Path, reason: str | None, expected_status: str,
+    tmp_path: Path, status: str, reason: str | None, expected_status: str,
 ) -> None:
     report = _frozen_report()
     _write_report(tmp_path, broker="tiger", artifact="report.json", payload=report)
@@ -376,7 +382,7 @@ def test_simulated_positions_clear_only_terminal_incomplete_sell(
     _write_action_event(
         tmp_path,
         side="sell",
-        status="incomplete",
+        status=status,
         filled_qty="40",
         report_sha256=_report_hash(report),
         recorded_at="2026-07-20T10:01:00-04:00",
