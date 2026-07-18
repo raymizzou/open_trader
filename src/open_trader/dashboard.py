@@ -344,6 +344,16 @@ def _valid_trend_review_metric_cell(value: object) -> bool:
     return finite and reason is None
 
 
+def _valid_iso_date(value: object) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _valid_trend_review_projection(
     payload: object, *, broker: str, market: str
 ) -> bool:
@@ -351,8 +361,12 @@ def _valid_trend_review_projection(
         return False
     snapshot = payload.get("strategy_snapshot")
     metrics = payload.get("metrics")
+    schema_version = payload.get("schema_version")
     if (
-        payload.get("schema_version") != "open_trader.trend_review.projection.v1"
+        schema_version not in {
+            "open_trader.trend_review.projection.v1",
+            "open_trader.trend_review.projection.v2",
+        }
         or payload.get("available") is not True
         or payload.get("broker") != broker
         or payload.get("market") != market
@@ -361,6 +375,33 @@ def _valid_trend_review_projection(
         or set(metrics) != TREND_REVIEW_METRICS
     ):
         return False
+    if schema_version == "open_trader.trend_review.projection.v2":
+        sample_counts = payload.get("sample_counts")
+        common_cutoff = payload.get("common_cutoff")
+        interval = payload.get("interval")
+        if (
+            not isinstance(sample_counts, dict)
+            or set(sample_counts) != {"discipline", "actual", "required"}
+            or any(
+                type(sample_counts[key]) is not int or sample_counts[key] < 0
+                for key in ("discipline", "actual")
+            )
+            or type(sample_counts["required"]) is not int
+            or sample_counts["required"] != 30
+            or not isinstance(interval, dict)
+            or set(interval) != {"start", "end"}
+            or not _valid_iso_date(interval["start"])
+            or snapshot.get("effective_from") != interval["start"]
+            or interval["end"] != common_cutoff
+            or (
+                common_cutoff is not None
+                and (
+                    not _valid_iso_date(common_cutoff)
+                    or common_cutoff < interval["start"]
+                )
+            )
+        ):
+            return False
     for key in (
         "strategy_id",
         "strategy_name",

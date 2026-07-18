@@ -271,6 +271,21 @@ def trend_review_projection(market: str, broker: str) -> dict[str, object]:
     }
 
 
+def trend_review_projection_v2(market: str, broker: str) -> dict[str, object]:
+    payload = trend_review_projection(market, broker)
+    effective_from = {"CN": "2026-07-16", "US": "2026-07-17", "HK": "2026-07-17"}[
+        market
+    ]
+    payload.update({
+        "schema_version": "open_trader.trend_review.projection.v2",
+        "sample_counts": {"discipline": 31, "actual": 29, "required": 30},
+        "common_cutoff": "2026-07-17",
+        "interval": {"start": effective_from, "end": "2026-07-17"},
+    })
+    payload["strategy_snapshot"]["effective_from"] = effective_from  # type: ignore[index]
+    return payload
+
+
 def test_dashboard_loads_only_strict_market_matched_trend_reviews(
     tmp_path: Path,
 ) -> None:
@@ -291,6 +306,19 @@ def test_dashboard_loads_only_strict_market_matched_trend_reviews(
     assert reviews["phillips"]["metrics"]["calmar"]["actual"]["value"] == "9.4"
     assert "batch" not in reviews["tiger"]
     assert "batch_path" not in reviews["tiger"]
+
+
+def test_dashboard_accepts_strict_v2_trend_review_projection(tmp_path: Path) -> None:
+    path = tmp_path / "data/latest/trend_review_us.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(trend_review_projection_v2("US", "tiger")), encoding="utf-8"
+    )
+
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+
+    assert review["available"] is True
+    assert review["metrics"]["calmar"]["actual"]["value"] == "9.4"
 
 
 @pytest.mark.parametrize(
