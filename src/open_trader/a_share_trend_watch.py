@@ -124,7 +124,6 @@ def watch_a_share_protection(
 
     trigger_count = exception_count = unknown_quote_count = 0
     calendar_checked = False
-    session_open_called = False
     interrupted = False
     now = first_now
     try:
@@ -209,16 +208,14 @@ def watch_a_share_protection(
                 now = now_fn()
                 continue
 
-            if not session_open_called:
-                if on_session_open is not None:
-                    exception_count += _run_review_callback(
-                        on_session_open,
-                        trading_date,
-                        events_path=events_path,
-                        trading_date=trading_date,
-                        now=now,
-                    )
-                session_open_called = True
+            if on_session_open is not None:
+                exception_count += _run_review_callback(
+                    on_session_open,
+                    trading_date,
+                    events_path=events_path,
+                    trading_date=trading_date,
+                    now=now,
+                )
 
             try:
                 with (

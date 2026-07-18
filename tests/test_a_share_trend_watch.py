@@ -258,6 +258,42 @@ def test_watcher_calls_review_open_and_stop_hooks_once(tmp_path: Path) -> None:
     assert stops[0]["event_id"]
 
 
+def test_watcher_retries_review_callback_on_next_poll(tmp_path: Path) -> None:
+    attempts: list[str] = []
+
+    def review(trading_date: str) -> None:
+        attempts.append(trading_date)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary review failure")
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path, active_line="20"),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=SequenceQuote(
+            [
+                {"SH.600900": Decimal("27.30")},
+                {"SH.600900": Decimal("27.20")},
+            ]
+        ),
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        now_fn=SequenceClock(
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:05+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
+        ),
+        sleep_fn=lambda seconds: None,
+        on_session_open=review,
+    )
+
+    assert result.status == "closed"
+    assert attempts == ["2026-07-15", "2026-07-15"]
+
+
 def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:
     quote = SequenceQuote(
         [

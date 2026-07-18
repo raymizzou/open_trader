@@ -335,7 +335,7 @@ def run_trend_review_close(
             trd_market=market,
         )
         snapshot = client.account_snapshot()
-        orders = client.list_orders()["orders"]
+        orders = client.list_orders(start=trading_date, end=trading_date)["orders"]
         path = capture_trend_review_close(
             data_dir=config.data_dir,
             market=market,
