@@ -15,6 +15,79 @@ from open_trader.daily_premarket import DailyPremarketConfig, NotificationAttemp
 from open_trader.notifications import CompositeNotifier
 
 
+def test_dashboard_cli_reads_three_distinct_simulate_account_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli,
+        "serve_dashboard",
+        lambda config, **_: captured.setdefault("config", config),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_optional_env_values",
+        lambda _: {
+            "OPEN_TRADER_TREND_REVIEW_CN_SIMULATE_ACC_ID": "101",
+            "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID": "102",
+            "OPEN_TRADER_TREND_REVIEW_HK_SIMULATE_ACC_ID": "103",
+        },
+    )
+
+    assert cli.main(["dashboard"]) == 0
+    config = captured["config"]
+    assert getattr(config, "trend_review_cn_simulate_acc_id") == 101
+    assert getattr(config, "trend_review_us_simulate_acc_id") == 102
+    assert getattr(config, "trend_review_hk_simulate_acc_id") == 103
+
+
+@pytest.mark.parametrize("value", ["not-an-integer", "-1"])
+def test_dashboard_cli_rejects_invalid_simulate_account_id(
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "serve_dashboard", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "_load_optional_env_values",
+        lambda _: {"OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID": value},
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["dashboard"])
+
+    assert exc_info.value.code == 2
+    assert (
+        "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID must be a positive integer"
+        in capsys.readouterr().err
+    )
+
+
+def test_dashboard_cli_rejects_duplicate_positive_simulate_account_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "serve_dashboard", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "_load_optional_env_values",
+        lambda _: {
+            "OPEN_TRADER_TREND_REVIEW_CN_SIMULATE_ACC_ID": "101",
+            "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID": "101",
+        },
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["dashboard"])
+
+    assert exc_info.value.code == 2
+    assert (
+        "trend review simulate account IDs must be distinct"
+        in capsys.readouterr().err
+    )
+
+
 @pytest.mark.parametrize("value", [None, "", "   ", " , , "])
 def test_parse_symbol_subset_returns_none_for_blank_values(
     value: str | None,

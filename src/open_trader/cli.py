@@ -497,6 +497,17 @@ def _load_optional_env_values(path: Path) -> dict[str, str]:
     return _read_env_file(path)
 
 
+def _optional_simulate_account_id(values: dict[str, str], key: str) -> int:
+    raw = values.get(key, "0").strip() or "0"
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{key} must be a positive integer") from None
+    if value < 0:
+        raise ValueError(f"{key} must be a positive integer")
+    return value
+
+
 def _optional_path(value: str | None) -> Path | None:
     if value is None or not value.strip():
         return None
@@ -2647,6 +2658,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "dashboard":
         config_values = _load_optional_env_values(args.config)
+        try:
+            simulate_account_ids = {
+                market: _optional_simulate_account_id(
+                    config_values,
+                    f"OPEN_TRADER_TREND_REVIEW_{market}_SIMULATE_ACC_ID",
+                )
+                for market in ("CN", "US", "HK")
+            }
+            populated_account_ids = [
+                value for value in simulate_account_ids.values() if value > 0
+            ]
+            if len(populated_account_ids) != len(set(populated_account_ids)):
+                raise ValueError(
+                    "trend review simulate account IDs must be distinct"
+                )
+        except ValueError as exc:
+            parser.error(str(exc))
         config = DashboardConfig(
             portfolio_path=args.portfolio,
             data_dir=args.data_dir,
@@ -2654,6 +2682,9 @@ def main(argv: list[str] | None = None) -> int:
             poll_seconds=args.poll_seconds,
             futu_host=args.futu_host,
             futu_port=args.futu_port,
+            trend_review_cn_simulate_acc_id=simulate_account_ids["CN"],
+            trend_review_us_simulate_acc_id=simulate_account_ids["US"],
+            trend_review_hk_simulate_acc_id=simulate_account_ids["HK"],
         )
         serve_dashboard(
             config,

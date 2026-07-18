@@ -151,6 +151,9 @@ class DashboardConfig:
     poll_seconds: float
     futu_host: str
     futu_port: int
+    trend_review_cn_simulate_acc_id: int = 0
+    trend_review_us_simulate_acc_id: int = 0
+    trend_review_hk_simulate_acc_id: int = 0
 
 
 @dataclass(frozen=True)

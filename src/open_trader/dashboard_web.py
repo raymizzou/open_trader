@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from .backtest import run_backtest
 from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
 from .dashboard import (
+    DETAIL_FX_TO_HKD,
     DashboardConfig,
     _backtest_holding_detail,
     _latest_backtests_by_holding,
@@ -31,6 +32,7 @@ from .strategy_backtest import (
     validate_standard_backtest_request,
 )
 from .trading_plan import load_trading_plan_rows
+from .trend_simulate_positions import TrendSimulatePositionService
 
 
 STATIC_DIR = Path(__file__).with_name("dashboard_static")
@@ -282,6 +284,7 @@ def create_dashboard_server(
     research_chat_service: ResearchChatService | None = None,
     backtest_price_provider: DailyKlineProvider | None = None,
     statement_import_service: StatementImportService | None = None,
+    trend_simulate_position_service: TrendSimulatePositionService | None = None,
     eastmoney_password: str = "",
 ) -> ThreadingHTTPServer:
     service = quote_service or DashboardQuoteService(config=config)
@@ -334,6 +337,21 @@ def create_dashboard_server(
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
+            trend_simulate_prefix = "/api/trend-simulate-positions/"
+            if path.startswith(trend_simulate_prefix):
+                broker = path.removeprefix(trend_simulate_prefix)
+                if broker and "/" not in broker:
+                    try:
+                        if trend_simulate_position_service is None:
+                            raise RuntimeError(
+                                "trend simulate position service is unavailable"
+                            )
+                        self._send_json(
+                            trend_simulate_position_service.load(broker)
+                        )
+                    except Exception as exc:
+                        self._send_error_json(exc)
+                    return
             session_id = self._research_chat_session_id(path)
             if session_id is not None:
                 try:
@@ -539,11 +557,24 @@ def serve_dashboard(
     eastmoney_password: str = "",
 ) -> None:
     account_sync_service = DashboardAccountSyncService(config=config)
+    trend_simulate_position_service = TrendSimulatePositionService(
+        host=config.futu_host,
+        port=config.futu_port,
+        account_ids={
+            "eastmoney": config.trend_review_cn_simulate_acc_id,
+            "tiger": config.trend_review_us_simulate_acc_id,
+            "phillips": config.trend_review_hk_simulate_acc_id,
+        },
+        fx_to_hkd=DETAIL_FX_TO_HKD,
+        data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
+    )
     server = create_dashboard_server(
         config=config,
         host=host,
         port=port,
         account_sync_service=account_sync_service,
+        trend_simulate_position_service=trend_simulate_position_service,
         eastmoney_password=eastmoney_password,
     )
     _, actual_port = server.server_address

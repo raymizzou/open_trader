@@ -156,7 +156,13 @@ def write_csv(path: Path, fieldnames: list[str] | tuple[str, ...], rows: list[di
         writer.writerows(rows)
 
 
-def dashboard_config(tmp_path: Path) -> DashboardConfig:
+def dashboard_config(
+    tmp_path: Path,
+    *,
+    trend_review_cn_simulate_acc_id: int = 0,
+    trend_review_us_simulate_acc_id: int = 0,
+    trend_review_hk_simulate_acc_id: int = 0,
+) -> DashboardConfig:
     return DashboardConfig(
         portfolio_path=tmp_path / "data" / "latest" / "portfolio.csv",
         data_dir=tmp_path / "data",
@@ -164,7 +170,18 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
         poll_seconds=1.5,
         futu_host="127.0.0.1",
         futu_port=11111,
+        trend_review_cn_simulate_acc_id=trend_review_cn_simulate_acc_id,
+        trend_review_us_simulate_acc_id=trend_review_us_simulate_acc_id,
+        trend_review_hk_simulate_acc_id=trend_review_hk_simulate_acc_id,
     )
+
+
+def test_dashboard_config_defaults_simulate_account_ids_to_zero(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+
+    assert config.trend_review_cn_simulate_acc_id == 0
+    assert config.trend_review_us_simulate_acc_id == 0
+    assert config.trend_review_hk_simulate_acc_id == 0
 
 
 def test_dashboard_ignores_zero_quantity_closed_positions(tmp_path: Path) -> None:

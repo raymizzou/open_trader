@@ -1036,6 +1036,15 @@ class RaisingQuoteService:
         raise RuntimeError("boom")
 
 
+class FakeTrendSimulatePositionService:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def load(self, broker: str) -> dict[str, Any]:
+        self.calls.append(broker)
+        return {"broker": broker, "positions": []}
+
+
 class FakeAccountSyncService:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
@@ -7537,6 +7546,143 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
     assert quotes_payload["account_sync"]["status"] == "skipped"
     assert quote_service.refresh_count == 1
     assert account_sync.refresh_count == 1
+
+
+def test_dashboard_http_loads_only_requested_simulated_account(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    calls: list[str] = []
+    server = create_dashboard_server(
+        config,
+        "127.0.0.1",
+        0,
+        quote_service=FakeQuoteService(quote_result()),
+        trend_simulate_position_service=FakeTrendSimulatePositionService(calls),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        read_json(f"http://{host}:{port}/api/dashboard")
+        read_json(f"http://{host}:{port}/api/quotes")
+        assert calls == []
+        status, _, _ = read_text_error(
+            f"http://{host}:{port}/api/trend-simulate-positions/tiger/positions"
+        )
+        assert status == 404
+        assert calls == []
+
+        payload = read_json(
+            f"http://{host}:{port}/api/trend-simulate-positions/tiger"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert calls == ["tiger"]
+    assert payload["broker"] == "tiger"
+
+
+def test_dashboard_http_rejects_unknown_simulated_broker(tmp_path) -> None:
+    from open_trader.dashboard import DETAIL_FX_TO_HKD
+    from open_trader.dashboard_web import create_dashboard_server
+    from open_trader.trend_simulate_positions import TrendSimulatePositionService
+
+    config = dashboard_config(tmp_path)
+    server = create_dashboard_server(
+        config,
+        "127.0.0.1",
+        0,
+        quote_service=FakeQuoteService(quote_result()),
+        trend_simulate_position_service=TrendSimulatePositionService(
+            host=config.futu_host,
+            port=config.futu_port,
+            account_ids={},
+            fx_to_hkd=DETAIL_FX_TO_HKD,
+            data_dir=config.data_dir,
+            reports_dir=config.reports_dir,
+        ),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        status, _, payload = read_error_json(
+            f"http://{host}:{port}/api/trend-simulate-positions/futu"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 400
+    assert payload["message"] == "unsupported trend simulate broker: futu"
+
+
+def test_serve_dashboard_configures_simulate_accounts_once(
+    tmp_path, monkeypatch
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+    from open_trader.dashboard import DETAIL_FX_TO_HKD
+
+    created: list[dict[str, object]] = []
+    server_kwargs: dict[str, object] = {}
+
+    class FakeTrendSimulatePositionServiceFactory:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 8765)
+
+        def serve_forever(self) -> None:
+            return None
+
+        def server_close(self) -> None:
+            return None
+
+    def fake_create_dashboard_server(**kwargs: object) -> FakeServer:
+        server_kwargs.update(kwargs)
+        return FakeServer()
+
+    monkeypatch.setattr(
+        dashboard_web,
+        "TrendSimulatePositionService",
+        FakeTrendSimulatePositionServiceFactory,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dashboard_web,
+        "DashboardAccountSyncService",
+        lambda **_: type("FakeAccountSync", (), {"interval_seconds": 60})(),
+    )
+    monkeypatch.setattr(
+        dashboard_web, "create_dashboard_server", fake_create_dashboard_server
+    )
+    config = dashboard_config(
+        tmp_path,
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
+    )
+
+    dashboard_web.serve_dashboard(config, host="127.0.0.1", port=0)
+
+    assert len(created) == 1
+    assert created[0]["account_ids"] == {
+        "eastmoney": 101,
+        "tiger": 102,
+        "phillips": 103,
+    }
+    assert created[0]["fx_to_hkd"] == DETAIL_FX_TO_HKD
+    assert server_kwargs["trend_simulate_position_service"].__class__ is (
+        FakeTrendSimulatePositionServiceFactory
+    )
 
 
 def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
