@@ -230,7 +230,9 @@ def _position_attributions(
         symbol = str(event["symbol"]).strip().upper()
         side = str(event.get("side") or "").strip().lower()
         status = str(event.get("status") or "").strip().lower()
-        if side == "sell" and status == "filled":
+        if side == "sell" and (
+            status == "filled" or event.get("reason") == "position_zero_confirmed"
+        ):
             active.pop(symbol, None)
             continue
         if side != "buy" or status not in {"partially_filled", "filled"}:

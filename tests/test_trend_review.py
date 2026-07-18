@@ -656,6 +656,88 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
     ) == 1
 
 
+@pytest.mark.parametrize(
+    ("dealt_qty", "order_status", "average_price", "terminal_status"),
+    [
+        ("40", "CANCELLED_PART", "10", "incomplete"),
+        ("0", "CANCELLED", None, "incomplete"),
+        ("100", "FILLED", "11", "filled"),
+    ],
+)
+def test_position_zero_terminal_uses_actual_broker_fill_facts(
+    tmp_path: Path,
+    dealt_qty: str,
+    order_status: str,
+    average_price: str | None,
+    terminal_status: str,
+) -> None:
+    client = FakeTrendSimClient()
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        prices={"600001": Decimal("10")},
+        market="CN",
+        execution_date="2026-07-16",
+        now="2026-07-16T09:31:00+08:00",
+    )
+    client.requests.clear()
+    client.orders.clear()
+    client.positions = [{"code": "SH.600001", "qty": "100"}]
+    report = report_with_actions([{"action": "SELL_ALL", "symbol": "600001"}])
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "prices": {},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T10:30:00+08:00"
+    )
+    request_count = len(client.requests)
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": client.requests[0]["remark"],
+        "code": "SH.600001",
+        "trd_side": "SELL",
+        "qty": "100",
+        "dealt_qty": dealt_qty,
+        "order_status": order_status,
+        **({"dealt_avg_price": average_price} if average_price is not None else {}),
+    }]
+    client.positions = []
+
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    terminal = next(
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+        if "position_zero_confirmed" in path.read_text(encoding="utf-8")
+    )
+
+    assert terminal["status"] == terminal_status
+    assert terminal["filled_qty"] == dealt_qty
+    assert terminal["target_qty"] == "100"
+    assert terminal["order_ids"] == ["SIM-1"]
+    assert terminal["avg_fill_price"] == (average_price or "")
+    client.positions = [{"code": "SH.600001", "qty": "25"}]
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-21T09:31:00+08:00"
+    )
+    assert len(client.requests) == request_count
+    assert sum(
+        "position_zero_confirmed" in path.read_text(encoding="utf-8")
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+    ) == 1
+
+
 def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:
     client = FakeTrendSimClient()
     arguments = {

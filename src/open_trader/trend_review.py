@@ -558,38 +558,10 @@ def execute_trend_review_open(
             )
             if position_zero_complete:
                 continue
-            if sell_quantity <= 0:
-                intent = json.loads(intent_path.read_text(encoding="utf-8"))
-                request = intent.get("request") if isinstance(intent, Mapping) else None
-                if not isinstance(request, Mapping):
-                    raise ValueError("trend review intent request is invalid")
-                target_qty = str(request.get("qty") or "")
-                _write_action_event(
-                    data_dir=data_dir,
-                    market=market,
-                    execution_date=execution_date,
-                    action_key=action_key,
-                    payload={
-                        "market": market,
-                        "date": execution_date,
-                        "strategy_version": strategy_version,
-                        "report_sha256": report_sha,
-                        "symbol": symbol,
-                        "futu_code": futu_code,
-                        "side": side,
-                        "status": "filled",
-                        "filled_qty": target_qty,
-                        "target_qty": target_qty,
-                        "reason": "position_zero_confirmed",
-                    },
-                    recorded_at=now,
-                )
-                continue
         if not same_day and not (
             local_current.date() > execution_day
             and action_name == "SELL_ALL"
             and intent_path.exists()
-            and sell_quantity > 0
         ):
             continue
         if action_name == "BUY" and (symbol in sell_symbols or not buy_window_open):
@@ -623,7 +595,7 @@ def execute_trend_review_open(
                     recorded_at=now,
                 )
             continue
-        if action_name == "SELL_ALL" and not market_open:
+        if action_name == "SELL_ALL" and not market_open and sell_quantity > 0:
             continue
         if intent_path.exists():
             intent_paths = [intent_path, *sorted(root.glob(f"{stem}-attempt-*-intent.json"))]
@@ -637,7 +609,9 @@ def execute_trend_review_open(
                 ),
                 None,
             )
-            if pending_intent is not None:
+            if pending_intent is not None and (
+                action_name != "SELL_ALL" or sell_quantity > 0
+            ):
                 request, reconciled = _reconcile_intent(pending_intent, client)
                 if reconciled:
                     continue
@@ -659,7 +633,7 @@ def execute_trend_review_open(
                     if isinstance(order, Mapping)
                     and _order_has_action_identity(order, request)
                 ]
-                if not matched:
+                if not matched and sell_quantity > 0:
                     continue
                 target_quantity = _required_decimal(request.get("qty"), "target quantity")
                 dealt_by_order = {
@@ -668,12 +642,17 @@ def execute_trend_review_open(
                     )
                     for index, order in enumerate(matched)
                 }
-                remaining = target_quantity - sum(
+                broker_filled = sum(
                     dealt_by_order.values(), start=Decimal("0")
                 )
-                if action_name == "SELL_ALL":
+                remaining = target_quantity - broker_filled
+                filled = broker_filled
+                position_zero = action_name == "SELL_ALL" and sell_quantity <= 0
+                if position_zero:
+                    remaining = Decimal("0")
+                elif action_name == "SELL_ALL":
                     remaining = Decimal(sell_quantity)
-                filled = target_quantity - remaining
+                    filled = target_quantity - remaining
                 order_ids = [
                     str(order.get("order_id"))
                     for order in matched
@@ -704,7 +683,7 @@ def execute_trend_review_open(
                     if weighted_prices
                     else None
                 )
-                if any(
+                if position_zero or any(
                     order.get("order_id")
                     or order.get("order_status")
                     or order.get("dealt_qty")
@@ -725,7 +704,9 @@ def execute_trend_review_open(
                             "side": side,
                             "status": (
                                 "filled"
-                                if remaining <= 0
+                                if filled >= target_quantity
+                                else "incomplete"
+                                if position_zero
                                 else "partially_filled"
                                 if filled > 0
                                 else "submitted"
@@ -738,6 +719,11 @@ def execute_trend_review_open(
                                 else ""
                             ),
                             "order_ids": order_ids,
+                            **(
+                                {"reason": "position_zero_confirmed"}
+                                if position_zero
+                                else {}
+                            ),
                         },
                         recorded_at=now,
                     )

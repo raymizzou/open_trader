@@ -75,6 +75,7 @@ def _write_action_event(
     filled_qty: str = "1",
     execution_date: str = "2026-07-20",
     recorded_at: str = "2026-07-20T10:00:00-04:00",
+    reason: str | None = None,
 ) -> None:
     action_key = hashlib.sha256(
         f"{market}:{execution_date}:{strategy_version}:{symbol}:{side}".encode()
@@ -104,6 +105,8 @@ def _write_action_event(
         payload["strategy_version"] = strategy_version
     if report_sha256 is not None:
         payload["report_sha256"] = report_sha256
+    if reason is not None:
+        payload["reason"] = reason
     path.write_text(
         json.dumps(payload),
         encoding="utf-8",
@@ -354,6 +357,35 @@ def test_simulated_positions_replay_sell_then_new_partial_buy(tmp_path: Path) ->
 
     assert payload["positions"][0]["attribution_status"] == "linked"
     assert payload["positions"][0]["report"]["artifact"] == "second.json"
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_status"),
+    [("position_zero_confirmed", "unlinked"), (None, "linked")],
+)
+def test_simulated_positions_clear_only_terminal_incomplete_sell(
+    tmp_path: Path, reason: str | None, expected_status: str,
+) -> None:
+    report = _frozen_report()
+    _write_report(tmp_path, broker="tiger", artifact="report.json", payload=report)
+    _write_action_event(
+        tmp_path,
+        report_sha256=_report_hash(report),
+        recorded_at="2026-07-20T10:00:00-04:00",
+    )
+    _write_action_event(
+        tmp_path,
+        side="sell",
+        status="incomplete",
+        filled_qty="40",
+        report_sha256=_report_hash(report),
+        recorded_at="2026-07-20T10:01:00-04:00",
+        reason=reason,
+    )
+
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+
+    assert payload["positions"][0]["attribution_status"] == expected_status
 
 
 def test_simulated_positions_do_not_link_zero_quantity_buy(tmp_path: Path) -> None:

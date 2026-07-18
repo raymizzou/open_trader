@@ -3702,6 +3702,27 @@ def write_current_attribution(
     }
 
 
+def write_current_terminal_sell(
+    root: Path, report: dict[str, str], *, reason: str | None,
+) -> None:
+    event = {
+        "date": "2026-07-17",
+        "market": "US",
+        "symbol": "NDAQ",
+        "side": "sell",
+        "status": "incomplete",
+        "filled_qty": "40",
+        "recorded_at": "2026-07-20T10:01:00-04:00",
+        "report_sha256": report["report_sha256"],
+        "strategy_version": report["strategy_version"],
+    }
+    if reason is not None:
+        event["reason"] = reason
+    path = root / "data/trend_review/ledgers/US/actions/2026-07-17/action/sell.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(event), encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("symbol", "AAPL"), ("quantity", "12"), ("cost_price", "94.26")],
@@ -3842,6 +3863,28 @@ def test_acceptance_rejects_hidden_current_attribution_conflict(
             tmp_path / "data",
             tmp_path / "reports",
         )
+
+
+@pytest.mark.parametrize(
+    ("reason", "status"),
+    [("position_zero_confirmed", "unlinked"), (None, "linked")],
+)
+def test_acceptance_clears_only_terminal_incomplete_sell(
+    tmp_path: Path, reason: str | None, status: str,
+) -> None:
+    report = write_current_attribution(tmp_path)
+    write_current_terminal_sell(tmp_path, report, reason=reason)
+
+    dashboard_acceptance._validate_simulated_positions(
+        "tiger",
+        simulate_snapshot(),
+        simulate_api_payload(
+            attribution_status=status,
+            report=report if status == "linked" else None,
+        ),
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
 
 
 def test_acceptance_rejects_hidden_unlinked_simulated_position(tmp_path: Path) -> None:

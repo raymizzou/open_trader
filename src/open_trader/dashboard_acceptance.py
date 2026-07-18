@@ -449,7 +449,9 @@ def _current_simulate_attributions(
         status = str(event.get("status") or "").strip().lower()
         if not symbol:
             continue
-        if side == "sell" and status == "filled":
+        if side == "sell" and (
+            status == "filled" or event.get("reason") == "position_zero_confirmed"
+        ):
             active.pop(symbol, None)
             continue
         if side != "buy" or status not in {"partially_filled", "filled"}:
