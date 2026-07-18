@@ -24,6 +24,7 @@ from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
     RunLock,
+    _optional_positive_tm_id,
     _read_env_file,
     build_notifier,
     load_env_config,
@@ -495,17 +496,6 @@ def _load_optional_env_values(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
     return _read_env_file(path)
-
-
-def _optional_simulate_account_id(values: dict[str, str], key: str) -> int:
-    raw = values.get(key, "0").strip() or "0"
-    try:
-        value = int(raw)
-    except ValueError:
-        raise ValueError(f"{key} must be a positive integer") from None
-    if value < 0:
-        raise ValueError(f"{key} must be a positive integer")
-    return value
 
 
 def _optional_path(value: str | None) -> Path | None:
@@ -2660,7 +2650,7 @@ def main(argv: list[str] | None = None) -> int:
         config_values = _load_optional_env_values(args.config)
         try:
             simulate_account_ids = {
-                market: _optional_simulate_account_id(
+                market: _optional_positive_tm_id(
                     config_values,
                     f"OPEN_TRADER_TREND_REVIEW_{market}_SIMULATE_ACC_ID",
                 )
