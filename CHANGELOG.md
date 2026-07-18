@@ -3,6 +3,16 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-18
+
+- Closed the CN/HK/US trend-simulation execution loop with idempotent Futu
+  market orders, buy/sell recovery, partial-fill and failure status, and
+  pre-close incomplete-execution alerts linked back to each frozen report.
+- Added same-level real holdings, simulated holdings, trend report, and review
+  views with attributed simulated positions and persistent immutable report
+  history; verified `2486` tests, live account/API refreshes, desktop/mobile
+  flows, and the Dashboard acceptance gate (`PASS`) on the deployed Git SHA.
+
 ## 2026-07-16
 
 - Added desktop-only, right-aligned Phillips and Eastmoney statement uploads
