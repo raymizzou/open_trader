@@ -2013,7 +2013,8 @@ function renderTrendReviewChart(review, title, definitions) {
 function renderTrendReviewWorkspace(review, embedded = false) {
   const snapshot = review.strategy_snapshot || {};
   const rows = Array.isArray(snapshot.parameter_rows) ? snapshot.parameter_rows : [];
-  return `<main class="trend-review">
+  const root = embedded ? "div" : "main";
+  return `<${root} class="trend-review">
     <header class="trend-review-header">
       <div><p>${escapeHtml(`${formatPlain(review.broker_label)}｜${formatPlain(review.market_label)}`)}</p>
       <h1>${escapeHtml(`${formatPlain(review.market_label)}趋势复盘`)}</h1>
@@ -2027,7 +2028,7 @@ function renderTrendReviewWorkspace(review, embedded = false) {
       ${renderTrendReviewChart(review,"收益与回撤",[["period_net_return","期间净收益率",true],["market_excess_return","相对市场超额收益",true],["max_drawdown","最大回撤",true]])}
       ${renderTrendReviewChart(review,"风险调整收益",[["calmar","卡玛比率",false],["sharpe","夏普比率",false]])}
     </div>
-  </main>`;
+  </${root}>`;
 }
 
 function renderTrendAction(item, kind) {
@@ -2324,7 +2325,8 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const isCn = String(report.market || "").toUpperCase() === "CN";
   const sellOrHold = isCn ? renderCnSellOrHoldStage : renderMarketSellOrHoldStage;
   const buyStage = isCn ? renderCnBuyStage(report) : renderMarketBuyStage(report);
-  return `<main class="cn-trend-report">
+  const root = embedded ? "div" : "main";
+  return `<${root} class="cn-trend-report">
     <header class="trend-report-header">
       <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1></div>
       ${embedded
@@ -2353,7 +2355,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     </div>
     ${isCn ? renderCnTrendDisciplines() : ""}
     ${isCn ? renderCnTrendAudit(audit) : renderTrendAudit(audit)}
-  </main>`;
+  </${root}>`;
 }
 
 const OPTION_ATTENTION_COLUMNS = [
@@ -2549,7 +2551,7 @@ async function setAccountView(broker, view) {
   state.selectedHoldingDetail = "decision";
   state.selectedDecisionTab = "final";
   syncDecisionDeepLink();
-  renderAccountHoldings();
+  renderAccountViewPanelOnly(broker);
   if (view === "simulate" && !Object.hasOwn(state.trendSimulatePositions, broker)) {
     await loadTrendSimulatePositions(broker);
   }
@@ -2571,7 +2573,7 @@ function handleAccountViewTabKeydown(event) {
 
 async function loadTrendSimulatePositions(broker) {
   state.trendSimulatePositions[broker] = {loading: true};
-  renderAccountHoldings();
+  renderAccountViewPanelOnly(broker);
   try {
     const response = await fetch(`/api/trend-simulate-positions/${encodeURIComponent(broker)}`, {cache: "no-store"});
     if (!response.ok) throw new Error(`simulate positions ${response.status}`);
@@ -2583,7 +2585,7 @@ async function loadTrendSimulatePositions(broker) {
       error: error instanceof Error ? error.message : String(error),
     };
   }
-  renderAccountHoldings();
+  renderAccountViewPanelOnly(broker);
 }
 
 function accountScrollY() {
@@ -2603,7 +2605,7 @@ async function openTrendReportHistory(broker) {
   if (existing && Array.isArray(existing.rows)) {
     state.trendReportHistories[broker] = {...existing, open: true, scrollY};
     renderAccountViewPanelOnly(broker);
-    restoreAccountScroll(scrollY);
+    if (state.brokerFilter === broker) restoreAccountScroll(scrollY);
     return;
   }
   state.trendReportHistories[broker] = {open: true, loading: true, rows: [], scrollY};
@@ -2627,13 +2629,13 @@ async function openTrendReportHistory(broker) {
     };
   }
   renderAccountViewPanelOnly(broker);
-  restoreAccountScroll(scrollY);
+  if (state.brokerFilter === broker) restoreAccountScroll(scrollY);
 }
 
 async function loadHistoricalTrendReport(broker, artifact) {
   if (!TREND_ACCOUNT_BROKERS.includes(broker) || !artifact) return;
   if (!Object.hasOwn(state.trendReportHistories, broker)) {
-    state.trendReportHistories[broker] = {open: false, rows: [], scrollY: accountScrollY()};
+    state.trendReportHistories[broker] = {open: false, scrollY: accountScrollY()};
   }
   const history = state.trendReportHistories[broker];
   state.accountViews[broker] = "report";
@@ -2650,7 +2652,7 @@ async function loadHistoricalTrendReport(broker, artifact) {
     };
   }
   renderAccountViewPanelOnly(broker);
-  restoreAccountScroll(history.scrollY);
+  if (state.brokerFilter === broker) restoreAccountScroll(history.scrollY);
 }
 
 function showCurrentTrendReport(broker) {
@@ -2660,7 +2662,7 @@ function showCurrentTrendReport(broker) {
     state.trendReportHistories[broker] = {...history, open: false};
   }
   renderAccountViewPanelOnly(broker);
-  restoreAccountScroll(history.scrollY || 0);
+  if (state.brokerFilter === broker) restoreAccountScroll(history.scrollY || 0);
 }
 
 function filterAccountRows(rows) {
@@ -2673,14 +2675,18 @@ function renderAccountViewPanelOnly(broker) {
   const panel = state.brokerFilter === broker && typeof container?.querySelector === "function"
     ? container.querySelector(`#account-${broker}-view-panel`)
     : null;
-  if (!panel) {
-    renderAccountHoldings();
-    return;
-  }
+  if (!panel) return;
   const group = accountHoldingGroups().find((item) => item.broker === broker);
   if (!group) return;
   const view = state.accountViews[broker] || "real";
-  panel.innerHTML = renderAccountViewPanel({...group, rows: filterAccountRows(group.rows)});
+  const rows = filterAccountRows(group.rows);
+  const visibleRows = view === "simulate"
+    ? filterAccountRows(simulatedAccountRows(broker))
+    : rows;
+  if (elements["visible-count"]) {
+    elements["visible-count"].textContent = `${formatDisplayNumber(visibleRows.length)} 条`;
+  }
+  panel.innerHTML = renderAccountViewPanel({...group, rows});
   panel.setAttribute("aria-labelledby", `account-${broker}-view-${view}`);
   container.querySelectorAll?.(`#account-${broker} [data-account-view]`).forEach((tab) => {
     const selected = tab.dataset.accountView === view;
@@ -2937,7 +2943,7 @@ function renderSimulationAttribution(position, broker) {
 function renderAccountHoldingRow(row, {simulated = false} = {}) {
   const holding = row.holding;
   const display = row.display;
-  const isSelected = !simulated && selectedHolding() && row.key === state.selectedHoldingKey;
+  const isSelected = !simulated && row.key === state.selectedHoldingKey;
   const selectedDetail = isSelected ? normalizeHoldingDetailMode(state.selectedHoldingDetail) : "";
   const pnlTone = pnlClass(display.unrealized_pnl_pct);
   const detailActions = simulated

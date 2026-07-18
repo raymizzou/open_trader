@@ -3050,6 +3050,11 @@ function mount(){return {innerHTML:"",textContent:"",attributes:{},classList:{ad
   setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},
   querySelector(){return null;}};}
 for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"]){elements[id]=mount();}
+const panel=mount();
+const tabs=["real","simulate","report","review"].map((view)=>({dataset:{accountBroker:"tiger",accountView:view},
+  tabIndex:-1,setAttribute(){}}));
+elements["account-holdings"].querySelector=(selector)=>selector==="#account-tiger-view-panel"?panel:null;
+elements["account-holdings"].querySelectorAll=()=>tabs;
 state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
   cash_rows:[],holdings:[],trend_reports:{tiger:{available:true}},trend_reviews:{tiger:{available:true,market_label:"美股"}}};
 state.brokerFilter="tiger";
@@ -3063,24 +3068,24 @@ let calls=[];
 let responsePayload=linked;
 globalThis.fetch=async(url)=>{calls.push(url);return {ok:true,json:async()=>responsePayload};};
 await setAccountView("tiger","simulate");
-const loaded=elements["account-holdings"].innerHTML;
+const loaded=panel.innerHTML;
 await setAccountView("tiger","simulate");
 const linkedCalls=[...calls];
 delete state.trendSimulatePositions.tiger;
 responsePayload={available:true,broker:"tiger",positions:[]};
 await setAccountView("tiger","real");
 await setAccountView("tiger","simulate");
-const empty=elements["account-holdings"].innerHTML;
+const empty=panel.innerHTML;
 delete state.trendSimulatePositions.tiger;
 responsePayload={available:false,broker:"tiger",positions:[],error:"OpenD 模拟账户不可用"};
 await setAccountView("tiger","real");
 await setAccountView("tiger","simulate");
-const unavailable=elements["account-holdings"].innerHTML;
+const unavailable=panel.innerHTML;
 state.trendSimulatePositions.tiger={...linked,positions:[linked.positions[0],
   {...linked.positions[0],symbol:"MSFT",attribution_status:"unlinked",report:null},
   {...linked.positions[0],symbol:"NVDA",attribution_status:"conflict",report:null}]};
-renderAccountHoldings();
-const attributionStates=elements["account-holdings"].innerHTML;
+renderAccountViewPanelOnly("tiger");
+const attributionStates=panel.innerHTML;
 console.log(JSON.stringify({loaded,linkedCalls,allCalls:calls,empty,unavailable,attributionStates}));
 ''')
     rendered = json.loads(output)
@@ -3110,6 +3115,9 @@ function mount(){const classes=new Set();return {innerHTML:"",textContent:"",att
   contains(name){return classes.has(name);}},setAttribute(name,value){this.attributes[name]=value;},
   removeAttribute(name){delete this.attributes[name];},querySelector(){return null;}};}
 for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"]){elements[id]=mount();}
+const panel=mount();
+elements["account-holdings"].querySelector=(selector)=>selector==="#account-tiger-view-panel"?panel:null;
+elements["account-holdings"].querySelectorAll=()=>[];
 let restored=-1;
 globalThis.window={scrollY:321,scrollTo(_x,y){restored=y;},location:{search:""}};
 const current={available:true,broker:"tiger",broker_label:"老虎",market:"US",market_label:"美股",
@@ -3122,13 +3130,13 @@ const urls=[];
 globalThis.fetch=async(url)=>{urls.push(url);return {ok:true,json:async()=>url.endsWith("2026-07-16.json")
   ? historical : [{available:true,artifact:"2026-07-16.json",execution_date:"2026-07-17",strategy_version:"v1"}]};};
 await setAccountView("tiger","report");
-const currentHtml=elements["account-holdings"].innerHTML;
+const currentHtml=panel.innerHTML;
 await openTrendReportHistory("tiger");
-const historyHtml=elements["account-holdings"].innerHTML;
+const historyHtml=panel.innerHTML;
 await loadHistoricalTrendReport("tiger","2026-07-16.json");
-const historicalHtml=elements["account-holdings"].innerHTML;
+const historicalHtml=panel.innerHTML;
 showCurrentTrendReport("tiger");
-const restoredHtml=elements["account-holdings"].innerHTML;
+const restoredHtml=panel.innerHTML;
 const historyRestored=restored;
 delete state.trendReportHistories.tiger;
 window.scrollY=456;
@@ -3161,7 +3169,7 @@ def test_dashboard_account_view_keyboard_and_mobile_acceptance_css() -> None:
     output = run_dashboard_js(r'''
 let focused="";
 elements["account-holdings"]={innerHTML:"",classList:{add(){},remove(){}},setAttribute(){},removeAttribute(){},
-  querySelector(selector){return {focus(){focused=selector;}};}};
+  querySelector(selector){return {innerHTML:"",setAttribute(){},focus(){focused=selector;}};}};
 state.accountViews={tiger:"real",phillips:"real",eastmoney:"real"};
 state.trendSimulatePositions={tiger:{available:true,positions:[]}};
 state.dashboard={summary:{portfolio_value_hkd:"0"},broker_summaries:[],cash_rows:[],holdings:[],
@@ -3189,7 +3197,69 @@ console.log(JSON.stringify({left:press("real","ArrowLeft"),right:press("real","A
     assert "font-weight: 700;" in selected
     assert ".trend-report-header .trend-history-button" in css
     assert ".account-view-tabs" in mobile
-    assert "body {" in mobile and "overflow-x: hidden;" in mobile
+    assert "body {\n    overflow-x: hidden;" not in mobile
+    assert ".account-holdings-table-wrap" in css
+
+    javascript = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    row_renderer = javascript.split("function renderAccountHoldingRow", 1)[1].split(
+        "function renderAccountTable", 1,
+    )[0]
+    assert "selectedHolding()" not in row_renderer
+
+
+def test_dashboard_inactive_account_requests_do_not_render_or_restore_scroll() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",counts:{},audit:{}}},trend_reviews:{}};
+state.brokerFilter="tiger";
+state.accountViews.tiger="report";
+const scrolls=[];
+globalThis.window={scrollY:111,scrollTo(_x,y){scrolls.push(y);},location:{search:""}};
+const pending=[];
+globalThis.fetch=(url)=>new Promise((resolve)=>pending.push((payload)=>resolve({ok:true,json:async()=>payload})));
+let fullRenders=0;
+renderAccountHoldings=()=>{fullRenders+=1;};
+const historyRequest=openTrendReportHistory("tiger");
+state.brokerFilter="phillips";
+pending.shift()([{available:true,artifact:"2026-07-16.json"}]);
+await historyRequest;
+state.brokerFilter="tiger";
+delete state.trendReportHistories.tiger;
+const exactRequest=loadHistoricalTrendReport("tiger","2026-07-16.json");
+state.brokerFilter="phillips";
+window.scrollY=999;
+pending.shift()({available:true,broker:"tiger",counts:{},audit:{}});
+await exactRequest;
+console.log(JSON.stringify({fullRenders,scrolls,broker:state.brokerFilter}));
+''')
+    assert json.loads(output) == {
+        "fullRenders": 0,
+        "scrolls": [],
+        "broker": "phillips",
+    }
+
+
+def test_dashboard_embedded_account_views_do_not_nest_main_landmarks() -> None:
+    output = run_dashboard_js(r'''
+const report={available:true,broker:"tiger",broker_label:"老虎",market:"US",market_label:"美股",counts:{},audit:{}};
+const review={available:true,broker:"tiger",broker_label:"老虎",market_label:"美股",strategy_snapshot:{parameter_rows:[]},metrics:{}};
+console.log(JSON.stringify({
+  standaloneReport:renderTrendReportWorkspace(report),
+  embeddedReport:renderTrendReportWorkspace(report,true),
+  standaloneReview:renderTrendReviewWorkspace(review),
+  embeddedReview:renderTrendReviewWorkspace(review,true),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["standaloneReport"].startswith('<main class="cn-trend-report">')
+    assert rendered["standaloneReview"].startswith('<main class="trend-review">')
+    assert rendered["embeddedReport"].startswith('<div class="cn-trend-report">')
+    assert rendered["embeddedReview"].startswith('<div class="trend-review">')
+    assert "<main" not in rendered["embeddedReport"]
+    assert "<main" not in rendered["embeddedReview"]
 
 
 def test_dashboard_account_view_dom_at_375px() -> None:
@@ -3241,13 +3311,16 @@ def test_dashboard_account_view_dom_at_375px() -> None:
     }
     bootstrap = f'''<script>
 window.__requests=[];
+window.__resolveSimulate=null;
 const dashboardPayload={json.dumps(dashboard, ensure_ascii=False)};
 const simulatedPayload={json.dumps(simulated, ensure_ascii=False)};
 window.fetch=async (input)=>{{
   const url=String(input); window.__requests.push(url);
+  if(url==="/api/trend-simulate-positions/tiger") return new Promise((resolve)=>{{
+    window.__resolveSimulate=()=>resolve({{ok:true,status:200,json:async()=>structuredClone(simulatedPayload)}});
+  }});
   const payload=url==="/api/dashboard"?dashboardPayload
     :url==="/api/quotes"?{{status:"ok",quotes:{{}},account_sync:{{status:"skipped"}}}}
-    :url==="/api/trend-simulate-positions/tiger"?simulatedPayload
     :url==="/api/trend-reports/tiger/history"?[{{available:true,artifact:"2026-07-16.json",execution_date:"2026-07-17",strategy_version:"v1"}}]
     :url.endsWith("/2026-07-16.json")?{{...dashboardPayload.trend_reports.tiger,buy_actions:[{{symbol:"AAPL",execution:{{status:"missed"}}}}]}}
     :{{available:false}};
@@ -3282,20 +3355,36 @@ window.fetch=async (input)=>{{
         ]
         assert all((tab.bounding_box() or {})["height"] >= 44 for tab in tabs.all())
         assert section.locator('[aria-selected="true"]').inner_text().strip() == "真实持仓"
+        header = section.locator(".account-section-header")
+        header.evaluate("node => { node.dataset.viewStable = 'yes'; }")
         tabs.first.focus()
         tabs.first.press("End")
         assert section.locator('[aria-selected="true"]').inner_text().strip() == "美股复盘"
+        assert header.get_attribute("data-view-stable") == "yes"
+        assert page.evaluate("document.activeElement.dataset.accountView") == "review"
         assert "卡玛比率" in section.inner_text()
         assert "夏普比率" in section.inner_text()
         assert page.locator(".workspace-grid").is_visible()
         section.locator('[data-account-view="simulate"]').click()
+        section.get_by_text("模拟盘持仓加载中", exact=True).wait_for()
+        assert header.get_attribute("data-view-stable") == "yes"
+        assert page.evaluate("document.activeElement.dataset.accountView") == "simulate"
+        page.evaluate("window.__resolveSimulate()")
         assert section.locator(".report-attribution-link").inner_text().strip() == "报告 2026-07-20 · v1"
+        assert header.get_attribute("data-view-stable") == "yes"
+        assert page.evaluate("document.activeElement.dataset.accountView") == "simulate"
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
-        section.locator('[data-account-view="report"]').click()
+        section.locator(".report-attribution-link").click()
+        section.locator("[data-current-trend-report]").wait_for()
+        assert "错过" in section.inner_text()
+        section.locator("[data-current-trend-report]").click()
         cash_details = section.locator(".account-cash-details")
         cash_details.evaluate("node => { node.open = true; node.dataset.historyStable = 'yes'; }")
         section.locator("[data-report-history]").click()
         section.locator('[data-history-artifact="2026-07-16.json"]').wait_for()
+        assert page.evaluate(
+            "window.__requests.filter(url => url === '/api/trend-reports/tiger/history').length",
+        ) == 1
         assert cash_details.get_attribute("data-history-stable") == "yes"
         assert cash_details.evaluate("node => node.open") is True
         section.locator('[data-history-artifact="2026-07-16.json"]').click()

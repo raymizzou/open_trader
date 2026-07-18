@@ -1973,6 +1973,11 @@ table {
   width: 100%;
 }
 
+.account-holdings-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
 .account-mobile-label {
   display: none;
 }
@@ -4171,10 +4176,6 @@ table {
 }
 
 @media (max-width: 760px) {
-  body {
-    overflow-x: hidden;
-  }
-
   .backtest-comparison-grid,
   .backtest-artifacts li,
   .backtest-run-details { grid-template-columns: 1fr; }
@@ -4414,7 +4415,6 @@ table {
 
   .account-holdings-table {
     display: block;
-    overflow-x: hidden;
   }
 
   .account-holdings-table thead {
