@@ -239,6 +239,11 @@ def _run_acceptance_main_with_reports(
         lambda *args, **kwargs: "accepted-sha\n",
     )
     monkeypatch.setattr(
+        dashboard_acceptance,
+        "_process_started_after_commit",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
         dashboard_acceptance, "_fetch_payload", lambda url: next(payloads)
     )
     monkeypatch.setattr(
@@ -252,10 +257,28 @@ def _run_acceptance_main_with_reports(
     monkeypatch.setattr(
         dashboard_acceptance, "validate_dashboard_payload", lambda *args, **kwargs: []
     )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_configured_simulate_account_ids",
+        lambda *_args: {"tiger": 1, "phillips": 2, "eastmoney": 3},
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_simulated_accounts",
+        lambda *_args: ({}, [], None),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_history_endpoints",
+        lambda *_args: ({}, []),
+    )
     def browser_check(
         url: str, expected_cn: int, payload: dict[str, object],
         reports_dir: Path | None = None,
+        simulate_payloads: object = None,
+        history_expectations: object = None,
     ) -> tuple[list[str], None]:
+        del simulate_payloads, history_expectations
         browser_reports.append(reports_dir)
         if browser_log_text:
             log_path.write_text(browser_log_text, encoding="utf-8")
@@ -2669,8 +2692,25 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         "_check_decision_tabs",
         lambda *_args: None,
     )
+    def check_trend_views(
+        page: Page,
+        _payload: object,
+        _simulate_payloads: object,
+        _history_expectations: object,
+        *,
+        screenshot_dir: Path,
+    ) -> None:
+        width = page.viewport_size["width"]
+        page.screenshot(
+            path=str(screenshot_dir / f"{width}-trend-report.png"),
+            full_page=True,
+        )
+
+    monkeypatch.setattr(
+        dashboard_acceptance, "_check_trend_account_views", check_trend_views
+    )
     errors, blocker = dashboard_acceptance._browser_check(
-        "http://dashboard", 5, payload
+        "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
     )
 
     assert errors == [
@@ -2702,7 +2742,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     )
 
     errors, blocker = dashboard_acceptance._browser_check(
-        "http://dashboard", 5, payload
+        "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
     )
 
     assert errors == [
@@ -2736,45 +2776,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             viewport,
             '#account-futu:visible .trend-report-entry [data-trend-report]',
         ) in clicks
-        assert (
-            viewport,
-            '#account-phillips:visible .trend-report-entry [data-trend-report]',
-        ) in clicks
-        assert (
-            viewport,
-            '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
-        ) in clicks
-        for broker in ("tiger", "phillips", "eastmoney"):
-            assert (
-                viewport,
-                f'#account-{broker}:visible [data-trend-review="{broker}"]',
-            ) in clicks
         assert (viewport, '#return-to-portfolio:visible') in clicks
-        assert (
-            viewport,
-            '#trend-report-workspace:visible [data-close-trend-report]',
-        ) in clicks
         assert (viewport, '#trend-report-workspace:visible') in selectors
-        assert selectors.count(
-            (viewport, '#trend-report-workspace:visible .cn-trend-report')
-        ) == 3
-        assert selectors.count(
-            (viewport, '#trend-report-workspace:visible .cn-trend-stage')
-        ) == 3
-        assert selectors.count(
-            (viewport, '#trend-report-workspace:visible .cn-trend-table')
-        ) == 3
-        buy_rows = '#trend-report-workspace:visible .cn-trend-buy .cn-trend-card'
-        assert (viewport, buy_rows) in selectors
-        for label in (
-            "行业", "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
-        ):
-            assert (
-                viewport,
-                f'{buy_rows}:nth(0) td[data-label="{label}"]',
-            ) in selectors
-        assert (viewport, '#trend-report-workspace:visible .trend-discipline') in selectors
-        assert (viewport, '.workspace-grid:visible') in selectors
         assert (viewport, '.account-section:visible') in selectors
         assert (viewport, '#account-tiger:visible') in selectors
         assert (viewport, '#tiger-long-term-panel') in selectors
@@ -2790,10 +2793,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             "#trend-report-workspace:visible .option-attention-market, "
             "#trend-report-workspace:visible .option-attention-row",
         ) in selectors
-    assert evaluated == [
-        *(["wide_desktop"] * 7), *(["desktop"] * 7),
-        *(["tablet"] * 14), *(["mobile"] * 14),
-    ]
+    assert set(evaluated) == {"wide_desktop", "desktop", "tablet", "mobile"}
     assert visual_token_evaluations == [
         "wide_desktop", "desktop", "tablet", "mobile",
     ]
@@ -2805,11 +2805,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         ] == list(VISUAL_CONTRACT_STYLES)
         assert (viewport, "#refresh-quotes") in visual_focus_calls
         assert (viewport, "#refresh-quotes") in visual_focus_evaluations
-    assert geometry_evaluations == ["wide_desktop"] * 3
-    assert buy_overflow_evaluations == [
-        *("wide_desktop" for _ in range(2)),
-        *("desktop" for _ in range(2)),
-    ]
+    assert geometry_evaluations == []
+    assert buy_overflow_evaluations == []
     screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
     assert screenshots == [
         ("wide_desktop", str(screenshot_dir / "wide_desktop-portfolio.png")),
@@ -2855,25 +2852,13 @@ def test_check_account_holdings_visits_every_broker_tab(
 
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.max_visible_account_sections == 1
-    assert page.opened_reports == ["futu", "tiger", "phillips", "eastmoney"]
-    assert page.opened_reviews == ["tiger", "phillips", "eastmoney"]
+    assert page.opened_reports == ["futu"]
+    assert page.opened_reviews == []
     assert page.disabled_reports == set()
     assert projections == ["tiger", "phillips", "eastmoney"]
     assert page.focus_checks == [
         "#return-to-portfolio:visible",
         '#account-futu:visible .trend-report-entry [data-trend-report]',
-        "#return-to-portfolio:visible",
-        "#trend-report-workspace:visible .cn-trend-buy",
-        '#account-tiger:visible .trend-report-entry [data-trend-report]',
-        '#account-tiger:visible [data-trend-review="tiger"]',
-        "#return-to-portfolio:visible",
-        "#trend-report-workspace:visible .cn-trend-buy",
-        '#account-phillips:visible .trend-report-entry [data-trend-report]',
-        '#account-phillips:visible [data-trend-review="phillips"]',
-        "#return-to-portfolio:visible",
-        "#trend-report-workspace:visible .cn-trend-buy",
-        '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
-        '#account-eastmoney:visible [data-trend-review="eastmoney"]',
     ]
 
 
@@ -3202,7 +3187,7 @@ def test_acceptance_rejects_unavailable_eastmoney_report_for_screenshot(
     report.update(available=False, status_text="今日报告不可用")
     page = tabbed_account_page(payload)
 
-    with pytest.raises(AssertionError, match="eastmoney.*不可用.*截图"):
+    with pytest.raises(AssertionError, match="eastmoney.*不可用"):
         dashboard_acceptance._check_account_holdings(
             page, payload, screenshot_dir=tmp_path
         )
@@ -3481,7 +3466,7 @@ def test_cn_filter_accepts_grouped_visible_count_for_large_account() -> None:
     "missing",
         (
             "富途", "老虎", "辉立", "东方财富", "期权增强", "跨市场期权关注",
-            "美股趋势交易", "港股趋势交易", "期权关注", "当天趋势报告", "报告日期", "数据截至",
+            "美股趋势交易", "港股趋势交易", "期权关注",
         ),
 )
 def test_check_account_holdings_rejects_missing_profile_or_metric(missing: str) -> None:
@@ -3612,3 +3597,393 @@ def test_dashboard_signature_ignores_live_values_but_detects_structural_change()
 
     second["holdings"][0]["brokers"] = "changed"  # type: ignore[index]
     assert dashboard_signature(first) != dashboard_signature(second)
+
+
+def simulate_snapshot(
+    code: str = "US.NDAQ", quantity: str = "13", cost_price: str = "94.25",
+) -> dict[str, object]:
+    return {
+        "positions": [{
+            "code": code,
+            "qty": quantity,
+            "cost_price": cost_price,
+        }],
+    }
+
+
+def simulate_api_payload(
+    *,
+    symbol: str = "NDAQ",
+    quantity: str = "13",
+    cost_price: str = "94.25",
+    attribution_status: str = "unlinked",
+    report: dict[str, str] | None = None,
+) -> dict[str, object]:
+    return {
+        "available": True,
+        "broker": "tiger",
+        "market": "US",
+        "positions": [{
+            "market": "US",
+            "symbol": symbol,
+            "quantity": quantity,
+            "cost_price": cost_price,
+            "attribution_status": attribution_status,
+            "report": report,
+        }],
+        "error": "",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("symbol", "AAPL"), ("quantity", "12"), ("cost_price", "94.26")],
+)
+def test_acceptance_rejects_simulated_api_facts_that_differ_from_direct_futu(
+    tmp_path: Path, field: str, value: str,
+) -> None:
+    payload = simulate_api_payload(**{field: value})
+
+    with pytest.raises(AssertionError, match="模拟盘持仓.*不匹配"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger", simulate_snapshot(), payload, tmp_path
+        )
+
+
+def test_acceptance_accepts_zero_simulated_positions(tmp_path: Path) -> None:
+    dashboard_acceptance._validate_simulated_positions(
+        "tiger",
+        {"positions": []},
+        {**simulate_api_payload(), "positions": []},
+        tmp_path,
+    )
+
+
+def test_acceptance_classifies_unavailable_configured_futu_account_as_blocked(
+    tmp_path: Path,
+) -> None:
+    def unavailable_client(**_kwargs: object) -> object:
+        raise RuntimeError("OpenD unavailable")
+
+    payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
+        "http://dashboard.test",
+        {"futu_host": "127.0.0.1", "futu_port": 11111},
+        {"tiger": 1, "phillips": 2, "eastmoney": 3},
+        tmp_path,
+        client_factory=unavailable_client,
+        fetcher=lambda _url, _path: pytest.fail("substitute API rows were queried"),
+    )
+
+    assert payloads == {}
+    assert errors == []
+    assert "OpenD unavailable" in str(blocker)
+    assert classify_result(
+        [], browser_blocker=None, external_blocker=blocker
+    ) == "BLOCKED"
+
+
+def test_acceptance_treats_dashboard_simulate_fallback_as_fail_when_futu_works(
+    tmp_path: Path,
+) -> None:
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return simulate_snapshot()
+
+        def close(self) -> None:
+            pass
+
+    def fetcher(_url: str, path: str) -> dict[str, object]:
+        broker = path.rsplit("/", 1)[-1]
+        market = dashboard_acceptance.TREND_SIMULATE_MARKETS[broker]
+        return {
+            "available": False,
+            "broker": broker,
+            "market": market,
+            "positions": [],
+            "error": "using cached report plan",
+        }
+
+    _payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
+        "http://dashboard.test",
+        {"futu_host": "127.0.0.1", "futu_port": 11111},
+        {"tiger": 1, "phillips": 2, "eastmoney": 3},
+        tmp_path,
+        client_factory=lambda **_kwargs: Client(),
+        fetcher=fetcher,
+    )
+
+    assert blocker is None
+    assert len(errors) == 3
+    assert all("Dashboard 模拟盘不可用" in error for error in errors)
+
+
+def test_acceptance_accepts_explicitly_unlinked_legacy_simulated_position(
+    tmp_path: Path,
+) -> None:
+    dashboard_acceptance._validate_simulated_positions(
+        "tiger", simulate_snapshot(), simulate_api_payload(), tmp_path
+    )
+
+
+def test_acceptance_rejects_hidden_unlinked_simulated_position(tmp_path: Path) -> None:
+    with pytest.raises(AssertionError, match="模拟盘持仓.*不匹配"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            {**simulate_api_payload(), "positions": []},
+            tmp_path,
+        )
+
+
+def test_acceptance_rejects_unavailable_simulated_api_with_substitute_rows(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        **simulate_api_payload(),
+        "available": False,
+        "error": "OpenD unavailable",
+    }
+
+    with pytest.raises(AssertionError, match="不可用.*替代持仓"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger", simulate_snapshot(), payload, tmp_path
+        )
+
+
+@pytest.mark.parametrize("wrong_field", ["report_sha256", "strategy_version"])
+def test_acceptance_rejects_linked_simulated_position_with_wrong_report_identity(
+    tmp_path: Path, wrong_field: str,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    report_payload = {
+        "execution_date": "2026-07-17",
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_snapshot": {"strategy_version": "v1"},
+    }
+    artifact = tmp_path / "trend_us_tiger" / "old.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(json.dumps(report_payload), encoding="utf-8")
+    report = {
+        "artifact": "old.json",
+        "execution_date": "2026-07-17",
+        "strategy_version": "v1",
+        "report_sha256": _report_hash(report_payload),
+    }
+    report[wrong_field] = "0" * 64 if wrong_field == "report_sha256" else "v2"
+
+    with pytest.raises(AssertionError, match="报告身份"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            simulate_api_payload(attribution_status="linked", report=report),
+            tmp_path,
+        )
+
+
+def _write_acceptance_history_artifact(
+    reports_dir: Path,
+    artifact: str,
+    *,
+    execution_date: str,
+    symbol: str,
+) -> tuple[dict[str, object], str]:
+    from open_trader.trend_review import _report_hash
+
+    payload: dict[str, object] = {
+        "execution_date": execution_date,
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_snapshot": {"strategy_version": "v1"},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": symbol}],
+        },
+    }
+    path = reports_dir / "trend_us_tiger" / artifact
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload, _report_hash(payload)
+
+
+def _write_acceptance_action(
+    data_dir: Path, *, report_sha256: str, symbol: str = "NDAQ",
+) -> dict[str, str]:
+    event = {
+        "date": "2026-07-17",
+        "market": "US",
+        "symbol": symbol,
+        "side": "buy",
+        "status": "missed",
+        "recorded_at": "2026-07-18T08:27:12+08:00",
+        "report_sha256": report_sha256,
+    }
+    path = (
+        data_dir / "trend_review/ledgers/US/actions/2026-07-17/action/event.json"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(event), encoding="utf-8")
+    return event
+
+
+def test_acceptance_rejects_history_that_drops_ledger_referenced_old_action(
+    tmp_path: Path,
+) -> None:
+    reports_dir = tmp_path / "reports"
+    _, old_hash = _write_acceptance_history_artifact(
+        reports_dir, "old.json", execution_date="2026-07-17", symbol="NDAQ"
+    )
+    _write_acceptance_history_artifact(
+        reports_dir, "new.json", execution_date="2026-07-20", symbol="AAPL"
+    )
+    _write_acceptance_action(tmp_path / "data", report_sha256=old_hash)
+    history = [{
+        "available": True,
+        "artifact": "new.json",
+        "execution_date": "2026-07-20",
+        "strategy_version": "v1",
+    }]
+
+    with pytest.raises(AssertionError, match="old.json.*历史报告"):
+        dashboard_acceptance._validate_history_projection(
+            tmp_path / "data", reports_dir, "tiger", history, {}
+        )
+
+
+def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
+    tmp_path: Path,
+) -> None:
+    reports_dir = tmp_path / "reports"
+    _, old_hash = _write_acceptance_history_artifact(
+        reports_dir, "old.json", execution_date="2026-07-17", symbol="NDAQ"
+    )
+    _write_acceptance_history_artifact(
+        reports_dir, "new.json", execution_date="2026-07-20", symbol="AAPL"
+    )
+    event = _write_acceptance_action(tmp_path / "data", report_sha256=old_hash)
+    history = [
+        {
+            "available": True,
+            "artifact": artifact,
+            "execution_date": execution_date,
+            "strategy_version": "v1",
+        }
+        for artifact, execution_date in (
+            ("new.json", "2026-07-20"), ("old.json", "2026-07-17")
+        )
+    ]
+    exact = {
+        "old.json": {
+            "report_date": "2026-07-17",
+            "audit": {"artifact": "old.json"},
+            "buy_actions": [{
+                "symbol": "NDAQ",
+                "execution": {
+                    "status": "missed",
+                    "recorded_at": event["recorded_at"],
+                },
+            }],
+        }
+    }
+
+    expectations = dashboard_acceptance._validate_history_projection(
+        tmp_path / "data", reports_dir, "tiger", history, exact
+    )
+
+    assert expectations[0]["artifact"] == "old.json"
+
+
+class AccountViewContractLocator:
+    def __init__(
+        self, page: "AccountViewContractPage", selector: str, index: int | None = None,
+    ) -> None:
+        self.page = page
+        self.selector = selector
+        self.index = index
+
+    def count(self) -> int:
+        assert self.selector == '[role="tab"][data-account-view]'
+        return 4
+
+    def nth(self, index: int) -> "AccountViewContractLocator":
+        return AccountViewContractLocator(self.page, self.selector, index)
+
+    def inner_text(self) -> str:
+        assert self.index is not None
+        return self.page.labels[self.index]
+
+    def get_attribute(self, name: str) -> str:
+        assert self.index is not None
+        if name == "data-account-view":
+            return ("real", "simulate", "report", "review")[self.index]
+        if name == "aria-selected":
+            return str(self.index == self.page.selected_index).lower()
+        raise AssertionError(name)
+
+    def evaluate(self, expression: str) -> dict[str, str]:
+        assert "getComputedStyle" in expression
+        return {
+            "borderTopWidth": self.page.border_width,
+            "borderLeftWidth": self.page.border_width,
+            "borderRightWidth": self.page.border_width,
+            "backgroundColor": "rgba(0, 0, 0, 0)",
+            "borderRadius": "0px",
+        }
+
+
+class AccountViewContractPage:
+    def __init__(
+        self,
+        *,
+        labels: list[str] | None = None,
+        selected_index: int = 0,
+        border_width: str = "0px",
+        fits: bool = True,
+    ) -> None:
+        self.labels = labels or ["真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"]
+        self.selected_index = selected_index
+        self.border_width = border_width
+        self.fits = fits
+
+    def locator(self, selector: str) -> AccountViewContractLocator:
+        return AccountViewContractLocator(self, selector)
+
+    def evaluate(self, expression: str) -> bool:
+        assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
+        return self.fits
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        AccountViewContractPage(labels=["模拟盘持仓", "真实持仓", "趋势报告", "美股复盘"]),
+        AccountViewContractPage(selected_index=1),
+        AccountViewContractPage(border_width="1px"),
+        AccountViewContractPage(fits=False),
+    ],
+)
+def test_acceptance_rejects_invalid_account_view_contract(
+    page: AccountViewContractPage,
+) -> None:
+    with pytest.raises(AssertionError):
+        dashboard_acceptance._check_account_view_contract(page, page, "tiger")
+
+
+def test_acceptance_accepts_exact_account_view_contract() -> None:
+    page = AccountViewContractPage()
+
+    dashboard_acceptance._check_account_view_contract(page, page, "tiger")
+
+
+def test_acceptance_rejects_stale_process_even_when_worktree_head_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    def output(command: list[str], **_kwargs: object) -> str:
+        if command[0] == "ps":
+            return "Sat Jul 18 12:00:00 2026\n"
+        assert command[:4] == ["git", "-C", str(tmp_path), "show"]
+        return "1784365200\n"  # 2026-07-18 13:00:00 +08:00
+
+    monkeypatch.setattr(dashboard_acceptance.subprocess, "check_output", output)
+
+    assert not dashboard_acceptance._process_started_after_commit(
+        123, tmp_path, "accepted-sha"
+    )

@@ -12,7 +12,11 @@ import time
 from typing import Any
 from urllib.request import urlopen
 
+from .daily_premarket import _optional_positive_tm_id, _read_env_file
+from .futu_symbols import to_futu_symbol
+from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .parsers.phillips import PhillipsStatementParser
+from .trend_simulate_positions import _action_events, _reports_by_hash
 
 
 REQUIRED_SOURCE_PATHS = (
@@ -34,6 +38,16 @@ TREND_REPORT_DIRECTORIES = {
     "tiger": "trend_us_tiger",
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
+}
+TREND_SIMULATE_MARKETS = {
+    "tiger": "US",
+    "phillips": "HK",
+    "eastmoney": "CN",
+}
+ACCOUNT_VIEW_LABELS = {
+    "tiger": ("真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"),
+    "phillips": ("真实持仓", "模拟盘持仓", "趋势报告", "港股复盘"),
+    "eastmoney": ("真实持仓", "模拟盘持仓", "趋势报告", "A股复盘"),
 }
 OPTION_ATTENTION_COLUMN_LABELS = (
     "标的",
@@ -141,6 +155,19 @@ def _project_data_dir(root: Path) -> Path:
     if not common.is_absolute():
         common = root / common
     return common.resolve().parent / "data"
+
+
+def _configured_simulate_account_ids(
+    expected_root: Path, config_path: Path | None = None,
+) -> dict[str, int]:
+    path = config_path or _project_data_dir(expected_root).parent / "config/daily_premarket.env"
+    values = _read_env_file(path)
+    return {
+        broker: _optional_positive_tm_id(
+            values, f"OPEN_TRADER_TREND_REVIEW_{market}_SIMULATE_ACC_ID"
+        )
+        for broker, market in TREND_SIMULATE_MARKETS.items()
+    }
 
 
 def validate_dashboard_payload(
@@ -287,10 +314,15 @@ def validate_quotes_payload(payload: dict[str, Any]) -> list[str]:
     return errors
 
 
-def classify_result(errors: list[str], *, browser_blocker: str | None) -> str:
+def classify_result(
+    errors: list[str],
+    *,
+    browser_blocker: str | None,
+    external_blocker: str | None = None,
+) -> str:
     if errors:
         return "FAIL"
-    return "BLOCKED" if browser_blocker else "PASS"
+    return "BLOCKED" if browser_blocker or external_blocker else "PASS"
 
 
 def dashboard_signature(payload: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
@@ -311,6 +343,455 @@ def _fetch_quotes_payload(url: str) -> dict[str, Any]:
         if response.status != 200:
             raise RuntimeError(f"Quotes API HTTP {response.status}")
         return json.load(response)
+
+
+def _fetch_json_path(url: str, path: str) -> Any:
+    with urlopen(f"{url.rstrip('/')}{path}", timeout=15) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Dashboard API HTTP {response.status}: {path}")
+        return json.load(response)
+
+
+def _position_decimal(value: object, field: str) -> Decimal:
+    try:
+        result = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise AssertionError(f"{field} 不是有效数字") from None
+    assert result.is_finite(), f"{field} 不是有限数字"
+    return result
+
+
+def _direct_simulate_facts(
+    snapshot: Mapping[str, Any], market: str,
+) -> tuple[tuple[str, str, Decimal, Decimal], ...]:
+    positions = snapshot.get("positions")
+    assert isinstance(positions, list), "Futu 模拟盘持仓不可用"
+    facts: list[tuple[str, str, Decimal, Decimal]] = []
+    for position in positions:
+        assert isinstance(position, Mapping), "Futu 模拟盘持仓格式无效"
+        quantity = _position_decimal(
+            position.get("qty", position.get("quantity")), "Futu 持仓数量"
+        )
+        if quantity <= 0:
+            continue
+        code = str(position.get("code") or position.get("futu_code") or "").upper()
+        assert to_futu_symbol(market, code) == code, f"Futu 持仓代码无效：{code}"
+        facts.append((
+            market,
+            code.split(".", 1)[1],
+            quantity,
+            _position_decimal(
+                position.get("cost_price", position.get("average_cost")),
+                "Futu 持仓成本价",
+            ),
+        ))
+    return tuple(sorted(facts))
+
+
+def _api_simulate_facts(
+    payload: Mapping[str, Any], market: str,
+) -> tuple[tuple[str, str, Decimal, Decimal], ...]:
+    positions = payload.get("positions")
+    assert isinstance(positions, list), "Dashboard 模拟盘持仓格式无效"
+    facts: list[tuple[str, str, Decimal, Decimal]] = []
+    for position in positions:
+        assert isinstance(position, Mapping), "Dashboard 模拟盘持仓行无效"
+        assert position.get("market") == market, "Dashboard 模拟盘持仓市场不匹配"
+        symbol = str(position.get("symbol") or "").strip().upper()
+        assert symbol, "Dashboard 模拟盘持仓代码缺失"
+        quantity = _position_decimal(position.get("quantity"), "Dashboard 持仓数量")
+        assert quantity > 0, "Dashboard 模拟盘持仓数量必须为正数"
+        facts.append((
+            market,
+            symbol,
+            quantity,
+            _position_decimal(position.get("cost_price"), "Dashboard 持仓成本价"),
+        ))
+    return tuple(sorted(facts))
+
+
+def _validate_simulated_positions(
+    broker: str,
+    direct_snapshot: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    reports_dir: Path,
+) -> None:
+    market = TREND_SIMULATE_MARKETS[broker]
+    positions = payload.get("positions")
+    if payload.get("available") is not True:
+        if positions:
+            raise AssertionError(f"{broker} 模拟盘不可用时显示了替代持仓")
+        raise AssertionError(f"{broker} Dashboard 模拟盘不可用：{payload.get('error', '')}")
+    assert payload.get("broker") == broker and payload.get("market") == market, (
+        f"{broker} Dashboard 模拟盘账户身份不匹配"
+    )
+    assert _api_simulate_facts(payload, market) == _direct_simulate_facts(
+        direct_snapshot, market
+    ), f"{broker} 模拟盘持仓与 Futu 不匹配"
+
+    reports = _reports_by_hash(
+        reports_dir / TREND_REPORT_DIRECTORIES[broker],
+        broker=broker,
+        market=market,
+    )
+    assert isinstance(positions, list)
+    for position in positions:
+        assert isinstance(position, Mapping)
+        status = position.get("attribution_status")
+        assert status in {"linked", "unlinked"}, (
+            f"{broker} {position.get('symbol', '')} 模拟盘报告归因无效"
+        )
+        if status == "unlinked":
+            assert position.get("report") is None, (
+                f"{broker} 未关联持仓错误携带报告"
+            )
+            continue
+        report = position.get("report")
+        assert isinstance(report, Mapping), f"{broker} 已关联持仓缺少报告身份"
+        expected = reports.get(str(report.get("report_sha256") or ""))
+        assert expected is not None and all(
+            report.get(key) == expected[key]
+            for key in (
+                "artifact", "execution_date", "strategy_version", "report_sha256"
+            )
+        ), f"{broker} {position.get('symbol', '')} 模拟盘报告身份不匹配"
+
+
+def _check_simulated_accounts(
+    url: str,
+    dashboard_payload: Mapping[str, Any],
+    account_ids: Mapping[str, int],
+    reports_dir: Path,
+    *,
+    client_factory: Any = FutuSimulateOrderExecutionClient,
+    fetcher: Any = _fetch_json_path,
+) -> tuple[dict[str, dict[str, Any]], list[str], str | None]:
+    host = dashboard_payload.get("futu_host")
+    port = dashboard_payload.get("futu_port")
+    if not isinstance(host, str) or not host or not isinstance(port, int) or port <= 0:
+        return {}, [], "Dashboard 缺少有效 Futu OpenD 配置"
+    payloads: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for broker, market in TREND_SIMULATE_MARKETS.items():
+        account_id = account_ids.get(broker, 0)
+        if not isinstance(account_id, int) or account_id <= 0:
+            return payloads, errors, f"{broker} 配置的 Futu 模拟账户不可用"
+        client = None
+        try:
+            client = client_factory(
+                host=host,
+                port=port,
+                simulate_acc_id=account_id,
+                trd_market=market,
+            )
+            snapshot = client.account_snapshot()
+        except Exception as exc:
+            return payloads, errors, f"{broker} Futu 模拟账户不可用：{exc}"
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception as exc:
+                    return payloads, errors, f"{broker} Futu 模拟账户关闭失败：{exc}"
+        try:
+            payload = fetcher(url, f"/api/trend-simulate-positions/{broker}")
+            assert isinstance(payload, dict), f"{broker} 模拟盘 API 不是对象"
+            _validate_simulated_positions(broker, snapshot, payload, reports_dir)
+        except Exception as exc:
+            errors.append(f"{broker} 模拟盘检查失败：{type(exc).__name__}: {exc}")
+            continue
+        payloads[broker] = payload
+    return payloads, errors, None
+
+
+def _validate_history_projection(
+    data_dir: Path,
+    reports_dir: Path,
+    broker: str,
+    history: object,
+    exact_by_artifact: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    market = TREND_SIMULATE_MARKETS[broker]
+    reports = _reports_by_hash(
+        reports_dir / TREND_REPORT_DIRECTORIES[broker],
+        broker=broker,
+        market=market,
+    )
+    assert isinstance(history, list), f"{broker} 历史报告 API 不是列表"
+    history_rows = {
+        str(row.get("artifact")): row
+        for row in history
+        if isinstance(row, Mapping) and row.get("available") is True
+    }
+    latest_events: dict[tuple[str, str, str], Mapping[str, object]] = {}
+    for _, _, _, event in _action_events(data_dir, market):
+        report_hash = str(event.get("report_sha256") or "").strip().lower()
+        if len(report_hash) == 64:
+            latest_events[(
+                report_hash,
+                str(event.get("symbol") or "").strip().upper(),
+                str(event.get("side") or "").strip().lower(),
+            )] = event
+
+    expectations: list[dict[str, Any]] = []
+    for (report_hash, symbol, side), event in latest_events.items():
+        report = reports.get(report_hash)
+        assert report is not None, f"{broker} 账本引用的冻结报告不存在：{report_hash}"
+        artifact = report["artifact"]
+        summary = history_rows.get(artifact)
+        assert summary is not None, f"{artifact} 从 Dashboard 历史报告中消失"
+        assert (
+            summary.get("execution_date") == report["execution_date"]
+            and summary.get("strategy_version") == report["strategy_version"]
+        ), f"{artifact} 历史报告身份不匹配"
+        exact = exact_by_artifact.get(artifact)
+        assert isinstance(exact, Mapping), f"{artifact} 精确历史报告缺失"
+        audit = exact.get("audit")
+        assert (
+            exact.get("report_date") == report["execution_date"]
+            and isinstance(audit, Mapping)
+            and audit.get("artifact") == artifact
+        ), f"{artifact} 精确历史报告身份不匹配"
+        action_key = {"buy": "buy_actions", "sell": "sell_actions"}.get(side)
+        assert action_key is not None, f"{artifact} 账本动作方向无效：{side}"
+        actions = exact.get(action_key)
+        assert isinstance(actions, list), f"{artifact} 精确历史报告动作缺失"
+        projected = next(
+            (
+                item for item in actions
+                if isinstance(item, Mapping)
+                and str(item.get("symbol") or "").strip().upper() == symbol
+            ),
+            None,
+        )
+        execution = projected.get("execution") if isinstance(projected, Mapping) else None
+        assert (
+            isinstance(execution, Mapping)
+            and execution.get("status") == event.get("status")
+            and execution.get("recorded_at") == event.get("recorded_at")
+        ), f"{artifact} 历史报告动作 {symbol} 消失或执行状态不匹配"
+        expectations.append({**report, "symbol": symbol, "side": side, "event": event})
+    return expectations
+
+
+def _check_account_view_contract(page: Any, section: Any, broker: str) -> None:
+    tabs = section.locator('[role="tab"][data-account-view]')
+    assert tabs.count() == 4, f"{broker} 账户视图 Tab 数量不是 4"
+    actual_labels = tuple(tabs.nth(index).inner_text().strip() for index in range(4))
+    assert actual_labels == ACCOUNT_VIEW_LABELS[broker], f"{broker} 账户视图 Tab 顺序不正确"
+    assert tuple(
+        tabs.nth(index).get_attribute("data-account-view") for index in range(4)
+    ) == ("real", "simulate", "report", "review"), (
+        f"{broker} 账户视图 Tab 身份不正确"
+    )
+    assert tabs.nth(0).get_attribute("aria-selected") == "true" and all(
+        tabs.nth(index).get_attribute("aria-selected") == "false"
+        for index in range(1, 4)
+    ), f"{broker} 默认视图不是真实持仓"
+    expression = (
+        "element => { const style = getComputedStyle(element); return {"
+        "borderTopWidth: style.borderTopWidth, borderLeftWidth: style.borderLeftWidth, "
+        "borderRightWidth: style.borderRightWidth, backgroundColor: style.backgroundColor, "
+        "borderRadius: style.borderRadius}; }"
+    )
+    for index in range(4):
+        style = tabs.nth(index).evaluate(expression)
+        assert style == {
+            "borderTopWidth": "0px",
+            "borderLeftWidth": "0px",
+            "borderRightWidth": "0px",
+            "backgroundColor": "rgba(0, 0, 0, 0)",
+            "borderRadius": "0px",
+        }, f"{broker} 账户视图使用了描边或按钮背景：{style}"
+    assert page.evaluate(
+        "document.documentElement.scrollWidth <= window.innerWidth"
+    ), f"{broker} 账户视图出现横向滚动"
+
+
+def _check_trend_account_views(
+    page: Any,
+    payload: Mapping[str, Any],
+    simulate_payloads: Mapping[str, Mapping[str, Any]],
+    history_expectations: Mapping[str, list[Mapping[str, Any]]],
+    *,
+    screenshot_dir: Path | None = None,
+) -> None:
+    status_labels = {
+        "submitted": "已提交",
+        "partially_filled": "部分成交",
+        "filled": "全部成交",
+        "failed": "失败",
+        "blocked": "受阻",
+        "missed": "错过",
+        "incomplete": "未完成",
+    }
+    reports = payload.get("trend_reports")
+    reviews = payload.get("trend_reviews")
+    assert isinstance(reports, Mapping) and isinstance(reviews, Mapping)
+    for broker in TREND_SIMULATE_MARKETS:
+        section = _select_account_tab(page, broker)
+        _check_account_view_contract(page, section, broker)
+        panel = section.locator(f"#account-{broker}-view-panel")
+        simulate_tab = section.locator('[data-account-view="simulate"]')
+        simulate_tab.click()
+        panel.locator(".account-holding-row, .account-empty").first.wait_for()
+        rows = panel.locator(".account-holding-row")
+        simulated = simulate_payloads.get(broker)
+        if simulated is None:
+            assert rows.count() == 0, f"{broker} Futu 不可用时显示了替代持仓"
+        else:
+            positions = simulated.get("positions")
+            assert isinstance(positions, list)
+            assert rows.count() == len(positions), f"{broker} 模拟盘持仓行数不匹配"
+            for index, position in enumerate(positions):
+                assert isinstance(position, Mapping)
+                row = rows.nth(index)
+                assert row.locator(".account-holding-symbol strong").inner_text().strip() == str(
+                    position.get("symbol")
+                ), f"{broker} 模拟盘持仓代码未显示"
+                assert row.locator(".account-holding-quantity").inner_text().strip().endswith(
+                    _display_number(position.get("quantity"))
+                ), f"{broker} 模拟盘持仓数量未显示"
+                assert row.locator(".account-holding-cost").inner_text().strip().endswith(
+                    _display_number(position.get("cost_price"))
+                ), f"{broker} 模拟盘持仓成本价未显示"
+                if position.get("attribution_status") == "unlinked":
+                    assert "未关联历史报告" in row.inner_text(), (
+                        f"{broker} 未关联模拟持仓被隐藏或缺少标记"
+                    )
+            linked = [
+                position for position in positions
+                if isinstance(position, Mapping)
+                and position.get("attribution_status") == "linked"
+            ]
+            links = panel.locator(".report-attribution-link")
+            assert links.count() == len(linked), f"{broker} 模拟持仓报告入口数量不匹配"
+            if linked:
+                links.first.click()
+                panel.locator("[data-current-trend-report]").wait_for()
+                report = linked[0].get("report")
+                assert isinstance(report, Mapping)
+                assert _plain(report.get("execution_date")) in panel.inner_text(), (
+                    f"{broker} 模拟持仓未打开精确历史报告"
+                )
+                panel.locator("[data-current-trend-report]").click()
+                panel.locator("[data-report-history]").wait_for()
+        assert simulate_tab.get_attribute("aria-selected") == "true", (
+            f"{broker} 模拟盘加载后 Tab 状态丢失"
+        )
+        assert simulate_tab.evaluate(
+            "element => element === document.activeElement"
+        ), f"{broker} 模拟盘加载后焦点未返回 Tab"
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        ), f"{broker} 模拟盘视图出现横向滚动"
+
+        report_tab = section.locator('[data-account-view="report"]')
+        report_tab.click()
+        report_root = panel.locator(".cn-trend-report")
+        report_root.wait_for()
+        report = reports.get(broker)
+        assert isinstance(report, Mapping) and report.get("available") is True, (
+            f"{broker} 当前趋势报告不可用"
+        )
+        assert _plain(report.get("report_date")) in report_root.inner_text(), (
+            f"{broker} 当前趋势报告日期未显示"
+        )
+        if broker == "eastmoney" and screenshot_dir is not None:
+            width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+            page.screenshot(
+                path=str(screenshot_dir / f"{width}-trend-report.png"),
+                full_page=True,
+            )
+        expectations = history_expectations.get(broker) or []
+        if expectations:
+            history_button = panel.locator("[data-report-history]")
+            assert history_button.count() == 1, f"{broker} 当前报告缺少历史入口"
+            history_button.click()
+            expectation = expectations[0]
+            artifact = str(expectation["artifact"])
+            exact = panel.locator(f'[data-history-artifact="{artifact}"]')
+            exact.wait_for()
+            exact.click()
+            panel.locator("[data-current-trend-report]").wait_for()
+            event = expectation.get("event")
+            if isinstance(event, Mapping):
+                label = status_labels.get(str(event.get("status") or ""))
+                if label:
+                    assert label in panel.inner_text(), (
+                        f"{broker} 精确历史报告缺少执行状态 {label}"
+                    )
+            panel.locator("[data-current-trend-report]").click()
+            panel.locator("[data-report-history]").wait_for()
+        assert report_tab.get_attribute("aria-selected") == "true", (
+            f"{broker} 历史报告返回后趋势报告 Tab 丢失"
+        )
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        ), f"{broker} 趋势报告视图出现横向滚动"
+
+        review_tab = section.locator('[data-account-view="review"]')
+        review_tab.click()
+        review_root = panel.locator(".trend-review")
+        review_root.wait_for()
+        review = reviews.get(broker)
+        assert isinstance(review, Mapping) and review.get("available") is True, (
+            f"{broker} 趋势复盘不可用"
+        )
+        text = review_root.inner_text()
+        assert "卡玛比率" in text and "夏普比率" in text, (
+            f"{broker} 趋势复盘指标不完整"
+        )
+        assert review_tab.get_attribute("aria-selected") == "true", (
+            f"{broker} 复盘 Tab 未保持选中"
+        )
+        assert review_tab.evaluate(
+            "element => element === document.activeElement"
+        ), f"{broker} 复盘打开后焦点未保持在 Tab"
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        ), f"{broker} 趋势复盘视图出现横向滚动"
+        section.locator('[data-account-view="real"]').click()
+
+
+def _check_history_endpoints(
+    url: str,
+    data_dir: Path,
+    reports_dir: Path,
+    *,
+    fetcher: Any = _fetch_json_path,
+) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    expected_by_broker: dict[str, list[dict[str, Any]]] = {}
+    errors: list[str] = []
+    for broker, market in TREND_SIMULATE_MARKETS.items():
+        try:
+            reports = _reports_by_hash(
+                reports_dir / TREND_REPORT_DIRECTORIES[broker],
+                broker=broker,
+                market=market,
+            )
+            artifacts = {
+                reports[report_hash]["artifact"]
+                for _, _, _, event in _action_events(data_dir, market)
+                if (
+                    len(report_hash := str(event.get("report_sha256") or "").lower())
+                    == 64
+                    and report_hash in reports
+                )
+            }
+            history = fetcher(url, f"/api/trend-reports/{broker}/history")
+            exact = {
+                artifact: fetcher(
+                    url, f"/api/trend-reports/{broker}/history/{artifact}"
+                )
+                for artifact in artifacts
+            }
+            expected_by_broker[broker] = _validate_history_projection(
+                data_dir, reports_dir, broker, history, exact
+            )
+        except Exception as exc:
+            errors.append(f"{broker} 历史报告检查失败：{type(exc).__name__}: {exc}")
+    return expected_by_broker, errors
 
 
 def _effective_reports_dir(
@@ -349,6 +830,20 @@ def _listener(url: str) -> tuple[int, Path]:
     if not cwd_line:
         raise RuntimeError("无法读取 Dashboard 进程工作目录")
     return pid, Path(cwd_line[1:]).resolve()
+
+
+def _process_started_after_commit(pid: int, cwd: Path, sha: str) -> bool:
+    started = datetime.strptime(
+        subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "lstart="], text=True
+        ).strip(),
+        "%a %b %d %H:%M:%S %Y",
+    ).astimezone()
+    committed = int(subprocess.check_output(
+        ["git", "-C", str(cwd), "show", "-s", "--format=%ct", sha],
+        text=True,
+    ).strip())
+    return started.timestamp() >= committed
 
 
 def _is_actionable_console_error(message: str) -> bool:
@@ -946,6 +1441,13 @@ def _check_account_holdings(
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 账户区块出现横向滚动"
+        if broker in TREND_REPORT_BROKERS:
+            report = reports.get(broker) if isinstance(reports, Mapping) else None
+            assert isinstance(report, Mapping), f"API 缺少 {broker} 趋势报告状态"
+            assert report.get("available") is True, f"{broker} 当前趋势报告不可用"
+            if reports_dir is not None:
+                _check_trend_artifact_projection(reports_dir, broker, report)
+            continue
         entry_label = "期权关注" if broker == "futu" else "当天趋势报告"
         assert entry_label in text, f"{broker} 账户区块缺少 {entry_label}"
         report = reports.get(broker) if isinstance(reports, Mapping) else None
@@ -1562,6 +2064,8 @@ def _browser_check(
     expected_cn: int,
     payload: dict[str, Any],
     reports_dir: Path | None = None,
+    simulate_payloads: Mapping[str, Mapping[str, Any]] | None = None,
+    history_expectations: Mapping[str, list[Mapping[str, Any]]] | None = None,
 ) -> tuple[list[str], str | None]:
     try:
         from playwright.sync_api import sync_playwright
@@ -1625,6 +2129,17 @@ def _browser_check(
                         )
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
+                    if simulate_payloads is not None and history_expectations is not None:
+                        try:
+                            _check_trend_account_views(
+                                page,
+                                payload,
+                                simulate_payloads,
+                                history_expectations,
+                                screenshot_dir=ACCEPTANCE_SCREENSHOT_DIR,
+                            )
+                        except Exception as exc:
+                            errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
                         _select_account_tab(page, "futu")
                         _check_session_prices(page)
@@ -1685,6 +2200,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--expected-root", type=Path, default=Path.cwd())
     parser.add_argument("--expected-sha")
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--log", type=Path, default=Path("/tmp/open_trader_dashboard_8766.log"))
     return parser
 
@@ -1694,6 +2210,9 @@ def main(argv: list[str] | None = None) -> int:
     errors: list[str] = []
     browser_payload: dict[str, Any] = {}
     reports_dir: Path | None = None
+    simulate_payloads: dict[str, dict[str, Any]] = {}
+    history_expectations: dict[str, list[dict[str, Any]]] = {}
+    external_blocker: str | None = None
     try:
         phillips_total, phillips_period = _latest_phillips_expectation(
             _project_data_dir(args.expected_root)
@@ -1709,6 +2228,8 @@ def main(argv: list[str] | None = None) -> int:
         ).strip()
         if running_sha != expected_sha:
             errors.append(f"运行 Git SHA 不匹配：{running_sha[:7]} != {expected_sha[:7]}")
+        elif not _process_started_after_commit(pid, cwd, expected_sha):
+            errors.append(f"Dashboard 进程早于验收 Git SHA：{pid}")
         first = _fetch_payload(args.url)
         first_reports_dir = _effective_reports_dir(first, process_cwd=cwd)
         errors.extend(validate_dashboard_payload(
@@ -1718,6 +2239,27 @@ def main(argv: list[str] | None = None) -> int:
             expected_phillips_total=phillips_total,
             expected_phillips_period=phillips_period,
         ))
+        try:
+            account_ids = _configured_simulate_account_ids(
+                args.expected_root, args.config
+            )
+        except Exception as exc:
+            external_blocker = f"Futu 模拟账户配置不可用：{exc}"
+        else:
+            (
+                simulate_payloads,
+                simulate_errors,
+                external_blocker,
+            ) = _check_simulated_accounts(
+                args.url, first, account_ids, first_reports_dir
+            )
+            errors.extend(simulate_errors)
+        history_expectations, history_errors = _check_history_endpoints(
+            args.url,
+            _project_data_dir(args.expected_root),
+            first_reports_dir,
+        )
+        errors.extend(history_errors)
         quotes = _fetch_quotes_payload(args.url)
         errors.extend(validate_quotes_payload(quotes))
         second = _fetch_payload(args.url)
@@ -1742,11 +2284,21 @@ def main(argv: list[str] | None = None) -> int:
         args.expected_cn,
         browser_payload,
         reports_dir,
+        simulate_payloads,
+        history_expectations,
     )
     errors.extend(browser_errors)
     errors.extend(_log_errors(args.log))
-    status = classify_result(errors, browser_blocker=blocker)
-    result = {"status": status, "pid": pid, "errors": errors, "blocker": blocker}
+    status = classify_result(
+        errors, browser_blocker=blocker, external_blocker=external_blocker
+    )
+    blockers = [item for item in (external_blocker, blocker) if item]
+    result = {
+        "status": status,
+        "pid": pid,
+        "errors": errors,
+        "blocker": "；".join(blockers) or None,
+    }
     print(json.dumps(result, ensure_ascii=False))
     return {"PASS": 0, "FAIL": 1, "BLOCKED": 2}[status]
 
