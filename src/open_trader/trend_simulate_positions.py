@@ -244,19 +244,20 @@ def _position_attributions(
 
     attributions: dict[str, dict[str, Any]] = {}
     for symbol, report_hashes in active.items():
+        valid_hashes = report_hashes - {None}
+        if len(valid_hashes) > 1:
+            attributions[symbol] = {
+                "attribution_status": "conflict",
+                "report": None,
+            }
+            continue
         if None in report_hashes:
             attributions[symbol] = {
                 "attribution_status": "unlinked",
                 "report": None,
             }
             continue
-        if len(report_hashes) > 1:
-            attributions[symbol] = {
-                "attribution_status": "conflict",
-                "report": None,
-            }
-            continue
-        report_hash = next(iter(report_hashes))
+        report_hash = next(iter(valid_hashes))
         report = reports.get(report_hash)
         attributions[symbol] = (
             {"attribution_status": "linked", "report": report}

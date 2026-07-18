@@ -293,6 +293,37 @@ def test_simulated_positions_fail_closed_on_conflicting_reports(
     assert payload["positions"][0]["report"] is None
 
 
+def test_simulated_positions_conflict_takes_precedence_over_unattributable_buy(
+    tmp_path: Path,
+) -> None:
+    first = _frozen_report(version="v1")
+    second = _frozen_report(version="v2")
+    _write_report(tmp_path, broker="tiger", artifact="first.json", payload=first)
+    _write_report(tmp_path, broker="tiger", artifact="second.json", payload=second)
+    _write_action_event(
+        tmp_path,
+        report_sha256=_report_hash(first),
+        recorded_at="2026-07-20T10:00:00-04:00",
+    )
+    _write_action_event(
+        tmp_path,
+        report_sha256=_report_hash(second),
+        strategy_version="v2",
+        recorded_at="2026-07-20T10:01:00-04:00",
+    )
+    _write_action_event(
+        tmp_path,
+        report_sha256=None,
+        strategy_version="v3",
+        recorded_at="2026-07-20T10:02:00-04:00",
+    )
+
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+
+    assert payload["positions"][0]["attribution_status"] == "conflict"
+    assert payload["positions"][0]["report"] is None
+
+
 def test_simulated_positions_replay_sell_then_new_partial_buy(tmp_path: Path) -> None:
     first = _frozen_report(version="v1")
     second = _frozen_report(version="v2")
