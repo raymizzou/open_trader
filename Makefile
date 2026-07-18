@@ -5,7 +5,7 @@ REPOSITORY_ROOT := $(shell git rev-parse --path-format=absolute --git-common-dir
 
 DASHBOARD_URL ?= http://127.0.0.1:8766
 DASHBOARD_LOG ?= /tmp/open_trader_dashboard_8766.log
-EXPECTED_CN ?= 4
+EXPECTED_CN ?= 2
 
 test:
 	cd "$(REPOSITORY_ROOT)" && \

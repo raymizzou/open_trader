@@ -59,7 +59,7 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
     assert '"$(WORKTREE_ROOT)/tests" -q' in makefile
     assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
     assert 'DASHBOARD_LOG ?= /tmp/open_trader_dashboard_8766.log' in makefile
-    assert 'EXPECTED_CN ?= 4' in makefile
+    assert 'EXPECTED_CN ?= 2' in makefile
     assert '--url "$(DASHBOARD_URL)"' in makefile
     assert '--log "$(DASHBOARD_LOG)"' in makefile
     assert '--expected-cn "$(EXPECTED_CN)"' in makefile
@@ -3954,6 +3954,23 @@ class AccountViewContractPage:
     def evaluate(self, expression: str) -> bool:
         assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
         return self.fits
+
+
+def test_wait_for_simulate_positions_waits_past_loading_state() -> None:
+    calls: list[tuple[str, object]] = []
+
+    class Page:
+        def wait_for_function(self, expression: str, argument: object) -> None:
+            calls.append((expression, argument))
+
+    dashboard_acceptance._wait_for_simulate_positions(Page(), "eastmoney", 1)
+
+    assert calls == [(
+        dashboard_acceptance.SIMULATE_POSITIONS_READY_EXPRESSION,
+        {"broker": "eastmoney", "expected": 1},
+    )]
+    assert "模拟盘持仓加载中" in calls[0][0]
+    assert "querySelectorAll" in calls[0][0]
 
 
 @pytest.mark.parametrize(

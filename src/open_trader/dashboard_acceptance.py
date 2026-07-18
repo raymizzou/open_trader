@@ -49,6 +49,16 @@ ACCOUNT_VIEW_LABELS = {
     "phillips": ("真实持仓", "模拟盘持仓", "趋势报告", "港股复盘"),
     "eastmoney": ("真实持仓", "模拟盘持仓", "趋势报告", "A股复盘"),
 }
+SIMULATE_POSITIONS_READY_EXPRESSION = """
+({broker, expected}) => {
+  const panel = document.querySelector(`#account-${broker}-view-panel`);
+  const tab = document.querySelector(`#account-${broker}-view-simulate`);
+  if (!panel || tab?.getAttribute("aria-selected") !== "true") return false;
+  if (panel.textContent.includes("模拟盘持仓加载中")) return false;
+  return expected === null
+    || panel.querySelectorAll(".account-holding-row").length === expected;
+}
+"""
 OPTION_ATTENTION_COLUMN_LABELS = (
     "标的",
     "分类",
@@ -608,6 +618,15 @@ def _check_account_view_contract(page: Any, section: Any, broker: str) -> None:
     ), f"{broker} 账户视图出现横向滚动"
 
 
+def _wait_for_simulate_positions(
+    page: Any, broker: str, expected: int | None,
+) -> None:
+    page.wait_for_function(
+        SIMULATE_POSITIONS_READY_EXPRESSION,
+        {"broker": broker, "expected": expected},
+    )
+
+
 def _check_trend_account_views(
     page: Any,
     payload: Mapping[str, Any],
@@ -633,15 +652,18 @@ def _check_trend_account_views(
         _check_account_view_contract(page, section, broker)
         panel = section.locator(f"#account-{broker}-view-panel")
         simulate_tab = section.locator('[data-account-view="simulate"]')
-        simulate_tab.click()
-        panel.locator(".account-holding-row, .account-empty").first.wait_for()
-        rows = panel.locator(".account-holding-row")
         simulated = simulate_payloads.get(broker)
+        positions = simulated.get("positions") if simulated is not None else []
+        if simulated is not None:
+            assert isinstance(positions, list)
+        simulate_tab.click()
+        _wait_for_simulate_positions(
+            page, broker, len(positions) if simulated is not None else None
+        )
+        rows = panel.locator(".account-holding-row")
         if simulated is None:
             assert rows.count() == 0, f"{broker} Futu 不可用时显示了替代持仓"
         else:
-            positions = simulated.get("positions")
-            assert isinstance(positions, list)
             assert rows.count() == len(positions), f"{broker} 模拟盘持仓行数不匹配"
             for index, position in enumerate(positions):
                 assert isinstance(position, Mapping)
