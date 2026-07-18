@@ -1257,10 +1257,59 @@ table {
 .account-section-header {
   align-items: flex-start;
   border-left: 3px solid var(--broker-accent);
-  display: flex;
+  display: grid;
   gap: 16px;
-  justify-content: space-between;
+  grid-template-columns: minmax(0, .8fr) minmax(0, 1.4fr) minmax(0, 1fr) auto;
   padding: 12px;
+}
+
+.account-view-tabs {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 8px;
+  grid-column: 1 / -1;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.account-view-tab {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: var(--muted);
+  cursor: pointer;
+  flex: 0 0 auto;
+  min-height: 44px;
+  padding: 0 10px;
+  position: relative;
+}
+
+.account-view-tab[aria-selected="true"] {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.account-view-tab[aria-selected="true"]::after {
+  background: var(--broker-accent);
+  bottom: -1px;
+  content: "";
+  height: 2px;
+  inset-inline: 8px;
+  position: absolute;
+}
+
+.account-view-tab:focus-visible {
+  outline-offset: -3px;
+}
+
+.account-view-panel {
+  min-width: 0;
+}
+
+.account-view-panel > .cn-trend-report,
+.account-view-panel > .trend-review,
+.trend-history-panel {
+  padding: 18px;
 }
 
 .account-cash-details {
@@ -1284,6 +1333,7 @@ table {
 }
 
 .account-section-actions {
+  grid-column: 4;
   margin-left: auto;
   text-align: right;
 }
@@ -1503,6 +1553,70 @@ table {
   border-color: var(--line);
   color: var(--muted);
   cursor: not-allowed;
+}
+
+.trend-report-header .trend-history-button,
+.trend-history-button,
+.report-attribution-link {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: var(--muted);
+  cursor: pointer;
+  min-height: 44px;
+  padding: 0 8px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.report-attribution-link {
+  display: block;
+  padding: 0;
+  text-align: left;
+}
+
+.trend-history-panel header {
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+}
+
+.trend-history-panel h1 {
+  font-size: 20px;
+  margin: 0;
+}
+
+.trend-history-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.trend-history-list li + li {
+  border-top: 1px solid var(--line);
+}
+
+.trend-history-list button,
+.trend-history-list li > span {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  display: flex;
+  justify-content: space-between;
+  min-height: 44px;
+  padding: 8px;
+  text-align: left;
+  width: 100%;
+}
+
+.trend-history-list button {
+  cursor: pointer;
+}
+
+.trend-history-list button span {
+  color: var(--muted);
 }
 
 .trend-report-workspace {
@@ -4057,6 +4171,10 @@ table {
 }
 
 @media (max-width: 760px) {
+  body {
+    overflow-x: hidden;
+  }
+
   .backtest-comparison-grid,
   .backtest-artifacts li,
   .backtest-run-details { grid-template-columns: 1fr; }
@@ -4273,6 +4391,21 @@ table {
   .account-section-header {
     display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .account-view-tabs {
+    grid-column: 1;
+    overflow-x: auto;
+  }
+
+  .account-section-actions {
+    grid-column: 1;
+  }
+
+  .account-view-panel > .cn-trend-report,
+  .account-view-panel > .trend-review,
+  .trend-history-panel {
+    padding: 12px;
   }
 
   .statement-upload {

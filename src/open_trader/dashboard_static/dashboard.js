@@ -14,6 +14,10 @@ const state = {
   selectedDecisionTab: "final",
   selectedTrendBroker: "",
   selectedTrendKind: "",
+  accountViews: {tiger: "real", phillips: "real", eastmoney: "real"},
+  trendSimulatePositions: {},
+  trendReportHistories: {},
+  trendHistoricalReports: {},
   decisionDeepLinkRestored: false,
   detailLanguage: "zh",
   refreshActive: false,
@@ -57,6 +61,8 @@ const ACCOUNT_STRATEGY_PROFILES = {
 };
 
 const ACCOUNT_BROKERS = Object.keys(ACCOUNT_STRATEGY_PROFILES);
+const TREND_ACCOUNT_BROKERS = ["tiger", "phillips", "eastmoney"];
+const ACCOUNT_VIEW_KEYS = ["real", "simulate", "report", "review"];
 
 const DECISION_TABS = [
   { key: "final", label: "最终决策" },
@@ -251,6 +257,32 @@ function bindEvents() {
   elements["account-tabs"].addEventListener("keydown", handleBrokerTabKeydown);
   elements["broker-summary-cards"].addEventListener("click", handleBrokerSelection);
   elements["account-holdings"].addEventListener("click", (event) => {
+    const accountView = event.target.closest("[data-account-view]");
+    if (accountView) {
+      setAccountView(
+        accountView.dataset.accountBroker || "",
+        accountView.dataset.accountView || "",
+      );
+      return;
+    }
+    const currentReport = event.target.closest("[data-current-trend-report]");
+    if (currentReport) {
+      showCurrentTrendReport(currentReport.dataset.currentTrendReport || "");
+      return;
+    }
+    const reportHistory = event.target.closest("[data-report-history]");
+    if (reportHistory) {
+      openTrendReportHistory(reportHistory.dataset.reportHistory || "");
+      return;
+    }
+    const historyArtifact = event.target.closest("[data-history-artifact]");
+    if (historyArtifact) {
+      loadHistoricalTrendReport(
+        historyArtifact.dataset.historyBroker || state.brokerFilter,
+        historyArtifact.dataset.historyArtifact || "",
+      );
+      return;
+    }
     const statementUpload = event.target.closest("[data-statement-upload]");
     if (statementUpload) {
       const broker = statementUpload.dataset.statementUpload || "";
@@ -276,6 +308,7 @@ function bindEvents() {
     }
     handleSymbolDetailClick(event);
   });
+  elements["account-holdings"].addEventListener("keydown", handleAccountViewTabKeydown);
   elements["account-holdings"].addEventListener("change", handleStatementFileSelection);
   if (elements["trade-actions"]) {
     elements["trade-actions"].addEventListener("click", (event) => {
@@ -1977,7 +2010,7 @@ function renderTrendReviewChart(review, title, definitions) {
   </figure>`;
 }
 
-function renderTrendReviewWorkspace(review) {
+function renderTrendReviewWorkspace(review, embedded = false) {
   const snapshot = review.strategy_snapshot || {};
   const rows = Array.isArray(snapshot.parameter_rows) ? snapshot.parameter_rows : [];
   return `<main class="trend-review">
@@ -1985,7 +2018,7 @@ function renderTrendReviewWorkspace(review) {
       <div><p>${escapeHtml(`${formatPlain(review.broker_label)}｜${formatPlain(review.market_label)}`)}</p>
       <h1>${escapeHtml(`${formatPlain(review.market_label)}趋势复盘`)}</h1>
       <span>${escapeHtml(formatPlain(snapshot.strategy_name))}｜版本 ${escapeHtml(formatPlain(snapshot.strategy_version))}</span></div>
-      <button type="button" data-close-trend-report>返回持仓看板</button>
+      ${embedded ? "" : '<button type="button" data-close-trend-report>返回持仓看板</button>'}
     </header>
     <section class="trend-review-parameters"><h2>当前策略参数</h2>
       <div class="trend-review-parameter-list trend-review-parameter-table">${rows.map((row) => `<div><span>${escapeHtml(formatPlain(row.group))}</span><strong>${escapeHtml(formatPlain(row.name))}</strong><p>${escapeHtml(formatPlain(row.value))}</p></div>`).join("")}</div>
@@ -2285,7 +2318,7 @@ function renderCnTrendAudit(audit) {
   </details>`;
 }
 
-function renderCnTrendReportWorkspace(report) {
+function renderCnTrendReportWorkspace(report, embedded = false, historical = false) {
   const counts = report.counts || {};
   const audit = report.audit || {};
   const isCn = String(report.market || "").toUpperCase() === "CN";
@@ -2294,7 +2327,11 @@ function renderCnTrendReportWorkspace(report) {
   return `<main class="cn-trend-report">
     <header class="trend-report-header">
       <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1></div>
-      <button type="button" data-close-trend-report>返回持仓看板</button>
+      ${embedded
+        ? historical
+          ? `<button class="trend-history-button" type="button" data-current-trend-report="${escapeHtml(report.broker)}">返回当前报告</button>`
+          : `<button class="trend-history-button" type="button" data-report-history="${escapeHtml(report.broker)}">历史报告</button>`
+        : '<button type="button" data-close-trend-report>返回持仓看板</button>'}
       <dl>
         <div><dt>报告日期</dt><dd>${escapeHtml(formatPlain(report.report_date))}</dd></div>
         <div><dt>数据截至</dt><dd>${escapeHtml(formatPlain(report.data_date))}</dd></div>
@@ -2386,10 +2423,10 @@ function renderOptionAttentionWorkspace(report) {
   </main>`;
 }
 
-function renderTrendReportWorkspace(report) {
+function renderTrendReportWorkspace(report, embedded = false, historical = false) {
   return String(report && report.broker || "").toLowerCase() === "futu"
     ? renderOptionAttentionWorkspace(report || {})
-    : renderCnTrendReportWorkspace(report || {});
+    : renderCnTrendReportWorkspace(report || {}, embedded, historical);
 }
 
 function renderHeaderSummary() {
@@ -2488,6 +2525,170 @@ function handleBrokerTabKeydown(event) {
   elements["account-tabs"].querySelector(`[data-broker="${broker}"]`)?.focus();
 }
 
+function accountViewLabel(broker, view) {
+  if (view === "real") return "真实持仓";
+  if (view === "simulate") return "模拟盘持仓";
+  if (view === "report") return "趋势报告";
+  return `${{tiger: "美股", phillips: "港股", eastmoney: "A股"}[broker] || "市场"}复盘`;
+}
+
+function renderAccountViewTabs(broker) {
+  const selectedView = state.accountViews[broker] || "real";
+  return `<div class="account-view-tabs" role="tablist" aria-label="${escapeHtml(brokerDisplayName(broker))}账户视图">
+    ${ACCOUNT_VIEW_KEYS.map((view) => {
+      const selected = view === selectedView;
+      return `<button id="account-${escapeHtml(broker)}-view-${escapeHtml(view)}" class="account-view-tab" type="button" role="tab" data-account-broker="${escapeHtml(broker)}" data-account-view="${escapeHtml(view)}" aria-selected="${selected}" tabindex="${selected ? "0" : "-1"}" aria-controls="account-${escapeHtml(broker)}-view-panel">${escapeHtml(accountViewLabel(broker, view))}</button>`;
+    }).join("")}
+  </div>`;
+}
+
+async function setAccountView(broker, view) {
+  if (!TREND_ACCOUNT_BROKERS.includes(broker) || !ACCOUNT_VIEW_KEYS.includes(view)) return;
+  state.accountViews[broker] = view;
+  state.selectedHoldingKey = "";
+  state.selectedHoldingDetail = "decision";
+  state.selectedDecisionTab = "final";
+  syncDecisionDeepLink();
+  renderAccountHoldings();
+  if (view === "simulate" && !Object.hasOwn(state.trendSimulatePositions, broker)) {
+    await loadTrendSimulatePositions(broker);
+  }
+}
+
+function handleAccountViewTabKeydown(event) {
+  const tab = event.target.closest('[role="tab"][data-account-view]');
+  if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const broker = tab.dataset.accountBroker || "";
+  const current = ACCOUNT_VIEW_KEYS.indexOf(tab.dataset.accountView || "");
+  const index = event.key === "Home" ? 0
+    : event.key === "End" ? ACCOUNT_VIEW_KEYS.length - 1
+      : (current + (event.key === "ArrowRight" ? 1 : -1) + ACCOUNT_VIEW_KEYS.length) % ACCOUNT_VIEW_KEYS.length;
+  const view = ACCOUNT_VIEW_KEYS[index];
+  setAccountView(broker, view);
+  elements["account-holdings"].querySelector(`[data-account-view="${view}"]`)?.focus();
+}
+
+async function loadTrendSimulatePositions(broker) {
+  state.trendSimulatePositions[broker] = {loading: true};
+  renderAccountHoldings();
+  try {
+    const response = await fetch(`/api/trend-simulate-positions/${encodeURIComponent(broker)}`, {cache: "no-store"});
+    if (!response.ok) throw new Error(`simulate positions ${response.status}`);
+    state.trendSimulatePositions[broker] = await response.json();
+  } catch (error) {
+    state.trendSimulatePositions[broker] = {
+      available: false,
+      positions: [],
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  renderAccountHoldings();
+}
+
+function accountScrollY() {
+  return typeof window !== "undefined" && Number.isFinite(window.scrollY) ? window.scrollY : 0;
+}
+
+function restoreAccountScroll(scrollY) {
+  if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+    window.scrollTo(0, scrollY);
+  }
+}
+
+async function openTrendReportHistory(broker) {
+  if (!TREND_ACCOUNT_BROKERS.includes(broker)) return;
+  const existing = state.trendReportHistories[broker];
+  const scrollY = accountScrollY();
+  if (existing && Array.isArray(existing.rows)) {
+    state.trendReportHistories[broker] = {...existing, open: true, scrollY};
+    renderAccountViewPanelOnly(broker);
+    restoreAccountScroll(scrollY);
+    return;
+  }
+  state.trendReportHistories[broker] = {open: true, loading: true, rows: [], scrollY};
+  renderAccountViewPanelOnly(broker);
+  try {
+    const response = await fetch(`/api/trend-reports/${encodeURIComponent(broker)}/history`, {cache: "no-store"});
+    if (!response.ok) throw new Error(`report history ${response.status}`);
+    state.trendReportHistories[broker] = {
+      open: true,
+      loading: false,
+      rows: await response.json(),
+      scrollY,
+    };
+  } catch (error) {
+    state.trendReportHistories[broker] = {
+      open: true,
+      loading: false,
+      rows: [],
+      error: error instanceof Error ? error.message : String(error),
+      scrollY,
+    };
+  }
+  renderAccountViewPanelOnly(broker);
+  restoreAccountScroll(scrollY);
+}
+
+async function loadHistoricalTrendReport(broker, artifact) {
+  if (!TREND_ACCOUNT_BROKERS.includes(broker) || !artifact) return;
+  if (!Object.hasOwn(state.trendReportHistories, broker)) {
+    state.trendReportHistories[broker] = {open: false, rows: [], scrollY: accountScrollY()};
+  }
+  const history = state.trendReportHistories[broker];
+  state.accountViews[broker] = "report";
+  state.trendHistoricalReports[broker] = {artifact, loading: true};
+  renderAccountViewPanelOnly(broker);
+  try {
+    const response = await fetch(`/api/trend-reports/${encodeURIComponent(broker)}/history/${encodeURIComponent(artifact)}`, {cache: "no-store"});
+    if (!response.ok) throw new Error(`historical report ${response.status}`);
+    state.trendHistoricalReports[broker] = {artifact, report: await response.json()};
+  } catch (error) {
+    state.trendHistoricalReports[broker] = {
+      artifact,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  renderAccountViewPanelOnly(broker);
+  restoreAccountScroll(history.scrollY);
+}
+
+function showCurrentTrendReport(broker) {
+  const history = state.trendReportHistories[broker] || {};
+  delete state.trendHistoricalReports[broker];
+  if (Object.hasOwn(state.trendReportHistories, broker)) {
+    state.trendReportHistories[broker] = {...history, open: false};
+  }
+  renderAccountViewPanelOnly(broker);
+  restoreAccountScroll(history.scrollY || 0);
+}
+
+function filterAccountRows(rows) {
+  return rows.filter(({display}) => state.marketFilter === "ALL"
+    || String(display.market || "").toUpperCase() === state.marketFilter);
+}
+
+function renderAccountViewPanelOnly(broker) {
+  const container = elements["account-holdings"] || elements["holdings-body"];
+  const panel = state.brokerFilter === broker && typeof container?.querySelector === "function"
+    ? container.querySelector(`#account-${broker}-view-panel`)
+    : null;
+  if (!panel) {
+    renderAccountHoldings();
+    return;
+  }
+  const group = accountHoldingGroups().find((item) => item.broker === broker);
+  if (!group) return;
+  const view = state.accountViews[broker] || "real";
+  panel.innerHTML = renderAccountViewPanel({...group, rows: filterAccountRows(group.rows)});
+  panel.setAttribute("aria-labelledby", `account-${broker}-view-${view}`);
+  container.querySelectorAll?.(`#account-${broker} [data-account-view]`).forEach((tab) => {
+    const selected = tab.dataset.accountView === view;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  });
+}
+
 function renderAccountHoldings() {
   const container = elements["account-holdings"] || elements["holdings-body"];
   elements["workspace-grid"].classList.remove("detail-mode");
@@ -2512,9 +2713,12 @@ function renderAccountHoldings() {
     if (typeof container.removeAttribute === "function") container.removeAttribute("aria-label");
     container.setAttribute("aria-labelledby", `account-tab-${active.broker}`);
   }
-  const rows = active ? active.rows.filter(({display}) => state.marketFilter === "ALL"
-    || String(display.market || "").toUpperCase() === state.marketFilter) : [];
-  elements["visible-count"].textContent = `${formatDisplayNumber(rows.length)} 条`;
+  const rows = active ? filterAccountRows(active.rows) : [];
+  const simulated = active ? simulatedAccountRows(active.broker) : [];
+  const visibleRows = active && state.accountViews[active.broker] === "simulate"
+    ? filterAccountRows(simulated)
+    : rows;
+  elements["visible-count"].textContent = `${formatDisplayNumber(visibleRows.length)} 条`;
   container.innerHTML = active
     ? renderAccountSection({...active, rows})
     : '<div class="empty-state">暂无券商账户</div>';
@@ -2551,14 +2755,92 @@ function renderAccountSection(group) {
         <span>时间 ${escapeHtml(formatPlain(sourceTime))}</span>
         ${renderAccountCashDetails(group)}
       </div>
-      ${renderTrendReportEntry(group.broker)}
+      ${group.broker === "futu" ? renderTrendReportEntry(group.broker) : ""}
       <div class="account-section-actions">
         <strong>${escapeHtml(formatMoney(group.summary.portfolio_value_hkd, "HKD"))}</strong>
         ${renderStatementUpload(group.broker)}
       </div>
+      ${TREND_ACCOUNT_BROKERS.includes(group.broker) ? renderAccountViewTabs(group.broker) : ""}
     </header>
-    ${rows.length ? renderAccountTable(rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
+    ${TREND_ACCOUNT_BROKERS.includes(group.broker)
+      ? `<div id="account-${escapeHtml(group.broker)}-view-panel" class="account-view-panel" role="tabpanel" aria-labelledby="account-${escapeHtml(group.broker)}-view-${escapeHtml(state.accountViews[group.broker] || "real")}">${renderAccountViewPanel(group)}</div>`
+      : rows.length ? renderAccountTable(rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
   </section>`;
+}
+
+function renderAccountViewPanel(group) {
+  const view = state.accountViews[group.broker] || "real";
+  if (view === "simulate") return renderSimulatedAccountView(group.broker);
+  if (view === "report") return renderEmbeddedTrendReport(group.broker);
+  if (view === "review") {
+    const review = state.dashboard?.trend_reviews?.[group.broker] || {};
+    return review.available
+      ? renderTrendReviewWorkspace(review, true)
+      : `<p class="account-empty">${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</p>`;
+  }
+  return group.rows.length
+    ? renderAccountTable(group.rows)
+    : '<p class="account-empty">当前筛选下没有持仓</p>';
+}
+
+function simulatedAccountRows(broker) {
+  const payload = state.trendSimulatePositions[broker] || {};
+  const positions = Array.isArray(payload.positions) ? payload.positions : [];
+  return positions.map((position, index) => {
+    const display = {
+      ...position,
+      total_quantity: position.quantity,
+      avg_cost_price: position.cost_price,
+    };
+    return {
+      key: `simulate:${broker}:${display.market || ""}:${display.symbol || ""}:${index}`,
+      broker,
+      holding: position,
+      display,
+      index,
+    };
+  });
+}
+
+function renderSimulatedAccountView(broker) {
+  const payload = state.trendSimulatePositions[broker];
+  if (!payload || payload.loading) return '<p class="account-empty">模拟盘持仓加载中</p>';
+  if (!payload.available) {
+    return `<p class="account-empty missing-text">${escapeHtml(formatPlain(payload.error || "模拟盘持仓不可用"))}</p>`;
+  }
+  const rows = filterAccountRows(simulatedAccountRows(broker));
+  return rows.length
+    ? renderAccountTable(rows, {simulated: true})
+    : '<p class="account-empty">当前无模拟盘持仓</p>';
+}
+
+function renderEmbeddedTrendReport(broker) {
+  const historical = state.trendHistoricalReports[broker];
+  if (historical) {
+    if (historical.loading) return '<p class="account-empty">历史报告加载中</p>';
+    if (historical.error) return `<div class="trend-history-panel"><button class="trend-history-button" type="button" data-current-trend-report="${escapeHtml(broker)}">返回当前报告</button><p class="missing-text">${escapeHtml(historical.error)}</p></div>`;
+    return renderTrendReportWorkspace(historical.report || {}, true, true);
+  }
+  const history = state.trendReportHistories[broker];
+  if (history?.open) return renderTrendReportHistory(broker, history);
+  const report = state.dashboard?.trend_reports?.[broker] || {};
+  return report.available
+    ? renderTrendReportWorkspace(report, true)
+    : `<p class="account-empty">${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</p>`;
+}
+
+function renderTrendReportHistory(broker, history) {
+  const rows = Array.isArray(history.rows) ? history.rows : [];
+  const content = history.loading
+    ? '<p class="account-empty">历史报告加载中</p>'
+    : history.error
+      ? `<p class="missing-text">${escapeHtml(history.error)}</p>`
+      : rows.length
+        ? `<ul class="trend-history-list">${rows.map((row) => row.available
+          ? `<li><button type="button" data-history-broker="${escapeHtml(broker)}" data-history-artifact="${escapeHtml(row.artifact)}"><strong>报告 ${escapeHtml(formatPlain(row.execution_date))} · ${escapeHtml(formatPlain(row.strategy_version))}</strong><span>${escapeHtml(row.artifact)}</span></button></li>`
+          : `<li><span class="missing-text">${escapeHtml(formatPlain(row.artifact))} · ${escapeHtml(formatPlain(row.status_text))}</span></li>`).join("")}</ul>`
+        : '<p class="account-empty">暂无历史报告</p>';
+  return `<section class="trend-history-panel"><header><h1>历史报告</h1><button class="trend-history-button" type="button" data-current-trend-report="${escapeHtml(broker)}">返回当前报告</button></header>${content}</section>`;
 }
 
 function renderAccountCashDetails(group) {
@@ -2637,37 +2919,56 @@ async function handleStatementFileSelection(event) {
   }
 }
 
-function renderAccountTable(rows) {
-  const selected = selectedHolding();
-  const body = rows.map((row) => {
-    const holding = row.holding;
-    const display = row.display;
-    const isSelected = selected && row.key === state.selectedHoldingKey;
-    const selectedDetail = isSelected ? normalizeHoldingDetailMode(state.selectedHoldingDetail) : "";
-    const pnlTone = pnlClass(display.unrealized_pnl_pct);
-    const detailActions = `<button class="expand-button" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="decision" data-detail-market="${escapeHtml(display.market)}" data-detail-symbol="${escapeHtml(display.symbol)}">交易决策</button><button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
-    const cells = `
-      <tr class="account-holding-row ${isSelected ? "active-row" : ""}">
-        <td class="account-holding-actions"><span class="account-mobile-label">明细</span>${detailActions}</td>
-        <td class="account-holding-market"><span class="account-mobile-label">市场</span>${escapeHtml(formatPlain(display.market))}</td>
-        <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span></td>
-        <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatDisplayNumber(display.total_quantity))}</td>
-        <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatDisplayNumber(display.avg_cost_price))}</td>
-        <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderQuotePrice(display, quoteForHolding(display))}</td>
-        <td class="number-cell account-holding-usd-value"><span class="account-mobile-label">美元市值</span>${escapeHtml(renderUsdMarketValue(display))}</td>
-        <td class="number-cell account-holding-market-value"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
-        <td class="number-cell account-holding-account-weight"><span class="account-mobile-label">账户权重</span>${escapeHtml(formatPlain(display.account_weight))}</td>
-        <td class="number-cell account-holding-portfolio-weight"><span class="account-mobile-label">组合权重</span>${escapeHtml(formatPlain(display.portfolio_weight))}</td>
-        <td class="number-cell account-holding-pnl${pnlTone ? ` ${pnlTone}` : ""}"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatSignedPnl(display.unrealized_pnl_pct))}</td>
-      </tr>`;
-    if (!isSelected) return cells;
-    return `${cells}<tr class="decision-detail-row"><td colspan="${ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT}"><div class="symbol-detail-panel inline-symbol-detail">${selectedDetail === "t_signal"
-      ? renderTSignalDetail(holding)
-      : renderSymbolDetail(holding, row.index)}</div></td></tr>`;
-  }).join("");
-  return `<table class="account-holdings-table"><thead><tr>${[
-    "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值", "港元市值", "账户权重", "组合权重", "盈亏",
-  ].map((label) => `<th>${label}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
+const ACCOUNT_HOLDING_COLUMNS = [
+  "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值", "港元市值", "账户权重", "组合权重", "盈亏",
+];
+
+function renderSimulationAttribution(position, broker) {
+  if (position.attribution_status === "conflict") {
+    return '<span class="missing-text">报告关联冲突</span>';
+  }
+  const report = position.report && typeof position.report === "object" ? position.report : null;
+  if (position.attribution_status !== "linked" || !report) {
+    return '<span class="meta-text">未关联历史报告</span>';
+  }
+  return `<button class="report-attribution-link" type="button" data-history-broker="${escapeHtml(broker)}" data-history-artifact="${escapeHtml(report.artifact)}">报告 ${escapeHtml(formatPlain(report.execution_date))} · ${escapeHtml(formatPlain(report.strategy_version))}</button>`;
+}
+
+function renderAccountHoldingRow(row, {simulated = false} = {}) {
+  const holding = row.holding;
+  const display = row.display;
+  const isSelected = !simulated && selectedHolding() && row.key === state.selectedHoldingKey;
+  const selectedDetail = isSelected ? normalizeHoldingDetailMode(state.selectedHoldingDetail) : "";
+  const pnlTone = pnlClass(display.unrealized_pnl_pct);
+  const detailActions = simulated
+    ? ""
+    : `<button class="expand-button" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="decision" data-detail-market="${escapeHtml(display.market)}" data-detail-symbol="${escapeHtml(display.symbol)}">交易决策</button><button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
+  const attribution = simulated ? renderSimulationAttribution(holding, row.broker) : "";
+  const quote = simulated && hasValue(display.last_price)
+    ? {last_price: display.last_price}
+    : quoteForHolding(display);
+  const cells = `<tr class="account-holding-row ${isSelected ? "active-row" : ""}">
+    <td class="account-holding-actions"><span class="account-mobile-label">明细</span>${detailActions}</td>
+    <td class="account-holding-market"><span class="account-mobile-label">市场</span>${escapeHtml(formatPlain(display.market))}</td>
+    <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span>${attribution}</td>
+    <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatDisplayNumber(display.total_quantity))}</td>
+    <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatDisplayNumber(display.avg_cost_price))}</td>
+    <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderQuotePrice(display, quote)}</td>
+    <td class="number-cell account-holding-usd-value"><span class="account-mobile-label">美元市值</span>${escapeHtml(renderUsdMarketValue(display))}</td>
+    <td class="number-cell account-holding-market-value"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
+    <td class="number-cell account-holding-account-weight"><span class="account-mobile-label">账户权重</span>${escapeHtml(formatPlain(display.account_weight))}</td>
+    <td class="number-cell account-holding-portfolio-weight"><span class="account-mobile-label">组合权重</span>${escapeHtml(formatPlain(display.portfolio_weight))}</td>
+    <td class="number-cell account-holding-pnl${pnlTone ? ` ${pnlTone}` : ""}"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatSignedPnl(display.unrealized_pnl_pct))}</td>
+  </tr>`;
+  if (!isSelected) return cells;
+  return `${cells}<tr class="decision-detail-row"><td colspan="${ACCOUNT_HOLDINGS_TABLE_COLUMN_COUNT}"><div class="symbol-detail-panel inline-symbol-detail">${selectedDetail === "t_signal"
+    ? renderTSignalDetail(holding)
+    : renderSymbolDetail(holding, row.index)}</div></td></tr>`;
+}
+
+function renderAccountTable(rows, options = {}) {
+  const body = rows.map((row) => renderAccountHoldingRow(row, options)).join("");
+  return `<div class="table-wrap account-holdings-table-wrap"><table class="account-holdings-table"><thead><tr>${ACCOUNT_HOLDING_COLUMNS.map((label) => `<th scope="col">${label}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
 function holdingKey(holding, index) {
