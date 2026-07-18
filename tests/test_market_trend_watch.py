@@ -243,6 +243,7 @@ def test_review_callback_failure_is_recorded_without_blocking_protection_notice(
     assert [event["event_type"] for event in events] == [
         "protection_triggered",
         "trend_review_callback_failed",
+        "trend_review_callback_failure_notified",
         "protection_triggered_notification_delivered_feishu",
         "protection_triggered_notification_delivered_macos",
     ]
@@ -291,7 +292,10 @@ def test_session_review_callback_failure_does_not_stop_watcher(tmp_path: Path) -
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     assert result.status == "completed"
     assert result.exception_count == 1
-    assert events[0]["event_type"] == "trend_review_callback_failed"
+    assert [event["event_type"] for event in events] == [
+        "trend_review_callback_failed",
+        "trend_review_callback_failure_notified",
+    ]
     assert events[0]["reason"] == "review open failed"
 
 
