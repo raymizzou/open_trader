@@ -3173,6 +3173,21 @@ console.log(JSON.stringify({urls,currentHtml,historyHtml,historicalHtml,restored
     assert rendered["workspaceHidden"] is False
 
 
+def test_dashboard_quote_refresh_does_not_replace_active_report_view() -> None:
+    output = run_dashboard_js(r'''
+elements["refresh-quotes"]={disabled:false,textContent:""};
+state.brokerFilter="tiger";
+state.accountViews.tiger="report";
+globalThis.fetch=async()=>({ok:true,json:async()=>({quotes:{},account_sync:{status:"skipped"}})});
+renderQuoteStatus=()=>{};
+let holdingRenders=0;
+renderHoldings=()=>{holdingRenders+=1;};
+await refreshQuotes();
+console.log(String(holdingRenders));
+''')
+    assert output.strip() == "0"
+
+
 def test_dashboard_account_view_keyboard_and_mobile_acceptance_css() -> None:
     output = run_dashboard_js(r'''
 let focused="";

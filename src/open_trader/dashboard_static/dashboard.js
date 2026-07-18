@@ -891,7 +891,6 @@ async function refreshQuotes() {
       await loadDashboard();
     }
     renderQuoteStatus(payload);
-    renderHoldings();
   } catch (error) {
     state.quotePayload = {
       status: "failed",
@@ -901,8 +900,8 @@ async function refreshQuotes() {
       quotes: state.quotes,
     };
     renderQuoteStatus(state.quotePayload);
-    renderHoldings();
   } finally {
+    if (!["report", "review"].includes(state.accountViews[state.brokerFilter])) renderHoldings();
     state.refreshActive = false;
     elements["refresh-quotes"].disabled = false;
     elements["refresh-quotes"].textContent = "刷新账户与行情";
