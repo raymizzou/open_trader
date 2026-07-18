@@ -351,14 +351,17 @@ def create_dashboard_server(
                         )
                         return
                     if len(route) == 3 and route[1] == "history":
-                        self._send_json(
-                            load_historical_trend_report(
+                        try:
+                            report = load_historical_trend_report(
                                 config.data_dir,
                                 config.reports_dir,
                                 broker=route[0],
                                 artifact=unquote(route[2]),
                             )
-                        )
+                        except FileNotFoundError as exc:
+                            self._send_error_json(exc, HTTPStatus.NOT_FOUND)
+                            return
+                        self._send_json(report)
                         return
                 except Exception as exc:
                     self._send_error_json(exc)
@@ -526,18 +529,19 @@ def create_dashboard_server(
             except (BrokenPipeError, ConnectionResetError):
                 return
 
-        def _send_error_json(self, error: Exception) -> None:
-            status = HTTPStatus.INTERNAL_SERVER_ERROR
-            if isinstance(error, RequestBodyTooLargeError):
-                status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
-            elif isinstance(error, FileNotFoundError):
-                status = HTTPStatus.NOT_FOUND
-            elif isinstance(error, PermissionError):
-                status = HTTPStatus.FORBIDDEN
-            elif isinstance(error, ValueError):
-                status = HTTPStatus.BAD_REQUEST
-            elif isinstance(error, StandardBacktestExecutionError):
-                status = HTTPStatus.BAD_GATEWAY
+        def _send_error_json(
+            self, error: Exception, status: HTTPStatus | None = None
+        ) -> None:
+            if status is None:
+                status = HTTPStatus.INTERNAL_SERVER_ERROR
+                if isinstance(error, RequestBodyTooLargeError):
+                    status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+                elif isinstance(error, PermissionError):
+                    status = HTTPStatus.FORBIDDEN
+                elif isinstance(error, ValueError):
+                    status = HTTPStatus.BAD_REQUEST
+                elif isinstance(error, StandardBacktestExecutionError):
+                    status = HTTPStatus.BAD_GATEWAY
             self._send_json(
                 {
                     "status": "error",

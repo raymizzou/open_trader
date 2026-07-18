@@ -344,6 +344,30 @@ def test_trend_report_history_marks_corrupt_artifact_without_hiding_siblings(
     }
 
 
+def test_trend_report_history_marks_symlink_escape_unreadable(tmp_path: Path) -> None:
+    from open_trader.dashboard import load_trend_report_history
+
+    outside = tmp_path / "outside"
+    write_trend_history_report(
+        outside,
+        "external.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    reports_dir = tmp_path / "reports"
+    linked = reports_dir / "trend_us_tiger" / "linked.json"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(outside / "trend_us_tiger" / "external.json")
+
+    history = load_trend_report_history(reports_dir, broker="tiger")
+
+    assert history == [{
+        "available": False,
+        "artifact": "linked.json",
+        "status_text": "报告不可读取",
+    }]
+
+
 def test_exact_historical_report_includes_its_immutable_execution(
     tmp_path: Path,
 ) -> None:
@@ -441,6 +465,39 @@ def test_historical_report_rejects_wrong_report_market(tmp_path: Path) -> None:
             config.reports_dir,
             broker="tiger",
             artifact="wrong-market.json",
+        )
+
+
+def test_trend_report_history_and_exact_loading_reject_missing_strategy_version(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import (
+        load_historical_trend_report,
+        load_trend_report_history,
+    )
+
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "missing-version.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    payload.pop("strategy_snapshot")
+    artifact = config.reports_dir / "trend_us_tiger" / "missing-version.json"
+    artifact.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert load_trend_report_history(config.reports_dir, broker="tiger") == [{
+        "available": False,
+        "artifact": "missing-version.json",
+        "status_text": "报告不可读取",
+    }]
+    with pytest.raises(ValueError, match="trend report artifact is unreadable"):
+        load_historical_trend_report(
+            config.data_dir,
+            config.reports_dir,
+            broker="tiger",
+            artifact="missing-version.json",
         )
 
 

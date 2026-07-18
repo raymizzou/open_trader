@@ -8202,6 +8202,48 @@ def test_dashboard_server_returns_json_500_when_dashboard_payload_raises(
     }
 
 
+def test_dashboard_server_keeps_unrelated_file_not_found_as_json_500(
+    tmp_path, monkeypatch,
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    def raise_file_not_found(config, **kwargs: Any) -> dict[str, Any]:
+        raise FileNotFoundError("dashboard source missing")
+
+    monkeypatch.setattr(
+        dashboard_web,
+        "build_dashboard_payload",
+        raise_file_not_found,
+    )
+    config = dashboard_config(tmp_path)
+    server = dashboard_web.create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        status, content_type, payload = read_error_json(
+            f"http://{host}:{port}/api/dashboard"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 500
+    assert content_type == "application/json; charset=utf-8"
+    assert payload == {
+        "status": "error",
+        "error_type": "FileNotFoundError",
+        "message": "dashboard source missing",
+    }
+
+
 def test_dashboard_server_serves_static_routes_when_files_exist(
     tmp_path,
     monkeypatch,

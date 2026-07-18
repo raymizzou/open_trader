@@ -493,6 +493,38 @@ def _load_trend_reports(
     return reports
 
 
+def _validated_trend_report_artifact(
+    reports_dir: Path, *, artifact: str, market: str, broker: str
+) -> tuple[Path, dict[str, Any], date, date, date, datetime, str] | None:
+    artifact_path = Path(artifact)
+    if artifact_path.name != artifact or artifact_path.suffix != ".json":
+        raise ValueError("unsafe trend report artifact")
+    reports_dir = reports_dir.resolve()
+    path = (reports_dir / artifact).resolve()
+    if path.parent != reports_dir:
+        raise ValueError("unsafe trend report artifact")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    chronology = _valid_trend_report_payload(
+        payload, market=market, broker=broker
+    )
+    snapshot = payload.get("strategy_snapshot")
+    strategy_version = (
+        str(snapshot.get("strategy_version") or "").strip()
+        if isinstance(snapshot, dict)
+        else ""
+    )
+    if chronology is None or not strategy_version:
+        return None
+    return path, payload, *chronology, strategy_version
+
+
 def load_trend_report_history(
     reports_dir: Path, *, broker: str
 ) -> list[dict[str, Any]]:
@@ -511,28 +543,29 @@ def load_trend_report_history(
             "status_text": "报告不可读取",
         })
 
-    for path in (reports_dir / directory).glob("*.json"):
+    broker_dir = reports_dir / directory
+    for path in broker_dir.glob("*.json"):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+            selected = _validated_trend_report_artifact(
+                broker_dir,
+                artifact=path.name,
+                market=market,
+                broker=broker,
+            )
+        except (FileNotFoundError, ValueError):
+            selected = None
+        if selected is None:
             mark_unreadable(path)
             continue
-        if not isinstance(payload, dict):
-            mark_unreadable(path)
-            continue
-        chronology = _valid_trend_report_payload(
-            payload, market=market, broker=broker
-        )
-        snapshot = payload.get("strategy_snapshot")
-        strategy_version = (
-            str(snapshot.get("strategy_version") or "").strip()
-            if isinstance(snapshot, dict)
-            else ""
-        )
-        if chronology is None or not strategy_version:
-            mark_unreadable(path)
-            continue
-        execution_date, as_of_date, _, generated_at = chronology
+        (
+            _,
+            payload,
+            execution_date,
+            as_of_date,
+            _,
+            generated_at,
+            strategy_version,
+        ) = selected
         sell_actions, buy_actions, hold_actions, review_actions = (
             _project_trend_actions(payload, executions={})
         )
@@ -569,27 +602,24 @@ def load_historical_trend_report(
         )
     except KeyError:
         raise ValueError(f"unsupported trend report broker: {broker}") from None
-    artifact_path = Path(artifact)
-    if artifact_path.name != artifact or artifact_path.suffix != ".json":
-        raise ValueError("unsafe trend report artifact")
-    broker_dir = (reports_dir / directory).resolve()
-    path = (broker_dir / artifact).resolve()
-    if path.parent != broker_dir:
-        raise ValueError("unsafe trend report artifact")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        raise ValueError("trend report artifact is unreadable") from None
-    if not isinstance(payload, dict):
-        raise ValueError("trend report artifact is unreadable")
-    chronology = _valid_trend_report_payload(
-        payload, market=market, broker=broker
+    broker_dir = reports_dir / directory
+    selected = _validated_trend_report_artifact(
+        broker_dir,
+        artifact=artifact,
+        market=market,
+        broker=broker,
     )
-    if chronology is None:
+    if selected is None:
         raise ValueError("trend report artifact is unreadable")
-    execution_date, as_of_date, freshness_date, generated_at = chronology
+    (
+        path,
+        payload,
+        execution_date,
+        as_of_date,
+        freshness_date,
+        generated_at,
+        _,
+    ) = selected
     return _project_broker_trend_report(
         selected=(
             path,
@@ -600,7 +630,7 @@ def load_historical_trend_report(
             generated_at,
         ),
         data_dir=data_dir,
-        reports_dir=broker_dir,
+        reports_dir=broker_dir.resolve(),
         broker=broker,
         market=market,
         market_label=market_label,
