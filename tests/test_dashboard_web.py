@@ -3567,6 +3567,74 @@ window.fetch=async (input)=>{{
         dashboard_acceptance._check_account_view_contract(page, section, "tiger")
         tabs = section.locator('[role="tab"][data-account-view]')
         tabs.first.wait_for(timeout=5000)
+
+        original_label = tabs.first.inner_text()
+        try:
+            tabs.first.evaluate("node => { node.textContent = '错误标签'; }")
+            with pytest.raises(AssertionError, match="Tab 顺序"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            tabs.first.evaluate(
+                "(node, label) => { node.textContent = label; }", original_label
+            )
+
+        tabs.nth(1).evaluate("node => { node.parentElement.prepend(node); }")
+        try:
+            with pytest.raises(AssertionError, match="Tab 顺序"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            page.evaluate("renderAccountHoldings()")
+            section = page.locator("#account-tiger")
+            tabs = section.locator('[role="tab"][data-account-view]')
+
+        tabs.first.evaluate("node => node.setAttribute('aria-selected', 'false')")
+        tabs.nth(1).evaluate("node => node.setAttribute('aria-selected', 'true')")
+        try:
+            with pytest.raises(AssertionError, match="默认视图"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            tabs.first.evaluate("node => node.setAttribute('aria-selected', 'true')")
+            tabs.nth(1).evaluate("node => node.setAttribute('aria-selected', 'false')")
+
+        original_tab_style = tabs.first.get_attribute("style")
+        try:
+            tabs.first.evaluate("node => { node.style.border = '1px solid red'; }")
+            with pytest.raises(AssertionError, match="描边"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            tabs.first.evaluate(
+                "(node, style) => style === null ? node.removeAttribute('style') : node.setAttribute('style', style)",
+                original_tab_style,
+            )
+
+        page.locator("head").evaluate("""head => {
+          const style = document.createElement('style');
+          style.id = 'acceptance-broken-tab-indicator';
+          style.textContent = '[role="tab"][data-account-view][aria-selected="true"]::after { content: none !important; height: 0 !important; background: transparent !important; }';
+          head.appendChild(style);
+        }""")
+        try:
+            with pytest.raises(AssertionError, match="下划线"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            page.locator("#acceptance-broken-tab-indicator").evaluate(
+                "node => node.remove()"
+            )
+
+        original_document_style = page.locator("html").get_attribute("style")
+        try:
+            page.locator("html").evaluate(
+                "node => { node.style.minWidth = '2000px'; }"
+            )
+            with pytest.raises(AssertionError, match="横向滚动"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            page.locator("html").evaluate(
+                "(node, style) => style === null ? node.removeAttribute('style') : node.setAttribute('style', style)",
+                original_document_style,
+            )
+
+        dashboard_acceptance._check_account_view_contract(page, section, "tiger")
         assert [label.strip() for label in tabs.all_text_contents()] == [
             "真实持仓", "模拟盘持仓", "趋势报告", "美股复盘",
         ]
@@ -3633,6 +3701,55 @@ window.fetch=async (input)=>{{
         report_root.evaluate(
             "node => { node.dataset.strategyVersion = 'v1'; }"
         )
+        dashboard_acceptance._check_history_control_contract(
+            return_current, "tiger 返回当前报告"
+        )
+
+        original_control_style = return_current.get_attribute("style")
+        try:
+            return_current.evaluate("node => { node.style.border = '1px solid red'; }")
+            with pytest.raises(AssertionError, match="低强调"):
+                dashboard_acceptance._check_history_control_contract(
+                    return_current, "tiger 返回当前报告"
+                )
+        finally:
+            return_current.evaluate(
+                "(node, style) => style === null ? node.removeAttribute('style') : node.setAttribute('style', style)",
+                original_control_style,
+            )
+
+        dashboard_styles = page.locator("head style").first
+        try:
+            dashboard_styles.evaluate("node => { node.sheet.disabled = true; }")
+            assert return_current.evaluate(
+                "node => getComputedStyle(node).backgroundColor"
+            ) != "rgba(0, 0, 0, 0)"
+            with pytest.raises(AssertionError, match="低强调"):
+                dashboard_acceptance._check_history_control_contract(
+                    return_current, "tiger 返回当前报告"
+                )
+        finally:
+            dashboard_styles.evaluate("node => { node.sheet.disabled = false; }")
+            page.wait_for_function(
+                "getComputedStyle(document.querySelector('[data-current-trend-report]')).backgroundColor === 'rgba(0, 0, 0, 0)'",
+                timeout=1000,
+            )
+
+        original_control_style = return_current.get_attribute("style")
+        try:
+            return_current.evaluate(
+                "node => node.style.setProperty('font-weight', '700', 'important')"
+            )
+            with pytest.raises(AssertionError, match="低强调"):
+                dashboard_acceptance._check_history_control_contract(
+                    return_current, "tiger 返回当前报告"
+                )
+        finally:
+            return_current.evaluate(
+                "(node, style) => style === null ? node.removeAttribute('style') : node.setAttribute('style', style)",
+                original_control_style,
+            )
+
         dashboard_acceptance._check_history_control_contract(
             return_current, "tiger 返回当前报告"
         )
