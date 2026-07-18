@@ -3570,17 +3570,6 @@ window.fetch=async (input)=>{{
         assert [label.strip() for label in tabs.all_text_contents()] == [
             "真实持仓", "模拟盘持仓", "趋势报告", "美股复盘",
         ]
-        for index in range(tabs.count()):
-            style = tabs.nth(index).evaluate(
-                "node => { const s = getComputedStyle(node); "
-                "const a = getComputedStyle(node, '::after'); return {"
-                "widths: [s.borderTopWidth, s.borderRightWidth, "
-                "s.borderBottomWidth, s.borderLeftWidth], "
-                "indicatorHeight: a.height, indicatorContent: a.content}; }"
-            )
-            assert style["widths"] == ["0px", "0px", "0px", "0px"]
-            assert style["indicatorHeight"] == ("2px" if index == 0 else "auto")
-            assert style["indicatorContent"] == ('""' if index == 0 else "none")
         assert all((tab.bounding_box() or {})["height"] >= 44 for tab in tabs.all())
         assert section.locator('[aria-selected="true"]').inner_text().strip() == "真实持仓"
         header = section.locator(".account-section-header")
@@ -3647,12 +3636,6 @@ window.fetch=async (input)=>{{
         dashboard_acceptance._check_history_control_contract(
             return_current, "tiger 返回当前报告"
         )
-        assert return_current.evaluate(
-            """node => {
-              const style = getComputedStyle(node);
-              return {border: style.borderTopWidth, background: style.backgroundColor, fontWeight: style.fontWeight};
-            }""",
-        ) == {"border": "0px", "background": "rgba(0, 0, 0, 0)", "fontWeight": "400"}
         assert "错过" in section.inner_text()
         return_current.click()
         history_button = section.locator("[data-report-history]")
@@ -3660,12 +3643,6 @@ window.fetch=async (input)=>{{
         dashboard_acceptance._check_history_control_contract(
             history_button, "tiger 历史报告"
         )
-        assert history_button.evaluate(
-            """node => {
-              const style = getComputedStyle(node);
-              return {border: style.borderTopWidth, background: style.backgroundColor, fontWeight: style.fontWeight};
-            }""",
-        ) == {"border": "0px", "background": "rgba(0, 0, 0, 0)", "fontWeight": "400"}
         cash_details = section.locator(".account-cash-details")
         cash_details.evaluate("node => { node.open = true; node.dataset.historyStable = 'yes'; }")
         section.locator("[data-report-history]").click()

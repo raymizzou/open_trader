@@ -3921,6 +3921,49 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
     assert expectations[0]["artifact"] == "old.json"
 
 
+def test_acceptance_rejects_latest_exact_api_identity_that_differs_from_local_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_hash = "a" * 64
+    local_report = {
+        "artifact": "latest.json",
+        "execution_date": "2026-07-17",
+        "strategy_version": "v1",
+        "report_sha256": local_hash,
+    }
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_reports_by_hash",
+        lambda *_args, **_kwargs: {local_hash: local_report},
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_action_events", lambda *_args: [])
+
+    def fetch(_url: str, path: str) -> object:
+        if path.endswith("/history"):
+            return [{
+                "available": True,
+                "artifact": "latest.json",
+                "execution_date": "2026-07-17",
+                "strategy_version": "v1",
+            }]
+        return {
+            "artifact": "latest.json",
+            "report_date": "2026-07-17",
+            "strategy_version": "v2",
+            "report_sha256": "b" * 64,
+        }
+
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", fetch)
+
+    expectations, errors = dashboard_acceptance._check_history_endpoints(
+        "http://dashboard.test", tmp_path / "data", tmp_path / "reports"
+    )
+
+    assert expectations == {}
+    assert len(errors) == 3
+    assert all("精确历史报告身份不匹配" in error for error in errors)
+
+
 def test_acceptance_rejects_dirty_dashboard_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

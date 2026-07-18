@@ -935,12 +935,18 @@ def _check_history_endpoints(
                 assert isinstance(latest, Mapping), (
                     f"{latest_artifact} 精确历史报告缺失"
                 )
-                expectations.append({
-                    "artifact": latest_artifact,
-                    "execution_date": latest.get("report_date"),
-                    "strategy_version": latest.get("strategy_version"),
-                    "report_sha256": latest.get("report_sha256"),
-                })
+                local = next(
+                    (
+                        report for report in reports.values()
+                        if report.get("artifact") == latest_artifact
+                    ),
+                    None,
+                )
+                assert isinstance(local, Mapping), (
+                    f"{latest_artifact} 本地冻结报告缺失"
+                )
+                _check_report_identity(latest, local, broker)
+                expectations.append(dict(local))
             expected_by_broker[broker] = expectations
         except Exception as exc:
             errors.append(f"{broker} 历史报告检查失败：{type(exc).__name__}: {exc}")

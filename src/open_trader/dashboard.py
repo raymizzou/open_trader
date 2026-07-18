@@ -972,11 +972,12 @@ def _project_broker_trend_report(
     path, payload, execution_date, as_of_date, freshness_date, generated_at = selected
     account = payload["account"]
     metadata = payload["metadata"]
+    report_sha256 = _report_hash(payload)
     executions = _trend_action_executions(
         data_dir,
         market=market,
         execution_date=execution_date.isoformat(),
-        report_sha256=_report_hash(payload),
+        report_sha256=report_sha256,
     )
     sell_actions, buy_actions, hold_actions, review_actions = (
         _project_trend_actions(payload, executions)
@@ -992,7 +993,7 @@ def _project_broker_trend_report(
     return {
         "available": True,
         "artifact": path.name,
-        "report_sha256": _report_hash(payload),
+        "report_sha256": report_sha256,
         "strategy_version": str(
             (payload.get("strategy_snapshot") or {}).get("strategy_version") or ""
         ),
