@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 import inspect
 import json
@@ -59,10 +60,12 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
     assert '"$(WORKTREE_ROOT)/tests" -q' in makefile
     assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
     assert 'DASHBOARD_LOG ?= /tmp/open_trader_dashboard_8766.log' in makefile
-    assert 'EXPECTED_CN ?= 2' in makefile
+    assert "test:\n\t.venv/bin/python -m pytest -q" in makefile
+    assert "acceptance: test" not in makefile
+    assert "EXPECTED_CN" not in makefile
     assert '--url "$(DASHBOARD_URL)"' in makefile
     assert '--log "$(DASHBOARD_LOG)"' in makefile
-    assert '--expected-cn "$(EXPECTED_CN)"' in makefile
+    assert "--expected-cn" not in makefile
     assert "WAIT_SECONDS" not in makefile
     assert "--wait-seconds" not in makefile
 
@@ -217,7 +220,12 @@ def _run_acceptance_main_with_reports(
     if log_is_directory:
         log_path.mkdir()
     else:
-        log_path.write_text("", encoding="utf-8")
+        log_path.write_text(
+            'dashboard_runtime: {"pid": 123, "git_sha": "accepted-sha", '
+            '"cwd": "' + str(worktree.resolve()) + '", "source_state": "clean", '
+            '"started_at": "2026-07-18T12:00:01+08:00"}\n',
+            encoding="utf-8",
+        )
     if log_read_error is not None:
         original_read_text = Path.read_text
 
@@ -245,8 +253,16 @@ def _run_acceptance_main_with_reports(
     )
     monkeypatch.setattr(
         dashboard_acceptance,
-        "_process_started_after_commit",
-        lambda *_args: True,
+        "_process_started_at",
+        lambda *_args: datetime.fromisoformat("2026-07-18T12:00:00+08:00"),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance, "_source_changes", lambda *_args: []
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_expected_cn_holdings",
+        lambda *_args: 2,
     )
     monkeypatch.setattr(
         dashboard_acceptance, "_fetch_payload", lambda url: next(payloads)
@@ -286,7 +302,8 @@ def _run_acceptance_main_with_reports(
         del simulate_payloads, history_expectations
         browser_reports.append(reports_dir)
         if browser_log_text:
-            log_path.write_text(browser_log_text, encoding="utf-8")
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(browser_log_text)
         return [], None
 
     monkeypatch.setattr(dashboard_acceptance, "_browser_check", browser_check)
@@ -3665,18 +3682,19 @@ def test_acceptance_accepts_zero_simulated_positions(tmp_path: Path) -> None:
 
 
 def test_acceptance_classifies_unavailable_configured_futu_account_as_blocked(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def unavailable_client(**_kwargs: object) -> object:
         raise RuntimeError("OpenD unavailable")
 
+    monkeypatch.setattr(
+        dashboard_acceptance, "FutuSimulateOrderExecutionClient", unavailable_client
+    )
     payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
         "http://dashboard.test",
         {"futu_host": "127.0.0.1", "futu_port": 11111},
         {"tiger": 1, "phillips": 2, "eastmoney": 3},
         tmp_path,
-        client_factory=unavailable_client,
-        fetcher=lambda _url, _path: pytest.fail("substitute API rows were queried"),
     )
 
     assert payloads == {}
@@ -3688,7 +3706,7 @@ def test_acceptance_classifies_unavailable_configured_futu_account_as_blocked(
 
 
 def test_acceptance_treats_dashboard_simulate_fallback_as_fail_when_futu_works(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Client:
         def account_snapshot(self) -> dict[str, object]:
@@ -3708,13 +3726,17 @@ def test_acceptance_treats_dashboard_simulate_fallback_as_fail_when_futu_works(
             "error": "using cached report plan",
         }
 
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "FutuSimulateOrderExecutionClient",
+        lambda **_kwargs: Client(),
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", fetcher)
     _payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
         "http://dashboard.test",
         {"futu_host": "127.0.0.1", "futu_port": 11111},
         {"tiger": 1, "phillips": 2, "eastmoney": 3},
         tmp_path,
-        client_factory=lambda **_kwargs: Client(),
-        fetcher=fetcher,
     )
 
     assert blocker is None
@@ -3877,6 +3899,9 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
     ]
     exact = {
         "old.json": {
+            "artifact": "old.json",
+            "report_sha256": old_hash,
+            "strategy_version": "v1",
             "report_date": "2026-07-17",
             "audit": {"artifact": "old.json"},
             "buy_actions": [{
@@ -3896,117 +3921,135 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
     assert expectations[0]["artifact"] == "old.json"
 
 
-class AccountViewContractLocator:
-    def __init__(
-        self, page: "AccountViewContractPage", selector: str, index: int | None = None,
-    ) -> None:
-        self.page = page
-        self.selector = selector
-        self.index = index
+def test_acceptance_rejects_dirty_dashboard_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        dashboard_acceptance.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: " M src/open_trader/dashboard.py\n",
+    )
 
-    def count(self) -> int:
-        assert self.selector == '[role="tab"][data-account-view]'
-        return 4
-
-    def nth(self, index: int) -> "AccountViewContractLocator":
-        return AccountViewContractLocator(self.page, self.selector, index)
-
-    def inner_text(self) -> str:
-        assert self.index is not None
-        return self.page.labels[self.index]
-
-    def get_attribute(self, name: str) -> str:
-        assert self.index is not None
-        if name == "data-account-view":
-            return ("real", "simulate", "report", "review")[self.index]
-        if name == "aria-selected":
-            return str(self.index == self.page.selected_index).lower()
-        raise AssertionError(name)
-
-    def evaluate(self, expression: str) -> dict[str, str]:
-        assert "getComputedStyle" in expression
-        return {
-            "borderTopWidth": self.page.border_width,
-            "borderLeftWidth": self.page.border_width,
-            "borderRightWidth": self.page.border_width,
-            "backgroundColor": "rgba(0, 0, 0, 0)",
-            "borderRadius": "0px",
-        }
-
-
-class AccountViewContractPage:
-    def __init__(
-        self,
-        *,
-        labels: list[str] | None = None,
-        selected_index: int = 0,
-        border_width: str = "0px",
-        fits: bool = True,
-    ) -> None:
-        self.labels = labels or ["真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"]
-        self.selected_index = selected_index
-        self.border_width = border_width
-        self.fits = fits
-
-    def locator(self, selector: str) -> AccountViewContractLocator:
-        return AccountViewContractLocator(self, selector)
-
-    def evaluate(self, expression: str) -> bool:
-        assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
-        return self.fits
-
-
-def test_wait_for_simulate_positions_waits_past_loading_state() -> None:
-    calls: list[tuple[str, object]] = []
-
-    class Page:
-        def wait_for_function(self, expression: str, *, arg: object) -> None:
-            calls.append((expression, arg))
-
-    dashboard_acceptance._wait_for_simulate_positions(Page(), "eastmoney", 1)
-
-    assert calls == [(
-        dashboard_acceptance.SIMULATE_POSITIONS_READY_EXPRESSION,
-        {"broker": "eastmoney", "expected": 1},
-    )]
-    assert "模拟盘持仓加载中" in calls[0][0]
-    assert "querySelectorAll" in calls[0][0]
-    assert "document.activeElement !== tab" in calls[0][0]
+    assert dashboard_acceptance._source_changes(tmp_path) == [
+        "M src/open_trader/dashboard.py"
+    ]
 
 
 @pytest.mark.parametrize(
-    "page",
+    ("record", "message"),
     [
-        AccountViewContractPage(labels=["模拟盘持仓", "真实持仓", "趋势报告", "美股复盘"]),
-        AccountViewContractPage(selected_index=1),
-        AccountViewContractPage(border_width="1px"),
-        AccountViewContractPage(fits=False),
+        ({"pid": 122}, "PID"),
+        ({"git_sha": "old-sha"}, "Git SHA"),
+        ({"source_state": "dirty"}, "源码状态"),
+        ({"started_at": "2026-07-18T11:59:59+08:00"}, "启动时间"),
     ],
 )
-def test_acceptance_rejects_invalid_account_view_contract(
-    page: AccountViewContractPage,
+def test_acceptance_rejects_log_not_bound_to_candidate_process(
+    tmp_path: Path, record: dict[str, object], message: str,
 ) -> None:
-    with pytest.raises(AssertionError):
-        dashboard_acceptance._check_account_view_contract(page, page, "tiger")
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-07-18T12:00:01+08:00",
+        **record,
+    }
+    log = tmp_path / "dashboard.log"
+    log.write_text(f"dashboard_runtime: {json.dumps(runtime)}\n", encoding="utf-8")
+
+    assert any(message in error for error in dashboard_acceptance._log_errors(
+        log,
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat("2026-07-18T12:00:00+08:00"),
+    ))
 
 
-def test_acceptance_accepts_exact_account_view_contract() -> None:
-    page = AccountViewContractPage()
-
-    dashboard_acceptance._check_account_view_contract(page, page, "tiger")
-
-
-def test_acceptance_rejects_stale_process_even_when_worktree_head_matches(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    def output(command: list[str], **_kwargs: object) -> str:
-        if command[0] == "ps":
-            return "Sat Jul 18 12:00:00 2026\n"
-        assert command[:4] == ["git", "-C", str(tmp_path), "show"]
-        return "1784365200\n"  # 2026-07-18 13:00:00 +08:00
-
-    monkeypatch.setattr(dashboard_acceptance.subprocess, "check_output", output)
-
-    assert not dashboard_acceptance._process_started_after_commit(
-        123, tmp_path, "accepted-sha"
+def test_acceptance_rejects_appended_stale_log_content(tmp_path: Path) -> None:
+    started = datetime.fromisoformat("2026-07-18T12:00:00+08:00")
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-07-18T12:00:01+08:00",
+    }
+    log = tmp_path / "dashboard.log"
+    log.write_text(
+        "stale clean log content\n"
+        f"dashboard_runtime: {json.dumps(runtime)}\n",
+        encoding="utf-8",
     )
+
+    errors = dashboard_acceptance._log_errors(
+        log,
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=started,
+    )
+
+    assert any("新日志" in error for error in errors)
+
+
+def test_acceptance_rejects_log_older_than_candidate_process(tmp_path: Path) -> None:
+    started = datetime.fromisoformat("2026-07-18T12:00:00+08:00")
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-07-18T12:00:01+08:00",
+    }
+    log = tmp_path / "dashboard.log"
+    log.write_text(f"dashboard_runtime: {json.dumps(runtime)}\n", encoding="utf-8")
+    old = started.timestamp() - 1
+    os.utime(log, (old, old))
+
+    errors = dashboard_acceptance._log_errors(
+        log,
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=started,
+    )
+
+    assert any("修改时间" in error for error in errors)
+
+
+def test_acceptance_derives_cn_count_from_canonical_portfolio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = tmp_path / "data"
+    latest = data / "latest"
+    latest.mkdir(parents=True)
+    (latest / "portfolio.csv").write_text(
+        "market,asset_class,total_quantity\nCN,stock,10\nCN,stock,0\nUS,stock,2\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_project_data_dir", lambda _root: data)
+
+    assert dashboard_acceptance._expected_cn_holdings(tmp_path) == 1
+
+
+def test_acceptance_local_missing_futu_configuration_is_fail(tmp_path: Path) -> None:
+    payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
+        "http://dashboard.test",
+        {"futu_host": "", "futu_port": 0},
+        {"tiger": 0, "phillips": 0, "eastmoney": 0},
+        tmp_path,
+    )
+
+    assert payloads == {}
+    assert errors == ["Dashboard 缺少有效 Futu OpenD 配置"]
+    assert blocker is None
+    assert classify_result(errors, browser_blocker=None) == "FAIL"
+
+
+def test_acceptance_cli_has_no_test_only_config_or_expected_cn_options() -> None:
+    destinations = {action.dest for action in dashboard_acceptance.build_parser()._actions}
+
+    assert "config" not in destinations
+    assert "expected_cn" not in destinations

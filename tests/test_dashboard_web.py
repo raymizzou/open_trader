@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -17,6 +19,7 @@ from typing import Any
 import pytest
 
 from open_trader.dashboard_quotes import QuoteRefreshResult
+from open_trader import dashboard_acceptance
 from open_trader.dashboard_web import STATIC_DIR
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
@@ -3483,6 +3486,8 @@ def test_dashboard_account_view_dom_at_375px() -> None:
         "market": "US", "market_label": "美股", "report_date": "2026-07-20",
         "data_date": "2026-07-17", "generated_at": "2026-07-18T09:00:00+08:00",
         "account_status": "已更新", "counts": {}, "audit": {},
+        "artifact": "current.json", "report_sha256": "c" * 64,
+        "strategy_version": "v-current",
     }
     review = {
         "available": True, "broker": "tiger", "broker_label": "老虎",
@@ -3517,7 +3522,7 @@ def test_dashboard_account_view_dom_at_375px() -> None:
             "market_value": "380", "market_value_hkd": "2964", "account_weight": "38%",
             "portfolio_weight": "38%", "unrealized_pnl_pct": "5.56%",
             "attribution_status": "linked",
-            "report": {"artifact": "2026-07-16.json", "execution_date": "2026-07-20", "strategy_version": "v1"},
+            "report": {"artifact": "2026-07-16.json", "execution_date": "2026-07-20", "strategy_version": "v1", "report_sha256": "a" * 64},
         }],
     }
     bootstrap = f'''<script>
@@ -3533,7 +3538,7 @@ window.fetch=async (input)=>{{
   const payload=url==="/api/dashboard"?dashboardPayload
     :url==="/api/quotes"?{{status:"ok",quotes:{{}},account_sync:{{status:"skipped"}}}}
     :url==="/api/trend-reports/tiger/history"?[{{available:true,artifact:"2026-07-16.json",execution_date:"2026-07-17",strategy_version:"v1"}}]
-    :url.endsWith("/2026-07-16.json")?{{...dashboardPayload.trend_reports.tiger,buy_actions:[{{symbol:"AAPL",execution:{{status:"missed"}}}}]}}
+    :url.endsWith("/2026-07-16.json")?{{...dashboardPayload.trend_reports.tiger,artifact:"2026-07-16.json",report_sha256:"{'a' * 64}",strategy_version:"v1",report_date:"2026-07-20",buy_actions:[{{symbol:"AAPL",execution:{{status:"missed"}}}}]}}
     :{{available:false}};
   return {{ok:true,status:200,json:async()=>structuredClone(payload)}};
 }};
@@ -3559,11 +3564,23 @@ window.fetch=async (input)=>{{
         page.locator("#account-tab-tiger").click()
         assert errors == []
         section = page.locator("#account-tiger")
+        dashboard_acceptance._check_account_view_contract(page, section, "tiger")
         tabs = section.locator('[role="tab"][data-account-view]')
         tabs.first.wait_for(timeout=5000)
         assert [label.strip() for label in tabs.all_text_contents()] == [
             "真实持仓", "模拟盘持仓", "趋势报告", "美股复盘",
         ]
+        for index in range(tabs.count()):
+            style = tabs.nth(index).evaluate(
+                "node => { const s = getComputedStyle(node); "
+                "const a = getComputedStyle(node, '::after'); return {"
+                "widths: [s.borderTopWidth, s.borderRightWidth, "
+                "s.borderBottomWidth, s.borderLeftWidth], "
+                "indicatorHeight: a.height, indicatorContent: a.content}; }"
+            )
+            assert style["widths"] == ["0px", "0px", "0px", "0px"]
+            assert style["indicatorHeight"] == ("2px" if index == 0 else "auto")
+            assert style["indicatorContent"] == ('""' if index == 0 else "none")
         assert all((tab.bounding_box() or {})["height"] >= 44 for tab in tabs.all())
         assert section.locator('[aria-selected="true"]').inner_text().strip() == "真实持仓"
         header = section.locator(".account-section-header")
@@ -3590,6 +3607,46 @@ window.fetch=async (input)=>{{
         section.locator(".report-attribution-link").click()
         return_current = section.locator("[data-current-trend-report]")
         return_current.wait_for()
+        assert page.evaluate("window.__requests.at(-1)") == (
+            "/api/trend-reports/tiger/history/2026-07-16.json"
+        )
+        dashboard_acceptance._check_loaded_report_identity(
+            section, simulated["positions"][0]["report"], "tiger"
+        )
+        report_root = section.locator(".cn-trend-report")
+        report_root.evaluate(
+            "node => { node.dataset.reportArtifact = 'same-date-wrong.json'; }"
+        )
+        with pytest.raises(AssertionError, match="报告身份"):
+            dashboard_acceptance._check_loaded_report_identity(
+                section, simulated["positions"][0]["report"], "tiger"
+            )
+        report_root.evaluate(
+            "node => { node.dataset.reportArtifact = '2026-07-16.json'; }"
+        )
+        section.locator(".cn-trend-report").evaluate(
+            "node => { node.dataset.reportSha256 = 'wrong'; }"
+        )
+        with pytest.raises(AssertionError, match="报告身份"):
+            dashboard_acceptance._check_loaded_report_identity(
+                section, simulated["positions"][0]["report"], "tiger"
+            )
+        section.locator(".cn-trend-report").evaluate(
+            f"node => {{ node.dataset.reportSha256 = '{'a' * 64}'; }}"
+        )
+        report_root.evaluate(
+            "node => { node.dataset.strategyVersion = 'wrong-version'; }"
+        )
+        with pytest.raises(AssertionError, match="报告身份"):
+            dashboard_acceptance._check_loaded_report_identity(
+                section, simulated["positions"][0]["report"], "tiger"
+            )
+        report_root.evaluate(
+            "node => { node.dataset.strategyVersion = 'v1'; }"
+        )
+        dashboard_acceptance._check_history_control_contract(
+            return_current, "tiger 返回当前报告"
+        )
         assert return_current.evaluate(
             """node => {
               const style = getComputedStyle(node);
@@ -3599,6 +3656,10 @@ window.fetch=async (input)=>{{
         assert "错过" in section.inner_text()
         return_current.click()
         history_button = section.locator("[data-report-history]")
+        assert history_button.evaluate("node => node === document.activeElement")
+        dashboard_acceptance._check_history_control_contract(
+            history_button, "tiger 历史报告"
+        )
         assert history_button.evaluate(
             """node => {
               const style = getComputedStyle(node);
@@ -3618,6 +3679,9 @@ window.fetch=async (input)=>{{
         section.locator("[data-current-trend-report]").wait_for()
         assert "错过" in section.inner_text()
         section.locator("[data-current-trend-report]").click()
+        assert section.locator("[data-report-history]").evaluate(
+            "node => node === document.activeElement"
+        )
         assert cash_details.get_attribute("data-history-stable") == "yes"
         assert cash_details.evaluate("node => node.open") is True
         page.locator("#account-tab-futu").click()
@@ -8351,7 +8415,7 @@ def test_dashboard_http_rejects_unknown_simulated_broker(tmp_path) -> None:
 
 
 def test_serve_dashboard_configures_simulate_accounts_once(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
     from open_trader.dashboard import DETAIL_FX_TO_HKD
@@ -8399,6 +8463,12 @@ def test_serve_dashboard_configures_simulate_accounts_once(
 
     dashboard_web.serve_dashboard(config, host="127.0.0.1", port=0)
 
+    sha = subprocess.check_output(
+        ["git", "-C", str(Path.cwd()), "rev-parse", "HEAD"], text=True
+    ).strip()
+    output = capsys.readouterr().out
+    assert f'"pid": {os.getpid()}' in output
+    assert f'"git_sha": "{sha}"' in output
     assert len(created) == 1
     assert created[0]["account_ids"] == {
         "eastmoney": 101,

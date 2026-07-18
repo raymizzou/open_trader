@@ -408,6 +408,8 @@ def test_exact_historical_report_includes_its_immutable_execution(
     assert report["report_date"] == "2026-07-17"
     assert report["buy_actions"][0]["execution"]["status"] == "missed"
     assert report["audit"]["artifact"] == "2026-07-16.json"
+    assert report["report_sha256"] == _report_hash(payload)
+    assert report["strategy_version"] == "v1"
 
 
 @pytest.mark.parametrize("artifact", ["../secret.json", "/tmp/secret.json"])

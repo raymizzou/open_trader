@@ -12,11 +12,16 @@ import time
 from typing import Any
 from urllib.request import urlopen
 
+from .dashboard import _is_dashboard_holding, _read_csv_rows
 from .daily_premarket import _optional_positive_tm_id, _read_env_file
 from .futu_symbols import to_futu_symbol
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .parsers.phillips import PhillipsStatementParser
-from .trend_simulate_positions import _action_events, _reports_by_hash
+from .trend_simulate_positions import (
+    TREND_SIMULATE_BROKERS,
+    _action_events,
+    _reports_by_hash,
+)
 
 
 REQUIRED_SOURCE_PATHS = (
@@ -40,9 +45,7 @@ TREND_REPORT_DIRECTORIES = {
     "eastmoney": "trend_a_share",
 }
 TREND_SIMULATE_MARKETS = {
-    "tiger": "US",
-    "phillips": "HK",
-    "eastmoney": "CN",
+    broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
 ACCOUNT_VIEW_LABELS = {
     "tiger": ("真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"),
@@ -168,10 +171,8 @@ def _project_data_dir(root: Path) -> Path:
     return common.resolve().parent / "data"
 
 
-def _configured_simulate_account_ids(
-    expected_root: Path, config_path: Path | None = None,
-) -> dict[str, int]:
-    path = config_path or _project_data_dir(expected_root).parent / "config/daily_premarket.env"
+def _configured_simulate_account_ids(expected_root: Path) -> dict[str, int]:
+    path = _project_data_dir(expected_root).parent / "config/daily_premarket.env"
     values = _read_env_file(path)
     return {
         broker: _optional_positive_tm_id(
@@ -179,6 +180,14 @@ def _configured_simulate_account_ids(
         )
         for broker, market in TREND_SIMULATE_MARKETS.items()
     }
+
+
+def _expected_cn_holdings(expected_root: Path) -> int:
+    rows = _read_csv_rows(_project_data_dir(expected_root) / "latest/portfolio.csv")
+    return sum(
+        row.get("market", "").strip().upper() == "CN" and _is_dashboard_holding(row)
+        for row in rows
+    )
 
 
 def validate_dashboard_payload(
@@ -473,23 +482,21 @@ def _check_simulated_accounts(
     dashboard_payload: Mapping[str, Any],
     account_ids: Mapping[str, int],
     reports_dir: Path,
-    *,
-    client_factory: Any = FutuSimulateOrderExecutionClient,
-    fetcher: Any = _fetch_json_path,
 ) -> tuple[dict[str, dict[str, Any]], list[str], str | None]:
     host = dashboard_payload.get("futu_host")
     port = dashboard_payload.get("futu_port")
     if not isinstance(host, str) or not host or not isinstance(port, int) or port <= 0:
-        return {}, [], "Dashboard 缺少有效 Futu OpenD 配置"
+        return {}, ["Dashboard 缺少有效 Futu OpenD 配置"], None
     payloads: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
     for broker, market in TREND_SIMULATE_MARKETS.items():
         account_id = account_ids.get(broker, 0)
         if not isinstance(account_id, int) or account_id <= 0:
-            return payloads, errors, f"{broker} 配置的 Futu 模拟账户不可用"
+            errors.append(f"{broker} 配置的 Futu 模拟账户不可用")
+            continue
         client = None
         try:
-            client = client_factory(
+            client = FutuSimulateOrderExecutionClient(
                 host=host,
                 port=port,
                 simulate_acc_id=account_id,
@@ -505,7 +512,7 @@ def _check_simulated_accounts(
                 except Exception as exc:
                     return payloads, errors, f"{broker} Futu 模拟账户关闭失败：{exc}"
         try:
-            payload = fetcher(url, f"/api/trend-simulate-positions/{broker}")
+            payload = _fetch_json_path(url, f"/api/trend-simulate-positions/{broker}")
             assert isinstance(payload, dict), f"{broker} 模拟盘 API 不是对象"
             _validate_simulated_positions(broker, snapshot, payload, reports_dir)
         except Exception as exc:
@@ -560,6 +567,9 @@ def _validate_history_projection(
         audit = exact.get("audit")
         assert (
             exact.get("report_date") == report["execution_date"]
+            and exact.get("artifact") == artifact
+            and exact.get("report_sha256") == report_hash
+            and exact.get("strategy_version") == report["strategy_version"]
             and isinstance(audit, Mapping)
             and audit.get("artifact") == artifact
         ), f"{artifact} 精确历史报告身份不匹配"
@@ -602,18 +612,37 @@ def _check_account_view_contract(page: Any, section: Any, broker: str) -> None:
     expression = (
         "element => { const style = getComputedStyle(element); return {"
         "borderTopWidth: style.borderTopWidth, borderLeftWidth: style.borderLeftWidth, "
-        "borderRightWidth: style.borderRightWidth, backgroundColor: style.backgroundColor, "
-        "borderRadius: style.borderRadius}; }"
+        "borderRightWidth: style.borderRightWidth, "
+        "borderBottomWidth: style.borderBottomWidth, "
+        "backgroundColor: style.backgroundColor, "
+        "borderRadius: style.borderRadius, "
+        "indicatorHeight: getComputedStyle(element, '::after').height, "
+        "indicatorBackground: getComputedStyle(element, '::after').backgroundColor, "
+        "indicatorContent: getComputedStyle(element, '::after').content}; }"
     )
     for index in range(4):
         style = tabs.nth(index).evaluate(expression)
-        assert style == {
+        common = {
             "borderTopWidth": "0px",
             "borderLeftWidth": "0px",
             "borderRightWidth": "0px",
+            "borderBottomWidth": "0px",
             "backgroundColor": "rgba(0, 0, 0, 0)",
             "borderRadius": "0px",
-        }, f"{broker} 账户视图使用了描边或按钮背景：{style}"
+        }
+        assert {key: style.get(key) for key in common} == common, (
+            f"{broker} 账户视图使用了描边或按钮背景：{style}"
+        )
+        if index == 0:
+            assert (
+                style.get("indicatorHeight") == "2px"
+                and style.get("indicatorBackground") != "rgba(0, 0, 0, 0)"
+                and style.get("indicatorContent") == '""'
+            ), f"{broker} 选中 Tab 缺少 2px 下划线：{style}"
+        else:
+            assert style.get("indicatorContent") == "none", (
+                f"{broker} 未选中 Tab 错误显示下划线：{style}"
+            )
     assert page.evaluate(
         "document.documentElement.scrollWidth <= window.innerWidth"
     ), f"{broker} 账户视图出现横向滚动"
@@ -625,6 +654,59 @@ def _wait_for_simulate_positions(
     page.wait_for_function(
         SIMULATE_POSITIONS_READY_EXPRESSION,
         arg={"broker": broker, "expected": expected},
+    )
+
+
+def _check_history_control_contract(control: Any, context: str) -> None:
+    style = control.evaluate(
+        """element => { const style = getComputedStyle(element); return {
+          borderTopWidth: style.borderTopWidth,
+          borderLeftWidth: style.borderLeftWidth,
+          borderRightWidth: style.borderRightWidth,
+          borderBottomWidth: style.borderBottomWidth,
+          backgroundColor: style.backgroundColor,
+          borderRadius: style.borderRadius,
+          fontWeight: style.fontWeight,
+          color: style.color,
+          textDecorationLine: style.textDecorationLine,
+        }; }"""
+    )
+    assert style == {
+        "borderTopWidth": "0px",
+        "borderLeftWidth": "0px",
+        "borderRightWidth": "0px",
+        "borderBottomWidth": "0px",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "borderRadius": "0px",
+        "fontWeight": "400",
+        "color": "rgb(116, 110, 100)",
+        "textDecorationLine": "underline",
+    }, f"{context} 不是低强调文字控件：{style}"
+
+
+def _check_loaded_report_identity(
+    panel: Any, expected: Mapping[str, Any], broker: str,
+) -> None:
+    report_root = panel.locator(".cn-trend-report")
+    actual = {
+        "artifact": report_root.get_attribute("data-report-artifact"),
+        "report_sha256": report_root.get_attribute("data-report-sha256"),
+        "strategy_version": report_root.get_attribute("data-strategy-version"),
+    }
+    _check_report_identity(actual, expected, broker)
+    assert str(expected.get("strategy_version") or "") in report_root.inner_text(), (
+        f"{broker} 精确历史报告未显示策略版本"
+    )
+
+
+def _check_report_identity(
+    actual: Mapping[str, Any], expected: Mapping[str, Any], broker: str,
+) -> None:
+    keys = ("artifact", "report_sha256", "strategy_version")
+    actual_identity = {key: str(actual.get(key) or "") for key in keys}
+    wanted = {key: str(expected.get(key) or "") for key in keys}
+    assert actual_identity == wanted, (
+        f"{broker} 精确历史报告身份不匹配：{actual_identity} != {wanted}"
     )
 
 
@@ -690,15 +772,32 @@ def _check_trend_account_views(
             links = panel.locator(".report-attribution-link")
             assert links.count() == len(linked), f"{broker} 模拟持仓报告入口数量不匹配"
             if linked:
-                links.first.click()
-                panel.locator("[data-current-trend-report]").wait_for()
                 report = linked[0].get("report")
                 assert isinstance(report, Mapping)
-                assert _plain(report.get("execution_date")) in panel.inner_text(), (
-                    f"{broker} 模拟持仓未打开精确历史报告"
+                artifact = str(report.get("artifact") or "")
+                exact_path = f"/api/trend-reports/{broker}/history/{artifact}"
+                _check_history_control_contract(links.first, f"{broker} 模拟持仓报告入口")
+                with page.expect_response(
+                    lambda response: response.url.endswith(exact_path)
+                ) as response_info:
+                    links.first.click()
+                response = response_info.value
+                assert response.ok, f"{broker} 精确历史报告请求失败：{response.status}"
+                loaded = response.json()
+                assert isinstance(loaded, Mapping)
+                _check_report_identity(loaded, report, broker)
+                panel.locator("[data-current-trend-report]").wait_for()
+                _check_loaded_report_identity(panel, report, broker)
+                current = panel.locator("[data-current-trend-report]")
+                _check_history_control_contract(current, f"{broker} 返回当前报告")
+                current.click()
+                history = panel.locator("[data-report-history]")
+                history.wait_for()
+                assert history.evaluate("node => node === document.activeElement"), (
+                    f"{broker} 模拟持仓报告返回后焦点未恢复"
                 )
-                panel.locator("[data-current-trend-report]").click()
-                panel.locator("[data-report-history]").wait_for()
+                simulate_tab.click()
+                _wait_for_simulate_positions(page, broker, len(positions))
         assert simulate_tab.get_attribute("aria-selected") == "true", (
             f"{broker} 模拟盘加载后 Tab 状态丢失"
         )
@@ -717,6 +816,9 @@ def _check_trend_account_views(
         assert _plain(report.get("report_date")) in report_root.inner_text(), (
             f"{broker} 当前趋势报告日期未显示"
         )
+        history_button = panel.locator("[data-report-history]")
+        assert history_button.count() == 1, f"{broker} 当前报告缺少历史入口"
+        _check_history_control_contract(history_button, f"{broker} 历史报告入口")
         if broker == "eastmoney" and screenshot_dir is not None:
             width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
             page.screenshot(
@@ -725,15 +827,16 @@ def _check_trend_account_views(
             )
         expectations = history_expectations.get(broker) or []
         if expectations:
-            history_button = panel.locator("[data-report-history]")
-            assert history_button.count() == 1, f"{broker} 当前报告缺少历史入口"
             history_button.click()
             expectation = expectations[0]
             artifact = str(expectation["artifact"])
             exact = panel.locator(f'[data-history-artifact="{artifact}"]')
             exact.wait_for()
             exact.click()
-            panel.locator("[data-current-trend-report]").wait_for()
+            current = panel.locator("[data-current-trend-report]")
+            current.wait_for()
+            _check_loaded_report_identity(panel, expectation, broker)
+            _check_history_control_contract(current, f"{broker} 历史报告返回")
             event = expectation.get("event")
             if isinstance(event, Mapping):
                 label = status_labels.get(str(event.get("status") or ""))
@@ -741,8 +844,12 @@ def _check_trend_account_views(
                     assert label in panel.inner_text(), (
                         f"{broker} 精确历史报告缺少执行状态 {label}"
                     )
-            panel.locator("[data-current-trend-report]").click()
-            panel.locator("[data-report-history]").wait_for()
+            current.click()
+            history_button = panel.locator("[data-report-history]")
+            history_button.wait_for()
+            assert history_button.evaluate("node => node === document.activeElement"), (
+                f"{broker} 历史报告返回后焦点未恢复"
+            )
         assert report_tab.get_attribute("aria-selected") == "true", (
             f"{broker} 历史报告返回后趋势报告 Tab 丢失"
         )
@@ -778,8 +885,6 @@ def _check_history_endpoints(
     url: str,
     data_dir: Path,
     reports_dir: Path,
-    *,
-    fetcher: Any = _fetch_json_path,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
     expected_by_broker: dict[str, list[dict[str, Any]]] = {}
     errors: list[str] = []
@@ -790,6 +895,7 @@ def _check_history_endpoints(
                 broker=broker,
                 market=market,
             )
+            history = _fetch_json_path(url, f"/api/trend-reports/{broker}/history")
             artifacts = {
                 reports[report_hash]["artifact"]
                 for _, _, _, event in _action_events(data_dir, market)
@@ -799,16 +905,43 @@ def _check_history_endpoints(
                     and report_hash in reports
                 )
             }
-            history = fetcher(url, f"/api/trend-reports/{broker}/history")
+            latest_artifact = ""
+            if isinstance(history, list):
+                latest_artifact = next(
+                    (
+                        str(row.get("artifact"))
+                        for row in history
+                        if isinstance(row, Mapping)
+                        and row.get("available") is True
+                        and row.get("artifact")
+                    ),
+                    "",
+                )
+                if latest_artifact:
+                    artifacts.add(latest_artifact)
             exact = {
-                artifact: fetcher(
+                artifact: _fetch_json_path(
                     url, f"/api/trend-reports/{broker}/history/{artifact}"
                 )
                 for artifact in artifacts
             }
-            expected_by_broker[broker] = _validate_history_projection(
+            expectations = _validate_history_projection(
                 data_dir, reports_dir, broker, history, exact
             )
+            if latest_artifact and not any(
+                item.get("artifact") == latest_artifact for item in expectations
+            ):
+                latest = exact.get(latest_artifact)
+                assert isinstance(latest, Mapping), (
+                    f"{latest_artifact} 精确历史报告缺失"
+                )
+                expectations.append({
+                    "artifact": latest_artifact,
+                    "execution_date": latest.get("report_date"),
+                    "strategy_version": latest.get("strategy_version"),
+                    "report_sha256": latest.get("report_sha256"),
+                })
+            expected_by_broker[broker] = expectations
         except Exception as exc:
             errors.append(f"{broker} 历史报告检查失败：{type(exc).__name__}: {exc}")
     return expected_by_broker, errors
@@ -852,18 +985,24 @@ def _listener(url: str) -> tuple[int, Path]:
     return pid, Path(cwd_line[1:]).resolve()
 
 
-def _process_started_after_commit(pid: int, cwd: Path, sha: str) -> bool:
-    started = datetime.strptime(
+def _process_started_at(pid: int) -> datetime:
+    return datetime.strptime(
         subprocess.check_output(
             ["ps", "-p", str(pid), "-o", "lstart="], text=True
         ).strip(),
         "%a %b %d %H:%M:%S %Y",
     ).astimezone()
-    committed = int(subprocess.check_output(
-        ["git", "-C", str(cwd), "show", "-s", "--format=%ct", sha],
+
+
+def _source_changes(cwd: Path) -> list[str]:
+    output = subprocess.check_output(
+        [
+            "git", "-C", str(cwd), "status", "--porcelain",
+            "--untracked-files=all", "--", "src/open_trader",
+        ],
         text=True,
-    ).strip())
-    return started.timestamp() >= committed
+    )
+    return [line.strip() for line in output.splitlines() if line.strip()]
 
 
 def _is_actionable_console_error(message: str) -> bool:
@@ -2199,28 +2338,76 @@ def _browser_check(
     return errors, None
 
 
-def _log_errors(path: Path) -> list[str]:
+def _log_errors(
+    path: Path,
+    *,
+    pid: int,
+    expected_sha: str,
+    expected_cwd: Path,
+    process_started_at: datetime,
+) -> list[str]:
     try:
         if not path.exists():
             return [f"日志不存在：{path}"]
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return [f"日志读取失败：{type(exc).__name__}: {exc}"]
+    prefix = "dashboard_runtime: "
+    records: list[tuple[int, Mapping[str, Any]]] = []
+    for index, line in enumerate(text.splitlines()):
+        if not line.startswith(prefix):
+            continue
+        try:
+            record = json.loads(line.removeprefix(prefix))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, Mapping):
+            records.append((index, record))
+    errors: list[str] = []
+    matching = [item for item in records if item[1].get("pid") == pid]
+    if not matching:
+        errors.append(f"日志没有候选 Dashboard PID：{pid}")
+        fresh_text = text
+    else:
+        index, record = matching[-1]
+        if index != 0:
+            errors.append("Dashboard 日志不是候选进程的新日志文件")
+        try:
+            if path.stat().st_mtime < process_started_at.timestamp():
+                errors.append("Dashboard 日志修改时间早于候选进程")
+        except OSError as exc:
+            errors.append(f"日志状态读取失败：{type(exc).__name__}: {exc}")
+        if record.get("git_sha") != expected_sha:
+            errors.append("日志中的 Dashboard Git SHA 不匹配")
+        if Path(str(record.get("cwd") or "")).resolve() != expected_cwd.resolve():
+            errors.append("日志中的 Dashboard 工作目录不匹配")
+        if record.get("source_state") != "clean":
+            errors.append("日志中的 Dashboard 源码状态不是 clean")
+        try:
+            recorded_start = datetime.fromisoformat(
+                str(record.get("started_at") or "")
+            )
+            if recorded_start < process_started_at:
+                errors.append("日志中的 Dashboard 启动时间早于候选进程")
+        except ValueError:
+            errors.append("日志中的 Dashboard 启动时间无效")
+        fresh_text = "\n".join(text.splitlines()[index:])
     markers = ("Traceback (most recent call last)", "看板数据加载失败")
-    return [f"日志包含错误标记：{marker}" for marker in markers if marker in text]
+    errors.extend(
+        f"日志包含错误标记：{marker}" for marker in markers if marker in fresh_text
+    )
+    return errors
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8766")
-    parser.add_argument("--expected-cn", type=int, default=5)
     parser.add_argument("--expected-rows", type=int)
     parser.add_argument(
         "--expected-eastmoney-cny", type=Decimal
     )
     parser.add_argument("--expected-root", type=Path, default=Path.cwd())
     parser.add_argument("--expected-sha")
-    parser.add_argument("--config", type=Path)
     parser.add_argument("--log", type=Path, default=Path("/tmp/open_trader_dashboard_8766.log"))
     return parser
 
@@ -2228,12 +2415,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     errors: list[str] = []
+    expected_cn = 0
+    expected_sha = ""
+    pid: int | None = None
+    cwd = args.expected_root.resolve()
+    process_started_at: datetime | None = None
     browser_payload: dict[str, Any] = {}
     reports_dir: Path | None = None
     simulate_payloads: dict[str, dict[str, Any]] = {}
     history_expectations: dict[str, list[dict[str, Any]]] = {}
     external_blocker: str | None = None
     try:
+        expected_cn = _expected_cn_holdings(args.expected_root)
         phillips_total, phillips_period = _latest_phillips_expectation(
             _project_data_dir(args.expected_root)
         )
@@ -2248,23 +2441,23 @@ def main(argv: list[str] | None = None) -> int:
         ).strip()
         if running_sha != expected_sha:
             errors.append(f"运行 Git SHA 不匹配：{running_sha[:7]} != {expected_sha[:7]}")
-        elif not _process_started_after_commit(pid, cwd, expected_sha):
-            errors.append(f"Dashboard 进程早于验收 Git SHA：{pid}")
+        process_started_at = _process_started_at(pid)
+        source_changes = _source_changes(cwd)
+        if source_changes:
+            errors.append(f"Dashboard 源码未提交：{'；'.join(source_changes)}")
         first = _fetch_payload(args.url)
         first_reports_dir = _effective_reports_dir(first, process_cwd=cwd)
         errors.extend(validate_dashboard_payload(
-            first, expected_cn=args.expected_cn,
+            first, expected_cn=expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
             expected_rows=args.expected_rows,
             expected_phillips_total=phillips_total,
             expected_phillips_period=phillips_period,
         ))
         try:
-            account_ids = _configured_simulate_account_ids(
-                args.expected_root, args.config
-            )
+            account_ids = _configured_simulate_account_ids(args.expected_root)
         except Exception as exc:
-            external_blocker = f"Futu 模拟账户配置不可用：{exc}"
+            errors.append(f"Futu 模拟账户配置不可用：{exc}")
         else:
             (
                 simulate_payloads,
@@ -2288,7 +2481,7 @@ def main(argv: list[str] | None = None) -> int:
         if first_reports_dir != reports_dir:
             errors.append("账户刷新前后的 Dashboard reports_dir 不一致")
         errors.extend(validate_dashboard_payload(
-            second, expected_cn=args.expected_cn,
+            second, expected_cn=expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
             expected_rows=args.expected_rows,
             expected_phillips_total=phillips_total,
@@ -2301,14 +2494,21 @@ def main(argv: list[str] | None = None) -> int:
         pid = None
     browser_errors, blocker = _browser_check(
         args.url,
-        args.expected_cn,
+        expected_cn,
         browser_payload,
         reports_dir,
         simulate_payloads,
         history_expectations,
     )
     errors.extend(browser_errors)
-    errors.extend(_log_errors(args.log))
+    if pid is not None and process_started_at is not None:
+        errors.extend(_log_errors(
+            args.log,
+            pid=pid,
+            expected_sha=expected_sha,
+            expected_cwd=cwd,
+            process_started_at=process_started_at,
+        ))
     status = classify_result(
         errors, browser_blocker=blocker, external_blocker=external_blocker
     )

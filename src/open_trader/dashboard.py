@@ -991,6 +991,11 @@ def _project_broker_trend_report(
     data_date = as_of_date.isoformat()
     return {
         "available": True,
+        "artifact": path.name,
+        "report_sha256": _report_hash(payload),
+        "strategy_version": str(
+            (payload.get("strategy_snapshot") or {}).get("strategy_version") or ""
+        ),
         "data_status": "current" if current else "stale",
         "broker": broker,
         "broker_label": broker_label,

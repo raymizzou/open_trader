@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import ipaddress
+import os
+import subprocess
 import threading
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -581,6 +583,31 @@ def _is_loopback_address(value: str) -> bool:
     return address.is_loopback
 
 
+def _dashboard_runtime_metadata() -> dict[str, object]:
+    cwd = Path.cwd().resolve()
+    try:
+        git_sha = subprocess.check_output(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"], text=True
+        ).strip()
+        source_status = subprocess.check_output(
+            [
+                "git", "-C", str(cwd), "status", "--porcelain",
+                "--untracked-files=all", "--", "src/open_trader",
+            ],
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        git_sha = ""
+        source_status = "unavailable"
+    return {
+        "pid": os.getpid(),
+        "started_at": datetime.now().astimezone().isoformat(),
+        "cwd": str(cwd),
+        "git_sha": git_sha,
+        "source_state": "clean" if not source_status else "dirty",
+    }
+
+
 def serve_dashboard(
     config: DashboardConfig,
     *,
@@ -611,7 +638,11 @@ def serve_dashboard(
     )
     _, actual_port = server.server_address
     try:
-        print(f"dashboard_url: http://{host}:{actual_port}")
+        print(
+            f"dashboard_runtime: {json.dumps(_dashboard_runtime_metadata())}",
+            flush=True,
+        )
+        print(f"dashboard_url: http://{host}:{actual_port}", flush=True)
         print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")
         print(f"poll_seconds: {config.poll_seconds}")

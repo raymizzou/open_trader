@@ -2325,9 +2325,15 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const sellOrHold = isCn ? renderCnSellOrHoldStage : renderMarketSellOrHoldStage;
   const buyStage = isCn ? renderCnBuyStage(report) : renderMarketBuyStage(report);
   const root = embedded ? "div" : "main";
-  return `<${root} class="cn-trend-report">
+  const identity = report.artifact && report.report_sha256 && report.strategy_version
+    ? ` data-report-artifact="${escapeHtml(formatPlain(report.artifact))}" data-report-sha256="${escapeHtml(formatPlain(report.report_sha256))}" data-strategy-version="${escapeHtml(formatPlain(report.strategy_version))}"`
+    : "";
+  const strategyVersion = report.strategy_version
+    ? `<span>版本 ${escapeHtml(formatPlain(report.strategy_version))}</span>`
+    : "";
+  return `<${root} class="cn-trend-report"${identity}>
     <header class="trend-report-header">
-      <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1></div>
+      <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1>${strategyVersion}</div>
       ${embedded
         ? historical
           ? `<button class="trend-history-button" type="button" data-current-trend-report="${escapeHtml(report.broker)}">返回当前报告</button>`
@@ -2679,7 +2685,12 @@ function showCurrentTrendReport(broker) {
     state.trendReportHistories[broker] = {...history, open: false};
   }
   renderAccountViewPanelOnly(broker);
-  if (state.brokerFilter === broker) restoreAccountScroll(history.scrollY || 0);
+  if (state.brokerFilter === broker) {
+    restoreAccountScroll(history.scrollY || 0);
+    const historyButton = elements["account-holdings"]
+      ?.querySelector(`[data-report-history="${broker}"]`);
+    if (typeof historyButton?.focus === "function") historyButton.focus();
+  }
 }
 
 function filterAccountRows(rows) {
