@@ -9,7 +9,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .backtest import run_backtest
 from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
@@ -18,7 +18,9 @@ from .dashboard import (
     DashboardConfig,
     _backtest_holding_detail,
     _latest_backtests_by_holding,
+    load_historical_trend_report,
     load_dashboard_state,
+    load_trend_report_history,
 )
 from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
@@ -337,6 +339,30 @@ def create_dashboard_server(
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
+            trend_reports_prefix = "/api/trend-reports/"
+            if path.startswith(trend_reports_prefix):
+                route = path.removeprefix(trend_reports_prefix).split("/", 2)
+                try:
+                    if len(route) == 2 and route[1] == "history":
+                        self._send_json(
+                            load_trend_report_history(
+                                config.reports_dir, broker=route[0]
+                            )
+                        )
+                        return
+                    if len(route) == 3 and route[1] == "history":
+                        self._send_json(
+                            load_historical_trend_report(
+                                config.data_dir,
+                                config.reports_dir,
+                                broker=route[0],
+                                artifact=unquote(route[2]),
+                            )
+                        )
+                        return
+                except Exception as exc:
+                    self._send_error_json(exc)
+                    return
             trend_simulate_prefix = "/api/trend-simulate-positions/"
             if path.startswith(trend_simulate_prefix):
                 broker = path.removeprefix(trend_simulate_prefix)
@@ -487,7 +513,7 @@ def create_dashboard_server(
 
         def _send_json(
             self,
-            payload: dict[str, Any],
+            payload: Any,
             status: HTTPStatus = HTTPStatus.OK,
         ) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -504,6 +530,8 @@ def create_dashboard_server(
             status = HTTPStatus.INTERNAL_SERVER_ERROR
             if isinstance(error, RequestBodyTooLargeError):
                 status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            elif isinstance(error, FileNotFoundError):
+                status = HTTPStatus.NOT_FOUND
             elif isinstance(error, PermissionError):
                 status = HTTPStatus.FORBIDDEN
             elif isinstance(error, ValueError):

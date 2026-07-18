@@ -63,6 +63,7 @@ from .technical_facts import (
     technical_facts_has_missing_timeframe,
     technical_facts_latest_path,
 )
+from .trend_review import _report_hash
 from .tradingagents_summary import (
     index_tradingagents_summary_by_market_symbol,
     load_tradingagents_summary_cache,
@@ -492,6 +493,123 @@ def _load_trend_reports(
     return reports
 
 
+def load_trend_report_history(
+    reports_dir: Path, *, broker: str
+) -> list[dict[str, Any]]:
+    """Return strict, newest-first summaries for one trend broker."""
+    try:
+        market, _, _, directory, _ = TREND_REPORT_SOURCES[broker]
+    except KeyError:
+        raise ValueError(f"unsupported trend report broker: {broker}") from None
+    rows: list[tuple[date, datetime, int, str, dict[str, Any]]] = []
+    invalid: list[dict[str, Any]] = []
+
+    def mark_unreadable(path: Path) -> None:
+        invalid.append({
+            "available": False,
+            "artifact": path.name,
+            "status_text": "报告不可读取",
+        })
+
+    for path in (reports_dir / directory).glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            mark_unreadable(path)
+            continue
+        if not isinstance(payload, dict):
+            mark_unreadable(path)
+            continue
+        chronology = _valid_trend_report_payload(
+            payload, market=market, broker=broker
+        )
+        snapshot = payload.get("strategy_snapshot")
+        strategy_version = (
+            str(snapshot.get("strategy_version") or "").strip()
+            if isinstance(snapshot, dict)
+            else ""
+        )
+        if chronology is None or not strategy_version:
+            mark_unreadable(path)
+            continue
+        execution_date, as_of_date, _, generated_at = chronology
+        sell_actions, buy_actions, hold_actions, review_actions = (
+            _project_trend_actions(payload, executions={})
+        )
+        revision_match = re.search(r"-r(\d+)\.json\Z", path.name)
+        revision = int(revision_match.group(1)) if revision_match else 0
+        summary = {
+            "available": True,
+            "artifact": path.name,
+            "execution_date": execution_date.isoformat(),
+            "data_date": as_of_date.isoformat(),
+            "generated_at": generated_at.isoformat(),
+            "strategy_version": strategy_version,
+            "revision": revision,
+            "execution_counts": {
+                "sell": len(sell_actions),
+                "buy": len(buy_actions),
+                "hold": len(hold_actions),
+                "review": len(review_actions),
+            },
+        }
+        rows.append((execution_date, generated_at, revision, path.name, summary))
+    rows.sort(key=lambda row: row[:4], reverse=True)
+    invalid.sort(key=lambda row: row["artifact"], reverse=True)
+    return [row[-1] for row in rows] + invalid
+
+
+def load_historical_trend_report(
+    data_dir: Path, reports_dir: Path, *, broker: str, artifact: str
+) -> dict[str, Any]:
+    """Return the same report projection used by the current-report UI."""
+    try:
+        market, market_label, broker_label, directory, buy_window = (
+            TREND_REPORT_SOURCES[broker]
+        )
+    except KeyError:
+        raise ValueError(f"unsupported trend report broker: {broker}") from None
+    artifact_path = Path(artifact)
+    if artifact_path.name != artifact or artifact_path.suffix != ".json":
+        raise ValueError("unsafe trend report artifact")
+    broker_dir = (reports_dir / directory).resolve()
+    path = (broker_dir / artifact).resolve()
+    if path.parent != broker_dir:
+        raise ValueError("unsafe trend report artifact")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("trend report artifact is unreadable") from None
+    if not isinstance(payload, dict):
+        raise ValueError("trend report artifact is unreadable")
+    chronology = _valid_trend_report_payload(
+        payload, market=market, broker=broker
+    )
+    if chronology is None:
+        raise ValueError("trend report artifact is unreadable")
+    execution_date, as_of_date, freshness_date, generated_at = chronology
+    return _project_broker_trend_report(
+        selected=(
+            path,
+            payload,
+            execution_date,
+            as_of_date,
+            freshness_date,
+            generated_at,
+        ),
+        data_dir=data_dir,
+        reports_dir=broker_dir,
+        broker=broker,
+        market=market,
+        market_label=market_label,
+        broker_label=broker_label,
+        buy_window=buy_window,
+        report_date=_shanghai_date().isoformat(),
+    )
+
+
 def _project_futu_attention(
     tiger: dict[str, Any], phillips: dict[str, Any]
 ) -> dict[str, Any]:
@@ -576,6 +694,58 @@ def _trend_action_needs_review(item: dict[str, Any]) -> bool:
         or action not in ACTION_LABELS
         or action in {"SELL_ALL", "HOLD"} and not known_reason
     )
+
+
+def _project_trend_actions(
+    payload: dict[str, Any],
+    executions: dict[tuple[str, str], dict[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    judgments = payload["strategy_judgments"]
+    formal = [
+        {
+            **item,
+            **(
+                {"execution": executions[key]}
+                if (key := (
+                    str(item.get("symbol") or "").strip(),
+                    {"BUY": "buy", "SELL_ALL": "sell"}.get(
+                        item.get("action"), ""
+                    ),
+                )) in executions
+                else {}
+            ),
+        }
+        for item in judgments["formal_actions"]
+    ]
+    holdings = judgments["holding_decisions"]
+    sell_actions = [
+        item
+        for item in formal
+        if item.get("action") == "SELL_ALL"
+        and not _trend_action_needs_review(item)
+    ]
+    buy_actions = [
+        item
+        for item in formal
+        if item.get("action") == "BUY"
+        and not _trend_action_needs_review(item)
+    ]
+    hold_actions = [
+        item
+        for item in holdings
+        if item.get("action") == "HOLD"
+        and not _trend_action_needs_review(item)
+    ]
+    review_actions: list[dict[str, Any]] = []
+    for item in formal + holdings:
+        if _trend_action_needs_review(item) and item not in review_actions:
+            review_actions.append(item)
+    return sell_actions, buy_actions, hold_actions, review_actions
 
 
 def _valid_trend_collections(
@@ -744,55 +914,47 @@ def _load_broker_trend_report(
     )
     if selected is None:
         return unavailable
+    return _project_broker_trend_report(
+        selected=selected,
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        broker=broker,
+        market=market,
+        market_label=market_label,
+        broker_label=broker_label,
+        buy_window=buy_window,
+        report_date=report_date,
+    )
+
+
+def _project_broker_trend_report(
+    *,
+    selected: tuple[Path, dict[str, Any], date, date, date, datetime],
+    data_dir: Path,
+    reports_dir: Path,
+    broker: str,
+    market: str,
+    market_label: str,
+    broker_label: str,
+    buy_window: str,
+    report_date: str,
+) -> dict[str, Any]:
     path, payload, execution_date, as_of_date, freshness_date, generated_at = selected
-    judgments = payload["strategy_judgments"]
     account = payload["account"]
     metadata = payload["metadata"]
-    formal = judgments["formal_actions"]
-    holdings = judgments["holding_decisions"]
     executions = _trend_action_executions(
-        data_dir, market=market, execution_date=execution_date.isoformat()
+        data_dir,
+        market=market,
+        execution_date=execution_date.isoformat(),
+        report_sha256=_report_hash(payload),
     )
-    formal = [
-        {
-            **item,
-            **(
-                {"execution": executions[key]}
-                if (key := (
-                    str(item.get("symbol") or "").strip(),
-                    {"BUY": "buy", "SELL_ALL": "sell"}.get(item.get("action"), ""),
-                )) in executions
-                else {}
-            ),
-        }
-        for item in formal
-    ]
+    sell_actions, buy_actions, hold_actions, review_actions = (
+        _project_trend_actions(payload, executions)
+    )
     account_fresh = account.get("fresh") is True
-    sell_actions = [
-        item
-        for item in formal
-        if item.get("action") == "SELL_ALL"
-        and not _trend_action_needs_review(item)
-    ]
-    buy_actions = [
-        item
-        for item in formal
-        if item.get("action") == "BUY"
-        and not _trend_action_needs_review(item)
-    ]
-    hold_actions = [
-        item
-        for item in holdings
-        if item.get("action") == "HOLD"
-        and not _trend_action_needs_review(item)
-    ]
-    review_actions: list[dict[str, Any]] = []
-    for item in formal + holdings:
-        if _trend_action_needs_review(item) and item not in review_actions:
-            review_actions.append(item)
     directory = reports_dir.name
     signal_snapshots = payload.get("signal_snapshots", {})
-    audit_candidates = judgments["top10_candidates"]
+    audit_candidates = payload["strategy_judgments"]["top10_candidates"]
     if market == "CN" and isinstance(signal_snapshots, dict):
         audit_candidates = signal_snapshots.get("candidates", audit_candidates)
     current = freshness_date.isoformat() == report_date
@@ -846,7 +1008,7 @@ def _load_broker_trend_report(
 
 
 def _trend_action_executions(
-    data_dir: Path, *, market: str, execution_date: str
+    data_dir: Path, *, market: str, execution_date: str, report_sha256: str
 ) -> dict[tuple[str, str], dict[str, Any]]:
     executions: dict[tuple[str, str], dict[str, Any]] = {}
     root = (
@@ -863,6 +1025,8 @@ def _trend_action_executions(
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(event, dict):
+            continue
+        if event.get("report_sha256") != report_sha256:
             continue
         symbol = str(event.get("symbol") or "").strip()
         side = str(event.get("side") or "").strip().lower()

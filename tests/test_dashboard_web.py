@@ -25,6 +25,7 @@ from tests.test_dashboard import (
     dashboard_config,
     portfolio_rows,
     write_csv,
+    write_trend_history_report,
 )
 
 
@@ -7585,6 +7586,117 @@ def test_dashboard_http_loads_only_requested_simulated_account(tmp_path) -> None
 
     assert calls == ["tiger"]
     assert payload["broker"] == "tiger"
+
+
+def test_dashboard_http_serves_report_history_and_exact_artifact(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+    from open_trader.trend_review import _report_hash
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-16.json",
+        execution_date="2026-07-17",
+        generated_at="2026-07-17T09:00:00+08:00",
+    )
+    event = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-17/action-key/event.json"
+    )
+    event.parent.mkdir(parents=True)
+    event.write_text(
+        json.dumps({
+            "report_sha256": _report_hash(payload),
+            "symbol": "VIXY",
+            "side": "buy",
+            "status": "missed",
+        }),
+        encoding="utf-8",
+    )
+    server = create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        history = read_json(
+            f"http://{host}:{port}/api/trend-reports/tiger/history"
+        )
+        report = read_json(
+            f"http://{host}:{port}/api/trend-reports/tiger/history/2026-07-16.json"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert [row["artifact"] for row in history] == ["2026-07-16.json"]
+    assert report["report_date"] == "2026-07-17"
+    assert report["buy_actions"][0]["execution"]["status"] == "missed"
+
+
+def test_dashboard_http_report_history_enforces_read_only_route_errors(
+    tmp_path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_trend_history_report(
+        config.reports_dir,
+        "wrong-market.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+        market="HK",
+    )
+    (config.reports_dir / "trend_us_tiger" / "broken.json").write_text(
+        "{broken", encoding="utf-8"
+    )
+    server = create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    root = f"http://{host}:{port}/api/trend-reports"
+    try:
+        assert read_error_json(f"{root}/unknown/history")[0] == 400
+        assert read_error_json(
+            f"{root}/tiger/history/..%2Fsecret.json"
+        )[0] == 400
+        assert read_error_json(f"{root}/tiger/history/missing.json")[0] == 404
+        assert read_error_json(
+            f"{root}/tiger/history/wrong-market.json"
+        )[0] == 400
+        history = read_json(f"{root}/tiger/history")
+        method_statuses = []
+        for method in ("POST", "PUT", "DELETE"):
+            request = urllib.request.Request(
+                f"{root}/tiger/history", data=b"{}", method=method
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=5)
+            method_statuses.append(error.value.code)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert history == [
+        {
+            "available": False,
+            "artifact": "wrong-market.json",
+            "status_text": "报告不可读取",
+        },
+        {
+            "available": False,
+            "artifact": "broken.json",
+            "status_text": "报告不可读取",
+        },
+    ]
+    assert all(status != 200 for status in method_statuses)
 
 
 def test_dashboard_http_rejects_unknown_simulated_broker(tmp_path) -> None:

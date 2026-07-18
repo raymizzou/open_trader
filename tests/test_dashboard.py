@@ -243,6 +243,228 @@ def serialized_trend_position() -> dict[str, object]:
     }
 
 
+def write_trend_history_report(
+    reports_dir: Path,
+    artifact: str,
+    *,
+    execution_date: str,
+    generated_at: str,
+    market: str = "US",
+    broker: str = "tiger",
+    symbol: str = "VIXY",
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "execution_date": execution_date,
+        "as_of_date": "2026-07-17",
+        "generated_at": generated_at,
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": market, "broker": broker},
+        "strategy_snapshot": {"strategy_version": "v1"},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": symbol}],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "option_attention": [],
+    }
+    path = reports_dir / "trend_us_tiger" / artifact
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def test_trend_report_history_uses_payload_date_and_keeps_revisions(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_trend_report_history
+
+    write_trend_history_report(
+        tmp_path,
+        "2026-07-17.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    write_trend_history_report(
+        tmp_path,
+        "2026-07-17-r1.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:30:00+08:00",
+    )
+    write_trend_history_report(
+        tmp_path,
+        "2026-07-16.json",
+        execution_date="2026-07-17",
+        generated_at="2026-07-17T09:00:00+08:00",
+    )
+
+    history = load_trend_report_history(tmp_path, broker="tiger")
+
+    assert [row["execution_date"] for row in history[:2]] == [
+        "2026-07-20",
+        "2026-07-20",
+    ]
+    assert {row["artifact"] for row in history[:2]} == {
+        "2026-07-17.json",
+        "2026-07-17-r1.json",
+    }
+    assert history[0] == {
+        "available": True,
+        "artifact": "2026-07-17-r1.json",
+        "execution_date": "2026-07-20",
+        "data_date": "2026-07-17",
+        "generated_at": "2026-07-18T09:30:00+08:00",
+        "strategy_version": "v1",
+        "revision": 1,
+        "execution_counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
+    }
+
+
+def test_trend_report_history_marks_corrupt_artifact_without_hiding_siblings(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_trend_report_history
+
+    write_trend_history_report(
+        tmp_path,
+        "valid.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    (tmp_path / "trend_us_tiger" / "broken.json").write_text(
+        "{broken", encoding="utf-8"
+    )
+
+    history = load_trend_report_history(tmp_path, broker="tiger")
+
+    assert history[0]["artifact"] == "valid.json"
+    assert history[-1] == {
+        "available": False,
+        "artifact": "broken.json",
+        "status_text": "报告不可读取",
+    }
+
+
+def test_exact_historical_report_includes_its_immutable_execution(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_historical_trend_report
+    from open_trader.trend_review import _report_hash
+
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-16.json",
+        execution_date="2026-07-17",
+        generated_at="2026-07-17T09:00:00+08:00",
+    )
+    event = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-17/action-key/event.json"
+    )
+    event.parent.mkdir(parents=True)
+    event.write_text(
+        json.dumps({
+            "report_sha256": _report_hash(payload),
+            "symbol": "VIXY",
+            "side": "buy",
+            "status": "missed",
+            "recorded_at": "2026-07-17T16:00:00-04:00",
+            "reason": "buy_window_closed",
+        }),
+        encoding="utf-8",
+    )
+
+    report = load_historical_trend_report(
+        config.data_dir,
+        config.reports_dir,
+        broker="tiger",
+        artifact="2026-07-16.json",
+    )
+
+    assert report["report_date"] == "2026-07-17"
+    assert report["buy_actions"][0]["execution"]["status"] == "missed"
+    assert report["audit"]["artifact"] == "2026-07-16.json"
+
+
+@pytest.mark.parametrize("artifact", ["../secret.json", "/tmp/secret.json"])
+def test_historical_report_rejects_unsafe_artifact_paths(
+    tmp_path: Path, artifact: str,
+) -> None:
+    from open_trader.dashboard import load_historical_trend_report
+
+    config = dashboard_config(tmp_path)
+    with pytest.raises(ValueError, match="unsafe trend report artifact"):
+        load_historical_trend_report(
+            config.data_dir,
+            config.reports_dir,
+            broker="tiger",
+            artifact=artifact,
+        )
+
+
+def test_historical_report_rejects_artifact_resolving_outside_broker_directory(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_historical_trend_report
+
+    config = dashboard_config(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    linked = config.reports_dir / "trend_us_tiger" / "linked.json"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="unsafe trend report artifact"):
+        load_historical_trend_report(
+            config.data_dir,
+            config.reports_dir,
+            broker="tiger",
+            artifact="linked.json",
+        )
+
+
+def test_historical_report_rejects_wrong_report_market(tmp_path: Path) -> None:
+    from open_trader.dashboard import load_historical_trend_report
+
+    config = dashboard_config(tmp_path)
+    write_trend_history_report(
+        config.reports_dir,
+        "wrong-market.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+        market="HK",
+    )
+
+    with pytest.raises(ValueError, match="trend report artifact is unreadable"):
+        load_historical_trend_report(
+            config.data_dir,
+            config.reports_dir,
+            broker="tiger",
+            artifact="wrong-market.json",
+        )
+
+
+@pytest.mark.parametrize("loader", ["history", "artifact"])
+def test_trend_report_loaders_reject_unknown_broker(
+    tmp_path: Path, loader: str,
+) -> None:
+    from open_trader.dashboard import (
+        load_historical_trend_report,
+        load_trend_report_history,
+    )
+
+    with pytest.raises(ValueError, match="unsupported trend report broker"):
+        if loader == "history":
+            load_trend_report_history(tmp_path, broker="unknown")
+        else:
+            load_historical_trend_report(
+                tmp_path / "data",
+                tmp_path / "reports",
+                broker="unknown",
+                artifact="report.json",
+            )
+
+
 def trend_review_projection(market: str, broker: str) -> dict[str, object]:
     return {
         "schema_version": "open_trader.trend_review.projection.v1",
@@ -418,6 +640,8 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from open_trader.trend_review import _report_hash
+
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
 
@@ -528,6 +752,12 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
             {
                 "market": "US",
                 "date": "2026-07-15",
+                "report_sha256": _report_hash(json.loads(
+                    (
+                        config.reports_dir
+                        / "trend_us_tiger/2026-07-15-b.json"
+                    ).read_text(encoding="utf-8")
+                )),
                 "symbol": "VIXY",
                 "side": "buy",
                 "status": "partially_filled",
