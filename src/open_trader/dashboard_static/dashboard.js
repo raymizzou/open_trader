@@ -2714,6 +2714,8 @@ function renderAccountViewPanelOnly(broker) {
 
 function renderAccountHoldings() {
   const container = elements["account-holdings"] || elements["holdings-body"];
+  const focusedView = document.activeElement?.dataset?.accountView || "";
+  const focusedBroker = document.activeElement?.dataset?.accountBroker || "";
   elements["workspace-grid"].classList.remove("detail-mode");
   container.classList.remove("hidden");
   elements["symbol-detail-panel"].classList.add("hidden");
@@ -2745,6 +2747,9 @@ function renderAccountHoldings() {
   container.innerHTML = active
     ? renderAccountSection({...active, rows})
     : '<div class="empty-state">暂无券商账户</div>';
+  if (active?.broker === focusedBroker && focusedView) {
+    container.querySelector(`[data-account-view="${focusedView}"]`)?.focus();
+  }
 }
 
 function setAccountHoldingsFallbackLabel(label) {

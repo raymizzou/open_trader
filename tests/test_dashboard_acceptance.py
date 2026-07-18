@@ -3971,6 +3971,7 @@ def test_wait_for_simulate_positions_waits_past_loading_state() -> None:
     )]
     assert "模拟盘持仓加载中" in calls[0][0]
     assert "querySelectorAll" in calls[0][0]
+    assert "document.activeElement !== tab" in calls[0][0]
 
 
 @pytest.mark.parametrize(

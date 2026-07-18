@@ -54,6 +54,7 @@ SIMULATE_POSITIONS_READY_EXPRESSION = """
   const panel = document.querySelector(`#account-${broker}-view-panel`);
   const tab = document.querySelector(`#account-${broker}-view-simulate`);
   if (!panel || tab?.getAttribute("aria-selected") !== "true") return false;
+  if (document.activeElement !== tab) return false;
   if (panel.textContent.includes("模拟盘持仓加载中")) return false;
   return expected === null
     || panel.querySelectorAll(".account-holding-row").length === expected;
@@ -701,9 +702,6 @@ def _check_trend_account_views(
         assert simulate_tab.get_attribute("aria-selected") == "true", (
             f"{broker} 模拟盘加载后 Tab 状态丢失"
         )
-        assert simulate_tab.evaluate(
-            "element => element === document.activeElement"
-        ), f"{broker} 模拟盘加载后焦点未返回 Tab"
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 模拟盘视图出现横向滚动"

@@ -3584,6 +3584,8 @@ window.fetch=async (input)=>{{
         assert section.locator(".report-attribution-link").inner_text().strip() == "报告 2026-07-20 · v1"
         assert header.get_attribute("data-view-stable") == "yes"
         assert page.evaluate("document.activeElement.dataset.accountView") == "simulate"
+        page.evaluate("renderHoldings()")
+        assert page.evaluate("document.activeElement.dataset.accountView") == "simulate"
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         section.locator(".report-attribution-link").click()
         return_current = section.locator("[data-current-trend-report]")
