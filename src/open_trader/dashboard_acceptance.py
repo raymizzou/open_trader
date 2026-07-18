@@ -623,7 +623,7 @@ def _wait_for_simulate_positions(
 ) -> None:
     page.wait_for_function(
         SIMULATE_POSITIONS_READY_EXPRESSION,
-        {"broker": broker, "expected": expected},
+        arg={"broker": broker, "expected": expected},
     )
 
 

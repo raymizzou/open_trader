@@ -3960,8 +3960,8 @@ def test_wait_for_simulate_positions_waits_past_loading_state() -> None:
     calls: list[tuple[str, object]] = []
 
     class Page:
-        def wait_for_function(self, expression: str, argument: object) -> None:
-            calls.append((expression, argument))
+        def wait_for_function(self, expression: str, *, arg: object) -> None:
+            calls.append((expression, arg))
 
     dashboard_acceptance._wait_for_simulate_positions(Page(), "eastmoney", 1)
 
