@@ -360,6 +360,15 @@ def test_simulated_positions_skip_non_positive_positions(tmp_path: Path) -> None
     assert [row["symbol"] for row in payload["positions"]] == ["TRV"]
 
 
+def test_simulated_positions_accept_beijing_exchange_position(tmp_path: Path) -> None:
+    payload = _service(
+        tmp_path, FakeClientFactory([_position("BJ.920000")])
+    ).load("eastmoney")
+
+    assert payload["available"] is True
+    assert payload["positions"][0]["symbol"] == "920000"
+
+
 def test_simulated_positions_return_unavailable_instead_of_fallback(
     tmp_path: Path,
 ) -> None:

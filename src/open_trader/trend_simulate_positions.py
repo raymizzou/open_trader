@@ -22,7 +22,11 @@ _REPORT_DIRECTORIES = {
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }
-_MARKET_PREFIXES = {"US": {"US"}, "HK": {"HK"}, "CN": {"CN", "SH", "SZ"}}
+_MARKET_PREFIXES = {
+    "US": {"US"},
+    "HK": {"HK"},
+    "CN": {"BJ", "CN", "SH", "SZ"},
+}
 
 
 class TrendSimulatePositionService:
@@ -128,24 +132,28 @@ def _project_positions(
         if not isinstance(position, Mapping):
             raise ValueError("simulate account position is invalid")
         quantity, quantity_text = _required_decimal(
-            _first(position, "qty", "quantity"), "position qty"
+            _first_nonempty(position, "qty", "quantity"), "position qty"
         )
         if quantity <= 0:
             continue
-        code = str(_first(position, "code", "futu_code") or "").strip().upper()
+        code = str(
+            _first_nonempty(position, "code", "futu_code") or ""
+        ).strip().upper()
         symbol = _position_symbol(code, market)
         cost_price, cost_price_text = _required_decimal(
-            _first(position, "cost_price", "average_cost"), "position cost price"
+            _first_nonempty(position, "cost_price", "average_cost"),
+            "position cost price",
         )
         _, last_price_text = _required_decimal(
-            _first(position, "nominal_price", "last_price", "price"),
+            _first_nonempty(position, "nominal_price", "last_price", "price"),
             "position last price",
         )
         market_value, market_value_text = _required_decimal(
-            _first(position, "market_val", "market_value"), "position market value"
+            _first_nonempty(position, "market_val", "market_value"),
+            "position market value",
         )
         _, pnl_ratio_text = _required_decimal(
-            _first(position, "pl_ratio", "unrealized_pnl_pct"),
+            _first_nonempty(position, "pl_ratio", "unrealized_pnl_pct"),
             "position P/L ratio",
         )
         attribution = attributions.get(
@@ -159,7 +167,9 @@ def _project_positions(
                 "market": market,
                 "symbol": symbol,
                 "name": str(
-                    _first(position, "stock_name", "name", "security_name")
+                    _first_nonempty(
+                        position, "stock_name", "name", "security_name"
+                    )
                     or symbol
                 ).strip(),
                 "currency": currency,
@@ -185,7 +195,7 @@ def _position_symbol(code: str, market: str) -> str:
     return symbol
 
 
-def _first(values: Mapping[str, object], *keys: str) -> object:
+def _first_nonempty(values: Mapping[str, object], *keys: str) -> object:
     for key in keys:
         if key in values and values[key] not in (None, ""):
             return values[key]
