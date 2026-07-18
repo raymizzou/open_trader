@@ -654,6 +654,7 @@ def _wait_for_simulate_positions(
     page.wait_for_function(
         SIMULATE_POSITIONS_READY_EXPRESSION,
         arg={"broker": broker, "expected": expected},
+        timeout=10_000,
     )
 
 
@@ -2393,9 +2394,11 @@ def _log_errors(
             recorded_start = datetime.fromisoformat(
                 str(record.get("started_at") or "")
             )
+            if recorded_start.tzinfo is None or recorded_start.utcoffset() is None:
+                raise ValueError("timezone-aware timestamp required")
             if recorded_start < process_started_at:
                 errors.append("日志中的 Dashboard 启动时间早于候选进程")
-        except ValueError:
+        except (TypeError, ValueError):
             errors.append("日志中的 Dashboard 启动时间无效")
         fresh_text = "\n".join(text.splitlines()[index:])
     markers = ("Traceback (most recent call last)", "看板数据加载失败")

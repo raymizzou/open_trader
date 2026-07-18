@@ -4010,6 +4010,48 @@ def test_acceptance_rejects_log_not_bound_to_candidate_process(
     ))
 
 
+def test_acceptance_rejects_timezone_naive_runtime_start_without_crashing(
+    tmp_path: Path,
+) -> None:
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-07-18T12:00:01",
+    }
+    log = tmp_path / "dashboard.log"
+    log.write_text(f"dashboard_runtime: {json.dumps(runtime)}\n", encoding="utf-8")
+
+    errors = dashboard_acceptance._log_errors(
+        log,
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat("2026-07-18T12:00:00+08:00"),
+    )
+
+    assert any("启动时间无效" in error for error in errors)
+
+
+def test_simulated_position_wait_has_bounded_timeout() -> None:
+    calls: list[tuple[str, object, int | None]] = []
+
+    class Page:
+        def wait_for_function(
+            self, expression: str, *, arg: object, timeout: int | None = None,
+        ) -> None:
+            calls.append((expression, arg, timeout))
+
+    dashboard_acceptance._wait_for_simulate_positions(Page(), "tiger", 1)
+
+    assert calls == [(
+        dashboard_acceptance.SIMULATE_POSITIONS_READY_EXPRESSION,
+        {"broker": "tiger", "expected": 1},
+        10_000,
+    )]
+
+
 def test_acceptance_rejects_appended_stale_log_content(tmp_path: Path) -> None:
     started = datetime.fromisoformat("2026-07-18T12:00:00+08:00")
     runtime = {
