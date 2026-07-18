@@ -568,7 +568,7 @@ def _validate_history_projection(
         assert (
             isinstance(execution, Mapping)
             and execution.get("status") == event.get("status")
-            and execution.get("recorded_at") == event.get("recorded_at")
+            and execution.get("updated_at") == event.get("recorded_at")
         ), f"{artifact} 历史报告动作 {symbol} 消失或执行状态不匹配"
         expectations.append({**report, "symbol": symbol, "side": side, "event": event})
     return expectations
