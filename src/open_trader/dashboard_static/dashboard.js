@@ -788,7 +788,7 @@ function handleSymbolDetailClick(event) {
   }
 }
 
-async function loadDashboard() {
+async function loadDashboard({preserveOnError = false} = {}) {
   try {
     const response = await fetch("/api/dashboard", { cache: "no-store" });
     if (!response.ok) {
@@ -800,6 +800,7 @@ async function loadDashboard() {
     scheduleQuotePolling(state.dashboard.poll_seconds);
     renderDashboard();
   } catch (error) {
+    if (preserveOnError) throw error;
     renderLoadError(error);
   }
 }
@@ -888,7 +889,7 @@ async function refreshQuotes() {
     state.quotePayload = payload;
     state.quotes = payload.quotes || {};
     if (accountSyncReloadNeeded(payload.account_sync)) {
-      await loadDashboard();
+      await loadDashboard({preserveOnError: true});
     }
     renderQuoteStatus(payload);
   } catch (error) {
@@ -1899,7 +1900,14 @@ function kellySampleStageLabel(stage) {
 
 function renderDashboardViews() {
   renderHeaderSummary();
+  const broker = state.brokerFilter;
+  const selector = `#account-${broker}-view-panel`;
+  const container = elements["account-holdings"] || elements["holdings-body"];
+  const frozenPanel = state.accountViews[broker] === "report" && state.trendReportHistories[broker]?.open
+    ? container?.querySelector(selector)
+    : null;
   renderAccountHoldings();
+  if (frozenPanel) container?.querySelector(selector)?.replaceWith(frozenPanel);
 }
 
 const TREND_REASON_LABELS = {

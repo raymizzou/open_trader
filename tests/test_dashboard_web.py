@@ -3178,14 +3178,37 @@ def test_dashboard_quote_refresh_does_not_replace_active_report_view() -> None:
 elements["refresh-quotes"]={disabled:false,textContent:""};
 state.brokerFilter="tiger";
 state.accountViews.tiger="report";
-globalThis.fetch=async()=>({ok:true,json:async()=>({quotes:{},account_sync:{status:"skipped"}})});
+state.trendReportHistories.tiger={open:true};
+state.dashboard={marker:"before"};
+let failDashboard=false;
+globalThis.fetch=async(url)=>url==="/api/quotes"
+  ? {ok:true,json:async()=>({quotes:{},account_sync:{status:"ok"}})}
+  : failDashboard
+    ? {ok:false,status:500}
+    : {ok:true,json:async()=>({poll_seconds:0,marker:"after"})};
 renderQuoteStatus=()=>{};
 let holdingRenders=0;
-renderHoldings=()=>{holdingRenders+=1;};
+const frozenPanel={id:"frozen"};
+let currentPanel=frozenPanel;
+const replacementPanel={replaceWith(panel){currentPanel=panel;}};
+elements["account-holdings"]={querySelector(){return currentPanel;}};
+renderDashboard=()=>renderDashboardViews();
+renderHeaderSummary=()=>{};
+renderAccountHoldings=()=>{holdingRenders+=1;currentPanel=replacementPanel;};
 await refreshQuotes();
-console.log(String(holdingRenders));
+const dashboardAfterSuccess=state.dashboard;
+failDashboard=true;
+await refreshQuotes();
+console.log(JSON.stringify({holdingRenders,panelPreserved:currentPanel===frozenPanel,
+  currentReportRefreshed:dashboardAfterSuccess.marker==="after",
+  failedReloadPreserved:state.dashboard===dashboardAfterSuccess}));
 ''')
-    assert output.strip() == "0"
+    assert json.loads(output) == {
+        "holdingRenders": 1,
+        "panelPreserved": True,
+        "currentReportRefreshed": True,
+        "failedReloadPreserved": True,
+    }
 
 
 def test_dashboard_account_view_keyboard_and_mobile_acceptance_css() -> None:
