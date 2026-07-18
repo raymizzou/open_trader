@@ -698,6 +698,15 @@ def _check_loaded_report_identity(
     assert str(expected.get("strategy_version") or "") in report_root.inner_text(), (
         f"{broker} 精确历史报告未显示策略版本"
     )
+    expected_date = str(expected.get("execution_date") or "")
+    report_date = report_root.locator("dt").filter(
+        has_text="报告日期"
+    ).locator("xpath=following-sibling::dd")
+    assert (
+        expected_date
+        and report_date.count() == 1
+        and report_date.inner_text().strip() == expected_date
+    ), f"{broker} 精确历史报告日期不匹配"
 
 
 def _check_report_identity(
@@ -708,6 +717,18 @@ def _check_report_identity(
     wanted = {key: str(expected.get(key) or "") for key in keys}
     assert actual_identity == wanted, (
         f"{broker} 精确历史报告身份不匹配：{actual_identity} != {wanted}"
+    )
+
+
+def _check_exact_api_report_identity(
+    actual: Mapping[str, Any], expected: Mapping[str, Any], broker: str,
+) -> None:
+    _check_report_identity(actual, expected, broker)
+    actual_date = str(actual.get("report_date") or "")
+    wanted_date = str(expected.get("execution_date") or "")
+    assert wanted_date and actual_date == wanted_date, (
+        f"{broker} 精确历史报告身份不匹配："
+        f"report_date {actual_date!r} != {wanted_date!r}"
     )
 
 
@@ -786,7 +807,7 @@ def _check_trend_account_views(
                 assert response.ok, f"{broker} 精确历史报告请求失败：{response.status}"
                 loaded = response.json()
                 assert isinstance(loaded, Mapping)
-                _check_report_identity(loaded, report, broker)
+                _check_exact_api_report_identity(loaded, report, broker)
                 panel.locator("[data-current-trend-report]").wait_for()
                 _check_loaded_report_identity(panel, report, broker)
                 current = panel.locator("[data-current-trend-report]")
@@ -946,7 +967,7 @@ def _check_history_endpoints(
                 assert isinstance(local, Mapping), (
                     f"{latest_artifact} 本地冻结报告缺失"
                 )
-                _check_report_identity(latest, local, broker)
+                _check_exact_api_report_identity(latest, local, broker)
                 expectations.append(dict(local))
             expected_by_broker[broker] = expectations
         except Exception as exc:

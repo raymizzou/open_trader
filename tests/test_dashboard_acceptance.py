@@ -3921,8 +3921,19 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
     assert expectations[0]["artifact"] == "old.json"
 
 
+@pytest.mark.parametrize(
+    ("wrong_field", "wrong_value"),
+    [
+        pytest.param("report_date", "2026-07-18", id="report-date"),
+        pytest.param("strategy_version", "v2", id="strategy-version"),
+        pytest.param("report_sha256", "b" * 64, id="report-sha256"),
+    ],
+)
 def test_acceptance_rejects_latest_exact_api_identity_that_differs_from_local_report(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrong_field: str,
+    wrong_value: str,
 ) -> None:
     local_hash = "a" * 64
     local_report = {
@@ -3946,12 +3957,14 @@ def test_acceptance_rejects_latest_exact_api_identity_that_differs_from_local_re
                 "execution_date": "2026-07-17",
                 "strategy_version": "v1",
             }]
-        return {
+        exact = {
             "artifact": "latest.json",
             "report_date": "2026-07-17",
-            "strategy_version": "v2",
-            "report_sha256": "b" * 64,
+            "strategy_version": "v1",
+            "report_sha256": local_hash,
         }
+        exact[wrong_field] = wrong_value
+        return exact
 
     monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", fetch)
 

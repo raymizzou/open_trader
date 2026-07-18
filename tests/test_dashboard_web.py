@@ -3701,6 +3701,22 @@ window.fetch=async (input)=>{{
         report_root.evaluate(
             "node => { node.dataset.strategyVersion = 'v1'; }"
         )
+        report_date = report_root.locator("dt").filter(
+            has_text="报告日期"
+        ).locator("xpath=following-sibling::dd")
+        assert report_date.count() == 1
+        original_report_date = report_date.inner_text()
+        try:
+            report_date.evaluate("node => { node.textContent = '2026-07-21'; }")
+            with pytest.raises(AssertionError, match="报告日期"):
+                dashboard_acceptance._check_loaded_report_identity(
+                    section, simulated["positions"][0]["report"], "tiger"
+                )
+        finally:
+            report_date.evaluate(
+                "(node, value) => { node.textContent = value; }",
+                original_report_date,
+            )
         dashboard_acceptance._check_history_control_contract(
             return_current, "tiger 返回当前报告"
         )
