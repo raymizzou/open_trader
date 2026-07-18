@@ -682,6 +682,76 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
 
 
 @pytest.mark.parametrize(
+    ("status", "expected_submitted"),
+    [
+        ("failed", 1),
+        ("submitted", 1),
+        ("missed", 1),
+        ("incomplete", 0),
+        ("filled", 0),
+    ],
+)
+def test_sell_recovery_stops_only_for_valid_position_zero_terminal_status(
+    tmp_path: Path, status: str, expected_submitted: int,
+) -> None:
+    client = FakeTrendSimClient()
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        prices={"600001": Decimal("10")},
+        market="CN",
+        execution_date="2026-07-16",
+        now="2026-07-16T09:31:00+08:00",
+    )
+    client.requests.clear()
+    client.orders.clear()
+    client.positions = [{"code": "SH.600001", "qty": "100"}]
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report_with_actions([
+            {"action": "SELL_ALL", "symbol": "600001"}
+        ]),
+        "client": client,
+        "prices": {},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T10:30:00+08:00"
+    )
+    action_event = next(
+        tmp_path.glob("trend_review/ledgers/CN/actions/2026-07-17/*/*.json")
+    )
+    (action_event.parent / f"terminal-{status}.json").write_text(
+        json.dumps({
+            "status": status,
+            "reason": "position_zero_confirmed",
+        }),
+        encoding="utf-8",
+    )
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": client.requests[0]["remark"],
+        "code": "SH.600001",
+        "trd_side": "SELL",
+        "qty": "100",
+        "dealt_qty": "50",
+        "order_status": "CANCELLED_PART",
+    }]
+    client.positions = [{"code": "SH.600001", "qty": "50"}]
+
+    recovered = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+
+    assert recovered["submitted_count"] == expected_submitted
+    assert len(client.requests) == 1 + expected_submitted
+    if expected_submitted:
+        assert client.requests[-1]["qty"] == "50"
+
+
+@pytest.mark.parametrize(
     ("dealt_qty", "order_status", "average_price", "terminal_status"),
     [
         ("40", "CANCELLED_PART", "10", "incomplete"),

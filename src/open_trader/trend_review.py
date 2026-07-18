@@ -552,9 +552,15 @@ def execute_trend_review_open(
                 / action_key
             )
             position_zero_complete = any(
-                json.loads(path.read_text(encoding="utf-8")).get("reason")
-                == "position_zero_confirmed"
-                for path in action_events_root.glob("*.json")
+                event.get("status") == "filled"
+                or (
+                    event.get("status") == "incomplete"
+                    and event.get("reason") == "position_zero_confirmed"
+                )
+                for event in (
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in action_events_root.glob("*.json")
+                )
             )
             if position_zero_complete:
                 continue
