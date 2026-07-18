@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from .futu_symbols import to_futu_symbol
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .trend_review import _report_hash
 
@@ -22,13 +23,6 @@ _REPORT_DIRECTORIES = {
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }
-_MARKET_PREFIXES = {
-    "US": {"US"},
-    "HK": {"HK"},
-    "CN": {"BJ", "CN", "SH", "SZ"},
-}
-
-
 class TrendSimulatePositionService:
     def __init__(
         self,
@@ -189,10 +183,10 @@ def _project_positions(
 
 
 def _position_symbol(code: str, market: str) -> str:
-    prefix, separator, symbol = code.partition(".")
-    if not separator or prefix not in _MARKET_PREFIXES[market] or not symbol:
+    canonical = to_futu_symbol(market, code)
+    if canonical != code:
         raise ValueError(f"position code {code!r} does not belong to {market}")
-    return symbol
+    return canonical.split(".", 1)[1]
 
 
 def _first_nonempty(values: Mapping[str, object], *keys: str) -> object:
@@ -231,7 +225,7 @@ def _position_attributions(
     reports = _reports_by_hash(
         reports_dir / _REPORT_DIRECTORIES[broker], broker=broker, market=market
     )
-    active: dict[str, set[str]] = {}
+    active: dict[str, set[str | None]] = {}
     for _, _, _, event in _action_events(data_dir, market):
         symbol = str(event["symbol"]).strip().upper()
         side = str(event.get("side") or "").strip().lower()
@@ -243,18 +237,27 @@ def _position_attributions(
             continue
         filled, _ = _required_decimal(event.get("filled_qty"), "filled quantity")
         report_sha256 = str(event.get("report_sha256") or "").strip().lower()
-        if filled > 0 and _is_sha256(report_sha256):
-            active.setdefault(symbol, set()).add(report_sha256)
+        if filled > 0:
+            active.setdefault(symbol, set()).add(
+                report_sha256 if _is_sha256(report_sha256) else None
+            )
 
     attributions: dict[str, dict[str, Any]] = {}
     for symbol, report_hashes in active.items():
+        if None in report_hashes:
+            attributions[symbol] = {
+                "attribution_status": "unlinked",
+                "report": None,
+            }
+            continue
         if len(report_hashes) > 1:
             attributions[symbol] = {
                 "attribution_status": "conflict",
                 "report": None,
             }
             continue
-        report = reports.get(next(iter(report_hashes)))
+        report_hash = next(iter(report_hashes))
+        report = reports.get(report_hash)
         attributions[symbol] = (
             {"attribution_status": "linked", "report": report}
             if report is not None

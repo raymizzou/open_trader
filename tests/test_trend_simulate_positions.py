@@ -70,7 +70,7 @@ def _write_action_event(
     symbol: str = "TRV",
     side: str = "buy",
     status: str = "filled",
-    report_sha256: str = "",
+    report_sha256: str | None = "",
     strategy_version: str = "v1",
     filled_qty: str = "1",
     execution_date: str = "2026-07-20",
@@ -91,20 +91,20 @@ def _write_action_event(
         / f"{recorded_at.replace(':', '-')}.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "market": market,
+        "date": execution_date,
+        "strategy_version": strategy_version,
+        "symbol": symbol,
+        "side": side,
+        "status": status,
+        "filled_qty": filled_qty,
+        "recorded_at": recorded_at,
+    }
+    if report_sha256 is not None:
+        payload["report_sha256"] = report_sha256
     path.write_text(
-        json.dumps(
-            {
-                "market": market,
-                "date": execution_date,
-                "strategy_version": strategy_version,
-                "report_sha256": report_sha256,
-                "symbol": symbol,
-                "side": side,
-                "status": status,
-                "filled_qty": filled_qty,
-                "recorded_at": recorded_at,
-            }
-        ),
+        json.dumps(payload),
         encoding="utf-8",
     )
 
@@ -334,6 +334,29 @@ def test_simulated_positions_do_not_link_zero_quantity_buy(tmp_path: Path) -> No
     payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
 
     assert payload["positions"][0]["attribution_status"] == "unlinked"
+
+
+@pytest.mark.parametrize("unattributable_hash", [None, "not-a-sha256"])
+def test_simulated_positions_fail_closed_after_unattributable_positive_buy(
+    tmp_path: Path, unattributable_hash: str | None
+) -> None:
+    report = _frozen_report()
+    _write_report(tmp_path, broker="tiger", artifact="report.json", payload=report)
+    _write_action_event(
+        tmp_path,
+        report_sha256=_report_hash(report),
+        recorded_at="2026-07-20T10:00:00-04:00",
+    )
+    _write_action_event(
+        tmp_path,
+        report_sha256=unattributable_hash,
+        recorded_at="2026-07-20T10:01:00-04:00",
+    )
+
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+
+    assert payload["positions"][0]["attribution_status"] == "unlinked"
+    assert payload["positions"][0]["report"] is None
 
 
 def test_simulated_positions_require_report_hash_and_identity_match(
