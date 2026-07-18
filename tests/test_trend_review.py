@@ -358,6 +358,16 @@ def test_open_uses_sim_nav_current_price_and_frozen_lot(tmp_path: Path) -> None:
     assert result["submitted_count"] == 1
     assert repeated["submitted_count"] == 0
     assert len(client.requests) == 1
+    events = sorted(
+        tmp_path.glob("trend_review/ledgers/CN/actions/2026-07-17/*/*.json")
+    )
+    assert json.loads(events[-1].read_text(encoding="utf-8")) | {
+        "symbol": "600001",
+        "side": "buy",
+        "status": "submitted",
+        "target_qty": "400",
+        "order_ids": ["SIM-1"],
+    } == json.loads(events[-1].read_text(encoding="utf-8"))
 
 
 def test_us_open_uses_us_market_date_after_shanghai_midnight(tmp_path: Path) -> None:
@@ -541,7 +551,9 @@ def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:
         }
     ]
 
-    result = trend_review.execute_trend_review_open(**arguments)
+    result = trend_review.execute_trend_review_open(
+        **{**arguments, "now": "2026-07-17T09:32:00+08:00"}
+    )
 
     assert result["submitted_count"] == 1
     assert client.requests[-1]["qty"] == "200"
@@ -575,10 +587,20 @@ def test_active_partial_buy_waits_instead_of_duplicate_submission(
         }
     ]
 
-    result = trend_review.execute_trend_review_open(**arguments)
+    result = trend_review.execute_trend_review_open(
+        **{**arguments, "now": "2026-07-17T09:32:00+08:00"}
+    )
 
     assert result["submitted_count"] == 0
     assert len(client.requests) == 1
+    events = sorted(
+        tmp_path.glob("trend_review/ledgers/CN/actions/2026-07-17/*/*.json")
+    )
+    latest = json.loads(events[-1].read_text(encoding="utf-8"))
+    assert latest["status"] == "partially_filled"
+    assert latest["filled_qty"] == "200"
+    assert latest["target_qty"] == "400"
+    assert latest["order_ids"] == ["SIM-1"]
 
 
 def test_open_retries_intent_when_failed_order_is_absent_at_broker(

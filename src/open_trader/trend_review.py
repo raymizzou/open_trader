@@ -597,6 +597,74 @@ def execute_trend_review_open(
                 remaining = target_quantity - sum(
                     dealt_by_order.values(), start=Decimal("0")
                 )
+                filled = target_quantity - remaining
+                order_ids = [
+                    str(order.get("order_id"))
+                    for order in matched
+                    if order.get("order_id") not in {None, ""}
+                ]
+                weighted_prices = [
+                    (
+                        _required_decimal(order.get("dealt_qty"), "broker dealt quantity"),
+                        _required_decimal(
+                            order.get("dealt_avg_price"), "broker average fill price"
+                        ),
+                    )
+                    for order in matched
+                    if _required_decimal(
+                        order.get("dealt_qty", "0"), "broker dealt quantity"
+                    ) > 0
+                    and order.get("dealt_avg_price") not in {None, ""}
+                ]
+                average_price = (
+                    sum(
+                        (quantity * price for quantity, price in weighted_prices),
+                        start=Decimal("0"),
+                    )
+                    / sum(
+                        (quantity for quantity, _ in weighted_prices),
+                        start=Decimal("0"),
+                    )
+                    if weighted_prices
+                    else None
+                )
+                if any(
+                    order.get("order_id")
+                    or order.get("order_status")
+                    or order.get("dealt_qty")
+                    for order in matched
+                ):
+                    _write_action_event(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        payload={
+                            "market": market,
+                            "date": execution_date,
+                            "strategy_version": strategy_version,
+                            "report_sha256": report_sha,
+                            "symbol": symbol,
+                            "futu_code": futu_code,
+                            "side": side,
+                            "status": (
+                                "filled"
+                                if remaining <= 0
+                                else "partially_filled"
+                                if filled > 0
+                                else "submitted"
+                            ),
+                            "filled_qty": format(filled, "f"),
+                            "target_qty": format(target_quantity, "f"),
+                            "avg_fill_price": (
+                                format(average_price, "f")
+                                if average_price is not None
+                                else ""
+                            ),
+                            "order_ids": order_ids,
+                        },
+                        recorded_at=now,
+                    )
                 if remaining <= 0:
                     continue
                 active_statuses = {
@@ -685,7 +753,32 @@ def execute_trend_review_open(
                     }
                 ),
             )
-        response = client.place_order(request)
+        base_intent = json.loads((root / f"{stem}-intent.json").read_text(encoding="utf-8"))
+        base_request = base_intent.get("request") if isinstance(base_intent, Mapping) else {}
+        target_qty = str(base_request.get("qty") or request.get("qty") or "")
+        try:
+            response = client.place_order(request)
+        except Exception as exc:
+            _write_action_event(
+                data_dir=data_dir,
+                market=market,
+                execution_date=execution_date,
+                action_key=action_key,
+                payload={
+                    "market": market,
+                    "date": execution_date,
+                    "strategy_version": strategy_version,
+                    "report_sha256": report_sha,
+                    "symbol": symbol,
+                    "futu_code": futu_code,
+                    "side": side,
+                    "status": "failed",
+                    "target_qty": target_qty,
+                    "reason": str(exc),
+                },
+                recorded_at=now,
+            )
+            raise
         result_path = intent_path.with_name(
             intent_path.name.replace("-intent", "-result")
         )
@@ -700,6 +793,26 @@ def execute_trend_review_open(
                     "submitted_at": now,
                 }
             ),
+        )
+        order_id = str(response.get("futu_order_id") or "")
+        _write_action_event(
+            data_dir=data_dir,
+            market=market,
+            execution_date=execution_date,
+            action_key=action_key,
+            payload={
+                "market": market,
+                "date": execution_date,
+                "strategy_version": strategy_version,
+                "report_sha256": report_sha,
+                "symbol": symbol,
+                "futu_code": futu_code,
+                "side": side,
+                "status": "submitted",
+                "target_qty": target_qty,
+                "order_ids": [order_id] if order_id else [],
+            },
+            recorded_at=now,
         )
         artifacts.append(str(result_path))
         submitted += 1

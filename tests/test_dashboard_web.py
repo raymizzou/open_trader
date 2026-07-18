@@ -3122,7 +3122,10 @@ const us = renderTrendReportWorkspace({
   counts:{sell:0,buy:1,hold:0,review:1},sell_actions:[],hold_actions:[],
   buy_actions:[{symbol:"EA",name:"艺电",close:"207.27",strength:"99.8",
     industry:"通讯服务",target_weight:"0.04",target_amount:"4941.49",
-    estimated_shares:23,estimated_initial_line:"205.46930"}],
+    estimated_shares:23,estimated_initial_line:"205.46930",
+    execution:{status:"partially_filled",filled_qty:"13",target_qty:"23",
+      avg_fill_price:"207.18",order_ids:["SIM-123"],
+      updated_at:"2026-07-17T10:01:00-04:00",reason:""}}],
   review_actions:[{symbol:"BOTZ",name:"Global X Robotics ETF",
     reason:"holding_signal_unknown",close:null,strength:null,active_line:null}],
   audit:{account_exceptions:["现金类资产不参与趋势判断"]},
@@ -3132,6 +3135,7 @@ for (const text of ["优先处理 · 卖出触发","需要确认 · 人工复核
   "正式买入 1","全部卖出 0","继续持有 0","人工复核 1",
   "EA 艺电","207.27","99.8","通讯服务","4%","4,941.49","23 股",
   "205.46930","BOTZ Global X Robotics ETF","趋势信号不完整",
+  "部分成交","成交 13 / 23","均价 207.18","订单 SIM-123","2026-07-17T10:01:00-04:00",
   "账户不参与项","现金类资产不参与趋势判断","审计详情"]) {
   if (!us.includes(text)) throw new Error(text + "\n" + us);
 }
@@ -3145,6 +3149,8 @@ if (!us.includes('class="cn-trend-report"') ||
     !us.includes('class="cn-trend-card"') ||
     us.includes("今日执行检查") || us.includes("筛选价（Trend Animals）") ||
     us.includes('class="trend-discipline"')) throw new Error(us);
+if (!us.includes('class="cn-trend-execution"') ||
+    us.includes("执行详情按钮") || us.includes("执行状态卡片")) throw new Error(us);
 console.log("ok");
 ''')
 

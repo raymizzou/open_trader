@@ -472,6 +472,30 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     log.write_text(json.dumps({
         "event": "failed", "run_date": "2026-07-15",
     }) + "\n", encoding="utf-8")
+    execution = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-15/action-key"
+        / "2026-07-15T10-00-00-04-00-event.json"
+    )
+    execution.parent.mkdir(parents=True)
+    execution.write_text(
+        json.dumps(
+            {
+                "market": "US",
+                "date": "2026-07-15",
+                "symbol": "VIXY",
+                "side": "buy",
+                "status": "partially_filled",
+                "filled_qty": "20",
+                "target_qty": "40",
+                "avg_fill_price": "50.25",
+                "order_ids": ["SIM-1"],
+                "recorded_at": "2026-07-15T10:00:00-04:00",
+                "reason": "",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     state = load_dashboard_state(config).to_dict()
     reports = state["trend_reports"]
@@ -483,6 +507,15 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     assert reports["tiger"]["data_status"] == "current"
     assert reports["tiger"]["generated_at"] == "2026-07-15T11:30:36+08:00"
     assert reports["tiger"]["sell_actions"][0]["symbol"] == "AAPL"
+    assert reports["tiger"]["buy_actions"][0]["execution"] == {
+        "status": "partially_filled",
+        "filled_qty": "20",
+        "target_qty": "40",
+        "avg_fill_price": "50.25",
+        "order_ids": ["SIM-1"],
+        "updated_at": "2026-07-15T10:00:00-04:00",
+        "reason": "",
+    }
     assert reports["tiger"]["counts"] == {"sell": 1, "buy": 1, "hold": 1, "review": 0}
     assert reports["tiger"]["run_status"] == "failed"
     assert reports["tiger"]["recent_protection_alert"] == (
