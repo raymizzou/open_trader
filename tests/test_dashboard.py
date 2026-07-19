@@ -1062,7 +1062,7 @@ def test_dashboard_trend_report_switches_from_stale_to_later_current_report(
     assert report["option_attention"] == current_attention
 
 
-def test_dashboard_hk_friday_report_is_current_then_stale_over_weekend(
+def test_dashboard_hk_friday_report_is_current_then_stale_then_current_for_execution(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -1108,11 +1108,16 @@ def test_dashboard_hk_friday_report_is_current_then_stale_over_weekend(
     saturday = dashboard_module._load_trend_reports(
         config.data_dir, config.reports_dir, today=date(2026, 7, 18)
     )["phillips"]
+    monday = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 20)
+    )["phillips"]
 
     assert friday["data_status"] == "current"
     assert friday["report_date"] == "2026-07-20"
     assert friday["option_attention"] == current_attention
     assert saturday["data_status"] == "stale"
+    assert monday["data_status"] == "current"
+    assert monday["status_text"] == "今日执行（数据截至 2026-07-17）"
 
 
 def test_dashboard_legacy_hk_friday_report_uses_generated_date_for_freshness(

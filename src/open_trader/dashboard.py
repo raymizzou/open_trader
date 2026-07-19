@@ -1218,7 +1218,9 @@ def _project_broker_trend_report(
     audit_candidates = payload["strategy_judgments"]["top10_candidates"]
     if market == "CN" and isinstance(signal_snapshots, dict):
         audit_candidates = signal_snapshots.get("candidates", audit_candidates)
-    current = freshness_date.isoformat() == report_date
+    updated_today = freshness_date.isoformat() == report_date
+    execution_today = execution_date.isoformat() == report_date
+    current = updated_today or execution_today
     data_date = as_of_date.isoformat()
     risk_summary = dict(payload.get("risk_summary", {}))
     risk_summary["trade_stats"] = _project_trend_trade_stats(
@@ -1253,7 +1255,11 @@ def _project_broker_trend_report(
         "data_date": data_date,
         "generated_at": generated_at.isoformat(),
         "status_text": (
-            "今日已更新" if current else f"数据截至 {data_date}；今日未更新"
+            "今日已更新"
+            if updated_today
+            else f"今日执行（数据截至 {data_date}）"
+            if execution_today
+            else f"数据截至 {data_date}；今日未更新"
         ),
         "option_attention": payload.get("option_attention", []),
         "account_source_date": str(account.get("source_date") or ""),
