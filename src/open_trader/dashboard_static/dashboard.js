@@ -2187,7 +2187,7 @@ function renderTrendTradeStats(stats) {
     return `<div><dt>${escapeHtml(label)}</dt><dd>胜率 ${escapeHtml(winRate)} · 盈亏比 ${escapeHtml(payoff)} · 样本 ${escapeHtml(sample)}</dd></div>`;
   };
   return `${row("富途模拟盘交易统计", stats.simulation)}
-      ${row("老虎实盘交易统计", stats.actual)}`;
+      ${row(stats.actual_label || "实盘交易统计", stats.actual)}`;
 }
 
 function renderTrendRiskSummary(summary, drawdown) {

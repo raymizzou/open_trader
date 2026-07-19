@@ -6,7 +6,14 @@ from hashlib import sha256
 from pathlib import Path
 import re
 
-from open_trader.models import AssetClass, CashBalance, Market, Position, WarningRecord
+from open_trader.models import (
+    AssetClass,
+    CashBalance,
+    Market,
+    Position,
+    StatementTrade,
+    WarningRecord,
+)
 
 
 @dataclass(frozen=True)
@@ -15,6 +22,7 @@ class ParseResult:
     broker: str
     positions: list[Position] = field(default_factory=list)
     cash_balances: list[CashBalance] = field(default_factory=list)
+    trades: list[StatementTrade] = field(default_factory=list)
     warnings: list[WarningRecord] = field(default_factory=list)
     page_count: int = 0
 

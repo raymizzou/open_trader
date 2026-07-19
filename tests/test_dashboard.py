@@ -1489,6 +1489,17 @@ def test_dashboard_projects_exact_version_api_stats_into_risk_summary(
         generated_at="2026-07-20T12:00:00+08:00",
         statistics_cutoff_at="2026-07-20T11:59:59+08:00",
     )
+    stats["sources"] = [{
+        "source": "actual",
+        "source_id": "actual:eastmoney:eastmoney_main",
+        "broker": "eastmoney",
+        "account_id": "eastmoney_main",
+        "market": "CN",
+        "orders_seen": 0,
+        "fill_count": 0,
+        "statistics_cutoff_at": "2026-07-17T23:59:59+08:00",
+        "status": "available",
+    }]
     write_trend_api_stats(config.data_dir, stats)
 
     report = dashboard_module._load_trend_reports(
@@ -1499,7 +1510,9 @@ def test_dashboard_projects_exact_version_api_stats_into_risk_summary(
     assert trade_stats["available"] is True
     assert trade_stats["strategy_id"] == "trend_animals_warm_to_hot/CN/v2"
     assert trade_stats["opening_strategy_version"] == "v2"
-    assert trade_stats["statistics_cutoff_at"] == "2026-07-20T11:59:59+08:00"
+    assert trade_stats["statistics_cutoff_at"] == "2026-07-17T23:59:59+08:00"
+    assert trade_stats["actual_broker"] == "eastmoney"
+    assert trade_stats["actual_label"] == "东方财富实盘交易统计"
     assert trade_stats["simulation"]["eligible_sample_count"] == 0
     assert trade_stats["actual"]["eligible_sample_count"] == 0
 

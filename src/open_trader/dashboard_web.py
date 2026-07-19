@@ -295,6 +295,7 @@ def create_dashboard_server(
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
     import_service = statement_import_service or StatementImportService(
         data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
         portfolio_path=config.portfolio_path,
         eastmoney_password=eastmoney_password,
     )

@@ -217,6 +217,32 @@ def test_parse_phillips_text_extracts_hk_and_us_positions() -> None:
     assert us.currency == "USD"
 
 
+def test_parse_phillips_text_extracts_trade_reference_time_price_and_fee() -> None:
+    result = parse_phillips_text(
+        """綜合日成交單及結單
+日期Date 產品 參考 類別 摘要 數量 單價 成交金額 金額 Amount
+10/07/26 14/07/26 Equity 33288084 Sold CSOP UST20 610 66.5600 40,601.60 40,562.67
+股票 賣出 南方美國國債２０/XHKG/003433
+""",
+        "2026-07-10",
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.reference == "33288084"
+    assert trade.side == "sell"
+    assert trade.market == Market.HK
+    assert trade.symbol == "03433"
+    assert trade.currency == "HKD"
+    assert trade.quantity == Decimal("610")
+    assert trade.price == Decimal("66.5600")
+    assert trade.fee == Decimal("38.93")
+    assert trade.costs_complete is True
+    assert trade.traded_at == "2026-07-10T16:00:00+08:00"
+    assert trade.execution_granularity == "statement_trade_date"
+    assert trade.statement_sequence == 3
+
+
 def test_parse_phillips_text_extracts_equity_rows_and_account_cash() -> None:
     result = parse_phillips_text(
         """戶口資料 Account Details
