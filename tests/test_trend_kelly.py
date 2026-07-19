@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
+from open_trader.trend_api_stats import (
+    build_trend_api_stats_payload,
+    write_trend_api_stats,
+)
 from open_trader.trend_kelly import (
     TREND_API_STATS_SCHEMA_VERSION,
     TrendKellyRound,
@@ -301,6 +306,74 @@ def test_kelly_sample_updates_only_after_a_simulation_round_closes() -> None:
 
 def test_stats_loader_treats_missing_artifact_as_cold_start(tmp_path) -> None:
     assert load_trend_kelly_rounds(tmp_path / "data") == ()
+
+
+def test_stats_loader_accepts_derived_rounds_and_rejects_tampering(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    common = {
+        "source": "simulation",
+        "source_id": "simulation:futu:102",
+        "broker": "futu",
+        "account_id": "102",
+        "market": "US",
+        "symbol": "AAA",
+        "currency": "USD",
+        "quantity": "1",
+        "fee": "0",
+        "costs_complete": True,
+        "strategy_id": "trend_animals_warm_to_hot/US/v4",
+        "strategy_version": "v4",
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "report_sha256": "a" * 64,
+        "attribution_status": "attributed",
+        "exclusion_reason": "",
+    }
+    payload = build_trend_api_stats_payload(
+        [
+            {
+                **common,
+                "fill_id": "buy-1",
+                "order_id": "buy-order-1",
+                "side": "buy",
+                "price": "100",
+                "filled_at": "2026-06-01T10:00:00+00:00",
+            },
+            {
+                **common,
+                "fill_id": "sell-1",
+                "order_id": "sell-order-1",
+                "side": "sell",
+                "price": "110.11",
+                "filled_at": "2026-06-01T11:00:00+00:00",
+            },
+        ],
+        strategy_versions=[
+            {
+                "market": "US",
+                "strategy_id": "trend_animals_warm_to_hot/US/v4",
+                "strategy_version": "v4",
+            }
+        ],
+        generated_at="2026-06-02T00:00:00+00:00",
+        statistics_cutoff_at="2026-06-01T23:59:59+00:00",
+    )
+    path = write_trend_api_stats(data_dir, payload)
+
+    rounds = load_trend_kelly_rounds(data_dir)
+
+    assert len(rounds) == 1
+    assert rounds[0].net_return == Decimal("0.1")
+
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["rounds"][0]["net_return"] = "999"
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"trend_api_stats\.json validation failed: rounds are not derived",
+    ):
+        load_trend_kelly_rounds(data_dir)
 
 
 @pytest.mark.parametrize(

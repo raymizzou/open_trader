@@ -3826,7 +3826,8 @@ def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
     assert payload["strategy_judgments"]["formal_actions"] == []
     assert payload["risk_summary"]["kelly_phase"] == "unavailable"
     assert payload["risk_summary"]["status"] == "paused"
-    assert "trend_api_stats.json schema_version" in payload["risk_summary"]["pause_reason"]
+    assert "trend_api_stats.json" in payload["risk_summary"]["pause_reason"]
+    assert "schema_version" in payload["risk_summary"]["pause_reason"]
 
 
 def test_missing_industry_row_excludes_only_affected_candidate(

@@ -36,6 +36,10 @@ from open_trader.notifications import (
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
 from open_trader.strategy_drawdown import manual_unlock_strategy_drawdown
+from open_trader.trend_api_stats import (
+    build_trend_api_stats_payload,
+    write_trend_api_stats,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -842,39 +846,60 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     tmp_path: Path,
 ) -> None:
     cfg = config(tmp_path)
-    stats_path = cfg.data_dir / "latest/trend_api_stats.json"
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    stats_path.write_text(
-        json.dumps(
+    fills = []
+    for index in range(30):
+        common = {
+            "source": "simulation",
+            "source_id": "simulation:futu:102",
+            "broker": "futu",
+            "account_id": "102",
+            "market": "US",
+            "symbol": f"ROUND{index:03d}",
+            "currency": "USD",
+            "quantity": "1",
+            "fee": "0",
+            "costs_complete": True,
+            "strategy_id": "trend_animals_warm_to_hot/US/v4",
+            "strategy_version": "v4",
+            "normal_cost_rate": "0.001",
+            "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+            "report_sha256": "a" * 64,
+            "attribution_status": "attributed",
+            "exclusion_reason": "",
+        }
+        fills.extend(
+            [
+                {
+                    **common,
+                    "fill_id": f"buy-{index:03d}",
+                    "order_id": f"buy-order-{index:03d}",
+                    "side": "buy",
+                    "price": "100",
+                    "filled_at": f"2026-06-{index + 1:02d}T10:00:00+00:00",
+                },
+                {
+                    **common,
+                    "fill_id": f"sell-{index:03d}",
+                    "order_id": f"sell-order-{index:03d}",
+                    "side": "sell",
+                    "price": "110.11" if index < 15 else "90.09",
+                    "filled_at": f"2026-06-{index + 1:02d}T11:00:00+00:00",
+                },
+            ]
+        )
+    stats_payload = build_trend_api_stats_payload(
+        fills,
+        strategy_versions=[
             {
-                "schema_version": "open_trader.trend_api_stats.v1",
-                "rounds": [
-                    {
-                        "round_id": f"round-{index:03d}",
-                        "source": "simulation",
-                        "market": "US",
-                        "strategy_id": "trend_animals_warm_to_hot/US/v4",
-                        "opening_strategy_version": "v4",
-                        "closed_at": f"2026-06-{index // 24 + 1:02d}T{index % 24:02d}:00:00+00:00",
-                        "net_return": "0.10" if index < 15 else "-0.10",
-                        "costs_complete": True,
-                        "attribution_status": "attributed",
-                        "kelly_eligible": True,
-                    }
-                    for index in range(30)
-                ]
-                + [
-                    {
-                        "round_id": "actual-must-not-count",
-                        "source": "actual",
-                        "market": "US",
-                        "net_return": "999",
-                    }
-                ],
+                "market": "US",
+                "strategy_id": "trend_animals_warm_to_hot/US/v4",
+                "strategy_version": "v4",
             }
-        ),
-        encoding="utf-8",
+        ],
+        generated_at="2026-07-15T00:00:00+00:00",
+        statistics_cutoff_at="2026-07-14T23:59:59+00:00",
     )
+    write_trend_api_stats(cfg.data_dir, stats_payload)
     unlock_live_drawdown(cfg.data_dir, "US")
     write_protection_state(
         market_paths(cfg.data_dir, cfg.reports_dir, "US").state,

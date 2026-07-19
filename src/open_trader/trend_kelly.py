@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,12 +47,19 @@ class TrendKellyState:
 
 def load_trend_kelly_rounds(data_dir: Path) -> tuple[TrendKellyRound, ...]:
     path = data_dir / "latest" / "trend_api_stats.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    if not path.exists():
         return ()
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        raise ValueError("trend_api_stats.json is unreadable") from None
+    # Import lazily to keep the pure optimizer free of broker/review imports.
+    # The canonical statistics loader re-derives rounds and stats from fills,
+    # validates sources and cutoff chronology, and fails closed on tampering.
+    from .trend_api_stats import load_trend_api_stats
+
+    try:
+        payload = load_trend_api_stats(data_dir)
+    except ValueError as exc:
+        raise ValueError(
+            f"trend_api_stats.json validation failed: {exc}"
+        ) from None
     return trend_kelly_rounds_from_payload(payload)
 
 
