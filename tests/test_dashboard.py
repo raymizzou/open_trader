@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import json
 from datetime import UTC, date, datetime
@@ -1201,10 +1202,7 @@ def test_dashboard_projects_futu_attention_from_tiger_us_and_phillips_hk(
     }
 
 
-def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> None:
-    config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_a_share/2026-07-15.json"
-    path.parent.mkdir(parents=True)
+def _valid_v2_dashboard_trend_payload() -> dict[str, object]:
     risk_summary = {
         "status": "active",
         "status_label": "风险预算内",
@@ -1225,14 +1223,19 @@ def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> Non
         "normal_cost_rate": "0.001",
         "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
         "disclaimer": "5% 是风险预算目标，不是最大损失保证。",
+        "portfolio_remaining_risk_note": (
+            "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"
+        ),
     }
     risk_skips = [{
         "symbol": "600002",
+        "target_weight": "0.04",
+        "target_amount": "4000",
         "estimated_shares": 0,
         "reason": "最小交易单位 100 股超过组合剩余风险",
         "decisive_constraint": "组合剩余风险",
     }]
-    path.write_text(json.dumps({
+    return {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T20:00:00+08:00",
@@ -1240,24 +1243,200 @@ def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> Non
         "metadata": {"market": "CN", "broker": "eastmoney"},
         "strategy_snapshot": {
             "strategy_version": "v2",
-            "parameters": {"normal_cost_rate": "0.001"},
+            "parameters": {
+                "single_entry_risk_limit": "0.004",
+                "portfolio_risk_limit": "0.04",
+                "abnormal_loss_buffer": "0.01",
+                "normal_cost_rate": "0.001",
+                "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+            },
         },
         "strategy_judgments": {
-            "formal_actions": [],
+            "formal_actions": [{
+                "action": "BUY",
+                "symbol": "600001",
+                "target_weight": "0.04",
+                "target_amount": "4000",
+                "estimated_shares": 300,
+                "lot_size": 100,
+                "close": "10",
+                "planned_stop_risk": "303",
+                "planned_stop_risk_pct": "0.00303",
+                "normal_cost": "3",
+                "decisive_constraint": "单笔风险上限",
+            }],
             "holding_decisions": [],
             "top10_candidates": [],
             "risk_skips": risk_skips,
         },
         "risk_summary": risk_summary,
         "option_attention": [],
-    }), encoding="utf-8")
+    }
+
+
+def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
     report = dashboard_module._load_trend_reports(
         config.data_dir, config.reports_dir, today=date(2026, 7, 15)
     )["eastmoney"]
 
-    assert report["risk_summary"] == risk_summary
-    assert report["risk_skips"] == risk_skips
+    assert report["risk_summary"] == payload["risk_summary"]
+    assert report["risk_skips"] == payload["strategy_judgments"]["risk_skips"]
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("summary", "portfolio_remaining_risk", "-999"),
+        ("summary", "single_entry_risk_limit_pct", "0.4"),
+        ("summary", "abnormal_loss_buffer_pct", "10"),
+        ("summary", "existing_planned_risk", "NaN"),
+        ("summary", "portfolio_remaining_risk_pct", None),
+        ("summary", "normal_cost_model", "bogus"),
+        ("summary", "disclaimer", "guaranteed max loss"),
+        ("parameters", "normal_cost_rate", "0.009"),
+        ("risk_skip", "reason", ""),
+        ("risk_skip", "estimated_shares", 1),
+        ("buy", "planned_stop_risk", None),
+        ("buy", "planned_stop_risk_pct", "0.4"),
+    ],
+)
+def test_dashboard_v2_risk_contract_fails_closed(
+    tmp_path: Path, section: str, key: str, value: object,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = copy.deepcopy(_valid_v2_dashboard_trend_payload())
+    if section == "summary":
+        target = payload["risk_summary"]
+    elif section == "parameters":
+        target = payload["strategy_snapshot"]["parameters"]
+    elif section == "risk_skip":
+        target = payload["strategy_judgments"]["risk_skips"][0]
+    else:
+        target = payload["strategy_judgments"]["formal_actions"][0]
+    assert isinstance(target, dict)
+    target[key] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is False
+
+
+def test_dashboard_accepts_v2_paused_unknown_risk_amounts(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["formal_actions"] = []
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    summary.update({
+        "status": "paused",
+        "status_label": "暂停新开仓",
+        "pause_reason": "模拟持仓风险事实缺失，暂停新开仓",
+        "existing_planned_risk": None,
+        "new_planned_risk": "0",
+        "portfolio_planned_risk": None,
+        "portfolio_planned_risk_pct": None,
+        "portfolio_remaining_risk": None,
+        "portfolio_remaining_risk_pct": None,
+    })
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is True
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "paused_with_buy",
+        "active_over_limit",
+        "amount_scale_drift",
+        "buy_zero_risk",
+        "buy_partial_lot",
+    ],
+)
+def test_dashboard_v2_risk_state_invariants_fail_closed(
+    tmp_path: Path, state: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    if state == "paused_with_buy":
+        summary.update({
+            "status": "paused",
+            "status_label": "暂停新开仓",
+            "pause_reason": "测试暂停",
+        })
+    elif state == "active_over_limit":
+        summary.update({
+            "existing_planned_risk": "4001",
+            "new_planned_risk": "303",
+            "portfolio_planned_risk": "4304",
+            "portfolio_planned_risk_pct": "0.04304",
+            "portfolio_remaining_risk": "0",
+            "portfolio_remaining_risk_pct": "0",
+        })
+    elif state == "amount_scale_drift":
+        judgments = payload["strategy_judgments"]
+        assert isinstance(judgments, dict)
+        judgments["formal_actions"] = []
+        summary.update({
+            "new_planned_risk": "0",
+            "portfolio_planned_risk": "0",
+            "portfolio_planned_risk_pct": "0",
+            "portfolio_risk_limit": "8000",
+            "portfolio_remaining_risk": "8000",
+            "portfolio_remaining_risk_pct": "0.04",
+            "single_entry_risk_limit": "800",
+            "abnormal_loss_buffer": "2000",
+        })
+    else:
+        judgments = payload["strategy_judgments"]
+        assert isinstance(judgments, dict)
+        buy = judgments["formal_actions"][0]
+        assert isinstance(buy, dict)
+        if state == "buy_zero_risk":
+            buy.update({
+                "planned_stop_risk": "0",
+                "planned_stop_risk_pct": "0",
+                "normal_cost": "0",
+            })
+            summary.update({
+                "new_planned_risk": "0",
+                "portfolio_planned_risk": "0",
+                "portfolio_planned_risk_pct": "0",
+                "portfolio_remaining_risk": "4000",
+                "portfolio_remaining_risk_pct": "0.04",
+            })
+        else:
+            buy.update({"estimated_shares": 350, "lot_size": 100})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is False
 
 
 def test_dashboard_futu_projection_keeps_both_unavailable_market_rows(

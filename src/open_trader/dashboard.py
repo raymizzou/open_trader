@@ -15,8 +15,11 @@ from zoneinfo import ZoneInfo
 from .a_share_trend import (
     ACTION_LABELS,
     NON_REALTIME_ACCOUNT_WARNING,
+    PORTFOLIO_RISK_LIMIT,
     REASON_LABELS,
+    SINGLE_ENTRY_RISK_LIMIT,
     valid_serialized_account,
+    valid_v2_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
 
@@ -837,41 +840,130 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     summary = payload.get("risk_summary")
     if summary is None:
         return strategy_version != "v2"
-    if strategy_version == "v2" and (
-        not isinstance(payload.get("strategy_judgments"), dict)
-        or "risk_skips" not in payload["strategy_judgments"]
-        or not isinstance(snapshot.get("parameters"), dict)
-        or not snapshot["parameters"].get("normal_cost_rate")
-    ):
-        return False
     if not isinstance(summary, dict) or any(
         isinstance(value, (dict, list)) for value in summary.values()
     ):
         return False
-    required = {
-        "status",
-        "status_label",
-        "pause_reason",
-        "existing_planned_risk",
-        "new_planned_risk",
-        "portfolio_planned_risk",
-        "portfolio_planned_risk_pct",
-        "portfolio_risk_limit",
-        "portfolio_risk_limit_pct",
-        "portfolio_remaining_risk",
-        "portfolio_remaining_risk_pct",
-        "single_entry_risk_limit",
-        "single_entry_risk_limit_pct",
-        "abnormal_loss_buffer",
-        "abnormal_loss_buffer_pct",
-        "total_risk_budget_target_pct",
-        "normal_cost_rate",
-        "normal_cost_model",
-        "disclaimer",
-    }
+    if strategy_version != "v2":
+        return summary.get("status") in {"active", "paused"}
+    judgments = payload.get("strategy_judgments")
+    parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
+    account = payload.get("account")
+    expected_nav = account.get("net_value") if isinstance(account, dict) else None
     return (
-        strategy_version != "v2" or required <= summary.keys()
-    ) and summary.get("status") in {"active", "paused"}
+        isinstance(judgments, dict)
+        and "risk_skips" in judgments
+        and valid_v2_risk_contract(
+            parameters, summary, expected_nav=expected_nav
+        )
+        and _valid_v2_risk_items(payload, judgments, summary)
+    )
+
+
+def _dashboard_risk_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return result if result.is_finite() and result >= 0 else None
+
+
+def _valid_v2_risk_items(
+    payload: dict[str, Any],
+    judgments: dict[str, Any],
+    summary: dict[str, Any],
+) -> bool:
+    portfolio_limit = _dashboard_risk_decimal(summary.get("portfolio_risk_limit"))
+    nav = (
+        portfolio_limit / PORTFOLIO_RISK_LIMIT
+        if portfolio_limit is not None and portfolio_limit > 0
+        else None
+    )
+    buys = [
+        item
+        for item in judgments["formal_actions"]
+        if item.get("action") == "BUY"
+    ]
+    if (nav is None or summary.get("status") == "paused") and buys:
+        return False
+    new_planned_risk = Decimal("0")
+    for item in buys:
+        shares = item.get("estimated_shares")
+        lot_size = item.get("lot_size")
+        planned_risk = _dashboard_risk_decimal(item.get("planned_stop_risk"))
+        planned_pct = _dashboard_risk_decimal(item.get("planned_stop_risk_pct"))
+        normal_cost = _dashboard_risk_decimal(item.get("normal_cost"))
+        target_weight = _dashboard_risk_decimal(item.get("target_weight"))
+        target_amount = _dashboard_risk_decimal(item.get("target_amount"))
+        close = _dashboard_risk_decimal(item.get("close"))
+        if (
+            not isinstance(item.get("symbol"), str)
+            or not item["symbol"].strip()
+            or isinstance(shares, bool)
+            or not isinstance(shares, int)
+            or shares <= 0
+            or isinstance(lot_size, bool)
+            or not isinstance(lot_size, int)
+            or lot_size <= 0
+            or shares % lot_size != 0
+            or planned_risk is None
+            or planned_risk <= 0
+            or planned_pct is None
+            or planned_pct <= 0
+            or normal_cost is None
+            or normal_cost <= 0
+            or target_weight is None
+            or target_weight <= 0
+            or target_weight > PORTFOLIO_RISK_LIMIT
+            or target_amount is None
+            or close is None
+            or close <= 0
+            or normal_cost > planned_risk
+            or nav is None
+            or planned_pct != planned_risk / nav
+            or planned_pct > SINGLE_ENTRY_RISK_LIMIT
+            or item.get("decisive_constraint")
+            not in {"名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"}
+        ):
+            return False
+        new_planned_risk += planned_risk
+
+    summary_new_risk = _dashboard_risk_decimal(summary.get("new_planned_risk"))
+    if summary_new_risk != new_planned_risk:
+        return False
+    allowed_constraints = {
+        "名义仓位上限",
+        "单笔风险上限",
+        "组合剩余风险",
+        "现金",
+        "持仓席位",
+        "交易单位",
+        "关键风险数据",
+    }
+    for item in judgments["risk_skips"]:
+        shares = item.get("estimated_shares")
+        target_weight = _dashboard_risk_decimal(item.get("target_weight"))
+        target_amount_raw = item.get("target_amount")
+        target_amount = _dashboard_risk_decimal(target_amount_raw)
+        if (
+            not isinstance(item.get("symbol"), str)
+            or not item["symbol"].strip()
+            or isinstance(shares, bool)
+            or not isinstance(shares, int)
+            or shares != 0
+            or target_weight is None
+            or target_weight <= 0
+            or target_weight > PORTFOLIO_RISK_LIMIT
+            or target_amount_raw is not None
+            and target_amount is None
+            or not isinstance(item.get("reason"), str)
+            or not item["reason"].strip()
+            or item.get("decisive_constraint") not in allowed_constraints
+        ):
+            return False
+    return True
 
 
 def _valid_option_attention(payload: dict[str, Any], *, market: str) -> bool:

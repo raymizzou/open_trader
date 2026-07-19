@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
 import json
@@ -2867,6 +2868,121 @@ def test_frozen_json_has_explicit_no_action_strategy_contract(tmp_path: Path) ->
     }
     assert payload["risk_summary"]["portfolio_risk_limit_pct"] == "0.04"
     assert payload["risk_summary"]["abnormal_loss_buffer_pct"] == "0.01"
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("parameters", "single_entry_risk_limit", "0.04"),
+        ("parameters", "portfolio_risk_limit", "0.4"),
+        ("parameters", "abnormal_loss_buffer", "0.1"),
+        ("parameters", "normal_cost_rate", "0.009"),
+        ("parameters", "normal_cost_model", "按心情估算"),
+        ("summary", "single_entry_risk_limit_pct", Decimal("0.4")),
+        ("summary", "normal_cost_rate", Decimal("0.009")),
+        ("summary", "normal_cost_model", "按心情估算"),
+        ("summary", "total_risk_budget_target_pct", Decimal("0.5")),
+        ("summary", "disclaimer", "5% 保证最大损失"),
+    ],
+)
+def test_v2_report_rejects_frozen_risk_contract_drift(
+    section: str, key: str, value: object,
+) -> None:
+    built = report(candidates=(candidate("600001"),))
+    snapshot = copy.deepcopy(built.strategy_snapshot)
+    summary = copy.deepcopy(built.risk_summary)
+    target = snapshot["parameters"] if section == "parameters" else summary
+    assert isinstance(target, dict)
+    target[key] = value
+    tampered = replace(built, strategy_snapshot=snapshot, risk_summary=summary)
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(tampered)
+
+
+def test_v2_report_freezes_shared_remaining_risk_semantics() -> None:
+    built = report(candidates=(candidate("600001"),))
+
+    assert built.risk_summary["portfolio_remaining_risk_note"] == (
+        "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"
+    )
+
+
+def test_v2_report_rejects_paused_state_with_new_buy_risk() -> None:
+    built = report(candidates=(candidate("600001"),))
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "status": "paused",
+        "status_label": "暂停新开仓",
+        "pause_reason": "测试暂停",
+    })
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(replace(built, risk_summary=summary))
+
+
+def test_v2_report_rejects_active_state_over_portfolio_risk_limit() -> None:
+    built = report()
+    summary = copy.deepcopy(built.risk_summary)
+    portfolio_limit = summary["portfolio_risk_limit"]
+    assert isinstance(portfolio_limit, Decimal)
+    nav = portfolio_limit / Decimal("0.04")
+    planned_risk = portfolio_limit + Decimal("1")
+    summary.update({
+        "existing_planned_risk": planned_risk,
+        "new_planned_risk": Decimal("0"),
+        "portfolio_planned_risk": planned_risk,
+        "portfolio_planned_risk_pct": planned_risk / nav,
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+    })
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(replace(built, risk_summary=summary))
+
+
+def test_v2_report_rejects_risk_amounts_scaled_away_from_account_nav() -> None:
+    built = report()
+    summary = copy.deepcopy(built.risk_summary)
+    for key in (
+        "portfolio_risk_limit",
+        "portfolio_remaining_risk",
+        "single_entry_risk_limit",
+        "abnormal_loss_buffer",
+    ):
+        summary[key] *= 2
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(replace(built, risk_summary=summary))
+
+
+@pytest.mark.parametrize("malformed", ["zero_risk", "partial_lot"])
+def test_v2_report_rejects_impossible_buy_risk_facts(malformed: str) -> None:
+    built = report(candidates=(candidate("600001"),))
+    action = built.buy_actions[0]
+    summary = copy.deepcopy(built.risk_summary)
+    if malformed == "zero_risk":
+        action = replace(
+            action,
+            planned_stop_risk=Decimal("0"),
+            planned_stop_risk_pct=Decimal("0"),
+            normal_cost=Decimal("0"),
+        )
+        summary.update({
+            "new_planned_risk": Decimal("0"),
+            "portfolio_planned_risk": Decimal("0"),
+            "portfolio_planned_risk_pct": Decimal("0"),
+            "portfolio_remaining_risk": summary["portfolio_risk_limit"],
+            "portfolio_remaining_risk_pct": Decimal("0.04"),
+        })
+    else:
+        action = replace(action, estimated_shares=350, lot_size=100)
+
+    tampered = replace(
+        built, buy_actions=(action,), risk_summary=summary
+    )
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(tampered)
 
 
 def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> None:
