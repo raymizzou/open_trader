@@ -21,6 +21,7 @@ from .a_share_trend import (
     valid_serialized_account,
     valid_v2_risk_contract,
     valid_v3_risk_contract,
+    valid_v4_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
 
@@ -68,6 +69,7 @@ from .technical_facts import (
     technical_facts_latest_path,
 )
 from .trend_review import _report_hash
+from .strategy_drawdown import valid_drawdown_decision
 from .tradingagents_summary import (
     index_tradingagents_summary_by_market_symbol,
     load_tradingagents_summary_cache,
@@ -840,29 +842,54 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     )
     summary = payload.get("risk_summary")
     if summary is None:
-        return strategy_version not in {"v2", "v3"}
+        return strategy_version not in {"v2", "v3", "v4"}
     if not isinstance(summary, dict) or any(
         isinstance(value, (dict, list)) for value in summary.values()
     ):
         return False
-    if strategy_version not in {"v2", "v3"}:
+    if strategy_version not in {"v2", "v3", "v4"}:
         return summary.get("status") in {"active", "paused"}
     judgments = payload.get("strategy_judgments")
     parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
     account = payload.get("account")
     expected_nav = account.get("net_value") if isinstance(account, dict) else None
-    return (
+    risk_valid = (
         isinstance(judgments, dict)
         and "risk_skips" in judgments
-        and (
-            valid_v3_risk_contract
-            if strategy_version == "v3"
-            else valid_v2_risk_contract
-        )(
+        and {
+            "v2": valid_v2_risk_contract,
+            "v3": valid_v3_risk_contract,
+            "v4": valid_v4_risk_contract,
+        }[strategy_version](
             parameters, summary, expected_nav=expected_nav
         )
         and _valid_v2_risk_items(
             payload, judgments, summary, strategy_version=strategy_version
+        )
+    )
+    if strategy_version in {"v2", "v3"}:
+        return risk_valid
+    metadata = payload.get("metadata")
+    market = metadata.get("market") if isinstance(metadata, dict) else ""
+    strategy_id = snapshot.get("strategy_id") if isinstance(snapshot, dict) else ""
+    formal_actions = judgments.get("formal_actions") if isinstance(judgments, dict) else None
+    drawdown = payload.get("drawdown_summary")
+    return (
+        risk_valid
+        and valid_drawdown_decision(
+            drawdown,
+            expected_market=str(market),
+            expected_strategy_id=str(strategy_id),
+            expected_strategy_version="v4",
+            expected_equity=expected_nav,
+        )
+        and (
+            drawdown.get("entry_allowed") is True
+            or isinstance(formal_actions, list)
+            and not any(
+                isinstance(action, dict) and action.get("action") == "BUY"
+                for action in formal_actions
+            )
         )
     )
 
@@ -901,7 +928,7 @@ def _valid_v2_risk_items(
     allowed_buy_constraints = {
         "名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"
     }
-    if strategy_version == "v3":
+    if strategy_version in {"v3", "v4"}:
         allowed_buy_constraints.add("Kelly 上限")
     for item in buys:
         shares = item.get("estimated_shares")
@@ -931,7 +958,7 @@ def _valid_v2_risk_items(
             or target_weight is None
             or target_weight <= 0
             or target_weight > PORTFOLIO_RISK_LIMIT
-            or strategy_version == "v3"
+            or strategy_version in {"v3", "v4"}
             and summary.get("kelly_phase") != "cold_start"
             and target_weight
             > (_dashboard_risk_decimal(summary.get("kelly_cap")) or Decimal("0"))
@@ -959,15 +986,17 @@ def _valid_v2_risk_items(
         "交易单位",
         "关键风险数据",
     }
-    if strategy_version == "v3":
+    if strategy_version in {"v3", "v4"}:
         allowed_constraints.add("Kelly 上限")
+    if strategy_version == "v4":
+        allowed_constraints.add("策略累计回撤")
     for item in judgments["risk_skips"]:
         shares = item.get("estimated_shares")
         target_weight = _dashboard_risk_decimal(item.get("target_weight"))
         target_amount_raw = item.get("target_amount")
         target_amount = _dashboard_risk_decimal(target_amount_raw)
         zero_kelly_skip = (
-            strategy_version == "v3"
+            strategy_version in {"v3", "v4"}
             and summary.get("status") == "paused"
             and summary.get("kelly_cap") in {"0", "0.000000", 0}
             and summary.get("pause_reason") == "Kelly 上限为 0，仅暂停未来新开仓"
@@ -1196,6 +1225,7 @@ def _project_broker_trend_report(
         "buy_actions": buy_actions,
         "risk_skips": payload["strategy_judgments"].get("risk_skips", []),
         "risk_summary": payload.get("risk_summary", {}),
+        "drawdown_summary": payload.get("drawdown_summary", {}),
         "hold_actions": hold_actions,
         "review_actions": review_actions,
         "counts": {

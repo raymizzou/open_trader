@@ -2165,35 +2165,43 @@ function renderTrendRiskRow(item, columnCount, status) {
   return `<tr class="cn-trend-execution cn-trend-risk-detail"><td colspan="${columnCount}">${details.map((detail) => `<span>${escapeHtml(detail)}</span>`).join("")}</td></tr>`;
 }
 
-function renderTrendRiskSummary(summary) {
-  if (!summary || typeof summary !== "object" || !hasValue(summary.status)) return "";
-  const planned = `${formatDisplayNumber(summary.portfolio_planned_risk)}（${trendRiskPercent(summary.portfolio_planned_risk_pct)} / ${trendRiskPercent(summary.portfolio_risk_limit_pct)}）`;
-  const remaining = `${formatDisplayNumber(summary.portfolio_remaining_risk)}（${trendRiskPercent(summary.portfolio_remaining_risk_pct)}）`;
-  const single = `${formatDisplayNumber(summary.single_entry_risk_limit)}（${trendRiskPercent(summary.single_entry_risk_limit_pct)}）`;
-  const buffer = `${formatDisplayNumber(summary.abnormal_loss_buffer)}（${trendRiskPercent(summary.abnormal_loss_buffer_pct)}）`;
-  const kellyPhase = ({
+function renderTrendRiskSummary(summary, drawdown) {
+  const hasPlanRisk = summary && typeof summary === "object" && hasValue(summary.status);
+  const hasDrawdown = drawdown && typeof drawdown === "object" && hasValue(drawdown.status);
+  if (!hasPlanRisk && !hasDrawdown) return "";
+  const planned = hasPlanRisk ? `${formatDisplayNumber(summary.portfolio_planned_risk)}（${trendRiskPercent(summary.portfolio_planned_risk_pct)} / ${trendRiskPercent(summary.portfolio_risk_limit_pct)}）` : "";
+  const remaining = hasPlanRisk ? `${formatDisplayNumber(summary.portfolio_remaining_risk)}（${trendRiskPercent(summary.portfolio_remaining_risk_pct)}）` : "";
+  const single = hasPlanRisk ? `${formatDisplayNumber(summary.single_entry_risk_limit)}（${trendRiskPercent(summary.single_entry_risk_limit_pct)}）` : "";
+  const buffer = hasPlanRisk ? `${formatDisplayNumber(summary.abnormal_loss_buffer)}（${trendRiskPercent(summary.abnormal_loss_buffer_pct)}）` : "";
+  const status = hasPlanRisk ? summary.status : drawdown.status;
+  const kellyPhase = hasPlanRisk ? ({
     cold_start: "冷启动",
     active_all_samples: "全样本启用",
     active_rolling_200: "最近 200 个样本启用",
     unavailable: "统计不可用",
-  })[summary.kelly_phase] || "";
+  })[summary.kelly_phase] || "" : "";
   const kellyRows = kellyPhase ? `
-      <div><dt>Kelly 阶段</dt><dd>${escapeHtml(`${kellyPhase} · ${formatPlain(summary.kelly_eligible_sample_count)} 个合格模拟闭环`)}</dd></div>
-      <div><dt>当前 Kelly 上限</dt><dd>${escapeHtml(trendKellyPercent(summary.kelly_cap))}</dd></div>` : "";
-  return `<section class="trend-risk-summary" data-risk-status="${escapeHtml(formatPlain(summary.status))}" aria-label="模拟策略风险摘要">
-    <header><strong>模拟策略风险</strong><span>${escapeHtml(formatPlain(summary.status_label))}</span></header>
-    ${hasValue(summary.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(summary.pause_reason))}</p>` : ""}
-    <dl>
-      <div><dt>组合正常计划风险</dt><dd>${escapeHtml(planned)}</dd></div>
-      <div><dt>组合剩余风险</dt><dd>${escapeHtml(remaining)}</dd></div>
-      <div><dt>单笔风险上限</dt><dd>${escapeHtml(single)}</dd></div>
-      <div><dt>异常损失缓冲</dt><dd>${escapeHtml(buffer)} · 不得用于开仓</dd></div>
-      ${kellyRows}
-    </dl>
-    ${hasValue(summary.kelly_reason) ? `<p>${escapeHtml(formatPlain(summary.kelly_reason))}</p>` : ""}
-    ${hasValue(summary.kelly_source) ? `<p>${escapeHtml(formatPlain(summary.kelly_source))}</p>` : ""}
-    <p>${escapeHtml(formatPlain(summary.portfolio_remaining_risk_note))}</p>
-    <p>${escapeHtml(formatPlain(summary.disclaimer))}</p>
+        <div><dt>Kelly 阶段</dt><dd>${escapeHtml(`${kellyPhase} · ${formatPlain(summary.kelly_eligible_sample_count)} 个合格模拟闭环`)}</dd></div>
+        <div><dt>当前 Kelly 上限</dt><dd>${escapeHtml(trendKellyPercent(summary.kelly_cap))}</dd></div>` : "";
+  return `<section class="trend-risk-summary" data-risk-status="${escapeHtml(formatPlain(status))}" aria-label="模拟策略风险摘要">
+    ${hasPlanRisk ? `<header><strong>组合计划风险</strong><span>${escapeHtml(formatPlain(summary.status_label))}</span></header>
+      ${hasValue(summary.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(summary.pause_reason))}</p>` : ""}
+      <dl>
+        <div><dt>组合计划风险</dt><dd>${escapeHtml(planned)}</dd></div>
+        <div><dt>组合剩余风险</dt><dd>${escapeHtml(remaining)}</dd></div>
+        <div><dt>单笔风险上限</dt><dd>${escapeHtml(single)}</dd></div>
+        <div><dt>异常损失缓冲</dt><dd>${escapeHtml(buffer)} · 不得用于开仓</dd></div>
+        ${kellyRows}
+      </dl>
+      ${hasValue(summary.kelly_reason) ? `<p>${escapeHtml(formatPlain(summary.kelly_reason))}</p>` : ""}
+      ${hasValue(summary.kelly_source) ? `<p>${escapeHtml(formatPlain(summary.kelly_source))}</p>` : ""}
+      <p>${escapeHtml(formatPlain(summary.portfolio_remaining_risk_note))}</p>
+      <p>${escapeHtml(formatPlain(summary.disclaimer))}</p>` : ""}
+    ${hasDrawdown ? `<div class="trend-drawdown-summary"><header><strong>策略累计回撤</strong><span>${escapeHtml(formatPlain(drawdown.status_label))}</span></header>
+      ${hasValue(drawdown.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(drawdown.pause_reason))}</p>` : ""}
+      <dl><div><dt>策略累计回撤</dt><dd>${trendRiskPercent(drawdown.drawdown_pct)} / ${trendRiskPercent(drawdown.drawdown_limit_pct)}</dd></div>
+      <div><dt>策略模拟净值</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.current_equity))}</dd></div>
+      <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl></div>` : ""}
   </section>`;
 }
 
@@ -2452,7 +2460,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
         <span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
       </div>
     </header>
-    ${renderTrendRiskSummary(report.risk_summary)}
+    ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary)}
     <div class="cn-trend-actions">
       ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
       ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}

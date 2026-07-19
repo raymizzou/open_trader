@@ -49,6 +49,7 @@ from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, MacOSNotifier
 from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
 from open_trader.trend_kelly import TrendKellyRound
+from open_trader.strategy_drawdown import manual_unlock_strategy_drawdown
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -367,6 +368,21 @@ def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
         data_sources=("Trend Animals", "Futu 日 K", "portfolio.csv"),
         estimated_api_cost=Decimal("1.20"),
         actual_api_cost=Decimal("1.00"),
+    )
+
+
+def unlock_live_drawdown(
+    data_dir: Path, *, market: str = "CN", equity: str = "100000"
+) -> None:
+    manual_unlock_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
+        strategy_version="v4",
+        current_equity=Decimal(equity),
+        occurred_at="2026-07-14T08:00:00+08:00",
+        event_id=f"test-bootstrap-{market.lower()}-v4",
+        actor="pytest",
     )
 
 
@@ -1453,6 +1469,91 @@ def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
     assert built.risk_summary["status_label"] == "组合风险已满"
     assert built.risk_summary["portfolio_remaining_risk"] == Decimal("0")
     assert built.risk_skips[0]["reason"] == "组合正常计划风险已达到净值 4%"
+
+
+def test_v4_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
+    strategy_snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "drawdown123", (622466, 697199)
+    )
+    drawdown_summary = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": "CN",
+        "strategy_id": strategy_snapshot["strategy_id"],
+        "strategy_version": "v4",
+        "kelly_sample_key": (
+            "CN|trend_animals_warm_to_hot/CN/v4|v4"
+        ),
+        "state_status": "ok",
+        "status": "paused",
+        "status_label": "暂停新开仓",
+        "entry_allowed": False,
+        "current_equity": "95000",
+        "high_water_mark": "100000",
+        "drawdown_pct": "0.05",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "策略累计回撤已达到 5%，需人工解锁",
+        "paused_at": "2026-07-14T18:00:00+08:00",
+        "observed_at": "2026-07-14T18:00:00+08:00",
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("95000"),
+            available_cash=Decimal("98000"),
+            positions=(
+                AccountPosition(
+                    "600001", "卖出", "stock", Decimal("100"),
+                    Decimal("9.5"), Decimal("1000"),
+                ),
+                AccountPosition(
+                    "600002", "持有", "stock", Decimal("100"),
+                    Decimal("9.5"), Decimal("1000"),
+                ),
+            ),
+            exceptions=(),
+            position_count=2,
+        ),
+        candidates=[candidate("600003")],
+        holding_snapshots={
+            "600001": holding("600001", danger=True),
+            "600002": holding("600002"),
+        },
+        bars_by_symbol={"600001": bars(), "600002": bars()},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "9",
+                    "active_line": "9",
+                    "atr14": "0.5",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+                for symbol in ("600001", "600002")
+            }
+        },
+        process_version="drawdown123",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=strategy_snapshot,
+        drawdown_summary=drawdown_summary,
+    )
+
+    assert [(item.symbol, item.action) for item in built.holdings] == [
+        ("600001", "SELL_ALL"),
+        ("600002", "HOLD"),
+    ]
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "active"
+    assert built.risk_summary["new_planned_risk"] == Decimal("0")
+    assert built.risk_skips[0]["reason"] == drawdown_summary["pause_reason"]
+    assert built.risk_skips[0]["decisive_constraint"] == "策略累计回撤"
+    payload = trend_module._report_payload(built)
+    assert payload["drawdown_summary"] == drawdown_summary
+    markdown = render_markdown(built)
+    assert "组合计划风险" in markdown
+    assert "策略累计回撤" in markdown
 
 
 def test_minimum_lot_skip_keeps_plain_integer_reason() -> None:
@@ -3685,7 +3786,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v3"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
@@ -3736,8 +3837,10 @@ def test_missing_industry_row_excludes_only_affected_candidate(
         missing_industry_ids={700001},
         industry_ids={1: 700001, 2: 700002},
     )
+    config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir)
     result = run_a_share_trend_report(
-        config=trend_config(tmp_path), run_date="2026-07-14",
+        config=config, run_date="2026-07-14",
         api_factory=lambda **kwargs: api,
         quote_factory=lambda **kwargs: ReadyQuote([]),
         notifier=RecordingFeishu(),
@@ -3836,12 +3939,17 @@ def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["account"]["positions"] == []
     assert payload["metadata"]["simulate_acc_id"] == 101
+    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["drawdown_summary"]["state_status"] == "missing"
+    assert payload["drawdown_summary"]["entry_allowed"] is False
+    assert payload["strategy_judgments"]["formal_actions"] == []
 
 
-def test_report_runner_sends_exact_broker_v2_text(tmp_path: Path) -> None:
+def test_report_runner_sends_exact_broker_v4_text(tmp_path: Path) -> None:
     calls: list[str] = []
     api_kwargs: dict[str, object] = {}
     config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir)
     notifier = RecordingFeishu()
 
     def api_factory(**kwargs: object) -> ReadyApi:

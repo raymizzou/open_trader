@@ -1383,6 +1383,78 @@ def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> Non
     assert report["risk_skips"] == payload["strategy_judgments"]["risk_skips"]
 
 
+def _valid_v4_dashboard_trend_payload() -> dict[str, object]:
+    payload = copy.deepcopy(_valid_v3_dashboard_trend_payload())
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+    })
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.update({
+        "drawdown_limit": "0.05",
+        "drawdown_equity_source": "Futu SIMULATE strategy NAV",
+        "drawdown_unlock": "manual_same_version_rebase",
+    })
+    payload["drawdown_summary"] = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v4|v4",
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": "100000",
+        "high_water_mark": "100000",
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": "2026-07-15T20:00:00+08:00",
+    }
+    return payload
+
+
+def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v4_dashboard_trend_payload()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is True
+    assert report["risk_summary"] == payload["risk_summary"]
+    assert report["drawdown_summary"] == payload["drawdown_summary"]
+
+
+@pytest.mark.parametrize("missing_section", ["risk_summary", "drawdown_summary"])
+def test_dashboard_v4_missing_risk_contract_fails_closed(
+    tmp_path: Path, missing_section: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v4_dashboard_trend_payload()
+    del payload[missing_section]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is False
+
+
 @pytest.mark.parametrize(
     ("section", "key", "value"),
     [

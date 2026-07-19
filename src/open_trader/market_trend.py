@@ -37,6 +37,7 @@ from .a_share_trend import (
     build_report,
     evaluate_candidate,
     load_futu_simulate_trend_account,
+    live_trend_strategy_snapshot,
     load_protection_state,
     load_watch_events,
     render_trend_failure_text,
@@ -59,6 +60,7 @@ from .parsers.base import detect_asset_class
 from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 from .trend_review import freeze_report_evidence
+from .strategy_drawdown import observe_strategy_equity
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -962,6 +964,19 @@ def _attempt_market_report(
         except ValueError as exc:
             kelly_rounds = ()
             kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
+        process_version = _process_version(config.repo)
+        generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
+        strategy_snapshot = live_trend_strategy_snapshot(
+            market, process_version, pool_ids
+        )
+        drawdown_summary = observe_strategy_equity(
+            config.data_dir,
+            market=market,
+            strategy_id=str(strategy_snapshot["strategy_id"]),
+            strategy_version=str(strategy_snapshot["strategy_version"]),
+            current_equity=account.net_value,
+            observed_at=generated_at,
+        )
         report = build_report(
             as_of_date=as_of_date,
             execution_date=execution_date,
@@ -983,19 +998,22 @@ def _attempt_market_report(
             ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost if actual_cost >= 0 else None,
+            generated_at=generated_at,
             market=market,
             lot_sizes=lot_sizes,
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
             price_fx_to_account_currency=Decimal("1"),
-            process_version=_process_version(config.repo),
+            process_version=process_version,
             candidate_pool_ids=pool_ids,
+            strategy_snapshot=strategy_snapshot,
+            drawdown_summary=drawdown_summary,
             metadata={
                 "market": market,
                 "broker": settings["broker"],
                 "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
-                "process_version": _process_version(config.repo),
+                "process_version": process_version,
                 **(
                     {
                         "account_currency": "USD",

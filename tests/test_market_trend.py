@@ -35,9 +35,23 @@ from open_trader.notifications import (
 )
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
+from open_trader.strategy_drawdown import manual_unlock_strategy_drawdown
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def unlock_live_drawdown(data_dir: Path, market: str) -> None:
+    manual_unlock_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
+        strategy_version="v4",
+        current_equity=Decimal("100000"),
+        occurred_at="2026-07-14T08:00:00+08:00",
+        event_id=f"test-bootstrap-{market.lower()}-v4",
+        actor="pytest",
+    )
 
 
 class DefaultSimAccountClient:
@@ -600,6 +614,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, "HK")
     write_protection_state(
         market_paths(cfg.data_dir, cfg.reports_dir, "HK").state,
         {
@@ -799,7 +814,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v3"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
@@ -838,8 +853,8 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
                         "round_id": f"round-{index:03d}",
                         "source": "simulation",
                         "market": "US",
-                        "strategy_id": "trend_animals_warm_to_hot/US/v3",
-                        "opening_strategy_version": "v3",
+                        "strategy_id": "trend_animals_warm_to_hot/US/v4",
+                        "opening_strategy_version": "v4",
                         "closed_at": f"2026-06-{index // 24 + 1:02d}T{index % 24:02d}:00:00+00:00",
                         "net_return": "0.10" if index < 15 else "-0.10",
                         "costs_complete": True,
@@ -860,6 +875,7 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
         ),
         encoding="utf-8",
     )
+    unlock_live_drawdown(cfg.data_dir, "US")
     write_protection_state(
         market_paths(cfg.data_dir, cfg.reports_dir, "US").state,
         {

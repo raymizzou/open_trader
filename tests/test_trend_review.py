@@ -15,7 +15,12 @@ from open_trader.a_share_trend import (
     CandidateInput,
     _report_payload,
     build_report,
+    live_trend_strategy_snapshot,
     trend_strategy_snapshot,
+)
+from open_trader.strategy_drawdown import (
+    manual_unlock_strategy_drawdown,
+    observe_strategy_equity,
 )
 
 
@@ -132,6 +137,106 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
     assert rebuilt["process_version"] == "newsha"
     assert rebuilt["strategy_snapshot"]["process_version"] == "newsha"
     assert rebuilt["account"]["net_value"] == "100000"
+
+
+def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
+    tmp_path: Path,
+) -> None:
+    snapshot = live_trend_strategy_snapshot(
+        "CN", "oldsha", (622466, 697199)
+    )
+    drawdown = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": "CN",
+        "strategy_id": snapshot["strategy_id"],
+        "strategy_version": "v4",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v4|v4",
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": "100000",
+        "high_water_mark": "100000",
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": "2026-07-16T17:00:00+08:00",
+    }
+    account = AccountSnapshot(
+        source_date="2026-07-16",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+        position_count=0,
+    )
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account,
+        candidates=[],
+        holding_snapshots={},
+        bars_by_symbol={},
+        generated_at="2026-07-16T17:00:00+08:00",
+        metadata={
+            "market": "CN", "broker": "eastmoney", "process_version": "oldsha"
+        },
+        process_version="oldsha",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=snapshot,
+        drawdown_summary=drawdown,
+    )
+    source = _report_payload(report)
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path,
+        report=report,
+        candidates=[],
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        watch_events=[],
+        query={"component_pool_ids": [622466, 697199]},
+        responses={},
+        candidate_pool_ids=(622466, 697199),
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=[],
+        option_attention_broker_label=None,
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+
+    manual_unlock_strategy_drawdown(
+        tmp_path,
+        market="CN",
+        strategy_id=str(snapshot["strategy_id"]),
+        strategy_version="v4",
+        current_equity=Decimal("100000"),
+        occurred_at="2026-07-16T17:01:00+08:00",
+        event_id="bootstrap-cn-v4",
+        actor="ray",
+    )
+    observe_strategy_equity(
+        tmp_path,
+        market="CN",
+        strategy_id=str(snapshot["strategy_id"]),
+        strategy_version="v4",
+        current_equity=Decimal("90000"),
+        observed_at="2026-07-17T17:00:00+08:00",
+    )
+
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+
+    assert rebuilt == source
+    assert rebuilt["drawdown_summary"] == drawdown
+    missing = json.loads(json.dumps(evidence))
+    del missing["rebuild_inputs"]["drawdown_summary"]
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match="missing original input: drawdown_summary",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(missing)
 
 
 def test_v1_rebuild_keeps_legacy_nominal_sizing_without_v2_risk_fields() -> None:

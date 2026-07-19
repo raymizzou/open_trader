@@ -27,6 +27,11 @@ from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .kline_technical_facts import DailyKlineBar
 from .notifications import Notifier, NullNotifier
 from .portfolio_risk import size_entry_by_risk
+from .strategy_drawdown import (
+    DRAWDOWN_LIMIT,
+    observe_strategy_equity,
+    valid_drawdown_decision,
+)
 from .trend_kelly import (
     KELLY_MINIMUM_SAMPLES,
     KELLY_OPTIMIZER,
@@ -345,6 +350,22 @@ def valid_v3_risk_contract(
     return phase_valid and reason == ""
 
 
+def valid_v4_risk_contract(
+    parameters: object,
+    summary: object,
+    *,
+    expected_nav: object,
+) -> bool:
+    return (
+        valid_v3_risk_contract(parameters, summary, expected_nav=expected_nav)
+        and isinstance(parameters, Mapping)
+        and parameters.get("drawdown_limit") == str(DRAWDOWN_LIMIT)
+        and parameters.get("drawdown_equity_source")
+        == "Futu SIMULATE strategy NAV"
+        and parameters.get("drawdown_unlock") == "manual_same_version_rebase"
+    )
+
+
 def trend_strategy_snapshot(
     market: str,
     process_version: str,
@@ -494,6 +515,45 @@ def trend_strategy_snapshot(
         "parameter_rows": [
             {"group": group, "name": label, "value": value}
             for group, label, value in rows
+        ],
+    }
+
+
+def live_trend_strategy_snapshot(
+    market: str,
+    process_version: str,
+    candidate_pool_ids: Sequence[int],
+    *,
+    normal_cost_rate: Decimal = NORMAL_COST_RATE,
+) -> dict[str, object]:
+    snapshot = trend_strategy_snapshot(
+        market,
+        process_version,
+        candidate_pool_ids,
+        normal_cost_rate=normal_cost_rate,
+    )
+    market = market.upper()
+    parameters = dict(snapshot["parameters"])
+    parameters.update(
+        {
+            "drawdown_limit": str(DRAWDOWN_LIMIT),
+            "drawdown_equity_source": "Futu SIMULATE strategy NAV",
+            "drawdown_unlock": "manual_same_version_rebase",
+        }
+    )
+    return {
+        **snapshot,
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+        "strategy_version": "v4",
+        "effective_from": "2026-07-20",
+        "parameters": parameters,
+        "parameter_rows": [
+            *snapshot["parameter_rows"],
+            {
+                "group": "累计回撤",
+                "name": "策略累计回撤暂停",
+                "value": "纪律模拟策略净值从高点回撤达到 5% 时暂停新开仓，人工解锁后重设基准",
+            },
         ],
     }
 
@@ -719,6 +779,7 @@ class TrendReport:
     signal_snapshots: dict[str, object]
     metadata: dict[str, object]
     strategy_snapshot: dict[str, object]
+    drawdown_summary: dict[str, object] | None = None
     replay_evidence: dict[str, str] | None = None
 
 
@@ -1895,6 +1956,7 @@ def build_report(
     strategy_snapshot: Mapping[str, object] | None = None,
     kelly_rounds: Sequence[TrendKellyRound] = (),
     kelly_data_reason: str = "",
+    drawdown_summary: Mapping[str, object] | None = None,
 ) -> TrendReport:
     resolved_strategy_snapshot = (
         {
@@ -1924,14 +1986,14 @@ def build_report(
             last_closed_at="",
             selected_round_ids=(),
         )
-        if snapshot_version == "v3" and kelly_data_reason
+        if snapshot_version in {"v3", "v4"} and kelly_data_reason
         else calculate_trend_kelly(
             kelly_rounds,
             market=market,
             strategy_id=str(resolved_strategy_snapshot.get("strategy_id") or ""),
             opening_strategy_version=snapshot_version,
         )
-        if snapshot_version == "v3"
+        if snapshot_version in {"v3", "v4"}
         else None
     )
     held_symbols = {position.symbol for position in account.positions}
@@ -2086,6 +2148,47 @@ def build_report(
             critical_data_reason=critical_data_reason,
             kelly_state=kelly_state,
         )
+        if snapshot_version == "v4" and (
+            not valid_drawdown_decision(
+                drawdown_summary,
+                expected_market=market,
+                expected_strategy_id=str(
+                    resolved_strategy_snapshot.get("strategy_id") or ""
+                ),
+                expected_strategy_version=snapshot_version,
+                expected_equity=account.net_value,
+            )
+            or drawdown_summary.get("entry_allowed") is not True
+        ):
+            valid_summary = isinstance(drawdown_summary, Mapping)
+            pause_reason = (
+                str(drawdown_summary.get("pause_reason") or "")
+                if valid_summary
+                else ""
+            ) or "策略累计回撤状态无效，暂停新开仓"
+            risk_skips = [
+                _risk_skip(
+                    item,
+                    weight=(
+                        CN_TARGET_WEIGHTS.get(item.temperature_curr)
+                        if market == "CN"
+                        else position_weight
+                    ),
+                    target_amount=None,
+                    reason=pause_reason,
+                    decisive_constraint="策略累计回撤",
+                )
+                for item in candidate_decision.eligible
+            ]
+            buy_actions = []
+            if risk_summary.get("status") == "active":
+                risk_summary = _risk_summary(
+                    net_value=account.net_value,
+                    existing_planned_risk=existing_planned_risk,
+                    new_planned_risk=Decimal("0"),
+                    normal_cost_rate=normal_cost_rate,
+                    kelly_state=kelly_state,
+                )
     industry_concentration = tuple(
         (
             industry,
@@ -2161,6 +2264,9 @@ def build_report(
             "position_weight_source": position_weight_source,
         },
         strategy_snapshot=resolved_strategy_snapshot,
+        drawdown_summary=(
+            dict(drawdown_summary) if drawdown_summary is not None else None
+        ),
         replay_evidence=None,
     )
 
@@ -2269,6 +2375,11 @@ def _candidate_signal(item: CandidateInput, *, market: str) -> dict[str, object]
 
 def _money(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01')):.2f}"
+
+
+def _risk_percent(value: object) -> str:
+    parsed = _nonnegative_risk_decimal(value)
+    return "未知" if parsed is None else f"{_money(parsed * Decimal('100'))}%"
 
 
 ACTION_LABELS = {
@@ -2607,7 +2718,7 @@ def render_markdown(report: TrendReport) -> str:
         f"全部卖出 {len(sells)}｜允许买入 {len(report.buy_actions)}｜"
         f"继续持有 {len(holds)}｜人工复核 {len(reviews)}｜其他动作 {len(others)}",
     ]
-    if report.strategy_snapshot.get("strategy_version") == "v3":
+    if report.strategy_snapshot.get("strategy_version") in {"v3", "v4"}:
         phase = {
             "cold_start": "冷启动",
             "active_all_samples": "全样本启用",
@@ -2628,7 +2739,33 @@ def render_markdown(report: TrendReport) -> str:
                 "实盘结果不参与计算",
             ]
         )
-    lines.extend(["", "## 开盘前：确认卖出", ""])
+    if report.risk_summary:
+        lines.extend([
+            "",
+            "## 组合计划风险",
+            "",
+            "- 正常计划风险："
+            f"{_risk_percent(report.risk_summary['portfolio_planned_risk_pct'])}"
+            f" / {_risk_percent(report.risk_summary['portfolio_risk_limit_pct'])}",
+            "- 异常损失缓冲："
+            f"{_risk_percent(report.risk_summary['abnormal_loss_buffer_pct'])}（不得用于开仓）",
+            "",
+        ])
+    if report.drawdown_summary is not None:
+        drawdown = report.drawdown_summary.get("drawdown_pct")
+        drawdown_text = _risk_percent(drawdown)
+        lines.extend([
+            "## 策略累计回撤",
+            "",
+            f"- 当前累计回撤：{drawdown_text}｜暂停阈值 5%｜{report.drawdown_summary.get('status_label', '未知')}",
+            *(
+                [f"- {report.drawdown_summary['pause_reason']}"]
+                if report.drawdown_summary.get("pause_reason")
+                else []
+            ),
+            "",
+        ])
+    lines.extend(["## 开盘前：确认卖出", ""])
     if sells:
         for item in sells:
             line = f"- {item.symbol} {item.name}｜{_reason_label(item.reason)}"
@@ -2784,14 +2921,14 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     if parameters.get("buy_window") != expected_window:
         raise ValueError("strategy snapshot does not match report actions")
     version = snapshot.get("strategy_version")
-    if version not in {"v1", "v2", "v3"}:
+    if version not in {"v1", "v2", "v3", "v4"}:
         raise ValueError("strategy snapshot does not match report actions")
-    if version in {"v2", "v3"}:
-        valid_contract = (
-            valid_v3_risk_contract
-            if version == "v3"
-            else valid_v2_risk_contract
-        )
+    if version in {"v2", "v3", "v4"}:
+        valid_contract = {
+            "v2": valid_v2_risk_contract,
+            "v3": valid_v3_risk_contract,
+            "v4": valid_v4_risk_contract,
+        }[version]
         if not valid_contract(
             parameters,
             report.risk_summary,
@@ -2843,6 +2980,19 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             report.risk_summary.get("new_planned_risk")
         ) != new_planned_risk:
             raise ValueError("strategy snapshot does not match report actions")
+    if version == "v4":
+        if (
+            not valid_drawdown_decision(
+                report.drawdown_summary,
+                expected_market=market,
+                expected_strategy_id=str(snapshot.get("strategy_id") or ""),
+                expected_strategy_version="v4",
+                expected_equity=report.account.net_value,
+            )
+            or report.drawdown_summary.get("entry_allowed") is not True
+            and report.buy_actions
+        ):
+            raise ValueError("strategy snapshot does not match report actions")
     try:
         protection_multiple = Decimal(str(parameters["initial_protection_atr_multiple"]))
     except (InvalidOperation, KeyError, ValueError):
@@ -2855,7 +3005,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             else target
         )
         expected_weight = Decimal(str(nominal_weight))
-        if version == "v3" and report.risk_summary.get("kelly_phase") != "cold_start":
+        if version in {"v3", "v4"} and report.risk_summary.get("kelly_phase") != "cold_start":
             cap = _nonnegative_risk_decimal(report.risk_summary.get("kelly_cap"))
             if cap is None:
                 raise ValueError("strategy snapshot does not match report actions")
@@ -2933,6 +3083,8 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "strategy_snapshot": _json_value(report.strategy_snapshot),
         "disclaimer": DISCLAIMER_TEXT,
     }
+    if report.drawdown_summary is not None:
+        payload["drawdown_summary"] = _json_value(report.drawdown_summary)
     if not legacy_v1:
         payload["risk_summary"] = _json_value(report.risk_summary)
     if report.replay_evidence is not None:
@@ -3873,6 +4025,23 @@ def _attempt_report(
         except ValueError as exc:
             kelly_rounds = ()
             kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
+        generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
+        strategy_snapshot = live_trend_strategy_snapshot(
+            "CN",
+            process_version,
+            (
+                config.trend_animals_a_share_tm_id,
+                config.trend_animals_etf_tm_id,
+            ),
+        )
+        drawdown_summary = observe_strategy_equity(
+            config.data_dir,
+            market="CN",
+            strategy_id=str(strategy_snapshot["strategy_id"]),
+            strategy_version=str(strategy_snapshot["strategy_version"]),
+            current_equity=account.net_value,
+            observed_at=generated_at,
+        )
         report = build_report(
             as_of_date=run_date,
             execution_date=execution_date,
@@ -3895,6 +4064,7 @@ def _attempt_report(
             ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost,
+            generated_at=generated_at,
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
             process_version=process_version,
@@ -3902,6 +4072,8 @@ def _attempt_report(
                 config.trend_animals_a_share_tm_id,
                 config.trend_animals_etf_tm_id,
             ),
+            strategy_snapshot=strategy_snapshot,
+            drawdown_summary=drawdown_summary,
             metadata={
                 "market": "CN",
                 "broker": "eastmoney",

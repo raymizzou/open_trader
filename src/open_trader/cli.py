@@ -18,6 +18,7 @@ from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
 from .a_share_trend import (
     _process_version,
+    live_trend_strategy_snapshot,
     load_futu_simulate_trend_account,
     run_a_share_trend_report,
 )
@@ -129,12 +130,17 @@ from .trend_review import (
     rebuild_trend_report_from_evidence,
     replay_trend_evidence,
 )
+from .strategy_drawdown import manual_unlock_strategy_drawdown
 
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 TREND_REPORT_STEM_RE = re.compile(
     r"(?P<date>\d{4}-\d{2}-\d{2})(?:-r(?P<revision>\d+))?\Z"
 )
+
+
+def _drawdown_unlock_now(timezone: str) -> datetime:
+    return datetime.now(ZoneInfo(timezone))
 
 
 def _trend_report_path_order(path: Path) -> tuple[str, int]:
@@ -780,6 +786,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--reconnect-seconds", type=positive_float, default=60.0
     )
     market_trend_watch.add_argument("--once", action="store_true")
+
+    drawdown_unlock = subparsers.add_parser(
+        "trend-drawdown-unlock",
+        help="Manually unlock and rebase one simulated trend strategy",
+    )
+    drawdown_unlock.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    drawdown_unlock.add_argument(
+        "--market", choices=("CN", "US", "HK"), required=True
+    )
+    drawdown_unlock.add_argument("--event-id", required=True)
+    drawdown_unlock.add_argument("--actor", required=True)
 
     trend_review_parser = subparsers.add_parser(
         "trend-review", help="Run or replay one market trend review workflow"
@@ -1489,6 +1508,57 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "trend-drawdown-unlock":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            configured_timezone = ZoneInfo(config.timezone)
+            now = _drawdown_unlock_now(config.timezone)
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("drawdown unlock clock must be timezone-aware")
+            now = now.astimezone(configured_timezone)
+            occurred_at = now.isoformat(timespec="seconds")
+            expected_date = now.date().isoformat()
+            account = load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=require_trend_review_config(config, args.market),
+                market=args.market,
+                expected_date=expected_date,
+            )
+            pool_ids = {
+                "CN": (
+                    config.trend_animals_a_share_tm_id,
+                    config.trend_animals_etf_tm_id,
+                ),
+                "US": config.trend_animals_us_tm_ids,
+                "HK": config.trend_animals_hk_tm_ids,
+            }[args.market]
+            strategy = live_trend_strategy_snapshot(
+                args.market,
+                _process_version(config.repo),
+                pool_ids,
+            )
+            result = manual_unlock_strategy_drawdown(
+                config.data_dir,
+                market=args.market,
+                strategy_id=strategy["strategy_id"],
+                strategy_version=strategy["strategy_version"],
+                current_equity=account.net_value,
+                occurred_at=occurred_at,
+                event_id=args.event_id,
+                actor=args.actor,
+            )
+        except (
+            FileNotFoundError,
+            ValueError,
+            RuntimeError,
+            ZoneInfoNotFoundError,
+        ) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
 
     if args.command == "trend-review":
         try:

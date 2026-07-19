@@ -191,6 +191,7 @@ def freeze_report_evidence(
             "position_weight_source": metadata.get("position_weight_source"),
             "price_fx_to_account_currency": price_fx_to_account_currency,
             "normal_cost_rate": risk_summary.get("normal_cost_rate"),
+            "drawdown_summary": getattr(report, "drawdown_summary", None),
             "option_attention": {
                 "previous_rows": previous_attention_rows,
                 "broker_label": option_attention_broker_label,
@@ -1626,10 +1627,12 @@ def rebuild_trend_report_from_evidence(
         "metadata",
         "price_fx_to_account_currency",
     }
-    if strategy_version in {"v2", "v3"}:
+    if strategy_version in {"v2", "v3", "v4"}:
         required.add("normal_cost_rate")
-    if strategy_version == "v3":
+    if strategy_version in {"v3", "v4"}:
         required.update({"kelly_rounds", "kelly_data_reason"})
+    if strategy_version == "v4":
+        required.add("drawdown_summary")
     missing = sorted(required - inputs.keys())
     if missing:
         raise TrendReplayIncompleteError(
@@ -1756,7 +1759,7 @@ def rebuild_trend_report_from_evidence(
             "invalid original input: price_fx_to_account_currency"
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
-    if strategy_version in {"v2", "v3"} and (
+    if strategy_version in {"v2", "v3", "v4"} and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
         or normal_cost_rate < 0
@@ -1821,6 +1824,12 @@ def rebuild_trend_report_from_evidence(
         strategy_snapshot=snapshot,
         kelly_rounds=kelly_rounds,
         kelly_data_reason=kelly_data_reason,
+        drawdown_summary=(
+            inputs["drawdown_summary"]
+            if strategy_version == "v4"
+            and isinstance(inputs.get("drawdown_summary"), Mapping)
+            else None
+        ),
     )
     market = str(inputs["market"]).upper()
     if market in {"US", "HK"}:
