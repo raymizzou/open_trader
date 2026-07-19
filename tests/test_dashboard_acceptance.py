@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -4494,29 +4495,42 @@ def test_acceptance_rejects_latest_exact_api_identity_that_differs_from_local_re
 
 
 def test_acceptance_rejects_dirty_dashboard_source(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    tmp_path: Path,
 ) -> None:
-    commands: list[list[str]] = []
-
-    def status(*args: object, **kwargs: object) -> str:
-        del kwargs
-        commands.append(list(args[0]))  # type: ignore[arg-type]
-        return " M src/open_trader/dashboard.py\n"
-
-    monkeypatch.setattr(
-        dashboard_acceptance.subprocess,
-        "check_output",
-        status,
+    (tmp_path / "src/open_trader").mkdir(parents=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "config").mkdir()
+    (tmp_path / ".gitignore").write_text(
+        ".venv/\n.superpowers/\nconfig/daily_premarket.env\n",
+        encoding="utf-8",
+    )
+    tracked_test = tmp_path / "tests/test_dashboard_acceptance.py"
+    tracked_test.write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(tmp_path), "-c", "user.name=Codex",
+            "-c", "user.email=codex@example.invalid", "commit", "-qm", "baseline",
+        ],
+        check=True,
     )
 
-    assert dashboard_acceptance._source_changes(tmp_path) == [
-        "M src/open_trader/dashboard.py"
-    ]
-    assert commands[0][-3:] == [
-        "--",
-        "src/open_trader",
-        "data/latest/kelly_strategy_templates.json",
-    ]
+    tracked_test.write_text("modified\n", encoding="utf-8")
+    (tmp_path / "src/open_trader/new_module.py").write_text("", encoding="utf-8")
+    for ignored in (
+        ".venv/cache",
+        ".superpowers/sdd/report.md",
+        "config/daily_premarket.env",
+    ):
+        path = tmp_path / ignored
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ignored\n", encoding="utf-8")
+
+    assert set(dashboard_acceptance._source_changes(tmp_path)) == {
+        "M tests/test_dashboard_acceptance.py",
+        "?? src/open_trader/new_module.py",
+    }
 
 
 @pytest.mark.parametrize(

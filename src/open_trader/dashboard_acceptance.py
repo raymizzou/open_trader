@@ -1330,8 +1330,7 @@ def _source_changes(cwd: Path) -> list[str]:
     output = subprocess.check_output(
         [
             "git", "-C", str(cwd), "status", "--porcelain",
-            "--untracked-files=all", "--", "src/open_trader",
-            "data/latest/kelly_strategy_templates.json",
+            "--untracked-files=all",
         ],
         text=True,
     )
