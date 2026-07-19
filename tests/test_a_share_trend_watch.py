@@ -9,12 +9,18 @@ from collections.abc import Callable, Mapping
 
 import pytest
 
+from open_trader.a_share_trend import load_eastmoney_account
 from open_trader.a_share_trend_watch import (
     _deliver_trigger_notification,
     _notify_trend_review_deadline,
     append_watch_event,
-    watch_a_share_protection,
+    watch_a_share_protection as _watch_a_share_protection,
 )
+
+
+def watch_a_share_protection(**kwargs: object) -> object:
+    kwargs.setdefault("account_loader", load_eastmoney_account)
+    return _watch_a_share_protection(**kwargs)
 from open_trader.daily_premarket import RunLock
 from open_trader.futu_quote import FutuQuoteError
 from open_trader.futu_watch import QuoteSnapshot

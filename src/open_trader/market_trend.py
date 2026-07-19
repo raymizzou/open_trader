@@ -55,11 +55,6 @@ from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .parsers.base import detect_asset_class
-from .tiger_account import (
-    TigerAccountClient,
-    load_tiger_account_config,
-    sync_tiger_portfolio,
-)
 from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 from .trend_review import freeze_report_evidence
@@ -686,24 +681,6 @@ def _attention_actions(payload: Mapping[str, object]) -> dict[str, str]:
             if isinstance(symbol, str) and isinstance(action, str):
                 actions[symbol] = action
     return actions
-
-
-def _refresh_tiger_account(config: DailyPremarketConfig, run_date: str) -> None:
-    tiger_config = load_tiger_account_config(
-        config_dir=Path("~/.tigeropen/"), account=None, sandbox=False
-    )
-    client = TigerAccountClient(config=tiger_config)
-    try:
-        sync_tiger_portfolio(
-            snapshot=client.fetch_snapshot(),
-            portfolio_path=config.portfolio,
-            data_dir=config.data_dir,
-            reports_dir=config.reports_dir,
-            run_date=run_date,
-            update_latest=True,
-        )
-    finally:
-        client.close()
 
 
 def _market_receipt_path(paths: MarketTrendPaths, artifact_stem: str) -> Path:

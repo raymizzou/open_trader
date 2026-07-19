@@ -424,46 +424,6 @@ def test_load_tiger_account_uses_latest_valid_snapshot_and_clamps_cash(
     assert account.available_cash == Decimal("0")
 
 
-def test_us_account_refreshes_directly_from_tiger_before_reporting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cfg = config(tmp_path)
-    calls: list[object] = []
-
-    class Client:
-        def __init__(self, *, config: object) -> None:
-            calls.append(("connect", config))
-
-        def fetch_snapshot(self) -> object:
-            calls.append("fetch")
-            return "snapshot"
-
-        def close(self) -> None:
-            calls.append("close")
-
-    def sync(**kwargs: object) -> None:
-        calls.append(("sync", kwargs))
-
-    monkeypatch.setattr(
-        "open_trader.market_trend.load_tiger_account_config",
-        lambda **kwargs: calls.append(("config", kwargs)) or "tiger-config",
-    )
-    monkeypatch.setattr("open_trader.market_trend.TigerAccountClient", Client)
-    monkeypatch.setattr("open_trader.market_trend.sync_tiger_portfolio", sync)
-
-    market_trend._refresh_tiger_account(cfg, "2026-07-15")
-
-    assert calls[:3] == [
-        ("config", {"config_dir": Path("~/.tigeropen/"), "account": None, "sandbox": False}),
-        ("connect", "tiger-config"),
-        "fetch",
-    ]
-    assert calls[3][0] == "sync"
-    assert calls[3][1]["snapshot"] == "snapshot"
-    assert calls[3][1]["update_latest"] is True
-    assert calls[4] == "close"
-
-
 def test_load_phillips_statement_can_be_stale_and_caps_cash_to_known_balance(
     tmp_path: Path,
 ) -> None:

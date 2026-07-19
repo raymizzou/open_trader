@@ -31,6 +31,7 @@ from open_trader.a_share_trend import (
     estimate_buy_actions,
     evaluate_candidate,
     load_eastmoney_account,
+    load_futu_simulate_trend_account,
     load_protection_state,
     load_watch_events,
     render_trend_failure_text,
@@ -97,6 +98,94 @@ def default_simulation_account(monkeypatch: pytest.MonkeyPatch) -> None:
         "FutuSimulateOrderExecutionClient",
         DefaultSimAccountClient,
     )
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "message"),
+    [
+        (
+            {"acc_id": 101, "net_value": "0", "cash": "100", "positions": []},
+            "net value must be positive",
+        ),
+        (
+            {"acc_id": 101, "net_value": "100", "cash": "-1", "positions": []},
+            "cash must be nonnegative",
+        ),
+        (
+            {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [
+                    {"code": "US.AAPL", "qty": "1", "market_val": "10"}
+                ],
+            },
+            "position market does not match CN",
+        ),
+        (
+            {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [{"code": "SH.600001", "qty": "-1", "market_val": "10"}],
+            },
+            "position quantity must be nonnegative",
+        ),
+        (
+            {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [{"code": "SH.600001", "qty": "1"}],
+            },
+            "position market value is invalid",
+        ),
+    ],
+)
+def test_futu_simulation_account_rejects_invalid_boundary_rows(
+    snapshot: dict[str, object], message: str
+) -> None:
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return snapshot
+
+        def close(self) -> None:
+            pass
+
+    with pytest.raises(ValueError, match=message):
+        load_futu_simulate_trend_account(
+            host="127.0.0.1",
+            port=11111,
+            simulate_acc_id=101,
+            market="CN",
+            expected_date="2026-07-17",
+            account_factory=lambda **kwargs: Client(),
+        )
+
+
+def test_futu_simulation_account_ignores_explicit_zero_quantity_rows() -> None:
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [{"code": "US.AAPL", "qty": "0"}],
+            }
+
+        def close(self) -> None:
+            pass
+
+    account = load_futu_simulate_trend_account(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=101,
+        market="CN",
+        expected_date="2026-07-17",
+        account_factory=lambda **kwargs: Client(),
+    )
+
+    assert account.positions == ()
 
 
 def test_unified_trend_fields_match_the_paid_catalog_selection() -> None:

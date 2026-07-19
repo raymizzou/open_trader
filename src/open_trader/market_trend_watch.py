@@ -17,7 +17,7 @@ from .a_share_trend_watch import (
     watch_a_share_protection,
 )
 from .futu_quote import FutuQuoteClient, FutuQuoteError
-from .market_trend import _market, load_trend_account
+from .market_trend import _market
 from .notifications import Notifier
 
 
@@ -72,6 +72,7 @@ def watch_market_protection(
     market: str,
     data_dir: Path,
     portfolio_path: Path,
+    account_loader: Callable[..., object],
     state_path: Path,
     events_path: Path,
     report_lock_path: Path,
@@ -165,27 +166,14 @@ def watch_market_protection(
             )
         break
 
-    active_lines = _load_active_lines(state_path)
-    load_trend_account(
-        data_dir=data_dir,
-        market=market,
+    account_loader(
+        portfolio_path,
         expected_date=opening.date().isoformat(),
-        managed_symbols=set(active_lines),
+        timezone=timezone,
     )
     local_now = now.astimezone(timezone)
     if opening > local_now:
         sleep_fn((opening - local_now).total_seconds())
-
-    def account_loader(
-        path: Path, *, expected_date: str, timezone: ZoneInfo
-    ):
-        del path, timezone
-        return load_trend_account(
-            data_dir=data_dir,
-            market=market,
-            expected_date=expected_date,
-            managed_symbols=set(_load_active_lines(state_path)),
-        )
 
     return watch_a_share_protection(
         portfolio_path=portfolio_path,

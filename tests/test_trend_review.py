@@ -342,7 +342,6 @@ def test_open_uses_frozen_report_quantity_despite_live_nav_and_price(tmp_path: P
         data_dir=tmp_path,
         report=report,
         client=client,
-        prices={"600001": Decimal("500")},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T09:31:00+08:00",
@@ -351,7 +350,6 @@ def test_open_uses_frozen_report_quantity_despite_live_nav_and_price(tmp_path: P
         data_dir=tmp_path,
         report=report,
         client=client,
-        prices={"600001": Decimal("1")},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T09:32:00+08:00",
@@ -382,7 +380,6 @@ def test_completed_buy_with_empty_broker_history_never_resubmits(
         "data_dir": tmp_path,
         "report": cn_buy_report(),
         "client": client,
-        "prices": {"600001": Decimal("10")},
         "market": "CN",
         "execution_date": "2026-07-17",
     }
@@ -408,7 +405,6 @@ def test_us_open_uses_us_market_date_after_shanghai_midnight(tmp_path: Path) -> 
         data_dir=tmp_path,
         report=report,
         client=client,
-        prices={"NDAQ": Decimal("94.25")},
         market="US",
         execution_date="2026-07-17",
         now="2026-07-18T00:30:00+08:00",
@@ -427,7 +423,6 @@ def test_us_open_does_not_carry_market_order_after_close(tmp_path: Path) -> None
         data_dir=tmp_path,
         report=report,
         client=client,
-        prices={"NDAQ": Decimal("94.25")},
         market="US",
         execution_date="2026-07-17",
         now="2026-07-17T19:54:00-04:00",
@@ -462,7 +457,6 @@ def test_report_revision_does_not_duplicate_existing_symbol_intent(
         data_dir=tmp_path,
         report=first_report,
         client=client,
-        prices={"600001": Decimal("10")},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T09:31:00+08:00",
@@ -471,7 +465,6 @@ def test_report_revision_does_not_duplicate_existing_symbol_intent(
         data_dir=tmp_path,
         report=revised_report,
         client=client,
-        prices={"600001": Decimal("9")},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T09:32:00+08:00",
@@ -488,7 +481,6 @@ def test_formal_sell_all_submits_full_position_market_order(tmp_path: Path) -> N
         data_dir=tmp_path,
         report=cn_buy_report(),
         client=client,
-        prices={"600001": Decimal("10")},
         market="CN",
         execution_date="2026-07-16",
         now="2026-07-16T09:31:00+08:00",
@@ -501,7 +493,6 @@ def test_formal_sell_all_submits_full_position_market_order(tmp_path: Path) -> N
             [{"action": "SELL_ALL", "symbol": "600001"}]
         ),
         client=client,
-        prices={},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T10:30:00+08:00",
@@ -522,7 +513,6 @@ def test_formal_sell_all_suppresses_conflicting_buy(tmp_path: Path) -> None:
         data_dir=tmp_path,
         report=cn_buy_report(),
         client=client,
-        prices={"600001": Decimal("10")},
         market="CN",
         execution_date="2026-07-16",
         now="2026-07-16T09:31:00+08:00",
@@ -540,12 +530,13 @@ def test_formal_sell_all_suppresses_conflicting_buy(tmp_path: Path) -> None:
                     "symbol": "600001",
                     "target_weight": "0.04",
                     "lot_size": 100,
+                    "estimated_shares": 200,
+                    "atr": "0.5",
                 },
                 {"action": "SELL_ALL", "symbol": "600001"},
             ]
         ),
         client=client,
-        prices={"600001": Decimal("10")},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T09:31:00+08:00",
@@ -563,7 +554,6 @@ def test_open_submits_all_sells_before_frozen_buys_regardless_of_report_order(
         data_dir=tmp_path,
         report=cn_buy_report(),
         client=client,
-        prices={},
         market="CN",
         execution_date="2026-07-16",
         now="2026-07-16T09:31:00+08:00",
@@ -588,7 +578,6 @@ def test_open_submits_all_sells_before_frozen_buys_regardless_of_report_order(
             ]
         ),
         client=client,
-        prices={"600002": Decimal("999")},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T09:31:00+08:00",
@@ -607,7 +596,6 @@ def test_open_stops_unsubmitted_buys_when_a_required_sell_submission_fails(
         data_dir=tmp_path,
         report=cn_buy_report(),
         client=client,
-        prices={},
         market="CN",
         execution_date="2026-07-16",
         now="2026-07-16T09:31:00+08:00",
@@ -634,13 +622,96 @@ def test_open_stops_unsubmitted_buys_when_a_required_sell_submission_fails(
                 ]
             ),
             client=client,
-            prices={},
             market="CN",
             execution_date="2026-07-17",
             now="2026-07-17T09:31:00+08:00",
         )
 
     assert [request["side"] for request in client.requests] == ["sell"]
+
+
+def test_reconciled_rejected_sell_stops_frozen_buys_and_records_failure(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "300"}],
+        fail_orders=1,
+        accepted_before_failure=True,
+    )
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report_with_actions(
+            [
+                {
+                    "action": "BUY",
+                    "symbol": "600002",
+                    "target_weight": "0.04",
+                    "lot_size": 100,
+                    "estimated_shares": 200,
+                    "atr": "0.5",
+                },
+                {"action": "SELL_ALL", "symbol": "600001"},
+            ]
+        ),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "now": "2026-07-17T09:31:00+08:00",
+    }
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_open(**arguments)
+    client.orders[0].update(
+        order_id="SIM-REJECTED",
+        order_status="SUBMIT_FAILED",
+    )
+
+    with pytest.raises(RuntimeError, match="SUBMIT_FAILED"):
+        trend_review.execute_trend_review_open(**arguments)
+
+    assert [request["side"] for request in client.requests] == ["sell"]
+    failures = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+        if json.loads(path.read_text(encoding="utf-8")).get("status") == "failed"
+    ]
+    assert "simulate sell order rejected: SUBMIT_FAILED" in {
+        failure["reason"] for failure in failures
+    }
+
+
+def test_open_preflights_all_actions_before_any_broker_or_ledger_side_effect(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "300"}]
+    )
+    report = report_with_actions(
+        [
+            {"action": "SELL_ALL", "symbol": "600001"},
+            {
+                "action": "BUY",
+                "symbol": "600002",
+                "target_weight": "0.04",
+                "lot_size": 100,
+                "estimated_shares": 200,
+            },
+        ]
+    )
+
+    with pytest.raises(ValueError, match="trend review buy action is invalid"):
+        trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=report,
+            client=client,
+            market="CN",
+            execution_date="2026-07-17",
+            now="2026-07-17T09:31:00+08:00",
+        )
+
+    assert client.requests == []
+    assert not (tmp_path / "trend_review/ledgers/CN").exists()
 
 
 def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zero(
@@ -651,7 +722,6 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
         data_dir=tmp_path,
         report=cn_buy_report(),
         client=client,
-        prices={"600001": Decimal("10")},
         market="CN",
         execution_date="2026-07-16",
         now="2026-07-16T09:31:00+08:00",
@@ -660,7 +730,6 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
         data_dir=tmp_path,
         report=cn_buy_report(symbol="600003"),
         client=client,
-        prices={"600003": Decimal("10")},
         market="CN",
         execution_date="2026-07-16",
         now="2026-07-16T09:32:00+08:00",
@@ -674,6 +743,8 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
             "symbol": "600002",
             "target_weight": "0.04",
             "lot_size": 100,
+            "estimated_shares": 200,
+            "atr": "0.5",
         },
         {"action": "SELL_ALL", "symbol": "600001"},
         {"action": "SELL_ALL", "symbol": "600003"},
@@ -682,7 +753,6 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
         "data_dir": tmp_path,
         "report": report,
         "client": client,
-        "prices": {"600002": Decimal("10")},
         "market": "CN",
         "execution_date": "2026-07-17",
     }
@@ -791,7 +861,6 @@ def test_sell_recovery_stops_only_for_valid_position_zero_terminal_status(
         data_dir=tmp_path,
         report=cn_buy_report(),
         client=client,
-        prices={"600001": Decimal("10")},
         market="CN",
         execution_date="2026-07-16",
         now="2026-07-16T09:31:00+08:00",
@@ -805,7 +874,6 @@ def test_sell_recovery_stops_only_for_valid_position_zero_terminal_status(
             {"action": "SELL_ALL", "symbol": "600001"}
         ]),
         "client": client,
-        "prices": {},
         "market": "CN",
         "execution_date": "2026-07-17",
     }
@@ -863,7 +931,6 @@ def test_position_zero_terminal_uses_actual_broker_fill_facts(
         data_dir=tmp_path,
         report=cn_buy_report(),
         client=client,
-        prices={"600001": Decimal("10")},
         market="CN",
         execution_date="2026-07-16",
         now="2026-07-16T09:31:00+08:00",
@@ -876,7 +943,6 @@ def test_position_zero_terminal_uses_actual_broker_fill_facts(
         "data_dir": tmp_path,
         "report": report,
         "client": client,
-        "prices": {},
         "market": "CN",
         "execution_date": "2026-07-17",
     }
@@ -933,7 +999,6 @@ def test_positive_sell_recovery_uses_broker_fills_and_live_retry_quantity(
         data_dir=tmp_path,
         report=cn_buy_report(),
         client=client,
-        prices={"600001": Decimal("10")},
         market="CN",
         execution_date="2026-07-16",
         now="2026-07-16T09:31:00+08:00",
@@ -946,7 +1011,6 @@ def test_positive_sell_recovery_uses_broker_fills_and_live_retry_quantity(
         "data_dir": tmp_path,
         "report": report,
         "client": client,
-        "prices": {},
         "market": "CN",
         "execution_date": "2026-07-17",
     }
@@ -1000,7 +1064,6 @@ def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:
         "data_dir": tmp_path,
         "report": cn_buy_report(),
         "client": client,
-        "prices": {"600001": Decimal("10")},
         "market": "CN",
         "execution_date": "2026-07-17",
         "now": "2026-07-17T09:31:00+08:00",
@@ -1036,7 +1099,6 @@ def test_active_partial_buy_waits_instead_of_duplicate_submission(
         "data_dir": tmp_path,
         "report": cn_buy_report(),
         "client": client,
-        "prices": {"600001": Decimal("10")},
         "market": "CN",
         "execution_date": "2026-07-17",
         "now": "2026-07-17T09:31:00+08:00",
@@ -1087,7 +1149,6 @@ def test_filled_buy_records_active_protection_line_without_mutating_report(
         "data_dir": tmp_path,
         "report": json.loads(original_bytes),
         "client": client,
-        "prices": {},
         "market": "CN",
         "execution_date": "2026-07-17",
     }
@@ -1116,9 +1177,22 @@ def test_filled_buy_records_active_protection_line_without_mutating_report(
         tmp_path.glob("trend_review/ledgers/CN/actions/2026-07-17/*/*.json")
     )
     filled = json.loads(events[-1].read_text(encoding="utf-8"))
+    state_path = tmp_path / "trend_a_share/protection_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
     assert filled["status"] == "filled"
     assert filled["avg_fill_price"] == "12.50"
     assert filled["active_protection_line"] == "10.00"
+    assert state["positions"]["600001"] | {
+        "initial_line": "10.00",
+        "active_line": "10.00",
+        "atr14": "1.25",
+        "position_started_for": "2026-07-17",
+        "tracking_active": False,
+        "updated_for": "2026-07-17",
+    } == state["positions"]["600001"]
+    from open_trader.a_share_trend_watch import _load_active_lines
+
+    assert _load_active_lines(state_path) == {"600001": Decimal("10.00")}
     assert report_path.read_bytes() == original_bytes
     assert hashlib.sha256(report_path.read_bytes()).hexdigest() == hashlib.sha256(
         original_bytes
@@ -1133,7 +1207,6 @@ def test_open_retries_intent_when_failed_order_is_absent_at_broker(
         "data_dir": tmp_path,
         "report": cn_buy_report(),
         "client": client,
-        "prices": {"600001": Decimal("10")},
         "market": "CN",
         "execution_date": "2026-07-17",
         "now": "2026-07-17T09:31:00+08:00",
@@ -1156,7 +1229,6 @@ def test_open_reconciles_accepted_order_after_response_failure(
         "data_dir": tmp_path,
         "report": cn_buy_report(),
         "client": client,
-        "prices": {"600001": Decimal("10")},
         "market": "CN",
         "execution_date": "2026-07-17",
         "now": "2026-07-17T09:31:00+08:00",
@@ -1185,7 +1257,6 @@ def test_newer_revision_cannot_reconcile_to_older_response_failure(
         "data_dir": tmp_path,
         "report": cn_buy_report(symbol="600001"),
         "client": client,
-        "prices": {"600001": Decimal("10")},
         "market": "CN",
         "execution_date": "2026-07-17",
         "now": "2026-07-17T09:31:00+08:00",
@@ -1198,7 +1269,6 @@ def test_newer_revision_cannot_reconcile_to_older_response_failure(
     revised = {
         **first,
         "report": cn_buy_report(symbol="600002"),
-        "prices": {"600002": Decimal("20")},
     }
     with pytest.raises(RuntimeError, match="place order failed"):
         trend_review.execute_trend_review_open(**revised)
@@ -1228,7 +1298,6 @@ def test_first_open_binds_discipline_account_with_existing_sell_position(
             [{"action": "SELL_ALL", "symbol": "600001"}]
         ),
         client=client,
-        prices={},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T09:31:00+08:00",

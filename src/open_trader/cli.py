@@ -16,7 +16,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
-from .a_share_trend import _process_version, run_a_share_trend_report
+from .a_share_trend import (
+    _process_version,
+    load_futu_simulate_trend_account,
+    run_a_share_trend_report,
+)
 from .a_share_trend_watch import watch_a_share_protection
 from .market_trend import market_paths, run_market_trend_report
 from .market_trend_watch import watch_market_protection
@@ -280,7 +284,6 @@ def run_trend_review_open(
             data_dir=config.data_dir,
             report=report,
             client=client,
-            prices={},
             market=market,
             execution_date=trading_date,
             now=datetime.now(ZoneInfo(config.timezone)).isoformat(timespec="seconds"),
@@ -1656,12 +1659,25 @@ def main(argv: list[str] | None = None) -> int:
             config = load_env_config(args.config, dry_run=False)
             notifier = build_notifier(config)
             paths = market_paths(config.data_dir, config.reports_dir, args.market)
+            account_id = require_trend_review_config(config, args.market)
         except (FileNotFoundError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
 
         def market_quote_factory() -> FutuQuoteClient:
             return FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+
+        def market_account_loader(
+            path: Path, *, expected_date: str, timezone: ZoneInfo
+        ) -> object:
+            del path, timezone
+            return load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=account_id,
+                market=args.market,
+                expected_date=expected_date,
+            )
 
         try:
             with RunLock(paths.watch_lock):
@@ -1678,6 +1694,7 @@ def main(argv: list[str] | None = None) -> int:
                     poll_seconds=args.poll_seconds,
                     reconnect_seconds=args.reconnect_seconds,
                     once=args.once,
+                    account_loader=market_account_loader,
                     on_session_open=lambda trading_date: run_trend_review_open(
                         config, args.market, trading_date
                     ),
@@ -1761,12 +1778,25 @@ def main(argv: list[str] | None = None) -> int:
         try:
             config = load_env_config(args.config, dry_run=False)
             notifier = build_notifier(config)
+            account_id = require_trend_review_config(config, "CN")
         except (FileNotFoundError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
 
         def quote_factory() -> FutuQuoteClient:
             return FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+
+        def account_loader(
+            path: Path, *, expected_date: str, timezone: ZoneInfo
+        ) -> object:
+            del path, timezone
+            return load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=account_id,
+                market="CN",
+                expected_date=expected_date,
+            )
 
         try:
             with RunLock(config.data_dir / "runs/.trend_a_share_watch.lock"):
@@ -1783,6 +1813,7 @@ def main(argv: list[str] | None = None) -> int:
                     poll_seconds=args.poll_seconds,
                     reconnect_seconds=args.reconnect_seconds,
                     once=args.once,
+                    account_loader=account_loader,
                     on_session_open=lambda trading_date: run_trend_review_open(
                         config, "CN", trading_date
                     ),

@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from .a_share_trend import AccountSnapshot, load_eastmoney_account, load_watch_events
+from .a_share_trend import AccountSnapshot, load_watch_events
 from .daily_premarket import RunLock, send_notification_with_results
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
@@ -98,7 +98,7 @@ def watch_a_share_protection(
     broker_label: str = "东方财富",
     session_timezone: ZoneInfo = SHANGHAI,
     session_fn: Callable[[datetime], str] = cn_session,
-    account_loader: Callable[..., AccountSnapshot] = load_eastmoney_account,
+    account_loader: Callable[..., AccountSnapshot],
     on_session_open: Callable[[str], None] | None = None,
     on_protection_trigger: Callable[[Mapping[str, object]], None] | None = None,
 ) -> AShareWatchResult:

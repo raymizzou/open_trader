@@ -578,21 +578,62 @@ def load_futu_simulate_trend_account(
             close()
     if not isinstance(snapshot, Mapping):
         raise ValueError("Futu simulation account snapshot must be an object")
-    if int(snapshot.get("acc_id") or 0) != simulate_acc_id:
+    try:
+        account_id = int(snapshot.get("acc_id"))
+    except (TypeError, ValueError):
+        raise ValueError("Futu simulation account snapshot ID is invalid") from None
+    if account_id != simulate_acc_id:
         raise ValueError("Futu simulation account snapshot ID does not match config")
+    try:
+        net_value = _decimal(snapshot.get("net_value"))
+    except ValueError:
+        raise ValueError("Futu simulation account net value is invalid") from None
+    if net_value <= 0:
+        raise ValueError("Futu simulation account net value must be positive")
+    try:
+        cash = _decimal(snapshot.get("cash"))
+    except ValueError:
+        raise ValueError("Futu simulation account cash is invalid") from None
+    if cash < 0:
+        raise ValueError("Futu simulation account cash must be nonnegative")
     rows = snapshot.get("positions")
     if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
         raise ValueError("Futu simulation account positions are invalid")
     prefixes = {"CN": {"SH", "SZ", "BJ"}, "HK": {"HK"}, "US": {"US"}}[market]
     positions: list[AccountPosition] = []
     for row in rows:
+        try:
+            quantity = _decimal(row.get("qty", row.get("quantity")))
+        except ValueError:
+            raise ValueError(
+                "Futu simulation account position quantity is invalid"
+            ) from None
+        if quantity < 0:
+            raise ValueError(
+                "Futu simulation account position quantity must be nonnegative"
+            )
+        if quantity == 0:
+            continue
         code = str(row.get("code") or row.get("futu_code") or "").strip().upper()
         prefix, separator, symbol = code.partition(".")
-        if not separator or prefix not in prefixes or not symbol:
-            continue
-        quantity = _decimal(row.get("qty", row.get("quantity", "0")))
-        if quantity <= 0:
-            continue
+        if not separator or not prefix or not symbol:
+            raise ValueError("Futu simulation account position code is invalid")
+        if prefix not in prefixes:
+            raise ValueError(
+                f"Futu simulation account position market does not match {market}"
+            )
+        try:
+            market_value = _decimal(
+                row.get("market_val", row.get("market_value"))
+            )
+        except ValueError:
+            raise ValueError(
+                "Futu simulation account position market value is invalid"
+            ) from None
+        if market_value < 0:
+            raise ValueError(
+                "Futu simulation account position market value must be nonnegative"
+            )
         stock_type = str(row.get("stock_type") or "").strip().upper()
         positions.append(
             AccountPosition(
@@ -603,16 +644,14 @@ def load_futu_simulate_trend_account(
                 avg_cost_price=_optional_decimal(
                     row.get("cost_price", row.get("avg_cost_price"))
                 ),
-                market_value=_decimal(
-                    row.get("market_val", row.get("market_value", "0"))
-                ),
+                market_value=market_value,
             )
         )
     return AccountSnapshot(
         source_date=expected_date,
         fresh=True,
-        net_value=_decimal(snapshot.get("net_value")),
-        available_cash=max(Decimal("0"), _decimal(snapshot.get("cash"))),
+        net_value=net_value,
+        available_cash=cash,
         positions=tuple(sorted(positions, key=lambda item: item.symbol)),
         exceptions=(),
         position_count=len(positions),
