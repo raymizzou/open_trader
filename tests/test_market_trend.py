@@ -32,12 +32,58 @@ from open_trader.notifications import (
     NotificationError,
     NullNotifier,
 )
-from open_trader.tiger_account import TigerAccountError
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+class DefaultSimAccountClient:
+    def __init__(self, **kwargs: object) -> None:
+        self.acc_id = int(kwargs["simulate_acc_id"])
+
+    def account_snapshot(self) -> dict[str, object]:
+        return {
+            "acc_id": self.acc_id,
+            "net_value": "100000",
+            "cash": "100000",
+            "positions": [],
+        }
+
+    def close(self) -> None:
+        pass
+
+
+def simulation_account_with_positions(
+    *codes: str,
+) -> type[DefaultSimAccountClient]:
+    class SimAccountClient(DefaultSimAccountClient):
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "positions": [
+                    {
+                        "code": code,
+                        "stock_name": code.split(".", 1)[-1],
+                        "qty": "100",
+                        "cost_price": "10",
+                        "market_val": "1000",
+                    }
+                    for code in codes
+                ],
+            }
+
+    return SimAccountClient
+
+
+@pytest.fixture(autouse=True)
+def default_simulation_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        market_trend,
+        "FutuSimulateOrderExecutionClient",
+        DefaultSimAccountClient,
+    )
 
 
 class RecordingFeishu(FeishuWebhookNotifier):
@@ -128,6 +174,9 @@ def config(tmp_path: Path) -> DailyPremarketConfig:
         trend_animals_hk_tm_ids=(622494,),
         trend_us_symbols=("VIXY",),
         trend_hk_symbols=("00700",),
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
     )
 
 
@@ -575,7 +624,7 @@ def test_market_report_failure_owns_day_at_noon_deadline(tmp_path: Path) -> None
     assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
 
 
-def test_hk_report_keeps_buys_when_statement_is_stale(
+def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
@@ -696,6 +745,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
+        account_factory=simulation_account_with_positions("HK.00700"),
         now_fn=lambda: datetime(2026, 7, 15, 16, tzinfo=SHANGHAI),
         sleep_fn=lambda seconds: None,
     )
@@ -719,6 +769,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
+        account_factory=simulation_account_with_positions("HK.00700"),
     )
 
     assert result.status == recovered.status == revised.status == "generated"
@@ -728,7 +779,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert api_instances == 2  # initial report plus explicit revision; recovery did not refetch
     title, message = notifier.messages[0]
     assert title == "【辉立｜港股趋势报告｜2026-07-16】"
-    assert "账户状态：账户数据非实时，执行前核对现金与持仓" in message
+    assert "账户状态：已更新" in message
     assert "今日动作：卖出 0｜买入 1｜持有 1｜复核 0" in message
     assert "\n买入\n" in message
     assert "02800 盈富基金" in message
@@ -758,7 +809,8 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert actions[0]["symbol"] == "02800"
     assert actions[0]["target_amount"] == "4000.00"
     assert actions[0]["estimated_shares"] == 400
-    assert payload["account"]["fresh"] is False
+    assert payload["account"]["fresh"] is True
+    assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
     assert payload["estimated_api_cost"] == "0.142"
@@ -781,39 +833,8 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert evidence["rebuild_inputs"]["lot_sizes"] == {"02800": 100}
 
 
-@pytest.mark.parametrize(
-    ("refresh_error", "expected_refresh_error", "forbidden_values"),
-    [
-        (
-            TigerAccountError(
-                "Tiger refresh failed token=TIGER-TOKEN account=123456789",
-                error_type="account_query_failed",
-            ),
-            "account_query_failed",
-            ("TIGER-TOKEN", "123456789"),
-        ),
-        (
-            TigerAccountError(
-                "Tiger refresh failed token=UNKNOWN-MESSAGE-SECRET",
-                error_type="unknown_type_UNKNOWN-TYPE-SECRET",
-            ),
-            "tiger_account_error",
-            ("UNKNOWN-MESSAGE-SECRET", "unknown_type_UNKNOWN-TYPE-SECRET"),
-        ),
-        (
-            RuntimeError(
-                "Tiger refresh failed token=TIGER-TOKEN account=123456789"
-            ),
-            "Tiger account refresh failed",
-            ("TIGER-TOKEN", "123456789"),
-        ),
-    ],
-)
-def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
+def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     tmp_path: Path,
-    refresh_error: Exception,
-    expected_refresh_error: str,
-    forbidden_values: tuple[str, ...],
 ) -> None:
     cfg = config(tmp_path)
     write_tiger_snapshot(
@@ -921,9 +942,7 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
         notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
-        account_refresher=lambda *args: (_ for _ in ()).throw(
-            refresh_error
-        ),
+        account_factory=simulation_account_with_positions("US.VIXY"),
     )
 
     assert result.json_path is not None
@@ -934,11 +953,12 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
         "cache=client-managed"
     ) in payload["api_facts"]
     assert payload["estimated_api_cost"] == "0.142"
-    assert payload["account"]["fresh"] is False
+    assert payload["account"]["fresh"] is True
+    assert payload["metadata"]["simulate_acc_id"] == 102
     assert payload["account"]["source_date"] == "2026-07-14"
-    assert payload["strategy_judgments"]["formal_actions"] == []
-    assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "MANUAL_REVIEW"
-    assert payload["strategy_judgments"]["holding_decisions"][0]["reason"] == "stale_tiger_account"
+    assert payload["strategy_judgments"]["formal_actions"][0]["action"] == "BUY"
+    assert payload["strategy_judgments"]["formal_actions"][0]["symbol"] == "QQQ"
+    assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "HOLD"
     evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     replayed = trend_review.rebuild_trend_report_from_evidence(evidence)
@@ -950,15 +970,11 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
         "strategy_snapshot",
     ):
         assert replayed[key] == payload[key]
-    assert replayed["strategy_judgments"]["formal_actions"] == []
-    assert replayed["strategy_judgments"]["holding_decisions"][0] | {
-        "action": "MANUAL_REVIEW",
-        "reason": "stale_tiger_account",
-    } == replayed["strategy_judgments"]["holding_decisions"][0]
+    assert replayed["strategy_judgments"] == payload["strategy_judgments"]
     assert payload["metadata"]["account_currency"] == "HKD"
     assert payload["metadata"]["price_fx_to_hkd"] == "7.85"
-    assert payload["metadata"]["account_refresh_error"] == expected_refresh_error
-    assert "账户状态：账户数据非实时，禁止新增买入；持仓需复核" in notifier.messages[0][1]
+    assert "account_refresh_error" not in payload["metadata"]
+    assert "账户状态：已更新" in notifier.messages[0][1]
     output = "\n".join(
         (
             result.json_path.read_text(encoding="utf-8"),
@@ -969,8 +985,7 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
             *(f"{title}\n{message}" for title, message in notifier.messages),
         )
     )
-    for value in forbidden_values:
-        assert value not in output
+    assert "200000" not in output
 
 
 def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
@@ -1044,7 +1059,6 @@ def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
         sleep_fn=lambda seconds: None,
         api_factory=Api,
         quote_factory=Quote,
-        account_refresher=lambda *args: None,
     )
 
     assert result.status == "failed"

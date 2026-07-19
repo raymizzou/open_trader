@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date, timedelta
 from decimal import Decimal
@@ -295,7 +296,7 @@ class FakeTrendSimClient:
 
 
 def cn_buy_report(
-    *, weight: str = "0.04", symbol: str = "600001"
+    *, weight: str = "0.04", symbol: str = "600001", shares: int = 400
 ) -> dict[str, object]:
     return {
         "account": {
@@ -319,6 +320,8 @@ def cn_buy_report(
                     "symbol": symbol,
                     "target_weight": weight,
                     "lot_size": 100,
+                    "estimated_shares": shares,
+                    "atr": "0.5",
                 }
             ]
         },
@@ -331,29 +334,30 @@ def report_with_actions(actions: list[dict[str, object]]) -> dict[str, object]:
     return report
 
 
-def test_open_uses_sim_nav_current_price_and_frozen_lot(tmp_path: Path) -> None:
-    client = FakeTrendSimClient()
+def test_open_uses_frozen_report_quantity_despite_live_nav_and_price(tmp_path: Path) -> None:
+    client = FakeTrendSimClient(nav="900000")
+    report = cn_buy_report(shares=300)
 
     result = trend_review.execute_trend_review_open(
         data_dir=tmp_path,
-        report=cn_buy_report(),
+        report=report,
         client=client,
-        prices={"600001": Decimal("10")},
+        prices={"600001": Decimal("500")},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T09:31:00+08:00",
     )
     repeated = trend_review.execute_trend_review_open(
         data_dir=tmp_path,
-        report=cn_buy_report(),
+        report=report,
         client=client,
-        prices={"600001": Decimal("9")},
+        prices={"600001": Decimal("1")},
         market="CN",
         execution_date="2026-07-17",
         now="2026-07-17T09:32:00+08:00",
     )
 
-    assert client.requests[0]["qty"] == "400"
+    assert client.requests[0]["qty"] == "300"
     assert client.requests[0]["order_type"] == "MARKET"
     assert result["submitted_count"] == 1
     assert repeated["submitted_count"] == 0
@@ -365,7 +369,7 @@ def test_open_uses_sim_nav_current_price_and_frozen_lot(tmp_path: Path) -> None:
         "symbol": "600001",
         "side": "buy",
         "status": "submitted",
-        "target_qty": "400",
+        "target_qty": "300",
         "order_ids": ["SIM-1"],
     } == json.loads(events[-1].read_text(encoding="utf-8"))
 
@@ -548,6 +552,94 @@ def test_formal_sell_all_suppresses_conflicting_buy(tmp_path: Path) -> None:
     )
 
     assert result["submitted_count"] == 1
+    assert [request["side"] for request in client.requests] == ["sell"]
+
+
+def test_open_submits_all_sells_before_frozen_buys_regardless_of_report_order(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        prices={},
+        market="CN",
+        execution_date="2026-07-16",
+        now="2026-07-16T09:31:00+08:00",
+    )
+    client.requests.clear()
+    client.orders.clear()
+    client.positions = [{"code": "SH.600001", "qty": "300"}]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report_with_actions(
+            [
+                {
+                    "action": "BUY",
+                    "symbol": "600002",
+                    "target_weight": "0.04",
+                    "lot_size": 100,
+                    "estimated_shares": 200,
+                    "atr": "0.5",
+                },
+                {"action": "SELL_ALL", "symbol": "600001"},
+            ]
+        ),
+        client=client,
+        prices={"600002": Decimal("999")},
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+    )
+
+    assert result["submitted_count"] == 2
+    assert [request["side"] for request in client.requests] == ["sell", "buy"]
+    assert client.requests[-1]["qty"] == "200"
+
+
+def test_open_stops_unsubmitted_buys_when_a_required_sell_submission_fails(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        prices={},
+        market="CN",
+        execution_date="2026-07-16",
+        now="2026-07-16T09:31:00+08:00",
+    )
+    client.requests.clear()
+    client.orders.clear()
+    client.positions = [{"code": "SH.600001", "qty": "300"}]
+    client.fail_orders = 1
+
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=report_with_actions(
+                [
+                    {
+                        "action": "BUY",
+                        "symbol": "600002",
+                        "target_weight": "0.04",
+                        "lot_size": 100,
+                        "estimated_shares": 200,
+                        "atr": "0.5",
+                    },
+                    {"action": "SELL_ALL", "symbol": "600001"},
+                ]
+            ),
+            client=client,
+            prices={},
+            market="CN",
+            execution_date="2026-07-17",
+            now="2026-07-17T09:31:00+08:00",
+        )
+
     assert [request["side"] for request in client.requests] == ["sell"]
 
 
@@ -979,6 +1071,60 @@ def test_active_partial_buy_waits_instead_of_duplicate_submission(
     assert latest["order_ids"] == ["SIM-1"]
 
 
+def test_filled_buy_records_active_protection_line_without_mutating_report(
+    tmp_path: Path,
+) -> None:
+    report = cn_buy_report()
+    report["strategy_judgments"]["formal_actions"][0]["atr"] = "1.25"
+    report_path = tmp_path / "frozen-report.json"
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    original_bytes = report_path.read_bytes()
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": json.loads(original_bytes),
+        "client": client,
+        "prices": {},
+        "market": "CN",
+        "execution_date": "2026-07-17",
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:31:00+08:00"
+    )
+    request = client.requests[0]
+    client.orders = [
+        {
+            "order_id": "SIM-1",
+            "remark": request["remark"],
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "400",
+            "dealt_qty": "400",
+            "dealt_avg_price": "12.50",
+            "order_status": "FILLED_ALL",
+        }
+    ]
+
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:32:00+08:00"
+    )
+
+    events = sorted(
+        tmp_path.glob("trend_review/ledgers/CN/actions/2026-07-17/*/*.json")
+    )
+    filled = json.loads(events[-1].read_text(encoding="utf-8"))
+    assert filled["status"] == "filled"
+    assert filled["avg_fill_price"] == "12.50"
+    assert filled["active_protection_line"] == "10.00"
+    assert report_path.read_bytes() == original_bytes
+    assert hashlib.sha256(report_path.read_bytes()).hexdigest() == hashlib.sha256(
+        original_bytes
+    ).hexdigest()
+
+
 def test_open_retries_intent_when_failed_order_is_absent_at_broker(
     tmp_path: Path,
 ) -> None:
@@ -1064,34 +1210,36 @@ def test_newer_revision_cannot_reconcile_to_older_response_failure(
     assert client.requests[-1] | {
         "futu_code": "SH.600002",
         "side": "buy",
-        "qty": "200",
+        "qty": "400",
     } == client.requests[-1]
     assert len(client.requests[-1]["remark"].encode("utf-8")) <= 64
 
 
-def test_first_open_requires_empty_dedicated_simulate_account(
+def test_first_open_binds_discipline_account_with_existing_sell_position(
     tmp_path: Path,
 ) -> None:
     client = FakeTrendSimClient(
         positions=[{"code": "SH.600001", "qty": "100"}]
     )
 
-    with pytest.raises(
-        trend_review.TrendReviewAccountStateError,
-        match="simulate account must start with zero positions",
-    ):
-        trend_review.execute_trend_review_open(
-            data_dir=tmp_path,
-            report=cn_buy_report(),
-            client=client,
-            prices={"600001": Decimal("10")},
-            market="CN",
-            execution_date="2026-07-17",
-            now="2026-07-17T09:31:00+08:00",
-        )
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report_with_actions(
+            [{"action": "SELL_ALL", "symbol": "600001"}]
+        ),
+        client=client,
+        prices={},
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+    )
+
+    assert result["submitted_count"] == 1
+    assert client.requests[0]["side"] == "sell"
+    assert client.requests[0]["qty"] == "100"
 
 
-def test_close_uses_authoritative_simulate_account_nav(tmp_path: Path) -> None:
+def test_close_keeps_actual_equity_out_of_simulation_report_state(tmp_path: Path) -> None:
     path = trend_review.capture_trend_review_close(
         data_dir=tmp_path,
         market="CN",
@@ -1112,7 +1260,7 @@ def test_close_uses_authoritative_simulate_account_nav(tmp_path: Path) -> None:
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["discipline_equity_after_fees"] == "101000.00"
-    assert payload["actual_equity"] == "735164.41"
+    assert "actual_equity" not in payload
 
 
 @pytest.mark.parametrize(

@@ -18,10 +18,12 @@ from zoneinfo import ZoneInfo
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
+    require_trend_review_config,
     send_notification_with_results,
 )
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
+from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .kline_technical_facts import DailyKlineBar
 from .notifications import Notifier, NullNotifier
 from .trend_animals import (
@@ -550,6 +552,73 @@ def load_eastmoney_account(
     )
 
 
+def load_futu_simulate_trend_account(
+    *,
+    host: str,
+    port: int,
+    simulate_acc_id: int,
+    market: str,
+    expected_date: str,
+    account_factory: Callable[..., object] = FutuSimulateOrderExecutionClient,
+) -> AccountSnapshot:
+    market = market.strip().upper()
+    if market not in {"CN", "HK", "US"}:
+        raise ValueError(f"unsupported trend review market: {market}")
+    client = account_factory(
+        host=host,
+        port=port,
+        simulate_acc_id=simulate_acc_id,
+        trd_market=market,
+    )
+    try:
+        snapshot = client.account_snapshot()
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("Futu simulation account snapshot must be an object")
+    if int(snapshot.get("acc_id") or 0) != simulate_acc_id:
+        raise ValueError("Futu simulation account snapshot ID does not match config")
+    rows = snapshot.get("positions")
+    if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
+        raise ValueError("Futu simulation account positions are invalid")
+    prefixes = {"CN": {"SH", "SZ", "BJ"}, "HK": {"HK"}, "US": {"US"}}[market]
+    positions: list[AccountPosition] = []
+    for row in rows:
+        code = str(row.get("code") or row.get("futu_code") or "").strip().upper()
+        prefix, separator, symbol = code.partition(".")
+        if not separator or prefix not in prefixes or not symbol:
+            continue
+        quantity = _decimal(row.get("qty", row.get("quantity", "0")))
+        if quantity <= 0:
+            continue
+        stock_type = str(row.get("stock_type") or "").strip().upper()
+        positions.append(
+            AccountPosition(
+                symbol=symbol,
+                name=str(row.get("stock_name") or row.get("name") or symbol).strip(),
+                asset_class="etf" if "ETF" in stock_type else "stock",
+                quantity=quantity,
+                avg_cost_price=_optional_decimal(
+                    row.get("cost_price", row.get("avg_cost_price"))
+                ),
+                market_value=_decimal(
+                    row.get("market_val", row.get("market_value", "0"))
+                ),
+            )
+        )
+    return AccountSnapshot(
+        source_date=expected_date,
+        fresh=True,
+        net_value=_decimal(snapshot.get("net_value")),
+        available_cash=max(Decimal("0"), _decimal(snapshot.get("cash"))),
+        positions=tuple(sorted(positions, key=lambda item: item.symbol)),
+        exceptions=(),
+        position_count=len(positions),
+    )
+
+
 def atr14(bars: Sequence[DailyKlineBar]) -> Decimal | None:
     valid = [bar for bar in bars if None not in (bar.high, bar.low)]
     if len(valid) < 15:
@@ -1073,20 +1142,6 @@ def build_report(
         market=market,
     )
     displayed_candidates = candidate_decision.eligible[:CANDIDATE_LIMIT]
-    buy_actions = estimate_buy_actions(
-        ranked=candidate_decision.eligible,
-        net_value=account.net_value,
-        available_cash=account.available_cash,
-        current_position_count=(
-            account.position_count
-            if account.position_count is not None
-            else len(account.positions)
-        ),
-        position_weight=position_weight,
-        market=market,
-        lot_sizes=lot_sizes,
-        price_fx_to_account_currency=price_fx_to_account_currency,
-    )
     old_positions = _state_positions(prior_state)
     holdings: list[HoldingDecision] = []
     new_positions: dict[str, object] = {}
@@ -1175,6 +1230,35 @@ def build_report(
                 "tracking_active": tracking_active,
                 "updated_for": as_of_date,
             }
+    sell_symbols = {
+        holding.symbol for holding in holdings if holding.action == "SELL_ALL"
+    }
+    buy_actions = estimate_buy_actions(
+        ranked=candidate_decision.eligible,
+        net_value=account.net_value,
+        available_cash=account.available_cash
+        + sum(
+            (
+                position.market_value
+                for position in account.positions
+                if position.symbol in sell_symbols
+            ),
+            Decimal("0"),
+        ),
+        current_position_count=max(
+            0,
+            (
+                account.position_count
+                if account.position_count is not None
+                else len(account.positions)
+            )
+            - len(sell_symbols),
+        ),
+        position_weight=position_weight,
+        market=market,
+        lot_sizes=lot_sizes,
+        price_fx_to_account_currency=price_fx_to_account_currency,
+    )
     industry_concentration = tuple(
         (
             industry,
@@ -2669,6 +2753,7 @@ def _attempt_report(
     process_version: str,
     api_factory: Callable[..., object],
     quote_factory: Callable[..., object],
+    account_factory: Callable[..., object],
     notifier: Notifier,
 ) -> AShareTrendRunResult:
     run_day = date.fromisoformat(run_date)
@@ -2706,10 +2791,14 @@ def _attempt_report(
                 component_pools[_row_tm_id(row)].add(str(tm_id))
         component_ids = {_row_tm_id(row) for row in component_rows}
 
-        account = load_eastmoney_account(
-            config.portfolio,
+        simulate_acc_id = require_trend_review_config(config, "CN")
+        account = load_futu_simulate_trend_account(
+            host=config.futu_host,
+            port=config.futu_port,
+            simulate_acc_id=simulate_acc_id,
+            market="CN",
             expected_date=run_date,
-            timezone=ZoneInfo(config.timezone),
+            account_factory=account_factory,
         )
         holding_ids: dict[str, int] = {}
         for position in account.positions:
@@ -2880,7 +2969,11 @@ def _attempt_report(
                 f"getTickerSnapshot fields={','.join(fields)} rows={len(snapshot_rows)} cache=client-managed",
                 f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
             ),
-            data_sources=("Trend Animals", "Futu CN calendar/QFQ daily K-line", str(config.portfolio)),
+            data_sources=(
+                "Trend Animals",
+                "Futu CN calendar/QFQ daily K-line",
+                "Futu CN SIMULATE account",
+            ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost,
             position_weight=Decimal("0.04"),
@@ -2893,6 +2986,7 @@ def _attempt_report(
             metadata={
                 "market": "CN",
                 "broker": "eastmoney",
+                "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
                 "paid_response_cache": cache_metadata,
             },
@@ -3015,6 +3109,7 @@ def run_a_share_trend_report(
     sleep_fn: Callable[[float], None] = sleep,
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
+    account_factory: Callable[..., object] | None = None,
     notifier: Notifier | None = None,
 ) -> AShareTrendRunResult:
     run_day = date.fromisoformat(run_date)
@@ -3081,6 +3176,9 @@ def run_a_share_trend_report(
                     process_version=version,
                     api_factory=api_factory,
                     quote_factory=quote_factory,
+                    account_factory=(
+                        account_factory or FutuSimulateOrderExecutionClient
+                    ),
                     notifier=notifier,
                 )
                 if attempt.status in {"generated", "existing", "holiday"}:
