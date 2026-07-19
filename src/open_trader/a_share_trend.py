@@ -79,11 +79,166 @@ SINGLE_ENTRY_RISK_LIMIT = Decimal("0.004")
 PORTFOLIO_RISK_LIMIT = Decimal("0.04")
 ABNORMAL_LOSS_BUFFER = Decimal("0.01")
 NORMAL_COST_RATE = Decimal("0.001")
+NORMAL_COST_MODEL = "预计完整开平仓正常成本按名义金额计提"
+RISK_BUDGET_DISCLAIMER = "5% 是风险预算目标，不是最大损失保证。"
+PORTFOLIO_REMAINING_RISK_NOTE = (
+    "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"
+)
 INITIAL_PROTECTION_ATR_MULTIPLE = Decimal("2")
 TRAILING_LOW_DAYS = 5
 ALLOWED_ENTRY_PHASES = {"谷雨", "立夏", "夏至"}
 HOT_TEMPERATURES = {"热", "沸"}
 KNOWN_TEMPERATURES = {"凉", "平", "温", "热", "沸"}
+
+V2_RISK_NUMERIC_FIELDS = (
+    "existing_planned_risk",
+    "new_planned_risk",
+    "portfolio_planned_risk",
+    "portfolio_planned_risk_pct",
+    "portfolio_risk_limit",
+    "portfolio_risk_limit_pct",
+    "portfolio_remaining_risk",
+    "portfolio_remaining_risk_pct",
+    "single_entry_risk_limit",
+    "single_entry_risk_limit_pct",
+    "abnormal_loss_buffer",
+    "abnormal_loss_buffer_pct",
+    "total_risk_budget_target_pct",
+    "normal_cost_rate",
+)
+
+
+def _nonnegative_risk_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return result if result.is_finite() and result >= 0 else None
+
+
+def valid_v2_risk_contract(
+    parameters: object,
+    summary: object,
+    *,
+    expected_nav: object,
+) -> bool:
+    if not isinstance(parameters, Mapping) or not isinstance(summary, Mapping):
+        return False
+    fixed_parameters = {
+        "single_entry_risk_limit": SINGLE_ENTRY_RISK_LIMIT,
+        "portfolio_risk_limit": PORTFOLIO_RISK_LIMIT,
+        "abnormal_loss_buffer": ABNORMAL_LOSS_BUFFER,
+        "normal_cost_rate": NORMAL_COST_RATE,
+    }
+    if any(
+        _nonnegative_risk_decimal(parameters.get(key)) != expected
+        for key, expected in fixed_parameters.items()
+    ) or parameters.get("normal_cost_model") != NORMAL_COST_MODEL:
+        return False
+    fixed_summary = {
+        "single_entry_risk_limit_pct": SINGLE_ENTRY_RISK_LIMIT,
+        "portfolio_risk_limit_pct": PORTFOLIO_RISK_LIMIT,
+        "abnormal_loss_buffer_pct": ABNORMAL_LOSS_BUFFER,
+        "total_risk_budget_target_pct": (
+            PORTFOLIO_RISK_LIMIT + ABNORMAL_LOSS_BUFFER
+        ),
+        "normal_cost_rate": NORMAL_COST_RATE,
+    }
+    if any(
+        _nonnegative_risk_decimal(summary.get(key)) != expected
+        for key, expected in fixed_summary.items()
+    ) or (
+        summary.get("normal_cost_model") != NORMAL_COST_MODEL
+        or summary.get("disclaimer") != RISK_BUDGET_DISCLAIMER
+        or summary.get("portfolio_remaining_risk_note")
+        != PORTFOLIO_REMAINING_RISK_NOTE
+    ):
+        return False
+
+    values: dict[str, Decimal | None] = {}
+    for key in V2_RISK_NUMERIC_FIELDS:
+        if key not in summary:
+            return False
+        raw = summary[key]
+        value = _nonnegative_risk_decimal(raw)
+        if raw is not None and value is None:
+            return False
+        values[key] = value
+
+    status = summary.get("status")
+    pause_reason = summary.get("pause_reason")
+    if status == "active":
+        if (
+            summary.get("status_label") != "风险预算内"
+            or pause_reason != ""
+            or any(values[key] is None for key in V2_RISK_NUMERIC_FIELDS)
+        ):
+            return False
+    elif status == "paused":
+        if (
+            summary.get("status_label") not in {"暂停新开仓", "组合风险已满"}
+            or not isinstance(pause_reason, str)
+            or not pause_reason
+            or values["new_planned_risk"] is None
+            or values["new_planned_risk"] != 0
+        ):
+            return False
+    else:
+        return False
+
+    existing = values["existing_planned_risk"]
+    new = values["new_planned_risk"]
+    planned = values["portfolio_planned_risk"]
+    planned_pct = values["portfolio_planned_risk_pct"]
+    remaining = values["portfolio_remaining_risk"]
+    remaining_pct = values["portfolio_remaining_risk_pct"]
+    portfolio_limit = values["portfolio_risk_limit"]
+    single_limit = values["single_entry_risk_limit"]
+    buffer = values["abnormal_loss_buffer"]
+    assert new is not None
+
+    if existing is None:
+        if any(
+            value is not None
+            for value in (planned, planned_pct, remaining, remaining_pct)
+        ):
+            return False
+    elif planned is None or planned != existing + new:
+        return False
+
+    account_nav = _nonnegative_risk_decimal(expected_nav)
+    if account_nav is None or account_nav <= 0:
+        return (
+            status == "paused"
+            and portfolio_limit is None
+            and single_limit is None
+            and buffer is None
+            and planned is None
+        )
+    if (
+        portfolio_limit != account_nav * PORTFOLIO_RISK_LIMIT
+        or single_limit is None
+        or buffer is None
+    ):
+        return False
+    nav = account_nav
+    if (
+        single_limit != nav * SINGLE_ENTRY_RISK_LIMIT
+        or buffer != nav * ABNORMAL_LOSS_BUFFER
+    ):
+        return False
+    if planned is None:
+        return planned_pct is None and remaining is None and remaining_pct is None
+    if status == "active" and planned > portfolio_limit:
+        return False
+    expected_remaining = max(Decimal("0"), portfolio_limit - planned)
+    return (
+        planned_pct == planned / nav
+        and remaining == expected_remaining
+        and remaining_pct == expected_remaining / nav
+    )
 
 
 def trend_strategy_snapshot(
@@ -96,6 +251,8 @@ def trend_strategy_snapshot(
     market = market.upper()
     if market not in {"CN", "US", "HK"}:
         raise ValueError(f"unsupported trend review market: {market}")
+    if normal_cost_rate != NORMAL_COST_RATE:
+        raise ValueError("v2 normal cost rate must remain 0.001")
 
     common = {
         "candidate_pool_ids": list(candidate_pool_ids),
@@ -112,7 +269,7 @@ def trend_strategy_snapshot(
         "portfolio_risk_limit": str(PORTFOLIO_RISK_LIMIT),
         "abnormal_loss_buffer": str(ABNORMAL_LOSS_BUFFER),
         "normal_cost_rate": str(normal_cost_rate),
-        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "normal_cost_model": NORMAL_COST_MODEL,
     }
     if market == "CN":
         parameters: dict[str, object] = {
@@ -1162,8 +1319,9 @@ def _risk_summary(
         "abnormal_loss_buffer_pct": ABNORMAL_LOSS_BUFFER,
         "total_risk_budget_target_pct": PORTFOLIO_RISK_LIMIT + ABNORMAL_LOSS_BUFFER,
         "normal_cost_rate": normal_cost_rate,
-        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
-        "disclaimer": "5% 是风险预算目标，不是最大损失保证。",
+        "normal_cost_model": NORMAL_COST_MODEL,
+        "disclaimer": RISK_BUDGET_DISCLAIMER,
+        "portfolio_remaining_risk_note": PORTFOLIO_REMAINING_RISK_NOTE,
     }
 
 
@@ -2407,6 +2565,52 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     expected_window = "美股常规交易时段" if market == "US" else "09:30-10:00"
     if parameters.get("buy_window") != expected_window:
         raise ValueError("strategy snapshot does not match report actions")
+    if snapshot.get("strategy_version") == "v2":
+        if not valid_v2_risk_contract(
+            parameters,
+            report.risk_summary,
+            expected_nav=report.account.net_value,
+        ):
+            raise ValueError("strategy snapshot does not match report actions")
+        if report.risk_summary.get("status") == "paused" and report.buy_actions:
+            raise ValueError("strategy snapshot does not match report actions")
+        portfolio_limit = _nonnegative_risk_decimal(
+            report.risk_summary.get("portfolio_risk_limit")
+        )
+        new_planned_risk = Decimal("0")
+        if portfolio_limit is None:
+            if report.buy_actions:
+                raise ValueError("strategy snapshot does not match report actions")
+            nav = None
+        elif portfolio_limit > 0:
+            nav = portfolio_limit / PORTFOLIO_RISK_LIMIT
+        else:
+            raise ValueError("strategy snapshot does not match report actions")
+        for action in report.buy_actions:
+            assert nav is not None
+            if (
+                action.estimated_shares <= 0
+                or action.lot_size <= 0
+                or action.estimated_shares % action.lot_size != 0
+                or not action.planned_stop_risk.is_finite()
+                or action.planned_stop_risk <= 0
+                or not action.planned_stop_risk_pct.is_finite()
+                or action.planned_stop_risk_pct <= 0
+                or action.planned_stop_risk_pct
+                != action.planned_stop_risk / nav
+                or action.planned_stop_risk > nav * SINGLE_ENTRY_RISK_LIMIT
+                or not action.normal_cost.is_finite()
+                or action.normal_cost <= 0
+                or action.normal_cost > action.planned_stop_risk
+                or action.decisive_constraint
+                not in {"名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"}
+            ):
+                raise ValueError("strategy snapshot does not match report actions")
+            new_planned_risk += action.planned_stop_risk
+        if _nonnegative_risk_decimal(
+            report.risk_summary.get("new_planned_risk")
+        ) != new_planned_risk:
+            raise ValueError("strategy snapshot does not match report actions")
     try:
         protection_multiple = Decimal(str(parameters["initial_protection_atr_multiple"]))
     except (InvalidOperation, KeyError, ValueError):

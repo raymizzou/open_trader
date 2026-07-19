@@ -2173,6 +2173,7 @@ function renderTrendRiskSummary(summary) {
       <div><dt>单笔风险上限</dt><dd>${escapeHtml(single)}</dd></div>
       <div><dt>异常损失缓冲</dt><dd>${escapeHtml(buffer)} · 不得用于开仓</dd></div>
     </dl>
+    <p>${escapeHtml(formatPlain(summary.portfolio_remaining_risk_note))}</p>
     <p>${escapeHtml(formatPlain(summary.disclaimer))}</p>
   </section>`;
 }

@@ -265,7 +265,6 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         metadata={"market": "US", "broker": "tiger"},
         market="US",
         price_fx_to_account_currency=Decimal("7.85"),
-        normal_cost_rate=Decimal("0.003"),
         process_version="oldsha",
         candidate_pool_ids=(1,),
     )
@@ -304,7 +303,7 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         option_attention_broker_label="老虎",
     )
     evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
-    assert evidence["rebuild_inputs"]["normal_cost_rate"] == "0.003"
+    assert evidence["rebuild_inputs"]["normal_cost_rate"] == "0.001"
 
     missing_fx = json.loads(json.dumps(evidence))
     del missing_fx["rebuild_inputs"]["price_fx_to_account_currency"]
@@ -327,6 +326,13 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         match="missing original input: normal_cost_rate",
     ):
         trend_review.rebuild_trend_report_from_evidence(missing_cost)
+    changed_cost = json.loads(json.dumps(evidence))
+    changed_cost["rebuild_inputs"]["normal_cost_rate"] = "0.003"
+    with pytest.raises(
+        ValueError,
+        match="strategy snapshot does not match report actions",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(changed_cost)
 
     rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
 
@@ -334,7 +340,7 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
     rebuilt_actions = rebuilt["strategy_judgments"]["formal_actions"]
     assert rebuilt["account"]["position_count"] == 9
     assert len(rebuilt_actions) == len(source_actions) == 1
-    assert rebuilt_actions[0]["estimated_shares"] == source_actions[0]["estimated_shares"] == 4
+    assert rebuilt_actions[0]["estimated_shares"] == source_actions[0]["estimated_shares"] == 5
     assert rebuilt["option_attention"] == source["option_attention"]
 
     corrected_path = trend_review.replay_trend_evidence(
