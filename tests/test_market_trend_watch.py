@@ -9,13 +9,17 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from open_trader.a_share_trend import write_protection_state
+from open_trader.a_share_trend import (
+    AccountPosition,
+    AccountSnapshot,
+    write_protection_state,
+)
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.market_trend_watch import (
     BROKER_LABELS,
     market_session,
     next_market_open,
-    watch_market_protection,
+    watch_market_protection as _watch_market_protection,
 )
 import open_trader.market_trend_watch as market_watch_module
 from open_trader.notifications import (
@@ -28,6 +32,38 @@ from open_trader.notifications import (
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def watch_market_protection(**kwargs: object) -> object:
+    if "account_loader" not in kwargs:
+        state_path = Path(kwargs["state_path"])
+
+        def account_loader(
+            path: Path, *, expected_date: str, timezone: ZoneInfo
+        ) -> AccountSnapshot:
+            del path, timezone
+            positions = tuple(
+                AccountPosition(
+                    symbol,
+                    {"00700": "腾讯", "NVDA": "NVIDIA"}.get(symbol, symbol),
+                    "stock",
+                    Decimal("100"),
+                    Decimal("10"),
+                    Decimal("1000"),
+                )
+                for symbol in market_watch_module._load_active_lines(state_path)
+            )
+            return AccountSnapshot(
+                source_date=expected_date,
+                fresh=True,
+                net_value=Decimal("100000"),
+                available_cash=Decimal("100000"),
+                positions=positions,
+                exceptions=(),
+            )
+
+        kwargs["account_loader"] = account_loader
+    return _watch_market_protection(**kwargs)
 
 
 class RecordingXiaoaiNotifier(XiaoaiSSHNotifier):
@@ -80,8 +116,6 @@ def test_closed_us_watcher_compensates_before_waiting_for_next_open(
 
         def close(self) -> None:
             pass
-
-    monkeypatch.setattr(market_watch_module, "load_trend_account", lambda **kwargs: None)
 
     with pytest.raises(RuntimeError, match="stop before long wait"):
         watch_market_protection(
@@ -200,6 +234,27 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
             pass
 
     now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+    account_calls: list[str] = []
+
+    def load_simulation_account(
+        path: Path, *, expected_date: str, timezone: ZoneInfo
+    ) -> AccountSnapshot:
+        del path, timezone
+        account_calls.append(expected_date)
+        return AccountSnapshot(
+            source_date=expected_date,
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("50000"),
+            positions=(
+                AccountPosition(
+                    "00700", "腾讯", "stock", Decimal("100"),
+                    Decimal("400"), Decimal("50000"),
+                ),
+            ),
+            exceptions=(),
+        )
+
     voice = RecordingXiaoaiNotifier()
     opens: list[str] = []
     stops: list[object] = []
@@ -215,6 +270,7 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
         poll_seconds=5,
         reconnect_seconds=60,
         once=True,
+        account_loader=load_simulation_account,
         now_fn=lambda: now,
         sleep_fn=lambda seconds: None,
         on_session_open=opens.append,
@@ -226,6 +282,7 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
     assert result.trigger_count == 1
     assert opens == ["2026-07-16"]
     assert len(stops) == 1
+    assert account_calls == ["2026-07-16", "2026-07-16"]
     assert voice.messages == [
         (
             "港股保护线触发 · 00700",

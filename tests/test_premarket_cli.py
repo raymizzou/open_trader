@@ -5,6 +5,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -579,7 +580,7 @@ def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
     result = cli.run_trend_review_open(config, "CN", "2026-07-17")
 
     assert captured["report"] == report
-    assert captured["prices"] == {}
+    assert "prices" not in captured
     assert result["artifact_path"] == str(tmp_path / "result.json")
 
 
@@ -668,8 +669,13 @@ def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
         portfolio=tmp_path / "portfolio.csv",
         futu_host="127.0.0.1",
         futu_port=11111,
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
     )
     quote = object()
+    simulation_account = object()
+    account_calls: list[dict[str, object]] = []
 
     class RecordingLock:
         def __init__(self, path: Path) -> None:
@@ -695,6 +701,12 @@ def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
     monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
     monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
     monkeypatch.setattr(cli, "FutuQuoteClient", lambda **kwargs: quote)
+    monkeypatch.setattr(
+        cli,
+        "load_futu_simulate_trend_account",
+        lambda **kwargs: account_calls.append(kwargs) or simulation_account,
+        raising=False,
+    )
     monkeypatch.setattr(cli, "RunLock", RecordingLock)
     monkeypatch.setattr(cli, "watch_a_share_protection", fake_watcher)
     monkeypatch.setattr(cli, "run_trend_review_open", lambda *args: None)
@@ -725,6 +737,18 @@ def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
     assert captured["poll_seconds"] == 2.5
     assert captured["reconnect_seconds"] == 30.0
     assert captured["once"] is True
+    assert captured["account_loader"](
+        config.portfolio,
+        expected_date="2026-07-17",
+        timezone=ZoneInfo("Asia/Shanghai"),
+    ) is simulation_account
+    assert account_calls == [{
+        "host": "127.0.0.1",
+        "port": 11111,
+        "simulate_acc_id": 101,
+        "market": "CN",
+        "expected_date": "2026-07-17",
+    }]
     assert callable(captured["on_session_open"])
     assert callable(captured["on_protection_trigger"])
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
@@ -893,16 +917,30 @@ def test_trend_market_report_dispatches_generic_runner(
     assert "trend review close failed: review failed" in output.err
 
 
-def test_watch_trend_market_uses_separate_market_paths(
+@pytest.mark.parametrize(
+    ("market", "account_id", "root"),
+    [
+        ("HK", 103, "trend_hk_phillips"),
+        ("US", 102, "trend_us_tiger"),
+    ],
+)
+def test_watch_trend_market_uses_simulation_account_and_separate_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    market: str,
+    account_id: int,
+    root: str,
 ) -> None:
     captured: dict[str, object] = {}
+    account_calls: list[dict[str, object]] = []
+    simulation_account = object()
     config = SimpleNamespace(
         data_dir=tmp_path / "data", reports_dir=tmp_path / "reports",
         portfolio=tmp_path / "portfolio.csv", futu_host="127.0.0.1", futu_port=11111,
-        trend_review_hk_simulate_acc_id=0,
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
     )
 
     class Lock:
@@ -927,21 +965,38 @@ def test_watch_trend_market_uses_separate_market_paths(
     monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
     monkeypatch.setattr(cli, "RunLock", Lock)
     monkeypatch.setattr(cli, "watch_market_protection", watcher)
+    monkeypatch.setattr(
+        cli,
+        "load_futu_simulate_trend_account",
+        lambda **kwargs: account_calls.append(kwargs) or simulation_account,
+    )
     monkeypatch.setattr(cli, "run_trend_review_open", lambda *args: None)
     monkeypatch.setattr(cli, "run_trend_review_stop", lambda *args: None, raising=False)
 
     assert cli.main([
-        "watch-trend-market", "--market", "HK", "--once",
+        "watch-trend-market", "--market", market, "--once",
         "--config", str(tmp_path / "daily.env"),
     ]) == 0
 
-    assert captured["watch_lock"] == tmp_path / "data/runs/.trend_hk_phillips_watch.lock"
-    assert captured["state_path"] == tmp_path / "data/trend_hk_phillips/protection_state.json"
-    assert captured["events_path"] == tmp_path / "data/trend_hk_phillips/watch_events.jsonl"
-    assert captured["report_lock_path"] == tmp_path / "data/runs/.trend_hk_phillips_report.lock"
-    assert captured["market"] == "HK"
+    assert captured["watch_lock"] == tmp_path / f"data/runs/.{root}_watch.lock"
+    assert captured["state_path"] == tmp_path / f"data/{root}/protection_state.json"
+    assert captured["events_path"] == tmp_path / f"data/{root}/watch_events.jsonl"
+    assert captured["report_lock_path"] == tmp_path / f"data/runs/.{root}_report.lock"
+    assert captured["market"] == market
     assert captured["quote_client"] is None
     assert callable(captured["quote_client_factory"])
+    assert captured["account_loader"](
+        config.portfolio,
+        expected_date="2026-07-17",
+        timezone=ZoneInfo("Asia/Shanghai"),
+    ) is simulation_account
+    assert account_calls == [{
+        "host": "127.0.0.1",
+        "port": 11111,
+        "simulate_acc_id": account_id,
+        "market": market,
+        "expected_date": "2026-07-17",
+    }]
     assert callable(captured["on_session_open"])
     assert callable(captured["on_protection_trigger"])
     assert json.loads(capsys.readouterr().out)["status"] == "completed"

@@ -32,6 +32,19 @@ BENCHMARK_FUTU_SYMBOLS = {
     "US": "US.SPY",
     "HK": "HK.800701",
 }
+REJECTED_ORDER_STATUSES = {
+    "FAILED",
+    "SUBMIT_FAILED",
+    "TIMEOUT",
+    "DISABLED",
+    "DELETED",
+    "REJECTED",
+}
+PROTECTION_STATE_ROOTS = {
+    "CN": "trend_a_share",
+    "HK": "trend_hk_phillips",
+    "US": "trend_us_tiger",
+}
 
 
 class TrendReplayIncompleteError(ValueError):
@@ -291,7 +304,7 @@ def _ensure_discipline_account(
 
 def _reconcile_intent(
     intent_path: Path, client: object
-) -> tuple[dict[str, object], bool]:
+) -> tuple[dict[str, object], bool, str | None]:
     payload = json.loads(intent_path.read_text(encoding="utf-8"))
     request = payload.get("request") if isinstance(payload, Mapping) else None
     if not isinstance(request, dict):
@@ -300,7 +313,7 @@ def _reconcile_intent(
         intent_path.name.replace("-intent", "-result")
     )
     if result_path.exists():
-        return request, True
+        return request, True, None
     listed = client.list_orders()
     orders = listed.get("orders") if isinstance(listed, Mapping) else None
     if not isinstance(orders, list):
@@ -314,14 +327,19 @@ def _reconcile_intent(
         None,
     )
     if matched is None:
-        return request, False
+        return request, False, None
+    status = str(
+        matched.get("order_status") or matched.get("status") or ""
+    ).strip().upper()
+    if status in REJECTED_ORDER_STATUSES:
+        return request, False, status
     _write_immutable(
         result_path,
         _canonical_json_bytes(
             {"request": request, "response": matched, "reconciled": True}
         ),
     )
-    return request, True
+    return request, True, None
 
 
 def _order_matches_request(
@@ -401,17 +419,101 @@ def _write_action_event(
     )
 
 
+def _activate_fill_protection_line(
+    *,
+    data_dir: Path,
+    market: str,
+    symbol: str,
+    execution_date: str,
+    atr: Decimal,
+    active_line: str,
+) -> None:
+    from .a_share_trend import load_protection_state, write_protection_state
+
+    state_path = (
+        data_dir / PROTECTION_STATE_ROOTS[market] / "protection_state.json"
+    )
+    state = load_protection_state(state_path)
+    positions = dict(state["positions"])
+    existing = positions.get(symbol)
+    prior = dict(existing) if isinstance(existing, Mapping) else {}
+    positions[symbol] = {
+        **prior,
+        "initial_line": str(prior.get("initial_line") or active_line),
+        "active_line": active_line,
+        "atr14": format(atr, "f"),
+        "position_started_for": str(
+            prior.get("position_started_for") or execution_date
+        ),
+        "tracking_active": prior.get("tracking_active") is True,
+        "updated_for": execution_date,
+    }
+    write_protection_state(state_path, {**state, "positions": positions})
+
+
+def _preflight_open_actions(
+    report: Mapping[str, object], market: str
+) -> tuple[list[Mapping[str, object]], str]:
+    judgments = report.get("strategy_judgments")
+    actions = judgments.get("formal_actions") if isinstance(judgments, Mapping) else None
+    if not isinstance(actions, list):
+        raise ValueError("trend report formal actions are unavailable")
+    strategy_snapshot = report.get("strategy_snapshot")
+    strategy_version = (
+        str(strategy_snapshot.get("strategy_version") or "")
+        if isinstance(strategy_snapshot, Mapping)
+        else ""
+    )
+    if not strategy_version:
+        raise ValueError("trend report strategy version is unavailable")
+
+    from .futu_symbols import to_futu_symbol
+
+    validated: list[Mapping[str, object]] = []
+    for action in actions:
+        if not isinstance(action, Mapping):
+            raise ValueError("trend review action is invalid")
+        action_name = str(action.get("action") or "")
+        symbol = str(action.get("symbol") or "").strip()
+        if action_name not in {"BUY", "SELL_ALL"} or not symbol:
+            raise ValueError("trend review action is invalid")
+        to_futu_symbol(market, symbol)
+        if action_name == "BUY":
+            try:
+                target_weight = _required_decimal(
+                    action.get("target_weight"), "target weight"
+                )
+                atr = _required_decimal(action.get("atr"), "action ATR")
+                lot_size = int(action.get("lot_size") or 0)
+                quantity = _required_decimal(
+                    action.get("estimated_shares"), "estimated shares"
+                )
+            except (TypeError, ValueError):
+                raise ValueError("trend review buy action is invalid") from None
+            if (
+                target_weight <= 0
+                or atr <= 0
+                or lot_size <= 0
+                or quantity <= 0
+                or quantity != quantity.to_integral_value()
+                or quantity % lot_size
+            ):
+                raise ValueError("trend review buy action is invalid")
+        validated.append(action)
+    return validated, strategy_version
+
+
 def execute_trend_review_open(
     *,
     data_dir: Path,
     report: Mapping[str, object],
     client: object,
-    prices: Mapping[str, Decimal],
     market: str,
     execution_date: str,
     now: str,
 ) -> dict[str, object]:
     market = _market(market)
+    actions, strategy_version = _preflight_open_actions(report, market)
     current = datetime.fromisoformat(now)
     local_current = current.astimezone(MARKET_TIMEZONES[market])
     execution_day = date.fromisoformat(execution_date)
@@ -453,22 +555,9 @@ def execute_trend_review_open(
     nav = _required_decimal(snapshot.get("net_value"), "simulate net value")
     if nav <= 0:
         raise TrendReviewAccountStateError("simulate net value must be positive")
-    judgments = report.get("strategy_judgments")
-    actions = judgments.get("formal_actions") if isinstance(judgments, Mapping) else None
-    if not isinstance(actions, list):
-        raise ValueError("trend report formal actions are unavailable")
-
     from .futu_symbols import to_futu_symbol
 
     report_sha = _report_hash(report)
-    strategy_snapshot = report.get("strategy_snapshot")
-    strategy_version = (
-        str(strategy_snapshot.get("strategy_version") or "")
-        if isinstance(strategy_snapshot, Mapping)
-        else ""
-    )
-    if not strategy_version:
-        raise ValueError("trend report strategy version is unavailable")
     submitted = 0
     artifacts: list[str] = []
     sell_symbols = {
@@ -604,7 +693,31 @@ def execute_trend_review_open(
             if pending_intent is not None and (
                 action_name != "SELL_ALL" or sell_quantity > 0
             ):
-                request, reconciled = _reconcile_intent(pending_intent, client)
+                request, reconciled, rejected_status = _reconcile_intent(
+                    pending_intent, client
+                )
+                if rejected_status is not None:
+                    reason = f"simulate {side} order rejected: {rejected_status}"
+                    _write_action_event(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        payload={
+                            "market": market,
+                            "date": execution_date,
+                            "strategy_version": strategy_version,
+                            "report_sha256": report_sha,
+                            "symbol": symbol,
+                            "futu_code": futu_code,
+                            "side": side,
+                            "status": "failed",
+                            "target_qty": str(request.get("qty") or ""),
+                            "reason": reason,
+                        },
+                        recorded_at=now,
+                    )
+                    raise RuntimeError(reason)
                 if reconciled:
                     continue
                 intent_path = pending_intent
@@ -729,6 +842,15 @@ def execute_trend_review_open(
                         },
                         recorded_at=now,
                     )
+                    if protection_fact:
+                        _activate_fill_protection_line(
+                            data_dir=data_dir,
+                            market=market,
+                            symbol=symbol,
+                            execution_date=execution_date,
+                            atr=_required_decimal(action.get("atr"), "action ATR"),
+                            active_line=protection_fact["active_protection_line"],
+                        )
                 if remaining <= 0:
                     continue
                 active_statuses = {
@@ -896,7 +1018,13 @@ def execute_trend_review_stop(
     root = data_dir / "trend_review" / "ledgers" / market / "stops"
     intent_path = root / f"{hashlib.sha256(event_id.encode()).hexdigest()}-intent.json"
     if intent_path.exists():
-        request, reconciled = _reconcile_intent(intent_path, client)
+        request, reconciled, rejected_status = _reconcile_intent(
+            intent_path, client
+        )
+        if rejected_status is not None:
+            raise RuntimeError(
+                f"simulate sell order rejected: {rejected_status}"
+            )
         if reconciled:
             return {
                 "status": "unchanged",
