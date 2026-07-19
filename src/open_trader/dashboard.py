@@ -786,6 +786,11 @@ def _valid_trend_collections(
         for key in ("formal_actions", "holding_decisions", "top10_candidates")
     ):
         return False
+    risk_skips = judgments.get("risk_skips", [])
+    if not isinstance(risk_skips, list) or not all(
+        isinstance(item, dict) for item in risk_skips
+    ):
+        return False
     snapshots = payload.get("signal_snapshots")
     if snapshots is not None and (
         not isinstance(snapshots, dict)
@@ -820,6 +825,53 @@ def _valid_trend_collections(
             payload.get("api_facts", []),
         )
     )
+
+
+def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
+    snapshot = payload.get("strategy_snapshot")
+    strategy_version = (
+        str(snapshot.get("strategy_version") or "")
+        if isinstance(snapshot, dict)
+        else ""
+    )
+    summary = payload.get("risk_summary")
+    if summary is None:
+        return strategy_version != "v2"
+    if strategy_version == "v2" and (
+        not isinstance(payload.get("strategy_judgments"), dict)
+        or "risk_skips" not in payload["strategy_judgments"]
+        or not isinstance(snapshot.get("parameters"), dict)
+        or not snapshot["parameters"].get("normal_cost_rate")
+    ):
+        return False
+    if not isinstance(summary, dict) or any(
+        isinstance(value, (dict, list)) for value in summary.values()
+    ):
+        return False
+    required = {
+        "status",
+        "status_label",
+        "pause_reason",
+        "existing_planned_risk",
+        "new_planned_risk",
+        "portfolio_planned_risk",
+        "portfolio_planned_risk_pct",
+        "portfolio_risk_limit",
+        "portfolio_risk_limit_pct",
+        "portfolio_remaining_risk",
+        "portfolio_remaining_risk_pct",
+        "single_entry_risk_limit",
+        "single_entry_risk_limit_pct",
+        "abnormal_loss_buffer",
+        "abnormal_loss_buffer_pct",
+        "total_risk_budget_target_pct",
+        "normal_cost_rate",
+        "normal_cost_model",
+        "disclaimer",
+    }
+    return (
+        strategy_version != "v2" or required <= summary.keys()
+    ) and summary.get("status") in {"active", "paused"}
 
 
 def _valid_option_attention(payload: dict[str, Any], *, market: str) -> bool:
@@ -912,6 +964,7 @@ def _valid_trend_report_payload(
         and str(metadata.get("market") or "").upper() == market
         and str(metadata.get("broker") or "").lower() == broker
         and _valid_trend_collections(payload, judgments)
+        and _valid_trend_risk_summary(payload)
         and _valid_option_attention(payload, market=market)
         and as_of_date <= freshness_date <= execution_date
     ):
@@ -1019,6 +1072,8 @@ def _project_broker_trend_report(
         ),
         "sell_actions": sell_actions,
         "buy_actions": buy_actions,
+        "risk_skips": payload["strategy_judgments"].get("risk_skips", []),
+        "risk_summary": payload.get("risk_summary", {}),
         "hold_actions": hold_actions,
         "review_actions": review_actions,
         "counts": {

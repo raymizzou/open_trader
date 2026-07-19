@@ -160,6 +160,7 @@ def freeze_report_evidence(
 ) -> dict[str, str]:
     metadata = getattr(report, "metadata")
     strategy_snapshot = getattr(report, "strategy_snapshot")
+    risk_summary = getattr(report, "risk_summary")
     evidence = {
         "market": str(metadata.get("market") or "CN"),
         "report_id": getattr(report, "as_of_date"),
@@ -187,6 +188,7 @@ def freeze_report_evidence(
             "position_weight": metadata.get("position_weight"),
             "position_weight_source": metadata.get("position_weight_source"),
             "price_fx_to_account_currency": price_fx_to_account_currency,
+            "normal_cost_rate": risk_summary.get("normal_cost_rate"),
             "option_attention": {
                 "previous_rows": previous_attention_rows,
                 "broker_label": option_attention_broker_label,
@@ -1600,6 +1602,12 @@ def rebuild_trend_report_from_evidence(
     inputs = evidence.get("rebuild_inputs")
     if not isinstance(inputs, Mapping):
         raise TrendReplayIncompleteError("missing original input: rebuild_inputs")
+    snapshot = evidence.get("strategy_snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise TrendReplayIncompleteError(
+            "missing original input: strategy_snapshot"
+        )
+    strategy_version = str(snapshot.get("strategy_version") or "")
     required = {
         "as_of_date",
         "execution_date",
@@ -1614,17 +1622,13 @@ def rebuild_trend_report_from_evidence(
         "metadata",
         "price_fx_to_account_currency",
     }
+    if strategy_version == "v2":
+        required.add("normal_cost_rate")
     missing = sorted(required - inputs.keys())
     if missing:
         raise TrendReplayIncompleteError(
             f"missing original input: {missing[0]}"
         )
-    snapshot = evidence.get("strategy_snapshot")
-    if not isinstance(snapshot, Mapping):
-        raise TrendReplayIncompleteError(
-            "missing original input: strategy_snapshot"
-        )
-
     from .a_share_trend import (
         AccountPosition,
         AccountSnapshot,
@@ -1741,6 +1745,13 @@ def rebuild_trend_report_from_evidence(
         raise TrendReplayIncompleteError(
             "invalid original input: price_fx_to_account_currency"
         )
+    normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
+    if strategy_version == "v2" and (
+        normal_cost_rate is None
+        or not normal_cost_rate.is_finite()
+        or normal_cost_rate < 0
+    ):
+        raise TrendReplayIncompleteError("invalid original input: normal_cost_rate")
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
         execution_date=str(inputs["execution_date"]),
@@ -1773,6 +1784,7 @@ def rebuild_trend_report_from_evidence(
             inputs.get("position_weight_source") or "fallback_4pct"
         ),
         price_fx_to_account_currency=price_fx,
+        normal_cost_rate=normal_cost_rate or Decimal("0"),
         process_version=process_version,
         candidate_pool_ids=tuple(int(item) for item in inputs["candidate_pool_ids"]),
         strategy_snapshot=snapshot,

@@ -2138,6 +2138,45 @@ function renderTrendExecutionRow(item, columnCount) {
   return `<tr class="cn-trend-execution"><td colspan="${columnCount}">${details.map((detail) => `<span>${escapeHtml(detail)}</span>`).join("")}</td></tr>`;
 }
 
+function trendRiskPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  return `${(number * 100).toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1")}%`;
+}
+
+function renderTrendRiskRow(item, columnCount, status) {
+  if (![item.planned_stop_risk, item.normal_cost, item.decisive_constraint, item.reason].some(hasValue)) return "";
+  const details = [
+    `${status} · 建议 ${hasValue(item.estimated_shares) ? formatDisplayNumber(item.estimated_shares) : "0"} 股`,
+  ];
+  if (hasValue(item.planned_stop_risk)) {
+    details.push(`计划止损风险 ${formatDisplayNumber(item.planned_stop_risk)}（${trendRiskPercent(item.planned_stop_risk_pct)}）`);
+  }
+  if (hasValue(item.normal_cost)) details.push(`正常成本 ${formatDisplayNumber(item.normal_cost)}`);
+  if (hasValue(item.decisive_constraint)) details.push(`决定性约束 ${formatPlain(item.decisive_constraint)}`);
+  if (hasValue(item.reason)) details.push(`原因 ${formatPlain(item.reason)}`);
+  return `<tr class="cn-trend-execution cn-trend-risk-detail"><td colspan="${columnCount}">${details.map((detail) => `<span>${escapeHtml(detail)}</span>`).join("")}</td></tr>`;
+}
+
+function renderTrendRiskSummary(summary) {
+  if (!summary || typeof summary !== "object" || !hasValue(summary.status)) return "";
+  const planned = `${formatDisplayNumber(summary.portfolio_planned_risk)}（${trendRiskPercent(summary.portfolio_planned_risk_pct)} / ${trendRiskPercent(summary.portfolio_risk_limit_pct)}）`;
+  const remaining = `${formatDisplayNumber(summary.portfolio_remaining_risk)}（${trendRiskPercent(summary.portfolio_remaining_risk_pct)}）`;
+  const single = `${formatDisplayNumber(summary.single_entry_risk_limit)}（${trendRiskPercent(summary.single_entry_risk_limit_pct)}）`;
+  const buffer = `${formatDisplayNumber(summary.abnormal_loss_buffer)}（${trendRiskPercent(summary.abnormal_loss_buffer_pct)}）`;
+  return `<section class="trend-risk-summary" data-risk-status="${escapeHtml(formatPlain(summary.status))}" aria-label="模拟策略风险摘要">
+    <header><strong>模拟策略风险</strong><span>${escapeHtml(formatPlain(summary.status_label))}</span></header>
+    ${hasValue(summary.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(summary.pause_reason))}</p>` : ""}
+    <dl>
+      <div><dt>组合正常计划风险</dt><dd>${escapeHtml(planned)}</dd></div>
+      <div><dt>组合剩余风险</dt><dd>${escapeHtml(remaining)}</dd></div>
+      <div><dt>单笔风险上限</dt><dd>${escapeHtml(single)}</dd></div>
+      <div><dt>异常损失缓冲</dt><dd>${escapeHtml(buffer)} · 不得用于开仓</dd></div>
+    </dl>
+    <p>${escapeHtml(formatPlain(summary.disclaimer))}</p>
+  </section>`;
+}
+
 function formatCnTrendPrice(value) {
   const number = numericValue(value);
   return number === null
@@ -2214,7 +2253,7 @@ function renderMarketSellOrHoldStage(title, items, kind) {
 }
 
 function renderMarketBuyStage(report) {
-  const headings = ["标的", "动作", "执行参考价", "强度", "行业", "目标仓位", "金额上限", "预计数量", "预计保护线"];
+  const headings = ["标的", "动作", "执行参考价", "强度", "行业", "目标仓位（占净值）", "金额上限", "预计数量", "预计保护线"];
   const rows = cnTrendRows(report.buy_actions).map((item) => {
     const targetWeight = decimalAsPercent(item.target_weight, "—");
     return `<tr class="cn-trend-card">
@@ -2223,12 +2262,26 @@ function renderMarketBuyStage(report) {
       ${renderCnTrendCell("执行参考价", item.close)}
       ${renderCnTrendCell("强度", item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
-      ${renderCnTrendCell("目标仓位", targetWeight, `目标仓位 ${targetWeight}`)}
+      ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
       ${renderCnTrendCell("金额上限", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : "—")}
       ${renderCnTrendCell("预计数量", hasValue(item.estimated_shares) ? `${formatDisplayNumber(item.estimated_shares)} 股` : "—")}
       ${renderCnTrendCell("预计保护线", hasValue(item.estimated_initial_line) ? formatDisplayNumber(item.estimated_initial_line) : "—")}
-    </tr>${renderTrendExecutionRow(item, headings.length)}`;
+    </tr>${renderTrendRiskRow(item, headings.length, "允许")}${renderTrendExecutionRow(item, headings.length)}`;
   });
+  rows.push(...cnTrendRows(report.risk_skips).map((item) => {
+    const targetWeight = decimalAsPercent(item.target_weight, "—");
+    return `<tr class="cn-trend-card">
+      ${renderCnTrendCell("标的", cnTrendIdentity(item))}
+      ${renderCnTrendCell("动作", "跳过")}
+      ${renderCnTrendCell("执行参考价", item.close)}
+      ${renderCnTrendCell("强度", item.strength)}
+      ${renderCnTrendCell("行业", item.industry)}
+      ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
+      ${renderCnTrendCell("金额上限", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : "—")}
+      ${renderCnTrendCell("预计数量", "0 股")}
+      ${renderCnTrendCell("预计保护线", "—")}
+    </tr>${renderTrendRiskRow(item, headings.length, "跳过")}`;
+  }));
   return renderCnTrendTable(`${formatPlain(report.buy_window)} · 正式买入计划`, "buy", headings, rows);
 }
 
@@ -2236,7 +2289,7 @@ function renderCnBuyStage(report) {
   const headings = [
     "标的", "动作", "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
     "温度变化", "节气", "强度", "行业", "行业温度", "市值（亿元）",
-    "日成交额（亿元）", "目标仓位", "目标金额", "预计数量", "预计保护线",
+    "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线",
   ];
   const rows = cnTrendRows(report.buy_actions).map((item) => {
     const targetWeight = decimalAsPercent(item.target_weight, "-");
@@ -2252,12 +2305,32 @@ function renderCnBuyStage(report) {
       ${renderCnTrendCell("行业温度", item.industry_temperature)}
       ${renderCnTrendCell("市值（亿元）", item.market_cap)}
       ${renderCnTrendCell("日成交额（亿元）", item.amount)}
-      ${renderCnTrendCell("目标仓位", targetWeight, `目标仓位 ${targetWeight}`)}
+      ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
       ${renderCnTrendCell("目标金额", item.target_amount)}
       ${renderCnTrendCell("预计数量", `${formatPlain(item.estimated_shares)} 股`)}
       ${renderCnTrendCell("预计保护线", formatCnTrendPrice(item.estimated_initial_line))}
-    </tr>${renderTrendExecutionRow(item, headings.length)}`;
+    </tr>${renderTrendRiskRow(item, headings.length, "允许")}${renderTrendExecutionRow(item, headings.length)}`;
   });
+  rows.push(...cnTrendRows(report.risk_skips).map((item) => {
+    const targetWeight = decimalAsPercent(item.target_weight, "-");
+    return `<tr class="cn-trend-card">
+      ${renderCnTrendCell("标的", cnTrendIdentity(item))}
+      ${renderCnTrendCell("动作", "跳过")}
+      ${renderCnTrendCell("筛选价（Trend Animals）", item.filter_price)}
+      ${renderCnTrendCell("执行参考价（Futu 前复权）", item.close)}
+      ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
+      ${renderCnTrendCell("节气", item.phase)}
+      ${renderCnTrendCell("强度", item.strength)}
+      ${renderCnTrendCell("行业", item.industry)}
+      ${renderCnTrendCell("行业温度", item.industry_temperature)}
+      ${renderCnTrendCell("市值（亿元）", item.market_cap)}
+      ${renderCnTrendCell("日成交额（亿元）", item.amount)}
+      ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
+      ${renderCnTrendCell("目标金额", item.target_amount)}
+      ${renderCnTrendCell("预计数量", "0 股")}
+      ${renderCnTrendCell("预计保护线", "—")}
+    </tr>${renderTrendRiskRow(item, headings.length, "跳过")}`;
+  }));
   return renderCnTrendTable(
     `${formatPlain(report.buy_window)} · 正式买入计划`, "buy", headings, rows,
     "价格口径：筛选价（Trend Animals）｜执行参考价（Futu 前复权）",
@@ -2359,6 +2432,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
         <span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
       </div>
     </header>
+    ${renderTrendRiskSummary(report.risk_summary)}
     <div class="cn-trend-actions">
       ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
       ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}

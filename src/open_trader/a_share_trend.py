@@ -26,6 +26,7 @@ from .futu_symbols import to_futu_symbol
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .kline_technical_facts import DailyKlineBar
 from .notifications import Notifier, NullNotifier
+from .portfolio_risk import size_entry_by_risk
 from .trend_animals import (
     TrendAnimalsClient,
     TrendAnimalsError,
@@ -74,6 +75,10 @@ POSITION_LIMIT = 10
 CANDIDATE_LIMIT = 10
 CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
 DEFAULT_TARGET_WEIGHT = Decimal("0.04")
+SINGLE_ENTRY_RISK_LIMIT = Decimal("0.004")
+PORTFOLIO_RISK_LIMIT = Decimal("0.04")
+ABNORMAL_LOSS_BUFFER = Decimal("0.01")
+NORMAL_COST_RATE = Decimal("0.001")
 INITIAL_PROTECTION_ATR_MULTIPLE = Decimal("2")
 TRAILING_LOW_DAYS = 5
 ALLOWED_ENTRY_PHASES = {"谷雨", "立夏", "夏至"}
@@ -85,6 +90,8 @@ def trend_strategy_snapshot(
     market: str,
     process_version: str,
     candidate_pool_ids: Sequence[int],
+    *,
+    normal_cost_rate: Decimal = NORMAL_COST_RATE,
 ) -> dict[str, object]:
     market = market.upper()
     if market not in {"CN", "US", "HK"}:
@@ -101,6 +108,11 @@ def trend_strategy_snapshot(
         "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
         "candidate_limit": CANDIDATE_LIMIT,
         "position_limit": POSITION_LIMIT,
+        "single_entry_risk_limit": str(SINGLE_ENTRY_RISK_LIMIT),
+        "portfolio_risk_limit": str(PORTFOLIO_RISK_LIMIT),
+        "abnormal_loss_buffer": str(ABNORMAL_LOSS_BUFFER),
+        "normal_cost_rate": str(normal_cost_rate),
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
     }
     if market == "CN":
         parameters: dict[str, object] = {
@@ -146,6 +158,9 @@ def trend_strategy_snapshot(
             ("候选排序", "排序顺序", "趋势强度降序、右侧天数升序、成交额降序、股票代码升序"),
             ("候选排序", "候选数量", "展示前 10；按剩余持仓席位产生买入动作"),
             ("仓位执行", "持仓上限", "10 笔"),
+            ("仓位执行", "单笔计划止损风险上限", "账户净值的 0.40%"),
+            ("仓位执行", "组合正常计划风险上限", "账户净值的 4%"),
+            ("仓位执行", "异常损失缓冲", "账户净值的 1%，不得用于开仓"),
             ("仓位执行", "热状态仓位", "账户净值的 4%"),
             ("仓位执行", "沸状态仓位", "账户净值的 2%"),
             ("仓位执行", "买入数量", "按 100 股整数倍向下取整"),
@@ -187,6 +202,9 @@ def trend_strategy_snapshot(
             ("候选排序", "排序顺序", "趋势强度降序、右侧天数升序、成交额降序、股票代码升序"),
             ("候选排序", "候选数量", "展示前 10；按剩余持仓席位产生买入动作"),
             ("仓位执行", "持仓上限", "10 笔"),
+            ("仓位执行", "单笔计划止损风险上限", "账户净值的 0.40%"),
+            ("仓位执行", "组合正常计划风险上限", "账户净值的 4%"),
+            ("仓位执行", "异常损失缓冲", "账户净值的 1%，不得用于开仓"),
             ("仓位执行", "目标仓位", "账户净值的 4%"),
             (
                 "仓位执行",
@@ -204,11 +222,11 @@ def trend_strategy_snapshot(
         ]
 
     return {
-        "strategy_id": f"trend_animals_warm_to_hot/{market}/v1",
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/v2",
         "strategy_name": name,
-        "strategy_version": "v1",
+        "strategy_version": "v2",
         "market": market,
-        "effective_from": "2026-07-14",
+        "effective_from": "2026-07-19",
         "process_version": process_version,
         "parameters": parameters,
         "parameter_rows": [
@@ -361,6 +379,10 @@ class BuyAction:
     amount: Decimal | None
     atr: Decimal
     estimated_initial_line: Decimal
+    planned_stop_risk: Decimal
+    planned_stop_risk_pct: Decimal
+    normal_cost: Decimal
+    decisive_constraint: str
 
 
 @dataclass(frozen=True)
@@ -425,6 +447,8 @@ class TrendReport:
     candidates: tuple[CandidateInput, ...]
     excluded: dict[str, list[str]]
     buy_actions: tuple[BuyAction, ...]
+    risk_skips: tuple[dict[str, object], ...]
+    risk_summary: dict[str, object]
     industry_concentration: tuple[tuple[str, int, Decimal], ...]
     data_sources: tuple[str, ...]
     estimated_api_cost: Decimal | None
@@ -970,7 +994,36 @@ def estimate_buy_actions(
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
     price_fx_to_account_currency: Decimal = Decimal("1"),
+    portfolio_planned_risk: Decimal = Decimal("0"),
+    normal_cost_rate: Decimal = NORMAL_COST_RATE,
 ) -> list[BuyAction]:
+    actions, _, _ = _plan_buy_actions(
+        ranked=ranked,
+        net_value=net_value,
+        available_cash=available_cash,
+        current_position_count=current_position_count,
+        position_weight=position_weight,
+        market=market,
+        lot_sizes=lot_sizes,
+        price_fx_to_account_currency=price_fx_to_account_currency,
+        portfolio_planned_risk=portfolio_planned_risk,
+        normal_cost_rate=normal_cost_rate,
+    )
+    return actions
+
+
+def _estimate_buy_actions_v1(
+    *,
+    ranked: Sequence[CandidateInput],
+    net_value: Decimal,
+    available_cash: Decimal,
+    current_position_count: int,
+    position_weight: Decimal,
+    market: str,
+    lot_sizes: Mapping[str, int] | None,
+    price_fx_to_account_currency: Decimal,
+) -> list[BuyAction]:
+    """Preserve the frozen v1 nominal/cash/slot sizing for evidence replay."""
     slots = max(0, POSITION_LIMIT - current_position_count)
     if slots == 0:
         return []
@@ -990,12 +1043,13 @@ def estimate_buy_actions(
             continue
         target = (net_value * weight).quantize(Decimal("0.01"))
         amount = min(target, remaining_cash)
-        if market == "CN":
-            lot_size = 100
-        elif market == "HK":
-            lot_size = (lot_sizes or {}).get(item.symbol, 0)
-        else:
-            lot_size = 1
+        lot_size = (
+            100
+            if market == "CN"
+            else (lot_sizes or {}).get(item.symbol, 0)
+            if market == "HK"
+            else 1
+        )
         share_price = item.close * price_fx_to_account_currency
         shares = int(amount / share_price / lot_size) * lot_size if lot_size > 0 else 0
         if shares <= 0:
@@ -1023,11 +1077,295 @@ def estimate_buy_actions(
                 estimated_initial_line=(
                     item.close - INITIAL_PROTECTION_ATR_MULTIPLE * item.atr
                 ),
+                planned_stop_risk=Decimal("0"),
+                planned_stop_risk_pct=Decimal("0"),
+                normal_cost=Decimal("0"),
+                decisive_constraint="",
             )
         )
         remaining_cash -= amount
         slots -= 1
     return actions
+
+
+def _risk_skip(
+    item: CandidateInput,
+    *,
+    weight: Decimal | None,
+    target_amount: Decimal | None,
+    reason: str,
+    decisive_constraint: str,
+) -> dict[str, object]:
+    return {
+        **asdict(item),
+        "target_weight": weight,
+        "target_amount": target_amount,
+        "estimated_shares": 0,
+        "reason": reason,
+        "decisive_constraint": decisive_constraint,
+    }
+
+
+def _risk_summary(
+    *,
+    net_value: Decimal,
+    existing_planned_risk: Decimal | None,
+    new_planned_risk: Decimal,
+    normal_cost_rate: Decimal,
+    pause_reason: str = "",
+) -> dict[str, object]:
+    valid_nav = net_value.is_finite() and net_value > 0
+    portfolio_limit = net_value * PORTFOLIO_RISK_LIMIT if valid_nav else None
+    planned_risk = (
+        existing_planned_risk + new_planned_risk
+        if existing_planned_risk is not None
+        else None
+    )
+    remaining_risk = (
+        max(Decimal("0"), portfolio_limit - planned_risk)
+        if portfolio_limit is not None and planned_risk is not None
+        else None
+    )
+    return {
+        "status": "paused" if pause_reason else "active",
+        "status_label": (
+            "组合风险已满"
+            if pause_reason == "组合正常计划风险已达到净值 4%"
+            else "暂停新开仓"
+            if pause_reason
+            else "风险预算内"
+        ),
+        "pause_reason": pause_reason,
+        "existing_planned_risk": existing_planned_risk,
+        "new_planned_risk": new_planned_risk,
+        "portfolio_planned_risk": planned_risk,
+        "portfolio_planned_risk_pct": (
+            planned_risk / net_value
+            if valid_nav and planned_risk is not None
+            else None
+        ),
+        "portfolio_risk_limit": portfolio_limit,
+        "portfolio_risk_limit_pct": PORTFOLIO_RISK_LIMIT,
+        "portfolio_remaining_risk": remaining_risk,
+        "portfolio_remaining_risk_pct": (
+            remaining_risk / net_value
+            if valid_nav and remaining_risk is not None
+            else None
+        ),
+        "single_entry_risk_limit": (
+            net_value * SINGLE_ENTRY_RISK_LIMIT if valid_nav else None
+        ),
+        "single_entry_risk_limit_pct": SINGLE_ENTRY_RISK_LIMIT,
+        "abnormal_loss_buffer": (
+            net_value * ABNORMAL_LOSS_BUFFER if valid_nav else None
+        ),
+        "abnormal_loss_buffer_pct": ABNORMAL_LOSS_BUFFER,
+        "total_risk_budget_target_pct": PORTFOLIO_RISK_LIMIT + ABNORMAL_LOSS_BUFFER,
+        "normal_cost_rate": normal_cost_rate,
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "disclaimer": "5% 是风险预算目标，不是最大损失保证。",
+    }
+
+
+def _plan_buy_actions(
+    *,
+    ranked: Sequence[CandidateInput],
+    net_value: Decimal,
+    available_cash: Decimal,
+    current_position_count: int,
+    position_weight: Decimal,
+    market: str,
+    lot_sizes: Mapping[str, int] | None,
+    price_fx_to_account_currency: Decimal,
+    portfolio_planned_risk: Decimal | None,
+    normal_cost_rate: Decimal,
+    critical_data_reason: str = "",
+) -> tuple[list[BuyAction], list[dict[str, object]], dict[str, object]]:
+    if not critical_data_reason:
+        if not net_value.is_finite() or net_value <= 0:
+            critical_data_reason = "模拟盘净值缺失，暂停新开仓"
+        elif not available_cash.is_finite() or available_cash < 0:
+            critical_data_reason = "模拟盘现金缺失，暂停新开仓"
+        elif (
+            not price_fx_to_account_currency.is_finite()
+            or price_fx_to_account_currency <= 0
+        ):
+            critical_data_reason = "汇率缺失，暂停新开仓"
+        elif portfolio_planned_risk is None:
+            critical_data_reason = "模拟持仓风险事实缺失，暂停新开仓"
+        elif any(
+            item.close is None
+            or not item.close.is_finite()
+            or item.close <= 0
+            or item.atr is None
+            or not item.atr.is_finite()
+            or item.atr <= 0
+            for item in ranked
+        ):
+            critical_data_reason = "候选价格或活动保护线缺失，暂停新开仓"
+
+    if critical_data_reason:
+        skips = [
+            _risk_skip(
+                item,
+                weight=(
+                    CN_TARGET_WEIGHTS.get(item.temperature_curr)
+                    if market == "CN"
+                    else position_weight
+                ),
+                target_amount=None,
+                reason=critical_data_reason,
+                decisive_constraint="关键风险数据",
+            )
+            for item in ranked
+        ]
+        return [], skips, _risk_summary(
+            net_value=net_value,
+            existing_planned_risk=portfolio_planned_risk,
+            new_planned_risk=Decimal("0"),
+            normal_cost_rate=normal_cost_rate,
+            pause_reason=critical_data_reason,
+        )
+
+    assert portfolio_planned_risk is not None
+    if portfolio_planned_risk >= net_value * PORTFOLIO_RISK_LIMIT:
+        pause_reason = "组合正常计划风险已达到净值 4%"
+        skips = [
+            _risk_skip(
+                item,
+                weight=(
+                    CN_TARGET_WEIGHTS.get(item.temperature_curr)
+                    if market == "CN"
+                    else position_weight
+                ),
+                target_amount=None,
+                reason=pause_reason,
+                decisive_constraint="组合剩余风险",
+            )
+            for item in ranked
+        ]
+        return [], skips, _risk_summary(
+            net_value=net_value,
+            existing_planned_risk=portfolio_planned_risk,
+            new_planned_risk=Decimal("0"),
+            normal_cost_rate=normal_cost_rate,
+            pause_reason=pause_reason,
+        )
+    remaining_cash = available_cash
+    remaining_risk = max(
+        Decimal("0"),
+        net_value * PORTFOLIO_RISK_LIMIT - portfolio_planned_risk,
+    )
+    single_entry_limit = net_value * SINGLE_ENTRY_RISK_LIMIT
+    slots = max(0, POSITION_LIMIT - current_position_count)
+    actions: list[BuyAction] = []
+    skips: list[dict[str, object]] = []
+    for item in ranked:
+        weight = (
+            CN_TARGET_WEIGHTS.get(item.temperature_curr)
+            if market == "CN"
+            else position_weight
+        )
+        if weight is None:
+            continue
+        target_amount = min(net_value * weight, remaining_cash).quantize(
+            Decimal("0.01")
+        )
+        if slots == 0:
+            skips.append(
+                _risk_skip(
+                    item,
+                    weight=weight,
+                    target_amount=target_amount,
+                    reason="10 个持仓席位已满",
+                    decisive_constraint="持仓席位",
+                )
+            )
+            continue
+        lot_size = (
+            100
+            if market == "CN"
+            else (lot_sizes or {}).get(item.symbol, 0)
+            if market == "HK"
+            else 1
+        )
+        if lot_size <= 0:
+            skips.append(
+                _risk_skip(
+                    item,
+                    weight=weight,
+                    target_amount=target_amount,
+                    reason="缺少实际每手股数",
+                    decisive_constraint="交易单位",
+                )
+            )
+            continue
+        assert item.close is not None and item.atr is not None
+        protection_line = item.close - INITIAL_PROTECTION_ATR_MULTIPLE * item.atr
+        sized = size_entry_by_risk(
+            entry_price=item.close,
+            protection_line=protection_line,
+            fx_to_account_currency=price_fx_to_account_currency,
+            portfolio_nav=net_value,
+            nominal_weight_limit=weight,
+            single_entry_risk_limit=single_entry_limit,
+            portfolio_remaining_risk=remaining_risk,
+            available_cash=remaining_cash,
+            lot_size=Decimal(lot_size),
+            normal_cost_rate=normal_cost_rate,
+        )
+        if sized.final_quantity <= 0:
+            skips.append(
+                _risk_skip(
+                    item,
+                    weight=weight,
+                    target_amount=target_amount,
+                    reason=sized.reason,
+                    decisive_constraint=sized.decisive_constraint,
+                )
+            )
+            continue
+        quantity = int(sized.final_quantity)
+        actions.append(
+            BuyAction(
+                symbol=item.symbol,
+                name=item.name,
+                industry=item.industry,
+                target_weight=weight,
+                target_amount=target_amount,
+                estimated_shares=quantity,
+                lot_size=lot_size,
+                filter_price=item.filter_price,
+                close=item.close,
+                market_cap=item.market_cap,
+                industry_tm_id=item.industry_tm_id,
+                industry_temperature=item.industry_temperature,
+                temperature_prev=item.temperature_prev,
+                temperature_curr=item.temperature_curr,
+                phase=item.phase,
+                strength=item.strength,
+                amount=item.amount,
+                atr=item.atr,
+                estimated_initial_line=protection_line,
+                planned_stop_risk=sized.planned_stop_risk,
+                planned_stop_risk_pct=sized.planned_stop_risk / net_value,
+                normal_cost=sized.normal_cost,
+                decisive_constraint=sized.decisive_constraint,
+            )
+        )
+        remaining_cash -= sized.cash_required
+        remaining_risk -= sized.planned_stop_risk
+        slots -= 1
+
+    new_planned_risk = sum(
+        (item.planned_stop_risk for item in actions), Decimal("0")
+    )
+    return actions, skips, _risk_summary(
+        net_value=net_value,
+        existing_planned_risk=portfolio_planned_risk,
+        new_planned_risk=new_planned_risk,
+        normal_cost_rate=normal_cost_rate,
+    )
 
 
 def update_protection_line(
@@ -1148,6 +1486,56 @@ def _protection_was_triggered(
     return False
 
 
+def _post_sell_planned_risk(
+    *,
+    account: AccountSnapshot,
+    holdings: Sequence[HoldingDecision],
+    sell_symbols: set[str],
+    price_fx_to_account_currency: Decimal,
+    normal_cost_rate: Decimal,
+) -> tuple[Decimal | None, str]:
+    if not account.net_value.is_finite() or account.net_value <= 0:
+        return None, "模拟盘净值缺失，暂停新开仓"
+    if not account.available_cash.is_finite() or account.available_cash < 0:
+        return None, "模拟盘现金缺失，暂停新开仓"
+    if (
+        not price_fx_to_account_currency.is_finite()
+        or price_fx_to_account_currency <= 0
+    ):
+        return None, "汇率缺失，暂停新开仓"
+    if not normal_cost_rate.is_finite() or normal_cost_rate < 0:
+        return None, "正常成本模型缺失，暂停新开仓"
+
+    holding_by_symbol = {item.symbol: item for item in holdings}
+    planned_risk = Decimal("0")
+    for position in account.positions:
+        if position.symbol in sell_symbols:
+            continue
+        if not position.quantity.is_finite() or position.quantity <= 0:
+            return None, f"模拟持仓 {position.symbol} 数量缺失，暂停新开仓"
+        holding = holding_by_symbol.get(position.symbol)
+        if (
+            holding is None
+            or holding.close is None
+            or not holding.close.is_finite()
+            or holding.close <= 0
+        ):
+            return None, f"模拟持仓 {position.symbol} 价格缺失，暂停新开仓"
+        if (
+            holding.historical
+            or holding.active_line is None
+            or not holding.active_line.is_finite()
+            or holding.active_line < 0
+        ):
+            return None, f"模拟持仓 {position.symbol} 活动保护线缺失，暂停新开仓"
+        planned_risk += position.quantity * (
+            max(Decimal("0"), holding.close - holding.active_line)
+            * price_fx_to_account_currency
+            + holding.close * price_fx_to_account_currency * normal_cost_rate
+        )
+    return planned_risk, ""
+
+
 def build_report(
     *,
     as_of_date: str,
@@ -1169,6 +1557,7 @@ def build_report(
     position_weight: Decimal = DEFAULT_TARGET_WEIGHT,
     position_weight_source: str = "fallback_4pct",
     price_fx_to_account_currency: Decimal = Decimal("1"),
+    normal_cost_rate: Decimal = NORMAL_COST_RATE,
     process_version: str = "",
     candidate_pool_ids: Sequence[int] = (),
     strategy_snapshot: Mapping[str, object] | None = None,
@@ -1272,39 +1661,67 @@ def build_report(
     sell_symbols = {
         holding.symbol for holding in holdings if holding.action == "SELL_ALL"
     }
-    buy_actions = estimate_buy_actions(
-        ranked=candidate_decision.eligible,
-        net_value=account.net_value,
-        available_cash=account.available_cash
-        + sum(
-            (
-                position.market_value
-                for position in account.positions
-                if position.symbol in sell_symbols
-            ),
-            Decimal("0"),
+    post_sell_cash = account.available_cash + sum(
+        (
+            position.market_value
+            for position in account.positions
+            if position.symbol in sell_symbols
         ),
-        current_position_count=max(
-            0,
-            (
-                account.position_count
-                if account.position_count is not None
-                else len(account.positions)
-            )
-            - len(sell_symbols),
-        ),
-        position_weight=position_weight,
-        market=market,
-        lot_sizes=lot_sizes,
-        price_fx_to_account_currency=price_fx_to_account_currency,
+        Decimal("0"),
     )
+    post_sell_position_count = max(
+        0,
+        (
+            account.position_count
+            if account.position_count is not None
+            else len(account.positions)
+        )
+        - len(sell_symbols),
+    )
+    snapshot_version = str(
+        (strategy_snapshot or {}).get("strategy_version") or "v2"
+    )
+    if snapshot_version == "v1":
+        buy_actions = _estimate_buy_actions_v1(
+            ranked=candidate_decision.eligible,
+            net_value=account.net_value,
+            available_cash=post_sell_cash,
+            current_position_count=post_sell_position_count,
+            position_weight=position_weight,
+            market=market,
+            lot_sizes=lot_sizes,
+            price_fx_to_account_currency=price_fx_to_account_currency,
+        )
+        risk_skips: list[dict[str, object]] = []
+        risk_summary: dict[str, object] = {}
+    else:
+        existing_planned_risk, critical_data_reason = _post_sell_planned_risk(
+            account=account,
+            holdings=holdings,
+            sell_symbols=sell_symbols,
+            price_fx_to_account_currency=price_fx_to_account_currency,
+            normal_cost_rate=normal_cost_rate,
+        )
+        buy_actions, risk_skips, risk_summary = _plan_buy_actions(
+            ranked=candidate_decision.eligible,
+            net_value=account.net_value,
+            available_cash=post_sell_cash,
+            current_position_count=post_sell_position_count,
+            position_weight=position_weight,
+            market=market,
+            lot_sizes=lot_sizes,
+            price_fx_to_account_currency=price_fx_to_account_currency,
+            portfolio_planned_risk=existing_planned_risk,
+            normal_cost_rate=normal_cost_rate,
+            critical_data_reason=critical_data_reason,
+        )
     industry_concentration = tuple(
         (
             industry,
             count,
             (
                 industry_values[industry] * Decimal("100") / account.net_value
-                if account.net_value > 0
+                if account.net_value.is_finite() and account.net_value > 0
                 else Decimal("0")
             ),
         )
@@ -1355,6 +1772,8 @@ def build_report(
         candidates=displayed_candidates,
         excluded=candidate_decision.excluded,
         buy_actions=tuple(buy_actions),
+        risk_skips=tuple(risk_skips),
+        risk_summary=risk_summary,
         industry_concentration=industry_concentration,
         data_sources=tuple(data_sources),
         estimated_api_cost=estimated_api_cost,
@@ -1382,6 +1801,7 @@ def build_report(
                 process_version
                 or str((metadata or {}).get("process_version") or ""),
                 candidate_pool_ids,
+                normal_cost_rate=normal_cost_rate,
             )
         ),
         replay_evidence=None,
@@ -2012,6 +2432,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
 def _report_payload(report: TrendReport) -> dict[str, object]:
     validate_report_strategy_snapshot(report)
     market = str(report.metadata.get("market") or "CN").upper()
+    legacy_v1 = report.strategy_snapshot.get("strategy_version") == "v1"
     buy_window = (
         f"{report.execution_date} 09:30–10:00"
         if market in {"CN", "HK"}
@@ -2030,14 +2451,27 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         for item in report.holdings
         if item.action == "SELL_ALL"
     ]
-    formal_actions.extend(
-        {
-            **_json_value(asdict(item)),  # type: ignore[arg-type]
-            "action": "BUY",
-            "valid_window": buy_window,
-        }
-        for item in report.buy_actions
-    )
+    for item in report.buy_actions:
+        action = _json_value(asdict(item))
+        assert isinstance(action, dict)
+        if legacy_v1:
+            for key in (
+                "planned_stop_risk",
+                "planned_stop_risk_pct",
+                "normal_cost",
+                "decisive_constraint",
+            ):
+                action.pop(key)
+        formal_actions.append(
+            {**action, "action": "BUY", "valid_window": buy_window}
+        )
+    strategy_judgments = {
+        "holding_decisions": holding_decisions,
+        "top10_candidates": top10_candidates,
+        "formal_actions": formal_actions,
+    }
+    if not legacy_v1:
+        strategy_judgments["risk_skips"] = _json_value(report.risk_skips)
     payload = {
         "schema_version": report.schema_version,
         "generated_at": report.generated_at,
@@ -2045,11 +2479,7 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "execution_date": report.execution_date,
         "account": _json_value(asdict(report.account)),
         "api_facts": list(report.api_facts),
-        "strategy_judgments": {
-            "holding_decisions": holding_decisions,
-            "top10_candidates": top10_candidates,
-            "formal_actions": formal_actions,
-        },
+        "strategy_judgments": strategy_judgments,
         "industry_concentration": _json_value(report.industry_concentration),
         "excluded": report.excluded,
         "data_sources": list(report.data_sources),
@@ -2061,6 +2491,8 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "strategy_snapshot": _json_value(report.strategy_snapshot),
         "disclaimer": DISCLAIMER_TEXT,
     }
+    if not legacy_v1:
+        payload["risk_summary"] = _json_value(report.risk_summary)
     if report.replay_evidence is not None:
         payload["replay_evidence"] = dict(report.replay_evidence)
     for key in ("delivery_status", "process_version"):
