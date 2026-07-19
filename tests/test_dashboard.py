@@ -1274,6 +1274,100 @@ def _valid_v2_dashboard_trend_payload() -> dict[str, object]:
     }
 
 
+def _valid_v3_dashboard_trend_payload() -> dict[str, object]:
+    payload = copy.deepcopy(_valid_v2_dashboard_trend_payload())
+    snapshot = payload["strategy_snapshot"]
+    summary = payload["risk_summary"]
+    assert isinstance(snapshot, dict) and isinstance(summary, dict)
+    snapshot["strategy_version"] = "v3"
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.update(
+        {
+            "kelly_sample_minimum": 30,
+            "kelly_rolling_window": 200,
+            "kelly_fraction": "0.25",
+            "kelly_optimizer": "mean_log_growth_derivative_bisection_96_floor_1e-6",
+            "kelly_sample_scope": "market+strategy_id+opening_strategy_version",
+            "kelly_source": "cost_complete_attributed_simulation_closed_rounds",
+        }
+    )
+    summary.update(
+        {
+            "kelly_phase": "cold_start",
+            "kelly_eligible_sample_count": 0,
+            "kelly_selected_sample_count": 0,
+            "kelly_cap": None,
+            "kelly_reason": "Kelly 冷启动：0/30 个合格模拟闭环；继续使用固定风险仓位",
+            "kelly_last_closed_at": "",
+            "kelly_source": "合格的富途模拟闭环；实盘结果不参与计算",
+        }
+    )
+    return payload
+
+
+def test_dashboard_enforces_issue_4_and_kelly_contract_for_v3(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v3_dashboard_trend_payload()
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    summary["normal_cost_rate"] = "0.009"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is False
+
+
+def test_dashboard_accepts_exact_v3_zero_kelly_pause(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v3_dashboard_trend_payload()
+    judgments = payload["strategy_judgments"]
+    summary = payload["risk_summary"]
+    assert isinstance(judgments, dict) and isinstance(summary, dict)
+    judgments["formal_actions"] = []
+    judgments["risk_skips"][0].update(
+        {
+            "target_weight": "0",
+            "target_amount": "0",
+            "reason": "Kelly 上限为 0，仅暂停未来新开仓",
+            "decisive_constraint": "Kelly 上限",
+        }
+    )
+    summary.update(
+        {
+            "status": "paused",
+            "status_label": "暂停新开仓",
+            "pause_reason": "Kelly 上限为 0，仅暂停未来新开仓",
+            "new_planned_risk": "0",
+            "portfolio_planned_risk": "0",
+            "portfolio_planned_risk_pct": "0",
+            "portfolio_remaining_risk": "4000",
+            "portfolio_remaining_risk_pct": "0.04",
+            "kelly_phase": "active_all_samples",
+            "kelly_eligible_sample_count": 30,
+            "kelly_selected_sample_count": 30,
+            "kelly_cap": "0.000000",
+            "kelly_reason": "Kelly 上限为 0，仅暂停未来新开仓",
+            "kelly_last_closed_at": "2026-07-14T16:00:00+00:00",
+        }
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is True
+    assert report["risk_summary"]["kelly_cap"] == "0.000000"
+
+
 def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     path = config.reports_dir / "trend_a_share/2026-07-15.json"

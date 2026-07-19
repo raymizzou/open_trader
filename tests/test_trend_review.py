@@ -122,6 +122,8 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
             "candidate_pool_ids": [622466, 697199],
             "generated_at": "2026-07-16T17:00:00+08:00",
             "metadata": {"market": "CN", "broker": "eastmoney"},
+            "kelly_rounds": [],
+            "kelly_data_reason": "",
         },
     }
 

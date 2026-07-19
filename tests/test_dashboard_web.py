@@ -4000,6 +4000,9 @@ const html = renderTrendReportWorkspace({
     single_entry_risk_limit:"400",single_entry_risk_limit_pct:"0.004",
     abnormal_loss_buffer:"1000",abnormal_loss_buffer_pct:"0.01",
     total_risk_budget_target_pct:"0.05",
+    kelly_phase:"active_all_samples",kelly_eligible_sample_count:30,
+    kelly_selected_sample_count:30,kelly_cap:"0.012626",kelly_reason:"",
+    kelly_source:"合格的富途模拟闭环；实盘结果不参与计算",
     disclaimer:"5% 是风险预算目标，不是最大损失保证。",
     portfolio_remaining_risk_note:"组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"},
   sell_actions:[{symbol:"600000",name:"浦发银行",reason:"danger_signal"}],
@@ -4019,6 +4022,8 @@ const html = renderTrendReportWorkspace({
   hold_actions:[],review_actions:[],audit:{},
 });
 for (const text of ["模拟策略风险","风险预算内","组合正常计划风险",
+  "Kelly 阶段","全样本启用 · 30 个合格模拟闭环","当前 Kelly 上限","1.2626%",
+  "合格的富途模拟闭环；实盘结果不参与计算",
   "组合剩余风险","单笔风险上限","异常损失缓冲","不得用于开仓",
   "5% 是风险预算目标，不是最大损失保证。","目标仓位（占净值）",
   "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
