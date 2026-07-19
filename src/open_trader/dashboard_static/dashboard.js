@@ -2214,6 +2214,7 @@ function renderTrendActualOverlay(overlay) {
           target,
           `模拟数量 ${hasValue(item.simulation_quantity) ? formatDisplayNumber(item.simulation_quantity) : "—"}`,
           `实盘参考数量 ${hasValue(item.actual_reference_quantity) ? formatDisplayNumber(item.actual_reference_quantity) : "—"}`,
+          hasValue(item.reference_note) ? formatPlain(item.reference_note) : "",
           `真实持仓 ${formatDisplayNumber(item.actual_quantity)}`,
           `市值 ${formatPlain(item.currency)} ${formatDisplayNumber(item.actual_market_value)}`,
           hasValue(item.frozen_reference_price) ? `冻结参考价 ${formatPlain(item.currency)} ${formatDisplayNumber(item.frozen_reference_price)}` : "",

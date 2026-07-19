@@ -1338,15 +1338,11 @@ def _project_trend_actual_overlay(
         broker, [], broker_positions, cash_details, {}
     )
     nav_hkd = _optional_decimal(summary.get("portfolio_value_hkd", ""))
-    price_fx_to_hkd = next(
-        (
-            rate
-            for row in [*broker_rows, *broker_cash]
-            if str(row.get("currency") or "").strip().upper()
-            == TREND_MARKET_CURRENCIES.get(market)
-            and (rate := _detail_fx_to_hkd(row)) is not None
-        ),
-        DETAIL_FX_TO_HKD.get(TREND_MARKET_CURRENCIES.get(market, "")),
+    actual_rows = [*broker_rows, *broker_cash]
+    price_fx_to_hkd, price_fx_note = _trend_actual_price_fx_to_hkd(
+        actual_rows,
+        broker=broker,
+        market=market,
     )
     position_by_symbol = _aggregate_trend_actual_positions(positions)
     rows: list[dict[str, Any]] = []
@@ -1369,6 +1365,7 @@ def _project_trend_actual_overlay(
                 nav_hkd=nav_hkd,
                 market=market,
                 price_fx_to_hkd=price_fx_to_hkd,
+                price_fx_note=price_fx_note,
                 risk_skip=action in risk_skips,
             )
         )
@@ -1392,7 +1389,7 @@ def _project_trend_actual_overlay(
         for symbol, position in sorted(position_by_symbol.items())
         if symbol not in seen
     ]
-    live = _has_live_statement_row([*broker_rows, *broker_cash], broker)
+    live = _has_live_statement_row(actual_rows, broker)
     return {
         "available": True,
         "broker": broker,
@@ -1408,6 +1405,51 @@ def _project_trend_actual_overlay(
         "items": rows,
         "outside_positions": outside,
     }
+
+
+def _trend_actual_price_fx_to_hkd(
+    rows: list[dict[str, str]],
+    *,
+    broker: str,
+    market: str,
+) -> tuple[Decimal | None, str]:
+    currency = TREND_MARKET_CURRENCIES.get(market, "")
+    matching_rows = [
+        row
+        for row in rows
+        if _broker_key(row.get("broker", "")) == broker
+        and str(row.get("currency") or "").strip().upper() == currency
+    ]
+    if _has_live_statement_row(rows, broker):
+        live_suffix = f"-{broker}-live"
+        live_rows = [
+            row
+            for row in matching_rows
+            if row.get("statement_id", "").strip().lower().endswith(live_suffix)
+        ]
+        rates: list[Decimal] = []
+        for row in live_rows:
+            rate = _optional_decimal(row.get("fx_to_hkd", ""))
+            if rate is None or rate <= 0:
+                return None, "实盘汇率缺失，暂无法换算"
+            rates.append(rate)
+        if not rates:
+            return None, "实盘汇率缺失，暂无法换算"
+        if any(rate != rates[0] for rate in rates[1:]):
+            return None, "实盘汇率冲突，暂无法换算"
+        return rates[0], ""
+
+    return (
+        next(
+            (
+                rate
+                for row in matching_rows
+                if (rate := _detail_fx_to_hkd(row)) is not None
+            ),
+            DETAIL_FX_TO_HKD.get(currency),
+        ),
+        "",
+    )
 
 
 def _aggregate_trend_actual_positions(
@@ -1445,6 +1487,7 @@ def _project_trend_actual_item(
     nav_hkd: Decimal | None,
     market: str,
     price_fx_to_hkd: Decimal | None,
+    price_fx_note: str,
     risk_skip: bool,
 ) -> dict[str, Any]:
     symbol = str(action.get("symbol") or "").strip().upper()
@@ -1480,7 +1523,7 @@ def _project_trend_actual_item(
         if line is not None and close is not None
         else None
     )
-    return {
+    item = {
         "symbol": symbol,
         "name": str(action.get("name") or symbol),
         "frozen_action": frozen_action,
@@ -1528,6 +1571,9 @@ def _project_trend_actual_item(
             else "暂无策略保护线，风险未纳入估算"
         ),
     }
+    if frozen_action == "BUY" and price_fx_note:
+        item["reference_note"] = price_fx_note
+    return item
 
 
 def _trend_actual_reference_quantity(

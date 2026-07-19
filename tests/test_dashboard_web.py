@@ -4183,6 +4183,11 @@ const followed = renderTrendActualOverlay({available:true,broker_label:"老虎",
     risk_note:"若按策略保护线退出，预计损失 USD 1.00"}],outside_positions:[]});
 if (!followed.includes("偏差 0") || followed.includes('class="trend-actual-overlay" open') ||
     !followed.includes('data-deviation="followed"')) throw new Error(followed);
+const missingFx = renderTrendActualOverlay({available:true,broker_label:"老虎",status_text:"账户实时同步",account_nav_hkd:"780000",
+  notice:"只读",items:[{symbol:"AAPL",name:"Apple",deviation:"reference_unavailable",deviation_label:"暂无法换算",
+    frozen_action_label:"正式买入",actual_reference_quantity:"",actual_quantity:"1",actual_market_value:"",currency:"USD",
+    reference_note:"实盘汇率缺失，暂无法换算",risk_note:"暂无策略保护线，风险未纳入估算"}],outside_positions:[]});
+if (!missingFx.includes("实盘汇率缺失，暂无法换算")) throw new Error(missingFx);
 console.log("ok");
 ''')
 
