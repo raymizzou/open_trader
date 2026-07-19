@@ -410,11 +410,11 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
             "process_version",
         )
     } == {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v1",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v2",
         "strategy_name": "A 股短线右侧趋势",
-        "strategy_version": "v1",
+        "strategy_version": "v2",
         "market": "CN",
-        "effective_from": "2026-07-14",
+        "effective_from": "2026-07-19",
         "process_version": "abc123",
     }
     assert snapshot["parameters"] == {
@@ -438,6 +438,11 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
         "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
         "candidate_limit": 10,
         "position_limit": 10,
+        "single_entry_risk_limit": "0.004",
+        "portfolio_risk_limit": "0.04",
+        "abnormal_loss_buffer": "0.01",
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
         "target_weight": {"热": "0.04", "沸": "0.02"},
         "lot_size": 100,
         "buy_window": "09:30-10:00",
@@ -976,7 +981,7 @@ def test_buy_actions_respect_four_percent_cash_slots_and_round_lots() -> None:
 
     assert [
         (item.symbol, item.target_amount, item.estimated_shares) for item in actions
-    ] == [("600001", Decimal("7000"), 700)]
+    ] == [("600001", Decimal("7000"), 600)]
 
 
 def test_buy_action_targets_never_reserve_more_than_available_cash() -> None:
@@ -1031,7 +1036,7 @@ def test_report_plans_buys_after_all_sell_all_actions_release_cash_and_slots() -
     assert [
         (item.symbol, item.target_amount, item.estimated_shares)
         for item in built.buy_actions
-    ] == [("600002", Decimal("4000.00"), 400)]
+    ] == [("600002", Decimal("4000.00"), 300)]
 
 
 def test_buy_actions_use_four_percent_even_when_account_is_stale() -> None:
@@ -1046,7 +1051,7 @@ def test_buy_actions_use_four_percent_even_when_account_is_stale() -> None:
     assert [
         (item.symbol, item.target_amount, item.estimated_shares)
         for item in actions
-    ] == [("600001", Decimal("4000.00"), 400)]
+    ] == [("600001", Decimal("4000.00"), 300)]
 
 
 def test_cn_buy_weight_follows_current_temperature() -> None:
@@ -1064,9 +1069,211 @@ def test_cn_buy_weight_follows_current_temperature() -> None:
         (item.symbol, item.target_weight, item.target_amount, item.estimated_shares)
         for item in actions
     ] == [
-        ("600001", Decimal("0.04"), Decimal("4000.00"), 400),
+        ("600001", Decimal("0.04"), Decimal("4000.00"), 300),
         ("600002", Decimal("0.02"), Decimal("2000.00"), 200),
     ]
+
+
+@pytest.mark.parametrize(
+    ("market", "exchange", "lot_sizes", "expected_quantity"),
+    [
+        ("CN", "SH", None, 300),
+        ("HK", "HK", {"600001": 100}, 300),
+        ("US", "US", None, 396),
+    ],
+)
+def test_fixed_risk_sizing_includes_normal_costs_and_market_rounding(
+    market: str,
+    exchange: str,
+    lot_sizes: dict[str, int] | None,
+    expected_quantity: int,
+) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange=exchange)],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market=market,
+        lot_sizes=lot_sizes,
+        metadata={"market": market, "broker": "futu"},
+    )
+
+    action = built.buy_actions[0]
+    assert action.estimated_shares == expected_quantity
+    assert action.normal_cost > 0
+    assert action.planned_stop_risk == (
+        Decimal(expected_quantity) * Decimal("1.01")
+    )
+    assert action.planned_stop_risk <= Decimal("400")
+    assert action.decisive_constraint == "单笔风险上限"
+    assert built.risk_summary["single_entry_risk_limit_pct"] == Decimal("0.004")
+    assert built.risk_summary["portfolio_risk_limit_pct"] == Decimal("0.04")
+    assert built.risk_summary["abnormal_loss_buffer_pct"] == Decimal("0.01")
+
+
+def test_boiling_nominal_limit_stays_two_percent_below_risk_capacity() -> None:
+    built = report(candidates=(candidate("600001", temperature_curr="沸"),))
+
+    action = built.buy_actions[0]
+    assert action.target_weight == Decimal("0.02")
+    assert action.estimated_shares == 1300
+    assert action.decisive_constraint == "名义仓位上限"
+
+
+def test_sell_all_releases_cash_slot_and_planned_risk_before_new_entries() -> None:
+    discipline_account = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("62000"),
+        positions=(
+            AccountPosition(
+                "600001", "退出标的", "stock", Decimal("3800"),
+                Decimal("9.5"), Decimal("38000"),
+            ),
+        ),
+        exceptions=(),
+        position_count=1,
+    )
+    common = {
+        "as_of_date": "2026-07-14",
+        "execution_date": "2026-07-15",
+        "account": discipline_account,
+        "candidates": [candidate("600002")],
+        "bars_by_symbol": {"600001": bars()},
+        "prior_state": {
+            "positions": {
+                "600001": {
+                    "initial_line": "9", "active_line": "9", "atr14": "0.5",
+                    "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
+                }
+            }
+        },
+    }
+
+    held = build_report(
+        **common,
+        holding_snapshots={"600001": holding("600001")},
+    )
+    sold = build_report(
+        **common,
+        holding_snapshots={"600001": holding("600001", danger=True)},
+    )
+
+    assert held.risk_summary["existing_planned_risk"] == Decimal("3838.000")
+    assert held.buy_actions[0].estimated_shares == 100
+    assert held.buy_actions[0].decisive_constraint == "组合剩余风险"
+    assert sold.risk_summary["existing_planned_risk"] == Decimal("0")
+    assert sold.buy_actions[0].estimated_shares == 300
+    assert sold.buy_actions[0].decisive_constraint == "单笔风险上限"
+
+
+def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("60000"),
+            positions=(
+                AccountPosition(
+                    "600001", "持仓", "stock", Decimal("4000"),
+                    Decimal("9.5"), Decimal("40000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=[candidate("600002")],
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={"600001": bars()},
+        prior_state={
+            "positions": {
+                "600001": {
+                    "initial_line": "9", "active_line": "9", "atr14": "0.5",
+                    "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
+                }
+            }
+        },
+    )
+
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["status_label"] == "组合风险已满"
+    assert built.risk_summary["portfolio_remaining_risk"] == Decimal("0")
+    assert built.risk_skips[0]["reason"] == "组合正常计划风险已达到净值 4%"
+
+
+def test_minimum_lot_skip_keeps_plain_integer_reason() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14", fresh=True,
+            net_value=Decimal("100000"), available_cash=Decimal("100000"),
+            positions=(), exceptions=(),
+        ),
+        candidates=[candidate("600001", atr="2")],
+        holding_snapshots={},
+        bars_by_symbol={},
+    )
+
+    assert built.buy_actions == ()
+    assert built.risk_skips[0]["reason"] == "最小交易单位 100 股超过单笔风险上限"
+
+
+@pytest.mark.parametrize("unknown", ["nav", "quantity", "price", "fx", "line"])
+def test_unknown_critical_simulation_fact_pauses_the_whole_entry_batch(
+    unknown: str,
+) -> None:
+    quantity = Decimal("NaN") if unknown == "quantity" else Decimal("100")
+    nav = Decimal("NaN") if unknown == "nav" else Decimal("100000")
+    prior_positions = {} if unknown == "line" else {
+        "600001": {
+            "initial_line": "9", "active_line": "9", "atr14": "0.5",
+            "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
+        }
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=nav,
+            available_cash=Decimal("50000"),
+            positions=(
+                AccountPosition(
+                    "600001", "持仓", "stock", quantity,
+                    Decimal("9.5"), Decimal("1000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=[candidate("600002"), candidate("600003")],
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={} if unknown == "price" else {"600001": bars()},
+        prior_state={"positions": prior_positions},
+        price_fx_to_account_currency=(
+            Decimal("NaN") if unknown == "fx" else Decimal("1")
+        ),
+    )
+
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["pause_reason"]
+    assert [item["symbol"] for item in built.risk_skips] == ["600002", "600003"]
+    assert all(item["reason"] == built.risk_summary["pause_reason"] for item in built.risk_skips)
 
 
 def test_cn_buy_action_serializes_candidate_industry(tmp_path: Path) -> None:
@@ -1120,7 +1327,7 @@ def test_us_buy_actions_convert_usd_share_price_to_hkd() -> None:
     )
 
     assert actions[0].target_amount == Decimal("31400.00")
-    assert actions[0].estimated_shares == 40
+    assert actions[0].estimated_shares == 39
 
 
 def test_hk_four_percent_weight_can_buy_one_board_lot() -> None:
@@ -1162,7 +1369,7 @@ def test_unaffordable_candidate_does_not_consume_cash_or_slot() -> None:
     actions = estimate_buy_actions(
         ranked=[
             candidate("600001", close="20"),
-            candidate("600002", close="1"),
+            candidate("600002", close="1", atr="0.01"),
         ],
         net_value=Decimal("10000"),
         available_cash=Decimal("600"),
@@ -1176,7 +1383,7 @@ def test_unaffordable_candidate_does_not_consume_cash_or_slot() -> None:
 
 def test_unaffordable_top_ten_promotes_later_affordable_candidate() -> None:
     ranked = [candidate(f"6000{index:02d}", close="100") for index in range(1, 11)]
-    ranked.append(candidate("600011", close="1"))
+    ranked.append(candidate("600011", close="1", atr="0.01"))
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
@@ -2536,7 +2743,7 @@ def test_no_action_report_uses_exact_cash_sentence() -> None:
 def test_formal_buy_text_includes_window_estimates_target_and_line() -> None:
     markdown = render_markdown(report(candidates=(candidate("600001"),)))
     assert "09:30–10:00" in markdown
-    assert "约 2700 股" in markdown
+    assert "约 2600 股" in markdown
     assert "金额上限 27061.98 元" in markdown
     assert "预计保护线 9.00" in markdown
     assert "按富途数据日前复权日线收盘价向下取整为 100 股整数倍" in markdown
@@ -2656,7 +2863,10 @@ def test_frozen_json_has_explicit_no_action_strategy_contract(tmp_path: Path) ->
         "holding_decisions": [],
         "top10_candidates": [],
         "formal_actions": [],
+        "risk_skips": [],
     }
+    assert payload["risk_summary"]["portfolio_risk_limit_pct"] == "0.04"
+    assert payload["risk_summary"]["abnormal_loss_buffer_pct"] == "0.01"
 
 
 def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> None:
@@ -3199,7 +3409,7 @@ class ReadyQuote:
         self.calls.append(f"futu.kline.{symbol}")
         if symbol in self.failed_klines:
             raise self.kline_error or FutuQuoteError("kline unavailable")
-        return bars()
+        return [replace(item, high=10.2, low=9.8) for item in bars()]
 
     def close(self) -> None:
         pass
@@ -3244,7 +3454,7 @@ def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
     assert payload["metadata"]["simulate_acc_id"] == 101
 
 
-def test_report_runner_sends_exact_broker_v1_text(tmp_path: Path) -> None:
+def test_report_runner_sends_exact_broker_v2_text(tmp_path: Path) -> None:
     calls: list[str] = []
     api_kwargs: dict[str, object] = {}
     config = trend_config(tmp_path)
@@ -3278,8 +3488,8 @@ def test_report_runner_sends_exact_broker_v1_text(tmp_path: Path) -> None:
             "账户状态：已更新\n"
             "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n\n"
             "买入\n"
-            "1. 000001 股票000001｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 6\n"
-            "2. 000002 股票000002｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 6\n\n"
+            "1. 000001 股票000001｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 9.2\n"
+            "2. 000002 股票000002｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 9.2\n\n"
             "请人工确认，不自动下单。",
         )
     ]

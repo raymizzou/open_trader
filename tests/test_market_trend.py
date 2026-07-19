@@ -15,6 +15,7 @@ from open_trader.a_share_trend import (
     AShareTrendRunResult,
     CandidateInput,
     build_report,
+    write_protection_state,
 )
 from open_trader.daily_premarket import DailyPremarketConfig
 from open_trader.market_trend import (
@@ -128,7 +129,7 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     snapshot = trend_module.trend_strategy_snapshot(market, "abc123", pool_ids)
 
     assert snapshot["strategy_name"] == name
-    assert snapshot["strategy_version"] == "v1"
+    assert snapshot["strategy_version"] == "v2"
     assert snapshot["parameters"] == {
         "candidate_pool_ids": list(pool_ids),
         "min_strength_exclusive": "90",
@@ -143,6 +144,11 @@ def test_market_strategy_snapshot_matches_runtime_rules(
         "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
         "candidate_limit": 10,
         "position_limit": 10,
+        "single_entry_risk_limit": "0.004",
+        "portfolio_risk_limit": "0.04",
+        "abnormal_loss_buffer": "0.01",
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
         "target_weight": "0.04",
         **market_parameters,
         "initial_protection_atr_multiple": "2",
@@ -588,6 +594,20 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
+    write_protection_state(
+        market_paths(cfg.data_dir, cfg.reports_dir, "HK").state,
+        {
+            "schema_version": 1,
+            "positions": {
+                "00700": {
+                    "initial_line": "9.6",
+                    "active_line": "9.6",
+                    "atr14": "0.2",
+                    "updated_for": "2026-07-14",
+                }
+            },
+        },
+    )
     write_details(
         cfg.data_dir,
         "2026-06",
@@ -671,9 +691,9 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
 
         def get_daily_kline(self, *args: object, **kwargs: object) -> list[DailyKlineBar]:
             return [
-                DailyKlineBar(
-                    date=f"2026-07-{index + 1:02d}", open=10, high=11,
-                    low=9, close=10, volume=100,
+                    DailyKlineBar(
+                        date=f"2026-07-{index + 1:02d}", open=10, high=10.1,
+                        low=9.9, close=10, volume=100,
                 )
                 for index in range(15)
             ]
@@ -797,6 +817,20 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     tmp_path: Path,
 ) -> None:
     cfg = config(tmp_path)
+    write_protection_state(
+        market_paths(cfg.data_dir, cfg.reports_dir, "US").state,
+        {
+            "schema_version": 1,
+            "positions": {
+                "VIXY": {
+                    "initial_line": "9.6",
+                    "active_line": "9.6",
+                    "atr14": "0.2",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
     write_tiger_snapshot(
         cfg.data_dir,
         "2026-07-14",
@@ -886,7 +920,7 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
                     date=(end - timedelta(days=14 - index))
                     .date()
                     .isoformat(),
-                    open=10, high=11, low=9, close=10, volume=100,
+                    open=10, high=10.1, low=9.9, close=10, volume=100,
                 )
                 for index in range(15)
             ]
@@ -916,8 +950,11 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     assert payload["account"]["fresh"] is True
     assert payload["metadata"]["simulate_acc_id"] == 102
     assert payload["account"]["source_date"] == "2026-07-14"
-    assert payload["strategy_judgments"]["formal_actions"][0]["action"] == "BUY"
-    assert payload["strategy_judgments"]["formal_actions"][0]["symbol"] == "QQQ"
+    buy_action = payload["strategy_judgments"]["formal_actions"][0]
+    assert buy_action["action"] == "BUY"
+    assert buy_action["symbol"] == "QQQ"
+    assert buy_action["estimated_shares"] == 400
+    assert buy_action["target_amount"] == "4000.00"
     assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "HOLD"
     evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -931,8 +968,10 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     ):
         assert replayed[key] == payload[key]
     assert replayed["strategy_judgments"] == payload["strategy_judgments"]
-    assert payload["metadata"]["account_currency"] == "HKD"
-    assert payload["metadata"]["price_fx_to_hkd"] == "7.85"
+    assert payload["metadata"]["account_currency"] == "USD"
+    assert payload["metadata"]["price_fx_to_account_currency"] == "1"
+    assert "price_fx_to_hkd" not in payload["metadata"]
+    assert evidence["rebuild_inputs"]["price_fx_to_account_currency"] == "1"
     assert "account_refresh_error" not in payload["metadata"]
     assert "账户状态：已更新" in notifier.messages[0][1]
     output = "\n".join(

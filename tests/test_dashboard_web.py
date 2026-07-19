@@ -3986,6 +3986,116 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_renders_frozen_risk_summary_and_candidate_detail_rows() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendReportWorkspace({
+  available:true,market:"CN",broker:"eastmoney",broker_label:"富途模拟",market_label:"A股",
+  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
+  account_status:"已更新",buy_window:"09:30–10:00",
+  counts:{sell:1,buy:1,hold:0,review:0},
+  risk_summary:{status:"active",status_label:"风险预算内",
+    portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
+    portfolio_risk_limit:"4000",portfolio_risk_limit_pct:"0.04",
+    portfolio_remaining_risk:"3697",portfolio_remaining_risk_pct:"0.03697",
+    single_entry_risk_limit:"400",single_entry_risk_limit_pct:"0.004",
+    abnormal_loss_buffer:"1000",abnormal_loss_buffer_pct:"0.01",
+    total_risk_budget_target_pct:"0.05",
+    disclaimer:"5% 是风险预算目标，不是最大损失保证。"},
+  sell_actions:[{symbol:"600000",name:"浦发银行",reason:"danger_signal"}],
+  buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
+    industry:"电力",industry_temperature:"热",market_cap:"100",amount:"2",
+    target_weight:"0.04",target_amount:"4000",estimated_shares:300,
+    estimated_initial_line:"9",planned_stop_risk:"303",
+    planned_stop_risk_pct:"0.00303",normal_cost:"3",
+    decisive_constraint:"单笔风险上限"}],
+  risk_skips:[{symbol:"600002",name:"第二候选",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
+    industry:"电力",industry_temperature:"热",market_cap:"100",amount:"2",
+    target_weight:"0.04",target_amount:"4000",estimated_shares:0,
+    reason:"最小交易单位 100 股超过组合剩余风险",
+    decisive_constraint:"组合剩余风险"}],
+  hold_actions:[],review_actions:[],audit:{},
+});
+for (const text of ["模拟策略风险","风险预算内","组合正常计划风险",
+  "组合剩余风险","单笔风险上限","异常损失缓冲","不得用于开仓",
+  "5% 是风险预算目标，不是最大损失保证。","目标仓位（占净值）",
+  "允许 · 建议 300 股","计划止损风险 303","正常成本 3",
+  "决定性约束 单笔风险上限","跳过 · 建议 0 股","第二候选",
+  "最小交易单位 100 股超过组合剩余风险"]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+if (html.includes("本次可用风险") || html.includes("<th scope=\"col\">目标仓位</th>")) {
+  throw new Error(html);
+}
+const counts = html.indexOf('class="trend-report-metrics cn-trend-counts"');
+const risk = html.indexOf('class="trend-risk-summary"');
+const sell = html.indexOf("优先处理 · 卖出触发");
+if (!(counts >= 0 && counts < risk && risk < sell)) throw new Error(html);
+if ((html.match(/class="cn-trend-card"/g) || []).length < 3 ||
+    (html.match(/class="cn-trend-execution cn-trend-risk-detail"/g) || []).length !== 2) {
+  throw new Error(html);
+}
+console.log("ok");
+''')
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+
+    assert "ok" in output
+    assert ".trend-risk-summary" in css
+    assert ".trend-risk-summary" in mobile
+    assert ".cn-trend-buy {\n    overflow-x: hidden;\n  }" in mobile
+
+
+def test_dashboard_risk_summary_and_candidate_cards_fit_375px() -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    rendered = json.loads(run_dashboard_js(r'''
+console.log(JSON.stringify(renderTrendReportWorkspace({
+  available:true,market:"CN",broker:"eastmoney",broker_label:"富途模拟",market_label:"A股",
+  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
+  account_status:"已更新",buy_window:"09:30–10:00",counts:{sell:0,buy:1,hold:0,review:0},
+  risk_summary:{status:"active",status_label:"风险预算内",
+    portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
+    portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"3697",
+    portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
+    single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
+    abnormal_loss_buffer_pct:"0.01",disclaimer:"5% 是风险预算目标，不是最大损失保证。"},
+  sell_actions:[],buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",industry:"电力",
+    industry_temperature:"热",market_cap:"100",amount:"2",target_weight:"0.04",
+    target_amount:"4000",estimated_shares:300,estimated_initial_line:"9",
+    planned_stop_risk:"303",planned_stop_risk_pct:"0.00303",normal_cost:"3",
+    decisive_constraint:"单笔风险上限"}],
+  risk_skips:[{symbol:"600002",name:"第二候选",close:"10",target_weight:"0.04",
+    target_amount:"4000",estimated_shares:0,reason:"最小交易单位 100 股超过组合剩余风险",
+    decisive_constraint:"组合剩余风险"}],hold_actions:[],review_actions:[],audit:{},
+})));
+'''))
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    errors: list[str] = []
+    with playwright_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception as exc:  # pragma: no cover - local browser availability
+            pytest.skip(f"Chrome is required for dashboard DOM checks: {exc}")
+        page = browser.new_page(viewport={"width": 375, "height": 844})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.set_content(f"<style>{css}</style>{rendered}")
+
+        assert errors == []
+        risk_text = page.locator(".trend-risk-summary").inner_text()
+        assert "模拟策略风险" in risk_text
+        assert "风险预算内" in risk_text
+        assert page.locator(".cn-trend-card").count() == 2
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
+        assert page.locator(".cn-trend-buy").evaluate(
+            "node => node.scrollWidth <= node.clientWidth"
+        )
+        browser.close()
+
+
 def test_dashboard_cn_trend_report_escapes_every_rendered_fact() -> None:
     output = run_dashboard_js(r'''
 const attack='<img src=x onerror=alert(1)>';

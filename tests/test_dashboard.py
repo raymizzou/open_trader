@@ -1201,6 +1201,65 @@ def test_dashboard_projects_futu_attention_from_tiger_us_and_phillips_hk(
     }
 
 
+def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    risk_summary = {
+        "status": "active",
+        "status_label": "风险预算内",
+        "pause_reason": "",
+        "existing_planned_risk": "0",
+        "new_planned_risk": "303",
+        "portfolio_planned_risk": "303",
+        "portfolio_planned_risk_pct": "0.00303",
+        "portfolio_risk_limit": "4000",
+        "portfolio_risk_limit_pct": "0.04",
+        "portfolio_remaining_risk": "3697",
+        "portfolio_remaining_risk_pct": "0.03697",
+        "single_entry_risk_limit": "400",
+        "single_entry_risk_limit_pct": "0.004",
+        "abnormal_loss_buffer": "1000",
+        "abnormal_loss_buffer_pct": "0.01",
+        "total_risk_budget_target_pct": "0.05",
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "disclaimer": "5% 是风险预算目标，不是最大损失保证。",
+    }
+    risk_skips = [{
+        "symbol": "600002",
+        "estimated_shares": 0,
+        "reason": "最小交易单位 100 股超过组合剩余风险",
+        "decisive_constraint": "组合剩余风险",
+    }]
+    path.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T20:00:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_snapshot": {
+            "strategy_version": "v2",
+            "parameters": {"normal_cost_rate": "0.001"},
+        },
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+            "risk_skips": risk_skips,
+        },
+        "risk_summary": risk_summary,
+        "option_attention": [],
+    }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["risk_summary"] == risk_summary
+    assert report["risk_skips"] == risk_skips
+
+
 def test_dashboard_futu_projection_keeps_both_unavailable_market_rows(
     tmp_path: Path,
 ) -> None:

@@ -1805,6 +1805,61 @@ table {
   text-align: center;
 }
 
+.trend-risk-summary {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok);
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.trend-risk-summary[data-risk-status="paused"] {
+  border-left-color: var(--danger);
+}
+
+.trend-risk-summary header {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.trend-risk-summary header span,
+.trend-risk-summary dt,
+.trend-risk-summary p {
+  color: var(--muted);
+}
+
+.trend-risk-summary dl {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+}
+
+.trend-risk-summary dl div {
+  background: var(--surface-soft);
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+}
+
+.trend-risk-summary dd,
+.trend-risk-summary dt,
+.trend-risk-summary p {
+  margin: 0;
+}
+
+.trend-risk-summary dd {
+  font-weight: 700;
+}
+
+.trend-risk-pause {
+  color: var(--danger) !important;
+  font-weight: 700;
+}
+
 .cn-trend-stage {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -4098,6 +4153,7 @@ tbody tr.active-row,
 .action-card-metrics div,
 .action-card,
 .backtest-metric-card,
+.trend-risk-summary dl div,
 .cn-trend-card td:nth-child(-n + 2),
 .cn-trend-execution td,
 .cn-trend-buy .cn-trend-execution td,
@@ -4297,6 +4353,14 @@ table {
   }
 
   .cn-trend-counts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .trend-risk-summary {
+    padding: 12px;
+  }
+
+  .trend-risk-summary dl {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

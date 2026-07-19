@@ -980,7 +980,7 @@ def _attempt_market_report(
             lot_sizes=lot_sizes,
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
-            price_fx_to_account_currency=(USD_TO_HKD if market == "US" else Decimal("1")),
+            price_fx_to_account_currency=Decimal("1"),
             process_version=_process_version(config.repo),
             candidate_pool_ids=pool_ids,
             metadata={
@@ -991,8 +991,8 @@ def _attempt_market_report(
                 "process_version": _process_version(config.repo),
                 **(
                     {
-                        "account_currency": "HKD",
-                        "price_fx_to_hkd": str(USD_TO_HKD),
+                        "account_currency": "USD",
+                        "price_fx_to_account_currency": "1",
                     }
                     if market == "US"
                     else {}
@@ -1023,9 +1023,7 @@ def _attempt_market_report(
             },
             candidate_pool_ids=pool_ids,
             lot_sizes=lot_sizes,
-            price_fx_to_account_currency=(
-                USD_TO_HKD if market == "US" else Decimal("1")
-            ),
+            price_fx_to_account_currency=Decimal("1"),
             previous_attention_rows=previous_attention_rows,
             option_attention_broker_label=option_attention_broker_label,
         )

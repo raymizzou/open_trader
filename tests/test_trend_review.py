@@ -118,6 +118,7 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
             "position_weight": "0.04",
             "position_weight_source": "fallback_4pct",
             "price_fx_to_account_currency": "1",
+            "normal_cost_rate": "0.001",
             "candidate_pool_ids": [622466, 697199],
             "generated_at": "2026-07-16T17:00:00+08:00",
             "metadata": {"market": "CN", "broker": "eastmoney"},
@@ -129,6 +130,91 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
     assert rebuilt["process_version"] == "newsha"
     assert rebuilt["strategy_snapshot"]["process_version"] == "newsha"
     assert rebuilt["account"]["net_value"] == "100000"
+
+
+def test_v1_rebuild_keeps_legacy_nominal_sizing_without_v2_risk_fields() -> None:
+    snapshot = trend_strategy_snapshot("US", "oldsha", (622460,))
+    snapshot = {
+        **snapshot,
+        "strategy_id": "trend_animals_warm_to_hot/US/v1",
+        "strategy_version": "v1",
+        "effective_from": "2026-07-14",
+        "parameters": {
+            key: value
+            for key, value in snapshot["parameters"].items()
+            if key
+            not in {
+                "single_entry_risk_limit",
+                "portfolio_risk_limit",
+                "abnormal_loss_buffer",
+                "normal_cost_rate",
+                "normal_cost_model",
+            }
+        },
+    }
+    evidence = {
+        **frozen_evidence(),
+        "market": "US",
+        "strategy_snapshot": snapshot,
+        "rebuild_inputs": {
+            "as_of_date": "2026-07-16",
+            "execution_date": "2026-07-17",
+            "account": {
+                "source_date": "2026-07-16",
+                "fresh": True,
+                "net_value": "100000",
+                "available_cash": "100000",
+                "positions": [],
+                "exceptions": [],
+                "position_count": 0,
+            },
+            "candidates": [
+                {
+                    "tm_id": 1,
+                    "symbol": "AAPL",
+                    "exchange": "US",
+                    "name": "Apple",
+                    "asset": "US stock",
+                    "industry": "Technology",
+                    "as_of_date": "2026-07-16",
+                    "tradable": True,
+                    "amount": "2",
+                    "right_side": True,
+                    "days": 3,
+                    "strength": "96",
+                    "danger": False,
+                    "close": "100",
+                    "atr": "5",
+                }
+            ],
+            "holding_snapshots": {},
+            "bars_by_symbol": {},
+            "prior_state": {"schema_version": 1, "positions": {}},
+            "watch_events": [],
+            "market": "US",
+            "lot_sizes": {},
+            "position_weight": "0.04",
+            "position_weight_source": "fallback_4pct",
+            "price_fx_to_account_currency": "1",
+            "candidate_pool_ids": [622460],
+            "generated_at": "2026-07-16T17:00:00+08:00",
+            "metadata": {"market": "US", "broker": "tiger"},
+            "managed_symbols": [],
+            "option_attention": {
+                "previous_rows": [],
+                "broker_label": "老虎",
+            },
+        },
+    }
+
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+
+    action = rebuilt["strategy_judgments"]["formal_actions"][0]
+    assert action["estimated_shares"] == 40
+    assert action["target_amount"] == "4000.00"
+    assert "planned_stop_risk" not in action
+    assert "risk_skips" not in rebuilt["strategy_judgments"]
+    assert "risk_summary" not in rebuilt
 
 
 def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
@@ -179,6 +265,7 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         metadata={"market": "US", "broker": "tiger"},
         market="US",
         price_fx_to_account_currency=Decimal("7.85"),
+        normal_cost_rate=Decimal("0.003"),
         process_version="oldsha",
         candidate_pool_ids=(1,),
     )
@@ -217,6 +304,7 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         option_attention_broker_label="老虎",
     )
     evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+    assert evidence["rebuild_inputs"]["normal_cost_rate"] == "0.003"
 
     missing_fx = json.loads(json.dumps(evidence))
     del missing_fx["rebuild_inputs"]["price_fx_to_account_currency"]
@@ -232,6 +320,13 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         match="missing original input: account.position_count",
     ):
         trend_review.rebuild_trend_report_from_evidence(missing_count)
+    missing_cost = json.loads(json.dumps(evidence))
+    del missing_cost["rebuild_inputs"]["normal_cost_rate"]
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match="missing original input: normal_cost_rate",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(missing_cost)
 
     rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
 
@@ -239,7 +334,7 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
     rebuilt_actions = rebuilt["strategy_judgments"]["formal_actions"]
     assert rebuilt["account"]["position_count"] == 9
     assert len(rebuilt_actions) == len(source_actions) == 1
-    assert rebuilt_actions[0]["estimated_shares"] == source_actions[0]["estimated_shares"] == 5
+    assert rebuilt_actions[0]["estimated_shares"] == source_actions[0]["estimated_shares"] == 4
     assert rebuilt["option_attention"] == source["option_attention"]
 
     corrected_path = trend_review.replay_trend_evidence(
