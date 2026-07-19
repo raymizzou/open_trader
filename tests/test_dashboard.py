@@ -1617,6 +1617,7 @@ def test_dashboard_actual_overlay_refreshes_without_mutating_frozen_report(
         "directory",
         "currency",
         "fx",
+        "expected_fx",
         "price",
         "lot",
         "cash_balance",
@@ -1626,11 +1627,11 @@ def test_dashboard_actual_overlay_refreshes_without_mutating_frozen_report(
     ),
     [
         (
-            "US", "tiger", "trend_us_tiger", "USD", "8", "100",
+            "US", "tiger", "trend_us_tiger", "USD", "8", "8", "100",
             1, "248000", "100", True, "老虎",
         ),
         (
-            "HK", "phillips", "trend_hk_phillips", "HKD", "1", "20",
+            "HK", "phillips", "trend_hk_phillips", "HKD", "", "1", "20",
             100, "98000", "200", False, "辉立",
         ),
     ],
@@ -1642,6 +1643,7 @@ def test_dashboard_actual_overlay_uses_full_broker_nav_for_each_market(
     directory: str,
     currency: str,
     fx: str,
+    expected_fx: str,
     price: str,
     lot: int,
     cash_balance: str,
@@ -1714,15 +1716,85 @@ def test_dashboard_actual_overlay_uses_full_broker_nav_for_each_market(
     overlay = report["actual_overlay"]
     assert overlay["broker_label"] == label
     assert overlay["account_nav_hkd"] == str(
-        ((Decimal("2000") + Decimal(cash_balance)) * Decimal(fx)).quantize(
-            Decimal("0.01")
-        )
+        (
+            (Decimal("2000") + Decimal(cash_balance))
+            * Decimal(expected_fx)
+        ).quantize(Decimal("0.01"))
     )
     assert overlay["items"][0]["actual_reference_quantity"] == expected_quantity
     assert overlay["items"][0]["frozen_reference_price"] == price
     assert overlay["status_text"] == (
         "账户实时同步" if live else "结单数据，非实时"
     )
+
+
+@pytest.mark.parametrize(
+    ("position_fx", "cash_currency", "cash_fx", "expected_note"),
+    [
+        ("", "USD", "", "实盘汇率缺失，暂无法换算"),
+        ("", "HKD", "1", "实盘汇率缺失，暂无法换算"),
+        ("8", "USD", "7.9", "实盘汇率冲突，暂无法换算"),
+    ],
+)
+def test_dashboard_actual_overlay_fails_closed_for_unusable_tiger_live_fx(
+    position_fx: str,
+    cash_currency: str,
+    cash_fx: str,
+    expected_note: str,
+) -> None:
+    positions = [{
+        "statement_id": "2026-07-15-tiger-live",
+        "broker": "tiger",
+        "account_alias": "tiger_main",
+        "market": "US",
+        "asset_class": "stock",
+        "symbol": "TARGET",
+        "name": "Target",
+        "currency": "USD",
+        "quantity": "20",
+        "last_price": "100",
+        "market_value": "" if not position_fx else "2000",
+        "fx_to_hkd": position_fx,
+    }]
+    cash = [{
+        "statement_id": "2026-07-15-tiger-live",
+        "broker": "tiger",
+        "account_alias": "tiger_main",
+        "currency": cash_currency,
+        "cash_balance": "780000" if cash_currency == "HKD" else "98000",
+        "available_balance": "1000",
+        "fx_to_hkd": cash_fx,
+    }]
+
+    overlay = dashboard_module._project_trend_actual_overlay(
+        broker="tiger",
+        market="US",
+        sell_actions=[],
+        buy_actions=[{
+            "action": "BUY",
+            "symbol": "TARGET",
+            "name": "Target",
+            "target_weight": "0.04",
+            "estimated_shares": 3,
+            "close": "100",
+            "lot_size": 1,
+            "estimated_initial_line": "90",
+        }],
+        hold_actions=[],
+        review_actions=[],
+        risk_skips=[],
+        broker_positions=positions,
+        cash_details=cash,
+    )
+
+    item = overlay["items"][0]
+    assert overlay["available"] is True
+    if not position_fx and not cash_fx:
+        assert overlay["account_nav_hkd"] == ""
+    assert item["actual_reference_quantity"] == ""
+    assert item["deviation"] == "reference_unavailable"
+    assert item["deviation_label"] == "暂无法换算"
+    assert item["reference_note"] == expected_note
 
 
 @pytest.mark.parametrize("missing_section", ["risk_summary", "drawdown_summary"])
