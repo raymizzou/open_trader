@@ -1108,9 +1108,10 @@ def test_dashboard_hk_friday_report_is_current_then_stale_then_current_for_execu
     saturday = dashboard_module._load_trend_reports(
         config.data_dir, config.reports_dir, today=date(2026, 7, 18)
     )["phillips"]
-    monday = dashboard_module._load_trend_reports(
+    monday_reports = dashboard_module._load_trend_reports(
         config.data_dir, config.reports_dir, today=date(2026, 7, 20)
-    )["phillips"]
+    )
+    monday = monday_reports["phillips"]
 
     assert friday["data_status"] == "current"
     assert friday["report_date"] == "2026-07-20"
@@ -1118,6 +1119,9 @@ def test_dashboard_hk_friday_report_is_current_then_stale_then_current_for_execu
     assert saturday["data_status"] == "stale"
     assert monday["data_status"] == "current"
     assert monday["status_text"] == "今日执行（数据截至 2026-07-17）"
+    assert monday_reports["futu"]["attention_markets"][1]["status_text"] == (
+        "今日执行（数据截至 2026-07-17）"
+    )
 
 
 def test_dashboard_legacy_hk_friday_report_uses_generated_date_for_freshness(
@@ -1198,6 +1202,7 @@ def test_dashboard_projects_futu_attention_from_tiger_us_and_phillips_hk(
                 "market_label": "美股",
                 "data_status": "stale",
                 "data_date": "2026-07-14",
+                "status_text": "数据截至 2026-07-14；今日未更新",
                 "items": stale_us,
             },
             {
@@ -1205,6 +1210,7 @@ def test_dashboard_projects_futu_attention_from_tiger_us_and_phillips_hk(
                 "market_label": "港股",
                 "data_status": "current",
                 "data_date": "2026-07-15",
+                "status_text": "今日已更新",
                 "items": current_hk,
             },
         ],
@@ -2058,6 +2064,7 @@ def test_dashboard_futu_projection_keeps_both_unavailable_market_rows(
             "market_label": "美股",
             "data_status": "unavailable",
             "data_date": "",
+            "status_text": "暂时不可用",
             "items": [],
         },
         {
@@ -2065,6 +2072,7 @@ def test_dashboard_futu_projection_keeps_both_unavailable_market_rows(
             "market_label": "港股",
             "data_status": "unavailable",
             "data_date": "",
+            "status_text": "暂时不可用",
             "items": [],
         },
     ]

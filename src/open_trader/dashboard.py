@@ -675,6 +675,7 @@ def _project_futu_attention(
             "market_label": source["market_label"],
             "data_status": source["data_status"],
             "data_date": source.get("data_date", ""),
+            "status_text": source["status_text"],
             "items": source.get("option_attention", [])
             if source["available"]
             else [],
