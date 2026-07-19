@@ -569,23 +569,33 @@ def _merge_synced_fills(
         new_quantity = _required_decimal(
             incoming["quantity"], "incoming aggregate quantity"
         )
+        old_price = _required_decimal(
+            existing["price"], "existing aggregate average price"
+        )
+        new_price = _required_decimal(
+            incoming["price"], "incoming aggregate average price"
+        )
         old_time = _aware_timestamp(existing["filled_at"], "existing aggregate time")
         new_time = _aware_timestamp(incoming["filled_at"], "incoming aggregate time")
         if new_quantity < old_quantity or new_time < old_time:
             raise ValueError("Futu aggregate snapshot regressed")
+        if new_quantity == old_quantity and new_price != old_price:
+            raise ValueError("Futu aggregate average price changed without new fills")
         if new_time == old_time and (
             new_quantity != old_quantity
-            or incoming["price"] != existing["price"]
+            or new_price != old_price
         ):
             raise ValueError("conflicting duplicate fill: Futu aggregate snapshot")
         if (
             existing["attribution_status"] == "attributed"
-            and incoming["attribution_status"] == "attributed"
-            and any(
-                existing.get(field) != incoming.get(field)
-                for field in (
-                    "strategy_id", "strategy_version", "report_sha256",
-                    "normal_cost_rate", "normal_cost_model",
+            and (
+                incoming["attribution_status"] != "attributed"
+                or any(
+                    existing.get(field) != incoming.get(field)
+                    for field in (
+                        "strategy_id", "strategy_version", "report_sha256",
+                        "normal_cost_rate", "normal_cost_model",
+                    )
                 )
             )
         ):

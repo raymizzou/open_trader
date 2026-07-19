@@ -171,6 +171,83 @@ def test_futu_order_aggregate_snapshot_advances_monotonically_across_syncs() -> 
         _merge_synced_fills([actual], [{**actual, "price": "11"}])
 
 
+@pytest.mark.parametrize("incoming_status", ["outside_strategy", "ambiguous"])
+def test_futu_order_aggregate_cannot_erase_existing_attribution(
+    incoming_status: str,
+) -> None:
+    attributed = normalized_fill(
+        "futu-sim-order:7:aggregate", "7", source="simulation", side="buy",
+        filled_at="2026-01-01T10:00:00-05:00", price="10",
+    ) | {
+        "broker_fill_id": None,
+        "execution_granularity": "order_aggregate",
+        "attribution_status": "attributed",
+        "exclusion_reason": "",
+        "strategy_id": "trend_animals_warm_to_hot/US/v2",
+        "strategy_version": "v2",
+        "report_sha256": "a" * 64,
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+    }
+    degraded = {
+        **attributed,
+        "filled_at": "2026-01-01T10:01:00-05:00",
+        "attribution_status": incoming_status,
+        "exclusion_reason": "temporary_attribution_gap",
+        "strategy_id": "",
+        "strategy_version": "",
+        "report_sha256": "",
+        "normal_cost_rate": "",
+        "normal_cost_model": "",
+    }
+
+    with pytest.raises(ValueError, match="aggregate snapshot attribution changed"):
+        _merge_synced_fills([attributed], [degraded])
+
+
+def test_futu_order_aggregate_allows_attribution_enrichment_only_with_stable_execution() -> None:
+    outside = normalized_fill(
+        "futu-sim-order:7:aggregate", "7", source="simulation", side="buy",
+        filled_at="2026-01-01T10:00:00-05:00", price="10",
+    ) | {
+        "broker_fill_id": None,
+        "execution_granularity": "order_aggregate",
+    }
+    attributed = {
+        **outside,
+        "filled_at": "2026-01-01T10:01:00-05:00",
+        "attribution_status": "attributed",
+        "exclusion_reason": "",
+        "strategy_id": "trend_animals_warm_to_hot/US/v2",
+        "strategy_version": "v2",
+        "report_sha256": "a" * 64,
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+    }
+
+    assert _merge_synced_fills([outside], [attributed]) == [attributed]
+    with pytest.raises(ValueError, match="aggregate snapshot attribution changed"):
+        _merge_synced_fills(
+            [attributed],
+            [{**attributed, "strategy_version": "v3"}],
+        )
+
+
+def test_futu_order_aggregate_rejects_changed_price_when_quantity_is_unchanged() -> None:
+    existing = normalized_fill(
+        "futu-sim-order:7:aggregate", "7", source="simulation", side="buy",
+        filled_at="2026-01-01T10:00:00-05:00", price="10",
+    ) | {
+        "broker_fill_id": None,
+        "execution_granularity": "order_aggregate",
+    }
+    later = {**existing, "filled_at": "2026-01-01T10:01:00-05:00"}
+
+    assert _merge_synced_fills([existing], [later]) == [later]
+    with pytest.raises(ValueError, match="aggregate average price changed"):
+        _merge_synced_fills([existing], [{**later, "price": "11"}])
+
+
 class FakeTigerTransactionsPage:
     def __init__(self, result: list[object], next_page_token: str | None) -> None:
         self.result = result
