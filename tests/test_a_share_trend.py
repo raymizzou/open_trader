@@ -52,6 +52,53 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 MISSING_FRESH = object()
 
 
+class DefaultSimAccountClient:
+    def __init__(self, **kwargs: object) -> None:
+        self.acc_id = int(kwargs["simulate_acc_id"])
+
+    def account_snapshot(self) -> dict[str, object]:
+        return {
+            "acc_id": self.acc_id,
+            "net_value": "100000",
+            "cash": "100000",
+            "positions": [],
+        }
+
+    def close(self) -> None:
+        pass
+
+
+def simulation_account_with_positions(
+    *codes: str,
+) -> type[DefaultSimAccountClient]:
+    class SimAccountClient(DefaultSimAccountClient):
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "positions": [
+                    {
+                        "code": code,
+                        "stock_name": code.split(".", 1)[-1],
+                        "qty": "100",
+                        "cost_price": "9.5",
+                        "market_val": "1000",
+                    }
+                    for code in codes
+                ],
+            }
+
+    return SimAccountClient
+
+
+@pytest.fixture(autouse=True)
+def default_simulation_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        trend_module,
+        "FutuSimulateOrderExecutionClient",
+        DefaultSimAccountClient,
+    )
+
+
 def test_unified_trend_fields_match_the_paid_catalog_selection() -> None:
     from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
 
@@ -858,6 +905,44 @@ def test_buy_action_targets_never_reserve_more_than_available_cash() -> None:
     assert sum((item.target_amount for item in actions), Decimal("0")) <= Decimal(
         "7000"
     )
+
+
+def test_report_plans_buys_after_all_sell_all_actions_release_cash_and_slots() -> None:
+    discipline_account = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("0"),
+        positions=(
+            AccountPosition(
+                "600001",
+                "退出标的",
+                "stock",
+                Decimal("400"),
+                Decimal("10"),
+                Decimal("4000"),
+            ),
+        ),
+        exceptions=(),
+        position_count=10,
+    )
+
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=discipline_account,
+        candidates=[candidate("600002")],
+        holding_snapshots={"600001": holding("600001", danger=True)},
+        bars_by_symbol={"600001": bars()},
+    )
+
+    assert [(item.symbol, item.action) for item in built.holdings] == [
+        ("600001", "SELL_ALL")
+    ]
+    assert [
+        (item.symbol, item.target_amount, item.estimated_shares)
+        for item in built.buy_actions
+    ] == [("600002", Decimal("4000.00"), 400)]
 
 
 def test_buy_actions_use_four_percent_even_when_account_is_stale() -> None:
@@ -2744,6 +2829,9 @@ def trend_config(tmp_path: Path) -> DailyPremarketConfig:
         trend_animals_api_key="secret-value",
         trend_animals_a_share_tm_id=622466,
         trend_animals_etf_tm_id=697199,
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
     )
 
 
@@ -3026,6 +3114,45 @@ class ReadyQuote:
 
     def close(self) -> None:
         pass
+
+
+def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    config.portfolio.write_text("actual account changes are overlay-only", encoding="utf-8")
+    account_calls: list[dict[str, object]] = []
+
+    class SimAccountClient:
+        def __init__(self, **kwargs: object) -> None:
+            account_calls.append(dict(kwargs))
+            self.acc_id = int(kwargs["simulate_acc_id"])
+
+        def account_snapshot(self) -> dict[str, object]:
+            return DefaultSimAccountClient(
+                simulate_acc_id=self.acc_id
+            ).account_snapshot()
+
+        def close(self) -> None:
+            pass
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=SimAccountClient,
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.status == "generated"
+    assert account_calls[0] | {
+        "simulate_acc_id": 101,
+        "trd_market": "CN",
+    } == account_calls[0]
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["account"]["positions"] == []
+    assert payload["metadata"]["simulate_acc_id"] == 101
 
 
 def test_report_runner_sends_exact_broker_v1_text(tmp_path: Path) -> None:
@@ -4168,6 +4295,7 @@ def test_report_runner_degrades_holding_kline_without_blocking_report(
         config=config, run_date="2026-07-14",
         api_factory=lambda **kwargs: ReadyApi(calls),
         quote_factory=lambda **kwargs: ReadyQuote(calls, failed_klines={"SH.600009"}),
+        account_factory=simulation_account_with_positions("SH.600009"),
         notifier=RecordingFeishu(),
     )
     decision = json.loads(result.json_path.read_text(encoding="utf-8"))[
@@ -4208,6 +4336,7 @@ def test_report_runner_degrades_beijing_holding_kline_value_error(
         run_date="2026-07-14",
         api_factory=lambda **kwargs: BeijingApi([]),
         quote_factory=lambda **kwargs: RejectingBeijingQuote([]),
+        account_factory=simulation_account_with_positions("BJ.920000"),
         notifier=RecordingFeishu(),
     )
 
@@ -4344,7 +4473,9 @@ def test_report_runner_lookup_miss_is_manual_but_transport_failure_blocks(tmp_pa
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14",
         api_factory=lambda **kwargs: ReadyApi(calls, holding_error=TrendAnimalsLookupError("missing")),
-        quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=RecordingFeishu(),
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        account_factory=simulation_account_with_positions("SH.600009"),
+        notifier=RecordingFeishu(),
     )
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     decision = payload["strategy_judgments"]["holding_decisions"][0]
@@ -4357,7 +4488,9 @@ def test_report_runner_lookup_miss_is_manual_but_transport_failure_blocks(tmp_pa
         config=blocked, run_date="2026-07-14",
         now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], holding_error=TrendAnimalsError("transport")),
-        quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=simulation_account_with_positions("SH.600009"),
+        notifier=RecordingMacOS(),
     )
     assert blocked_result.status == "failed"
 

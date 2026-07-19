@@ -9,7 +9,7 @@ from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -266,7 +266,7 @@ def _positive_positions(snapshot: Mapping[str, object]) -> list[Mapping[str, obj
     return positions
 
 
-def _ensure_experiment_account(
+def _ensure_discipline_account(
     data_dir: Path,
     market: str,
     snapshot: Mapping[str, object],
@@ -276,12 +276,7 @@ def _ensure_experiment_account(
     account_id = int(snapshot.get("acc_id") or 0)
     if account_id <= 0:
         raise TrendReviewAccountStateError("simulate account ID is unavailable")
-    positions = _positive_positions(snapshot)
     if not started.exists():
-        if positions:
-            raise TrendReviewAccountStateError(
-                "simulate account must start with zero positions"
-            )
         _write_immutable(
             started,
             _canonical_json_bytes(
@@ -291,22 +286,7 @@ def _ensure_experiment_account(
         return
     existing = json.loads(started.read_text(encoding="utf-8"))
     if existing.get("acc_id") != account_id:
-        raise TrendReviewAccountStateError("simulate account changed during experiment")
-    known_codes = {
-        str(payload.get("request", {}).get("futu_code") or "")
-        for path in root.glob("open/*/*-intent.json")
-        for payload in [json.loads(path.read_text(encoding="utf-8"))]
-        if isinstance(payload, dict) and isinstance(payload.get("request"), dict)
-    }
-    unexplained = [
-        str(item.get("code") or item.get("futu_code") or "")
-        for item in positions
-        if str(item.get("code") or item.get("futu_code") or "") not in known_codes
-    ]
-    if unexplained:
-        raise TrendReviewAccountStateError(
-            "simulate account contains positions outside this experiment"
-        )
+        raise TrendReviewAccountStateError("configured simulate account changed")
 
 
 def _reconcile_intent(
@@ -469,7 +449,7 @@ def execute_trend_review_open(
     snapshot = client.account_snapshot()
     if not isinstance(snapshot, Mapping):
         raise TrendReviewAccountStateError("simulate account snapshot is invalid")
-    _ensure_experiment_account(data_dir, market, snapshot)
+    _ensure_discipline_account(data_dir, market, snapshot)
     nav = _required_decimal(snapshot.get("net_value"), "simulate net value")
     if nav <= 0:
         raise TrendReviewAccountStateError("simulate net value must be positive")
@@ -504,7 +484,13 @@ def execute_trend_review_open(
         / "open"
         / execution_date
     )
-    for index, action in enumerate(actions):
+    ordered_actions = sorted(
+        enumerate(actions),
+        key=lambda item: not (
+            isinstance(item[1], Mapping) and item[1].get("action") == "SELL_ALL"
+        ),
+    )
+    for index, action in ordered_actions:
         if not isinstance(action, Mapping):
             continue
         action_name = str(action.get("action") or "")
@@ -688,6 +674,16 @@ def execute_trend_review_open(
                     if weighted_prices
                     else None
                 )
+                protection_fact = {}
+                if action_name == "BUY" and average_price is not None:
+                    protection_fact = {
+                        "active_protection_line": format(
+                            average_price
+                            - Decimal("2")
+                            * _required_decimal(action.get("atr"), "action ATR"),
+                            "f",
+                        )
+                    }
                 if position_zero or any(
                     order.get("order_id")
                     or order.get("order_status")
@@ -723,6 +719,7 @@ def execute_trend_review_open(
                                 if average_price is not None
                                 else ""
                             ),
+                            **protection_fact,
                             "order_ids": order_ids,
                             **(
                                 {"reason": "position_zero_confirmed"}
@@ -768,16 +765,19 @@ def execute_trend_review_open(
                 )
         else:
             if action_name == "BUY":
-                price = _required_decimal(prices.get(symbol), f"price for {symbol}")
-                weight = _required_decimal(action.get("target_weight"), "target weight")
                 lot_size = int(action.get("lot_size") or 0)
-                if not symbol or price <= 0 or weight <= 0 or lot_size <= 0:
+                frozen_quantity = _required_decimal(
+                    action.get("estimated_shares"), "estimated shares"
+                )
+                if (
+                    not symbol
+                    or lot_size <= 0
+                    or frozen_quantity <= 0
+                    or frozen_quantity != frozen_quantity.to_integral_value()
+                    or frozen_quantity % lot_size
+                ):
                     raise ValueError("trend review buy action is invalid")
-                quantity = int(
-                    (nav * weight / price / Decimal(lot_size)).to_integral_value(
-                        rounding=ROUND_DOWN
-                    )
-                ) * lot_size
+                quantity = int(frozen_quantity)
             else:
                 quantity = sell_quantity
             if quantity <= 0:
@@ -997,9 +997,6 @@ def capture_trend_review_close(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
     _validate_benchmark(benchmark, market=market, trading_date=trading_date)
-    account = report.get("account")
-    if not isinstance(account, Mapping):
-        raise ValueError("trend report account is unavailable")
     strategy_snapshot = report.get("strategy_snapshot")
     if (
         not isinstance(strategy_snapshot, Mapping)
@@ -1022,10 +1019,6 @@ def capture_trend_review_close(
         "orders": orders,
         "positions": simulate_snapshot.get("positions"),
     }
-    if account.get("fresh") is True and account.get("source_date") == trading_date:
-        payload["actual_equity"] = str(
-            _required_decimal(account.get("net_value"), "actual net value")
-        )
     path = (
         data_dir
         / "trend_review"

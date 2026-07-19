@@ -244,9 +244,16 @@ def _valid_trend_review_report(
             return False
         if action["action"] == "BUY":
             try:
+                quantity = Decimal(str(action.get("estimated_shares")))
+                atr = Decimal(str(action.get("atr")))
+                lot_size = int(action.get("lot_size") or 0)
                 if (
                     Decimal(str(action.get("target_weight"))) <= 0
-                    or int(action.get("lot_size") or 0) <= 0
+                    or lot_size <= 0
+                    or quantity <= 0
+                    or quantity != quantity.to_integral_value()
+                    or quantity % lot_size
+                    or atr <= 0
                 ):
                     return False
             except (InvalidOperation, TypeError, ValueError):
@@ -261,16 +268,6 @@ def run_trend_review_open(
     report = _load_trend_review_report(
         config, market, trading_date, date_field="execution_date"
     )
-    judgments = report.get("strategy_judgments")
-    actions = judgments.get("formal_actions") if isinstance(judgments, dict) else []
-    from .futu_symbols import to_futu_symbol
-
-    symbols = [
-        str(action.get("symbol"))
-        for action in actions
-        if isinstance(action, dict) and action.get("action") == "BUY"
-    ]
-    quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
     client = None
     try:
         client = FutuSimulateOrderExecutionClient(
@@ -279,25 +276,16 @@ def run_trend_review_open(
             simulate_acc_id=account_id,
             trd_market=market,
         )
-        snapshots = quote.get_snapshots(
-            [to_futu_symbol(market, symbol) for symbol in symbols]
-        ) if symbols else {}
-        prices = {
-            symbol: snapshots[to_futu_symbol(market, symbol)].last_price
-            for symbol in symbols
-            if to_futu_symbol(market, symbol) in snapshots
-        }
         result = execute_trend_review_open(
             data_dir=config.data_dir,
             report=report,
             client=client,
-            prices=prices,
+            prices={},
             market=market,
             execution_date=trading_date,
             now=datetime.now(ZoneInfo(config.timezone)).isoformat(timespec="seconds"),
         )
     finally:
-        quote.close()
         if client is not None:
             client.close()
     paths = result.get("artifact_paths")

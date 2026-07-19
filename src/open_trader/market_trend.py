@@ -36,6 +36,7 @@ from .a_share_trend import (
     _freeze_receipt_report,
     build_report,
     evaluate_candidate,
+    load_futu_simulate_trend_account,
     load_protection_state,
     load_watch_events,
     render_trend_failure_text,
@@ -46,15 +47,16 @@ from .a_share_trend import (
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
+    require_trend_review_config,
     send_notification_with_results,
 )
+from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .parsers.base import detect_asset_class
 from .tiger_account import (
     TigerAccountClient,
-    TigerAccountError,
     load_tiger_account_config,
     sync_tiger_portfolio,
 )
@@ -73,17 +75,6 @@ MARKET_NOTIFICATION_LABELS = {
     "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
 }
 USD_TO_HKD = Decimal("7.85")
-TIGER_REFRESH_ERROR_TYPES = {
-    "account_query_failed",
-    "asset_query_failed",
-    "blocking_data_error",
-    "config_invalid",
-    "config_missing",
-    "mixed_tiger_broker_row",
-    "no_matching_accounts",
-    "position_query_failed",
-    "tigeropen_missing",
-}
 SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 ATTENTION_CHANGE_FIELDS = (
     "right_side",
@@ -825,7 +816,7 @@ def _attempt_market_report(
     notifier: Notifier,
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
-    account_refresher: Callable[[DailyPremarketConfig, str], None] = _refresh_tiger_account,
+    account_factory: Callable[..., object] | None = None,
 ) -> AShareTrendRunResult:
     market = _market(market)
     settings = MARKET_SETTINGS[market]
@@ -869,31 +860,19 @@ def _attempt_market_report(
         if not updates_ready(update_rows, market=market, as_of_date=as_of_date):
             return AShareTrendRunResult("waiting", None, None)
 
-        account_refresh_error: str | None = None
-        if market == "US":
-            try:
-                account_refresher(config, run_date)
-            except TigerAccountError as exc:
-                account_refresh_error = (
-                    exc.error_type
-                    if exc.error_type in TIGER_REFRESH_ERROR_TYPES
-                    else "tiger_account_error"
-                )
-            except Exception:
-                account_refresh_error = "Tiger account refresh failed"
         prior_state = load_protection_state(paths.state)
         configured = (
             config.trend_us_symbols if market == "US" else config.trend_hk_symbols
         )
         managed = _managed_symbols(prior_state, configured, market)
-        account = load_trend_account(
-            data_dir=config.data_dir,
+        simulate_acc_id = require_trend_review_config(config, market)
+        account = load_futu_simulate_trend_account(
+            host=config.futu_host,
+            port=config.futu_port,
+            simulate_acc_id=simulate_acc_id,
             market=market,
-            expected_date=run_date if market == "US" else as_of_date,
-            managed_symbols=managed,
-            snapshot_before=(
-                run_date if market == "US" and account_refresh_error is not None else None
-            ),
+            expected_date=as_of_date,
+            account_factory=account_factory or FutuSimulateOrderExecutionClient,
         )
 
         balance_before = _balance(api.get_account_balance())
@@ -1016,7 +995,7 @@ def _attempt_market_report(
             data_sources=(
                 "Trend Animals",
                 f"Futu {market} calendar/QFQ daily K-line",
-                "Tiger live account" if market == "US" else "Phillips daily statement",
+                f"Futu {market} SIMULATE account",
             ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost if actual_cost >= 0 else None,
@@ -1030,7 +1009,7 @@ def _attempt_market_report(
             metadata={
                 "market": market,
                 "broker": settings["broker"],
-                "account_check_required": market == "HK",
+                "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
                 "process_version": _process_version(config.repo),
                 **(
@@ -1039,11 +1018,6 @@ def _attempt_market_report(
                         "price_fx_to_hkd": str(USD_TO_HKD),
                     }
                     if market == "US"
-                    else {}
-                ),
-                **(
-                    {"account_refresh_error": account_refresh_error}
-                    if account_refresh_error is not None
                     else {}
                 ),
             },

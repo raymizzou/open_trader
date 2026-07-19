@@ -454,6 +454,20 @@ def test_trend_review_loader_prefers_latest_numeric_revision(tmp_path: Path) -> 
         {**valid, "metadata": {"market": "US", "broker": "tiger"}},
         {**valid, "as_of_date": "2026-07-17"},
         {**valid, "strategy_judgments": {**valid["strategy_judgments"], "formal_actions": [{"action": "WAIT", "symbol": "600001"}]}},
+        {
+            **valid,
+            "strategy_judgments": {
+                **valid["strategy_judgments"],
+                "formal_actions": [
+                    {
+                        "action": "BUY",
+                        "symbol": "600001",
+                        "target_weight": "0.04",
+                        "lot_size": 100,
+                    }
+                ],
+            },
+        },
     ]
     for revision, payload in enumerate(invalid_reports, 11):
         (report_dir / f"2026-07-16-r{revision}.json").write_text(
@@ -500,6 +514,73 @@ def test_trend_review_loader_accepts_report_named_for_as_of_date(
     assert cli._load_trend_review_report(
         config, "US", "2026-07-16", date_field="as_of_date"
     ) == report
+
+
+def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_dir = tmp_path / "reports/trend_a_share"
+    report_dir.mkdir(parents=True)
+    report = {
+        "schema_version": 1,
+        "execution_date": "2026-07-17",
+        "as_of_date": "2026-07-16",
+        "generated_at": "2026-07-16T18:00:00+08:00",
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY",
+                "symbol": "600001",
+                "target_weight": "0.04",
+                "lot_size": 100,
+                "estimated_shares": 300,
+                "atr": "0.5",
+            }],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+    }
+    (report_dir / "2026-07-16.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+    config = SimpleNamespace(
+        reports_dir=tmp_path / "reports",
+        data_dir=tmp_path / "data",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        timezone="Asia/Shanghai",
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
+    )
+    client = SimpleNamespace(close=lambda: None)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli,
+        "FutuSimulateOrderExecutionClient",
+        lambda **kwargs: client,
+    )
+    monkeypatch.setattr(
+        cli,
+        "FutuQuoteClient",
+        lambda **kwargs: pytest.fail("frozen execution must not query opening prices"),
+    )
+
+    def execute(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {
+            "status": "submitted",
+            "submitted_count": 1,
+            "artifact_paths": [str(tmp_path / "result.json")],
+        }
+
+    monkeypatch.setattr(cli, "execute_trend_review_open", execute)
+
+    result = cli.run_trend_review_open(config, "CN", "2026-07-17")
+
+    assert captured["report"] == report
+    assert captured["prices"] == {}
+    assert result["artifact_path"] == str(tmp_path / "result.json")
 
 
 def test_trend_a_share_report_invalid_private_config_returns_two(
