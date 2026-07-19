@@ -70,6 +70,7 @@ from .technical_facts import (
 )
 from .trend_review import _report_hash
 from .strategy_drawdown import valid_drawdown_decision
+from .trend_api_stats import load_trend_api_stats
 from .tradingagents_summary import (
     index_tradingagents_summary_by_market_symbol,
     load_tradingagents_summary_cache,
@@ -1194,6 +1195,12 @@ def _project_broker_trend_report(
         audit_candidates = signal_snapshots.get("candidates", audit_candidates)
     current = freshness_date.isoformat() == report_date
     data_date = as_of_date.isoformat()
+    risk_summary = dict(payload.get("risk_summary", {}))
+    risk_summary["trade_stats"] = _project_trend_trade_stats(
+        data_dir,
+        market=market,
+        strategy_snapshot=payload.get("strategy_snapshot"),
+    )
     return {
         "available": True,
         "artifact": path.name,
@@ -1224,7 +1231,7 @@ def _project_broker_trend_report(
         "sell_actions": sell_actions,
         "buy_actions": buy_actions,
         "risk_skips": payload["strategy_judgments"].get("risk_skips", []),
-        "risk_summary": payload.get("risk_summary", {}),
+        "risk_summary": risk_summary,
         "drawdown_summary": payload.get("drawdown_summary", {}),
         "hold_actions": hold_actions,
         "review_actions": review_actions,
@@ -1247,6 +1254,55 @@ def _project_broker_trend_report(
             "actual_api_cost": payload.get("actual_api_cost"),
             "artifact": path.name,
         },
+    }
+
+
+def _project_trend_trade_stats(
+    data_dir: Path,
+    *,
+    market: str,
+    strategy_snapshot: object,
+) -> dict[str, Any]:
+    unavailable = {
+        "available": False,
+        "status_text": "交易统计暂不可用",
+    }
+    if not isinstance(strategy_snapshot, dict):
+        return unavailable
+    strategy_id = str(strategy_snapshot.get("strategy_id") or "").strip()
+    version = str(strategy_snapshot.get("strategy_version") or "").strip()
+    if not strategy_id or not version:
+        return unavailable
+    try:
+        payload = load_trend_api_stats(data_dir)
+    except (FileNotFoundError, OSError, UnicodeError, ValueError):
+        return unavailable
+    matching = [
+        stat for stat in payload["stats"]
+        if stat["market"] == market
+        and stat["strategy_id"] == strategy_id
+        and stat["opening_strategy_version"] == version
+    ]
+    by_source = {str(stat["source"]): stat for stat in matching}
+    if len(matching) != 2 or set(by_source) != {"simulation", "actual"}:
+        return unavailable
+
+    def compact(source: str) -> dict[str, Any]:
+        stat = by_source[source]
+        return {
+            "win_rate": stat["win_rate"],
+            "payoff_ratio": stat["payoff_ratio"],
+            "payoff_ratio_status": stat["payoff_ratio_status"],
+            "eligible_sample_count": stat["eligible_sample_count"],
+        }
+
+    return {
+        "available": True,
+        "strategy_id": strategy_id,
+        "opening_strategy_version": version,
+        "statistics_cutoff_at": payload["statistics_cutoff_at"],
+        "simulation": compact("simulation"),
+        "actual": compact("actual"),
     }
 
 

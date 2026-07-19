@@ -109,6 +109,11 @@ from .tiger_account import (
     sync_tiger_portfolio,
 )
 from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_facts
+from .trend_api_stats import (
+    FutuSimulateFillClient,
+    TigerActualFillClient,
+    sync_trend_api_stats,
+)
 from .trade_actions import generate_trade_actions
 from .tradingagents_summary import (
     LLMTradingAgentsSummaryExtractor,
@@ -822,6 +827,16 @@ def build_parser() -> argparse.ArgumentParser:
     replay_parser.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
+    sync_stats_parser = trend_review_commands.add_parser("sync-stats")
+    sync_stats_parser.add_argument("--start", type=canonical_date, required=True)
+    sync_stats_parser.add_argument("--end", type=canonical_date, required=True)
+    sync_stats_parser.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    sync_stats_parser.add_argument(
+        "--tiger-config-dir", type=Path, default=Path("~/.tigeropen/")
+    )
+    sync_stats_parser.add_argument("--tiger-account")
 
     test_notification_parser = subparsers.add_parser(
         "test-notification",
@@ -1561,17 +1576,56 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "trend-review":
+        stats_clients: list[object] = []
         try:
             config = load_env_config(args.config, dry_run=False)
             if args.trend_review_command == "open":
                 result = run_trend_review_open(config, args.market, args.date)
             elif args.trend_review_command == "close":
                 result = run_trend_review_close(config, args.market, args.date)
-            else:
+            elif args.trend_review_command == "replay":
                 result = run_trend_review_replay(config, args.evidence)
+            else:
+                futu_clients = {}
+                for market in ("CN", "HK", "US"):
+                    client = FutuSimulateFillClient(
+                        host=config.futu_host,
+                        port=config.futu_port,
+                        simulate_acc_id=require_trend_review_config(config, market),
+                        trd_market=market,
+                    )
+                    futu_clients[market] = client
+                    stats_clients.append(client)
+                tiger_config = load_tiger_account_config(
+                    config_dir=args.tiger_config_dir,
+                    account=args.tiger_account,
+                    sandbox=False,
+                )
+                tiger_client = TigerActualFillClient(config=tiger_config)
+                stats_clients.append(tiger_client)
+                timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                result = sync_trend_api_stats(
+                    data_dir=config.data_dir,
+                    reports_dir=config.reports_dir,
+                    futu_clients=futu_clients,
+                    tiger_client=tiger_client,
+                    start=args.start,
+                    end=args.end,
+                    generated_at=timestamp,
+                    statistics_cutoff_at=timestamp,
+                )
         except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        finally:
+            for client in stats_clients:
+                client.close()
+        if args.trend_review_command == "sync-stats":
+            print(f"fills: {len(result['fills'])}")
+            print(f"rounds: {len(result['rounds'])}")
+            print(f"stats: {len(result['stats'])}")
+            print(f"latest: {config.data_dir / 'latest' / 'trend_api_stats.json'}")
+            return 0
         print(json.dumps(result, ensure_ascii=False))
         return 0
 

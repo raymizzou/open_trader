@@ -30,6 +30,10 @@ from open_trader.decision_facts import (
 )
 from open_trader.decision_plan import build_decision_plan, publish_decision_plans
 from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
+from open_trader.trend_api_stats import (
+    build_trend_api_stats_payload,
+    write_trend_api_stats,
+)
 from open_trader.plan_events import PlanEvent, append_plan_event
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.technical_facts import source_hash
@@ -1242,6 +1246,7 @@ def _valid_v2_dashboard_trend_payload() -> dict[str, object]:
         "account": serialized_trend_account(fresh=True),
         "metadata": {"market": "CN", "broker": "eastmoney"},
         "strategy_snapshot": {
+            "strategy_id": "trend_animals_warm_to_hot/CN/v2",
             "strategy_version": "v2",
             "parameters": {
                 "single_entry_risk_limit": "0.004",
@@ -1379,7 +1384,15 @@ def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> Non
         config.data_dir, config.reports_dir, today=date(2026, 7, 15)
     )["eastmoney"]
 
-    assert report["risk_summary"] == payload["risk_summary"]
+    assert {
+        key: value
+        for key, value in report["risk_summary"].items()
+        if key != "trade_stats"
+    } == payload["risk_summary"]
+    assert report["risk_summary"]["trade_stats"] == {
+        "available": False,
+        "status_text": "交易统计暂不可用",
+    }
     assert report["risk_skips"] == payload["strategy_judgments"]["risk_skips"]
 
 
@@ -1432,8 +1445,11 @@ def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
         config.data_dir, config.reports_dir, today=date(2026, 7, 15)
     )["eastmoney"]
 
-    assert report["available"] is True
-    assert report["risk_summary"] == payload["risk_summary"]
+    assert {
+        key: value
+        for key, value in report["risk_summary"].items()
+        if key != "trade_stats"
+    } == payload["risk_summary"]
     assert report["drawdown_summary"] == payload["drawdown_summary"]
 
 
@@ -1453,6 +1469,63 @@ def test_dashboard_v4_missing_risk_contract_fails_closed(
     )["eastmoney"]
 
     assert report["available"] is False
+
+
+def test_dashboard_projects_exact_version_api_stats_into_risk_summary(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    stats = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[{
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v2",
+            "strategy_version": "v2",
+        }],
+        generated_at="2026-07-20T12:00:00+08:00",
+        statistics_cutoff_at="2026-07-20T11:59:59+08:00",
+    )
+    write_trend_api_stats(config.data_dir, stats)
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    trade_stats = report["risk_summary"]["trade_stats"]
+    assert trade_stats["available"] is True
+    assert trade_stats["strategy_id"] == "trend_animals_warm_to_hot/CN/v2"
+    assert trade_stats["opening_strategy_version"] == "v2"
+    assert trade_stats["statistics_cutoff_at"] == "2026-07-20T11:59:59+08:00"
+    assert trade_stats["simulation"]["eligible_sample_count"] == 0
+    assert trade_stats["actual"]["eligible_sample_count"] == 0
+
+
+def test_dashboard_api_stats_projection_fails_closed_for_malformed_artifact(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    report_path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(_valid_v2_dashboard_trend_payload()), encoding="utf-8"
+    )
+    stats_path = config.data_dir / "latest/trend_api_stats.json"
+    stats_path.parent.mkdir(parents=True)
+    stats_path.write_text('{"schema_version":"wrong"}', encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is True
+    assert report["risk_summary"]["trade_stats"] == {
+        "available": False,
+        "status_text": "交易统计暂不可用",
+    }
 
 
 @pytest.mark.parametrize(

@@ -4067,6 +4067,31 @@ console.log("ok");
     assert ".cn-trend-buy {\n    overflow-x: hidden;\n  }" in mobile
 
 
+def test_dashboard_renders_api_trade_stats_inside_risk_summary() -> None:
+    output = run_dashboard_js(r'''
+const base={status:"active",status_label:"风险预算内",
+  portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
+  portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"3697",
+  portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
+  single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
+  abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",portfolio_remaining_risk_note:"说明"};
+const available=renderTrendRiskSummary({...base,trade_stats:{available:true,
+  statistics_cutoff_at:"2026-07-20T11:59:59+08:00",
+  simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
+  actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}});
+for (const text of ["富途模拟盘交易统计","胜率 50% · 盈亏比 1.25 · 样本 4",
+  "老虎实盘交易统计","胜率 — · 盈亏比 无盈利样本 · 样本 0",
+  "统计截至 2026-07-20T11:59:59+08:00"]) {
+  if (!available.includes(text)) throw new Error(text + "\n" + available);
+}
+const unavailable=renderTrendRiskSummary({...base,trade_stats:{available:false,status_text:"交易统计暂不可用"}});
+if (!unavailable.includes("交易统计暂不可用")) throw new Error(unavailable);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_risk_summary_and_candidate_cards_fit_375px() -> None:
     playwright_api = pytest.importorskip("playwright.sync_api")
     rendered = json.loads(run_dashboard_js(r'''
@@ -4080,7 +4105,10 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
     portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
     single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
     abnormal_loss_buffer_pct:"0.01",disclaimer:"5% 是风险预算目标，不是最大损失保证。",
-    portfolio_remaining_risk_note:"组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"},
+    portfolio_remaining_risk_note:"组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
+    trade_stats:{available:true,statistics_cutoff_at:"2026-07-20T11:59:59+08:00",
+      simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
+      actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}},
   sell_actions:[],buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
     temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",industry:"电力",
     industry_temperature:"热",market_cap:"100",amount:"2",target_weight:"0.04",
@@ -4107,6 +4135,8 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
         risk_text = page.locator(".trend-risk-summary").inner_text()
         assert "组合计划风险" in risk_text
         assert "风险预算内" in risk_text
+        assert "富途模拟盘交易统计" in risk_text
+        assert "老虎实盘交易统计" in risk_text
         assert page.locator(".cn-trend-card").count() == 2
         assert page.evaluate(
             "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
