@@ -1286,6 +1286,21 @@ def _project_trend_trade_stats(
     by_source = {str(stat["source"]): stat for stat in matching}
     if len(matching) != 2 or set(by_source) != {"simulation", "actual"}:
         return unavailable
+    actual_sources = [
+        source
+        for source in payload["sources"]
+        if source["source"] == "actual" and source["market"] == market
+    ]
+    actual_broker = (
+        str(actual_sources[0]["broker"])
+        if len(actual_sources) == 1
+        else {"CN": "eastmoney", "HK": "phillips", "US": "tiger"}[market]
+    )
+    actual_label = {
+        "eastmoney": "东方财富实盘交易统计",
+        "phillips": "辉立实盘交易统计",
+        "tiger": "老虎实盘交易统计",
+    }[actual_broker]
 
     def compact(source: str) -> dict[str, Any]:
         stat = by_source[source]
@@ -1300,7 +1315,13 @@ def _project_trend_trade_stats(
         "available": True,
         "strategy_id": strategy_id,
         "opening_strategy_version": version,
-        "statistics_cutoff_at": payload["statistics_cutoff_at"],
+        "statistics_cutoff_at": (
+            actual_sources[0]["statistics_cutoff_at"]
+            if len(actual_sources) == 1
+            else payload["statistics_cutoff_at"]
+        ),
+        "actual_broker": actual_broker,
+        "actual_label": actual_label,
         "simulation": compact("simulation"),
         "actual": compact("actual"),
     }

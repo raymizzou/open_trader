@@ -28,6 +28,8 @@ def fill(
     account_id: str = "101",
     attribution_status: str = "attributed",
     exclusion_reason: str = "",
+    market: str = "US",
+    currency: str = "USD",
 ) -> dict[str, object]:
     result = {
         "fill_id": fill_id,
@@ -36,9 +38,9 @@ def fill(
         "source_id": f"{source}:{broker}:{account_id}",
         "broker": broker,
         "account_id": account_id,
-        "market": "US",
+        "market": market,
         "symbol": "AAA",
-        "currency": "USD",
+        "currency": currency,
         "side": side,
         "quantity": quantity,
         "price": price,
@@ -57,6 +59,80 @@ def fill(
             "report_sha256": "a" * 64,
         })
     return result
+
+
+@pytest.mark.parametrize(
+    ("broker", "market", "currency", "account_id"),
+    [
+        ("eastmoney", "CN", "CNY", "eastmoney_main"),
+        ("phillips", "HK", "HKD", "phillips_main"),
+    ],
+)
+def test_statement_actual_fill_source_pairs_are_strictly_supported(
+    broker: str,
+    market: str,
+    currency: str,
+    account_id: str,
+) -> None:
+    actual = fill(
+        "statement:2026-07:trade-1",
+        side="buy",
+        quantity="1",
+        price="10",
+        fee="0.1",
+        filled_at="2026-07-10T10:00:00+08:00",
+        source="actual",
+        broker=broker,
+        account_id=account_id,
+        market=market,
+        currency=currency,
+    )
+    actual["statement_period"] = "2026-07"
+    actual["execution_granularity"] = "statement_trade_date"
+    actual["timestamp_semantics"] = "market_close_ordering_sentinel"
+    actual["statement_sequence"] = 1
+    actual["filled_at"] = (
+        "2026-07-10T15:00:00+08:00"
+        if broker == "eastmoney"
+        else "2026-07-10T16:00:00+08:00"
+    )
+
+    payload = build_trend_api_stats_payload(
+        [actual],
+        strategy_versions=[],
+        generated_at="2026-07-11T00:00:00+08:00",
+        statistics_cutoff_at="2026-07-10T23:59:59+08:00",
+    )
+
+    assert payload["fills"] == [actual]
+
+
+def test_statement_actual_fill_rejects_wrong_broker_market_pair() -> None:
+    actual = fill(
+        "statement:2026-07:trade-1",
+        side="buy",
+        quantity="1",
+        price="10",
+        fee="0.1",
+        filled_at="2026-07-10T10:00:00+08:00",
+        source="actual",
+        broker="eastmoney",
+        account_id="eastmoney_main",
+        market="HK",
+        currency="HKD",
+    )
+    actual["statement_period"] = "2026-07"
+    actual["execution_granularity"] = "statement_trade_date"
+    actual["timestamp_semantics"] = "market_close_ordering_sentinel"
+    actual["statement_sequence"] = 1
+
+    with pytest.raises(ValueError, match="fill source"):
+        build_trend_api_stats_payload(
+            [actual],
+            strategy_versions=[],
+            generated_at="2026-07-11T00:00:00+08:00",
+            statistics_cutoff_at="2026-07-10T23:59:59+08:00",
+        )
 
 
 def test_closed_round_deduplicates_fills_and_aggregates_scaled_entry_partial_exit_and_fees() -> None:
@@ -486,10 +562,10 @@ def test_non_strategy_actual_rounds_are_explicit_and_excluded(
         ("orders_seen", -1),
         ("fill_count", True),
         ("status", "partial"),
-        ("statistics_cutoff_at", "2026-01-01T00:00:00+00:00"),
+        ("statistics_cutoff_at", "2026-01-03T00:00:00+00:00"),
     ],
 )
-def test_source_audit_records_are_strict_and_share_the_artifact_cutoff(
+def test_source_audit_records_are_strict_and_do_not_exceed_artifact_cutoff(
     field: str, value: object,
 ) -> None:
     payload = build_trend_api_stats_payload(
@@ -517,6 +593,32 @@ def test_source_audit_records_are_strict_and_share_the_artifact_cutoff(
             market="US",
             strategy_id="trend_animals_warm_to_hot/US/v1",
         )
+
+
+def test_source_audit_cutoff_may_precede_shared_artifact_cutoff() -> None:
+    payload = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[],
+        generated_at="2026-01-03T00:00:00+00:00",
+        statistics_cutoff_at="2026-01-02T00:00:00+00:00",
+    )
+    payload["sources"] = [{
+        "source": "actual",
+        "source_id": "actual:eastmoney:eastmoney_main",
+        "broker": "eastmoney",
+        "account_id": "eastmoney_main",
+        "market": "CN",
+        "orders_seen": 0,
+        "fill_count": 0,
+        "statistics_cutoff_at": "2026-01-01T00:00:00+00:00",
+        "status": "available",
+    }]
+
+    assert eligible_simulation_rounds(
+        payload,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v4",
+    ) == []
 
 
 @pytest.mark.parametrize(

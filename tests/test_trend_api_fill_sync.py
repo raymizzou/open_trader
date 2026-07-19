@@ -18,6 +18,7 @@ from open_trader.trend_api_stats import (
     _tiger_transaction_record,
     load_trend_api_stats,
     sync_trend_api_stats,
+    write_trend_api_stats,
 )
 from open_trader.trend_review import _report_hash
 
@@ -501,21 +502,36 @@ def test_sync_uses_frozen_attribution_merges_idempotently_and_writes_canonical_a
         normalized_fill("actual-s", "actual-sell", source="actual", side="sell", filled_at="2026-01-02T10:02:00-05:00", price="11"),
     ])
 
-    for _ in range(2):
-        payload = sync_trend_api_stats(
-            data_dir=tmp_path / "data",
-            reports_dir=tmp_path / "reports",
-            futu_clients={"US": simulation},
-            tiger_client=actual,
-            start="2026-01-01",
-            end="2026-01-03",
-            generated_at="2026-01-03T12:00:00+00:00",
-            statistics_cutoff_at="2026-01-03T12:00:00+00:00",
-        )
+    sync_args = {
+        "data_dir": tmp_path / "data",
+        "reports_dir": tmp_path / "reports",
+        "futu_clients": {"US": simulation},
+        "tiger_client": actual,
+        "start": "2026-01-01",
+        "end": "2026-01-03",
+        "generated_at": "2026-01-03T12:00:00+00:00",
+        "statistics_cutoff_at": "2026-01-03T12:00:00+00:00",
+    }
+    payload = sync_trend_api_stats(**sync_args)
+    payload["sources"].append({
+        "source": "actual",
+        "source_id": "actual:eastmoney:eastmoney_main",
+        "broker": "eastmoney",
+        "account_id": "eastmoney_main",
+        "market": "CN",
+        "orders_seen": 0,
+        "fill_count": 0,
+        "statistics_cutoff_at": "2026-01-02T12:00:00+00:00",
+        "status": "available",
+    })
+    write_trend_api_stats(tmp_path / "data", payload)
+
+    payload = sync_trend_api_stats(**sync_args)
 
     assert simulation.attributions["sim-buy"]["report_sha256"] == report_sha
     assert len(payload["fills"]) == 4
     assert len(payload["rounds"]) == 2
     assert all(round_["attribution_status"] == "attributed" for round_ in payload["rounds"])
+    assert any(source["broker"] == "eastmoney" for source in payload["sources"])
     assert load_trend_api_stats(tmp_path / "data") == payload
     assert (tmp_path / "data/latest/trend_api_stats.json").is_file()

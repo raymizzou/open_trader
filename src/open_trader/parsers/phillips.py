@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 import re
+from zoneinfo import ZoneInfo
 
 import pdfplumber
 
-from open_trader.models import AssetClass, CashBalance, Market, Position
+from open_trader.models import (
+    AssetClass,
+    CashBalance,
+    Market,
+    Position,
+    StatementTrade,
+)
 from open_trader.parsers.base import (
     ParseResult,
     StatementParser,
@@ -32,13 +39,23 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
     base_cash: CashBalance | None = None
+    trades: list[StatementTrade] = []
     in_positions = False
     in_cash = False
     in_account_details = False
 
-    for raw_line in text.splitlines():
-        line = _normalize_line(raw_line)
+    lines = [_normalize_line(raw_line) for raw_line in text.splitlines()]
+    for index, line in enumerate(lines):
         if not line:
+            continue
+
+        trade = _parse_transaction_lines(
+            line,
+            lines[index + 1] if index + 1 < len(lines) else "",
+            statement_id,
+        )
+        if trade is not None:
+            trades.append(replace(trade, statement_sequence=index + 1))
             continue
 
         if _is_account_details_start(line):
@@ -95,6 +112,74 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         broker=BROKER,
         positions=positions,
         cash_balances=[base_cash] if base_cash is not None else cash_balances,
+        trades=trades,
+    )
+
+
+def _parse_transaction_lines(
+    line: str, continuation: str, statement_id: str
+) -> StatementTrade | None:
+    match = re.fullmatch(
+        r"(?P<trade_date>\d{2}/\d{2}/\d{2})\s+"
+        r"(?P<settlement_date>\d{2}/\d{2}/\d{2})\s+"
+        r"Equity\s+(?P<reference>\d+)\s+"
+        r"(?P<side>Bought|Sold)\s+.+?\s+"
+        rf"(?P<quantity>{NUMERIC})\s+"
+        rf"(?P<price>{NUMERIC})\s+"
+        rf"(?P<gross>{NUMERIC})\s+"
+        rf"(?P<amount>{NUMERIC})",
+        line,
+        re.IGNORECASE,
+    )
+    symbol_match = re.search(
+        r"/(?P<market>XHKG|HK)/(?P<symbol>[A-Z0-9.-]+)\s*$",
+        continuation,
+        re.IGNORECASE,
+    )
+    if match is None or symbol_match is None:
+        return None
+    day, month, year = match.group("trade_date").split("/")
+    try:
+        traded_date = date(2000 + int(year), int(month), int(day))
+    except ValueError:
+        raise ValueError("辉立结单包含无效成交日期") from None
+    quantity = parse_decimal(match.group("quantity"))
+    price = parse_decimal(match.group("price"))
+    gross = parse_decimal(match.group("gross"))
+    amount = parse_decimal(match.group("amount"))
+    if (
+        quantity is None
+        or quantity <= 0
+        or price is None
+        or price <= 0
+        or gross is None
+        or amount is None
+        or abs(abs(gross) - quantity * price) > Decimal("0.02")
+    ):
+        raise ValueError("辉立结单包含无效成交行")
+    fee = abs(abs(amount) - abs(gross))
+    return StatementTrade(
+        statement_id=statement_id,
+        broker=BROKER,
+        account_alias=ACCOUNT_ALIAS,
+        market=Market.HK,
+        symbol=_normalize_phillips_symbol(symbol_match.group("symbol"), Market.HK),
+        currency="HKD",
+        side="buy" if match.group("side").lower() == "bought" else "sell",
+        quantity=quantity,
+        price=price,
+        fee=fee,
+        costs_complete=True,
+        traded_at=datetime(
+            traded_date.year,
+            traded_date.month,
+            traded_date.day,
+            16,
+            tzinfo=ZoneInfo("Asia/Hong_Kong"),
+        ).isoformat(),
+        reference=match.group("reference"),
+        execution_granularity="statement_trade_date",
+        statement_sequence=0,
     )
 
 

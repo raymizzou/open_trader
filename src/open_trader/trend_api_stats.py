@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Context, Decimal, InvalidOperation, localcontext
 from pathlib import Path
+import re
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -29,6 +30,16 @@ _REPORT_DIRECTORIES = {
     "CN": "trend_a_share",
     "HK": "trend_hk_phillips",
     "US": "trend_us_tiger",
+}
+_SOURCE_MARKETS = {
+    ("simulation", "futu"): {"CN", "HK", "US"},
+    ("actual", "tiger"): {"US"},
+    ("actual", "eastmoney"): {"CN"},
+    ("actual", "phillips"): {"HK"},
+}
+_STATEMENT_ACCOUNTS = {
+    "eastmoney": ("eastmoney_main", "CN"),
+    "phillips": ("phillips_main", "HK"),
 }
 
 
@@ -512,8 +523,11 @@ def sync_trend_api_stats(
     })
     path = data_dir / "latest" / "trend_api_stats.json"
     existing_fills: list[Mapping[str, object]] = []
+    existing_sources: list[Mapping[str, object]] = []
     if path.exists():
-        existing_fills = list(load_trend_api_stats(data_dir)["fills"])
+        existing = load_trend_api_stats(data_dir)
+        existing_fills = list(existing["fills"])
+        existing_sources = list(existing["sources"])
     strategy_versions = sorted({
         (str(fact["market"]), str(fact["strategy_id"]), str(fact["strategy_version"]))
         for fact in facts
@@ -527,9 +541,168 @@ def sync_trend_api_stats(
         generated_at=generated_at,
         statistics_cutoff_at=statistics_cutoff_at,
     )
-    payload["sources"] = sources
+    payload["sources"] = _merge_source_audits(existing_sources, sources)
     write_trend_api_stats(data_dir, payload)
     return payload
+
+
+def build_statement_actual_stats_payload(
+    *,
+    data_dir: Any,
+    reports_dir: Any,
+    broker: str,
+    statement_period: str,
+    fills: Sequence[Mapping[str, object]],
+    generated_at: str,
+    statistics_cutoff_at: str,
+) -> dict[str, object]:
+    normalized_broker = broker.strip().lower()
+    if normalized_broker not in _STATEMENT_ACCOUNTS:
+        raise ValueError(f"unsupported statement stats broker: {broker}")
+    if re.fullmatch(r"\d{4}-\d{2}(?:-\d{2})?", statement_period) is None:
+        raise ValueError("statement_period is invalid")
+    account_id, market = _STATEMENT_ACCOUNTS[normalized_broker]
+    incoming = [dict(fill) for fill in fills]
+    if any(
+        fill.get("source") != "actual"
+        or fill.get("broker") != normalized_broker
+        or fill.get("account_id") != account_id
+        or fill.get("market") != market
+        or fill.get("statement_period") != statement_period
+        for fill in incoming
+    ):
+        raise ValueError("statement fill source facts are inconsistent")
+
+    path = _path(data_dir) / "latest" / "trend_api_stats.json"
+    existing: dict[str, object] | None = None
+    if path.exists():
+        existing = load_trend_api_stats(data_dir)
+    incoming_identities = {
+        (str(fill.get("source_id")), str(fill.get("fill_id"))) for fill in incoming
+    }
+    retained = [
+        dict(fill)
+        for fill in (existing["fills"] if existing is not None else [])
+        if not (
+            fill["broker"] == normalized_broker
+            and fill.get("statement_period") == statement_period
+        )
+        and (str(fill["source_id"]), str(fill["fill_id"])) not in incoming_identities
+    ]
+    combined = [*retained, *incoming]
+    facts = _load_frozen_strategy_facts(reports_dir)
+    combined = _reattribute_statement_fills(combined, facts)
+
+    cutoff_values = [statistics_cutoff_at]
+    if existing is not None:
+        cutoff_values.append(str(existing["statistics_cutoff_at"]))
+    artifact_cutoff = max(
+        cutoff_values,
+        key=lambda value: _aware_timestamp(value, "statistics_cutoff_at"),
+    )
+    existing_versions = {
+        (
+            str(stat["market"]),
+            str(stat["strategy_id"]),
+            str(stat["opening_strategy_version"]),
+        )
+        for stat in (existing["stats"] if existing is not None else [])
+    }
+    strategy_versions = existing_versions | {
+        (str(fact["market"]), str(fact["strategy_id"]), str(fact["strategy_version"]))
+        for fact in facts
+    }
+    payload = build_trend_api_stats_payload(
+        combined,
+        strategy_versions=[
+            {"market": item[0], "strategy_id": item[1], "strategy_version": item[2]}
+            for item in sorted(strategy_versions)
+        ],
+        generated_at=generated_at,
+        statistics_cutoff_at=artifact_cutoff,
+    )
+    statement_source_id = f"actual:{normalized_broker}:{account_id}"
+    broker_fills = [
+        fill
+        for fill in payload["fills"]
+        if fill["source_id"] == statement_source_id and fill["market"] == market
+    ]
+    source = {
+        "source": "actual",
+        "source_id": statement_source_id,
+        "broker": normalized_broker,
+        "account_id": account_id,
+        "market": market,
+        "orders_seen": len(broker_fills),
+        "fill_count": len(broker_fills),
+        "statistics_cutoff_at": statistics_cutoff_at,
+        "status": "available",
+    }
+    payload["sources"] = _merge_source_audits(
+        existing["sources"] if existing is not None else [],
+        [source],
+    )
+    return _validated_payload(payload)
+
+
+def _reattribute_statement_fills(
+    fills: Sequence[Mapping[str, object]],
+    facts: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    statement_brokers = set(_STATEMENT_ACCOUNTS)
+    other: list[dict[str, object]] = []
+    statement: list[dict[str, object]] = []
+    for raw in fills:
+        fill = dict(raw)
+        if fill.get("broker") not in statement_brokers:
+            other.append(fill)
+            continue
+        fill.update(
+            strategy_id="",
+            strategy_version="",
+            report_sha256="",
+            attribution_status="outside_strategy",
+            exclusion_reason="no_matching_opening_strategy_action",
+        )
+        statement.append(fill)
+    attributed = _attribute_actual_fills(statement, facts)
+    same_day_sides: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
+    for fill in attributed:
+        market = str(fill["market"])
+        local_date = _aware_timestamp(
+            fill["filled_at"], "fill filled_at"
+        ).astimezone(_MARKET_TIMEZONES[market]).date().isoformat()
+        same_day_sides[(
+            str(fill["source_id"]), market, str(fill["symbol"]), local_date
+        )].add(str(fill["side"]))
+    for fill in attributed:
+        market = str(fill["market"])
+        local_date = _aware_timestamp(
+            fill["filled_at"], "fill filled_at"
+        ).astimezone(_MARKET_TIMEZONES[market]).date().isoformat()
+        key = (str(fill["source_id"]), market, str(fill["symbol"]), local_date)
+        if len(same_day_sides[key]) > 1:
+            fill.update(
+                strategy_id="",
+                strategy_version="",
+                report_sha256="",
+                attribution_status="ambiguous",
+                exclusion_reason="statement_trade_time_unavailable",
+            )
+    return [*other, *attributed]
+
+
+def _merge_source_audits(
+    existing: Sequence[Mapping[str, object]],
+    incoming: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    merged = {
+        (str(source["source_id"]), str(source["market"])): dict(source)
+        for source in existing
+    }
+    for source in incoming:
+        merged[(str(source["source_id"]), str(source["market"]))] = dict(source)
+    return [merged[key] for key in sorted(merged)]
 
 
 def _merge_synced_fills(
@@ -855,15 +1028,11 @@ def _validate_sources(
         broker = str(raw["broker"])
         account_id = _required_text(raw["account_id"], "source account_id")
         market = str(raw["market"])
-        if (source, broker) not in {
-            ("simulation", "futu"),
-            ("actual", "tiger"),
-        }:
+        allowed_markets = _SOURCE_MARKETS.get((source, broker))
+        if allowed_markets is None:
             raise ValueError("source and broker are inconsistent")
-        if market not in _MARKET_TIMEZONES:
+        if market not in allowed_markets:
             raise ValueError("source market is invalid")
-        if source == "actual" and market != "US":
-            raise ValueError("actual Tiger source market must be US")
         expected_source_id = f"{source}:{broker}:{account_id}"
         if raw["source_id"] != expected_source_id:
             raise ValueError("source_id is inconsistent with source facts")
@@ -873,9 +1042,13 @@ def _validate_sources(
                 raise ValueError(f"source {field} must be a non-negative integer")
         if raw["status"] != "available":
             raise ValueError("source status is invalid")
-        if raw["statistics_cutoff_at"] != statistics_cutoff_at:
-            raise ValueError("source statistics_cutoff_at must match artifact cutoff")
-        _aware_timestamp(raw["statistics_cutoff_at"], "source statistics_cutoff_at")
+        source_cutoff = _aware_timestamp(
+            raw["statistics_cutoff_at"], "source statistics_cutoff_at"
+        )
+        if source_cutoff > _aware_timestamp(
+            statistics_cutoff_at, "statistics_cutoff_at"
+        ):
+            raise ValueError("source statistics_cutoff_at exceeds artifact cutoff")
         identity = (expected_source_id, market)
         if identity in identities:
             raise ValueError("source audit record is duplicated")
@@ -919,20 +1092,36 @@ def _validated_fill(raw: Mapping[str, object]) -> dict[str, object]:
             raise ValueError(f"fill {field} is required")
     if fill.get("source") not in {"simulation", "actual"}:
         raise ValueError("fill source must be simulation or actual")
-    expected_broker = {
-        "simulation": "futu",
-        "actual": "tiger",
-    }[str(fill["source"])]
-    if fill["broker"] != expected_broker:
+    source = str(fill["source"])
+    broker = str(fill["broker"])
+    allowed_markets = _SOURCE_MARKETS.get((source, broker))
+    if allowed_markets is None:
         raise ValueError("fill source and broker are inconsistent")
-    if fill["market"] not in _MARKET_TIMEZONES:
+    if fill["market"] not in allowed_markets:
         raise ValueError("fill source market is invalid")
-    if fill["source"] == "actual" and fill["market"] != "US":
-        raise ValueError("fill source actual Tiger market must be US")
     if fill["source_id"] != (
-        f"{fill['source']}:{expected_broker}:{fill['account_id']}"
+        f"{fill['source']}:{broker}:{fill['account_id']}"
     ):
         raise ValueError("fill source_id is inconsistent with source facts")
+    if broker in {"eastmoney", "phillips"}:
+        period = fill.get("statement_period")
+        if not isinstance(period, str) or re.fullmatch(
+            r"\d{4}-\d{2}(?:-\d{2})?", period
+        ) is None:
+            raise ValueError("statement fill statement_period is invalid")
+        if fill.get("execution_granularity") != "statement_trade_date":
+            raise ValueError("statement fill execution_granularity is invalid")
+        if fill.get("timestamp_semantics") != "market_close_ordering_sentinel":
+            raise ValueError("statement fill timestamp_semantics is invalid")
+        sequence = fill.get("statement_sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+            raise ValueError("statement fill statement_sequence is invalid")
+        local_timestamp = _aware_timestamp(fill.get("filled_at"), "fill filled_at").astimezone(
+            _MARKET_TIMEZONES[str(fill["market"])]
+        )
+        sentinel = time(15 if broker == "eastmoney" else 16)
+        if local_timestamp.time().replace(tzinfo=None) != sentinel:
+            raise ValueError("statement fill ordering sentinel is invalid")
     if fill.get("side") not in {"buy", "sell"}:
         raise ValueError("fill side must be buy or sell")
     quantity = _required_decimal(fill.get("quantity"), "fill quantity")

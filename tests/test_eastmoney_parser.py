@@ -18,6 +18,48 @@ POSITIONS = [
     ["沪市A股", "600025", "华能水电", "6000", "9.620", "8.891", "57720.00"],
 ]
 
+TRANSACTIONS = [
+    [
+        "发生日期",
+        "买卖类别",
+        "证券代码",
+        "证券名称",
+        "成交数量",
+        "成交价格",
+        "总发生金额",
+        "手续费",
+        "印花税",
+        "过户费",
+        "资金余额",
+    ],
+    [
+        "20260716",
+        "证券买入",
+        "688796",
+        "百奥赛图",
+        "200",
+        "144.7500",
+        "-28955.29",
+        "5.00",
+        "0.00",
+        "0.29",
+        "34911.30",
+    ],
+    [
+        "20260717",
+        "证券卖出",
+        "688796",
+        "百奥赛图",
+        "200",
+        "113.9000",
+        "22763.38",
+        "5.00",
+        "11.39",
+        "0.23",
+        "10000.10",
+    ],
+]
+
 
 def test_parse_eastmoney_first_page_only() -> None:
     result = parse_eastmoney_page(
@@ -35,6 +77,50 @@ def test_parse_eastmoney_first_page_only() -> None:
     assert result.positions[0].unrealized_pnl == Decimal("4374.000")
     assert result.cash_balances[0].cash_balance == Decimal("405219.55")
     assert result.cash_balances[0].available_balance == Decimal("405219.55")
+
+
+def test_parse_eastmoney_extracts_auditable_trade_facts_and_complete_fees() -> None:
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, TRANSACTIONS],
+        "2026-07",
+    )
+
+    assert [trade.side for trade in result.trades] == ["buy", "sell"]
+    assert result.trades[0].market == Market.CN
+    assert result.trades[0].symbol == "688796"
+    assert result.trades[0].quantity == Decimal("200")
+    assert result.trades[0].price == Decimal("144.7500")
+    assert result.trades[0].fee == Decimal("5.29")
+    assert result.trades[0].traded_at == "2026-07-16T15:00:00+08:00"
+    assert result.trades[0].execution_granularity == "statement_trade_date"
+    assert result.trades[0].statement_sequence == 1
+    assert result.trades[1].fee == Decimal("16.62")
+    assert result.trades[1].costs_complete is True
+
+
+def test_parse_eastmoney_ignores_non_trade_cash_ledger_rows() -> None:
+    non_trade = [
+        "20260716",
+        "银行利息",
+        "",
+        "",
+        "",
+        "",
+        "1.23",
+        "0",
+        "0",
+        "0",
+        "10001.23",
+    ]
+
+    result = parse_eastmoney_page(
+        "总资产(RMB)： 57730.00\n资金可用(RMB)： 10.00",
+        [POSITIONS, [TRANSACTIONS[0], non_trade, *TRANSACTIONS[1:]]],
+        "2026-07",
+    )
+
+    assert len(result.trades) == 2
 
 
 def test_parse_eastmoney_cash_when_currency_balances_share_lines() -> None:
@@ -86,7 +172,7 @@ def test_parser_rejects_invalid_summary_rows_and_cash() -> None:
         parse_eastmoney_page("资金余额(RMB)： 1", [POSITIONS], "2026-07")
 
 
-def test_encrypted_parser_reads_only_first_page_and_hides_password(
+def test_encrypted_parser_reads_cash_from_first_page_and_trade_tables_from_all_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakePage:
@@ -99,6 +185,9 @@ def test_encrypted_parser_reads_only_first_page_and_hides_password(
     class UnreadablePage:
         def extract_text(self) -> str:
             raise AssertionError("second page must not be read")
+
+        def extract_tables(self) -> list[list[list[str]]]:
+            return [TRANSACTIONS]
 
     class FakePdf:
         pages = [FakePage(), UnreadablePage()]
@@ -125,6 +214,7 @@ def test_encrypted_parser_reads_only_first_page_and_hides_password(
         "password": "sanitized-secret",
     }
     assert result.page_count == 2
+    assert len(result.trades) == 2
     assert "sanitized-secret" not in repr(result)
 
 

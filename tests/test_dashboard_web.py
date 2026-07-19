@@ -387,6 +387,35 @@ console.log(JSON.stringify({fetches,messages}));
     }
 
 
+def test_failed_statement_upload_keeps_rendered_stats_cutoff_and_shows_reason() -> None:
+    output = run_dashboard_js(r'''
+const tradeStats={available:true,statistics_cutoff_at:"2026-07-12T23:59:59+08:00",
+  actual_label:"辉立实盘交易统计",
+  simulation:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0},
+  actual:{win_rate:"1",payoff_ratio:null,payoff_ratio_status:"no_losses",eligible_sample_count:1}};
+const base={status:"active",status_label:"风险预算内",portfolio_planned_risk:"0",
+  portfolio_planned_risk_pct:"0",portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"4000",
+  portfolio_remaining_risk_pct:"0.04",single_entry_risk_limit:"400",single_entry_risk_limit_pct:"0.004",
+  abnormal_loss_buffer:"1000",abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",
+  portfolio_remaining_risk_note:"说明",trade_stats:tradeStats};
+const before=renderTrendRiskSummary(base);
+let reloads=0; loadDashboard=async()=>{reloads+=1;};
+globalThis.fetch=async()=>({ok:false,status:400,json:async()=>({status:"error",message:"辉立成交表格式无法识别"})});
+let reason="";
+try { await uploadStatement("phillips", {name:"statement.pdf",size:100}); }
+catch (error) { reason=error.message; }
+const after=renderTrendRiskSummary(base);
+console.log(JSON.stringify({reason,reloads,same:before===after,kept:after.includes("统计截至 2026-07-12T23:59:59+08:00")}));
+''')
+
+    assert json.loads(output) == {
+        "reason": "辉立成交表格式无法识别",
+        "reloads": 0,
+        "same": True,
+        "kept": True,
+    }
+
+
 def test_dashboard_renders_validated_and_fallback_decision_plans() -> None:
     node = shutil.which("node")
     if node is None:
@@ -4077,10 +4106,11 @@ const base={status:"active",status_label:"风险预算内",
   abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",portfolio_remaining_risk_note:"说明"};
 const available=renderTrendRiskSummary({...base,trade_stats:{available:true,
   statistics_cutoff_at:"2026-07-20T11:59:59+08:00",
+  actual_label:"东方财富实盘交易统计",
   simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
   actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}});
 for (const text of ["富途模拟盘交易统计","胜率 50% · 盈亏比 1.25 · 样本 4",
-  "老虎实盘交易统计","胜率 — · 盈亏比 无盈利样本 · 样本 0",
+  "东方财富实盘交易统计","胜率 — · 盈亏比 无盈利样本 · 样本 0",
   "统计截至 2026-07-20T11:59:59+08:00"]) {
   if (!available.includes(text)) throw new Error(text + "\n" + available);
 }
@@ -4106,7 +4136,7 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
     single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
     abnormal_loss_buffer_pct:"0.01",disclaimer:"5% 是风险预算目标，不是最大损失保证。",
     portfolio_remaining_risk_note:"组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
-    trade_stats:{available:true,statistics_cutoff_at:"2026-07-20T11:59:59+08:00",
+    trade_stats:{available:true,statistics_cutoff_at:"2026-07-20T11:59:59+08:00",actual_label:"东方财富实盘交易统计",
       simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
       actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}},
   sell_actions:[],buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
@@ -4136,7 +4166,7 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
         assert "组合计划风险" in risk_text
         assert "风险预算内" in risk_text
         assert "富途模拟盘交易统计" in risk_text
-        assert "老虎实盘交易统计" in risk_text
+        assert "东方财富实盘交易统计" in risk_text
         assert page.locator(".cn-trend-card").count() == 2
         assert page.evaluate(
             "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
@@ -8811,6 +8841,37 @@ def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
 
     assert payload["statement_date"] == "2026-07-10"
     assert importer.calls == [("phillips", b"%PDF-1.7\nstatement")]
+
+
+def test_dashboard_server_returns_statement_parse_failure_reason(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FailingStatementImportService:
+        def import_pdf(self, broker: str, body: bytes) -> dict[str, Any]:
+            raise ValueError("辉立成交表格式无法识别")
+
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        statement_import_service=FailingStatementImportService(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        status, payload = post_pdf_error(
+            f"http://{host}:{port}/api/statements/phillips",
+            b"%PDF-1.7\nbroken",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 400
+    assert payload["message"] == "辉立成交表格式无法识别"
 
 
 @pytest.mark.parametrize(
