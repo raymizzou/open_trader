@@ -22,6 +22,7 @@ from .trend_simulate_positions import (
     _action_events,
     _reports_by_hash,
 )
+from .trend_review import _report_hash
 
 
 REQUIRED_SOURCE_PATHS = (
@@ -349,6 +350,252 @@ def dashboard_signature(payload: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
     fields = ("market", "symbol", "brokers")
     rows = [*(payload.get("holdings") or []), *(payload.get("cash_rows") or [])]
     return tuple(sorted(tuple(str(row.get(field, "")) for field in fields) for row in rows))
+
+
+def trend_advice_signature(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    reports = payload.get("trend_reports")
+    reports = reports if isinstance(reports, Mapping) else {}
+    signature: list[str] = []
+    for broker in TREND_SIMULATE_MARKETS:
+        report = reports.get(broker)
+        report = report if isinstance(report, Mapping) else {}
+        summary = report.get("risk_summary")
+        summary = dict(summary) if isinstance(summary, Mapping) else {}
+
+        def frozen_actions(key: str) -> list[dict[str, Any]]:
+            actions = report.get(key)
+            if not isinstance(actions, list):
+                return []
+            return [
+                {field: value for field, value in action.items() if field != "execution"}
+                for action in actions
+                if isinstance(action, Mapping)
+            ]
+
+        signature.append(json.dumps({
+            "broker": broker,
+            "report_sha256": report.get("report_sha256"),
+            "strategy_version": report.get("strategy_version"),
+            "sell_actions": frozen_actions("sell_actions"),
+            "buy_actions": frozen_actions("buy_actions"),
+            "hold_actions": frozen_actions("hold_actions"),
+            "review_actions": frozen_actions("review_actions"),
+            "risk_skips": frozen_actions("risk_skips"),
+            "risk_summary": summary,
+            "drawdown_summary": report.get("drawdown_summary"),
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return tuple(signature)
+
+
+def validate_integrated_candidate(
+    payload: Mapping[str, Any],
+    *,
+    expected_root: Path,
+    reports_dir: Path,
+    account_ids: Mapping[str, int],
+) -> list[str]:
+    errors: list[str] = []
+    try:
+        templates_payload = json.loads(
+            (expected_root / "data/latest/kelly_strategy_templates.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        expected_templates = templates_payload["templates"]
+        lab = payload.get("kelly_lab")
+        assert isinstance(lab, Mapping) and lab.get("available") is True, (
+            "Kelly 模板未从干净候选加载"
+        )
+        assert (
+            isinstance(expected_templates, list)
+            and expected_templates
+            and lab.get("template_count") == len(expected_templates)
+            and lab.get("templates") == expected_templates
+        ), "Kelly 模板与候选 SHA 不一致"
+    except (AssertionError, KeyError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        errors.append(str(exc) or f"Kelly 模板检查失败：{type(exc).__name__}")
+
+    source_cutoffs: dict[str, str] = {}
+    try:
+        data_dir_value = payload.get("data_dir")
+        assert isinstance(data_dir_value, str) and data_dir_value.strip(), (
+            "Dashboard 缺少交易统计数据目录"
+        )
+        data_dir = Path(data_dir_value)
+        if not data_dir.is_absolute():
+            data_dir = expected_root / data_dir
+        stats_payload = json.loads(
+            (data_dir / "latest/trend_api_stats.json").read_text(encoding="utf-8")
+        )
+        sources = stats_payload.get("sources")
+        assert isinstance(sources, list), "交易统计来源清单无效"
+        for broker, market in TREND_SIMULATE_MARKETS.items():
+            matching = [
+                source for source in sources
+                if isinstance(source, Mapping)
+                and source.get("source") == "actual"
+                and source.get("broker") == broker
+                and source.get("market") == market
+            ]
+            assert len(matching) == 1 and matching[0].get("statistics_cutoff_at"), (
+                f"{broker} 实盘统计来源截止时间不可用"
+            )
+            source_cutoffs[broker] = str(matching[0]["statistics_cutoff_at"])
+    except (AssertionError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        errors.append(str(exc) or f"交易统计来源检查失败：{type(exc).__name__}")
+
+    reports = payload.get("trend_reports")
+    if not isinstance(reports, Mapping):
+        return [*errors, "Dashboard 缺少三市场趋势报告"]
+    labels = {"tiger": "老虎", "phillips": "辉立", "eastmoney": "东方财富"}
+    for broker, market in TREND_SIMULATE_MARKETS.items():
+        try:
+            report = reports.get(broker)
+            assert isinstance(report, Mapping) and report.get("available") is True, (
+                f"{broker} {market} 趋势报告不可用"
+            )
+            assert report.get("broker") == broker and report.get("market") == market, (
+                f"{broker} 三市场报告身份不匹配"
+            )
+            artifact = report.get("artifact") or (
+                report.get("audit") or {}
+            ).get("artifact")
+            assert (
+                isinstance(artifact, str)
+                and artifact.endswith(".json")
+                and Path(artifact).name == artifact
+            ), f"{broker} 冻结报告文件名无效"
+            path = reports_dir / TREND_REPORT_DIRECTORIES[broker] / artifact
+            frozen = json.loads(path.read_text(encoding="utf-8"))
+            assert isinstance(frozen, Mapping), f"{broker} 冻结报告不是对象"
+            assert report.get("report_sha256") == _report_hash(frozen), (
+                f"{broker} 报告哈希与冻结产物不一致"
+            )
+            metadata = frozen.get("metadata")
+            assert (
+                isinstance(metadata, Mapping)
+                and metadata.get("market") == market
+                and metadata.get("broker") == broker
+                and metadata.get("simulate_acc_id") == account_ids.get(broker)
+            ), f"{broker} 未使用对应 Futu 模拟账户作为策略基线"
+            assert f"Futu {market} SIMULATE account" in frozen.get(
+                "data_sources", []
+            ), f"{broker} 冻结报告缺少 Futu 模拟账户数据源"
+
+            snapshot = frozen.get("strategy_snapshot")
+            parameters = (
+                snapshot.get("parameters") if isinstance(snapshot, Mapping) else None
+            )
+            assert (
+                isinstance(parameters, Mapping)
+                and snapshot.get("strategy_version") == "v4"
+                and report.get("strategy_version") == "v4"
+            ), f"{broker} 未加载 Kelly/回撤 v4 策略"
+            for key, expected, label in (
+                ("single_entry_risk_limit", Decimal("0.004"), "单笔风险"),
+                ("portfolio_risk_limit", Decimal("0.04"), "组合风险"),
+                ("abnormal_loss_buffer", Decimal("0.01"), "异常损失缓冲"),
+                ("drawdown_limit", Decimal("0.05"), "回撤阈值"),
+            ):
+                assert _position_decimal(parameters.get(key), label) == expected, (
+                    f"{broker} {label}参数不正确"
+                )
+            target = parameters.get("target_weight")
+            target_values = (
+                target.values() if isinstance(target, Mapping) else (target,)
+            )
+            assert target_values and max(
+                _position_decimal(value, "名义仓位上限") for value in target_values
+            ) == Decimal("0.04"), f"{broker} 固定名义仓位上限不是 4%"
+
+            summary = report.get("risk_summary")
+            assert isinstance(summary, Mapping), f"{broker} 缺少风险摘要"
+            for key, expected, label in (
+                ("single_entry_risk_limit_pct", Decimal("0.004"), "单笔风险"),
+                ("portfolio_risk_limit_pct", Decimal("0.04"), "组合风险"),
+                ("abnormal_loss_buffer_pct", Decimal("0.01"), "异常损失缓冲"),
+                ("total_risk_budget_target_pct", Decimal("0.05"), "总风险预算"),
+            ):
+                assert _position_decimal(summary.get(key), label) == expected, (
+                    f"{broker} {label}摘要不正确"
+                )
+            assert summary.get("disclaimer") == (
+                "5% 是风险预算目标，不是最大损失保证。"
+            ), f"{broker} 风险预算免责声明不正确"
+            frozen_summary = frozen.get("risk_summary")
+            projected_summary = dict(summary)
+            stats = projected_summary.pop("trade_stats", None)
+            assert projected_summary == frozen_summary, (
+                f"{broker} 冻结风险摘要被实盘数据改写"
+            )
+            assert (
+                isinstance(stats, Mapping)
+                and stats.get("available") is True
+                and isinstance(stats.get("simulation"), Mapping)
+                and isinstance(stats.get("actual"), Mapping)
+                and stats.get("actual_broker") == broker
+                and stats.get("actual_broker_label") == labels[broker]
+            ), f"{broker} 实盘统计券商或来源截止时间不正确"
+            assert stats.get("statistics_cutoff_at") == source_cutoffs.get(broker), (
+                f"{broker} 实盘统计来源截止时间与源数据不一致"
+            )
+            assert (
+                summary.get("kelly_phase") in {
+                    "cold_start", "active_all_samples", "active_rolling_200",
+                    "unavailable",
+                }
+                and summary.get("kelly_source")
+                == "合格的富途模拟闭环；实盘结果不参与计算"
+            ), f"{broker} Kelly 统计来源不正确"
+
+            judgments = frozen.get("strategy_judgments")
+            assert isinstance(judgments, Mapping), f"{broker} 冻结策略动作缺失"
+            assert report.get("risk_skips") == judgments.get("risk_skips", []), (
+                f"{broker} 风险跳过动作与冻结报告不一致"
+            )
+            buys = report.get("buy_actions")
+            assert isinstance(buys, list), f"{broker} 正式买入动作无效"
+            for action in buys:
+                assert isinstance(action, Mapping), f"{broker} 正式买入动作无效"
+                quantity = _position_decimal(action.get("estimated_shares"), "买入数量")
+                lot = _position_decimal(action.get("lot_size"), "整手数量")
+                weight = _position_decimal(action.get("target_weight"), "目标仓位")
+                assert (
+                    quantity == quantity.to_integral_value()
+                    and lot > 0
+                    and lot == lot.to_integral_value()
+                    and quantity % lot == 0
+                ), f"{broker} 买入数量未按整手向下取整"
+                assert Decimal("0") < weight <= Decimal("0.04"), (
+                    f"{broker} 买入目标超过固定名义仓位上限"
+                )
+
+            drawdown = report.get("drawdown_summary")
+            assert (
+                isinstance(drawdown, Mapping)
+                and drawdown == frozen.get("drawdown_summary")
+                and drawdown.get("status") in {"active", "paused"}
+                and bool(drawdown.get("status_label"))
+                and _position_decimal(
+                    drawdown.get("drawdown_limit_pct"), "回撤阈值"
+                ) == Decimal("0.05")
+            ), f"{broker} 5% 策略回撤状态不正确"
+            overlay = report.get("actual_overlay")
+            assert (
+                isinstance(overlay, Mapping)
+                and overlay.get("available") is True
+                and overlay.get("broker") == broker
+                and overlay.get("broker_label") == labels[broker]
+                and overlay.get("market") == market
+                and "不会改写模拟建议、Kelly、模拟统计或报告哈希"
+                in str(overlay.get("notice") or "")
+            ), f"{broker} 只读实盘辅助与对应账户不一致"
+        except (
+            AssertionError, InvalidOperation, KeyError, OSError, TypeError,
+            UnicodeError, ValueError, json.JSONDecodeError,
+        ) as exc:
+            errors.append(str(exc) or f"{broker} 集成报告检查失败：{type(exc).__name__}")
+    return errors
 
 
 def _fetch_payload(url: str) -> dict[str, Any]:
@@ -877,6 +1124,7 @@ def _check_trend_account_views(
         assert isinstance(report, Mapping) and report.get("available") is True, (
             f"{broker} 当前趋势报告不可用"
         )
+        _check_integrated_trend_ui(report_root, report, broker)
         assert _plain(report.get("report_date")) in report_root.inner_text(), (
             f"{broker} 当前趋势报告日期未显示"
         )
@@ -1233,6 +1481,57 @@ def _check_decision_tabs(page: Any, market: str, symbol: str, broker: str) -> No
 
 def _plain(value: Any) -> str:
     return "-" if value is None or str(value).strip() == "" else str(value)
+
+
+def _check_integrated_trend_ui(
+    report_root: Any, report: Mapping[str, Any], broker: str,
+) -> None:
+    summary = report.get("risk_summary")
+    drawdown = report.get("drawdown_summary")
+    overlay = report.get("actual_overlay")
+    assert (
+        isinstance(summary, Mapping)
+        and isinstance(drawdown, Mapping)
+        and isinstance(overlay, Mapping)
+    ), f"{broker} 趋势报告缺少集成风险视图数据"
+    risk = report_root.locator(".trend-risk-summary")
+    assert risk.count() == 1, f"{broker} 趋势报告缺少风险摘要"
+    assert risk.get_attribute("data-risk-status") == summary.get("status"), (
+        f"{broker} 风险状态未同时提供文字状态"
+    )
+    assert report_root.locator(".trend-drawdown-summary").count() == 1, (
+        f"{broker} 趋势报告缺少回撤状态"
+    )
+    assert report_root.locator(".trend-actual-overlay").count() == 1, (
+        f"{broker} 趋势报告缺少只读实盘辅助"
+    )
+    text = risk.inner_text()
+    stats = summary.get("trade_stats")
+    actual_label = (
+        stats.get("actual_broker_label") if isinstance(stats, Mapping) else ""
+    )
+    required = (
+        "组合计划风险", "组合剩余风险", "单笔风险上限", "异常损失缓冲",
+        "不得用于开仓", "Kelly 阶段", "当前 Kelly 上限",
+        "富途模拟盘交易统计", f"{_plain(actual_label)}实盘交易统计",
+        "策略累计回撤", _plain(summary.get("status_label")),
+        _plain(drawdown.get("status_label")), "实盘执行辅助",
+        _plain(overlay.get("broker_label")),
+        "5% 是风险预算目标，不是最大损失保证。",
+        "不会改写模拟建议、Kelly、模拟统计或报告哈希",
+        "不会自动交易真实账户",
+    )
+    for value in required:
+        assert value != "-" and value in text, f"{broker} 集成风险视图缺少 {value}"
+    for key in ("items", "outside_positions"):
+        items = overlay.get(key)
+        assert isinstance(items, list), f"{broker} 实盘偏差列表无效"
+        for item in items:
+            label = item.get("deviation_label") if isinstance(item, Mapping) else None
+            assert isinstance(label, str) and label and label in text, (
+                f"{broker} 实盘偏差状态未用文字表达"
+            )
+    assert "本次可用风险" not in text, f"{broker} UI 仍包含 本次可用风险"
 
 
 def _display_number(value: Any) -> str:
@@ -2496,6 +2795,7 @@ def main(argv: list[str] | None = None) -> int:
     reports_dir: Path | None = None
     simulate_payloads: dict[str, dict[str, Any]] = {}
     history_expectations: dict[str, list[dict[str, Any]]] = {}
+    account_ids: dict[str, int] = {}
     external_blocker: str | None = None
     try:
         expected_cn = _expected_cn_holdings(args.expected_root)
@@ -2543,6 +2843,12 @@ def main(argv: list[str] | None = None) -> int:
                 first_reports_dir,
             )
             errors.extend(simulate_errors)
+            errors.extend(validate_integrated_candidate(
+                first,
+                expected_root=args.expected_root,
+                reports_dir=first_reports_dir,
+                account_ids=account_ids,
+            ))
         history_expectations, history_errors = _check_history_endpoints(
             args.url,
             _project_data_dir(args.expected_root),
@@ -2563,8 +2869,17 @@ def main(argv: list[str] | None = None) -> int:
             expected_phillips_total=phillips_total,
             expected_phillips_period=phillips_period,
         ))
+        if account_ids:
+            errors.extend(validate_integrated_candidate(
+                second,
+                expected_root=args.expected_root,
+                reports_dir=reports_dir,
+                account_ids=account_ids,
+            ))
         if dashboard_signature(first) != dashboard_signature(second):
             errors.append("账户刷新后的 Dashboard 数据不稳定")
+        if trend_advice_signature(first) != trend_advice_signature(second):
+            errors.append("实盘刷新改写了冻结建议、Kelly 或模拟统计")
     except Exception as exc:
         errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
         pid = None

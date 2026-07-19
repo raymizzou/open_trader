@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+import copy
 import inspect
 import json
 import os
@@ -280,6 +281,11 @@ def _run_acceptance_main_with_reports(
     )
     monkeypatch.setattr(
         dashboard_acceptance,
+        "validate_integrated_candidate",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
         "_configured_simulate_account_ids",
         lambda *_args: {"tiger": 1, "phillips": 2, "eastmoney": 3},
     )
@@ -350,6 +356,29 @@ def test_acceptance_main_fails_when_reports_dir_changes_during_refresh(
     assert result["status"] == "FAIL"
     assert "账户刷新前后的 Dashboard reports_dir 不一致" in result["errors"]
     assert browser_reports == [second.resolve()]
+
+
+def test_acceptance_main_fails_when_actual_refresh_changes_frozen_advice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "shared" / "reports"
+    reports.mkdir(parents=True)
+    signatures = iter((("first",), ("second",)))
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "trend_advice_signature",
+        lambda _payload: next(signatures),
+    )
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch, capsys, tmp_path, [reports, reports]
+    )
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert "实盘刷新改写了冻结建议、Kelly 或模拟统计" in result["errors"]
 
 
 def test_acceptance_main_fails_on_traceback_written_during_browser_check(
@@ -878,6 +907,299 @@ def valid_payload() -> dict[str, object]:
         "trend_reports": trend_reports(),
         "trend_reviews": trend_reviews(),
     }
+
+
+def integrated_v4_payload(
+    tmp_path: Path,
+) -> tuple[dict[str, object], Path, dict[str, int]]:
+    from open_trader.trend_review import _report_hash
+
+    reports_dir = tmp_path / "reports"
+    account_ids = {"tiger": 102, "phillips": 103, "eastmoney": 101}
+    payload = valid_payload()
+    payload["data_dir"] = str(tmp_path / "data")
+    payload["kelly_lab"] = {
+        "available": True,
+        "template_count": 1,
+        "templates": [{"strategy_id": "trend_pullback_20d"}],
+    }
+    (tmp_path / "data/latest").mkdir(parents=True)
+    (tmp_path / "data/latest/kelly_strategy_templates.json").write_text(
+        json.dumps({
+            "schema_version": "open_trader.kelly_strategy_templates.v1",
+            "templates": [{"strategy_id": "trend_pullback_20d"}],
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "data/latest/trend_api_stats.json").write_text(
+        json.dumps({
+            "sources": [
+                {
+                    "source": "actual",
+                    "broker": broker,
+                    "market": market,
+                    "statistics_cutoff_at": "2026-07-20T08:59:59+08:00",
+                }
+                for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items()
+            ],
+        }),
+        encoding="utf-8",
+    )
+    labels = {"tiger": "老虎", "phillips": "辉立", "eastmoney": "东方财富"}
+    directories = {
+        "tiger": "trend_us_tiger",
+        "phillips": "trend_hk_phillips",
+        "eastmoney": "trend_a_share",
+    }
+    for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
+        lot_size = 100 if market in {"CN", "HK"} else 1
+        risk_summary = {
+            "status": "active",
+            "status_label": "风险预算内",
+            "single_entry_risk_limit_pct": "0.004",
+            "portfolio_risk_limit_pct": "0.04",
+            "abnormal_loss_buffer_pct": "0.01",
+            "total_risk_budget_target_pct": "0.05",
+            "disclaimer": "5% 是风险预算目标，不是最大损失保证。",
+            "kelly_phase": "active_all_samples",
+            "kelly_eligible_sample_count": 30,
+            "kelly_selected_sample_count": 30,
+            "kelly_cap": "0.01",
+            "kelly_source": "合格的富途模拟闭环；实盘结果不参与计算",
+        }
+        buy = {
+            "action": "BUY",
+            "symbol": {"CN": "600001", "HK": "00700", "US": "AAPL"}[market],
+            "target_weight": "0.04",
+            "estimated_shares": lot_size * 3,
+            "lot_size": lot_size,
+        }
+        frozen = {
+            "execution_date": "2026-07-20",
+            "as_of_date": "2026-07-17",
+            "generated_at": "2026-07-20T09:00:00+08:00",
+            "metadata": {
+                "market": market,
+                "broker": broker,
+                "simulate_acc_id": account_ids[broker],
+            },
+            "account": serialized_trend_account(fresh=True),
+            "strategy_snapshot": {
+                "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+                "strategy_version": "v4",
+                "parameters": {
+                    "single_entry_risk_limit": "0.004",
+                    "portfolio_risk_limit": "0.04",
+                    "abnormal_loss_buffer": "0.01",
+                    "drawdown_limit": "0.05",
+                    **(
+                        {"lot_size_source": "Futu 每标的整手"}
+                        if market == "HK"
+                        else {"lot_size": lot_size}
+                    ),
+                    "target_weight": (
+                        {"热": "0.04", "沸": "0.02"}
+                        if market == "CN"
+                        else "0.04"
+                    ),
+                },
+            },
+            "strategy_judgments": {
+                "formal_actions": [buy],
+                "holding_decisions": [],
+                "top10_candidates": [],
+                "risk_skips": [],
+            },
+            "risk_summary": risk_summary,
+            "drawdown_summary": {
+                "status": "active",
+                "status_label": "纪律内",
+                "entry_allowed": True,
+                "drawdown_pct": "0",
+                "drawdown_limit_pct": "0.05",
+            },
+            "data_sources": [f"Futu {market} SIMULATE account"],
+        }
+        artifact = reports_dir / directories[broker] / "2026-07-20.json"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text(json.dumps(frozen), encoding="utf-8")
+        report = payload["trend_reports"][broker]  # type: ignore[index]
+        assert isinstance(report, dict)
+        report.update({
+            "available": True,
+            "broker": broker,
+            "broker_label": labels[broker],
+            "market": market,
+            "artifact": artifact.name,
+            "report_sha256": _report_hash(frozen),
+            "strategy_version": "v4",
+            "buy_actions": [buy],
+            "sell_actions": [],
+            "hold_actions": [],
+            "review_actions": [],
+            "risk_skips": [],
+            "risk_summary": {
+                **risk_summary,
+                "trade_stats": {
+                    "available": True,
+                    "statistics_cutoff_at": "2026-07-20T08:59:59+08:00",
+                    "actual_broker": broker,
+                    "actual_broker_label": labels[broker],
+                    "simulation": {"eligible_sample_count": 30},
+                    "actual": {"eligible_sample_count": 2},
+                },
+            },
+            "drawdown_summary": frozen["drawdown_summary"],
+            "actual_overlay": {
+                "available": True,
+                "broker": broker,
+                "broker_label": labels[broker],
+                "market": market,
+                "notice": (
+                    "只读执行辅助；实盘变化不会改写模拟建议、Kelly、模拟统计或报告哈希；"
+                    "系统不会自动交易真实账户。"
+                ),
+                "items": [{"deviation_label": "已跟随"}],
+                "outside_positions": [],
+            },
+            "audit": {"artifact": artifact.name},
+        })
+    return payload, reports_dir, account_ids
+
+
+def test_acceptance_validates_integrated_templates_and_three_market_reports(
+    tmp_path: Path,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+
+    assert dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("template", "Kelly 模板"),
+        ("account", "模拟账户"),
+        ("risk", "单笔风险"),
+        ("lot", "整手"),
+        ("stats", "实盘统计券商"),
+        ("cutoff", "来源截止时间"),
+        ("overlay", "实盘辅助"),
+    ],
+)
+def test_acceptance_rejects_integrated_contract_drift(
+    tmp_path: Path, mutation: str, expected: str,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    if mutation == "template":
+        payload["kelly_lab"]["templates"] = []  # type: ignore[index]
+    elif mutation == "account":
+        artifact = reports_dir / "trend_us_tiger/2026-07-20.json"
+        frozen = json.loads(artifact.read_text(encoding="utf-8"))
+        frozen["metadata"]["simulate_acc_id"] = 999
+        artifact.write_text(json.dumps(frozen), encoding="utf-8")
+        from open_trader.trend_review import _report_hash
+        report["report_sha256"] = _report_hash(frozen)
+    elif mutation == "risk":
+        report["risk_summary"]["single_entry_risk_limit_pct"] = "0.4"  # type: ignore[index]
+    elif mutation == "lot":
+        report["buy_actions"][0]["estimated_shares"] = 3.5  # type: ignore[index]
+    elif mutation == "stats":
+        report["risk_summary"]["trade_stats"]["actual_broker"] = "eastmoney"  # type: ignore[index]
+    elif mutation == "cutoff":
+        report["risk_summary"]["trade_stats"][  # type: ignore[index]
+            "statistics_cutoff_at"
+        ] = "2026-07-21T00:00:00+08:00"
+    else:
+        report["actual_overlay"]["broker"] = "eastmoney"  # type: ignore[index]
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert any(expected in error for error in errors)
+
+
+def test_trend_advice_signature_allows_overlay_refresh_only(tmp_path: Path) -> None:
+    first, _reports_dir, _account_ids = integrated_v4_payload(tmp_path)
+    second = copy.deepcopy(first)
+    second_report = second["trend_reports"]["tiger"]  # type: ignore[index]
+    second_report["actual_overlay"]["items"] = [{"deviation_label": "超买"}]  # type: ignore[index]
+
+    assert dashboard_acceptance.trend_advice_signature(
+        first
+    ) == dashboard_acceptance.trend_advice_signature(second)
+
+    second_report["risk_summary"]["trade_stats"]["actual"] = {  # type: ignore[index]
+        "eligible_sample_count": 3,
+    }
+    assert dashboard_acceptance.trend_advice_signature(
+        first
+    ) != dashboard_acceptance.trend_advice_signature(second)
+
+    second = copy.deepcopy(first)
+    second_report = second["trend_reports"]["tiger"]  # type: ignore[index]
+    second_report["buy_actions"][0]["estimated_shares"] = 4  # type: ignore[index]
+    assert dashboard_acceptance.trend_advice_signature(
+        first
+    ) != dashboard_acceptance.trend_advice_signature(second)
+
+
+def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
+    report = {
+        "risk_summary": {
+            "status": "active", "status_label": "风险预算内",
+            "trade_stats": {"actual_broker_label": "东方财富"},
+        },
+        "drawdown_summary": {"status_label": "纪律内"},
+        "actual_overlay": {
+            "broker_label": "东方财富",
+            "items": [{"deviation_label": "超买"}],
+            "outside_positions": [{"deviation_label": "报告外加仓"}],
+        },
+    }
+    text = " ".join((
+        "组合计划风险 风险预算内 组合剩余风险 单笔风险上限 异常损失缓冲 不得用于开仓",
+        "Kelly 阶段 当前 Kelly 上限 富途模拟盘交易统计 东方财富实盘交易统计",
+        "策略累计回撤 纪律内 实盘执行辅助 东方财富 超买 报告外加仓",
+        "5% 是风险预算目标，不是最大损失保证。",
+        "不会改写模拟建议、Kelly、模拟统计或报告哈希 不会自动交易真实账户",
+    ))
+
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self) -> str:
+            return text
+
+        def get_attribute(self, name: str) -> str | None:
+            assert name == "data-risk-status"
+            return "active"
+
+    class Root:
+        def inner_text(self) -> str:
+            return text
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+    dashboard_acceptance._check_integrated_trend_ui(
+        Root(), report, "eastmoney"
+    )
 
 
 def test_acceptance_checks_exact_trend_review_content() -> None:
