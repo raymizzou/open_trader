@@ -741,11 +741,14 @@ def trend_reports() -> dict[str, dict[str, object]]:
             "attention_markets": [
                 {
                     "market": "US", "market_label": "美股", "data_status": "current",
-                    "data_date": "2026-07-15", "items": [{"symbol": "VIXY"}],
+                    "data_date": "2026-07-15", "status_text": "今日已更新",
+                    "items": [{"symbol": "VIXY"}],
                 },
                 {
                     "market": "HK", "market_label": "港股", "data_status": "stale",
-                    "data_date": "2026-07-14", "items": [{"symbol": "00700"}],
+                    "data_date": "2026-07-14",
+                    "status_text": "数据截至 2026-07-14；今日未更新",
+                    "items": [{"symbol": "00700"}],
                 },
             ],
         },
@@ -1364,6 +1367,8 @@ def trend_workspace_text(
 
 
 def option_attention_market_status(market: dict[str, object]) -> str:
+    if market.get("status_text"):
+        return str(market["status_text"])
     status = market.get("data_status")
     if status == "current":
         return "今日已更新"
@@ -3330,6 +3335,22 @@ def test_option_attention_acceptance_checks_current_and_stale_status_text() -> N
     ]
 
 
+def test_option_attention_acceptance_checks_execution_day_status_text() -> None:
+    payload = valid_payload()
+    market = payload["trend_reports"]["futu"]["attention_markets"][0]  # type: ignore[index]
+    market.update(
+        data_date="2026-07-17",
+        status_text="今日执行（数据截至 2026-07-17）",
+    )
+    page = tabbed_account_page(payload)
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert page.option_attention_header_spans[0] == [
+        "美股", "今日执行（数据截至 2026-07-17）",
+    ]
+
+
 @pytest.mark.parametrize("width", (760, 375))
 def test_option_attention_acceptance_checks_valid_responsive_geometry(
     width: int,
@@ -3503,7 +3524,7 @@ def test_option_attention_acceptance_rejects_missing_market_status(
 def test_option_attention_acceptance_checks_unavailable_without_data_date() -> None:
     payload = valid_payload()
     unavailable = payload["trend_reports"]["futu"]["attention_markets"][0]  # type: ignore[index]
-    unavailable.update(data_status="unavailable")
+    unavailable.update(data_status="unavailable", status_text="暂时不可用")
     unavailable.pop("data_date")
     page = tabbed_account_page(payload)
 
@@ -3516,7 +3537,7 @@ def test_option_attention_acceptance_accepts_empty_unavailable_markets() -> None
     payload = valid_payload()
     markets = payload["trend_reports"]["futu"]["attention_markets"]  # type: ignore[index]
     for market in markets:
-        market.update(data_status="unavailable", items=[])
+        market.update(data_status="unavailable", status_text="暂时不可用", items=[])
         market.pop("data_date", None)
     page = tabbed_account_page(payload)
 
@@ -3528,7 +3549,7 @@ def test_option_attention_acceptance_accepts_empty_unavailable_markets() -> None
 def test_option_attention_acceptance_rejects_missing_unavailable_status() -> None:
     payload = valid_payload()
     unavailable = payload["trend_reports"]["futu"]["attention_markets"][0]  # type: ignore[index]
-    unavailable.update(data_status="unavailable")
+    unavailable.update(data_status="unavailable", status_text="暂时不可用")
     unavailable.pop("data_date")
     page = tabbed_account_page(payload)
     page.option_attention_header_spans[0][1] = "状态缺失"

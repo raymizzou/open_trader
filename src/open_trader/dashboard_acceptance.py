@@ -2053,14 +2053,22 @@ def _check_account_holdings(
                 assert data_status in {"current", "stale", "unavailable"}, (
                     f"futu 期权关注 {market_name} 数据状态无效"
                 )
+                data_date = str(market.get("data_date") or "").strip()
+                status_text = str(market.get("status_text") or "").strip()
                 if data_status == "current":
-                    status_text = "今日已更新"
+                    assert status_text == "今日已更新" or (
+                        data_date
+                        and status_text == f"今日执行（数据截至 {data_date}）"
+                    ), f"futu 期权关注 {market_name} 当前状态文案无效"
                 elif data_status == "stale":
-                    data_date = str(market.get("data_date") or "").strip()
                     assert data_date, "futu 期权关注过期市场缺少数据日期"
-                    status_text = f"数据截至 {data_date}；今日未更新"
+                    assert status_text == f"数据截至 {data_date}；今日未更新", (
+                        f"futu 期权关注 {market_name} 过期状态文案无效"
+                    )
                 else:
-                    status_text = "暂时不可用"
+                    assert status_text == "暂时不可用", (
+                        f"futu 期权关注 {market_name} 不可用状态文案无效"
+                    )
                 header = rowgroup.locator(
                     ".option-attention-market-content span"
                 )
