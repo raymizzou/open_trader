@@ -35,9 +35,23 @@ from open_trader.notifications import (
 )
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
+from open_trader.strategy_drawdown import manual_unlock_strategy_drawdown
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def unlock_live_drawdown(data_dir: Path, market: str) -> None:
+    manual_unlock_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/v3",
+        strategy_version="v3",
+        current_equity=Decimal("100000"),
+        occurred_at="2026-07-14T08:00:00+08:00",
+        event_id=f"test-bootstrap-{market.lower()}-v3",
+        actor="pytest",
+    )
 
 
 class DefaultSimAccountClient:
@@ -594,6 +608,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, "HK")
     write_protection_state(
         market_paths(cfg.data_dir, cfg.reports_dir, "HK").state,
         {
@@ -817,6 +832,7 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     tmp_path: Path,
 ) -> None:
     cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, "US")
     write_protection_state(
         market_paths(cfg.data_dir, cfg.reports_dir, "US").state,
         {

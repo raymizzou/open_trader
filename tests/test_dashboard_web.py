@@ -4002,6 +4002,9 @@ const html = renderTrendReportWorkspace({
     total_risk_budget_target_pct:"0.05",
     disclaimer:"5% 是风险预算目标，不是最大损失保证。",
     portfolio_remaining_risk_note:"组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"},
+  drawdown_summary:{status:"paused",status_label:"暂停新开仓",
+    current_equity:"95000",high_water_mark:"100000",drawdown_pct:"0.05",
+    drawdown_limit_pct:"0.05",pause_reason:"策略累计回撤已达到 5%，需人工解锁"},
   sell_actions:[{symbol:"600000",name:"浦发银行",reason:"danger_signal"}],
   buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
     temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
@@ -4018,7 +4021,8 @@ const html = renderTrendReportWorkspace({
     decisive_constraint:"组合剩余风险"}],
   hold_actions:[],review_actions:[],audit:{},
 });
-for (const text of ["模拟策略风险","风险预算内","组合正常计划风险",
+for (const text of ["组合计划风险","风险预算内","策略累计回撤",
+  "暂停新开仓","策略累计回撤已达到 5%，需人工解锁",
   "组合剩余风险","单笔风险上限","异常损失缓冲","不得用于开仓",
   "5% 是风险预算目标，不是最大损失保证。","目标仓位（占净值）",
   "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
@@ -4030,6 +4034,7 @@ for (const text of ["模拟策略风险","风险预算内","组合正常计划�
 if (html.includes("本次可用风险") || html.includes("<th scope=\"col\">目标仓位</th>")) {
   throw new Error(html);
 }
+if (html.includes("组合正常计划风险")) throw new Error(html);
 const counts = html.indexOf('class="trend-report-metrics cn-trend-counts"');
 const risk = html.indexOf('class="trend-risk-summary"');
 const sell = html.indexOf("优先处理 · 卖出触发");
@@ -4038,6 +4043,13 @@ if ((html.match(/class="cn-trend-card"/g) || []).length < 3 ||
     (html.match(/class="cn-trend-execution cn-trend-risk-detail"/g) || []).length !== 2) {
   throw new Error(html);
 }
+const drawdownOnly = renderTrendRiskSummary(null, {
+  status:"paused",status_label:"暂停新开仓",drawdown_pct:null,
+  drawdown_limit_pct:"0.05",current_equity:"95000",high_water_mark:null,
+  pause_reason:"策略累计回撤状态缺失，暂停新开仓"
+});
+if (!drawdownOnly.includes("策略累计回撤") ||
+    !drawdownOnly.includes('data-risk-status="paused"')) throw new Error(drawdownOnly);
 console.log("ok");
 ''')
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
@@ -4087,7 +4099,7 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
 
         assert errors == []
         risk_text = page.locator(".trend-risk-summary").inner_text()
-        assert "模拟策略风险" in risk_text
+        assert "组合计划风险" in risk_text
         assert "风险预算内" in risk_text
         assert page.locator(".cn-trend-card").count() == 2
         assert page.evaluate(

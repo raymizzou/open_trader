@@ -67,6 +67,7 @@ from .technical_facts import (
     technical_facts_latest_path,
 )
 from .trend_review import _report_hash
+from .strategy_drawdown import DRAWDOWN_LIMIT, valid_drawdown_decision
 from .tradingagents_summary import (
     index_tradingagents_summary_by_market_symbol,
     load_tradingagents_summary_cache,
@@ -839,24 +840,54 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     )
     summary = payload.get("risk_summary")
     if summary is None:
-        return strategy_version != "v2"
+        return strategy_version not in {"v2", "v3"}
     if not isinstance(summary, dict) or any(
         isinstance(value, (dict, list)) for value in summary.values()
     ):
         return False
-    if strategy_version != "v2":
+    if strategy_version not in {"v2", "v3"}:
         return summary.get("status") in {"active", "paused"}
     judgments = payload.get("strategy_judgments")
     parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
     account = payload.get("account")
     expected_nav = account.get("net_value") if isinstance(account, dict) else None
-    return (
+    risk_valid = (
         isinstance(judgments, dict)
         and "risk_skips" in judgments
         and valid_v2_risk_contract(
             parameters, summary, expected_nav=expected_nav
         )
         and _valid_v2_risk_items(payload, judgments, summary)
+    )
+    if strategy_version == "v2":
+        return risk_valid
+    metadata = payload.get("metadata")
+    market = metadata.get("market") if isinstance(metadata, dict) else ""
+    strategy_id = snapshot.get("strategy_id") if isinstance(snapshot, dict) else ""
+    formal_actions = judgments.get("formal_actions") if isinstance(judgments, dict) else None
+    drawdown = payload.get("drawdown_summary")
+    return (
+        risk_valid
+        and isinstance(parameters, dict)
+        and parameters.get("drawdown_limit") == str(DRAWDOWN_LIMIT)
+        and parameters.get("drawdown_equity_source")
+        == "Futu SIMULATE strategy NAV"
+        and parameters.get("drawdown_unlock") == "manual_same_version_rebase"
+        and valid_drawdown_decision(
+            drawdown,
+            expected_market=str(market),
+            expected_strategy_id=str(strategy_id),
+            expected_strategy_version="v3",
+            expected_equity=expected_nav,
+        )
+        and (
+            drawdown.get("entry_allowed") is True
+            or isinstance(formal_actions, list)
+            and not any(
+                isinstance(action, dict) and action.get("action") == "BUY"
+                for action in formal_actions
+            )
+        )
     )
 
 
@@ -1166,6 +1197,7 @@ def _project_broker_trend_report(
         "buy_actions": buy_actions,
         "risk_skips": payload["strategy_judgments"].get("risk_skips", []),
         "risk_summary": payload.get("risk_summary", {}),
+        "drawdown_summary": payload.get("drawdown_summary", {}),
         "hold_actions": hold_actions,
         "review_actions": review_actions,
         "counts": {
