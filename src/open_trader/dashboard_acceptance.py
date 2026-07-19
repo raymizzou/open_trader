@@ -391,6 +391,7 @@ def validate_integrated_candidate(
     payload: Mapping[str, Any],
     *,
     expected_root: Path,
+    expected_sha: str,
     reports_dir: Path,
     account_ids: Mapping[str, int],
 ) -> list[str]:
@@ -401,6 +402,7 @@ def validate_integrated_candidate(
                 encoding="utf-8"
             )
         )
+        assert isinstance(templates_payload, Mapping), "Kelly 模板文件不是对象"
         expected_templates = templates_payload["templates"]
         lab = payload.get("kelly_lab")
         assert isinstance(lab, Mapping) and lab.get("available") is True, (
@@ -427,6 +429,7 @@ def validate_integrated_candidate(
         stats_payload = json.loads(
             (data_dir / "latest/trend_api_stats.json").read_text(encoding="utf-8")
         )
+        assert isinstance(stats_payload, Mapping), "交易统计来源文件不是对象"
         sources = stats_payload.get("sources")
         assert isinstance(sources, list), "交易统计来源清单无效"
         for broker, market in TREND_SIMULATE_MARKETS.items():
@@ -457,6 +460,12 @@ def validate_integrated_candidate(
             assert report.get("broker") == broker and report.get("market") == market, (
                 f"{broker} 三市场报告身份不匹配"
             )
+            assert report.get("data_status") == "current", (
+                f"{broker} 未加载当前真实数据报告"
+            )
+            assert report.get("account_fresh") is True, (
+                f"{broker} Futu 模拟账户快照不是最新"
+            )
             artifact = report.get("artifact") or (
                 report.get("audit") or {}
             ).get("artifact")
@@ -481,6 +490,10 @@ def validate_integrated_candidate(
             assert f"Futu {market} SIMULATE account" in frozen.get(
                 "data_sources", []
             ), f"{broker} 冻结报告缺少 Futu 模拟账户数据源"
+            account = frozen.get("account")
+            assert isinstance(account, Mapping) and account.get("fresh") is True, (
+                f"{broker} 冻结报告的 Futu 模拟账户快照不是最新"
+            )
 
             snapshot = frozen.get("strategy_snapshot")
             parameters = (
@@ -489,8 +502,9 @@ def validate_integrated_candidate(
             assert (
                 isinstance(parameters, Mapping)
                 and snapshot.get("strategy_version") == "v4"
+                and snapshot.get("process_version") == expected_sha
                 and report.get("strategy_version") == "v4"
-            ), f"{broker} 未加载 Kelly/回撤 v4 策略"
+            ), f"{broker} 未加载候选 Git SHA 的 Kelly/回撤 v4 策略"
             for key, expected, label in (
                 ("single_entry_risk_limit", Decimal("0.004"), "单笔风险"),
                 ("portfolio_risk_limit", Decimal("0.04"), "组合风险"),
@@ -1317,6 +1331,7 @@ def _source_changes(cwd: Path) -> list[str]:
         [
             "git", "-C", str(cwd), "status", "--porcelain",
             "--untracked-files=all", "--", "src/open_trader",
+            "data/latest/kelly_strategy_templates.json",
         ],
         text=True,
     )
@@ -2846,6 +2861,7 @@ def main(argv: list[str] | None = None) -> int:
             errors.extend(validate_integrated_candidate(
                 first,
                 expected_root=args.expected_root,
+                expected_sha=expected_sha,
                 reports_dir=first_reports_dir,
                 account_ids=account_ids,
             ))
@@ -2873,6 +2889,7 @@ def main(argv: list[str] | None = None) -> int:
             errors.extend(validate_integrated_candidate(
                 second,
                 expected_root=args.expected_root,
+                expected_sha=expected_sha,
                 reports_dir=reports_dir,
                 account_ids=account_ids,
             ))

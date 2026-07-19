@@ -987,6 +987,7 @@ def integrated_v4_payload(
             "strategy_snapshot": {
                 "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
                 "strategy_version": "v4",
+                "process_version": "candidate-sha",
                 "parameters": {
                     "single_entry_risk_limit": "0.004",
                     "portfolio_risk_limit": "0.04",
@@ -1027,6 +1028,8 @@ def integrated_v4_payload(
         assert isinstance(report, dict)
         report.update({
             "available": True,
+            "data_status": "current",
+            "account_fresh": True,
             "broker": broker,
             "broker_label": labels[broker],
             "market": market,
@@ -1075,9 +1078,34 @@ def test_acceptance_validates_integrated_templates_and_three_market_reports(
     assert dashboard_acceptance.validate_integrated_candidate(
         payload,
         expected_root=tmp_path,
+        expected_sha="candidate-sha",
         reports_dir=reports_dir,
         account_ids=account_ids,
     ) == []
+
+
+@pytest.mark.parametrize(
+    ("artifact", "expected"),
+    [
+        ("kelly_strategy_templates.json", "Kelly 模板"),
+        ("trend_api_stats.json", "交易统计来源"),
+    ],
+)
+def test_acceptance_reports_malformed_integrated_artifact_container(
+    tmp_path: Path, artifact: str, expected: str,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    (tmp_path / "data/latest" / artifact).write_text("[]", encoding="utf-8")
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert any(expected in error for error in errors)
 
 
 @pytest.mark.parametrize(
@@ -1123,6 +1151,44 @@ def test_acceptance_rejects_integrated_contract_drift(
     errors = dashboard_acceptance.validate_integrated_candidate(
         payload,
         expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert any(expected in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("process", "候选 Git SHA"),
+        ("stale", "当前真实数据"),
+        ("account", "模拟账户快照不是最新"),
+    ],
+)
+def test_acceptance_rejects_noncandidate_or_stale_integrated_report(
+    tmp_path: Path, mutation: str, expected: str,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    if mutation == "process":
+        artifact = reports_dir / "trend_us_tiger/2026-07-20.json"
+        frozen = json.loads(artifact.read_text(encoding="utf-8"))
+        frozen["strategy_snapshot"]["process_version"] = "other-sha"
+        artifact.write_text(json.dumps(frozen), encoding="utf-8")
+        from open_trader.trend_review import _report_hash
+        report["report_sha256"] = _report_hash(frozen)
+    elif mutation == "stale":
+        report["data_status"] = "stale"
+    else:
+        report["account_fresh"] = False
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
         reports_dir=reports_dir,
         account_ids=account_ids,
     )
@@ -4430,14 +4496,26 @@ def test_acceptance_rejects_latest_exact_api_identity_that_differs_from_local_re
 def test_acceptance_rejects_dirty_dashboard_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
+    commands: list[list[str]] = []
+
+    def status(*args: object, **kwargs: object) -> str:
+        del kwargs
+        commands.append(list(args[0]))  # type: ignore[arg-type]
+        return " M src/open_trader/dashboard.py\n"
+
     monkeypatch.setattr(
         dashboard_acceptance.subprocess,
         "check_output",
-        lambda *_args, **_kwargs: " M src/open_trader/dashboard.py\n",
+        status,
     )
 
     assert dashboard_acceptance._source_changes(tmp_path) == [
         "M src/open_trader/dashboard.py"
+    ]
+    assert commands[0][-3:] == [
+        "--",
+        "src/open_trader",
+        "data/latest/kelly_strategy_templates.json",
     ]
 
 
