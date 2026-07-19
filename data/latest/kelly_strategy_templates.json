@@ -1,0 +1,103 @@
+{
+  "schema_version": "open_trader.kelly_strategy_templates.v1",
+  "templates": [
+    {
+      "strategy_id": "trend_pullback_20d",
+      "strategy_name": "趋势回调 20D",
+      "strategy_version": "v1",
+      "entry_rule_description": "价格回调到 20 日均线附近，且趋势结构未破坏。",
+      "exit_rule_description": "达到目标价、跌破止损位，或持仓满 20 个交易日后退出。",
+      "rules": {
+        "entry": {
+          "type": "pullback_to_moving_average",
+          "ma_days": 20,
+          "tolerance_pct": 1,
+          "trend_filter": {
+            "type": "moving_average_slope",
+            "ma_days": 50,
+            "direction": "up"
+          }
+        },
+        "stop_loss": {
+          "type": "any_of",
+          "rules": [
+            {
+              "type": "pct_below_moving_average",
+              "ma_days": 20,
+              "pct": 3
+            },
+            {
+              "type": "recent_swing_low_break",
+              "lookback_days": 20
+            }
+          ]
+        },
+        "take_profit": {
+          "type": "risk_multiple",
+          "trigger_r": 2,
+          "sell_pct": 50
+        },
+        "trailing_stop": {
+          "type": "close_below_moving_average",
+          "ma_days": 10,
+          "apply_to_remaining_position": true
+        },
+        "time_exit": {
+          "type": "max_holding_days",
+          "days": 20,
+          "exit_if": "no_take_profit_or_stop_loss"
+        }
+      },
+      "max_holding_days": 20,
+      "order_type": "limit",
+      "market_session": "regular"
+    },
+    {
+      "strategy_id": "breakout_10d",
+      "strategy_name": "突破 10D",
+      "strategy_version": "v1",
+      "entry_rule_description": "价格放量突破近 10 个交易日高点后买入。",
+      "exit_rule_description": "跌回突破位下方、触发止损，或持仓满 10 个交易日后退出。",
+      "rules": {
+        "entry": {
+          "type": "volume_breakout_high",
+          "lookback_days": 10,
+          "volume_multiple": 1.5
+        },
+        "stop_loss": {
+          "type": "any_of",
+          "rules": [
+            {
+              "type": "pct_below_reference_price",
+              "reference": "突破价",
+              "pct": 2
+            },
+            {
+              "type": "atr_below_entry",
+              "atr_multiple": 1.5
+            }
+          ]
+        },
+        "take_profit": {
+          "type": "risk_multiple",
+          "trigger_r": 2,
+          "sell_pct": 50
+        },
+        "trailing_stop": {
+          "type": "close_below_recent_low",
+          "lookback_days": 5,
+          "apply_to_remaining_position": true
+        },
+        "time_exit": {
+          "type": "max_holding_days",
+          "days": 10,
+          "exit_if": "minimum_unrealized_r_not_reached",
+          "min_unrealized_r": 1
+        }
+      },
+      "max_holding_days": 10,
+      "order_type": "limit",
+      "market_session": "regular"
+    }
+  ]
+}
