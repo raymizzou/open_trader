@@ -1860,6 +1860,67 @@ table {
   font-weight: 700;
 }
 
+.trend-actual-overlay {
+  border-top: 1px solid var(--line);
+  min-width: 0;
+  padding-top: 10px;
+}
+
+.trend-actual-overlay summary {
+  cursor: pointer;
+  font-weight: 700;
+  min-height: 44px;
+  overflow-wrap: anywhere;
+}
+
+.trend-actual-rows,
+.trend-actual-row {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.trend-actual-row {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.trend-actual-row header,
+.trend-actual-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.trend-actual-row header span {
+  color: var(--muted);
+}
+
+.trend-actual-row header span[data-deviation="followed"] {
+  color: var(--ok);
+}
+
+.trend-actual-row header span[data-deviation="underbought"],
+.trend-actual-row header span[data-deviation="skipped"],
+.trend-actual-row header span[data-deviation="chased"],
+.trend-actual-row header span[data-deviation="not_held"],
+.trend-actual-row header span[data-deviation="reference_unavailable"],
+.trend-actual-row header span[data-deviation="review"] {
+  color: var(--accent-strong);
+}
+
+.trend-actual-row header span[data-deviation="missed_sell"],
+.trend-actual-row header span[data-deviation="overbought"],
+.trend-actual-row header span[data-deviation="outside_report_addition"] {
+  color: var(--danger);
+}
+
+.trend-actual-facts span {
+  background: var(--surface-soft);
+  overflow-wrap: anywhere;
+  padding: 4px 7px;
+}
+
 .cn-trend-stage {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -4154,6 +4215,7 @@ tbody tr.active-row,
 .action-card,
 .backtest-metric-card,
 .trend-risk-summary dl div,
+.trend-actual-facts span,
 .cn-trend-card td:nth-child(-n + 2),
 .cn-trend-execution td,
 .cn-trend-buy .cn-trend-execution td,

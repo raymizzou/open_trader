@@ -1453,6 +1453,278 @@ def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
     assert report["drawdown_summary"] == payload["drawdown_summary"]
 
 
+def test_dashboard_actual_overlay_refreshes_without_mutating_frozen_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
+    monkeypatch.setattr(
+        dashboard_module, "_shanghai_date", lambda: date(2026, 7, 15)
+    )
+    report_path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    report_path.parent.mkdir(parents=True)
+    payload = _valid_v4_dashboard_trend_payload()
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    buy = judgments["formal_actions"][0]
+    assert isinstance(buy, dict)
+    buy["name"] = "测试"
+    buy["estimated_initial_line"] = "9"
+    sell = {
+        "action": "SELL_ALL",
+        "symbol": "600003",
+        "name": "待卖",
+        "reason": "danger_signal",
+        "close": "20",
+        "active_line": "18",
+    }
+    hold = {
+        "action": "HOLD",
+        "symbol": "600004",
+        "name": "持有",
+        "reason": "trend_intact",
+        "close": "30",
+        "active_line": "29",
+    }
+    judgments["formal_actions"].insert(0, sell)
+    judgments["holding_decisions"] = [sell, hold]
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    frozen_bytes = report_path.read_bytes()
+    frozen_hash = _report_hash(payload)
+
+    detail_dir = config.data_dir / "runs/2026-07-15"
+    positions = [
+        ("600001", "200", "10", "2000"),
+        ("600002", "100", "10", "1000"),
+        ("600003", "50", "20", "1000"),
+        ("600004", "100", "30", "3000"),
+        ("600099", "10", "50", "500"),
+    ]
+
+    def write_actual_rows(buy_quantity: str) -> None:
+        rows = []
+        for symbol, quantity, last_price, market_value in positions:
+            if symbol == "600001":
+                quantity, market_value = buy_quantity, str(Decimal(buy_quantity) * 10)
+            rows.append({
+                "statement_id": "2026-07-eastmoney",
+                "broker": "eastmoney",
+                "account_alias": "eastmoney_main",
+                "market": "CN",
+                "asset_class": "stock",
+                "symbol": symbol,
+                "name": symbol,
+                "currency": "CNY",
+                "quantity": quantity,
+                "last_price": last_price,
+                "market_value": market_value,
+            })
+        write_csv(detail_dir / "extracted_positions.csv", POSITION_FIELDNAMES, rows)
+        invested = sum(Decimal(row["market_value"]) for row in rows)
+        write_csv(
+            detail_dir / "extracted_cash.csv",
+            CASH_FIELDNAMES,
+            [{
+                "statement_id": "2026-07-eastmoney",
+                "broker": "eastmoney",
+                "account_alias": "eastmoney_main",
+                "currency": "CNY",
+                "cash_balance": str(Decimal("100000") - invested),
+                "available_balance": str(Decimal("100000") - invested),
+            }],
+        )
+
+    write_actual_rows("200")
+    first = load_dashboard_state(config).to_dict()["trend_reports"]["eastmoney"]
+    write_actual_rows("500")
+    second = load_dashboard_state(config).to_dict()["trend_reports"]["eastmoney"]
+    write_actual_rows("0")
+    third = load_dashboard_state(config).to_dict()["trend_reports"]["eastmoney"]
+
+    assert report_path.read_bytes() == frozen_bytes
+    assert (
+        first["report_sha256"]
+        == second["report_sha256"]
+        == third["report_sha256"]
+        == frozen_hash
+    )
+    for key in ("buy_actions", "sell_actions", "hold_actions", "risk_skips"):
+        assert first[key] == second[key] == third[key]
+    assert {
+        key: value
+        for key, value in first["risk_summary"].items()
+        if key != "trade_stats"
+    } == payload["risk_summary"]
+    assert first["risk_summary"] == second["risk_summary"] == third["risk_summary"]
+
+    first_overlay = first["actual_overlay"]
+    assert first_overlay["available"] is True
+    assert first_overlay["broker_label"] == "东方财富"
+    assert first_overlay["account_nav_hkd"] == "108000.00"
+    assert first_overlay["status_text"] == "结单数据，非实时"
+    first_by_symbol = {
+        item["symbol"]: item for item in first_overlay["items"]
+    }
+    assert first_by_symbol["600001"] == {
+        "symbol": "600001",
+        "name": "测试",
+        "frozen_action": "BUY",
+        "frozen_action_label": "正式买入",
+        "target_weight": "0.04",
+        "simulation_quantity": "300",
+        "actual_reference_quantity": "400",
+        "actual_quantity": "200",
+        "actual_market_value": "2000",
+        "currency": "CNY",
+        "deviation": "underbought",
+        "deviation_label": "少买",
+        "frozen_reference_price": "10",
+        "protection_line": "9",
+        "protection_line_label": "预计保护线",
+        "estimated_exit_loss": "200.00",
+        "risk_note": "若按策略保护线退出，预计损失 CNY 200.00（按冻结参考价估算，不代表实时风险上限）",
+    }
+    assert first_by_symbol["600002"]["deviation_label"] == "追买"
+    assert first_by_symbol["600003"]["deviation_label"] == "漏卖"
+    assert first_by_symbol["600004"]["deviation_label"] == "已跟随"
+    assert first_by_symbol["600004"]["risk_note"] == (
+        "若按策略保护线退出，预计损失 CNY 100.00（按冻结参考价估算，不代表实时风险上限）"
+    )
+    assert first_overlay["outside_positions"] == [{
+        "symbol": "600099",
+        "name": "600099",
+        "actual_quantity": "10",
+        "actual_market_value": "500",
+        "currency": "CNY",
+        "deviation": "outside_report_addition",
+        "deviation_label": "报告外加仓",
+        "attribution_status": "unconfirmed",
+        "risk_note": "风险未纳入估算",
+    }]
+    assert second["actual_overlay"]["items"][1]["deviation_label"] == "超买"
+    assert third["actual_overlay"]["items"][1]["deviation_label"] == "跳过"
+    assert "真实最大风险" not in json.dumps(first_overlay, ensure_ascii=False)
+    assert "已挂" not in json.dumps(first_overlay, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    (
+        "market",
+        "broker",
+        "directory",
+        "currency",
+        "fx",
+        "price",
+        "lot",
+        "cash_balance",
+        "expected_quantity",
+        "live",
+        "label",
+    ),
+    [
+        (
+            "US", "tiger", "trend_us_tiger", "USD", "8", "100",
+            1, "248000", "100", True, "老虎",
+        ),
+        (
+            "HK", "phillips", "trend_hk_phillips", "HKD", "1", "20",
+            100, "98000", "200", False, "辉立",
+        ),
+    ],
+)
+def test_dashboard_actual_overlay_uses_full_broker_nav_for_each_market(
+    tmp_path: Path,
+    market: str,
+    broker: str,
+    directory: str,
+    currency: str,
+    fx: str,
+    price: str,
+    lot: int,
+    cash_balance: str,
+    expected_quantity: str,
+    live: bool,
+    label: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    report_path = config.reports_dir / directory / "2026-07-15.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps({
+            "execution_date": "2026-07-15",
+            "as_of_date": "2026-07-14",
+            "generated_at": "2026-07-15T08:00:00+08:00",
+            "account": serialized_trend_account(fresh=True),
+            "metadata": {"market": market, "broker": broker},
+            "strategy_snapshot": {"strategy_version": "v1"},
+            "strategy_judgments": {
+                "formal_actions": [{
+                    "action": "BUY",
+                    "symbol": "TARGET",
+                    "name": "Target",
+                    "target_weight": "0.04",
+                    "estimated_shares": 3,
+                    "close": price,
+                    "lot_size": lot,
+                    "estimated_initial_line": str(Decimal(price) * Decimal("0.9")),
+                }],
+                "holding_decisions": [],
+                "top10_candidates": [],
+            },
+            "option_attention": [],
+        }),
+        encoding="utf-8",
+    )
+    statement_id = f"2026-07-15-{broker}-live" if live else f"2026-07-{broker}"
+    positions = [{
+        "statement_id": statement_id,
+        "broker": broker,
+        "account_alias": f"{broker}_main",
+        "market": market,
+        "asset_class": "stock",
+        "symbol": "TARGET",
+        "name": "Target",
+        "currency": currency,
+        "quantity": str(Decimal("2000") / Decimal(price)),
+        "last_price": price,
+        "market_value": "2000",
+        "fx_to_hkd": fx,
+    }]
+    cash = [{
+        "statement_id": statement_id,
+        "broker": broker,
+        "account_alias": f"{broker}_main",
+        "currency": currency,
+        "cash_balance": cash_balance,
+        "available_balance": "1000",
+        "fx_to_hkd": fx,
+    }]
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+        broker_positions=positions,
+        cash_details=cash,
+    )[broker]
+
+    overlay = report["actual_overlay"]
+    assert overlay["broker_label"] == label
+    assert overlay["account_nav_hkd"] == str(
+        ((Decimal("2000") + Decimal(cash_balance)) * Decimal(fx)).quantize(
+            Decimal("0.01")
+        )
+    )
+    assert overlay["items"][0]["actual_reference_quantity"] == expected_quantity
+    assert overlay["items"][0]["frozen_reference_price"] == price
+    assert overlay["status_text"] == (
+        "账户实时同步" if live else "结单数据，非实时"
+    )
+
+
 @pytest.mark.parametrize("missing_section", ["risk_summary", "drawdown_summary"])
 def test_dashboard_v4_missing_risk_contract_fails_closed(
     tmp_path: Path, missing_section: str,
@@ -1512,7 +1784,7 @@ def test_dashboard_projects_exact_version_api_stats_into_risk_summary(
     assert trade_stats["opening_strategy_version"] == "v2"
     assert trade_stats["statistics_cutoff_at"] == "2026-07-17T23:59:59+08:00"
     assert trade_stats["actual_broker"] == "eastmoney"
-    assert trade_stats["actual_label"] == "东方财富实盘交易统计"
+    assert trade_stats["actual_broker_label"] == "东方财富"
     assert trade_stats["simulation"]["eligible_sample_count"] == 0
     assert trade_stats["actual"]["eligible_sample_count"] == 0
 

@@ -100,10 +100,14 @@ DETAIL_FX_TO_HKD = {
     "USD": Decimal("7.8"),
     "CNY": Decimal("1.08"),
 }
+TREND_MARKET_CURRENCIES = {"CN": "CNY", "HK": "HKD", "US": "USD"}
 TREND_REPORT_SOURCES = {
     "tiger": ("US", "美股", "老虎", "trend_us_tiger", "美股常规交易时段"),
     "phillips": ("HK", "港股", "辉立", "trend_hk_phillips", "09:30–10:00"),
     "eastmoney": ("CN", "A股", "东方财富", "trend_a_share", "09:30–10:00"),
+}
+TREND_ACTUAL_BROKERS = {
+    market: broker for broker, (market, *_rest) in TREND_REPORT_SOURCES.items()
 }
 OPTION_ATTENTION_KEYS = {
     "market",
@@ -322,7 +326,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         kelly_lab=kelly_lab,
         backtest_universe=backtest_universe,
         trend_reports=_load_trend_reports(
-            config.data_dir, config.reports_dir
+            config.data_dir,
+            config.reports_dir,
+            broker_positions=broker_positions,
+            cash_details=raw_cash_details,
         ),
         trend_reviews=_load_trend_reviews(config.data_dir),
     )
@@ -477,8 +484,15 @@ def _load_trend_reviews(data_dir: Path) -> dict[str, dict[str, Any]]:
 
 
 def _load_trend_reports(
-    data_dir: Path, reports_dir: Path, *, today: date | None = None
+    data_dir: Path,
+    reports_dir: Path,
+    *,
+    today: date | None = None,
+    broker_positions: list[dict[str, str]] | None = None,
+    cash_details: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    if broker_positions is None or cash_details is None:
+        broker_positions, cash_details = _latest_broker_details(data_dir)
     report_date = (today or _shanghai_date()).isoformat()
     reports = {
         broker: _load_broker_trend_report(
@@ -490,6 +504,8 @@ def _load_trend_reports(
             broker_label=broker_label,
             buy_window=buy_window,
             report_date=report_date,
+            broker_positions=broker_positions,
+            cash_details=cash_details,
         )
         for broker, (market, market_label, broker_label, directory, buy_window)
         in TREND_REPORT_SOURCES.items()
@@ -627,6 +643,7 @@ def load_historical_trend_report(
         generated_at,
         _,
     ) = selected
+    broker_positions, cash_details = _latest_broker_details(data_dir)
     return _project_broker_trend_report(
         selected=(
             path,
@@ -644,6 +661,8 @@ def load_historical_trend_report(
         broker_label=broker_label,
         buy_window=buy_window,
         report_date=_shanghai_date().isoformat(),
+        broker_positions=broker_positions,
+        cash_details=cash_details,
     )
 
 
@@ -1134,6 +1153,8 @@ def _load_broker_trend_report(
     broker_label: str,
     buy_window: str,
     report_date: str,
+    broker_positions: list[dict[str, str]],
+    cash_details: list[dict[str, str]],
 ) -> dict[str, Any]:
     unavailable = {
         "available": False,
@@ -1159,6 +1180,8 @@ def _load_broker_trend_report(
         broker_label=broker_label,
         buy_window=buy_window,
         report_date=report_date,
+        broker_positions=broker_positions,
+        cash_details=cash_details,
     )
 
 
@@ -1173,6 +1196,8 @@ def _project_broker_trend_report(
     broker_label: str,
     buy_window: str,
     report_date: str,
+    broker_positions: list[dict[str, str]] | None = None,
+    cash_details: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     path, payload, execution_date, as_of_date, freshness_date, generated_at = selected
     account = payload["account"]
@@ -1200,6 +1225,17 @@ def _project_broker_trend_report(
         data_dir,
         market=market,
         strategy_snapshot=payload.get("strategy_snapshot"),
+    )
+    actual_overlay = _project_trend_actual_overlay(
+        broker=broker,
+        market=market,
+        sell_actions=sell_actions,
+        buy_actions=buy_actions,
+        hold_actions=hold_actions,
+        review_actions=review_actions,
+        risk_skips=payload["strategy_judgments"].get("risk_skips", []),
+        broker_positions=broker_positions or [],
+        cash_details=cash_details or [],
     )
     return {
         "available": True,
@@ -1233,6 +1269,7 @@ def _project_broker_trend_report(
         "risk_skips": payload["strategy_judgments"].get("risk_skips", []),
         "risk_summary": risk_summary,
         "drawdown_summary": payload.get("drawdown_summary", {}),
+        "actual_overlay": actual_overlay,
         "hold_actions": hold_actions,
         "review_actions": review_actions,
         "counts": {
@@ -1255,6 +1292,308 @@ def _project_broker_trend_report(
             "artifact": path.name,
         },
     }
+
+
+def _project_trend_actual_overlay(
+    *,
+    broker: str,
+    market: str,
+    sell_actions: list[dict[str, Any]],
+    buy_actions: list[dict[str, Any]],
+    hold_actions: list[dict[str, Any]],
+    review_actions: list[dict[str, Any]],
+    risk_skips: list[dict[str, Any]],
+    broker_positions: list[dict[str, str]],
+    cash_details: list[dict[str, str]],
+) -> dict[str, Any]:
+    positions = [
+        row
+        for row in broker_positions
+        if _broker_key(row.get("broker", "")) == broker
+        and str(row.get("market") or "").strip().upper() == market
+        and not _is_cash_like_row(row)
+    ]
+    broker_cash = [
+        row
+        for row in cash_details
+        if _broker_key(row.get("broker", "")) == broker
+    ]
+    broker_rows = [
+        row
+        for row in broker_positions
+        if _broker_key(row.get("broker", "")) == broker
+    ]
+    if not broker_rows and not broker_cash:
+        return {
+            "available": False,
+            "broker": broker,
+            "broker_label": BROKER_LABELS[broker],
+            "market": market,
+            "status_text": "实盘账户数据暂不可用",
+            "items": [],
+            "outside_positions": [],
+        }
+
+    summary = _build_broker_summary(
+        broker, [], broker_positions, cash_details, {}
+    )
+    nav_hkd = _optional_decimal(summary.get("portfolio_value_hkd", ""))
+    price_fx_to_hkd = next(
+        (
+            rate
+            for row in [*broker_rows, *broker_cash]
+            if str(row.get("currency") or "").strip().upper()
+            == TREND_MARKET_CURRENCIES.get(market)
+            and (rate := _detail_fx_to_hkd(row)) is not None
+        ),
+        DETAIL_FX_TO_HKD.get(TREND_MARKET_CURRENCIES.get(market, "")),
+    )
+    position_by_symbol = _aggregate_trend_actual_positions(positions)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for action in [
+        *sell_actions,
+        *buy_actions,
+        *hold_actions,
+        *review_actions,
+        *risk_skips,
+    ]:
+        symbol = str(action.get("symbol") or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        rows.append(
+            _project_trend_actual_item(
+                action,
+                position_by_symbol.get(symbol),
+                nav_hkd=nav_hkd,
+                market=market,
+                price_fx_to_hkd=price_fx_to_hkd,
+                risk_skip=action in risk_skips,
+            )
+        )
+
+    outside = [
+        {
+            "symbol": position["symbol"],
+            "name": position["name"],
+            "actual_quantity": _decimal_text(position["quantity"]),
+            "actual_market_value": (
+                _decimal_text(position["market_value"])
+                if position["market_value"] is not None
+                else ""
+            ),
+            "currency": position["currency"],
+            "deviation": "outside_report_addition",
+            "deviation_label": "报告外加仓",
+            "attribution_status": "unconfirmed",
+            "risk_note": "风险未纳入估算",
+        }
+        for symbol, position in sorted(position_by_symbol.items())
+        if symbol not in seen
+    ]
+    live = _has_live_statement_row([*broker_rows, *broker_cash], broker)
+    return {
+        "available": True,
+        "broker": broker,
+        "broker_label": BROKER_LABELS[broker],
+        "market": market,
+        "account_nav_hkd": _money_text(nav_hkd) if nav_hkd is not None else "",
+        "account_nav_basis": "完整账户净值（持仓+现金）",
+        "status_text": "账户实时同步" if live else "结单数据，非实时",
+        "notice": (
+            "只读执行辅助；实盘变化不会改写模拟建议、Kelly、模拟统计或报告哈希；"
+            "系统不会自动交易真实账户。"
+        ),
+        "items": rows,
+        "outside_positions": outside,
+    }
+
+
+def _aggregate_trend_actual_positions(
+    positions: list[dict[str, str]],
+) -> dict[str, dict[str, Any]]:
+    aggregated: dict[str, dict[str, Any]] = {}
+    for row in positions:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        quantity = _optional_decimal(row.get("quantity", ""))
+        market_value = _optional_decimal(row.get("market_value", ""))
+        if not symbol or quantity is None or quantity <= 0:
+            continue
+        current = aggregated.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "name": str(row.get("name") or symbol).strip() or symbol,
+                "currency": str(row.get("currency") or "").strip().upper(),
+                "quantity": Decimal("0"),
+                "market_value": Decimal("0"),
+            },
+        )
+        current["quantity"] += quantity
+        if market_value is None:
+            current["market_value"] = None
+        elif current["market_value"] is not None:
+            current["market_value"] += market_value
+    return aggregated
+
+
+def _project_trend_actual_item(
+    action: dict[str, Any],
+    position: dict[str, Any] | None,
+    *,
+    nav_hkd: Decimal | None,
+    market: str,
+    price_fx_to_hkd: Decimal | None,
+    risk_skip: bool,
+) -> dict[str, Any]:
+    symbol = str(action.get("symbol") or "").strip().upper()
+    frozen_action = "SKIP" if risk_skip else str(action.get("action") or "")
+    actual_quantity = position["quantity"] if position else Decimal("0")
+    currency = (
+        str(position.get("currency") or "").strip().upper()
+        if position
+        else TREND_MARKET_CURRENCIES.get(market, "")
+    )
+    reference_quantity = (
+        _trend_actual_reference_quantity(
+            action,
+            nav_hkd=nav_hkd,
+            price_fx_to_hkd=price_fx_to_hkd,
+        )
+        if frozen_action == "BUY"
+        else Decimal("0")
+        if frozen_action in {"SELL_ALL", "SKIP"}
+        else None
+    )
+    deviation, deviation_label = _trend_actual_deviation(
+        frozen_action,
+        actual_quantity=actual_quantity,
+        reference_quantity=reference_quantity,
+    )
+    line = _optional_decimal(
+        str(action.get("active_line") or action.get("estimated_initial_line") or "")
+    )
+    close = _optional_decimal(str(action.get("close") or ""))
+    estimated_loss = (
+        max(Decimal("0"), close - line) * actual_quantity
+        if line is not None and close is not None
+        else None
+    )
+    return {
+        "symbol": symbol,
+        "name": str(action.get("name") or symbol),
+        "frozen_action": frozen_action,
+        "frozen_action_label": {
+            "BUY": "正式买入",
+            "SELL_ALL": "全部卖出",
+            "HOLD": "继续持有",
+            "SKIP": "跳过",
+            "MANUAL_REVIEW": "人工复核",
+        }.get(frozen_action, "人工复核"),
+        "target_weight": str(action.get("target_weight") or ""),
+        "simulation_quantity": str(action.get("estimated_shares") or ""),
+        "actual_reference_quantity": (
+            _decimal_text(reference_quantity)
+            if reference_quantity is not None
+            else ""
+        ),
+        "actual_quantity": _decimal_text(actual_quantity),
+        "actual_market_value": (
+            _decimal_text(position["market_value"])
+            if position and position["market_value"] is not None
+            else "0"
+            if position is None
+            else ""
+        ),
+        "currency": currency,
+        "deviation": deviation,
+        "deviation_label": deviation_label,
+        "frozen_reference_price": _decimal_text(close) if close is not None else "",
+        "protection_line": _decimal_text(line) if line is not None else "",
+        "protection_line_label": (
+            "活动保护线"
+            if action.get("active_line") not in {None, ""}
+            else "预计保护线"
+            if action.get("estimated_initial_line") not in {None, ""}
+            else ""
+        ),
+        "estimated_exit_loss": (
+            _money_text(estimated_loss) if estimated_loss is not None else ""
+        ),
+        "risk_note": (
+            f"若按策略保护线退出，预计损失 {currency} {_money_text(estimated_loss)}"
+            "（按冻结参考价估算，不代表实时风险上限）"
+            if estimated_loss is not None
+            else "暂无策略保护线，风险未纳入估算"
+        ),
+    }
+
+
+def _trend_actual_reference_quantity(
+    action: dict[str, Any],
+    *,
+    nav_hkd: Decimal | None,
+    price_fx_to_hkd: Decimal | None,
+) -> Decimal | None:
+    weight = _optional_decimal(str(action.get("target_weight") or ""))
+    price = _optional_decimal(str(action.get("close") or ""))
+    lot = _optional_decimal(str(action.get("lot_size") or ""))
+    if (
+        nav_hkd is None
+        or weight is None
+        or weight < 0
+        or price is None
+        or price <= 0
+        or lot is None
+        or lot <= 0
+        or price_fx_to_hkd is None
+    ):
+        return None
+    return Decimal(
+        int(nav_hkd * weight / price / price_fx_to_hkd / lot)
+    ) * lot
+
+
+def _trend_actual_deviation(
+    frozen_action: str,
+    *,
+    actual_quantity: Decimal,
+    reference_quantity: Decimal | None,
+) -> tuple[str, str]:
+    if frozen_action == "BUY":
+        if reference_quantity is None:
+            return "reference_unavailable", "暂无法换算"
+        if actual_quantity == 0:
+            return "skipped", "跳过"
+        if actual_quantity < reference_quantity:
+            return "underbought", "少买"
+        if actual_quantity > reference_quantity:
+            return "overbought", "超买"
+        return "followed", "已跟随"
+    if frozen_action == "SELL_ALL":
+        return (
+            ("missed_sell", "漏卖")
+            if actual_quantity > 0
+            else ("followed", "已跟随")
+        )
+    if frozen_action == "SKIP":
+        return (
+            ("chased", "追买")
+            if actual_quantity > 0
+            else ("followed", "跳过")
+        )
+    if frozen_action == "HOLD":
+        return (
+            ("followed", "已跟随")
+            if actual_quantity > 0
+            else ("not_held", "未持有")
+        )
+    return "review", "待人工复核"
+
+
+def _decimal_text(value: Decimal) -> str:
+    return format(value.normalize(), "f")
 
 
 def _project_trend_trade_stats(
@@ -1296,12 +1635,6 @@ def _project_trend_trade_stats(
         if len(actual_sources) == 1
         else {"CN": "eastmoney", "HK": "phillips", "US": "tiger"}[market]
     )
-    actual_label = {
-        "eastmoney": "东方财富实盘交易统计",
-        "phillips": "辉立实盘交易统计",
-        "tiger": "老虎实盘交易统计",
-    }[actual_broker]
-
     def compact(source: str) -> dict[str, Any]:
         stat = by_source[source]
         return {
@@ -1321,7 +1654,7 @@ def _project_trend_trade_stats(
             else payload["statistics_cutoff_at"]
         ),
         "actual_broker": actual_broker,
-        "actual_label": actual_label,
+        "actual_broker_label": BROKER_LABELS[actual_broker],
         "simulation": compact("simulation"),
         "actual": compact("actual"),
     }

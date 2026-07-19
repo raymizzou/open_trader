@@ -2186,19 +2186,66 @@ function renderTrendTradeStats(stats) {
       : "—";
     return `<div><dt>${escapeHtml(label)}</dt><dd>胜率 ${escapeHtml(winRate)} · 盈亏比 ${escapeHtml(payoff)} · 样本 ${escapeHtml(sample)}</dd></div>`;
   };
+  const actualLabel = hasValue(stats.actual_broker_label)
+    ? `${formatPlain(stats.actual_broker_label)}实盘交易统计`
+    : "实盘交易统计";
   return `${row("富途模拟盘交易统计", stats.simulation)}
-      ${row(stats.actual_label || "实盘交易统计", stats.actual)}`;
+      ${row(actualLabel, stats.actual)}`;
 }
 
-function renderTrendRiskSummary(summary, drawdown) {
+function renderTrendActualOverlay(overlay) {
+  if (!overlay || typeof overlay !== "object") return "";
+  const broker = formatPlain(overlay.broker_label || "实盘");
+  if (overlay.available !== true) {
+    return `<details class="trend-actual-overlay"><summary>实盘执行辅助 · ${escapeHtml(broker)} · ${escapeHtml(formatPlain(overlay.status_text || "数据暂不可用"))}</summary></details>`;
+  }
+  const renderRow = (item, outside = false) => {
+    const target = hasValue(item.target_weight)
+      ? `目标仓位 ${decimalAsPercent(item.target_weight, "—")}`
+      : "";
+    const facts = outside
+      ? [
+          `真实持仓 ${formatDisplayNumber(item.actual_quantity)}`,
+          `市值 ${formatPlain(item.currency)} ${formatDisplayNumber(item.actual_market_value)}`,
+          "归因未确认",
+        ]
+      : [
+          `冻结动作 ${formatPlain(item.frozen_action_label)}`,
+          target,
+          `模拟数量 ${hasValue(item.simulation_quantity) ? formatDisplayNumber(item.simulation_quantity) : "—"}`,
+          `实盘参考数量 ${hasValue(item.actual_reference_quantity) ? formatDisplayNumber(item.actual_reference_quantity) : "—"}`,
+          `真实持仓 ${formatDisplayNumber(item.actual_quantity)}`,
+          `市值 ${formatPlain(item.currency)} ${formatDisplayNumber(item.actual_market_value)}`,
+          hasValue(item.frozen_reference_price) ? `冻结参考价 ${formatPlain(item.currency)} ${formatDisplayNumber(item.frozen_reference_price)}` : "",
+          hasValue(item.protection_line) ? `${formatPlain(item.protection_line_label || "策略保护线")} ${formatDisplayNumber(item.protection_line)}` : "",
+        ];
+    return `<div class="trend-actual-row"><header><strong>${escapeHtml(`${formatPlain(item.symbol)} ${formatPlain(item.name)}`.trim())}</strong><span data-deviation="${escapeHtml(formatPlain(item.deviation))}">${escapeHtml(formatPlain(item.deviation_label))}</span></header>
+      <div class="trend-actual-facts">${facts.filter(Boolean).map((fact) => `<span>${escapeHtml(fact)}</span>`).join("")}</div>
+      <p>${escapeHtml(formatPlain(item.risk_note))}</p></div>`;
+  };
+  const items = Array.isArray(overlay.items) ? overlay.items : [];
+  const outside = Array.isArray(overlay.outside_positions) ? overlay.outside_positions : [];
+  const actionable = new Set(["underbought", "skipped", "missed_sell", "chased", "overbought", "outside_report_addition", "not_held", "reference_unavailable", "review"]);
+  const deviationCount = items.filter((item) => actionable.has(item.deviation)).length + outside.length;
+  const open = deviationCount ? " open" : "";
+  const renderedRows = `${items.map((item) => renderRow(item)).join("")}${outside.map((item) => renderRow(item, true)).join("")}`;
+  return `<details class="trend-actual-overlay"${open}><summary>实盘执行辅助 · ${escapeHtml(broker)} · 偏差 ${deviationCount} · ${escapeHtml(formatPlain(overlay.status_text))}</summary>
+    <p>真实账户净值 HKD ${escapeHtml(formatDisplayNumber(overlay.account_nav_hkd))}（持仓+现金） · 实盘参考数量按真实账户净值和冻结参考价换算</p>
+    <p>${escapeHtml(formatPlain(overlay.notice))}</p>
+    <div class="trend-actual-rows">${renderedRows || "<p>暂无执行偏差</p>"}</div>
+  </details>`;
+}
+
+function renderTrendRiskSummary(summary, drawdown, actualOverlay) {
   const hasPlanRisk = summary && typeof summary === "object" && hasValue(summary.status);
   const hasDrawdown = drawdown && typeof drawdown === "object" && hasValue(drawdown.status);
-  if (!hasPlanRisk && !hasDrawdown) return "";
+  const hasActualOverlay = actualOverlay && typeof actualOverlay === "object";
+  if (!hasPlanRisk && !hasDrawdown && !hasActualOverlay) return "";
   const planned = hasPlanRisk ? `${formatDisplayNumber(summary.portfolio_planned_risk)}（${trendRiskPercent(summary.portfolio_planned_risk_pct)} / ${trendRiskPercent(summary.portfolio_risk_limit_pct)}）` : "";
   const remaining = hasPlanRisk ? `${formatDisplayNumber(summary.portfolio_remaining_risk)}（${trendRiskPercent(summary.portfolio_remaining_risk_pct)}）` : "";
   const single = hasPlanRisk ? `${formatDisplayNumber(summary.single_entry_risk_limit)}（${trendRiskPercent(summary.single_entry_risk_limit_pct)}）` : "";
   const buffer = hasPlanRisk ? `${formatDisplayNumber(summary.abnormal_loss_buffer)}（${trendRiskPercent(summary.abnormal_loss_buffer_pct)}）` : "";
-  const status = hasPlanRisk ? summary.status : drawdown.status;
+  const status = hasPlanRisk ? summary.status : hasDrawdown ? drawdown.status : "actual";
   const kellyPhase = hasPlanRisk ? ({
     cold_start: "冷启动",
     active_all_samples: "全样本启用",
@@ -2229,6 +2276,7 @@ function renderTrendRiskSummary(summary, drawdown) {
       <dl><div><dt>策略累计回撤</dt><dd>${trendRiskPercent(drawdown.drawdown_pct)} / ${trendRiskPercent(drawdown.drawdown_limit_pct)}</dd></div>
       <div><dt>策略模拟净值</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.current_equity))}</dd></div>
       <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl></div>` : ""}
+    ${renderTrendActualOverlay(actualOverlay)}
   </section>`;
 }
 
@@ -2487,7 +2535,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
         <span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
       </div>
     </header>
-    ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary)}
+    ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay)}
     <div class="cn-trend-actions">
       ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
       ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}

@@ -4106,7 +4106,7 @@ const base={status:"active",status_label:"风险预算内",
   abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",portfolio_remaining_risk_note:"说明"};
 const available=renderTrendRiskSummary({...base,trade_stats:{available:true,
   statistics_cutoff_at:"2026-07-20T11:59:59+08:00",
-  actual_label:"东方财富实盘交易统计",
+  actual_broker_label:"东方财富",
   simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
   actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}});
 for (const text of ["富途模拟盘交易统计","胜率 50% · 盈亏比 1.25 · 样本 4",
@@ -4120,6 +4120,78 @@ console.log("ok");
 ''')
 
     assert "ok" in output
+
+
+def test_dashboard_renders_read_only_actual_execution_overlay() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendReportWorkspace({
+  available:true,market:"CN",broker:"eastmoney",broker_label:"东方财富",market_label:"A股",
+  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
+  account_status:"已更新",buy_window:"09:30–10:00",counts:{},
+  risk_summary:{status:"active",status_label:"风险预算内",
+    portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
+    portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"3697",
+    portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
+    single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
+    abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",portfolio_remaining_risk_note:"说明"},
+  actual_overlay:{available:true,broker_label:"东方财富",account_nav_hkd:"108000.00",
+    status_text:"结单数据，非实时",
+    notice:"只读执行辅助；实盘变化不会改写模拟建议、Kelly、模拟统计或报告哈希；系统不会自动交易真实账户。",
+    items:[
+      {symbol:"600001",name:"测试",frozen_action_label:"正式买入",target_weight:"0.04",
+       simulation_quantity:"300",actual_reference_quantity:"400",actual_quantity:"200",
+       actual_market_value:"2000",currency:"CNY",deviation:"underbought",deviation_label:"少买",frozen_reference_price:"10",protection_line:"9",
+       risk_note:"若按策略保护线退出，预计损失 CNY 200.00（按冻结参考价估算，不代表实时风险上限）"},
+      {symbol:"600002",name:"跳过",frozen_action_label:"正式买入",target_weight:"0.04",
+       simulation_quantity:"300",actual_reference_quantity:"400",actual_quantity:"0",
+       actual_market_value:"0",currency:"CNY",deviation:"skipped",deviation_label:"跳过",protection_line:"9",
+       risk_note:"暂无策略保护线，风险未纳入估算"},
+      {symbol:"600003",name:"待卖",frozen_action_label:"全部卖出",target_weight:"",
+       simulation_quantity:"",actual_reference_quantity:"0",actual_quantity:"50",
+       actual_market_value:"1000",currency:"CNY",deviation:"missed_sell",deviation_label:"漏卖",protection_line:"18",
+       risk_note:"若按策略保护线退出，预计损失 CNY 100.00"},
+      {symbol:"600004",name:"追买",frozen_action_label:"跳过",target_weight:"0.04",
+       simulation_quantity:"0",actual_reference_quantity:"0",actual_quantity:"100",
+       actual_market_value:"1000",currency:"CNY",deviation:"chased",deviation_label:"追买",protection_line:"",
+       risk_note:"暂无策略保护线，风险未纳入估算"},
+      {symbol:"600005",name:"超买",frozen_action_label:"正式买入",target_weight:"0.04",
+       simulation_quantity:"300",actual_reference_quantity:"400",actual_quantity:"500",
+       actual_market_value:"5000",currency:"CNY",deviation:"overbought",deviation_label:"超买",protection_line:"9",
+       risk_note:"若按策略保护线退出，预计损失 CNY 500.00"}
+    ],
+    outside_positions:[{symbol:"600099",name:"报告外",actual_quantity:"10",
+      actual_market_value:"500",currency:"CNY",deviation:"outside_report_addition",deviation_label:"报告外加仓",
+      attribution_status:"unconfirmed",risk_note:"风险未纳入估算"}]},
+  sell_actions:[],buy_actions:[],risk_skips:[],hold_actions:[],review_actions:[],audit:{},
+});
+for (const text of ["实盘执行辅助","东方财富","偏差 6","真实账户净值 HKD 108,000.00",
+  "结单数据，非实时","模拟数量 300","实盘参考数量 400","真实持仓 200",
+  "冻结参考价 CNY 10","按冻结参考价估算，不代表实时风险上限",
+  "少买","跳过","漏卖","追买","超买","报告外加仓",
+  "若按策略保护线退出，预计损失 CNY 200.00","风险未纳入估算",
+  "不会改写模拟建议、Kelly、模拟统计或报告哈希","不会自动交易真实账户"]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+for (const forbidden of ["真实最大风险","券商端已挂止损","已挂止损"]) {
+  if (html.includes(forbidden)) throw new Error(forbidden + "\n" + html);
+}
+if ((html.match(/class="trend-actual-row"/g) || []).length !== 6 ||
+    !html.includes('class="trend-actual-overlay" open')) throw new Error(html);
+const followed = renderTrendActualOverlay({available:true,broker_label:"老虎",status_text:"账户实时同步",account_nav_hkd:"100",
+  notice:"只读",items:[{symbol:"AAPL",name:"Apple",deviation:"followed",deviation_label:"已跟随",
+    frozen_action_label:"继续持有",actual_quantity:"1",actual_market_value:"10",currency:"USD",
+    risk_note:"若按策略保护线退出，预计损失 USD 1.00"}],outside_positions:[]});
+if (!followed.includes("偏差 0") || followed.includes('class="trend-actual-overlay" open') ||
+    !followed.includes('data-deviation="followed"')) throw new Error(followed);
+console.log("ok");
+''')
+
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    assert "ok" in output
+    assert '.trend-actual-row header span[data-deviation="followed"]' in css
+    assert 'color: var(--ok);' in css
+    assert '.trend-actual-row header span[data-deviation="overbought"]' in css
 
 
 def test_dashboard_risk_summary_and_candidate_cards_fit_375px() -> None:
@@ -4136,9 +4208,21 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
     single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
     abnormal_loss_buffer_pct:"0.01",disclaimer:"5% 是风险预算目标，不是最大损失保证。",
     portfolio_remaining_risk_note:"组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
-    trade_stats:{available:true,statistics_cutoff_at:"2026-07-20T11:59:59+08:00",actual_label:"东方财富实盘交易统计",
+    trade_stats:{available:true,statistics_cutoff_at:"2026-07-20T11:59:59+08:00",
+      actual_broker_label:"东方财富",
       simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
       actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}},
+  actual_overlay:{available:true,broker_label:"东方财富",account_nav_hkd:"108000",
+    status_text:"结单数据，非实时",notice:"只读执行辅助；系统不会自动交易真实账户。",
+    items:[{symbol:"600001",name:"一个名称很长但仍然必须在三百七十五像素宽度内换行的标的",
+      frozen_action_label:"正式买入",target_weight:"0.04",simulation_quantity:"300",
+      actual_reference_quantity:"400",actual_quantity:"200",actual_market_value:"2000",
+      currency:"CNY",deviation:"underbought",deviation_label:"少买",frozen_reference_price:"10",protection_line:"9",
+      risk_note:"若按策略保护线退出，预计损失 CNY 200.00（按冻结参考价估算，不代表实时风险上限）"}],
+    outside_positions:[{symbol:"600099",name:"报告外加仓",actual_quantity:"10",
+      actual_market_value:"500",currency:"CNY",deviation_label:"报告外加仓",
+      deviation:"outside_report_addition",
+      risk_note:"风险未纳入估算"}]},
   sell_actions:[],buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
     temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",industry:"电力",
     industry_temperature:"热",market_cap:"100",amount:"2",target_weight:"0.04",
@@ -4167,12 +4251,21 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
         assert "风险预算内" in risk_text
         assert "富途模拟盘交易统计" in risk_text
         assert "东方财富实盘交易统计" in risk_text
+        assert "实盘执行辅助" in risk_text
+        assert "冻结参考价 CNY 10" in risk_text
+        assert page.locator(".trend-actual-overlay").get_attribute("open") is not None
         assert page.locator(".cn-trend-card").count() == 2
         assert page.evaluate(
             "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
         )
         assert page.locator(".cn-trend-buy").evaluate(
             "node => node.scrollWidth <= node.clientWidth"
+        )
+        assert page.locator(".trend-actual-overlay").evaluate(
+            "node => node.scrollWidth <= node.clientWidth"
+        )
+        assert page.locator(".trend-actual-row").evaluate_all(
+            "nodes => nodes.every(node => node.scrollWidth <= node.clientWidth)"
         )
         browser.close()
 
@@ -4194,6 +4287,12 @@ const html=renderTrendReportWorkspace({
   hold_actions:[],review_actions:[{symbol:attack,name:attack,close:attack,
     temperature_prev:attack,temperature_curr:attack,strength:attack,
     reason:"holding_kline_unavailable",active_line:attack,entry_hints:[attack]}],
+  actual_overlay:{available:true,broker_label:attack,account_nav_hkd:attack,
+    status_text:attack,notice:attack,items:[{symbol:attack,name:attack,
+      frozen_action_label:attack,target_weight:attack,simulation_quantity:attack,
+      actual_reference_quantity:attack,actual_quantity:attack,actual_market_value:attack,
+      currency:attack,deviation_label:attack,frozen_reference_price:attack,
+      protection_line:attack,risk_note:attack}],outside_positions:[]},
   audit:{candidates:[{symbol:attack,name:attack,
     excluded_reasons:[attack],filter_price:attack,close:attack}],excluded:{[attack]:[attack]},
     industry_concentration:[[attack]],data_sources:[attack],actual_api_cost:attack},
