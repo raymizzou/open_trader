@@ -135,6 +135,93 @@ def test_statement_actual_fill_rejects_wrong_broker_market_pair() -> None:
         )
 
 
+def test_statement_fills_sort_by_source_sequence_without_changing_api_order() -> None:
+    statement_fills = [
+        fill(
+            fill_id,
+            side="buy",
+            quantity="1",
+            price="10",
+            fee="0.1",
+            filled_at="2026-07-10T15:00:00+08:00",
+            source="actual",
+            broker="eastmoney",
+            account_id="eastmoney_main",
+            market="CN",
+            currency="CNY",
+        )
+        for fill_id in ("z-source-first", "a-source-second")
+    ]
+    for sequence, statement_fill in enumerate(statement_fills, start=1):
+        statement_fill.update({
+            "statement_period": "2026-07",
+            "execution_granularity": "statement_trade_date",
+            "timestamp_semantics": "market_close_ordering_sentinel",
+            "statement_sequence": sequence,
+        })
+    closing_fill = fill(
+        "m-close",
+        side="sell",
+        quantity="2",
+        price="11",
+        fee="0.2",
+        filled_at="2026-07-11T15:00:00+08:00",
+        source="actual",
+        broker="eastmoney",
+        account_id="eastmoney_main",
+        market="CN",
+        currency="CNY",
+    )
+    closing_fill.update({
+        "statement_period": "2026-07",
+        "execution_granularity": "statement_trade_date",
+        "timestamp_semantics": "market_close_ordering_sentinel",
+        "statement_sequence": 3,
+    })
+    statement_fills.append(closing_fill)
+    api_fills = [
+        fill(
+            fill_id,
+            side="buy",
+            quantity="1",
+            price="10",
+            fee="0.1",
+            filled_at="2026-07-10T07:00:00+00:00",
+            source="actual",
+            broker="tiger",
+            account_id="U1",
+        )
+        for fill_id in ("z-api", "a-api")
+    ]
+
+    payload = build_trend_api_stats_payload(
+        [*statement_fills, *api_fills],
+        strategy_versions=[],
+        generated_at="2026-07-12T00:00:00+08:00",
+        statistics_cutoff_at="2026-07-11T23:59:59+08:00",
+    )
+
+    assert [
+        item["fill_id"]
+        for item in payload["fills"]
+        if item["broker"] == "eastmoney"
+    ] == ["z-source-first", "a-source-second", "m-close"]
+    assert [
+        item["fill_id"]
+        for item in payload["fills"]
+        if item["broker"] == "tiger"
+    ] == ["a-api", "z-api"]
+    statement_round = next(
+        round_ for round_ in payload["rounds"] if round_["broker"] == "eastmoney"
+    )
+    assert statement_round["opening_fill_id"] == "z-source-first"
+    assert statement_round["fill_ids"] == [
+        "z-source-first",
+        "a-source-second",
+        "m-close",
+    ]
+
+
 def test_closed_round_deduplicates_fills_and_aggregates_scaled_entry_partial_exit_and_fees() -> None:
     fills = [
         fill("b1", side="buy", quantity="10", price="10", fee="1", filled_at="2026-01-01T10:00:00+00:00", source="actual", broker="tiger", account_id="U1"),

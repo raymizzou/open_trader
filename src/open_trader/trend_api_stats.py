@@ -1068,12 +1068,23 @@ def _deduplicate_fills(
         by_identity[identity] = fill
     return sorted(
         by_identity.values(),
-        key=lambda fill: (
-            _aware_timestamp(fill["filled_at"], "fill filled_at"),
-            str(fill["source_id"]),
-            str(fill["fill_id"]),
-        ),
+        key=_fill_sort_key,
     )
+
+
+def _fill_sort_key(fill: Mapping[str, object]) -> tuple[object, ...]:
+    common = (
+        _aware_timestamp(fill["filled_at"], "fill filled_at"),
+        str(fill["source_id"]),
+    )
+    if fill.get("broker") in _STATEMENT_ACCOUNTS:
+        return (
+            *common,
+            0,
+            int(fill["statement_sequence"]),
+            str(fill["fill_id"]),
+        )
+    return (*common, 1, 0, str(fill["fill_id"]))
 
 
 def _validated_fill(raw: Mapping[str, object]) -> dict[str, object]:
