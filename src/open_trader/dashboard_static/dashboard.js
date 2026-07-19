@@ -2158,6 +2158,31 @@ function renderTrendRiskRow(item, columnCount, status) {
   return `<tr class="cn-trend-execution cn-trend-risk-detail"><td colspan="${columnCount}">${details.map((detail) => `<span>${escapeHtml(detail)}</span>`).join("")}</td></tr>`;
 }
 
+function renderTrendTradeStats(stats) {
+  if (!stats || typeof stats !== "object") return "";
+  if (stats.available !== true) {
+    return `<div><dt>交易统计</dt><dd>${escapeHtml(formatPlain(stats.status_text || "交易统计暂不可用"))}</dd></div>`;
+  }
+  const payoffLabels = {
+    no_wins: "无盈利样本",
+    no_losses: "无亏损样本",
+    zero_denominator: "亏损均值为零",
+  };
+  const row = (label, item) => {
+    const stat = item && typeof item === "object" ? item : {};
+    const winRate = hasValue(stat.win_rate) ? trendRiskPercent(stat.win_rate) : "—";
+    const payoff = hasValue(stat.payoff_ratio)
+      ? formatDisplayNumber(stat.payoff_ratio)
+      : (payoffLabels[stat.payoff_ratio_status] || "—");
+    const sample = hasValue(stat.eligible_sample_count)
+      ? formatDisplayNumber(stat.eligible_sample_count)
+      : "—";
+    return `<div><dt>${escapeHtml(label)}</dt><dd>胜率 ${escapeHtml(winRate)} · 盈亏比 ${escapeHtml(payoff)} · 样本 ${escapeHtml(sample)}</dd></div>`;
+  };
+  return `${row("富途模拟盘交易统计", stats.simulation)}
+      ${row("老虎实盘交易统计", stats.actual)}`;
+}
+
 function renderTrendRiskSummary(summary) {
   if (!summary || typeof summary !== "object" || !hasValue(summary.status)) return "";
   const planned = `${formatDisplayNumber(summary.portfolio_planned_risk)}（${trendRiskPercent(summary.portfolio_planned_risk_pct)} / ${trendRiskPercent(summary.portfolio_risk_limit_pct)}）`;
@@ -2172,7 +2197,9 @@ function renderTrendRiskSummary(summary) {
       <div><dt>组合剩余风险</dt><dd>${escapeHtml(remaining)}</dd></div>
       <div><dt>单笔风险上限</dt><dd>${escapeHtml(single)}</dd></div>
       <div><dt>异常损失缓冲</dt><dd>${escapeHtml(buffer)} · 不得用于开仓</dd></div>
+      ${renderTrendTradeStats(summary.trade_stats)}
     </dl>
+    ${summary.trade_stats?.available === true && hasValue(summary.trade_stats.statistics_cutoff_at) ? `<p>统计截至 ${escapeHtml(formatPlain(summary.trade_stats.statistics_cutoff_at))}</p>` : ""}
     <p>${escapeHtml(formatPlain(summary.portfolio_remaining_risk_note))}</p>
     <p>${escapeHtml(formatPlain(summary.disclaimer))}</p>
   </section>`;
