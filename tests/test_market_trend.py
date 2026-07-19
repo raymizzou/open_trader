@@ -129,7 +129,7 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     snapshot = trend_module.trend_strategy_snapshot(market, "abc123", pool_ids)
 
     assert snapshot["strategy_name"] == name
-    assert snapshot["strategy_version"] == "v2"
+    assert snapshot["strategy_version"] == "v3"
     assert snapshot["parameters"] == {
         "candidate_pool_ids": list(pool_ids),
         "min_strength_exclusive": "90",
@@ -149,6 +149,12 @@ def test_market_strategy_snapshot_matches_runtime_rules(
         "abnormal_loss_buffer": "0.01",
         "normal_cost_rate": "0.001",
         "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "kelly_sample_minimum": 30,
+        "kelly_rolling_window": 200,
+        "kelly_fraction": "0.25",
+        "kelly_optimizer": "mean_log_growth_derivative_bisection_96_floor_1e-6",
+        "kelly_sample_scope": "market+strategy_id+opening_strategy_version",
+        "kelly_source": "cost_complete_attributed_simulation_closed_rounds",
         "target_weight": "0.04",
         **market_parameters,
         "initial_protection_atr_multiple": "2",
@@ -793,6 +799,10 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v3"
+    assert payload["risk_summary"]["kelly_phase"] == "cold_start"
+    assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
+    assert payload["risk_summary"]["kelly_cap"] is None
     assert payload["estimated_api_cost"] == "0.142"
     assert payload["signal_snapshots"]["holdings"]["00700"] | {
         "gain_since_entry": "0.048",
@@ -817,6 +827,39 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     tmp_path: Path,
 ) -> None:
     cfg = config(tmp_path)
+    stats_path = cfg.data_dir / "latest/trend_api_stats.json"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.trend_api_stats.v1",
+                "rounds": [
+                    {
+                        "round_id": f"round-{index:03d}",
+                        "source": "simulation",
+                        "market": "US",
+                        "strategy_id": "trend_animals_warm_to_hot/US/v3",
+                        "opening_strategy_version": "v3",
+                        "closed_at": f"2026-06-{index // 24 + 1:02d}T{index % 24:02d}:00:00+00:00",
+                        "net_return": "0.10" if index < 15 else "-0.10",
+                        "costs_complete": True,
+                        "attribution_status": "attributed",
+                        "kelly_eligible": True,
+                    }
+                    for index in range(30)
+                ]
+                + [
+                    {
+                        "round_id": "actual-must-not-count",
+                        "source": "actual",
+                        "market": "US",
+                        "net_return": "999",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     write_protection_state(
         market_paths(cfg.data_dir, cfg.reports_dir, "US").state,
         {
@@ -950,11 +993,13 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     assert payload["account"]["fresh"] is True
     assert payload["metadata"]["simulate_acc_id"] == 102
     assert payload["account"]["source_date"] == "2026-07-14"
-    buy_action = payload["strategy_judgments"]["formal_actions"][0]
-    assert buy_action["action"] == "BUY"
-    assert buy_action["symbol"] == "QQQ"
-    assert buy_action["estimated_shares"] == 400
-    assert buy_action["target_amount"] == "4000.00"
+    assert payload["strategy_judgments"]["formal_actions"] == []
+    assert payload["risk_summary"]["kelly_phase"] == "active_all_samples"
+    assert payload["risk_summary"]["kelly_eligible_sample_count"] == 30
+    assert payload["risk_summary"]["kelly_cap"] == "0.000000"
+    assert payload["risk_summary"]["pause_reason"] == (
+        "Kelly 上限为 0，仅暂停未来新开仓"
+    )
     assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "HOLD"
     evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -968,10 +1013,33 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     ):
         assert replayed[key] == payload[key]
     assert replayed["strategy_judgments"] == payload["strategy_judgments"]
+    tampered_evidence = json.loads(json.dumps(evidence))
+    tampered_evidence["rebuild_inputs"]["kelly_rounds"][-1][
+        "net_return"
+    ] = "0.10"
+    tampered = trend_review.rebuild_trend_report_from_evidence(tampered_evidence)
+    assert tampered["risk_summary"]["kelly_cap"] != "0.000000"
+    assert tampered["strategy_judgments"]["formal_actions"] != []
+    shortened_evidence = json.loads(json.dumps(evidence))
+    shortened_evidence["rebuild_inputs"]["kelly_rounds"].pop()
+    shortened = trend_review.rebuild_trend_report_from_evidence(shortened_evidence)
+    assert shortened["risk_summary"]["kelly_phase"] == "cold_start"
+    assert shortened["risk_summary"]["kelly_eligible_sample_count"] == 29
+    assert shortened["risk_summary"]["kelly_cap"] is None
+    invalid_evidence = json.loads(json.dumps(evidence))
+    invalid_evidence["rebuild_inputs"]["kelly_rounds"][0][
+        "costs_complete"
+    ] = 1
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match="invalid original input: kelly_rounds",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(invalid_evidence)
     assert payload["metadata"]["account_currency"] == "USD"
     assert payload["metadata"]["price_fx_to_account_currency"] == "1"
     assert "price_fx_to_hkd" not in payload["metadata"]
     assert evidence["rebuild_inputs"]["price_fx_to_account_currency"] == "1"
+    assert len(evidence["rebuild_inputs"]["kelly_rounds"]) == 30
     assert "account_refresh_error" not in payload["metadata"]
     assert "账户状态：已更新" in notifier.messages[0][1]
     output = "\n".join(

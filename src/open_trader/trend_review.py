@@ -157,6 +157,8 @@ def freeze_report_evidence(
     price_fx_to_account_currency: Decimal,
     previous_attention_rows: object,
     option_attention_broker_label: str | None,
+    kelly_rounds: object = (),
+    kelly_data_reason: str = "",
 ) -> dict[str, str]:
     metadata = getattr(report, "metadata")
     strategy_snapshot = getattr(report, "strategy_snapshot")
@@ -199,6 +201,8 @@ def freeze_report_evidence(
             "managed_symbols": list(
                 getattr(report, "protection_state").get("managed_symbols", [])
             ),
+            "kelly_rounds": kelly_rounds,
+            "kelly_data_reason": kelly_data_reason,
         },
     }
     return freeze_trend_evidence(data_dir, evidence)
@@ -1622,8 +1626,10 @@ def rebuild_trend_report_from_evidence(
         "metadata",
         "price_fx_to_account_currency",
     }
-    if strategy_version == "v2":
+    if strategy_version in {"v2", "v3"}:
         required.add("normal_cost_rate")
+    if strategy_version == "v3":
+        required.update({"kelly_rounds", "kelly_data_reason"})
     missing = sorted(required - inputs.keys())
     if missing:
         raise TrendReplayIncompleteError(
@@ -1639,6 +1645,10 @@ def rebuild_trend_report_from_evidence(
         build_report,
     )
     from .kline_technical_facts import DailyKlineBar
+    from .trend_kelly import (
+        TREND_API_STATS_SCHEMA_VERSION,
+        trend_kelly_rounds_from_payload,
+    )
 
     def decimal_or_none(value: object) -> Decimal | None:
         return None if value is None or value == "" else Decimal(str(value))
@@ -1746,12 +1756,33 @@ def rebuild_trend_report_from_evidence(
             "invalid original input: price_fx_to_account_currency"
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
-    if strategy_version == "v2" and (
+    if strategy_version in {"v2", "v3"} and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
         or normal_cost_rate < 0
     ):
         raise TrendReplayIncompleteError("invalid original input: normal_cost_rate")
+    kelly_rounds_raw = inputs.get("kelly_rounds", [])
+    if not isinstance(kelly_rounds_raw, list):
+        raise TrendReplayIncompleteError("invalid original input: kelly_rounds")
+    try:
+        kelly_rounds = trend_kelly_rounds_from_payload(
+            {
+                "schema_version": TREND_API_STATS_SCHEMA_VERSION,
+                "rounds": kelly_rounds_raw,
+            }
+        )
+    except ValueError:
+        raise TrendReplayIncompleteError(
+            "invalid original input: kelly_rounds"
+        ) from None
+    if len(kelly_rounds) != len(kelly_rounds_raw):
+        raise TrendReplayIncompleteError("invalid original input: kelly_rounds")
+    kelly_data_reason = inputs.get("kelly_data_reason", "")
+    if not isinstance(kelly_data_reason, str):
+        raise TrendReplayIncompleteError(
+            "invalid original input: kelly_data_reason"
+        )
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
         execution_date=str(inputs["execution_date"]),
@@ -1788,6 +1819,8 @@ def rebuild_trend_report_from_evidence(
         process_version=process_version,
         candidate_pool_ids=tuple(int(item) for item in inputs["candidate_pool_ids"]),
         strategy_snapshot=snapshot,
+        kelly_rounds=kelly_rounds,
+        kelly_data_reason=kelly_data_reason,
     )
     market = str(inputs["market"]).upper()
     if market in {"US", "HK"}:

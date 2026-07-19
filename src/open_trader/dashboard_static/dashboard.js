@@ -2144,6 +2144,13 @@ function trendRiskPercent(value) {
   return `${(number * 100).toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1")}%`;
 }
 
+function trendKellyPercent(value) {
+  if (!hasValue(value)) return "禁用（固定风险仓位）";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "禁用（固定风险仓位）";
+  return `${(number * 100).toFixed(4).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1")}%`;
+}
+
 function renderTrendRiskRow(item, columnCount, status) {
   if (![item.planned_stop_risk, item.normal_cost, item.decisive_constraint, item.reason].some(hasValue)) return "";
   const details = [
@@ -2164,6 +2171,15 @@ function renderTrendRiskSummary(summary) {
   const remaining = `${formatDisplayNumber(summary.portfolio_remaining_risk)}（${trendRiskPercent(summary.portfolio_remaining_risk_pct)}）`;
   const single = `${formatDisplayNumber(summary.single_entry_risk_limit)}（${trendRiskPercent(summary.single_entry_risk_limit_pct)}）`;
   const buffer = `${formatDisplayNumber(summary.abnormal_loss_buffer)}（${trendRiskPercent(summary.abnormal_loss_buffer_pct)}）`;
+  const kellyPhase = ({
+    cold_start: "冷启动",
+    active_all_samples: "全样本启用",
+    active_rolling_200: "最近 200 个样本启用",
+    unavailable: "统计不可用",
+  })[summary.kelly_phase] || "";
+  const kellyRows = kellyPhase ? `
+      <div><dt>Kelly 阶段</dt><dd>${escapeHtml(`${kellyPhase} · ${formatPlain(summary.kelly_eligible_sample_count)} 个合格模拟闭环`)}</dd></div>
+      <div><dt>当前 Kelly 上限</dt><dd>${escapeHtml(trendKellyPercent(summary.kelly_cap))}</dd></div>` : "";
   return `<section class="trend-risk-summary" data-risk-status="${escapeHtml(formatPlain(summary.status))}" aria-label="模拟策略风险摘要">
     <header><strong>模拟策略风险</strong><span>${escapeHtml(formatPlain(summary.status_label))}</span></header>
     ${hasValue(summary.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(summary.pause_reason))}</p>` : ""}
@@ -2172,7 +2188,10 @@ function renderTrendRiskSummary(summary) {
       <div><dt>组合剩余风险</dt><dd>${escapeHtml(remaining)}</dd></div>
       <div><dt>单笔风险上限</dt><dd>${escapeHtml(single)}</dd></div>
       <div><dt>异常损失缓冲</dt><dd>${escapeHtml(buffer)} · 不得用于开仓</dd></div>
+      ${kellyRows}
     </dl>
+    ${hasValue(summary.kelly_reason) ? `<p>${escapeHtml(formatPlain(summary.kelly_reason))}</p>` : ""}
+    ${hasValue(summary.kelly_source) ? `<p>${escapeHtml(formatPlain(summary.kelly_source))}</p>` : ""}
     <p>${escapeHtml(formatPlain(summary.portfolio_remaining_risk_note))}</p>
     <p>${escapeHtml(formatPlain(summary.disclaimer))}</p>
   </section>`;

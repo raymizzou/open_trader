@@ -20,6 +20,7 @@ from .a_share_trend import (
     SINGLE_ENTRY_RISK_LIMIT,
     valid_serialized_account,
     valid_v2_risk_contract,
+    valid_v3_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
 
@@ -839,12 +840,12 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     )
     summary = payload.get("risk_summary")
     if summary is None:
-        return strategy_version != "v2"
+        return strategy_version not in {"v2", "v3"}
     if not isinstance(summary, dict) or any(
         isinstance(value, (dict, list)) for value in summary.values()
     ):
         return False
-    if strategy_version != "v2":
+    if strategy_version not in {"v2", "v3"}:
         return summary.get("status") in {"active", "paused"}
     judgments = payload.get("strategy_judgments")
     parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
@@ -853,10 +854,16 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     return (
         isinstance(judgments, dict)
         and "risk_skips" in judgments
-        and valid_v2_risk_contract(
+        and (
+            valid_v3_risk_contract
+            if strategy_version == "v3"
+            else valid_v2_risk_contract
+        )(
             parameters, summary, expected_nav=expected_nav
         )
-        and _valid_v2_risk_items(payload, judgments, summary)
+        and _valid_v2_risk_items(
+            payload, judgments, summary, strategy_version=strategy_version
+        )
     )
 
 
@@ -874,6 +881,8 @@ def _valid_v2_risk_items(
     payload: dict[str, Any],
     judgments: dict[str, Any],
     summary: dict[str, Any],
+    *,
+    strategy_version: str = "v2",
 ) -> bool:
     portfolio_limit = _dashboard_risk_decimal(summary.get("portfolio_risk_limit"))
     nav = (
@@ -889,6 +898,11 @@ def _valid_v2_risk_items(
     if (nav is None or summary.get("status") == "paused") and buys:
         return False
     new_planned_risk = Decimal("0")
+    allowed_buy_constraints = {
+        "名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"
+    }
+    if strategy_version == "v3":
+        allowed_buy_constraints.add("Kelly 上限")
     for item in buys:
         shares = item.get("estimated_shares")
         lot_size = item.get("lot_size")
@@ -917,6 +931,10 @@ def _valid_v2_risk_items(
             or target_weight is None
             or target_weight <= 0
             or target_weight > PORTFOLIO_RISK_LIMIT
+            or strategy_version == "v3"
+            and summary.get("kelly_phase") != "cold_start"
+            and target_weight
+            > (_dashboard_risk_decimal(summary.get("kelly_cap")) or Decimal("0"))
             or target_amount is None
             or close is None
             or close <= 0
@@ -924,8 +942,7 @@ def _valid_v2_risk_items(
             or nav is None
             or planned_pct != planned_risk / nav
             or planned_pct > SINGLE_ENTRY_RISK_LIMIT
-            or item.get("decisive_constraint")
-            not in {"名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"}
+            or item.get("decisive_constraint") not in allowed_buy_constraints
         ):
             return False
         new_planned_risk += planned_risk
@@ -942,11 +959,23 @@ def _valid_v2_risk_items(
         "交易单位",
         "关键风险数据",
     }
+    if strategy_version == "v3":
+        allowed_constraints.add("Kelly 上限")
     for item in judgments["risk_skips"]:
         shares = item.get("estimated_shares")
         target_weight = _dashboard_risk_decimal(item.get("target_weight"))
         target_amount_raw = item.get("target_amount")
         target_amount = _dashboard_risk_decimal(target_amount_raw)
+        zero_kelly_skip = (
+            strategy_version == "v3"
+            and summary.get("status") == "paused"
+            and summary.get("kelly_cap") in {"0", "0.000000", 0}
+            and summary.get("pause_reason") == "Kelly 上限为 0，仅暂停未来新开仓"
+            and item.get("reason") == summary.get("pause_reason")
+            and item.get("decisive_constraint") == "Kelly 上限"
+            and target_weight == 0
+            and target_amount == 0
+        )
         if (
             not isinstance(item.get("symbol"), str)
             or not item["symbol"].strip()
@@ -955,6 +984,7 @@ def _valid_v2_risk_items(
             or shares != 0
             or target_weight is None
             or target_weight <= 0
+            and not zero_kelly_skip
             or target_weight > PORTFOLIO_RISK_LIMIT
             or target_amount_raw is not None
             and target_amount is None

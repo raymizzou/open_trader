@@ -27,6 +27,15 @@ from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .kline_technical_facts import DailyKlineBar
 from .notifications import Notifier, NullNotifier
 from .portfolio_risk import size_entry_by_risk
+from .trend_kelly import (
+    KELLY_MINIMUM_SAMPLES,
+    KELLY_OPTIMIZER,
+    KELLY_ROLLING_SAMPLES,
+    TrendKellyRound,
+    TrendKellyState,
+    calculate_trend_kelly,
+    load_trend_kelly_rounds,
+)
 from .trend_animals import (
     TrendAnimalsClient,
     TrendAnimalsError,
@@ -84,6 +93,14 @@ RISK_BUDGET_DISCLAIMER = "5% 是风险预算目标，不是最大损失保证。
 PORTFOLIO_REMAINING_RISK_NOTE = (
     "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"
 )
+KELLY_STRATEGY_PARAMETERS = {
+    "kelly_sample_minimum": KELLY_MINIMUM_SAMPLES,
+    "kelly_rolling_window": KELLY_ROLLING_SAMPLES,
+    "kelly_fraction": "0.25",
+    "kelly_optimizer": KELLY_OPTIMIZER,
+    "kelly_sample_scope": "market+strategy_id+opening_strategy_version",
+    "kelly_source": "cost_complete_attributed_simulation_closed_rounds",
+}
 INITIAL_PROTECTION_ATR_MULTIPLE = Decimal("2")
 TRAILING_LOW_DAYS = 5
 ALLOWED_ENTRY_PHASES = {"谷雨", "立夏", "夏至"}
@@ -241,6 +258,93 @@ def valid_v2_risk_contract(
     )
 
 
+def valid_v3_risk_contract(
+    parameters: object,
+    summary: object,
+    *,
+    expected_nav: object,
+) -> bool:
+    if not valid_v2_risk_contract(
+        parameters, summary, expected_nav=expected_nav
+    ) or not isinstance(parameters, Mapping) or not isinstance(summary, Mapping):
+        return False
+    if {
+        key: parameters.get(key) for key in KELLY_STRATEGY_PARAMETERS
+    } != KELLY_STRATEGY_PARAMETERS:
+        return False
+    count = summary.get("kelly_eligible_sample_count")
+    selected = summary.get("kelly_selected_sample_count")
+    phase = summary.get("kelly_phase")
+    cap_raw = summary.get("kelly_cap")
+    cap = _nonnegative_risk_decimal(cap_raw)
+    reason = summary.get("kelly_reason")
+    last_closed_at = summary.get("kelly_last_closed_at")
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or isinstance(selected, bool)
+        or not isinstance(selected, int)
+        or not isinstance(reason, str)
+        or not isinstance(last_closed_at, str)
+        or summary.get("kelly_source")
+        != "合格的富途模拟闭环；实盘结果不参与计算"
+    ):
+        return False
+    if count:
+        try:
+            closed = datetime.fromisoformat(last_closed_at)
+        except ValueError:
+            return False
+        if (
+            closed.tzinfo is None
+            or closed.utcoffset() is None
+            or closed.isoformat() != last_closed_at
+        ):
+            return False
+    elif last_closed_at:
+        return False
+    if phase == "cold_start":
+        return (
+            0 <= count < KELLY_MINIMUM_SAMPLES
+            and selected == count
+            and cap_raw is None
+            and reason
+            == f"Kelly 冷启动：{count}/{KELLY_MINIMUM_SAMPLES} 个合格模拟闭环；"
+            "继续使用固定风险仓位"
+        )
+    if phase == "unavailable":
+        return (
+            count == 0
+            and selected == 0
+            and cap_raw is None
+            and bool(reason)
+            and summary.get("status") == "paused"
+            and not last_closed_at
+        )
+    if cap is None or cap > Decimal("0.25"):
+        return False
+    if phase == "active_all_samples":
+        phase_valid = (
+            KELLY_MINIMUM_SAMPLES <= count < KELLY_ROLLING_SAMPLES
+            and selected == count
+        )
+    elif phase == "active_rolling_200":
+        phase_valid = (
+            count >= KELLY_ROLLING_SAMPLES
+            and selected == KELLY_ROLLING_SAMPLES
+        )
+    else:
+        return False
+    if cap == 0:
+        return (
+            phase_valid
+            and reason == "Kelly 上限为 0，仅暂停未来新开仓"
+            and summary.get("status") == "paused"
+            and summary.get("pause_reason") == reason
+        )
+    return phase_valid and reason == ""
+
+
 def trend_strategy_snapshot(
     market: str,
     process_version: str,
@@ -270,6 +374,7 @@ def trend_strategy_snapshot(
         "abnormal_loss_buffer": str(ABNORMAL_LOSS_BUFFER),
         "normal_cost_rate": str(normal_cost_rate),
         "normal_cost_model": NORMAL_COST_MODEL,
+        **KELLY_STRATEGY_PARAMETERS,
     }
     if market == "CN":
         parameters: dict[str, object] = {
@@ -379,11 +484,11 @@ def trend_strategy_snapshot(
         ]
 
     return {
-        "strategy_id": f"trend_animals_warm_to_hot/{market}/v2",
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/v3",
         "strategy_name": name,
-        "strategy_version": "v2",
+        "strategy_version": "v3",
         "market": market,
-        "effective_from": "2026-07-19",
+        "effective_from": "2026-07-20",
         "process_version": process_version,
         "parameters": parameters,
         "parameter_rows": [
@@ -1270,6 +1375,7 @@ def _risk_summary(
     new_planned_risk: Decimal,
     normal_cost_rate: Decimal,
     pause_reason: str = "",
+    kelly_state: TrendKellyState | None = None,
 ) -> dict[str, object]:
     valid_nav = net_value.is_finite() and net_value > 0
     portfolio_limit = net_value * PORTFOLIO_RISK_LIMIT if valid_nav else None
@@ -1283,7 +1389,7 @@ def _risk_summary(
         if portfolio_limit is not None and planned_risk is not None
         else None
     )
-    return {
+    summary = {
         "status": "paused" if pause_reason else "active",
         "status_label": (
             "组合风险已满"
@@ -1323,6 +1429,32 @@ def _risk_summary(
         "disclaimer": RISK_BUDGET_DISCLAIMER,
         "portfolio_remaining_risk_note": PORTFOLIO_REMAINING_RISK_NOTE,
     }
+    if kelly_state is not None:
+        reason = (
+            kelly_state.reason
+            if kelly_state.phase == "unavailable"
+            else (
+                f"Kelly 冷启动：{kelly_state.eligible_sample_count}/"
+                f"{KELLY_MINIMUM_SAMPLES} 个合格模拟闭环；"
+                "继续使用固定风险仓位"
+            )
+            if not kelly_state.enabled
+            else "Kelly 上限为 0，仅暂停未来新开仓"
+            if kelly_state.quarter_kelly_cap == 0
+            else ""
+        )
+        summary.update(
+            {
+                "kelly_phase": kelly_state.phase,
+                "kelly_eligible_sample_count": kelly_state.eligible_sample_count,
+                "kelly_selected_sample_count": kelly_state.selected_sample_count,
+                "kelly_cap": kelly_state.quarter_kelly_cap,
+                "kelly_reason": reason,
+                "kelly_last_closed_at": kelly_state.last_closed_at,
+                "kelly_source": "合格的富途模拟闭环；实盘结果不参与计算",
+            }
+        )
+    return summary
 
 
 def _plan_buy_actions(
@@ -1338,7 +1470,23 @@ def _plan_buy_actions(
     portfolio_planned_risk: Decimal | None,
     normal_cost_rate: Decimal,
     critical_data_reason: str = "",
+    kelly_state: TrendKellyState | None = None,
 ) -> tuple[list[BuyAction], list[dict[str, object]], dict[str, object]]:
+    def entry_weight(item: CandidateInput) -> Decimal | None:
+        nominal = (
+            CN_TARGET_WEIGHTS.get(item.temperature_curr)
+            if market == "CN"
+            else position_weight
+        )
+        if (
+            nominal is not None
+            and kelly_state is not None
+            and kelly_state.enabled
+            and kelly_state.quarter_kelly_cap is not None
+        ):
+            return min(nominal, kelly_state.quarter_kelly_cap)
+        return nominal
+
     if not critical_data_reason:
         if not net_value.is_finite() or net_value <= 0:
             critical_data_reason = "模拟盘净值缺失，暂停新开仓"
@@ -1366,11 +1514,7 @@ def _plan_buy_actions(
         skips = [
             _risk_skip(
                 item,
-                weight=(
-                    CN_TARGET_WEIGHTS.get(item.temperature_curr)
-                    if market == "CN"
-                    else position_weight
-                ),
+                weight=entry_weight(item),
                 target_amount=None,
                 reason=critical_data_reason,
                 decisive_constraint="关键风险数据",
@@ -1383,19 +1527,40 @@ def _plan_buy_actions(
             new_planned_risk=Decimal("0"),
             normal_cost_rate=normal_cost_rate,
             pause_reason=critical_data_reason,
+            kelly_state=kelly_state,
         )
 
     assert portfolio_planned_risk is not None
+    if (
+        kelly_state is not None
+        and kelly_state.enabled
+        and kelly_state.quarter_kelly_cap == 0
+    ):
+        pause_reason = "Kelly 上限为 0，仅暂停未来新开仓"
+        skips = [
+            _risk_skip(
+                item,
+                weight=Decimal("0"),
+                target_amount=Decimal("0"),
+                reason=pause_reason,
+                decisive_constraint="Kelly 上限",
+            )
+            for item in ranked
+        ]
+        return [], skips, _risk_summary(
+            net_value=net_value,
+            existing_planned_risk=portfolio_planned_risk,
+            new_planned_risk=Decimal("0"),
+            normal_cost_rate=normal_cost_rate,
+            pause_reason=pause_reason,
+            kelly_state=kelly_state,
+        )
     if portfolio_planned_risk >= net_value * PORTFOLIO_RISK_LIMIT:
         pause_reason = "组合正常计划风险已达到净值 4%"
         skips = [
             _risk_skip(
                 item,
-                weight=(
-                    CN_TARGET_WEIGHTS.get(item.temperature_curr)
-                    if market == "CN"
-                    else position_weight
-                ),
+                weight=entry_weight(item),
                 target_amount=None,
                 reason=pause_reason,
                 decisive_constraint="组合剩余风险",
@@ -1408,6 +1573,7 @@ def _plan_buy_actions(
             new_planned_risk=Decimal("0"),
             normal_cost_rate=normal_cost_rate,
             pause_reason=pause_reason,
+            kelly_state=kelly_state,
         )
     remaining_cash = available_cash
     remaining_risk = max(
@@ -1419,11 +1585,12 @@ def _plan_buy_actions(
     actions: list[BuyAction] = []
     skips: list[dict[str, object]] = []
     for item in ranked:
-        weight = (
+        nominal_weight = (
             CN_TARGET_WEIGHTS.get(item.temperature_curr)
             if market == "CN"
             else position_weight
         )
+        weight = entry_weight(item)
         if weight is None:
             continue
         target_amount = min(net_value * weight, remaining_cash).quantize(
@@ -1508,7 +1675,13 @@ def _plan_buy_actions(
                 planned_stop_risk=sized.planned_stop_risk,
                 planned_stop_risk_pct=sized.planned_stop_risk / net_value,
                 normal_cost=sized.normal_cost,
-                decisive_constraint=sized.decisive_constraint,
+                decisive_constraint=(
+                    "Kelly 上限"
+                    if nominal_weight is not None
+                    and weight < nominal_weight
+                    and sized.decisive_constraint == "名义仓位上限"
+                    else sized.decisive_constraint
+                ),
             )
         )
         remaining_cash -= sized.cash_required
@@ -1523,6 +1696,7 @@ def _plan_buy_actions(
         existing_planned_risk=portfolio_planned_risk,
         new_planned_risk=new_planned_risk,
         normal_cost_rate=normal_cost_rate,
+        kelly_state=kelly_state,
     )
 
 
@@ -1719,7 +1893,47 @@ def build_report(
     process_version: str = "",
     candidate_pool_ids: Sequence[int] = (),
     strategy_snapshot: Mapping[str, object] | None = None,
+    kelly_rounds: Sequence[TrendKellyRound] = (),
+    kelly_data_reason: str = "",
 ) -> TrendReport:
+    resolved_strategy_snapshot = (
+        {
+            **dict(strategy_snapshot),
+            "process_version": process_version
+            or str((metadata or {}).get("process_version") or ""),
+        }
+        if strategy_snapshot is not None
+        else trend_strategy_snapshot(
+            market,
+            process_version
+            or str((metadata or {}).get("process_version") or ""),
+            candidate_pool_ids,
+            normal_cost_rate=normal_cost_rate,
+        )
+    )
+    snapshot_version = str(resolved_strategy_snapshot.get("strategy_version") or "")
+    kelly_state = (
+        TrendKellyState(
+            phase="unavailable",
+            eligible_sample_count=0,
+            selected_sample_count=0,
+            enabled=False,
+            full_kelly=None,
+            quarter_kelly_cap=None,
+            reason=kelly_data_reason,
+            last_closed_at="",
+            selected_round_ids=(),
+        )
+        if snapshot_version == "v3" and kelly_data_reason
+        else calculate_trend_kelly(
+            kelly_rounds,
+            market=market,
+            strategy_id=str(resolved_strategy_snapshot.get("strategy_id") or ""),
+            opening_strategy_version=snapshot_version,
+        )
+        if snapshot_version == "v3"
+        else None
+    )
     held_symbols = {position.symbol for position in account.positions}
     candidate_decision = build_candidate_list(
         candidates,
@@ -1836,9 +2050,6 @@ def build_report(
         )
         - len(sell_symbols),
     )
-    snapshot_version = str(
-        (strategy_snapshot or {}).get("strategy_version") or "v2"
-    )
     if snapshot_version == "v1":
         buy_actions = _estimate_buy_actions_v1(
             ranked=candidate_decision.eligible,
@@ -1860,6 +2071,7 @@ def build_report(
             price_fx_to_account_currency=price_fx_to_account_currency,
             normal_cost_rate=normal_cost_rate,
         )
+        critical_data_reason = critical_data_reason or kelly_data_reason
         buy_actions, risk_skips, risk_summary = _plan_buy_actions(
             ranked=candidate_decision.eligible,
             net_value=account.net_value,
@@ -1872,6 +2084,7 @@ def build_report(
             portfolio_planned_risk=existing_planned_risk,
             normal_cost_rate=normal_cost_rate,
             critical_data_reason=critical_data_reason,
+            kelly_state=kelly_state,
         )
     industry_concentration = tuple(
         (
@@ -1947,21 +2160,7 @@ def build_report(
             "position_weight": str(position_weight),
             "position_weight_source": position_weight_source,
         },
-        strategy_snapshot=(
-            {
-                **dict(strategy_snapshot),
-                "process_version": process_version
-                or str((metadata or {}).get("process_version") or ""),
-            }
-            if strategy_snapshot is not None
-            else trend_strategy_snapshot(
-                market,
-                process_version
-                or str((metadata or {}).get("process_version") or ""),
-                candidate_pool_ids,
-                normal_cost_rate=normal_cost_rate,
-            )
-        ),
+        strategy_snapshot=resolved_strategy_snapshot,
         replay_evidence=None,
     )
 
@@ -2407,10 +2606,29 @@ def render_markdown(report: TrendReport) -> str:
         f"数据日期：{report.as_of_date}｜生成时间：{report.generated_at}｜账户：{freshness}",
         f"全部卖出 {len(sells)}｜允许买入 {len(report.buy_actions)}｜"
         f"继续持有 {len(holds)}｜人工复核 {len(reviews)}｜其他动作 {len(others)}",
-        "",
-        "## 开盘前：确认卖出",
-        "",
     ]
+    if report.strategy_snapshot.get("strategy_version") == "v3":
+        phase = {
+            "cold_start": "冷启动",
+            "active_all_samples": "全样本启用",
+            "active_rolling_200": "最近 200 个样本启用",
+        }.get(str(report.risk_summary.get("kelly_phase") or ""), "未知")
+        count = report.risk_summary.get("kelly_eligible_sample_count", 0)
+        cap = report.risk_summary.get("kelly_cap")
+        cap_text = (
+            "禁用（固定风险仓位）"
+            if cap is None
+            else f"{format((Decimal(str(cap)) * Decimal('100')).normalize(), 'f')}%"
+        )
+        lines.extend(
+            [
+                f"Kelly 阶段：{phase}（{count} 个合格模拟闭环）｜"
+                f"当前 Kelly 上限：{cap_text}",
+                f"Kelly 说明：{report.risk_summary.get('kelly_reason') or '仅向下约束未来新仓'}；"
+                "实盘结果不参与计算",
+            ]
+        )
+    lines.extend(["", "## 开盘前：确认卖出", ""])
     if sells:
         for item in sells:
             line = f"- {item.symbol} {item.name}｜{_reason_label(item.reason)}"
@@ -2565,8 +2783,16 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     expected_window = "美股常规交易时段" if market == "US" else "09:30-10:00"
     if parameters.get("buy_window") != expected_window:
         raise ValueError("strategy snapshot does not match report actions")
-    if snapshot.get("strategy_version") == "v2":
-        if not valid_v2_risk_contract(
+    version = snapshot.get("strategy_version")
+    if version not in {"v1", "v2", "v3"}:
+        raise ValueError("strategy snapshot does not match report actions")
+    if version in {"v2", "v3"}:
+        valid_contract = (
+            valid_v3_risk_contract
+            if version == "v3"
+            else valid_v2_risk_contract
+        )
+        if not valid_contract(
             parameters,
             report.risk_summary,
             expected_nav=report.account.net_value,
@@ -2603,7 +2829,13 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 or action.normal_cost <= 0
                 or action.normal_cost > action.planned_stop_risk
                 or action.decisive_constraint
-                not in {"名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"}
+                not in {
+                    "名义仓位上限",
+                    "Kelly 上限",
+                    "单笔风险上限",
+                    "组合剩余风险",
+                    "现金",
+                }
             ):
                 raise ValueError("strategy snapshot does not match report actions")
             new_planned_risk += action.planned_stop_risk
@@ -2617,14 +2849,20 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         raise ValueError("strategy snapshot does not match report actions") from None
     for action in report.buy_actions:
         target = parameters.get("target_weight")
-        expected_weight = (
+        nominal_weight = (
             target.get(action.temperature_curr)
             if isinstance(target, Mapping)
             else target
         )
+        expected_weight = Decimal(str(nominal_weight))
+        if version == "v3" and report.risk_summary.get("kelly_phase") != "cold_start":
+            cap = _nonnegative_risk_decimal(report.risk_summary.get("kelly_cap"))
+            if cap is None:
+                raise ValueError("strategy snapshot does not match report actions")
+            expected_weight = min(expected_weight, cap)
         expected_lot = parameters.get("lot_size")
         if (
-            str(action.target_weight) != str(expected_weight)
+            action.target_weight != expected_weight
             or (expected_lot is not None and action.lot_size != expected_lot)
             or action.lot_size <= 0
             or action.estimated_initial_line
@@ -3629,6 +3867,12 @@ def _attempt_report(
         watch_events = load_watch_events(
             config.data_dir / "trend_a_share/watch_events.jsonl"
         )
+        try:
+            kelly_rounds = load_trend_kelly_rounds(config.data_dir)
+            kelly_data_reason = ""
+        except ValueError as exc:
+            kelly_rounds = ()
+            kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
         report = build_report(
             as_of_date=run_date,
             execution_date=execution_date,
@@ -3665,6 +3909,8 @@ def _attempt_report(
                 "run_date": run_date,
                 "paid_response_cache": cache_metadata,
             },
+            kelly_rounds=kelly_rounds,
+            kelly_data_reason=kelly_data_reason,
         )
         report = replace(
             report,
@@ -3704,6 +3950,8 @@ def _attempt_report(
             price_fx_to_account_currency=Decimal("1"),
             previous_attention_rows=(),
             option_attention_broker_label=None,
+            kelly_rounds=kelly_rounds,
+            kelly_data_reason=kelly_data_reason,
         )
         report = replace(
             report,

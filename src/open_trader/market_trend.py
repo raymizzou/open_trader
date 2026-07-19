@@ -51,6 +51,7 @@ from .daily_premarket import (
     send_notification_with_results,
 )
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
+from .trend_kelly import load_trend_kelly_rounds
 from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
@@ -955,6 +956,12 @@ def _attempt_market_report(
         estimated_cost = unified_unit_cost * len(requested_ids)
         actual_cost = balance_before - balance_after
         watch_events = load_watch_events(paths.events)
+        try:
+            kelly_rounds = load_trend_kelly_rounds(config.data_dir)
+            kelly_data_reason = ""
+        except ValueError as exc:
+            kelly_rounds = ()
+            kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
         report = build_report(
             as_of_date=as_of_date,
             execution_date=execution_date,
@@ -998,6 +1005,8 @@ def _attempt_market_report(
                     else {}
                 ),
             },
+            kelly_rounds=kelly_rounds,
+            kelly_data_reason=kelly_data_reason,
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
         previous_attention_rows = _previous_attention_rows(
@@ -1026,6 +1035,8 @@ def _attempt_market_report(
             price_fx_to_account_currency=Decimal("1"),
             previous_attention_rows=previous_attention_rows,
             option_attention_broker_label=option_attention_broker_label,
+            kelly_rounds=kelly_rounds,
+            kelly_data_reason=kelly_data_reason,
         )
         report = replace(
             report,

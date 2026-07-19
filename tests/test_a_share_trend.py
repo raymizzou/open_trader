@@ -48,6 +48,7 @@ from open_trader.futu_quote import FutuQuoteError
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, MacOSNotifier
 from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
+from open_trader.trend_kelly import TrendKellyRound
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -411,11 +412,11 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
             "process_version",
         )
     } == {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v2",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v3",
         "strategy_name": "A 股短线右侧趋势",
-        "strategy_version": "v2",
+        "strategy_version": "v3",
         "market": "CN",
-        "effective_from": "2026-07-19",
+        "effective_from": "2026-07-20",
         "process_version": "abc123",
     }
     assert snapshot["parameters"] == {
@@ -444,6 +445,12 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
         "abnormal_loss_buffer": "0.01",
         "normal_cost_rate": "0.001",
         "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "kelly_sample_minimum": 30,
+        "kelly_rolling_window": 200,
+        "kelly_fraction": "0.25",
+        "kelly_optimizer": "mean_log_growth_derivative_bisection_96_floor_1e-6",
+        "kelly_sample_scope": "market+strategy_id+opening_strategy_version",
+        "kelly_source": "cost_complete_attributed_simulation_closed_rounds",
         "target_weight": {"热": "0.04", "沸": "0.02"},
         "lot_size": 100,
         "buy_window": "09:30-10:00",
@@ -1128,6 +1135,239 @@ def test_boiling_nominal_limit_stays_two_percent_below_risk_capacity() -> None:
     assert action.target_weight == Decimal("0.02")
     assert action.estimated_shares == 1300
     assert action.decisive_constraint == "名义仓位上限"
+
+
+def _trend_kelly_rounds(*returns: str, market: str = "US") -> tuple[TrendKellyRound, ...]:
+    return tuple(
+        TrendKellyRound(
+            round_id=f"round-{index:03d}",
+            source="simulation",
+            market=market,
+            strategy_id=f"trend_animals_warm_to_hot/{market}/v3",
+            opening_strategy_version="v3",
+            closed_at=f"2026-07-{index // 24 + 1:02d}T{index % 24:02d}:00:00+00:00",
+            net_return=Decimal(net_return),
+            costs_complete=True,
+            attribution_status="attributed",
+            kelly_eligible=True,
+        )
+        for index, net_return in enumerate(returns)
+    )
+
+
+def _us_kelly_report(rounds: tuple[TrendKellyRound, ...]) -> TrendReport:
+    return build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        kelly_rounds=rounds,
+    )
+
+
+def test_v3_kelly_cold_start_keeps_issue_4_nominal_sizing() -> None:
+    built = _us_kelly_report(_trend_kelly_rounds(*(["0.10"] * 29)))
+
+    assert built.strategy_snapshot["strategy_version"] == "v3"
+    assert built.buy_actions[0].target_weight == Decimal("0.04")
+    assert built.risk_summary["kelly_phase"] == "cold_start"
+    assert built.risk_summary["kelly_eligible_sample_count"] == 29
+    assert built.risk_summary["kelly_selected_sample_count"] == 29
+    assert built.risk_summary["kelly_cap"] is None
+    assert built.risk_summary["kelly_reason"] == (
+        "Kelly 冷启动：29/30 个合格模拟闭环；继续使用固定风险仓位"
+    )
+    assert built.risk_summary["status"] == "active"
+
+
+def test_v3_kelly_only_reduces_nominal_before_fixed_risk_constraints() -> None:
+    rounds = _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.099"] * 15))
+
+    built = _us_kelly_report(rounds)
+
+    action = built.buy_actions[0]
+    assert action.target_weight == Decimal("0.012626")
+    assert action.target_amount == Decimal("1262.60")
+    assert action.estimated_shares == 12
+    assert action.target_weight < Decimal("0.04")
+    assert action.planned_stop_risk <= Decimal("400")
+    assert built.risk_summary["kelly_phase"] == "active_all_samples"
+    assert built.risk_summary["kelly_eligible_sample_count"] == 30
+    assert built.risk_summary["kelly_cap"] == Decimal("0.012626")
+    assert built.risk_summary["kelly_reason"] == ""
+
+
+def test_v3_zero_kelly_pauses_only_future_entries_and_keeps_sell_decision() -> None:
+    zero_rounds = _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.10"] * 15))
+    existing = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("99000"),
+        positions=(
+            AccountPosition(
+                "OLD", "旧持仓", "stock", Decimal("10"), Decimal("90"), Decimal("1000")
+            ),
+        ),
+        exceptions=(),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=existing,
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={
+            "OLD": HoldingSnapshot(
+                tm_id=1,
+                symbol="OLD",
+                exchange="US",
+                name="旧持仓",
+                as_of_date="2026-07-14",
+                right_side=True,
+                danger=True,
+                boiling=False,
+                champagne=False,
+            )
+        },
+        bars_by_symbol={"OLD": bars(close=100, low=99)},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        kelly_rounds=zero_rounds,
+    )
+
+    assert [(item.symbol, item.action) for item in built.holdings] == [("OLD", "SELL_ALL")]
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["kelly_cap"] == Decimal("0")
+    assert built.risk_summary["pause_reason"] == "Kelly 上限为 0，仅暂停未来新开仓"
+    assert built.risk_skips[0]["decisive_constraint"] == "Kelly 上限"
+
+
+def test_frozen_v2_snapshot_does_not_enable_kelly() -> None:
+    snapshot = trend_module.trend_strategy_snapshot("US", "abc123", (622460,))
+    snapshot["strategy_id"] = "trend_animals_warm_to_hot/US/v2"
+    snapshot["strategy_version"] = "v2"
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=snapshot,
+        kelly_rounds=_trend_kelly_rounds(*(["-0.10"] * 30)),
+    )
+
+    assert built.buy_actions[0].target_weight == Decimal("0.04")
+    assert "kelly_phase" not in built.risk_summary
+
+
+def test_v3_payload_and_compact_report_freeze_kelly_facts() -> None:
+    built = _us_kelly_report(
+        _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.099"] * 15))
+    )
+
+    payload = trend_module._report_payload(built)
+    markdown = render_markdown(built)
+
+    assert payload["strategy_snapshot"]["strategy_version"] == "v3"
+    assert payload["risk_summary"]["kelly_phase"] == "active_all_samples"
+    assert payload["risk_summary"]["kelly_eligible_sample_count"] == 30
+    assert payload["risk_summary"]["kelly_cap"] == "0.012626"
+    assert "Kelly 阶段：全样本启用（30 个合格模拟闭环）" in markdown
+    assert "当前 Kelly 上限：1.2626%" in markdown
+    assert "实盘结果不参与计算" in markdown
+
+
+def test_v3_payload_rejects_kelly_cap_action_mismatch() -> None:
+    built = _us_kelly_report(
+        _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.099"] * 15))
+    )
+    summary = {**built.risk_summary, "kelly_cap": Decimal("0.02")}
+
+    with pytest.raises(
+        ValueError,
+        match="^strategy snapshot does not match report actions$",
+    ):
+        trend_module._report_payload(replace(built, risk_summary=summary))
+
+
+def test_v3_corrupt_stats_reason_pauses_entries_visibly() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        kelly_data_reason=(
+            "Kelly 模拟闭环统计不可用，暂停新开仓："
+            "trend_api_stats.json schema_version must be 'open_trader.trend_api_stats.v1'"
+        ),
+    )
+
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["kelly_phase"] == "unavailable"
+    assert built.risk_summary["kelly_cap"] is None
+    assert built.risk_summary["kelly_reason"] == built.risk_summary["pause_reason"]
+    assert "trend_api_stats.json schema_version" in render_markdown(built)
+
+
+def test_v3_corrupt_stats_remain_visible_when_fixed_risk_also_pauses() -> None:
+    kelly_reason = "Kelly 模拟闭环统计不可用，暂停新开仓：invalid stats"
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("0"),
+            available_cash=Decimal("0"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange="US")],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        kelly_data_reason=kelly_reason,
+    )
+
+    payload = trend_module._report_payload(built)
+
+    assert payload["risk_summary"]["pause_reason"] == "模拟盘净值缺失，暂停新开仓"
+    assert payload["risk_summary"]["kelly_reason"] == kelly_reason
 
 
 def test_sell_all_releases_cash_slot_and_planned_risk_before_new_entries() -> None:
@@ -3445,6 +3685,10 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v3"
+    assert payload["risk_summary"]["kelly_phase"] == "cold_start"
+    assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
+    assert payload["risk_summary"]["kelly_cap"] is None
     audit = payload["signal_snapshots"]["candidates"]
     assert audit[0]["industry_tm_id"] == 700001
     assert audit[0]["industry_temperature"] == "热"
@@ -3458,6 +3702,30 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert evidence["query"]["component_pool_ids"] == [622466, 697199]
     assert evidence["responses"]["snapshots"]
     assert evidence["rebuild_inputs"]["candidates"]
+
+
+def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
+    tmp_path: Path,
+) -> None:
+    cfg = trend_config(tmp_path)
+    stats = cfg.data_dir / "latest/trend_api_stats.json"
+    stats.parent.mkdir(parents=True, exist_ok=True)
+    stats.write_text('{"schema_version":"broken","rounds":[]}', encoding="utf-8")
+
+    result = run_a_share_trend_report(
+        config=cfg,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["strategy_judgments"]["formal_actions"] == []
+    assert payload["risk_summary"]["kelly_phase"] == "unavailable"
+    assert payload["risk_summary"]["status"] == "paused"
+    assert "trend_api_stats.json schema_version" in payload["risk_summary"]["pause_reason"]
 
 
 def test_missing_industry_row_excludes_only_affected_candidate(
