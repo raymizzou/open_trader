@@ -3,6 +3,16 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-20
+
+- Added fixed-risk and conservative Kelly sizing to frozen CN/HK/US trend
+  reports, with 0.4% entry risk, a 4% portfolio budget, a 1% abnormal-loss
+  buffer, a 5% drawdown limit, and Kelly restricted to reducing new-entry risk.
+- Added rolling simulation/actual win-rate and payoff statistics, statement/API
+  updates, read-only real-account comparison, and truthful execution-day status;
+  verified `2695` tests, live account/API refreshes, desktop/mobile flows, and
+  the Dashboard acceptance gate (`PASS`) on the deployed Git SHA.
+
 ## 2026-07-18
 
 - Closed the CN/HK/US trend-simulation execution loop with idempotent Futu
