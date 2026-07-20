@@ -116,3 +116,82 @@ def test_trend_drawdown_unlock_cli_rejects_operator_state_overrides(
             "--actor", "ray",
             *unsafe_override,
         ])
+
+
+def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    config = SimpleNamespace(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        timezone="Asia/Shanghai",
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+    )
+    account_calls: list[tuple[str, str]] = []
+
+    class Quote:
+        closed = False
+
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_trading_days(
+            self, *, market: str, start: str, end: str
+        ) -> list[str]:
+            assert start < "2026-07-17" < end
+            return ["2026-07-17", "2026-07-20", "2026-07-21"]
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(cli, "build_notifier", lambda config: cli.NullNotifier())
+    monkeypatch.setattr(cli, "require_trend_review_config", lambda cfg, market: 101)
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "a" * 40)
+    monkeypatch.setattr(
+        cli,
+        "_drawdown_preflight_now",
+        lambda: datetime.fromisoformat("2026-07-20T08:00:00+08:00"),
+    )
+
+    def load_account(**kwargs: object) -> object:
+        account_calls.append((str(kwargs["market"]), str(kwargs["expected_date"])))
+        return SimpleNamespace(
+            net_value=Decimal({"CN": "100", "HK": "200", "US": "300"}[kwargs["market"]])
+        )
+
+    monkeypatch.setattr(cli, "load_futu_simulate_trend_account", load_account)
+    monkeypatch.setattr(
+        cli,
+        "live_trend_strategy_snapshot",
+        lambda market, process_version, pool_ids: {
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+            "strategy_version": "v4",
+            "parameters": {"market": market},
+        },
+    )
+
+    result = cli.main([
+        "trend-drawdown-preflight",
+        "--config", str(tmp_path / "daily.env"),
+        "--repo", str(tmp_path),
+        "--actor", "acceptance",
+    ])
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "ready"
+    assert [item["status"] for item in output["markets"]] == [
+        "bootstrapped", "bootstrapped", "bootstrapped"
+    ]
+    assert account_calls == [
+        ("CN", "2026-07-17"),
+        ("HK", "2026-07-17"),
+        ("US", "2026-07-17"),
+    ]

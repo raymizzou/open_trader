@@ -412,6 +412,17 @@ def _state_path(data_dir: Path) -> Path:
     return data_dir / "trend_drawdown" / "state.json"
 
 
+def strategy_drawdown_state_status(data_dir: Path) -> str:
+    path = _state_path(data_dir)
+    if not path.exists():
+        return "missing"
+    try:
+        _load_state(path)
+    except ValueError:
+        return "corrupt"
+    return "ok"
+
+
 def recover_strategy_drawdown_state(data_dir: Path) -> dict[str, object]:
     with _state_lock(data_dir):
         path = _state_path(data_dir)

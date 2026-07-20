@@ -7,7 +7,7 @@ import re
 import sys
 import time
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -136,6 +136,12 @@ from .trend_review import (
     replay_trend_evidence,
 )
 from .strategy_drawdown import manual_unlock_strategy_drawdown
+from .drawdown_preflight import (
+    DrawdownMarketInput,
+    frozen_missing_baseline,
+    market_preflight_dates,
+    run_drawdown_preflight,
+)
 
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
@@ -146,6 +152,10 @@ TREND_REPORT_STEM_RE = re.compile(
 
 def _drawdown_unlock_now(timezone: str) -> datetime:
     return datetime.now(ZoneInfo(timezone))
+
+
+def _drawdown_preflight_now() -> datetime:
+    return datetime.now().astimezone()
 
 
 def _trend_report_path_order(path: Path) -> tuple[str, int]:
@@ -804,6 +814,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     drawdown_unlock.add_argument("--event-id", required=True)
     drawdown_unlock.add_argument("--actor", required=True)
+
+    drawdown_preflight = subparsers.add_parser(
+        "trend-drawdown-preflight",
+        help="Initialize or recover audited trend drawdown baselines",
+    )
+    drawdown_preflight.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    drawdown_preflight.add_argument("--repo", type=Path, default=Path.cwd())
+    drawdown_preflight.add_argument("--actor", default="deployment")
 
     trend_review_parser = subparsers.add_parser(
         "trend-review", help="Run or replay one market trend review workflow"
@@ -1523,6 +1543,91 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "trend-drawdown-preflight":
+        quote = None
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            accepted_git_sha = _process_version(args.repo)
+            now = _drawdown_preflight_now()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("drawdown preflight clock must be timezone-aware")
+            occurred_at = now.isoformat(timespec="seconds")
+            quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+            inputs: dict[str, DrawdownMarketInput] = {}
+            for market in ("CN", "HK", "US"):
+                pool_ids = {
+                    "CN": (
+                        config.trend_animals_a_share_tm_id,
+                        config.trend_animals_etf_tm_id,
+                    ),
+                    "HK": config.trend_animals_hk_tm_ids,
+                    "US": config.trend_animals_us_tm_ids,
+                }[market]
+                strategy = live_trend_strategy_snapshot(
+                    market, accepted_git_sha, pool_ids
+                )
+                try:
+                    today = now.date()
+                    trading_days = quote.get_trading_days(
+                        market=market,
+                        start=(today - timedelta(days=14)).isoformat(),
+                        end=(today + timedelta(days=21)).isoformat(),
+                    )
+                    source_date, entry_eligible_from = market_preflight_dates(
+                        market, now=now, trading_days=trading_days
+                    )
+                    baseline = frozen_missing_baseline(
+                        config.reports_dir,
+                        market=market,
+                        strategy_id=str(strategy["strategy_id"]),
+                        strategy_version=str(strategy["strategy_version"]),
+                        source_date=source_date,
+                    )
+                    if baseline is None:
+                        account = load_futu_simulate_trend_account(
+                            host=config.futu_host,
+                            port=config.futu_port,
+                            simulate_acc_id=require_trend_review_config(
+                                config, market
+                            ),
+                            market=market,
+                            expected_date=source_date,
+                        )
+                        baseline = account.net_value
+                    inputs[market] = DrawdownMarketInput(
+                        market=market,
+                        strategy_snapshot=strategy,
+                        baseline_equity=baseline,
+                        source_date=source_date,
+                        entry_eligible_from=entry_eligible_from,
+                    )
+                except Exception as exc:
+                    inputs[market] = DrawdownMarketInput(
+                        market=market,
+                        strategy_snapshot=strategy,
+                        baseline_equity=Decimal("1"),
+                        source_date=now.date().isoformat(),
+                        entry_eligible_from=now.date().isoformat(),
+                        error=str(exc),
+                    )
+            result = run_drawdown_preflight(
+                data_dir=config.data_dir,
+                reports_dir=config.reports_dir,
+                market_inputs=inputs,
+                accepted_git_sha=accepted_git_sha,
+                actor=args.actor,
+                occurred_at=occurred_at,
+                notifier=build_notifier(config),
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        finally:
+            if quote is not None:
+                quote.close()
+        print(json.dumps(result, ensure_ascii=False))
+        return {"ready": 0, "failed": 1, "unavailable": 2}[str(result["status"])]
 
     if args.command == "trend-drawdown-unlock":
         try:
