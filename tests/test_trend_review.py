@@ -162,6 +162,7 @@ def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
         "pause_reason": "",
         "paused_at": None,
         "observed_at": "2026-07-16T17:00:00+08:00",
+        "bootstrap_event": None,
     }
     account = AccountSnapshot(
         source_date="2026-07-16",

@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 
 from open_trader.strategy_drawdown import (
+    automatic_bootstrap_strategy_drawdown,
     manual_unlock_strategy_drawdown,
     observe_strategy_equity,
+    strategy_parameter_hash,
 )
 
 
@@ -30,6 +32,100 @@ def test_missing_drawdown_state_fails_closed_without_creating_artifact(
     assert decision["state_status"] == "missing"
     assert decision["pause_reason"] == "策略累计回撤状态缺失，暂停新开仓"
     assert not (data_dir / "trend_drawdown" / "state.json").exists()
+
+
+def test_parameter_hash_is_canonical() -> None:
+    assert strategy_parameter_hash({"limit": "0.05", "markets": ["CN", "HK"]}) == (
+        strategy_parameter_hash({"markets": ["CN", "HK"], "limit": "0.05"})
+    )
+    assert len(strategy_parameter_hash({"limit": "0.05"})) == 64
+
+
+def test_automatic_bootstrap_is_audited_and_idempotent_by_parameters(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    request = {
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+        "parameters": {"position_limit": 10, "drawdown_limit": "0.05"},
+        "baseline_equity": Decimal("100000"),
+        "source_date": "2026-07-17",
+        "accepted_git_sha": "a" * 40,
+        "actor": "deployment",
+        "occurred_at": "2026-07-20T08:00:00+08:00",
+        "reason": "first_activation",
+        "entry_eligible_from": "2026-07-20",
+    }
+
+    decision = automatic_bootstrap_strategy_drawdown(data_dir, **request)
+
+    assert decision["entry_allowed"] is True
+    assert decision["bootstrap_event"] == {
+        "accepted_git_sha": "a" * 40,
+        "actor": "deployment",
+        "baseline_equity": "100000",
+        "entry_eligible_from": "2026-07-20",
+        "event_id": decision["bootstrap_event"]["event_id"],
+        "event_type": "automatic_bootstrap",
+        "market": "CN",
+        "occurred_at": "2026-07-20T08:00:00+08:00",
+        "parameter_hash": strategy_parameter_hash(request["parameters"]),
+        "reason": "first_activation",
+        "source_date": "2026-07-17",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+    }
+    state_path = data_dir / "trend_drawdown" / "state.json"
+    before = state_path.read_bytes()
+    replay = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        **{**request, "accepted_git_sha": "b" * 40},
+    )
+    assert replay == decision
+    assert state_path.read_bytes() == before
+
+    with pytest.raises(
+        ValueError, match="strategy parameters changed without a version bump"
+    ):
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            **{**request, "parameters": {"position_limit": 9}},
+        )
+
+
+def test_observe_does_not_bootstrap_a_missing_strategy_key(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v4",
+        strategy_version="v4",
+        parameters={"position_limit": 10},
+        baseline_equity=Decimal("100"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="deployment",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-20",
+    )
+    state_path = data_dir / "trend_drawdown" / "state.json"
+    before = state_path.read_bytes()
+
+    decision = observe_strategy_equity(
+        data_dir,
+        market="HK",
+        strategy_id="trend_animals_warm_to_hot/HK/v4",
+        strategy_version="v4",
+        current_equity=Decimal("90"),
+        observed_at="2026-07-20T17:00:00+08:00",
+    )
+
+    assert decision["state_status"] == "missing"
+    assert decision["entry_allowed"] is False
+    assert state_path.read_bytes() == before
 
 
 def test_manual_unlock_bootstraps_an_audited_strategy_baseline(tmp_path: Path) -> None:
@@ -153,7 +249,7 @@ def test_paused_drawdown_persists_after_equity_recovers_above_the_peak(
     assert recovered["paused_at"] == paused["paused_at"]
 
 
-def test_new_version_and_market_get_isolated_baselines(tmp_path: Path) -> None:
+def test_observe_keeps_new_version_and_market_fail_closed(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     base = {
         "market": "CN",
@@ -198,19 +294,16 @@ def test_new_version_and_market_get_isolated_baselines(tmp_path: Path) -> None:
         observed_at="2026-07-22T09:00:00+08:00",
     )
 
-    assert new_version["entry_allowed"] is True
-    assert new_version["high_water_mark"] == "90"
-    assert new_version["kelly_sample_key"].endswith("|v3")
-    assert other_market["entry_allowed"] is True
-    assert other_market["high_water_mark"] == "80"
+    assert new_version["entry_allowed"] is False
+    assert new_version["state_status"] == "missing"
+    assert other_market["entry_allowed"] is False
+    assert other_market["state_status"] == "missing"
     assert old_version["entry_allowed"] is False
     records = json.loads(
         (data_dir / "trend_drawdown" / "state.json").read_text(encoding="utf-8")
     )["records"]
     assert {record["kelly_sample_key"] for record in records} == {
         "CN|trend_animals_warm_to_hot/CN|v2",
-        "CN|trend_animals_warm_to_hot/CN|v3",
-        "US|trend_animals_warm_to_hot/CN|v2",
     }
 
 

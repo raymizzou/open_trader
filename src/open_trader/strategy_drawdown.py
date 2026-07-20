@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -30,6 +31,7 @@ DECISION_FIELDS = {
     "pause_reason",
     "paused_at",
     "observed_at",
+    "bootstrap_event",
 }
 
 
@@ -74,8 +76,15 @@ def valid_drawdown_decision(
             and value.get("drawdown_pct") is None
             and value.get("pause_reason") == expected_reason
             and value.get("paused_at") is None
+            and value.get("bootstrap_event") is None
         )
     if state_status != "ok":
+        return False
+    bootstrap_event = value.get("bootstrap_event")
+    if bootstrap_event is not None and (
+        not _valid_automatic_bootstrap_event(bootstrap_event)
+        or _record_key(bootstrap_event) != key
+    ):
         return False
     try:
         high_water_mark = _positive_decimal(
@@ -159,9 +168,13 @@ def _observe_strategy_equity_locked(
         (_record for _record in records if _record_key(_record) == key), None
     )
     if record is None:
-        record = _new_record(key, equity=equity, updated_at=observed_at)
-        records.append(record)
-        records.sort(key=lambda item: _record_key(item))
+        return _decision(
+            key=key,
+            current_equity=equity,
+            observed_at=observed_at,
+            state_status="missing",
+            pause_reason="策略累计回撤状态缺失，暂停新开仓",
+        )
     else:
         assert isinstance(record, dict)
         high_water_mark = Decimal(str(record["high_water_mark"]))
@@ -188,7 +201,100 @@ def _observe_strategy_equity_locked(
         )
     _write_state(path, payload)
     assert isinstance(record, dict)
-    return _decision_from_record(record, state_status="ok")
+    return _decision_from_record(record, state_status="ok", events=payload["audit_events"])
+
+
+def strategy_parameter_hash(parameters: Mapping[str, object]) -> str:
+    try:
+        encoded = json.dumps(
+            dict(parameters),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError("strategy parameters must be canonical JSON") from None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def automatic_bootstrap_strategy_drawdown(
+    data_dir: Path,
+    *,
+    market: str,
+    strategy_id: str,
+    strategy_version: str,
+    parameters: Mapping[str, object],
+    baseline_equity: Decimal,
+    source_date: str,
+    accepted_git_sha: str,
+    actor: str,
+    occurred_at: str,
+    reason: str,
+    entry_eligible_from: str,
+) -> dict[str, object]:
+    key = _strategy_key(market, strategy_id, strategy_version)
+    equity = _positive_decimal(baseline_equity, "baseline_equity")
+    parameter_hash = strategy_parameter_hash(parameters)
+    _canonical_date(source_date, "source_date")
+    _canonical_date(entry_eligible_from, "entry_eligible_from")
+    _canonical_timestamp(occurred_at, "occurred_at")
+    if not _is_sha1(accepted_git_sha):
+        raise ValueError("accepted_git_sha must be a full lowercase Git SHA")
+    if not actor.strip():
+        raise ValueError("actor must be non-empty")
+    if reason not in {"first_activation", "new_strategy_version"}:
+        raise ValueError("invalid automatic bootstrap reason")
+    event_id = "automatic-bootstrap-" + hashlib.sha256(
+        "|".join((*key, parameter_hash)).encode("utf-8")
+    ).hexdigest()
+    with _state_lock(data_dir):
+        path = _state_path(data_dir)
+        payload = _load_state_for_unlock(path)
+        records = payload["records"]
+        events = payload["audit_events"]
+        assert isinstance(records, list) and isinstance(events, list)
+        record = next((item for item in records if _record_key(item) == key), None)
+        event = next(
+            (
+                item
+                for item in events
+                if isinstance(item, dict)
+                and item.get("event_type") == "automatic_bootstrap"
+                and _record_key(item) == key
+            ),
+            None,
+        )
+        if record is not None:
+            if event is None:
+                raise ValueError("strategy parameter identity is unavailable")
+            if event.get("parameter_hash") != parameter_hash:
+                raise ValueError("strategy parameters changed without a version bump")
+            assert isinstance(record, dict)
+            return _decision_from_record(record, state_status="ok", events=events)
+        if event is not None:
+            raise ValueError("automatic bootstrap event has no strategy record")
+        record = _new_record(key, equity=equity, updated_at=occurred_at)
+        event = {
+            "event_id": event_id,
+            "event_type": "automatic_bootstrap",
+            "market": key[0],
+            "strategy_id": key[1],
+            "strategy_version": key[2],
+            "actor": actor.strip(),
+            "occurred_at": occurred_at,
+            "baseline_equity": _decimal_text(equity),
+            "source_date": source_date,
+            "accepted_git_sha": accepted_git_sha,
+            "parameter_hash": parameter_hash,
+            "reason": reason,
+            "entry_eligible_from": entry_eligible_from,
+        }
+        records.append(record)
+        records.sort(key=lambda item: _record_key(item))
+        events.append(event)
+        _write_state(path, payload)
+        return _decision_from_record(record, state_status="ok", events=events)
 
 
 def manual_unlock_strategy_drawdown(
@@ -259,7 +365,7 @@ def _manual_unlock_strategy_drawdown_locked(
         if not request_matches:
             raise ValueError("strategy drawdown unlock event_id was reused")
         assert isinstance(record, dict)
-        return _decision_from_record(record, state_status="ok")
+        return _decision_from_record(record, state_status="ok", events=events)
     previous_high_water_mark = (
         record.get("high_water_mark") if isinstance(record, dict) else None
     )
@@ -298,7 +404,7 @@ def _manual_unlock_strategy_drawdown_locked(
     )
     records.sort(key=lambda item: _record_key(item))
     _write_state(path, payload)
-    return _decision_from_record(record, state_status="ok")
+    return _decision_from_record(record, state_status="ok", events=events)
 
 
 def _state_path(data_dir: Path) -> Path:
@@ -419,6 +525,8 @@ def _valid_record(value: object) -> bool:
 
 
 def _valid_audit_event(value: object) -> bool:
+    if isinstance(value, dict) and value.get("event_type") == "automatic_bootstrap":
+        return _valid_automatic_bootstrap_event(value)
     if not isinstance(value, dict) or set(value) != {
         "event_id",
         "event_type",
@@ -460,6 +568,47 @@ def _valid_audit_event(value: object) -> bool:
         )
         and ((previous is None) is (value["previous_paused"] is None))
         and rebased > 0
+    )
+
+
+def _valid_automatic_bootstrap_event(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "event_id",
+        "event_type",
+        "market",
+        "strategy_id",
+        "strategy_version",
+        "actor",
+        "occurred_at",
+        "baseline_equity",
+        "source_date",
+        "accepted_git_sha",
+        "parameter_hash",
+        "reason",
+        "entry_eligible_from",
+    }:
+        return False
+    try:
+        _strategy_key(
+            str(value["market"]),
+            str(value["strategy_id"]),
+            str(value["strategy_version"]),
+        )
+        _positive_decimal(value["baseline_equity"], "baseline_equity")
+        _canonical_date(str(value["source_date"]), "source_date")
+        _canonical_date(str(value["entry_eligible_from"]), "entry_eligible_from")
+    except ValueError:
+        return False
+    return (
+        value["event_type"] == "automatic_bootstrap"
+        and isinstance(value["event_id"], str)
+        and value["event_id"].startswith("automatic-bootstrap-")
+        and isinstance(value["actor"], str)
+        and bool(value["actor"].strip())
+        and _is_canonical_timestamp(value["occurred_at"])
+        and _is_sha1(value["accepted_git_sha"])
+        and _is_sha256(value["parameter_hash"])
+        and value["reason"] in {"first_activation", "new_strategy_version"}
     )
 
 
@@ -547,6 +696,31 @@ def _canonical_timestamp(value: str, field: str) -> None:
         raise ValueError(f"{field} must be a canonical timezone-aware ISO timestamp")
 
 
+def _canonical_date(value: str, field: str) -> None:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{field} must be a canonical ISO date") from None
+    if parsed.isoformat() != value:
+        raise ValueError(f"{field} must be a canonical ISO date")
+
+
+def _is_sha1(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _is_canonical_timestamp(value: object) -> bool:
     if not isinstance(value, str):
         return False
@@ -587,13 +761,24 @@ def _decision(
         "pause_reason": pause_reason,
         "paused_at": None,
         "observed_at": observed_at,
+        "bootstrap_event": None,
     }
 
 
 def _decision_from_record(
-    record: dict[str, object], *, state_status: str
+    record: dict[str, object], *, state_status: str, events: object = ()
 ) -> dict[str, object]:
     paused = record.get("paused") is True
+    bootstrap_event = next(
+        (
+            dict(event)
+            for event in events
+            if isinstance(event, dict)
+            and event.get("event_type") == "automatic_bootstrap"
+            and _record_key(event) == _record_key(record)
+        ),
+        None,
+    )
     return {
         "schema_version": DECISION_SCHEMA_VERSION,
         "market": record["market"],
@@ -613,4 +798,5 @@ def _decision_from_record(
         ),
         "paused_at": record["paused_at"],
         "observed_at": record["updated_at"],
+        "bootstrap_event": bootstrap_event,
     }

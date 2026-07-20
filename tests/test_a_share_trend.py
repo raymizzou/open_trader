@@ -1494,6 +1494,7 @@ def test_v4_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None
         "pause_reason": "策略累计回撤已达到 5%，需人工解锁",
         "paused_at": "2026-07-14T18:00:00+08:00",
         "observed_at": "2026-07-14T18:00:00+08:00",
+        "bootstrap_event": None,
     }
     built = build_report(
         as_of_date="2026-07-14",
