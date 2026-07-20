@@ -23,6 +23,11 @@ REPORT_DIRECTORIES = {
     "HK": "trend_hk_phillips",
     "US": "trend_us_tiger",
 }
+MARKET_TIMEZONES = {
+    "CN": ZoneInfo("Asia/Shanghai"),
+    "HK": ZoneInfo("Asia/Hong_Kong"),
+    "US": ZoneInfo("America/New_York"),
+}
 
 
 @dataclass(frozen=True)
@@ -39,9 +44,9 @@ def market_preflight_dates(
     market: str, *, now: datetime, trading_days: list[str]
 ) -> tuple[str, str]:
     settings = {
-        "CN": (ZoneInfo("Asia/Shanghai"), time(9, 30), time(15)),
-        "HK": (ZoneInfo("Asia/Hong_Kong"), time(9, 30), time(16)),
-        "US": (ZoneInfo("America/New_York"), time(9, 30), time(16)),
+        "CN": (MARKET_TIMEZONES["CN"], time(9, 30), time(15)),
+        "HK": (MARKET_TIMEZONES["HK"], time(9, 30), time(16)),
+        "US": (MARKET_TIMEZONES["US"], time(9, 30), time(16)),
     }
     try:
         timezone, opened_at, closed_at = settings[market.strip().upper()]
@@ -200,6 +205,7 @@ def run_drawdown_preflight(
                 occurred_at=occurred_at,
                 reason=reason,
                 entry_eligible_from=item.entry_eligible_from,
+                entry_date=_market_date(market, occurred_at),
             )
         except (OSError, ValueError) as exc:
             error = str(exc)
@@ -308,6 +314,12 @@ def _ordered_markets(
     market_inputs: Mapping[str, DrawdownMarketInput],
 ) -> list[str]:
     return [market for market in ("CN", "HK", "US") if market in market_inputs]
+
+
+def _market_date(market: str, occurred_at: str) -> str:
+    return datetime.fromisoformat(occurred_at).astimezone(
+        MARKET_TIMEZONES[market]
+    ).date().isoformat()
 
 
 def _any_frozen_report_has_healthy_drawdown(reports_dir: Path) -> bool:

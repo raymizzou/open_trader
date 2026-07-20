@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -97,6 +98,16 @@ def test_first_activation_bootstraps_markets_and_is_idempotent(tmp_path: Path) -
     assert {event["reason"] for event in state["audit_events"]} == {
         "first_activation"
     }
+
+
+def test_late_preflight_reports_entries_blocked_until_eligible_date(
+    tmp_path: Path,
+) -> None:
+    item = replace(market_input("CN"), entry_eligible_from="2026-07-21")
+
+    result = run_preflight(tmp_path, {"CN": item})
+
+    assert result["markets"][0]["entry_allowed"] is False
 
 
 def test_historical_ok_report_prevents_rebuilding_missing_state(tmp_path: Path) -> None:

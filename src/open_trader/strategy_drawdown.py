@@ -268,12 +268,15 @@ def automatic_bootstrap_strategy_drawdown(
     occurred_at: str,
     reason: str,
     entry_eligible_from: str,
+    entry_date: str | None = None,
 ) -> dict[str, object]:
     key = _strategy_key(market, strategy_id, strategy_version)
     equity = _positive_decimal(baseline_equity, "baseline_equity")
     parameter_hash = strategy_parameter_hash(parameters)
     _canonical_date(source_date, "source_date")
     _canonical_date(entry_eligible_from, "entry_eligible_from")
+    if entry_date is not None:
+        _canonical_date(entry_date, "entry_date")
     _canonical_timestamp(occurred_at, "occurred_at")
     if not _is_sha1(accepted_git_sha):
         raise ValueError("accepted_git_sha must be a full lowercase Git SHA")
@@ -307,7 +310,12 @@ def automatic_bootstrap_strategy_drawdown(
             if event.get("parameter_hash") != parameter_hash:
                 raise ValueError("strategy parameters changed without a version bump")
             assert isinstance(record, dict)
-            return _decision_from_record(record, state_status="ok", events=events)
+            return _decision_from_record(
+                record,
+                state_status="ok",
+                events=events,
+                entry_date=entry_date,
+            )
         if event is not None:
             raise ValueError("automatic bootstrap event has no strategy record")
         record = _new_record(key, equity=equity, updated_at=occurred_at)
@@ -330,7 +338,12 @@ def automatic_bootstrap_strategy_drawdown(
         records.sort(key=lambda item: _record_key(item))
         events.append(event)
         _write_state(path, payload)
-        return _decision_from_record(record, state_status="ok", events=events)
+        return _decision_from_record(
+            record,
+            state_status="ok",
+            events=events,
+            entry_date=entry_date,
+        )
 
 
 def manual_unlock_strategy_drawdown(
