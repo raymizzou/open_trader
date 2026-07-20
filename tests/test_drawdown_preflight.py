@@ -138,7 +138,7 @@ def test_state_loss_recovers_exact_snapshot_instead_of_rebasing(tmp_path: Path) 
         observed_at="2026-07-19T16:00:00+08:00",
     )
     state_path = data_dir / "trend_drawdown/state.json"
-    expected = state_path.read_bytes()
+    expected = json.loads(state_path.read_bytes())
     state_path.unlink()
     write_report(tmp_path, "HK", "ok")
 
@@ -147,7 +147,11 @@ def test_state_loss_recovers_exact_snapshot_instead_of_rebasing(tmp_path: Path) 
     assert result["status"] == "ready"
     assert result["markets"][0]["status"] == "recovered"
     assert result["markets"][0]["entry_allowed"] is False
-    assert state_path.read_bytes() == expected
+    assert result["markets"][0]["recovery"]["status"] == "recovered"
+    assert result["markets"][0]["recovery_event"]["event_type"] == "snapshot_recovery"
+    restored = json.loads(state_path.read_bytes())
+    assert restored["records"] == expected["records"]
+    assert restored["audit_events"][:-1] == expected["audit_events"]
 
 
 def test_unavailable_market_does_not_block_other_market_bootstrap(tmp_path: Path) -> None:

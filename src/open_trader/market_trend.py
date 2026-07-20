@@ -976,6 +976,7 @@ def _attempt_market_report(
             strategy_version=str(strategy_snapshot["strategy_version"]),
             current_equity=account.net_value,
             observed_at=generated_at,
+            entry_date=execution_date,
         )
         report = build_report(
             as_of_date=as_of_date,

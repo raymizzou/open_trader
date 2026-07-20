@@ -35,7 +35,7 @@ from open_trader.notifications import (
 )
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
-from open_trader.strategy_drawdown import manual_unlock_strategy_drawdown
+from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
 from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
     write_trend_api_stats,
@@ -46,15 +46,19 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def unlock_live_drawdown(data_dir: Path, market: str) -> None:
-    manual_unlock_strategy_drawdown(
+    automatic_bootstrap_strategy_drawdown(
         data_dir,
         market=market,
         strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
         strategy_version="v4",
-        current_equity=Decimal("100000"),
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100000"),
+        source_date="2026-07-13",
+        accepted_git_sha="a" * 40,
         occurred_at="2026-07-14T08:00:00+08:00",
-        event_id=f"test-bootstrap-{market.lower()}-v4",
         actor="pytest",
+        reason="first_activation",
+        entry_eligible_from="2026-07-14",
     )
 
 

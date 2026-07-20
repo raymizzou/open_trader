@@ -903,6 +903,7 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
             expected_strategy_id=str(strategy_id),
             expected_strategy_version="v4",
             expected_equity=expected_nav,
+            expected_entry_date=str(payload.get("execution_date") or ""),
         )
         and (
             drawdown.get("entry_allowed") is True

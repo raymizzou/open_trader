@@ -2237,7 +2237,7 @@ function renderTrendActualOverlay(overlay) {
   </details>`;
 }
 
-function renderTrendRiskSummary(summary, drawdown, actualOverlay) {
+function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate) {
   const hasPlanRisk = summary && typeof summary === "object" && hasValue(summary.status);
   const hasDrawdown = drawdown && typeof drawdown === "object" && hasValue(drawdown.status);
   const hasActualOverlay = actualOverlay && typeof actualOverlay === "object";
@@ -2259,13 +2259,28 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay) {
   const bootstrap = hasDrawdown && drawdown.bootstrap_event && typeof drawdown.bootstrap_event === "object"
     ? drawdown.bootstrap_event
     : null;
-  const bootstrapRows = bootstrap ? `<p><strong>基准已自动建立</strong> · 基准净值 ${escapeHtml(formatDisplayNumber(bootstrap.baseline_equity))} · 快照日期 ${escapeHtml(formatPlain(bootstrap.source_date))}</p>
+  const bootstrapNotice = bootstrap && hasValue(reportDate) &&
+    String(bootstrap.occurred_at || "").slice(0, 10) === String(reportDate)
+    ? `<p><strong>基准已自动建立</strong> · 基准净值 ${escapeHtml(formatDisplayNumber(bootstrap.baseline_equity))} · 快照日期 ${escapeHtml(formatPlain(bootstrap.source_date))}</p>`
+    : "";
+  const bootstrapRows = bootstrap ? `${bootstrapNotice}
       <details><summary>回撤基准审计详情</summary><dl>
         <div><dt>事件</dt><dd>${escapeHtml(formatPlain(bootstrap.event_id))}</dd></div>
         <div><dt>验收 Git SHA</dt><dd>${escapeHtml(formatPlain(bootstrap.accepted_git_sha))}</dd></div>
         <div><dt>参数哈希</dt><dd>${escapeHtml(formatPlain(bootstrap.parameter_hash))}</dd></div>
         <div><dt>任务身份</dt><dd>${escapeHtml(formatPlain(bootstrap.actor))}</dd></div>
+        <div><dt>发生时间</dt><dd>${escapeHtml(formatPlain(bootstrap.occurred_at))}</dd></div>
         <div><dt>允许入场日期</dt><dd>${escapeHtml(formatPlain(bootstrap.entry_eligible_from))}</dd></div>
+      </dl></details>` : "";
+  const recovery = hasDrawdown && drawdown.recovery_event && typeof drawdown.recovery_event === "object"
+    ? drawdown.recovery_event
+    : null;
+  const recoveryRows = recovery ? `<details><summary>状态恢复审计详情</summary><dl>
+        <div><dt>事件</dt><dd>${escapeHtml(formatPlain(recovery.event_id))}</dd></div>
+        <div><dt>恢复快照</dt><dd>${escapeHtml(formatPlain(recovery.snapshot))}</dd></div>
+        <div><dt>状态哈希</dt><dd>${escapeHtml(formatPlain(recovery.state_sha256))}</dd></div>
+        <div><dt>任务身份</dt><dd>${escapeHtml(formatPlain(recovery.actor))}</dd></div>
+        <div><dt>发生时间</dt><dd>${escapeHtml(formatPlain(recovery.occurred_at))}</dd></div>
       </dl></details>` : "";
   return `<section class="trend-risk-summary" data-risk-status="${escapeHtml(formatPlain(status))}" aria-label="模拟策略风险摘要">
     ${hasPlanRisk ? `<header><strong>组合计划风险</strong><span>${escapeHtml(formatPlain(summary.status_label))}</span></header>
@@ -2287,7 +2302,7 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay) {
       ${hasValue(drawdown.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(drawdown.pause_reason))}</p>` : ""}
       <dl><div><dt>策略累计回撤</dt><dd>${trendRiskPercent(drawdown.drawdown_pct)} / ${trendRiskPercent(drawdown.drawdown_limit_pct)}</dd></div>
       <div><dt>策略模拟净值</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.current_equity))}</dd></div>
-      <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl>${bootstrapRows}</div>` : ""}
+      <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl>${bootstrapRows}${recoveryRows}</div>` : ""}
     ${renderTrendActualOverlay(actualOverlay)}
   </section>`;
 }
@@ -2547,7 +2562,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
         <span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
       </div>
     </header>
-    ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay)}
+    ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date)}
     <div class="cn-trend-actions">
       ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
       ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}

@@ -33,6 +33,7 @@ DECISION_FIELDS = {
     "paused_at",
     "observed_at",
     "bootstrap_event",
+    "recovery_event",
 }
 
 
@@ -43,6 +44,7 @@ def valid_drawdown_decision(
     expected_strategy_id: str,
     expected_strategy_version: str,
     expected_equity: object,
+    expected_entry_date: str | None = None,
 ) -> bool:
     if not isinstance(value, Mapping) or set(value) != DECISION_FIELDS:
         return False
@@ -78,6 +80,7 @@ def valid_drawdown_decision(
             and value.get("pause_reason") == expected_reason
             and value.get("paused_at") is None
             and value.get("bootstrap_event") is None
+            and value.get("recovery_event") is None
         )
     if state_status != "ok":
         return False
@@ -87,6 +90,19 @@ def valid_drawdown_decision(
         or _record_key(bootstrap_event) != key
     ):
         return False
+    recovery_event = value.get("recovery_event")
+    if recovery_event is not None and (
+        not _valid_recovery_event(recovery_event)
+        or _record_key(recovery_event) != key
+    ):
+        return False
+    pending_until = (
+        str(bootstrap_event.get("entry_eligible_from"))
+        if isinstance(bootstrap_event, dict)
+        and expected_entry_date is not None
+        and expected_entry_date < str(bootstrap_event.get("entry_eligible_from"))
+        else None
+    )
     try:
         high_water_mark = _positive_decimal(
             value["high_water_mark"], "high_water_mark"
@@ -107,6 +123,15 @@ def valid_drawdown_decision(
             and drawdown < DRAWDOWN_LIMIT
             and current_equity <= high_water_mark
         )
+    if pending_until is not None:
+        return (
+            value.get("status") == "pending"
+            and value.get("status_label") == "等待下一交易日"
+            and value.get("pause_reason")
+            == f"回撤基准将在 {pending_until} 起允许新开仓"
+            and value.get("paused_at") is None
+            and drawdown < DRAWDOWN_LIMIT
+        )
     return (
         value.get("entry_allowed") is False
         and value.get("status") == "paused"
@@ -124,16 +149,20 @@ def observe_strategy_equity(
     strategy_version: str,
     current_equity: Decimal,
     observed_at: str,
+    entry_date: str | None = None,
 ) -> dict[str, object]:
     key = _strategy_key(market, strategy_id, strategy_version)
     equity = _positive_decimal(current_equity, "current_equity")
     _canonical_timestamp(observed_at, "observed_at")
+    if entry_date is not None:
+        _canonical_date(entry_date, "entry_date")
     with _state_lock(data_dir):
         return _observe_strategy_equity_locked(
             data_dir,
             key=key,
             equity=equity,
             observed_at=observed_at,
+            entry_date=entry_date,
         )
 
 
@@ -143,6 +172,7 @@ def _observe_strategy_equity_locked(
     key: tuple[str, str, str],
     equity: Decimal,
     observed_at: str,
+    entry_date: str | None,
 ) -> dict[str, object]:
     path = _state_path(data_dir)
     if not path.exists():
@@ -202,7 +232,12 @@ def _observe_strategy_equity_locked(
         )
     _write_state(path, payload)
     assert isinstance(record, dict)
-    return _decision_from_record(record, state_status="ok", events=payload["audit_events"])
+    return _decision_from_record(
+        record,
+        state_status="ok",
+        events=payload["audit_events"],
+        entry_date=entry_date,
+    )
 
 
 def strategy_parameter_hash(parameters: Mapping[str, object]) -> str:
@@ -367,18 +402,10 @@ def _manual_unlock_strategy_drawdown_locked(
             raise ValueError("strategy drawdown unlock event_id was reused")
         assert isinstance(record, dict)
         return _decision_from_record(record, state_status="ok", events=events)
-    previous_high_water_mark = (
-        record.get("high_water_mark") if isinstance(record, dict) else None
-    )
-    previous_paused = record.get("paused") if isinstance(record, dict) else None
-    if record is None:
-        record = {
-            "market": key[0],
-            "strategy_id": key[1],
-            "strategy_version": key[2],
-            "kelly_sample_key": "|".join(key),
-        }
-        records.append(record)
+    if not isinstance(record, dict) or record.get("paused") is not True:
+        raise ValueError("manual unlock requires an existing paused strategy record")
+    previous_high_water_mark = record["high_water_mark"]
+    previous_paused = True
     record.update(
         {
             "high_water_mark": _decimal_text(equity),
@@ -423,7 +450,22 @@ def strategy_drawdown_state_status(data_dir: Path) -> str:
     return "ok"
 
 
-def recover_strategy_drawdown_state(data_dir: Path) -> dict[str, object]:
+def strategy_drawdown_keys(data_dir: Path) -> set[tuple[str, str, str]]:
+    path = _state_path(data_dir)
+    if not path.exists():
+        return set()
+    payload = _load_state(path)
+    records = payload["records"]
+    assert isinstance(records, list)
+    return {_record_key(record) for record in records}
+
+
+def recover_strategy_drawdown_state(
+    data_dir: Path, *, actor: str, occurred_at: str
+) -> dict[str, object]:
+    if not actor.strip():
+        raise ValueError("actor must be non-empty")
+    _canonical_timestamp(occurred_at, "occurred_at")
     with _state_lock(data_dir):
         path = _state_path(data_dir)
         if path.exists():
@@ -457,7 +499,32 @@ def recover_strategy_drawdown_state(data_dir: Path) -> dict[str, object]:
                 digest = hashlib.sha256(_state_bytes(state)).hexdigest()
                 if digest != envelope["state_sha256"]:
                     continue
-                _replace_json(path, _state_bytes(state))
+                records = state["records"]
+                events = state["audit_events"]
+                assert isinstance(records, list) and isinstance(events, list)
+                for record in records:
+                    key = _record_key(record)
+                    event_id = "snapshot-recovery-" + hashlib.sha256(
+                        "|".join((*key, digest, occurred_at)).encode("utf-8")
+                    ).hexdigest()
+                    if any(
+                        isinstance(event, dict)
+                        and event.get("event_id") == event_id
+                        for event in events
+                    ):
+                        continue
+                    events.append({
+                        "event_id": event_id,
+                        "event_type": "snapshot_recovery",
+                        "market": key[0],
+                        "strategy_id": key[1],
+                        "strategy_version": key[2],
+                        "actor": actor.strip(),
+                        "occurred_at": occurred_at,
+                        "snapshot": snapshot_path.name,
+                        "state_sha256": digest,
+                    })
+                _write_state(path, state)
                 return {
                     "status": "recovered",
                     "snapshot": str(snapshot_path),
@@ -584,6 +651,8 @@ def _valid_record(value: object) -> bool:
 def _valid_audit_event(value: object) -> bool:
     if isinstance(value, dict) and value.get("event_type") == "automatic_bootstrap":
         return _valid_automatic_bootstrap_event(value)
+    if isinstance(value, dict) and value.get("event_type") == "snapshot_recovery":
+        return _valid_recovery_event(value)
     if not isinstance(value, dict) or set(value) != {
         "event_id",
         "event_type",
@@ -666,6 +735,40 @@ def _valid_automatic_bootstrap_event(value: object) -> bool:
         and _is_sha1(value["accepted_git_sha"])
         and _is_sha256(value["parameter_hash"])
         and value["reason"] in {"first_activation", "new_strategy_version"}
+    )
+
+
+def _valid_recovery_event(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "event_id",
+        "event_type",
+        "market",
+        "strategy_id",
+        "strategy_version",
+        "actor",
+        "occurred_at",
+        "snapshot",
+        "state_sha256",
+    }:
+        return False
+    try:
+        _strategy_key(
+            str(value["market"]),
+            str(value["strategy_id"]),
+            str(value["strategy_version"]),
+        )
+    except ValueError:
+        return False
+    return (
+        value["event_type"] == "snapshot_recovery"
+        and isinstance(value["event_id"], str)
+        and value["event_id"].startswith("snapshot-recovery-")
+        and isinstance(value["actor"], str)
+        and bool(value["actor"].strip())
+        and _is_canonical_timestamp(value["occurred_at"])
+        and isinstance(value["snapshot"], str)
+        and value["snapshot"] == f"{value['state_sha256']}.json"
+        and _is_sha256(value["state_sha256"])
     )
 
 
@@ -850,11 +953,16 @@ def _decision(
         "paused_at": None,
         "observed_at": observed_at,
         "bootstrap_event": None,
+        "recovery_event": None,
     }
 
 
 def _decision_from_record(
-    record: dict[str, object], *, state_status: str, events: object = ()
+    record: dict[str, object],
+    *,
+    state_status: str,
+    events: object = (),
+    entry_date: str | None = None,
 ) -> dict[str, object]:
     paused = record.get("paused") is True
     bootstrap_event = next(
@@ -867,6 +975,24 @@ def _decision_from_record(
         ),
         None,
     )
+    recovery_event = next(
+        (
+            dict(event)
+            for event in reversed(events if isinstance(events, list) else [])
+            if isinstance(event, dict)
+            and event.get("event_type") == "snapshot_recovery"
+            and _record_key(event) == _record_key(record)
+        ),
+        None,
+    )
+    pending_until = (
+        str(bootstrap_event["entry_eligible_from"])
+        if not paused
+        and bootstrap_event is not None
+        and entry_date is not None
+        and entry_date < str(bootstrap_event["entry_eligible_from"])
+        else None
+    )
     return {
         "schema_version": DECISION_SCHEMA_VERSION,
         "market": record["market"],
@@ -874,17 +1000,24 @@ def _decision_from_record(
         "strategy_version": record["strategy_version"],
         "kelly_sample_key": record["kelly_sample_key"],
         "state_status": state_status,
-        "status": "paused" if paused else "active",
-        "status_label": "暂停新开仓" if paused else "纪律内",
-        "entry_allowed": not paused,
+        "status": "paused" if paused else "pending" if pending_until else "active",
+        "status_label": (
+            "暂停新开仓" if paused else "等待下一交易日" if pending_until else "纪律内"
+        ),
+        "entry_allowed": not paused and pending_until is None,
         "current_equity": record["current_equity"],
         "high_water_mark": record["high_water_mark"],
         "drawdown_pct": record["drawdown_pct"],
         "drawdown_limit_pct": str(DRAWDOWN_LIMIT),
         "pause_reason": (
-            "策略累计回撤已达到 5%，需人工解锁" if paused else ""
+            "策略累计回撤已达到 5%，需人工解锁"
+            if paused
+            else f"回撤基准将在 {pending_until} 起允许新开仓"
+            if pending_until
+            else ""
         ),
         "paused_at": record["paused_at"],
         "observed_at": record["updated_at"],
         "bootstrap_event": bootstrap_event,
+        "recovery_event": recovery_event,
     }

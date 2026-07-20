@@ -49,7 +49,7 @@ from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, MacOSNotifier
 from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
 from open_trader.trend_kelly import TrendKellyRound
-from open_trader.strategy_drawdown import manual_unlock_strategy_drawdown
+from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -374,15 +374,19 @@ def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
 def unlock_live_drawdown(
     data_dir: Path, *, market: str = "CN", equity: str = "100000"
 ) -> None:
-    manual_unlock_strategy_drawdown(
+    automatic_bootstrap_strategy_drawdown(
         data_dir,
         market=market,
         strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
         strategy_version="v4",
-        current_equity=Decimal(equity),
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal(equity),
+        source_date="2026-07-13",
+        accepted_git_sha="a" * 40,
         occurred_at="2026-07-14T08:00:00+08:00",
-        event_id=f"test-bootstrap-{market.lower()}-v4",
         actor="pytest",
+        reason="first_activation",
+        entry_eligible_from="2026-07-14",
     )
 
 
@@ -1495,6 +1499,7 @@ def test_v4_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None
         "paused_at": "2026-07-14T18:00:00+08:00",
         "observed_at": "2026-07-14T18:00:00+08:00",
         "bootstrap_event": None,
+        "recovery_event": None,
     }
     built = build_report(
         as_of_date="2026-07-14",

@@ -1454,6 +1454,7 @@ def _valid_v4_dashboard_trend_payload() -> dict[str, object]:
             "reason": "first_activation",
             "entry_eligible_from": "2026-07-15",
         },
+        "recovery_event": None,
     }
     return payload
 

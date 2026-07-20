@@ -592,10 +592,14 @@ def validate_integrated_candidate(
             bootstrap = drawdown.get("bootstrap_event")
             assert (
                 isinstance(bootstrap, Mapping)
-                and bootstrap.get("accepted_git_sha") == expected_sha
+                and re.fullmatch(
+                    r"[0-9a-f]{40}", str(bootstrap.get("accepted_git_sha") or "")
+                )
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", str(bootstrap.get("parameter_hash") or "")
+                )
                 and bootstrap.get("baseline_equity")
                 and bootstrap.get("source_date")
-                and bootstrap.get("parameter_hash")
                 and bootstrap.get("event_id")
                 and bootstrap.get("actor")
             ), f"{broker} 自动回撤基准审计不完整"
@@ -1562,16 +1566,32 @@ def _check_integrated_trend_ui(
     bootstrap = drawdown.get("bootstrap_event")
     if isinstance(bootstrap, Mapping):
         for value in (
-            "基准已自动建立",
+            "回撤基准审计详情",
             bootstrap.get("baseline_equity"),
             bootstrap.get("source_date"),
             bootstrap.get("event_id"),
             bootstrap.get("accepted_git_sha"),
             bootstrap.get("parameter_hash"),
             bootstrap.get("actor"),
+            bootstrap.get("occurred_at"),
             bootstrap.get("entry_eligible_from"),
         ):
             assert _plain(value) in text, f"{broker} 回撤基准审计未显示 {_plain(value)}"
+        if str(bootstrap.get("occurred_at") or "")[:10] == str(
+            report.get("report_date") or ""
+        ):
+            assert "基准已自动建立" in text, f"{broker} 当日自动建基准提示未显示"
+    recovery = drawdown.get("recovery_event")
+    if isinstance(recovery, Mapping):
+        for value in (
+            "状态恢复审计详情",
+            recovery.get("event_id"),
+            recovery.get("snapshot"),
+            recovery.get("state_sha256"),
+            recovery.get("actor"),
+            recovery.get("occurred_at"),
+        ):
+            assert _plain(value) in text, f"{broker} 状态恢复审计未显示 {_plain(value)}"
     for key in ("items", "outside_positions"):
         items = overlay.get(key)
         assert isinstance(items, list), f"{broker} 实盘偏差列表无效"

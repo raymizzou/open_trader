@@ -13,6 +13,7 @@ from .notifications import Notifier
 from .strategy_drawdown import (
     automatic_bootstrap_strategy_drawdown,
     recover_strategy_drawdown_state,
+    strategy_drawdown_keys,
     strategy_drawdown_state_status,
 )
 
@@ -28,9 +29,9 @@ REPORT_DIRECTORIES = {
 class DrawdownMarketInput:
     market: str
     strategy_snapshot: Mapping[str, object]
-    baseline_equity: Decimal
-    source_date: str
-    entry_eligible_from: str
+    baseline_equity: Decimal | None
+    source_date: str | None
+    entry_eligible_from: str | None
     error: str = ""
 
 
@@ -117,11 +118,14 @@ def run_drawdown_preflight(
     notifier: Notifier,
 ) -> dict[str, object]:
     initial_status = strategy_drawdown_state_status(data_dir)
-    historical_ok = _historical_ok_exists(reports_dir)
+    historical_ok = _any_frozen_report_has_healthy_drawdown(reports_dir)
     recovered = False
+    recovery_details: dict[str, object] | None = None
     if initial_status == "corrupt" or initial_status == "missing" and historical_ok:
         try:
-            recover_strategy_drawdown_state(data_dir)
+            recovery_details = recover_strategy_drawdown_state(
+                data_dir, actor=actor, occurred_at=occurred_at
+            )
             recovered = True
         except ValueError as exc:
             error = str(exc)
@@ -140,7 +144,7 @@ def run_drawdown_preflight(
             return result
 
     first_activation = initial_status == "missing" and not historical_ok
-    existing_keys = _state_keys(data_dir)
+    existing_keys = strategy_drawdown_keys(data_dir)
     results: list[dict[str, object]] = []
     for market in _ordered_markets(market_inputs):
         item = market_inputs[market]
@@ -148,6 +152,18 @@ def run_drawdown_preflight(
             results.append(
                 {"market": market, "status": "unavailable", "error": item.error}
             )
+            continue
+        if (
+            item.baseline_equity is None
+            or item.source_date is None
+            or item.entry_eligible_from is None
+        ):
+            results.append({
+                "market": market,
+                "status": "failed",
+                "failure_status": "baseline_unavailable",
+                "error": "completed-date frozen Futu baseline is unavailable",
+            })
             continue
         strategy_id = str(item.strategy_snapshot.get("strategy_id") or "")
         strategy_version = str(
@@ -208,16 +224,18 @@ def run_drawdown_preflight(
             else "ready" if was_present
             else "bootstrapped"
         )
-        results.append(
-            {
-                "market": market,
-                "status": result_status,
-                "state_status": decision["state_status"],
-                "entry_allowed": decision["entry_allowed"],
-                "high_water_mark": decision["high_water_mark"],
-                "bootstrap_event": decision["bootstrap_event"],
-            }
-        )
+        result = {
+            "market": market,
+            "status": result_status,
+            "state_status": decision["state_status"],
+            "entry_allowed": decision["entry_allowed"],
+            "high_water_mark": decision["high_water_mark"],
+            "bootstrap_event": decision["bootstrap_event"],
+            "recovery_event": decision["recovery_event"],
+        }
+        if result_status == "recovered" and recovery_details is not None:
+            result["recovery"] = recovery_details
+        results.append(result)
     statuses = {str(item["status"]) for item in results}
     overall = "failed" if "failed" in statuses else "unavailable" if "unavailable" in statuses else "ready"
     _sync_failure_alerts(data_dir, market_inputs, results, notifier)
@@ -292,7 +310,7 @@ def _ordered_markets(
     return [market for market in ("CN", "HK", "US") if market in market_inputs]
 
 
-def _historical_ok_exists(reports_dir: Path) -> bool:
+def _any_frozen_report_has_healthy_drawdown(reports_dir: Path) -> bool:
     for market, directory in REPORT_DIRECTORIES.items():
         for path in (reports_dir / directory).glob("*.json"):
             try:
@@ -311,19 +329,3 @@ def _historical_ok_exists(reports_dir: Path) -> bool:
             ):
                 return True
     return False
-
-
-def _state_keys(data_dir: Path) -> set[tuple[str, str, str]]:
-    path = data_dir / "trend_drawdown/state.json"
-    if not path.exists():
-        return set()
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return {
-        (
-            str(record.get("market") or ""),
-            str(record.get("strategy_id") or ""),
-            str(record.get("strategy_version") or ""),
-        )
-        for record in payload.get("records", [])
-        if isinstance(record, dict)
-    }

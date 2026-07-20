@@ -19,7 +19,7 @@ from open_trader.a_share_trend import (
     trend_strategy_snapshot,
 )
 from open_trader.strategy_drawdown import (
-    manual_unlock_strategy_drawdown,
+    automatic_bootstrap_strategy_drawdown,
     observe_strategy_equity,
 )
 
@@ -163,6 +163,7 @@ def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
         "paused_at": None,
         "observed_at": "2026-07-16T17:00:00+08:00",
         "bootstrap_event": None,
+        "recovery_event": None,
     }
     account = AccountSnapshot(
         source_date="2026-07-16",
@@ -208,15 +209,19 @@ def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
     )
     evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
 
-    manual_unlock_strategy_drawdown(
+    automatic_bootstrap_strategy_drawdown(
         tmp_path,
         market="CN",
         strategy_id=str(snapshot["strategy_id"]),
         strategy_version="v4",
-        current_equity=Decimal("100000"),
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100000"),
+        source_date="2026-07-16",
+        accepted_git_sha="a" * 40,
         occurred_at="2026-07-16T17:01:00+08:00",
-        event_id="bootstrap-cn-v4",
         actor="ray",
+        reason="first_activation",
+        entry_eligible_from="2026-07-17",
     )
     observe_strategy_equity(
         tmp_path,

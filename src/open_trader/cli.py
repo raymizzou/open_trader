@@ -1585,16 +1585,10 @@ def main(argv: list[str] | None = None) -> int:
                         source_date=source_date,
                     )
                     if baseline is None:
-                        account = load_futu_simulate_trend_account(
-                            host=config.futu_host,
-                            port=config.futu_port,
-                            simulate_acc_id=require_trend_review_config(
-                                config, market
-                            ),
-                            market=market,
-                            expected_date=source_date,
+                        raise ValueError(
+                            f"{market} completed-date frozen Futu baseline "
+                            f"is unavailable for {source_date}"
                         )
-                        baseline = account.net_value
                     inputs[market] = DrawdownMarketInput(
                         market=market,
                         strategy_snapshot=strategy,
@@ -1606,9 +1600,9 @@ def main(argv: list[str] | None = None) -> int:
                     inputs[market] = DrawdownMarketInput(
                         market=market,
                         strategy_snapshot=strategy,
-                        baseline_equity=Decimal("1"),
-                        source_date=now.date().isoformat(),
-                        entry_eligible_from=now.date().isoformat(),
+                        baseline_equity=None,
+                        source_date=None,
+                        entry_eligible_from=None,
                         error=str(exc),
                     )
             result = run_drawdown_preflight(

@@ -15,6 +15,27 @@ from open_trader.strategy_drawdown import (
 )
 
 
+def bootstrap(
+    data_dir: Path,
+    key: dict[str, str],
+    *,
+    equity: str = "100",
+    occurred_at: str = "2026-07-20T09:00:00+08:00",
+) -> None:
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        **key,
+        parameters={"test_strategy": True},
+        baseline_equity=Decimal(equity),
+        source_date=occurred_at[:10],
+        accepted_git_sha="a" * 40,
+        actor="pytest",
+        occurred_at=occurred_at,
+        reason="first_activation",
+        entry_eligible_from=occurred_at[:10],
+    )
+
+
 def test_missing_drawdown_state_fails_closed_without_creating_artifact(
     tmp_path: Path,
 ) -> None:
@@ -129,46 +150,68 @@ def test_observe_does_not_bootstrap_a_missing_strategy_key(tmp_path: Path) -> No
     assert state_path.read_bytes() == before
 
 
-def test_manual_unlock_bootstraps_an_audited_strategy_baseline(tmp_path: Path) -> None:
+def test_late_bootstrap_blocks_entries_until_the_recorded_trading_date(
+    tmp_path: Path,
+) -> None:
     data_dir = tmp_path / "data"
-
-    decision = manual_unlock_strategy_drawdown(
+    key = {
+        "market": "HK",
+        "strategy_id": "trend_animals_warm_to_hot/HK/v4",
+        "strategy_version": "v4",
+    }
+    automatic_bootstrap_strategy_drawdown(
         data_dir,
-        market="CN",
-        strategy_id="trend_animals_warm_to_hot/CN/v2",
-        strategy_version="v2",
-        current_equity=Decimal("100"),
-        occurred_at="2026-07-20T09:05:00+08:00",
-        event_id="unlock-cn-v2-001",
-        actor="ray",
+        **key,
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="deployment",
+        occurred_at="2026-07-20T09:31:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-21",
     )
 
-    assert decision["entry_allowed"] is True
-    assert decision["high_water_mark"] == "100"
-    assert decision["current_equity"] == "100"
-    assert decision["drawdown_pct"] == "0"
-    assert decision["kelly_sample_key"] == (
-        "CN|trend_animals_warm_to_hot/CN/v2|v2"
+    blocked = observe_strategy_equity(
+        data_dir,
+        **key,
+        current_equity=Decimal("100"),
+        observed_at="2026-07-20T09:32:00+08:00",
+        entry_date="2026-07-20",
     )
-    payload = json.loads(
-        (data_dir / "trend_drawdown" / "state.json").read_text(encoding="utf-8")
+    eligible = observe_strategy_equity(
+        data_dir,
+        **key,
+        current_equity=Decimal("100"),
+        observed_at="2026-07-20T09:33:00+08:00",
+        entry_date="2026-07-21",
     )
-    assert payload["schema_version"] == "open_trader.strategy_drawdown_state.v1"
-    assert payload["records"][0]["paused"] is False
-    assert payload["audit_events"] == [
-        {
-            "actor": "ray",
-            "event_id": "unlock-cn-v2-001",
-            "event_type": "manual_unlock",
-            "market": "CN",
-            "occurred_at": "2026-07-20T09:05:00+08:00",
-            "previous_high_water_mark": None,
-            "previous_paused": None,
-            "rebased_high_water_mark": "100",
-            "strategy_id": "trend_animals_warm_to_hot/CN/v2",
-            "strategy_version": "v2",
-        }
-    ]
+
+    assert blocked["status"] == "pending"
+    assert blocked["entry_allowed"] is False
+    assert blocked["pause_reason"] == "回撤基准将在 2026-07-21 起允许新开仓"
+    assert eligible["status"] == "active"
+    assert eligible["entry_allowed"] is True
+
+
+def test_manual_unlock_rejects_a_missing_or_active_strategy(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    key = {
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v2",
+        "strategy_version": "v2",
+    }
+    request = dict(
+        **key, current_equity=Decimal("100"),
+        occurred_at="2026-07-20T09:05:00+08:00",
+        event_id="unlock-cn-v2-001", actor="ray",
+    )
+
+    with pytest.raises(ValueError, match="existing paused strategy"):
+        manual_unlock_strategy_drawdown(data_dir, **request)
+    bootstrap(data_dir, key)
+    with pytest.raises(ValueError, match="existing paused strategy"):
+        manual_unlock_strategy_drawdown(data_dir, **request)
 
 
 @pytest.mark.parametrize(
@@ -191,14 +234,7 @@ def test_drawdown_entry_gate_is_inclusive_at_five_percent(
         "strategy_id": "trend_animals_warm_to_hot/US/v2",
         "strategy_version": "v2",
     }
-    manual_unlock_strategy_drawdown(
-        data_dir,
-        **key,
-        current_equity=Decimal("100"),
-        occurred_at="2026-07-20T09:00:00+08:00",
-        event_id="bootstrap-us-v2",
-        actor="ray",
-    )
+    bootstrap(data_dir, key)
 
     decision = observe_strategy_equity(
         data_dir,
@@ -220,14 +256,7 @@ def test_paused_drawdown_persists_after_equity_recovers_above_the_peak(
         "strategy_id": "trend_animals_warm_to_hot/HK/v2",
         "strategy_version": "v2",
     }
-    manual_unlock_strategy_drawdown(
-        data_dir,
-        **key,
-        current_equity=Decimal("100"),
-        occurred_at="2026-07-20T09:00:00+08:00",
-        event_id="bootstrap-hk-v2",
-        actor="ray",
-    )
+    bootstrap(data_dir, key)
     paused = observe_strategy_equity(
         data_dir,
         **key,
@@ -257,14 +286,7 @@ def test_observe_keeps_new_version_and_market_fail_closed(tmp_path: Path) -> Non
         "strategy_id": "trend_animals_warm_to_hot/CN",
         "strategy_version": "v2",
     }
-    manual_unlock_strategy_drawdown(
-        data_dir,
-        **base,
-        current_equity=Decimal("100"),
-        occurred_at="2026-07-20T09:00:00+08:00",
-        event_id="bootstrap-cn-v2",
-        actor="ray",
-    )
+    bootstrap(data_dir, base)
     observe_strategy_equity(
         data_dir,
         **base,
@@ -350,14 +372,7 @@ def test_same_version_unlock_rebases_without_touching_kelly_samples_and_is_idemp
         "strategy_id": "trend_animals_warm_to_hot/US/v2",
         "strategy_version": "v2",
     }
-    manual_unlock_strategy_drawdown(
-        data_dir,
-        **key,
-        current_equity=Decimal("100"),
-        occurred_at="2026-07-20T09:00:00+08:00",
-        event_id="bootstrap-us-v2",
-        actor="ray",
-    )
+    bootstrap(data_dir, key)
     observe_strategy_equity(
         data_dir,
         **key,
@@ -445,14 +460,7 @@ def test_drawdown_persistence_is_independent_of_ambient_decimal_precision(
     }
 
     def run(data_dir: Path) -> tuple[dict[str, object], bytes]:
-        manual_unlock_strategy_drawdown(
-            data_dir,
-            **key,
-            current_equity=Decimal("123456.789"),
-            occurred_at="2026-07-20T09:00:00+08:00",
-            event_id="bootstrap-cn-v3",
-            actor="ray",
-        )
+        bootstrap(data_dir, key, equity="123456.789")
         decision = observe_strategy_equity(
             data_dir,
             **key,
@@ -484,14 +492,7 @@ def test_atomic_state_replace_failure_preserves_previous_artifact(
         "strategy_id": "trend_animals_warm_to_hot/CN/v3",
         "strategy_version": "v3",
     }
-    manual_unlock_strategy_drawdown(
-        data_dir,
-        **key,
-        current_equity=Decimal("100"),
-        occurred_at="2026-07-20T09:00:00+08:00",
-        event_id="bootstrap-cn-v3",
-        actor="ray",
-    )
+    bootstrap(data_dir, key)
     state_path = data_dir / "trend_drawdown" / "state.json"
     before = state_path.read_bytes()
 
@@ -579,16 +580,26 @@ def test_recovery_restores_latest_sticky_pause_snapshot(tmp_path: Path) -> None:
         observed_at="2026-07-21T16:00:00+08:00",
     )
     state_path = data_dir / "trend_drawdown/state.json"
-    paused_bytes = state_path.read_bytes()
     state_path.unlink()
 
-    result = recover_strategy_drawdown_state(data_dir)
+    result = recover_strategy_drawdown_state(
+        data_dir,
+        actor="acceptance",
+        occurred_at="2026-07-22T08:00:00+08:00",
+    )
 
     assert result["status"] == "recovered"
-    assert state_path.read_bytes() == paused_bytes
-    restored = json.loads(paused_bytes)
+    restored = json.loads(state_path.read_bytes())
     assert restored["records"][0]["paused"] is True
     assert restored["records"][0]["high_water_mark"] == "100"
+    decision = observe_strategy_equity(
+        data_dir,
+        **key,
+        current_equity=Decimal("94"),
+        observed_at="2026-07-22T08:01:00+08:00",
+    )
+    assert decision["recovery_event"]["actor"] == "acceptance"
+    assert decision["recovery_event"]["state_sha256"] == result["state_sha256"]
 
 
 def test_recovery_skips_invalid_newest_snapshot(tmp_path: Path) -> None:
@@ -608,15 +619,23 @@ def test_recovery_skips_invalid_newest_snapshot(tmp_path: Path) -> None:
         entry_eligible_from="2026-07-20",
     )
     state_path = data_dir / "trend_drawdown/state.json"
-    expected = state_path.read_bytes()
+    expected = json.loads(state_path.read_bytes())
     state_path.unlink()
     invalid = data_dir / "trend_drawdown/snapshots" / ("f" * 64 + ".json")
     invalid.write_text('{"state_sha256":"bad"}\n', encoding="utf-8")
 
-    result = recover_strategy_drawdown_state(data_dir)
+    result = recover_strategy_drawdown_state(
+        data_dir,
+        actor="acceptance",
+        occurred_at="2026-07-22T08:00:00+08:00",
+    )
 
     assert result["snapshot"] != str(invalid)
-    assert state_path.read_bytes() == expected
+    restored = json.loads(state_path.read_bytes())
+    assert restored["records"] == expected["records"]
+    assert restored["audit_events"][:-1] == expected["audit_events"]
+    assert restored["audit_events"][-1]["event_type"] == "snapshot_recovery"
+    assert restored["audit_events"][-1]["snapshot"] == Path(result["snapshot"]).name
 
 
 def test_recovery_failure_does_not_overwrite_corrupt_state(tmp_path: Path) -> None:
@@ -627,7 +646,11 @@ def test_recovery_failure_does_not_overwrite_corrupt_state(tmp_path: Path) -> No
     before = state_path.read_bytes()
 
     with pytest.raises(ValueError, match="no valid strategy drawdown snapshot"):
-        recover_strategy_drawdown_state(data_dir)
+        recover_strategy_drawdown_state(
+            data_dir,
+            actor="acceptance",
+            occurred_at="2026-07-22T08:00:00+08:00",
+        )
 
     assert state_path.read_bytes() == before
 

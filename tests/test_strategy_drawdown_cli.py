@@ -9,6 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from open_trader import cli
+from open_trader.strategy_drawdown import (
+    automatic_bootstrap_strategy_drawdown,
+    observe_strategy_equity,
+)
 
 
 def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
@@ -57,6 +61,29 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
     monkeypatch.setattr(cli, "load_futu_simulate_trend_account", load_account)
     monkeypatch.setattr(cli, "live_trend_strategy_snapshot", strategy_snapshot)
 
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v4",
+        strategy_version="v4",
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100000"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="deployment",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-20",
+    )
+    observe_strategy_equity(
+        data_dir,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v4",
+        strategy_version="v4",
+        current_equity=Decimal("94000"),
+        observed_at="2026-07-20T09:00:00+08:00",
+    )
+
     argv = [
         "trend-drawdown-unlock",
         "--config", str(config_path),
@@ -83,8 +110,12 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
     state = json.loads(
         (data_dir / "trend_drawdown" / "state.json").read_text(encoding="utf-8")
     )
-    assert state["audit_events"][0]["event_id"] == "unlock-cn-v4-001"
-    assert state["audit_events"][0]["occurred_at"] == "2026-07-20T09:30:00+08:00"
+    unlock_event = next(
+        event for event in state["audit_events"]
+        if event["event_type"] == "manual_unlock"
+    )
+    assert unlock_event["event_id"] == "unlock-cn-v4-001"
+    assert unlock_event["occurred_at"] == "2026-07-20T09:30:00+08:00"
 
     state_path = data_dir / "trend_drawdown" / "state.json"
     state_before_retry = state_path.read_bytes()
@@ -159,6 +190,22 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
         "_drawdown_preflight_now",
         lambda: datetime.fromisoformat("2026-07-20T08:00:00+08:00"),
     )
+    for market, directory, equity in (
+        ("CN", "trend_a_share", "100"),
+        ("HK", "trend_hk_phillips", "200"),
+        ("US", "trend_us_tiger", "300"),
+    ):
+        path = config.reports_dir / directory / "2026-07-17.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "metadata": {"market": market},
+            "strategy_snapshot": {
+                "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+                "strategy_version": "v4",
+            },
+            "account": {"source_date": "2026-07-17", "net_value": equity},
+            "drawdown_summary": {"state_status": "missing"},
+        }), encoding="utf-8")
 
     def load_account(**kwargs: object) -> object:
         account_calls.append((str(kwargs["market"]), str(kwargs["expected_date"])))
@@ -190,8 +237,62 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
     assert [item["status"] for item in output["markets"]] == [
         "bootstrapped", "bootstrapped", "bootstrapped"
     ]
-    assert account_calls == [
-        ("CN", "2026-07-17"),
-        ("HK", "2026-07-17"),
-        ("US", "2026-07-17"),
-    ]
+    assert account_calls == []
+
+
+def test_trend_drawdown_preflight_does_not_relabel_live_nav_as_historical(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    config = SimpleNamespace(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+    )
+    account_calls: list[str] = []
+
+    class Quote:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_trading_days(self, **_: object) -> list[str]:
+            return ["2026-07-17", "2026-07-20", "2026-07-21"]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(cli, "build_notifier", lambda config: cli.NullNotifier())
+    monkeypatch.setattr(cli, "require_trend_review_config", lambda cfg, market: 101)
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "a" * 40)
+    monkeypatch.setattr(
+        cli, "_drawdown_preflight_now",
+        lambda: datetime.fromisoformat("2026-07-20T08:00:00+08:00"),
+    )
+    monkeypatch.setattr(
+        cli, "live_trend_strategy_snapshot",
+        lambda market, process_version, pool_ids: {
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+            "strategy_version": "v4",
+            "parameters": {"market": market},
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_futu_simulate_trend_account",
+        lambda **kwargs: account_calls.append(str(kwargs["market"])),
+    )
+
+    result = cli.main([
+        "trend-drawdown-preflight", "--config", str(tmp_path / "daily.env"),
+        "--repo", str(tmp_path),
+    ])
+
+    assert result == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "unavailable"
+    assert account_calls == []

@@ -1027,9 +1027,10 @@ def integrated_v4_payload(
                     "event_id": "automatic-bootstrap-audit",
                     "baseline_equity": "100000",
                     "source_date": "2026-07-17",
-                    "accepted_git_sha": "candidate-sha",
-                    "parameter_hash": "parameter-hash",
+                    "accepted_git_sha": "a" * 40,
+                    "parameter_hash": "b" * 64,
                     "actor": "acceptance",
+                    "occurred_at": "2026-07-20T08:00:00+08:00",
                     "entry_eligible_from": "2026-07-20",
                 },
             },
@@ -1240,6 +1241,7 @@ def test_trend_advice_signature_allows_overlay_refresh_only(tmp_path: Path) -> N
 
 def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
     report = {
+        "report_date": "2026-07-20",
         "risk_summary": {
             "status": "active", "status_label": "风险预算内",
             "trade_stats": {"actual_broker_label": "东方财富"},
@@ -1253,7 +1255,15 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
                 "accepted_git_sha": "candidate-sha",
                 "parameter_hash": "parameter-hash",
                 "actor": "acceptance",
+                "occurred_at": "2026-07-20T08:00:00+08:00",
                 "entry_eligible_from": "2026-07-20",
+            },
+            "recovery_event": {
+                "event_id": "snapshot-recovery-audit",
+                "snapshot": "snapshot.json",
+                "state_sha256": "state-hash",
+                "actor": "acceptance",
+                "occurred_at": "2026-07-20T08:30:00+08:00",
             },
         },
         "actual_overlay": {
@@ -1266,8 +1276,9 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
         "组合计划风险 风险预算内 组合剩余风险 单笔风险上限 异常损失缓冲 不得用于开仓",
         "Kelly 阶段 当前 Kelly 上限 富途模拟盘交易统计 东方财富实盘交易统计",
         "策略累计回撤 纪律内 实盘执行辅助 东方财富 超买 报告外加仓",
-        "基准已自动建立 100000 2026-07-17 automatic-bootstrap-audit ",
-        "candidate-sha parameter-hash acceptance 2026-07-20",
+        "基准已自动建立 回撤基准审计详情 100000 2026-07-17 automatic-bootstrap-audit ",
+        "candidate-sha parameter-hash acceptance 2026-07-20T08:00:00+08:00 2026-07-20 ",
+        "状态恢复审计详情 snapshot-recovery-audit snapshot.json state-hash 2026-07-20T08:30:00+08:00",
         "5% 是风险预算目标，不是最大损失保证。",
         "不会改写模拟建议、Kelly、模拟统计或报告哈希 不会自动交易真实账户",
     ))

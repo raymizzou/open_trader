@@ -2157,6 +2157,7 @@ def build_report(
                 ),
                 expected_strategy_version=snapshot_version,
                 expected_equity=account.net_value,
+                expected_entry_date=execution_date,
             )
             or drawdown_summary.get("entry_allowed") is not True
         ):
@@ -2988,6 +2989,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 expected_strategy_id=str(snapshot.get("strategy_id") or ""),
                 expected_strategy_version="v4",
                 expected_equity=report.account.net_value,
+                expected_entry_date=report.execution_date,
             )
             or report.drawdown_summary.get("entry_allowed") is not True
             and report.buy_actions
@@ -4041,6 +4043,7 @@ def _attempt_report(
             strategy_version=str(strategy_snapshot["strategy_version"]),
             current_equity=account.net_value,
             observed_at=generated_at,
+            entry_date=execution_date,
         )
         report = build_report(
             as_of_date=run_date,

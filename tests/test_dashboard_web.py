@@ -4040,7 +4040,10 @@ const html = renderTrendReportWorkspace({
     bootstrap_event:{event_id:"automatic-bootstrap-audit",event_type:"automatic_bootstrap",
       baseline_equity:"100000",source_date:"2026-07-14",accepted_git_sha:"abc123",
       parameter_hash:"params456",actor:"acceptance",reason:"first_activation",
-      entry_eligible_from:"2026-07-15"}},
+      occurred_at:"2026-07-16T08:00:00+08:00",entry_eligible_from:"2026-07-15"},
+    recovery_event:{event_id:"snapshot-recovery-audit",event_type:"snapshot_recovery",
+      snapshot:"state-snapshot.json",state_sha256:"statehash789",actor:"acceptance",
+      occurred_at:"2026-07-16T08:30:00+08:00"}},
   sell_actions:[{symbol:"600000",name:"浦发银行",reason:"danger_signal"}],
   buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
     temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
@@ -4064,6 +4067,7 @@ for (const text of ["组合计划风险","风险预算内",
   "暂停新开仓","策略累计回撤已达到 5%，需人工解锁",
   "基准已自动建立","基准净值 100,000","快照日期 2026-07-14",
   "automatic-bootstrap-audit","abc123","params456","acceptance",
+  "状态恢复审计详情","snapshot-recovery-audit","state-snapshot.json","statehash789",
   "组合剩余风险","单笔风险上限","异常损失缓冲","不得用于开仓",
   "5% 是风险预算目标，不是最大损失保证。","目标仓位（占净值）",
   "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
@@ -4084,6 +4088,16 @@ if ((html.match(/class="cn-trend-card"/g) || []).length < 3 ||
     (html.match(/class="cn-trend-execution cn-trend-risk-detail"/g) || []).length !== 2) {
   throw new Error(html);
 }
+const historical = renderTrendRiskSummary(null, {
+  status:"active",status_label:"纪律内",current_equity:"100000",
+  high_water_mark:"100000",drawdown_pct:"0",drawdown_limit_pct:"0.05",
+  bootstrap_event:{event_id:"automatic-bootstrap-audit",event_type:"automatic_bootstrap",
+    baseline_equity:"100000",source_date:"2026-07-14",accepted_git_sha:"abc123",
+    parameter_hash:"params456",actor:"acceptance",
+    occurred_at:"2026-07-16T08:00:00+08:00",entry_eligible_from:"2026-07-15"}
+}, null, "2026-07-17");
+if (historical.includes("基准已自动建立") ||
+    !historical.includes("回撤基准审计详情")) throw new Error(historical);
 const drawdownOnly = renderTrendRiskSummary(null, {
   status:"paused",status_label:"暂停新开仓",drawdown_pct:null,
   drawdown_limit_pct:"0.05",current_equity:"95000",high_water_mark:null,
