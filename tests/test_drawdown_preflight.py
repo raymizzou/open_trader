@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -43,6 +44,17 @@ def run_preflight(root: Path, inputs: dict[str, DrawdownMarketInput]) -> dict[st
         occurred_at="2026-07-20T08:00:00+08:00",
         notifier=NullNotifier(),
     )
+
+
+class RecordingNotifier:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.calls.append((title, message))
+        if self.fail:
+            raise RuntimeError("notification failed")
 
 
 def write_report(root: Path, market: str, state_status: str) -> Path:
@@ -197,3 +209,52 @@ def test_frozen_missing_report_supplies_original_account_baseline(
         strategy_version="v4",
         source_date="2026-07-17",
     ) == Decimal("123.45")
+
+
+def test_failure_alert_is_deduplicated_and_rearmed_after_recovery(
+    tmp_path: Path,
+) -> None:
+    report = write_report(tmp_path, "US", "ok")
+    notifier = RecordingNotifier()
+    request = dict(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        market_inputs={"US": market_input("US")},
+        accepted_git_sha="a" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        notifier=notifier,
+    )
+
+    run_drawdown_preflight(**request)
+    run_drawdown_preflight(**request)
+    assert len(notifier.calls) == 1
+    assert "高优先级" in notifier.calls[0][0]
+
+    report.unlink()
+    assert run_drawdown_preflight(**request)["status"] == "ready"
+    state_root = tmp_path / "data/trend_drawdown"
+    (state_root / "state.json").unlink()
+    shutil.rmtree(state_root / "snapshots")
+    write_report(tmp_path, "US", "ok")
+    assert run_drawdown_preflight(**request)["status"] == "failed"
+    assert len(notifier.calls) == 2
+
+
+def test_notification_failure_does_not_change_fail_closed_result(
+    tmp_path: Path,
+) -> None:
+    write_report(tmp_path, "HK", "ok")
+
+    result = run_drawdown_preflight(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        market_inputs={"HK": market_input("HK")},
+        accepted_git_sha="a" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        notifier=RecordingNotifier(fail=True),
+    )
+
+    assert result["status"] == "failed"
+    assert not (tmp_path / "data/trend_drawdown/alerts.json").exists()

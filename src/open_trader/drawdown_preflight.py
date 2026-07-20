@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from zoneinfo import ZoneInfo
 
 from .notifications import Notifier
@@ -115,7 +116,6 @@ def run_drawdown_preflight(
     occurred_at: str,
     notifier: Notifier,
 ) -> dict[str, object]:
-    del notifier  # Alert delivery is added at the preflight result boundary.
     initial_status = strategy_drawdown_state_status(data_dir)
     historical_ok = _historical_ok_exists(reports_dir)
     recovered = False
@@ -125,11 +125,19 @@ def run_drawdown_preflight(
             recovered = True
         except ValueError as exc:
             error = str(exc)
+            failure_status = f"state_{initial_status}_recovery_failed"
             results = [
-                {"market": market, "status": "failed", "error": error}
+                {
+                    "market": market,
+                    "status": "failed",
+                    "failure_status": failure_status,
+                    "error": error,
+                }
                 for market in _ordered_markets(market_inputs)
             ]
-            return {"status": "failed", "markets": results}
+            result = {"status": "failed", "markets": results}
+            _sync_failure_alerts(data_dir, market_inputs, results, notifier)
+            return result
 
     first_activation = initial_status == "missing" and not historical_ok
     existing_keys = _state_keys(data_dir)
@@ -178,8 +186,20 @@ def run_drawdown_preflight(
                 entry_eligible_from=item.entry_eligible_from,
             )
         except (OSError, ValueError) as exc:
+            error = str(exc)
             results.append(
-                {"market": market, "status": "failed", "error": str(exc)}
+                {
+                    "market": market,
+                    "status": "failed",
+                    "failure_status": (
+                        "parameter_mismatch"
+                        if "parameters changed" in error
+                        else "parameter_identity_missing"
+                        if "parameter identity" in error
+                        else "preflight_failed"
+                    ),
+                    "error": error,
+                }
             )
             continue
         existing_keys.add(key)
@@ -200,7 +220,70 @@ def run_drawdown_preflight(
         )
     statuses = {str(item["status"]) for item in results}
     overall = "failed" if "failed" in statuses else "unavailable" if "unavailable" in statuses else "ready"
+    _sync_failure_alerts(data_dir, market_inputs, results, notifier)
     return {"status": overall, "markets": results}
+
+
+def _sync_failure_alerts(
+    data_dir: Path,
+    market_inputs: Mapping[str, DrawdownMarketInput],
+    results: list[dict[str, object]],
+    notifier: Notifier,
+) -> None:
+    path = data_dir / "trend_drawdown/alerts.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        active = set(payload["active"])
+        if not all(isinstance(item, str) for item in active):
+            raise ValueError
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        active = set()
+    original = set(active)
+    for result in results:
+        market = str(result["market"])
+        strategy = market_inputs[market].strategy_snapshot
+        version = str(strategy.get("strategy_version") or "")
+        prefix = f"{market}|{version}|"
+        if result["status"] in {"ready", "bootstrapped", "recovered"}:
+            active = {key for key in active if not key.startswith(prefix)}
+            continue
+        failure_status = result.get("failure_status")
+        if result["status"] != "failed" or not failure_status:
+            continue
+        key = prefix + str(failure_status)
+        if key in active:
+            continue
+        try:
+            notifier.notify(
+                "高优先级：策略累计回撤状态阻断",
+                f"{market} {version}：{result.get('error', failure_status)}",
+            )
+        except Exception:
+            continue
+        active.add(key)
+    if active == original:
+        return
+    content = (
+        json.dumps(
+            {"active": sorted(active)},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", delete=False, dir=path.parent
+        ) as handle:
+            handle.write(content)
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _ordered_markets(

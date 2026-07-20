@@ -2256,6 +2256,17 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay) {
   const kellyRows = kellyPhase ? `
         <div><dt>Kelly 阶段</dt><dd>${escapeHtml(`${kellyPhase} · ${formatPlain(summary.kelly_eligible_sample_count)} 个合格模拟闭环`)}</dd></div>
         <div><dt>当前 Kelly 上限</dt><dd>${escapeHtml(trendKellyPercent(summary.kelly_cap))}</dd></div>` : "";
+  const bootstrap = hasDrawdown && drawdown.bootstrap_event && typeof drawdown.bootstrap_event === "object"
+    ? drawdown.bootstrap_event
+    : null;
+  const bootstrapRows = bootstrap ? `<p><strong>基准已自动建立</strong> · 基准净值 ${escapeHtml(formatDisplayNumber(bootstrap.baseline_equity))} · 快照日期 ${escapeHtml(formatPlain(bootstrap.source_date))}</p>
+      <details><summary>回撤基准审计详情</summary><dl>
+        <div><dt>事件</dt><dd>${escapeHtml(formatPlain(bootstrap.event_id))}</dd></div>
+        <div><dt>验收 Git SHA</dt><dd>${escapeHtml(formatPlain(bootstrap.accepted_git_sha))}</dd></div>
+        <div><dt>参数哈希</dt><dd>${escapeHtml(formatPlain(bootstrap.parameter_hash))}</dd></div>
+        <div><dt>任务身份</dt><dd>${escapeHtml(formatPlain(bootstrap.actor))}</dd></div>
+        <div><dt>允许入场日期</dt><dd>${escapeHtml(formatPlain(bootstrap.entry_eligible_from))}</dd></div>
+      </dl></details>` : "";
   return `<section class="trend-risk-summary" data-risk-status="${escapeHtml(formatPlain(status))}" aria-label="模拟策略风险摘要">
     ${hasPlanRisk ? `<header><strong>组合计划风险</strong><span>${escapeHtml(formatPlain(summary.status_label))}</span></header>
       ${hasValue(summary.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(summary.pause_reason))}</p>` : ""}
@@ -2276,7 +2287,7 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay) {
       ${hasValue(drawdown.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(drawdown.pause_reason))}</p>` : ""}
       <dl><div><dt>策略累计回撤</dt><dd>${trendRiskPercent(drawdown.drawdown_pct)} / ${trendRiskPercent(drawdown.drawdown_limit_pct)}</dd></div>
       <div><dt>策略模拟净值</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.current_equity))}</dd></div>
-      <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl></div>` : ""}
+      <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl>${bootstrapRows}</div>` : ""}
     ${renderTrendActualOverlay(actualOverlay)}
   </section>`;
 }

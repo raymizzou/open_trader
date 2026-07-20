@@ -1439,6 +1439,21 @@ def _valid_v4_dashboard_trend_payload() -> dict[str, object]:
         "pause_reason": "",
         "paused_at": None,
         "observed_at": "2026-07-15T20:00:00+08:00",
+        "bootstrap_event": {
+            "event_id": "automatic-bootstrap-" + "1" * 64,
+            "event_type": "automatic_bootstrap",
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+            "strategy_version": "v4",
+            "actor": "acceptance",
+            "occurred_at": "2026-07-15T08:00:00+08:00",
+            "baseline_equity": "100000",
+            "source_date": "2026-07-14",
+            "accepted_git_sha": "a" * 40,
+            "parameter_hash": "b" * 64,
+            "reason": "first_activation",
+            "entry_eligible_from": "2026-07-15",
+        },
     }
     return payload
 
