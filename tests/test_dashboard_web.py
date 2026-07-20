@@ -4097,7 +4097,9 @@ const historical = renderTrendRiskSummary(null, {
     occurred_at:"2026-07-16T08:00:00+08:00",entry_eligible_from:"2026-07-15"}
 }, null, "2026-07-17");
 if (historical.includes("基准已自动建立") ||
-    !historical.includes("回撤基准审计详情")) throw new Error(historical);
+    !historical.includes("回撤基准审计详情") ||
+    !historical.includes("100000") ||
+    !historical.includes("2026-07-14")) throw new Error(historical);
 const drawdownOnly = renderTrendRiskSummary(null, {
   status:"paused",status_label:"暂停新开仓",drawdown_pct:null,
   drawdown_limit_pct:"0.05",current_equity:"95000",high_water_mark:null,
