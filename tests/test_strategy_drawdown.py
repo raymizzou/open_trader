@@ -12,6 +12,7 @@ from open_trader.strategy_drawdown import (
     observe_strategy_equity,
     recover_strategy_drawdown_state,
     strategy_parameter_hash,
+    valid_drawdown_decision,
 )
 
 
@@ -54,6 +55,35 @@ def test_missing_drawdown_state_fails_closed_without_creating_artifact(
     assert decision["state_status"] == "missing"
     assert decision["pause_reason"] == "策略累计回撤状态缺失，暂停新开仓"
     assert not (data_dir / "trend_drawdown" / "state.json").exists()
+
+
+def test_legacy_missing_decision_remains_readable() -> None:
+    decision = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v4|v4",
+        "state_status": "missing",
+        "status": "paused",
+        "status_label": "暂停新开仓",
+        "entry_allowed": False,
+        "current_equity": "100",
+        "high_water_mark": None,
+        "drawdown_pct": None,
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "策略累计回撤状态缺失，暂停新开仓",
+        "paused_at": None,
+        "observed_at": "2026-07-20T09:00:00+08:00",
+    }
+
+    assert valid_drawdown_decision(
+        decision,
+        expected_market="CN",
+        expected_strategy_id="trend_animals_warm_to_hot/CN/v4",
+        expected_strategy_version="v4",
+        expected_equity="100",
+    )
 
 
 def test_parameter_hash_is_canonical() -> None:

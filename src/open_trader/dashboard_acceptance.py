@@ -614,7 +614,7 @@ def validate_integrated_candidate(
             ), f"{broker} 仍因回撤状态缺失跳过买入"
             assert (
                 drawdown == frozen.get("drawdown_summary")
-                and drawdown.get("status") in {"active", "paused"}
+                and drawdown.get("status") in {"active", "pending", "paused"}
                 and bool(drawdown.get("status_label"))
                 and _position_decimal(
                     drawdown.get("drawdown_limit_pct"), "回撤阈值"
@@ -1545,6 +1545,16 @@ def _check_integrated_trend_ui(
     assert report_root.locator(".trend-actual-overlay").count() == 1, (
         f"{broker} 趋势报告缺少只读实盘辅助"
     )
+    bootstrap = drawdown.get("bootstrap_event")
+    if isinstance(bootstrap, Mapping):
+        audit = risk.locator(".trend-drawdown-bootstrap-audit")
+        assert audit.count() == 1, f"{broker} 缺少回撤基准审计详情"
+        audit.locator("summary").click()
+    recovery = drawdown.get("recovery_event")
+    if isinstance(recovery, Mapping):
+        audit = risk.locator(".trend-drawdown-recovery-audit")
+        assert audit.count() == 1, f"{broker} 缺少状态恢复审计详情"
+        audit.locator("summary").click()
     text = risk.inner_text()
     stats = summary.get("trade_stats")
     actual_label = (
@@ -1563,7 +1573,6 @@ def _check_integrated_trend_ui(
     )
     for value in required:
         assert value != "-" and value in text, f"{broker} 集成风险视图缺少 {value}"
-    bootstrap = drawdown.get("bootstrap_event")
     if isinstance(bootstrap, Mapping):
         for value in (
             "回撤基准审计详情",
@@ -1581,7 +1590,6 @@ def _check_integrated_trend_ui(
             report.get("report_date") or ""
         ):
             assert "基准已自动建立" in text, f"{broker} 当日自动建基准提示未显示"
-    recovery = drawdown.get("recovery_event")
     if isinstance(recovery, Mapping):
         for value in (
             "状态恢复审计详情",

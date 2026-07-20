@@ -2264,7 +2264,7 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate) {
     ? `<p><strong>基准已自动建立</strong> · 基准净值 ${escapeHtml(formatDisplayNumber(bootstrap.baseline_equity))} · 快照日期 ${escapeHtml(formatPlain(bootstrap.source_date))}</p>`
     : "";
   const bootstrapRows = bootstrap ? `${bootstrapNotice}
-      <details><summary>回撤基准审计详情</summary><dl>
+      <details class="trend-drawdown-bootstrap-audit"><summary>回撤基准审计详情</summary><dl>
         <div><dt>事件</dt><dd>${escapeHtml(formatPlain(bootstrap.event_id))}</dd></div>
         <div><dt>验收 Git SHA</dt><dd>${escapeHtml(formatPlain(bootstrap.accepted_git_sha))}</dd></div>
         <div><dt>参数哈希</dt><dd>${escapeHtml(formatPlain(bootstrap.parameter_hash))}</dd></div>
@@ -2275,7 +2275,7 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate) {
   const recovery = hasDrawdown && drawdown.recovery_event && typeof drawdown.recovery_event === "object"
     ? drawdown.recovery_event
     : null;
-  const recoveryRows = recovery ? `<details><summary>状态恢复审计详情</summary><dl>
+  const recoveryRows = recovery ? `<details class="trend-drawdown-recovery-audit"><summary>状态恢复审计详情</summary><dl>
         <div><dt>事件</dt><dd>${escapeHtml(formatPlain(recovery.event_id))}</dd></div>
         <div><dt>恢复快照</dt><dd>${escapeHtml(formatPlain(recovery.snapshot))}</dd></div>
         <div><dt>状态哈希</dt><dd>${escapeHtml(formatPlain(recovery.state_sha256))}</dd></div>

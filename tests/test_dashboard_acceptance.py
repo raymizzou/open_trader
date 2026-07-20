@@ -956,6 +956,7 @@ def integrated_v4_payload(
         "eastmoney": "trend_a_share",
     }
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
+        pending = market == "HK"
         lot_size = 100 if market in {"CN", "HK"} else 1
         risk_summary = {
             "status": "active",
@@ -1010,7 +1011,7 @@ def integrated_v4_payload(
                 },
             },
             "strategy_judgments": {
-                "formal_actions": [buy],
+                "formal_actions": [] if pending else [buy],
                 "holding_decisions": [],
                 "top10_candidates": [],
                 "risk_skips": [],
@@ -1018,11 +1019,14 @@ def integrated_v4_payload(
             "risk_summary": risk_summary,
             "drawdown_summary": {
                 "state_status": "ok",
-                "status": "active",
-                "status_label": "纪律内",
-                "entry_allowed": True,
+                "status": "pending" if pending else "active",
+                "status_label": "等待下一交易日" if pending else "纪律内",
+                "entry_allowed": not pending,
                 "drawdown_pct": "0",
                 "drawdown_limit_pct": "0.05",
+                "pause_reason": (
+                    "回撤基准将在 2026-07-21 起允许新开仓" if pending else ""
+                ),
                 "bootstrap_event": {
                     "event_id": "automatic-bootstrap-audit",
                     "baseline_equity": "100000",
@@ -1031,7 +1035,7 @@ def integrated_v4_payload(
                     "parameter_hash": "b" * 64,
                     "actor": "acceptance",
                     "occurred_at": "2026-07-20T08:00:00+08:00",
-                    "entry_eligible_from": "2026-07-20",
+                    "entry_eligible_from": "2026-07-21" if pending else "2026-07-20",
                 },
             },
             "data_sources": [f"Futu {market} SIMULATE account"],
@@ -1051,7 +1055,7 @@ def integrated_v4_payload(
             "artifact": artifact.name,
             "report_sha256": _report_hash(frozen),
             "strategy_version": "v4",
-            "buy_actions": [buy],
+            "buy_actions": [] if pending else [buy],
             "sell_actions": [],
             "hold_actions": [],
             "review_actions": [],
@@ -1283,6 +1287,8 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
         "不会改写模拟建议、Kelly、模拟统计或报告哈希 不会自动交易真实账户",
     ))
 
+    clicked: list[str] = []
+
     class Locator:
         def __init__(self, selector: str) -> None:
             self.selector = selector
@@ -1292,6 +1298,12 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
 
         def inner_text(self) -> str:
             return text
+
+        def locator(self, selector: str) -> "Locator":
+            return Locator(f"{self.selector} {selector}")
+
+        def click(self) -> None:
+            clicked.append(self.selector)
 
         def get_attribute(self, name: str) -> str | None:
             assert name == "data-risk-status"
@@ -1307,6 +1319,8 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
     dashboard_acceptance._check_integrated_trend_ui(
         Root(), report, "eastmoney"
     )
+    assert ".trend-risk-summary .trend-drawdown-bootstrap-audit summary" in clicked
+    assert ".trend-risk-summary .trend-drawdown-recovery-audit summary" in clicked
 
 
 def test_acceptance_checks_exact_trend_review_content() -> None:

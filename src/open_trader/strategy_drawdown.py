@@ -46,7 +46,10 @@ def valid_drawdown_decision(
     expected_equity: object,
     expected_entry_date: str | None = None,
 ) -> bool:
-    if not isinstance(value, Mapping) or set(value) != DECISION_FIELDS:
+    if not isinstance(value, Mapping) or frozenset(value) not in {
+        frozenset(DECISION_FIELDS),
+        frozenset(DECISION_FIELDS - {"bootstrap_event", "recovery_event"}),
+    }:
         return False
     try:
         key = _strategy_key(
