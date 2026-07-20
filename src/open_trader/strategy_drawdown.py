@@ -12,6 +12,7 @@ from tempfile import NamedTemporaryFile
 
 
 STATE_SCHEMA_VERSION = "open_trader.strategy_drawdown_state.v1"
+SNAPSHOT_SCHEMA_VERSION = "open_trader.strategy_drawdown_snapshot.v1"
 DECISION_SCHEMA_VERSION = "open_trader.strategy_drawdown.v1"
 DRAWDOWN_LIMIT = Decimal("0.05")
 DECISION_FIELDS = {
@@ -411,6 +412,51 @@ def _state_path(data_dir: Path) -> Path:
     return data_dir / "trend_drawdown" / "state.json"
 
 
+def recover_strategy_drawdown_state(data_dir: Path) -> dict[str, object]:
+    with _state_lock(data_dir):
+        path = _state_path(data_dir)
+        if path.exists():
+            try:
+                _load_state(path)
+            except ValueError:
+                pass
+            else:
+                raise ValueError("strategy drawdown state is already valid")
+        snapshots_dir = path.parent / "snapshots"
+        candidates = sorted(
+            snapshots_dir.glob("*.json"),
+            key=lambda item: (item.stat().st_mtime_ns, item.name),
+            reverse=True,
+        )
+        for snapshot_path in candidates:
+            try:
+                envelope = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(envelope, dict)
+                    or set(envelope) != {
+                        "schema_version",
+                        "state",
+                        "state_sha256",
+                    }
+                    or envelope.get("schema_version") != SNAPSHOT_SCHEMA_VERSION
+                    or snapshot_path.stem != envelope.get("state_sha256")
+                ):
+                    continue
+                state = _validate_state(envelope.get("state"))
+                digest = hashlib.sha256(_state_bytes(state)).hexdigest()
+                if digest != envelope["state_sha256"]:
+                    continue
+                _replace_json(path, _state_bytes(state))
+                return {
+                    "status": "recovered",
+                    "snapshot": str(snapshot_path),
+                    "state_sha256": digest,
+                }
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                continue
+        raise ValueError("no valid strategy drawdown snapshot is available")
+
+
 @contextmanager
 def _state_lock(data_dir: Path) -> Iterator[None]:
     path = data_dir / "trend_drawdown" / ".state.lock"
@@ -614,19 +660,50 @@ def _valid_automatic_bootstrap_event(value: object) -> bool:
 
 def _write_state(path: Path, payload: dict[str, object]) -> None:
     _validate_state(payload)
+    state_bytes = _state_bytes(payload)
+    _replace_json(path, state_bytes)
+    _write_snapshot(path.parent / "snapshots", payload, state_bytes)
+
+
+def _state_bytes(payload: Mapping[str, object]) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def _replace_json(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     try:
         with NamedTemporaryFile(
-            "w", encoding="utf-8", delete=False, dir=path.parent
+            "wb", delete=False, dir=path.parent
         ) as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
+            handle.write(content)
             temp_path = Path(handle.name)
         temp_path.replace(path)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+def _write_snapshot(
+    snapshots_dir: Path,
+    payload: dict[str, object],
+    state_bytes: bytes,
+) -> None:
+    digest = hashlib.sha256(state_bytes).hexdigest()
+    path = snapshots_dir / f"{digest}.json"
+    envelope = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "state": payload,
+        "state_sha256": digest,
+    }
+    content = _state_bytes(envelope)
+    if path.exists():
+        if path.read_bytes() != content:
+            raise ValueError("strategy drawdown snapshot digest collision")
+        return
+    _replace_json(path, content)
 
 
 def _strategy_key(

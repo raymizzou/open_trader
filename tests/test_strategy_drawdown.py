@@ -10,6 +10,7 @@ from open_trader.strategy_drawdown import (
     automatic_bootstrap_strategy_drawdown,
     manual_unlock_strategy_drawdown,
     observe_strategy_equity,
+    recover_strategy_drawdown_state,
     strategy_parameter_hash,
 )
 
@@ -509,8 +510,126 @@ def test_atomic_state_replace_failure_preserves_previous_artifact(
     assert state_path.read_bytes() == before
     assert {path.name for path in state_path.parent.iterdir()} == {
         ".state.lock",
+        "snapshots",
         "state.json",
     }
+
+
+def test_state_updates_create_distinct_immutable_hashed_snapshots(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    key = {
+        "market": "US",
+        "strategy_id": "trend_animals_warm_to_hot/US/v4",
+        "strategy_version": "v4",
+    }
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        **key,
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="deployment",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-20",
+    )
+    observe_strategy_equity(
+        data_dir,
+        **key,
+        current_equity=Decimal("94"),
+        observed_at="2026-07-21T16:00:00-04:00",
+    )
+
+    snapshots = sorted((data_dir / "trend_drawdown/snapshots").glob("*.json"))
+    assert len(snapshots) == 2
+    for path in snapshots:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        assert envelope["schema_version"] == (
+            "open_trader.strategy_drawdown_snapshot.v1"
+        )
+        assert path.stem == envelope["state_sha256"]
+
+
+def test_recovery_restores_latest_sticky_pause_snapshot(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    key = {
+        "market": "HK",
+        "strategy_id": "trend_animals_warm_to_hot/HK/v4",
+        "strategy_version": "v4",
+    }
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        **key,
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="deployment",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-20",
+    )
+    observe_strategy_equity(
+        data_dir,
+        **key,
+        current_equity=Decimal("94"),
+        observed_at="2026-07-21T16:00:00+08:00",
+    )
+    state_path = data_dir / "trend_drawdown/state.json"
+    paused_bytes = state_path.read_bytes()
+    state_path.unlink()
+
+    result = recover_strategy_drawdown_state(data_dir)
+
+    assert result["status"] == "recovered"
+    assert state_path.read_bytes() == paused_bytes
+    restored = json.loads(paused_bytes)
+    assert restored["records"][0]["paused"] is True
+    assert restored["records"][0]["high_water_mark"] == "100"
+
+
+def test_recovery_skips_invalid_newest_snapshot(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v4",
+        strategy_version="v4",
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="deployment",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-20",
+    )
+    state_path = data_dir / "trend_drawdown/state.json"
+    expected = state_path.read_bytes()
+    state_path.unlink()
+    invalid = data_dir / "trend_drawdown/snapshots" / ("f" * 64 + ".json")
+    invalid.write_text('{"state_sha256":"bad"}\n', encoding="utf-8")
+
+    result = recover_strategy_drawdown_state(data_dir)
+
+    assert result["snapshot"] != str(invalid)
+    assert state_path.read_bytes() == expected
+
+
+def test_recovery_failure_does_not_overwrite_corrupt_state(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    state_path = data_dir / "trend_drawdown/state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_bytes(b"corrupt-state\n")
+    before = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="no valid strategy drawdown snapshot"):
+        recover_strategy_drawdown_state(data_dir)
+
+    assert state_path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
