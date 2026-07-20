@@ -1017,11 +1017,21 @@ def integrated_v4_payload(
             },
             "risk_summary": risk_summary,
             "drawdown_summary": {
+                "state_status": "ok",
                 "status": "active",
                 "status_label": "纪律内",
                 "entry_allowed": True,
                 "drawdown_pct": "0",
                 "drawdown_limit_pct": "0.05",
+                "bootstrap_event": {
+                    "event_id": "automatic-bootstrap-audit",
+                    "baseline_equity": "100000",
+                    "source_date": "2026-07-17",
+                    "accepted_git_sha": "candidate-sha",
+                    "parameter_hash": "parameter-hash",
+                    "actor": "acceptance",
+                    "entry_eligible_from": "2026-07-20",
+                },
             },
             "data_sources": [f"Futu {market} SIMULATE account"],
         }
@@ -1122,6 +1132,7 @@ def test_acceptance_reports_malformed_integrated_artifact_container(
         ("stats", "实盘统计券商"),
         ("cutoff", "来源截止时间"),
         ("overlay", "实盘辅助"),
+        ("drawdown_missing", "回撤状态缺失"),
     ],
 )
 def test_acceptance_rejects_integrated_contract_drift(
@@ -1149,6 +1160,8 @@ def test_acceptance_rejects_integrated_contract_drift(
         report["risk_summary"]["trade_stats"][  # type: ignore[index]
             "statistics_cutoff_at"
         ] = "2026-07-21T00:00:00+08:00"
+    elif mutation == "drawdown_missing":
+        report["drawdown_summary"]["state_status"] = "missing"  # type: ignore[index]
     else:
         report["actual_overlay"]["broker"] = "eastmoney"  # type: ignore[index]
 
@@ -1231,7 +1244,18 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
             "status": "active", "status_label": "风险预算内",
             "trade_stats": {"actual_broker_label": "东方财富"},
         },
-        "drawdown_summary": {"status_label": "纪律内"},
+        "drawdown_summary": {
+            "status_label": "纪律内",
+            "bootstrap_event": {
+                "event_id": "automatic-bootstrap-audit",
+                "baseline_equity": "100000",
+                "source_date": "2026-07-17",
+                "accepted_git_sha": "candidate-sha",
+                "parameter_hash": "parameter-hash",
+                "actor": "acceptance",
+                "entry_eligible_from": "2026-07-20",
+            },
+        },
         "actual_overlay": {
             "broker_label": "东方财富",
             "items": [{"deviation_label": "超买"}],
@@ -1242,6 +1266,8 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
         "组合计划风险 风险预算内 组合剩余风险 单笔风险上限 异常损失缓冲 不得用于开仓",
         "Kelly 阶段 当前 Kelly 上限 富途模拟盘交易统计 东方财富实盘交易统计",
         "策略累计回撤 纪律内 实盘执行辅助 东方财富 超买 报告外加仓",
+        "基准已自动建立 100000 2026-07-17 automatic-bootstrap-audit ",
+        "candidate-sha parameter-hash acceptance 2026-07-20",
         "5% 是风险预算目标，不是最大损失保证。",
         "不会改写模拟建议、Kelly、模拟统计或报告哈希 不会自动交易真实账户",
     ))

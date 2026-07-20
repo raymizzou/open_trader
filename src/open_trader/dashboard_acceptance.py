@@ -587,7 +587,29 @@ def validate_integrated_candidate(
             drawdown = report.get("drawdown_summary")
             assert (
                 isinstance(drawdown, Mapping)
-                and drawdown == frozen.get("drawdown_summary")
+                and drawdown.get("state_status") == "ok"
+            ), f"{broker} 回撤状态缺失或损坏"
+            bootstrap = drawdown.get("bootstrap_event")
+            assert (
+                isinstance(bootstrap, Mapping)
+                and bootstrap.get("accepted_git_sha") == expected_sha
+                and bootstrap.get("baseline_equity")
+                and bootstrap.get("source_date")
+                and bootstrap.get("parameter_hash")
+                and bootstrap.get("event_id")
+                and bootstrap.get("actor")
+            ), f"{broker} 自动回撤基准审计不完整"
+            assert (
+                drawdown.get("entry_allowed") is True or not buys
+            ), f"{broker} 回撤阻断状态仍包含正式买入"
+            assert not any(
+                isinstance(item, Mapping)
+                and item.get("decisive_constraint") == "策略累计回撤"
+                and "状态" in str(item.get("reason") or "")
+                for item in report.get("risk_skips", [])
+            ), f"{broker} 仍因回撤状态缺失跳过买入"
+            assert (
+                drawdown == frozen.get("drawdown_summary")
                 and drawdown.get("status") in {"active", "paused"}
                 and bool(drawdown.get("status_label"))
                 and _position_decimal(
@@ -1537,6 +1559,19 @@ def _check_integrated_trend_ui(
     )
     for value in required:
         assert value != "-" and value in text, f"{broker} 集成风险视图缺少 {value}"
+    bootstrap = drawdown.get("bootstrap_event")
+    if isinstance(bootstrap, Mapping):
+        for value in (
+            "基准已自动建立",
+            bootstrap.get("baseline_equity"),
+            bootstrap.get("source_date"),
+            bootstrap.get("event_id"),
+            bootstrap.get("accepted_git_sha"),
+            bootstrap.get("parameter_hash"),
+            bootstrap.get("actor"),
+            bootstrap.get("entry_eligible_from"),
+        ):
+            assert _plain(value) in text, f"{broker} 回撤基准审计未显示 {_plain(value)}"
     for key in ("items", "outside_positions"):
         items = overlay.get(key)
         assert isinstance(items, list), f"{broker} 实盘偏差列表无效"
