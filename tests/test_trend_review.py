@@ -602,7 +602,7 @@ def test_action_identity_ignores_report_revision_and_strategy_version() -> None:
     )
 
 
-def test_open_execution_lists_broker_orders_once_for_multiple_actions(
+def test_open_execution_refreshes_broker_orders_before_each_submission(
     tmp_path: Path,
 ) -> None:
     report = report_with_actions([
@@ -615,7 +615,30 @@ def test_open_execution_lists_broker_orders_once_for_multiple_actions(
             "lot_size": 100, "estimated_shares": 400, "atr": "0.5",
         },
     ])
-    client = FakeTrendSimClient()
+    second_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600002", "buy"
+    )
+    external_second_order = {
+        "order_id": "EXTERNAL-2",
+        "remark": trend_review.trend_attempt_remark(
+            "CN", "2026-07-20", second_key, 1
+        ),
+        "code": "SH.600002",
+        "trd_side": "BUY",
+        "qty": "400",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }
+
+    class RefreshingClient(FakeTrendSimClient):
+        def list_orders(self, **kwargs: object) -> dict[str, object]:
+            self.list_order_calls.append(dict(kwargs))
+            orders = [dict(order) for order in self.orders]
+            if len(self.list_order_calls) >= 2:
+                orders.append(external_second_order)
+            return {"orders": orders}
+
+    client = RefreshingClient()
 
     result = trend_review.execute_trend_review_open(
         data_dir=tmp_path,
@@ -627,10 +650,11 @@ def test_open_execution_lists_broker_orders_once_for_multiple_actions(
         quote_prices=TEST_QUOTE_PRICES,
     )
 
-    assert result["submitted_count"] == 2
-    assert len(client.requests) == 2
+    assert result["submitted_count"] == 1
+    assert [request["futu_code"] for request in client.requests] == ["SH.600001"]
     assert client.list_order_calls == [
-        {"start": "2026-07-20", "end": "2026-07-20"}
+        {"start": "2026-07-20", "end": "2026-07-20"},
+        {"start": "2026-07-20", "end": "2026-07-20"},
     ]
 
 

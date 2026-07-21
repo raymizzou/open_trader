@@ -2115,6 +2115,25 @@ class TabbedAccountLocator:
 
     def all_inner_texts(self) -> list[str]:
         if self.selector == (
+            "#trend-report-workspace:visible .trend-controller-status dl div"
+        ):
+            controller = self.page.controllers[str(self.page.trend_broker)]
+            return [
+                f"{label}\n{value if value not in (None, '') else '—'}"
+                for label, value in (
+                    ("执行模式", controller["effective_mode"]),
+                    ("执行主机", controller["executor_host"]),
+                    ("本地主机", controller["local_host"]),
+                    ("PID", controller["pid"]),
+                    ("Git SHA", controller["git_sha"]),
+                    ("当前阶段", controller["phase"]),
+                    ("心跳", controller["heartbeat_at"]),
+                    ("最近成功", controller["last_success"]),
+                    ("当前阻塞", controller["blocker"]),
+                    ("下次检查", controller["next_check_at"]),
+                )
+            ]
+        if self.selector == (
             '#trend-report-workspace:visible .option-attention-table '
             'thead th[scope="col"]'
         ):
@@ -2479,6 +2498,28 @@ def test_acceptance_allows_controller_heartbeat_to_advance_during_browser_check(
         "tiger",
         controller,
     )
+
+
+@pytest.mark.parametrize(
+    "rendered_heartbeat",
+    ["not-a-time", "2026-07-21T09:30:59+08:00", "2026-07-21T09:37:00+08:00"],
+)
+def test_acceptance_rejects_invalid_or_unbounded_rendered_controller_heartbeat(
+    rendered_heartbeat: str,
+) -> None:
+    payload = valid_payload()
+    controller = copy.deepcopy(payload["trend_controllers"]["tiger"])  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.controllers["tiger"]["heartbeat_at"] = rendered_heartbeat
+
+    with pytest.raises(AssertionError, match="心跳"):
+        dashboard_acceptance._check_trend_controller_status(
+            page,
+            page.locator("#trend-report-workspace:visible"),
+            "tiger",
+            controller,
+        )
 
 
 def test_acceptance_rejects_blocking_batch_with_healthy_controller() -> None:
@@ -4364,11 +4405,18 @@ def test_acceptance_partitions_only_current_402_source_failures_as_external(
                 "source": "decision_facts.kline",
                 "error": "error",
             },
+            {
+                "market": "US",
+                "symbol": "DRAM",
+                "source": "technical_facts",
+                "error": "independent provider failure",
+            },
         ],
     }), encoding="utf-8")
     source_errors = [
         "US.DRAM 数据源 tradingagents_summary 不可用：error",
         "US.DRAM 数据源 decision_facts.kline 不可用：error",
+        "US.DRAM 数据源 technical_facts 不可用：independent provider failure",
         "US.QQQ 数据源 decision_facts.kline 不可用：error",
         "控制器内部失败",
     ]
@@ -4380,6 +4428,7 @@ def test_acceptance_partitions_only_current_402_source_failures_as_external(
     )
 
     assert remaining == [
+        "US.DRAM 数据源 technical_facts 不可用：independent provider failure",
         "US.QQQ 数据源 decision_facts.kline 不可用：error",
         "控制器内部失败",
     ]

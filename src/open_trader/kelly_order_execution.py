@@ -83,6 +83,11 @@ class FutuSimulateOrderExecutionClient:
         self.port = port
         self.trd_market = trd_market
         self.account = self._select_simulate_account(simulate_acc_id)
+        # Current orders are refreshed before every action. Cache only the
+        # rate-limited history query for this short-lived reconciliation client.
+        self._history_order_cache: dict[
+            tuple[str | None, str | None], list[dict[str, Any]]
+        ] = {}
 
     def place_order(self, request: dict[str, Any]) -> dict[str, Any]:
         side = str(request["side"]).strip().lower()
@@ -142,14 +147,20 @@ class FutuSimulateOrderExecutionClient:
         if start is not None or end is not None:
             kwargs["start"] = start
             kwargs["end"] = end
-        ret_code, data = self.context.history_order_list_query(**kwargs)
-        if ret_code != 0:
-            raise FutuOrderExecutionError(
-                str(data), error_type="history_order_list_query_failed"
-            )
+        cache_key = (start, end)
+        if cache_key not in self._history_order_cache:
+            ret_code, data = self.context.history_order_list_query(**kwargs)
+            if ret_code != 0:
+                raise FutuOrderExecutionError(
+                    str(data), error_type="history_order_list_query_failed"
+                )
+            self._history_order_cache[cache_key] = [
+                dict(item) for item in _records(data)
+            ]
+        history = self._history_order_cache[cache_key]
         orders: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
-        for item in [*active, *[dict(item) for item in _records(data)]]:
+        for item in [*active, *history]:
             order_id = _first_text(item, ("order_id", "orderid")).strip()
             identity = (
                 ("id", order_id)

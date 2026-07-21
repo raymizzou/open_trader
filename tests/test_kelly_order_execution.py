@@ -400,15 +400,23 @@ def test_futu_list_orders_combines_active_and_history_without_duplicates() -> No
 
         def order_list_query(self, **kwargs: object) -> object:
             self.active_order_calls.append(dict(kwargs))
+            rows = [
+                {
+                    "order_id": "SIM-ACTIVE",
+                    "order_status": "FILLED_PART",
+                    "qty": "100",
+                    "dealt_qty": "20",
+                }
+            ]
+            if len(self.active_order_calls) > 1:
+                rows.append({
+                    "order_id": "SIM-NEW",
+                    "order_status": "SUBMITTED",
+                    "qty": "50",
+                    "dealt_qty": "0",
+                })
             return 0, FakeDataFrame(
-                [
-                    {
-                        "order_id": "SIM-ACTIVE",
-                        "order_status": "FILLED_PART",
-                        "qty": "100",
-                        "dealt_qty": "20",
-                    }
-                ]
+                rows
             )
 
         def history_order_list_query(self, **kwargs: object) -> object:
@@ -442,12 +450,20 @@ def test_futu_list_orders_combines_active_and_history_without_duplicates() -> No
     orders = client.list_orders(start="2026-07-20", end="2026-07-20")[
         "orders"
     ]
+    refreshed = client.list_orders(start="2026-07-20", end="2026-07-20")[
+        "orders"
+    ]
 
     assert [order["order_id"] for order in orders] == [
         "SIM-ACTIVE",
         "SIM-TERMINAL",
     ]
-    assert len(client.context.active_order_calls) == 1
+    assert [order["order_id"] for order in refreshed] == [
+        "SIM-ACTIVE",
+        "SIM-NEW",
+        "SIM-TERMINAL",
+    ]
+    assert len(client.context.active_order_calls) == 2
     assert len(client.context.history_order_calls) == 1
 
 

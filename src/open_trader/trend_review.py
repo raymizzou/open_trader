@@ -1991,14 +1991,6 @@ def execute_trend_review_open(
     submitted = 0
     artifacts: list[str] = []
     blocked_status: str | None = None
-    orders_cache: dict[tuple[str, str], list[Mapping[str, object]]] = {}
-
-    def listed_orders(*, start: str, end: str) -> list[Mapping[str, object]]:
-        key = (start, end)
-        if key not in orders_cache:
-            orders_cache[key] = _listed_orders(client, start=start, end=end)
-        return orders_cache[key]
-
     sell_symbols = {
         str(action.get("symbol") or "").strip()
         for action in actions
@@ -2219,7 +2211,8 @@ def execute_trend_review_open(
                     raise ValueError(
                         f"invalid trend action fact: {pending_intent}"
                     )
-                orders = listed_orders(
+                orders = _listed_orders(
+                    client,
                     start=execution_date,
                     end=local_current.date().isoformat(),
                 )
@@ -2314,7 +2307,8 @@ def execute_trend_review_open(
                 or broker_order is not None
                 or pending_sell_completed
             ):
-                orders = listed_orders(
+                orders = _listed_orders(
+                    client,
                     start=execution_date,
                     end=local_current.date().isoformat(),
                 )
@@ -2684,7 +2678,8 @@ def execute_trend_review_open(
                     market, execution_date, action_key, 1
                 ),
             }
-            orders = listed_orders(
+            orders = _listed_orders(
+                client,
                 start=execution_date,
                 end=local_current.date().isoformat(),
             )

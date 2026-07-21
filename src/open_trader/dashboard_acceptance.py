@@ -39,6 +39,11 @@ REQUIRED_SOURCE_PATHS = (
 )
 SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
 SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
+BALANCE_CAUSAL_SOURCES = {
+    "tradingagents_summary",
+    "decision_facts.kline",
+    "decision_facts.news_sentiment",
+}
 
 ACCOUNT_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 TREND_REPORT_BROKERS = ("tiger", "phillips", "eastmoney")
@@ -420,6 +425,7 @@ def _partition_external_source_errors(
             identity is not None
             and identity in source_failures
             and identity[:2] in affected_symbols
+            and identity[2] in BALANCE_CAUSAL_SOURCES
         ):
             external.append(identity)
         else:
@@ -2464,6 +2470,11 @@ def _check_trend_controller_status(
         f"{broker} 控制器状态卡健康标记与 API 不一致"
     )
     text = card.inner_text()
+    rendered_facts: dict[str, str] = {}
+    for row in card.locator("dl div").all_inner_texts():
+        parts = row.splitlines()
+        if len(parts) >= 2:
+            rendered_facts[parts[0].strip()] = " ".join(parts[1:]).strip()
     for label, key in (
         ("执行模式", "effective_mode"),
         ("执行主机", "executor_host"),
@@ -2479,6 +2490,27 @@ def _check_trend_controller_status(
         assert label in text, f"{broker} 控制器状态卡缺少 {label}"
         value = controller.get(key)
         if key in {"heartbeat_at", "next_check_at"}:
+            rendered = rendered_facts.get(label, "")
+            if value in (None, ""):
+                assert rendered == "—", f"{broker} 控制器状态卡 {label} 无效"
+                continue
+            try:
+                baseline_time = datetime.fromisoformat(str(value))
+                rendered_time = datetime.fromisoformat(rendered)
+            except ValueError:
+                raise AssertionError(
+                    f"{broker} 控制器状态卡 {label} 不是有效时间"
+                ) from None
+            assert (
+                baseline_time.tzinfo is not None
+                and baseline_time.utcoffset() is not None
+                and rendered_time.tzinfo is not None
+                and rendered_time.utcoffset() is not None
+            ), f"{broker} 控制器状态卡 {label} 不是带时区时间"
+            advancement = rendered_time - baseline_time
+            assert timedelta(0) <= advancement <= timedelta(minutes=5), (
+                f"{broker} 控制器状态卡 {label} 与 API 时间范围不一致"
+            )
             continue
         if key == "last_success" and isinstance(value, Mapping):
             assert "[object Object]" not in text, (
