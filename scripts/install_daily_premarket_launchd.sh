@@ -3,11 +3,11 @@ set -euo pipefail
 
 DRY_RUN=0
 MARKET="all"
-MARKET_REQUESTED=0
 TREND_ONLY=0
+CONFIG_PATH=""
 
 usage() {
-  echo "usage: $0 [--dry-run] [--trend-only] [--market HK|US|CN|all]" >&2
+  echo "usage: $0 [--dry-run] [--trend-only] [--market HK|US|CN|all] [--config PATH]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -17,17 +17,18 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --market)
-      if [[ $# -lt 2 ]]; then
-        usage
-        exit 2
-      fi
+      [[ $# -ge 2 ]] || { usage; exit 2; }
       MARKET="$2"
-      MARKET_REQUESTED=1
       shift 2
       ;;
     --trend-only)
       TREND_ONLY=1
       shift
+      ;;
+    --config)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      CONFIG_PATH="$2"
+      shift 2
       ;;
     *)
       usage
@@ -40,22 +41,40 @@ if [[ "$MARKET" != "HK" && "$MARKET" != "US" && "$MARKET" != "CN" && "$MARKET" !
   usage
   exit 2
 fi
-if [[ "$TREND_ONLY" -eq 1 && "$MARKET" == "CN" ]]; then
-  usage
-  exit 2
-fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-ENV_FILE="$REPO_ROOT/config/daily_premarket.env"
-TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.premarket.plist.template"
-CN_REPORT_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-a-share-report.plist.template"
-CN_WATCH_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-a-share-watch.plist.template"
-TREND_REPORT_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-market-report.plist.template"
-TREND_WATCH_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-market-watch.plist.template"
 
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "missing required config: $ENV_FILE" >&2
+expand_home_path() {
+  local value="$1"
+  if [[ "$value" == "~" ]]; then
+    printf '%s' "$HOME"
+  elif [[ "$value" == "~/"* ]]; then
+    printf '%s/%s' "$HOME" "${value#"~/"}"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+resolve_config_path() {
+  local value repo
+  value="$(expand_home_path "$1")"
+  repo="$2"
+  if [[ "$value" == /* ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s/%s' "$repo" "$value"
+  fi
+}
+
+if [[ -z "$CONFIG_PATH" ]]; then
+  CONFIG_PATH="$REPO_ROOT/config/daily_premarket.env"
+else
+  CONFIG_PATH="$(resolve_config_path "$CONFIG_PATH" "$REPO_ROOT")"
+fi
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  echo "missing required config: $CONFIG_PATH" >&2
   echo "copy config/daily_premarket.env.example to config/daily_premarket.env and fill local values" >&2
   exit 1
 fi
@@ -71,47 +90,19 @@ read_env_value() {
     {
       stripped=trim($0)
       equals=index(stripped, "=")
-      if (equals == 0) {
-        next
-      }
+      if (equals == 0) next
       parsed_key=trim(substr(stripped, 1, equals - 1))
       if (parsed_key == key) {
         value=trim(substr(stripped, equals + 1))
         if ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") ||
-            (substr(value, 1, 1) == "'"'"'" && substr(value, length(value), 1) == "'"'"'")) {
+            (substr(value, 1, 1) == "'" && substr(value, length(value), 1) == "'")) {
           value=substr(value, 2, length(value) - 2)
         }
         found=1
       }
     }
-    END {
-      if (found) {
-        print value
-      }
-    }
-  ' "$ENV_FILE"
-}
-
-expand_home_path() {
-  local value="$1"
-  if [[ "$value" == "~" ]]; then
-    printf '%s' "$HOME"
-  elif [[ "$value" == "~/"* ]]; then
-    printf '%s/%s' "$HOME" "${value#"~/"}"
-  else
-    printf '%s' "$value"
-  fi
-}
-
-resolve_config_path() {
-  local value="$1"
-  local repo="$2"
-  value="$(expand_home_path "$value")"
-  if [[ "$value" == /* ]]; then
-    printf '%s' "$value"
-  else
-    printf '%s/%s' "$repo" "$value"
-  fi
+    END { if (found) print value }
+  ' "$CONFIG_PATH"
 }
 
 xml_escape() {
@@ -134,188 +125,193 @@ sed_replacement_escape() {
 
 OPEN_TRADER_REPO="$(read_env_value OPEN_TRADER_REPO)"
 OPEN_TRADER_PYTHON="$(read_env_value OPEN_TRADER_PYTHON)"
-
 if [[ -z "$OPEN_TRADER_REPO" || -z "$OPEN_TRADER_PYTHON" ]]; then
-  echo "OPEN_TRADER_REPO and OPEN_TRADER_PYTHON are required in $ENV_FILE" >&2
+  echo "OPEN_TRADER_REPO and OPEN_TRADER_PYTHON are required in $CONFIG_PATH" >&2
   exit 1
 fi
-
 OPEN_TRADER_REPO="$(expand_home_path "$OPEN_TRADER_REPO")"
 OPEN_TRADER_PYTHON="$(resolve_config_path "$OPEN_TRADER_PYTHON" "$OPEN_TRADER_REPO")"
 
-markets=()
-if [[ "$MARKET" == "all" ]]; then
-  markets=("HK" "US")
-elif [[ "$MARKET" == "CN" ]]; then
-  markets=()
-else
-  markets=("$MARKET")
-fi
-
-render_market() {
-  local market="$1"
-  local label hour minute
-  if [[ "$market" == "HK" ]]; then
-    label="com.open-trader.premarket.hk"
-    hour="8"
-    minute="0"
-  elif [[ "$market" == "US" ]]; then
-    label="com.open-trader.premarket.us"
-    hour="18"
-    minute="30"
-  else
-    usage
-    exit 2
-  fi
-
-  sed \
-    -e "s#OPEN_TRADER_LABEL#$(sed_replacement_escape "$(xml_escape "$label")")#g" \
-    -e "s#OPEN_TRADER_MARKET#$(sed_replacement_escape "$(xml_escape "$market")")#g" \
-    -e "s#OPEN_TRADER_HOUR#$hour#g" \
-    -e "s#OPEN_TRADER_MINUTE#$minute#g" \
-    -e "s#OPEN_TRADER_REPO#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_REPO")")#g" \
-    -e "s#OPEN_TRADER_PYTHON#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_PYTHON")")#g" \
-    "$TEMPLATE"
-}
+PREMARKET_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.premarket.plist.template"
+CONTROLLER_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-market-controller.plist.template"
 
 lint_rendered() {
-  local rendered="$1"
-  local temp_path
+  local rendered="$1" temp_path
   temp_path="$(mktemp "${TMPDIR:-/tmp}/open-trader-launchd.XXXXXX.plist")"
   printf '%s\n' "$rendered" > "$temp_path"
   plutil -lint "$temp_path" >/dev/null
   rm -f "$temp_path"
 }
 
-remove_legacy_agent() {
-  local legacy_target="$HOME/Library/LaunchAgents/com.open-trader.premarket.plist"
-  if [[ -f "$legacy_target" ]]; then
-    launchctl unload "$legacy_target" 2>/dev/null || true
-    rm "$legacy_target"
-    echo "removed legacy launchd agent: $legacy_target"
-  fi
-}
-
-render_cn_template() {
-  local template="$1"
-  sed \
-    -e "s#OPEN_TRADER_REPO#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_REPO")")#g" \
-    -e "s#OPEN_TRADER_PYTHON#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_PYTHON")")#g" \
-    "$template"
-}
-
-render_cn_jobs() {
-  local index label template rendered target
-  local labels=(
-    "com.open-trader.trend-a-share-report"
-    "com.open-trader.trend-a-share-watch"
-  )
-  local templates=("$CN_REPORT_TEMPLATE" "$CN_WATCH_TEMPLATE")
-
-  for index in 0 1; do
-    label="${labels[$index]}"
-    template="${templates[$index]}"
-    rendered="$(render_cn_template "$template")"
-    lint_rendered "$rendered"
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-      printf '%s\n' "$rendered"
-      continue
-    fi
-
-    target="$HOME/Library/LaunchAgents/$label.plist"
-    mkdir -p "$HOME/Library/LaunchAgents" "$OPEN_TRADER_REPO/logs/daily_premarket"
-    printf '%s\n' "$rendered" > "$target"
-    plutil -lint "$target" >/dev/null
-    launchctl unload "$target" 2>/dev/null || true
-    launchctl load "$target"
-    echo "installed launchd agent: $target"
-  done
-}
-
-render_trend_template() {
-  local template="$1"
-  local market="$2"
-  local label="$3"
-  local hour="$4"
-  local first_weekday=1
-  if [[ "$market" == "US" ]]; then
-    first_weekday=2
+render_premarket() {
+  local market="$1" label hour minute
+  if [[ "$market" == "HK" ]]; then
+    label="com.open-trader.premarket.hk"
+    hour="8"
+    minute="0"
+  else
+    label="com.open-trader.premarket.us"
+    hour="18"
+    minute="30"
   fi
   sed \
     -e "s#OPEN_TRADER_LABEL#$(sed_replacement_escape "$(xml_escape "$label")")#g" \
     -e "s#OPEN_TRADER_MARKET#$(sed_replacement_escape "$(xml_escape "$market")")#g" \
     -e "s#OPEN_TRADER_HOUR#$hour#g" \
-    -e "s#OPEN_TRADER_WEEKDAY_1#$first_weekday#g" \
-    -e "s#OPEN_TRADER_WEEKDAY_2#$((first_weekday + 1))#g" \
-    -e "s#OPEN_TRADER_WEEKDAY_3#$((first_weekday + 2))#g" \
-    -e "s#OPEN_TRADER_WEEKDAY_4#$((first_weekday + 3))#g" \
-    -e "s#OPEN_TRADER_WEEKDAY_5#$((first_weekday + 4))#g" \
+    -e "s#OPEN_TRADER_MINUTE#$minute#g" \
+    -e "s#OPEN_TRADER_REPO/config/daily_premarket.env#$(sed_replacement_escape "$(xml_escape "$CONFIG_PATH")")#g" \
     -e "s#OPEN_TRADER_REPO#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_REPO")")#g" \
     -e "s#OPEN_TRADER_PYTHON#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_PYTHON")")#g" \
-    "$template"
+    "$PREMARKET_TEMPLATE"
 }
 
-render_trend_jobs() {
-  local market="$1"
-  local hour label kind template rendered target
-  if [[ "$market" == "HK" ]]; then
-    hour=18
-  else
-    hour=9
+render_controller() {
+  local market="$1" lower label
+  lower="$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
+  label="com.open-trader.trend-market-controller.$lower"
+  sed \
+    -e "s#OPEN_TRADER_LABEL#$(sed_replacement_escape "$(xml_escape "$label")")#g" \
+    -e "s#OPEN_TRADER_MARKET_LOWER#$(sed_replacement_escape "$(xml_escape "$lower")")#g" \
+    -e "s#OPEN_TRADER_MARKET#$(sed_replacement_escape "$(xml_escape "$market")")#g" \
+    -e "s#OPEN_TRADER_CONFIG#$(sed_replacement_escape "$(xml_escape "$CONFIG_PATH")")#g" \
+    -e "s#OPEN_TRADER_REPO#$(sed_replacement_escape "$(xml_escape "$REPO_ROOT")")#g" \
+    -e "s#OPEN_TRADER_PYTHON#$(sed_replacement_escape "$(xml_escape "$OPEN_TRADER_PYTHON")")#g" \
+    "$CONTROLLER_TEMPLATE"
+}
+
+stop_label() {
+  local label="$1" target
+  target="$HOME/Library/LaunchAgents/$label.plist"
+  launchctl bootout "gui/$UID/$label" 2>/dev/null || true
+  if [[ -f "$target" ]]; then
+    rm "$target"
+    echo "removed launchd agent: $target"
   fi
-  for kind in report watch; do
-    label="com.open-trader.trend-$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')-$kind"
-    if [[ "$kind" == "report" ]]; then
-      template="$TREND_REPORT_TEMPLATE"
-    else
-      template="$TREND_WATCH_TEMPLATE"
-    fi
-    rendered="$(render_trend_template "$template" "$market" "$label" "$hour")"
-    lint_rendered "$rendered"
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-      printf '%s\n' "$rendered"
-      continue
-    fi
-    target="$HOME/Library/LaunchAgents/$label.plist"
-    mkdir -p "$HOME/Library/LaunchAgents" "$OPEN_TRADER_REPO/logs/daily_premarket"
-    printf '%s\n' "$rendered" > "$target"
-    plutil -lint "$target" >/dev/null
-    launchctl unload "$target" 2>/dev/null || true
-    launchctl load "$target"
-    echo "installed launchd agent: $target"
-  done
 }
 
-if [[ "$TREND_ONLY" -eq 0 && "$DRY_RUN" -eq 0 && "$MARKET" != "CN" ]]; then
-  remove_legacy_agent
-fi
+verify_absent() {
+  local label="$1"
+  if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
+    echo "legacy launchd job is still loaded: $label" >&2
+    return 1
+  fi
+  echo "verified launchd label absent: $label"
+}
 
-if [[ "$TREND_ONLY" -eq 0 && "$MARKET" != "CN" ]]; then
-  for market in "${markets[@]}"; do
-    rendered="$(render_market "$market")"
+legacy_labels() {
+  local market="$1" lower
+  if [[ "$market" == "CN" ]]; then
+    printf '%s\n' \
+      "com.open-trader.trend-a-share-report" \
+      "com.open-trader.trend-a-share-watch"
+  else
+    lower="$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
+    printf '%s\n' \
+      "com.open-trader.trend-$lower-report" \
+      "com.open-trader.trend-$lower-watch"
+  fi
+}
+
+install_rendered() {
+  local label="$1" rendered="$2" target
+  target="$HOME/Library/LaunchAgents/$label.plist"
+  mkdir -p "$HOME/Library/LaunchAgents" "$REPO_ROOT/logs/daily_premarket"
+  printf '%s\n' "$rendered" > "$target"
+  plutil -lint "$target" >/dev/null
+  launchctl load "$target"
+  echo "installed launchd agent: $target"
+}
+
+if [[ "$TREND_ONLY" -eq 0 ]]; then
+  ordinary_markets=()
+  if [[ "$MARKET" == "all" ]]; then
+    ordinary_markets=("HK" "US")
+  elif [[ "$MARKET" == "HK" || "$MARKET" == "US" ]]; then
+    ordinary_markets=("$MARKET")
+  fi
+  if [[ "$DRY_RUN" -eq 0 && "$MARKET" != "CN" ]]; then
+    legacy_target="$HOME/Library/LaunchAgents/com.open-trader.premarket.plist"
+    if [[ -f "$legacy_target" ]]; then
+      launchctl unload "$legacy_target" 2>/dev/null || true
+      rm "$legacy_target"
+      echo "removed legacy launchd agent: $legacy_target"
+    fi
+  fi
+  for market in "${ordinary_markets[@]}"; do
+    rendered="$(render_premarket "$market")"
     lint_rendered "$rendered"
     if [[ "$DRY_RUN" -eq 1 ]]; then
       printf '%s\n' "$rendered"
-      continue
+    else
+      label="com.open-trader.premarket.$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
+      target="$HOME/Library/LaunchAgents/$label.plist"
+      mkdir -p "$HOME/Library/LaunchAgents" "$OPEN_TRADER_REPO/logs/daily_premarket"
+      printf '%s\n' "$rendered" > "$target"
+      plutil -lint "$target" >/dev/null
+      launchctl unload "$target" 2>/dev/null || true
+      launchctl load "$target"
+      echo "installed launchd agent: $target"
     fi
-
-    label="com.open-trader.premarket.$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
-    target="$HOME/Library/LaunchAgents/$label.plist"
-    mkdir -p "$HOME/Library/LaunchAgents" "$OPEN_TRADER_REPO/logs/daily_premarket"
-    printf '%s\n' "$rendered" > "$target"
-    plutil -lint "$target" >/dev/null
-    launchctl unload "$target" 2>/dev/null || true
-    launchctl load "$target"
-    echo "installed launchd agent: $target"
   done
+  exit 0
 fi
 
-if [[ "$TREND_ONLY" -eq 0 && "$MARKET_REQUESTED" -eq 1 && ( "$MARKET" == "CN" || "$MARKET" == "all" ) ]]; then
-  render_cn_jobs
+selected_markets=()
+if [[ "$MARKET" == "all" ]]; then
+  selected_markets=("CN" "HK" "US")
+else
+  selected_markets=("$MARKET")
 fi
 
-if [[ "$TREND_ONLY" -eq 1 ]]; then
-  for market in "${markets[@]}"; do
-    render_trend_jobs "$market"
-  done
+local_host="$(hostname)"
+executor_host="$(read_env_value OPEN_TRADER_TREND_EXECUTOR_HOST)"
+mode="readonly"
+if [[ -n "$executor_host" && "$executor_host" == "$local_host" ]]; then
+  mode="execute"
 fi
+echo "local host: $local_host"
+echo "configured executor host: $executor_host"
+echo "effective mode: $mode"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  if [[ "$mode" == "execute" ]]; then
+    for market in "${selected_markets[@]}"; do
+      rendered="$(render_controller "$market")"
+      lint_rendered "$rendered"
+      printf '%s\n' "$rendered"
+    done
+  fi
+  exit 0
+fi
+
+cleanup_markets=("${selected_markets[@]}")
+if [[ "$mode" == "readonly" ]]; then
+  cleanup_markets=("CN" "HK" "US")
+fi
+
+for market in "${cleanup_markets[@]}"; do
+  while IFS= read -r label; do
+    stop_label "$label"
+    verify_absent "$label"
+  done < <(legacy_labels "$market")
+done
+
+for market in "${cleanup_markets[@]}"; do
+  lower="$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
+  label="com.open-trader.trend-market-controller.$lower"
+  stop_label "$label"
+  verify_absent "$label"
+done
+
+if [[ "$mode" == "readonly" ]]; then
+  echo "readonly host: no trend controller installed"
+  exit 0
+fi
+
+for market in "${selected_markets[@]}"; do
+  lower="$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
+  label="com.open-trader.trend-market-controller.$lower"
+  rendered="$(render_controller "$market")"
+  lint_rendered "$rendered"
+  install_rendered "$label" "$rendered"
+done

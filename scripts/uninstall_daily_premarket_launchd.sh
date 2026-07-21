@@ -12,10 +12,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --market)
-      if [[ $# -lt 2 ]]; then
-        usage
-        exit 2
-      fi
+      [[ $# -ge 2 ]] || { usage; exit 2; }
       MARKET="$2"
       MARKET_REQUESTED=1
       shift 2
@@ -35,15 +32,12 @@ if [[ "$MARKET" != "HK" && "$MARKET" != "US" && "$MARKET" != "CN" && "$MARKET" !
   usage
   exit 2
 fi
-if [[ "$TREND_ONLY" -eq 1 && "$MARKET" == "CN" ]]; then
-  usage
-  exit 2
-fi
 
-remove_target() {
-  local target="$1"
+remove_label() {
+  local label="$1" target
+  target="$HOME/Library/LaunchAgents/$label.plist"
+  launchctl bootout "gui/$UID/$label" 2>/dev/null || true
   if [[ -f "$target" ]]; then
-    launchctl unload "$target" 2>/dev/null || true
     rm "$target"
     echo "removed launchd agent: $target"
   else
@@ -51,30 +45,38 @@ remove_target() {
   fi
 }
 
-if [[ "$TREND_ONLY" -eq 0 && ( "$MARKET" == "all" || "$MARKET" == "HK" ) ]]; then
-  remove_target "$HOME/Library/LaunchAgents/com.open-trader.premarket.hk.plist"
+remove_trend_market() {
+  local market="$1" lower
+  lower="$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
+  remove_label "com.open-trader.trend-market-controller.$lower"
+  if [[ "$market" == "CN" ]]; then
+    remove_label "com.open-trader.trend-a-share-report"
+    remove_label "com.open-trader.trend-a-share-watch"
+  else
+    remove_label "com.open-trader.trend-$lower-report"
+    remove_label "com.open-trader.trend-$lower-watch"
+  fi
+}
+
+if [[ "$TREND_ONLY" -eq 0 ]]; then
+  if [[ "$MARKET" == "all" || "$MARKET" == "HK" ]]; then
+    remove_label "com.open-trader.premarket.hk"
+  fi
+  if [[ "$MARKET" == "all" || "$MARKET" == "US" ]]; then
+    remove_label "com.open-trader.premarket.us"
+  fi
+  if [[ "$MARKET" == "all" ]]; then
+    remove_label "com.open-trader.premarket"
+  fi
 fi
 
-if [[ "$TREND_ONLY" -eq 0 && ( "$MARKET" == "all" || "$MARKET" == "US" ) ]]; then
-  remove_target "$HOME/Library/LaunchAgents/com.open-trader.premarket.us.plist"
-fi
-
-if [[ "$TREND_ONLY" -eq 0 && "$MARKET" == "all" ]]; then
-  remove_target "$HOME/Library/LaunchAgents/com.open-trader.premarket.plist"
-fi
-
-if [[ "$TREND_ONLY" -eq 0 && "$MARKET_REQUESTED" -eq 1 && ( "$MARKET" == "CN" || "$MARKET" == "all" ) ]]; then
-  remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-a-share-report.plist"
-  remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-a-share-watch.plist"
-fi
-
-if [[ "$TREND_ONLY" -eq 1 ]]; then
-  for market in HK US; do
-    if [[ "$MARKET" != "all" && "$MARKET" != "$market" ]]; then
-      continue
-    fi
-    lower="$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
-    remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-$lower-report.plist"
-    remove_target "$HOME/Library/LaunchAgents/com.open-trader.trend-$lower-watch.plist"
+if [[ "$TREND_ONLY" -eq 1 || "$MARKET_REQUESTED" -eq 1 ]]; then
+  if [[ "$MARKET" == "all" ]]; then
+    trend_markets=("CN" "HK" "US")
+  else
+    trend_markets=("$MARKET")
+  fi
+  for market in "${trend_markets[@]}"; do
+    remove_trend_market "$market"
   done
 fi
