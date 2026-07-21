@@ -195,12 +195,18 @@ stop_label() {
 }
 
 verify_absent() {
-  local label="$1"
-  if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
-    echo "legacy launchd job is still loaded: $label" >&2
-    return 1
-  fi
-  echo "verified launchd label absent: $label"
+  local label="$1" attempt
+  for attempt in 1 2 3 4 5; do
+    if ! launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
+      echo "verified launchd label absent: $label"
+      return 0
+    fi
+    if [[ "$attempt" -lt 5 ]]; then
+      sleep 1
+    fi
+  done
+  echo "legacy launchd job is still loaded: $label" >&2
+  return 1
 }
 
 legacy_labels() {

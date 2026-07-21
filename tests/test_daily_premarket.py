@@ -4906,6 +4906,9 @@ def test_launchd_installer_fences_every_selected_market_before_first_load(
             "HOME": str(home),
             "PATH": f"{fake_bin}:/usr/bin:/bin",
             "OPEN_TRADER_OPERATION_LOG": str(operations),
+            "OPEN_TRADER_PRESENT_LABEL": "com.open-trader.trend-hk-report",
+            "OPEN_TRADER_PRESENT_PRINTS": "2",
+            "OPEN_TRADER_PRINT_STATE": str(tmp_path / "print-state"),
         },
     )
 
@@ -4916,7 +4919,62 @@ def test_launchd_installer_fences_every_selected_market_before_first_load(
         i for i, call in enumerate(calls) if call.startswith("launchctl load ")
     )
     assert len(probes) == 6
+    first_probe = min(probes)
+    delayed_prints = [
+        i
+        for i, call in enumerate(calls)
+        if call.startswith("launchctl print ")
+        and call.endswith("com.open-trader.trend-hk-report")
+    ]
+    assert len(delayed_prints) == 3
+    for label in _all_trend_labels():
+        assert any(
+            i < first_probe
+            and call.startswith("launchctl print ")
+            and call.endswith(label)
+            for i, call in enumerate(calls)
+        )
     assert max(probes) < first_load
+
+
+def test_launchd_installer_fails_after_five_present_label_checks(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    operations = tmp_path / "operations.log"
+    present = "com.open-trader.trend-us-report"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_OPERATION_LOG": str(operations),
+            "OPEN_TRADER_PRESENT_LABEL": present,
+        },
+    )
+
+    assert result.returncode == 1
+    calls = operations.read_text(encoding="utf-8").splitlines()
+    prints = [
+        call
+        for call in calls
+        if call.startswith("launchctl print ") and call.endswith(present)
+    ]
+    assert len(prints) == 5
+    assert not any(call.startswith("pgrep ") for call in calls)
+    assert not any(call.startswith("launchctl load ") for call in calls)
 
 
 def test_launchd_installer_readonly_fails_when_orphan_process_remains(
@@ -5588,7 +5646,18 @@ if [[ -n "${OPEN_TRADER_OPERATION_LOG:-}" ]]; then
 fi
 if [[ "${1:-}" == "print" ]]; then
   if [[ -n "${OPEN_TRADER_PRESENT_LABEL:-}" && "$*" == *"$OPEN_TRADER_PRESENT_LABEL" ]]; then
-    exit 0
+    if [[ -z "${OPEN_TRADER_PRESENT_PRINTS:-}" ]]; then
+      exit 0
+    fi
+    count=0
+    if [[ -f "${OPEN_TRADER_PRINT_STATE:-}" ]]; then
+      read -r count < "$OPEN_TRADER_PRINT_STATE"
+    fi
+    count=$((count + 1))
+    printf '%s\\n' "$count" > "$OPEN_TRADER_PRINT_STATE"
+    if [[ "$count" -le "$OPEN_TRADER_PRESENT_PRINTS" ]]; then
+      exit 0
+    fi
   fi
   exit "${OPEN_TRADER_PRINT_EXIT:-1}"
 fi
