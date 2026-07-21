@@ -138,6 +138,38 @@ def write_report(
     return path, report
 
 
+def write_report_delivery_receipt(
+    config: DailyPremarketConfig,
+    report_path: Path,
+    report: dict[str, object],
+    *,
+    status: str,
+    markdown: str = "# frozen",
+    receipt_report: dict[str, object] | None = None,
+    receipt_markdown: str | None = None,
+) -> Path:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_json = json.dumps(report)
+    report_path.write_text(report_json, encoding="utf-8")
+    report_path.with_suffix(".md").write_text(markdown, encoding="utf-8")
+    receipt_path = (
+        config.data_dir
+        / "trend_a_share"
+        / "delivery"
+        / f"{report_path.stem}.json"
+    )
+    a_share_trend._write_delivery_receipt(
+        receipt_path,
+        status=status,
+        generated_at=str(report["generated_at"]),
+        artifact_stem=report_path.stem,
+        markdown=receipt_markdown if receipt_markdown is not None else markdown,
+        report_json=json.dumps(receipt_report or report),
+        protection_state={"schema_version": 1, "positions": {}},
+    )
+    return receipt_path
+
+
 def patch_cycle(monkeypatch: pytest.MonkeyPatch, cycle: ControllerCycle) -> None:
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
     monkeypatch.setattr(
@@ -1676,7 +1708,10 @@ def test_revision_replaces_invalid_frozen_report_before_execution(
         revision: bool,
     ) -> None:
         assert revision is True
-        write_report(config, revision=1)
+        report_path, report = write_report(config, revision=1)
+        write_report_delivery_receipt(
+            config, report_path, report, status="sent"
+        )
 
     monkeypatch.setattr(controller, "_generate_report", generate)
     executed: list[Path] = []
@@ -1764,19 +1799,14 @@ def test_controller_recovers_failed_delivery_for_valid_frozen_report(
     report = valid_cn_report(
         as_of_date="2026-07-17", execution_date="2026-07-20"
     )
-    receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-17.json"
-    a_share_trend._write_delivery_receipt(
-        receipt_path,
-        status="delivery_failed",
-        generated_at="2026-07-17T18:00:00+08:00",
-        artifact_stem="2026-07-17",
-        markdown="# frozen",
-        report_json=json.dumps(report),
-        protection_state={"schema_version": 1, "positions": {}},
-    )
     report_path = config.reports_dir / "trend_a_share/2026-07-17.json"
-    report_path.parent.mkdir(parents=True)
-    report_path.write_text(json.dumps(report), encoding="utf-8")
+    receipt_path = write_report_delivery_receipt(
+        config,
+        report_path,
+        report,
+        status="delivery_failed",
+        markdown="# frozen",
+    )
     monkeypatch.setattr(controller, "_derive_cycle", lambda *_args: active_cn_cycle())
     monkeypatch.setattr(
         controller, "_run_protection_pass", lambda *_args: protection_success()
@@ -1819,6 +1849,117 @@ def test_controller_recovers_failed_delivery_for_valid_frozen_report(
     assert json.loads(receipt_path.read_text(encoding="utf-8"))["status"] == "sent"
     assert json.loads(report_path.read_text(encoding="utf-8"))["delivery_status"] == "sent"
     assert result["blocker"] is None
+
+
+@pytest.mark.parametrize("mismatch", ["json", "markdown"])
+def test_controller_rejects_receipt_bound_to_different_frozen_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mismatch: str
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    patch_cycle(monkeypatch, cycle)
+    write_report(config)
+    controller._request_revision(config, cycle, NOW)
+    report_path, report = write_report(config, revision=1)
+    different = json.loads(json.dumps(report))
+    different["strategy_snapshot"]["process_version"] = "other-sha"
+    write_report_delivery_receipt(
+        config,
+        report_path,
+        report,
+        status="delivery_failed",
+        receipt_report=different if mismatch == "json" else None,
+        receipt_markdown="# different report" if mismatch == "markdown" else None,
+    )
+    generated: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda _config, _market, run_date, revision: generated.append(
+            (run_date, revision)
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: pytest.fail("mismatched receipt was executed"),
+    )
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "blocked"
+    assert "delivery receipt" in str(result["blocker"])
+    assert generated == []
+
+
+def test_failed_r1_delivery_without_request_recovers_in_revision_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    patch_cycle(monkeypatch, cycle)
+    report_path, report = write_report(config, revision=1)
+    write_report_delivery_receipt(
+        config,
+        report_path,
+        report,
+        status="delivery_failed",
+    )
+    generated: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda _config, _market, run_date, revision: generated.append(
+            (run_date, revision)
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert generated == [(cycle.report_run_date, True)]
+    assert not (report_path.parent / "2026-07-17.json").exists()
+
+
+def test_controller_rejects_frozen_report_with_mismatched_replay_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    report_path, report = write_report(config)
+    evidence_path = config.data_dir / "trend_review/evidence/CN/fake.json"
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text("{}", encoding="utf-8")
+    report["replay_evidence"] = {
+        "path": str(evidence_path.relative_to(config.data_dir)),
+        "sha256": "0" * 64,
+    }
+    write_report_delivery_receipt(
+        config,
+        report_path,
+        report,
+        status="delivery_failed",
+    )
+    generated: list[object] = []
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: generated.append(1),
+    )
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "blocked"
+    assert "replay evidence" in str(result["blocker"])
+    assert generated == []
 
 
 def test_empty_action_report_executes_without_futu_clients(
@@ -1996,7 +2137,7 @@ def test_abnormal_protection_result_disables_new_buys(
         controller,
         "_run_protection_pass",
         lambda *_args: SimpleNamespace(
-            status="completed", exception_count=1, unknown_quote_count=0
+            status="abnormal", exception_count=1, unknown_quote_count=0
         ),
     )
     allow_flags: list[bool] = []
@@ -2158,14 +2299,145 @@ def test_global_execution_noop_protocol_is_removed() -> None:
     assert not hasattr(controller, "_execution_noop_path")
 
 
+def test_revision_request_freezes_latest_report_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    baseline_path, _ = write_report(config, revision=1)
+
+    request_path = controller._request_revision(config, cycle, NOW)
+
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["baseline_report_path"] == str(baseline_path)
+    assert request["baseline_report_sha256"] == hashlib.sha256(
+        baseline_path.read_bytes()
+    ).hexdigest()
+    assert request["baseline_revision"] == 1
+
+
+def test_legacy_revision_request_without_baseline_fails_closed(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    request_path, _ = controller._revision_paths(
+        config, cycle.market, cycle.as_of_date
+    )
+    request_path.parent.mkdir(parents=True)
+    request_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.revision_request.v1",
+            "market": cycle.market,
+            "as_of_date": cycle.as_of_date,
+            "execution_date": cycle.execution_date,
+            "requested_at": NOW.isoformat(),
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid trend report revision request"):
+        controller._revision_state(
+            config,
+            cycle.market,
+            cycle.as_of_date,
+            cycle.execution_date,
+        )
+
+
+def test_revision_frozen_before_request_requires_next_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    patch_cycle(monkeypatch, cycle)
+    r1_path, _ = write_report(config, revision=1)
+    controller._request_revision(config, cycle, NOW)
+    generated: list[tuple[str, bool]] = []
+
+    def generate(
+        _config: DailyPremarketConfig,
+        _market: str,
+        run_date: str,
+        revision: bool,
+    ) -> None:
+        generated.append((run_date, revision))
+        report_path, report = write_report(config, revision=2)
+        write_report_delivery_receipt(
+            config, report_path, report, status="sent"
+        )
+
+    executed: list[Path] = []
+    monkeypatch.setattr(controller, "_generate_report", generate)
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda _config, _market, _date, path, _report, **_kwargs: executed.append(path)
+        or {"status": "unchanged", "submitted_count": 0},
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    _, completion_path = controller._revision_paths(
+        config, cycle.market, cycle.as_of_date
+    )
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    assert generated == [(cycle.report_run_date, True)]
+    assert [path.name for path in executed] == ["2026-07-17-r2.json"]
+    assert completion["report_path"].endswith("2026-07-17-r2.json")
+    assert r1_path.exists()
+
+
+def test_pending_revision_does_not_accept_newer_report_without_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    patch_cycle(monkeypatch, cycle)
+    write_report(config)
+    controller._request_revision(config, cycle, NOW)
+    r1_path, _ = write_report(config, revision=1)
+    generated: list[tuple[str, bool]] = []
+
+    def generate(
+        _config: DailyPremarketConfig,
+        _market: str,
+        run_date: str,
+        revision: bool,
+    ) -> None:
+        generated.append((run_date, revision))
+        r2_path, r2 = write_report(config, revision=2)
+        write_report_delivery_receipt(
+            config, r2_path, r2, status="sent"
+        )
+
+    executed: list[Path] = []
+    monkeypatch.setattr(controller, "_generate_report", generate)
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda _config, _market, _date, path, _report, **_kwargs: executed.append(path)
+        or {"status": "unchanged", "submitted_count": 0},
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert generated == [(cycle.report_run_date, True)]
+    assert [path.name for path in executed] == ["2026-07-17-r2.json"]
+    assert r1_path.exists()
+
+
 def test_pending_revision_completes_existing_delivered_r1_without_r2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = controller_config(tmp_path)
     cycle = active_cn_cycle()
     patch_cycle(monkeypatch, cycle)
+    write_report(config)
     request = controller._request_revision(config, cycle, NOW)
     r1_path, r1 = write_report(config, revision=1)
+    write_report_delivery_receipt(config, r1_path, r1, status="sent")
     monkeypatch.setattr(
         controller,
         "_generate_report",
@@ -2194,10 +2466,15 @@ def test_pending_revision_recovers_existing_failed_r1_and_binds_completion(
     config = controller_config(tmp_path)
     cycle = active_cn_cycle()
     patch_cycle(monkeypatch, cycle)
+    write_report(config)
     request = controller._request_revision(config, cycle, NOW)
     r1_path, r1 = write_report(config, revision=1)
-    r1["delivery_status"] = "delivery_failed"
-    r1_path.write_text(json.dumps(r1), encoding="utf-8")
+    receipt_path = write_report_delivery_receipt(
+        config,
+        r1_path,
+        r1,
+        status="delivery_failed",
+    )
     generated: list[tuple[str, bool]] = []
 
     def recover(
@@ -2207,8 +2484,9 @@ def test_pending_revision_recovers_existing_failed_r1_and_binds_completion(
         revision: bool,
     ) -> None:
         generated.append((run_date, revision))
-        r1["delivery_status"] = "sent"
-        r1_path.write_text(json.dumps(r1), encoding="utf-8")
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["status"] = "sent"
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     monkeypatch.setattr(controller, "_generate_report", recover)
     monkeypatch.setattr(

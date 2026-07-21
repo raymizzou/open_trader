@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from .a_share_trend import (
     _process_version,
     load_futu_simulate_trend_account,
+    read_delivery_receipt,
     run_a_share_trend_report,
     valid_serialized_account,
 )
@@ -76,6 +77,12 @@ class ControllerCycle:
     session: str
     market_open: bool
     next_check_at: datetime
+
+
+@dataclass(frozen=True)
+class ReportTask:
+    cycle: ControllerCycle
+    completes_revision_request: bool
 
 
 def _market(value: str) -> str:
@@ -534,27 +541,72 @@ def _load_cycle_report(
     return latest
 
 
-def _delivery_needs_recovery(
-    config: DailyPremarketConfig,
-    market: str,
-    report: tuple[Path, Mapping[str, object]],
-) -> bool:
-    path, payload = report
-    receipt = (
-        config.data_dir / "trend_a_share" / "delivery" / f"{path.stem}.json"
+def _delivery_receipt_path(
+    config: DailyPremarketConfig, market: str, report_path: Path
+) -> Path:
+    return (
+        config.data_dir
+        / "trend_a_share"
+        / "delivery"
+        / f"{report_path.stem}.json"
         if market == "CN"
         else market_paths(config.data_dir, config.reports_dir, market).root
         / "delivery"
-        / f"{path.stem}.json"
+        / f"{report_path.stem}.json"
     )
-    if receipt.exists():
-        status = _read_json(receipt, "trend report delivery receipt").get("status")
-        return status in {"prepared", "pending", "delivery_failed"}
-    return payload.get("delivery_status") in {
-        "prepared",
-        "pending",
-        "delivery_failed",
-    }
+
+
+def _recovery_revision_for_report(
+    config: DailyPremarketConfig,
+    market: str,
+    report: tuple[Path, Mapping[str, object]],
+    *,
+    require_receipt: bool = False,
+) -> bool | None:
+    path, payload = report
+    receipt_path = _delivery_receipt_path(config, market, path)
+    receipt = read_delivery_receipt(receipt_path, artifact_stem=path.stem)
+    if receipt is None:
+        if require_receipt:
+            raise ValueError(
+                f"selected trend report has no delivery receipt: {path}"
+            )
+        return None
+    markdown_path = path.with_suffix(".md")
+    try:
+        report_json = path.read_text(encoding="utf-8")
+        markdown = markdown_path.read_text(encoding="utf-8")
+        receipt_report = json.loads(str(receipt["report_json"]))
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError) as exc:
+        raise ValueError(
+            f"delivery receipt does not match selected frozen artifacts: {receipt_path}"
+        ) from exc
+    if (
+        not isinstance(receipt_report, Mapping)
+        or report_json != receipt["report_json"]
+        or markdown != receipt["markdown"]
+        or _report_hash(receipt_report) != _report_hash(payload)
+    ):
+        raise ValueError(
+            f"delivery receipt does not match selected frozen artifacts: {receipt_path}"
+        )
+    replay = payload.get("replay_evidence")
+    if replay is not None:
+        if not isinstance(replay, Mapping):
+            raise ValueError("frozen report replay evidence is invalid")
+        evidence_path = Path(str(replay.get("path") or ""))
+        if not evidence_path.is_absolute():
+            evidence_path = config.data_dir / evidence_path
+        try:
+            evidence_path.resolve().relative_to(config.data_dir.resolve())
+            digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        except (OSError, ValueError) as exc:
+            raise ValueError("frozen report replay evidence is invalid") from exc
+        if digest != replay.get("sha256"):
+            raise ValueError("frozen report replay evidence hash mismatch")
+    if receipt["status"] in {"prepared", "pending", "delivery_failed"}:
+        return _report_order(path)[1] > 0
+    return None
 
 
 def _generate_report(
@@ -923,6 +975,27 @@ def _revision_gate_path(
     )
 
 
+def _revision_baseline(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+) -> tuple[Path | None, str | None, int]:
+    candidates = sorted(
+        (
+            path
+            for path in _report_dir(config, cycle.market).glob(
+                f"{cycle.as_of_date}*.json"
+            )
+            if _report_order(path)[0] == cycle.as_of_date
+        ),
+        key=_report_order,
+        reverse=True,
+    )
+    if not candidates:
+        return None, None, -1
+    path = candidates[0]
+    return path, hashlib.sha256(path.read_bytes()).hexdigest(), _report_order(path)[1]
+
+
 def _request_revision(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
@@ -938,18 +1011,16 @@ def _request_revision(
                 )
             request, _ = _revision_paths(config, cycle.market, cycle.as_of_date)
             if request.exists():
-                payload = _read_json(request, "trend report revision request")
-                if (
-                    payload.get("schema_version")
-                    != "open_trader.trend_controller.revision_request.v1"
-                    or payload.get("market") != cycle.market
-                    or payload.get("as_of_date") != cycle.as_of_date
-                    or payload.get("execution_date") != cycle.execution_date
-                ):
-                    raise ValueError(
-                        f"invalid trend report revision request: {request}"
-                    )
+                _revision_state(
+                    config,
+                    cycle.market,
+                    cycle.as_of_date,
+                    cycle.execution_date,
+                )
                 return request
+            baseline_path, baseline_sha, baseline_revision = _revision_baseline(
+                config, cycle
+            )
             return _write_immutable(
                 request,
                 _canonical_json_bytes({
@@ -959,6 +1030,11 @@ def _request_revision(
                     "market": cycle.market,
                     "as_of_date": cycle.as_of_date,
                     "execution_date": cycle.execution_date,
+                    "baseline_report_path": (
+                        str(baseline_path) if baseline_path is not None else None
+                    ),
+                    "baseline_report_sha256": baseline_sha,
+                    "baseline_revision": baseline_revision,
                     "requested_at": now.isoformat(timespec="seconds"),
                 }),
             )
@@ -968,16 +1044,25 @@ def _request_revision(
         ) from exc
 
 
-def _pending_revision(
-    config: DailyPremarketConfig, cycle: ControllerCycle
-) -> bool:
-    request, completion = _revision_state(
-        config,
-        cycle.market,
-        cycle.as_of_date,
-        cycle.execution_date,
-    )
-    return request is not None and completion is None
+def _pending_revision_report(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    request: Mapping[str, object],
+) -> tuple[Path, dict[str, object]] | None:
+    try:
+        latest = _load_latest_valid_report(
+            config, cycle.market, cycle.execution_date
+        )
+    except ValueError:
+        return None
+    if (
+        latest is None
+        or _report_order(latest[0])[0] != cycle.as_of_date
+        or _report_order(latest[0])[1] <= int(request["baseline_revision"])
+        or not _delivery_receipt_path(config, cycle.market, latest[0]).exists()
+    ):
+        return None
+    return latest
 
 
 def _revision_state(
@@ -994,8 +1079,38 @@ def _revision_state(
     request = _read_json(request_path, "trend report revision request")
     try:
         requested_at = datetime.fromisoformat(str(request["requested_at"]))
+        baseline_revision = request["baseline_revision"]
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid trend report revision request: {request_path}") from exc
+    baseline_path_value = request.get("baseline_report_path")
+    baseline_sha = request.get("baseline_report_sha256")
+    valid_baseline = (
+        isinstance(baseline_revision, int)
+        and not isinstance(baseline_revision, bool)
+        and baseline_revision >= -1
+    )
+    if baseline_revision == -1:
+        valid_baseline = (
+            valid_baseline
+            and baseline_path_value is None
+            and baseline_sha is None
+        )
+    elif valid_baseline:
+        baseline_path = Path(str(baseline_path_value or ""))
+        try:
+            valid_baseline = (
+                isinstance(baseline_path_value, str)
+                and bool(baseline_path_value)
+                and _report_order(baseline_path)
+                == (as_of_date, baseline_revision)
+                and baseline_path.resolve().parent
+                == _report_dir(config, market).resolve()
+                and isinstance(baseline_sha, str)
+                and hashlib.sha256(baseline_path.read_bytes()).hexdigest()
+                == baseline_sha
+            )
+        except OSError:
+            valid_baseline = False
     if (
         request.get("schema_version")
         != "open_trader.trend_controller.revision_request.v1"
@@ -1004,6 +1119,7 @@ def _revision_state(
         or request.get("execution_date") != execution_date
         or requested_at.tzinfo is None
         or requested_at.utcoffset() is None
+        or not valid_baseline
     ):
         raise ValueError(f"invalid trend report revision request: {request_path}")
     if not completion_path.exists():
@@ -1011,6 +1127,15 @@ def _revision_state(
     completion = _read_json(completion_path, "trend report revision completion")
     report_path = Path(str(completion.get("report_path") or ""))
     report = _read_json(report_path, "completed trend report revision")
+    try:
+        completed_at = datetime.fromisoformat(str(completion["completed_at"]))
+        recovery_revision = _recovery_revision_for_report(
+            config, market, (report_path, report), require_receipt=True
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"invalid trend report revision completion: {completion_path}"
+        ) from exc
     if (
         completion.get("schema_version")
         != "open_trader.trend_controller.revision_completion.v1"
@@ -1021,9 +1146,12 @@ def _revision_state(
         or completion.get("request_sha256")
         != hashlib.sha256(request_path.read_bytes()).hexdigest()
         or _report_order(report_path)[0] != as_of_date
-        or _report_order(report_path)[1] <= 0
+        or _report_order(report_path)[1] <= baseline_revision
         or not _valid_report(config, market, execution_date, report_path, report)
         or completion.get("report_sha256") != _report_hash(report)
+        or completed_at.tzinfo is None
+        or completed_at.utcoffset() is None
+        or recovery_revision is not None
     ):
         raise ValueError(f"invalid trend report revision completion: {completion_path}")
     return request, completion
@@ -1051,10 +1179,17 @@ def _complete_revision(
     path, payload = report
     if (
         _report_order(path)[0] != cycle.as_of_date
-        or _report_order(path)[1] <= 0
+        or _report_order(path)[1] <= int(request["baseline_revision"])
         or not _valid_report(
             config, cycle.market, cycle.execution_date, path, payload
         )
+        or _recovery_revision_for_report(
+            config,
+            cycle.market,
+            (path, payload),
+            require_receipt=True,
+        )
+        is not None
     ):
         raise ValueError(f"invalid completed trend report revision: {path}")
     _write_immutable(
@@ -1354,7 +1489,7 @@ def run_trend_market_controller(
         thread_name_prefix=f"trend-report-{market}",
     )
     future: Future[None] | None = None
-    report_target: tuple[ControllerCycle, bool] | None = None
+    report_target: ReportTask | None = None
     report_failures = 0
     report_retry_after: datetime | None = None
     operation_failures = 0
@@ -1453,67 +1588,81 @@ def run_trend_market_controller(
             blocker = protection_error
             if blocker is not None:
                 phase = "blocked"
-            work_cycle = report_target[0] if report_target else cycle
+            work_cycle = report_target.cycle if report_target else cycle
             latest: tuple[Path, dict[str, object]] | None = None
             try:
                 if report_target is None:
                     work_cycle = _cycle_to_reconcile(config, cycle, now)
-                wants_revision = (
-                    report_target[1]
-                    if report_target is not None
-                    else _pending_revision(config, work_cycle)
+                request, completion = _revision_state(
+                    config,
+                    market,
+                    work_cycle.as_of_date,
+                    work_cycle.execution_date,
                 )
-                if wants_revision:
-                    try:
-                        latest = _load_latest_valid_report(
-                            config, market, work_cycle.execution_date
-                        )
-                    except ValueError:
-                        latest = None
+                if report_target is not None:
+                    revision_pending = report_target.completes_revision_request
+                else:
+                    revision_pending = request is not None and completion is None
+                if revision_pending:
+                    assert request is not None
+                    latest = _pending_revision_report(
+                        config, work_cycle, request
+                    )
                 else:
                     latest = _load_cycle_report(config, work_cycle)
-                revision_frozen = bool(
-                    wants_revision
+                recovery_revision = (
+                    _recovery_revision_for_report(
+                        config,
+                        market,
+                        latest,
+                        require_receipt=revision_pending,
+                    )
+                    if latest is not None
+                    else None
+                )
+                if (
+                    revision_pending
                     and latest is not None
-                    and _report_order(latest[0])[1] > 0
-                )
-                needs_delivery = bool(
-                    latest is not None
-                    and _delivery_needs_recovery(config, market, latest)
-                )
-                if revision_frozen and not needs_delivery:
+                    and recovery_revision is None
+                    and future is None
+                ):
                     assert latest is not None
                     _complete_revision(config, work_cycle, latest, now)
-                    wants_revision = False
+                    revision_pending = False
+                    report_target = None
                 can_start = (
                     report_retry_after is None or now >= report_retry_after
                 )
                 if (
                     future is None
                     and can_start
-                    and (
-                        latest is None
-                        or needs_delivery
-                        or wants_revision and not revision_frozen
-                    )
+                    and (latest is None or recovery_revision is not None)
                 ):
-                    if wants_revision and _batch_path(
+                    if revision_pending and _batch_path(
                         config, market, work_cycle.execution_date
                     ).exists():
                         raise ValueError(
                             "trend report revision rejected: execution has begun"
                         )
+                    generator_revision = (
+                        recovery_revision
+                        if recovery_revision is not None
+                        else revision_pending
+                    )
                     future = pool.submit(
                         _generate_report,
                         config,
                         market,
                         work_cycle.report_run_date,
-                        wants_revision,
+                        generator_revision,
                     )
-                    report_target = (work_cycle, wants_revision)
+                    report_target = ReportTask(
+                        cycle=work_cycle,
+                        completes_revision_request=revision_pending,
+                    )
 
                 if future is not None and (future.done() or once):
-                    report_cycle = report_target[0] if report_target else cycle
+                    report_cycle = report_target.cycle if report_target else cycle
                     try:
                         future.result(timeout=1 if once else None)
                     except TimeoutError:
@@ -1528,12 +1677,34 @@ def run_trend_market_controller(
                         future = None
                         report_failures = 0
                         report_retry_after = None
-                        latest = _load_cycle_report(config, report_cycle)
+                        if report_target and report_target.completes_revision_request:
+                            assert request is not None
+                            latest = _pending_revision_report(
+                                config, report_cycle, request
+                            )
+                        else:
+                            latest = _load_cycle_report(config, report_cycle)
                         if latest is None:
                             raise RuntimeError(
                                 "report generation completed without a valid report"
                             )
-                        if report_target and report_target[1]:
+                        if (
+                            _recovery_revision_for_report(
+                                config,
+                                market,
+                                latest,
+                                require_receipt=(
+                                    report_target.completes_revision_request
+                                    if report_target
+                                    else False
+                                ),
+                            )
+                            is not None
+                        ):
+                            raise RuntimeError(
+                                "report delivery recovery did not complete"
+                            )
+                        if report_target and report_target.completes_revision_request:
                             _complete_revision(config, report_cycle, latest, now)
                         work_cycle = report_cycle
                         report_target = None
@@ -1545,7 +1716,7 @@ def run_trend_market_controller(
                 if operation_delayed:
                     blocker = operation_blocker
                     phase = "blocked"
-                elif future is not None or (report_target and report_target[1]):
+                elif future is not None or report_target is not None:
                     phase = "recovering_report"
                 elif latest is None:
                     phase = "recovering_report"

@@ -99,7 +99,18 @@ Ordinary premarket automation is unchanged by this work.
 - A missing report must be generated whenever the controller discovers it, including recovery during a trading session.
 - Report work remains one logical report for its data date and execution date. A failure before atomic freeze discards temporary output and recomputes that same report identity; it does not create a revision.
 - Once a report is frozen, delivery failure retries delivery only and never recomputes the report.
+- Delivery recovery uses the report runner's strict receipt reader. The receipt
+  stem, embedded JSON and Markdown, declared content hashes, and any declared
+  replay-evidence path/SHA must match the selected frozen artifacts before the
+  controller may recover or execute them.
 - An explicit correction may create a revision before execution begins. At the first eligible execution check, atomically lock the latest valid report SHA as the day's execution batch.
+- A revision request immutably records the latest report path, byte SHA, and
+  revision number visible when it is written. Only a later revision number can
+  satisfy that request, and it is not eligible until its strict delivery
+  receipt binds the exact frozen JSON/Markdown and any declared replay
+  evidence. A revision frozen after the request is recovered in place after a
+  crash; a revision already present before the request is the baseline and
+  therefore cannot satisfy it. A newer report with no receipt remains pending.
 - A revision appearing after the execution batch is locked is an anomaly. Display and notify the difference, but do not add, remove, resize, or submit actions from it automatically.
 - If a recovered report freezes inside the valid window, it may execute after all validation passes. If it freezes after the window, preserve it for audit and mark its opening actions `missed`; never roll them into the next trading day.
 
@@ -120,6 +131,25 @@ Ordinary premarket automation is unchanged by this work.
 - A buy retry may not make cumulative shares exceed the frozen plan quantity or cumulative notional exceed the frozen amount limit. Recalculate the remaining affordable quantity from confirmed fills, remaining budget, current quote, lot size, cash, and the existing risk limits.
 - When the buy window closes, retain the partial position and stop retrying the unfilled remainder.
 
+### Trust boundary and artifact integrity
+
+- The designated local executor process and the code that writes its immutable
+  ledger are trusted components. Local filesystem permissions and the exact
+  executor-host fence are the security boundary for these artifacts.
+- The strict audit loader is designed to fail closed on partial writes,
+  malformed JSON, missing artifacts, stale or mismatched report/action
+  identities, forged standalone terminal events, and inconsistent
+  intent/result/order/observation facts.
+- An adversary able to coherently rewrite the frozen report, batch, intents,
+  results, broker observations, terminal events, and all matching hashes is
+  outside this design's threat model. The ledger is not a cryptographic
+  attestation system, and historical audit loading does not re-query broker
+  status solely to prove authenticity.
+- Futu remains the cross-machine source checked before every possible order
+  submission. Broker responses and account snapshots used for terminal local
+  facts are captured by the trusted executor and bound to the exact frozen
+  action and immutable attempt facts.
+
 ### Validation and retry policy
 
 - Validate market, execution date, report freshness and completeness, strategy version, action fields, account identity, positions, cash/NAV, quote validity, quantity, and trading window before writing an intent.
@@ -128,6 +158,12 @@ Ordinary premarket automation is unchanged by this work.
 - When a valid window expires, write one durable `missed` fact and stop attempting the action.
 - Missing reports trigger generation with bounded backoff until the report freezes, even if the execution window later closes. Invalid frozen reports block execution and require an explicit correction; they are never silently replaced.
 - Trend data or Futu being unavailable for an entire valid window is an unavoidable `missed` outcome. The controller continues the audit/report work but never violates the strategy window to force a fill.
+- The controller invokes protection watchers in one-pass mode. A one-pass
+  watcher returns a structured `abnormal` result immediately on client,
+  calendar, account-snapshot, quote-snapshot, reconnect, or lock failure; it
+  never performs an internal reconnect sleep. The controller can therefore
+  publish its next heartbeat, disable every new BUY, and continue safe
+  SELL/reconciliation work before its own bounded retry.
 
 ### Manual resolution
 
@@ -161,7 +197,13 @@ Ordinary premarket automation is unchanged by this work.
 - Preserve focused tests for the existing report, risk, execution, and protection modules; delete obsolete tests that only assert the removed launchd split.
 - Verify that report completion followed by restart does not regenerate the report.
 - Verify that failure before report freeze regenerates the same logical report, while delivery failure retries delivery without recomputing report content.
+- Verify that receipt/report mismatches fail closed, revision delivery recovery
+  uses the selected artifact's suffix, and revision requests accept only an
+  artifact newer than their frozen baseline.
 - Verify that a report recovered during an active session does not interrupt protection monitoring.
+- Verify real CN/HK/US one-pass watcher failures return `abnormal` without
+  sleeping, while persistent standalone watcher mode retains reconnect
+  behavior.
 - Verify that a report recovered inside the window executes after validation, while one recovered after the window is preserved with `missed` actions.
 - Verify that the report SHA locked at opening remains the complete execution batch and that a later revision changes no automatic action.
 - Verify that broker acceptance followed by a crash before result persistence reconciles without a second submission.
@@ -192,6 +234,8 @@ Ordinary premarket automation is unchanged by this work.
 - Real-money order placement.
 - Changes to trend selection, sizing, protection, Kelly, or review rules.
 - Retrospective submission after a strategy window has closed.
+- Protection against a malicious actor that already controls the trusted
+  executor or can coherently rewrite the entire local ledger and its hashes.
 
 ## Further Notes
 

@@ -4513,7 +4513,7 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
         )
 
     assert json.loads(receipt_path.read_text(encoding="utf-8")) == old_receipt
-    recovered = trend_module._read_delivery_receipt(
+    recovered = trend_module.read_delivery_receipt(
         receipt_path, artifact_stem="2026-07-14"
     )
     assert recovered is not None

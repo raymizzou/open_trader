@@ -141,6 +141,15 @@ def watch_a_share_protection(
                             market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
+                    if once:
+                        return _result(
+                            "abnormal",
+                            positions,
+                            trigger_count,
+                            exception_count + 1,
+                            unknown_quote_count,
+                            events_path,
+                        )
                     sleep_fn(reconnect_seconds)
                     now = now_fn()
                     continue
@@ -161,8 +170,22 @@ def watch_a_share_protection(
                             market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
-                    _close(client)
+                    failed_client = client
                     client = None
+                    try:
+                        _close(failed_client)
+                    except Exception:
+                        if not once:
+                            raise
+                    if once:
+                        return _result(
+                            "abnormal",
+                            positions,
+                            trigger_count,
+                            exception_count + 1,
+                            unknown_quote_count,
+                            events_path,
+                        )
                     sleep_fn(reconnect_seconds)
                     now = now_fn()
                     continue
@@ -289,8 +312,19 @@ def watch_a_share_protection(
                         and event.get("event_type")
                         == "quote_unknown_notification_delivered"
                     }
-            except RuntimeError as exc:
-                if str(exc) != "daily premarket run already active":
+            except Exception as exc:
+                if once:
+                    return _result(
+                        "abnormal",
+                        positions,
+                        trigger_count,
+                        exception_count + 1,
+                        unknown_quote_count,
+                        events_path,
+                    )
+                if not isinstance(exc, RuntimeError) or str(exc) != (
+                    "daily premarket run already active"
+                ):
                     raise
                 sleep_fn(poll_seconds)
                 now = now_fn()
@@ -385,8 +419,22 @@ def watch_a_share_protection(
                         market_label=market_label, broker_label=broker_label,
                     )
                     interrupted = True
-                _close(client)
+                failed_client = client
                 client = None
+                try:
+                    _close(failed_client)
+                except Exception:
+                    if not once:
+                        raise
+                if once:
+                    return _result(
+                        "abnormal",
+                        positions,
+                        trigger_count,
+                        exception_count + 1,
+                        unknown_quote_count,
+                        events_path,
+                    )
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue

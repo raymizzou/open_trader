@@ -29,6 +29,17 @@ MARKET_LABELS = {"HK": "港股", "US": "美股"}
 BROKER_LABELS = {"HK": "辉立", "US": "老虎"}
 
 
+def _abnormal_result(events_path: Path) -> AShareWatchResult:
+    return AShareWatchResult(
+        status="abnormal",
+        watched_symbol_count=0,
+        trigger_count=0,
+        exception_count=1,
+        unknown_quote_count=0,
+        events_path=events_path,
+    )
+
+
 def market_session(now: datetime, market: str) -> str:
     market = _market(market)
     local = now.astimezone(MARKET_TIMEZONES[market]).time()
@@ -110,6 +121,8 @@ def watch_market_protection(
                         broker_label=BROKER_LABELS[market],
                     )
                     interrupted = True
+                if once:
+                    return _abnormal_result(events_path)
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue
@@ -151,8 +164,15 @@ def watch_market_protection(
                     broker_label=BROKER_LABELS[market],
                 )
                 interrupted = True
-            _close(client)
+            failed_client = client
             client = None
+            try:
+                _close(failed_client)
+            except Exception:
+                if not once:
+                    raise
+            if once:
+                return _abnormal_result(events_path)
             sleep_fn(reconnect_seconds)
             now = now_fn()
             continue
@@ -166,11 +186,20 @@ def watch_market_protection(
             )
         break
 
-    account_loader(
-        portfolio_path,
-        expected_date=opening.date().isoformat(),
-        timezone=timezone,
-    )
+    try:
+        account_loader(
+            portfolio_path,
+            expected_date=opening.date().isoformat(),
+            timezone=timezone,
+        )
+    except Exception:
+        if not once:
+            raise
+        try:
+            _close(client)
+        except Exception:
+            pass
+        return _abnormal_result(events_path)
     local_now = now.astimezone(timezone)
     if opening > local_now:
         sleep_fn((opening - local_now).total_seconds())

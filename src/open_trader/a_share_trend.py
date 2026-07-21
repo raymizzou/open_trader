@@ -3346,7 +3346,7 @@ def _write_delivery_receipt(
     return payload
 
 
-def _read_delivery_receipt(
+def read_delivery_receipt(
     path: Path,
     *,
     artifact_stem: str,
@@ -3502,7 +3502,7 @@ def _artifact_stem(
         ):
             number += 1
             continue
-        receipt = _read_delivery_receipt(receipt_path, artifact_stem=stem)
+        receipt = read_delivery_receipt(receipt_path, artifact_stem=stem)
         if receipt is not None:
             if receipt["status"] != "sent" or not _final_pair_matches(
                 receipt, markdown_path, json_path
@@ -3612,7 +3612,7 @@ def _recover_receipt_report(
     notifier: Notifier,
 ) -> AShareTrendRunResult | None:
     receipt_path = _receipt_path(config.data_dir, artifact_stem)
-    receipt = _read_delivery_receipt(
+    receipt = read_delivery_receipt(
         receipt_path,
         artifact_stem=artifact_stem,
     )
@@ -4234,7 +4234,7 @@ def run_a_share_trend_report(
         ):
             return AShareTrendRunResult("existing", base_markdown, base_json)
         receipt_path = _receipt_path(config.data_dir, artifact_stem)
-        receipt = _read_delivery_receipt(
+        receipt = read_delivery_receipt(
             receipt_path,
             artifact_stem=artifact_stem,
         )

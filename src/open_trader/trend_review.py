@@ -1141,6 +1141,7 @@ def _validate_broker_evidence(
         or Path(name).name != name
         or not name.startswith(f"{action_key}-observation-")
         or not isinstance(digest, str)
+        or name != f"{action_key}-observation-{digest[:12]}.json"
     ):
         raise ValueError("invalid trend action event evidence")
     path = (

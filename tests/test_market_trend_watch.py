@@ -14,6 +14,7 @@ from open_trader.a_share_trend import (
     AccountSnapshot,
     write_protection_state,
 )
+from open_trader.futu_quote import FutuQuoteError
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.market_trend_watch import (
     BROKER_LABELS,
@@ -85,6 +86,186 @@ class RecordingFeishuNotifier(FeishuWebhookNotifier):
 class RecordingMacOSNotifier(MacOSNotifier):
     def notify(self, title: str, message: str) -> None:
         pass
+
+
+def watcher_error(message: str) -> FutuQuoteError:
+    return FutuQuoteError(message, error_type="quote_server_interrupted")
+
+
+def test_once_market_watcher_returns_abnormal_when_reconnect_client_fails(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    result = watch_market_protection(
+        market="HK",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=tmp_path / "state.json",
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=None,
+        quote_client_factory=lambda: (_ for _ in ()).throw(
+            watcher_error("reconnect offline")
+        ),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: pytest.fail("once market watcher slept"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_once_market_watcher_returns_abnormal_when_calendar_fails(
+    tmp_path: Path,
+) -> None:
+    class Quote:
+        closed = False
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            raise watcher_error("calendar offline")
+
+        def close(self) -> None:
+            self.closed = True
+
+    quote = Quote()
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    result = watch_market_protection(
+        market="HK",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=tmp_path / "state.json",
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=quote,
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: pytest.fail("once market watcher slept"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+    assert quote.closed is True
+
+
+def test_once_market_watcher_returns_abnormal_when_snapshot_fails(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    write_protection_state(state_path, {
+        "schema_version": 1,
+        "positions": {"00700": {"active_line": "11"}},
+    })
+
+    class Quote:
+        closed = False
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def get_snapshots(self, _symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            raise watcher_error("snapshot offline")
+
+        def close(self) -> None:
+            self.closed = True
+
+    quote = Quote()
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    result = watch_market_protection(
+        market="HK",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=state_path,
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=quote,
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: pytest.fail("once market watcher slept"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+    assert quote.closed is True
+
+
+def test_once_market_watcher_returns_abnormal_when_account_snapshot_fails(
+    tmp_path: Path,
+) -> None:
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def close(self) -> None:
+            pass
+
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    result = watch_market_protection(
+        market="HK",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=tmp_path / "state.json",
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=Quote(),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        account_loader=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("account snapshot offline")
+        ),
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: pytest.fail("once market watcher slept"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_once_market_watcher_returns_abnormal_when_failed_client_cannot_close(
+    tmp_path: Path,
+) -> None:
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            raise watcher_error("calendar offline")
+
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    result = watch_market_protection(
+        market="HK",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=tmp_path / "state.json",
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=Quote(),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: pytest.fail("once market watcher slept"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
 
 
 def test_hk_regular_sessions_exclude_lunch_and_auction() -> None:

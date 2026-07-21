@@ -2581,6 +2581,63 @@ def test_fresh_zero_position_sell_does_not_append_observation_on_repeat(
     ))) == 1
 
 
+def test_action_audit_rejects_observation_filename_with_wrong_digest_suffix(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {"action": "SELL_ALL", "symbol": "600001"}
+    ])
+    report_path = tmp_path / "reports/2026-07-17.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-17T09:30:00+08:00",
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=FakeTrendSimClient(),
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-17", "SH.600001", "sell"
+    )
+    observation = next(tmp_path.glob(
+        "trend_review/ledgers/CN/open/2026-07-17/*-observation-*.json"
+    ))
+    renamed = observation.with_name(
+        f"{action_key}-observation-000000000000.json"
+    )
+    observation.rename(renamed)
+    event_path = next(
+        path
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+        if "position_zero_confirmed" in path.read_text(encoding="utf-8")
+    )
+    event = json.loads(event_path.read_text(encoding="utf-8"))
+    event["observation_path"] = renamed.name
+    event_path.write_text(json.dumps(event), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid trend action event evidence"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-17",
+            symbol="600001",
+            side="sell",
+        )
+
+
 @pytest.mark.parametrize(
     ("status", "expected_submitted"),
     [

@@ -26,10 +26,13 @@ Implemented Task 4 on `feat/trend-market-controller-spec` from baseline
 - On a restart after close, the next morning, or over a weekend, first
   reconciles an unfinished prior execution date, then advances to the current
   cycle only after terminal action facts exist.
-- Uses one supervised `ThreadPoolExecutor(max_workers=1)` report future while
-  continuing active-session protection passes.
+- Uses one supervised `ThreadPoolExecutor(max_workers=1)` report future and a
+  named immutable `ReportTask` target while continuing active-session
+  protection passes.
 - Retries calendar, report, broker, and close failures with bounded exponential
-  backoff while maintaining five-second persistent heartbeats.
+  backoff. It publishes a heartbeat before each reconciliation tick; dependency
+  calls return control to the controller rather than promising a wall-clock
+  heartbeat interval while external I/O is still running.
 
 ### Report freeze, validation, and revision safety
 
@@ -39,10 +42,19 @@ Implemented Task 4 on `feat/trend-market-controller-spec` from baseline
 - Missing reports are generated for the same logical dates until a valid frozen
   report exists. Frozen delivery recovery delegates to the existing report
   runner and does not rebuild expensive content.
+- Delivery recovery uses the public strict receipt reader and binds its stem,
+  embedded JSON/Markdown, declared hashes, canonical selected-report SHA, and
+  declared replay-evidence path/SHA to the exact frozen artifact. Recovery mode
+  comes from that artifact's revision suffix, not from ambient request state.
 - Malformed or invalid frozen reports fail closed and require an explicit
   revision; a pending revision may replace that artifact before execution.
 - Revision request creation and first batch lock share a per-execution-date
   gate, closing the request-versus-batch TOCTOU race.
+- Every revision request freezes its baseline path, byte SHA, and revision
+  number. Only a higher revision with a strictly bound delivery receipt
+  satisfies it: an r1 present before the request requires r2, while an r1
+  frozen after an r0-baseline request can be recovered and completed after a
+  crash. A newer report without its receipt remains incomplete.
 - A later revision cannot replace an already locked batch and produces one
   deduplicated anomaly notification.
 
@@ -52,7 +64,10 @@ Implemented Task 4 on `feat/trend-market-controller-spec` from baseline
 - Quote acquisition is best effort: missing BUY quotes remain per-action
   pending/missed facts, while SELL reconciliation is still allowed to run.
 - Runs the existing CN/HK/US protection watchers in `once=True` mode and routes
-  protection exits through the shared stable sell action protocol.
+  protection exits through the shared stable sell action protocol. One-pass
+  client/calendar/account/quote/reconnect/lock failures return structured
+  `abnormal` results immediately and never sleep; persistent standalone watcher
+  mode retains reconnect behavior.
 - Adds an immutable close-completion cursor. A crash after the daily close fact
   but before projection completion rebuilds the projection once; a completed
   close is not repeatedly mutated every heartbeat.
@@ -76,8 +91,8 @@ Implemented Task 4 on `feat/trend-market-controller-spec` from baseline
 - Controller, calendar, uncertainty/conflict, missed-window, and revision
   anomaly notifications use immutable success-only receipts.
 - Refreshes the heartbeat before calendar I/O on every tick and runs protection
-  immediately after the current cycle is available, before loading or repairing
-  any opening report.
+  from the best-effort local market date before calendar derivation, backoff,
+  and any opening-report load or repair.
 - Added one shared Task 3 audit loader used by completion checks. It validates
   action identity, timezone, strict resolution attempt identity, and terminal
   `filled`, `missed`, and position-zero evidence before a ledger action can be
@@ -112,26 +127,35 @@ broker evidence selections each ran red before the strict loader was added.
 Two final durability regressions also ran red before their fixes: a fresh-zero
 SELL appended a second broker observation on restart, and an abnormal
 protection result allowed BUY when the calendar cycle said the market was not
-open. The controller test file now contains 50 state-transition tests.
+open. That review stage ended with 50 state-transition test cases.
+
+The next spec review added 20 focused RED cases: six initial real watcher
+client/calendar/snapshot failures, five further account/lock/client-close
+failures, eight receipt/revision/replay binding cases (including separate JSON
+and Markdown mismatch cases), and one observation filename-digest mismatch.
+Each failed against the prior implementation before
+the targeted change and passed afterward. Existing persistent watcher
+recovery, valid delivery recovery, post-request revision recovery, and strict
+audit paths were retained as controls.
 
 ### Final automated verification
 
 Controller tests:
 
 ```text
-50 passed in 3.84s
+58 passed in 3.91s
 ```
 
 Task-required controller/report/watcher/ledger suite:
 
 ```text
-501 passed in 5.22s
+521 passed in 5.42s
 ```
 
 Full repository suite:
 
 ```text
-2832 passed in 49.08s
+2852 passed in 49.87s
 ```
 
 Static checks:
@@ -153,20 +177,26 @@ No temporary data or reports directory was created.
 
 ## Self-Review
 
-- Consolidated the report future's logical cycle and revision flag into one
-  target tuple, reducing branching in the main loop without a state class.
+- Consolidated the report future's logical cycle and request-completion
+  responsibility into the named immutable `ReportTask` value; generator mode
+  remains a local decision derived from the selected artifact/request facts.
 - Centralized timezone normalization, retry calculation, and status
   construction plus atomic publication.
 - Kept the seven task-specified adapter seams directly patchable.
 - Removed the execution-noop protocol and the intermediate parallel
   `broker_facts` directory. Terminal observations now live in the existing
   immutable open ledger and are SHA-bound from the action event.
-- The remediation is a net 583 production lines relative to the original Task
-  4 commit: 119 in the controller for delivery/revision/protection recovery and
-  464 in Task 3 for client-free missed facts plus strict report, intent, result,
-  broker observation, order, fill, and zero-position validation. The bulk is
-  explicit fail-closed validation at the persistence boundary, not a new
+- The two remediation rounds are a net 832 production lines relative to the
+  original Task 4 commit: 290 in the controller, 465 in Task 3 review/audit
+  validation, and 77 in watcher one-pass recovery. The bulk is explicit
+  fail-closed validation at persistence and process boundaries, not a new
   scheduler, state machine, service layer, or alternate execution path.
+- Trust boundary: the designated local executor and immutable-ledger writer are
+  trusted. Strict audit validation targets partial, corrupt, missing, stale, or
+  mismatched artifacts and fails closed on them. Coherent malicious rewriting
+  of the complete report/batch/intent/result/observation/event chain and all
+  hashes is out of scope; no crypto attestation or historical broker-status
+  re-read was added.
 - Deliberately left the temporarily duplicated legacy CLI validation/execution
   routes unchanged because Task 5 removes those operational branches.
 
@@ -175,10 +205,11 @@ No temporary data or reports directory was created.
 - No live Futu/OpenD workflow was run because it could place simulated broker
   orders. Automated tests exercised broker reconciliation and duplicate
   prevention through controlled clients.
-- Read-only process inspection found the existing HK watcher (PID 90181) and US
-  watcher (PID 77982) still running from the `dashboard-main-merge` worktree;
-  the CN launchd watcher was loaded but not running. They were not stopped or
-  restarted in Task 4; the fenced job migration belongs to Task 8.
+- Read-only process inspection found the existing US watcher (PID 77982) still
+  running from the `dashboard-main-merge` worktree. The HK and CN launchd
+  watchers were loaded but not running, both with last exit code 0. No existing
+  watcher was stopped or restarted in Task 4; the fenced job migration belongs
+  to Task 8.
 - No Task 4 controller process is deployed yet, so fresh controller PID/log
   verification and the Dashboard acceptance gate are not applicable at this
   stage. Completion of the overall Dashboard task must still pass the later
