@@ -552,10 +552,9 @@ Expected: all trend-review tests PASS; no test expects automatic retry from an u
 - Modify: `src/open_trader/market_trend_watch.py:70-160` only if a one-pass hook is needed; prefer its existing `once=True` interface.
 
 **Interfaces:**
-- Produces: `run_trend_market_controller(config: DailyPremarketConfig, market: str, *, revision: bool = False, once: bool = False, now_fn: Callable[[], datetime] = datetime.now, sleep_fn: Callable[[float], None] = sleep, _services: _ControllerServices | None = None) -> dict[str, object]`.
+- Produces: `run_trend_market_controller(config: DailyPremarketConfig, market: str, *, revision: bool = False, once: bool = False, now_fn: Callable[[], datetime] = datetime.now, sleep_fn: Callable[[float], None] = sleep) -> dict[str, object]`.
 - Produces: `load_trend_market_status(config: DailyPremarketConfig, market: str, *, now: datetime | None = None) -> dict[str, object]`.
 - Produces internal: `ControllerCycle(market, as_of_date, execution_date, report_run_date, session, buy_window_open, market_open, next_check_at)`.
-- Produces internal: `_ControllerServices(cycle, load_report, generate_report, protection_pass, execute_report, capture_close, notify)` with real defaults; `run_trend_market_controller` accepts `_services: _ControllerServices | None = None` only as a test seam.
 - Consumes: mode boundary from Task 1, batch/action functions from Tasks 2–3, existing `run_a_share_trend_report`, `run_market_trend_report`, one-pass protection watchers, and close capture.
 
 - [ ] **Step 1: Write controller state-transition tests before creating the module**
@@ -625,7 +624,7 @@ def valid_cn_report(*, as_of_date: str, execution_date: str) -> dict[str, object
     }
 ```
 
-Use `_ControllerServices` to supply deterministic functions without adding a public adapter framework. The first end-to-end test must be complete and shaped like this:
+Monkeypatch the module's private `_derive_cycle`, `_load_latest_valid_report`, `_generate_report`, `_run_protection_pass`, `_execute_locked_report`, `_capture_close`, and `_notify_once` functions directly. The first end-to-end test must be complete and shaped like this:
 
 ```python
 def test_start_after_original_trigger_generates_report_and_executes_inside_window(
@@ -648,20 +647,29 @@ def test_start_after_original_trigger_generates_report_and_executes_inside_windo
         path.write_text(json.dumps(report), encoding="utf-8")
         reports.append((path, report))
 
-    services = _ControllerServices(
-        cycle=lambda _config, _market, _now: active_cn_cycle(),
-        load_report=lambda _config, _market, _date: reports[-1] if reports else None,
-        generate_report=generate,
-        protection_pass=lambda _config, market, day: calls.append(
-            ("protect", market, day)
-        ),
-        execute_report=lambda _config, market, day, path, report: calls.append(
+    monkeypatch.setattr(controller, "_derive_cycle", lambda _config, _market, _now: active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report",
+        lambda _config, _market, _date: reports[-1] if reports else None,
+    )
+    monkeypatch.setattr(controller, "_generate_report", generate)
+    monkeypatch.setattr(
+        controller, "_run_protection_pass",
+        lambda _config, market, day: calls.append(("protect", market, day)),
+    )
+    monkeypatch.setattr(
+        controller, "_execute_locked_report",
+        lambda _config, market, day, path, report: calls.append(
             ("execute", market, (day, path.name))
         ) or {"status": "submitted", "submitted_count": 1},
-        capture_close=lambda _config, market, day: calls.append(
-            ("close", market, day)
-        ),
-        notify=lambda title, message, key: calls.append(
+    )
+    monkeypatch.setattr(
+        controller, "_capture_close",
+        lambda _config, market, day: calls.append(("close", market, day)),
+    )
+    monkeypatch.setattr(
+        controller, "_notify_once",
+        lambda title, message, key: calls.append(
             ("notify", title, (message, key))
         ) or True,
     )
@@ -671,7 +679,6 @@ def test_start_after_original_trigger_generates_report_and_executes_inside_windo
         "CN",
         once=True,
         now_fn=lambda: datetime.fromisoformat("2026-07-20T09:31:00+08:00"),
-        _services=services,
     )
 
     assert ("generate", "CN", ("2026-07-17", False)) in calls
@@ -680,7 +687,7 @@ def test_start_after_original_trigger_generates_report_and_executes_inside_windo
     assert result["phase"] == "monitoring"
 ```
 
-Use the same service seam for the other exact test names below. Each test must assert the report-generator call tuple, broker submission count, status phase/blocker, and immutable paths:
+Use the same direct module monkeypatches for the other exact test names below. Each test must assert the report-generator call tuple, broker submission count, status phase/blocker, and immutable paths:
 
 - `test_report_failure_before_freeze_retries_same_logical_dates`: first `generate_report` raises, second controller tick uses the same `("CN", "2026-07-17", False)` tuple and creates no revision filename.
 - `test_frozen_delivery_failure_retries_delivery_without_rebuilding`: `load_report` returns a frozen receipt/report and the real report runner’s recovery path is invoked once; its expensive attempt function remains uncalled.
@@ -757,26 +764,7 @@ Deduplicate controller failure, uncertainty, conflict, missed-window, and post-l
 
 - [ ] **Step 5: Implement the reconciliation loop with one supervised report future**
 
-Define the test seam as one private dataclass; default construction binds each field to the real existing business function:
-
-```python
-@dataclass(frozen=True)
-class _ControllerServices:
-    cycle: Callable[[DailyPremarketConfig, str, datetime], ControllerCycle]
-    load_report: Callable[
-        [DailyPremarketConfig, str, str], tuple[Path, dict[str, object]] | None
-    ]
-    generate_report: Callable[[DailyPremarketConfig, str, str, bool], None]
-    protection_pass: Callable[[DailyPremarketConfig, str, str], object]
-    execute_report: Callable[
-        [DailyPremarketConfig, str, str, Path, Mapping[str, object]],
-        dict[str, object],
-    ]
-    capture_close: Callable[[DailyPremarketConfig, str, str], object]
-    notify: Callable[[str, str, str], bool]
-```
-
-Inside a per-market `RunLock`, maintain at most one `ThreadPoolExecutor(max_workers=1)` report future. In `once=True` tests, perform the protection pass first, then call `future.result(timeout=1)` and harvest that report before returning from the one full tick; the protection-priority test releases its blocked future from the protection callback. In the persistent loop, keep a five-second heartbeat cadence. Schedule report/broker retries without blocking heartbeats at `min(300, 5 * 2 ** min(consecutive_failures, 6))` seconds. Process each tick in this order:
+Inside a per-market `RunLock`, maintain at most one `ThreadPoolExecutor(max_workers=1)` report future. Keep the real business calls in the seven small private functions named in Step 1 so tests can monkeypatch them without a service interface. In `once=True` tests, perform the protection pass first, then call `future.result(timeout=1)` and harvest that report before returning from the one full tick; the protection-priority test releases its blocked future from the protection callback. In the persistent loop, keep a five-second heartbeat cadence. Schedule report/broker retries without blocking heartbeats at `min(300, 5 * 2 ** min(consecutive_failures, 6))` seconds. Process each tick in this order:
 
 1. Refresh heartbeat/status from durable facts.
 2. Derive the market cycle and load the latest valid report for its execution date.
