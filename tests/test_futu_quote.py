@@ -8,6 +8,7 @@ from open_trader.futu_quote import (
     DashboardQuoteSnapshot,
     FutuQuoteClient,
     FutuQuoteError,
+    _clear_trading_days_cache,
 )
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.kline_technical_facts import DailyKlineBar
@@ -355,6 +356,75 @@ def test_futu_quote_client_returns_market_trading_days(market: str) -> None:
     assert client.context.requested_trading_days["market"] == getattr(
         TradeDateMarket, market
     )
+
+
+def test_trading_day_cache_refreshes_after_five_minutes() -> None:
+    class ChangingCalendarContext(FakeOpenQuoteContext):
+        def request_trading_days(
+            self, *, market: object, start: str, end: str
+        ) -> tuple[int, object]:
+            self.calendar_calls = getattr(self, "calendar_calls", 0) + 1
+            day = "2026-07-14" if self.calendar_calls == 1 else "2026-07-15"
+            return 0, [{"time": day}]
+
+    clock = [0.0]
+    _clear_trading_days_cache()
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=ChangingCalendarContext,
+        connectivity_checker=lambda host, port: True,
+        monotonic_fn=lambda: clock[0],
+    )
+
+    try:
+        assert client.get_trading_days(
+            market="US", start="2026-07-14", end="2026-07-20"
+        ) == ["2026-07-14"]
+        clock[0] = 299.0
+        assert client.get_trading_days(
+            market="US", start="2026-07-14", end="2026-07-20"
+        ) == ["2026-07-14"]
+        clock[0] = 300.0
+        assert client.get_trading_days(
+            market="US", start="2026-07-14", end="2026-07-20"
+        ) == ["2026-07-15"]
+        assert client.context.calendar_calls == 2
+    finally:
+        client.close()
+        _clear_trading_days_cache()
+
+
+def test_trading_day_cache_does_not_cache_failures() -> None:
+    class RecoveringCalendarContext(FakeOpenQuoteContext):
+        def request_trading_days(
+            self, *, market: object, start: str, end: str
+        ) -> tuple[int, object]:
+            self.calendar_calls = getattr(self, "calendar_calls", 0) + 1
+            if self.calendar_calls == 1:
+                return -1, "频率太高，请求失败，每30秒最多30次。"
+            return 0, [{"time": "2026-07-14"}]
+
+    _clear_trading_days_cache()
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=RecoveringCalendarContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    try:
+        with pytest.raises(FutuQuoteError, match="每30秒最多30次"):
+            client.get_trading_days(
+                market="US", start="2026-07-14", end="2026-07-20"
+            )
+        assert client.get_trading_days(
+            market="US", start="2026-07-14", end="2026-07-20"
+        ) == ["2026-07-14"]
+        assert client.context.calendar_calls == 2
+    finally:
+        client.close()
+        _clear_trading_days_cache()
 
 
 def test_futu_quote_client_returns_lot_sizes() -> None:

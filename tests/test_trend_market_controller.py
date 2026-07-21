@@ -7,7 +7,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -67,6 +67,74 @@ def active_cn_cycle() -> ControllerCycle:
         market_open=True,
         next_check_at=datetime.fromisoformat("2026-07-20T09:31:05+08:00"),
     )
+
+
+def test_repeated_controller_and_watcher_calendar_queries_stay_below_futu_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from open_trader.futu_quote import FutuQuoteClient
+    from open_trader.market_trend_watch import next_market_open
+
+    requests: list[tuple[object, str, str]] = []
+    contexts: list[object] = []
+
+    class CalendarContext:
+        def __init__(self, *, host: str, port: int) -> None:
+            self.closed = False
+            contexts.append(self)
+
+        def request_trading_days(
+            self, *, market: object, start: str, end: str
+        ) -> tuple[int, list[dict[str, str]]]:
+            requests.append((market, start, end))
+            current = date.fromisoformat(start)
+            last = date.fromisoformat(end)
+            rows: list[dict[str, str]] = []
+            while current <= last:
+                if current.weekday() < 5:
+                    rows.append({"time": current.isoformat()})
+                current += timedelta(days=1)
+            return 0, rows
+
+        def close(self) -> None:
+            self.closed = True
+
+    def context_factory(*, host: str, port: int) -> CalendarContext:
+        return CalendarContext(host=host, port=port)
+
+    def quote_factory(**kwargs: object) -> FutuQuoteClient:
+        return FutuQuoteClient(
+            **kwargs,
+            context_factory=context_factory,
+            connectivity_checker=lambda _host, _port: True,
+        )
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", quote_factory)
+    monkeypatch.setattr(controller, "_durable_report_cycles", lambda *_args: [])
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args: True)
+    config = controller_config(tmp_path)
+    now = datetime.fromisoformat("2026-07-20T09:31:00+08:00")
+
+    for _ in range(6):
+        for market in ("CN", "HK", "US"):
+            cycle = controller._derive_cycle(config, market, now)
+            assert controller._cycle_to_reconcile(config, cycle, now) == cycle
+        for market in ("HK", "US"):
+            quote = quote_factory(host=config.futu_host, port=config.futu_port)
+            try:
+                local_day = now.astimezone(controller.TIMEZONES[market]).date()
+                quote.get_trading_days(
+                    market=market,
+                    start=local_day.isoformat(),
+                    end=local_day.isoformat(),
+                )
+                next_market_open(quote, market=market, now=now)
+            finally:
+                quote.close()
+
+    assert len(contexts) > 30
+    assert all(context.closed for context in contexts)
+    assert len(requests) == 10
 
 
 def valid_cn_report(
