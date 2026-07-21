@@ -1167,6 +1167,150 @@ def _revision_state(
     return request, completion
 
 
+def _legacy_cutover_path(
+    config: DailyPremarketConfig, market: str, as_of_date: str
+) -> Path:
+    return (
+        _controller_root(config, market)
+        / "legacy_cutovers"
+        / f"{as_of_date}.json"
+    )
+
+
+def _record_legacy_cycle_cutover(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    *,
+    actor: str,
+    reason: str,
+    authorized_at: datetime,
+) -> Path:
+    require_trend_executor(config, hostname_fn=socket.gethostname)
+    path = _legacy_cutover_path(config, cycle.market, cycle.as_of_date)
+    actor = actor.strip()
+    reason = reason.strip()
+    try:
+        market = _market(cycle.market)
+        as_of = date.fromisoformat(cycle.as_of_date)
+        execution = date.fromisoformat(cycle.execution_date)
+        authorized_at = datetime.fromisoformat(
+            authorized_at.isoformat(timespec="seconds")
+        )
+        window_end = datetime.combine(
+            execution, BUY_WINDOWS[market][1], tzinfo=TIMEZONES[market]
+        )
+        request_path, _ = _revision_paths(config, market, cycle.as_of_date)
+        request, completion = _revision_state(
+            config, market, cycle.as_of_date, cycle.execution_date
+        )
+        report_path, report_sha, _ = _revision_baseline(config, cycle)
+        valid = (
+            market == cycle.market
+            and as_of.isoformat() == cycle.as_of_date
+            and execution.isoformat() == cycle.execution_date
+            and bool(actor)
+            and bool(reason)
+            and authorized_at.tzinfo is not None
+            and authorized_at.utcoffset() is not None
+            and authorized_at.astimezone(TIMEZONES[market]) > window_end
+            and not _batch_path(config, market, cycle.execution_date).exists()
+            and request is not None
+            and completion is None
+            and report_path is not None
+            and report_sha is not None
+            and report_path.resolve().parent
+            == _report_dir(config, market).resolve()
+            and request.get("baseline_report_path") == str(report_path)
+            and request.get("baseline_report_sha256") == report_sha
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid legacy trend cutover: {path}") from exc
+    if not valid:
+        raise ValueError(f"invalid legacy trend cutover: {path}")
+    return _write_immutable(
+        path,
+        _canonical_json_bytes({
+            "schema_version": "open_trader.trend_controller.legacy_cutover.v1",
+            "market": cycle.market,
+            "as_of_date": cycle.as_of_date,
+            "execution_date": cycle.execution_date,
+            "report_path": str(report_path),
+            "report_sha256": report_sha,
+            "revision_request_path": str(request_path),
+            "revision_request_sha256": hashlib.sha256(
+                request_path.read_bytes()
+            ).hexdigest(),
+            "actor": actor,
+            "reason": reason,
+            "authorized_at": authorized_at.isoformat(timespec="seconds"),
+        }),
+    )
+
+
+def _legacy_cycle_cutover(
+    config: DailyPremarketConfig, cycle: ControllerCycle
+) -> bool:
+    path = _legacy_cutover_path(config, cycle.market, cycle.as_of_date)
+    if not path.exists():
+        return False
+    try:
+        payload = _read_json(path, "legacy trend cutover")
+        market = _market(cycle.market)
+        as_of = date.fromisoformat(cycle.as_of_date)
+        execution = date.fromisoformat(cycle.execution_date)
+        authorized_at = datetime.fromisoformat(str(payload["authorized_at"]))
+        window_end = datetime.combine(
+            execution, BUY_WINDOWS[market][1], tzinfo=TIMEZONES[market]
+        )
+        request_path, _ = _revision_paths(config, market, cycle.as_of_date)
+        request, completion = _revision_state(
+            config, market, cycle.as_of_date, cycle.execution_date
+        )
+        report_path, report_sha, _ = _revision_baseline(config, cycle)
+        actor = payload.get("actor")
+        reason = payload.get("reason")
+        valid = (
+            payload.get("schema_version")
+            == "open_trader.trend_controller.legacy_cutover.v1"
+            and market == cycle.market
+            and as_of.isoformat() == cycle.as_of_date
+            and execution.isoformat() == cycle.execution_date
+            and payload.get("market") == cycle.market
+            and payload.get("as_of_date") == cycle.as_of_date
+            and payload.get("execution_date") == cycle.execution_date
+            and isinstance(actor, str)
+            and bool(actor)
+            and actor == actor.strip()
+            and isinstance(reason, str)
+            and bool(reason)
+            and reason == reason.strip()
+            and authorized_at.tzinfo is not None
+            and authorized_at.utcoffset() is not None
+            and payload.get("authorized_at")
+            == authorized_at.isoformat(timespec="seconds")
+            and authorized_at.astimezone(TIMEZONES[market]) > window_end
+            and not _batch_path(config, market, cycle.execution_date).exists()
+            and request is not None
+            and completion is None
+            and report_path is not None
+            and report_sha is not None
+            and report_path.resolve().parent
+            == _report_dir(config, market).resolve()
+            and request.get("baseline_report_path") == str(report_path)
+            and request.get("baseline_report_sha256") == report_sha
+            and payload.get("report_path") == str(report_path)
+            and payload.get("report_sha256") == report_sha
+            and payload.get("revision_request_path") == str(request_path)
+            and payload.get("revision_request_sha256")
+            == hashlib.sha256(request_path.read_bytes()).hexdigest()
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid legacy trend cutover: {path}") from exc
+    if not valid:
+        raise ValueError(f"invalid legacy trend cutover: {path}")
+    return True
+
+
 def _complete_revision(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
@@ -1268,6 +1412,8 @@ def _execution_completed(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
 ) -> bool:
+    if _legacy_cycle_cutover(config, cycle):
+        return True
     batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     if not batch_path.exists():
         return False

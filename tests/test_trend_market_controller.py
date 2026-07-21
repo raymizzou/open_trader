@@ -1621,6 +1621,141 @@ def test_invalid_historical_batch_remains_selected_but_cannot_be_revised(
     assert not request_path.exists()
 
 
+def prepare_legacy_cutover(
+    config: DailyPremarketConfig,
+) -> tuple[ControllerCycle, Path, Path, datetime]:
+    cycle = active_cn_cycle()
+    report_path, report = write_report(config, revision=2)
+    report["schema_version"] = 999
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
+    request_path = controller._request_revision(config, cycle, authorized_at)
+    return cycle, report_path, request_path, authorized_at
+
+
+def test_legacy_cutover_skips_only_exact_expired_unreplayable_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    historical = active_cn_cycle()
+    current = ControllerCycle(
+        market="CN",
+        as_of_date="2026-07-20",
+        execution_date="2026-07-21",
+        report_run_date="2026-07-20",
+        session="morning",
+        market_open=True,
+        next_check_at=NOW + timedelta(seconds=5),
+    )
+    path, report = write_report(config, revision=2)
+    report["schema_version"] = 999
+    path.write_text(json.dumps(report), encoding="utf-8")
+    authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
+    controller._request_revision(config, historical, authorized_at)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+
+    cutover = controller._record_legacy_cycle_cutover(
+        config,
+        historical,
+        actor="ray",
+        reason="historical replay evidence and dated account snapshot unavailable",
+        authorized_at=authorized_at,
+    )
+
+    assert cutover.exists()
+    assert controller._execution_completed(config, historical) is True
+    assert controller._cycle_to_reconcile(config, current, authorized_at) == current
+    assert not controller._batch_path(
+        config, historical.market, historical.execution_date
+    ).exists()
+    assert not (config.data_dir / "trend_review/ledgers/CN/actions").exists()
+
+
+@pytest.mark.parametrize("blocker", ["open_window", "batch"])
+def test_legacy_cutover_rejects_open_window_or_existing_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocker: str,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle, _, _, authorized_at = prepare_legacy_cutover(config)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    if blocker == "open_window":
+        authorized_at = NOW
+    else:
+        batch = controller._batch_path(config, cycle.market, cycle.execution_date)
+        batch.parent.mkdir(parents=True, exist_ok=True)
+        batch.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        controller._record_legacy_cycle_cutover(
+            config,
+            cycle,
+            actor="ray",
+            reason="historical evidence unavailable",
+            authorized_at=authorized_at,
+        )
+
+
+@pytest.mark.parametrize("bound_artifact", ["report", "request"])
+def test_legacy_cutover_fails_closed_after_report_or_request_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bound_artifact: str,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle, report_path, request_path, authorized_at = prepare_legacy_cutover(config)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    controller._record_legacy_cycle_cutover(
+        config,
+        cycle,
+        actor="ray",
+        reason="historical evidence unavailable",
+        authorized_at=authorized_at,
+    )
+    target = report_path if bound_artifact == "report" else request_path
+    target.write_bytes(target.read_bytes() + b" ")
+
+    with pytest.raises(ValueError, match="invalid legacy trend cutover"):
+        controller._execution_completed(config, cycle)
+
+
+def test_legacy_cutover_is_immutable_and_validates_operator_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle, _, _, authorized_at = prepare_legacy_cutover(config)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    values = {
+        "config": config,
+        "cycle": cycle,
+        "actor": "ray",
+        "reason": "historical evidence unavailable",
+        "authorized_at": authorized_at,
+    }
+    first = controller._record_legacy_cycle_cutover(**values)
+    assert controller._record_legacy_cycle_cutover(**values) == first
+    with pytest.raises(FileExistsError, match="immutable artifact collision"):
+        controller._record_legacy_cycle_cutover(
+            **{**values, "reason": "different reason"}
+        )
+    for index, changed in enumerate((
+        {"actor": ""},
+        {"reason": ""},
+        {"authorized_at": datetime(2026, 7, 21, 18)},
+    )):
+        other = controller_config(tmp_path / str(index))
+        other_cycle, _, _, other_at = prepare_legacy_cutover(other)
+        with pytest.raises(ValueError):
+            controller._record_legacy_cycle_cutover(
+                other,
+                other_cycle,
+                actor=str(changed.get("actor", "ray")),
+                reason=str(changed.get("reason", "historical evidence unavailable")),
+                authorized_at=changed.get("authorized_at", other_at),
+            )
+
+
 def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
