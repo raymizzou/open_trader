@@ -378,7 +378,7 @@ def _partition_external_source_errors(
     errors: list[str], *, data_dir: Path, run_date: str
 ) -> tuple[list[str], str | None]:
     affected_symbols: set[tuple[str, str]] = set()
-    source_failures: set[tuple[str, str, str]] = set()
+    source_failures: dict[tuple[str, str, str], str] = {}
     for market in ("CN", "HK", "US"):
         path = data_dir / "runs" / run_date / market / "daily_run_status.json"
         try:
@@ -408,10 +408,12 @@ def _partition_external_source_errors(
             and "402" in str(item.get("error") or "")
             and "insufficient balance" in str(item.get("error") or "").lower()
         )
-        source_failures.update(
-            (market, str(item["symbol"]), str(item["source"]))
+        source_failures.update({
+            (market, str(item["symbol"]), str(item["source"])): str(
+                item.get("error") or ""
+            )
             for item in failures
-        )
+        })
 
     external: list[tuple[str, str, str]] = []
     remaining: list[str] = []
@@ -421,11 +423,27 @@ def _partition_external_source_errors(
     for error in errors:
         match = pattern.match(error)
         identity = match.groups() if match else None
+        recorded_error = source_failures.get(identity) if identity else None
+        causal_failure = (
+            identity is not None
+            and identity[2] in BALANCE_CAUSAL_SOURCES
+            and (
+                (
+                    identity[2] == "tradingagents_summary"
+                    and "402" in str(recorded_error)
+                    and "insufficient balance" in str(recorded_error).lower()
+                )
+                or (
+                    identity[2] != "tradingagents_summary"
+                    and str(recorded_error).strip().lower() == "error"
+                )
+            )
+        )
         if (
             identity is not None
             and identity in source_failures
             and identity[:2] in affected_symbols
-            and identity[2] in BALANCE_CAUSAL_SOURCES
+            and causal_failure
         ):
             external.append(identity)
         else:

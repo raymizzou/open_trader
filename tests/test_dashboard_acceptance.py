@@ -4411,12 +4411,19 @@ def test_acceptance_partitions_only_current_402_source_failures_as_external(
                 "source": "technical_facts",
                 "error": "independent provider failure",
             },
+            {
+                "market": "US",
+                "symbol": "DRAM",
+                "source": "decision_facts.news_sentiment",
+                "error": "corrupt schema",
+            },
         ],
     }), encoding="utf-8")
     source_errors = [
         "US.DRAM 数据源 tradingagents_summary 不可用：error",
         "US.DRAM 数据源 decision_facts.kline 不可用：error",
         "US.DRAM 数据源 technical_facts 不可用：independent provider failure",
+        "US.DRAM 数据源 decision_facts.news_sentiment 不可用：corrupt schema",
         "US.QQQ 数据源 decision_facts.kline 不可用：error",
         "控制器内部失败",
     ]
@@ -4429,6 +4436,7 @@ def test_acceptance_partitions_only_current_402_source_failures_as_external(
 
     assert remaining == [
         "US.DRAM 数据源 technical_facts 不可用：independent provider failure",
+        "US.DRAM 数据源 decision_facts.news_sentiment 不可用：corrupt schema",
         "US.QQQ 数据源 decision_facts.kline 不可用：error",
         "控制器内部失败",
     ]
