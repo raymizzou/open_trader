@@ -187,6 +187,7 @@ def _status_payload(
     last_success: object,
     blocker: object,
     next_check_at: datetime,
+    fixed_process_version: str | None = None,
 ) -> dict[str, object]:
     mode = trend_execution_mode(config, hostname_fn=socket.gethostname)
     return {
@@ -196,7 +197,11 @@ def _status_payload(
         "local_host": mode.local_host,
         "pid": os.getpid(),
         "working_directory": str(Path.cwd().resolve()),
-        "git_sha": _process_version(config.repo),
+        "git_sha": (
+            fixed_process_version
+            if fixed_process_version is not None
+            else _process_version(config.repo)
+        ),
         "phase": phase,
         "heartbeat_at": now.isoformat(timespec="seconds"),
         "last_success": last_success,
@@ -214,6 +219,7 @@ def _record_status(
     last_success: object,
     blocker: object,
     next_check_at: datetime,
+    fixed_process_version: str,
 ) -> dict[str, object]:
     payload = _status_payload(
         config,
@@ -223,6 +229,7 @@ def _record_status(
         last_success=last_success,
         blocker=blocker,
         next_check_at=next_check_at,
+        fixed_process_version=fixed_process_version,
     )
     _write_status(config, market, payload)
     return payload
@@ -1614,6 +1621,7 @@ def run_trend_market_controller(
     sleep_fn: Callable[[float], None] = sleep,
 ) -> dict[str, object]:
     market = _market(market)
+    process_version = _process_version(config.repo)
     mode = trend_execution_mode(config, hostname_fn=socket.gethostname)
     initial_now = _localized(now_fn(), config.timezone)
     if mode.mode == "readonly":
@@ -1625,6 +1633,7 @@ def run_trend_market_controller(
             last_success=None,
             blocker=mode.reason,
             next_check_at=initial_now,
+            fixed_process_version=process_version,
         )
 
     if revision:
@@ -1648,6 +1657,7 @@ def run_trend_market_controller(
                 last_success=None,
                 blocker=None,
                 next_check_at=revision_cycle.next_check_at,
+                fixed_process_version=process_version,
             )
         raise
 
@@ -1676,6 +1686,7 @@ def run_trend_market_controller(
             last_success=None,
             blocker=None,
             next_check_at=initial_now + timedelta(seconds=5),
+            fixed_process_version=process_version,
         )
         while True:
             now = _localized(now_fn(), config.timezone)
@@ -1687,6 +1698,7 @@ def run_trend_market_controller(
                 last_success=last_success,
                 blocker=cycle_blocker or report_blocker or operation_blocker,
                 next_check_at=now + timedelta(seconds=5),
+                fixed_process_version=process_version,
             )
             local = now.astimezone(TIMEZONES[market])
             local_session = (
@@ -1713,6 +1725,7 @@ def run_trend_market_controller(
                     last_success=last_success,
                     blocker=cycle_blocker,
                     next_check_at=cycle_retry_after,
+                    fixed_process_version=process_version,
                 )
                 if once:
                     return status_payload
@@ -1744,6 +1757,7 @@ def run_trend_market_controller(
                     last_success=last_success,
                     blocker=cycle_blocker,
                     next_check_at=cycle_retry_after,
+                    fixed_process_version=process_version,
                 )
                 if once:
                     return status_payload
@@ -2015,6 +2029,7 @@ def run_trend_market_controller(
                 last_success=last_success,
                 blocker=blocker,
                 next_check_at=next_check,
+                fixed_process_version=process_version,
             )
             if once:
                 return status_payload

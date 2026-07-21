@@ -658,6 +658,58 @@ def test_heartbeat_is_written_before_slow_reconciliation_work(
     assert result["phase"] == "monitoring"
 
 
+def test_controller_process_version_is_fixed_across_status_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args: {"status": "unchanged", "submitted_count": 0},
+    )
+    version_calls = 0
+
+    def process_version(_repo: Path) -> str:
+        nonlocal version_calls
+        version_calls += 1
+        return "start-sha" if version_calls == 1 else "changed-sha"
+
+    written: list[dict[str, object]] = []
+    write_status = controller._write_status
+
+    def capture_status(
+        observed_config: DailyPremarketConfig,
+        market: str,
+        payload: dict[str, object],
+    ) -> None:
+        written.append(payload.copy())
+        write_status(observed_config, market, payload)
+
+    monkeypatch.setattr(controller, "_process_version", process_version)
+    monkeypatch.setattr(controller, "_write_status", capture_status)
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert version_calls == 1
+    assert [payload["phase"] for payload in written] == [
+        "starting",
+        "reconciling",
+        "monitoring",
+    ]
+    assert {payload["git_sha"] for payload in written} == {"start-sha"}
+    assert result["git_sha"] == "start-sha"
+    assert load_trend_market_status(config, "CN", now=NOW)["git_sha"] == (
+        "start-sha"
+    )
+
+
 def test_heartbeat_refreshes_before_each_calendar_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -908,6 +960,22 @@ def test_readonly_controller_returns_without_report_broker_or_notification_calls
     assert result["phase"] == "readonly"
     assert result["blocker"] == "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST"
     assert calls == []
+    assert not config.data_dir.exists()
+
+
+def test_readonly_status_reads_current_process_version_each_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    versions = iter(("first-sha", "second-sha"))
+    monkeypatch.setattr(socket, "gethostname", lambda: "readonly-copy")
+    monkeypatch.setattr(controller, "_process_version", lambda _repo: next(versions))
+
+    first = load_trend_market_status(config, "CN", now=NOW)
+    second = load_trend_market_status(config, "CN", now=NOW)
+
+    assert first["git_sha"] == "first-sha"
+    assert second["git_sha"] == "second-sha"
     assert not config.data_dir.exists()
 
 
