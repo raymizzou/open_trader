@@ -2632,6 +2632,7 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
 
         @property
         def first(self) -> "Locator":
+            self.page.first_uses.append(self.selector)
             return self
 
         def count(self) -> int:
@@ -2699,6 +2700,7 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             self.clicks: list[str] = []
             self.evaluations: list[tuple[str, object | None]] = []
             self.target_checks: list[str] = []
+            self.first_uses: list[str] = []
 
         def locator(self, selector: str) -> Locator:
             return Locator(self, selector)
@@ -2721,6 +2723,10 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
         "#open-kelly-lab", "#return-to-portfolio:visible",
         "#open-standard-backtest", "#return-to-portfolio:visible",
         "#research-chat-close:visible",
+    ]
+    assert page.first_uses == [
+        '.account-holding-actions button[data-detail-mode="t_signal"]:visible',
+        "[data-back-to-holdings]:visible",
     ]
     assert len(page.evaluations) == 1
     assert page.target_checks == [

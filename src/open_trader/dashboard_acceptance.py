@@ -1452,7 +1452,7 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
         )
         back_button = page.locator("[data-back-to-holdings]:visible")
         assert back_button.count() >= 1, "做T详情缺少返回入口"
-        back_button.click()
+        back_button.first.click()
         assert page.locator(".holdings-panel:visible").count() == 1, (
             "做T详情返回后持仓未恢复"
         )
