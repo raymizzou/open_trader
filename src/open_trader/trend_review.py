@@ -1095,12 +1095,19 @@ def _strict_action_facts(
                 ValueError,
             ) as exc:
                 raise ValueError(f"invalid trend action fact: {result_path}") from exc
+            result_identity = (
+                payload
+                if path != result_path
+                and "report_sha256" not in result
+                and "action_index" not in result
+                else result
+            )
             if (
                 not isinstance(result, Mapping)
                 or result.get("market") != market
                 or result.get("date") != execution_date
-                or result.get("report_sha256") != report_sha
-                or result.get("action_index") != action_index
+                or result_identity.get("report_sha256") != report_sha
+                or result_identity.get("action_index") != action_index
                 or result.get("request") != request
                 or not isinstance(result.get("response"), Mapping)
                 or submitted.tzinfo is None

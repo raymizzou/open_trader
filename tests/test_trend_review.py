@@ -940,6 +940,124 @@ def test_uncertain_action_resolution_is_immutable(
     assert list(path.parent.glob("*.json")) == [path]
 
 
+def filled_buy_audit(
+    tmp_path: Path,
+) -> tuple[FakeTrendSimClient, dict[str, object], Path]:
+    report = cn_buy_report()
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    request = client.requests[0]
+    client.positions = [{"code": "SH.600001", "qty": request["qty"]}]
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": request["remark"],
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": request["qty"],
+        "dealt_qty": request["qty"],
+        "dealt_avg_price": "10",
+        "order_status": "FILLED_ALL",
+    }]
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T10:01:00+08:00"
+    )
+    report_path = tmp_path / "reports/2026-07-17.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-20T09:30:00+08:00",
+    )
+    result_path = next(tmp_path.glob(
+        "trend_review/ledgers/CN/open/2026-07-20/*-result.json"
+    ))
+    return client, arguments, result_path
+
+
+def test_action_audit_accepts_paired_legacy_result_without_identity_fields(
+    tmp_path: Path,
+) -> None:
+    client, arguments, result_path = filled_buy_audit(tmp_path)
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    del result["report_sha256"]
+    del result["action_index"]
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    legacy_bytes = result_path.read_bytes()
+
+    events, _ = trend_review.load_trend_action_audit(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        symbol="600001",
+        side="buy",
+    )
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T10:02:00+08:00"
+    )
+
+    assert any(event.get("status") == "filled" for event in events)
+    assert len(client.requests) == 1
+    assert result_path.read_bytes() == legacy_bytes
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_report",
+        "wrong_index",
+        "missing_report",
+        "missing_index",
+        "request_mismatch",
+        "orphan",
+    ],
+)
+def test_action_audit_rejects_other_legacy_result_identity_gaps(
+    tmp_path: Path, mutation: str
+) -> None:
+    _client, _arguments, result_path = filled_buy_audit(tmp_path)
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if mutation == "wrong_report":
+        result["report_sha256"] = "0" * 64
+    elif mutation == "wrong_index":
+        result["action_index"] = 1
+    elif mutation == "missing_report":
+        del result["report_sha256"]
+    elif mutation == "missing_index":
+        del result["action_index"]
+    elif mutation == "request_mismatch":
+        result["request"] = {**result["request"], "qty": "300"}
+    else:
+        del result["report_sha256"]
+        del result["action_index"]
+        result_path.with_name(
+            result_path.name.replace("-result", "-intent")
+        ).unlink()
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid trend action fact"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            symbol="600001",
+            side="buy",
+        )
+
+
 def test_action_audit_loader_rejects_wrong_identity_event(tmp_path: Path) -> None:
     action_key = trend_review.trend_action_key(
         "CN", "2026-07-20", "SH.600001", "buy"
