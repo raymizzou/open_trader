@@ -355,6 +355,60 @@ def test_report_failure_remains_visible_while_close_waits_for_report(
         )
 
 
+def test_report_blocker_remains_visible_when_close_capture_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(active_cn_cycle(), session="closed", market_open=False)
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller, "_cycle_to_reconcile", lambda _config, _cycle, _now: cycle
+    )
+    monkeypatch.setattr(controller, "_load_cycle_report", lambda *_args: None)
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("upstream unavailable")),
+    )
+    close_attempts: list[str] = []
+
+    def capture_close(
+        _config: DailyPremarketConfig, _market: str, trading_date: str
+    ) -> None:
+        close_attempts.append(trading_date)
+        raise RuntimeError("close unavailable")
+
+    monkeypatch.setattr(controller, "_capture_close", capture_close)
+    observed: list[object] = []
+    report_created = False
+
+    class _StopController(Exception):
+        pass
+
+    def stop_after_close_failure(_seconds: float) -> None:
+        nonlocal report_created
+        observed.append(load_trend_market_status(config, "CN", now=NOW)["blocker"])
+        assert len(observed) <= 5
+        if not report_created and observed[-1] == (
+            "report generation failed: upstream unavailable"
+        ):
+            write_report(config)
+            report_created = True
+        elif close_attempts:
+            raise _StopController
+
+    with pytest.raises(_StopController):
+        run_trend_market_controller(
+            config,
+            "CN",
+            now_fn=lambda: NOW,
+            sleep_fn=stop_after_close_failure,
+        )
+
+    assert close_attempts == [cycle.as_of_date]
+    assert observed[-1] == "report generation failed: upstream unavailable"
+
+
 def test_failed_report_keeps_same_logical_dates_after_cycle_advances(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

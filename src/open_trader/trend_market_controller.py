@@ -2000,6 +2000,7 @@ def run_trend_market_controller(
                         now.isoformat(timespec="seconds"),
                     ),
                 )
+                blocker = cycle_blocker or report_blocker or operation_blocker
 
             next_check = (
                 operation_retry_after
