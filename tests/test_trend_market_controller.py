@@ -1175,6 +1175,71 @@ def test_quote_failure_still_records_missed_without_broker_submission(
     assert any(event.get("status") == "missed" for event in events)
 
 
+def test_in_window_quote_failure_keeps_controller_blocked_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(controller_config(tmp_path), trend_review_cn_simulate_acc_id=101)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    report_path, report = write_report(config, buy=True)
+    report["metadata"]["simulate_acc_id"] = 101  # type: ignore[index]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    class BrokenQuote:
+        def get_snapshots(self, _symbols: object) -> object:
+            raise RuntimeError("quote offline")
+
+        def close(self) -> None:
+            pass
+
+    class Orders:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            return {"futu_order_id": "unexpected"}
+
+        def close(self) -> None:
+            pass
+
+    orders = Orders()
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: BrokenQuote())
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args: orders)
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "blocked"
+    assert result["last_success"] is None
+    assert "current quote unavailable" in str(result["blocker"])
+    assert orders.requests == []
+    assert any(
+        json.loads(event_path.read_text(encoding="utf-8")).get("reason")
+        == "current_quote_unavailable"
+        for event_path in config.data_dir.glob(
+            "trend_review/ledgers/CN/actions/2026-07-20/*/*.json"
+        )
+    )
+
+
 def test_broker_failure_uses_bounded_backoff_without_stopping_protection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

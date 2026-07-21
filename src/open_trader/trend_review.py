@@ -2575,6 +2575,7 @@ def execute_trend_review_open(
                             reason="current_quote_unavailable",
                             recorded_at=now,
                         )
+                        blocked_status = "quote_unavailable"
                         continue
                     remaining = Decimal(
                         _remaining_buy_quantity(
@@ -2651,6 +2652,7 @@ def execute_trend_review_open(
                         reason="current_quote_unavailable",
                         recorded_at=now,
                     )
+                    blocked_status = "quote_unavailable"
                     continue
                 quantity = _remaining_buy_quantity(
                     action,

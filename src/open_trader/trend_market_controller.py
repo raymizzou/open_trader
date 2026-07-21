@@ -849,7 +849,7 @@ def _execute_locked_report(
             except Exception:
                 prices = {}
         client = _new_order_client(config, market)
-        return execute_trend_review_open(
+        execution = execute_trend_review_open(
             data_dir=config.data_dir,
             report=locked_report,
             client=client,
@@ -858,6 +858,9 @@ def _execute_locked_report(
             now=now,
             quote_prices=prices,
         )
+        if allow_new_buys and execution.get("status") == "quote_unavailable":
+            raise RuntimeError("current quote unavailable for pending trend buy")
+        return execution
     finally:
         if quote is not None:
             quote.close()

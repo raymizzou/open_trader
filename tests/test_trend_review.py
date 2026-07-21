@@ -3450,6 +3450,7 @@ def test_missing_buy_quote_skips_only_that_buy_after_sell(tmp_path: Path) -> Non
         ).glob("*.json")
     ]
 
+    assert result["status"] == "quote_unavailable"
     assert result["submitted_count"] == 2
     assert [request["side"] for request in client.requests] == ["sell", "buy"]
     assert [request["futu_code"] for request in client.requests] == [
