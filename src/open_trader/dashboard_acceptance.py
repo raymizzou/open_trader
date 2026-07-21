@@ -27,23 +27,8 @@ from .trend_review import _report_hash
 from .strategy_drawdown import strategy_parameter_hash
 
 
-REQUIRED_SOURCE_PATHS = (
-    ("tradingagents_summary",),
-    ("technical_facts",),
-    ("decision_facts", "kline"),
-    ("decision_facts", "news_sentiment"),
-    ("futu_skill_facts", "news_sentiment"),
-    ("futu_skill_facts", "technical_anomaly"),
-    ("futu_skill_facts", "capital_anomaly"),
-    ("futu_skill_facts", "derivatives_anomaly"),
-)
 SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
 SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
-BALANCE_CAUSAL_SOURCES = {
-    "tradingagents_summary",
-    "decision_facts.kline",
-    "decision_facts.news_sentiment",
-}
 
 ACCOUNT_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 TREND_REPORT_BROKERS = ("tiger", "phillips", "eastmoney")
@@ -267,30 +252,6 @@ def validate_dashboard_payload(
     if len(cn_rows) != expected_cn:
         errors.append(f"A 股持仓数量不是 {expected_cn}：{len(cn_rows)}")
 
-    for holding in holdings:
-        if (holding.get("agent_report") or {}).get("available") is not True:
-            continue
-        for path in REQUIRED_SOURCE_PATHS:
-            source: Any = holding
-            for key in path:
-                source = source.get(key) if isinstance(source, Mapping) else None
-            if not isinstance(source, Mapping) or (
-                source.get("available") is not True
-                and source.get("unsupported") is not True
-            ):
-                detail = next(
-                    (
-                        str(source.get(key))
-                        for key in ("error", "blocking_reason", "status")
-                        if isinstance(source, Mapping) and source.get(key)
-                    ),
-                    "missing",
-                )
-                errors.append(
-                    f"{holding.get('market', '')}.{holding.get('symbol', '')} "
-                    f"数据源 {'.'.join(path)} 不可用：{detail}"
-                )
-
     universe = (payload.get("backtest_universe") or {}).get("holdings") or []
     cn_universe = [row for row in universe if row.get("market") == "CN"]
     if len(cn_universe) != expected_cn:
@@ -372,88 +333,6 @@ def classify_result(
     if errors:
         return "FAIL"
     return "BLOCKED" if browser_blocker or external_blocker else "PASS"
-
-
-def _partition_external_source_errors(
-    errors: list[str], *, data_dir: Path, run_date: str
-) -> tuple[list[str], str | None]:
-    affected_symbols: set[tuple[str, str]] = set()
-    source_failures: dict[tuple[str, str, str], str] = {}
-    for market in ("CN", "HK", "US"):
-        path = data_dir / "runs" / run_date / market / "daily_run_status.json"
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if not (
-            isinstance(payload, Mapping)
-            and payload.get("run_date") == run_date
-            and payload.get("market") == market
-            and payload.get("readiness") == "blocked"
-            and isinstance(payload.get("source_failures"), list)
-        ):
-            continue
-        failures = [
-            item
-            for item in payload["source_failures"]
-            if isinstance(item, Mapping)
-            and item.get("market") == market
-            and isinstance(item.get("symbol"), str)
-            and isinstance(item.get("source"), str)
-        ]
-        affected_symbols.update(
-            (market, str(item["symbol"]))
-            for item in failures
-            if item.get("source") == "tradingagents_summary"
-            and "402" in str(item.get("error") or "")
-            and "insufficient balance" in str(item.get("error") or "").lower()
-        )
-        source_failures.update({
-            (market, str(item["symbol"]), str(item["source"])): str(
-                item.get("error") or ""
-            )
-            for item in failures
-        })
-
-    external: list[tuple[str, str, str]] = []
-    remaining: list[str] = []
-    pattern = re.compile(
-        r"^(CN|HK|US)\.([^ ]+) 数据源 ([^ ]+) 不可用："
-    )
-    for error in errors:
-        match = pattern.match(error)
-        identity = match.groups() if match else None
-        recorded_error = source_failures.get(identity) if identity else None
-        causal_failure = (
-            identity is not None
-            and identity[2] in BALANCE_CAUSAL_SOURCES
-            and (
-                (
-                    identity[2] == "tradingagents_summary"
-                    and "402" in str(recorded_error)
-                    and "insufficient balance" in str(recorded_error).lower()
-                )
-                or (
-                    identity[2] != "tradingagents_summary"
-                    and str(recorded_error).strip().lower() == "error"
-                )
-            )
-        )
-        if (
-            identity is not None
-            and identity in source_failures
-            and identity[:2] in affected_symbols
-            and causal_failure
-        ):
-            external.append(identity)
-        else:
-            remaining.append(error)
-    if not external:
-        return remaining, None
-    symbols = "、".join(
-        sorted({f"{market}.{symbol}" for market, symbol, _ in external})
-    )
-    return remaining, f"DeepSeek API 余额不足，{symbols} 当天数据源未生成"
 
 
 def dashboard_signature(payload: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
@@ -1505,24 +1384,23 @@ def _is_actionable_console_error(message: str) -> bool:
 
 def _first_in_scope_holding(payload: dict[str, Any]) -> tuple[str, str, str]:
     for holding in payload.get("holdings") or []:
-        if (holding.get("agent_report") or {}).get("available") is True:
-            brokers = {
-                "phillips" if value == "phillip" else value
-                for value in [
-                    *(str(holding.get("brokers") or "").lower().split(";")),
-                    str(holding.get("broker") or "").lower(),
-                    *(
-                        str(detail.get("broker") or "").lower()
-                        for detail in holding.get("broker_details") or []
-                        if isinstance(detail, Mapping)
-                    ),
-                ]
-                if value
-            }
-            broker = next((item for item in ACCOUNT_BROKERS if item in brokers), "")
-            assert broker, "advice-backed holding has no account broker"
+        brokers = {
+            "phillips" if value == "phillip" else value
+            for value in [
+                *(str(holding.get("brokers") or "").lower().split(";")),
+                str(holding.get("broker") or "").lower(),
+                *(
+                    str(detail.get("broker") or "").lower()
+                    for detail in holding.get("broker_details") or []
+                    if isinstance(detail, Mapping)
+                ),
+            ]
+            if value
+        }
+        broker = next((item for item in ACCOUNT_BROKERS if item in brokers), "")
+        if broker:
             return str(holding.get("market", "")), str(holding.get("symbol", "")), broker
-    raise AssertionError("no advice-backed holding exists in Dashboard payload")
+    raise AssertionError("no account holding exists in Dashboard payload")
 
 
 def _dashboard_holding_key(
@@ -1619,35 +1497,6 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
     assert page.locator(".research-chat-modal:visible").count() == 0, (
         "投研讨论弹窗关闭失败"
     )
-
-
-def _check_decision_tabs(page: Any, market: str, symbol: str, broker: str) -> None:
-    _select_account_tab(page, broker)
-    button = page.locator(
-        'button[data-detail-mode="decision"]'
-        f'[data-detail-market="{market}"]'
-        f'[data-detail-symbol="{symbol}"]:visible'
-    )
-    assert button.count() >= 1, f"{market}.{symbol} has no trading-decision button"
-    button.first.click()
-    tabs = page.locator(".decision-tab-list [data-decision-tab]")
-    expected_labels = ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
-    assert tabs.all_inner_texts() == expected_labels, "decision tabs are missing or out of order"
-    assert page.locator(".decision-tab-list .decision-tab-failed").count() == 0, "decision tab failed"
-    for index in range(tabs.count()):
-        tab = tabs.nth(index)
-        tab.click()
-        panel_id = tab.get_attribute("aria-controls")
-        assert panel_id, f"tab {expected_labels[index]} has no controlled panel"
-        panel = page.locator(f"#{panel_id}:visible")
-        assert panel.count() == 1, f"tab {expected_labels[index]} has {panel.count()} visible panels"
-        panel_text = panel.inner_text()
-        assert "数据未生成" not in panel_text, f"tab {expected_labels[index]} contains 数据未生成"
-        if index == 0:
-            assert "夏普比率" in panel_text, "最终决策缺少夏普比率"
-            assert "卡玛比率" in panel_text, "最终决策缺少卡玛比率"
-        if index == 2:
-            assert not re.search(r"当前价\s*缺失", panel_text), "趋势 / K 线当前价缺失"
 
 
 def _plain(value: Any) -> str:
@@ -2969,10 +2818,6 @@ def _browser_check(
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
-                        _check_decision_tabs(page, market, symbol, decision_broker)
-                    except Exception as exc:
-                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
-                    try:
                         _check_tool_workspaces(page, detail_key)
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
@@ -3378,16 +3223,6 @@ def main(argv: list[str] | None = None) -> int:
             expected_cwd=cwd,
             process_started_at=process_started_at,
         ))
-    source_blocker = None
-    if project_data_dir is not None:
-        errors, source_blocker = _partition_external_source_errors(
-            errors,
-            data_dir=project_data_dir,
-            run_date=datetime.now().astimezone().date().isoformat(),
-        )
-    external_blocker = "；".join(
-        item for item in (external_blocker, source_blocker) if item
-    ) or None
     status = classify_result(
         errors, browser_blocker=blocker, external_blocker=external_blocker
     )

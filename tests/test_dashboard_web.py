@@ -5141,7 +5141,7 @@ elements["visible-count"] = mount();
 elements["workspace-grid"] = mount();
 elements["symbol-detail-panel"] = mount();
 elements["account-tabs"] = mount();
-renderSymbolDetail = (holding) => `DETAIL:${holding.symbol}`;
+renderTSignalDetail = (holding) => `TDETAIL:${holding.symbol}`;
 state.dashboard = {
   summary: {portfolio_value_hkd: "3000"},
   broker_summaries: [
@@ -5161,7 +5161,7 @@ renderAccountHoldings();
 const html = elements["account-holdings"].innerHTML;
 if ((html.match(/active-row/g) || []).length !== 1) throw new Error("expected one active broker row: " + html);
 if ((html.match(/inline-symbol-detail/g) || []).length !== 1) throw new Error("expected one inline detail: " + html);
-if (html.includes('id="account-futu"') || !html.includes('id="account-tiger"') || !html.includes("DETAIL:QQQ")) {
+if (html.includes('id="account-futu"') || !html.includes('id="account-tiger"') || !html.includes("TDETAIL:QQQ")) {
   throw new Error("selected Tiger QQQ should not activate Futu QQQ: " + html);
 }
 ''')
@@ -8206,11 +8206,14 @@ renderHoldings();
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
   throw new Error("trading decision should keep bottom symbol detail panel hidden");
 }
-if (!elements["holdings-body"].innerHTML.includes("交易决策") || !elements["holdings-body"].innerHTML.includes(">做T<") || elements["holdings-body"].innerHTML.includes(">凯利<") || elements["holdings-body"].innerHTML.includes(">详情<")) {
-  throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
+const initialHoldingHtml = elements["holdings-body"].innerHTML;
+if (!initialHoldingHtml.includes(">做T<") || initialHoldingHtml.includes(">凯利<") || initialHoldingHtml.includes(">详情<")) {
+  throw new Error("holdings row should expose only the T-signal entry: " + initialHoldingHtml);
 }
-if (!elements["holdings-body"].innerHTML.includes('data-detail-market="US"') || !elements["holdings-body"].innerHTML.includes('data-detail-symbol="VIXY"')) {
-  throw new Error("trading decision entry should expose exact holding identity: " + elements["holdings-body"].innerHTML);
+for (const retired of ['data-detail-mode="decision"', "TradingAgents", "交易决策"]) {
+  if (initialHoldingHtml.includes(retired)) {
+    throw new Error("retired AI decision UI remains " + retired + ": " + initialHoldingHtml);
+  }
 }
 if (!elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
   throw new Error("active BUY_T/SELL_T signals should pulse the t signal button: " + elements["holdings-body"].innerHTML);
@@ -8256,21 +8259,6 @@ for (const unexpected of ["<td>futu;tiger</td>", "<td>phillips</td>", "<td>futu<
 if (renderedHoldings.includes("观察 ·") || renderedHoldings.includes("人工复核 ·")) {
   throw new Error("main holdings table should not render action badges: " + renderedHoldings);
 }
-if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
-  throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
-}
-for (const required of ["交易决策 ·", "最终决策", "趋势 / K 线", "新闻 / 舆论", "富途异动", "数据未生成"]) {
-  if (!elements["holdings-body"].innerHTML.includes(required)) {
-    throw new Error("trading decision detail missing " + required + ": " + elements["holdings-body"].innerHTML);
-  }
-}
-for (const unexpected of ["插件管理", "策略阈值"]) {
-  if (elements["holdings-body"].innerHTML.includes(unexpected)) {
-    throw new Error("trading decision detail should not render extra panel " + unexpected);
-  }
-}
-state.selectedHoldingDetail = "t_signal";
-renderHoldings();
 for (const required of ["做T信号 ·", "买入做T", "确定比例", "15%", "信号依据", "价格低于 VWAP 后回收", "前置条件", "t-signal-checkmark", "交易时段", "详细信息", "消息 timeline", "已发送 BUY_T 通知。", "已发起提醒 · 2026-07-02T22:32:00+08:00"]) {
   if (!elements["holdings-body"].innerHTML.includes(required)) {
     throw new Error("t signal detail missing " + required + ": " + elements["holdings-body"].innerHTML);
@@ -8281,7 +8269,6 @@ for (const unexpected of ["小T", "大T", "状态机", ">session_phase<", "已�
     throw new Error("t signal detail should not render ambiguous wording " + unexpected);
   }
 }
-state.selectedHoldingDetail = "decision";
 state.dashboard.holdings.push({
   market: "JP",
   symbol: "7203",

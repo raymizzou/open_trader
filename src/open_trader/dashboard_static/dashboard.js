@@ -3254,7 +3254,7 @@ function renderAccountHoldingRow(row, {simulated = false} = {}) {
   const pnlTone = pnlClass(display.unrealized_pnl_pct);
   const detailActions = simulated
     ? ""
-    : `<button class="expand-button" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="decision" data-detail-market="${escapeHtml(display.market)}" data-detail-symbol="${escapeHtml(display.symbol)}">交易决策</button><button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
+    : `<button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
   const attribution = simulated ? renderSimulationAttribution(holding, row.broker) : "";
   const quote = simulated && hasValue(display.last_price)
     ? {last_price: display.last_price}
@@ -3307,8 +3307,8 @@ function showSymbolDetail(detailKey, detailMode = "decision") {
   renderHoldings();
 }
 
-function normalizeHoldingDetailMode(mode) {
-  return mode === "t_signal" ? mode : "decision";
+function normalizeHoldingDetailMode() {
+  return "t_signal";
 }
 
 function tSignalButtonClass(holding) {

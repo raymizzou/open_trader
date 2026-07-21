@@ -15,7 +15,6 @@ import pytest
 
 from open_trader import dashboard_acceptance
 from open_trader.dashboard_acceptance import (
-    REQUIRED_SOURCE_PATHS,
     _is_actionable_console_error,
     classify_result,
     dashboard_signature,
@@ -2595,50 +2594,6 @@ def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
     dashboard_acceptance._check_trend_audit(Locator(), report, "futu")
 
 
-def nested_get(row: dict[str, object], path: tuple[str, ...]) -> dict[str, object]:
-    value: object = row
-    for key in path:
-        value = value[key]  # type: ignore[index]
-    return value  # type: ignore[return-value]
-
-
-@pytest.mark.parametrize("path", REQUIRED_SOURCE_PATHS)
-def test_validate_dashboard_payload_rejects_each_missing_current_source(
-    path: tuple[str, ...],
-) -> None:
-    payload = valid_payload()
-    source = nested_get(payload["holdings"][-1], path)  # type: ignore[index]
-    source["available"] = False
-    source["status"] = "stale_source_hash"
-
-    errors = validate_dashboard_payload(payload, expected_cn=5)
-
-    assert any("US.MSFT" in error and path[-1] in error for error in errors)
-
-
-def test_validate_dashboard_payload_ignores_missing_sources_without_current_advice() -> None:
-    payload = valid_payload()
-    payload["holdings"][0]["tradingagents_summary"] = {  # type: ignore[index]
-        "available": False,
-        "status": "stale_source_hash",
-    }
-
-    assert validate_dashboard_payload(payload, expected_cn=5) == []
-
-
-def test_validate_dashboard_payload_accepts_explicitly_unsupported_source() -> None:
-    payload = valid_payload()
-    source = payload["holdings"][-1]["futu_skill_facts"]["technical_anomaly"]  # type: ignore[index]
-    source.update(
-        available=False,
-        unsupported=True,
-        status="error",
-        summary="富途接口不支持技术异动：US.MSFT",
-    )
-
-    assert validate_dashboard_payload(payload, expected_cn=5) == []
-
-
 def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
     assert dashboard_acceptance._first_in_scope_holding(valid_payload()) == ("US", "MSFT", "tiger")
     assert dashboard_acceptance._dashboard_holding_key(
@@ -2646,12 +2601,13 @@ def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
     ) == "US:MSFT::5"
 
 
-def test_first_in_scope_holding_rejects_payload_without_current_advice() -> None:
+def test_first_in_scope_holding_ignores_current_advice_availability() -> None:
     payload = valid_payload()
     payload["holdings"][-1]["agent_report"]["available"] = False  # type: ignore[index]
 
-    with pytest.raises(AssertionError, match="advice-backed holding"):
-        dashboard_acceptance._first_in_scope_holding(payload)
+    assert dashboard_acceptance._first_in_scope_holding(payload) == (
+        "US", "MSFT", "tiger",
+    )
 
 
 def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> None:
@@ -2855,147 +2811,6 @@ def test_tabbed_acceptance_fake_rejects_unknown_broker_everywhere() -> None:
     with pytest.raises(AssertionError, match="unknown broker"):
         dashboard_acceptance._select_account_tab(page, "futtu")
     assert page.selected == original_broker
-
-
-def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None:
-    selectors: list[str] = []
-    clicks: list[str] = []
-
-    class Locator:
-        def __init__(
-            self, kind: str, index: int = 0, visible: tuple[bool, ...] = (True,),
-        ) -> None:
-            self.kind = kind
-            self.index = index
-            self.visible = visible
-
-        def count(self) -> int:
-            return {
-                "button": len(self.visible), "tabs": 5, "failed": 0, "panel": 1,
-                "account-tab": 1, "account-section": 1, "account-sections": 1,
-            }[self.kind]
-
-        @property
-        def first(self) -> "Locator":
-            return Locator(self.kind, self.index, self.visible[:1])
-
-        def click(self) -> None:
-            if self.kind == "button":
-                assert self.visible[0], "clicked hidden duplicate"
-            clicks.append(self.kind)
-
-        def all_inner_texts(self) -> list[str]:
-            return ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
-
-        def nth(self, index: int) -> "Locator":
-            return Locator("tab", index)
-
-        def get_attribute(self, name: str) -> str:
-            if self.kind == "account-tab":
-                assert name == "aria-selected"
-                return "true"
-            assert name == "aria-controls"
-            return f"decision-panel-{self.index}"
-
-        def inner_text(self) -> str:
-            if self.index == 0:
-                return "回测闸门 夏普比率 1.2 卡玛比率 0.8"
-            if self.index == 2:
-                return "当前价 710.55"
-            return "source data"
-
-    class Page:
-        def locator(self, selector: str) -> Locator:
-            selectors.append(selector)
-            if selector == '#account-tabs [data-broker="tiger"]':
-                return Locator("account-tab")
-            if selector == "#account-tiger:visible":
-                return Locator("account-section")
-            if selector == ".account-section:visible":
-                return Locator("account-sections")
-            button_selector = (
-                'button[data-detail-mode="decision"]'
-                '[data-detail-market="US"]'
-                '[data-detail-symbol="MSFT"]'
-            )
-            if selector == button_selector:
-                return Locator("button", visible=(False, True))
-            if selector == f"{button_selector}:visible":
-                return Locator("button")
-            if selector == ".decision-tab-list [data-decision-tab]":
-                return Locator("tabs")
-            if selector == ".decision-tab-list .decision-tab-failed":
-                return Locator("failed")
-            match = re.search(r"decision-panel-(\d+)", selector)
-            return Locator("panel", int(match.group(1)) if match else 0)
-
-    dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT", "tiger")
-
-    assert selectors[0] == '#account-tabs [data-broker="tiger"]'
-    assert selectors[3] == (
-        'button[data-detail-mode="decision"]'
-        '[data-detail-market="US"]'
-        '[data-detail-symbol="MSFT"]:visible'
-    )
-    assert clicks == ["account-tab", "button", "tab", "tab", "tab", "tab", "tab"]
-
-
-def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> None:
-    class Locator:
-        def __init__(self, kind: str, index: int = 0) -> None:
-            self.kind = kind
-            self.index = index
-
-        def count(self) -> int:
-            if self.kind in {"button", "initial-panel", "account-tab", "account-section", "account-sections"}:
-                return 1
-            if self.kind == "tabs":
-                return 5
-            return 0
-
-        @property
-        def first(self) -> "Locator":
-            return self
-
-        def click(self) -> None:
-            pass
-
-        def all_inner_texts(self) -> list[str]:
-            return ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
-
-        def nth(self, index: int) -> "Locator":
-            return Locator("tab", index)
-
-        def get_attribute(self, name: str) -> str:
-            if self.kind == "account-tab":
-                assert name == "aria-selected"
-                return "true"
-            assert name == "aria-controls"
-            return f"decision-panel-{self.index}"
-
-        def inner_text(self) -> str:
-            return "source data 夏普比率 1.2 卡玛比率 0.8"
-
-    class Page:
-        def locator(self, selector: str) -> Locator:
-            if selector == '#account-tabs [data-broker="futu"]':
-                return Locator("account-tab")
-            if selector == "#account-futu:visible":
-                return Locator("account-section")
-            if selector == ".account-section:visible":
-                return Locator("account-sections")
-            if selector.startswith('button[data-detail-mode="decision"]'):
-                return Locator("button")
-            if selector == ".decision-tab-list [data-decision-tab]":
-                return Locator("tabs")
-            if selector == ".decision-tab-panel:visible":
-                return Locator("initial-panel")
-            if selector == "#decision-panel-0:visible":
-                return Locator("initial-panel")
-            return Locator("missing")
-
-    with pytest.raises(AssertionError, match="TradingAgents"):
-        dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT", "futu")
 
 
 def test_acceptance_formats_grouped_numeric_expectations_without_touching_text() -> None:
@@ -3468,11 +3283,6 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     module.sync_playwright = Context  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "playwright", ModuleType("playwright"))
     monkeypatch.setitem(sys.modules, "playwright.sync_api", module)
-    monkeypatch.setattr(
-        dashboard_acceptance,
-        "_check_decision_tabs",
-        lambda *_args: None,
-    )
     def check_trend_views(
         page: Page,
         _payload: object,
@@ -3516,22 +3326,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     visual_focus_evaluations.clear()
     geometry_evaluations.clear()
     buy_overflow_evaluations.clear()
-    monkeypatch.setattr(
-        dashboard_acceptance,
-        "_check_decision_tabs",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("decision failed")),
-    )
-
     errors, blocker = dashboard_acceptance._browser_check(
         "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
     )
 
-    assert errors == [
-        "wide_desktop：AssertionError: decision failed",
-        "desktop：AssertionError: decision failed",
-        "tablet：AssertionError: decision failed",
-        "mobile：AssertionError: decision failed",
-    ]
+    assert errors == []
     assert blocker is None
     for viewport in ("wide_desktop", "desktop", "tablet", "mobile"):
         assert (viewport, '#broker-summary-cards [data-broker="phillips"]') in selectors
@@ -4383,95 +4182,19 @@ def test_classify_result_has_only_three_states() -> None:
     assert classify_result(["API failed"], browser_blocker="Chrome unavailable") == "FAIL"
 
 
-def test_acceptance_partitions_only_current_402_source_failures_as_external(
-    tmp_path: Path,
-) -> None:
-    status = tmp_path / "runs/2026-07-21/US/daily_run_status.json"
-    status.parent.mkdir(parents=True)
-    status.write_text(json.dumps({
-        "run_date": "2026-07-21",
-        "market": "US",
-        "readiness": "blocked",
-        "source_failures": [
-            {
-                "market": "US",
-                "symbol": "DRAM",
-                "source": "tradingagents_summary",
-                "error": "Error code: 402 - Insufficient Balance",
-            },
-            {
-                "market": "US",
-                "symbol": "DRAM",
-                "source": "decision_facts.kline",
-                "error": "error",
-            },
-            {
-                "market": "US",
-                "symbol": "DRAM",
-                "source": "technical_facts",
-                "error": "independent provider failure",
-            },
-            {
-                "market": "US",
-                "symbol": "DRAM",
-                "source": "decision_facts.news_sentiment",
-                "error": "corrupt schema",
-            },
-        ],
-    }), encoding="utf-8")
-    source_errors = [
-        "US.DRAM 数据源 tradingagents_summary 不可用：error",
-        "US.DRAM 数据源 decision_facts.kline 不可用：error",
-        "US.DRAM 数据源 technical_facts 不可用：independent provider failure",
-        "US.DRAM 数据源 decision_facts.news_sentiment 不可用：corrupt schema",
-        "US.QQQ 数据源 decision_facts.kline 不可用：error",
-        "控制器内部失败",
-    ]
+def test_dashboard_acceptance_does_not_require_daily_ai_sources() -> None:
+    payload = valid_payload()
+    for holding in payload["holdings"]:  # type: ignore[index]
+        holding["agent_report"] = {"available": True}
+        for key in (
+            "tradingagents_summary",
+            "technical_facts",
+            "decision_facts",
+            "futu_skill_facts",
+        ):
+            holding.pop(key, None)
 
-    remaining, blocker = dashboard_acceptance._partition_external_source_errors(
-        source_errors,
-        data_dir=tmp_path,
-        run_date="2026-07-21",
-    )
-
-    assert remaining == [
-        "US.DRAM 数据源 technical_facts 不可用：independent provider failure",
-        "US.DRAM 数据源 decision_facts.news_sentiment 不可用：corrupt schema",
-        "US.QQQ 数据源 decision_facts.kline 不可用：error",
-        "控制器内部失败",
-    ]
-    assert "DeepSeek API 余额不足" in str(blocker)
-    assert "US.DRAM" in str(blocker)
-
-
-def test_acceptance_keeps_nonbalance_source_failure_as_fail(
-    tmp_path: Path,
-) -> None:
-    status = tmp_path / "runs/2026-07-21/HK/daily_run_status.json"
-    status.parent.mkdir(parents=True)
-    status.write_text(json.dumps({
-        "run_date": "2026-07-21",
-        "market": "HK",
-        "readiness": "blocked",
-        "source_failures": [{
-            "market": "HK",
-            "symbol": "02623",
-            "source": "tradingagents_summary",
-            "error": "timeout",
-        }],
-    }), encoding="utf-8")
-    source_errors = [
-        "HK.02623 数据源 tradingagents_summary 不可用：timeout",
-    ]
-
-    remaining, blocker = dashboard_acceptance._partition_external_source_errors(
-        source_errors,
-        data_dir=tmp_path,
-        run_date="2026-07-21",
-    )
-
-    assert remaining == source_errors
-    assert blocker is None
+    assert validate_dashboard_payload(payload, expected_cn=5) == []
 
 
 def test_dashboard_signature_ignores_live_values_but_detects_structural_change() -> None:
