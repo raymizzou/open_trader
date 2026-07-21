@@ -868,6 +868,139 @@ def _action_resolutions(
     return resolutions
 
 
+def load_trend_action_audit(
+    data_dir: Path,
+    *,
+    market: str,
+    execution_date: str,
+    symbol: str,
+    side: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    market = _market(market)
+    execution_date = date.fromisoformat(execution_date).isoformat()
+    symbol = symbol.strip()
+    side = side.strip().lower()
+    if not symbol or side not in {"buy", "sell"}:
+        raise ValueError("trend action identity is invalid")
+    from .futu_symbols import to_futu_symbol
+
+    futu_code = to_futu_symbol(market, symbol)
+    action_key = trend_action_key(
+        market, execution_date, futu_code, side
+    )
+    action_root = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+        / execution_date
+        / action_key
+    )
+    facts = _action_facts(
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "open"
+        / execution_date,
+        futu_code=futu_code,
+        side=side,
+    )
+    events = _action_events(action_root)
+    filled_terminal = False
+    for event in events:
+        try:
+            recorded_at = datetime.fromisoformat(str(event["recorded_at"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid trend action event identity") from exc
+        if (
+            event.get("market") != market
+            or event.get("date") != execution_date
+            or event.get("symbol") != symbol
+            or event.get("futu_code") != futu_code
+            or event.get("side") != side
+            or not str(event.get("status") or "").strip()
+            or recorded_at.tzinfo is None
+            or recorded_at.utcoffset() is None
+        ):
+            raise ValueError("invalid trend action event identity")
+        status = event.get("status")
+        if status == "filled":
+            order_ids = event.get("order_ids")
+            try:
+                filled_qty = _required_decimal(
+                    event.get("filled_qty"), "filled quantity"
+                )
+                target_qty = _required_decimal(
+                    event.get("target_qty"), "target quantity"
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "invalid trend action event evidence"
+                ) from exc
+            if (
+                target_qty <= 0
+                or filled_qty < target_qty
+                or not isinstance(order_ids, list)
+                or not order_ids
+                or any(
+                    not isinstance(item, str) or not item.strip()
+                    for item in order_ids
+                )
+            ):
+                raise ValueError("invalid trend action event evidence")
+            filled_terminal = True
+        elif status == "missed" and (
+            side != "buy" or event.get("reason") != "buy_window_closed"
+        ):
+            raise ValueError("invalid trend action event evidence")
+        elif (
+            status == "incomplete"
+            and event.get("reason") == "position_zero_confirmed"
+        ):
+            order_ids = event.get("order_ids")
+            try:
+                filled_qty = _required_decimal(
+                    event.get("filled_qty"), "filled quantity"
+                )
+                target_qty = _required_decimal(
+                    event.get("target_qty"), "target quantity"
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "invalid trend action event evidence"
+                ) from exc
+            if (
+                side != "sell"
+                or not facts
+                or target_qty <= 0
+                or filled_qty < 0
+                or filled_qty > target_qty
+                or not isinstance(order_ids, list)
+                or any(
+                    not isinstance(item, str) or not item.strip()
+                    for item in order_ids
+                )
+            ):
+                raise ValueError("invalid trend action event evidence")
+    if filled_terminal and any(
+        event.get("status") == "missed" for event in events
+    ):
+        raise ValueError("invalid trend action event evidence")
+    resolutions = _action_resolutions(
+        action_root,
+        market=market,
+        execution_date=execution_date,
+        action_key=action_key,
+        symbol=symbol,
+        futu_code=futu_code,
+        side=side,
+        action_attempts={item[3] for item in facts},
+    )
+    return events, resolutions
+
+
 def resolve_trend_action(
     data_dir: Path,
     *,

@@ -940,6 +940,126 @@ def test_uncertain_action_resolution_is_immutable(
     assert list(path.parent.glob("*.json")) == [path]
 
 
+def test_action_audit_loader_rejects_wrong_identity_event(tmp_path: Path) -> None:
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    path = (
+        tmp_path
+        / "trend_review/ledgers/CN/actions/2026-07-20"
+        / action_key
+        / "missed.json"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "market": "US",
+            "date": "2026-07-20",
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "buy",
+            "status": "missed",
+            "recorded_at": "2026-07-20T15:01:00+08:00",
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid trend action event identity"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            symbol="600001",
+            side="buy",
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "evidence"),
+    [
+        ("missed", {}),
+        (
+            "filled",
+            {"filled_qty": "100", "target_qty": "100", "order_ids": []},
+        ),
+    ],
+)
+def test_action_audit_loader_rejects_terminal_event_without_required_evidence(
+    tmp_path: Path,
+    status: str,
+    evidence: dict[str, object],
+) -> None:
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    path = (
+        tmp_path
+        / "trend_review/ledgers/CN/actions/2026-07-20"
+        / action_key
+        / f"{status}.json"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "market": "CN",
+            "date": "2026-07-20",
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "buy",
+            "status": status,
+            "recorded_at": "2026-07-20T15:01:00+08:00",
+            **evidence,
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid trend action event evidence"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            symbol="600001",
+            side="buy",
+        )
+
+
+def test_action_audit_loader_rejects_position_zero_without_prior_action_fact(
+    tmp_path: Path,
+) -> None:
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "sell"
+    )
+    path = (
+        tmp_path
+        / "trend_review/ledgers/CN/actions/2026-07-20"
+        / action_key
+        / "position-zero.json"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "market": "CN",
+            "date": "2026-07-20",
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "sell",
+            "status": "incomplete",
+            "reason": "position_zero_confirmed",
+            "recorded_at": "2026-07-20T15:01:00+08:00",
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid trend action event evidence"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            symbol="600001",
+            side="sell",
+        )
+
+
 @pytest.mark.parametrize(("actor", "reason"), [("", "checked"), ("ray", " ")])
 def test_resolution_requires_actor_and_reason(
     tmp_path: Path, actor: str, reason: str
@@ -2334,6 +2454,14 @@ def test_position_zero_terminal_uses_actual_broker_fill_facts(
     assert terminal["target_qty"] == "100"
     assert terminal["order_ids"] == ["SIM-1"]
     assert terminal["avg_fill_price"] == (average_price or "")
+    events, _ = trend_review.load_trend_action_audit(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        symbol="600001",
+        side="sell",
+    )
+    assert terminal in events
     client.positions = [{"code": "SH.600001", "qty": "25"}]
     trend_review.execute_trend_review_open(
         **arguments, now="2026-07-21T09:31:00+08:00"
