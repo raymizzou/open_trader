@@ -4108,7 +4108,7 @@ def test_launchd_template_runs_persistent_trend_controller() -> None:
     assert "StartCalendarInterval" not in template
 
 
-def test_launchd_installer_default_renders_hk_and_us_jobs(
+def test_launchd_installer_default_renders_only_three_controllers(
     tmp_path: Path,
 ) -> None:
     repo = _copy_launchd_installer_assets(tmp_path)
@@ -4119,6 +4119,7 @@ def test_launchd_installer_default_renders_hk_and_us_jobs(
             [
                 f"OPEN_TRADER_REPO={repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -4132,26 +4133,49 @@ def test_launchd_installer_default_renders_hk_and_us_jobs(
         env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
     )
 
-    plists = _launchd_plists(result.stdout)
-    by_label = {payload["Label"]: payload for payload in plists}
-    assert set(by_label) == {
+    labels = {payload["Label"] for payload in _launchd_plists(result.stdout)}
+    assert labels == {
+        "com.open-trader.trend-market-controller.cn",
+        "com.open-trader.trend-market-controller.hk",
+        "com.open-trader.trend-market-controller.us",
+    }
+    assert "com.open-trader.premarket" not in result.stdout
+
+
+def test_launchd_installer_retires_all_premarket_jobs(tmp_path: Path) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    labels = (
+        "com.open-trader.premarket",
         "com.open-trader.premarket.hk",
         "com.open-trader.premarket.us",
-    }
-    _assert_launchd_job(
-        by_label["com.open-trader.premarket.hk"],
-        repo=repo,
-        market="HK",
-        hour=8,
-        minute=0,
     )
-    _assert_launchd_job(
-        by_label["com.open-trader.premarket.us"],
-        repo=repo,
-        market="US",
-        hour=18,
-        minute=30,
+    for label in labels:
+        (agents / f"{label}.plist").write_text("retired\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                "OPEN_TRADER_TREND_EXECUTOR_HOST=another-host",
+            ]
+        ),
+        encoding="utf-8",
     )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--market", "all"],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert "effective mode: readonly" in result.stdout
+    assert all(not (agents / f"{label}.plist").exists() for label in labels)
 
 
 def test_launchd_installer_renders_cn_controller(tmp_path: Path) -> None:
@@ -4241,58 +4265,6 @@ def test_launchd_installer_trend_all_renders_exactly_three_controllers(
             config=repo / "config/daily_premarket.env",
             market=market,
         )
-
-
-@pytest.mark.parametrize(
-    ("market", "label", "hour", "minute"),
-    [
-        ("HK", "com.open-trader.premarket.hk", 8, 0),
-        ("US", "com.open-trader.premarket.us", 18, 30),
-    ],
-)
-def test_launchd_installer_renders_single_market_job(
-    market: str,
-    label: str,
-    hour: int,
-    minute: int,
-    tmp_path: Path,
-) -> None:
-    repo = _copy_launchd_installer_assets(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    (repo / "config/daily_premarket.env").write_text(
-        "\n".join(
-            [
-                f"OPEN_TRADER_REPO={repo}",
-                "OPEN_TRADER_PYTHON=.venv/bin/python",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [
-            str(repo / "scripts/install_daily_premarket_launchd.sh"),
-            "--dry-run",
-            "--market",
-            market,
-        ],
-        check=True,
-        capture_output=True,
-        encoding="utf-8",
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
-    )
-
-    plists = _launchd_plists(result.stdout)
-    assert len(plists) == 1
-    assert plists[0]["Label"] == label
-    _assert_launchd_job(
-        plists[0],
-        repo=repo,
-        market=market,
-        hour=hour,
-        minute=minute,
-    )
 
 
 @pytest.mark.parametrize("market", ["CN", "HK", "US"])
@@ -4496,117 +4468,6 @@ def test_launchd_installer_rejects_unsupported_market_argument(
 
     assert result.returncode == 2
     assert "usage:" in result.stderr
-
-
-def test_launchd_installer_removes_legacy_agent_before_installing_ordinary_jobs(
-    tmp_path: Path,
-) -> None:
-    repo = _copy_launchd_installer_assets(tmp_path)
-    home = tmp_path / "home"
-    agents = home / "Library/LaunchAgents"
-    agents.mkdir(parents=True)
-    legacy = agents / "com.open-trader.premarket.plist"
-    legacy.write_text("legacy\n", encoding="utf-8")
-    fake_bin = _fake_launchctl_bin(tmp_path)
-    (repo / "config/daily_premarket.env").write_text(
-        "\n".join(
-            [
-                f"OPEN_TRADER_REPO={repo}",
-                "OPEN_TRADER_PYTHON=.venv/bin/python",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--market", "all"],
-        check=True,
-        capture_output=True,
-        encoding="utf-8",
-        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
-    )
-
-    assert not legacy.exists()
-    assert (agents / "com.open-trader.premarket.hk.plist").exists()
-    assert (agents / "com.open-trader.premarket.us.plist").exists()
-
-
-def test_launchd_installer_removes_legacy_agent_for_single_market_install(
-    tmp_path: Path,
-) -> None:
-    repo = _copy_launchd_installer_assets(tmp_path)
-    home = tmp_path / "home"
-    agents = home / "Library/LaunchAgents"
-    agents.mkdir(parents=True)
-    legacy = agents / "com.open-trader.premarket.plist"
-    legacy.write_text("legacy\n", encoding="utf-8")
-    fake_bin = _fake_launchctl_bin(tmp_path)
-    (repo / "config/daily_premarket.env").write_text(
-        "\n".join(
-            [
-                f"OPEN_TRADER_REPO={repo}",
-                "OPEN_TRADER_PYTHON=.venv/bin/python",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [
-            str(repo / "scripts/install_daily_premarket_launchd.sh"),
-            "--market",
-            "HK",
-        ],
-        check=True,
-        capture_output=True,
-        encoding="utf-8",
-        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
-    )
-
-    assert not legacy.exists()
-    assert (agents / "com.open-trader.premarket.hk.plist").exists()
-    assert not (agents / "com.open-trader.premarket.us.plist").exists()
-
-
-def test_launchd_installer_cn_controller_preserves_ordinary_legacy_agent(
-    tmp_path: Path,
-) -> None:
-    repo = _copy_launchd_installer_assets(tmp_path)
-    home = tmp_path / "home"
-    agents = home / "Library/LaunchAgents"
-    agents.mkdir(parents=True)
-    legacy = agents / "com.open-trader.premarket.plist"
-    legacy.write_text("legacy\n", encoding="utf-8")
-    fake_bin = _fake_launchctl_bin(tmp_path)
-    (repo / "config/daily_premarket.env").write_text(
-        "\n".join(
-            [
-                f"OPEN_TRADER_REPO={repo}",
-                "OPEN_TRADER_PYTHON=.venv/bin/python",
-                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [
-            str(repo / "scripts/install_daily_premarket_launchd.sh"),
-            "--trend-only",
-            "--market",
-            "CN",
-        ],
-        check=True,
-        capture_output=True,
-        encoding="utf-8",
-        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
-    )
-
-    assert legacy.exists()
-    assert "removed legacy launchd agent" not in result.stdout
-    assert (agents / "com.open-trader.trend-market-controller.cn.plist").exists()
-    assert not (agents / "com.open-trader.premarket.hk.plist").exists()
-    assert not (agents / "com.open-trader.premarket.us.plist").exists()
 
 
 def test_launchd_installer_dry_run_does_not_remove_legacy_agent(
@@ -5188,6 +5049,7 @@ def test_launchd_installer_expands_tilde_paths_for_launchd(
             [
                 "OPEN_TRADER_REPO=~/projects/open_trader",
                 "OPEN_TRADER_PYTHON=~/.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -5201,7 +5063,6 @@ def test_launchd_installer_expands_tilde_paths_for_launchd(
         env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
     )
 
-    assert f"{home}/projects/open_trader" in result.stdout
     assert f"{home}/.venv/bin/python" in result.stdout
     assert "~/projects/open_trader" not in result.stdout
     assert "~/.venv/bin/python" not in result.stdout
@@ -5218,6 +5079,7 @@ def test_launchd_installer_resolves_relative_python_under_repo(
             [
                 f"OPEN_TRADER_REPO={repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -5250,6 +5112,7 @@ def test_launchd_installer_uses_last_duplicate_env_values_like_runtime_parser(
                 f"OPEN_TRADER_PYTHON={first_repo / '.venv/bin/python'}",
                 f"OPEN_TRADER_REPO={second_repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -5264,7 +5127,6 @@ def test_launchd_installer_uses_last_duplicate_env_values_like_runtime_parser(
     )
 
     assert str(first_repo) not in result.stdout
-    assert f"<string>{second_repo}</string>" in result.stdout
     assert f"<string>{second_repo}/.venv/bin/python</string>" in result.stdout
 
 
@@ -5305,7 +5167,8 @@ def test_launchd_installer_preserves_inline_comment_text_like_runtime_parser(
         "\n".join(
             [
                 f"OPEN_TRADER_REPO={repo} # literal suffix",
-                f"OPEN_TRADER_PYTHON={repo / '.venv/bin/python'}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -5319,7 +5182,7 @@ def test_launchd_installer_preserves_inline_comment_text_like_runtime_parser(
         env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
     )
 
-    assert f"{repo} # literal suffix" in result.stdout
+    assert f"{repo} # literal suffix/.venv/bin/python" in result.stdout
 
 
 def test_launchd_uninstaller_defaults_to_hk_us_and_legacy_plists(
@@ -5638,34 +5501,6 @@ def _launchd_plists(plist_text: str) -> list[dict[str, object]]:
             break
         documents.append(f"<?xml{body}</plist>")
     return [plistlib.loads(document.encode("utf-8")) for document in documents]
-
-
-def _assert_launchd_job(
-    payload: dict[str, object],
-    *,
-    repo: Path,
-    market: str,
-    hour: int,
-    minute: int,
-) -> None:
-    args = payload["ProgramArguments"]
-    assert isinstance(args, list)
-    args = [str(arg) for arg in args]
-    market_index = args.index("--market")
-    assert args[market_index + 1] == market
-    assert args[args.index("--date") + 1] == "today"
-    assert args[args.index("--config") + 1] == f"{repo}/config/daily_premarket.env"
-    intervals = payload["StartCalendarInterval"]
-    assert isinstance(intervals, list)
-    assert {item["Weekday"] for item in intervals} == {1, 2, 3, 4, 5}
-    assert {item["Hour"] for item in intervals} == {hour}
-    assert {item["Minute"] for item in intervals} == {minute}
-    assert payload["StandardOutPath"] == (
-        f"{repo}/logs/daily_premarket/launchd-{market}.out.log"
-    )
-    assert payload["StandardErrorPath"] == (
-        f"{repo}/logs/daily_premarket/launchd-{market}.err.log"
-    )
 
 
 def _assert_trend_controller_job(
