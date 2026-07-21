@@ -273,6 +273,74 @@ def _report_hash(report: Mapping[str, object]) -> str:
     return hashlib.sha256(_canonical_json_bytes(report)).hexdigest()
 
 
+def _result_path(intent_path: Path) -> Path:
+    return intent_path.with_name(intent_path.name.replace("-intent", "-result"))
+
+
+def _intent_path(result_path: Path) -> Path:
+    return result_path.with_name(result_path.name.replace("-result", "-intent"))
+
+
+def _ledger_fact_paths(root: Path) -> list[Path]:
+    intents = list(root.glob("*-intent.json"))
+    results = [
+        path for path in root.glob("*-result.json") if not _intent_path(path).exists()
+    ]
+    return sorted([*intents, *results])
+
+
+def _result_request(path: Path, payload: object) -> dict[str, object]:
+    request = payload.get("request") if isinstance(payload, Mapping) else None
+    response = payload.get("response") if isinstance(payload, Mapping) else None
+    try:
+        quantity = _required_decimal(
+            request.get("qty") if isinstance(request, Mapping) else None,
+            "result quantity",
+        )
+    except ValueError:
+        quantity = Decimal("0")
+    if (
+        not isinstance(request, dict)
+        or not isinstance(response, Mapping)
+        or not str(request.get("futu_code") or "").strip()
+        or not str(request.get("side") or "").strip()
+        or not str(request.get("remark") or "").strip()
+        or quantity <= 0
+    ):
+        raise ValueError(f"invalid trend review result: {path}")
+    return request
+
+
+def _ledger_fact_attempt(
+    path: Path, payload: Mapping[str, object], request: Mapping[str, object]
+) -> int:
+    candidates: list[int] = []
+    raw_attempt = payload.get("attempt")
+    if raw_attempt is not None:
+        if isinstance(raw_attempt, bool):
+            raise ValueError(f"invalid trend review attempt: {path}")
+        try:
+            candidates.append(int(raw_attempt))
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid trend review attempt: {path}") from None
+    marker = "-attempt-"
+    if marker in path.name:
+        try:
+            candidates.append(int(path.name.rsplit(marker, 1)[1].split("-", 1)[0]))
+        except ValueError:
+            raise ValueError(f"invalid trend review attempt: {path}") from None
+    remark = str(request.get("remark") or "")
+    if remark.startswith("trend:"):
+        try:
+            candidates.append(int(remark.rsplit(":", 1)[1]))
+        except ValueError:
+            raise ValueError(f"invalid trend review attempt: {path}") from None
+    attempts = set(candidates or [1])
+    if len(attempts) != 1 or next(iter(attempts)) <= 0:
+        raise ValueError(f"invalid trend review attempt: {path}")
+    return attempts.pop()
+
+
 def trend_action_key(
     market: str, execution_date: str, futu_code: str, side: str
 ) -> str:
@@ -351,19 +419,29 @@ def lock_trend_execution_batch(
         return _validate_execution_batch(
             existing, market=market, execution_date=execution_date
         )
-    legacy_intents: list[tuple[datetime, str]] = []
-    for intent_path in (
+    legacy_facts: list[tuple[datetime, str]] = []
+    ledger_root = (
         data_dir
         / "trend_review"
         / "ledgers"
         / market
         / "open"
         / execution_date
-    ).glob("*-intent.json"):
+    )
+    for fact_path in _ledger_fact_paths(ledger_root):
         try:
-            intent = json.loads(intent_path.read_text(encoding="utf-8"))
-            created_at = datetime.fromisoformat(str(intent["created_at"]))
-            report_sha = intent["report_sha256"]
+            fact = json.loads(fact_path.read_text(encoding="utf-8"))
+            if not isinstance(fact, dict):
+                raise TypeError
+            timestamp_field = (
+                "submitted_at"
+                if fact_path.name.endswith("-result.json")
+                else "created_at"
+            )
+            if timestamp_field == "submitted_at":
+                _result_request(fact_path, fact)
+            created_at = datetime.fromisoformat(str(fact[timestamp_field]))
+            report_sha = fact["report_sha256"]
         except (
             OSError,
             UnicodeError,
@@ -373,7 +451,7 @@ def lock_trend_execution_batch(
             ValueError,
         ) as exc:
             raise ValueError(
-                f"trend execution batch is blocked by invalid intent: {intent_path}"
+                f"trend execution batch is blocked by invalid ledger fact: {fact_path}"
             ) from exc
         if (
             created_at.tzinfo is None
@@ -383,13 +461,13 @@ def lock_trend_execution_batch(
             or any(character not in "0123456789abcdef" for character in report_sha)
         ):
             raise ValueError(
-                f"trend execution batch is blocked by invalid intent: {intent_path}"
+                f"trend execution batch is blocked by invalid ledger fact: {fact_path}"
             )
-        legacy_intents.append((created_at, report_sha))
+        legacy_facts.append((created_at, report_sha))
     selected_path = report_path
     selected_sha = _report_hash(report)
-    if legacy_intents:
-        selected_sha = min(legacy_intents, key=lambda item: item[0])[1]
+    if legacy_facts:
+        selected_sha = min(legacy_facts, key=lambda item: item[0])[1]
         matches: list[Path] = []
         for candidate in sorted(report_path.parent.glob("*.json")):
             try:
@@ -546,28 +624,40 @@ def _order_has_action_identity(
     )
 
 
-def _action_intents(
+def _action_facts(
     root: Path, *, futu_code: str, side: str
-) -> list[tuple[Path, dict[str, object], dict[str, object]]]:
-    intents: list[tuple[Path, dict[str, object], dict[str, object]]] = []
-    for path in root.glob("*-intent.json"):
+) -> list[tuple[Path, dict[str, object], dict[str, object], int]]:
+    facts: list[tuple[Path, dict[str, object], dict[str, object], int]] = []
+    for path in _ledger_fact_paths(root):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"invalid trend review intent: {path}") from exc
-        request = payload.get("request") if isinstance(payload, dict) else None
+            kind = "result" if path.name.endswith("-result.json") else "intent"
+            raise ValueError(f"invalid trend review {kind}: {path}") from exc
+        if not isinstance(payload, dict):
+            kind = "result" if path.name.endswith("-result.json") else "intent"
+            raise ValueError(f"invalid trend review {kind}: {path}")
+        if path.name.endswith("-result.json"):
+            request = _result_request(path, payload)
+        else:
+            request = payload.get("request")
         if not isinstance(request, dict):
             raise ValueError(f"invalid trend review intent: {path}")
+        attempt = _ledger_fact_attempt(path, payload, request)
         if (
             str(request.get("futu_code") or "").strip().upper()
             == futu_code.strip().upper()
             and str(request.get("side") or "").strip().rsplit(".", 1)[-1].lower()
             == side.strip().rsplit(".", 1)[-1].lower()
         ):
-            intents.append((path, payload, request))
+            facts.append((path, payload, request, attempt))
     return sorted(
-        intents,
-        key=lambda item: (str(item[1].get("created_at") or ""), item[0].name),
+        facts,
+        key=lambda item: (
+            item[3],
+            str(item[1].get("created_at") or item[1].get("submitted_at") or ""),
+            item[0].name,
+        ),
     )
 
 
@@ -599,10 +689,6 @@ def _broker_attempt_fact(
     if len(same_remark) == len(exact) == 1:
         return "exact", exact[0]
     return "conflict", None
-
-
-def _result_path(intent_path: Path) -> Path:
-    return intent_path.with_name(intent_path.name.replace("-intent", "-result"))
 
 
 def _write_reconciled_result(
@@ -844,7 +930,7 @@ def execute_trend_review_open(
         }
         stem = action_key
         intent_path = root / f"{stem}-intent.json"
-        intents = _action_intents(root, futu_code=futu_code, side=side)
+        action_facts = _action_facts(root, futu_code=futu_code, side=side)
         sell_position = next(
             (
                 item
@@ -866,7 +952,7 @@ def execute_trend_review_open(
             if sell_position is not None
             else 0
         )
-        if action_name == "SELL_ALL" and intents:
+        if action_name == "SELL_ALL" and action_facts:
             action_events_root = (
                 data_dir
                 / "trend_review"
@@ -892,7 +978,7 @@ def execute_trend_review_open(
         if not same_day and not (
             local_current.date() > execution_day
             and action_name == "SELL_ALL"
-            and bool(intents)
+            and bool(action_facts)
         ):
             continue
         if action_name == "BUY" and (symbol in sell_symbols or not buy_window_open):
@@ -922,12 +1008,12 @@ def execute_trend_review_open(
             continue
         if action_name == "SELL_ALL" and not market_open and sell_quantity > 0:
             continue
-        if intents:
-            intent_paths = [item[0] for item in intents]
+        if action_facts:
+            fact_paths = [item[0] for item in action_facts]
             pending_intent = next(
                 (
                     path
-                    for path in intent_paths
+                    for path in fact_paths
                     if not _result_path(path).exists()
                 ),
                 None,
@@ -936,7 +1022,7 @@ def execute_trend_review_open(
                 action_name != "SELL_ALL" or sell_quantity > 0
             ):
                 request = next(
-                    item[2] for item in intents if item[0] == pending_intent
+                    item[2] for item in action_facts if item[0] == pending_intent
                 )
                 orders = _listed_orders(
                     client,
@@ -1044,14 +1130,14 @@ def execute_trend_review_open(
                 blocked_status = "uncertain"
                 break
             else:
-                request = intents[0][2]
+                request = action_facts[0][2]
                 orders = _listed_orders(
                     client,
                     start=execution_date,
                     end=local_current.date().isoformat(),
                 )
                 requests_by_remark: dict[str, list[dict[str, object]]] = {}
-                for _, _, intent_request in intents:
+                for _, _, intent_request, _ in action_facts:
                     requests_by_remark.setdefault(
                         str(intent_request.get("remark") or ""), []
                     ).append(intent_request)
@@ -1220,7 +1306,7 @@ def execute_trend_review_open(
                 ):
                     continue
                 request = {**request, "qty": format(remaining, "f")}
-                attempt = len(intent_paths) + 1
+                attempt = max(item[3] for item in action_facts) + 1
                 request["remark"] = trend_attempt_remark(
                     market, execution_date, action_key, attempt
                 )
@@ -1376,7 +1462,7 @@ def execute_trend_review_open(
                     reconciled_at=now,
                 )
                 continue
-        base_request = intents[0][2] if intents else request
+        base_request = action_facts[0][2] if action_facts else request
         target_qty = str(base_request.get("qty") or request.get("qty") or "")
         try:
             response = client.place_order(request)
