@@ -226,8 +226,9 @@ Ordinary premarket automation is unchanged by this work.
   the same fact with `report_missing: true`, `report_path: null`, and
   `report_sha256: null`. This is valid only when the locked revision baseline is
   exactly `(None, None, -1)`, its immutable request records the same null
-  baseline, and no artifact for that as-of date exists in the market report
-  directory.
+  baseline, the report's as-of date is strictly earlier than the local
+  authorization date, and no artifact for that as-of date exists in the market
+  report directory.
 - A cutover is valid only after the execution window, before any execution
   batch exists, and while every bound artifact still has the recorded hash.
   Missing, malformed, conflicting, or changed facts fail closed.

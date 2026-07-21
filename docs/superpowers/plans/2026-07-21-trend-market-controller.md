@@ -1568,13 +1568,15 @@ Expected: FAIL because `report_missing` is not accepted yet.
 
 - [ ] **Step 2: Implement the minimum writer/reader branch**
 
-For `report_missing=True`, require `_revision_baseline(config, cycle) ==
-(None, None, -1)`, no matching artifact in `_report_dir(config, market)`, a
+For `report_missing=True`, require
+`_revision_baseline(config, cycle) == (None, None, -1)`, no matching artifact
+in `_report_dir(config, market)`, a
 pending revision request with null path/SHA and revision `-1`, no completion,
-an expired execution window, no batch, executor host, and valid actor/reason/
+an expired execution window, an as-of date strictly before the authorization
+date in the market timezone, no batch, executor host, and valid actor/reason/
 timezone-aware authorization. Write `report_missing: true`, null report path
-and SHA, and the existing request path/SHA binding. On every read, recompute
-the same absence. Keep the old report-bound branch unchanged when the field is
+and SHA, and the existing request path/SHA binding. On every read, recompute the
+same absence. Keep the old report-bound branch unchanged when the field is
 absent or false.
 
 - [ ] **Step 3: Add fail-closed boundary tests**

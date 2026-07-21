@@ -1791,21 +1791,21 @@ def test_missing_report_cutover_skips_exact_expired_cycle(
     config = controller_config(tmp_path)
     historical = ControllerCycle(
         market="HK",
-        as_of_date="2026-07-17",
-        execution_date="2026-07-20",
-        report_run_date="2026-07-17",
-        session="catchup",
-        market_open=False,
-        next_check_at=datetime.fromisoformat("2026-07-20T10:01:05+08:00"),
-    )
-    current = ControllerCycle(
-        market="HK",
         as_of_date="2026-07-20",
         execution_date="2026-07-21",
         report_run_date="2026-07-20",
+        session="catchup",
+        market_open=False,
+        next_check_at=datetime.fromisoformat("2026-07-21T10:01:05+08:00"),
+    )
+    current = ControllerCycle(
+        market="HK",
+        as_of_date="2026-07-21",
+        execution_date="2026-07-22",
+        report_run_date="2026-07-21",
         session="closed",
         market_open=False,
-        next_check_at=datetime.fromisoformat("2026-07-21T16:01:05+08:00"),
+        next_check_at=datetime.fromisoformat("2026-07-22T16:01:05+08:00"),
     )
     authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
@@ -1910,7 +1910,19 @@ def test_missing_report_cutover_preserves_authorization_guards(
     blocker: str,
 ) -> None:
     config = controller_config(tmp_path)
-    cycle = active_cn_cycle()
+    cycle = (
+        ControllerCycle(
+            market="CN",
+            as_of_date="2026-07-21",
+            execution_date="2026-07-22",
+            report_run_date="2026-07-21",
+            session="before",
+            market_open=False,
+            next_check_at=datetime.fromisoformat("2026-07-22T09:00:05+08:00"),
+        )
+        if blocker == "current_cycle"
+        else active_cn_cycle()
+    )
     authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
     monkeypatch.setattr(
         socket,
@@ -1920,8 +1932,6 @@ def test_missing_report_cutover_preserves_authorization_guards(
     controller._request_revision(config, cycle, authorized_at)
     if blocker == "open_window":
         authorized_at = NOW
-    elif blocker == "current_cycle":
-        authorized_at = datetime.fromisoformat("2026-07-20T18:00:00+08:00")
     elif blocker == "batch":
         batch = controller._batch_path(
             config, cycle.market, cycle.execution_date

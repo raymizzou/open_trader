@@ -1217,7 +1217,7 @@ def _record_legacy_cycle_cutover(
         report_binding_valid = (
             report_missing is True
             and (report_path, report_sha, report_revision) == (None, None, -1)
-            and execution < authorized_at.astimezone(TIMEZONES[market]).date()
+            and as_of < authorized_at.astimezone(TIMEZONES[market]).date()
             and not any(
                 _report_dir(config, market).glob(f"{cycle.as_of_date}*")
             )
@@ -1301,7 +1301,7 @@ def _legacy_cycle_cutover(
         report_binding_valid = (
             report_missing is True
             and (report_path, report_sha, report_revision) == (None, None, -1)
-            and execution < authorized_at.astimezone(TIMEZONES[market]).date()
+            and as_of < authorized_at.astimezone(TIMEZONES[market]).date()
             and not any(
                 _report_dir(config, market).glob(f"{cycle.as_of_date}*")
             )
