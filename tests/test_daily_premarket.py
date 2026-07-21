@@ -4382,6 +4382,55 @@ def test_launchd_installer_binds_shared_config_but_runs_installer_checkout(
     assert str(configured_repo) not in str(payload)
 
 
+def test_launchd_installer_parses_single_quoted_values_like_runtime_dotenv(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "shared config #1/config.env"
+    config.parent.mkdir()
+    configured_repo = tmp_path / "configured repo #1"
+    python = "bin/python #runner"
+    config.write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO='{configured_repo}'",
+                f"OPEN_TRADER_PYTHON='{python}'",
+                "OPEN_TRADER_TREND_EXECUTOR_HOST='wrong host #old'",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST='{_local_hostname()}'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--config",
+            str(config),
+            "--dry-run",
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    payload = _launchd_plists(result.stdout)[0]
+    _assert_trend_controller_job(
+        payload,
+        repo=repo,
+        config=config,
+        market="US",
+        python=configured_repo / python,
+    )
+    assert f"configured executor host: {_local_hostname()}" in result.stdout
+
+
 @pytest.mark.parametrize("executor_host", [None, "another-host"])
 def test_launchd_installer_readonly_renders_no_trend_controller(
     tmp_path: Path,
@@ -5083,6 +5132,128 @@ def test_launchd_uninstaller_trend_only_removes_only_requested_market(
     for label in _all_trend_labels():
         exists = (agents / f"{label}.plist").exists()
         assert exists is not ("trend-us-" in label or ".us" in label)
+    calls = (tmp_path / "launchctl.log").read_text(encoding="utf-8").splitlines()
+    for label in [
+        "com.open-trader.trend-market-controller.us",
+        "com.open-trader.trend-us-report",
+        "com.open-trader.trend-us-watch",
+    ]:
+        assert any(call.startswith("bootout ") and call.endswith(label) for call in calls)
+        assert any(call.startswith("print ") and call.endswith(label) for call in calls)
+
+
+@pytest.mark.parametrize(
+    "present_label",
+    [
+        "com.open-trader.trend-market-controller.us",
+        "com.open-trader.trend-us-report",
+    ],
+)
+def test_launchd_uninstaller_preserves_selected_plist_when_label_remains_loaded(
+    tmp_path: Path,
+    present_label: str,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    selected = [
+        "com.open-trader.trend-market-controller.us",
+        "com.open-trader.trend-us-report",
+        "com.open-trader.trend-us-watch",
+    ]
+    for label in selected:
+        (agents / f"{label}.plist").write_text("plist\n", encoding="utf-8")
+    log = tmp_path / "launchctl.log"
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/uninstall_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{_fake_launchctl_bin(tmp_path)}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(log),
+            "OPEN_TRADER_PRESENT_LABEL": present_label,
+        },
+    )
+
+    target = agents / f"{present_label}.plist"
+    assert result.returncode == 1
+    assert target.exists()
+    assert f"launchd job is still loaded: {present_label}" in result.stderr
+    assert f"removed launchd agent: {target}" not in result.stdout
+
+
+def test_launchd_uninstaller_all_stops_after_residual_label(tmp_path: Path) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    for label in _all_trend_labels():
+        (agents / f"{label}.plist").write_text("plist\n", encoding="utf-8")
+    present = "com.open-trader.trend-hk-watch"
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/uninstall_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "all",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{_fake_launchctl_bin(tmp_path)}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(tmp_path / "launchctl.log"),
+            "OPEN_TRADER_PRESENT_LABEL": present,
+        },
+    )
+
+    assert result.returncode == 1
+    assert (agents / f"{present}.plist").exists()
+    assert (agents / "com.open-trader.trend-market-controller.us.plist").exists()
+
+
+def test_launchd_uninstaller_accepts_failed_bootout_when_print_is_absent(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    selected = [
+        "com.open-trader.trend-market-controller.us",
+        "com.open-trader.trend-us-report",
+        "com.open-trader.trend-us-watch",
+    ]
+    for label in selected:
+        (agents / f"{label}.plist").write_text("plist\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/uninstall_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{_fake_launchctl_bin(tmp_path)}:/usr/bin:/bin",
+            "OPEN_TRADER_BOOTOUT_EXIT": "5",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not any((agents / f"{label}.plist").exists() for label in selected)
 
 
 def test_launchd_uninstaller_rejects_unsupported_market_argument(
@@ -5213,7 +5384,13 @@ if [[ -n "${OPEN_TRADER_LAUNCHCTL_LOG:-}" ]]; then
   printf '%s\\n' "$*" >> "$OPEN_TRADER_LAUNCHCTL_LOG"
 fi
 if [[ "${1:-}" == "print" ]]; then
+  if [[ -n "${OPEN_TRADER_PRESENT_LABEL:-}" && "$*" == *"$OPEN_TRADER_PRESENT_LABEL" ]]; then
+    exit 0
+  fi
   exit "${OPEN_TRADER_PRINT_EXIT:-1}"
+fi
+if [[ "${1:-}" == "bootout" ]]; then
+  exit "${OPEN_TRADER_BOOTOUT_EXIT:-0}"
 fi
 exit 0
 """,

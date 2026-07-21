@@ -37,6 +37,10 @@ remove_label() {
   local label="$1" target
   target="$HOME/Library/LaunchAgents/$label.plist"
   launchctl bootout "gui/$UID/$label" 2>/dev/null || true
+  if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
+    echo "launchd job is still loaded: $label; preserving $target" >&2
+    return 1
+  fi
   if [[ -f "$target" ]]; then
     rm "$target"
     echo "removed launchd agent: $target"

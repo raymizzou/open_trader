@@ -80,8 +80,8 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 
 read_env_value() {
-  local key="$1"
-  awk -v key="$key" '
+  local key="$1" value first last
+  value="$(awk -v key="$key" '
     function trim(value) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
       return value
@@ -94,15 +94,19 @@ read_env_value() {
       parsed_key=trim(substr(stripped, 1, equals - 1))
       if (parsed_key == key) {
         value=trim(substr(stripped, equals + 1))
-        if ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") ||
-            (substr(value, 1, 1) == "'" && substr(value, length(value), 1) == "'")) {
-          value=substr(value, 2, length(value) - 2)
-        }
         found=1
       }
     }
     END { if (found) print value }
-  ' "$CONFIG_PATH"
+  ' "$CONFIG_PATH")"
+  if [[ "${#value}" -ge 2 ]]; then
+    first="${value:0:1}"
+    last="${value: -1}"
+    if [[ "$first" == "$last" && ( "$first" == "'" || "$first" == '"' ) ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+  fi
+  printf '%s\n' "$value"
 }
 
 xml_escape() {
