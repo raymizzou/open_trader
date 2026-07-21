@@ -9,7 +9,7 @@ import os
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Literal
@@ -806,6 +806,137 @@ def _write_action_status_once(
     )
 
 
+def record_trend_review_missed_buys(
+    *,
+    data_dir: Path,
+    report: Mapping[str, object],
+    market: str,
+    execution_date: str,
+    now: str,
+) -> int:
+    market = _market(market)
+    actions, strategy_version = _preflight_open_actions(report, market)
+    current = datetime.fromisoformat(now).astimezone(MARKET_TIMEZONES[market])
+    execution_day = date.fromisoformat(execution_date)
+    window_end = time(16) if market == "US" else time(10)
+    if current.date() < execution_day or (
+        current.date() == execution_day
+        and current.time().replace(tzinfo=None) <= window_end
+    ):
+        return 0
+    report_sha = _report_hash(report)
+    sell_symbols = {
+        str(action.get("symbol") or "").strip()
+        for action in actions
+        if action.get("action") == "SELL_ALL"
+    }
+    completed = 0
+    for index, action in enumerate(actions):
+        symbol = str(action.get("symbol") or "").strip()
+        if action.get("action") != "BUY" or symbol in sell_symbols:
+            continue
+        from .futu_symbols import to_futu_symbol
+
+        futu_code = to_futu_symbol(market, symbol)
+        action_key = trend_action_key(
+            market, execution_date, futu_code, "buy"
+        )
+        facts = _action_facts(
+            data_dir
+            / "trend_review"
+            / "ledgers"
+            / market
+            / "open"
+            / execution_date,
+            futu_code=futu_code,
+            side="buy",
+        )
+        if facts:
+            continue
+        root = (
+            data_dir
+            / "trend_review"
+            / "ledgers"
+            / market
+            / "actions"
+            / execution_date
+            / action_key
+        )
+        _write_action_status_once(
+            data_dir=data_dir,
+            market=market,
+            execution_date=execution_date,
+            action_key=action_key,
+            action_root=root,
+            evidence={
+                "market": market,
+                "date": execution_date,
+                "strategy_version": strategy_version,
+                "report_sha256": report_sha,
+                "action_index": index,
+                "symbol": symbol,
+                "futu_code": futu_code,
+                "side": "buy",
+            },
+            status="missed",
+            reason="buy_window_closed",
+            recorded_at=now,
+        )
+        completed += 1
+    return completed
+
+
+def _write_broker_observation(
+    *,
+    data_dir: Path,
+    market: str,
+    execution_date: str,
+    action_key: str,
+    evidence: Mapping[str, object],
+    snapshot: Mapping[str, object],
+    orders: Sequence[Mapping[str, object]],
+    recorded_at: str,
+) -> dict[str, object]:
+    futu_code = str(evidence["futu_code"])
+    position_qty = sum(
+        (
+            _required_decimal(
+                item.get("qty", item.get("quantity", "0")), "position qty"
+            )
+            for item in _positive_positions(snapshot)
+            if str(item.get("code", item.get("futu_code", ""))).strip().upper()
+            == futu_code.upper()
+        ),
+        start=Decimal("0"),
+    )
+    observation = {
+        "schema_version": "open_trader.trend_review.action_observation.v1",
+        **evidence,
+        "account_id": int(snapshot.get("acc_id") or 0),
+        "position_qty": format(position_qty, "f"),
+        "orders": [dict(order) for order in orders],
+        "observed_at": recorded_at,
+    }
+    body = _canonical_json_bytes(observation)
+    path = _write_immutable(
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "open"
+        / execution_date
+        / (
+            f"{action_key}-observation-"
+            f"{hashlib.sha256(body).hexdigest()[:12]}.json"
+        ),
+        body,
+    )
+    return {
+        "observation_path": path.name,
+        "observation_sha256": hashlib.sha256(body).hexdigest(),
+    }
+
+
 def _action_resolutions(
     root: Path,
     *,
@@ -866,6 +997,224 @@ def _action_resolutions(
         resolved_attempts.add(attempt_no)
         resolutions.append(payload)
     return resolutions
+
+
+def _locked_action_context(
+    data_dir: Path,
+    *,
+    market: str,
+    execution_date: str,
+    symbol: str,
+    side: str,
+) -> tuple[str, int, Mapping[str, object], str]:
+    batch_path = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "batches"
+        / f"{execution_date}.json"
+    )
+    try:
+        batch = json.loads(batch_path.read_text(encoding="utf-8"))
+        batch = _validate_execution_batch(
+            batch, market=market, execution_date=execution_date
+        )
+        report_path = Path(str(batch["report_path"]))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid trend execution batch: {batch_path}") from exc
+    if (
+        not isinstance(report, Mapping)
+        or _report_hash(report) != batch["report_sha256"]
+    ):
+        raise ValueError(f"invalid trend execution batch: {batch_path}")
+    actions, strategy_version = _preflight_open_actions(report, market)
+    expected_action = "BUY" if side == "buy" else "SELL_ALL"
+    matches = [
+        (index, action)
+        for index, action in enumerate(actions)
+        if action.get("action") == expected_action
+        and str(action.get("symbol") or "").strip() == symbol
+    ]
+    if len(matches) != 1:
+        raise ValueError("invalid trend action identity")
+    index, action = matches[0]
+    return str(batch["report_sha256"]), index, action, strategy_version
+
+
+def _strict_action_facts(
+    facts: Sequence[tuple[Path, dict[str, object], dict[str, object], int]],
+    *,
+    market: str,
+    execution_date: str,
+    action_key: str,
+    futu_code: str,
+    side: str,
+    report_sha: str,
+    action_index: int,
+) -> tuple[list[Mapping[str, object]], set[str]]:
+    requests: list[Mapping[str, object]] = []
+    result_order_ids: set[str] = set()
+    for path, payload, request, attempt in facts:
+        timestamp_name = (
+            "submitted_at" if path.name.endswith("-result.json") else "created_at"
+        )
+        try:
+            timestamp = datetime.fromisoformat(str(payload[timestamp_name]))
+            quantity = _required_decimal(request.get("qty"), "target quantity")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid trend action fact: {path}") from exc
+        if (
+            payload.get("market") != market
+            or payload.get("date") != execution_date
+            or payload.get("report_sha256") != report_sha
+            or payload.get("action_index") != action_index
+            or request.get("market") != market
+            or str(request.get("futu_code") or "").strip().upper()
+            != futu_code.upper()
+            or str(request.get("side") or "").strip().lower() != side
+            or request.get("remark")
+            != trend_attempt_remark(market, execution_date, action_key, attempt)
+            or quantity <= 0
+            or timestamp.tzinfo is None
+            or timestamp.utcoffset() is None
+        ):
+            raise ValueError(f"invalid trend action fact: {path}")
+        result_path = path if path.name.endswith("-result.json") else _result_path(path)
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                submitted = datetime.fromisoformat(str(result["submitted_at"]))
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise ValueError(f"invalid trend action fact: {result_path}") from exc
+            if (
+                not isinstance(result, Mapping)
+                or result.get("market") != market
+                or result.get("date") != execution_date
+                or result.get("report_sha256") != report_sha
+                or result.get("action_index") != action_index
+                or result.get("request") != request
+                or not isinstance(result.get("response"), Mapping)
+                or submitted.tzinfo is None
+                or submitted.utcoffset() is None
+            ):
+                raise ValueError(f"invalid trend action fact: {result_path}")
+            response = result["response"]
+            assert isinstance(response, Mapping)
+            order_id = str(
+                response.get("order_id") or response.get("futu_order_id") or ""
+            ).strip()
+            if not order_id:
+                raise ValueError(f"invalid trend action fact: {result_path}")
+            result_order_ids.add(order_id)
+        requests.append(request)
+    return requests, result_order_ids
+
+
+def _validate_broker_evidence(
+    data_dir: Path,
+    event: Mapping[str, object],
+    *,
+    market: str,
+    execution_date: str,
+    action_key: str,
+    symbol: str,
+    futu_code: str,
+    side: str,
+    report_sha: str,
+    action_index: int,
+    requests: Sequence[Mapping[str, object]],
+    result_order_ids: set[str],
+) -> tuple[Decimal, Decimal, list[str]]:
+    name = event.get("observation_path")
+    digest = event.get("observation_sha256")
+    if (
+        not isinstance(name, str)
+        or Path(name).name != name
+        or not name.startswith(f"{action_key}-observation-")
+        or not isinstance(digest, str)
+    ):
+        raise ValueError("invalid trend action event evidence")
+    path = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "open"
+        / execution_date
+        / name
+    )
+    try:
+        body = path.read_bytes()
+        observation = json.loads(body)
+        observed = datetime.fromisoformat(str(observation["observed_at"]))
+        position_qty = _required_decimal(
+            observation.get("position_qty"), "position quantity"
+        )
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        KeyError,
+        AttributeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError("invalid trend action event evidence") from exc
+    orders = observation.get("orders")
+    if (
+        not isinstance(observation, Mapping)
+        or hashlib.sha256(body).hexdigest() != digest
+        or observation.get("schema_version")
+        != "open_trader.trend_review.action_observation.v1"
+        or observation.get("market") != market
+        or observation.get("date") != execution_date
+        or observation.get("symbol") != symbol
+        or observation.get("futu_code") != futu_code
+        or observation.get("side") != side
+        or observation.get("report_sha256") != report_sha
+        or observation.get("action_index") != action_index
+        or not isinstance(observation.get("account_id"), int)
+        or isinstance(observation.get("account_id"), bool)
+        or int(observation["account_id"]) <= 0
+        or position_qty < 0
+        or observed.tzinfo is None
+        or observed.utcoffset() is None
+        or not isinstance(orders, list)
+        or not all(isinstance(order, Mapping) for order in orders)
+    ):
+        raise ValueError("invalid trend action event evidence")
+    order_ids: list[str] = []
+    filled = Decimal("0")
+    for order in orders:
+        order_id = str(order.get("order_id") or "").strip()
+        try:
+            dealt = _required_decimal(
+                order.get("dealt_qty", "0"), "broker dealt quantity"
+            )
+        except ValueError as exc:
+            raise ValueError("invalid trend action event evidence") from exc
+        if (
+            not order_id
+            or order_id in order_ids
+            or order_id not in result_order_ids
+            or dealt < 0
+            or not any(_order_matches_request(order, request) for request in requests)
+        ):
+            raise ValueError("invalid trend action event evidence")
+        order_ids.append(order_id)
+        filled += dealt
+    if orders and not requests:
+        raise ValueError("invalid trend action event evidence")
+    return position_qty, filled, order_ids
 
 
 def load_trend_action_audit(
@@ -973,8 +1322,7 @@ def load_trend_action_audit(
                 ) from exc
             if (
                 side != "sell"
-                or not facts
-                or target_qty <= 0
+                or target_qty < 0
                 or filled_qty < 0
                 or filled_qty > target_qty
                 or not isinstance(order_ids, list)
@@ -984,6 +1332,78 @@ def load_trend_action_audit(
                 )
             ):
                 raise ValueError("invalid trend action event evidence")
+    report_sha, action_index, action, strategy_version = _locked_action_context(
+        data_dir,
+        market=market,
+        execution_date=execution_date,
+        symbol=symbol,
+        side=side,
+    )
+    requests, result_order_ids = _strict_action_facts(
+        facts,
+        market=market,
+        execution_date=execution_date,
+        action_key=action_key,
+        futu_code=futu_code,
+        side=side,
+        report_sha=report_sha,
+        action_index=action_index,
+    )
+    for event in events:
+        if (
+            event.get("report_sha256") != report_sha
+            or event.get("action_index") != action_index
+            or event.get("strategy_version") != strategy_version
+        ):
+            raise ValueError("invalid trend action event identity")
+        status = event.get("status")
+        if status == "missed" and facts:
+            raise ValueError("invalid trend action event evidence")
+        if status != "filled" and not (
+            status == "incomplete"
+            and event.get("reason") == "position_zero_confirmed"
+        ):
+            continue
+        position_qty, broker_filled, broker_order_ids = _validate_broker_evidence(
+            data_dir,
+            event,
+            market=market,
+            execution_date=execution_date,
+            action_key=action_key,
+            symbol=symbol,
+            futu_code=futu_code,
+            side=side,
+            report_sha=report_sha,
+            action_index=action_index,
+            requests=requests,
+            result_order_ids=result_order_ids,
+        )
+        filled_qty = _required_decimal(event.get("filled_qty"), "filled quantity")
+        target_qty = _required_decimal(event.get("target_qty"), "target quantity")
+        expected_target = (
+            _required_decimal(requests[0].get("qty"), "target quantity")
+            if requests
+            else Decimal("0")
+        )
+        if (
+            event.get("order_ids") != broker_order_ids
+            or filled_qty != broker_filled
+            or target_qty != expected_target
+        ):
+            raise ValueError("invalid trend action event evidence")
+        if status == "filled":
+            frozen_target = _required_decimal(
+                action.get("estimated_shares"), "estimated shares"
+            ) if side == "buy" else expected_target
+            if (
+                not requests
+                or not broker_order_ids
+                or filled_qty < target_qty
+                or target_qty > frozen_target
+            ):
+                raise ValueError("invalid trend action event evidence")
+        elif position_qty != 0:
+            raise ValueError("invalid trend action event evidence")
     if filled_terminal and any(
         event.get("status") == "missed" for event in events
     ):
@@ -1512,7 +1932,7 @@ def execute_trend_review_open(
             if sell_position is not None
             else 0
         )
-        if action_name == "SELL_ALL" and action_facts:
+        if action_name == "SELL_ALL":
             position_zero_complete = any(
                 event.get("status") == "filled"
                 or (
@@ -1524,6 +1944,35 @@ def execute_trend_review_open(
             if position_zero_complete:
                 continue
         if local_current.date() < execution_day:
+            continue
+        if action_name == "SELL_ALL" and sell_quantity <= 0 and not action_facts:
+            broker_evidence = _write_broker_observation(
+                data_dir=data_dir,
+                market=market,
+                execution_date=execution_date,
+                action_key=action_key,
+                evidence=action_evidence,
+                snapshot=snapshot,
+                orders=(),
+                recorded_at=now,
+            )
+            _write_action_status_once(
+                data_dir=data_dir,
+                market=market,
+                execution_date=execution_date,
+                action_key=action_key,
+                action_root=action_events_root,
+                evidence={
+                    **action_evidence,
+                    **broker_evidence,
+                    "filled_qty": "0",
+                    "target_qty": "0",
+                    "order_ids": [],
+                },
+                status="incomplete",
+                reason="position_zero_confirmed",
+                recorded_at=now,
+            )
             continue
         if (
             not same_day
@@ -1823,6 +2272,20 @@ def execute_trend_review_open(
                     or order.get("dealt_qty")
                     for order in matched
                 ):
+                    terminal_evidence = (
+                        _write_broker_observation(
+                            data_dir=data_dir,
+                            market=market,
+                            execution_date=execution_date,
+                            action_key=action_key,
+                            evidence=action_evidence,
+                            snapshot=snapshot,
+                            orders=matched,
+                            recorded_at=now,
+                        )
+                        if position_zero or filled >= target_quantity
+                        else {}
+                    )
                     _write_action_event(
                         data_dir=data_dir,
                         market=market,
@@ -1847,6 +2310,7 @@ def execute_trend_review_open(
                                 else ""
                             ),
                             **protection_fact,
+                            **terminal_evidence,
                             "order_ids": order_ids,
                             **(
                                 {"reason": "position_zero_confirmed"}

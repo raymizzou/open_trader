@@ -1060,6 +1060,238 @@ def test_action_audit_loader_rejects_position_zero_without_prior_action_fact(
         )
 
 
+def test_action_audit_loader_rejects_filled_event_without_broker_fact(
+    tmp_path: Path,
+) -> None:
+    report = cn_buy_report()
+    report_path = tmp_path / "reports/2026-07-17.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-20T09:30:00+08:00",
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    path = (
+        tmp_path
+        / "trend_review/ledgers/CN/actions/2026-07-20"
+        / action_key
+        / "forged-filled.json"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "market": "CN",
+            "date": "2026-07-20",
+            "strategy_version": "v1",
+            "report_sha256": trend_review._report_hash(report),
+            "action_index": 0,
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "buy",
+            "status": "filled",
+            "filled_qty": "400",
+            "target_qty": "400",
+            "order_ids": ["FORGED"],
+            "recorded_at": "2026-07-20T09:31:00+08:00",
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid trend action event evidence"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            symbol="600001",
+            side="buy",
+        )
+
+
+def test_action_audit_loader_rejects_position_zero_for_wrong_report_attempt(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {"action": "SELL_ALL", "symbol": "600001"}
+    ])
+    report_path = tmp_path / "reports/2026-07-17.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-20T09:30:00+08:00",
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "sell"
+    )
+    intent = (
+        tmp_path
+        / "trend_review/ledgers/CN/open/2026-07-20"
+        / f"{action_key}-intent.json"
+    )
+    intent.parent.mkdir(parents=True)
+    intent.write_text(
+        json.dumps({
+            "market": "CN",
+            "date": "2026-07-20",
+            "report_sha256": "0" * 64,
+            "action_index": 1,
+            "attempt": 1,
+            "request": {
+                "market": "CN",
+                "futu_code": "SH.600001",
+                "side": "sell",
+                "order_type": "MARKET",
+                "price": "0",
+                "qty": "100",
+                "remark": trend_review.trend_attempt_remark(
+                    "CN", "2026-07-20", action_key, 1
+                ),
+            },
+            "created_at": "2026-07-20T09:31:00+08:00",
+        }),
+        encoding="utf-8",
+    )
+    event = (
+        tmp_path
+        / "trend_review/ledgers/CN/actions/2026-07-20"
+        / action_key
+        / "forged-position-zero.json"
+    )
+    event.parent.mkdir(parents=True)
+    event.write_text(
+        json.dumps({
+            "market": "CN",
+            "date": "2026-07-20",
+            "strategy_version": "v1",
+            "report_sha256": trend_review._report_hash(report),
+            "action_index": 0,
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "sell",
+            "status": "incomplete",
+            "reason": "position_zero_confirmed",
+            "filled_qty": "0",
+            "target_qty": "100",
+            "order_ids": [],
+            "recorded_at": "2026-07-20T09:32:00+08:00",
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid trend action"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            symbol="600001",
+            side="sell",
+        )
+
+
+def test_action_audit_loader_rejects_self_reported_broker_snapshot(
+    tmp_path: Path,
+) -> None:
+    report = cn_buy_report()
+    report_path = tmp_path / "reports/2026-07-17.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-20T09:30:00+08:00",
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    request = {
+        "market": "CN",
+        "futu_code": "SH.600001",
+        "side": "buy",
+        "order_type": "MARKET",
+        "price": "0",
+        "qty": "400",
+        "remark": trend_review.trend_attempt_remark(
+            "CN", "2026-07-20", action_key, 1
+        ),
+    }
+    intent = (
+        tmp_path
+        / "trend_review/ledgers/CN/open/2026-07-20"
+        / f"{action_key}-intent.json"
+    )
+    intent.parent.mkdir(parents=True)
+    intent.write_text(
+        json.dumps({
+            "market": "CN",
+            "date": "2026-07-20",
+            "report_sha256": trend_review._report_hash(report),
+            "action_index": 0,
+            "request": request,
+            "created_at": "2026-07-20T09:31:00+08:00",
+        }),
+        encoding="utf-8",
+    )
+    event = (
+        tmp_path
+        / "trend_review/ledgers/CN/actions/2026-07-20"
+        / action_key
+        / "forged-complete-snapshot.json"
+    )
+    event.parent.mkdir(parents=True)
+    event.write_text(
+        json.dumps({
+            "market": "CN",
+            "date": "2026-07-20",
+            "strategy_version": "v1",
+            "report_sha256": trend_review._report_hash(report),
+            "action_index": 0,
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "buy",
+            "status": "filled",
+            "filled_qty": "400",
+            "target_qty": "400",
+            "order_ids": ["FORGED"],
+            "broker_account_id": 101,
+            "broker_position_qty": "400",
+            "broker_orders": [{
+                "order_id": "FORGED",
+                "remark": request["remark"],
+                "code": "SH.600001",
+                "trd_side": "BUY",
+                "qty": "400",
+                "dealt_qty": "400",
+                "order_status": "FILLED",
+            }],
+            "recorded_at": "2026-07-20T09:32:00+08:00",
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid trend action event evidence"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            symbol="600001",
+            side="buy",
+        )
+
+
 @pytest.mark.parametrize(("actor", "reason"), [("", "checked"), ("ray", " ")])
 def test_resolution_requires_actor_and_reason(
     tmp_path: Path, actor: str, reason: str
@@ -2284,13 +2516,16 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
         )
         if "position_zero_confirmed" in path.read_text(encoding="utf-8")
     ]
-    assert len(terminal_events) == 1
-    assert terminal_events[0] | {
+    assert {event["symbol"] for event in terminal_events} == {"600001", "600003"}
+    completed_sell = next(
+        event for event in terminal_events if event["symbol"] == "600001"
+    )
+    assert completed_sell | {
         "symbol": "600001",
         "side": "sell",
         "status": "filled",
         "reason": "position_zero_confirmed",
-    } == terminal_events[0]
+    } == completed_sell
 
     client.positions = [
         {"code": "SH.600001", "qty": "25"},
@@ -2312,7 +2547,38 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
         for path in tmp_path.glob(
             "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
         )
-    ) == 1
+    ) == 2
+
+
+def test_fresh_zero_position_sell_does_not_append_observation_on_repeat(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    report = report_with_actions([
+        {"action": "SELL_ALL", "symbol": "600001"}
+    ])
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "quote_prices": TEST_QUOTE_PRICES,
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:31:00+08:00"
+    )
+    repeated = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+
+    assert first["submitted_count"] == 0
+    assert repeated["submitted_count"] == 0
+    assert client.requests == []
+    assert len(list(tmp_path.glob(
+        "trend_review/ledgers/CN/open/2026-07-17/*-observation-*.json"
+    ))) == 1
 
 
 @pytest.mark.parametrize(
@@ -2454,6 +2720,17 @@ def test_position_zero_terminal_uses_actual_broker_fill_facts(
     assert terminal["target_qty"] == "100"
     assert terminal["order_ids"] == ["SIM-1"]
     assert terminal["avg_fill_price"] == (average_price or "")
+    report_path = tmp_path / "reports/2026-07-17.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-17T09:30:00+08:00",
+    )
     events, _ = trend_review.load_trend_action_audit(
         tmp_path,
         market="CN",

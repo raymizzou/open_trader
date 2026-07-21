@@ -53,6 +53,7 @@ from .trend_review import (
     execute_trend_review_stop,
     load_trend_action_audit,
     lock_trend_execution_batch,
+    record_trend_review_missed_buys,
 )
 
 
@@ -73,7 +74,6 @@ class ControllerCycle:
     execution_date: str
     report_run_date: str
     session: str
-    buy_window_open: bool
     market_open: bool
     next_check_at: datetime
 
@@ -343,8 +343,6 @@ def _derive_cycle(
     execution = future[0]
     if not today_is_trading:
         session = "holiday"
-    local_time = local.time().replace(tzinfo=None)
-    start, end = BUY_WINDOWS[market]
     market_open = today_is_trading and execution == today and session in {
         "morning",
         "afternoon",
@@ -360,9 +358,6 @@ def _derive_cycle(
             else as_of.isoformat()
         ),
         session=session,
-        buy_window_open=(
-            market_open and execution == today and start <= local_time <= end
-        ),
         market_open=market_open,
         next_check_at=now + timedelta(seconds=5),
     )
@@ -539,6 +534,29 @@ def _load_cycle_report(
     return latest
 
 
+def _delivery_needs_recovery(
+    config: DailyPremarketConfig,
+    market: str,
+    report: tuple[Path, Mapping[str, object]],
+) -> bool:
+    path, payload = report
+    receipt = (
+        config.data_dir / "trend_a_share" / "delivery" / f"{path.stem}.json"
+        if market == "CN"
+        else market_paths(config.data_dir, config.reports_dir, market).root
+        / "delivery"
+        / f"{path.stem}.json"
+    )
+    if receipt.exists():
+        status = _read_json(receipt, "trend report delivery receipt").get("status")
+        return status in {"prepared", "pending", "delivery_failed"}
+    return payload.get("delivery_status") in {
+        "prepared",
+        "pending",
+        "delivery_failed",
+    }
+
+
 def _generate_report(
     config: DailyPremarketConfig, market: str, run_date: str, revision: bool
 ) -> None:
@@ -599,7 +617,7 @@ def _run_stop(
 
 def _run_protection_pass(
     config: DailyPremarketConfig, market: str, trading_date: str
-) -> None:
+) -> object:
     require_trend_executor(config, hostname_fn=socket.gethostname)
     account_id = require_trend_review_config(config, market)
     notifier = build_notifier(config)
@@ -622,7 +640,7 @@ def _run_protection_pass(
     )
     callback = lambda event: _run_stop(config, market, event)
     if market == "CN":
-        watch_a_share_protection(
+        return watch_a_share_protection(
             portfolio_path=config.portfolio,
             state_path=config.data_dir / "trend_a_share/protection_state.json",
             events_path=config.data_dir / "trend_a_share/watch_events.jsonl",
@@ -636,9 +654,8 @@ def _run_protection_pass(
             account_loader=account_loader,
             on_protection_trigger=callback,
         )
-        return
     paths = market_paths(config.data_dir, config.reports_dir, market)
-    watch_market_protection(
+    return watch_market_protection(
         market=market,
         data_dir=config.data_dir,
         portfolio_path=config.portfolio,
@@ -656,23 +673,47 @@ def _run_protection_pass(
     )
 
 
+def _protection_blocker(result: object) -> str | None:
+    status = str(getattr(result, "status", "") or "")
+    exceptions = getattr(result, "exception_count", None)
+    unknown_quotes = getattr(result, "unknown_quote_count", None)
+    if (
+        status != "completed"
+        or not isinstance(exceptions, int)
+        or isinstance(exceptions, bool)
+        or exceptions
+        or not isinstance(unknown_quotes, int)
+        or isinstance(unknown_quotes, bool)
+        or unknown_quotes
+    ):
+        return (
+            "protection pass abnormal: "
+            f"status={status or 'missing'}, exceptions={exceptions}, "
+            f"unknown_quotes={unknown_quotes}"
+        )
+    return None
+
+
 def _execute_locked_report(
     config: DailyPremarketConfig,
     market: str,
     execution_date: str,
     report_path: Path,
     report: Mapping[str, object],
+    *,
+    allow_new_buys: bool = True,
 ) -> dict[str, object]:
     require_trend_executor(config, hostname_fn=socket.gethostname)
     now = datetime.now(TIMEZONES[market]).isoformat(timespec="seconds")
     as_of_date = str(report.get("as_of_date") or "")
-    request, completion = _revision_paths(config, market, as_of_date)
     with RunLock(_revision_gate_path(config, market, execution_date)):
-        if request.exists() and not completion.exists():
+        request, completion = _revision_state(
+            config, market, as_of_date, execution_date
+        )
+        if request is not None and completion is None:
             raise RuntimeError("trend report revision request is pending")
-        if completion.exists():
-            completed = _read_json(completion, "trend report revision completion")
-            if completed.get("report_sha256") != _report_hash(report):
+        if completion is not None:
+            if completion.get("report_sha256") != _report_hash(report):
                 raise RuntimeError("completed trend report revision is not selected")
         batch = lock_trend_execution_batch(
             config.data_dir,
@@ -691,11 +732,44 @@ def _execute_locked_report(
         raise ValueError(f"invalid locked trend report: {locked_path}")
     judgments = locked_report["strategy_judgments"]
     actions = judgments["formal_actions"]
+    if not actions:
+        return {
+            "status": "unchanged",
+            "market": market,
+            "date": execution_date,
+            "submitted_count": 0,
+            "artifact_paths": [],
+        }
+    missed = record_trend_review_missed_buys(
+        data_dir=config.data_dir,
+        report=locked_report,
+        market=market,
+        execution_date=execution_date,
+        now=now,
+    )
+    sell_symbols = {
+        str(action.get("symbol") or "").strip()
+        for action in actions
+        if action.get("action") == "SELL_ALL"
+    }
+    eligible_buys = sum(
+        action.get("action") == "BUY"
+        and str(action.get("symbol") or "").strip() not in sell_symbols
+        for action in actions
+    )
+    if missed == eligible_buys == len(actions):
+        return {
+            "status": "missed_window",
+            "market": market,
+            "date": execution_date,
+            "submitted_count": 0,
+            "artifact_paths": [],
+        }
     symbols = sorted(
         {
             to_futu_symbol(market, str(action["symbol"]))
             for action in actions
-            if action["action"] == "BUY"
+            if allow_new_buys and action["action"] == "BUY"
         }
     )
     quote = None
@@ -742,9 +816,11 @@ def _capture_close(
     if report_item is None:
         raise FileNotFoundError(f"no {market} trend report for {trading_date}")
     _, report = report_item
-    quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-    client = _new_order_client(config, market)
+    quote = None
+    client = None
     try:
+        quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+        client = _new_order_client(config, market)
         capture_trend_review_close(
             data_dir=config.data_dir,
             market=market,
@@ -756,8 +832,10 @@ def _capture_close(
         )
         build_trend_review_projection(config.data_dir, market)
     finally:
-        quote.close()
-        client.close()
+        if quote is not None:
+            quote.close()
+        if client is not None:
+            client.close()
 
 
 def _load_report_for_as_of(
@@ -893,8 +971,62 @@ def _request_revision(
 def _pending_revision(
     config: DailyPremarketConfig, cycle: ControllerCycle
 ) -> bool:
-    request, completion = _revision_paths(config, cycle.market, cycle.as_of_date)
-    return request.exists() and not completion.exists()
+    request, completion = _revision_state(
+        config,
+        cycle.market,
+        cycle.as_of_date,
+        cycle.execution_date,
+    )
+    return request is not None and completion is None
+
+
+def _revision_state(
+    config: DailyPremarketConfig,
+    market: str,
+    as_of_date: str,
+    execution_date: str,
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    request_path, completion_path = _revision_paths(config, market, as_of_date)
+    if not request_path.exists():
+        if completion_path.exists():
+            raise ValueError(f"invalid trend report revision completion: {completion_path}")
+        return None, None
+    request = _read_json(request_path, "trend report revision request")
+    try:
+        requested_at = datetime.fromisoformat(str(request["requested_at"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid trend report revision request: {request_path}") from exc
+    if (
+        request.get("schema_version")
+        != "open_trader.trend_controller.revision_request.v1"
+        or request.get("market") != market
+        or request.get("as_of_date") != as_of_date
+        or request.get("execution_date") != execution_date
+        or requested_at.tzinfo is None
+        or requested_at.utcoffset() is None
+    ):
+        raise ValueError(f"invalid trend report revision request: {request_path}")
+    if not completion_path.exists():
+        return request, None
+    completion = _read_json(completion_path, "trend report revision completion")
+    report_path = Path(str(completion.get("report_path") or ""))
+    report = _read_json(report_path, "completed trend report revision")
+    if (
+        completion.get("schema_version")
+        != "open_trader.trend_controller.revision_completion.v1"
+        or completion.get("market") != market
+        or completion.get("as_of_date") != as_of_date
+        or completion.get("execution_date") != execution_date
+        or completion.get("request_path") != str(request_path)
+        or completion.get("request_sha256")
+        != hashlib.sha256(request_path.read_bytes()).hexdigest()
+        or _report_order(report_path)[0] != as_of_date
+        or _report_order(report_path)[1] <= 0
+        or not _valid_report(config, market, execution_date, report_path, report)
+        or completion.get("report_sha256") != _report_hash(report)
+    ):
+        raise ValueError(f"invalid trend report revision completion: {completion_path}")
+    return request, completion
 
 
 def _complete_revision(
@@ -903,16 +1035,37 @@ def _complete_revision(
     report: tuple[Path, dict[str, object]],
     now: datetime,
 ) -> None:
-    request, completion = _revision_paths(config, cycle.market, cycle.as_of_date)
+    request_path, completion_path = _revision_paths(
+        config, cycle.market, cycle.as_of_date
+    )
+    request, completion = _revision_state(
+        config,
+        cycle.market,
+        cycle.as_of_date,
+        cycle.execution_date,
+    )
+    if request is None:
+        raise RuntimeError("trend report revision request is missing")
+    if completion is not None:
+        return
     path, payload = report
+    if (
+        _report_order(path)[0] != cycle.as_of_date
+        or _report_order(path)[1] <= 0
+        or not _valid_report(
+            config, cycle.market, cycle.execution_date, path, payload
+        )
+    ):
+        raise ValueError(f"invalid completed trend report revision: {path}")
     _write_immutable(
-        completion,
+        completion_path,
         _canonical_json_bytes({
             "schema_version": "open_trader.trend_controller.revision_completion.v1",
             "market": cycle.market,
             "as_of_date": cycle.as_of_date,
             "execution_date": cycle.execution_date,
-            "request_path": str(request),
+            "request_path": str(request_path),
+            "request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
             "report_path": str(path),
             "report_sha256": _report_hash(payload),
             "completed_at": now.isoformat(timespec="seconds"),
@@ -965,49 +1118,6 @@ def _execution_due(cycle: ControllerCycle, now: datetime) -> bool:
     )
 
 
-def _execution_noop_path(
-    config: DailyPremarketConfig,
-    market: str,
-    execution_date: str,
-    result_status: str,
-) -> Path:
-    return (
-        _controller_root(config, market)
-        / "execution_noops"
-        / f"{execution_date}-{result_status}.json"
-    )
-
-
-def _record_execution_noop(
-    config: DailyPremarketConfig,
-    cycle: ControllerCycle,
-    report: Mapping[str, object],
-    execution: Mapping[str, object],
-) -> None:
-    if (
-        execution.get("status") not in {"unchanged", "missed_window"}
-        or not _batch_path(
-            config, cycle.market, cycle.execution_date
-        ).exists()
-    ):
-        return
-    _write_immutable(
-        _execution_noop_path(
-            config,
-            cycle.market,
-            cycle.execution_date,
-            str(execution["status"]),
-        ),
-        _canonical_json_bytes({
-            "schema_version": "open_trader.trend_controller.execution_noop.v1",
-            "market": cycle.market,
-            "execution_date": cycle.execution_date,
-            "report_sha256": _report_hash(report),
-            "result_status": execution["status"],
-        }),
-    )
-
-
 def _execution_completed(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
@@ -1038,27 +1148,6 @@ def _execution_completed(
     actions = judgments["formal_actions"]
     if not actions:
         return True
-    noop_statuses: set[str] = set()
-    for result_status in ("unchanged", "missed_window"):
-        noop_path = _execution_noop_path(
-            config,
-            cycle.market,
-            cycle.execution_date,
-            result_status,
-        )
-        if not noop_path.exists():
-            continue
-        noop = _read_json(noop_path, "trend execution noop")
-        if (
-            noop.get("schema_version")
-            != "open_trader.trend_controller.execution_noop.v1"
-            or noop.get("market") != cycle.market
-            or noop.get("execution_date") != cycle.execution_date
-            or noop.get("report_sha256") != report_sha
-            or noop.get("result_status") != result_status
-        ):
-            raise ValueError(f"invalid trend execution noop: {noop_path}")
-        noop_statuses.add(result_status)
 
     sell_symbols = {
         str(action.get("symbol") or "").strip()
@@ -1091,15 +1180,6 @@ def _execution_completed(
             or item.get("status") == "incomplete"
             and item.get("reason") == "position_zero_confirmed"
             for item in events
-        ):
-            continue
-        meaningful = [
-            item for item in events if item.get("status") != "reason_added"
-        ]
-        if (
-            not meaningful
-            and noop_statuses
-            and action_name == "SELL_ALL"
         ):
             continue
         return False
@@ -1151,7 +1231,6 @@ def _durable_report_cycles(
                 else as_of.isoformat()
             ),
             session="catchup",
-            buy_window_open=False,
             market_open=False,
             next_check_at=now + timedelta(seconds=5),
         )
@@ -1306,6 +1385,22 @@ def run_trend_market_controller(
                 blocker=cycle_blocker or operation_blocker,
                 next_check_at=now + timedelta(seconds=5),
             )
+            local = now.astimezone(TIMEZONES[market])
+            local_session = (
+                cn_session(local)
+                if market == "CN"
+                else market_session(local, market)
+            )
+            protection_error: str | None = None
+            if local_session in {"morning", "afternoon", "open"}:
+                try:
+                    protection_error = _protection_blocker(
+                        _run_protection_pass(
+                            config, market, local.date().isoformat()
+                        )
+                    )
+                except Exception as exc:
+                    protection_error = f"protection pass failed: {exc}"
             if cycle_retry_after is not None and now < cycle_retry_after:
                 status_payload = _record_status(
                     config,
@@ -1355,12 +1450,9 @@ def run_trend_market_controller(
             cycle_retry_after = None
             cycle_blocker = None
             phase = "monitoring" if cycle.market_open else cycle.session
-            blocker: str | None = None
-            if cycle.market_open:
-                try:
-                    _run_protection_pass(config, market, cycle.execution_date)
-                except Exception as exc:
-                    blocker = f"protection pass failed: {exc}"
+            blocker = protection_error
+            if blocker is not None:
+                phase = "blocked"
             work_cycle = report_target[0] if report_target else cycle
             latest: tuple[Path, dict[str, object]] | None = None
             try:
@@ -1380,13 +1472,30 @@ def run_trend_market_controller(
                         latest = None
                 else:
                     latest = _load_cycle_report(config, work_cycle)
+                revision_frozen = bool(
+                    wants_revision
+                    and latest is not None
+                    and _report_order(latest[0])[1] > 0
+                )
+                needs_delivery = bool(
+                    latest is not None
+                    and _delivery_needs_recovery(config, market, latest)
+                )
+                if revision_frozen and not needs_delivery:
+                    assert latest is not None
+                    _complete_revision(config, work_cycle, latest, now)
+                    wants_revision = False
                 can_start = (
                     report_retry_after is None or now >= report_retry_after
                 )
                 if (
                     future is None
                     and can_start
-                    and (latest is None or wants_revision)
+                    and (
+                        latest is None
+                        or needs_delivery
+                        or wants_revision and not revision_frozen
+                    )
                 ):
                     if wants_revision and _batch_path(
                         config, market, work_cycle.execution_date
@@ -1442,19 +1551,23 @@ def run_trend_market_controller(
                     phase = "recovering_report"
                 elif _execution_due(work_cycle, now):
                     selected = _locked_report(config, work_cycle, latest, now)
-                    execution = _execute_locked_report(
-                        config,
-                        market,
-                        work_cycle.execution_date,
-                        selected[0],
-                        selected[1],
-                    )
-                    _record_execution_noop(
-                        config,
-                        work_cycle,
-                        selected[1],
-                        execution,
-                    )
+                    if protection_error is not None:
+                        execution = _execute_locked_report(
+                            config,
+                            market,
+                            work_cycle.execution_date,
+                            selected[0],
+                            selected[1],
+                            allow_new_buys=False,
+                        )
+                    else:
+                        execution = _execute_locked_report(
+                            config,
+                            market,
+                            work_cycle.execution_date,
+                            selected[0],
+                            selected[1],
+                        )
                     last_success = execution
                     operation_failures = 0
                     operation_retry_after = None
@@ -1490,7 +1603,13 @@ def run_trend_market_controller(
                             ),
                         )
                     else:
-                        phase = "monitoring" if cycle.market_open else cycle.session
+                        phase = (
+                            "blocked"
+                            if protection_error is not None
+                            else "monitoring"
+                            if cycle.market_open
+                            else cycle.session
+                        )
                     report_target = None
 
                 close_due = (
