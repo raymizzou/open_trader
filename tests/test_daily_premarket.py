@@ -4802,6 +4802,193 @@ def test_launchd_installer_refuses_load_while_legacy_label_is_present(
     assert not any(call.startswith("load ") for call in calls)
 
 
+def test_launchd_installer_rejects_orphan_process_for_selected_market(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    launchctl_log = tmp_path / "launchctl.log"
+    pgrep_log = tmp_path / "pgrep.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(launchctl_log),
+            "OPEN_TRADER_PGREP_LOG": str(pgrep_log),
+            "OPEN_TRADER_PGREP_MATCH": "watch-trend-market",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "legacy trend process is still running for US" in result.stderr
+    assert not any(
+        call.startswith("load ")
+        for call in launchctl_log.read_text(encoding="utf-8").splitlines()
+    )
+    patterns = pgrep_log.read_text(encoding="utf-8").splitlines()
+    assert any("watch-trend-market" in pattern for pattern in patterns)
+    assert all("--market[[:space:]]+HK" not in pattern for pattern in patterns)
+
+
+def test_launchd_installer_stops_all_labels_before_orphan_process_fence(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    operations = tmp_path / "operations.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "all",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_OPERATION_LOG": str(operations),
+            "OPEN_TRADER_PGREP_MATCH": "--market[[:space:]]+HK",
+        },
+    )
+
+    assert result.returncode == 1
+    calls = operations.read_text(encoding="utf-8").splitlines()
+    first_probe = next(i for i, call in enumerate(calls) if call.startswith("pgrep "))
+    for market in ["cn", "hk", "us"]:
+        print_index = next(
+            i
+            for i, call in enumerate(calls)
+            if call.startswith("launchctl print ")
+            and call.endswith(f"trend-market-controller.{market}")
+        )
+        assert print_index < first_probe
+    assert not any(call.startswith("launchctl load ") for call in calls)
+
+
+def test_launchd_installer_fences_every_selected_market_before_first_load(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    operations = tmp_path / "operations.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "all",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_OPERATION_LOG": str(operations),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = operations.read_text(encoding="utf-8").splitlines()
+    probes = [i for i, call in enumerate(calls) if call.startswith("pgrep ")]
+    first_load = next(
+        i for i, call in enumerate(calls) if call.startswith("launchctl load ")
+    )
+    assert len(probes) == 6
+    assert max(probes) < first_load
+
+
+def test_launchd_installer_readonly_fails_when_orphan_process_remains(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    launchctl_log = tmp_path / "launchctl.log"
+    _write_launchd_executor_config(repo, "another-host")
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(launchctl_log),
+            "OPEN_TRADER_PGREP_MATCH": "trend-a-share-report",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "legacy trend process is still running for CN" in result.stderr
+    assert "readonly host: no trend controller installed" not in result.stdout
+    assert not any(
+        call.startswith("load ")
+        for call in launchctl_log.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_launchd_installer_does_not_match_other_market_legacy_process(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    pgrep_log = tmp_path / "pgrep.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_PGREP_LOG": str(pgrep_log),
+            "OPEN_TRADER_PGREP_MATCH": "--market[[:space:]]+HK",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    patterns = pgrep_log.read_text(encoding="utf-8").splitlines()
+    assert len(patterns) == 2
+    assert all(pattern.startswith("-f ^") for pattern in patterns)
+    assert all("--market[[:space:]]+US" in pattern for pattern in patterns)
+
+
 def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
     example = (
         Path(__file__).resolve().parents[1] / "config/daily_premarket.env.example"
@@ -5374,6 +5561,19 @@ def _all_trend_labels() -> list[str]:
     ]
 
 
+def _write_launchd_executor_config(repo: Path, executor_host: str) -> None:
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={executor_host}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _fake_launchctl_bin(tmp_path: Path) -> Path:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
@@ -5382,6 +5582,9 @@ def _fake_launchctl_bin(tmp_path: Path) -> Path:
         """#!/usr/bin/env bash
 if [[ -n "${OPEN_TRADER_LAUNCHCTL_LOG:-}" ]]; then
   printf '%s\\n' "$*" >> "$OPEN_TRADER_LAUNCHCTL_LOG"
+fi
+if [[ -n "${OPEN_TRADER_OPERATION_LOG:-}" ]]; then
+  printf 'launchctl %s\\n' "$*" >> "$OPEN_TRADER_OPERATION_LOG"
 fi
 if [[ "${1:-}" == "print" ]]; then
   if [[ -n "${OPEN_TRADER_PRESENT_LABEL:-}" && "$*" == *"$OPEN_TRADER_PRESENT_LABEL" ]]; then
@@ -5397,6 +5600,28 @@ exit 0
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
+    pgrep = fake_bin / "pgrep"
+    pgrep.write_text(
+        """#!/usr/bin/env bash
+if [[ -n "${OPEN_TRADER_PGREP_LOG:-}" ]]; then
+  printf '%s\\n' "$*" >> "$OPEN_TRADER_PGREP_LOG"
+fi
+if [[ -n "${OPEN_TRADER_OPERATION_LOG:-}" ]]; then
+  printf 'pgrep %s\\n' "$*" >> "$OPEN_TRADER_OPERATION_LOG"
+fi
+pattern="${*: -1}"
+if [[ -n "${OPEN_TRADER_PGREP_MATCH:-}" && "$pattern" == *"$OPEN_TRADER_PGREP_MATCH"* ]]; then
+  echo "4242"
+  exit 0
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    pgrep.chmod(0o755)
+    sleep = fake_bin / "sleep"
+    sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    sleep.chmod(0o755)
     return fake_bin
 
 

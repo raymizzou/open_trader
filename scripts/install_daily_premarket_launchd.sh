@@ -138,6 +138,7 @@ OPEN_TRADER_PYTHON="$(resolve_config_path "$OPEN_TRADER_PYTHON" "$OPEN_TRADER_RE
 
 PREMARKET_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.premarket.plist.template"
 CONTROLLER_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-market-controller.plist.template"
+PGREP_BIN="${PGREP_BIN:-pgrep}"
 
 lint_rendered() {
   local rendered="$1" temp_path
@@ -214,6 +215,47 @@ legacy_labels() {
       "com.open-trader.trend-$lower-report" \
       "com.open-trader.trend-$lower-watch"
   fi
+}
+
+legacy_process_patterns() {
+  local market="$1" python_pattern
+  python_pattern='^([^[:space:]]*/)?[Pp]ython[^[:space:]]*[[:space:]]+-m[[:space:]]+open_trader[[:space:]]+'
+  if [[ "$market" == "CN" ]]; then
+    printf '%s\n' \
+      "${python_pattern}trend-a-share-report([[:space:]]|$)" \
+      "${python_pattern}watch-trend-a-share([[:space:]]|$)"
+  else
+    printf '%s\n' \
+      "${python_pattern}trend-market-report[[:space:]]+--market[[:space:]]+$market([[:space:]]|$)" \
+      "${python_pattern}watch-trend-market[[:space:]]+--market[[:space:]]+$market([[:space:]]|$)"
+  fi
+}
+
+verify_legacy_processes_absent() {
+  local market="$1" pattern attempt matches status running
+  while IFS= read -r pattern; do
+    running=0
+    for attempt in 1 2 3 4 5; do
+      if matches="$("$PGREP_BIN" -f "$pattern")"; then
+        running=1
+        if [[ "$attempt" -lt 5 ]]; then
+          sleep 1
+        fi
+      else
+        status=$?
+        if [[ "$status" -ne 1 ]]; then
+          echo "failed to inspect legacy trend processes for $market" >&2
+          return 1
+        fi
+        running=0
+        break
+      fi
+    done
+    if [[ "$running" -eq 1 ]]; then
+      echo "legacy trend process is still running for $market: $matches" >&2
+      return 1
+    fi
+  done < <(legacy_process_patterns "$market")
 }
 
 install_rendered() {
@@ -305,6 +347,10 @@ for market in "${cleanup_markets[@]}"; do
   label="com.open-trader.trend-market-controller.$lower"
   stop_label "$label"
   verify_absent "$label"
+done
+
+for market in "${cleanup_markets[@]}"; do
+  verify_legacy_processes_absent "$market"
 done
 
 if [[ "$mode" == "readonly" ]]; then
