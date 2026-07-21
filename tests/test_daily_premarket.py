@@ -46,7 +46,9 @@ from open_trader.trading_plan import (
 )
 
 
-def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
+def test_load_env_config_parses_required_values_and_executor_host(
+    tmp_path: Path,
+) -> None:
     env = tmp_path / "daily.env"
     env.write_text(
         "\n".join(
@@ -77,6 +79,7 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "OPEN_TRADER_TREND_REVIEW_CN_SIMULATE_ACC_ID=101",
                 "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID=102",
                 "OPEN_TRADER_TREND_REVIEW_HK_SIMULATE_ACC_ID=103",
+                "OPEN_TRADER_TREND_EXECUTOR_HOST=ray-mac",
                 "DEEPSEEK_API_KEY=secret",
             ]
         ),
@@ -113,6 +116,27 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.trend_review_cn_simulate_acc_id == 101
     assert config.trend_review_us_simulate_acc_id == 102
     assert config.trend_review_hk_simulate_acc_id == 103
+    assert config.trend_executor_host == "ray-mac"
+
+
+def test_load_env_config_defaults_executor_host_to_empty(tmp_path: Path) -> None:
+    env = tmp_path / "daily.env"
+    env.write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={tmp_path}",
+                f"OPEN_TRADER_PYTHON={tmp_path / '.venv/bin/python'}",
+                "OPEN_TRADER_TIMEZONE=Asia/Shanghai",
+                "OPEN_TRADER_DEADLINE=21:10",
+                "OPEN_TRADER_FUTU_HOST=127.0.0.1",
+                "OPEN_TRADER_FUTU_PORT=11111",
+                "DEEPSEEK_API_KEY=secret",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_env_config(env).trend_executor_host == ""
 
 
 def test_shared_env_loader_accepts_other_positive_a_share_pool_ids(
@@ -1380,6 +1404,47 @@ def test_require_trend_review_config_returns_selected_market_values(
 
     assert daily_premarket.require_trend_review_config(config, "CN") == 101
     assert daily_premarket.require_trend_review_config(config, "US") == 102
+
+
+def test_trend_execution_mode_requires_exact_named_host(tmp_path: Path) -> None:
+    config = replace(_daily_config(tmp_path), trend_executor_host="ray-mac")
+
+    matched = daily_premarket.trend_execution_mode(
+        config,
+        hostname_fn=lambda: "ray-mac",
+    )
+    assert matched.mode == "execute"
+    assert matched.reason == "executor host matched"
+
+    mismatch = daily_premarket.trend_execution_mode(
+        config,
+        hostname_fn=lambda: "laptop",
+    )
+    assert mismatch.mode == "readonly"
+    assert mismatch.executor_host == "ray-mac"
+    assert mismatch.local_host == "laptop"
+    assert mismatch.reason == (
+        "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST"
+    )
+
+
+def test_missing_executor_host_is_readonly(tmp_path: Path) -> None:
+    config = _daily_config(tmp_path)
+
+    mode = daily_premarket.trend_execution_mode(
+        config,
+        hostname_fn=lambda: "ray-mac",
+    )
+    assert mode.mode == "readonly"
+    assert mode.executor_host == ""
+    assert mode.local_host == "ray-mac"
+    assert mode.reason == "OPEN_TRADER_TREND_EXECUTOR_HOST is not configured"
+
+    with pytest.raises(ValueError, match="trend automation is readonly"):
+        daily_premarket.require_trend_executor(
+            config,
+            hostname_fn=lambda: "ray-mac",
+        )
 
 
 def _daily_runner(

@@ -6,13 +6,14 @@ import json
 import logging
 import os
 import shutil
+import socket
 import sys
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 from zoneinfo import ZoneInfo
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
@@ -115,6 +116,15 @@ class DailyPremarketConfig:
     trend_review_cn_simulate_acc_id: int = 0
     trend_review_us_simulate_acc_id: int = 0
     trend_review_hk_simulate_acc_id: int = 0
+    trend_executor_host: str = ""
+
+
+@dataclass(frozen=True)
+class TrendExecutionMode:
+    mode: Literal["execute", "readonly"]
+    executor_host: str
+    local_host: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -278,6 +288,7 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         trend_review_cn_simulate_acc_id=review_account_ids["CN"],
         trend_review_us_simulate_acc_id=review_account_ids["US"],
         trend_review_hk_simulate_acc_id=review_account_ids["HK"],
+        trend_executor_host=values.get("OPEN_TRADER_TREND_EXECUTOR_HOST", ""),
     )
 
 
@@ -310,6 +321,34 @@ def require_trend_review_config(
     if account_id <= 0:
         raise ValueError(f"{market} trend review config is incomplete")
     return account_id
+
+
+def trend_execution_mode(
+    config: DailyPremarketConfig,
+    *,
+    hostname_fn: Callable[[], str] = socket.gethostname,
+) -> TrendExecutionMode:
+    executor = config.trend_executor_host.strip()
+    local = hostname_fn().strip()
+    if executor and local == executor:
+        return TrendExecutionMode("execute", executor, local, "executor host matched")
+    reason = (
+        "OPEN_TRADER_TREND_EXECUTOR_HOST is not configured"
+        if not executor
+        else "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST"
+    )
+    return TrendExecutionMode("readonly", executor, local, reason)
+
+
+def require_trend_executor(
+    config: DailyPremarketConfig,
+    *,
+    hostname_fn: Callable[[], str] = socket.gethostname,
+) -> TrendExecutionMode:
+    mode = trend_execution_mode(config, hostname_fn=hostname_fn)
+    if mode.mode != "execute":
+        raise ValueError(f"trend automation is readonly: {mode.reason}")
+    return mode
 
 
 def _positive_tm_ids(value: str) -> tuple[int, ...]:
