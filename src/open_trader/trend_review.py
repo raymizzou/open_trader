@@ -2983,9 +2983,9 @@ def _completed_trades(facts: list[dict[str, object]]) -> list[dict[str, object]]
                 ) + quantity
                 current["orders"].append(dict(order))
                 continue
-            if current is None or _required_decimal(
-                current["quantity"], "open quantity"
-            ) < quantity:
+            if current is None:
+                continue
+            if _required_decimal(current["quantity"], "open quantity") < quantity:
                 raise ValueError("sell fill exceeds experiment position")
             current["quantity"] = _required_decimal(
                 current["quantity"], "open quantity"

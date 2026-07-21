@@ -2059,6 +2059,28 @@ def run_trend_market_controller(
                 )
                 blocker = cycle_blocker or report_blocker or operation_blocker
 
+            if (
+                last_success is None
+                and blocker is None
+                and latest is not None
+                and phase
+                not in {
+                    "starting",
+                    "reconciling",
+                    "recovering_report",
+                    "blocked",
+                    "uncertain",
+                    "conflict",
+                    "missed",
+                }
+            ):
+                last_success = {
+                    "status": "reconciled",
+                    "market": market,
+                    "date": work_cycle.execution_date,
+                    "submitted_count": 0,
+                    "artifact_paths": [],
+                }
             next_check = (
                 operation_retry_after
                 or report_retry_after

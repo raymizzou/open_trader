@@ -4540,6 +4540,29 @@ def test_projection_rejects_wrong_benchmark_identity(tmp_path: Path) -> None:
         trend_review.build_trend_review_projection(tmp_path, "CN")
 
 
+def test_projection_ignores_exit_for_position_held_before_tracking(
+    tmp_path: Path,
+) -> None:
+    write_review_history(tmp_path, completed_trades=30, days=40)
+    first_path = sorted((tmp_path / "trend_review/daily/CN").glob("*.json"))[0]
+    first = json.loads(first_path.read_text(encoding="utf-8"))
+    first["orders"].insert(  # type: ignore[union-attr]
+        0,
+        {
+            "side": "SELL",
+            "status": "FILLED",
+            "symbol": "PREEXISTING",
+            "qty": "1900",
+        },
+    )
+    first_path.write_text(json.dumps(first), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+    batch = json.loads(Path(projection["batch_path"]).read_text(encoding="utf-8"))
+
+    assert len(batch["completed_trades"]) == 30
+
+
 def test_projection_counts_partial_exit_once_and_keeps_entry_version(
     tmp_path: Path,
 ) -> None:

@@ -1335,6 +1335,51 @@ def test_close_capture_is_recovered_once_after_session_close(
     assert calls == 1
 
 
+def test_stable_closed_restart_records_successful_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = ControllerCycle(
+        market="CN",
+        as_of_date="2026-07-20",
+        execution_date="2026-07-21",
+        report_run_date="2026-07-20",
+        session="closed",
+        market_open=False,
+        next_check_at=NOW + timedelta(seconds=5),
+    )
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller, "_cycle_to_reconcile", lambda _config, _cycle, _now: cycle
+    )
+    report_path = config.reports_dir / "trend_a_share/2026-07-20.json"
+    report_path.parent.mkdir(parents=True)
+    report = valid_cn_report(
+        as_of_date=cycle.as_of_date,
+        execution_date=cycle.execution_date,
+    )
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    monkeypatch.setattr(
+        controller, "_load_cycle_report", lambda *_args: (report_path, report)
+    )
+    monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
+    monkeypatch.setattr(controller, "_execute_locked_report", pytest.fail)
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "closed"
+    assert result["blocker"] is None
+    assert result["last_success"] == {
+        "status": "reconciled",
+        "market": "CN",
+        "date": "2026-07-21",
+        "submitted_count": 0,
+        "artifact_paths": [],
+    }
+
+
 def test_restart_after_close_recovers_unlocked_prior_execution_before_next_cycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
