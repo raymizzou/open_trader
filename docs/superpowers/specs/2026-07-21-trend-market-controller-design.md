@@ -119,7 +119,9 @@ Ordinary premarket automation is unchanged by this work.
   or batch therefore remains the blocking catch-up target instead of silently
   redirecting the correction to the current cycle. If that historical cycle
   already has an execution batch, revision is rejected even when validation of
-  the batch or its report fails.
+  the batch or its report fails. The only exception is an explicitly authorized,
+  SHA-bound legacy cutover for an expired cycle that cannot be replayed; it
+  records a no-backfill audit skip rather than pretending to complete a revision.
 - Revision baseline capture and immutable request publication hold the same
   per-market report lock used by the real report runner. Lock order is revision
   gate followed by report lock, and request creation occurs before the
@@ -250,7 +252,8 @@ Ordinary premarket automation is unchanged by this work.
   `run --revision` publishes a request for that historical identity while the
   controller lock is held, and the persistent loop later completes it only
   with a strictly receipt-bound rN+1. Verify no request is published for the
-  current cycle and no revision is allowed once a historical batch exists.
+  current cycle and no revision is allowed once a historical batch exists when
+  no authorized legacy cutover applies.
 - Verify an explicitly authorized legacy cutover skips only its exact expired
   cycle, validates the report and revision-request hashes, rejects an existing
   batch or an open execution window, and performs no broker/report/action

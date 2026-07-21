@@ -24,6 +24,7 @@
 - A partially filled buy is completed only inside its window and never above frozen shares, frozen amount, available cash, or frozen risk limits.
 - Multiple same-day exit reasons for one symbol merge into one `SELL_ALL`; no overlapping sell is submitted while an earlier sell remains active or ambiguous.
 - External dependency failure for the entire valid window becomes one durable `missed` outcome; no order is submitted outside the strategy window.
+- An operator-authorized legacy cutover may skip only an expired, unreplayable cycle whose frozen report and pending revision request are bound by exact path and SHA-256; it creates no report, batch, action, notification, or broker mutation.
 - Do not add a database, queue, distributed lock, leader election, automatic failover, real-money execution, or cross-machine artifact synchronization.
 - Run focused tests and direct safe workflows during development. Do not run `make acceptance` during intermediate work; run it only as the final Dashboard gate after all source changes are committed, and rerun it only if a FAIL required a new fix/commit.
 - Only an acceptance `PASS` permits completion language. After PASS, redeploy the exact accepted Git SHA and verify PID, working directory, Git SHA, fresh logs, heartbeat, and HTTP 200.
@@ -49,6 +50,7 @@
 - Modify `src/open_trader/dashboard.py`, `src/open_trader/dashboard_static/dashboard.js`, and `src/open_trader/dashboard_static/dashboard.css`: project and render controller health and terminal execution states.
 - Modify `src/open_trader/dashboard_acceptance.py`, `tests/test_dashboard_web.py`, and `tests/test_dashboard_acceptance.py`: desktop/mobile controller-health acceptance.
 - Modify `README.md`: configuration, operations, manual resolution, migration, rollback, and verification instructions.
+- Modify `src/open_trader/trend_market_controller.py` and `tests/test_trend_market_controller.py`: one-time immutable legacy cutover facts for pre-controller expired reports that cannot be safely replayed.
 
 ---
 
@@ -1223,6 +1225,317 @@ Expected: deployed Git SHA equals the accepted SHA; PIDs and timestamps are fres
 
 ---
 
+### Task 9: Cut over expired legacy cycles that cannot be replayed
+
+This live-discovered migration task runs before Task 8 Steps 7–8. It does not
+add a public CLI or change report validation.
+
+**Files:**
+- Modify: `src/open_trader/trend_market_controller.py:950-1400`
+- Test: `tests/test_trend_market_controller.py:1450-1800`
+
+**Interfaces:**
+- Produces: `_legacy_cutover_path(config: DailyPremarketConfig, market: str, as_of_date: str) -> Path`.
+- Produces: `_record_legacy_cycle_cutover(config: DailyPremarketConfig, cycle: ControllerCycle, *, actor: str, reason: str, authorized_at: datetime) -> Path`.
+- Produces: `_legacy_cycle_cutover(config: DailyPremarketConfig, cycle: ControllerCycle) -> bool`.
+- Modifies: `_execution_completed(...)` returns `True` before batch loading only when `_legacy_cycle_cutover(...)` validates the exact immutable fact.
+
+- [ ] **Step 1: Write failing exact-cutover tests**
+
+Add one end-to-end state-transition test that writes an invalid historical r2,
+creates its immutable revision request, records a cutover after the buy window,
+and proves `_cycle_to_reconcile` advances to the current cycle without creating
+a batch or action ledger:
+
+```python
+def test_legacy_cutover_skips_only_exact_expired_unreplayable_cycle(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    historical = active_cn_cycle()
+    current = ControllerCycle(
+        market="CN",
+        as_of_date="2026-07-20",
+        execution_date="2026-07-21",
+        report_run_date="2026-07-20",
+        session="morning",
+        market_open=True,
+        next_check_at=NOW + timedelta(seconds=5),
+    )
+    path, report = write_report(config, revision=2)
+    report["schema_version"] = 999
+    path.write_text(json.dumps(report), encoding="utf-8")
+    authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
+    controller._request_revision(config, historical, authorized_at)
+
+    cutover = controller._record_legacy_cycle_cutover(
+        config,
+        historical,
+        actor="ray",
+        reason="historical replay evidence and dated account snapshot unavailable",
+        authorized_at=authorized_at,
+    )
+
+    assert cutover.exists()
+    assert controller._execution_completed(config, historical) is True
+    assert controller._cycle_to_reconcile(config, current, authorized_at) == current
+    assert not controller._batch_path(
+        config, historical.market, historical.execution_date
+    ).exists()
+    assert not (config.data_dir / "trend_review/ledgers/CN/actions").exists()
+```
+
+Add this test helper and the focused boundary tests:
+
+```python
+def prepare_legacy_cutover(
+    config: DailyPremarketConfig,
+) -> tuple[ControllerCycle, Path, Path, datetime]:
+    cycle = active_cn_cycle()
+    report_path, report = write_report(config, revision=2)
+    report["schema_version"] = 999
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
+    request_path = controller._request_revision(config, cycle, authorized_at)
+    return cycle, report_path, request_path, authorized_at
+
+
+@pytest.mark.parametrize("blocker", ["open_window", "batch"])
+def test_legacy_cutover_rejects_open_window_or_existing_batch(
+    tmp_path: Path,
+    blocker: str,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle, _, _, authorized_at = prepare_legacy_cutover(config)
+    if blocker == "open_window":
+        authorized_at = NOW
+    else:
+        batch = controller._batch_path(config, cycle.market, cycle.execution_date)
+        batch.parent.mkdir(parents=True, exist_ok=True)
+        batch.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        controller._record_legacy_cycle_cutover(
+            config,
+            cycle,
+            actor="ray",
+            reason="historical evidence unavailable",
+            authorized_at=authorized_at,
+        )
+
+
+@pytest.mark.parametrize("bound_artifact", ["report", "request"])
+def test_legacy_cutover_fails_closed_after_report_or_request_tampering(
+    tmp_path: Path,
+    bound_artifact: str,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle, report_path, request_path, authorized_at = prepare_legacy_cutover(config)
+    controller._record_legacy_cycle_cutover(
+        config,
+        cycle,
+        actor="ray",
+        reason="historical evidence unavailable",
+        authorized_at=authorized_at,
+    )
+    target = report_path if bound_artifact == "report" else request_path
+    target.write_bytes(target.read_bytes() + b" ")
+
+    with pytest.raises(ValueError, match="invalid legacy trend cutover"):
+        controller._execution_completed(config, cycle)
+
+
+def test_legacy_cutover_is_immutable_and_validates_operator_fields(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle, _, _, authorized_at = prepare_legacy_cutover(config)
+    values = {
+        "config": config,
+        "cycle": cycle,
+        "actor": "ray",
+        "reason": "historical evidence unavailable",
+        "authorized_at": authorized_at,
+    }
+    first = controller._record_legacy_cycle_cutover(**values)
+    assert controller._record_legacy_cycle_cutover(**values) == first
+    with pytest.raises(FileExistsError, match="immutable artifact collision"):
+        controller._record_legacy_cycle_cutover(
+            **{**values, "reason": "different reason"}
+        )
+    for index, changed in enumerate((
+        {"actor": ""},
+        {"reason": ""},
+        {"authorized_at": datetime(2026, 7, 21, 18)},
+    )):
+        other = controller_config(tmp_path / str(index))
+        other_cycle, _, _, other_at = prepare_legacy_cutover(other)
+        with pytest.raises(ValueError):
+            controller._record_legacy_cycle_cutover(
+                other,
+                other_cycle,
+                actor=str(changed.get("actor", "ray")),
+                reason=str(changed.get("reason", "historical evidence unavailable")),
+                authorized_at=changed.get("authorized_at", other_at),
+            )
+```
+
+The tampering test changes one bound file byte after recording and expects the
+cutover reader to wrap lower-level request/report failures as
+`ValueError("invalid legacy trend cutover: <path>")`; it must not silently
+return `False` once a cutover file exists.
+
+- [ ] **Step 2: Run the tests and verify RED**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_trend_market_controller.py::test_legacy_cutover_skips_only_exact_expired_unreplayable_cycle \
+  tests/test_trend_market_controller.py::test_legacy_cutover_rejects_open_window_or_existing_batch \
+  tests/test_trend_market_controller.py::test_legacy_cutover_fails_closed_after_report_or_request_tampering \
+  tests/test_trend_market_controller.py::test_legacy_cutover_is_immutable_and_validates_operator_fields -q
+```
+
+Expected: FAIL because the three cutover helpers do not exist.
+
+- [ ] **Step 3: Implement the minimum immutable fact**
+
+Reuse `_controller_root`, `_revision_paths`, `_revision_state`,
+`_revision_baseline`, `_batch_path`, `_read_json`, `_write_immutable`, and
+`_canonical_json_bytes`. Store one fact at
+`data/trend_controller/{market}/legacy_cutovers/{as_of_date}.json` with this
+exact schema:
+
+```python
+{
+    "schema_version": "open_trader.trend_controller.legacy_cutover.v1",
+    "market": cycle.market,
+    "as_of_date": cycle.as_of_date,
+    "execution_date": cycle.execution_date,
+    "report_path": str(report_path),
+    "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+    "revision_request_path": str(request_path),
+    "revision_request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+    "actor": actor.strip(),
+    "reason": reason.strip(),
+    "authorized_at": authorized_at.isoformat(timespec="seconds"),
+}
+```
+
+The writer and reader both enforce: exact market/date identity; nonempty actor
+and reason; timezone-aware authorization; authorization strictly after the
+market's buy-window end; no execution batch; an existing valid pending revision
+request with no completion; the latest report path/SHA is unchanged and lives
+in the market report directory. The writer calls `require_trend_executor`
+before touching data. `_write_immutable` provides idempotence and
+rejects conflicting rewrites. Do not add a new class, dependency, public CLI,
+notification, report transformation, or relaxed `_valid_report` branch.
+
+- [ ] **Step 4: Verify GREEN and regression coverage**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/test_trend_market_controller.py -q
+.venv/bin/python -m pytest tests/test_trend_market_cli.py tests/test_trend_review.py -q
+git diff --check
+```
+
+Expected: controller, CLI, and immutable-ledger tests PASS; no public command
+changed and no whitespace errors exist.
+
+- [ ] **Step 5: Commit and task-review before touching live data**
+
+Run:
+
+```bash
+git add src/open_trader/trend_market_controller.py tests/test_trend_market_controller.py
+git commit -m "fix: cut over unreplayable legacy trend cycles"
+```
+
+Expected: only the minimal controller/test files, plus an operator note if
+needed, are committed. Run the task-review gate before invoking the helper on
+shared data.
+
+- [ ] **Step 6: Record only the authorized live legacy cycles and resume Task 8**
+
+With all controller launchd labels still unloaded, run this one-time invocation.
+It cuts over only consecutive expired invalid cycles and stops at the first
+valid unfinished or current cycle:
+
+```bash
+PYTHONPATH=src .venv/bin/python - <<'PY'
+import hashlib
+from datetime import datetime
+from pathlib import Path
+
+from open_trader.daily_premarket import load_env_config
+from open_trader import trend_market_controller as controller
+
+config = load_env_config(
+    Path("/Users/ray/projects/open_trader/config/daily_premarket.env")
+)
+reason = "legacy report cannot be safely rebuilt without date-bound replay evidence"
+for market in ("CN", "HK", "US"):
+    now = datetime.now(controller.TIMEZONES[market])
+    current = controller._derive_cycle(config, market, now)
+    for _ in range(60):
+        cycle = controller._cycle_to_reconcile(config, current, now)
+        if (
+            cycle.as_of_date == current.as_of_date
+            and cycle.execution_date == current.execution_date
+        ):
+            break
+        try:
+            report = controller._load_cycle_report(config, cycle)
+        except ValueError as exc:
+            if "invalid frozen trend report" not in str(exc):
+                raise
+            controller._request_revision(config, cycle, now)
+            path = controller._record_legacy_cycle_cutover(
+                config,
+                cycle,
+                actor="ray",
+                reason=reason,
+                authorized_at=now,
+            )
+            print(
+                market,
+                cycle.as_of_date,
+                cycle.execution_date,
+                path,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            continue
+        if report is not None:
+            print(
+                market,
+                "stopped_at_valid_unfinished_cycle",
+                cycle.as_of_date,
+                cycle.execution_date,
+            )
+            break
+        raise RuntimeError(
+            f"{market} legacy cutover stopped at missing historical report "
+            f"{cycle.as_of_date}/{cycle.execution_date}"
+        )
+    else:
+        raise RuntimeError(f"{market} legacy cutover exceeded 60 cycles")
+PY
+```
+
+The output contains only market/date/path/SHA-safe metadata, never account
+contents or secrets. Do not cut over a valid report, any cycle with a batch, or
+the current cycle.
+
+After recording, reinstall all three controllers from the candidate worktree,
+verify fresh PIDs/heartbeats/logs, and confirm each market advances beyond the
+bound legacy cycles. Then rerun focused/full tests and continue Task 8 Steps
+7–8. Do not submit a manual test order.
+
+---
+
 ## Spec-Coverage Checklist
 
 - One controller per CN/HK/US market, one operational namespace, and unchanged ordinary premarket: Tasks 4–6.
@@ -1232,4 +1545,5 @@ Expected: deployed Git SHA equals the accepted SHA; PIDs and timestamps are fres
 - Explicit immutable resolution, capped partial buys, merged/remaining-only sells: Task 3.
 - Atomic status, deduplicated alerts, Dashboard health/action states: Tasks 4 and 7.
 - Fenced migration, readonly cleanup, no direct old-watcher rollback, live process/log verification: Tasks 6 and 8.
+- SHA-bound, operator-authorized, no-backfill cutover for unreplayable expired legacy cycles: Task 9.
 - Focused tests, full suite, safe direct workflow, live process restart, final acceptance PASS, exact-SHA redeploy: Task 8.
