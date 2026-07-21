@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -1367,13 +1368,17 @@ def _listener(url: str) -> tuple[int, Path]:
     if len(pid_text) != 1:
         raise RuntimeError(f"端口 {port} 没有唯一监听进程")
     pid = int(pid_text[0])
+    return pid, _process_cwd(pid)
+
+
+def _process_cwd(pid: int) -> Path:
     output = subprocess.check_output(
         ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], text=True
     )
     cwd_line = next((line for line in output.splitlines() if line.startswith("n")), "")
     if not cwd_line:
         raise RuntimeError("无法读取 Dashboard 进程工作目录")
-    return pid, Path(cwd_line[1:]).resolve()
+    return Path(cwd_line[1:]).resolve()
 
 
 def _process_started_at(pid: int) -> datetime:
@@ -2972,6 +2977,147 @@ def _log_errors(
     return errors
 
 
+def _controller_log_errors(
+    root: Path,
+    *,
+    market: str,
+    pid: int,
+    expected_sha: str,
+    expected_cwd: Path,
+    process_started_at: datetime,
+) -> list[str]:
+    stem = root / "logs/daily_premarket" / (
+        f"launchd-trend-controller-{market.lower()}"
+    )
+    stdout_path = stem.with_suffix(".out.log")
+    stderr_path = stem.with_suffix(".err.log")
+    try:
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_bytes()
+    except OSError as exc:
+        return [f"{market} 控制器日志读取失败：{type(exc).__name__}: {exc}"]
+
+    prefix = "controller_runtime: "
+    records: list[Mapping[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.startswith(prefix):
+            continue
+        try:
+            record = json.loads(line.removeprefix(prefix))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, Mapping) and record.get("pid") == pid:
+            records.append(record)
+    if not records:
+        return [f"{market} 控制器日志没有当前 PID：{pid}"]
+
+    record = records[-1]
+    errors: list[str] = []
+    if record.get("git_sha") != expected_sha:
+        errors.append(f"{market} 控制器日志 Git SHA 不匹配")
+    record_cwd = record.get("cwd")
+    if (
+        not isinstance(record_cwd, str)
+        or not record_cwd.strip()
+        or Path(record_cwd).resolve() != expected_cwd.resolve()
+    ):
+        errors.append(f"{market} 控制器日志工作目录不匹配")
+    try:
+        verified_at = datetime.fromisoformat(str(record.get("verified_at") or ""))
+        if verified_at.tzinfo is None or verified_at.utcoffset() is None:
+            raise ValueError
+        if verified_at < process_started_at:
+            errors.append(f"{market} 控制器日志早于当前进程")
+    except (TypeError, ValueError):
+        errors.append(f"{market} 控制器日志验证时间无效")
+    offset = record.get("stderr_offset")
+    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= len(stderr):
+        errors.append(f"{market} 控制器 stderr 起点无效")
+    elif stderr[offset:].strip():
+        errors.append(f"{market} 控制器 stderr 包含启动后输出")
+    return errors
+
+
+def _trend_controller_errors(
+    payload: Mapping[str, Any],
+    *,
+    expected_root: Path,
+    expected_sha: str,
+    now: datetime | None = None,
+) -> list[str]:
+    controllers = payload.get("trend_controllers")
+    if not isinstance(controllers, Mapping):
+        return ["Dashboard 缺少三市场趋势控制器状态"]
+
+    errors: list[str] = []
+    current = now or datetime.now().astimezone()
+    expected_cwd = expected_root.resolve()
+    for broker, market in TREND_SIMULATE_MARKETS.items():
+        controller = controllers.get(broker)
+        if not isinstance(controller, Mapping):
+            errors.append(f"{broker} 控制器状态缺失")
+            continue
+        if (
+            controller.get("effective_mode") != "execute"
+            or controller.get("health") != "healthy"
+            or controller.get("blocking") is not False
+            or controller.get("blocker") not in (None, "")
+        ):
+            errors.append(f"{broker} 控制器不可用或阻塞")
+        if controller.get("last_success") is None:
+            errors.append(f"{broker} 控制器尚无首次成功状态")
+
+        pid = controller.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            errors.append(f"{broker} 控制器 PID 无效")
+            continue
+        try:
+            os.kill(pid, 0)
+        except OSError as exc:
+            errors.append(f"{broker} 控制器 PID 不存活：{pid}（{exc}）")
+            continue
+
+        working_directory = controller.get("working_directory")
+        if (
+            not isinstance(working_directory, str)
+            or not working_directory.strip()
+            or Path(working_directory).resolve() != expected_cwd
+        ):
+            errors.append(f"{broker} 控制器工作目录不匹配")
+        if controller.get("git_sha") != expected_sha:
+            errors.append(f"{broker} 控制器 Git SHA 不匹配")
+        try:
+            heartbeat = datetime.fromisoformat(
+                str(controller.get("heartbeat_at") or "")
+            )
+            if heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
+                raise ValueError
+            if abs(current - heartbeat) > timedelta(minutes=2):
+                errors.append(f"{broker} 控制器心跳不新鲜")
+        except (TypeError, ValueError):
+            errors.append(f"{broker} 控制器心跳无效")
+
+        try:
+            process_cwd = _process_cwd(pid)
+            process_started_at = _process_started_at(pid)
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+            errors.append(
+                f"{broker} 控制器进程事实读取失败：{type(exc).__name__}: {exc}"
+            )
+            continue
+        if process_cwd != expected_cwd:
+            errors.append(f"{broker} 控制器实际工作目录不匹配")
+        errors.extend(_controller_log_errors(
+            expected_root,
+            market=market,
+            pid=pid,
+            expected_sha=expected_sha,
+            expected_cwd=expected_cwd,
+            process_started_at=process_started_at,
+        ))
+    return errors
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8766")
@@ -3071,6 +3217,11 @@ def main(argv: list[str] | None = None) -> int:
             expected_rows=args.expected_rows,
             expected_phillips_total=phillips_total,
             expected_phillips_period=phillips_period,
+        ))
+        errors.extend(_trend_controller_errors(
+            second,
+            expected_root=args.expected_root,
+            expected_sha=expected_sha,
         ))
         if account_ids:
             errors.extend(validate_integrated_candidate(

@@ -420,6 +420,26 @@ def _load_trend_controllers(
                 "reason": "controller heartbeat is stale",
                 "blocker": "controller heartbeat is stale",
             }
+        unhealthy_phase = payload["phase"] in {
+            "starting",
+            "reconciling",
+            "recovering_report",
+            "blocked",
+            "uncertain",
+            "conflict",
+            "missed",
+        }
+        if payload["blocker"] not in (None, "") or unhealthy_phase:
+            reason = str(
+                payload["blocker"] or f"controller phase is {payload['phase']}"
+            )
+            return {
+                **payload,
+                "market": market,
+                "health": "unavailable",
+                "blocking": True,
+                "reason": reason,
+            }
         return {
             **payload,
             "market": market,

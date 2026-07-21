@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from collections.abc import Mapping
 import copy
@@ -213,6 +213,7 @@ def _run_acceptance_main_with_reports(
     browser_log_text: str = "",
     log_is_directory: bool = False,
     log_read_error: OSError | None = None,
+    controller_errors: list[str] | None = None,
 ) -> tuple[int, dict[str, object], list[Path | None]]:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -285,6 +286,11 @@ def _run_acceptance_main_with_reports(
         dashboard_acceptance,
         "validate_integrated_candidate",
         lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_trend_controller_errors",
+        lambda *args, **kwargs: list(controller_errors or []),
     )
     monkeypatch.setattr(
         dashboard_acceptance,
@@ -402,6 +408,27 @@ def test_acceptance_main_fails_on_traceback_written_during_browser_check(
     assert status == 1
     assert result["status"] == "FAIL"
     assert "日志包含错误标记：Traceback (most recent call last)" in result["errors"]
+
+
+def test_acceptance_main_fails_on_controller_runtime_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "shared" / "reports"
+    reports.mkdir(parents=True)
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [reports, reports],
+        controller_errors=["tiger 控制器不可用或阻塞"],
+    )
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert "tiger 控制器不可用或阻塞" in result["errors"]
 
 
 @pytest.mark.parametrize(
@@ -4926,6 +4953,229 @@ def test_acceptance_rejects_log_older_than_candidate_process(tmp_path: Path) -> 
     )
 
     assert any("修改时间" in error for error in errors)
+
+
+def _controller_runtime_payload(
+    tmp_path: Path,
+    *,
+    now: datetime,
+) -> dict[str, object]:
+    payload = valid_payload()
+    controllers = payload["trend_controllers"]
+    assert isinstance(controllers, dict)
+    for pid, (broker, controller) in enumerate(controllers.items(), start=4210):
+        assert isinstance(controller, dict)
+        controller.update({
+            "pid": pid,
+            "working_directory": str(tmp_path),
+            "git_sha": "accepted-sha",
+            "heartbeat_at": now.isoformat(),
+        })
+        market = str(controller["market"]).lower()
+        logs = tmp_path / "logs/daily_premarket"
+        logs.mkdir(parents=True, exist_ok=True)
+        runtime = {
+            "pid": pid,
+            "git_sha": "accepted-sha",
+            "cwd": str(tmp_path),
+            "verified_at": now.isoformat(),
+            "stderr_offset": 0,
+        }
+        (logs / f"launchd-trend-controller-{market}.out.log").write_text(
+            f"controller_runtime: {json.dumps(runtime)}\n", encoding="utf-8"
+        )
+        (logs / f"launchd-trend-controller-{market}.err.log").write_text(
+            "", encoding="utf-8"
+        )
+    return payload
+
+
+def _controller_runtime_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    now: datetime,
+    payload: dict[str, object],
+) -> list[str]:
+    monkeypatch.setattr(dashboard_acceptance.os, "kill", lambda *_args: None)
+    monkeypatch.setattr(
+        dashboard_acceptance, "_process_cwd", lambda _pid: tmp_path.resolve()
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_process_started_at",
+        lambda _pid: now - timedelta(seconds=1),
+    )
+    return dashboard_acceptance._trend_controller_errors(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="accepted-sha",
+        now=now,
+    )
+
+
+def test_acceptance_rejects_fresh_blocked_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({  # type: ignore[union-attr]
+        "health": "unavailable",
+        "blocking": True,
+        "phase": "recovering_report",
+        "blocker": "report generation failed",
+    })
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and "阻塞" in error for error in errors)
+
+
+def test_acceptance_accepts_matching_controller_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+
+    assert _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    ) == []
+
+
+def test_acceptance_rejects_controller_without_first_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    payload["trend_controllers"]["tiger"]["last_success"] = None  # type: ignore[index]
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and "成功" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("working_directory", "/wrong/review", "工作目录"),
+        ("git_sha", "old-sha", "Git SHA"),
+        ("heartbeat_at", "2026-07-21T09:20:00+08:00", "心跳"),
+    ],
+)
+def test_acceptance_rejects_controller_status_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    payload["trend_controllers"]["tiger"][field] = value  # type: ignore[index]
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and message in error for error in errors)
+
+
+def test_acceptance_rejects_missing_controller_working_directory_from_expected_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    payload["trend_controllers"]["tiger"]["working_directory"] = ""  # type: ignore[index]
+    monkeypatch.chdir(tmp_path)
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and "工作目录" in error for error in errors)
+
+
+def test_acceptance_rejects_missing_controller_log_cwd_from_expected_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    pid = payload["trend_controllers"]["tiger"]["pid"]  # type: ignore[index]
+    runtime = {
+        "pid": pid,
+        "git_sha": "accepted-sha",
+        "verified_at": now.isoformat(),
+        "stderr_offset": 0,
+    }
+    stdout = (
+        tmp_path
+        / "logs/daily_premarket/launchd-trend-controller-us.out.log"
+    )
+    stdout.write_text(
+        f"controller_runtime: {json.dumps(runtime)}\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("US" in error and "工作目录" in error for error in errors)
+
+
+def test_acceptance_rejects_dead_controller_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    dead_pid = payload["trend_controllers"]["tiger"]["pid"]  # type: ignore[index]
+
+    def kill(pid: int, signal: int) -> None:
+        del signal
+        if pid == dead_pid:
+            raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(dashboard_acceptance.os, "kill", kill)
+    monkeypatch.setattr(
+        dashboard_acceptance, "_process_cwd", lambda _pid: tmp_path.resolve()
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_process_started_at",
+        lambda _pid: now - timedelta(seconds=1),
+    )
+
+    errors = dashboard_acceptance._trend_controller_errors(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="accepted-sha",
+        now=now,
+    )
+
+    assert any("tiger" in error and "PID" in error for error in errors)
+
+
+def test_acceptance_rejects_fresh_controller_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    stderr = (
+        tmp_path
+        / "logs/daily_premarket/launchd-trend-controller-us.err.log"
+    )
+    stderr.write_text("Traceback (most recent call last):\n", encoding="utf-8")
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("US" in error and "stderr" in error for error in errors)
 
 
 def test_acceptance_derives_cn_count_from_canonical_portfolio(

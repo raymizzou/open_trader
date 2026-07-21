@@ -135,6 +135,8 @@ if [[ -z "$OPEN_TRADER_REPO" || -z "$OPEN_TRADER_PYTHON" ]]; then
 fi
 OPEN_TRADER_REPO="$(expand_home_path "$OPEN_TRADER_REPO")"
 OPEN_TRADER_PYTHON="$(resolve_config_path "$OPEN_TRADER_PYTHON" "$OPEN_TRADER_REPO")"
+OPEN_TRADER_DATA_DIR="$(read_env_value OPEN_TRADER_DATA_DIR)"
+OPEN_TRADER_DATA_DIR="$(resolve_config_path "${OPEN_TRADER_DATA_DIR:-data}" "$OPEN_TRADER_REPO")"
 
 PREMARKET_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.premarket.plist.template"
 CONTROLLER_TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.trend-market-controller.plist.template"
@@ -274,13 +276,104 @@ verify_legacy_processes_absent() {
   done < <(legacy_process_patterns "$market")
 }
 
+controller_status_matches() {
+  "$OPEN_TRADER_PYTHON" - "$@" <<'PY'
+from datetime import datetime
+import json
+from pathlib import Path
+import sys
+
+path, pid, cwd, git_sha, loaded_at = sys.argv[1:]
+try:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    heartbeat = datetime.fromisoformat(str(payload["heartbeat_at"]))
+    working_directory = payload.get("working_directory")
+    valid = (
+        payload.get("schema_version")
+        == "open_trader.trend_controller.status.v1"
+        and payload.get("effective_mode") == "execute"
+        and type(payload.get("pid")) is int
+        and payload["pid"] == int(pid)
+        and isinstance(working_directory, str)
+        and bool(working_directory.strip())
+        and Path(working_directory).resolve() == Path(cwd).resolve()
+        and payload.get("git_sha") == git_sha
+        and heartbeat.tzinfo is not None
+        and heartbeat.utcoffset() is not None
+        and heartbeat.timestamp() >= int(loaded_at)
+        and abs((datetime.now().astimezone() - heartbeat).total_seconds()) <= 120
+    )
+except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+}
+
+record_controller_runtime() {
+  "$OPEN_TRADER_PYTHON" - "$@" <<'PY'
+from datetime import datetime
+import json
+from pathlib import Path
+import sys
+
+status_path, log_path, stderr_offset = sys.argv[1:]
+status = json.loads(Path(status_path).read_text(encoding="utf-8"))
+record = {
+    "pid": status["pid"],
+    "git_sha": status["git_sha"],
+    "cwd": status["working_directory"],
+    "verified_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    "stderr_offset": int(stderr_offset),
+}
+with Path(log_path).open("a", encoding="utf-8") as handle:
+    handle.write("controller_runtime: ")
+    handle.write(json.dumps(record, ensure_ascii=False))
+    handle.write("\n")
+PY
+}
+
+verify_loaded_controller() {
+  local label="$1" market="$2" loaded_at="$3" stderr_offset="$4"
+  local attempt output pid status_path expected_sha out_log
+  status_path="$OPEN_TRADER_DATA_DIR/trend_controller/$market/status.json"
+  expected_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  out_log="$REPO_ROOT/logs/daily_premarket/launchd-trend-controller-$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]').out.log"
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    output="$(launchctl print "gui/$UID/$label" 2>&1 || true)"
+    pid="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }')"
+    if [[ -n "$pid" ]] && controller_status_matches \
+      "$status_path" "$pid" "$REPO_ROOT" "$expected_sha" "$loaded_at"; then
+      if ! record_controller_runtime "$status_path" "$out_log" "$stderr_offset"; then
+        launchctl bootout "gui/$UID/$label" 2>/dev/null || true
+        echo "failed to record controller runtime: $label" >&2
+        return 1
+      fi
+      echo "verified launchd controller: $market pid=$pid"
+      return 0
+    fi
+    if [[ "$attempt" -lt 15 ]]; then
+      sleep 1
+    fi
+  done
+  launchctl bootout "gui/$UID/$label" 2>/dev/null || true
+  echo "controller did not write fresh matching status: $label" >&2
+  return 1
+}
+
 install_rendered() {
-  local label="$1" rendered="$2" target
+  local label="$1" market="$2" rendered="$3" target loaded_at stderr_path stderr_offset
   target="$HOME/Library/LaunchAgents/$label.plist"
   mkdir -p "$HOME/Library/LaunchAgents" "$REPO_ROOT/logs/daily_premarket"
   printf '%s\n' "$rendered" > "$target"
   plutil -lint "$target" >/dev/null
+  stderr_path="$REPO_ROOT/logs/daily_premarket/launchd-trend-controller-$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]').err.log"
+  stderr_offset=0
+  if [[ -f "$stderr_path" ]]; then
+    stderr_offset="$(wc -c < "$stderr_path" | tr -d '[:space:]')"
+  fi
+  loaded_at="$(date +%s)"
   launchctl load "$target"
+  verify_loaded_controller "$label" "$market" "$loaded_at" "$stderr_offset"
   echo "installed launchd agent: $target"
 }
 
@@ -379,5 +472,5 @@ for market in "${selected_markets[@]}"; do
   label="com.open-trader.trend-market-controller.$lower"
   rendered="$(render_controller "$market")"
   lint_rendered "$rendered"
-  install_rendered "$label" "$rendered"
+  install_rendered "$label" "$market" "$rendered"
 done

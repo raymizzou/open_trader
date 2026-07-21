@@ -121,6 +121,64 @@ def test_dashboard_projects_strict_controller_health(
         assert "OPEN_TRADER_TREND_EXECUTOR_HOST" in controller["reason"]
 
 
+def test_dashboard_projects_fresh_controller_blocker_as_unavailable(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _load_trend_controllers
+
+    now = datetime(2026, 7, 21, 9, 31, tzinfo=timezone(timedelta(hours=8)))
+    path = tmp_path / "trend_controller/US/status.json"
+    path.parent.mkdir(parents=True)
+    payload = _controller_status(heartbeat_at=now.isoformat())
+    payload.update({
+        "phase": "recovering_report",
+        "last_success": None,
+        "blocker": "report generation failed: upstream unavailable",
+    })
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    controller = _load_trend_controllers(
+        tmp_path,
+        executor_host="ray-mac",
+        now=now,
+        hostname_fn=lambda: "ray-mac",
+    )["tiger"]
+
+    assert controller["health"] == "unavailable"
+    assert controller["blocking"] is True
+    assert controller["reason"] == payload["blocker"]
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "starting", "reconciling", "recovering_report", "blocked", "uncertain",
+        "conflict", "missed",
+    ],
+)
+def test_dashboard_projects_unhealthy_controller_phase_as_unavailable(
+    tmp_path: Path, phase: str,
+) -> None:
+    from open_trader.dashboard import _load_trend_controllers
+
+    now = datetime(2026, 7, 21, 9, 31, tzinfo=timezone(timedelta(hours=8)))
+    path = tmp_path / "trend_controller/US/status.json"
+    path.parent.mkdir(parents=True)
+    payload = _controller_status(heartbeat_at=now.isoformat())
+    payload.update({"phase": phase, "blocker": None})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    controller = _load_trend_controllers(
+        tmp_path,
+        executor_host="ray-mac",
+        now=now,
+        hostname_fn=lambda: "ray-mac",
+    )["tiger"]
+
+    assert controller["health"] == "unavailable"
+    assert controller["blocking"] is True
+
+
 @pytest.mark.parametrize("status", ["uncertain", "conflict", "missed"])
 def test_dashboard_preserves_terminal_trend_action_status(
     tmp_path: Path, status: str,

@@ -5,6 +5,7 @@ import json
 import plistlib
 import shutil
 import subprocess
+import sys
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -4713,6 +4714,57 @@ def test_launchd_installer_executor_migrates_only_requested_market(
     assert not any("trend-a-share" in call or "controller.cn" in call for call in calls)
 
 
+@pytest.mark.parametrize("status_mode", ["fresh", "eventual-fresh"])
+def test_launchd_installer_waits_for_fresh_matching_controller_status(
+    tmp_path: Path, status_mode: str,
+) -> None:
+    result, repo, calls = _run_fake_controller_install(
+        tmp_path, status_mode=status_mode
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "verified launchd controller: US pid=4242" in result.stdout
+    load_index = next(i for i, call in enumerate(calls) if call.startswith("load "))
+    post_load_prints = [
+        call for i, call in enumerate(calls)
+        if i > load_index
+        and call.startswith("print ")
+        and call.endswith("com.open-trader.trend-market-controller.us")
+    ]
+    assert len(post_load_prints) == (2 if status_mode == "eventual-fresh" else 1)
+    runtime_log = (
+        repo
+        / "logs/daily_premarket/launchd-trend-controller-us.out.log"
+    ).read_text(encoding="utf-8")
+    assert "controller_runtime: " in runtime_log
+    assert '"pid": 4242' in runtime_log
+
+
+@pytest.mark.parametrize(
+    "status_mode",
+    [
+        "stale", "malformed", "pid-mismatch", "cwd-mismatch", "cwd-missing",
+        "sha-mismatch",
+    ],
+)
+def test_launchd_installer_fails_closed_on_unmatched_controller_status(
+    tmp_path: Path, status_mode: str,
+) -> None:
+    result, _repo, calls = _run_fake_controller_install(
+        tmp_path, status_mode=status_mode
+    )
+
+    assert result.returncode == 1
+    assert "controller did not write fresh matching status" in result.stderr
+    load_index = next(i for i, call in enumerate(calls) if call.startswith("load "))
+    assert any(
+        i > load_index
+        and call.startswith("print ")
+        and call.endswith("com.open-trader.trend-market-controller.us")
+        for i, call in enumerate(calls)
+    )
+
+
 def test_launchd_installer_readonly_cleans_all_trend_automation(
     tmp_path: Path,
 ) -> None:
@@ -5690,6 +5742,41 @@ def _fake_launchctl_bin(tmp_path: Path) -> Path:
     launchctl = fake_bin / "launchctl"
     launchctl.write_text(
         """#!/usr/bin/env bash
+state_dir="$HOME/.open-trader-fake-launchctl"
+mkdir -p "$state_dir"
+
+write_controller_status() {
+  status_mode="$1"
+  status_pid="$2"
+  status_repo="$3"
+  status_sha="$4"
+  status_market="$5"
+  status_path="$status_repo/data/trend_controller/$status_market/status.json"
+  mkdir -p "$(dirname "$status_path")" "$status_repo/logs/daily_premarket"
+  : >> "$status_repo/logs/daily_premarket/launchd-trend-controller-$(printf '%s' "$status_market" | tr '[:upper:]' '[:lower:]').out.log"
+  : >> "$status_repo/logs/daily_premarket/launchd-trend-controller-$(printf '%s' "$status_market" | tr '[:upper:]' '[:lower:]').err.log"
+  if [[ "$status_mode" == "missing" ]]; then
+    return
+  fi
+  if [[ "$status_mode" == "malformed" ]]; then
+    printf '{' > "$status_path"
+    return
+  fi
+  heartbeat="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if [[ "$status_mode" == "stale" || "$status_mode" == "eventual-fresh" ]]; then
+    heartbeat="2000-01-01T00:00:00Z"
+  elif [[ "$status_mode" == "pid-mismatch" ]]; then
+    status_pid=$((status_pid + 1))
+  elif [[ "$status_mode" == "cwd-mismatch" ]]; then
+    status_repo="/wrong/review"
+  elif [[ "$status_mode" == "cwd-missing" ]]; then
+    status_repo=""
+  elif [[ "$status_mode" == "sha-mismatch" ]]; then
+    status_sha="old-sha"
+  fi
+  printf '%s\\n' "{\\"schema_version\\":\\"open_trader.trend_controller.status.v1\\",\\"effective_mode\\":\\"execute\\",\\"executor_host\\":\\"fake-host\\",\\"local_host\\":\\"fake-host\\",\\"pid\\":$status_pid,\\"working_directory\\":\\"$status_repo\\",\\"git_sha\\":\\"$status_sha\\",\\"phase\\":\\"monitoring\\",\\"heartbeat_at\\":\\"$heartbeat\\",\\"last_success\\":null,\\"blocker\\":null,\\"next_check_at\\":\\"$heartbeat\\"}" > "$status_path"
+}
+
 if [[ -n "${OPEN_TRADER_LAUNCHCTL_LOG:-}" ]]; then
   printf '%s\\n' "$*" >> "$OPEN_TRADER_LAUNCHCTL_LOG"
 fi
@@ -5716,12 +5803,50 @@ if [[ "${1:-}" == "print" ]]; then
       exit 0
     fi
   fi
+  label="${*: -1}"
+  label="${label##*/}"
+  state="$state_dir/$label"
+  if [[ -f "$state" ]]; then
+    status_pid="$(sed -n '1p' "$state")"
+    status_repo="$(sed -n '2p' "$state")"
+    status_sha="$(sed -n '3p' "$state")"
+    status_market="$(sed -n '4p' "$state")"
+    if [[ "${OPEN_TRADER_FAKE_CONTROLLER_STATUS_MODE:-fresh}" == "eventual-fresh" ]]; then
+      count=0
+      if [[ -f "$state.prints" ]]; then
+        read -r count < "$state.prints"
+      fi
+      count=$((count + 1))
+      printf '%s\\n' "$count" > "$state.prints"
+      if [[ "$count" -ge 2 ]]; then
+        write_controller_status fresh "$status_pid" "$status_repo" "$status_sha" "$status_market"
+      fi
+    fi
+    echo "pid = $status_pid"
+    exit 0
+  fi
   echo "Bad request." >&2
   echo "Could not find service '$*' in domain for user gui" >&2
   exit "${OPEN_TRADER_PRINT_EXIT:-113}"
 fi
 if [[ "${1:-}" == "bootout" ]]; then
+  label="${*: -1}"
+  label="${label##*/}"
+  rm -f "$state_dir/$label" "$state_dir/$label.prints"
   exit "${OPEN_TRADER_BOOTOUT_EXIT:-0}"
+fi
+if [[ "${1:-}" == "load" ]]; then
+  plist="${2:-}"
+  label="$(basename "$plist" .plist)"
+  status_market="$(printf '%s' "${label##*.}" | tr '[:lower:]' '[:upper:]')"
+  status_repo="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$plist")"
+  status_sha="$(git -C "$status_repo" rev-parse HEAD)"
+  status_pid=4242
+  printf '%s\\n%s\\n%s\\n%s\\n' \
+    "$status_pid" "$status_repo" "$status_sha" "$status_market" > "$state_dir/$label"
+  write_controller_status "${OPEN_TRADER_FAKE_CONTROLLER_STATUS_MODE:-fresh}" \
+    "$status_pid" "$status_repo" "$status_sha" "$status_market"
+  exit 0
 fi
 exit 0
 """,
@@ -5776,4 +5901,46 @@ def _copy_launchd_installer_assets(tmp_path: Path) -> Path:
         source_root / "scripts/uninstall_daily_premarket_launchd.sh",
         repo / "scripts/uninstall_daily_premarket_launchd.sh",
     )
+    python = repo / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Codex",
+            "-c", "user.email=codex@example.invalid", "commit", "-qm", "fixture",
+        ],
+        check=True,
+    )
     return repo
+
+
+def _run_fake_controller_install(
+    tmp_path: Path, *, status_mode: str,
+) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    launchctl_log = tmp_path / "launchctl.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(launchctl_log),
+            "OPEN_TRADER_FAKE_CONTROLLER_STATUS_MODE": status_mode,
+        },
+    )
+    calls = launchctl_log.read_text(encoding="utf-8").splitlines()
+    return result, repo, calls
