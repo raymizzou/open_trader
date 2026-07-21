@@ -132,7 +132,10 @@ from .trend_market_controller import (
     load_trend_market_status,
     run_trend_market_controller,
 )
-from .strategy_drawdown import manual_unlock_strategy_drawdown
+from .strategy_drawdown import (
+    manual_unlock_strategy_drawdown,
+    strategy_drawdown_state_status,
+)
 from .drawdown_preflight import (
     DrawdownMarketInput,
     frozen_missing_baseline,
@@ -1361,6 +1364,7 @@ def main(argv: list[str] | None = None) -> int:
             if now.tzinfo is None or now.utcoffset() is None:
                 raise ValueError("drawdown preflight clock must be timezone-aware")
             occurred_at = now.isoformat(timespec="seconds")
+            drawdown_state_status = strategy_drawdown_state_status(config.data_dir)
             quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
             inputs: dict[str, DrawdownMarketInput] = {}
             for market in ("CN", "HK", "US"):
@@ -1392,7 +1396,7 @@ def main(argv: list[str] | None = None) -> int:
                         strategy_version=str(strategy["strategy_version"]),
                         source_date=source_date,
                     )
-                    if baseline is None:
+                    if baseline is None and drawdown_state_status != "ok":
                         raise ValueError(
                             f"{market} completed-date frozen Futu baseline "
                             f"is unavailable for {source_date}"

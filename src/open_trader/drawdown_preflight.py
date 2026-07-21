@@ -158,18 +158,6 @@ def run_drawdown_preflight(
                 {"market": market, "status": "unavailable", "error": item.error}
             )
             continue
-        if (
-            item.baseline_equity is None
-            or item.source_date is None
-            or item.entry_eligible_from is None
-        ):
-            results.append({
-                "market": market,
-                "status": "failed",
-                "failure_status": "baseline_unavailable",
-                "error": "completed-date frozen Futu baseline is unavailable",
-            })
-            continue
         strategy_id = str(item.strategy_snapshot.get("strategy_id") or "")
         strategy_version = str(
             item.strategy_snapshot.get("strategy_version") or ""
@@ -186,6 +174,18 @@ def run_drawdown_preflight(
             continue
         key = (market, strategy_id, strategy_version)
         was_present = key in existing_keys
+        if not was_present and (
+            item.baseline_equity is None
+            or item.source_date is None
+            or item.entry_eligible_from is None
+        ):
+            results.append({
+                "market": market,
+                "status": "failed",
+                "failure_status": "baseline_unavailable",
+                "error": "completed-date frozen Futu baseline is unavailable",
+            })
+            continue
         reason = (
             "first_activation"
             if first_activation or not any(row[0] == market for row in existing_keys)

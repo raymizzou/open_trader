@@ -100,6 +100,31 @@ def test_first_activation_bootstraps_markets_and_is_idempotent(tmp_path: Path) -
     }
 
 
+def test_existing_state_does_not_require_repeated_frozen_baseline(
+    tmp_path: Path,
+) -> None:
+    item = market_input("CN")
+    assert run_preflight(tmp_path, {"CN": item})["status"] == "ready"
+    state_path = tmp_path / "data/trend_drawdown/state.json"
+    before = state_path.read_bytes()
+
+    result = run_preflight(
+        tmp_path,
+        {
+            "CN": replace(
+                item,
+                baseline_equity=None,
+                source_date=None,
+                entry_eligible_from=None,
+            )
+        },
+    )
+
+    assert result["status"] == "ready"
+    assert result["markets"][0]["status"] == "ready"
+    assert state_path.read_bytes() == before
+
+
 def test_late_preflight_reports_entries_blocked_until_eligible_date(
     tmp_path: Path,
 ) -> None:
