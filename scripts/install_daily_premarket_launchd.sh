@@ -195,11 +195,21 @@ stop_label() {
 }
 
 verify_absent() {
-  local label="$1" attempt
+  local label="$1" attempt output status
   for attempt in 1 2 3 4 5; do
-    if ! launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
+    if output="$(launchctl print "gui/$UID/$label" 2>&1)"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [[ "$status" -ne 0 && "$output" == *"Could not find service"* ]]; then
       echo "verified launchd label absent: $label"
       return 0
+    fi
+    if [[ "$status" -ne 0 ]]; then
+      echo "failed to inspect launchd label: $label" >&2
+      printf '%s\n' "$output" >&2
+      return 1
     fi
     if [[ "$attempt" -lt 5 ]]; then
       sleep 1

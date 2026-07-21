@@ -4977,6 +4977,58 @@ def test_launchd_installer_fails_after_five_present_label_checks(
     assert not any(call.startswith("launchctl load ") for call in calls)
 
 
+@pytest.mark.parametrize(
+    ("market", "error_label"),
+    [
+        ("US", "com.open-trader.trend-us-report"),
+        ("all", "com.open-trader.trend-hk-report"),
+    ],
+)
+def test_launchd_installer_fails_closed_on_launchctl_print_error(
+    tmp_path: Path,
+    market: str,
+    error_label: str,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    operations = tmp_path / "operations.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            market,
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_OPERATION_LOG": str(operations),
+            "OPEN_TRADER_PRINT_ERROR_LABEL": error_label,
+            "OPEN_TRADER_PRINT_ERROR_STATUS": "3",
+            "OPEN_TRADER_PRINT_ERROR_MESSAGE": "I/O error",
+        },
+    )
+
+    assert result.returncode == 1
+    assert f"failed to inspect launchd label: {error_label}" in result.stderr
+    assert "I/O error" in result.stderr
+    calls = operations.read_text(encoding="utf-8").splitlines()
+    error_prints = [
+        call
+        for call in calls
+        if call.startswith("launchctl print ") and call.endswith(error_label)
+    ]
+    assert len(error_prints) == 1
+    assert not any(call.startswith("pgrep ") for call in calls)
+    assert not any(call.startswith("launchctl load ") for call in calls)
+
+
 def test_launchd_installer_readonly_fails_when_orphan_process_remains(
     tmp_path: Path,
 ) -> None:
@@ -5645,6 +5697,11 @@ if [[ -n "${OPEN_TRADER_OPERATION_LOG:-}" ]]; then
   printf 'launchctl %s\\n' "$*" >> "$OPEN_TRADER_OPERATION_LOG"
 fi
 if [[ "${1:-}" == "print" ]]; then
+  if [[ -n "${OPEN_TRADER_PRINT_ERROR_LABEL:-}" && "$*" == *"$OPEN_TRADER_PRINT_ERROR_LABEL" ]]; then
+    echo "Bad request." >&2
+    echo "${OPEN_TRADER_PRINT_ERROR_MESSAGE:-I/O error}" >&2
+    exit "${OPEN_TRADER_PRINT_ERROR_STATUS:-3}"
+  fi
   if [[ -n "${OPEN_TRADER_PRESENT_LABEL:-}" && "$*" == *"$OPEN_TRADER_PRESENT_LABEL" ]]; then
     if [[ -z "${OPEN_TRADER_PRESENT_PRINTS:-}" ]]; then
       exit 0
@@ -5659,7 +5716,9 @@ if [[ "${1:-}" == "print" ]]; then
       exit 0
     fi
   fi
-  exit "${OPEN_TRADER_PRINT_EXIT:-1}"
+  echo "Bad request." >&2
+  echo "Could not find service '$*' in domain for user gui" >&2
+  exit "${OPEN_TRADER_PRINT_EXIT:-113}"
 fi
 if [[ "${1:-}" == "bootout" ]]; then
   exit "${OPEN_TRADER_BOOTOUT_EXIT:-0}"
