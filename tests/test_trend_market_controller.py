@@ -5,6 +5,7 @@ import hashlib
 import socket
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
@@ -99,6 +100,7 @@ def valid_cn_report(
             "position_count": 0,
         },
         "metadata": {"market": "CN", "broker": "eastmoney"},
+        "protection_state": {"schema_version": 1, "positions": {}},
         "strategy_snapshot": {
             "strategy_id": "trend_animals_warm_to_hot/CN/v1",
             "strategy_version": "v1",
@@ -147,6 +149,7 @@ def write_report_delivery_receipt(
     markdown: str = "# frozen",
     receipt_report: dict[str, object] | None = None,
     receipt_markdown: str | None = None,
+    receipt_protection_state: dict[str, object] | None = None,
 ) -> Path:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_json = json.dumps(report)
@@ -165,7 +168,11 @@ def write_report_delivery_receipt(
         artifact_stem=report_path.stem,
         markdown=receipt_markdown if receipt_markdown is not None else markdown,
         report_json=json.dumps(receipt_report or report),
-        protection_state={"schema_version": 1, "positions": {}},
+        protection_state=(
+            receipt_protection_state
+            if receipt_protection_state is not None
+            else report["protection_state"]
+        ),
     )
     return receipt_path
 
@@ -1894,6 +1901,43 @@ def test_controller_rejects_receipt_bound_to_different_frozen_artifacts(
     assert generated == []
 
 
+@pytest.mark.parametrize("market", ["CN", "HK", "US"])
+def test_prepared_recovery_rejects_receipt_protection_state_not_in_report(
+    tmp_path: Path, market: str
+) -> None:
+    config = controller_config(tmp_path)
+    report = valid_cn_report(
+        as_of_date="2026-07-17", execution_date="2026-07-20"
+    )
+    report["metadata"] = {
+        "market": market,
+        "broker": {"CN": "eastmoney", "HK": "phillips", "US": "tiger"}[market],
+    }
+    report_path = controller._report_dir(config, market) / "2026-07-17-r1.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_json = json.dumps(report)
+    report_path.write_text(report_json, encoding="utf-8")
+    report_path.with_suffix(".md").write_text("# frozen", encoding="utf-8")
+    receipt_path = controller._delivery_receipt_path(config, market, report_path)
+    a_share_trend._write_delivery_receipt(
+        receipt_path,
+        status="prepared",
+        generated_at=str(report["generated_at"]),
+        artifact_stem=report_path.stem,
+        markdown="# frozen",
+        report_json=report_json,
+        protection_state={
+            "schema_version": 1,
+            "positions": {"different": {"active_line": "1"}},
+        },
+    )
+
+    with pytest.raises(ValueError, match="protection state"):
+        controller._recovery_revision_for_report(
+            config, market, (report_path, report)
+        )
+
+
 def test_failed_r1_delivery_without_request_recovers_in_revision_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2315,6 +2359,181 @@ def test_revision_request_freezes_latest_report_baseline(
         baseline_path.read_bytes()
     ).hexdigest()
     assert request["baseline_revision"] == 1
+
+
+@pytest.mark.parametrize(
+    ("market", "relative_lock"),
+    [
+        ("CN", "runs/.trend_a_share_report.lock"),
+        ("HK", "runs/.trend_hk_phillips_report.lock"),
+        ("US", "runs/.trend_us_tiger_report.lock"),
+    ],
+)
+def test_revision_request_waits_for_report_freeze_before_capturing_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+    relative_lock: str,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(active_cn_cycle(), market=market)
+    report_path = controller._report_dir(config, market) / "2026-07-17.json"
+    report_lock = config.data_dir / relative_lock
+    lock_held = threading.Event()
+    release_report = threading.Event()
+    baseline_checked = threading.Event()
+    lock_visible_at_baseline: list[bool] = []
+    original_baseline = controller._revision_baseline
+
+    def observe_baseline(
+        observed_config: DailyPremarketConfig, observed_cycle: ControllerCycle
+    ) -> tuple[Path | None, str | None, int]:
+        lock_visible_at_baseline.append(report_lock.exists())
+        baseline_checked.set()
+        return original_baseline(observed_config, observed_cycle)
+
+    def freeze_base_report() -> None:
+        with RunLock(report_lock):
+            lock_held.set()
+            assert release_report.wait(timeout=2)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = (
+                valid_cn_report(
+                    as_of_date=cycle.as_of_date,
+                    execution_date=cycle.execution_date,
+                )
+                if market == "CN"
+                else {}
+            )
+            report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(controller, "_revision_baseline", observe_baseline)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        freeze_future = pool.submit(freeze_base_report)
+        assert lock_held.wait(timeout=1)
+        request_future = pool.submit(controller._request_revision, config, cycle, NOW)
+        try:
+            assert not baseline_checked.wait(timeout=0.1)
+        finally:
+            release_report.set()
+        freeze_future.result(timeout=1)
+        request_path = request_future.result(timeout=1)
+
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["baseline_report_path"] == str(report_path)
+    assert request["baseline_report_sha256"] == hashlib.sha256(
+        report_path.read_bytes()
+    ).hexdigest()
+    assert request["baseline_revision"] == 0
+    assert lock_visible_at_baseline == [True]
+    if market == "CN":
+        patch_cycle(monkeypatch, cycle)
+        generated: list[tuple[str, bool]] = []
+
+        def generate(
+            _config: DailyPremarketConfig,
+            _market: str,
+            run_date: str,
+            revision: bool,
+        ) -> None:
+            generated.append((run_date, revision))
+            r1_path, r1 = write_report(config, revision=1)
+            write_report_delivery_receipt(config, r1_path, r1, status="sent")
+
+        executed: list[Path] = []
+        monkeypatch.setattr(controller, "_generate_report", generate)
+        monkeypatch.setattr(
+            controller,
+            "_execute_locked_report",
+            lambda _config, _market, _date, path, _report, **_kwargs: executed.append(
+                path
+            )
+            or {"status": "unchanged", "submitted_count": 0},
+        )
+
+        run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+        assert generated == [(cycle.report_run_date, True)]
+        assert [path.name for path in executed] == ["2026-07-17-r1.json"]
+
+
+def test_revision_requested_without_baseline_requires_r1_not_r0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    patch_cycle(monkeypatch, cycle)
+    request_path = controller._request_revision(config, cycle, NOW)
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["baseline_revision"] == -1
+    r0_path, r0 = write_report(config)
+    write_report_delivery_receipt(config, r0_path, r0, status="sent")
+    generated: list[tuple[str, bool]] = []
+
+    def generate(
+        _config: DailyPremarketConfig,
+        _market: str,
+        run_date: str,
+        revision: bool,
+    ) -> None:
+        generated.append((run_date, revision))
+        r1_path, r1 = write_report(config, revision=1)
+        write_report_delivery_receipt(config, r1_path, r1, status="sent")
+
+    executed: list[Path] = []
+    monkeypatch.setattr(controller, "_generate_report", generate)
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda _config, _market, _date, path, _report, **_kwargs: executed.append(path)
+        or {"status": "unchanged", "submitted_count": 0},
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    _, completion_path = controller._revision_paths(
+        config, cycle.market, cycle.as_of_date
+    )
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    assert generated == [(cycle.report_run_date, True)]
+    assert [path.name for path in executed] == ["2026-07-17-r1.json"]
+    assert completion["report_path"].endswith("2026-07-17-r1.json")
+
+
+def test_revision_completion_rejects_r0_when_baseline_is_missing(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    request_path = controller._request_revision(config, cycle, NOW)
+    report_path, report = write_report(config)
+    write_report_delivery_receipt(config, report_path, report, status="sent")
+    _, completion_path = controller._revision_paths(
+        config, cycle.market, cycle.as_of_date
+    )
+    completion_path.parent.mkdir(parents=True, exist_ok=True)
+    completion_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.revision_completion.v1",
+            "market": cycle.market,
+            "as_of_date": cycle.as_of_date,
+            "execution_date": cycle.execution_date,
+            "request_path": str(request_path),
+            "request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+            "report_path": str(report_path),
+            "report_sha256": _report_hash(report),
+            "completed_at": NOW.isoformat(),
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid trend report revision completion"):
+        controller._revision_state(
+            config,
+            cycle.market,
+            cycle.as_of_date,
+            cycle.execution_date,
+        )
 
 
 def test_legacy_revision_request_without_baseline_fails_closed(

@@ -586,6 +586,8 @@ def _recovery_revision_for_report(
         or report_json != receipt["report_json"]
         or markdown != receipt["markdown"]
         or _report_hash(receipt_report) != _report_hash(payload)
+        or receipt["protection_state"] != receipt_report.get("protection_state")
+        or receipt_report.get("protection_state") != payload.get("protection_state")
     ):
         raise ValueError(
             f"delivery receipt does not match selected frozen artifacts: {receipt_path}"
@@ -975,6 +977,12 @@ def _revision_gate_path(
     )
 
 
+def _report_lock_path(config: DailyPremarketConfig, market: str) -> Path:
+    if market == "CN":
+        return config.data_dir / "runs/.trend_a_share_report.lock"
+    return market_paths(config.data_dir, config.reports_dir, market).report_lock
+
+
 def _revision_baseline(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
@@ -1018,26 +1026,27 @@ def _request_revision(
                     cycle.execution_date,
                 )
                 return request
-            baseline_path, baseline_sha, baseline_revision = _revision_baseline(
-                config, cycle
-            )
-            return _write_immutable(
-                request,
-                _canonical_json_bytes({
-                    "schema_version": (
-                        "open_trader.trend_controller.revision_request.v1"
-                    ),
-                    "market": cycle.market,
-                    "as_of_date": cycle.as_of_date,
-                    "execution_date": cycle.execution_date,
-                    "baseline_report_path": (
-                        str(baseline_path) if baseline_path is not None else None
-                    ),
-                    "baseline_report_sha256": baseline_sha,
-                    "baseline_revision": baseline_revision,
-                    "requested_at": now.isoformat(timespec="seconds"),
-                }),
-            )
+            with RunLock(_report_lock_path(config, cycle.market), wait=True):
+                baseline_path, baseline_sha, baseline_revision = _revision_baseline(
+                    config, cycle
+                )
+                return _write_immutable(
+                    request,
+                    _canonical_json_bytes({
+                        "schema_version": (
+                            "open_trader.trend_controller.revision_request.v1"
+                        ),
+                        "market": cycle.market,
+                        "as_of_date": cycle.as_of_date,
+                        "execution_date": cycle.execution_date,
+                        "baseline_report_path": (
+                            str(baseline_path) if baseline_path is not None else None
+                        ),
+                        "baseline_report_sha256": baseline_sha,
+                        "baseline_revision": baseline_revision,
+                        "requested_at": now.isoformat(timespec="seconds"),
+                    }),
+                )
     except RuntimeError as exc:
         raise ValueError(
             "trend report revision rejected: execution has begun"
@@ -1058,7 +1067,8 @@ def _pending_revision_report(
     if (
         latest is None
         or _report_order(latest[0])[0] != cycle.as_of_date
-        or _report_order(latest[0])[1] <= int(request["baseline_revision"])
+        or _report_order(latest[0])[1]
+        <= max(0, int(request["baseline_revision"]))
         or not _delivery_receipt_path(config, cycle.market, latest[0]).exists()
     ):
         return None
@@ -1146,7 +1156,7 @@ def _revision_state(
         or completion.get("request_sha256")
         != hashlib.sha256(request_path.read_bytes()).hexdigest()
         or _report_order(report_path)[0] != as_of_date
-        or _report_order(report_path)[1] <= baseline_revision
+        or _report_order(report_path)[1] <= max(0, baseline_revision)
         or not _valid_report(config, market, execution_date, report_path, report)
         or completion.get("report_sha256") != _report_hash(report)
         or completed_at.tzinfo is None
@@ -1179,7 +1189,8 @@ def _complete_revision(
     path, payload = report
     if (
         _report_order(path)[0] != cycle.as_of_date
-        or _report_order(path)[1] <= int(request["baseline_revision"])
+        or _report_order(path)[1]
+        <= max(0, int(request["baseline_revision"]))
         or not _valid_report(
             config, cycle.market, cycle.execution_date, path, payload
         )

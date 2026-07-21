@@ -4489,7 +4489,10 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
         generated_at="2026-07-14T17:00:00+08:00",
         artifact_stem="2026-07-14",
         markdown="old report",
-        report_json='{\n  "delivery_status": "delivery_failed"\n}\n',
+        report_json=(
+            '{\n  "delivery_status": "delivery_failed",\n'
+            '  "protection_state": {"positions": {}, "schema_version": 1}\n}\n'
+        ),
         protection_state={"schema_version": 1, "positions": {}},
     )
     old_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -4508,7 +4511,10 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
             generated_at="2026-07-14T17:00:00+08:00",
             artifact_stem="2026-07-14",
             markdown="new report",
-            report_json='{\n  "delivery_status": "sent"\n}\n',
+            report_json=(
+                '{\n  "delivery_status": "sent",\n'
+                '  "protection_state": {"positions": {}, "schema_version": 1}\n}\n'
+            ),
             protection_state={"schema_version": 1, "positions": {}},
         )
 
@@ -4518,7 +4524,10 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
     )
     assert recovered is not None
     assert recovered["markdown"] == "old report"
-    assert recovered["report_json"] == '{\n  "delivery_status": "delivery_failed"\n}\n'
+    assert recovered["report_json"] == (
+        '{\n  "delivery_status": "delivery_failed",\n'
+        '  "protection_state": {"positions": {}, "schema_version": 1}\n}\n'
+    )
 
 
 def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(

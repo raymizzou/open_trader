@@ -126,6 +126,37 @@ def watch_a_share_protection(
     calendar_checked = False
     interrupted = False
     now = first_now
+
+    def outcome(status: str, *, failed: bool = False) -> AShareWatchResult:
+        nonlocal client
+        result = _result(
+            status,
+            positions,
+            trigger_count,
+            exception_count + int(failed),
+            unknown_quote_count,
+            events_path,
+        )
+        if client is None:
+            return result
+        closing_client = client
+        client = None
+        try:
+            _close(closing_client)
+        except Exception:
+            if not once:
+                raise
+            if status != "abnormal":
+                result = _result(
+                    "abnormal",
+                    positions,
+                    trigger_count,
+                    exception_count + 1,
+                    unknown_quote_count,
+                    events_path,
+                )
+        return result
+
     try:
         while True:
             session = session_fn(now)
@@ -142,14 +173,7 @@ def watch_a_share_protection(
                         )
                         interrupted = True
                     if once:
-                        return _result(
-                            "abnormal",
-                            positions,
-                            trigger_count,
-                            exception_count + 1,
-                            unknown_quote_count,
-                            events_path,
-                        )
+                        return outcome("abnormal", failed=True)
                     sleep_fn(reconnect_seconds)
                     now = now_fn()
                     continue
@@ -178,14 +202,7 @@ def watch_a_share_protection(
                         if not once:
                             raise
                     if once:
-                        return _result(
-                            "abnormal",
-                            positions,
-                            trigger_count,
-                            exception_count + 1,
-                            unknown_quote_count,
-                            events_path,
-                        )
+                        return outcome("abnormal", failed=True)
                     sleep_fn(reconnect_seconds)
                     now = now_fn()
                     continue
@@ -197,14 +214,7 @@ def watch_a_share_protection(
                     )
                     interrupted = False
                 if trading_date not in trading_days:
-                    return _result(
-                        "holiday",
-                        positions,
-                        trigger_count,
-                        exception_count,
-                        unknown_quote_count,
-                        events_path,
-                    )
+                    return outcome("holiday")
 
             if on_session_open is not None:
                 exception_count += _run_review_callback(
@@ -225,14 +235,7 @@ def watch_a_share_protection(
                 )
 
             if session == "closed":
-                return _result(
-                    "closed",
-                    positions,
-                    trigger_count,
-                    exception_count,
-                    unknown_quote_count,
-                    events_path,
-                )
+                return outcome("closed")
             if session == "before":
                 opening = now.astimezone(session_timezone).replace(
                     hour=9, minute=30, second=0, microsecond=0
@@ -314,14 +317,7 @@ def watch_a_share_protection(
                     }
             except Exception as exc:
                 if once:
-                    return _result(
-                        "abnormal",
-                        positions,
-                        trigger_count,
-                        exception_count + 1,
-                        unknown_quote_count,
-                        events_path,
-                    )
+                    return outcome("abnormal", failed=True)
                 if not isinstance(exc, RuntimeError) or str(exc) != (
                     "daily premarket run already active"
                 ):
@@ -398,14 +394,7 @@ def watch_a_share_protection(
 
             if not comparable:
                 if once:
-                    return _result(
-                        "completed",
-                        positions,
-                        trigger_count,
-                        exception_count,
-                        unknown_quote_count,
-                        events_path,
-                    )
+                    return outcome("completed")
                 sleep_fn(poll_seconds)
                 now = now_fn()
                 continue
@@ -427,14 +416,7 @@ def watch_a_share_protection(
                     if not once:
                         raise
                 if once:
-                    return _result(
-                        "abnormal",
-                        positions,
-                        trigger_count,
-                        exception_count + 1,
-                        unknown_quote_count,
-                        events_path,
-                    )
+                    return outcome("abnormal", failed=True)
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue
@@ -518,14 +500,7 @@ def watch_a_share_protection(
                     )
 
             if once:
-                return _result(
-                    "completed",
-                    positions,
-                    trigger_count,
-                    exception_count,
-                    unknown_quote_count,
-                    events_path,
-                )
+                return outcome("completed")
             sleep_fn(poll_seconds)
             now = now_fn()
     finally:

@@ -3398,6 +3398,9 @@ def read_delivery_receipt(
         )
     if not isinstance(protection_state, dict):
         raise ValueError("delivery receipt has no embedded protection state")
+    if protection_state != report_payload.get("protection_state"):
+        raise ValueError("delivery receipt protection state mismatch")
+    _validate_protection_state(protection_state)
     hashes = _payload_hashes(markdown, report_json, protection_state)
     if any(payload.get(key) != value for key, value in hashes.items()):
         raise ValueError("delivery receipt content hash mismatch")

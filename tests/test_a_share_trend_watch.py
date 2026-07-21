@@ -347,6 +347,72 @@ def test_once_watcher_returns_abnormal_when_failed_client_cannot_close(
     assert result.exception_count == 1
 
 
+def test_once_completed_result_becomes_abnormal_when_client_close_fails(
+    tmp_path: Path,
+) -> None:
+    class Quote(SequenceQuote):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    result = run_once(
+        tmp_path,
+        quote=Quote([{"SH.600900": Decimal("28")}]),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_once_holiday_result_becomes_abnormal_when_client_close_fails(
+    tmp_path: Path,
+) -> None:
+    class Quote(SequenceQuote):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    result = run_once(tmp_path, quote=Quote([], trading_days=[]))
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_once_no_comparable_result_becomes_abnormal_when_client_close_fails(
+    tmp_path: Path,
+) -> None:
+    class Quote(SequenceQuote):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    result = run_once(
+        tmp_path,
+        quote=Quote([]),
+        state_path=state(tmp_path, active_line=None),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count >= 1
+
+
+def test_persistent_holiday_close_failure_still_raises(tmp_path: Path) -> None:
+    class Quote(SequenceQuote):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        watch_a_share_protection(
+            portfolio_path=portfolio(tmp_path),
+            state_path=state(tmp_path),
+            events_path=tmp_path / "events.jsonl",
+            quote_client=Quote([], trading_days=[]),
+            notifier=RecordingNotifier(),
+            poll_seconds=5,
+            reconnect_seconds=60,
+            once=False,
+            now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+            sleep_fn=lambda _seconds: pytest.fail("holiday watcher slept"),
+        )
+
+
 def test_watcher_calls_review_open_and_stop_hooks_once(tmp_path: Path) -> None:
     opens: list[str] = []
     stops: list[Mapping[str, object]] = []

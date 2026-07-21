@@ -102,7 +102,10 @@ Ordinary premarket automation is unchanged by this work.
 - Delivery recovery uses the report runner's strict receipt reader. The receipt
   stem, embedded JSON and Markdown, declared content hashes, and any declared
   replay-evidence path/SHA must match the selected frozen artifacts before the
-  controller may recover or execute them.
+  controller may recover or execute them. The receipt's standalone protection
+  state, the state embedded in its report JSON, and the state in the selected
+  frozen report must also be identical; a self-consistent receipt hash does not
+  excuse a cross-artifact state mismatch.
 - An explicit correction may create a revision before execution begins. At the first eligible execution check, atomically lock the latest valid report SHA as the day's execution batch.
 - A revision request immutably records the latest report path, byte SHA, and
   revision number visible when it is written. Only a later revision number can
@@ -111,6 +114,12 @@ Ordinary premarket automation is unchanged by this work.
   evidence. A revision frozen after the request is recovered in place after a
   crash; a revision already present before the request is the baseline and
   therefore cannot satisfy it. A newer report with no receipt remains pending.
+- Revision baseline capture and immutable request publication hold the same
+  per-market report lock used by the real report runner. Lock order is revision
+  gate followed by report lock, and request creation occurs before the
+  controller's long-lived process lock. A missing or r0 baseline still requires
+  at least r1: candidates and completions must have a revision number greater
+  than `max(0, baseline_revision)`.
 - A revision appearing after the execution batch is locked is an anomaly. Display and notify the difference, but do not add, remove, resize, or submit actions from it automatically.
 - If a recovered report freezes inside the valid window, it may execute after all validation passes. If it freezes after the window, preserve it for audit and mark its opening actions `missed`; never roll them into the next trading day.
 
@@ -164,6 +173,11 @@ Ordinary premarket automation is unchanged by this work.
   never performs an internal reconnect sleep. The controller can therefore
   publish its next heartbeat, disable every new BUY, and continue safe
   SELL/reconciliation work before its own bounded retry.
+- One-pass watcher shutdown is part of its outcome. If client close fails after
+  an otherwise normal, holiday, closed, or no-comparable result, the watcher
+  returns structured `abnormal` instead of allowing the close exception to
+  replace the result. Persistent watcher mode retains its existing exception
+  contract.
 
 ### Manual resolution
 
@@ -200,10 +214,17 @@ Ordinary premarket automation is unchanged by this work.
 - Verify that receipt/report mismatches fail closed, revision delivery recovery
   uses the selected artifact's suffix, and revision requests accept only an
   artifact newer than their frozen baseline.
+- Verify CN/HK/US prepared recovery rejects a protection state that differs
+  between the receipt, embedded report JSON, and selected frozen report.
+- Verify a revision request waits for the real CN/HK/US report lock, captures a
+  report frozen by the prior holder as its baseline, and can only complete with
+  r1 or later.
 - Verify that a report recovered during an active session does not interrupt protection monitoring.
 - Verify real CN/HK/US one-pass watcher failures return `abnormal` without
   sleeping, while persistent standalone watcher mode retains reconnect
   behavior.
+- Verify one-pass normal, holiday, and no-comparable exits become `abnormal`
+  when client close fails, while persistent close exceptions still propagate.
 - Verify that a report recovered inside the window executes after validation, while one recovered after the window is preserved with `missed` actions.
 - Verify that the report SHA locked at opening remains the complete execution batch and that a later revision changes no automatic action.
 - Verify that broker acceptance followed by a crash before result persistence reconciles without a second submission.

@@ -44,8 +44,10 @@ Implemented Task 4 on `feat/trend-market-controller-spec` from baseline
   runner and does not rebuild expensive content.
 - Delivery recovery uses the public strict receipt reader and binds its stem,
   embedded JSON/Markdown, declared hashes, canonical selected-report SHA, and
-  declared replay-evidence path/SHA to the exact frozen artifact. Recovery mode
-  comes from that artifact's revision suffix, not from ambient request state.
+  declared replay-evidence path/SHA to the exact frozen artifact. The receipt,
+  embedded report JSON, and selected frozen report must contain the same
+  protection state. Recovery mode comes from that artifact's revision suffix,
+  not from ambient request state.
 - Malformed or invalid frozen reports fail closed and require an explicit
   revision; a pending revision may replace that artifact before execution.
 - Revision request creation and first batch lock share a per-execution-date
@@ -55,6 +57,12 @@ Implemented Task 4 on `feat/trend-market-controller-spec` from baseline
   satisfies it: an r1 present before the request requires r2, while an r1
   frozen after an r0-baseline request can be recovered and completed after a
   crash. A newer report without its receipt remains incomplete.
+- Baseline capture and request publication serialize on the real CN/HK/US
+  report-runner lock while still holding the execution-date revision gate.
+  Missing and r0 baselines both require at least r1, preventing an unnumbered
+  report from completing an explicit revision request. The opt-in waiting lock
+  reopens after a prior owner unlinks a stale inode, so the critical section
+  always owns the lock file currently visible to another report runner.
 - A later revision cannot replace an already locked batch and produces one
   deduplicated anomaly notification.
 
@@ -67,7 +75,9 @@ Implemented Task 4 on `feat/trend-market-controller-spec` from baseline
   protection exits through the shared stable sell action protocol. One-pass
   client/calendar/account/quote/reconnect/lock failures return structured
   `abnormal` results immediately and never sleep; persistent standalone watcher
-  mode retains reconnect behavior.
+  mode retains reconnect behavior. A one-pass close failure after a normal,
+  holiday, closed, or no-comparable exit also becomes structured `abnormal`;
+  persistent mode retains its exception behavior.
 - Adds an immutable close-completion cursor. A crash after the daily close fact
   but before projection completion rebuilds the projection once; a completed
   close is not repeatedly mutated every heartbeat.
@@ -138,24 +148,31 @@ the targeted change and passed afterward. Existing persistent watcher
 recovery, valid delivery recovery, post-request revision recovery, and strict
 audit paths were retained as controls.
 
+The final review added 12 RED cases: three CN/HK/US prepared-receipt state
+binding failures, five report-lock/revision-floor failures, and four one-pass
+close-result failures. The persistent close exception remained green as a
+control. Strengthening the concurrency test then reproduced three stale-inode
+failures before the waiting `RunLock` verified that its descriptor still
+matched the current lock path.
+
 ### Final automated verification
 
 Controller tests:
 
 ```text
-58 passed in 3.91s
+66 passed in 4.30s
 ```
 
 Task-required controller/report/watcher/ledger suite:
 
 ```text
-521 passed in 5.42s
+534 passed in 5.90s
 ```
 
 Full repository suite:
 
 ```text
-2852 passed in 49.87s
+2865 passed in 47.50s
 ```
 
 Static checks:
@@ -186,9 +203,10 @@ No temporary data or reports directory was created.
 - Removed the execution-noop protocol and the intermediate parallel
   `broker_facts` directory. Terminal observations now live in the existing
   immutable open ledger and are SHA-bound from the action event.
-- The two remediation rounds are a net 832 production lines relative to the
-  original Task 4 commit: 290 in the controller, 465 in Task 3 review/audit
-  validation, and 77 in watcher one-pass recovery. The bulk is explicit
+- The three remediation rounds are a net 842 production lines relative to the
+  original Task 4 commit: 301 in the controller, 465 in Task 3 review/audit
+  validation, 52 in watcher one-pass recovery, 21 in opt-in waiting-lock
+  integrity, and 3 in the public receipt reader. The bulk is explicit
   fail-closed validation at persistence and process boundaries, not a new
   scheduler, state machine, service layer, or alternate execution path.
 - Trust boundary: the designated local executor and immutable-ledger writer are

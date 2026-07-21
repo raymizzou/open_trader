@@ -268,6 +268,45 @@ def test_once_market_watcher_returns_abnormal_when_failed_client_cannot_close(
     assert result.exception_count == 1
 
 
+def test_once_market_completed_result_becomes_abnormal_when_close_fails(
+    tmp_path: Path,
+) -> None:
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+    result = watch_market_protection(
+        market="HK",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=tmp_path / "state.json",
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=Quote(),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        account_loader=lambda _path, *, expected_date, timezone: AccountSnapshot(
+            source_date=expected_date,
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: pytest.fail("once market watcher slept"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
 def test_hk_regular_sessions_exclude_lunch_and_auction() -> None:
     hk = ZoneInfo("Asia/Hong_Kong")
     assert market_session(datetime(2026, 7, 16, 9, 29, tzinfo=hk), "HK") == "before"

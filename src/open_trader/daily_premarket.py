@@ -155,18 +155,39 @@ class _LatestPromotion:
 
 
 class RunLock:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, wait: bool = False) -> None:
         self.path = path
+        self.wait = wait
         self._handle: object | None = None
 
     def __enter__(self) -> RunLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+        while True:
+            handle = self.path.open("a+", encoding="utf-8")
+            try:
+                operation = (
+                    fcntl.LOCK_EX
+                    if self.wait
+                    else fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                fcntl.flock(handle.fileno(), operation)
+            except BlockingIOError as exc:
+                handle.close()
+                raise RuntimeError("daily premarket run already active") from exc
+            if not self.wait:
+                break
+            try:
+                current = self.path.stat()
+            except FileNotFoundError:
+                current = None
+            locked = os.fstat(handle.fileno())
+            if current is not None and (current.st_dev, current.st_ino) == (
+                locked.st_dev,
+                locked.st_ino,
+            ):
+                break
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
-            raise RuntimeError("daily premarket run already active") from exc
         handle.seek(0)
         handle.truncate()
         handle.write(str(os.getpid()))
