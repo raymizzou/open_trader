@@ -155,6 +155,11 @@ TREND_REVIEW_METRICS = {
 }
 TREND_REVIEW_SERIES = {"discipline", "actual", "benchmark"}
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+TREND_MARKET_TIMEZONES = {
+    "CN": SHANGHAI,
+    "HK": ZoneInfo("Asia/Hong_Kong"),
+    "US": ZoneInfo("America/New_York"),
+}
 
 
 @dataclass(frozen=True)
@@ -607,12 +612,12 @@ def _load_trend_reports(
     reports_dir: Path,
     *,
     today: date | None = None,
+    now: datetime | None = None,
     broker_positions: list[dict[str, str]] | None = None,
     cash_details: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if broker_positions is None or cash_details is None:
         broker_positions, cash_details = _latest_broker_details(data_dir)
-    report_date = (today or _shanghai_date()).isoformat()
     reports = {
         broker: _load_broker_trend_report(
             data_dir=data_dir,
@@ -622,7 +627,9 @@ def _load_trend_reports(
             market_label=market_label,
             broker_label=broker_label,
             buy_window=buy_window,
-            report_date=report_date,
+            report_date=(
+                today or _trend_market_date(market, now=now)
+            ).isoformat(),
             broker_positions=broker_positions,
             cash_details=cash_details,
         )
@@ -813,6 +820,11 @@ def _project_futu_attention(
 
 def _shanghai_date(now: datetime | None = None) -> date:
     return (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI).date()
+
+
+def _trend_market_date(market: str, *, now: datetime | None = None) -> date:
+    reference_now = now or datetime.now(SHANGHAI)
+    return reference_now.astimezone(TREND_MARKET_TIMEZONES[market]).date()
 
 
 def _latest_valid_report_payload(

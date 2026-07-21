@@ -1693,6 +1693,14 @@ class TabbedAccountLocator:
         if self.selector == "#trend-report-workspace:visible .trend-audit summary":
             self.page.active = self.selector
             return
+        if self.selector == (
+            '.account-holding-actions button[data-detail-mode="t_signal"]:visible'
+        ):
+            self.page.workspace_view = "detail"
+            return
+        if self.selector == "[data-back-to-holdings]:visible":
+            self.page.workspace_view = "portfolio"
+            return
         if self.selector == "#open-kelly-lab":
             self.page.workspace_view = "kelly"
             return
@@ -1743,6 +1751,12 @@ class TabbedAccountLocator:
             return 1
         if self.selector in VISUAL_CONTRACT_STYLES:
             return 1
+        if self.selector == (
+            '.account-holding-actions button[data-detail-mode="t_signal"]:visible'
+        ):
+            return 1
+        if self.selector == "[data-back-to-holdings]:visible":
+            return int(self.page.workspace_view == "detail")
         if self.selector == "#open-kelly-lab":
             return 1
         if self.selector == ".kelly-lab-panel:visible":
@@ -2616,6 +2630,10 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             self.page = page
             self.selector = selector
 
+        @property
+        def first(self) -> "Locator":
+            return self
+
         def count(self) -> int:
             target_selectors = {
                 '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
@@ -2634,6 +2652,8 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             if self.selector in target_selectors:
                 return 1
             counts = {
+                '.account-holding-actions button[data-detail-mode="t_signal"]:visible': 1,
+                "[data-back-to-holdings]:visible": int(self.page.view == "detail"),
                 "#open-kelly-lab": 1,
                 ".kelly-lab-panel:visible": int(self.page.view == "kelly"),
                 "#return-to-portfolio:visible": int(self.page.view != "portfolio"),
@@ -2652,6 +2672,10 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             self.page.clicks.append(self.selector)
             if self.selector == "#open-kelly-lab":
                 self.page.view = "kelly"
+            elif self.selector == '.account-holding-actions button[data-detail-mode="t_signal"]:visible':
+                self.page.view = "detail"
+            elif self.selector == "[data-back-to-holdings]:visible":
+                self.page.view = "portfolio"
             elif self.selector == "#open-standard-backtest":
                 self.page.view = "backtest"
             elif self.selector == "#return-to-portfolio:visible":
@@ -2692,6 +2716,8 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     )
 
     assert page.clicks == [
+        '.account-holding-actions button[data-detail-mode="t_signal"]:visible',
+        "[data-back-to-holdings]:visible",
         "#open-kelly-lab", "#return-to-portfolio:visible",
         "#open-standard-backtest", "#return-to-portfolio:visible",
         "#research-chat-close:visible",

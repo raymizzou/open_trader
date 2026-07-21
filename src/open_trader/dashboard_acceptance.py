@@ -1439,11 +1439,22 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
             ".broker-summary-card:visible, .account-holding-actions button:visible, "
             ".trend-report-entry button:visible",
         )
+        t_signal_button = page.locator(
+            '.account-holding-actions button[data-detail-mode="t_signal"]:visible'
+        )
+        assert t_signal_button.count() >= 1, "移动端缺少做T详情入口"
+        t_signal_button.first.click()
         _check_mobile_targets(
             page,
             ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
             ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
             ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
+        )
+        back_button = page.locator("[data-back-to-holdings]:visible")
+        assert back_button.count() >= 1, "做T详情缺少返回入口"
+        back_button.click()
+        assert page.locator(".holdings-panel:visible").count() == 1, (
+            "做T详情返回后持仓未恢复"
         )
 
     page.locator("#open-kelly-lab").click()
