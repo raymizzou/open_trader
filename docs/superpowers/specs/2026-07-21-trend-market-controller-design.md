@@ -210,6 +210,27 @@ Ordinary premarket automation is unchanged by this work.
 - Migration never runs old and new executors concurrently. Stop the old report/watcher jobs, verify their PIDs are absent, install the controller, reconcile existing Futu orders and ledgers, and only then enable execution.
 - A rollback must not directly restart the old watcher. Deploy the old source with trend automation stopped, reconcile all intents and Futu orders, and only then explicitly restore the old automation if it is still safe.
 
+### Legacy cutover for unreplayable expired cycles
+
+- A report created before replay evidence and strict account-date binding existed
+  may be impossible to revise safely after its execution window has expired.
+  The controller must not substitute current Trend Animals or account data for
+  that historical date and must not weaken normal report validation.
+- After explicit operator authorization, deployment may record one immutable
+  legacy cutover fact per affected cycle. The fact binds the market, as-of and
+  execution dates, latest frozen report path and SHA-256, pending revision
+  request path and SHA-256, actor, reason, and authorization timestamp.
+- A cutover is valid only after the execution window, before any execution
+  batch exists, and while every bound artifact still has the recorded hash.
+  Missing, malformed, conflicting, or changed facts fail closed.
+- A valid cutover means only “audit this expired cycle as skipped and never
+  backfill its orders.” It creates no report, batch, action result, broker
+  request, notification, or retrospective submission. The original report and
+  revision request remain immutable and visible for audit.
+- Cutover recording is a one-time deployment migration helper, not another
+  public operational command. Normal operation remains the single
+  `trend-market` namespace.
+
 ## Testing Decisions
 
 - Test through the controller interface. Clock, sleep, market data, broker, notifier, and filesystem dependencies are internal adapters supplied by the controller implementation and replaced in tests.
@@ -230,6 +251,10 @@ Ordinary premarket automation is unchanged by this work.
   controller lock is held, and the persistent loop later completes it only
   with a strictly receipt-bound rN+1. Verify no request is published for the
   current cycle and no revision is allowed once a historical batch exists.
+- Verify an explicitly authorized legacy cutover skips only its exact expired
+  cycle, validates the report and revision-request hashes, rejects an existing
+  batch or an open execution window, and performs no broker/report/action
+  mutation. Verify a missing or tampered cutover remains blocked.
 - Verify that a report recovered during an active session does not interrupt protection monitoring.
 - Verify real CN/HK/US one-pass watcher failures return `abnormal` without
   sleeping, while persistent standalone watcher mode retains reconnect
