@@ -1053,9 +1053,16 @@ def _strict_action_facts(
     side: str,
     report_sha: str,
     action_index: int,
+    strategy_version: str,
 ) -> tuple[list[Mapping[str, object]], set[str]]:
     requests: list[Mapping[str, object]] = []
     result_order_ids: set[str] = set()
+    legacy_key = hashlib.sha256(
+        f"{market}:{execution_date}:{strategy_version}:{futu_code}:{side}".encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    legacy_remark = f"trend-review:{market}:{execution_date}:{legacy_key[:24]}"
     for path, payload, request, attempt in facts:
         timestamp_name = (
             "submitted_at" if path.name.endswith("-result.json") else "created_at"
@@ -1065,6 +1072,11 @@ def _strict_action_facts(
             quantity = _required_decimal(request.get("qty"), "target quantity")
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"invalid trend action fact: {path}") from exc
+        legacy_name = (
+            f"{legacy_key}-intent.json"
+            if attempt == 1
+            else f"{legacy_key}-attempt-{attempt}-intent.json"
+        )
         if (
             payload.get("market") != market
             or payload.get("date") != execution_date
@@ -1074,8 +1086,14 @@ def _strict_action_facts(
             or str(request.get("futu_code") or "").strip().upper()
             != futu_code.upper()
             or str(request.get("side") or "").strip().lower() != side
-            or request.get("remark")
-            != trend_attempt_remark(market, execution_date, action_key, attempt)
+            or (
+                request.get("remark")
+                != trend_attempt_remark(market, execution_date, action_key, attempt)
+                and not (
+                    path.name == legacy_name
+                    and request.get("remark") == legacy_remark
+                )
+            )
             or quantity <= 0
             or timestamp.tzinfo is None
             or timestamp.utcoffset() is None
@@ -1356,6 +1374,7 @@ def load_trend_action_audit(
         side=side,
         report_sha=report_sha,
         action_index=action_index,
+        strategy_version=strategy_version,
     )
     for event in events:
         if (

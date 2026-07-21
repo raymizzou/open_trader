@@ -940,8 +940,8 @@ def test_uncertain_action_resolution_is_immutable(
     assert list(path.parent.glob("*.json")) == [path]
 
 
-def filled_buy_audit(
-    tmp_path: Path,
+def legacy_filled_buy_audit(
+    tmp_path: Path, *, attempt: int = 1
 ) -> tuple[FakeTrendSimClient, dict[str, object], Path]:
     report = cn_buy_report()
     client = FakeTrendSimClient()
@@ -956,7 +956,31 @@ def filled_buy_audit(
     trend_review.execute_trend_review_open(
         **arguments, now="2026-07-20T09:31:00+08:00"
     )
+    legacy_key = hashlib.sha256(
+        "CN:2026-07-20:v1:SH.600001:buy".encode("utf-8")
+    ).hexdigest()
+    legacy_remark = f"trend-review:CN:2026-07-20:{legacy_key[:24]}"
+    intent_path = next(tmp_path.glob(
+        "trend_review/ledgers/CN/open/2026-07-20/*-intent.json"
+    ))
+    result_path = intent_path.with_name(
+        intent_path.name.replace("-intent", "-result")
+    )
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    intent["request"]["remark"] = legacy_remark
+    result["request"]["remark"] = legacy_remark
+    if attempt > 1:
+        intent["attempt"] = attempt
+    stem = legacy_key if attempt == 1 else f"{legacy_key}-attempt-{attempt}"
+    legacy_intent_path = intent_path.with_name(f"{stem}-intent.json")
+    legacy_result_path = result_path.with_name(f"{stem}-result.json")
+    legacy_intent_path.write_text(json.dumps(intent), encoding="utf-8")
+    legacy_result_path.write_text(json.dumps(result), encoding="utf-8")
+    intent_path.unlink()
+    result_path.unlink()
     request = client.requests[0]
+    request["remark"] = legacy_remark
     client.positions = [{"code": "SH.600001", "qty": request["qty"]}]
     client.orders = [{
         "order_id": "SIM-1",
@@ -982,16 +1006,16 @@ def filled_buy_audit(
         report=report,
         locked_at="2026-07-20T09:30:00+08:00",
     )
-    result_path = next(tmp_path.glob(
-        "trend_review/ledgers/CN/open/2026-07-20/*-result.json"
-    ))
-    return client, arguments, result_path
+    return client, arguments, legacy_result_path
 
 
+@pytest.mark.parametrize("attempt", [1, 2])
 def test_action_audit_accepts_paired_legacy_result_without_identity_fields(
-    tmp_path: Path,
+    tmp_path: Path, attempt: int
 ) -> None:
-    client, arguments, result_path = filled_buy_audit(tmp_path)
+    client, arguments, result_path = legacy_filled_buy_audit(
+        tmp_path, attempt=attempt
+    )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     del result["report_sha256"]
     del result["action_index"]
@@ -1023,12 +1047,18 @@ def test_action_audit_accepts_paired_legacy_result_without_identity_fields(
         "missing_index",
         "request_mismatch",
         "orphan",
+        "legacy_remark_mismatch",
+        "legacy_path_mismatch",
+        "legacy_key_mismatch",
     ],
 )
 def test_action_audit_rejects_other_legacy_result_identity_gaps(
     tmp_path: Path, mutation: str
 ) -> None:
-    _client, _arguments, result_path = filled_buy_audit(tmp_path)
+    _client, _arguments, result_path = legacy_filled_buy_audit(tmp_path)
+    intent_path = result_path.with_name(
+        result_path.name.replace("-result", "-intent")
+    )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if mutation == "wrong_report":
         result["report_sha256"] = "0" * 64
@@ -1040,12 +1070,35 @@ def test_action_audit_rejects_other_legacy_result_identity_gaps(
         del result["action_index"]
     elif mutation == "request_mismatch":
         result["request"] = {**result["request"], "qty": "300"}
-    else:
+    elif mutation == "orphan":
         del result["report_sha256"]
         del result["action_index"]
-        result_path.with_name(
-            result_path.name.replace("-result", "-intent")
-        ).unlink()
+        intent_path.unlink()
+    elif mutation == "legacy_remark_mismatch":
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        intent["request"]["remark"] = "trend-review:CN:2026-07-20:wrong"
+        result["request"] = intent["request"]
+        intent_path.write_text(json.dumps(intent), encoding="utf-8")
+    elif mutation == "legacy_path_mismatch":
+        mismatched_intent = intent_path.with_name(f"wrong-{intent_path.name}")
+        mismatched_result = result_path.with_name(f"wrong-{result_path.name}")
+        intent_path.rename(mismatched_intent)
+        result_path.rename(mismatched_result)
+        intent_path = mismatched_intent
+        result_path = mismatched_result
+    else:
+        wrong_key = "0" * 64
+        wrong_remark = f"trend-review:CN:2026-07-20:{wrong_key[:24]}"
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        intent["request"]["remark"] = wrong_remark
+        result["request"] = intent["request"]
+        wrong_intent = intent_path.with_name(f"{wrong_key}-intent.json")
+        wrong_result = result_path.with_name(f"{wrong_key}-result.json")
+        wrong_intent.write_text(json.dumps(intent), encoding="utf-8")
+        intent_path.unlink()
+        result_path.unlink()
+        intent_path = wrong_intent
+        result_path = wrong_result
     result_path.write_text(json.dumps(result), encoding="utf-8")
 
     with pytest.raises(ValueError, match="invalid trend action fact"):
