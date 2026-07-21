@@ -4179,6 +4179,88 @@ def test_formal_batch_does_not_ignore_tampered_protection_fact(
         )
 
 
+def test_formal_report_recovers_accepted_protection_intent_with_original_identity(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "300"}],
+        fail_orders=1,
+        accepted_before_failure=True,
+    )
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_stop(
+            data_dir=tmp_path,
+            market="CN",
+            symbol="600001",
+            trading_date="2026-07-17",
+            event_id="protection-1",
+            client=client,
+            now="2026-07-17T10:15:00+08:00",
+        )
+    report = report_with_actions(
+        [{"action": "SELL_ALL", "symbol": "600001", "reason": "danger_signal"}]
+    )
+    report_path = tmp_path / "reports/2026-07-17.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-17T10:16:00+08:00",
+    )
+
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T10:16:00+08:00",
+        quote_prices={},
+    )
+    intent_path = next(
+        tmp_path.glob("trend_review/ledgers/CN/open/2026-07-17/*-intent.json")
+    )
+    result_path = intent_path.with_name(intent_path.name.replace("-intent", "-result"))
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+
+    assert len(client.requests) == 1
+    assert result["report_sha256"] == intent["report_sha256"]
+    assert result["action_index"] == intent["action_index"]
+
+    client.orders[0].update(
+        {
+            "dealt_qty": "300",
+            "dealt_avg_price": "10",
+            "order_status": "FILLED_ALL",
+        }
+    )
+    client.positions = []
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T10:17:00+08:00",
+        quote_prices={},
+    )
+    events, _ = trend_review.load_trend_action_audit(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        symbol="600001",
+        side="sell",
+    )
+
+    assert len(client.requests) == 1
+    assert any(event.get("status") == "filled" for event in events)
+
+
 def test_merged_sell_retry_uses_live_remaining_position(tmp_path: Path) -> None:
     client = FakeTrendSimClient(
         positions=[{"code": "SH.600001", "qty": "300"}]

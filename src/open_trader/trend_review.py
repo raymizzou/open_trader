@@ -2193,12 +2193,24 @@ def execute_trend_review_open(
             if pending_intent is not None and (
                 action_name != "SELL_ALL" or sell_quantity > 0
             ):
-                request = next(
-                    item[2] for item in action_facts if item[0] == pending_intent
+                pending_fact = next(
+                    item for item in action_facts if item[0] == pending_intent
                 )
-                pending_attempt = next(
-                    item[3] for item in action_facts if item[0] == pending_intent
-                )
+                pending_payload = pending_fact[1]
+                request = pending_fact[2]
+                pending_attempt = pending_fact[3]
+                pending_report_sha = pending_payload.get("report_sha256")
+                pending_action_index = pending_payload.get("action_index")
+                if (
+                    not isinstance(pending_report_sha, str)
+                    or len(pending_report_sha) != 64
+                    or not isinstance(pending_action_index, int)
+                    or isinstance(pending_action_index, bool)
+                    or pending_action_index < 0
+                ):
+                    raise ValueError(
+                        f"invalid trend action fact: {pending_intent}"
+                    )
                 orders = _listed_orders(
                     client,
                     start=execution_date,
@@ -2250,8 +2262,8 @@ def execute_trend_review_open(
                         execution_date=execution_date,
                         request=request,
                         response=broker_order,
-                        report_sha=report_sha,
-                        action_index=index,
+                        report_sha=pending_report_sha,
+                        action_index=pending_action_index,
                         reconciled_at=now,
                     )
                 if rejected_status is not None:
