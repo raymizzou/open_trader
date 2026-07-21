@@ -1659,6 +1659,7 @@ def run_trend_market_controller(
     report_target: ReportTask | None = None
     report_failures = 0
     report_retry_after: datetime | None = None
+    report_blocker: str | None = None
     operation_failures = 0
     operation_retry_after: datetime | None = None
     operation_blocker: str | None = None
@@ -1684,7 +1685,7 @@ def run_trend_market_controller(
                 now=now,
                 phase="reconciling",
                 last_success=last_success,
-                blocker=cycle_blocker or operation_blocker,
+                blocker=cycle_blocker or report_blocker or operation_blocker,
                 next_check_at=now + timedelta(seconds=5),
             )
             local = now.astimezone(TIMEZONES[market])
@@ -1837,13 +1838,15 @@ def run_trend_market_controller(
                     except Exception as exc:
                         report_failures += 1
                         report_retry_after = _retry_at(now, report_failures)
-                        blocker = f"report generation failed: {exc}"
+                        report_blocker = f"report generation failed: {exc}"
+                        blocker = report_blocker
                         phase = "recovering_report"
                         future = None
                     else:
                         future = None
                         report_failures = 0
                         report_retry_after = None
+                        report_blocker = None
                         if report_target and report_target.completes_revision_request:
                             assert request is not None
                             latest = _pending_revision_report(
@@ -1876,12 +1879,13 @@ def run_trend_market_controller(
                         work_cycle = report_cycle
                         report_target = None
 
+                blocker = report_blocker or blocker
                 operation_delayed = (
                     operation_retry_after is not None
                     and now < operation_retry_after
                 )
                 if operation_delayed:
-                    blocker = operation_blocker
+                    blocker = report_blocker or operation_blocker
                     phase = "blocked"
                 elif future is not None or report_target is not None:
                     phase = "recovering_report"
@@ -1959,6 +1963,9 @@ def run_trend_market_controller(
                     close_due
                     and not operation_delayed
                     and not _close_completed(config, market, cycle.as_of_date)
+                    and _load_report_for_as_of(
+                        config, market, cycle.as_of_date
+                    ) is not None
                 ):
                     _capture_close(config, market, cycle.as_of_date)
                     _complete_close(config, market, cycle.as_of_date, now)

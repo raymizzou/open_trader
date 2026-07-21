@@ -313,6 +313,48 @@ def test_report_failure_before_freeze_retries_same_logical_dates(
     assert not list(config.reports_dir.rglob("*-r*.json"))
 
 
+def test_report_failure_remains_visible_while_close_waits_for_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(active_cn_cycle(), session="closed", market_open=False)
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller, "_cycle_to_reconcile", lambda _config, _cycle, _now: cycle
+    )
+    monkeypatch.setattr(controller, "_load_cycle_report", lambda *_args: None)
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("upstream unavailable")),
+    )
+    monkeypatch.setattr(controller, "_capture_close", pytest.fail)
+    blockers: list[object] = []
+    sleeps = 0
+
+    class _StopController(Exception):
+        pass
+
+    def stop_after_backoff(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        assert sleeps <= 5, blockers
+        blockers.append(load_trend_market_status(config, "CN", now=NOW)["blocker"])
+        if blockers[-2:] == [
+            "report generation failed: upstream unavailable",
+            "report generation failed: upstream unavailable",
+        ]:
+            raise _StopController
+
+    with pytest.raises(_StopController):
+        run_trend_market_controller(
+            config,
+            "CN",
+            now_fn=lambda: NOW,
+            sleep_fn=stop_after_backoff,
+        )
+
+
 def test_failed_report_keeps_same_logical_dates_after_cycle_advances(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1312,7 +1354,7 @@ def test_next_morning_reconciles_unfinished_prior_batch(
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: next_morning)
 
     assert executed == [prior.execution_date]
-    assert captured == [current.as_of_date]
+    assert captured == []
 
 
 def test_weekend_reconciles_unfinished_prior_batch(
@@ -1393,7 +1435,7 @@ def test_weekend_reconciles_unfinished_prior_batch(
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: weekend)
 
     assert executed == [prior.execution_date]
-    assert captured == [current.as_of_date]
+    assert captured == []
 
 
 def test_buy_without_terminal_event_remains_incomplete(
