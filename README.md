@@ -585,13 +585,17 @@ Use the same namespace for status, foreground operation, report correction,
 and an auditable uncertainty decision:
 
 ```bash
-.venv/bin/python -m open_trader trend-market status --market US
-.venv/bin/python -m open_trader trend-market run --market US
-.venv/bin/python -m open_trader trend-market run --market US --revision
+.venv/bin/python -m open_trader trend-market status --market US \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env
+.venv/bin/python -m open_trader trend-market run --market US \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env
+.venv/bin/python -m open_trader trend-market run --market US --revision \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env
 .venv/bin/python -m open_trader trend-market resolve \
   --market US --execution-date 2026-07-20 --symbol TRV --side buy \
   --resolution confirm-submitted --futu-order-id SIM-42 \
-  --actor ray --reason "verified in Futu order history"
+  --actor ray --reason "verified in Futu order history" \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env
 ```
 
 `status` is read-only. `run` is normally owned by `launchd`; `run --revision`
@@ -625,13 +629,17 @@ formal and protection exits merge into one sell action, with no overlapping
 sell while an earlier attempt is active or ambiguous.
 
 Migration is fenced: inspect the current jobs and processes, then run the
-installer. It unloads the selected legacy jobs and verifies their labels are
-absent before loading any new controller. Independently verify that no old
-report/watcher PID remains before trusting the new controllers:
+installer. Before loading a new controller, it must unload the selected legacy
+jobs and verify both their labels and processes are gone. If an orphan process
+remains or any fence check fails, it loads no new controller; stop and diagnose
+the orphan, then rerun the installer. A newly loaded controller reconciles the
+immutable ledger against current and historical Futu orders before any eligible
+submission. Independently verify that no old report/watcher PID remains before
+trusting the new controllers:
 
 ```bash
 launchctl list | rg 'com\.open-trader\.(trend|premarket)'
-ps aux | rg 'open_trader (trend|watch-trend)|trend-market run'
+ps aux | rg 'open_trader .*trend|trend-market run'
 scripts/install_daily_premarket_launchd.sh \
   --config /Users/ray/projects/open_trader/config/daily_premarket.env \
   --trend-only --market all
@@ -647,6 +655,72 @@ Rollback is also fenced: stop all trend automation, deploy the old source with
 automation still stopped, reconcile every local intent against Futu, and only
 then explicitly restore an old watcher if the facts prove it safe. Never start
 an old watcher directly while a controller may still be alive.
+
+After the final acceptance result is `PASS`, redeploy the exact accepted SHA;
+do not treat the acceptance process itself as the deployment. From the accepted
+worktree, confirm its SHA and clean state, restart all controllers with the
+shared config, then restart the Dashboard from that exact worktree:
+
+```bash
+cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec
+export ACCEPTED_SHA=replace-with-full-accepted-sha
+test "$(git rev-parse HEAD)" = "$ACCEPTED_SHA"
+test -z "$(git status --short)"
+
+scripts/install_daily_premarket_launchd.sh \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env \
+  --trend-only --market all
+
+screen -S open_trader_dashboard_8766 -X quit 2>/dev/null || true
+screen -dmS open_trader_dashboard_8766 zsh -lc \
+  'cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec && exec env PYTHONPATH=src .venv/bin/python -u -m open_trader dashboard --portfolio /Users/ray/projects/open_trader/data/latest/portfolio.csv --data-dir /Users/ray/projects/open_trader/data --reports-dir /Users/ray/projects/open_trader/reports --config /Users/ray/projects/open_trader/config/daily_premarket.env --poll-seconds 5 --host 127.0.0.1 --port 8766 >> /tmp/open_trader_dashboard_8766.log 2>&1'
+```
+
+For each CN/HK/US status document, verify the PID is live, `working_directory`
+is the accepted worktree, `git_sha` equals `$ACCEPTED_SHA`, and `heartbeat_at`
+advances between two reads. Then check fresh controller/Dashboard logs and both
+Dashboard endpoints:
+
+```bash
+.venv/bin/python - <<'PY'
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import time
+
+accepted_sha = os.environ["ACCEPTED_SHA"]
+worktree = "/Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec"
+root = Path("/Users/ray/projects/open_trader/data/trend_controller")
+
+def read(market):
+    return json.loads((root / market / "status.json").read_text(encoding="utf-8"))
+
+before = {market: read(market) for market in ("CN", "HK", "US")}
+time.sleep(10)
+for market, previous in before.items():
+    current = read(market)
+    pid = int(current["pid"])
+    os.kill(pid, 0)
+    assert current["working_directory"] == worktree
+    assert current["git_sha"] == accepted_sha
+    assert datetime.fromisoformat(current["heartbeat_at"]) > datetime.fromisoformat(
+        previous["heartbeat_at"]
+    )
+    print(market, pid, current["git_sha"], current["heartbeat_at"])
+PY
+
+pgrep -f 'open_trader trend-market run' | xargs ps -o pid,lstart,command -p
+tail -n 80 /Users/ray/projects/open_trader/logs/daily_premarket/launchd-trend-controller-*.out.log
+tail -n 80 /tmp/open_trader_dashboard_8766.log
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/
+curl -sS http://127.0.0.1:8766/api/dashboard | \
+  .venv/bin/python -m json.tool >/dev/null
+```
+
+The review deployment is valid only when the URL returns HTTP 200, the API is
+valid JSON, all three heartbeats advance, and the process/status/log evidence
+belongs to the accepted SHA.
 
 ## Outputs
 
