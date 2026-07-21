@@ -517,7 +517,7 @@ def test_trend_review_loader_accepts_report_named_for_as_of_date(
     ) == report
 
 
-def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
+def test_trend_review_open_caps_frozen_actions_with_opening_quotes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report_dir = tmp_path / "reports/trend_a_share"
@@ -535,6 +535,7 @@ def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
                 "target_weight": "0.04",
                 "lot_size": 100,
                 "estimated_shares": 300,
+                "target_amount": "3000",
                 "atr": "0.5",
             }],
             "holding_decisions": [],
@@ -561,6 +562,8 @@ def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
     captured: dict[str, object] = {}
     executed_reports: list[object] = []
     authorizations: list[str] = []
+    quoted: list[list[str]] = []
+    quote_closes: list[bool] = []
     monkeypatch.setattr(
         cli,
         "FutuSimulateOrderExecutionClient",
@@ -569,7 +572,15 @@ def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
     monkeypatch.setattr(
         cli,
         "FutuQuoteClient",
-        lambda **kwargs: pytest.fail("frozen execution must not query opening prices"),
+        lambda **kwargs: SimpleNamespace(
+            get_snapshots=lambda symbols: (
+                quoted.append(list(symbols))
+                or {
+                    "SH.600001": SimpleNamespace(last_price=Decimal("10"))
+                }
+            ),
+            close=lambda: quote_closes.append(True),
+        ),
     )
     monkeypatch.setattr(
         cli,
@@ -601,7 +612,9 @@ def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
 
     assert captured["report"] == report
     assert executed_reports == [report, report]
-    assert "prices" not in captured
+    assert captured["quote_prices"] == {"SH.600001": Decimal("10")}
+    assert quoted == [["SH.600001"], ["SH.600001"]]
+    assert quote_closes == [True, True]
     assert authorizations == ["checked", "checked", "checked", "checked"]
     assert result["artifact_path"] == str(tmp_path / "result.json")
     assert repeated["artifact_path"] == str(tmp_path / "result.json")

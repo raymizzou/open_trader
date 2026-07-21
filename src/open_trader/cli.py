@@ -337,7 +337,28 @@ def run_trend_review_open(
         raise ValueError(f"invalid locked trend report: {locked_path}")
     report = locked_report
     client = None
+    quote = None
     try:
+        from .futu_symbols import to_futu_symbol
+
+        judgments = report["strategy_judgments"]
+        actions = judgments["formal_actions"]
+        buy_symbols = sorted(
+            {
+                to_futu_symbol(market, str(action["symbol"]))
+                for action in actions
+                if action["action"] == "BUY"
+            }
+        )
+        quote_prices: dict[str, Decimal] = {}
+        if buy_symbols:
+            quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+            quote_prices = {
+                symbol: snapshot.last_price
+                for symbol, snapshot in quote.get_snapshots(buy_symbols).items()
+            }
+            if set(quote_prices) != set(buy_symbols):
+                raise ValueError("trend review opening quotes are unavailable")
         client = ExecutorGuardedOrderClient(
             FutuSimulateOrderExecutionClient(
                 host=config.futu_host,
@@ -354,8 +375,11 @@ def run_trend_review_open(
             market=market,
             execution_date=trading_date,
             now=now,
+            quote_prices=quote_prices,
         )
     finally:
+        if quote is not None:
+            quote.close()
         if client is not None:
             client.close()
     paths = result.get("artifact_paths")
