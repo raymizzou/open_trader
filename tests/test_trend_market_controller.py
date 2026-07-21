@@ -1785,6 +1785,189 @@ def test_invalid_historical_batch_remains_selected_but_cannot_be_revised(
     assert not request_path.exists()
 
 
+def test_missing_report_cutover_skips_exact_expired_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    historical = ControllerCycle(
+        market="HK",
+        as_of_date="2026-07-17",
+        execution_date="2026-07-20",
+        report_run_date="2026-07-17",
+        session="catchup",
+        market_open=False,
+        next_check_at=datetime.fromisoformat("2026-07-20T10:01:05+08:00"),
+    )
+    current = ControllerCycle(
+        market="HK",
+        as_of_date="2026-07-20",
+        execution_date="2026-07-21",
+        report_run_date="2026-07-20",
+        session="closed",
+        market_open=False,
+        next_check_at=datetime.fromisoformat("2026-07-21T16:01:05+08:00"),
+    )
+    authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(
+        controller,
+        "_derive_cycle",
+        lambda _config, _market, now: historical if now.hour == 9 else current,
+    )
+
+    assert controller._cycle_to_reconcile(config, current, authorized_at) == (
+        historical
+    )
+    request_path = controller._request_revision(
+        config, historical, authorized_at
+    )
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    cutover = controller._record_legacy_cycle_cutover(
+        config,
+        historical,
+        actor="ray",
+        reason="historical report was never generated",
+        authorized_at=authorized_at,
+        report_missing=True,
+    )
+    payload = json.loads(cutover.read_text(encoding="utf-8"))
+
+    assert request["baseline_report_path"] is None
+    assert request["baseline_report_sha256"] is None
+    assert request["baseline_revision"] == -1
+    assert payload["report_missing"] is True
+    assert payload["report_path"] is None
+    assert payload["report_sha256"] is None
+    assert controller._execution_completed(config, historical) is True
+    assert controller._cycle_to_reconcile(config, current, authorized_at) == current
+    assert not controller._batch_path(
+        config, historical.market, historical.execution_date
+    ).exists()
+    assert not (config.data_dir / "trend_review/ledgers/HK/actions").exists()
+
+
+@pytest.mark.parametrize(
+    ("report_timing", "suffix"),
+    [("before", ".json"), ("before", ".md"), ("after", ".json")],
+)
+def test_missing_report_cutover_fails_closed_if_report_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    report_timing: str,
+    suffix: str,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    controller._request_revision(config, cycle, authorized_at)
+    report_path = config.reports_dir / f"trend_a_share/2026-07-17{suffix}"
+
+    if report_timing == "before":
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("{}", encoding="utf-8")
+        with pytest.raises(ValueError, match="invalid legacy trend cutover"):
+            controller._record_legacy_cycle_cutover(
+                config,
+                cycle,
+                actor="ray",
+                reason="historical report was never generated",
+                authorized_at=authorized_at,
+                report_missing=True,
+            )
+        return
+
+    controller._record_legacy_cycle_cutover(
+        config,
+        cycle,
+        actor="ray",
+        reason="historical report was never generated",
+        authorized_at=authorized_at,
+        report_missing=True,
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid legacy trend cutover"):
+        controller._execution_completed(config, cycle)
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "readonly",
+        "open_window",
+        "current_cycle",
+        "batch",
+        "actor",
+        "reason",
+        "naive_time",
+    ],
+)
+def test_missing_report_cutover_preserves_authorization_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocker: str,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
+    monkeypatch.setattr(
+        socket,
+        "gethostname",
+        lambda: "readonly-copy" if blocker == "readonly" else "executor",
+    )
+    controller._request_revision(config, cycle, authorized_at)
+    if blocker == "open_window":
+        authorized_at = NOW
+    elif blocker == "current_cycle":
+        authorized_at = datetime.fromisoformat("2026-07-20T18:00:00+08:00")
+    elif blocker == "batch":
+        batch = controller._batch_path(
+            config, cycle.market, cycle.execution_date
+        )
+        batch.parent.mkdir(parents=True, exist_ok=True)
+        batch.write_text("{}", encoding="utf-8")
+    elif blocker == "naive_time":
+        authorized_at = datetime(2026, 7, 21, 18)
+
+    with pytest.raises(ValueError):
+        controller._record_legacy_cycle_cutover(
+            config,
+            cycle,
+            actor="" if blocker == "actor" else "ray",
+            reason="" if blocker == "reason" else "historical report missing",
+            authorized_at=authorized_at,
+            report_missing=True,
+        )
+
+
+def test_missing_report_cutover_is_immutable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    controller._request_revision(config, cycle, authorized_at)
+    values = {
+        "config": config,
+        "cycle": cycle,
+        "actor": "ray",
+        "reason": "historical report missing",
+        "authorized_at": authorized_at,
+        "report_missing": True,
+    }
+
+    first = controller._record_legacy_cycle_cutover(**values)
+
+    assert controller._record_legacy_cycle_cutover(**values) == first
+    with pytest.raises(FileExistsError, match="immutable artifact collision"):
+        controller._record_legacy_cycle_cutover(
+            **{**values, "reason": "different reason"}
+        )
+
+
 def prepare_legacy_cutover(
     config: DailyPremarketConfig,
 ) -> tuple[ControllerCycle, Path, Path, datetime]:

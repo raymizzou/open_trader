@@ -1191,6 +1191,7 @@ def _record_legacy_cycle_cutover(
     actor: str,
     reason: str,
     authorized_at: datetime,
+    report_missing: bool = False,
 ) -> Path:
     require_trend_executor(config, hostname_fn=socket.gethostname)
     path = _legacy_cutover_path(config, cycle.market, cycle.as_of_date)
@@ -1210,7 +1211,30 @@ def _record_legacy_cycle_cutover(
         request, completion = _revision_state(
             config, market, cycle.as_of_date, cycle.execution_date
         )
-        report_path, report_sha, _ = _revision_baseline(config, cycle)
+        report_path, report_sha, report_revision = _revision_baseline(
+            config, cycle
+        )
+        report_binding_valid = (
+            report_missing is True
+            and (report_path, report_sha, report_revision) == (None, None, -1)
+            and execution < authorized_at.astimezone(TIMEZONES[market]).date()
+            and not any(
+                _report_dir(config, market).glob(f"{cycle.as_of_date}*")
+            )
+            and request is not None
+            and request.get("baseline_report_path") is None
+            and request.get("baseline_report_sha256") is None
+            and request.get("baseline_revision") == -1
+        ) or (
+            report_missing is False
+            and report_path is not None
+            and report_sha is not None
+            and report_path.resolve().parent
+            == _report_dir(config, market).resolve()
+            and request is not None
+            and request.get("baseline_report_path") == str(report_path)
+            and request.get("baseline_report_sha256") == report_sha
+        )
         valid = (
             market == cycle.market
             and as_of.isoformat() == cycle.as_of_date
@@ -1223,35 +1247,30 @@ def _record_legacy_cycle_cutover(
             and not _batch_path(config, market, cycle.execution_date).exists()
             and request is not None
             and completion is None
-            and report_path is not None
-            and report_sha is not None
-            and report_path.resolve().parent
-            == _report_dir(config, market).resolve()
-            and request.get("baseline_report_path") == str(report_path)
-            and request.get("baseline_report_sha256") == report_sha
+            and report_binding_valid
         )
     except (KeyError, OSError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid legacy trend cutover: {path}") from exc
     if not valid:
         raise ValueError(f"invalid legacy trend cutover: {path}")
-    return _write_immutable(
-        path,
-        _canonical_json_bytes({
-            "schema_version": "open_trader.trend_controller.legacy_cutover.v1",
-            "market": cycle.market,
-            "as_of_date": cycle.as_of_date,
-            "execution_date": cycle.execution_date,
-            "report_path": str(report_path),
-            "report_sha256": report_sha,
-            "revision_request_path": str(request_path),
-            "revision_request_sha256": hashlib.sha256(
-                request_path.read_bytes()
-            ).hexdigest(),
-            "actor": actor,
-            "reason": reason,
-            "authorized_at": authorized_at.isoformat(timespec="seconds"),
-        }),
-    )
+    payload: dict[str, object] = {
+        "schema_version": "open_trader.trend_controller.legacy_cutover.v1",
+        "market": cycle.market,
+        "as_of_date": cycle.as_of_date,
+        "execution_date": cycle.execution_date,
+        "report_path": str(report_path) if report_path is not None else None,
+        "report_sha256": report_sha,
+        "revision_request_path": str(request_path),
+        "revision_request_sha256": hashlib.sha256(
+            request_path.read_bytes()
+        ).hexdigest(),
+        "actor": actor,
+        "reason": reason,
+        "authorized_at": authorized_at.isoformat(timespec="seconds"),
+    }
+    if report_missing:
+        payload["report_missing"] = True
+    return _write_immutable(path, _canonical_json_bytes(payload))
 
 
 def _legacy_cycle_cutover(
@@ -1273,9 +1292,37 @@ def _legacy_cycle_cutover(
         request, completion = _revision_state(
             config, market, cycle.as_of_date, cycle.execution_date
         )
-        report_path, report_sha, _ = _revision_baseline(config, cycle)
+        report_path, report_sha, report_revision = _revision_baseline(
+            config, cycle
+        )
         actor = payload.get("actor")
         reason = payload.get("reason")
+        report_missing = payload.get("report_missing", False)
+        report_binding_valid = (
+            report_missing is True
+            and (report_path, report_sha, report_revision) == (None, None, -1)
+            and execution < authorized_at.astimezone(TIMEZONES[market]).date()
+            and not any(
+                _report_dir(config, market).glob(f"{cycle.as_of_date}*")
+            )
+            and request is not None
+            and request.get("baseline_report_path") is None
+            and request.get("baseline_report_sha256") is None
+            and request.get("baseline_revision") == -1
+            and payload.get("report_path") is None
+            and payload.get("report_sha256") is None
+        ) or (
+            report_missing is False
+            and report_path is not None
+            and report_sha is not None
+            and report_path.resolve().parent
+            == _report_dir(config, market).resolve()
+            and request is not None
+            and request.get("baseline_report_path") == str(report_path)
+            and request.get("baseline_report_sha256") == report_sha
+            and payload.get("report_path") == str(report_path)
+            and payload.get("report_sha256") == report_sha
+        )
         valid = (
             payload.get("schema_version")
             == "open_trader.trend_controller.legacy_cutover.v1"
@@ -1299,14 +1346,7 @@ def _legacy_cycle_cutover(
             and not _batch_path(config, market, cycle.execution_date).exists()
             and request is not None
             and completion is None
-            and report_path is not None
-            and report_sha is not None
-            and report_path.resolve().parent
-            == _report_dir(config, market).resolve()
-            and request.get("baseline_report_path") == str(report_path)
-            and request.get("baseline_report_sha256") == report_sha
-            and payload.get("report_path") == str(report_path)
-            and payload.get("report_sha256") == report_sha
+            and report_binding_valid
             and payload.get("revision_request_path") == str(request_path)
             and payload.get("revision_request_sha256")
             == hashlib.sha256(request_path.read_bytes()).hexdigest()

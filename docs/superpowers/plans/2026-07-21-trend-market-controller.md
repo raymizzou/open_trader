@@ -1536,6 +1536,70 @@ bound legacy cycles. Then rerun focused/full tests and continue Task 8 Steps
 
 ---
 
+### Task 10: Cut over an explicitly missing historical report
+
+This user-authorized extension reuses Task 9's immutable fact and private
+writer. It adds no CLI, service, database, notification, or report generator.
+
+**Files:**
+- Modify: `src/open_trader/trend_market_controller.py:1187-1320`
+- Test: `tests/test_trend_market_controller.py:1780-1940`
+- Modify: `docs/superpowers/specs/2026-07-21-trend-market-controller-design.md`
+
+**Interfaces:**
+- Modifies: `_record_legacy_cycle_cutover(..., report_missing: bool = False) -> Path`.
+- Preserves: `_legacy_cycle_cutover(config, cycle) -> bool` and the default
+  report-bound behavior for facts without `report_missing`.
+
+- [ ] **Step 1: Prove the missing-cycle transition is RED**
+
+Add an HK-like historical cycle with no report, create its revision request,
+call `_record_legacy_cycle_cutover(..., report_missing=True)`, and assert the
+fact stores null report identity, `_execution_completed` is true,
+`_cycle_to_reconcile` advances, and no batch/action artifacts exist.
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/test_trend_market_controller.py::test_missing_report_cutover_skips_exact_expired_cycle -q
+```
+
+Expected: FAIL because `report_missing` is not accepted yet.
+
+- [ ] **Step 2: Implement the minimum writer/reader branch**
+
+For `report_missing=True`, require `_revision_baseline(config, cycle) ==
+(None, None, -1)`, no matching artifact in `_report_dir(config, market)`, a
+pending revision request with null path/SHA and revision `-1`, no completion,
+an expired execution window, no batch, executor host, and valid actor/reason/
+timezone-aware authorization. Write `report_missing: true`, null report path
+and SHA, and the existing request path/SHA binding. On every read, recompute
+the same absence. Keep the old report-bound branch unchanged when the field is
+absent or false.
+
+- [ ] **Step 3: Add fail-closed boundary tests**
+
+Prove: an existing report cannot be marked missing; a report appearing after
+the fact invalidates completion; missing cutovers retain executor, operator,
+expired-window, no-batch, and immutable-collision guards; existing report-bound
+cutover tests still pass.
+
+- [ ] **Step 4: Verify and commit without touching live state**
+
+Run focused missing/default cutover tests, then:
+
+```bash
+.venv/bin/python -m pytest tests/test_trend_market_controller.py -q
+.venv/bin/python -m pytest tests/test_trend_market_cli.py -q
+.venv/bin/python -m pytest tests/test_trend_review.py -q
+git diff --check
+```
+
+Expected: all suites pass without warnings. Commit source, tests, design, and
+plan together. Do not deploy, run acceptance, or write a shared cutover fact.
+
+---
+
 ## Spec-Coverage Checklist
 
 - One controller per CN/HK/US market, one operational namespace, and unchanged ordinary premarket: Tasks 4–6.
@@ -1546,4 +1610,6 @@ bound legacy cycles. Then rerun focused/full tests and continue Task 8 Steps
 - Atomic status, deduplicated alerts, Dashboard health/action states: Tasks 4 and 7.
 - Fenced migration, readonly cleanup, no direct old-watcher rollback, live process/log verification: Tasks 6 and 8.
 - SHA-bound, operator-authorized, no-backfill cutover for unreplayable expired legacy cycles: Task 9.
+- Explicitly authorized missing-report historical cutover with continuous
+  absence validation and mandatory current/future reports: Task 10.
 - Focused tests, full suite, safe direct workflow, live process restart, final acceptance PASS, exact-SHA redeploy: Task 8.
