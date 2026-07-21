@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+from collections.abc import Mapping
 import copy
 import inspect
 import json
@@ -929,7 +930,13 @@ def trend_controllers() -> dict[str, dict[str, object]]:
             "git_sha": "abc1234",
             "phase": "monitoring",
             "heartbeat_at": "2026-07-21T09:31:00+08:00",
-            "last_success": "report_locked",
+            "last_success": {
+                "status": "missed_window",
+                "market": market,
+                "date": "2026-07-20",
+                "submitted_count": 0,
+                "artifact_paths": [],
+            },
             "blocker": None,
             "next_check_at": "2026-07-21T09:31:05+08:00",
         }
@@ -1964,6 +1971,21 @@ class TabbedAccountLocator:
                 if controller["health"] == "unavailable"
                 else "执行主机控制器正常"
             )
+            last_success = controller["last_success"]
+            if isinstance(last_success, Mapping):
+                artifacts = last_success.get("artifact_paths")
+                artifact_text = (
+                    "，".join(str(item) for item in artifacts)
+                    if isinstance(artifacts, list) and artifacts
+                    else "无"
+                )
+                last_success = " · ".join((
+                    f"状态 {last_success.get('status')}",
+                    f"市场 {last_success.get('market')}",
+                    f"日期 {last_success.get('date')}",
+                    f"提交数 {last_success.get('submitted_count')}",
+                    f"产物 {artifact_text}",
+                ))
             return " ".join(str(value) for value in (
                 "策略控制器", headline,
                 "执行模式", controller["effective_mode"],
@@ -1973,7 +1995,7 @@ class TabbedAccountLocator:
                 "Git SHA", controller["git_sha"],
                 "当前阶段", controller["phase"],
                 "心跳", controller["heartbeat_at"],
-                "最近成功", controller["last_success"],
+                "最近成功", last_success,
                 "当前阻塞", controller["blocker"],
                 "下次检查", controller["next_check_at"],
             ))
@@ -2361,6 +2383,20 @@ def test_acceptance_allows_readonly_controller_without_heartbeat() -> None:
 
     page = tabbed_account_page(payload)
     page.trend_broker = "tiger"
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
+
+
+def test_acceptance_checks_readable_mapping_last_success_fields() -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+
     dashboard_acceptance._check_trend_controller_status(
         page,
         page.locator("#trend-report-workspace:visible"),

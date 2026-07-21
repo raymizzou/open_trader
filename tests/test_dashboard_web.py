@@ -56,6 +56,8 @@ def _controller_status(*, heartbeat_at: str) -> dict[str, object]:
         ("healthy", "ray-mac", "ray-mac", "healthy", False),
         ("missing", "ray-mac", "ray-mac", "unavailable", True),
         ("stale", "ray-mac", "ray-mac", "unavailable", True),
+        ("future-stale", "ray-mac", "ray-mac", "unavailable", True),
+        ("future-skew", "ray-mac", "ray-mac", "healthy", False),
         ("malformed", "ray-mac", "ray-mac", "unavailable", True),
         ("wrong-host", "ray-mac", "ray-mac", "unavailable", True),
         ("missing", "ray-mac", "readonly-copy", "readonly", False),
@@ -79,7 +81,15 @@ def test_dashboard_projects_strict_controller_health(
         if status == "malformed":
             path.write_text('{"phase":"monitoring"}', encoding="utf-8")
         else:
-            heartbeat = now - timedelta(minutes=3) if status == "stale" else now
+            heartbeat = (
+                now - timedelta(minutes=3)
+                if status == "stale"
+                else now + timedelta(seconds=121)
+                if status == "future-stale"
+                else now + timedelta(seconds=30)
+                if status == "future-skew"
+                else now
+            )
             payload = _controller_status(heartbeat_at=heartbeat.isoformat())
             if status == "wrong-host":
                 payload["local_host"] = "retired-host"
@@ -105,7 +115,7 @@ def test_dashboard_projects_strict_controller_health(
         assert controller["pid"] == 4242
         assert controller["git_sha"] == "abc1234"
         assert controller["phase"] == "monitoring"
-    if status == "stale":
+    if status in {"stale", "future-stale"}:
         assert controller["blocker"] == "controller heartbeat is stale"
     if health == "readonly":
         assert "OPEN_TRADER_TREND_EXECUTOR_HOST" in controller["reason"]
@@ -196,10 +206,81 @@ def test_dashboard_projects_locked_batch_when_latest_report_is_a_revision(
     batch.write_text(json.dumps(invalid_batch), encoding="utf-8")
     report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
 
-    assert report["artifact"] == "2026-07-17-r1.json"
     assert report["execution_batch"] is None
-    assert report["revision_anomaly"] is False
-    assert report["buy_actions"][0]["symbol"] == "REVISION"
+    assert report["execution_batch_blocking"] is True
+    assert report["execution_batch_error"] == "执行批次无效，已阻止操作投影"
+    assert report["buy_actions"] == []
+    assert report["sell_actions"] == []
+    assert report["hold_actions"] == []
+    assert report["review_actions"] == []
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["bad-json", "wrong-sha", "missing-artifact", "invalid-report"],
+)
+def test_dashboard_fails_closed_when_existing_execution_batch_is_invalid(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    from open_trader.dashboard import load_dashboard_state
+    from open_trader.trend_review import _report_hash
+
+    config = replace(dashboard_config(tmp_path), trend_executor_host="")
+    locked = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    revised = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17-r1.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:30:00+08:00",
+    )
+    revised["strategy_judgments"]["formal_actions"][0]["symbol"] = "REVISION"
+    revised_path = config.reports_dir / "trend_us_tiger/2026-07-17-r1.json"
+    revised_path.write_text(json.dumps(revised), encoding="utf-8")
+    locked_path = config.reports_dir / "trend_us_tiger/2026-07-17.json"
+    batch_path = (
+        config.data_dir / "trend_review/ledgers/US/batches/2026-07-20.json"
+    )
+    batch_path.parent.mkdir(parents=True)
+    batch_payload = {
+        "schema_version": "open_trader.trend_review.batch.v1",
+        "market": "US",
+        "execution_date": "2026-07-20",
+        "report_path": str(locked_path),
+        "report_sha256": _report_hash(locked),
+        "locked_at": "2026-07-20T09:30:00-04:00",
+    }
+    if corruption == "bad-json":
+        batch_path.write_text("{broken", encoding="utf-8")
+    else:
+        if corruption == "wrong-sha":
+            batch_payload["report_sha256"] = "f" * 64
+        elif corruption == "missing-artifact":
+            batch_payload["report_path"] = str(locked_path.with_name("missing.json"))
+        else:
+            invalid_path = locked_path.with_name("invalid.json")
+            invalid_payload: dict[str, object] = {}
+            invalid_path.write_text(json.dumps(invalid_payload), encoding="utf-8")
+            batch_payload["report_path"] = str(invalid_path)
+            batch_payload["report_sha256"] = _report_hash(invalid_payload)
+        batch_path.write_text(json.dumps(batch_payload), encoding="utf-8")
+
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
+
+    assert report["execution_batch"] is None
+    assert report["execution_batch_blocking"] is True
+    assert report["execution_batch_error"] == "执行批次无效，已阻止操作投影"
+    assert report["counts"] == {"sell": 0, "buy": 0, "hold": 0, "review": 0}
+    assert all(
+        report[key] == []
+        for key in ("sell_actions", "buy_actions", "hold_actions", "review_actions")
+    )
+    assert "REVISION" not in json.dumps(report, ensure_ascii=False)
 
 
 def relative_luminance(color: str) -> float:
@@ -3235,16 +3316,33 @@ const report={
 const healthy={effective_mode:"execute",executor_host:"ray-mac",local_host:"ray-mac",
   health:"healthy",blocking:false,pid:4242,working_directory:"/srv/open_trader",
   git_sha:"abc1234",phase:"monitoring",heartbeat_at:"2026-07-21T09:31:00+08:00",
-  last_success:"report_locked",blocker:null,next_check_at:"2026-07-21T09:31:05+08:00"};
+  last_success:{status:"<script>alert(1)</script>",market:"US",date:"2026-07-20",
+    submitted_count:0,artifact_paths:[]},
+  blocker:null,next_check_at:"2026-07-21T09:31:05+08:00"};
 state.dashboard={trend_controllers:{tiger:healthy}};
 const normal=renderTrendReportWorkspace(report);
 for(const text of ["策略控制器","执行模式","execute","执行主机","ray-mac","本地主机",
   "PID","4242","Git SHA","abc1234","当前阶段","monitoring","心跳",
-  "最近成功","report_locked","当前阻塞","下次检查",
+  "最近成功","状态 &lt;script&gt;alert(1)&lt;/script&gt;","市场 US","日期 2026-07-20",
+  "提交数 0","产物 无","当前阻塞","下次检查",
   "状态不确定，禁止自动重试","订单事实冲突，禁止提交","已错过策略窗口",
   "发现后续报告版本，执行仍锁定原批次","aaaaaaaaaaaa","bbbbbbbbbbbb"]){
   if(!normal.includes(text))throw new Error(text+"\n"+normal);
 }
+if(normal.includes("[object Object]") || normal.includes("<script>"))throw new Error(normal);
+state.dashboard.trend_controllers.tiger={...healthy,last_success:"report_locked"};
+if(!renderTrendReportWorkspace(report).includes("report_locked"))throw new Error("string last_success");
+state.dashboard.trend_controllers.tiger={...healthy,last_success:null};
+if(!renderTrendReportWorkspace(report).includes("<dt>最近成功</dt><dd>—</dd>"))throw new Error("null last_success");
+state.dashboard.trend_controllers.tiger=healthy;
+const batchBlocked=renderTrendReportWorkspace({...report,
+  execution_batch:null,execution_batch_blocking:true,
+  execution_batch_error:"执行批次无效，已阻止操作投影",counts:{buy:0},
+  sell_actions:[],buy_actions:[],hold_actions:[],review_actions:[]});
+if(!batchBlocked.includes('class="trend-execution-batch-error"') ||
+   !batchBlocked.includes("执行批次无效，已阻止操作投影") ||
+   !batchBlocked.includes('class="trend-controller-status"') ||
+   batchBlocked.includes("TRV"))throw new Error(batchBlocked);
 state.dashboard.trend_controllers.tiger={...healthy,health:"unavailable",blocking:true,
   phase:"unavailable",blocker:"controller heartbeat is stale",reason:"controller heartbeat is stale"};
 const blocked=renderTrendReportWorkspace(report);
@@ -3276,7 +3374,9 @@ state.dashboard={trend_controllers:{tiger:{effective_mode:"execute",executor_hos
   local_host:"ray-mac",health:"unavailable",blocking:true,pid:4242,
   working_directory:"/a/very/long/path/to/the/exact/accepted/dashboard/checkout",
   git_sha:"1234567890abcdef1234567890abcdef12345678",phase:"report_generation_blocked",
-  heartbeat_at:"2026-07-21T09:31:00+08:00",last_success:"report_locked",
+  heartbeat_at:"2026-07-21T09:31:00+08:00",last_success:{status:"missed_window",
+    market:"US",date:"2026-07-20",submitted_count:0,
+    artifact_paths:["/a/very/long/path/to/an/execution/artifact.json"]},
   blocker:"controller heartbeat is stale after an intentionally long diagnostic message",
   next_check_at:"2026-07-21T09:31:05+08:00",reason:"controller heartbeat is stale"}}};
 console.log(JSON.stringify(renderTrendReportWorkspace({available:true,market:"US",broker:"tiger",
@@ -3296,6 +3396,12 @@ console.log(JSON.stringify(renderTrendReportWorkspace({available:true,market:"US
 
         assert errors == []
         assert page.locator(".trend-controller-status").count() == 1
+        assert "状态 missed_window" in page.locator(
+            ".trend-controller-status"
+        ).inner_text()
+        assert "[object Object]" not in page.locator(
+            ".trend-controller-status"
+        ).inner_text()
         assert page.locator(".trend-controller-status dl").evaluate(
             "node => getComputedStyle(node).gridTemplateColumns.split(' ').length"
         ) == 1

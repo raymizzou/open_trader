@@ -1864,7 +1864,8 @@ table {
   font-weight: 700;
 }
 
-.trend-revision-anomaly {
+.trend-revision-anomaly,
+.trend-execution-batch-error {
   background: var(--surface-soft);
   border-left: 3px solid var(--danger);
   margin: 0;
@@ -4283,6 +4284,7 @@ tbody tr.active-row,
 .backtest-metric-card,
 .trend-controller-status dl div,
 .trend-revision-anomaly,
+.trend-execution-batch-error,
 .trend-risk-summary dl div,
 .trend-actual-facts span,
 .cn-trend-card td:nth-child(-n + 2),

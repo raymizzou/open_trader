@@ -2549,6 +2549,9 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const revisionAnomaly = report.revision_anomaly === true
     ? `<p class="trend-revision-anomaly">发现后续报告版本，执行仍锁定原批次 · 批次 ${escapeHtml(String(batchSha || "—").slice(0, 12))} · 最新 ${escapeHtml(String(report.latest_report_sha256 || "—").slice(0, 12))}</p>`
     : "";
+  const batchError = report.execution_batch_blocking === true
+    ? `<p class="trend-execution-batch-error">${escapeHtml(formatPlain(report.execution_batch_error || "执行批次无效，已阻止操作投影"))}</p>`
+    : "";
   return `<${root} class="cn-trend-report"${identity}>
     <header class="trend-report-header">
       <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1>${strategyVersion}</div>
@@ -2571,6 +2574,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
       </div>
     </header>
     ${renderTrendControllerStatus(report.broker)}
+    ${batchError}
     ${revisionAnomaly}
     ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date)}
     <div class="cn-trend-actions">
@@ -2600,7 +2604,7 @@ function renderTrendControllerStatus(broker) {
     ["Git SHA", controller.git_sha],
     ["当前阶段", controller.phase],
     ["心跳", controller.heartbeat_at],
-    ["最近成功", controller.last_success],
+    ["最近成功", formatTrendControllerLastSuccess(controller.last_success)],
     ["当前阻塞", controller.blocker || controller.reason],
     ["下次检查", controller.next_check_at],
   ];
@@ -2608,6 +2612,26 @@ function renderTrendControllerStatus(broker) {
     <header><h2>策略控制器</h2><strong>${escapeHtml(headline)}</strong></header>
     <dl>${facts.map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHtml(hasValue(value) ? formatPlain(value) : "—")}</dd></div>`).join("")}</dl>
   </section>`;
+}
+
+function formatTrendControllerLastSuccess(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value !== "object" || Array.isArray(value)) return formatPlain(value);
+  const labels = {
+    status: "状态", market: "市场", date: "日期",
+    submitted_count: "提交数", artifact_paths: "产物",
+  };
+  const keys = ["status", "market", "date", "submitted_count", "artifact_paths"]
+    .filter((key) => Object.hasOwn(value, key));
+  const ordered = keys.length ? keys : Object.keys(value).sort();
+  const parts = ordered.map((key) => {
+    const item = value[key];
+    const rendered = Array.isArray(item)
+      ? item.length ? item.map(formatPlain).join("，") : "无"
+      : formatPlain(item);
+    return `${labels[key] || key} ${rendered}`;
+  });
+  return parts.length ? parts.join(" · ") : "—";
 }
 
 const OPTION_ATTENTION_COLUMNS = [

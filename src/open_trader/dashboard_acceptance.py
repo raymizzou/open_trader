@@ -2381,6 +2381,33 @@ def _check_trend_controller_status(
     ):
         assert label in text, f"{broker} 控制器状态卡缺少 {label}"
         value = controller.get(key)
+        if key == "last_success" and isinstance(value, Mapping):
+            assert "[object Object]" not in text, (
+                f"{broker} 控制器最近成功不可读"
+            )
+            for fact_label, fact_key in (
+                ("状态", "status"),
+                ("市场", "market"),
+                ("日期", "date"),
+                ("提交数", "submitted_count"),
+                ("产物", "artifact_paths"),
+            ):
+                if fact_key not in value:
+                    continue
+                assert fact_label in text, (
+                    f"{broker} 控制器最近成功缺少 {fact_label}"
+                )
+                fact_value = value[fact_key]
+                if isinstance(fact_value, list):
+                    expected = [str(item) for item in fact_value] or ["无"]
+                elif fact_value not in (None, ""):
+                    expected = [str(fact_value)]
+                else:
+                    expected = []
+                assert all(item in text for item in expected), (
+                    f"{broker} 控制器最近成功 {fact_label} 与 API 不一致"
+                )
+            continue
         if value not in (None, ""):
             assert str(value) in text, f"{broker} 控制器状态卡 {label} 与 API 不一致"
     mode = controller.get("effective_mode")

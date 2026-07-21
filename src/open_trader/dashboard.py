@@ -411,7 +411,7 @@ def _load_trend_controllers(
                 market, "unavailable", True, "controller hostname does not match"
             )
         heartbeat = datetime.fromisoformat(str(payload["heartbeat_at"]))
-        if current - heartbeat.astimezone(current.tzinfo) > timedelta(minutes=2):
+        if abs(current - heartbeat) > timedelta(minutes=2):
             return {
                 **base(market, "unavailable", True, "controller heartbeat is stale"),
                 **payload,
@@ -1305,6 +1305,7 @@ def _project_broker_trend_report(
     _, latest_payload, *_ = selected
     latest_report_sha256 = _report_hash(latest_payload)
     execution_batch: dict[str, object] | None = None
+    execution_batch_error = ""
     revision_anomaly = False
     if use_execution_batch:
         batch_path = (
@@ -1316,52 +1317,79 @@ def _project_broker_trend_report(
             / f"{selected[2].isoformat()}.json"
         )
         try:
-            batch = json.loads(batch_path.read_text(encoding="utf-8"))
-            batch = _validate_execution_batch(
-                batch,
-                market=market,
-                execution_date=selected[2].isoformat(),
-            )
-            locked_path = Path(str(batch["report_path"])).resolve()
-            if locked_path.parent != reports_dir.resolve():
-                raise ValueError
-            locked = _validated_trend_report_artifact(
-                reports_dir,
-                artifact=locked_path.name,
-                market=market,
-                broker=broker,
-            )
-            if (
-                locked is None
-                or locked[0].resolve() != locked_path
-                or locked[2] != selected[2]
-                or _report_hash(locked[1]) != batch.get("report_sha256")
-            ):
-                raise ValueError
+            batch_text = batch_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             pass
-        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, ValueError):
-            pass
+        except (OSError, UnicodeError):
+            execution_batch_error = "执行批次无效，已阻止操作投影"
         else:
-            path, payload, execution_date, as_of_date, freshness_date, generated_at, _ = locked
-            selected = (
-                path, payload, execution_date, as_of_date, freshness_date, generated_at
-            )
-            execution_batch = batch
-            revision_anomaly = batch["report_sha256"] != latest_report_sha256
+            try:
+                batch = json.loads(batch_text)
+                batch = _validate_execution_batch(
+                    batch,
+                    market=market,
+                    execution_date=selected[2].isoformat(),
+                )
+                locked_path = Path(str(batch["report_path"])).resolve()
+                if locked_path.parent != reports_dir.resolve():
+                    raise ValueError
+                locked = _validated_trend_report_artifact(
+                    reports_dir,
+                    artifact=locked_path.name,
+                    market=market,
+                    broker=broker,
+                )
+                if (
+                    locked is None
+                    or locked[0].resolve() != locked_path
+                    or locked[2] != selected[2]
+                    or _report_hash(locked[1]) != batch.get("report_sha256")
+                ):
+                    raise ValueError
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                ValueError,
+            ):
+                execution_batch_error = "执行批次无效，已阻止操作投影"
+            else:
+                (
+                    path,
+                    payload,
+                    execution_date,
+                    as_of_date,
+                    freshness_date,
+                    generated_at,
+                    _,
+                ) = locked
+                selected = (
+                    path,
+                    payload,
+                    execution_date,
+                    as_of_date,
+                    freshness_date,
+                    generated_at,
+                )
+                execution_batch = batch
+                revision_anomaly = batch["report_sha256"] != latest_report_sha256
     path, payload, execution_date, as_of_date, freshness_date, generated_at = selected
     account = payload["account"]
     metadata = payload["metadata"]
     report_sha256 = _report_hash(payload)
-    executions = _trend_action_executions(
-        data_dir,
-        market=market,
-        execution_date=execution_date.isoformat(),
-        report_sha256=report_sha256,
-    )
-    sell_actions, buy_actions, hold_actions, review_actions = (
-        _project_trend_actions(payload, executions)
-    )
+    if execution_batch_error:
+        sell_actions, buy_actions, hold_actions, review_actions = [], [], [], []
+    else:
+        executions = _trend_action_executions(
+            data_dir,
+            market=market,
+            execution_date=execution_date.isoformat(),
+            report_sha256=report_sha256,
+        )
+        sell_actions, buy_actions, hold_actions, review_actions = (
+            _project_trend_actions(payload, executions)
+        )
     account_fresh = account.get("fresh") is True
     directory = reports_dir.name
     signal_snapshots = payload.get("signal_snapshots", {})
@@ -1394,6 +1422,8 @@ def _project_broker_trend_report(
         "artifact": path.name,
         "report_sha256": report_sha256,
         "execution_batch": execution_batch,
+        "execution_batch_blocking": bool(execution_batch_error),
+        "execution_batch_error": execution_batch_error,
         "latest_report_sha256": latest_report_sha256,
         "revision_anomaly": revision_anomaly,
         "strategy_version": str(
