@@ -667,6 +667,7 @@ export ACCEPTED_SHA=replace-with-full-accepted-sha
 test "$(git rev-parse HEAD)" = "$ACCEPTED_SHA"
 test -z "$(git status --short)"
 
+pgrep -f 'open_trader trend-market run' | xargs ps -o pid,lstart,command -p || true
 scripts/install_daily_premarket_launchd.sh \
   --config /Users/ray/projects/open_trader/config/daily_premarket.env \
   --trend-only --market all
@@ -679,7 +680,9 @@ screen -dmS open_trader_dashboard_8766 zsh -lc \
 For each CN/HK/US status document, verify the PID is live, `working_directory`
 is the accepted worktree, `git_sha` equals `$ACCEPTED_SHA`, and `heartbeat_at`
 advances between two reads. Then check fresh controller/Dashboard logs and both
-Dashboard endpoints:
+Dashboard endpoints. Compare the final process list with the pre-install list:
+each controller status PID must be new, and its `lstart` timestamp must be after
+the exact-SHA reinstall:
 
 ```bash
 .venv/bin/python - <<'PY'
@@ -711,7 +714,7 @@ for market, previous in before.items():
 PY
 
 pgrep -f 'open_trader trend-market run' | xargs ps -o pid,lstart,command -p
-tail -n 80 /Users/ray/projects/open_trader/logs/daily_premarket/launchd-trend-controller-*.out.log
+tail -n 80 /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec/logs/daily_premarket/launchd-trend-controller-*.{out,err}.log
 tail -n 80 /tmp/open_trader_dashboard_8766.log
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/
 curl -sS http://127.0.0.1:8766/api/dashboard | \
