@@ -815,8 +815,10 @@ def _action_resolutions(
     symbol: str,
     futu_code: str,
     side: str,
+    action_attempts: set[int],
 ) -> list[dict[str, object]]:
     resolutions: list[dict[str, object]] = []
+    resolved_attempts: set[int] = set()
     for path in sorted((root / "resolutions").glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -847,6 +849,8 @@ def _action_resolutions(
             or not isinstance(attempt_no, int)
             or isinstance(attempt_no, bool)
             or attempt_no <= 0
+            or attempt_no not in action_attempts
+            or attempt_no in resolved_attempts
             or resolution not in RESOLUTION_STATUSES
             or payload.get("status") != RESOLUTION_STATUSES.get(resolution)
             or not str(payload.get("actor") or "").strip()
@@ -859,6 +863,7 @@ def _action_resolutions(
             and order_id is not None
         ):
             raise ValueError(f"invalid trend action resolution: {path}")
+        resolved_attempts.add(attempt_no)
         resolutions.append(payload)
     return resolutions
 
@@ -917,15 +922,6 @@ def resolve_trend_action(
     lock = os.open(action_root / ".resolution.lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        resolutions = _action_resolutions(
-            action_root,
-            market=market,
-            execution_date=execution_date,
-            action_key=action_key,
-            symbol=symbol,
-            futu_code=futu_code,
-            side=side,
-        )
         facts = _action_facts(
             data_dir
             / "trend_review"
@@ -935,6 +931,16 @@ def resolve_trend_action(
             / execution_date,
             futu_code=futu_code,
             side=side,
+        )
+        resolutions = _action_resolutions(
+            action_root,
+            market=market,
+            execution_date=execution_date,
+            action_key=action_key,
+            symbol=symbol,
+            futu_code=futu_code,
+            side=side,
+            action_attempts={item[3] for item in facts},
         )
         action_attempt = max((item[3] for item in facts), default=0)
         resolved_attempts = {
@@ -1303,6 +1309,7 @@ def execute_trend_review_open(
             / execution_date
             / action_key
         )
+        action_facts = _action_facts(root, futu_code=futu_code, side=side)
         resolutions = _action_resolutions(
             action_events_root,
             market=market,
@@ -1311,13 +1318,13 @@ def execute_trend_review_open(
             symbol=symbol,
             futu_code=futu_code,
             side=side,
+            action_attempts={item[3] for item in action_facts},
         )
         authorized_attempts = {
             int(item["attempt_no"])
             for item in resolutions
             if item.get("resolution") == "authorize-retry"
         }
-        action_facts = _action_facts(root, futu_code=futu_code, side=side)
         buy_window_event = None
         if action_name == "BUY" and symbol not in sell_symbols:
             if same_day and local_time < datetime.strptime("09:30", "%H:%M").time():

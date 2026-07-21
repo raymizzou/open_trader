@@ -1093,7 +1093,7 @@ def test_only_authorize_retry_permits_attempt_two(tmp_path: Path) -> None:
     assert unresolved["status"] == "uncertain"
     assert len(client.requests) == 1
 
-    trend_review.resolve_trend_action(
+    resolution_path = trend_review.resolve_trend_action(
         tmp_path,
         market="CN",
         execution_date="2026-07-20",
@@ -1104,6 +1104,7 @@ def test_only_authorize_retry_permits_attempt_two(tmp_path: Path) -> None:
         reason="broker confirmed no order",
         resolved_at="2026-07-20T09:40:00+08:00",
     )
+    assert json.loads(resolution_path.read_text(encoding="utf-8"))["attempt_no"] == 1
     retried = trend_review.execute_trend_review_open(
         **arguments, now="2026-07-20T09:41:00+08:00"
     )
@@ -1115,6 +1116,88 @@ def test_only_authorize_retry_permits_attempt_two(tmp_path: Path) -> None:
     assert client.requests[-1]["remark"] == trend_review.trend_attempt_remark(
         "CN", "2026-07-20", action_key, 2
     )
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "contradictory"])
+def test_resolution_loader_rejects_migrated_duplicate_attempt(
+    tmp_path: Path, kind: str,
+) -> None:
+    client = make_uncertain_buy(tmp_path)
+    first = trend_review.resolve_trend_action(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        symbol="600001",
+        side="buy",
+        resolution="authorize-retry",
+        actor="ray",
+        reason="broker checked",
+        resolved_at="2026-07-20T09:40:00+08:00",
+    )
+    migrated = json.loads(first.read_text(encoding="utf-8"))
+    migrated["resolved_at"] = "2026-07-20T09:41:00+08:00"
+    if kind == "contradictory":
+        migrated.update(resolution="abandon", status="abandoned")
+    (first.parent / f"migrated-{kind}.json").write_text(
+        json.dumps(migrated), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="invalid trend action resolution"):
+        trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=cn_buy_report(),
+            client=client,
+            market="CN",
+            execution_date="2026-07-20",
+            now="2026-07-20T09:42:00+08:00",
+            quote_prices={"SH.600001": Decimal("10")},
+        )
+
+
+def test_resolution_loader_rejects_future_attempt_authorization(
+    tmp_path: Path,
+) -> None:
+    client = make_uncertain_buy(tmp_path)
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    resolution_root = (
+        tmp_path
+        / "trend_review/ledgers/CN/actions/2026-07-20"
+        / action_key
+        / "resolutions"
+    )
+    resolution_root.mkdir(parents=True)
+    (resolution_root / "future.json").write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_review.resolution.v1",
+            "market": "CN",
+            "execution_date": "2026-07-20",
+            "action_key": action_key,
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "buy",
+            "attempt_no": 2,
+            "resolution": "authorize-retry",
+            "status": "retry_authorized",
+            "actor": "ray",
+            "reason": "future approval",
+            "futu_order_id": None,
+            "resolved_at": "2026-07-20T09:40:00+08:00",
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid trend action resolution"):
+        trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=cn_buy_report(),
+            client=client,
+            market="CN",
+            execution_date="2026-07-20",
+            now="2026-07-20T09:41:00+08:00",
+            quote_prices={"SH.600001": Decimal("10")},
+        )
 
 
 def test_authorize_retry_is_consumed_by_one_uncertain_attempt(tmp_path: Path) -> None:
