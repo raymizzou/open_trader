@@ -1653,6 +1653,7 @@ def test_legacy_cutover_skips_only_exact_expired_unreplayable_cycle(
     authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
     controller._request_revision(config, historical, authorized_at)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args: current)
 
     cutover = controller._record_legacy_cycle_cutover(
         config,
