@@ -273,6 +273,164 @@ def _report_hash(report: Mapping[str, object]) -> str:
     return hashlib.sha256(_canonical_json_bytes(report)).hexdigest()
 
 
+def trend_action_key(
+    market: str, execution_date: str, futu_code: str, side: str
+) -> str:
+    identity = ":".join(
+        (
+            _market(market),
+            date.fromisoformat(execution_date).isoformat(),
+            futu_code.strip().upper(),
+            side.strip().lower(),
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def trend_attempt_remark(
+    market: str, execution_date: str, action_key: str, attempt: int
+) -> str:
+    if attempt <= 0:
+        raise ValueError("attempt must be positive")
+    remark = f"trend:{_market(market)}:{execution_date}:{action_key[:20]}:{attempt}"
+    if len(remark.encode("utf-8")) > 64:
+        raise ValueError("trend order remark exceeds Futu's 64-byte limit")
+    return remark
+
+
+def _validate_execution_batch(
+    payload: object, *, market: str, execution_date: str
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError("trend execution batch must be a JSON object")
+    try:
+        locked_at = datetime.fromisoformat(str(payload["locked_at"]))
+    except (KeyError, ValueError):
+        raise ValueError("trend execution batch has an invalid locked_at") from None
+    report_sha = payload.get("report_sha256")
+    if (
+        payload.get("schema_version") != "open_trader.trend_review.batch.v1"
+        or payload.get("market") != market
+        or payload.get("execution_date") != execution_date
+        or not isinstance(payload.get("report_path"), str)
+        or not payload["report_path"]
+        or not isinstance(report_sha, str)
+        or len(report_sha) != 64
+        or any(character not in "0123456789abcdef" for character in report_sha)
+        or locked_at.tzinfo is None
+        or locked_at.utcoffset() is None
+    ):
+        raise ValueError("trend execution batch is invalid")
+    return payload
+
+
+def lock_trend_execution_batch(
+    data_dir: Path,
+    *,
+    market: str,
+    execution_date: str,
+    report_path: Path,
+    report: Mapping[str, object],
+    locked_at: str,
+) -> dict[str, object]:
+    market = _market(market)
+    execution_date = date.fromisoformat(execution_date).isoformat()
+    path = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "batches"
+        / f"{execution_date}.json"
+    )
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid trend execution batch: {path}") from exc
+        return _validate_execution_batch(
+            existing, market=market, execution_date=execution_date
+        )
+    legacy_intents: list[tuple[datetime, str]] = []
+    for intent_path in (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "open"
+        / execution_date
+    ).glob("*-intent.json"):
+        try:
+            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            created_at = datetime.fromisoformat(str(intent["created_at"]))
+            report_sha = intent["report_sha256"]
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ValueError(
+                f"trend execution batch is blocked by invalid intent: {intent_path}"
+            ) from exc
+        if (
+            created_at.tzinfo is None
+            or created_at.utcoffset() is None
+            or not isinstance(report_sha, str)
+            or len(report_sha) != 64
+            or any(character not in "0123456789abcdef" for character in report_sha)
+        ):
+            raise ValueError(
+                f"trend execution batch is blocked by invalid intent: {intent_path}"
+            )
+        legacy_intents.append((created_at, report_sha))
+    selected_path = report_path
+    selected_sha = _report_hash(report)
+    if legacy_intents:
+        selected_sha = min(legacy_intents, key=lambda item: item[0])[1]
+        matches: list[Path] = []
+        for candidate in sorted(report_path.parent.glob("*.json")):
+            try:
+                candidate_report = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(candidate_report, Mapping)
+                and _report_hash(candidate_report) == selected_sha
+            ):
+                matches.append(candidate)
+        if not matches:
+            raise ValueError(
+                "trend execution batch is blocked: no matching report artifact"
+            )
+        selected_path = matches[0]
+    payload = _validate_execution_batch(
+        {
+            "schema_version": "open_trader.trend_review.batch.v1",
+            "market": market,
+            "execution_date": execution_date,
+            "report_path": str(selected_path),
+            "report_sha256": selected_sha,
+            "locked_at": locked_at,
+        },
+        market=market,
+        execution_date=execution_date,
+    )
+    try:
+        _write_immutable(path, _canonical_json_bytes(payload))
+    except FileExistsError:
+        try:
+            concurrent = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid trend execution batch: {path}") from exc
+        return _validate_execution_batch(
+            concurrent, market=market, execution_date=execution_date
+        )
+    return payload
+
+
 def _positive_positions(snapshot: Mapping[str, object]) -> list[Mapping[str, object]]:
     raw = snapshot.get("positions")
     if not isinstance(raw, list):
@@ -316,9 +474,7 @@ def _reconcile_intent(
     request = payload.get("request") if isinstance(payload, Mapping) else None
     if not isinstance(request, dict):
         raise ValueError("trend review intent request is invalid")
-    result_path = intent_path.with_name(
-        intent_path.name.replace("-intent", "-result")
-    )
+    result_path = _result_path(intent_path)
     if result_path.exists():
         return request, True, None
     listed = client.list_orders()
@@ -390,13 +546,91 @@ def _order_has_action_identity(
     )
 
 
-def _open_order_remark(
-    market: str, execution_date: str, action_key: str
-) -> str:
-    remark = f"trend-review:{market}:{execution_date}:{action_key[:24]}"
-    if len(remark.encode("utf-8")) > 64:
-        raise ValueError("trend review order remark exceeds Futu's 64-byte limit")
-    return remark
+def _action_intents(
+    root: Path, *, futu_code: str, side: str
+) -> list[tuple[Path, dict[str, object], dict[str, object]]]:
+    intents: list[tuple[Path, dict[str, object], dict[str, object]]] = []
+    for path in root.glob("*-intent.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid trend review intent: {path}") from exc
+        request = payload.get("request") if isinstance(payload, dict) else None
+        if not isinstance(request, dict):
+            raise ValueError(f"invalid trend review intent: {path}")
+        if (
+            str(request.get("futu_code") or "").strip().upper()
+            == futu_code.strip().upper()
+            and str(request.get("side") or "").strip().rsplit(".", 1)[-1].lower()
+            == side.strip().rsplit(".", 1)[-1].lower()
+        ):
+            intents.append((path, payload, request))
+    return sorted(
+        intents,
+        key=lambda item: (str(item[1].get("created_at") or ""), item[0].name),
+    )
+
+
+def _listed_orders(
+    client: object, *, start: str, end: str
+) -> list[Mapping[str, object]]:
+    listed = client.list_orders(start=start, end=end)
+    orders = listed.get("orders") if isinstance(listed, Mapping) else None
+    if not isinstance(orders, list) or not all(
+        isinstance(order, Mapping) for order in orders
+    ):
+        raise ValueError("simulate broker orders are unavailable")
+    return orders
+
+
+def _broker_attempt_fact(
+    orders: Sequence[Mapping[str, object]], request: Mapping[str, object]
+) -> tuple[str, Mapping[str, object] | None]:
+    same_remark = [
+        order
+        for order in orders
+        if str(order.get("remark") or "") == str(request.get("remark") or "")
+    ]
+    exact = [
+        order for order in same_remark if _order_matches_request(order, request)
+    ]
+    if not same_remark:
+        return "absent", None
+    if len(same_remark) == len(exact) == 1:
+        return "exact", exact[0]
+    return "conflict", None
+
+
+def _result_path(intent_path: Path) -> Path:
+    return intent_path.with_name(intent_path.name.replace("-intent", "-result"))
+
+
+def _write_reconciled_result(
+    intent_path: Path,
+    *,
+    market: str,
+    execution_date: str,
+    request: Mapping[str, object],
+    response: Mapping[str, object],
+    report_sha: str,
+    action_index: int,
+    reconciled_at: str,
+) -> Path:
+    return _write_immutable(
+        _result_path(intent_path),
+        _canonical_json_bytes(
+            {
+                "market": market,
+                "date": execution_date,
+                "report_sha256": report_sha,
+                "action_index": action_index,
+                "request": request,
+                "response": response,
+                "reconciled": True,
+                "submitted_at": reconciled_at,
+            }
+        ),
+    )
 
 
 def _write_action_event(
@@ -518,6 +752,7 @@ def execute_trend_review_open(
     market: str,
     execution_date: str,
     now: str,
+    quote_prices: Mapping[str, Decimal] | None = None,
 ) -> dict[str, object]:
     market = _market(market)
     actions, strategy_version = _preflight_open_actions(report, market)
@@ -567,6 +802,7 @@ def execute_trend_review_open(
     report_sha = _report_hash(report)
     submitted = 0
     artifacts: list[str] = []
+    blocked_status: str | None = None
     sell_symbols = {
         str(action.get("symbol") or "").strip()
         for action in actions
@@ -595,13 +831,20 @@ def execute_trend_review_open(
             continue
         futu_code = to_futu_symbol(market, symbol)
         side = "buy" if action_name == "BUY" else "sell"
-        action_key = hashlib.sha256(
-            f"{market}:{execution_date}:{strategy_version}:{futu_code}:{side}".encode(
-                "utf-8"
-            )
-        ).hexdigest()
+        action_key = trend_action_key(market, execution_date, futu_code, side)
+        action_evidence = {
+            "market": market,
+            "date": execution_date,
+            "strategy_version": strategy_version,
+            "report_sha256": report_sha,
+            "action_index": index,
+            "symbol": symbol,
+            "futu_code": futu_code,
+            "side": side,
+        }
         stem = action_key
         intent_path = root / f"{stem}-intent.json"
+        intents = _action_intents(root, futu_code=futu_code, side=side)
         sell_position = next(
             (
                 item
@@ -623,7 +866,7 @@ def execute_trend_review_open(
             if sell_position is not None
             else 0
         )
-        if action_name == "SELL_ALL" and intent_path.exists():
+        if action_name == "SELL_ALL" and intents:
             action_events_root = (
                 data_dir
                 / "trend_review"
@@ -649,7 +892,7 @@ def execute_trend_review_open(
         if not same_day and not (
             local_current.date() > execution_day
             and action_name == "SELL_ALL"
-            and intent_path.exists()
+            and bool(intents)
         ):
             continue
         if action_name == "BUY" and (symbol in sell_symbols or not buy_window_open):
@@ -660,13 +903,7 @@ def execute_trend_review_open(
                     execution_date=execution_date,
                     action_key=action_key,
                     payload={
-                        "market": market,
-                        "date": execution_date,
-                        "strategy_version": strategy_version,
-                        "report_sha256": report_sha,
-                        "symbol": symbol,
-                        "futu_code": futu_code,
-                        "side": side,
+                        **action_evidence,
                         "status": (
                             "pending"
                             if local_time
@@ -685,24 +922,77 @@ def execute_trend_review_open(
             continue
         if action_name == "SELL_ALL" and not market_open and sell_quantity > 0:
             continue
-        if intent_path.exists():
-            intent_paths = [intent_path, *sorted(root.glob(f"{stem}-attempt-*-intent.json"))]
+        if intents:
+            intent_paths = [item[0] for item in intents]
             pending_intent = next(
                 (
                     path
                     for path in intent_paths
-                    if not path.with_name(
-                        path.name.replace("-intent", "-result")
-                    ).exists()
+                    if not _result_path(path).exists()
                 ),
                 None,
             )
             if pending_intent is not None and (
                 action_name != "SELL_ALL" or sell_quantity > 0
             ):
-                request, reconciled, rejected_status = _reconcile_intent(
-                    pending_intent, client
+                request = next(
+                    item[2] for item in intents if item[0] == pending_intent
                 )
+                orders = _listed_orders(
+                    client,
+                    start=execution_date,
+                    end=local_current.date().isoformat(),
+                )
+                broker_fact, broker_order = _broker_attempt_fact(orders, request)
+                if broker_fact == "conflict":
+                    _write_action_event(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        payload={
+                            **action_evidence,
+                            "status": "conflict",
+                            "target_qty": str(request.get("qty") or ""),
+                            "reason": "broker order conflicts with immutable intent",
+                        },
+                        recorded_at=now,
+                    )
+                    blocked_status = "conflict"
+                    break
+                rejected_status = next(
+                    (
+                        str(
+                            order.get("order_status")
+                            or order.get("status")
+                            or ""
+                        )
+                        .strip()
+                        .upper()
+                        for order in [broker_order]
+                        if order is not None
+                        if str(
+                            order.get("order_status")
+                            or order.get("status")
+                            or ""
+                        )
+                        .strip()
+                        .upper()
+                        in REJECTED_ORDER_STATUSES
+                    ),
+                    None,
+                )
+                if broker_order is not None:
+                    _write_reconciled_result(
+                        pending_intent,
+                        market=market,
+                        execution_date=execution_date,
+                        request=request,
+                        response=broker_order,
+                        report_sha=report_sha,
+                        action_index=index,
+                        reconciled_at=now,
+                    )
                 if rejected_status is not None:
                     reason = f"simulate {side} order rejected: {rejected_status}"
                     _write_action_event(
@@ -711,13 +1001,7 @@ def execute_trend_review_open(
                         execution_date=execution_date,
                         action_key=action_key,
                         payload={
-                            "market": market,
-                            "date": execution_date,
-                            "strategy_version": strategy_version,
-                            "report_sha256": report_sha,
-                            "symbol": symbol,
-                            "futu_code": futu_code,
-                            "side": side,
+                            **action_evidence,
                             "status": "failed",
                             "target_qty": str(request.get("qty") or ""),
                             "reason": reason,
@@ -725,25 +1009,91 @@ def execute_trend_review_open(
                         recorded_at=now,
                     )
                     raise RuntimeError(reason)
-                if reconciled:
+                if broker_order is not None:
                     continue
-                intent_path = pending_intent
+                uncertain_events = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in (
+                        data_dir
+                        / "trend_review"
+                        / "ledgers"
+                        / market
+                        / "actions"
+                        / execution_date
+                        / action_key
+                    ).glob("*.json")
+                ]
+                if not any(
+                    event.get("status") == "uncertain"
+                    for event in uncertain_events
+                    if isinstance(event, Mapping)
+                ):
+                    _write_action_event(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        payload={
+                            **action_evidence,
+                            "status": "uncertain",
+                            "target_qty": str(request.get("qty") or ""),
+                            "reason": "intent has no conclusive broker fact",
+                        },
+                        recorded_at=now,
+                    )
+                blocked_status = "uncertain"
+                break
             else:
-                base = json.loads(intent_path.read_text(encoding="utf-8"))
-                request = base.get("request") if isinstance(base, Mapping) else None
-                if not isinstance(request, dict):
-                    raise ValueError("trend review intent request is invalid")
-                listed = client.list_orders(
-                    start=execution_date, end=local_current.date().isoformat()
+                request = intents[0][2]
+                orders = _listed_orders(
+                    client,
+                    start=execution_date,
+                    end=local_current.date().isoformat(),
                 )
-                orders = listed.get("orders") if isinstance(listed, Mapping) else None
-                if not isinstance(orders, list):
-                    raise ValueError("simulate broker orders are unavailable")
+                requests_by_remark: dict[str, list[dict[str, object]]] = {}
+                for _, _, intent_request in intents:
+                    requests_by_remark.setdefault(
+                        str(intent_request.get("remark") or ""), []
+                    ).append(intent_request)
+                conflicting_order = next(
+                    (
+                        order
+                        for order in orders
+                        if str(order.get("remark") or "") in requests_by_remark
+                        and not any(
+                            _order_matches_request(order, candidate)
+                            for candidate in requests_by_remark[
+                                str(order.get("remark") or "")
+                            ]
+                        )
+                    ),
+                    None,
+                )
+                if conflicting_order is not None:
+                    _write_action_event(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        payload={
+                            **action_evidence,
+                            "status": "conflict",
+                            "target_qty": str(request.get("qty") or ""),
+                            "reason": "broker order conflicts with immutable intent",
+                        },
+                        recorded_at=now,
+                    )
+                    blocked_status = "conflict"
+                    break
                 matched = [
                     order
                     for order in orders
-                    if isinstance(order, Mapping)
-                    and _order_has_action_identity(order, request)
+                    if any(
+                        _order_has_action_identity(order, candidate)
+                        for candidate in requests_by_remark.get(
+                            str(order.get("remark") or ""), []
+                        )
+                    )
                 ]
                 position_zero = action_name == "SELL_ALL" and sell_quantity <= 0
                 if not matched and not position_zero:
@@ -816,13 +1166,7 @@ def execute_trend_review_open(
                         execution_date=execution_date,
                         action_key=action_key,
                         payload={
-                            "market": market,
-                            "date": execution_date,
-                            "strategy_version": strategy_version,
-                            "report_sha256": report_sha,
-                            "symbol": symbol,
-                            "futu_code": futu_code,
-                            "side": side,
+                            **action_evidence,
                             "status": (
                                 "filled"
                                 if filled >= target_quantity
@@ -877,6 +1221,26 @@ def execute_trend_review_open(
                     continue
                 request = {**request, "qty": format(remaining, "f")}
                 attempt = len(intent_paths) + 1
+                request["remark"] = trend_attempt_remark(
+                    market, execution_date, action_key, attempt
+                )
+                broker_fact, broker_order = _broker_attempt_fact(orders, request)
+                if broker_fact == "conflict":
+                    _write_action_event(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        payload={
+                            **action_evidence,
+                            "status": "conflict",
+                            "target_qty": format(remaining, "f"),
+                            "reason": "broker order conflicts with proposed attempt",
+                        },
+                        recorded_at=now,
+                    )
+                    blocked_status = "conflict"
+                    break
                 intent_path = root / f"{stem}-attempt-{attempt}-intent.json"
                 _write_immutable(
                     intent_path,
@@ -892,6 +1256,18 @@ def execute_trend_review_open(
                         }
                     ),
                 )
+                if broker_order is not None:
+                    _write_reconciled_result(
+                        intent_path,
+                        market=market,
+                        execution_date=execution_date,
+                        request=request,
+                        response=broker_order,
+                        report_sha=report_sha,
+                        action_index=index,
+                        reconciled_at=now,
+                    )
+                    continue
         else:
             if action_name == "BUY":
                 lot_size = int(action.get("lot_size") or 0)
@@ -918,8 +1294,63 @@ def execute_trend_review_open(
                 "order_type": "MARKET",
                 "price": "0",
                 "qty": str(quantity),
-                "remark": _open_order_remark(market, execution_date, action_key),
+                "remark": trend_attempt_remark(
+                    market, execution_date, action_key, 1
+                ),
             }
+            orders = _listed_orders(
+                client,
+                start=execution_date,
+                end=local_current.date().isoformat(),
+            )
+            same_remark = [
+                order
+                for order in orders
+                if str(order.get("remark") or "") == request["remark"]
+            ]
+            legacy_prefix = f"trend-review:{market}:{execution_date}:"
+            legacy_candidates = [
+                order
+                for order in orders
+                if str(order.get("remark") or "").startswith(legacy_prefix)
+                and _order_has_action_identity(
+                    order,
+                    {
+                        **request,
+                        "remark": str(order.get("remark") or ""),
+                    },
+                )
+            ]
+            candidates = [*same_remark, *legacy_candidates]
+            exact = [
+                order
+                for order in candidates
+                if _order_matches_request(
+                    order,
+                    {
+                        **request,
+                        "remark": str(order.get("remark") or ""),
+                    },
+                )
+            ]
+            if candidates and (len(candidates) != 1 or len(exact) != 1):
+                _write_action_event(
+                    data_dir=data_dir,
+                    market=market,
+                    execution_date=execution_date,
+                    action_key=action_key,
+                    payload={
+                        **action_evidence,
+                        "status": "conflict",
+                        "target_qty": str(quantity),
+                        "reason": "broker action candidate is conflicting or ambiguous",
+                    },
+                    recorded_at=now,
+                )
+                blocked_status = "conflict"
+                break
+            if exact:
+                request["remark"] = str(exact[0].get("remark") or "")
             _write_immutable(
                 intent_path,
                 _canonical_json_bytes(
@@ -933,8 +1364,19 @@ def execute_trend_review_open(
                     }
                 ),
             )
-        base_intent = json.loads((root / f"{stem}-intent.json").read_text(encoding="utf-8"))
-        base_request = base_intent.get("request") if isinstance(base_intent, Mapping) else {}
+            if exact:
+                _write_reconciled_result(
+                    intent_path,
+                    market=market,
+                    execution_date=execution_date,
+                    request=request,
+                    response=exact[0],
+                    report_sha=report_sha,
+                    action_index=index,
+                    reconciled_at=now,
+                )
+                continue
+        base_request = intents[0][2] if intents else request
         target_qty = str(base_request.get("qty") or request.get("qty") or "")
         try:
             response = client.place_order(request)
@@ -945,13 +1387,7 @@ def execute_trend_review_open(
                 execution_date=execution_date,
                 action_key=action_key,
                 payload={
-                    "market": market,
-                    "date": execution_date,
-                    "strategy_version": strategy_version,
-                    "report_sha256": report_sha,
-                    "symbol": symbol,
-                    "futu_code": futu_code,
-                    "side": side,
+                    **action_evidence,
                     "status": "failed",
                     "target_qty": target_qty,
                     "reason": str(exc),
@@ -959,15 +1395,15 @@ def execute_trend_review_open(
                 recorded_at=now,
             )
             raise
-        result_path = intent_path.with_name(
-            intent_path.name.replace("-intent", "-result")
-        )
+        result_path = _result_path(intent_path)
         _write_immutable(
             result_path,
             _canonical_json_bytes(
                 {
                     "market": market,
                     "date": execution_date,
+                    "report_sha256": report_sha,
+                    "action_index": index,
                     "request": request,
                     "response": response,
                     "submitted_at": now,
@@ -981,13 +1417,7 @@ def execute_trend_review_open(
             execution_date=execution_date,
             action_key=action_key,
             payload={
-                "market": market,
-                "date": execution_date,
-                "strategy_version": strategy_version,
-                "report_sha256": report_sha,
-                "symbol": symbol,
-                "futu_code": futu_code,
-                "side": side,
+                **action_evidence,
                 "status": "submitted",
                 "target_qty": target_qty,
                 "order_ids": [order_id] if order_id else [],
@@ -998,7 +1428,9 @@ def execute_trend_review_open(
         submitted += 1
     return {
         "status": (
-            "submitted"
+            blocked_status
+            if blocked_status is not None
+            else "submitted"
             if submitted
             else "unchanged"
             if buy_window_open or market_open
@@ -1040,9 +1472,7 @@ def execute_trend_review_stop(
                 "submitted_count": 0,
             }
         response = client.place_order(request)
-        result_path = intent_path.with_name(
-            intent_path.name.replace("-intent", "-result")
-        )
+        result_path = _result_path(intent_path)
         _write_immutable(
             result_path,
             _canonical_json_bytes({"request": request, "response": response}),
@@ -1100,7 +1530,7 @@ def execute_trend_review_stop(
         ),
     )
     response = client.place_order(request)
-    result_path = intent_path.with_name(intent_path.name.replace("-intent", "-result"))
+    result_path = _result_path(intent_path)
     _write_immutable(
         result_path,
         _canonical_json_bytes({"request": request, "response": response}),

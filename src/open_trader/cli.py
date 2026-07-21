@@ -33,6 +33,7 @@ from .daily_premarket import (
     _read_env_file,
     build_notifier,
     load_env_config,
+    require_trend_executor,
     require_trend_review_config,
     refresh_live_portfolio,
     send_notification_with_results,
@@ -81,6 +82,7 @@ from .kelly_trade_samples import (
 )
 from .kelly_lab import load_kelly_lab_state
 from .kelly_order_execution import (
+    ExecutorGuardedOrderClient,
     FutuOrderExecutionError,
     FutuSimulateOrderExecutionClient,
     MarketRoutingOrderExecutionClient,
@@ -127,11 +129,13 @@ from .trading_plan import (
 )
 from .watchlist import build_watchlist
 from .trend_review import (
+    _report_hash,
     benchmark_fact,
     build_trend_review_projection,
     capture_trend_review_close,
     execute_trend_review_open,
     execute_trend_review_stop,
+    lock_trend_execution_batch,
     rebuild_trend_report_from_evidence,
     replay_trend_evidence,
 )
@@ -185,13 +189,13 @@ def _run_trend_review_close_best_effort(
         print(f"trend review close failed: {exc}", file=sys.stderr)
 
 
-def _load_trend_review_report(
+def _find_trend_review_report(
     config: object,
     market: str,
     trading_date: str,
     *,
     date_field: str,
-) -> dict[str, object]:
+) -> tuple[Path, dict[str, object]]:
     report_dir = (
         config.reports_dir / "trend_a_share"
         if market == "CN"
@@ -211,10 +215,22 @@ def _load_trend_review_report(
             trading_date=trading_date,
             date_field=date_field,
         ):
-            return payload
+            return path, payload
     raise FileNotFoundError(
         f"no {market} trend report with {date_field}={trading_date}"
     )
+
+
+def _load_trend_review_report(
+    config: object,
+    market: str,
+    trading_date: str,
+    *,
+    date_field: str,
+) -> dict[str, object]:
+    return _find_trend_review_report(
+        config, market, trading_date, date_field=date_field
+    )[1]
 
 
 def _valid_trend_review_report(
@@ -290,16 +306,46 @@ def run_trend_review_open(
     config: object, market: str, trading_date: str
 ) -> dict[str, object]:
     account_id = require_trend_review_config(config, market)
-    report = _load_trend_review_report(
+    require_trend_executor(config)
+    report_path, report = _find_trend_review_report(
         config, market, trading_date, date_field="execution_date"
     )
+    now = datetime.now(ZoneInfo(config.timezone)).isoformat(timespec="seconds")
+    batch = lock_trend_execution_batch(
+        config.data_dir,
+        market=market,
+        execution_date=trading_date,
+        report_path=report_path,
+        report=report,
+        locked_at=now,
+    )
+    locked_path = Path(str(batch["report_path"]))
+    try:
+        locked_report = json.loads(locked_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid locked trend report: {locked_path}") from exc
+    if (
+        not _valid_trend_review_report(
+            locked_report,
+            path=locked_path,
+            market=market,
+            trading_date=trading_date,
+            date_field="execution_date",
+        )
+        or _report_hash(locked_report) != batch["report_sha256"]
+    ):
+        raise ValueError(f"invalid locked trend report: {locked_path}")
+    report = locked_report
     client = None
     try:
-        client = FutuSimulateOrderExecutionClient(
-            host=config.futu_host,
-            port=config.futu_port,
-            simulate_acc_id=account_id,
-            trd_market=market,
+        client = ExecutorGuardedOrderClient(
+            FutuSimulateOrderExecutionClient(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=account_id,
+                trd_market=market,
+            ),
+            lambda: require_trend_executor(config),
         )
         result = execute_trend_review_open(
             data_dir=config.data_dir,
@@ -307,7 +353,7 @@ def run_trend_review_open(
             client=client,
             market=market,
             execution_date=trading_date,
-            now=datetime.now(ZoneInfo(config.timezone)).isoformat(timespec="seconds"),
+            now=now,
         )
     finally:
         if client is not None:
@@ -377,11 +423,15 @@ def run_trend_review_stop(
     if not isinstance(event, dict):
         raise ValueError("trend review protection event must be an object")
     account_id = require_trend_review_config(config, market)
-    client = FutuSimulateOrderExecutionClient(
-        host=config.futu_host,
-        port=config.futu_port,
-        simulate_acc_id=account_id,
-        trd_market=market,
+    require_trend_executor(config)
+    client = ExecutorGuardedOrderClient(
+        FutuSimulateOrderExecutionClient(
+            host=config.futu_host,
+            port=config.futu_port,
+            simulate_acc_id=account_id,
+            trd_market=market,
+        ),
+        lambda: require_trend_executor(config),
     )
     try:
         return execute_trend_review_stop(

@@ -554,8 +554,13 @@ def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
         trend_review_us_simulate_acc_id=102,
         trend_review_hk_simulate_acc_id=103,
     )
-    client = SimpleNamespace(close=lambda: None)
+    client = SimpleNamespace(
+        close=lambda: None,
+        place_order=lambda request: {"request": request},
+    )
     captured: dict[str, object] = {}
+    executed_reports: list[object] = []
+    authorizations: list[str] = []
     monkeypatch.setattr(
         cli,
         "FutuSimulateOrderExecutionClient",
@@ -566,9 +571,17 @@ def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
         "FutuQuoteClient",
         lambda **kwargs: pytest.fail("frozen execution must not query opening prices"),
     )
+    monkeypatch.setattr(
+        cli,
+        "require_trend_executor",
+        lambda config: authorizations.append("checked"),
+        raising=False,
+    )
 
     def execute(**kwargs: object) -> dict[str, object]:
         captured.update(kwargs)
+        executed_reports.append(kwargs["report"])
+        kwargs["client"].place_order({"futu_code": "SH.600001"})
         return {
             "status": "submitted",
             "submitted_count": 1,
@@ -578,10 +591,70 @@ def test_trend_review_open_submits_frozen_actions_without_opening_quotes(
     monkeypatch.setattr(cli, "execute_trend_review_open", execute)
 
     result = cli.run_trend_review_open(config, "CN", "2026-07-17")
+    revised = json.loads(json.dumps(report))
+    revised["generated_at"] = "2026-07-16T18:01:00+08:00"
+    revised["strategy_judgments"]["formal_actions"][0]["estimated_shares"] = 200
+    (report_dir / "2026-07-16-r1.json").write_text(
+        json.dumps(revised), encoding="utf-8"
+    )
+    repeated = cli.run_trend_review_open(config, "CN", "2026-07-17")
 
     assert captured["report"] == report
+    assert executed_reports == [report, report]
     assert "prices" not in captured
+    assert authorizations == ["checked", "checked", "checked", "checked"]
     assert result["artifact_path"] == str(tmp_path / "result.json")
+    assert repeated["artifact_path"] == str(tmp_path / "result.json")
+    assert (
+        config.data_dir
+        / "trend_review/ledgers/CN/batches/2026-07-17.json"
+    ).exists()
+
+
+def test_trend_review_stop_checks_executor_again_at_broker_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    delegate = SimpleNamespace(
+        close=lambda: None,
+        place_order=lambda request: {"request": request},
+    )
+    authorizations: list[str] = []
+    monkeypatch.setattr(
+        cli, "FutuSimulateOrderExecutionClient", lambda **kwargs: delegate
+    )
+    monkeypatch.setattr(
+        cli,
+        "require_trend_executor",
+        lambda config: authorizations.append("checked"),
+        raising=False,
+    )
+
+    def execute(**kwargs: object) -> dict[str, object]:
+        kwargs["client"].place_order({"futu_code": "SH.600001"})
+        return {"status": "submitted"}
+
+    monkeypatch.setattr(cli, "execute_trend_review_stop", execute)
+
+    result = cli.run_trend_review_stop(
+        SimpleNamespace(
+            data_dir=tmp_path,
+            futu_host="127.0.0.1",
+            futu_port=11111,
+            trend_review_cn_simulate_acc_id=101,
+            trend_review_us_simulate_acc_id=102,
+            trend_review_hk_simulate_acc_id=103,
+        ),
+        "CN",
+        {
+            "symbol": "600001",
+            "trading_date": "2026-07-20",
+            "event_id": "event-1",
+            "occurred_at": "2026-07-20T09:31:00+08:00",
+        },
+    )
+
+    assert result == {"status": "submitted"}
+    assert authorizations == ["checked", "checked"]
 
 
 def test_trend_a_share_report_invalid_private_config_returns_two(

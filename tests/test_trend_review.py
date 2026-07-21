@@ -548,6 +548,407 @@ def report_with_actions(actions: list[dict[str, object]]) -> dict[str, object]:
     return report
 
 
+def test_action_identity_ignores_report_revision_and_strategy_version() -> None:
+    first = trend_review.trend_action_key(
+        "US", "2026-07-20", "US.TRV", "buy"
+    )
+    second = trend_review.trend_action_key(
+        "US", "2026-07-20", "us.trv", "BUY"
+    )
+
+    assert first == second
+    assert trend_review.trend_attempt_remark(
+        "US", "2026-07-20", first, 1
+    ) != trend_review.trend_attempt_remark(
+        "US", "2026-07-20", first, 2
+    )
+
+
+def test_execution_batch_keeps_first_report_sha(tmp_path: Path) -> None:
+    first = cn_buy_report()
+    revised = {
+        **cn_buy_report(),
+        "generated_at": "2026-07-20T08:59:00+08:00",
+    }
+
+    locked = trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=tmp_path / "2026-07-17.json",
+        report=first,
+        locked_at="2026-07-20T09:30:00+08:00",
+    )
+    repeated = trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=tmp_path / "2026-07-17-r1.json",
+        report=revised,
+        locked_at="2026-07-20T09:31:00+08:00",
+    )
+
+    assert repeated == locked
+    assert repeated["report_sha256"] == trend_review._report_hash(first)
+
+
+def test_execution_batch_recovers_report_selected_by_legacy_intent(
+    tmp_path: Path,
+) -> None:
+    old_report = cn_buy_report(shares=300)
+    old_path = tmp_path / "reports/2026-07-17.json"
+    old_path.parent.mkdir(parents=True)
+    old_path.write_text(json.dumps(old_report), encoding="utf-8")
+    latest_report = cn_buy_report(shares=400)
+    latest_path = old_path.with_name("2026-07-17-r1.json")
+    latest_path.write_text(json.dumps(latest_report), encoding="utf-8")
+    intent_path = (
+        tmp_path
+        / "trend_review/ledgers/CN/open/2026-07-20/legacy-intent.json"
+    )
+    intent_path.parent.mkdir(parents=True)
+    intent_path.write_text(
+        json.dumps(
+                {
+                    "report_sha256": trend_review._report_hash(old_report),
+                    "created_at": "2026-07-20T09:29:00+08:00",
+                    "request": {"futu_code": "SH.600001", "side": "buy"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    locked = trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=latest_path,
+        report=latest_report,
+        locked_at="2026-07-20T09:30:00+08:00",
+    )
+
+    assert locked["report_path"] == str(old_path)
+    assert locked["report_sha256"] == trend_review._report_hash(old_report)
+
+
+def test_execution_batch_blocks_when_legacy_report_is_missing(
+    tmp_path: Path,
+) -> None:
+    latest_report = cn_buy_report(shares=400)
+    latest_path = tmp_path / "reports/2026-07-17-r1.json"
+    latest_path.parent.mkdir(parents=True)
+    latest_path.write_text(json.dumps(latest_report), encoding="utf-8")
+    intent_path = (
+        tmp_path
+        / "trend_review/ledgers/CN/open/2026-07-20/legacy-intent.json"
+    )
+    intent_path.parent.mkdir(parents=True)
+    intent_path.write_text(
+        json.dumps(
+                {
+                    "report_sha256": "a" * 64,
+                    "created_at": "2026-07-20T09:29:00+08:00",
+                    "request": {"futu_code": "SH.600001", "side": "buy"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="blocked.*matching report"):
+        trend_review.lock_trend_execution_batch(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            report_path=latest_path,
+            report=latest_report,
+            locked_at="2026-07-20T09:30:00+08:00",
+        )
+
+
+def test_existing_exact_broker_order_repairs_result_without_submit(
+    tmp_path: Path,
+) -> None:
+    report = cn_buy_report()
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    client = FakeTrendSimClient()
+    client.orders = [
+        {
+            "order_id": "SIM-EXISTING",
+            "remark": trend_review.trend_attempt_remark(
+                "CN", "2026-07-20", action_key, 1
+            ),
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "400",
+            "dealt_qty": "0",
+            "order_status": "SUBMITTED",
+        }
+    ]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={"SH.600001": Decimal("10")},
+    )
+
+    assert result["submitted_count"] == 0
+    assert client.requests == []
+    assert list(
+        tmp_path.glob("trend_review/ledgers/CN/open/2026-07-20/*-result.json")
+    )
+
+
+def test_same_remark_with_conflicting_quantity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    report = cn_buy_report()
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    client = FakeTrendSimClient()
+    client.orders = [
+        {
+            "order_id": "SIM-CONFLICT",
+            "remark": trend_review.trend_attempt_remark(
+                "CN", "2026-07-20", action_key, 1
+            ),
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "999",
+            "dealt_qty": "0",
+            "order_status": "SUBMITTED",
+        }
+    ]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={"SH.600001": Decimal("10")},
+    )
+
+    assert result["status"] == "conflict"
+    assert client.requests == []
+
+
+def test_same_remark_with_exact_and_conflicting_orders_fails_closed(
+    tmp_path: Path,
+) -> None:
+    report = cn_buy_report()
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    remark = trend_review.trend_attempt_remark(
+        "CN", "2026-07-20", action_key, 1
+    )
+    client = FakeTrendSimClient(fail_orders=1)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "now": "2026-07-20T09:31:00+08:00",
+    }
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_open(**arguments)
+    client.orders = [
+        {
+            "order_id": "SIM-EXACT",
+            "remark": remark,
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "400",
+        },
+        {
+            "order_id": "SIM-CONFLICT",
+            "remark": remark,
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "999",
+        },
+    ]
+
+    result = trend_review.execute_trend_review_open(**arguments)
+
+    assert result["status"] == "conflict"
+    assert len(client.requests) == 1
+
+
+def test_intent_without_broker_fact_becomes_uncertain_and_never_resubmits(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(fail_orders=1)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "now": "2026-07-20T09:31:00+08:00",
+        "quote_prices": {"SH.600001": Decimal("10")},
+    }
+
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_open(**arguments)
+    client.fail_orders = 0
+    recovered = trend_review.execute_trend_review_open(**arguments)
+    repeated = trend_review.execute_trend_review_open(
+        **{**arguments, "now": "2026-07-20T09:32:00+08:00"}
+    )
+
+    assert recovered["status"] == "uncertain"
+    assert repeated["status"] == "uncertain"
+    assert len(client.requests) == 1
+    uncertain = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-20/*/*.json"
+        )
+        if '"status":"uncertain"' in path.read_text(encoding="utf-8")
+    ]
+    assert len(uncertain) == 1
+
+
+def test_legacy_intent_is_discovered_by_symbol_and_side(tmp_path: Path) -> None:
+    request = {
+        "market": "CN",
+        "futu_code": "SH.600001",
+        "side": "buy",
+        "order_type": "MARKET",
+        "price": "0",
+        "qty": "400",
+        "remark": "trend-review:CN:2026-07-20:legacy",
+    }
+    intent_path = (
+        tmp_path
+        / "trend_review/ledgers/CN/open/2026-07-20/old-strategy-intent.json"
+    )
+    intent_path.parent.mkdir(parents=True)
+    intent_path.write_text(
+        json.dumps(
+            {
+                "report_sha256": "b" * 64,
+                "action_index": 0,
+                "request": request,
+                "created_at": "2026-07-20T09:30:00+08:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = FakeTrendSimClient()
+    client.orders = [
+        {
+            "order_id": "SIM-LEGACY",
+            "remark": request["remark"],
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "400",
+            "dealt_qty": "0",
+            "order_status": "SUBMITTED",
+        }
+    ]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+    )
+
+    assert result["submitted_count"] == 0
+    assert client.requests == []
+    assert intent_path.exists()
+    assert intent_path.with_name("old-strategy-result.json").exists()
+
+
+def test_broker_only_legacy_remark_repairs_canonical_ledger(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    client.orders = [
+        {
+            "order_id": "SIM-LEGACY",
+            "remark": "trend-review:CN:2026-07-20:old-action",
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "400",
+            "dealt_qty": "0",
+            "order_status": "SUBMITTED",
+        }
+    ]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+    )
+
+    assert result["submitted_count"] == 0
+    assert client.requests == []
+    result_path = next(
+        tmp_path.glob("trend_review/ledgers/CN/open/2026-07-20/*-result.json")
+    )
+    repaired = json.loads(result_path.read_text(encoding="utf-8"))
+    assert repaired["request"]["remark"] == client.orders[0]["remark"]
+
+
+def test_broker_only_canonical_and_legacy_candidates_fail_closed(
+    tmp_path: Path,
+) -> None:
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    common = {
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "400",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }
+    client = FakeTrendSimClient()
+    client.orders = [
+        {
+            **common,
+            "order_id": "SIM-CANONICAL",
+            "remark": trend_review.trend_attempt_remark(
+                "CN", "2026-07-20", action_key, 1
+            ),
+        },
+        {
+            **common,
+            "order_id": "SIM-LEGACY",
+            "remark": "trend-review:CN:2026-07-20:old-action",
+        },
+    ]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=cn_buy_report(),
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+    )
+
+    assert result["status"] == "conflict"
+    assert client.requests == []
+
+
 def test_open_uses_frozen_report_quantity_despite_live_nav_and_price(tmp_path: Path) -> None:
     client = FakeTrendSimClient(nav="900000")
     report = cn_buy_report(shares=300)
@@ -583,6 +984,7 @@ def test_open_uses_frozen_report_quantity_despite_live_nav_and_price(tmp_path: P
         "status": "submitted",
         "target_qty": "300",
         "order_ids": ["SIM-1"],
+        "action_index": 0,
     } == json.loads(events[-1].read_text(encoding="utf-8"))
 
 
@@ -1000,7 +1402,7 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
         client.orders[0],
         {
             "order_id": "SIM-2",
-            "remark": remark,
+            "remark": client.requests[-1]["remark"],
             "code": "SH.600001",
             "trd_side": "SELL",
             "qty": "100",
@@ -1257,8 +1659,13 @@ def test_positive_sell_recovery_uses_broker_fills_and_live_retry_quantity(
     recovered = trend_review.execute_trend_review_open(
         **arguments, now="2026-07-20T09:32:00+08:00"
     )
-    latest = json.loads(
-        sorted(tmp_path.glob(action_glob))[-1].read_text(encoding="utf-8")
+    latest = next(
+        event
+        for event in (
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in tmp_path.glob(action_glob)
+        )
+        if event.get("status") == "partially_filled"
     )
 
     assert recovered["submitted_count"] == 1
@@ -1302,7 +1709,61 @@ def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:
 
     assert result["submitted_count"] == 1
     assert client.requests[-1]["qty"] == "200"
-    assert client.requests[-1]["remark"] == remark
+    assert client.requests[-1]["remark"] != remark
+
+
+def test_existing_broker_retry_repairs_result_without_duplicate_submit(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "now": "2026-07-17T09:31:00+08:00",
+    }
+    trend_review.execute_trend_review_open(**arguments)
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-17", "SH.600001", "buy"
+    )
+    client.orders = [
+        {
+            "order_id": "SIM-1",
+            "remark": client.requests[0]["remark"],
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "400",
+            "dealt_qty": "200",
+            "order_status": "CANCELLED_PART",
+        },
+        {
+            "order_id": "SIM-2",
+            "remark": trend_review.trend_attempt_remark(
+                "CN", "2026-07-17", action_key, 2
+            ),
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "200",
+            "dealt_qty": "0",
+            "order_status": "SUBMITTED",
+        },
+    ]
+
+    result = trend_review.execute_trend_review_open(
+        **{**arguments, "now": "2026-07-17T09:32:00+08:00"}
+    )
+
+    assert result["submitted_count"] == 0
+    assert len(client.requests) == 1
+    assert len(
+        list(
+            tmp_path.glob(
+                "trend_review/ledgers/CN/open/2026-07-17/*-result.json"
+            )
+        )
+    ) == 2
 
 
 def test_active_partial_buy_waits_instead_of_duplicate_submission(
@@ -1413,7 +1874,7 @@ def test_filled_buy_records_active_protection_line_without_mutating_report(
     ).hexdigest()
 
 
-def test_open_retries_intent_when_failed_order_is_absent_at_broker(
+def test_open_marks_intent_uncertain_when_failed_order_is_absent_at_broker(
     tmp_path: Path,
 ) -> None:
     client = FakeTrendSimClient(fail_orders=1)
@@ -1430,9 +1891,9 @@ def test_open_retries_intent_when_failed_order_is_absent_at_broker(
         trend_review.execute_trend_review_open(**arguments)
     result = trend_review.execute_trend_review_open(**arguments)
 
-    assert result["status"] == "submitted"
-    assert result["submitted_count"] == 1
-    assert len(client.requests) == 2
+    assert result["status"] == "uncertain"
+    assert result["submitted_count"] == 0
+    assert len(client.requests) == 1
 
 
 def test_open_reconciles_accepted_order_after_response_failure(
@@ -1463,7 +1924,7 @@ def test_open_reconciles_accepted_order_after_response_failure(
     assert list(tmp_path.glob("trend_review/ledgers/CN/open/*/*-result.json"))
 
 
-def test_newer_revision_cannot_reconcile_to_older_response_failure(
+def test_newer_revision_reconciles_same_stable_action_after_response_failure(
     tmp_path: Path,
 ) -> None:
     client = FakeTrendSimClient(fail_orders=1, accepted_before_failure=True)
@@ -1478,25 +1939,18 @@ def test_newer_revision_cannot_reconcile_to_older_response_failure(
     with pytest.raises(RuntimeError, match="place order failed"):
         trend_review.execute_trend_review_open(**first)
 
-    client.fail_orders = 1
-    client.accepted_before_failure = False
     revised = {
         **first,
-        "report": cn_buy_report(symbol="600002"),
+        "report": {
+            **cn_buy_report(symbol="600001"),
+            "generated_at": "2026-07-17T09:32:00+08:00",
+        },
     }
-    with pytest.raises(RuntimeError, match="place order failed"):
-        trend_review.execute_trend_review_open(**revised)
     result = trend_review.execute_trend_review_open(**revised)
 
-    assert result["submitted_count"] == 1
-    assert len(client.requests) == 3
-    assert client.requests[0]["remark"] != client.requests[1]["remark"]
-    assert client.requests[-1] | {
-        "futu_code": "SH.600002",
-        "side": "buy",
-        "qty": "400",
-    } == client.requests[-1]
-    assert len(client.requests[-1]["remark"].encode("utf-8")) <= 64
+    assert result["status"] == "unchanged"
+    assert result["submitted_count"] == 0
+    assert len(client.requests) == 1
 
 
 def test_first_open_binds_discipline_account_with_existing_sell_position(
